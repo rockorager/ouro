@@ -9,6 +9,7 @@ pub const RegionRectangle = @import("region.zig").Rectangle;
 pub const SurfaceRegions = @import("region.zig").SurfaceRegions;
 pub const FramePool = @import("frame.zig").Pool;
 pub const FrameQueue = @import("frame.zig").Queue;
+pub const SubsurfaceGraph = @import("subsurface.zig").Graph;
 
 pub const Error = error{
     InvalidRole,
