@@ -7,6 +7,8 @@ pub const RegionPool = @import("region.zig").Pool;
 pub const Region = @import("region.zig").Region;
 pub const RegionRectangle = @import("region.zig").Rectangle;
 pub const SurfaceRegions = @import("region.zig").SurfaceRegions;
+pub const FramePool = @import("frame.zig").Pool;
+pub const FrameQueue = @import("frame.zig").Queue;
 
 pub const Error = error{
     InvalidRole,
