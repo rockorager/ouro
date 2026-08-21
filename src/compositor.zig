@@ -13,6 +13,8 @@ pub const SubsurfaceGraph = @import("subsurface.zig").Graph;
 pub const ReleasePool = @import("release.zig").Pool;
 pub const ReleaseQueue = @import("release.zig").Queue;
 pub const ReleaseBatch = @import("release.zig").Batch;
+pub const ContentUpdateScheduler = @import("content_update.zig").Scheduler;
+pub const ContentUpdateKind = @import("content_update.zig").Kind;
 
 pub const Error = error{
     InvalidRole,
