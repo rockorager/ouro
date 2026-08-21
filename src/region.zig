@@ -174,6 +174,37 @@ pub const SurfaceRegions = struct {
         input_changed: bool,
     };
 
+    pub const Prepared = struct {
+        owner: *SurfaceRegions,
+        next_opaque: Region,
+        next_input: Region,
+        changes: Changes,
+
+        /// Releases prepared snapshots when a later preflight check fails.
+        /// Calling this after `publish` is also valid; both temporaries are
+        /// empty by then.
+        pub fn deinit(prepared: *Prepared) void {
+            prepared.next_opaque.clear();
+            prepared.next_input.clear();
+        }
+
+        pub fn publish(prepared: *Prepared) Changes {
+            const regions = prepared.owner;
+            if (prepared.changes.opaque_changed) {
+                std.mem.swap(Region, &regions.current_opaque, &prepared.next_opaque);
+                prepared.next_opaque.clear();
+                regions.opaque_dirty = false;
+            }
+            if (prepared.changes.input_changed) {
+                std.mem.swap(Region, &regions.current_input, &prepared.next_input);
+                prepared.next_input.clear();
+                regions.current_input_infinite = regions.pending_input_infinite;
+                regions.input_dirty = false;
+            }
+            return prepared.changes;
+        }
+    };
+
     pub fn init(pool: *Pool) SurfaceRegions {
         return .{
             .current_opaque = Region.init(pool),
@@ -211,32 +242,32 @@ pub const SurfaceRegions = struct {
         regions.input_dirty = true;
     }
 
-    /// Copies dirty pending regions atomically. Pool exhaustion leaves both
-    /// current snapshots and dirty flags unchanged for retry or protocol error.
-    pub fn commit(regions: *SurfaceRegions) Error!Changes {
+    /// Prepares dirty region replacements without mutating current snapshots or
+    /// dirty flags. This composes with other fallible commit preflight work.
+    pub fn prepareCommit(regions: *SurfaceRegions) Error!Prepared {
         var next_opaque = Region.init(regions.current_opaque.pool);
         errdefer next_opaque.clear();
         var input = Region.init(regions.current_input.pool);
         errdefer input.clear();
         if (regions.opaque_dirty) try next_opaque.cloneFrom(&regions.pending_opaque);
         if (regions.input_dirty) try input.cloneFrom(&regions.pending_input);
-
-        const changes: Changes = .{
-            .opaque_changed = regions.opaque_dirty,
-            .input_changed = regions.input_dirty,
+        return .{
+            .owner = regions,
+            .next_opaque = next_opaque,
+            .next_input = input,
+            .changes = .{
+                .opaque_changed = regions.opaque_dirty,
+                .input_changed = regions.input_dirty,
+            },
         };
-        if (regions.opaque_dirty) {
-            std.mem.swap(Region, &regions.current_opaque, &next_opaque);
-            next_opaque.clear();
-            regions.opaque_dirty = false;
-        }
-        if (regions.input_dirty) {
-            std.mem.swap(Region, &regions.current_input, &input);
-            input.clear();
-            regions.current_input_infinite = regions.pending_input_infinite;
-            regions.input_dirty = false;
-        }
-        return changes;
+    }
+
+    /// Copies dirty pending regions atomically. Pool exhaustion leaves both
+    /// current snapshots and dirty flags unchanged for retry or protocol error.
+    pub fn commit(regions: *SurfaceRegions) Error!Changes {
+        var prepared = try regions.prepareCommit();
+        defer prepared.deinit();
+        return prepared.publish();
     }
 };
 

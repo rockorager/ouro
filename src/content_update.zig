@@ -31,6 +31,16 @@ pub fn Scheduler(comptime Key: type, comptime Payload: type) type {
             payload: Payload,
         };
 
+        pub const CommitPlan = struct {
+            queue: *Queue,
+            previous: ?Token,
+            child_dependencies: []const Token,
+            kind: Kind,
+            constraints: u32,
+            required_edges: usize,
+            valid: bool = true,
+        };
+
         const Node = struct {
             active: bool = false,
             generation: u32 = 0,
@@ -68,6 +78,25 @@ pub fn Scheduler(comptime Key: type, comptime Payload: type) type {
                 while (queue.head != none) {
                     const index = queue.head;
                     queue.head = queue.scheduler.nodes[index].queue_next;
+                    queue.scheduler.releaseEdges(index);
+                    queue.scheduler.releaseNode(index);
+                }
+                queue.tail = none;
+                queue.count = 0;
+                queue.* = undefined;
+            }
+
+            /// Deinitializes queued payload ownership before releasing DAG
+            /// nodes. Use this for payloads containing callback batches, file
+            /// descriptors, or other explicit resources.
+            pub fn deinitWith(
+                queue: *Queue,
+                comptime discard: fn (*Payload) void,
+            ) void {
+                while (queue.head != none) {
+                    const index = queue.head;
+                    queue.head = queue.scheduler.nodes[index].queue_next;
+                    discard(&queue.scheduler.nodes[index].payload);
                     queue.scheduler.releaseEdges(index);
                     queue.scheduler.releaseNode(index);
                 }
@@ -137,17 +166,16 @@ pub fn Scheduler(comptime Key: type, comptime Payload: type) type {
             return scheduler.edges.len - scheduler.active_edges;
         }
 
-        /// Appends one content update. The queue predecessor is always a
-        /// dependency. Eligible child SCUs are claimed exactly once, matching
-        /// wl_surface.commit's direct-child dependency rule.
-        pub fn commit(
+        /// Validates dependencies and pool capacity without mutation. The plan
+        /// borrows `child_dependencies` and must be published synchronously,
+        /// before any other operation touches this scheduler.
+        pub fn prepareCommit(
             scheduler: *Self,
             queue: *Queue,
-            payload: Payload,
             kind: Kind,
             child_dependencies: []const Token,
             constraints: u32,
-        ) Error!Token {
+        ) Error!CommitPlan {
             if (queue.scheduler != scheduler) return error.InvalidDependency;
             var edge_count: usize = if (queue.tail == none) 0 else 1;
             for (child_dependencies, 0..) |dependency, position| {
@@ -165,14 +193,42 @@ pub fn Scheduler(comptime Key: type, comptime Payload: type) type {
             }
             if (scheduler.node_free == none) return error.NodeExhausted;
             if (scheduler.availableEdges() < edge_count) return error.EdgeExhausted;
+            return .{
+                .queue = queue,
+                .previous = if (queue.tail == none) null else scheduler.nodeToken(queue.tail),
+                .child_dependencies = child_dependencies,
+                .kind = kind,
+                .constraints = constraints,
+                .required_edges = edge_count,
+            };
+        }
 
-            const index = scheduler.acquireNode(queue, payload, kind, constraints);
-            if (queue.tail != none)
-                scheduler.addEdge(index, scheduler.nodeToken(queue.tail), false);
-            for (child_dependencies, 0..) |dependency, position| {
-                const dependency_index = try scheduler.validateToken(dependency);
-                var duplicate = queue.tail == dependency_index;
-                for (child_dependencies[0..position]) |earlier| {
+        /// Publishes a prepared update without a failure path.
+        pub fn publishCommit(
+            scheduler: *Self,
+            plan: *CommitPlan,
+            payload: Payload,
+        ) Token {
+            std.debug.assert(plan.valid);
+            std.debug.assert(plan.queue.scheduler == scheduler);
+            std.debug.assert(scheduler.node_free != none);
+            std.debug.assert(scheduler.availableEdges() >= plan.required_edges);
+            if (plan.previous) |previous| {
+                std.debug.assert(plan.queue.tail == previous.index);
+                _ = scheduler.validateToken(previous) catch unreachable;
+            } else std.debug.assert(plan.queue.tail == none);
+
+            const index = scheduler.acquireNode(
+                plan.queue,
+                payload,
+                plan.kind,
+                plan.constraints,
+            );
+            if (plan.previous) |previous| scheduler.addEdge(index, previous, false);
+            for (plan.child_dependencies, 0..) |dependency, position| {
+                const dependency_index = scheduler.validateToken(dependency) catch unreachable;
+                var duplicate = plan.queue.tail == dependency_index;
+                for (plan.child_dependencies[0..position]) |earlier| {
                     if (std.meta.eql(earlier, dependency)) {
                         duplicate = true;
                         break;
@@ -183,10 +239,31 @@ pub fn Scheduler(comptime Key: type, comptime Payload: type) type {
                     scheduler.nodes[dependency_index].child_claimed = true;
                 }
             }
-            if (queue.tail == none) queue.head = index else scheduler.nodes[queue.tail].queue_next = index;
-            queue.tail = index;
-            queue.count += 1;
+            if (plan.queue.tail == none) plan.queue.head = index else scheduler.nodes[plan.queue.tail].queue_next = index;
+            plan.queue.tail = index;
+            plan.queue.count += 1;
+            plan.valid = false;
             return scheduler.nodeToken(index);
+        }
+
+        /// Appends one content update. The queue predecessor is always a
+        /// dependency. Eligible child SCUs are claimed exactly once, matching
+        /// wl_surface.commit's direct-child dependency rule.
+        pub fn commit(
+            scheduler: *Self,
+            queue: *Queue,
+            payload: Payload,
+            kind: Kind,
+            child_dependencies: []const Token,
+            constraints: u32,
+        ) Error!Token {
+            var plan = try scheduler.prepareCommit(
+                queue,
+                kind,
+                child_dependencies,
+                constraints,
+            );
+            return scheduler.publishCommit(&plan, payload);
         }
 
         pub fn satisfy(scheduler: *Self, update: Token, count: u32) Error!void {

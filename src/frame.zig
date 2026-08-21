@@ -62,6 +62,24 @@ pub const Pool = struct {
     }
 };
 
+/// Frame callbacks owned by one content update until that update applies.
+pub const Batch = struct {
+    pool: *Pool,
+    head: u32,
+    tail: u32,
+    count: usize,
+
+    pub fn deinit(batch: *Batch) void {
+        while (batch.head != none) {
+            const index = batch.head;
+            batch.head = batch.pool.nodes[index].next;
+            batch.pool.release(index);
+        }
+        batch.tail = none;
+        batch.count = 0;
+    }
+};
+
 /// Pending callbacks become ready atomically with the next surface commit.
 /// Ready callbacks preserve request and commit order. Callers peek, enqueue
 /// callback.done/delete_id transactionally, then consume only after success.
@@ -95,21 +113,43 @@ pub const Queue = struct {
         queue.pending_count += 1;
     }
 
-    /// Splices all pending callbacks onto the ready queue in O(1).
-    pub fn commit(queue: *Queue) usize {
-        const committed = queue.pending_count;
-        if (committed == 0) return 0;
-        if (queue.ready_tail == none) {
-            queue.ready_head = queue.pending_head;
-        } else {
-            queue.pool.nodes[queue.ready_tail].next = queue.pending_head;
-        }
-        queue.ready_tail = queue.pending_tail;
-        queue.ready_count += committed;
+    /// Detaches pending callbacks into per-content-update ownership in O(1).
+    pub fn detachPending(queue: *Queue) ?Batch {
+        if (queue.pending_count == 0) return null;
+        const batch: Batch = .{
+            .pool = queue.pool,
+            .head = queue.pending_head,
+            .tail = queue.pending_tail,
+            .count = queue.pending_count,
+        };
         queue.pending_head = none;
         queue.pending_tail = none;
         queue.pending_count = 0;
-        return committed;
+        return batch;
+    }
+
+    /// Makes callbacks ready when their owning content update applies.
+    pub fn activate(queue: *Queue, batch: *Batch) usize {
+        std.debug.assert(batch.pool == queue.pool);
+        const activated = batch.count;
+        if (activated == 0) return 0;
+        if (queue.ready_tail == none) {
+            queue.ready_head = batch.head;
+        } else {
+            queue.pool.nodes[queue.ready_tail].next = batch.head;
+        }
+        queue.ready_tail = batch.tail;
+        queue.ready_count += activated;
+        batch.head = none;
+        batch.tail = none;
+        batch.count = 0;
+        return activated;
+    }
+
+    /// Splices all pending callbacks onto the ready queue in O(1).
+    pub fn commit(queue: *Queue) usize {
+        var batch = queue.detachPending() orelse return 0;
+        return queue.activate(&batch);
     }
 
     pub fn peekReady(queue: Queue) ?objects.Handle {
@@ -172,4 +212,19 @@ test "frame callback capacity is shared" {
     try first.addPending(callback);
     try std.testing.expectError(error.Exhausted, second.addPending(callback));
     try std.testing.expectEqual(@as(usize, 0), second.pending_count);
+}
+
+test "frame callbacks remain owned by a content update until activation" {
+    var pool = try Pool.init(std.testing.allocator, 2);
+    defer pool.deinit(std.testing.allocator);
+    var queue = Queue.init(&pool);
+    defer queue.deinit();
+    const callback: objects.Handle = .{ .id = 2, .generation = 1 };
+    try queue.addPending(callback);
+    var batch = queue.detachPending().?;
+    defer batch.deinit();
+    try std.testing.expectEqual(@as(?objects.Handle, null), queue.peekReady());
+    try std.testing.expectEqual(@as(usize, 1), queue.activate(&batch));
+    try std.testing.expectEqual(callback, queue.peekReady().?);
+    try queue.consumeReady(callback);
 }

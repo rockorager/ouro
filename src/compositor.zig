@@ -9,6 +9,7 @@ pub const RegionRectangle = @import("region.zig").Rectangle;
 pub const SurfaceRegions = @import("region.zig").SurfaceRegions;
 pub const FramePool = @import("frame.zig").Pool;
 pub const FrameQueue = @import("frame.zig").Queue;
+pub const FrameBatch = @import("frame.zig").Batch;
 pub const SubsurfaceGraph = @import("subsurface.zig").Graph;
 pub const ReleasePool = @import("release.zig").Pool;
 pub const ReleaseQueue = @import("release.zig").Queue;
@@ -180,6 +181,10 @@ pub const Surface = struct {
         surface.pending_offset = .{ .x = x, .y = y };
     }
 
+    pub fn hasPendingBufferAttachment(surface: Surface) bool {
+        return surface.attach_changed and surface.pending_buffer != null;
+    }
+
     /// Atomically applies persistent scalar state and extracts one-shot state.
     pub fn commit(surface: *Surface) Update {
         surface.sequence +%= 1;
@@ -213,6 +218,76 @@ pub const Surface = struct {
     }
 };
 
+/// Transactional composition of one wl_surface commit with shared state pools
+/// and the version-7 content-update scheduler.
+pub fn CommitState(comptime Key: type) type {
+    return struct {
+        pub const Content = struct {
+            surface: Update,
+            regions: SurfaceRegions.Changes,
+            frame_callbacks: ?FrameBatch,
+            release_callbacks: ?ReleaseBatch,
+
+            /// Releases callback ownership when an unapplied CU is discarded.
+            pub fn deinit(content: *Content) void {
+                if (content.frame_callbacks) |*batch| batch.deinit();
+                if (content.release_callbacks) |*batch| batch.deinit();
+                content.frame_callbacks = null;
+                content.release_callbacks = null;
+            }
+
+            /// Frame callbacks become ready only when this CU applies.
+            pub fn activateFrames(content: *Content, queue: *FrameQueue) usize {
+                if (content.frame_callbacks) |*batch| {
+                    const activated = queue.activate(batch);
+                    content.frame_callbacks = null;
+                    return activated;
+                }
+                return 0;
+            }
+        };
+
+        pub const Scheduler = ContentUpdateScheduler(Key, Content);
+
+        pub fn deinitQueue(queue: *Scheduler.Queue) void {
+            queue.deinitWith(Content.deinit);
+        }
+
+        /// All failures occur before externally visible state mutation. The
+        /// prepared scheduler plan is published synchronously after infallible
+        /// surface, region, and callback ownership transitions.
+        pub fn commit(
+            scheduler: *Scheduler,
+            queue: *Scheduler.Queue,
+            surface: *Surface,
+            regions: *SurfaceRegions,
+            frames: *FrameQueue,
+            releases: *ReleaseQueue,
+            kind: ContentUpdateKind,
+            child_dependencies: []const Scheduler.Token,
+            constraints: u32,
+        ) !Scheduler.Token {
+            var scheduler_plan = try scheduler.prepareCommit(
+                queue,
+                kind,
+                child_dependencies,
+                constraints,
+            );
+            var region_plan = try regions.prepareCommit();
+            defer region_plan.deinit();
+            try releases.validateCommit(surface.hasPendingBufferAttachment());
+
+            const content: Content = .{
+                .surface = surface.commit(),
+                .regions = region_plan.publish(),
+                .frame_callbacks = frames.detachPending(),
+                .release_callbacks = releases.publishCommit(),
+            };
+            return scheduler.publishCommit(&scheduler_plan, content);
+        }
+    };
+}
+
 test "surface commits persistent and one-shot state atomically" {
     var surface: Surface = .{};
     const buffer: objects.Handle = .{ .id = 9, .generation = 3 };
@@ -243,6 +318,150 @@ test "surface commits persistent and one-shot state atomically" {
     try std.testing.expectEqual(@as(i32, 2), second.scale);
     try std.testing.expectEqual(Point{}, second.offset);
     try std.testing.expectEqual(buffer, surface.current_buffer.?);
+}
+
+test "transactional surface commit publishes callback ownership with its CU" {
+    const State = CommitState(objects.Handle);
+    var region_pool = try RegionPool.init(std.testing.allocator, 6);
+    defer region_pool.deinit(std.testing.allocator);
+    var source = Region.init(&region_pool);
+    defer source.deinit();
+    try source.add(.{ .x = 1, .y = 2, .width = 3, .height = 4 });
+    var regions = SurfaceRegions.init(&region_pool);
+    defer regions.deinit();
+    try regions.setOpaque(&source);
+    var frame_pool = try FramePool.init(std.testing.allocator, 1);
+    defer frame_pool.deinit(std.testing.allocator);
+    var frames = FrameQueue.init(&frame_pool);
+    defer frames.deinit();
+    var release_pool = try ReleasePool.init(std.testing.allocator, 1);
+    defer release_pool.deinit(std.testing.allocator);
+    var releases = ReleaseQueue.init(&release_pool);
+    defer releases.deinit();
+    var scheduler = try State.Scheduler.init(std.testing.allocator, 1, 1);
+    defer scheduler.deinit(std.testing.allocator);
+    const surface_key: objects.Handle = .{ .id = 2, .generation = 1 };
+    var queue = State.Scheduler.Queue.init(&scheduler, surface_key);
+    defer queue.deinit();
+    var surface: Surface = .{};
+    const buffer: objects.Handle = .{ .id = 3, .generation = 1 };
+    const frame_callback: objects.Handle = .{ .id = 4, .generation = 1 };
+    const release_callback: objects.Handle = .{ .id = 5, .generation = 1 };
+    try surface.attach(7, buffer, 0, 0);
+    try frames.addPending(frame_callback);
+    try releases.request(release_callback);
+
+    _ = try State.commit(
+        &scheduler,
+        &queue,
+        &surface,
+        &regions,
+        &frames,
+        &releases,
+        .desync,
+        &.{},
+        0,
+    );
+    try std.testing.expectEqual(@as(u64, 1), surface.sequence);
+    try std.testing.expectEqual(@as(usize, 1), regions.current_opaque.count);
+    try std.testing.expectEqual(@as(?objects.Handle, null), frames.peekReady());
+    var applied: [1]State.Scheduler.Applied = undefined;
+    const result = try scheduler.tryApply(&queue, &applied);
+    try std.testing.expectEqual(@as(usize, 1), result.len);
+    var content = result[0].payload;
+    defer content.deinit();
+    try std.testing.expectEqual(@as(usize, 1), content.activateFrames(&frames));
+    try std.testing.expectEqual(frame_callback, frames.peekReady().?);
+    try std.testing.expectEqual(release_callback, content.release_callbacks.?.peek().?);
+    try frames.consumeReady(frame_callback);
+    try content.release_callbacks.?.consume(release_callback);
+}
+
+test "transactional surface commit rolls back every preflight failure" {
+    const State = CommitState(objects.Handle);
+    var region_pool = try RegionPool.init(std.testing.allocator, 4);
+    defer region_pool.deinit(std.testing.allocator);
+    var source = Region.init(&region_pool);
+    defer source.deinit();
+    try source.add(.{ .x = 1, .y = 2, .width = 3, .height = 4 });
+    var regions = SurfaceRegions.init(&region_pool);
+    defer regions.deinit();
+    try regions.setOpaque(&source);
+    var frame_pool = try FramePool.init(std.testing.allocator, 1);
+    defer frame_pool.deinit(std.testing.allocator);
+    var frames = FrameQueue.init(&frame_pool);
+    defer frames.deinit();
+    var release_pool = try ReleasePool.init(std.testing.allocator, 1);
+    defer release_pool.deinit(std.testing.allocator);
+    var releases = ReleaseQueue.init(&release_pool);
+    defer releases.deinit();
+    var scheduler = try State.Scheduler.init(std.testing.allocator, 1, 1);
+    defer scheduler.deinit(std.testing.allocator);
+    const surface_key: objects.Handle = .{ .id = 2, .generation = 1 };
+    var queue = State.Scheduler.Queue.init(&scheduler, surface_key);
+    defer queue.deinit();
+    var surface: Surface = .{};
+    const frame_callback: objects.Handle = .{ .id = 4, .generation = 1 };
+    const release_callback: objects.Handle = .{ .id = 5, .generation = 1 };
+    try frames.addPending(frame_callback);
+    try releases.request(release_callback);
+
+    try std.testing.expectError(error.MissingBuffer, State.commit(
+        &scheduler,
+        &queue,
+        &surface,
+        &regions,
+        &frames,
+        &releases,
+        .desync,
+        &.{},
+        0,
+    ));
+    try std.testing.expectEqual(@as(u64, 0), surface.sequence);
+    try std.testing.expectEqual(@as(usize, 0), regions.current_opaque.count);
+    try std.testing.expect(regions.opaque_dirty);
+    try std.testing.expectEqual(@as(usize, 1), frames.pending_count);
+    try std.testing.expectEqual(@as(usize, 1), releases.count);
+    try std.testing.expectEqual(@as(usize, 0), queue.count);
+}
+
+test "discarding an unapplied transactional CU releases callback batches" {
+    const State = CommitState(objects.Handle);
+    var region_pool = try RegionPool.init(std.testing.allocator, 1);
+    defer region_pool.deinit(std.testing.allocator);
+    var regions = SurfaceRegions.init(&region_pool);
+    defer regions.deinit();
+    var frame_pool = try FramePool.init(std.testing.allocator, 1);
+    defer frame_pool.deinit(std.testing.allocator);
+    var frames = FrameQueue.init(&frame_pool);
+    defer frames.deinit();
+    var release_pool = try ReleasePool.init(std.testing.allocator, 1);
+    defer release_pool.deinit(std.testing.allocator);
+    var releases = ReleaseQueue.init(&release_pool);
+    defer releases.deinit();
+    var scheduler = try State.Scheduler.init(std.testing.allocator, 1, 1);
+    defer scheduler.deinit(std.testing.allocator);
+    const surface_key: objects.Handle = .{ .id = 2, .generation = 1 };
+    var queue = State.Scheduler.Queue.init(&scheduler, surface_key);
+    var surface: Surface = .{};
+    const buffer: objects.Handle = .{ .id = 3, .generation = 1 };
+    try surface.attach(7, buffer, 0, 0);
+    try frames.addPending(.{ .id = 4, .generation = 1 });
+    try releases.request(.{ .id = 5, .generation = 1 });
+    _ = try State.commit(
+        &scheduler,
+        &queue,
+        &surface,
+        &regions,
+        &frames,
+        &releases,
+        .sync,
+        &.{},
+        0,
+    );
+    State.deinitQueue(&queue);
+    try std.testing.expectEqual(@as(usize, 1), frame_pool.available());
+    try std.testing.expectEqual(@as(usize, 1), release_pool.available());
 }
 
 test "surface validates offsets scale transform and permanent roles" {

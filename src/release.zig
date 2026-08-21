@@ -129,11 +129,13 @@ pub const Queue = struct {
         queue.count += 1;
     }
 
-    /// The non-null attachment requirement and detachment are transactional.
-    /// A protocol-error caller can still deinitialize the unchanged queue.
-    pub fn commit(queue: *Queue, has_attached_buffer: bool) Error!?Batch {
+    pub fn validateCommit(queue: Queue, has_attached_buffer: bool) Error!void {
+        if (queue.count != 0 and !has_attached_buffer) return error.MissingBuffer;
+    }
+
+    /// Detaches validated pending callbacks without a failure path.
+    pub fn publishCommit(queue: *Queue) ?Batch {
         if (queue.count == 0) return null;
-        if (!has_attached_buffer) return error.MissingBuffer;
         const batch: Batch = .{
             .pool = queue.pool,
             .head = queue.head,
@@ -144,6 +146,13 @@ pub const Queue = struct {
         queue.tail = none;
         queue.count = 0;
         return batch;
+    }
+
+    /// The non-null attachment requirement and detachment are transactional.
+    /// A protocol-error caller can still deinitialize the unchanged queue.
+    pub fn commit(queue: *Queue, has_attached_buffer: bool) Error!?Batch {
+        try queue.validateCommit(has_attached_buffer);
+        return queue.publishCommit();
     }
 };
 
