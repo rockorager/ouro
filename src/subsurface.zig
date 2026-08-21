@@ -18,6 +18,7 @@ pub const Error = std.mem.Allocator.Error || error{
     Cycle,
     InvalidToken,
     InvalidSibling,
+    DefunctSurface,
 };
 
 pub fn Graph(comptime Key: type, comptime Payload: type) type {
@@ -50,6 +51,8 @@ pub fn Graph(comptime Key: type, comptime Payload: type) type {
         const SurfaceNode = struct {
             surface: Key = undefined,
             active: bool = false,
+            destroyed: bool = false,
+            role_inactive: bool = false,
             generation: u32 = 0,
             parent: u32 = none,
             first_child: u32 = none,
@@ -131,9 +134,12 @@ pub fn Graph(comptime Key: type, comptime Payload: type) type {
             errdefer graph.releaseIfIdle(child_index);
             const parent_index = try graph.ensureSurface(parent);
             errdefer graph.releaseIfIdle(parent_index);
+            if (graph.surfaces[child_index].destroyed or graph.surfaces[parent_index].destroyed)
+                return error.DefunctSurface;
 
             var child_node = &graph.surfaces[child_index];
             child_node.parent = parent_index;
+            child_node.role_inactive = false;
             child_node.next_sibling = graph.surfaces[parent_index].first_child;
             child_node.pending_next_sibling = graph.surfaces[parent_index].pending_first_child;
             child_node.sync = true;
@@ -193,7 +199,22 @@ pub fn Graph(comptime Key: type, comptime Payload: type) type {
         }
 
         pub fn isVisible(graph: Self, child: Key) Error!bool {
-            return graph.surfaces[try graph.relationship(child)].visible;
+            var index = try graph.relationship(child);
+            while (graph.surfaces[index].parent != none) {
+                if (!graph.surfaces[index].visible) return false;
+                index = graph.surfaces[index].parent;
+                if (graph.surfaces[index].destroyed or graph.surfaces[index].role_inactive)
+                    return false;
+            }
+            return true;
+        }
+
+        /// Retained child associations become recursively invisible when a
+        /// parent surface is destroyed. They remain until each role object is
+        /// destroyed, preserving protocol teardown order.
+        pub fn surfaceDestroyed(graph: *Self, surface: Key) void {
+            const index = graph.find(surface) orelse return;
+            graph.surfaces[index].destroyed = true;
         }
 
         pub fn effectivelySynchronized(graph: Self, surface: Key) bool {
@@ -349,6 +370,7 @@ pub fn Graph(comptime Key: type, comptime Payload: type) type {
             while (link.* != index) link = &graph.surfaces[link.*].pending_next_sibling;
             link.* = graph.surfaces[index].pending_next_sibling;
             graph.surfaces[index].parent = none;
+            graph.surfaces[index].role_inactive = true;
             graph.surfaces[index].next_sibling = none;
             graph.surfaces[index].pending_next_sibling = none;
             graph.surfaces[index].visible = false;
@@ -731,6 +753,31 @@ test "relationship graph supplies scheduler commit inputs" {
     try std.testing.expectEqual(first, direct[1]);
     try std.testing.expectError(error.OutputTooSmall, graph.directChildren(root, children[0..1]));
     try std.testing.expectEqual(@as(usize, 0), (try graph.directChildren(handle(9), &children)).len);
+}
+
+test "ancestor lifetime controls recursive relationship visibility" {
+    var graph = try TestGraph.init(std.testing.allocator, 4, 1);
+    defer graph.deinit(std.testing.allocator);
+    const root = handle(1);
+    const child = handle(2);
+    const grandchild = handle(3);
+    try graph.add(child, root);
+    try graph.add(grandchild, child);
+    var applied: [2]TestGraph.Applied = undefined;
+    _ = try graph.commit(child, 20, &applied);
+    try std.testing.expect(!try graph.isVisible(grandchild));
+    _ = try graph.commit(root, 10, &applied);
+    try std.testing.expect(try graph.isVisible(child));
+    try std.testing.expect(try graph.isVisible(grandchild));
+
+    graph.surfaceDestroyed(root);
+    try std.testing.expect(!try graph.isVisible(child));
+    try std.testing.expect(!try graph.isVisible(grandchild));
+    try std.testing.expectError(error.DefunctSurface, graph.add(handle(4), root));
+
+    graph.surfaceDestroyed(handle(9));
+    _ = try graph.remove(child, &applied);
+    try std.testing.expect(!try graph.isVisible(grandchild));
 }
 
 test "subsurface stacking is validated and parent double buffered" {
