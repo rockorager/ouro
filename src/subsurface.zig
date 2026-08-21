@@ -196,6 +196,33 @@ pub fn Graph(comptime Key: type, comptime Payload: type) type {
             return graph.surfaces[try graph.relationship(child)].visible;
         }
 
+        pub fn effectivelySynchronized(graph: Self, surface: Key) bool {
+            const index = graph.find(surface) orelse return false;
+            return graph.effectivelySynchronizedIndex(index);
+        }
+
+        /// Returns every directly associated child, including a newly added
+        /// child whose relationship visibility awaits this parent's commit.
+        /// This is the dependency set used when constructing a parent CU.
+        pub fn directChildren(
+            graph: Self,
+            parent: Key,
+            output: []Key,
+        ) Error![]Key {
+            const parent_index = graph.find(parent) orelse return output[0..0];
+            var count: usize = 0;
+            var child = graph.surfaces[parent_index].first_child;
+            while (child != none) : (child = graph.surfaces[child].next_sibling) count += 1;
+            if (output.len < count) return error.OutputTooSmall;
+            var used: usize = 0;
+            child = graph.surfaces[parent_index].first_child;
+            while (child != none) : (child = graph.surfaces[child].next_sibling) {
+                output[used] = graph.surfaces[child].surface;
+                used += 1;
+            }
+            return output[0..used];
+        }
+
         pub fn setSync(graph: *Self, child: Key) Error!void {
             graph.surfaces[try graph.relationship(child)].sync = true;
         }
@@ -684,6 +711,26 @@ test "effective mode changes feed content update queue transitions" {
     try std.testing.expectEqual(@as(usize, 1), (try scheduler.tryApply(&child_queue, &applied)).len);
     try std.testing.expectEqual(@as(usize, 1), (try scheduler.tryApply(&inherited_queue, &applied)).len);
     try std.testing.expectEqual(@as(usize, 0), (try scheduler.tryApply(&barrier_queue, &applied)).len);
+}
+
+test "relationship graph supplies scheduler commit inputs" {
+    var graph = try TestGraph.init(std.testing.allocator, 3, 1);
+    defer graph.deinit(std.testing.allocator);
+    const root = handle(1);
+    const first = handle(2);
+    const second = handle(3);
+    try graph.add(first, root);
+    try graph.add(second, root);
+    try std.testing.expect(graph.effectivelySynchronized(first));
+    try std.testing.expect(!graph.effectivelySynchronized(root));
+    try std.testing.expect(!try graph.isVisible(first));
+    var children: [2]objects.Handle = undefined;
+    const direct = try graph.directChildren(root, &children);
+    try std.testing.expectEqual(@as(usize, 2), direct.len);
+    try std.testing.expectEqual(second, direct[0]);
+    try std.testing.expectEqual(first, direct[1]);
+    try std.testing.expectError(error.OutputTooSmall, graph.directChildren(root, children[0..1]));
+    try std.testing.expectEqual(@as(usize, 0), (try graph.directChildren(handle(9), &children)).len);
 }
 
 test "subsurface stacking is validated and parent double buffered" {
