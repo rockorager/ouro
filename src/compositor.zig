@@ -10,6 +10,9 @@ pub const SurfaceRegions = @import("region.zig").SurfaceRegions;
 pub const FramePool = @import("frame.zig").Pool;
 pub const FrameQueue = @import("frame.zig").Queue;
 pub const SubsurfaceGraph = @import("subsurface.zig").Graph;
+pub const ReleasePool = @import("release.zig").Pool;
+pub const ReleaseQueue = @import("release.zig").Queue;
+pub const ReleaseBatch = @import("release.zig").Batch;
 
 pub const Error = error{
     InvalidRole,
