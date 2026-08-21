@@ -235,7 +235,11 @@ const ReleaseServerHandler = struct {
             .attach => |value| {
                 if (value.buffer == null or value.buffer.? != handler.buffer_handle.id)
                     return error.InvalidBuffer;
-                try handler.surface.attach(7, handler.buffer_handle, value.x, value.y);
+                try handler.surface.attach(7, .{
+                    .handle = handler.buffer_handle,
+                    .width = 2,
+                    .height = 2,
+                }, value.x, value.y);
             },
             .get_release => |value| {
                 const admitted = try protocol.wl_surface.admit_get_release(
