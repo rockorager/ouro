@@ -17,6 +17,7 @@ pub const Error = std.mem.Allocator.Error || error{
     SelfParent,
     Cycle,
     InvalidToken,
+    InvalidSibling,
 };
 
 pub fn Graph(comptime Key: type, comptime Payload: type) type {
@@ -41,19 +42,29 @@ pub fn Graph(comptime Key: type, comptime Payload: type) type {
             y: i32 = 0,
         };
 
+        pub const StackEntry = struct {
+            surface: Key,
+            above_parent: bool,
+        };
+
         const SurfaceNode = struct {
             surface: Key = undefined,
             active: bool = false,
             generation: u32 = 0,
             parent: u32 = none,
             first_child: u32 = none,
+            pending_first_child: u32 = none,
             next_sibling: u32 = none,
+            pending_next_sibling: u32 = none,
             free_next: u32 = none,
             sync: bool = true,
             visible: bool = false,
             current_position: Position = .{},
             pending_position: Position = .{},
             position_changed: bool = false,
+            above_parent: bool = true,
+            pending_above_parent: bool = true,
+            stack_changed: bool = false,
             commit_head: u32 = none,
             commit_tail: u32 = none,
         };
@@ -124,12 +135,16 @@ pub fn Graph(comptime Key: type, comptime Payload: type) type {
             var child_node = &graph.surfaces[child_index];
             child_node.parent = parent_index;
             child_node.next_sibling = graph.surfaces[parent_index].first_child;
+            child_node.pending_next_sibling = graph.surfaces[parent_index].pending_first_child;
             child_node.sync = true;
             child_node.visible = false;
             child_node.current_position = .{};
             child_node.pending_position = .{};
             child_node.position_changed = false;
+            child_node.above_parent = true;
+            child_node.pending_above_parent = true;
             graph.surfaces[parent_index].first_child = child_index;
+            graph.surfaces[parent_index].pending_first_child = child_index;
         }
 
         pub fn token(graph: Self, surface: Key) ?Token {
@@ -141,6 +156,36 @@ pub fn Graph(comptime Key: type, comptime Payload: type) type {
             const index = try graph.relationship(child);
             graph.surfaces[index].pending_position = .{ .x = x, .y = y };
             graph.surfaces[index].position_changed = true;
+        }
+
+        /// Double-buffered restack immediately above the parent or sibling.
+        pub fn placeAbove(graph: *Self, child: Key, reference: Key) Error!void {
+            try graph.place(child, reference, true);
+        }
+
+        /// Double-buffered restack immediately below the parent or sibling.
+        pub fn placeBelow(graph: *Self, child: Key, reference: Key) Error!void {
+            try graph.place(child, reference, false);
+        }
+
+        /// Writes current top-to-bottom stacking order. The parent itself is
+        /// represented by the transition from `above_parent` to false.
+        pub fn stack(graph: Self, parent: Key, output: []StackEntry) Error![]StackEntry {
+            const parent_index = graph.find(parent) orelse return error.NotSubsurface;
+            var count: usize = 0;
+            var child = graph.surfaces[parent_index].first_child;
+            while (child != none) : (child = graph.surfaces[child].next_sibling) count += 1;
+            if (output.len < count) return error.OutputTooSmall;
+            var used: usize = 0;
+            child = graph.surfaces[parent_index].first_child;
+            while (child != none) : (child = graph.surfaces[child].next_sibling) {
+                output[used] = .{
+                    .surface = graph.surfaces[child].surface,
+                    .above_parent = graph.surfaces[child].above_parent,
+                };
+                used += 1;
+            }
+            return output[0..used];
         }
 
         pub fn position(graph: Self, child: Key) Error!Position {
@@ -250,8 +295,12 @@ pub fn Graph(comptime Key: type, comptime Payload: type) type {
             var link = &graph.surfaces[parent].first_child;
             while (link.* != index) link = &graph.surfaces[link.*].next_sibling;
             link.* = graph.surfaces[index].next_sibling;
+            link = &graph.surfaces[parent].pending_first_child;
+            while (link.* != index) link = &graph.surfaces[link.*].pending_next_sibling;
+            link.* = graph.surfaces[index].pending_next_sibling;
             graph.surfaces[index].parent = none;
             graph.surfaces[index].next_sibling = none;
+            graph.surfaces[index].pending_next_sibling = none;
             graph.surfaces[index].visible = false;
             graph.releaseIfIdle(parent);
             graph.releaseIfIdle(index);
@@ -301,6 +350,42 @@ pub fn Graph(comptime Key: type, comptime Payload: type) type {
             const index = graph.find(child) orelse return error.NotSubsurface;
             if (graph.surfaces[index].parent == none) return error.NotSubsurface;
             return index;
+        }
+
+        fn place(graph: *Self, child_key: Key, reference: Key, above: bool) Error!void {
+            const child = try graph.relationship(child_key);
+            if (std.meta.eql(child_key, reference)) return error.InvalidSibling;
+            const parent = graph.surfaces[child].parent;
+            const reference_is_parent = std.meta.eql(graph.surfaces[parent].surface, reference);
+            const sibling = if (reference_is_parent) none else graph.find(reference) orelse
+                return error.InvalidSibling;
+            if (sibling != none and graph.surfaces[sibling].parent != parent)
+                return error.InvalidSibling;
+
+            var link = &graph.surfaces[parent].pending_first_child;
+            while (link.* != child) link = &graph.surfaces[link.*].pending_next_sibling;
+            link.* = graph.surfaces[child].pending_next_sibling;
+
+            if (!reference_is_parent) {
+                graph.surfaces[child].pending_above_parent =
+                    graph.surfaces[sibling].pending_above_parent;
+                link = &graph.surfaces[parent].pending_first_child;
+                while (link.* != sibling) link = &graph.surfaces[link.*].pending_next_sibling;
+                if (!above) link = &graph.surfaces[sibling].pending_next_sibling;
+            } else if (above) {
+                graph.surfaces[child].pending_above_parent = true;
+                link = &graph.surfaces[parent].pending_first_child;
+                while (link.* != none and graph.surfaces[link.*].pending_above_parent)
+                    link = &graph.surfaces[link.*].pending_next_sibling;
+            } else {
+                graph.surfaces[child].pending_above_parent = false;
+                link = &graph.surfaces[parent].pending_first_child;
+                while (link.* != none and graph.surfaces[link.*].pending_above_parent)
+                    link = &graph.surfaces[link.*].pending_next_sibling;
+            }
+            graph.surfaces[child].pending_next_sibling = link.*;
+            link.* = child;
+            graph.surfaces[parent].stack_changed = true;
         }
 
         fn isDescendant(graph: Self, candidate: Key, ancestor: Key) bool {
@@ -365,6 +450,17 @@ pub fn Graph(comptime Key: type, comptime Payload: type) type {
         }
 
         fn latchParentState(graph: *Self, parent: u32) void {
+            if (graph.surfaces[parent].stack_changed) {
+                graph.surfaces[parent].first_child = graph.surfaces[parent].pending_first_child;
+                var stacked = graph.surfaces[parent].pending_first_child;
+                while (stacked != none) : (stacked = graph.surfaces[stacked].pending_next_sibling) {
+                    graph.surfaces[stacked].next_sibling =
+                        graph.surfaces[stacked].pending_next_sibling;
+                    graph.surfaces[stacked].above_parent =
+                        graph.surfaces[stacked].pending_above_parent;
+                }
+                graph.surfaces[parent].stack_changed = false;
+            }
             var child = graph.surfaces[parent].first_child;
             while (child != none) : (child = graph.surfaces[child].next_sibling) {
                 const node = &graph.surfaces[child];
@@ -426,6 +522,43 @@ test "desynchronized descendants inherit synchronized ancestors" {
     const immediate = try graph.commit(grandchild, 31, &applied);
     try std.testing.expectEqual(@as(usize, 1), immediate.len);
     try std.testing.expectEqual(@as(u32, 31), immediate[0].payload);
+}
+
+test "subsurface stacking is validated and parent double buffered" {
+    var graph = try TestGraph.init(std.testing.allocator, 6, 1);
+    defer graph.deinit(std.testing.allocator);
+    const root = handle(1);
+    const first = handle(2);
+    const second = handle(3);
+    const third = handle(4);
+    try graph.add(first, root);
+    try graph.add(second, root);
+    try graph.add(third, root);
+
+    var entries: [3]TestGraph.StackEntry = undefined;
+    var current = try graph.stack(root, &entries);
+    try std.testing.expectEqual(third, current[0].surface);
+    try std.testing.expectEqual(second, current[1].surface);
+    try std.testing.expectEqual(first, current[2].surface);
+    try graph.placeBelow(first, root);
+    try graph.placeAbove(third, root);
+    try graph.placeBelow(second, first);
+    try std.testing.expectError(error.InvalidSibling, graph.placeAbove(first, first));
+    try std.testing.expectError(error.InvalidSibling, graph.placeAbove(first, handle(9)));
+    try std.testing.expectError(error.OutputTooSmall, graph.stack(root, entries[0..2]));
+
+    // Restacking is invisible until the parent's next content update.
+    current = try graph.stack(root, &entries);
+    try std.testing.expectEqual(third, current[0].surface);
+    var applied: [1]TestGraph.Applied = undefined;
+    _ = try graph.commit(root, 1, &applied);
+    current = try graph.stack(root, &entries);
+    try std.testing.expectEqual(third, current[0].surface);
+    try std.testing.expect(current[0].above_parent);
+    try std.testing.expectEqual(first, current[1].surface);
+    try std.testing.expect(!current[1].above_parent);
+    try std.testing.expectEqual(second, current[2].surface);
+    try std.testing.expect(!current[2].above_parent);
 }
 
 test "relationship and cache operations are transactional under pressure" {
