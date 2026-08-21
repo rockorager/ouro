@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const objects = @import("objects.zig");
+const viewport = @import("viewport.zig");
 
 pub const RegionPool = @import("region.zig").Pool;
 pub const Region = @import("region.zig").Region;
@@ -16,8 +17,11 @@ pub const ReleaseQueue = @import("release.zig").Queue;
 pub const ReleaseBatch = @import("release.zig").Batch;
 pub const ContentUpdateScheduler = @import("content_update.zig").Scheduler;
 pub const ContentUpdateKind = @import("content_update.zig").Kind;
+pub const Viewport = viewport.Viewport;
+pub const ViewportState = viewport.State;
+pub const SurfaceSize = viewport.Size;
 
-pub const Error = error{
+pub const Error = viewport.Error || error{
     InvalidRole,
     WrongRole,
     RoleObjectActive,
@@ -135,6 +139,8 @@ pub const Update = struct {
     transform: Transform,
     scale: i32,
     offset: Point,
+    viewport: ViewportState,
+    size: SurfaceSize,
 };
 
 pub const Surface = struct {
@@ -143,6 +149,7 @@ pub const Surface = struct {
     current_buffer: ?Buffer = null,
     current_transform: Transform = .normal,
     current_scale: i32 = 1,
+    viewport: Viewport = .{},
 
     pending_buffer: ?Buffer = null,
     pending_attach_offset: Point = .{},
@@ -205,6 +212,7 @@ pub const Surface = struct {
             if (value.width % scale != 0 or value.height % scale != 0)
                 return error.InvalidSize;
         }
+        try surface.viewport.validateCommit(surface.contentSize(buffer));
     }
 
     /// Atomically applies persistent scalar state and extracts one-shot state.
@@ -222,6 +230,8 @@ pub const Surface = struct {
         if (surface.attach_changed) surface.current_buffer = surface.pending_buffer;
         surface.current_transform = surface.pending_transform;
         surface.current_scale = surface.pending_scale;
+        const content_size = surface.contentSize(surface.current_buffer);
+        const viewport_state = surface.viewport.publishCommit();
         const update: Update = .{
             .sequence = surface.sequence,
             .attachment = attachment,
@@ -230,6 +240,8 @@ pub const Surface = struct {
             .transform = surface.current_transform,
             .scale = surface.current_scale,
             .offset = surface.pending_offset,
+            .viewport = viewport_state,
+            .size = viewport_state.surfaceSize(content_size),
         };
         surface.pending_buffer = null;
         surface.pending_attach_offset = .{};
@@ -238,6 +250,18 @@ pub const Surface = struct {
         surface.pending_buffer_damage = .{};
         surface.pending_offset = .{};
         return update;
+    }
+
+    fn contentSize(surface: Surface, buffer: ?Buffer) ?SurfaceSize {
+        const value = buffer orelse return null;
+        const swaps_axes = switch (surface.pending_transform) {
+            .@"90", .@"270", .flipped_90, .flipped_270 => true,
+            else => false,
+        };
+        const width = if (swaps_axes) value.height else value.width;
+        const height = if (swaps_axes) value.width else value.height;
+        const scale: u32 = @intCast(surface.pending_scale);
+        return .{ .width = width / scale, .height = height / scale };
     }
 
     pub fn validateDestroy(surface: Surface) Error!void {
@@ -347,6 +371,39 @@ test "surface commits persistent and one-shot state atomically" {
     try std.testing.expectEqual(@as(i32, 2), second.scale);
     try std.testing.expectEqual(Point{}, second.offset);
     try std.testing.expectEqual(buffer, surface.current_buffer.?);
+}
+
+test "surface viewport validates transformed and scaled content atomically" {
+    var surface: Surface = .{};
+    const buffer: Buffer = .{
+        .handle = .{ .id = 9, .generation = 3 },
+        .width = 20,
+        .height = 12,
+    };
+    try surface.attach(7, buffer, 0, 0);
+    try surface.setTransform(1);
+    try surface.setScale(2);
+    try surface.viewport.setSource(256, 512, 1024, 1536);
+    try surface.viewport.setDestination(8, 12);
+
+    const update = try surface.commit();
+    try std.testing.expectEqual(SurfaceSize{ .width = 8, .height = 12 }, update.size);
+    try std.testing.expectEqual(surface.viewport.current, update.viewport);
+
+    try surface.viewport.setDestination(-1, -1);
+    try surface.viewport.setSource(0, 0, 257, 256);
+    try std.testing.expectError(error.InvalidSize, surface.commit());
+    try std.testing.expectEqual(@as(u64, 1), surface.sequence);
+    try std.testing.expectEqual(SurfaceSize{ .width = 8, .height = 12 }, surface.viewport.current.surfaceSize(.{ .width = 6, .height = 10 }));
+
+    try surface.viewport.setDestination(2, 1);
+    try surface.viewport.setSource(0, 0, 1537, 256);
+    try std.testing.expectError(error.OutOfBuffer, surface.commit());
+    try std.testing.expectEqual(@as(u64, 1), surface.sequence);
+
+    surface.viewport.clear();
+    const cleared = try surface.commit();
+    try std.testing.expectEqual(SurfaceSize{ .width = 6, .height = 10 }, cleared.size);
 }
 
 test "transactional surface commit publishes callback ownership with its CU" {
