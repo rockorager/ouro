@@ -3,6 +3,11 @@
 const std = @import("std");
 const objects = @import("objects.zig");
 
+pub const RegionPool = @import("region.zig").Pool;
+pub const Region = @import("region.zig").Region;
+pub const RegionRectangle = @import("region.zig").Rectangle;
+pub const SurfaceRegions = @import("region.zig").SurfaceRegions;
+
 pub const Error = error{
     InvalidRole,
     WrongRole,
