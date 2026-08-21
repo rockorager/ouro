@@ -211,13 +211,36 @@ pub fn Graph(comptime Key: type, comptime Payload: type) type {
             const was_effective = graph.effectivelySynchronizedIndex(index);
             graph.surfaces[index].sync = false;
             if (!was_effective or graph.effectivelySynchronizedIndex(index)) return output[0..0];
-            const required = graph.countSubtreeCommits(index);
+            const required = graph.countTransitionCommits(index);
             if (output.len < required) {
                 graph.surfaces[index].sync = true;
                 return error.OutputTooSmall;
             }
             var used: usize = 0;
-            graph.drainSubtree(index, output, &used);
+            graph.drainTransition(index, output, &used);
+            return output[0..used];
+        }
+
+        /// Scheduler-oriented mode change. Returns exactly the surfaces that
+        /// transition from effectively synchronized to desynchronized, stopping
+        /// at explicitly synchronized descendants. Call `transitionDesync` on
+        /// each corresponding content-update queue.
+        pub fn transitionDesync(
+            graph: *Self,
+            child: Key,
+            output: []Key,
+        ) Error![]Key {
+            const index = try graph.relationship(child);
+            const was_effective = graph.effectivelySynchronizedIndex(index);
+            graph.surfaces[index].sync = false;
+            if (!was_effective or graph.effectivelySynchronizedIndex(index)) return output[0..0];
+            const required = graph.countTransitionSurfaces(index);
+            if (output.len < required) {
+                graph.surfaces[index].sync = true;
+                return error.OutputTooSmall;
+            }
+            var used: usize = 0;
+            graph.collectTransitionSurfaces(index, output, &used);
             return output[0..used];
         }
 
@@ -427,6 +450,43 @@ pub fn Graph(comptime Key: type, comptime Payload: type) type {
             return count;
         }
 
+        fn countTransitionCommits(graph: Self, index: u32) usize {
+            var count: usize = 0;
+            var commit_index = graph.surfaces[index].commit_head;
+            while (commit_index != none) : (commit_index = graph.commits[commit_index].next) count += 1;
+            var child = graph.surfaces[index].first_child;
+            while (child != none) : (child = graph.surfaces[child].next_sibling) {
+                if (!graph.surfaces[child].sync)
+                    count += graph.countTransitionCommits(child);
+            }
+            return count;
+        }
+
+        fn countTransitionSurfaces(graph: Self, index: u32) usize {
+            var count: usize = 1;
+            var child = graph.surfaces[index].first_child;
+            while (child != none) : (child = graph.surfaces[child].next_sibling) {
+                if (!graph.surfaces[child].sync)
+                    count += graph.countTransitionSurfaces(child);
+            }
+            return count;
+        }
+
+        fn collectTransitionSurfaces(
+            graph: Self,
+            index: u32,
+            output: []Key,
+            used: *usize,
+        ) void {
+            output[used.*] = graph.surfaces[index].surface;
+            used.* += 1;
+            var child = graph.surfaces[index].first_child;
+            while (child != none) : (child = graph.surfaces[child].next_sibling) {
+                if (!graph.surfaces[child].sync)
+                    graph.collectTransitionSurfaces(child, output, used);
+            }
+        }
+
         fn drainSubtree(graph: *Self, index: u32, output: []Applied, used: *usize) void {
             var commit_index = graph.surfaces[index].commit_head;
             while (commit_index != none) {
@@ -447,6 +507,30 @@ pub fn Graph(comptime Key: type, comptime Payload: type) type {
             var child = graph.surfaces[index].first_child;
             while (child != none) : (child = graph.surfaces[child].next_sibling)
                 graph.drainSubtree(child, output, used);
+        }
+
+        fn drainTransition(graph: *Self, index: u32, output: []Applied, used: *usize) void {
+            var commit_index = graph.surfaces[index].commit_head;
+            while (commit_index != none) {
+                const next = graph.commits[commit_index].next;
+                output[used.*] = .{
+                    .surface = graph.surfaces[index].surface,
+                    .payload = graph.commits[commit_index].payload,
+                };
+                used.* += 1;
+                graph.commits[commit_index].next = graph.commit_free;
+                graph.commit_free = commit_index;
+                graph.cached_commits -= 1;
+                commit_index = next;
+            }
+            graph.surfaces[index].commit_head = none;
+            graph.surfaces[index].commit_tail = none;
+            graph.latchParentState(index);
+            var child = graph.surfaces[index].first_child;
+            while (child != none) : (child = graph.surfaces[child].next_sibling) {
+                if (!graph.surfaces[child].sync)
+                    graph.drainTransition(child, output, used);
+            }
         }
 
         fn latchParentState(graph: *Self, parent: u32) void {
@@ -474,6 +558,7 @@ pub fn Graph(comptime Key: type, comptime Payload: type) type {
 
 const objects = @import("objects.zig");
 const TestGraph = Graph(objects.Handle, u32);
+const TestUpdateScheduler = @import("content_update.zig").Scheduler(objects.Handle, u32);
 
 fn handle(id: u32) objects.Handle {
     return .{ .id = id, .generation = 1 };
@@ -522,6 +607,83 @@ test "desynchronized descendants inherit synchronized ancestors" {
     const immediate = try graph.commit(grandchild, 31, &applied);
     try std.testing.expectEqual(@as(usize, 1), immediate.len);
     try std.testing.expectEqual(@as(u32, 31), immediate[0].payload);
+}
+
+test "explicitly synchronized descendants survive ancestor desync" {
+    var graph = try TestGraph.init(std.testing.allocator, 4, 4);
+    defer graph.deinit(std.testing.allocator);
+    const root = handle(1);
+    const child = handle(2);
+    const grandchild = handle(3);
+    try graph.add(child, root);
+    try graph.add(grandchild, child);
+    var applied: [2]TestGraph.Applied = undefined;
+    _ = try graph.commit(child, 20, &applied);
+    _ = try graph.commit(grandchild, 30, &applied);
+
+    const child_result = try graph.setDesync(child, &applied);
+    try std.testing.expectEqual(@as(usize, 1), child_result.len);
+    try std.testing.expectEqual(@as(u32, 20), child_result[0].payload);
+    try std.testing.expectEqual(@as(usize, 1), graph.cached_commits);
+    const grandchild_result = try graph.setDesync(grandchild, &applied);
+    try std.testing.expectEqual(@as(usize, 1), grandchild_result.len);
+    try std.testing.expectEqual(@as(u32, 30), grandchild_result[0].payload);
+}
+
+test "scheduler transition reports exact effective mode changes" {
+    var graph = try TestGraph.init(std.testing.allocator, 5, 1);
+    defer graph.deinit(std.testing.allocator);
+    const root = handle(1);
+    const child = handle(2);
+    const inherited = handle(3);
+    const barrier = handle(4);
+    try graph.add(child, root);
+    try graph.add(inherited, child);
+    try graph.add(barrier, child);
+    var keys: [3]objects.Handle = undefined;
+    try std.testing.expectEqual(@as(usize, 0), (try graph.transitionDesync(inherited, &keys)).len);
+    const changed = try graph.transitionDesync(child, &keys);
+    try std.testing.expectEqual(@as(usize, 2), changed.len);
+    try std.testing.expectEqual(child, changed[0]);
+    try std.testing.expectEqual(inherited, changed[1]);
+}
+
+test "effective mode changes feed content update queue transitions" {
+    var graph = try TestGraph.init(std.testing.allocator, 5, 1);
+    defer graph.deinit(std.testing.allocator);
+    var scheduler = try TestUpdateScheduler.init(std.testing.allocator, 3, 1);
+    defer scheduler.deinit(std.testing.allocator);
+    const root = handle(1);
+    const child = handle(2);
+    const inherited = handle(3);
+    const barrier = handle(4);
+    try graph.add(child, root);
+    try graph.add(inherited, child);
+    try graph.add(barrier, child);
+    var child_queue = TestUpdateScheduler.Queue.init(&scheduler, child);
+    defer child_queue.deinit();
+    var inherited_queue = TestUpdateScheduler.Queue.init(&scheduler, inherited);
+    defer inherited_queue.deinit();
+    var barrier_queue = TestUpdateScheduler.Queue.init(&scheduler, barrier);
+    defer barrier_queue.deinit();
+    _ = try scheduler.commit(&child_queue, 20, .sync, &.{}, 0);
+    _ = try scheduler.commit(&inherited_queue, 30, .sync, &.{}, 0);
+    _ = try scheduler.commit(&barrier_queue, 40, .sync, &.{}, 0);
+
+    var changed_keys: [3]objects.Handle = undefined;
+    _ = try graph.transitionDesync(inherited, &changed_keys);
+    const changed = try graph.transitionDesync(child, &changed_keys);
+    for (changed) |key| {
+        if (std.meta.eql(key, child)) {
+            _ = try scheduler.transitionDesync(&child_queue);
+        } else if (std.meta.eql(key, inherited)) {
+            _ = try scheduler.transitionDesync(&inherited_queue);
+        } else return error.UnexpectedSurface;
+    }
+    var applied: [1]TestUpdateScheduler.Applied = undefined;
+    try std.testing.expectEqual(@as(usize, 1), (try scheduler.tryApply(&child_queue, &applied)).len);
+    try std.testing.expectEqual(@as(usize, 1), (try scheduler.tryApply(&inherited_queue, &applied)).len);
+    try std.testing.expectEqual(@as(usize, 0), (try scheduler.tryApply(&barrier_queue, &applied)).len);
 }
 
 test "subsurface stacking is validated and parent double buffered" {

@@ -196,6 +196,54 @@ pub fn Scheduler(comptime Key: type, comptime Payload: type) type {
             scheduler.nodes[index].constraint_count -= count;
         }
 
+        /// Implements the wl_surface synchronized-to-desynchronized rewrite.
+        /// SCUs reachable from any DCU remain synchronized. Other SCUs in this
+        /// queue become DCUs, and incoming dependencies from outside the queue
+        /// are removed. This transition is infallible and allocation-free.
+        pub fn transitionDesync(scheduler: *Self, queue: *Queue) Error!usize {
+            if (queue.scheduler != scheduler) return error.InvalidDependency;
+            const reachable_epoch = scheduler.nextEpoch();
+            for (scheduler.nodes, 0..) |node, index| {
+                if (node.active and node.kind == .desync)
+                    scheduler.markReachable(scheduler.nodeToken(@intCast(index)), reachable_epoch);
+            }
+
+            const converted_epoch = scheduler.nextEpoch();
+            var converted: usize = 0;
+            var index = queue.head;
+            while (index != none) : (index = scheduler.nodes[index].queue_next) {
+                const node = &scheduler.nodes[index];
+                if (node.kind == .sync and node.visit_epoch != reachable_epoch) {
+                    node.kind = .desync;
+                    node.visit_epoch = converted_epoch;
+                    converted += 1;
+                }
+            }
+            if (converted == 0) return 0;
+
+            for (scheduler.nodes) |*owner| {
+                if (!owner.active or owner.owner == queue) continue;
+                var link = &owner.dependency_head;
+                while (link.* != none) {
+                    const edge_index = link.*;
+                    const edge = scheduler.edges[edge_index];
+                    const dependency = scheduler.validateToken(edge.dependency) catch {
+                        link = &scheduler.edges[edge_index].next;
+                        continue;
+                    };
+                    if (scheduler.nodes[dependency].visit_epoch != converted_epoch) {
+                        link = &scheduler.edges[edge_index].next;
+                        continue;
+                    }
+                    if (edge.child_claim)
+                        scheduler.nodes[dependency].child_claimed = false;
+                    link.* = edge.next;
+                    scheduler.releaseEdge(edge_index);
+                }
+            }
+            return converted;
+        }
+
         /// Applies one candidate DCU and its complete reachable dependency
         /// graph. Blocked graphs return an empty slice. Capacity checking and
         /// constraint inspection happen before any queue or pool mutation.
@@ -269,12 +317,16 @@ pub fn Scheduler(comptime Key: type, comptime Payload: type) type {
                         scheduler.nodes[dependency].child_claimed = false
                     else |_| {}
                 }
-                scheduler.edges[edge_index].next = scheduler.edge_free;
-                scheduler.edge_free = edge_index;
-                scheduler.active_edges -= 1;
+                scheduler.releaseEdge(edge_index);
                 edge_index = next;
             }
             scheduler.nodes[owner].dependency_head = none;
+        }
+
+        fn releaseEdge(scheduler: *Self, index: u32) void {
+            scheduler.edges[index].next = scheduler.edge_free;
+            scheduler.edge_free = index;
+            scheduler.active_edges -= 1;
         }
 
         fn nodeToken(scheduler: Self, index: u32) Token {
@@ -313,6 +365,16 @@ pub fn Scheduler(comptime Key: type, comptime Payload: type) type {
             var edge_index = node.dependency_head;
             while (edge_index != none) : (edge_index = scheduler.edges[edge_index].next)
                 scheduler.inspect(scheduler.edges[edge_index].dependency, epoch, count, blocked);
+        }
+
+        fn markReachable(scheduler: *Self, token: Token, epoch: u32) void {
+            const index = scheduler.validateToken(token) catch return;
+            const node = &scheduler.nodes[index];
+            if (node.visit_epoch == epoch) return;
+            node.visit_epoch = epoch;
+            var edge_index = node.dependency_head;
+            while (edge_index != none) : (edge_index = scheduler.edges[edge_index].next)
+                scheduler.markReachable(scheduler.edges[edge_index].dependency, epoch);
         }
 
         fn apply(
@@ -407,6 +469,50 @@ test "child SCUs are claimed once and stale incoming edges become satisfied" {
     var applied: [2]TestScheduler.Applied = undefined;
     try std.testing.expectEqual(@as(usize, 2), (try scheduler.tryApply(&first_parent, &applied)).len);
     try std.testing.expectEqual(@as(usize, 1), (try scheduler.tryApply(&second_parent, &applied)).len);
+}
+
+test "desync transition preserves DCU-reachable SCUs" {
+    var scheduler = try TestScheduler.init(std.testing.allocator, 5, 6);
+    defer scheduler.deinit(std.testing.allocator);
+    var parent = TestScheduler.Queue.init(&scheduler, 1);
+    defer parent.deinit();
+    var child = TestScheduler.Queue.init(&scheduler, 2);
+    defer child.deinit();
+    const reachable = try scheduler.commit(&child, 20, .sync, &.{}, 0);
+    _ = try scheduler.commit(&parent, 10, .desync, &.{reachable}, 0);
+    _ = try scheduler.commit(&child, 21, .sync, &.{}, 0);
+
+    try std.testing.expectEqual(@as(usize, 1), try scheduler.transitionDesync(&child));
+    var applied: [2]TestScheduler.Applied = undefined;
+    try std.testing.expectEqual(@as(usize, 0), (try scheduler.tryApply(&child, &applied)).len);
+    const parent_result = try scheduler.tryApply(&parent, &applied);
+    try std.testing.expectEqual(@as(usize, 2), parent_result.len);
+    try std.testing.expectEqual(@as(u32, 20), parent_result[0].payload);
+    try std.testing.expectEqual(@as(u32, 10), parent_result[1].payload);
+    const child_result = try scheduler.tryApply(&child, &applied);
+    try std.testing.expectEqual(@as(usize, 1), child_result.len);
+    try std.testing.expectEqual(@as(u32, 21), child_result[0].payload);
+}
+
+test "desync transition removes incoming edges to promoted SCUs" {
+    var scheduler = try TestScheduler.init(std.testing.allocator, 5, 6);
+    defer scheduler.deinit(std.testing.allocator);
+    var parent = TestScheduler.Queue.init(&scheduler, 1);
+    defer parent.deinit();
+    var child = TestScheduler.Queue.init(&scheduler, 2);
+    defer child.deinit();
+    const first = try scheduler.commit(&child, 20, .sync, &.{}, 0);
+    const second = try scheduler.commit(&child, 21, .sync, &.{}, 0);
+    _ = first;
+    _ = try scheduler.commit(&parent, 10, .sync, &.{second}, 0);
+    try std.testing.expectEqual(@as(usize, 2), scheduler.active_edges);
+
+    try std.testing.expectEqual(@as(usize, 2), try scheduler.transitionDesync(&child));
+    // The child's predecessor edge remains; the parent's cross-queue edge is removed.
+    try std.testing.expectEqual(@as(usize, 1), scheduler.active_edges);
+    var applied: [2]TestScheduler.Applied = undefined;
+    try std.testing.expectEqual(@as(usize, 1), (try scheduler.tryApply(&child, &applied)).len);
+    try std.testing.expectEqual(@as(usize, 1), (try scheduler.tryApply(&child, &applied)).len);
 }
 
 test "node and edge pressure do not partially append" {
