@@ -1,7 +1,7 @@
 //! Shared allocation-free wl_surface callback queue storage.
 
 const std = @import("std");
-const objects = @import("objects.zig");
+const objects = @import("wayring").objects;
 
 const none = std.math.maxInt(u32);
 

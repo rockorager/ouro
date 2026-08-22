@@ -1,5 +1,6 @@
 const std = @import("std");
 const wayring = @import("wayring");
+const ouro = @import("ouro");
 const protocol = @import("core_protocol");
 
 const linux = std.os.linux;
@@ -7,7 +8,7 @@ const ClientCore = wayring.client.Core(protocol);
 const ClientConnection = wayring.client.Connection(protocol);
 const ServerCore = wayring.server.Core(protocol);
 const ServerConnections = wayring.server.SharedClients(protocol);
-const CommitState = wayring.compositor.CommitState(u32);
+const CommitState = ouro.surface.CommitState(u32);
 
 test "wl_surface get_release completes after its content update applies" {
     var sockets: [2]linux.fd_t = undefined;
@@ -69,17 +70,17 @@ test "wl_surface get_release completes after its content update applies" {
     _ = try server_objects.insertClient(surface.id, &protocol.wl_surface.info, 7, null);
     _ = try server_objects.insertClient(buffer.id, &protocol.wl_buffer.info, 1, null);
 
-    var region_pool = try wayring.compositor.RegionPool.init(std.testing.allocator, 1);
+    var region_pool = try ouro.surface.RegionPool.init(std.testing.allocator, 1);
     defer region_pool.deinit(std.testing.allocator);
-    var regions = wayring.compositor.SurfaceRegions.init(&region_pool);
+    var regions = ouro.surface.SurfaceRegions.init(&region_pool);
     defer regions.deinit();
-    var frame_pool = try wayring.compositor.FramePool.init(std.testing.allocator, 1);
+    var frame_pool = try ouro.surface.FramePool.init(std.testing.allocator, 1);
     defer frame_pool.deinit(std.testing.allocator);
-    var frames = wayring.compositor.FrameQueue.init(&frame_pool);
+    var frames = ouro.surface.FrameQueue.init(&frame_pool);
     defer frames.deinit();
-    var release_pool = try wayring.compositor.ReleasePool.init(std.testing.allocator, 1);
+    var release_pool = try ouro.surface.ReleasePool.init(std.testing.allocator, 1);
     defer release_pool.deinit(std.testing.allocator);
-    var releases = wayring.compositor.ReleaseQueue.init(&release_pool);
+    var releases = ouro.surface.ReleaseQueue.init(&release_pool);
     defer releases.deinit();
     var scheduler = try CommitState.Scheduler.init(std.testing.allocator, 1, 1);
     defer scheduler.deinit(std.testing.allocator);
@@ -208,10 +209,10 @@ const ReleaseServerHandler = struct {
     objects: *wayring.objects.SharedServerObjects,
     queue: *wayring.tx.Queue,
     buffer_handle: wayring.objects.Handle,
-    surface: wayring.compositor.Surface = .{},
-    regions: *wayring.compositor.SurfaceRegions,
-    frames: *wayring.compositor.FrameQueue,
-    releases: *wayring.compositor.ReleaseQueue,
+    surface: ouro.surface.Surface = .{},
+    regions: *ouro.surface.SurfaceRegions,
+    frames: *ouro.surface.FrameQueue,
+    releases: *ouro.surface.ReleaseQueue,
     scheduler: *CommitState.Scheduler,
     commit_queue: *CommitState.Scheduler.Queue,
     committed: bool = false,

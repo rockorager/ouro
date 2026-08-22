@@ -1,7 +1,7 @@
 //! Shared allocation-free per-content-update buffer release callbacks.
 
 const std = @import("std");
-const objects = @import("objects.zig");
+const objects = @import("wayring").objects;
 
 const none = std.math.maxInt(u32);
 

@@ -1,7 +1,7 @@
 //! Allocation-free protocol-independent compositor surface state.
 
 const std = @import("std");
-const objects = @import("objects.zig");
+const objects = @import("wayring").objects;
 const viewport = @import("viewport.zig");
 
 pub const RegionPool = @import("region.zig").Pool;

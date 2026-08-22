@@ -605,7 +605,7 @@ pub fn Graph(comptime Key: type, comptime Payload: type) type {
     };
 }
 
-const objects = @import("objects.zig");
+const objects = @import("wayring").objects;
 const TestGraph = Graph(objects.Handle, u32);
 const TestUpdateScheduler = @import("content_update.zig").Scheduler(objects.Handle, u32);
 
