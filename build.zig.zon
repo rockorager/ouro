@@ -4,7 +4,10 @@
     .fingerprint = 0xd03ff54f3d8d0299,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
-        .wayring = .{ .path = "../repo" },
+        .wayring = .{
+            .url = "git+https://github.com/rockorager/wayring.git#ed913200aa7db27c861bab23e4029f03e51a1b3d",
+            .hash = "wayring-0.1.0-N0pph8LtEgBCL8Q3OUhcI_TKd1iwEwotGTSieFv5YyGT",
+        },
         .wayland = .{
             .url = "https://gitlab.freedesktop.org/wayland/wayland/-/releases/1.26.0/downloads/wayland-1.26.0.tar.xz",
             .hash = "N-V-__8AAA46JQABKU7sa-6xGUAN44uFsYSUS_w79UVuu7qo",
