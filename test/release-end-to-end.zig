@@ -8,9 +8,15 @@ const ClientCore = wayring.client.Core(protocol);
 const ClientConnection = wayring.client.Connection(protocol);
 const ServerCore = wayring.server.Core(protocol);
 const ServerConnections = wayring.server.SharedClients(protocol);
+const Shm = wayring.server.Shm(protocol);
 const CommitState = ouro.surface.CommitState(u32);
 
-test "wl_surface get_release completes after its content update applies" {
+const shm_formats = [_]wayring.shm.Format{
+    .{ .value = protocol.wl_shm.format.argb8888.value, .bytes_per_pixel = 4 },
+    .{ .value = protocol.wl_shm.format.xrgb8888.value, .bytes_per_pixel = 4 },
+};
+
+test "SHM-backed wl_surface attachment commits before release completes" {
     var sockets: [2]linux.fd_t = undefined;
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(
         linux.AF.UNIX,
@@ -63,12 +69,23 @@ test "wl_surface get_release completes after its content update applies" {
     const client_peer = client_connection.peer;
     const server_objects = try server_connections.get(server_peer);
     const client_objects = &client_connection.objects;
+    var shm = try Shm.init(std.testing.allocator, .{
+        .limits = .{ .max_pool_bytes = 4096 },
+        .pool_capacity = 1,
+        .buffer_capacity = 1,
+        .formats = &shm_formats,
+    });
+    defer shm.deinit(std.testing.allocator);
+    server_objects.setRemovalHook(.{
+        .context = &shm,
+        .notify = removeShmResource,
+    });
+    const shm_resource = try client_objects.createLocal(&protocol.wl_shm.info, 1, null);
+    errdefer _ = client_objects.cancelLocal(shm_resource) catch {};
     const surface = try client_objects.createLocal(&protocol.wl_surface.info, 7, null);
     errdefer _ = client_objects.cancelLocal(surface) catch {};
-    const buffer = try client_objects.createLocal(&protocol.wl_buffer.info, 1, null);
-    errdefer _ = client_objects.cancelLocal(buffer) catch {};
+    _ = try server_objects.insertClient(shm_resource.id, &protocol.wl_shm.info, 1, &shm);
     _ = try server_objects.insertClient(surface.id, &protocol.wl_surface.info, 7, null);
-    _ = try server_objects.insertClient(buffer.id, &protocol.wl_buffer.info, 1, null);
 
     var region_pool = try ouro.surface.RegionPool.init(std.testing.allocator, 1);
     defer region_pool.deinit(std.testing.allocator);
@@ -88,8 +105,8 @@ test "wl_surface get_release completes after its content update applies" {
     defer CommitState.deinitQueue(&commit_queue);
     var server_handler: ReleaseServerHandler = .{
         .objects = server_objects,
-        .queue = &(try reactor.getActor(server_peer)).transmit,
-        .buffer_handle = server_objects.namespace.lookupHandle(buffer.id).?,
+        .actor = try reactor.getActor(server_peer),
+        .shm = &shm,
         .regions = &regions,
         .frames = &frames,
         .releases = &releases,
@@ -98,6 +115,25 @@ test "wl_surface get_release completes after its content update applies" {
     };
 
     const client_actor = try client_connection.actor();
+    const descriptor = try memfd(4096);
+    const pool = try protocol.wl_shm.construct_create_pool(
+        client_objects,
+        &client_actor.transmit,
+        shm_resource,
+        .{ .fd = descriptor, .size = 4096 },
+    );
+    const buffer = (try protocol.wl_shm_pool.construct_create_buffer(
+        client_objects,
+        &client_actor.transmit,
+        pool.id,
+        .{
+            .offset = 16,
+            .width = 3,
+            .height = 2,
+            .stride = 16,
+            .format = .argb8888,
+        },
+    )).id;
     try wayring.client.sendRequest(
         protocol.wl_surface,
         client_objects,
@@ -207,8 +243,8 @@ test "wl_surface get_release completes after its content update applies" {
 
 const ReleaseServerHandler = struct {
     objects: *wayring.objects.SharedServerObjects,
-    queue: *wayring.tx.Queue,
-    buffer_handle: wayring.objects.Handle,
+    actor: *wayring.connection.Actor,
+    shm: *Shm,
     surface: ouro.surface.Surface = .{},
     regions: *ouro.surface.SurfaceRegions,
     frames: *ouro.surface.FrameQueue,
@@ -217,6 +253,7 @@ const ReleaseServerHandler = struct {
     commit_queue: *CommitState.Scheduler.Queue,
     committed: bool = false,
     released: bool = false,
+    attached_buffer: ?wayring.objects.Handle = null,
 
     pub fn request(
         handler: *ReleaseServerHandler,
@@ -224,8 +261,14 @@ const ReleaseServerHandler = struct {
         message: wayring.wire.Message,
         fds: *wayring.ancillary.FdQueue,
     ) !wayring.dispatch.Control {
-        if (target.object.interface != &protocol.wl_surface.info)
-            return error.UnexpectedRequest;
+        if (try handler.shm.request(
+            handler.actor,
+            handler.objects,
+            target,
+            message,
+            fds,
+        )) |control| return control;
+        if (target.object.interface != &protocol.wl_surface.info) return error.UnexpectedRequest;
         const decoded = try wayring.server.decodeRequest(
             protocol.wl_surface,
             handler.objects,
@@ -234,12 +277,22 @@ const ReleaseServerHandler = struct {
         );
         switch (decoded.value) {
             .attach => |value| {
-                if (value.buffer == null or value.buffer.? != handler.buffer_handle.id)
+                const buffer_id = value.buffer orelse return error.InvalidBuffer;
+                const buffer_handle = handler.objects.namespace.lookupHandle(buffer_id) orelse
                     return error.InvalidBuffer;
+                const buffer_object = handler.objects.namespace.resolve(buffer_handle) orelse
+                    return error.InvalidBuffer;
+                const token = handler.shm.bufferToken(buffer_object) orelse
+                    return error.InvalidBuffer;
+                const metadata = try handler.shm.store.bufferInfo(token);
+                if (metadata.offset != 16 or metadata.width != 3 or metadata.height != 2 or
+                    metadata.stride != 16)
+                    return error.InvalidBufferMetadata;
+                handler.attached_buffer = buffer_handle;
                 try handler.surface.attach(7, .{
-                    .handle = handler.buffer_handle,
-                    .width = 2,
-                    .height = 2,
+                    .handle = buffer_handle,
+                    .width = metadata.width,
+                    .height = metadata.height,
                 }, value.x, value.y);
             },
             .get_release => |value| {
@@ -268,19 +321,52 @@ const ReleaseServerHandler = struct {
                 if (result.len != 1) return error.MissingContentUpdate;
                 var content = result[0].payload;
                 defer content.deinit();
+                const attachment = content.surface.attachment orelse
+                    return error.MissingAttachment;
+                const committed_buffer = attachment.buffer orelse
+                    return error.MissingBuffer;
+                const attached_buffer = handler.attached_buffer orelse
+                    return error.MissingAttachment;
+                if (!std.meta.eql(committed_buffer.handle, attached_buffer) or
+                    committed_buffer.width != 3 or committed_buffer.height != 2)
+                    return error.InvalidCommittedAttachment;
                 const callback = content.release_callbacks.?.peek() orelse
                     return error.MissingRelease;
-                try ServerCore.completeSync(handler.objects, handler.queue, callback, 0);
+                try ServerCore.completeSync(
+                    handler.objects,
+                    &handler.actor.transmit,
+                    callback,
+                    0,
+                );
                 try content.release_callbacks.?.consume(callback);
                 handler.committed = true;
                 handler.released = true;
             },
             else => return error.UnexpectedRequest,
         }
-        try decoded.finish(protocol, handler.objects, handler.queue);
+        try decoded.finish(protocol, handler.objects, &handler.actor.transmit);
         return .continue_dispatch;
     }
 };
+
+fn removeShmResource(
+    context: ?*anyopaque,
+    handle: wayring.objects.Handle,
+    object: wayring.objects.Object,
+) void {
+    const shm: *Shm = @ptrCast(@alignCast(context.?));
+    _ = shm.resourceRemoved(handle, object);
+}
+
+fn memfd(size: usize) !linux.fd_t {
+    const result = linux.memfd_create("ouro-release-e2e", linux.MFD.CLOEXEC);
+    if (linux.errno(result) != .SUCCESS) return error.SystemCallFailed;
+    const fd: linux.fd_t = @intCast(result);
+    errdefer _ = linux.close(fd);
+    if (linux.errno(linux.ftruncate(fd, @intCast(size))) != .SUCCESS)
+        return error.SystemCallFailed;
+    return fd;
+}
 
 const ReleaseClientHandler = struct {
     objects: *wayring.objects.ClientObjects,
