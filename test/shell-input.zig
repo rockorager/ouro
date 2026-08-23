@@ -20,7 +20,8 @@ const pixels = [_]u8{
 
 test "shell-input: pollable backend retains a backpressured suffix without replay" {
     const allocator = std.testing.allocator;
-    const path = "/tmp/ouro-shell-input.sock";
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-shell-input-{d}.sock", .{linux.getpid()});
     wayring.unix_socket.unlink(path) catch {};
     defer wayring.unix_socket.unlink(path) catch {};
 

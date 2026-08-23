@@ -123,9 +123,9 @@ fn realDestroyDevice(_: *anyopaque, device: Device) void {
 
 fn realCreateBo(_: *anyopaque, device: Device, allocation: Allocation) !Bo {
     var usage: u32 = c.GBM_BO_USE_SCANOUT | c.GBM_BO_USE_RENDERING;
-    if (!allocation.explicit_modifier or allocation.modifier == modifier_linear)
-        usage |= c.GBM_BO_USE_LINEAR;
-    const bo = if (allocation.explicit_modifier) blk: {
+    const explicit_tiled = usesExplicitModifierPath(allocation);
+    if (!explicit_tiled) usage |= c.GBM_BO_USE_LINEAR;
+    const bo = if (explicit_tiled) blk: {
         const modifiers = [_]u64{allocation.modifier};
         break :blk c.gbm_bo_create_with_modifiers2(
             @ptrCast(@alignCast(device)),
@@ -144,6 +144,10 @@ fn realCreateBo(_: *anyopaque, device: Device, allocation: Allocation) !Bo {
         usage,
     );
     return @ptrCast(bo orelse return error.CreateBoFailed);
+}
+
+fn usesExplicitModifierPath(allocation: Allocation) bool {
+    return allocation.explicit_modifier and allocation.modifier != modifier_linear;
 }
 
 fn realDestroyBo(_: *anyopaque, bo: Bo) void {
@@ -201,4 +205,24 @@ fn realUnmap(_: *anyopaque, bo_value: Bo, token: MapToken) void {
 
 test "gbm: real boundary is linked" {
     try std.testing.expect(real.context == @as(*anyopaque, @ptrCast(&real_context)));
+}
+
+test "gbm: explicit linear allocation uses ordinary linear path" {
+    const linear: Allocation = .{
+        .width = 1920,
+        .height = 1200,
+        .format = format_xrgb8888,
+        .modifier = modifier_linear,
+        .explicit_modifier = true,
+    };
+    const tiled: Allocation = .{
+        .width = 1920,
+        .height = 1200,
+        .format = format_xrgb8888,
+        .modifier = 1,
+        .explicit_modifier = true,
+    };
+
+    try std.testing.expect(!usesExplicitModifierPath(linear));
+    try std.testing.expect(usesExplicitModifierPath(tiled));
 }
