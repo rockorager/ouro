@@ -1,0 +1,1716 @@
+//! Bounded Wayring adapter for core compositor surface requests.
+//!
+//! Wayring owns decoding, object publication/removal, and SHM mappings. This
+//! adapter copies handles out of dispatch callbacks and feeds Ouro's existing
+//! transactional surface, callback, content-update, and attachment-lease state.
+
+const std = @import("std");
+const wayring = @import("wayring");
+const completion = @import("../runtime/completion.zig");
+const surface_state = @import("../surface.zig");
+
+const objects = wayring.objects;
+const none = std.math.maxInt(u32);
+
+pub const Config = struct {
+    surface_capacity: usize,
+    region_capacity: usize,
+    region_operation_capacity: usize,
+    frame_callback_capacity: usize,
+    release_callback_capacity: usize,
+    content_update_capacity: usize,
+    dependency_capacity: usize,
+    attachment_capacity: usize,
+    copy_capacity: usize,
+    max_copy_bytes: usize,
+    compositor_version: u32 = 7,
+
+    fn validate(config: Config) !void {
+        if (config.surface_capacity == 0 or config.surface_capacity >= none or
+            config.region_capacity == 0 or config.region_capacity >= none or
+            config.attachment_capacity == 0 or config.copy_capacity == 0 or
+            config.copy_capacity >= none or config.max_copy_bytes == 0)
+            return error.InvalidConfig;
+        _ = std.math.mul(usize, config.copy_capacity, config.max_copy_bytes) catch
+            return error.InvalidConfig;
+    }
+};
+
+/// Returns the protocol owner for one generated Wayland core module. The value
+/// and every pool it references must retain a stable address while installed.
+pub fn Adapter(comptime protocol: type) type {
+    return struct {
+        const Self = @This();
+        const Runtime = wayring.server.Runtime(protocol);
+        const Shm = wayring.server.Shm(protocol);
+        const ProtocolCore = wayring.server.Core(protocol);
+        const Compositor = protocol.wl_compositor;
+        const SurfaceInterface = protocol.wl_surface;
+        const RegionInterface = protocol.wl_region;
+        const Commit = surface_state.CommitState(objects.Handle);
+
+        pub const Applied = Commit.Scheduler.Applied;
+        pub const Content = Commit.Content;
+        pub const UpdateToken = Commit.Scheduler.Token;
+
+        const CopyState = union(enum) {
+            pending,
+            success: usize,
+            failed: anyerror,
+        };
+
+        const CopySlot = struct {
+            active: bool = false,
+            retired: bool = false,
+            generation: u32 = 1,
+            owner_alive: bool = false,
+            token: completion.Token = undefined,
+            copy: wayring.shm.Store.Copy = undefined,
+            state: CopyState = .pending,
+            update: ?UpdateToken = null,
+            destination: []u8,
+        };
+
+        const CopyOwner = struct {
+            slot: *CopySlot,
+            generation: u32,
+        };
+
+        const ShmBacking = union(enum) {
+            direct: struct {
+                store: *wayring.shm.Store,
+                pin: wayring.shm.Store.Pin,
+            },
+            copied: CopyOwner,
+        };
+        const Imports = @import("../buffer_import.zig").Registry(ShmBacking);
+
+        const SurfaceSlot = struct {
+            active: bool = false,
+            next_free: u32 = none,
+            resource: objects.Handle = .{ .id = 0, .generation = 0 },
+            state: surface_state.Surface = .{},
+            regions: surface_state.SurfaceRegions = undefined,
+            frames: surface_state.FrameQueue = undefined,
+            releases: surface_state.ReleaseQueue = undefined,
+            attachment: surface_state.AttachmentLeaseState = .{},
+            updates: Commit.Scheduler.Queue = undefined,
+        };
+
+        const RegionSlot = struct {
+            active: bool = false,
+            next_free: u32 = none,
+            resource: objects.Handle = .{ .id = 0, .generation = 0 },
+            region: surface_state.Region = undefined,
+        };
+
+        allocator: std.mem.Allocator,
+        shm: *Shm,
+        ring: *std.os.linux.IoUring,
+        router: *completion.Router,
+        runtime: ?*Runtime = null,
+        global: ?objects.Handle = null,
+        compositor_version: u32,
+        surfaces: []SurfaceSlot,
+        regions: []RegionSlot,
+        surface_free: u32,
+        region_free: u32,
+        region_pool: surface_state.RegionPool,
+        frame_pool: surface_state.FramePool,
+        release_pool: surface_state.ReleasePool,
+        scheduler: Commit.Scheduler,
+        imports: Imports,
+        copies: []CopySlot,
+        copy_storage: []u8,
+        max_copy_bytes: usize,
+
+        pub fn init(
+            allocator: std.mem.Allocator,
+            shm: *Shm,
+            ring: *std.os.linux.IoUring,
+            router: *completion.Router,
+            config: Config,
+        ) !Self {
+            try config.validate();
+            try Compositor.info.validateVersion(config.compositor_version);
+
+            const surfaces = try allocator.alloc(SurfaceSlot, config.surface_capacity);
+            errdefer allocator.free(surfaces);
+            const regions = try allocator.alloc(RegionSlot, config.region_capacity);
+            errdefer allocator.free(regions);
+            var region_pool = try surface_state.RegionPool.init(
+                allocator,
+                config.region_operation_capacity,
+            );
+            errdefer region_pool.deinit(allocator);
+            var frame_pool = try surface_state.FramePool.init(
+                allocator,
+                config.frame_callback_capacity,
+            );
+            errdefer frame_pool.deinit(allocator);
+            var release_pool = try surface_state.ReleasePool.init(
+                allocator,
+                config.release_callback_capacity,
+            );
+            errdefer release_pool.deinit(allocator);
+            var scheduler = try Commit.Scheduler.init(
+                allocator,
+                config.content_update_capacity,
+                config.dependency_capacity,
+            );
+            errdefer scheduler.deinit(allocator);
+            var imports = try Imports.init(
+                allocator,
+                config.attachment_capacity,
+                null,
+                disposeShmBacking,
+            );
+            errdefer imports.deinit(allocator);
+            const copies = try allocator.alloc(CopySlot, config.copy_capacity);
+            errdefer allocator.free(copies);
+            const storage_len = std.math.mul(
+                usize,
+                config.copy_capacity,
+                config.max_copy_bytes,
+            ) catch return error.InvalidConfig;
+            const copy_storage = try allocator.alloc(u8, storage_len);
+            errdefer allocator.free(copy_storage);
+
+            for (surfaces, 0..) |*slot, index| slot.* = .{
+                .next_free = if (index + 1 < surfaces.len) @intCast(index + 1) else none,
+            };
+            for (regions, 0..) |*slot, index| slot.* = .{
+                .next_free = if (index + 1 < regions.len) @intCast(index + 1) else none,
+            };
+            for (copies, 0..) |*slot, index| slot.* = .{
+                .destination = copy_storage[index * config.max_copy_bytes .. (index + 1) * config.max_copy_bytes],
+            };
+            return .{
+                .allocator = allocator,
+                .shm = shm,
+                .ring = ring,
+                .router = router,
+                .compositor_version = config.compositor_version,
+                .surfaces = surfaces,
+                .regions = regions,
+                .surface_free = 0,
+                .region_free = 0,
+                .region_pool = region_pool,
+                .frame_pool = frame_pool,
+                .release_pool = release_pool,
+                .scheduler = scheduler,
+                .imports = imports,
+                .copies = copies,
+                .copy_storage = copy_storage,
+                .max_copy_bytes = config.max_copy_bytes,
+            };
+        }
+
+        pub fn deinit(adapter: *Self) void {
+            for (adapter.surfaces, 0..) |slot, index| {
+                if (slot.active) adapter.releaseSurface(@intCast(index));
+            }
+            for (adapter.regions, 0..) |slot, index| {
+                if (slot.active) adapter.releaseRegion(@intCast(index));
+            }
+            for (adapter.copies) |slot| std.debug.assert(!slot.active or
+                (!slot.owner_alive and slot.state != .pending));
+            adapter.imports.deinit(adapter.allocator);
+            adapter.scheduler.deinit(adapter.allocator);
+            adapter.release_pool.deinit(adapter.allocator);
+            adapter.frame_pool.deinit(adapter.allocator);
+            adapter.region_pool.deinit(adapter.allocator);
+            adapter.allocator.free(adapter.regions);
+            adapter.allocator.free(adapter.surfaces);
+            adapter.allocator.free(adapter.copy_storage);
+            adapter.allocator.free(adapter.copies);
+            adapter.* = undefined;
+        }
+
+        /// Publishes wl_compositor. Parent integration should install this once
+        /// and route this client's central removal hook to `resourceRemoved`.
+        pub fn install(adapter: *Self, runtime: *Runtime) !objects.Handle {
+            if (adapter.runtime != null) return error.AlreadyInstalled;
+            adapter.runtime = runtime;
+            errdefer adapter.runtime = null;
+            const global = try runtime.addGlobalWithBinder(
+                &Compositor.info,
+                adapter.compositor_version,
+                adapter,
+                bind,
+            );
+            adapter.global = global;
+            return global;
+        }
+
+        /// Driver-facing dispatch entry point. Null means another protocol
+        /// owner should inspect the request.
+        pub fn request(
+            adapter: *Self,
+            peer: wayring.io_uring.Peer,
+            target: objects.Dispatch,
+            message: wayring.wire.Message,
+            fds: *wayring.ancillary.FdQueue,
+        ) !?wayring.dispatch.Control {
+            const runtime = adapter.runtime orelse return error.NotInstalled;
+            const actor = try runtime.clients.reactor.getActor(peer);
+            const server_objects = try runtime.clients.get(peer);
+            return adapter.requestOn(actor, server_objects, target, message, fds);
+        }
+
+        /// Explicit dispatch boundary used by composition roots and focused
+        /// tests which already have the connection actor and object namespace.
+        pub fn requestOn(
+            adapter: *Self,
+            actor: *wayring.connection.Actor,
+            server_objects: anytype,
+            target: objects.Dispatch,
+            message: wayring.wire.Message,
+            fds: *wayring.ancillary.FdQueue,
+        ) !?wayring.dispatch.Control {
+            const interface = target.object.interface;
+            if (interface == &Compositor.info) {
+                if (target.object.context != @as(?*anyopaque, @ptrCast(adapter))) return null;
+                return try adapter.compositorRequest(actor, server_objects, message, fds);
+            }
+            if (interface == &SurfaceInterface.info) {
+                const slot = adapter.surfaceFromObject(target.object) orelse return null;
+                return try adapter.surfaceRequest(actor, server_objects, slot, message, fds);
+            }
+            if (interface == &RegionInterface.info) {
+                const slot = adapter.regionFromObject(target.object) orelse return null;
+                return try adapter.regionRequest(actor, server_objects, slot, message, fds);
+            }
+            return null;
+        }
+
+        /// Central removal-hook branch. It composes Wayring SHM teardown and
+        /// validates the complete resource handle before releasing an Ouro slot.
+        pub fn resourceRemoved(
+            adapter: *Self,
+            handle: objects.Handle,
+            object: objects.Object,
+        ) bool {
+            if (adapter.shm.resourceRemoved(handle, object)) return true;
+            if (object.interface == &SurfaceInterface.info) {
+                const slot = adapter.surfaceFromObject(&object) orelse return false;
+                if (!std.meta.eql(slot.resource, handle)) return false;
+                adapter.releaseSurface(adapter.surfaceIndex(slot));
+                return true;
+            }
+            if (object.interface == &RegionInterface.info) {
+                const slot = adapter.regionFromObject(&object) orelse return false;
+                if (!std.meta.eql(slot.resource, handle)) return false;
+                adapter.releaseRegion(adapter.regionIndex(slot));
+                return true;
+            }
+            return object.interface == &Compositor.info and
+                object.context == @as(?*anyopaque, @ptrCast(adapter));
+        }
+
+        pub fn getSurface(
+            adapter: *Self,
+            handle: objects.Handle,
+        ) !*surface_state.Surface {
+            return &(try adapter.resolveSurface(handle)).state;
+        }
+
+        pub fn tryApply(
+            adapter: *Self,
+            handle: objects.Handle,
+            output: []Applied,
+        ) ![]Applied {
+            const slot = try adapter.resolveSurface(handle);
+            return adapter.scheduler.tryApply(&slot.updates, output);
+        }
+
+        pub fn satisfy(adapter: *Self, token: UpdateToken, count: u32) !void {
+            try adapter.scheduler.satisfy(token, count);
+        }
+
+        /// Returns the retained zero-copy mapping for sealed SHM, or the stable
+        /// bounded destination after an ordinary SHM copy succeeds.
+        pub fn shmBytes(
+            adapter: *Self,
+            lease: surface_state.BufferLease,
+        ) ![]const u8 {
+            const backing = try adapter.imports.get(lease);
+            return switch (backing.*) {
+                .direct => |direct| direct.store.bytes(direct.pin),
+                .copied => |owner| {
+                    const slot = try resolveCopyOwner(owner);
+                    return switch (slot.state) {
+                        .pending => error.CopyPending,
+                        .failed => error.CopyFailed,
+                        .success => |len| slot.destination[0..len],
+                    };
+                },
+            };
+        }
+
+        /// Handles one R1-routed `.copy` completion during R4's pre-submit
+        /// completion hook. Unknown, duplicate, and stale completions are inert.
+        pub fn completeShmCopy(adapter: *Self, outcome: anytype) !void {
+            try adapter.completeCopy(outcome.token, outcome.cqe);
+        }
+
+        pub fn completeCopy(
+            adapter: *Self,
+            token: completion.Token,
+            cqe: std.os.linux.io_uring_cqe,
+        ) !void {
+            if (token.kind != .copy or cqe.user_data != token.encode())
+                return error.StaleCopyCompletion;
+            const slot = adapter.findPendingCopy(token) orelse
+                return error.StaleCopyCompletion;
+            const copied = adapter.shm.store.completeCopy(slot.copy, cqe) catch |cause| {
+                if (cause == error.InvalidCompletion) return error.StaleCopyCompletion;
+                try adapter.router.retire(token);
+                slot.state = .{ .failed = cause };
+                return cause;
+            };
+            try adapter.router.retire(token);
+            slot.state = .{ .success = copied.len };
+            if (slot.owner_alive) {
+                if (slot.update) |update| try adapter.scheduler.satisfy(update, 1);
+            }
+        }
+
+        pub fn pendingShmCopies(adapter: *const Self) usize {
+            var count: usize = 0;
+            for (adapter.copies) |slot| {
+                if (slot.active and slot.state == .pending) count += 1;
+            }
+            return count;
+        }
+
+        /// Moves frame callbacks from an applied content update to the owning
+        /// surface's ready queue. If the surface was removed, the caller should
+        /// discard the content instead of attempting callback delivery.
+        pub fn activateFrames(
+            adapter: *Self,
+            handle: objects.Handle,
+            content: *Content,
+        ) !usize {
+            const slot = try adapter.resolveSurface(handle);
+            return content.activateFrames(&slot.frames);
+        }
+
+        /// Queues callback.done and delete_id before consuming ready ownership.
+        pub fn completeFrameOn(
+            adapter: *Self,
+            server_objects: anytype,
+            queue: *wayring.tx.Queue,
+            surface_handle: objects.Handle,
+            callback_data: u32,
+        ) !bool {
+            const slot = try adapter.resolveSurface(surface_handle);
+            const callback = slot.frames.peekReady() orelse return false;
+            try ProtocolCore.completeSync(server_objects, queue, callback, callback_data);
+            try slot.frames.consumeReady(callback);
+            return true;
+        }
+
+        /// Generated-event helper for a parent presentation callback wrapper.
+        pub fn completeReleaseOn(
+            server_objects: anytype,
+            queue: *wayring.tx.Queue,
+            callback: objects.Handle,
+        ) !void {
+            try ProtocolCore.completeSync(server_objects, queue, callback, 0);
+        }
+
+        fn bind(context: ?*anyopaque, binding: wayring.server.Binding) !?*anyopaque {
+            _ = binding;
+            return context;
+        }
+
+        fn compositorRequest(
+            adapter: *Self,
+            actor: *wayring.connection.Actor,
+            server_objects: anytype,
+            message: wayring.wire.Message,
+            fds: *wayring.ancillary.FdQueue,
+        ) !wayring.dispatch.Control {
+            const decoded = try wayring.server.decodeRequest(
+                Compositor,
+                server_objects,
+                message,
+                fds,
+            );
+            switch (decoded.value) {
+                .create_surface => |value| {
+                    const slot = adapter.acquireSurface() catch |cause|
+                        return try adapter.failure(actor, decoded.handle.id, cause);
+                    const admitted = Compositor.admit_create_surface(
+                        server_objects,
+                        decoded.handle,
+                        value,
+                        .{ .id = slot },
+                    ) catch |cause| {
+                        adapter.releaseSurface(adapter.surfaceIndex(slot));
+                        return try adapter.failure(actor, decoded.handle.id, cause);
+                    };
+                    slot.resource = admitted.id;
+                    slot.updates = Commit.Scheduler.Queue.init(&adapter.scheduler, admitted.id);
+                },
+                .create_region => |value| {
+                    const slot = adapter.acquireRegion() catch |cause|
+                        return try adapter.failure(actor, decoded.handle.id, cause);
+                    const admitted = Compositor.admit_create_region(
+                        server_objects,
+                        decoded.handle,
+                        value,
+                        .{ .id = slot },
+                    ) catch |cause| {
+                        adapter.releaseRegion(adapter.regionIndex(slot));
+                        return try adapter.failure(actor, decoded.handle.id, cause);
+                    };
+                    slot.resource = admitted.id;
+                },
+                .release => {},
+            }
+            try decoded.finish(protocol, server_objects, &actor.transmit);
+            return .continue_dispatch;
+        }
+
+        fn surfaceRequest(
+            adapter: *Self,
+            actor: *wayring.connection.Actor,
+            server_objects: anytype,
+            slot: *SurfaceSlot,
+            message: wayring.wire.Message,
+            fds: *wayring.ancillary.FdQueue,
+        ) !wayring.dispatch.Control {
+            const decoded = try wayring.server.decodeRequest(
+                SurfaceInterface,
+                server_objects,
+                message,
+                fds,
+            );
+            const resource = decoded.handle;
+            const version = targetVersion(server_objects, resource) catch |cause|
+                return try adapter.failure(actor, resource.id, cause);
+            switch (decoded.value) {
+                .destroy => slot.state.validateDestroy() catch |cause|
+                    return try adapter.surfaceFailure(actor, resource.id, cause),
+                .attach => |value| adapter.attach(
+                    server_objects,
+                    slot,
+                    version,
+                    value.buffer,
+                    value.x,
+                    value.y,
+                ) catch |cause| return try adapter.surfaceFailure(
+                    actor,
+                    resource.id,
+                    cause,
+                ),
+                .damage => |value| slot.state.damage(
+                    value.x,
+                    value.y,
+                    value.width,
+                    value.height,
+                ),
+                .frame => |value| {
+                    if (adapter.frame_pool.available() == 0)
+                        return try adapter.noMemory(actor);
+                    const admitted = SurfaceInterface.admit_frame(
+                        server_objects,
+                        resource,
+                        value,
+                        .{},
+                    ) catch |cause| return try adapter.failure(actor, resource.id, cause);
+                    slot.frames.addPending(admitted.callback) catch unreachable;
+                },
+                .set_opaque_region => |value| adapter.setRegion(
+                    server_objects,
+                    &slot.regions,
+                    true,
+                    value.region,
+                ) catch |cause| return try adapter.failure(actor, resource.id, cause),
+                .set_input_region => |value| adapter.setRegion(
+                    server_objects,
+                    &slot.regions,
+                    false,
+                    value.region,
+                ) catch |cause| return try adapter.failure(actor, resource.id, cause),
+                .commit => {
+                    const pending_copy = adapter.pendingAttachmentCopy(slot) catch |cause|
+                        return try adapter.surfaceFailure(actor, resource.id, cause);
+                    const token = Commit.commitWithAttachment(
+                        &adapter.scheduler,
+                        &slot.updates,
+                        &slot.state,
+                        &slot.regions,
+                        &slot.frames,
+                        &slot.releases,
+                        &slot.attachment,
+                        .desync,
+                        &.{},
+                        if (pending_copy == null) 0 else 1,
+                    ) catch |cause| return try adapter.surfaceFailure(
+                        actor,
+                        resource.id,
+                        cause,
+                    );
+                    if (pending_copy) |copy_slot| copy_slot.update = token;
+                },
+                .set_buffer_transform => |value| slot.state.setTransform(
+                    @intCast(value.transform.value),
+                ) catch |cause| return try adapter.surfaceFailure(
+                    actor,
+                    resource.id,
+                    cause,
+                ),
+                .set_buffer_scale => |value| slot.state.setScale(value.scale) catch |cause|
+                    return try adapter.surfaceFailure(actor, resource.id, cause),
+                .damage_buffer => |value| slot.state.damageBuffer(
+                    value.x,
+                    value.y,
+                    value.width,
+                    value.height,
+                ),
+                .offset => |value| slot.state.setOffset(value.x, value.y),
+                .get_release => |value| {
+                    if (adapter.release_pool.available() == 0)
+                        return try adapter.noMemory(actor);
+                    const admitted = SurfaceInterface.admit_get_release(
+                        server_objects,
+                        resource,
+                        value,
+                        .{},
+                    ) catch |cause| return try adapter.failure(actor, resource.id, cause);
+                    slot.releases.request(admitted.callback) catch unreachable;
+                },
+            }
+            try decoded.finish(protocol, server_objects, &actor.transmit);
+            return .continue_dispatch;
+        }
+
+        fn regionRequest(
+            adapter: *Self,
+            actor: *wayring.connection.Actor,
+            server_objects: anytype,
+            slot: *RegionSlot,
+            message: wayring.wire.Message,
+            fds: *wayring.ancillary.FdQueue,
+        ) !wayring.dispatch.Control {
+            const decoded = try wayring.server.decodeRequest(
+                RegionInterface,
+                server_objects,
+                message,
+                fds,
+            );
+            switch (decoded.value) {
+                .destroy => {},
+                .add => |value| slot.region.add(.{
+                    .x = value.x,
+                    .y = value.y,
+                    .width = value.width,
+                    .height = value.height,
+                }) catch |cause| return try adapter.regionFailure(
+                    actor,
+                    decoded.handle.id,
+                    cause,
+                ),
+                .subtract => |value| slot.region.subtract(.{
+                    .x = value.x,
+                    .y = value.y,
+                    .width = value.width,
+                    .height = value.height,
+                }) catch |cause| return try adapter.regionFailure(
+                    actor,
+                    decoded.handle.id,
+                    cause,
+                ),
+            }
+            try decoded.finish(protocol, server_objects, &actor.transmit);
+            return .continue_dispatch;
+        }
+
+        fn attach(
+            adapter: *Self,
+            server_objects: anytype,
+            slot: *SurfaceSlot,
+            version: u32,
+            buffer_id: ?u32,
+            x: i32,
+            y: i32,
+        ) !void {
+            const id = buffer_id orelse {
+                try slot.state.attach(version, null, x, y);
+                slot.attachment.attach(null);
+                return;
+            };
+            const handle = server_objects.namespace.lookupHandle(id) orelse
+                return error.UnknownObject;
+            const object = server_objects.namespace.resolve(handle) orelse
+                return error.UnknownObject;
+            const token = adapter.shm.bufferToken(object) orelse return error.UnsupportedBuffer;
+            const info = try adapter.shm.store.bufferInfo(token);
+
+            // All fallible surface validation and bounded-admission checks must
+            // precede prepareCopy: once queued, its pin and destination must
+            // survive through a terminal CQE.
+            if (version >= 5 and (x != 0 or y != 0)) return error.InvalidOffset;
+            if (info.width <= 0 or info.height <= 0) return error.InvalidSize;
+            if (adapter.imports.available() == 0) return error.Exhausted;
+
+            const pin = try adapter.shm.store.pin(token);
+            var pin_owned = true;
+            errdefer if (pin_owned) adapter.shm.store.unpin(pin) catch unreachable;
+            const backing: ShmBacking = direct: {
+                _ = adapter.shm.store.bytes(pin) catch |cause| switch (cause) {
+                    error.UnsafeAccess => {
+                        try adapter.shm.store.unpin(pin);
+                        pin_owned = false;
+                        break :direct .{ .copied = try adapter.prepareCopy(token, info.extent) };
+                    },
+                    else => return cause,
+                };
+                pin_owned = false;
+                break :direct .{ .direct = .{
+                    .store = &adapter.shm.store,
+                    .pin = pin,
+                } };
+            };
+            var lease = adapter.imports.acquire(backing) catch |cause| {
+                disposeShmBacking(null, backing);
+                return cause;
+            };
+            errdefer lease.deinit();
+            try slot.state.attach(version, .{
+                .handle = handle,
+                .width = info.width,
+                .height = info.height,
+            }, x, y);
+            slot.attachment.attach(lease);
+        }
+
+        fn setRegion(
+            adapter: *Self,
+            server_objects: anytype,
+            destination: *surface_state.SurfaceRegions,
+            is_opaque: bool,
+            region_id: ?u32,
+        ) !void {
+            const source = if (region_id) |id| source: {
+                const handle = server_objects.namespace.lookupHandle(id) orelse
+                    return error.UnknownObject;
+                const object = server_objects.namespace.resolve(handle) orelse
+                    return error.UnknownObject;
+                const slot = adapter.regionFromObject(object) orelse return error.WrongOwner;
+                if (!std.meta.eql(slot.resource, handle)) return error.StaleHandle;
+                break :source &slot.region;
+            } else null;
+            if (is_opaque)
+                try destination.setOpaque(source)
+            else
+                try destination.setInput(source);
+        }
+
+        fn acquireSurface(adapter: *Self) !*SurfaceSlot {
+            if (adapter.surface_free == none) return error.Exhausted;
+            const index = adapter.surface_free;
+            const slot = &adapter.surfaces[index];
+            adapter.surface_free = slot.next_free;
+            slot.* = .{
+                .active = true,
+                .regions = surface_state.SurfaceRegions.init(&adapter.region_pool),
+                .frames = surface_state.FrameQueue.init(&adapter.frame_pool),
+                .releases = surface_state.ReleaseQueue.init(&adapter.release_pool),
+            };
+            return slot;
+        }
+
+        fn releaseSurface(adapter: *Self, index: u32) void {
+            const slot = &adapter.surfaces[index];
+            if (!slot.active) return;
+            // The queue is initialized only after generated object admission.
+            if (slot.resource.id != 0) Commit.deinitQueue(&slot.updates);
+            slot.attachment.deinit();
+            slot.releases.deinit();
+            slot.frames.deinit();
+            slot.regions.deinit();
+            slot.* = .{ .next_free = adapter.surface_free };
+            adapter.surface_free = index;
+        }
+
+        fn acquireRegion(adapter: *Self) !*RegionSlot {
+            if (adapter.region_free == none) return error.Exhausted;
+            const index = adapter.region_free;
+            const slot = &adapter.regions[index];
+            adapter.region_free = slot.next_free;
+            slot.* = .{
+                .active = true,
+                .region = surface_state.Region.init(&adapter.region_pool),
+            };
+            return slot;
+        }
+
+        fn releaseRegion(adapter: *Self, index: u32) void {
+            const slot = &adapter.regions[index];
+            if (!slot.active) return;
+            slot.region.deinit();
+            slot.* = .{ .next_free = adapter.region_free };
+            adapter.region_free = index;
+        }
+
+        fn resolveSurface(adapter: *Self, handle: objects.Handle) !*SurfaceSlot {
+            for (adapter.surfaces) |*slot| {
+                if (slot.active and std.meta.eql(slot.resource, handle)) return slot;
+            }
+            return error.StaleSurface;
+        }
+
+        fn pendingAttachmentCopy(adapter: *Self, surface: *SurfaceSlot) !?*CopySlot {
+            const lease = surface.attachment.pending orelse return null;
+            const backing = try adapter.imports.get(lease);
+            return switch (backing.*) {
+                .direct => null,
+                .copied => |owner| {
+                    const slot = try resolveCopyOwner(owner);
+                    return switch (slot.state) {
+                        .pending => slot,
+                        .success => null,
+                        .failed => error.CopyFailed,
+                    };
+                },
+            };
+        }
+
+        fn prepareCopy(
+            adapter: *Self,
+            token: wayring.shm.BufferToken,
+            extent: usize,
+        ) !CopyOwner {
+            if (extent > adapter.max_copy_bytes) return error.DestinationTooSmall;
+            const slot = adapter.acquireCopySlot() orelse return error.Exhausted;
+            const completion_token = adapter.router.acquire(.copy) catch |cause| {
+                adapter.abandonCopySlot(slot);
+                return cause;
+            };
+            slot.token = completion_token;
+            slot.copy = adapter.shm.store.prepareCopy(
+                adapter.ring,
+                token,
+                slot.destination,
+                completion_token.encode(),
+            ) catch |cause| {
+                adapter.router.retire(completion_token) catch unreachable;
+                adapter.abandonCopySlot(slot);
+                return cause;
+            };
+            return .{ .slot = slot, .generation = slot.generation };
+        }
+
+        fn acquireCopySlot(adapter: *Self) ?*CopySlot {
+            for (adapter.copies) |*slot| {
+                if (slot.active and !slot.owner_alive and slot.state != .pending)
+                    adapter.abandonCopySlot(slot);
+                if (!slot.active and !slot.retired) {
+                    slot.active = true;
+                    slot.owner_alive = true;
+                    slot.state = .pending;
+                    slot.update = null;
+                    return slot;
+                }
+            }
+            return null;
+        }
+
+        fn abandonCopySlot(_: *Self, slot: *CopySlot) void {
+            std.debug.assert(slot.active);
+            slot.active = false;
+            slot.owner_alive = false;
+            slot.update = null;
+            if (slot.generation == std.math.maxInt(u32)) {
+                slot.retired = true;
+            } else {
+                slot.generation += 1;
+            }
+        }
+
+        fn findPendingCopy(adapter: *Self, token: completion.Token) ?*CopySlot {
+            for (adapter.copies) |*slot| {
+                if (slot.active and slot.state == .pending and
+                    std.meta.eql(slot.token, token)) return slot;
+            }
+            return null;
+        }
+
+        fn resolveCopyOwner(owner: CopyOwner) !*CopySlot {
+            if (!owner.slot.active or owner.slot.generation != owner.generation or
+                !owner.slot.owner_alive)
+                return error.StaleCopy;
+            return owner.slot;
+        }
+
+        fn surfaceFromObject(adapter: *Self, object: *const objects.Object) ?*SurfaceSlot {
+            return bindingFromContext(SurfaceSlot, adapter.surfaces, object.context);
+        }
+
+        fn regionFromObject(adapter: *Self, object: *const objects.Object) ?*RegionSlot {
+            return bindingFromContext(RegionSlot, adapter.regions, object.context);
+        }
+
+        fn surfaceIndex(adapter: *Self, slot: *SurfaceSlot) u32 {
+            return @intCast((@intFromPtr(slot) - @intFromPtr(adapter.surfaces.ptr)) /
+                @sizeOf(SurfaceSlot));
+        }
+
+        fn regionIndex(adapter: *Self, slot: *RegionSlot) u32 {
+            return @intCast((@intFromPtr(slot) - @intFromPtr(adapter.regions.ptr)) /
+                @sizeOf(RegionSlot));
+        }
+
+        fn bindingFromContext(
+            comptime T: type,
+            bindings: []T,
+            context: ?*anyopaque,
+        ) ?*T {
+            const pointer = context orelse return null;
+            const address = @intFromPtr(pointer);
+            const start = @intFromPtr(bindings.ptr);
+            const bytes = std.math.mul(usize, bindings.len, @sizeOf(T)) catch return null;
+            const end = std.math.add(usize, start, bytes) catch return null;
+            if (address < start or address >= end or (address - start) % @sizeOf(T) != 0)
+                return null;
+            const binding = &bindings[(address - start) / @sizeOf(T)];
+            if (!binding.active or @intFromPtr(binding) != address) return null;
+            return binding;
+        }
+
+        fn targetVersion(server_objects: anytype, handle: objects.Handle) !u32 {
+            return (server_objects.namespace.resolve(handle) orelse
+                return error.StaleHandle).version;
+        }
+
+        fn disposeShmBacking(_: ?*anyopaque, backing: ShmBacking) void {
+            switch (backing) {
+                .direct => |direct| direct.store.unpin(direct.pin) catch unreachable,
+                .copied => |owner| {
+                    const slot = resolveCopyOwner(owner) catch unreachable;
+                    slot.owner_alive = false;
+                },
+            }
+        }
+
+        fn noMemory(
+            adapter: *Self,
+            actor: *wayring.connection.Actor,
+        ) !wayring.dispatch.Control {
+            _ = adapter;
+            try ProtocolCore.postError(actor, objects.display_id, 2, "out of memory");
+            return .stop;
+        }
+
+        fn failure(
+            adapter: *Self,
+            actor: *wayring.connection.Actor,
+            object_id: u32,
+            cause: anyerror,
+        ) !wayring.dispatch.Control {
+            return switch (cause) {
+                error.Exhausted,
+                error.NodeExhausted,
+                error.EdgeExhausted,
+                error.Full,
+                error.OutOfMemory,
+                => adapter.noMemory(actor),
+                else => adapter.protocolError(actor, object_id, 0, "invalid core request"),
+            };
+        }
+
+        fn surfaceFailure(
+            adapter: *Self,
+            actor: *wayring.connection.Actor,
+            object_id: u32,
+            cause: anyerror,
+        ) !wayring.dispatch.Control {
+            return switch (cause) {
+                error.InvalidScale => adapter.protocolError(
+                    actor,
+                    object_id,
+                    SurfaceInterface.@"error".invalid_scale.value,
+                    "invalid buffer scale",
+                ),
+                error.InvalidTransform => adapter.protocolError(
+                    actor,
+                    object_id,
+                    SurfaceInterface.@"error".invalid_transform.value,
+                    "invalid buffer transform",
+                ),
+                error.InvalidSize,
+                error.InvalidValue,
+                error.OutOfBuffer,
+                => adapter.protocolError(
+                    actor,
+                    object_id,
+                    SurfaceInterface.@"error".invalid_size.value,
+                    "invalid surface size",
+                ),
+                error.InvalidOffset => adapter.protocolError(
+                    actor,
+                    object_id,
+                    SurfaceInterface.@"error".invalid_offset.value,
+                    "invalid attach offset",
+                ),
+                error.DefunctRoleObject => adapter.protocolError(
+                    actor,
+                    object_id,
+                    SurfaceInterface.@"error".defunct_role_object.value,
+                    "defunct role object",
+                ),
+                error.MissingBuffer => adapter.protocolError(
+                    actor,
+                    object_id,
+                    SurfaceInterface.@"error".no_buffer.value,
+                    "release requested without attached buffer",
+                ),
+                error.Exhausted,
+                error.NodeExhausted,
+                error.EdgeExhausted,
+                error.Full,
+                error.OutOfMemory,
+                => adapter.noMemory(actor),
+                else => adapter.protocolError(actor, object_id, 0, "invalid surface request"),
+            };
+        }
+
+        fn regionFailure(
+            adapter: *Self,
+            actor: *wayring.connection.Actor,
+            object_id: u32,
+            cause: anyerror,
+        ) !wayring.dispatch.Control {
+            return switch (cause) {
+                error.Exhausted, error.OutOfMemory => adapter.noMemory(actor),
+                else => adapter.protocolError(actor, object_id, 0, "invalid region rectangle"),
+            };
+        }
+
+        fn protocolError(
+            adapter: *Self,
+            actor: *wayring.connection.Actor,
+            object_id: u32,
+            code: u32,
+            message: []const u8,
+        ) !wayring.dispatch.Control {
+            _ = adapter;
+            try ProtocolCore.postError(actor, object_id, code, message);
+            return .stop;
+        }
+    };
+}
+
+const test_protocol = @import("core_protocol");
+const TestAdapter = Adapter(test_protocol);
+const TestShm = wayring.server.Shm(test_protocol);
+const TestCore = wayring.server.Core(test_protocol);
+const linux = std.os.linux;
+
+const test_formats = [_]wayring.shm.Format{
+    .{ .value = test_protocol.wl_shm.format.argb8888.value, .bytes_per_pixel = 4 },
+    .{ .value = test_protocol.wl_shm.format.xrgb8888.value, .bytes_per_pixel = 4 },
+};
+
+const TestContext = struct {
+    blocks: wayring.pool.SharedBlocks,
+    descriptors: wayring.pool.SharedFds,
+    requests: wayring.tx.Queue,
+    fragment_storage: [128]u8,
+    actor: wayring.connection.Actor,
+    server_objects: wayring.objects.ServerObjects,
+    received_fds: wayring.ancillary.FdQueue,
+    shm: TestShm,
+    ring: linux.IoUring,
+    router: completion.Router,
+    adapter: TestAdapter,
+    compositor: objects.Handle,
+    shm_resource: objects.Handle,
+
+    fn init() !*TestContext {
+        return initWithCopyLimits(2, 64);
+    }
+
+    fn initWithCopyLimits(copy_capacity: usize, max_copy_bytes: usize) !*TestContext {
+        const context = try std.testing.allocator.create(TestContext);
+        errdefer std.testing.allocator.destroy(context);
+        context.blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 256, 16);
+        errdefer context.blocks.deinit(std.testing.allocator);
+        context.descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 4);
+        errdefer context.descriptors.deinit(std.testing.allocator);
+        context.requests = wayring.tx.Queue.init(
+            &context.blocks,
+            2048,
+            &context.descriptors,
+            1,
+        );
+        errdefer context.requests.deinit();
+        context.fragment_storage = undefined;
+        context.actor = wayring.connection.Actor.init(
+            0,
+            1,
+            &context.fragment_storage,
+            &context.descriptors,
+            1,
+            &context.blocks,
+            2048,
+            0,
+        );
+        errdefer context.actor.deinit();
+        context.server_objects = try wayring.objects.ServerObjects.init(
+            std.testing.allocator,
+            32,
+            4,
+            &TestCore.Display.info,
+            null,
+        );
+        errdefer context.server_objects.deinit(std.testing.allocator);
+        context.received_fds = wayring.ancillary.FdQueue.init(&context.descriptors, 1);
+        errdefer context.received_fds.deinit();
+        context.shm = try TestShm.init(std.testing.allocator, .{
+            .limits = .{ .max_pool_bytes = 4096 },
+            .pool_capacity = 2,
+            .buffer_capacity = 2,
+            .formats = &test_formats,
+        });
+        errdefer context.shm.deinit(std.testing.allocator);
+        context.ring = try linux.IoUring.init(8, 0);
+        errdefer context.ring.deinit();
+        context.router = try completion.Router.init(std.testing.allocator, 4);
+        errdefer context.router.deinit(std.testing.allocator);
+        context.adapter = try TestAdapter.init(std.testing.allocator, &context.shm, &context.ring, &context.router, .{
+            .surface_capacity = 2,
+            .region_capacity = 2,
+            .region_operation_capacity = 16,
+            .frame_callback_capacity = 4,
+            .release_callback_capacity = 4,
+            .content_update_capacity = 4,
+            .dependency_capacity = 4,
+            .attachment_capacity = 2,
+            .copy_capacity = copy_capacity,
+            .max_copy_bytes = max_copy_bytes,
+        });
+        errdefer context.adapter.deinit();
+        context.server_objects.setRemovalHook(.{
+            .context = &context.adapter,
+            .notify = testResourceRemoved,
+        });
+        context.compositor = try context.server_objects.insertClient(
+            2,
+            &test_protocol.wl_compositor.info,
+            7,
+            &context.adapter,
+        );
+        context.shm_resource = try context.server_objects.insertClient(
+            3,
+            &test_protocol.wl_shm.info,
+            2,
+            &context.shm,
+        );
+        return context;
+    }
+
+    fn deinit(context: *TestContext) void {
+        context.server_objects.deinit(std.testing.allocator);
+        context.drainCopies() catch unreachable;
+        context.adapter.deinit();
+        context.router.deinit(std.testing.allocator);
+        context.ring.deinit();
+        context.shm.deinit(std.testing.allocator);
+        context.received_fds.deinit();
+        context.actor.deinit();
+        context.requests.deinit();
+        context.descriptors.deinit(std.testing.allocator);
+        context.blocks.deinit(std.testing.allocator);
+        std.testing.allocator.destroy(context);
+    }
+
+    fn createSurface(context: *TestContext, id: u32) !objects.Handle {
+        try test_protocol.wl_compositor.encodeRequest(
+            &context.requests,
+            context.compositor.id,
+            .{ .create_surface = .{ .id = id } },
+        );
+        try std.testing.expectEqual(
+            wayring.dispatch.Control.continue_dispatch,
+            try context.dispatchCore(),
+        );
+        return context.server_objects.namespace.lookupHandle(id) orelse
+            error.MissingSurface;
+    }
+
+    fn createRegion(context: *TestContext, id: u32) !objects.Handle {
+        try test_protocol.wl_compositor.encodeRequest(
+            &context.requests,
+            context.compositor.id,
+            .{ .create_region = .{ .id = id } },
+        );
+        try std.testing.expectEqual(
+            wayring.dispatch.Control.continue_dispatch,
+            try context.dispatchCore(),
+        );
+        return context.server_objects.namespace.lookupHandle(id) orelse
+            error.MissingRegion;
+    }
+
+    fn createShmBuffer(context: *TestContext, pool_id: u32, buffer_id: u32) !objects.Handle {
+        const created = try context.createShmBufferRetainingFd(pool_id, buffer_id);
+        _ = linux.close(created.fd);
+        return created.buffer;
+    }
+
+    const RetainedShmBuffer = struct {
+        buffer: objects.Handle,
+        fd: linux.fd_t,
+    };
+
+    fn createShmBufferRetainingFd(
+        context: *TestContext,
+        pool_id: u32,
+        buffer_id: u32,
+    ) !RetainedShmBuffer {
+        const fd = try testMemfd(4096);
+        const retained_result = linux.dup(fd);
+        if (linux.errno(retained_result) != .SUCCESS) return error.SystemCallFailed;
+        const retained: linux.fd_t = @intCast(retained_result);
+        errdefer _ = linux.close(retained);
+        try test_protocol.wl_shm.encodeRequest(
+            &context.requests,
+            context.shm_resource.id,
+            .{ .create_pool = .{ .id = pool_id, .fd = fd, .size = 4096 } },
+        );
+        try std.testing.expectEqual(
+            wayring.dispatch.Control.continue_dispatch,
+            try context.dispatchShm(true),
+        );
+        const pool = context.server_objects.namespace.lookupHandle(pool_id) orelse
+            return error.MissingPool;
+        try test_protocol.wl_shm_pool.encodeRequest(&context.requests, pool.id, .{
+            .create_buffer = .{
+                .id = buffer_id,
+                .offset = 0,
+                .width = 4,
+                .height = 2,
+                .stride = 16,
+                .format = .argb8888,
+            },
+        });
+        try std.testing.expectEqual(
+            wayring.dispatch.Control.continue_dispatch,
+            try context.dispatchShm(false),
+        );
+        return .{
+            .buffer = context.server_objects.namespace.lookupHandle(buffer_id) orelse
+                return error.MissingBuffer,
+            .fd = retained,
+        };
+    }
+
+    fn dispatchCore(context: *TestContext) !wayring.dispatch.Control {
+        const decoded = try context.nextRequest(false);
+        const target = try context.server_objects.namespace.request(
+            decoded.message.header.object_id,
+            decoded.message.header.opcode,
+        );
+        const control = (try context.adapter.requestOn(
+            &context.actor,
+            &context.server_objects,
+            target,
+            decoded.message,
+            &context.received_fds,
+        )).?;
+        try context.consumeRequest(decoded.snapshot);
+        return control;
+    }
+
+    fn dispatchShm(context: *TestContext, duplicate_fd: bool) !wayring.dispatch.Control {
+        const decoded = try context.nextRequest(duplicate_fd);
+        const target = try context.server_objects.namespace.request(
+            decoded.message.header.object_id,
+            decoded.message.header.opcode,
+        );
+        const control = (try context.shm.request(
+            &context.actor,
+            &context.server_objects,
+            target,
+            decoded.message,
+            &context.received_fds,
+        )).?;
+        try context.consumeRequest(decoded.snapshot);
+        return control;
+    }
+
+    const Decoded = struct {
+        snapshot: wayring.tx.Snapshot,
+        message: wayring.wire.Message,
+    };
+
+    fn nextRequest(context: *TestContext, duplicate_fd: bool) !Decoded {
+        var descriptor_scratch: [1]linux.fd_t = undefined;
+        var control: [64]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+        const snapshot = try context.requests.snapshot(&descriptor_scratch, &control);
+        const message = (try wayring.wire.Message.decode(snapshot.first)) orelse
+            return error.IncompleteMessage;
+        if (duplicate_fd) {
+            const result = linux.dup(descriptor_scratch[0]);
+            if (linux.errno(result) != .SUCCESS) return error.SystemCallFailed;
+            try context.received_fds.append(@intCast(result));
+        }
+        return .{ .snapshot = snapshot, .message = message };
+    }
+
+    fn consumeRequest(context: *TestContext, snapshot: wayring.tx.Snapshot) !void {
+        try context.requests.begin(snapshot);
+        try context.requests.complete(snapshot.byteCount());
+    }
+
+    fn completeNextCopy(context: *TestContext) !void {
+        _ = try context.ring.submit_and_wait(1);
+        const cqe = try context.ring.copy_cqe();
+        const token = context.router.route(cqe.user_data) orelse
+            return error.UnroutedCompletion;
+        try context.adapter.completeCopy(token, cqe);
+    }
+
+    fn drainCopies(context: *TestContext) !void {
+        while (context.adapter.pendingShmCopies() != 0)
+            context.completeNextCopy() catch |cause| switch (cause) {
+                error.ShortRead, error.CopyFailed => {},
+                else => return cause,
+            };
+    }
+};
+
+fn testResourceRemoved(
+    context: ?*anyopaque,
+    handle: objects.Handle,
+    object: objects.Object,
+) void {
+    const adapter: *TestAdapter = @ptrCast(@alignCast(context.?));
+    _ = adapter.resourceRemoved(handle, object);
+}
+
+fn testMemfd(size: usize) !linux.fd_t {
+    const result = linux.memfd_create("ouro-core-surface-test", linux.MFD.CLOEXEC);
+    if (linux.errno(result) != .SUCCESS) return error.SystemCallFailed;
+    const fd: linux.fd_t = @intCast(result);
+    errdefer _ = linux.close(fd);
+    if (linux.errno(linux.ftruncate(fd, @intCast(size))) != .SUCCESS)
+        return error.SystemCallFailed;
+    var payload: [32]u8 = undefined;
+    @memset(&payload, 0xa5);
+    if (size >= payload.len and linux.write(fd, &payload, payload.len) != payload.len)
+        return error.SystemCallFailed;
+    return fd;
+}
+
+test "generated attach and commit retain SHM after wl_buffer destruction" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const surface = try context.createSurface(10);
+    const buffer = try context.createShmBuffer(11, 12);
+
+    try test_protocol.wl_surface.encodeRequest(&context.requests, surface.id, .{
+        .attach = .{ .buffer = buffer.id, .x = 0, .y = 0 },
+    });
+    try std.testing.expectEqual(
+        wayring.dispatch.Control.continue_dispatch,
+        try context.dispatchCore(),
+    );
+    try test_protocol.wl_surface.encodeRequest(
+        &context.requests,
+        surface.id,
+        .{ .commit = .{} },
+    );
+    try std.testing.expectEqual(
+        wayring.dispatch.Control.continue_dispatch,
+        try context.dispatchCore(),
+    );
+    try std.testing.expectEqual(@as(usize, 1), context.shm.store.active_pins);
+
+    const token = context.shm.bufferToken(
+        context.server_objects.namespace.resolve(buffer).?,
+    ).?;
+    try test_protocol.wl_buffer.encodeRequest(
+        &context.requests,
+        buffer.id,
+        .{ .destroy = .{} },
+    );
+    try std.testing.expectEqual(
+        wayring.dispatch.Control.continue_dispatch,
+        try context.dispatchShm(false),
+    );
+    try std.testing.expectError(error.StaleBuffer, context.shm.store.bufferInfo(token));
+    try std.testing.expectEqual(@as(usize, 1), context.shm.store.active_pins);
+
+    var output: [1]TestAdapter.Applied = undefined;
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        (try context.adapter.tryApply(surface, &output)).len,
+    );
+    try context.completeNextCopy();
+    try std.testing.expectEqual(@as(usize, 0), context.shm.store.active_pins);
+
+    const applied = try context.adapter.tryApply(surface, &output);
+    try std.testing.expectEqual(@as(usize, 1), applied.len);
+    var content = applied[0].payload;
+    try std.testing.expect(content.attachment_lease != null);
+    try std.testing.expectEqual(
+        @as(usize, 32),
+        (try context.adapter.shmBytes(content.attachment_lease.?)).len,
+    );
+    content.deinit();
+}
+
+test "unsealed SHM completion before commit publishes without a constraint" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const surface = try context.createSurface(10);
+    const buffer = try context.createShmBuffer(11, 12);
+
+    try test_protocol.wl_surface.encodeRequest(&context.requests, surface.id, .{
+        .attach = .{ .buffer = buffer.id, .x = 0, .y = 0 },
+    });
+    _ = try context.dispatchCore();
+    try context.completeNextCopy();
+    try test_protocol.wl_surface.encodeRequest(
+        &context.requests,
+        surface.id,
+        .{ .commit = .{} },
+    );
+    _ = try context.dispatchCore();
+
+    var output: [1]TestAdapter.Applied = undefined;
+    var content = (try context.adapter.tryApply(surface, &output))[0].payload;
+    defer content.deinit();
+    const bytes = try context.adapter.shmBytes(content.attachment_lease.?);
+    try std.testing.expectEqual(@as(usize, 32), bytes.len);
+    try std.testing.expectEqual(@as(u8, 0xa5), bytes[0]);
+}
+
+test "surface removal drops copy ownership but preserves storage through CQE" {
+    const context = try TestContext.initWithCopyLimits(1, 64);
+    defer context.deinit();
+    const surface = try context.createSurface(10);
+    const buffer = try context.createShmBuffer(11, 12);
+
+    try test_protocol.wl_surface.encodeRequest(&context.requests, surface.id, .{
+        .attach = .{ .buffer = buffer.id, .x = 0, .y = 0 },
+    });
+    _ = try context.dispatchCore();
+    try std.testing.expectEqual(@as(usize, 1), context.shm.store.active_pins);
+    _ = try context.server_objects.removeClient(surface);
+    try std.testing.expectEqual(@as(usize, 1), context.shm.store.active_pins);
+    try context.completeNextCopy();
+    try std.testing.expectEqual(@as(usize, 0), context.shm.store.active_pins);
+
+    const replacement = try context.createSurface(10);
+    try test_protocol.wl_surface.encodeRequest(&context.requests, replacement.id, .{
+        .attach = .{ .buffer = buffer.id, .x = 0, .y = 0 },
+    });
+    try std.testing.expectEqual(
+        wayring.dispatch.Control.continue_dispatch,
+        try context.dispatchCore(),
+    );
+}
+
+test "short SHM copy blocks transactional commit without publication" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const surface = try context.createSurface(10);
+    const created = try context.createShmBufferRetainingFd(11, 12);
+    defer _ = linux.close(created.fd);
+
+    try test_protocol.wl_surface.encodeRequest(&context.requests, surface.id, .{
+        .attach = .{ .buffer = created.buffer.id, .x = 0, .y = 0 },
+    });
+    _ = try context.dispatchCore();
+    try std.testing.expectEqual(
+        linux.E.SUCCESS,
+        linux.errno(linux.ftruncate(created.fd, 0)),
+    );
+    try std.testing.expectError(error.ShortRead, context.completeNextCopy());
+    try test_protocol.wl_surface.encodeRequest(
+        &context.requests,
+        surface.id,
+        .{ .commit = .{} },
+    );
+    try std.testing.expectEqual(wayring.dispatch.Control.stop, try context.dispatchCore());
+    var output: [1]TestAdapter.Applied = undefined;
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        (try context.adapter.tryApply(surface, &output)).len,
+    );
+    try std.testing.expectEqual(@as(u64, 0), (try context.adapter.getSurface(surface)).sequence);
+}
+
+test "failed SHM read retires copy identity and remains unpublished" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const surface = try context.createSurface(10);
+    const buffer = try context.createShmBuffer(11, 12);
+
+    try test_protocol.wl_surface.encodeRequest(&context.requests, surface.id, .{
+        .attach = .{ .buffer = buffer.id, .x = 0, .y = 0 },
+    });
+    _ = try context.dispatchCore();
+    _ = try context.ring.submit_and_wait(1);
+    var cqe = try context.ring.copy_cqe();
+    const token = context.router.route(cqe.user_data).?;
+    cqe.res = -@as(i32, @intCast(@intFromEnum(linux.E.IO)));
+    try std.testing.expectError(error.CopyFailed, context.adapter.completeCopy(token, cqe));
+    try std.testing.expect(context.router.route(cqe.user_data) == null);
+    try std.testing.expectEqual(@as(usize, 0), context.adapter.pendingShmCopies());
+
+    try test_protocol.wl_surface.encodeRequest(
+        &context.requests,
+        surface.id,
+        .{ .commit = .{} },
+    );
+    try std.testing.expectEqual(wayring.dispatch.Control.stop, try context.dispatchCore());
+    var output: [1]TestAdapter.Applied = undefined;
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        (try context.adapter.tryApply(surface, &output)).len,
+    );
+}
+
+test "copy capacity failure leaves the target surface unchanged" {
+    const context = try TestContext.initWithCopyLimits(2, 64);
+    defer context.deinit();
+    const first = try context.createSurface(10);
+    const second = try context.createSurface(13);
+    const buffer = try context.createShmBuffer(11, 12);
+
+    try test_protocol.wl_surface.encodeRequest(&context.requests, first.id, .{
+        .attach = .{ .buffer = buffer.id, .x = 0, .y = 0 },
+    });
+    _ = try context.dispatchCore();
+    try test_protocol.wl_surface.encodeRequest(&context.requests, first.id, .{
+        .attach = .{ .buffer = null, .x = 0, .y = 0 },
+    });
+    _ = try context.dispatchCore();
+    try test_protocol.wl_surface.encodeRequest(&context.requests, first.id, .{
+        .attach = .{ .buffer = buffer.id, .x = 0, .y = 0 },
+    });
+    _ = try context.dispatchCore();
+    try test_protocol.wl_surface.encodeRequest(&context.requests, second.id, .{
+        .attach = .{ .buffer = buffer.id, .x = 0, .y = 0 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.stop, try context.dispatchCore());
+    try std.testing.expectEqual(@as(u64, 0), (try context.adapter.getSurface(second)).sequence);
+    try std.testing.expectEqual(@as(usize, 2), context.adapter.pendingShmCopies());
+}
+
+test "oversized unsealed SHM fails before copy or surface publication" {
+    const context = try TestContext.initWithCopyLimits(1, 16);
+    defer context.deinit();
+    const surface = try context.createSurface(10);
+    const buffer = try context.createShmBuffer(11, 12);
+
+    try test_protocol.wl_surface.encodeRequest(&context.requests, surface.id, .{
+        .attach = .{ .buffer = buffer.id, .x = 0, .y = 0 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.stop, try context.dispatchCore());
+    try std.testing.expectEqual(@as(usize, 0), context.adapter.pendingShmCopies());
+    try std.testing.expectEqual(@as(usize, 0), context.shm.store.active_pins);
+    try std.testing.expectEqual(@as(u64, 0), (try context.adapter.getSurface(surface)).sequence);
+}
+
+test "stale copy completion cannot alias a reused copy slot" {
+    const context = try TestContext.initWithCopyLimits(1, 64);
+    defer context.deinit();
+    const surface = try context.createSurface(10);
+    const buffer = try context.createShmBuffer(11, 12);
+
+    try test_protocol.wl_surface.encodeRequest(&context.requests, surface.id, .{
+        .attach = .{ .buffer = buffer.id, .x = 0, .y = 0 },
+    });
+    _ = try context.dispatchCore();
+    _ = try context.ring.submit_and_wait(1);
+    const stale_cqe = try context.ring.copy_cqe();
+    const stale_token = context.router.route(stale_cqe.user_data).?;
+    try context.adapter.completeCopy(stale_token, stale_cqe);
+
+    try test_protocol.wl_surface.encodeRequest(&context.requests, surface.id, .{
+        .attach = .{ .buffer = null, .x = 0, .y = 0 },
+    });
+    _ = try context.dispatchCore();
+    try test_protocol.wl_surface.encodeRequest(&context.requests, surface.id, .{
+        .attach = .{ .buffer = buffer.id, .x = 0, .y = 0 },
+    });
+    _ = try context.dispatchCore();
+    try std.testing.expectError(
+        error.StaleCopyCompletion,
+        context.adapter.completeCopy(stale_token, stale_cqe),
+    );
+    try std.testing.expectEqual(@as(usize, 1), context.adapter.pendingShmCopies());
+    try context.completeNextCopy();
+}
+
+test "frame callback activates on apply and generated completion removes it" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const surface = try context.createSurface(10);
+
+    try test_protocol.wl_surface.encodeRequest(&context.requests, surface.id, .{
+        .frame = .{ .callback = 13 },
+    });
+    try std.testing.expectEqual(
+        wayring.dispatch.Control.continue_dispatch,
+        try context.dispatchCore(),
+    );
+    const callback = context.server_objects.namespace.lookupHandle(13).?;
+    try test_protocol.wl_surface.encodeRequest(
+        &context.requests,
+        surface.id,
+        .{ .commit = .{} },
+    );
+    _ = try context.dispatchCore();
+
+    var output: [1]TestAdapter.Applied = undefined;
+    var content = (try context.adapter.tryApply(surface, &output))[0].payload;
+    defer content.deinit();
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try context.adapter.activateFrames(surface, &content),
+    );
+    try std.testing.expect(try context.adapter.completeFrameOn(
+        &context.server_objects,
+        &context.actor.transmit,
+        surface,
+        42,
+    ));
+    try std.testing.expect(context.server_objects.namespace.resolve(callback) == null);
+    try std.testing.expect(!(try context.adapter.completeFrameOn(
+        &context.server_objects,
+        &context.actor.transmit,
+        surface,
+        42,
+    )));
+}
+
+test "release callback and attachment publish in the same content update" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const surface = try context.createSurface(10);
+    const buffer = try context.createShmBuffer(11, 12);
+
+    try test_protocol.wl_surface.encodeRequest(&context.requests, surface.id, .{
+        .attach = .{ .buffer = buffer.id, .x = 0, .y = 0 },
+    });
+    _ = try context.dispatchCore();
+    try test_protocol.wl_surface.encodeRequest(&context.requests, surface.id, .{
+        .get_release = .{ .callback = 13 },
+    });
+    _ = try context.dispatchCore();
+    const callback = context.server_objects.namespace.lookupHandle(13).?;
+    try test_protocol.wl_surface.encodeRequest(
+        &context.requests,
+        surface.id,
+        .{ .commit = .{} },
+    );
+    _ = try context.dispatchCore();
+
+    try context.completeNextCopy();
+    var output: [1]TestAdapter.Applied = undefined;
+    var content = (try context.adapter.tryApply(surface, &output))[0].payload;
+    defer content.deinit();
+    try std.testing.expect(content.attachment_lease != null);
+    try std.testing.expectEqual(callback, content.release_callbacks.?.peek().?);
+}
+
+test "surface copies region request data before the region is destroyed" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const surface = try context.createSurface(10);
+    const region = try context.createRegion(11);
+
+    try test_protocol.wl_region.encodeRequest(&context.requests, region.id, .{
+        .add = .{ .x = 1, .y = 2, .width = 3, .height = 4 },
+    });
+    _ = try context.dispatchCore();
+    try test_protocol.wl_surface.encodeRequest(&context.requests, surface.id, .{
+        .set_opaque_region = .{ .region = region.id },
+    });
+    _ = try context.dispatchCore();
+    try test_protocol.wl_region.encodeRequest(
+        &context.requests,
+        region.id,
+        .{ .destroy = .{} },
+    );
+    _ = try context.dispatchCore();
+    try std.testing.expect(context.server_objects.namespace.resolve(region) == null);
+
+    try test_protocol.wl_surface.encodeRequest(
+        &context.requests,
+        surface.id,
+        .{ .commit = .{} },
+    );
+    _ = try context.dispatchCore();
+    var output: [1]TestAdapter.Applied = undefined;
+    var content = (try context.adapter.tryApply(surface, &output))[0].payload;
+    defer content.deinit();
+    try std.testing.expect(content.regions.opaque_changed);
+}
+
+test "invalid generated surface request posts the specified protocol error" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const surface = try context.createSurface(10);
+
+    try test_protocol.wl_surface.encodeRequest(&context.requests, surface.id, .{
+        .attach = .{ .buffer = null, .x = 1, .y = 0 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.stop, try context.dispatchCore());
+    try std.testing.expectEqual(wayring.connection.Lifecycle.draining, context.actor.lifecycle);
+    try std.testing.expectEqual(@as(u64, 0), (try context.adapter.getSurface(surface)).sequence);
+
+    var descriptor_scratch: [1]linux.fd_t = undefined;
+    var control: [64]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+    const snapshot = try context.actor.transmit.snapshot(&descriptor_scratch, &control);
+    const message = (try wayring.wire.Message.decode(snapshot.first)).?;
+    const event = try TestCore.Display.decodeEvent(message, &context.received_fds);
+    switch (event) {
+        .@"error" => |value| {
+            try std.testing.expectEqual(surface.id, value.object_id);
+            try std.testing.expectEqual(
+                test_protocol.wl_surface.@"error".invalid_offset.value,
+                value.code,
+            );
+        },
+        else => return error.ExpectedProtocolError,
+    }
+}
+
+test "fixed surface capacity fails without publishing a partial object" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    _ = try context.createSurface(10);
+    _ = try context.createSurface(11);
+
+    try test_protocol.wl_compositor.encodeRequest(
+        &context.requests,
+        context.compositor.id,
+        .{ .create_surface = .{ .id = 12 } },
+    );
+    try std.testing.expectEqual(wayring.dispatch.Control.stop, try context.dispatchCore());
+    try std.testing.expect(context.server_objects.namespace.get(12) == null);
+}
+
+test "stale removal cannot release a reused surface slot" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const stale = try context.createSurface(10);
+    const stale_object = context.server_objects.namespace.resolve(stale).?.*;
+    _ = try context.server_objects.removeClient(stale);
+    const current = try context.createSurface(11);
+
+    try std.testing.expect(!context.adapter.resourceRemoved(stale, stale_object));
+    try std.testing.expectEqual(@as(u64, 0), (try context.adapter.getSurface(current)).sequence);
+    try std.testing.expectError(error.StaleSurface, context.adapter.getSurface(stale));
+}

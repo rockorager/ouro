@@ -7,6 +7,10 @@ dispatch, and protocol code generation. Ouro consumes that runtime and owns
 the compositor semantics and policy built on top of it. This is an intentional
 repository boundary; compositor state does not belong in Wayring.
 
+The long-term ownership model, event turn, rendering pipeline, transaction
+boundaries, and vertical delivery plan are defined in
+[ARCHITECTURE.md](ARCHITECTURE.md).
+
 ## Compositor state
 
 Ouro currently owns these bounded, allocation-free compositor-state

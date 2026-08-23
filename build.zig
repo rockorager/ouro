@@ -8,15 +8,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const wayring = wayring_dependency.module("wayring");
-    const ouro = b.addModule("ouro", .{
-        .root_source_file = b.path("src/root.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{.{ .name = "wayring", .module = wayring }},
-    });
-
-    const unit_tests = b.addTest(.{ .root_module = ouro });
-    const run_unit_tests = b.addRunArtifact(unit_tests);
 
     const wayland = b.dependency("wayland", .{});
     const scanner = wayring_dependency.artifact("wayring-scanner");
@@ -29,6 +20,20 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{.{ .name = "wayring", .module = wayring }},
     });
+
+    const ouro = b.addModule("ouro", .{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "wayring", .module = wayring },
+            .{ .name = "core_protocol", .module = core_protocol },
+        },
+    });
+
+    const unit_tests = b.addTest(.{ .root_module = ouro });
+    const run_unit_tests = b.addRunArtifact(unit_tests);
+
     const integration_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("test/release-end-to-end.zig"),
@@ -43,7 +48,28 @@ pub fn build(b: *std.Build) void {
     });
     const run_integration_tests = b.addRunArtifact(integration_tests);
 
+    const headless_presentation_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/headless-presentation.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "wayring", .module = wayring },
+                .{ .name = "ouro", .module = ouro },
+                .{ .name = "core_protocol", .module = core_protocol },
+            },
+        }),
+    });
+    const run_headless_presentation_tests = b.addRunArtifact(headless_presentation_tests);
+
+    const headless_test_step = b.step(
+        "test-headless-presentation",
+        "Run the headless presentation integration test",
+    );
+    headless_test_step.dependOn(&run_headless_presentation_tests.step);
+
     const test_step = b.step("test", "Run unit and integration tests");
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_integration_tests.step);
+    test_step.dependOn(&run_headless_presentation_tests.step);
 }
