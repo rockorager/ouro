@@ -142,7 +142,14 @@ pub const Pool = struct {
         while (created < slots.len) : (created += 1) {
             const bo = try gbm_platform.createBo(device, allocation);
             errdefer gbm_platform.destroyBo(bo);
-            const metadata = try gbm_platform.getMetadata(bo);
+            var metadata = try gbm_platform.getMetadata(bo);
+            // The ordinary GBM allocation API does not retain an explicit
+            // modifier and Mesa may report INVALID even when LINEAR usage was
+            // required. This path is linear by construction; explicit tiled
+            // allocations remain subject to exact modifier validation.
+            if (allocation.modifier == gbm.modifier_linear and
+                metadata.modifier == gbm.modifier_invalid)
+                metadata.modifier = gbm.modifier_linear;
             try validateMetadata(allocation, metadata);
             const framebuffer_id = try drm_platform.add(fd, metadata);
             if (framebuffer_id == 0) return error.InvalidFramebufferId;
@@ -420,6 +427,46 @@ test "scanout: multiplane metadata is copied and mismatches roll back" {
     try std.testing.expectError(error.AllocationMismatch, Pool.init(std.testing.allocator, fake.gbmPlatform(), fake.drmPlatform(), 17, fixture.snapshot(), .{ .capacity = 1 }));
     try std.testing.expectEqual(@as(usize, 1), fake.bo_destroy_count);
     try std.testing.expectEqual(@as(usize, 1), fake.device_destroy_count);
+}
+
+test "scanout: ordinary linear allocation normalizes invalid GBM modifier" {
+    var fixture = TestSnapshot.init(&.{.{
+        .fourcc = gbm.format_xrgb8888,
+        .modifier = gbm.modifier_linear,
+    }});
+    var fake = FakePlatform{ .modifier = gbm.modifier_invalid };
+    var pool = try Pool.init(
+        std.testing.allocator,
+        fake.gbmPlatform(),
+        fake.drmPlatform(),
+        17,
+        fixture.snapshot(),
+        .{ .capacity = 1 },
+    );
+    const handle = try pool.acquire();
+    const image = try pool.image(handle);
+    try std.testing.expectEqual(gbm.modifier_linear, image.metadata.modifier);
+    try std.testing.expect(!requiresModifierRegistration(image.metadata));
+    _ = try pool.map(handle);
+    try pool.unmap(handle);
+    try pool.discard(handle);
+    try pool.deinit();
+    try std.testing.expectEqual(@as(usize, 1), fake.add_count);
+
+    fixture = TestSnapshot.init(&.{.{
+        .fourcc = gbm.format_xrgb8888,
+        .modifier = 9,
+    }});
+    fake = .{ .modifier = gbm.modifier_invalid };
+    try std.testing.expectError(error.AllocationMismatch, Pool.init(
+        std.testing.allocator,
+        fake.gbmPlatform(),
+        fake.drmPlatform(),
+        17,
+        fixture.snapshot(),
+        .{ .capacity = 1 },
+    ));
+    try std.testing.expectEqual(@as(usize, 0), fake.add_count);
 }
 
 test "scanout: AddFB and partial creation failures clean up in reverse" {
