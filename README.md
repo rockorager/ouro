@@ -56,3 +56,38 @@ Ouro requires Zig 0.16. Run its unit and real-kernel integration tests with:
 ```sh
 zig build test
 ```
+
+## Physical-display compositor
+
+M2 packages the first runnable single-output compositor. It accepts one
+ordinary core `wl_surface`, copies unsafe/unsealed SHM through the shared
+io_uring runtime, composites it to the selected KMS output, and exits cleanly
+when that client disconnects:
+
+```sh
+zig build run -- --socket=/tmp/ouro.sock --renderer=auto
+```
+
+Renderer selection is explicit:
+
+- `--renderer=auto` tries Vulkan and falls back to Pixman during startup;
+- `--renderer=pixman` requires the CPU renderer;
+- `--renderer=vulkan` requires Vulkan and a primary KMS plane with
+  `IN_FENCE_FD`. Vulkan exports a sync-file fence to KMS and never host-waits.
+
+The compositor currently has no shell policy, input, or multi-output support.
+It also requires a usable `/dev/dri` device and libseat backend. Real-hardware
+smoke is deliberately opt-in:
+
+```sh
+zig build run-drm-smoke -- --renderer=pixman
+```
+
+That command is not part of `zig build test`. On machines without accessible
+DRM hardware it fails honestly with `DrmHardwareUnavailable`; successful
+execution additionally depends on a functional seat and connected output.
+The presence of `/dev/dri` alone is not treated as success: no discovered card,
+connected connector, compatible CRTC, or primary plane is a terminal startup
+failure rather than a compositor that listens forever without an output.
+Deterministic physical-path coverage uses simulated libseat/DRM/GBM/KMS
+boundaries and is available as `zig build test-drm-presentation`.

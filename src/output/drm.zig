@@ -1,0 +1,925 @@
+//! R14 single-output orchestration owner. This is the only boundary which composes
+//! the reviewed CU/render identities, R13 planner, R10 pool, renderer, and R11
+//! KMS owner. It queues no io_uring submission; the runtime remains the sole
+//! submitter and routes timer/DRM completions back into this owner.
+
+const std = @import("std");
+const linux = std.os.linux;
+const completion = @import("../runtime/completion.zig");
+const timer = @import("../runtime/timer.zig");
+const gbm = @import("../backend/gbm.zig");
+const drm = @import("../backend/drm/manager.zig");
+const framebuffer = @import("../backend/drm/framebuffer.zig");
+const atomic = @import("../backend/drm/atomic.zig");
+const kms = @import("../backend/drm/output.zig");
+const render = @import("../render/types.zig");
+const cpu = @import("../render/cpu.zig");
+const vulkan = @import("../render/vulkan.zig");
+const vulkan_platform = @import("../render/vulkan_platform.zig");
+const render_list = @import("../scene/render_list.zig");
+const damage = @import("../scene/damage.zig");
+const scheduler_api = @import("headless.zig");
+
+pub const RendererPreference = enum { pixman, vulkan, vulkan_then_pixman };
+pub const RendererKind = enum { pixman, vulkan };
+
+pub const Config = struct {
+    output_id: scheduler_api.OutputId,
+    scheduler: scheduler_api.Config,
+    renderer: RendererPreference = .vulkan_then_pixman,
+    image_count: usize = framebuffer.default_capacity,
+    max_samples: usize,
+    max_source_bytes: usize,
+    max_source_width: u32,
+    max_source_height: u32,
+    max_client_damage: usize = 32,
+    max_scene_damage: usize = 32,
+    max_repair_damage: usize = 32,
+    max_render_damage: usize = 32,
+    clear: render.Color = .{ .r = 0, .g = 0, .b = 0 },
+    output_transform: render.Transform = .normal,
+    kms: kms.Config = .{},
+};
+
+pub const Platforms = struct {
+    gbm: gbm.Platform = gbm.real,
+    framebuffer: framebuffer.Platform = framebuffer.real,
+    atomic: atomic.Platform = atomic.real,
+    vulkan: vulkan_platform.Platform = vulkan_platform.real,
+};
+
+pub const SampleBinding = struct {
+    surface: scheduler_api.SurfaceId,
+    sample: render.SampleIdentity,
+    presentation: render.PresentationIdentity,
+};
+
+/// Copies the exact generational identity from `presentation.Queue.Token`;
+/// the queue pointer remains owned by the protocol/presentation boundary.
+pub fn presentationIdentity(token: anytype) render.PresentationIdentity {
+    return .{ .slot = token.index, .generation = token.generation };
+}
+
+/// Converts an applied CU's generational surface key and committed sequence to
+/// the exact renderer identity. Callers retain no protocol-resource pointer.
+pub fn appliedSampleBinding(
+    surface: scheduler_api.SurfaceId,
+    commit_sequence: u64,
+    presentation: render.PresentationIdentity,
+) !SampleBinding {
+    if (surface.generation == 0 or commit_sequence == 0 or presentation.generation == 0)
+        return error.InvalidIdentity;
+    return .{
+        .surface = surface,
+        .sample = .{
+            .surface = (@as(u64, surface.generation) << 32) | surface.index,
+            .commit_sequence = commit_sequence,
+        },
+        .presentation = presentation,
+    };
+}
+
+const Scheduler = scheduler_api.Scheduler(render.PresentationIdentity);
+pub const FrameOutcome = scheduler_api.FrameOutcome(render.PresentationIdentity);
+
+/// The protocol/runtime implementation must transactionally activate and queue
+/// frame callbacks, then queue each sampled presentation's release callbacks
+/// and finish its lease. Returning an error retains the completed outcome for
+/// retry and blocks another render from overwriting scheduler sample storage.
+pub const WaylandCallbacks = struct {
+    context: *anyopaque,
+    presented_fn: *const fn (*anyopaque, FrameOutcome, u32) anyerror!void,
+    retired_fn: *const fn (*anyopaque, FrameOutcome) anyerror!void,
+
+    pub fn presented(self: WaylandCallbacks, outcome: FrameOutcome, callback_data: u32) !void {
+        return self.presented_fn(self.context, outcome, callback_data);
+    }
+
+    pub fn retired(self: WaylandCallbacks, outcome: FrameOutcome) !void {
+        return self.retired_fn(self.context, outcome);
+    }
+};
+
+const Renderer = union(RendererKind) {
+    pixman: cpu.Renderer,
+    vulkan: vulkan.Renderer,
+
+    fn deinit(self: *Renderer) void {
+        switch (self.*) {
+            .pixman => |*value| value.deinit(),
+            .vulkan => |*value| value.deinit(),
+        }
+    }
+};
+
+const RenderPath = struct {
+    pool: framebuffer.Pool,
+    renderer: Renderer,
+};
+
+pub const RenderFailure = struct {
+    cause: anyerror,
+    frame: FrameOutcome,
+};
+
+pub const RenderResult = union(enum) {
+    submitted,
+    retired: RenderFailure,
+};
+
+pub const RetireAction = union(enum) { cancel: timer.Handle, retired: FrameOutcome };
+
+pub const SessionAction = enum { none, create_output, quiesce_output };
+
+/// Converts Session events into composition-root actions. A disabling event
+/// starts output quiescence; the root acknowledges Session disable only after
+/// `drainComplete`, `destroy`, and DRM-manager device release. A later enabled
+/// generation creates a fresh output and scheduler generation.
+pub fn sessionAction(event: @import("../backend/session.zig").Event) SessionAction {
+    return switch (event) {
+        .enabled => .create_output,
+        .disabling => .quiesce_output,
+        else => .none,
+    };
+}
+
+/// Heap-stable because R11 retains pointers into `kms_output` commit records
+/// and its image adapter points at the embedded pool.
+pub const Output = struct {
+    allocator: std.mem.Allocator,
+    pool: framebuffer.Pool,
+    renderer: ?Renderer,
+    builder: render_list.Builder,
+    planner: damage.Planner,
+    scheduler: Scheduler,
+    sample_storage: []scheduler_api.Sample(render.PresentationIdentity),
+    kms_output: *kms.Output,
+    output_format: render.PixelFormat,
+    clear: render.Color,
+    accepting_frames: bool = true,
+    in_flight_frame: ?scheduler_api.FrameId = null,
+    pending_callback: ?FrameOutcome = null,
+    event_cursor: usize = 0,
+    paused: bool = false,
+
+    pub fn create(
+        allocator: std.mem.Allocator,
+        platforms: Platforms,
+        device: kms.Device,
+        snapshot: drm.Snapshot,
+        config: Config,
+    ) !*Output {
+        if (config.image_count == 0 or config.max_samples == 0 or
+            config.max_source_bytes == 0)
+            return error.InvalidConfig;
+        const fd = try device.fd(snapshot.handle);
+        const self = try allocator.create(Output);
+        errdefer allocator.destroy(self);
+
+        var path = try initRenderPath(allocator, platforms, fd, snapshot, config);
+        errdefer {
+            path.renderer.deinit();
+            path.pool.deinit() catch {};
+        }
+        self.pool = path.pool;
+        self.renderer = path.renderer;
+        const mode = snapshot.selectedMode();
+        const logical_output: render.Size = .{ .width = mode.hdisplay, .height = mode.vdisplay };
+        self.output_format = formatFromDrm(self.pool.allocation.format) orelse
+            return error.UnsupportedOutputFormat;
+        self.builder = try render_list.Builder.init(
+            allocator,
+            config.max_samples,
+            config.max_source_bytes,
+        );
+        errdefer self.builder.deinit();
+        self.planner = try damage.Planner.init(allocator, logical_output, config.output_transform, .{
+            .image_count = config.image_count,
+            .max_samples = config.max_samples,
+            .max_client_rects = config.max_client_damage,
+            .max_scene_rects = config.max_scene_damage,
+            .max_repair_rects = config.max_repair_damage,
+            .max_render_rects = config.max_render_damage,
+        });
+        errdefer self.planner.deinit();
+        self.scheduler = try Scheduler.init(allocator, config.output_id, config.scheduler, config.max_samples);
+        errdefer self.scheduler.deinit(allocator);
+        self.sample_storage = try allocator.alloc(
+            scheduler_api.Sample(render.PresentationIdentity),
+            config.max_samples,
+        );
+        errdefer allocator.free(self.sample_storage);
+        self.kms_output = try kms.Output.create(
+            allocator,
+            platforms.atomic,
+            device,
+            kms.Images.fromPool(&self.pool),
+            snapshot,
+            config.kms,
+        );
+        self.allocator = allocator;
+        self.clear = config.clear;
+        self.accepting_frames = true;
+        self.in_flight_frame = null;
+        self.pending_callback = null;
+        self.event_cursor = 0;
+        self.paused = false;
+        return self;
+    }
+
+    /// Strict teardown order: R11 has already drained R10, then renderer waits
+    /// and releases imported targets while the pool/BOs remain alive, then R10
+    /// removes framebuffers and BOs.
+    pub fn destroy(self: *Output) !void {
+        if (!self.drainComplete() or self.pending_callback != null)
+            return error.DrainIncomplete;
+        try self.kms_output.destroy();
+        if (self.renderer) |*value| value.deinit();
+        self.renderer = null;
+        try self.pool.deinit();
+        self.allocator.free(self.sample_storage);
+        self.scheduler.deinit(self.allocator);
+        self.planner.deinit();
+        self.builder.deinit();
+        const allocator = self.allocator;
+        allocator.destroy(self);
+    }
+
+    pub fn rendererKind(self: *const Output) ?RendererKind {
+        return if (self.renderer) |value| std.meta.activeTag(value) else null;
+    }
+
+    pub fn outputId(self: *const Output) scheduler_api.OutputId {
+        return self.scheduler.output;
+    }
+
+    pub fn currentFrameId(self: *const Output) ?scheduler_api.FrameId {
+        return self.scheduler.currentFrameId();
+    }
+
+    pub fn request(self: *Output, reason: scheduler_api.Reason, now_ns: u64) !void {
+        if (!self.accepting_frames) return error.OutputPaused;
+        try self.scheduler.request(reason, now_ns);
+    }
+
+    pub fn timerRequest(self: *const Output, now_ns: u64) !?scheduler_api.TimerRequest {
+        if (!self.accepting_frames) return null;
+        return self.scheduler.timerRequest(now_ns);
+    }
+
+    pub fn timerArmed(self: *Output, request_value: scheduler_api.TimerRequest, handle: timer.Handle, now_ns: u64) !void {
+        try self.scheduler.timerArmed(request_value, handle, now_ns);
+    }
+
+    pub fn timerEvent(self: *Output, handle: timer.Handle, event: timer.Event, now_ns: u64) !?scheduler_api.RenderRequest {
+        const result = try self.scheduler.timerEvent(handle, event, now_ns) orelse return null;
+        return switch (result) {
+            .render => |value| value,
+            .frame => error.UnexpectedHeadlessPresentation,
+        };
+    }
+
+    /// Performs the complete synchronous event-turn render/commit transition.
+    /// `applied` must already come from the CU scheduler. The builder copies its
+    /// bytes, and every binding must exactly match one sampled presentation.
+    pub fn renderFrame(
+        self: *Output,
+        frame_id: scheduler_api.FrameId,
+        applied: []const render_list.AppliedSurface,
+        changes: []const damage.Change,
+        bindings: []const SampleBinding,
+        now_ns: u64,
+    ) !RenderResult {
+        if (!self.accepting_frames or self.in_flight_frame != null or
+            self.pending_callback != null)
+            return error.InvalidState;
+        const list = self.builder.build(
+            self.planner.output,
+            self.output_format,
+            self.clear,
+            applied,
+        ) catch |cause| return self.retireUnstartedRender(frame_id, cause);
+        bindSamples(list, bindings, self.sample_storage) catch |cause|
+            return self.retireUnstartedRender(frame_id, cause);
+        try self.scheduler.captureSamples(frame_id, self.sample_storage[0..bindings.len]);
+        const handle = self.pool.acquire() catch |cause|
+            return self.retireRender(frame_id, cause);
+        const plan = self.planner.prepare(handle, list, changes) catch |cause| {
+            self.pool.discard(handle) catch {};
+            return self.retireRender(frame_id, cause);
+        };
+
+        var in_fence: ?std.posix.fd_t = null;
+        const renderer = &(self.renderer orelse {
+            return self.retireAndDiscard(frame_id, error.RendererUnavailable, handle);
+        });
+        switch (renderer.*) {
+            .pixman => |*value| value.renderPool(&self.pool, handle, list) catch |cause| {
+                return self.retireAndDiscard(frame_id, cause, handle);
+            },
+            .vulkan => |*value| {
+                in_fence = value.renderPool(&self.pool, handle, list, plan) catch |cause| {
+                    if (cause == error.CompletionExportFailedAfterSubmit) {
+                        // The GPU has accepted work without exporting the only
+                        // synchronization primitive. Renderer teardown is the
+                        // terminal wait and must happen while Pool/BO lives.
+                        renderer.deinit();
+                        self.renderer = null;
+                    }
+                    return self.retireAndDiscard(frame_id, cause, handle);
+                };
+            },
+        }
+        // Capture and renderer success prove this transition under the
+        // single-thread event-turn contract. Record it before KMS acceptance
+        // so no fallible scheduler bookkeeping remains beyond that boundary.
+        _ = self.scheduler.renderComplete(frame_id, now_ns) catch unreachable;
+        self.kms_output.queue(handle, in_fence) catch |cause| {
+            if (in_fence) |fd| _ = linux.close(fd); // R11 rejected ownership.
+            return self.retireAndDiscard(frame_id, cause, handle);
+        };
+        self.kms_output.commitQueued() catch |cause| {
+            // R11 now owns and closes the fence and terminally disposes the
+            // acquired image on every commit rollback.
+            self.planner.cancel() catch unreachable;
+            return self.retireRender(frame_id, cause);
+        };
+        // KMS now irreversibly owns the submitted R10 image. Establish R14's
+        // tracking first; the remaining transitions are prevalidated and
+        // cannot fail without violating single-thread ownership.
+        self.in_flight_frame = frame_id;
+        self.planner.publish() catch unreachable;
+        self.scheduler.submitPhysical(frame_id, now_ns) catch unreachable;
+        return .submitted;
+    }
+
+    /// Dispatches callbacks already recorded by R11. Callback backpressure is
+    /// retryable: the exact scheduler outcome remains pinned until success.
+    pub fn processKmsEvents(self: *Output, callbacks: WaylandCallbacks) !void {
+        // Never ask R11 to publish deferred policy into an already-full queue.
+        // This matters when callback delivery previously hit TX backpressure.
+        if (self.kms_output.events().len == 0)
+            try self.kms_output.processCallbacks();
+        try self.consumeKmsEvents(callbacks);
+
+        // One page flip can defer exactly one disabling commit because its
+        // `.presented` event occupied the final event slot. After consuming the
+        // batch, give R11 one non-spinning policy pass and consume that result.
+        try self.kms_output.processCallbacks();
+        try self.consumeKmsEvents(callbacks);
+    }
+
+    fn consumeKmsEvents(self: *Output, callbacks: WaylandCallbacks) !void {
+        const events = self.kms_output.events();
+        while (self.event_cursor < events.len) {
+            switch (events[self.event_cursor]) {
+                .presented => |event| {
+                    if (self.pending_callback == null) {
+                        const frame_id = self.in_flight_frame orelse return error.UnexpectedPageFlip;
+                        if (!std.meta.eql(event.image, self.kms_output.current.?))
+                            return error.UnexpectedPageFlip;
+                        self.pending_callback = try self.scheduler.presentPhysical(
+                            frame_id,
+                            flipTimestampNs(event.seconds, event.microseconds),
+                        );
+                    }
+                    const outcome = self.pending_callback.?;
+                    try callbacks.presented(outcome, callbackData(outcome.actual_ns.?));
+                    self.pending_callback = null;
+                    self.in_flight_frame = null;
+                },
+                .paused => self.paused = true,
+                .removed => {
+                    if (self.in_flight_frame) |frame_id| {
+                        if (self.pending_callback == null)
+                            self.pending_callback = try self.scheduler.retirePhysical(frame_id);
+                        try callbacks.retired(self.pending_callback.?);
+                        self.pending_callback = null;
+                        self.in_flight_frame = null;
+                    }
+                    self.paused = true;
+                },
+                .failed => return error.KmsFailed,
+                .drained => {},
+            }
+            self.event_cursor += 1;
+        }
+        self.kms_output.clearEvents();
+        self.event_cursor = 0;
+    }
+
+    /// Starts the Session-disable path. A submitted frame is allowed to flip
+    /// and produce its real callback before R11 disables scanout.
+    pub fn requestPause(self: *Output) !?RetireAction {
+        self.accepting_frames = false;
+        const removal = try self.scheduler.remove();
+        try self.kms_output.requestPause();
+        if (retireAction(removal)) |action| return action;
+        if (self.scheduler.currentStage() == .rendering) return .{
+            .retired = try self.scheduler.cancelUnstartedRender(self.scheduler.currentFrameId().?),
+        };
+        return null;
+    }
+
+    pub fn terminalDeviceTeardown(self: *Output) !?RetireAction {
+        self.accepting_frames = false;
+        const removal = try self.scheduler.remove();
+        try self.kms_output.terminalDeviceTeardown();
+        if (retireAction(removal)) |action| return action;
+        if (self.scheduler.currentStage() == .rendering) return .{
+            .retired = try self.scheduler.cancelUnstartedRender(self.scheduler.currentFrameId().?),
+        };
+        return null;
+    }
+
+    pub fn prepareReadiness(self: *Output, router: *completion.Router, ring: *linux.IoUring) !void {
+        try self.kms_output.prepareReadiness(router, ring);
+    }
+
+    pub fn completeReadiness(self: *Output, router: *completion.Router, ring: *linux.IoUring, token: completion.Token, result: i32) !void {
+        try self.kms_output.completeReadiness(router, ring, token, result);
+    }
+
+    pub fn beginDrain(self: *Output, router: *completion.Router, ring: *linux.IoUring) !void {
+        if (!self.paused) return error.ScanoutNotQuiescent;
+        try self.kms_output.beginDrain(router, ring);
+    }
+
+    pub fn drainComplete(self: *const Output) bool {
+        return self.kms_output.drainComplete() and
+            self.scheduler.currentStage() == .removed and self.in_flight_frame == null;
+    }
+
+    fn retireRender(self: *Output, frame_id: scheduler_api.FrameId, cause: anyerror) !RenderResult {
+        return .{ .retired = .{ .cause = cause, .frame = try self.scheduler.failRender(frame_id) } };
+    }
+
+    fn retireUnstartedRender(
+        self: *Output,
+        frame_id: scheduler_api.FrameId,
+        cause: anyerror,
+    ) !RenderResult {
+        return .{ .retired = .{
+            .cause = cause,
+            .frame = try self.scheduler.cancelUnstartedRender(frame_id),
+        } };
+    }
+
+    /// Retire Scheduler first so cleanup can never strand the frame. R10's
+    /// `GenerationExhausted` means the slot was successfully retired and does
+    /// not replace the initiating cause; other cleanup failures are reported
+    /// with the already-retired outcome.
+    fn retireAndDiscard(
+        self: *Output,
+        frame_id: scheduler_api.FrameId,
+        cause: anyerror,
+        handle: framebuffer.Handle,
+    ) !RenderResult {
+        const frame = try self.scheduler.failRender(frame_id);
+        self.planner.cancel() catch unreachable;
+        var reported = cause;
+        self.pool.discard(handle) catch |cleanup| switch (cleanup) {
+            error.GenerationExhausted => {},
+            else => reported = cleanup,
+        };
+        return .{ .retired = .{ .cause = reported, .frame = frame } };
+    }
+};
+
+fn retireAction(removal: anytype) ?RetireAction {
+    const value = removal orelse return null;
+    return switch (value) {
+        .cancel => |handle| .{ .cancel = handle },
+        .frame => |frame| .{ .retired = frame },
+    };
+}
+
+fn initRenderPath(allocator: std.mem.Allocator, platforms: Platforms, fd: std.posix.fd_t, snapshot: drm.Snapshot, config: Config) !RenderPath {
+    return switch (config.renderer) {
+        .pixman => initPixman(allocator, platforms, fd, snapshot, config),
+        .vulkan => initVulkan(allocator, platforms, fd, snapshot, config),
+        .vulkan_then_pixman => initVulkan(allocator, platforms, fd, snapshot, config) catch
+            initPixman(allocator, platforms, fd, snapshot, config),
+    };
+}
+
+fn initPixman(allocator: std.mem.Allocator, platforms: Platforms, fd: std.posix.fd_t, snapshot: drm.Snapshot, config: Config) !RenderPath {
+    var pool = try cpu.initTargetPool(allocator, platforms.gbm, platforms.framebuffer, fd, snapshot, config.image_count);
+    errdefer pool.deinit() catch {};
+    const renderer = try cpu.Renderer.init(allocator, .{
+        .max_samples = config.max_samples,
+        .max_source_width = config.max_source_width,
+        .max_source_height = config.max_source_height,
+    });
+    return .{ .pool = pool, .renderer = .{ .pixman = renderer } };
+}
+
+fn initVulkan(allocator: std.mem.Allocator, platforms: Platforms, fd: std.posix.fd_t, snapshot: drm.Snapshot, config: Config) !RenderPath {
+    if (snapshot.selectedPlane().properties.in_fence_fd == 0)
+        return error.InFenceUnsupported;
+    var pool = try vulkan.initTargetPool(allocator, platforms.gbm, platforms.framebuffer, fd, snapshot, config.image_count);
+    errdefer pool.deinit() catch {};
+    const renderer = try vulkan.Renderer.init(allocator, platforms.vulkan, fd, .{
+        .max_samples = config.max_samples,
+        .max_source_bytes = config.max_source_bytes,
+        .max_targets = config.image_count,
+        .max_damage_rects = config.max_render_damage,
+    });
+    return .{ .pool = pool, .renderer = .{ .vulkan = renderer } };
+}
+
+fn bindSamples(list: render.List, bindings: []const SampleBinding, output: []scheduler_api.Sample(render.PresentationIdentity)) !void {
+    if (bindings.len != list.samples.len or bindings.len > output.len)
+        return error.SampleBindingMismatch;
+    for (bindings, 0..) |binding, index| {
+        const sample = list.samples[index];
+        if (!std.meta.eql(binding.sample, sample.sample) or
+            !std.meta.eql(binding.presentation, sample.presentation) or
+            binding.sample.surface !=
+                ((@as(u64, binding.surface.generation) << 32) | binding.surface.index))
+            return error.SampleBindingMismatch;
+        output[index] = .{ .surface = binding.surface, .presentation = binding.presentation };
+    }
+}
+
+fn formatFromDrm(value: u32) ?render.PixelFormat {
+    if (value == gbm.format_xrgb8888) return .xrgb8888;
+    if (value == gbm.format_argb8888) return .argb8888_premultiplied;
+    return null;
+}
+
+fn flipTimestampNs(seconds: u32, microseconds: u32) u64 {
+    return @as(u64, seconds) * std.time.ns_per_s + @as(u64, microseconds) * std.time.ns_per_us;
+}
+
+fn callbackData(timestamp_ns: u64) u32 {
+    return @truncate(timestamp_ns / std.time.ns_per_ms);
+}
+
+test "drm-sim: exact sampled identities bind in presentation order" {
+    const bytes = [_]u8{ 0, 0, 0, 255 };
+    const binding = try appliedSampleBinding(
+        .{ .index = 11, .generation = 3 },
+        9,
+        .{ .slot = 2, .generation = 4 },
+    );
+    const sample: render.SurfaceSample = .{
+        .sample = binding.sample,
+        .presentation = binding.presentation,
+        .source = .{ .size = .{ .width = 1, .height = 1 }, .stride = 4, .format = .xrgb8888, .bytes = &bytes },
+        .crop = render.SourceRect.pixels(0, 0, 1, 1),
+        .destination = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+        .clip = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+    };
+    const list: render.List = .{ .output = .{ .width = 1, .height = 1 }, .output_format = .xrgb8888, .clear = .{ .r = 0, .g = 0, .b = 0 }, .samples = &.{sample} };
+    var output: [1]scheduler_api.Sample(render.PresentationIdentity) = undefined;
+    try bindSamples(list, &.{binding}, &output);
+    try std.testing.expectEqual(sample.presentation, output[0].presentation);
+    var stale = sample;
+    stale.presentation.generation += 1;
+    try std.testing.expectError(error.SampleBindingMismatch, bindSamples(list, &.{.{
+        .surface = binding.surface,
+        .sample = stale.sample,
+        .presentation = stale.presentation,
+    }}, &output));
+}
+
+test "drm-sim: physical scheduler is page-flip paced and retires on failure" {
+    var scheduler = try Scheduler.init(std.testing.allocator, .{ .index = 1, .generation = 2 }, .{ .refresh_ns = 10, .render_budget_ns = 3 }, 1);
+    defer scheduler.deinit(std.testing.allocator);
+    try scheduler.request(.damage, 1);
+    const arm = (try scheduler.timerRequest(1)).?;
+    const timer_handle: timer.Handle = .{ .slot = 1, .generation = 1 };
+    try scheduler.timerArmed(arm, timer_handle, 1);
+    const render_event = (try scheduler.timerEvent(timer_handle, .fired, 7)).?;
+    const samples = [_]scheduler_api.Sample(render.PresentationIdentity){.{
+        .surface = .{ .index = 4, .generation = 5 },
+        .presentation = .{ .slot = 6, .generation = 7 },
+    }};
+    try scheduler.captureSamples(render_event.render.frame, &samples);
+    _ = try scheduler.renderComplete(render_event.render.frame, 8);
+    try scheduler.submitPhysical(render_event.render.frame, 8);
+    try std.testing.expect((try scheduler.timerRequest(9)) == null);
+    const outcome = try scheduler.presentPhysical(render_event.render.frame, 12);
+    try std.testing.expect(outcome.frame_callbacks_due);
+    try std.testing.expectEqual(@as(?u64, 12), outcome.actual_ns);
+    try std.testing.expectEqualSlices(scheduler_api.Sample(render.PresentationIdentity), &samples, outcome.sampled);
+
+    try scheduler.request(.damage, 13);
+    const second = (try scheduler.timerRequest(13)).?;
+    const second_timer: timer.Handle = .{ .slot = 1, .generation = 2 };
+    try scheduler.timerArmed(second, second_timer, 13);
+    const second_event = (try scheduler.timerEvent(second_timer, .fired, 17)).?;
+    try scheduler.captureSamples(second_event.render.frame, &samples);
+    const retired = try scheduler.failRender(second_event.render.frame);
+    try std.testing.expectEqual(scheduler_api.Disposition.retired, retired.disposition);
+    try std.testing.expect(!retired.frame_callbacks_due);
+}
+
+test "drm-sim: Session generations select create and quiesce actions" {
+    try std.testing.expectEqual(SessionAction.create_output, sessionAction(.{ .enabled = 2 }));
+    try std.testing.expectEqual(SessionAction.quiesce_output, sessionAction(.{ .disabling = 2 }));
+    try std.testing.expectEqual(SessionAction.none, sessionAction(.{ .disabled = 2 }));
+}
+
+test "drm-sim: pre-capture failures retire scheduler and remain removable" {
+    var fixture = SimFixture{};
+    const output = try Output.create(
+        std.testing.allocator,
+        fixture.platforms(),
+        fixture.device(),
+        fixture.snapshot(),
+        .{
+            .output_id = .{ .index = 0, .generation = 1 },
+            .scheduler = .{ .refresh_ns = 10, .render_budget_ns = 3 },
+            .renderer = .pixman,
+            .image_count = 2,
+            .max_samples = 1,
+            .max_source_bytes = 4,
+            .max_source_width = 1,
+            .max_source_height = 1,
+        },
+    );
+    const bytes = [_]u8{ 0, 0, 0, 255 };
+    const malformed: render_list.AppliedSurface = .{
+        .sample = .{ .surface = 0, .commit_sequence = 1 },
+        .presentation = .{ .slot = 0, .generation = 1 },
+        .source = .{ .size = .{ .width = 1, .height = 1 }, .stride = 4, .format = .xrgb8888, .bytes = &bytes },
+        .crop = render.SourceRect.pixels(0, 0, 1, 1),
+        .destination = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+        .clip = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+    };
+
+    const first = try startSimFrame(output, 1, .{ .slot = 0, .generation = 1 });
+    var stale = first;
+    stale.output.generation += 1;
+    try std.testing.expectError(
+        error.StaleFrame,
+        output.renderFrame(stale, &.{malformed}, &.{}, &.{}, 8),
+    );
+    try std.testing.expectEqual(scheduler_api.Stage.rendering, output.scheduler.currentStage());
+    try std.testing.expectEqual(first, output.scheduler.currentFrameId().?);
+    const malformed_result = try output.renderFrame(first, &.{malformed}, &.{}, &.{}, 8);
+    switch (malformed_result) {
+        .retired => |failure| try std.testing.expect(failure.cause == error.InvalidIdentity),
+        .submitted => return error.ExpectedRetirement,
+    }
+    try std.testing.expectEqual(scheduler_api.Stage.idle, output.scheduler.currentStage());
+
+    const second = try startSimFrame(output, 11, .{ .slot = 0, .generation = 2 });
+    const binding = try appliedSampleBinding(
+        .{ .index = 1, .generation = 1 },
+        1,
+        .{ .slot = 0, .generation = 1 },
+    );
+    const binding_result = try output.renderFrame(second, &.{}, &.{}, &.{binding}, 18);
+    switch (binding_result) {
+        .retired => |failure| try std.testing.expect(failure.cause == error.SampleBindingMismatch),
+        .submitted => return error.ExpectedRetirement,
+    }
+    try std.testing.expectEqual(scheduler_api.Stage.idle, output.scheduler.currentStage());
+
+    try output.request(.damage, 21);
+    try std.testing.expect((try output.requestPause()) == null);
+    const callbacks: WaylandCallbacks = .{
+        .context = &fixture,
+        .presented_fn = SimFixture.unexpectedPresented,
+        .retired_fn = SimFixture.unexpectedRetired,
+    };
+    try output.processKmsEvents(callbacks);
+    try output.beginDrain(&fixture.router, &fixture.ring);
+    try output.processKmsEvents(callbacks);
+    try output.destroy();
+    fixture.ring.deinit();
+    fixture.router.deinit(std.testing.allocator);
+}
+
+test "drm-sim: physical Pixman owner starts and drains in strict order" {
+    var fixture = SimFixture{};
+    const snapshot = fixture.snapshot();
+    const output = try Output.create(
+        std.testing.allocator,
+        fixture.platforms(),
+        fixture.device(),
+        snapshot,
+        .{
+            .output_id = .{ .index = 0, .generation = 1 },
+            .scheduler = .{ .refresh_ns = 16_666_667, .render_budget_ns = 2_000_000 },
+            .renderer = .pixman,
+            .image_count = 2,
+            .max_samples = 1,
+            .max_source_bytes = 4,
+            .max_source_width = 1,
+            .max_source_height = 1,
+            .kms = .{ .event_capacity = 1 },
+        },
+    );
+    try std.testing.expectEqual(RendererKind.pixman, output.rendererKind().?);
+    try output.prepareReadiness(&fixture.router, &fixture.ring);
+    try output.request(.damage, 1);
+    const timer_request = (try output.timerRequest(1)).?;
+    const timer_handle: timer.Handle = .{ .slot = 0, .generation = 1 };
+    try output.timerArmed(timer_request, timer_handle, 1);
+    const frame = (try output.timerEvent(timer_handle, .fired, 14_666_667)).?.frame;
+    try std.testing.expectEqual(RenderResult.submitted, try output.renderFrame(
+        frame,
+        &.{},
+        &.{},
+        &.{},
+        15_000_000,
+    ));
+    try std.testing.expectEqual(frame, output.in_flight_frame.?);
+    try std.testing.expect((try output.requestPause()) == null);
+    const first_poll = output.kms_output.poll_token.?;
+    try output.completeReadiness(
+        &fixture.router,
+        &fixture.ring,
+        first_poll,
+        @intCast(linux.POLL.IN),
+    );
+    const callbacks: WaylandCallbacks = .{
+        .context = &fixture,
+        .presented_fn = SimFixture.presented,
+        .retired_fn = SimFixture.unexpectedRetired,
+    };
+    try output.processKmsEvents(callbacks);
+    try std.testing.expectEqual(@as(usize, 1), fixture.presented_count);
+    try std.testing.expect(output.paused);
+    try output.beginDrain(&fixture.router, &fixture.ring);
+    const drain_poll = output.kms_output.poll_token.?;
+    const drain_cancel = output.kms_output.cancel_token.?;
+    try output.completeReadiness(
+        &fixture.router,
+        &fixture.ring,
+        drain_poll,
+        -@as(i32, @intFromEnum(linux.E.CANCELED)),
+    );
+    try output.completeReadiness(&fixture.router, &fixture.ring, drain_cancel, 0);
+    try output.processKmsEvents(callbacks);
+    try std.testing.expect(output.drainComplete());
+    try output.destroy();
+    fixture.ring.deinit();
+    fixture.router.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), fixture.bos_destroyed);
+    try std.testing.expectEqual(@as(usize, 2), fixture.framebuffers_removed);
+    try std.testing.expect(fixture.pool_removal_started_before_bo);
+}
+
+const SimFixture = struct {
+    bytes: [2][4]u8 align(4) = .{ [_]u8{0} ** 4, [_]u8{0} ** 4 },
+    bo_count: usize = 0,
+    bos_destroyed: usize = 0,
+    framebuffers_removed: usize = 0,
+    pool_removal_started_before_bo: bool = false,
+    requests: [2]u8 = .{ 0, 0 },
+    request_count: usize = 0,
+    flip_userdata: ?*anyopaque = null,
+    presented_count: usize = 0,
+    router: completion.Router = undefined,
+    ring: linux.IoUring = undefined,
+
+    const gbm_vtable: gbm.Platform.VTable = .{
+        .create_device = createDevice,
+        .destroy_device = destroyDevice,
+        .create_bo = createBo,
+        .destroy_bo = destroyBo,
+        .metadata = metadata,
+        .export_plane_fd = exportPlaneFd,
+        .map = map,
+        .unmap = unmap,
+    };
+    const framebuffer_vtable: framebuffer.Platform.VTable = .{
+        .add = addFramebuffer,
+        .remove = removeFramebuffer,
+    };
+    const atomic_vtable: atomic.Platform.VTable = .{
+        .create_blob = createBlob,
+        .destroy_blob = destroyBlob,
+        .create_request = createRequest,
+        .destroy_request = destroyRequest,
+        .reset_request = resetRequest,
+        .add_property = addProperty,
+        .commit = commit,
+        .handle_events = handleEvents,
+    };
+
+    fn platforms(self: *SimFixture) Platforms {
+        self.router = completion.Router.init(std.testing.allocator, 6) catch unreachable;
+        self.ring = linux.IoUring.init(8, 0) catch unreachable;
+        return .{
+            .gbm = .{ .context = self, .vtable = &gbm_vtable },
+            .framebuffer = .{ .context = self, .vtable = &framebuffer_vtable },
+            .atomic = .{ .context = self, .vtable = &atomic_vtable },
+        };
+    }
+
+    fn device(self: *SimFixture) kms.Device {
+        return .{ .context = self, .get_fd = getFd };
+    }
+
+    fn snapshot(self: *SimFixture) drm.Snapshot {
+        _ = self;
+        const Data = struct {
+            var connectors = [_]drm.Connector{.{ .id = 10, .connector_type = 1, .connector_type_id = 1, .connected = true, .desktop = true, .width_mm = 1, .height_mm = 1, .encoder_id = 20, .mode_start = 0, .mode_count = 1, .encoder_start = 0, .encoder_count = 1, .properties = .{ .crtc_id = 1 } }};
+            var modes = [_]drm.Mode{.{ .clock = 1, .hdisplay = 1, .hsync_start = 1, .hsync_end = 1, .htotal = 1, .hskew = 0, .vdisplay = 1, .vsync_start = 1, .vsync_end = 1, .vtotal = 1, .vscan = 0, .vrefresh = 60, .flags = 0, .mode_type = 0 }};
+            var connector_encoders = [_]u32{20};
+            var encoders = [_]drm.Encoder{.{ .id = 20, .crtc_id = 30, .possible_crtcs = 1 }};
+            var crtcs = [_]drm.Crtc{.{ .id = 30, .index = 0, .properties = .{ .active = 2, .mode_id = 3 } }};
+            var planes = [_]drm.Plane{.{ .id = 40, .possible_crtcs = 1, .plane_type_value = 1, .format_start = 0, .format_count = 1, .properties = .{ .plane_type = 4, .fb_id = 5, .crtc_id = 6, .src_x = 7, .src_y = 8, .src_w = 9, .src_h = 10, .crtc_x = 11, .crtc_y = 12, .crtc_w = 13, .crtc_h = 14 } }};
+            var formats = [_]drm.Format{.{ .fourcc = gbm.format_xrgb8888, .modifier = gbm.modifier_linear }};
+        };
+        return .{
+            .handle = .{ .generation = 1 },
+            .card = .{},
+            .connectors = &Data.connectors,
+            .modes = &Data.modes,
+            .connector_encoders = &Data.connector_encoders,
+            .encoders = &Data.encoders,
+            .crtcs = &Data.crtcs,
+            .planes = &Data.planes,
+            .formats = &Data.formats,
+            .selection = .{ .connector_index = 0, .mode_index = 0, .crtc_index = 0, .plane_index = 0 },
+        };
+    }
+
+    fn getFd(_: *anyopaque, _: drm.Handle) !std.posix.fd_t {
+        return 99;
+    }
+    fn createDevice(context: *anyopaque, _: std.posix.fd_t) !gbm.Device {
+        return context;
+    }
+    fn destroyDevice(_: *anyopaque, _: gbm.Device) void {}
+    fn createBo(context: *anyopaque, _: gbm.Device, _: gbm.Allocation) !gbm.Bo {
+        const self: *SimFixture = @ptrCast(@alignCast(context));
+        const index = self.bo_count;
+        self.bo_count += 1;
+        return @ptrCast(&self.bytes[index]);
+    }
+    fn destroyBo(context: *anyopaque, _: gbm.Bo) void {
+        const self: *SimFixture = @ptrCast(@alignCast(context));
+        self.bos_destroyed += 1;
+    }
+    fn metadata(_: *anyopaque, bo: gbm.Bo) !gbm.Metadata {
+        return .{ .width = 1, .height = 1, .format = gbm.format_xrgb8888, .modifier = gbm.modifier_linear, .plane_count = 1, .handles = .{ @intCast(@intFromPtr(bo) & 0xffffffff), 0, 0, 0 }, .strides = .{ 4, 0, 0, 0 } };
+    }
+    fn exportPlaneFd(_: *anyopaque, _: gbm.Bo, _: u8) !std.posix.fd_t {
+        return error.UnexpectedExport;
+    }
+    fn map(_: *anyopaque, bo: gbm.Bo) !gbm.Mapping {
+        return .{ .data = @ptrCast(bo), .stride = 4, .token = bo };
+    }
+    fn unmap(_: *anyopaque, _: gbm.Bo, _: gbm.MapToken) void {}
+    fn addFramebuffer(_: *anyopaque, _: std.posix.fd_t, metadata_value: gbm.Metadata) !u32 {
+        return metadata_value.handles[0];
+    }
+    fn removeFramebuffer(context: *anyopaque, _: std.posix.fd_t, _: u32) !void {
+        const self: *SimFixture = @ptrCast(@alignCast(context));
+        if (self.framebuffers_removed == 0)
+            self.pool_removal_started_before_bo = self.bos_destroyed == 0;
+        self.framebuffers_removed += 1;
+    }
+    fn createBlob(_: *anyopaque, _: std.posix.fd_t, _: drm.Mode) !u32 {
+        return 1;
+    }
+    fn destroyBlob(_: *anyopaque, _: std.posix.fd_t, _: u32) !void {}
+    fn createRequest(context: *anyopaque) !atomic.Request {
+        const self: *SimFixture = @ptrCast(@alignCast(context));
+        const request = &self.requests[self.request_count];
+        self.request_count += 1;
+        return @ptrCast(request);
+    }
+    fn destroyRequest(_: *anyopaque, _: atomic.Request) void {}
+    fn resetRequest(_: *anyopaque, _: atomic.Request) void {}
+    fn addProperty(_: *anyopaque, _: atomic.Request, _: u32, _: u32, _: u64) !void {}
+    fn commit(context: *anyopaque, _: std.posix.fd_t, _: atomic.Request, _: atomic.CommitFlags, userdata: ?*anyopaque) !void {
+        const self: *SimFixture = @ptrCast(@alignCast(context));
+        if (userdata) |value| self.flip_userdata = value;
+    }
+    fn handleEvents(context: *anyopaque, _: std.posix.fd_t, callback: atomic.FlipCallback) !void {
+        const self: *SimFixture = @ptrCast(@alignCast(context));
+        const userdata = self.flip_userdata orelse return error.MissingFlip;
+        self.flip_userdata = null;
+        callback(userdata, 1, 2, 3000, 30);
+    }
+    fn presented(context: *anyopaque, outcome: FrameOutcome, callback_data: u32) !void {
+        const self: *SimFixture = @ptrCast(@alignCast(context));
+        try std.testing.expect(outcome.frame_callbacks_due);
+        try std.testing.expect(outcome.output_removed);
+        try std.testing.expectEqual(@as(usize, 0), outcome.sampled.len);
+        try std.testing.expectEqual(@as(u32, 2003), callback_data);
+        self.presented_count += 1;
+    }
+    fn unexpectedPresented(_: *anyopaque, _: FrameOutcome, _: u32) !void {
+        return error.UnexpectedPresentation;
+    }
+    fn unexpectedRetired(_: *anyopaque, _: FrameOutcome) !void {
+        return error.UnexpectedRetirement;
+    }
+};
+
+fn startSimFrame(output: *Output, now_ns: u64, handle: timer.Handle) !scheduler_api.FrameId {
+    try output.request(.damage, now_ns);
+    const request_value = (try output.timerRequest(now_ns)).?;
+    try output.timerArmed(request_value, handle, now_ns);
+    return (try output.timerEvent(handle, .fired, request_value.frame.sequence + now_ns + 5)).?.frame;
+}

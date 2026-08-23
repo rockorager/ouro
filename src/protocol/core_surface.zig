@@ -76,12 +76,16 @@ pub fn Adapter(comptime protocol: type) type {
             generation: u32,
         };
 
-        const ShmBacking = union(enum) {
+        const ShmStorage = union(enum) {
             direct: struct {
                 store: *wayring.shm.Store,
                 pin: wayring.shm.Store.Pin,
             },
             copied: CopyOwner,
+        };
+        const ShmBacking = struct {
+            info: wayring.shm.Buffer,
+            storage: ShmStorage,
         };
         const Imports = @import("../buffer_import.zig").Registry(ShmBacking);
 
@@ -315,6 +319,13 @@ pub fn Adapter(comptime protocol: type) type {
             return &(try adapter.resolveSurface(handle)).state;
         }
 
+        /// M2 has no shell policy and therefore selects the first ordinary
+        /// surface. The handle remains generation checked by every later call.
+        pub fn firstSurface(adapter: *Self) ?objects.Handle {
+            for (adapter.surfaces) |slot| if (slot.active) return slot.resource;
+            return null;
+        }
+
         pub fn tryApply(
             adapter: *Self,
             handle: objects.Handle,
@@ -328,24 +339,46 @@ pub fn Adapter(comptime protocol: type) type {
             try adapter.scheduler.satisfy(token, count);
         }
 
-        /// Returns the retained zero-copy mapping for sealed SHM, or the stable
-        /// bounded destination after an ordinary SHM copy succeeds.
-        pub fn shmBytes(
+        pub const ShmSource = struct {
+            bytes: []const u8,
+            width: u32,
+            height: u32,
+            stride: usize,
+            format: wayring.shm.Format,
+        };
+
+        /// Returns renderer metadata with the retained zero-copy mapping for
+        /// sealed SHM, or the stable bounded ordinary-SHM copy destination.
+        pub fn shmSource(
             adapter: *Self,
             lease: surface_state.BufferLease,
-        ) ![]const u8 {
+        ) !ShmSource {
             const backing = try adapter.imports.get(lease);
-            return switch (backing.*) {
+            const bytes = try switch (backing.storage) {
                 .direct => |direct| direct.store.bytes(direct.pin),
-                .copied => |owner| {
+                .copied => |owner| copied: {
                     const slot = try resolveCopyOwner(owner);
-                    return switch (slot.state) {
-                        .pending => error.CopyPending,
-                        .failed => error.CopyFailed,
+                    break :copied switch (slot.state) {
+                        .pending => return error.CopyPending,
+                        .failed => return error.CopyFailed,
                         .success => |len| slot.destination[0..len],
                     };
                 },
             };
+            return .{
+                .bytes = bytes,
+                .width = backing.info.width,
+                .height = backing.info.height,
+                .stride = backing.info.stride,
+                .format = backing.info.format,
+            };
+        }
+
+        pub fn shmBytes(
+            adapter: *Self,
+            lease: surface_state.BufferLease,
+        ) ![]const u8 {
+            return (try adapter.shmSource(lease)).bytes;
         }
 
         /// Handles one R1-routed `.copy` completion during R4's pre-submit
@@ -660,7 +693,7 @@ pub fn Adapter(comptime protocol: type) type {
             const pin = try adapter.shm.store.pin(token);
             var pin_owned = true;
             errdefer if (pin_owned) adapter.shm.store.unpin(pin) catch unreachable;
-            const backing: ShmBacking = direct: {
+            const storage: ShmStorage = direct: {
                 _ = adapter.shm.store.bytes(pin) catch |cause| switch (cause) {
                     error.UnsafeAccess => {
                         try adapter.shm.store.unpin(pin);
@@ -675,6 +708,7 @@ pub fn Adapter(comptime protocol: type) type {
                     .pin = pin,
                 } };
             };
+            const backing: ShmBacking = .{ .info = info, .storage = storage };
             var lease = adapter.imports.acquire(backing) catch |cause| {
                 disposeShmBacking(null, backing);
                 return cause;
@@ -767,7 +801,7 @@ pub fn Adapter(comptime protocol: type) type {
         fn pendingAttachmentCopy(adapter: *Self, surface: *SurfaceSlot) !?*CopySlot {
             const lease = surface.attachment.pending orelse return null;
             const backing = try adapter.imports.get(lease);
-            return switch (backing.*) {
+            return switch (backing.storage) {
                 .direct => null,
                 .copied => |owner| {
                     const slot = try resolveCopyOwner(owner);
@@ -888,7 +922,7 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         fn disposeShmBacking(_: ?*anyopaque, backing: ShmBacking) void {
-            switch (backing) {
+            switch (backing.storage) {
                 .direct => |direct| direct.store.unpin(direct.pin) catch unreachable,
                 .copied => |owner| {
                     const slot = resolveCopyOwner(owner) catch unreachable;

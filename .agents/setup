@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+packages=(glslang-tools libdrm-dev libgbm-dev libpixman-1-dev libseat-dev libudev-dev libvulkan-dev pkg-config)
+missing=()
+for package in "${packages[@]}"; do
+    if ! dpkg-query -W -f='${db:Status-Abbrev}' "$package" 2>/dev/null | grep -q '^ii '; then
+        missing+=("$package")
+    fi
+done
+if ((${#missing[@]})); then
+    sudo apt-get update
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"
+fi
+
+zig_version=0.16.0
+zig_root="$HOME/.local/zig-$zig_version"
+zig_bin="$HOME/.local/bin/zig"
+if [[ ! -x "$zig_root/zig" ]]; then
+    case "$(uname -m)" in
+        x86_64)
+            archive="zig-x86_64-linux-$zig_version.tar.xz"
+            checksum=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
+            ;;
+        aarch64)
+            archive="zig-aarch64-linux-$zig_version.tar.xz"
+            checksum=ea4b09bfb22ec6f6c6eac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17
+            ;;
+        *)
+            echo "unsupported architecture for Zig $zig_version: $(uname -m)" >&2
+            exit 1
+            ;;
+    esac
+    temporary="$(mktemp -d)"
+    trap 'rm -rf "$temporary"' EXIT
+    curl --fail --location --silent --show-error \
+        "https://ziglang.org/download/$zig_version/$archive" \
+        --output "$temporary/$archive"
+    echo "$checksum  $temporary/$archive" | sha256sum --check --status
+    mkdir -p "$HOME/.local"
+    tar -xJf "$temporary/$archive" -C "$temporary"
+    mv "$temporary/${archive%.tar.xz}" "$zig_root"
+fi
+
+mkdir -p "$(dirname "$zig_bin")"
+ln -sfn "$zig_root/zig" "$zig_bin"
+
+printf 'Zig %s, libseat %s, libudev %s, libdrm %s, GBM %s, Pixman %s, and Vulkan %s are ready.\n' \
+    "$("$zig_bin" version)" "$(pkg-config --modversion libseat)" \
+    "$(pkg-config --modversion libudev)" "$(pkg-config --modversion libdrm)" \
+    "$(pkg-config --modversion gbm)" "$(pkg-config --modversion pixman-1)" \
+    "$(pkg-config --modversion vulkan)"

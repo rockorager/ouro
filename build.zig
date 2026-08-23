@@ -25,14 +25,112 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
         .imports = &.{
             .{ .name = "wayring", .module = wayring },
             .{ .name = "core_protocol", .module = core_protocol },
         },
     });
+    ouro.linkSystemLibrary("seat", .{});
+    ouro.linkSystemLibrary("udev", .{});
+    ouro.linkSystemLibrary("drm", .{});
+    ouro.linkSystemLibrary("gbm", .{});
+    ouro.linkSystemLibrary("pixman-1", .{});
+    ouro.linkSystemLibrary("vulkan", .{});
+
+    const executable = b.addExecutable(.{
+        .name = "ouro",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "wayring", .module = wayring },
+                .{ .name = "ouro", .module = ouro },
+                .{ .name = "core_protocol", .module = core_protocol },
+            },
+        }),
+    });
+    b.installArtifact(executable);
+    const run_executable = b.addRunArtifact(executable);
+    if (b.args) |args| run_executable.addArgs(args);
+    const run_step = b.step("run", "Run the physical-display compositor");
+    run_step.dependOn(&run_executable.step);
+    const smoke_step = b.step(
+        "run-drm-smoke",
+        "Opt-in real DRM/libseat smoke (requires usable hardware and seat)",
+    );
+    smoke_step.dependOn(&run_executable.step);
 
     const unit_tests = b.addTest(.{ .root_module = ouro });
     const run_unit_tests = b.addRunArtifact(unit_tests);
+
+    const session_tests = b.addTest(.{
+        .root_module = ouro,
+        .filters = &.{"session:"},
+    });
+    const run_session_tests = b.addRunArtifact(session_tests);
+    const session_test_step = b.step("test-session", "Run libseat session ownership tests");
+    session_test_step.dependOn(&run_session_tests.step);
+
+    const drm_tests = b.addTest(.{
+        .root_module = ouro,
+        .filters = &.{"drm:"},
+    });
+    const run_drm_tests = b.addRunArtifact(drm_tests);
+    const drm_test_step = b.step("test-drm", "Run deterministic DRM discovery and topology tests");
+    drm_test_step.dependOn(&run_drm_tests.step);
+
+    const scanout_tests = b.addTest(.{
+        .root_module = ouro,
+        .filters = &.{"scanout:"},
+    });
+    const run_scanout_tests = b.addRunArtifact(scanout_tests);
+    const scanout_test_step = b.step("test-scanout", "Run deterministic GBM scanout pool tests");
+    scanout_test_step.dependOn(&run_scanout_tests.step);
+
+    const render_tests = b.addTest(.{
+        .root_module = ouro,
+        .filters = &.{"render:"},
+    });
+    const run_render_tests = b.addRunArtifact(render_tests);
+    const render_test_step = b.step("test-render-cpu", "Run deterministic Pixman CPU renderer tests");
+    render_test_step.dependOn(&run_render_tests.step);
+
+    const damage_tests = b.addTest(.{
+        .root_module = ouro,
+        .filters = &.{"damage:"},
+    });
+    const run_damage_tests = b.addRunArtifact(damage_tests);
+    const damage_test_step = b.step("test-damage", "Run scene damage and scanout repair tests");
+    damage_test_step.dependOn(&run_damage_tests.step);
+
+    const vulkan_tests = b.addTest(.{
+        .root_module = ouro,
+        .filters = &.{"render-vulkan:"},
+    });
+    const run_vulkan_tests = b.addRunArtifact(vulkan_tests);
+    const vulkan_test_step = b.step("test-render-vulkan", "Run deterministic Vulkan renderer contract tests");
+    vulkan_test_step.dependOn(&run_vulkan_tests.step);
+
+    const kms_tests = b.addTest(.{
+        .root_module = ouro,
+        .filters = &.{"kms:"},
+    });
+    const run_kms_tests = b.addRunArtifact(kms_tests);
+    const kms_test_step = b.step("test-kms", "Run deterministic atomic KMS output tests");
+    kms_test_step.dependOn(&run_kms_tests.step);
+
+    const drm_sim_tests = b.addTest(.{
+        .root_module = ouro,
+        .filters = &.{"drm-sim:"},
+    });
+    const run_drm_sim_tests = b.addRunArtifact(drm_sim_tests);
+    const drm_sim_test_step = b.step(
+        "test-drm-sim",
+        "Run deterministic real-output scheduler integration tests",
+    );
+    drm_sim_test_step.dependOn(&run_drm_sim_tests.step);
 
     const integration_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -68,8 +166,28 @@ pub fn build(b: *std.Build) void {
     );
     headless_test_step.dependOn(&run_headless_presentation_tests.step);
 
+    const drm_presentation_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/drm-presentation.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "wayring", .module = wayring },
+                .{ .name = "ouro", .module = ouro },
+                .{ .name = "core_protocol", .module = core_protocol },
+            },
+        }),
+    });
+    const run_drm_presentation_tests = b.addRunArtifact(drm_presentation_tests);
+    const drm_presentation_test_step = b.step(
+        "test-drm-presentation",
+        "Run the deterministic physical presentation integration test",
+    );
+    drm_presentation_test_step.dependOn(&run_drm_presentation_tests.step);
+
     const test_step = b.step("test", "Run unit and integration tests");
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_integration_tests.step);
     test_step.dependOn(&run_headless_presentation_tests.step);
+    test_step.dependOn(&run_drm_presentation_tests.step);
 }

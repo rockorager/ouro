@@ -171,6 +171,7 @@ pub fn Scheduler(comptime PresentationToken: type) type {
         timer_handle: ?timer.Handle = null,
         next_sequence: u64 = 1,
         retiring: bool = false,
+        physical_submission: bool = false,
 
         pub fn init(
             allocator: std.mem.Allocator,
@@ -195,6 +196,10 @@ pub fn Scheduler(comptime PresentationToken: type) type {
 
         pub fn currentStage(self: Self) Stage {
             return self.stage;
+        }
+
+        pub fn currentFrameId(self: Self) ?FrameId {
+            return if (self.frame) |active| active.id else null;
         }
 
         /// Coalesces reasons while preserving the timestamp of the earliest
@@ -365,6 +370,65 @@ pub fn Scheduler(comptime PresentationToken: type) type {
             return self.finishFrame(.retired, null);
         }
 
+        /// Transitions a completed render to a real presentation backend.
+        /// Unlike the headless path, no presentation timer is armed: the
+        /// physical page-flip callback supplies the authoritative timestamp.
+        pub fn submitPhysical(
+            self: *Self,
+            frame_id: FrameId,
+            now_ns: Timestamp,
+        ) Error!void {
+            try self.requireFrame(frame_id, .rendering);
+            if (self.frame.?.render_finished_ns == null or !self.samples_captured)
+                return error.InvalidStage;
+            self.frame.?.submitted_ns = now_ns;
+            self.physical_submission = true;
+            self.stage = .submitted;
+        }
+
+        /// Completes a real presentation from its generation-matched page flip.
+        pub fn presentPhysical(
+            self: *Self,
+            frame_id: FrameId,
+            actual_ns: Timestamp,
+        ) Error!Outcome {
+            try self.requireFrame(frame_id, .submitted);
+            if (!self.physical_submission) return error.InvalidStage;
+            self.physical_submission = false;
+            return self.finishFrame(.presented, actual_ns);
+        }
+
+        /// Retires a KMS-accepted frame after a terminal device boundary proves
+        /// that no page flip can arrive for it.
+        pub fn retirePhysical(self: *Self, frame_id: FrameId) Error!Outcome {
+            try self.requireFrame(frame_id, .submitted);
+            if (!self.physical_submission) return error.InvalidStage;
+            self.physical_submission = false;
+            return self.finishFrame(.retired, null);
+        }
+
+        /// Retires exact samples when rendering or physical queueing failed
+        /// before KMS accepted a commit.
+        pub fn failRender(self: *Self, frame_id: FrameId) Error!Outcome {
+            try self.requireFrame(frame_id, .rendering);
+            if (!self.samples_captured) return error.MissingSamples;
+            if (self.frame.?.render_finished_ns == null)
+                self.frame.?.render_finished_ns = self.frame.?.render_started_ns.?;
+            return self.finishFrame(.retired, null);
+        }
+
+        /// Cancels a render turn before it captured any presentation leases.
+        /// This is used when Session disable is processed in the same event
+        /// turn as the render-deadline completion.
+        pub fn cancelUnstartedRender(self: *Self, frame_id: FrameId) Error!Outcome {
+            try self.requireFrame(frame_id, .rendering);
+            if (self.samples_captured) return error.InvalidStage;
+            self.sample_count = 0;
+            self.samples_captured = true;
+            self.frame.?.render_finished_ns = self.frame.?.render_started_ns.?;
+            return self.finishFrame(.retired, null);
+        }
+
         /// Marks the output terminal. A returned timer handle must be canceled
         /// through `timer.Timers.cancel` before submission; if queuing the SQE
         /// fails, call this again next turn to retry. Render work already in
@@ -377,7 +441,9 @@ pub fn Scheduler(comptime PresentationToken: type) type {
             self.retiring = true;
             switch (self.stage) {
                 .idle, .requested => self.finishRemoved(),
-                .armed, .submitted => return .{ .cancel = self.timer_handle.? },
+                .armed => return .{ .cancel = self.timer_handle.? },
+                .submitted => if (!self.physical_submission)
+                    return .{ .cancel = self.timer_handle.? },
                 .rendering => if (self.frame.?.render_finished_ns != null) {
                     return .{ .frame = self.finishFrame(.retired, null) };
                 },
@@ -434,6 +500,7 @@ pub fn Scheduler(comptime PresentationToken: type) type {
             };
             self.frame = null;
             self.timer_handle = null;
+            self.physical_submission = false;
             if (removed) {
                 self.stage = .removed;
                 self.pending = .{};
@@ -448,6 +515,7 @@ pub fn Scheduler(comptime PresentationToken: type) type {
         fn finishRemoved(self: *Self) void {
             self.frame = null;
             self.timer_handle = null;
+            self.physical_submission = false;
             self.pending = .{};
             self.stage = .removed;
         }

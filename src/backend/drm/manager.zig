@@ -1,0 +1,764 @@
+//! Generation-safe DRM discovery and topology ownership. Rescans are explicit:
+//! a future udev monitor may call `rescan` from Ouro's command phase, but this
+//! owner neither submits io_uring work nor retains transient udev/libdrm data.
+
+const std = @import("std");
+const api = @import("platform.zig");
+const seat_platform = @import("../platform.zig");
+const session_api = @import("../session.zig");
+
+pub const Card = api.Card;
+pub const Connector = api.Connector;
+pub const Encoder = api.Encoder;
+pub const Crtc = api.Crtc;
+pub const Plane = api.Plane;
+pub const Mode = api.Mode;
+pub const Format = api.Format;
+pub const Platform = api.Platform;
+
+const seat_capacity = 64;
+const primary_plane_type: u64 = 1;
+
+pub const Config = struct {
+    card_capacity: usize,
+    connector_capacity: usize,
+    mode_capacity: usize,
+    connector_encoder_capacity: usize,
+    encoder_capacity: usize,
+    crtc_capacity: usize,
+    plane_capacity: usize,
+    format_capacity: usize,
+    event_capacity: usize,
+};
+
+pub const Handle = struct { generation: u32 };
+
+pub const Selection = struct {
+    connector_index: u32,
+    mode_index: u32,
+    crtc_index: u32,
+    plane_index: u32,
+};
+
+pub const Snapshot = struct {
+    handle: Handle,
+    card: Card,
+    connectors: []const Connector,
+    modes: []const Mode,
+    connector_encoders: []const u32,
+    encoders: []const Encoder,
+    crtcs: []const Crtc,
+    planes: []const Plane,
+    formats: []const Format,
+    selection: Selection,
+
+    pub fn selectedConnector(self: Snapshot) Connector {
+        return self.connectors[self.selection.connector_index];
+    }
+
+    pub fn selectedMode(self: Snapshot) Mode {
+        return self.modes[self.selection.mode_index];
+    }
+
+    pub fn selectedCrtc(self: Snapshot) Crtc {
+        return self.crtcs[self.selection.crtc_index];
+    }
+
+    pub fn selectedPlane(self: Snapshot) Plane {
+        return self.planes[self.selection.plane_index];
+    }
+};
+
+pub const Event = union(enum) {
+    snapshot: Handle,
+    removed: u32,
+};
+
+const Storage = struct {
+    buffer: api.TopologyBuffer,
+    selection: Selection = undefined,
+
+    fn init(allocator: std.mem.Allocator, config: Config) !Storage {
+        const connectors = try allocator.alloc(Connector, config.connector_capacity);
+        errdefer allocator.free(connectors);
+        const modes = try allocator.alloc(Mode, config.mode_capacity);
+        errdefer allocator.free(modes);
+        const connector_encoders = try allocator.alloc(u32, config.connector_encoder_capacity);
+        errdefer allocator.free(connector_encoders);
+        const encoders = try allocator.alloc(Encoder, config.encoder_capacity);
+        errdefer allocator.free(encoders);
+        const crtcs = try allocator.alloc(Crtc, config.crtc_capacity);
+        errdefer allocator.free(crtcs);
+        const planes = try allocator.alloc(Plane, config.plane_capacity);
+        errdefer allocator.free(planes);
+        const formats = try allocator.alloc(Format, config.format_capacity);
+        return .{ .buffer = .{
+            .connectors = connectors,
+            .modes = modes,
+            .connector_encoders = connector_encoders,
+            .encoders = encoders,
+            .crtcs = crtcs,
+            .planes = planes,
+            .formats = formats,
+        } };
+    }
+
+    fn deinit(self: *Storage, allocator: std.mem.Allocator) void {
+        allocator.free(self.buffer.formats);
+        allocator.free(self.buffer.planes);
+        allocator.free(self.buffer.crtcs);
+        allocator.free(self.buffer.encoders);
+        allocator.free(self.buffer.connector_encoders);
+        allocator.free(self.buffer.modes);
+        allocator.free(self.buffer.connectors);
+        self.* = undefined;
+    }
+};
+
+pub const Manager = struct {
+    allocator: std.mem.Allocator,
+    platform: Platform,
+    session: *session_api.Session,
+    seat: [seat_capacity]u8 = [_]u8{0} ** seat_capacity,
+    seat_len: u8,
+    cards: []Card,
+    stores: [2]Storage,
+    active_store: u1 = 0,
+    device: ?session_api.DeviceHandle = null,
+    card: Card = .{},
+    generation: u32 = 0,
+    present: bool = false,
+    events_buffer: []Event,
+    event_count: usize = 0,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        platform: Platform,
+        session: *session_api.Session,
+        seat: []const u8,
+        config: Config,
+    ) !Manager {
+        if (seat.len == 0 or seat.len > seat_capacity or config.card_capacity == 0 or
+            config.connector_capacity == 0 or config.mode_capacity == 0 or
+            config.connector_encoder_capacity == 0 or config.encoder_capacity == 0 or
+            config.crtc_capacity == 0 or config.plane_capacity == 0 or
+            config.format_capacity == 0 or config.event_capacity == 0)
+            return error.InvalidConfig;
+        const cards = try allocator.alloc(Card, config.card_capacity);
+        errdefer allocator.free(cards);
+        var first = try Storage.init(allocator, config);
+        errdefer first.deinit(allocator);
+        var second = try Storage.init(allocator, config);
+        errdefer second.deinit(allocator);
+        const event_storage = try allocator.alloc(Event, config.event_capacity);
+        var manager: Manager = .{
+            .allocator = allocator,
+            .platform = platform,
+            .session = session,
+            .seat_len = @intCast(seat.len),
+            .cards = cards,
+            .stores = .{ first, second },
+            .events_buffer = event_storage,
+        };
+        @memcpy(manager.seat[0..seat.len], seat);
+        return manager;
+    }
+
+    /// Terminal cleanup. Device ownership is released only through Session;
+    /// its exactly-once close semantics apply even when the close reports an
+    /// error. Storage is always reclaimed and this manager cannot be retried.
+    pub fn deinit(self: *Manager) !void {
+        const close_result = if (self.device) |device| self.session.closeDevice(device) else {};
+        self.device = null;
+        self.present = false;
+        const allocator = self.allocator;
+        allocator.free(self.events_buffer);
+        self.stores[1].deinit(allocator);
+        self.stores[0].deinit(allocator);
+        allocator.free(self.cards);
+        self.* = undefined;
+        return close_result;
+    }
+
+    pub fn events(self: *const Manager) []const Event {
+        return self.events_buffer[0..self.event_count];
+    }
+
+    pub fn clearEvents(self: *Manager) void {
+        self.event_count = 0;
+    }
+
+    /// Borrows the active card FD for child DRM/GBM owners. The FD remains
+    /// owned by Session and is valid only while this generation stays current.
+    pub fn deviceFd(self: *Manager, handle: Handle) !std.posix.fd_t {
+        if (!self.present or handle.generation != self.generation)
+            return error.StaleSnapshot;
+        return self.session.deviceFd(self.device orelse return error.StaleSnapshot);
+    }
+
+    /// Enumerates the active seat, selects boot_vga first and otherwise the
+    /// lexicographically smallest udev syspath. The syspath fallback is stable
+    /// across enumeration ordering and card-node renumbering when udev exposes
+    /// stable PCI/platform ancestry.
+    pub fn rescan(self: *Manager) !?Handle {
+        const card_count = try self.platform.discover(self.cards, self.seat[0..self.seat_len]);
+        if (card_count > self.cards.len) return error.InvalidPlatformResult;
+        const selected_card = chooseCard(self.cards[0..card_count]) orelse {
+            try self.remove();
+            return null;
+        };
+        if (self.event_count == self.events_buffer.len) return error.EventQueueFull;
+
+        const same_device = self.device != null and
+            std.mem.eql(u8, self.card.stablePath(), selected_card.stablePath());
+        const candidate = if (same_device)
+            self.device.?
+        else
+            try self.session.openDevice(selected_card.devicePath());
+        var owns_candidate = !same_device;
+        errdefer if (owns_candidate) self.session.closeDevice(candidate) catch {};
+        const fd = try self.session.deviceFd(candidate);
+        if (!same_device) try self.platform.enableClientCaps(fd);
+
+        const next_store: u1 = self.active_store ^ 1;
+        const storage = &self.stores[next_store];
+        try self.platform.readTopology(fd, &storage.buffer);
+        try validateCounts(&storage.buffer);
+        storage.selection = try chooseOutput(&storage.buffer);
+        if (self.generation == std.math.maxInt(u32)) return error.GenerationExhausted;
+
+        if (!same_device) {
+            if (self.device) |old| {
+                self.device = null;
+                self.present = false;
+                self.session.closeDevice(old) catch |err| {
+                    const retired = self.generation;
+                    self.generation += 1;
+                    self.events_buffer[self.event_count] = .{ .removed = retired };
+                    self.event_count += 1;
+                    return err;
+                };
+            }
+            self.device = candidate;
+            owns_candidate = false;
+            self.card = selected_card.*;
+        }
+        self.active_store = next_store;
+        self.generation += 1;
+        self.present = true;
+        const handle: Handle = .{ .generation = self.generation };
+        self.events_buffer[self.event_count] = .{ .snapshot = handle };
+        self.event_count += 1;
+        return handle;
+    }
+
+    /// Device disappearance is idempotent. The retired generation is emitted
+    /// once, and all handles for it become stale before Session releases the
+    /// card node.
+    pub fn remove(self: *Manager) !void {
+        if (!self.present and self.device == null) return;
+        if (self.event_count == self.events_buffer.len) return error.EventQueueFull;
+        if (self.generation == std.math.maxInt(u32)) return error.GenerationExhausted;
+        const retired = self.generation;
+        const device = self.device;
+        self.device = null;
+        self.present = false;
+        self.generation += 1;
+        self.events_buffer[self.event_count] = .{ .removed = retired };
+        self.event_count += 1;
+        if (device) |handle| try self.session.closeDevice(handle);
+    }
+
+    /// Returned slices borrow the active store and must not be retained across
+    /// the next successful `rescan` or `remove`; the handle is stale then too.
+    pub fn snapshot(self: *const Manager, handle: Handle) !Snapshot {
+        if (!self.present or handle.generation != self.generation)
+            return error.StaleSnapshot;
+        const storage = &self.stores[self.active_store];
+        const buffer = &storage.buffer;
+        return .{
+            .handle = handle,
+            .card = self.card,
+            .connectors = buffer.connectors[0..buffer.connector_count],
+            .modes = buffer.modes[0..buffer.mode_count],
+            .connector_encoders = buffer.connector_encoders[0..buffer.connector_encoder_count],
+            .encoders = buffer.encoders[0..buffer.encoder_count],
+            .crtcs = buffer.crtcs[0..buffer.crtc_count],
+            .planes = buffer.planes[0..buffer.plane_count],
+            .formats = buffer.formats[0..buffer.format_count],
+            .selection = storage.selection,
+        };
+    }
+};
+
+fn chooseCard(cards: []Card) ?*const Card {
+    if (cards.len == 0) return null;
+    var selected: *const Card = &cards[0];
+    for (cards[1..]) |*card| {
+        if ((card.boot_vga and !selected.boot_vga) or
+            (card.boot_vga == selected.boot_vga and
+                std.mem.order(u8, card.stablePath(), selected.stablePath()) == .lt))
+            selected = card;
+    }
+    return selected;
+}
+
+fn validateCounts(buffer: *const api.TopologyBuffer) !void {
+    if (buffer.connector_count > buffer.connectors.len or
+        buffer.mode_count > buffer.modes.len or
+        buffer.connector_encoder_count > buffer.connector_encoders.len or
+        buffer.encoder_count > buffer.encoders.len or
+        buffer.crtc_count > buffer.crtcs.len or buffer.plane_count > buffer.planes.len or
+        buffer.format_count > buffer.formats.len)
+        return error.InvalidPlatformResult;
+    for (buffer.connectors[0..buffer.connector_count]) |connector| {
+        if (@as(usize, connector.mode_start) + connector.mode_count > buffer.mode_count or
+            @as(usize, connector.encoder_start) + connector.encoder_count >
+                buffer.connector_encoder_count or connector.properties.crtc_id == 0)
+            return error.MalformedTopology;
+    }
+    for (buffer.crtcs[0..buffer.crtc_count]) |crtc| {
+        if (crtc.index >= 32 or crtc.properties.active == 0 or crtc.properties.mode_id == 0)
+            return error.MalformedTopology;
+    }
+    for (buffer.planes[0..buffer.plane_count]) |plane| {
+        if (@as(usize, plane.format_start) + plane.format_count > buffer.format_count or
+            plane.properties.plane_type == 0 or plane.properties.fb_id == 0 or
+            plane.properties.crtc_id == 0 or plane.properties.src_x == 0 or
+            plane.properties.src_y == 0 or plane.properties.src_w == 0 or
+            plane.properties.src_h == 0 or plane.properties.crtc_x == 0 or
+            plane.properties.crtc_y == 0 or plane.properties.crtc_w == 0 or
+            plane.properties.crtc_h == 0)
+            return error.MalformedTopology;
+    }
+}
+
+fn chooseOutput(buffer: *const api.TopologyBuffer) !Selection {
+    var selected: ?Selection = null;
+    var saw_connector = false;
+    var saw_crtc = false;
+    for (buffer.connectors[0..buffer.connector_count], 0..) |connector, index| {
+        if (!connector.connected or !connector.desktop or connector.mode_count == 0) continue;
+        saw_connector = true;
+        var mode_index: usize = connector.mode_start;
+        const mode_end = @as(usize, connector.mode_start) + connector.mode_count;
+        var mode_candidate = mode_index + 1;
+        while (mode_candidate < mode_end) : (mode_candidate += 1) {
+            if (betterMode(buffer.modes[mode_candidate], buffer.modes[mode_index]))
+                mode_index = mode_candidate;
+        }
+
+        var crtc_index: ?usize = null;
+        var plane_index: ?usize = null;
+        for (buffer.crtcs[0..buffer.crtc_count], 0..) |crtc, candidate_index| {
+            if (!connectorSupportsCrtc(buffer, connector, crtc.index)) continue;
+            saw_crtc = true;
+            var candidate_plane: ?usize = null;
+            for (buffer.planes[0..buffer.plane_count], 0..) |plane, candidate_plane_index| {
+                if (plane.plane_type_value != primary_plane_type or plane.format_count == 0 or
+                    plane.possible_crtcs & (@as(u32, 1) << @intCast(crtc.index)) == 0)
+                    continue;
+                if (candidate_plane == null or
+                    plane.id < buffer.planes[candidate_plane.?].id)
+                    candidate_plane = candidate_plane_index;
+            }
+            if (candidate_plane == null) continue;
+            if (crtc_index == null or crtc.id < buffer.crtcs[crtc_index.?].id) {
+                crtc_index = candidate_index;
+                plane_index = candidate_plane;
+            }
+        }
+        const cri = crtc_index orelse continue;
+        const candidate: Selection = .{
+            .connector_index = @intCast(index),
+            .mode_index = @intCast(mode_index),
+            .crtc_index = @intCast(cri),
+            .plane_index = @intCast(plane_index.?),
+        };
+        if (selected == null or connector.id <
+            buffer.connectors[selected.?.connector_index].id)
+            selected = candidate;
+    }
+    if (selected) |selection| return selection;
+    if (!saw_connector) return error.NoConnectedOutput;
+    if (!saw_crtc) return error.NoCompatibleCrtc;
+    return error.NoPrimaryPlane;
+}
+
+fn findEncoder(buffer: *const api.TopologyBuffer, id: u32) ?Encoder {
+    for (buffer.encoders[0..buffer.encoder_count]) |encoder|
+        if (encoder.id == id) return encoder;
+    return null;
+}
+
+fn connectorSupportsCrtc(buffer: *const api.TopologyBuffer, connector: Connector, crtc_index: u32) bool {
+    const encoder_end = @as(usize, connector.encoder_start) + connector.encoder_count;
+    for (buffer.connector_encoders[connector.encoder_start..encoder_end]) |encoder_id| {
+        const encoder = findEncoder(buffer, encoder_id) orelse continue;
+        if (encoder.possible_crtcs & (@as(u32, 1) << @intCast(crtc_index)) != 0)
+            return true;
+    }
+    return false;
+}
+
+fn betterMode(candidate: Mode, current: Mode) bool {
+    if (candidate.preferred() != current.preferred()) return candidate.preferred();
+    const candidate_area = @as(u64, candidate.hdisplay) * candidate.vdisplay;
+    const current_area = @as(u64, current.hdisplay) * current.vdisplay;
+    if (candidate_area != current_area) return candidate_area > current_area;
+    if (candidate.vrefresh != current.vrefresh) return candidate.vrefresh > current.vrefresh;
+    if (candidate.clock != current.clock) return candidate.clock > current.clock;
+    return std.mem.order(u8, candidate.name[0..candidate.name_len], current.name[0..current.name_len]) == .lt;
+}
+
+test "drm: boot VGA and stable fallback selection ignore enumeration order" {
+    var cards = [_]Card{ testCard("/dev/dri/card2", "/sys/z", false), testCard("/dev/dri/card1", "/sys/b", true), testCard("/dev/dri/card0", "/sys/a", true) };
+    try std.testing.expectEqualStrings("/dev/dri/card0", chooseCard(&cards).?.devicePath());
+    cards[0].boot_vga = false;
+    cards[1].boot_vga = false;
+    cards[2].boot_vga = false;
+    try std.testing.expectEqualStrings("/dev/dri/card0", chooseCard(&cards).?.devicePath());
+}
+
+test "drm: deterministic output assignment prefers mode then lowest compatible IDs" {
+    var fixture: TestTopology = undefined;
+    fixture.init();
+    fixture.modes[0].mode_type = 0;
+    fixture.modes[1] = fixture.modes[0];
+    fixture.modes[1].hdisplay = 1920;
+    fixture.modes[1].vdisplay = 1080;
+    fixture.modes[1].mode_type = 1 << 3;
+    fixture.buffer.mode_count = 2;
+    fixture.connectors[0].mode_count = 2;
+    fixture.crtcs[0].id = 50;
+    fixture.crtcs[1] = fixture.crtcs[0];
+    fixture.crtcs[1].id = 40;
+    fixture.crtcs[1].index = 1;
+    fixture.buffer.crtc_count = 2;
+    fixture.encoders[0].possible_crtcs = 3;
+    fixture.planes[0].id = 70;
+    fixture.planes[0].possible_crtcs = 3;
+    fixture.planes[1] = fixture.planes[0];
+    fixture.planes[1].id = 60;
+    fixture.buffer.plane_count = 2;
+    const selection = try chooseOutput(&fixture.buffer);
+    try std.testing.expectEqual(@as(u32, 1), selection.mode_index);
+    try std.testing.expectEqual(@as(u32, 1), selection.crtc_index);
+    try std.testing.expectEqual(@as(u32, 1), selection.plane_index);
+}
+
+test "drm: output selection skips lower IDs without a complete scanout tuple" {
+    var fixture: TestTopology = undefined;
+    fixture.init();
+    fixture.connectors[1] = fixture.connectors[0];
+    fixture.connectors[1].id = 21;
+    fixture.connectors[1].mode_start = 1;
+    fixture.connectors[1].encoder_start = 1;
+    fixture.connectors[1].encoder_id = 31;
+    fixture.modes[1] = fixture.modes[0];
+    fixture.connector_encoders[1] = 31;
+    fixture.encoders[1] = .{ .id = 31, .crtc_id = 41, .possible_crtcs = 2 };
+    fixture.crtcs[1] = fixture.crtcs[0];
+    fixture.crtcs[1].id = 41;
+    fixture.crtcs[1].index = 1;
+    fixture.planes[0].possible_crtcs = 2;
+    fixture.buffer.connector_count = 2;
+    fixture.buffer.mode_count = 2;
+    fixture.buffer.connector_encoder_count = 2;
+    fixture.buffer.encoder_count = 2;
+    fixture.buffer.crtc_count = 2;
+    const selection = try chooseOutput(&fixture.buffer);
+    try std.testing.expectEqual(@as(u32, 1), selection.connector_index);
+    try std.testing.expectEqual(@as(u32, 1), selection.crtc_index);
+}
+
+test "drm: malformed relationships properties capacities and missing owners reject" {
+    var fixture: TestTopology = undefined;
+    fixture.init();
+    fixture.connectors[0].mode_count = 3;
+    try std.testing.expectError(error.MalformedTopology, validateCounts(&fixture.buffer));
+    fixture.init();
+    fixture.planes[0].properties.fb_id = 0;
+    try std.testing.expectError(error.MalformedTopology, validateCounts(&fixture.buffer));
+    fixture.init();
+    fixture.encoders[0].possible_crtcs = 0;
+    try std.testing.expectError(error.NoCompatibleCrtc, chooseOutput(&fixture.buffer));
+    fixture.init();
+    fixture.planes[0].plane_type_value = 2;
+    try std.testing.expectError(error.NoPrimaryPlane, chooseOutput(&fixture.buffer));
+}
+
+test "drm: rescan publishes copied snapshots and rejects stale generations" {
+    var seat = FakeSeat{};
+    const session = try seat.createSession();
+    defer destroyTestSession(session);
+    var platform = FakeDrm{};
+    var manager = try Manager.init(std.testing.allocator, platform.platform(), session, "seat0", testConfig());
+    defer manager.deinit() catch unreachable;
+
+    const first = (try manager.rescan()).?;
+    try std.testing.expect(platform.caps_enabled);
+    try std.testing.expect(platform.topology_after_caps);
+    const first_snapshot = try manager.snapshot(first);
+    try std.testing.expectEqual(@as(std.posix.fd_t, 101), try manager.deviceFd(first));
+    try std.testing.expectEqual(@as(u32, 20), first_snapshot.selectedConnector().id);
+    try std.testing.expectEqual(@as(u32, 40), first_snapshot.selectedCrtc().id);
+    try std.testing.expectEqual(@as(u32, 50), first_snapshot.selectedPlane().id);
+    const second = (try manager.rescan()).?;
+    try std.testing.expectError(error.StaleSnapshot, manager.snapshot(first));
+    try std.testing.expectError(error.StaleSnapshot, manager.deviceFd(first));
+    try std.testing.expectEqual(@as(u32, first.generation + 1), second.generation);
+    try std.testing.expectEqual(@as(usize, 1), seat.device_open_count);
+}
+
+test "drm: disappearance removal is idempotent and retires Session device once" {
+    var seat = FakeSeat{};
+    const session = try seat.createSession();
+    defer destroyTestSession(session);
+    var platform = FakeDrm{};
+    var manager = try Manager.init(std.testing.allocator, platform.platform(), session, "seat0", testConfig());
+    defer manager.deinit() catch unreachable;
+    const handle = (try manager.rescan()).?;
+    manager.clearEvents();
+    platform.card_count = 0;
+    try std.testing.expect((try manager.rescan()) == null);
+    try std.testing.expectError(error.StaleSnapshot, manager.snapshot(handle));
+    try std.testing.expectEqual(@as(usize, 1), seat.device_close_count);
+    try std.testing.expectEqual(@as(usize, 1), manager.events().len);
+    try std.testing.expect((try manager.rescan()) == null);
+    try manager.remove();
+    try std.testing.expectEqual(@as(usize, 1), seat.device_close_count);
+    try std.testing.expectEqual(@as(usize, 1), manager.events().len);
+}
+
+test "drm: failed replacement closes candidate and preserves current generation" {
+    var seat = FakeSeat{};
+    const session = try seat.createSession();
+    defer destroyTestSession(session);
+    var platform = FakeDrm{};
+    var manager = try Manager.init(std.testing.allocator, platform.platform(), session, "seat0", testConfig());
+    defer manager.deinit() catch unreachable;
+    const current = (try manager.rescan()).?;
+    platform.card = testCard("/dev/dri/card1", "/sys/new", true);
+    platform.fail_topology = true;
+    try std.testing.expectError(error.FakeTopology, manager.rescan());
+    try std.testing.expectEqual(@as(u32, 20), (try manager.snapshot(current)).selectedConnector().id);
+    try std.testing.expectEqual(@as(usize, 2), seat.device_open_count);
+    try std.testing.expectEqual(@as(usize, 1), seat.device_close_count);
+}
+
+test "drm: hotplug replacement retires old device and snapshot atomically" {
+    var seat = FakeSeat{};
+    const session = try seat.createSession();
+    defer destroyTestSession(session);
+    var platform = FakeDrm{};
+    var manager = try Manager.init(std.testing.allocator, platform.platform(), session, "seat0", testConfig());
+    defer manager.deinit() catch unreachable;
+    const old = (try manager.rescan()).?;
+    platform.card = testCard("/dev/dri/card1", "/sys/new", true);
+    const current = (try manager.rescan()).?;
+    try std.testing.expectError(error.StaleSnapshot, manager.snapshot(old));
+    try std.testing.expectEqualStrings("/dev/dri/card1", (try manager.snapshot(current)).card.devicePath());
+    try std.testing.expectEqual(@as(usize, 2), seat.device_open_count);
+    try std.testing.expectEqual(@as(usize, 1), seat.device_close_count);
+    try std.testing.expectEqual(@as(usize, 1), seat.fd_close_count);
+}
+
+test "drm: replacement close failure publishes terminal removal" {
+    var seat = FakeSeat{};
+    const session = try seat.createSession();
+    defer destroyTestSession(session);
+    var platform = FakeDrm{};
+    var manager = try Manager.init(std.testing.allocator, platform.platform(), session, "seat0", testConfig());
+    defer manager.deinit() catch unreachable;
+    const old = (try manager.rescan()).?;
+    manager.clearEvents();
+    seat.fail_close_device = true;
+    platform.card = testCard("/dev/dri/card1", "/sys/new", true);
+    try std.testing.expectError(error.FakeCloseDevice, manager.rescan());
+    try std.testing.expectError(error.StaleSnapshot, manager.snapshot(old));
+    try std.testing.expectEqualSlices(Event, &.{.{ .removed = old.generation }}, manager.events());
+    try std.testing.expectEqual(@as(usize, 2), seat.device_close_count);
+    try std.testing.expectEqual(@as(usize, 2), seat.fd_close_count);
+}
+
+test "drm: teardown releases Session ownership once even when close fails" {
+    var seat = FakeSeat{ .fail_close_device = true };
+    const session = try seat.createSession();
+    var platform = FakeDrm{};
+    var manager = try Manager.init(std.testing.allocator, platform.platform(), session, "seat0", testConfig());
+    _ = try manager.rescan();
+    try std.testing.expectError(error.FakeCloseDevice, manager.deinit());
+    try std.testing.expectEqual(@as(usize, 1), seat.device_close_count);
+    try std.testing.expectEqual(@as(usize, 1), seat.fd_close_count);
+    destroyTestSession(session);
+}
+
+test "drm: fixed card and event capacities fail before ownership mutation" {
+    var seat = FakeSeat{};
+    const session = try seat.createSession();
+    defer destroyTestSession(session);
+    var platform = FakeDrm{ .report_too_many_cards = true };
+    var config = testConfig();
+    config.event_capacity = 1;
+    var manager = try Manager.init(std.testing.allocator, platform.platform(), session, "seat0", config);
+    defer manager.deinit() catch unreachable;
+    try std.testing.expectError(error.InvalidPlatformResult, manager.rescan());
+    try std.testing.expectEqual(@as(usize, 0), seat.device_open_count);
+    platform.report_too_many_cards = false;
+    _ = try manager.rescan();
+    try std.testing.expectError(error.EventQueueFull, manager.rescan());
+    try std.testing.expectEqual(@as(usize, 1), seat.device_open_count);
+}
+
+const TestTopology = struct {
+    connectors: [2]Connector = undefined,
+    modes: [4]Mode = undefined,
+    connector_encoders: [2]u32 = undefined,
+    encoders: [2]Encoder = undefined,
+    crtcs: [2]Crtc = undefined,
+    planes: [2]Plane = undefined,
+    formats: [4]Format = undefined,
+    buffer: api.TopologyBuffer = undefined,
+
+    fn init(value: *TestTopology) void {
+        value.connectors[0] = .{ .id = 20, .connector_type = 1, .connector_type_id = 1, .connected = true, .desktop = true, .width_mm = 500, .height_mm = 300, .encoder_id = 30, .mode_start = 0, .mode_count = 1, .encoder_start = 0, .encoder_count = 1, .properties = .{ .crtc_id = 1 } };
+        value.modes[0] = testMode(1280, 720, 60);
+        value.connector_encoders[0] = 30;
+        value.encoders[0] = .{ .id = 30, .crtc_id = 40, .possible_crtcs = 1 };
+        value.crtcs[0] = .{ .id = 40, .index = 0, .properties = .{ .active = 2, .mode_id = 3 } };
+        value.planes[0] = .{ .id = 50, .possible_crtcs = 1, .plane_type_value = primary_plane_type, .format_start = 0, .format_count = 1, .properties = testPlaneProperties() };
+        value.formats[0] = .{ .fourcc = 1, .modifier = api.modifier_invalid };
+        value.buffer = .{ .connectors = &value.connectors, .modes = &value.modes, .connector_encoders = &value.connector_encoders, .encoders = &value.encoders, .crtcs = &value.crtcs, .planes = &value.planes, .formats = &value.formats, .connector_count = 1, .mode_count = 1, .connector_encoder_count = 1, .encoder_count = 1, .crtc_count = 1, .plane_count = 1, .format_count = 1 };
+    }
+};
+
+fn testCard(path: []const u8, syspath: []const u8, boot_vga: bool) Card {
+    var card: Card = .{ .boot_vga = boot_vga };
+    @memcpy(card.path[0..path.len], path);
+    card.path_len = @intCast(path.len);
+    @memcpy(card.syspath[0..syspath.len], syspath);
+    card.syspath_len = @intCast(syspath.len);
+    return card;
+}
+
+fn testMode(width: u16, height: u16, refresh: u32) Mode {
+    return .{ .clock = 1, .hdisplay = width, .hsync_start = width, .hsync_end = width, .htotal = width, .hskew = 0, .vdisplay = height, .vsync_start = height, .vsync_end = height, .vtotal = height, .vscan = 0, .vrefresh = refresh, .flags = 0, .mode_type = 0 };
+}
+
+fn testPlaneProperties() api.PlaneProperties {
+    return .{ .plane_type = 10, .fb_id = 11, .crtc_id = 12, .src_x = 13, .src_y = 14, .src_w = 15, .src_h = 16, .crtc_x = 17, .crtc_y = 18, .crtc_w = 19, .crtc_h = 20 };
+}
+
+fn testConfig() Config {
+    return .{ .card_capacity = 2, .connector_capacity = 2, .mode_capacity = 4, .connector_encoder_capacity = 2, .encoder_capacity = 2, .crtc_capacity = 2, .plane_capacity = 2, .format_capacity = 4, .event_capacity = 4 };
+}
+
+const FakeDrm = struct {
+    card: Card = testCard("/dev/dri/card0", "/sys/card0", true),
+    card_count: usize = 1,
+    report_too_many_cards: bool = false,
+    caps_enabled: bool = false,
+    topology_after_caps: bool = false,
+    fail_topology: bool = false,
+
+    const vtable: Platform.VTable = .{ .discover = discover, .enable_client_caps = enableClientCaps, .read_topology = readTopology };
+
+    fn platform(self: *FakeDrm) Platform {
+        return .{ .context = self, .vtable = &vtable };
+    }
+
+    fn discover(context: *anyopaque, cards: []Card, seat: []const u8) !usize {
+        const self: *FakeDrm = @ptrCast(@alignCast(context));
+        if (!std.mem.eql(u8, seat, "seat0")) return error.WrongSeat;
+        if (self.report_too_many_cards) return cards.len + 1;
+        if (self.card_count != 0) cards[0] = self.card;
+        return self.card_count;
+    }
+
+    fn enableClientCaps(context: *anyopaque, _: std.posix.fd_t) !void {
+        const self: *FakeDrm = @ptrCast(@alignCast(context));
+        self.caps_enabled = true;
+    }
+
+    fn readTopology(context: *anyopaque, _: std.posix.fd_t, buffer: *api.TopologyBuffer) !void {
+        const self: *FakeDrm = @ptrCast(@alignCast(context));
+        self.topology_after_caps = self.caps_enabled;
+        if (self.fail_topology) return error.FakeTopology;
+        buffer.reset();
+        buffer.connectors[0] = .{ .id = 20, .connector_type = 1, .connector_type_id = 1, .connected = true, .desktop = true, .width_mm = 500, .height_mm = 300, .encoder_id = 30, .mode_start = 0, .mode_count = 1, .encoder_start = 0, .encoder_count = 1, .properties = .{ .crtc_id = 1 } };
+        buffer.modes[0] = testMode(1280, 720, 60);
+        buffer.connector_encoders[0] = 30;
+        buffer.encoders[0] = .{ .id = 30, .crtc_id = 40, .possible_crtcs = 1 };
+        buffer.crtcs[0] = .{ .id = 40, .index = 0, .properties = .{ .active = 2, .mode_id = 3 } };
+        buffer.planes[0] = .{ .id = 50, .possible_crtcs = 1, .plane_type_value = primary_plane_type, .format_start = 0, .format_count = 1, .properties = testPlaneProperties() };
+        buffer.formats[0] = .{ .fourcc = 875713112, .modifier = api.modifier_invalid };
+        buffer.connector_count = 1;
+        buffer.mode_count = 1;
+        buffer.connector_encoder_count = 1;
+        buffer.encoder_count = 1;
+        buffer.crtc_count = 1;
+        buffer.plane_count = 1;
+        buffer.format_count = 1;
+    }
+};
+
+const FakeSeat = struct {
+    callback: ?*seat_platform.CallbackContext = null,
+    device_open_count: usize = 0,
+    device_close_count: usize = 0,
+    fd_close_count: usize = 0,
+    next_id: i32 = 1,
+    fail_close_device: bool = false,
+
+    const vtable: seat_platform.Platform.VTable = .{ .open_seat = openSeat, .close_seat = closeSeat, .get_fd = getFd, .dispatch = dispatch, .disable_seat = disableSeat, .open_device = openDevice, .close_device = closeDevice, .close_fd = closeFd };
+
+    fn createSession(self: *FakeSeat) !*session_api.Session {
+        const session = try session_api.Session.create(std.testing.allocator, .{ .context = self, .vtable = &vtable }, 4);
+        try session.processPending();
+        return session;
+    }
+
+    fn openSeat(context: *anyopaque, callback: *seat_platform.CallbackContext) !*anyopaque {
+        const self: *FakeSeat = @ptrCast(@alignCast(context));
+        self.callback = callback;
+        callback.listener.enable(callback.userdata);
+        return self;
+    }
+
+    fn closeSeat(context: *anyopaque, _: *anyopaque) !void {
+        const self: *FakeSeat = @ptrCast(@alignCast(context));
+        self.callback = null;
+    }
+
+    fn getFd(_: *anyopaque, _: *anyopaque) !std.posix.fd_t {
+        return 7;
+    }
+
+    fn dispatch(_: *anyopaque, _: *anyopaque) !void {}
+    fn disableSeat(_: *anyopaque, _: *anyopaque) !void {}
+
+    fn openDevice(context: *anyopaque, _: *anyopaque, _: [:0]const u8) !seat_platform.OpenedDevice {
+        const self: *FakeSeat = @ptrCast(@alignCast(context));
+        self.device_open_count += 1;
+        defer self.next_id += 1;
+        return .{ .id = self.next_id, .fd = 100 + self.next_id };
+    }
+
+    fn closeDevice(context: *anyopaque, _: *anyopaque, _: i32) !void {
+        const self: *FakeSeat = @ptrCast(@alignCast(context));
+        self.device_close_count += 1;
+        if (self.fail_close_device) return error.FakeCloseDevice;
+    }
+
+    fn closeFd(context: *anyopaque, _: std.posix.fd_t) !void {
+        const self: *FakeSeat = @ptrCast(@alignCast(context));
+        self.fd_close_count += 1;
+    }
+};
+
+fn destroyTestSession(session: *session_api.Session) void {
+    session.clearEvents();
+    session.state = .draining;
+    session.destroy() catch unreachable;
+}

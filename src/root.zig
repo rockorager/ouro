@@ -13,7 +13,23 @@ pub const completion = @import("runtime/completion.zig");
 pub const compositor = @import("runtime/compositor.zig");
 pub const timer = @import("runtime/timer.zig");
 pub const loop = @import("runtime/loop.zig");
+pub const physical = @import("runtime/physical.zig");
+pub const backend_platform = @import("backend/platform.zig");
+pub const session = @import("backend/session.zig");
+pub const gbm = @import("backend/gbm.zig");
+pub const drm_platform = @import("backend/drm/platform.zig");
+pub const drm = @import("backend/drm/manager.zig");
+pub const drm_framebuffer = @import("backend/drm/framebuffer.zig");
+pub const drm_atomic = @import("backend/drm/atomic.zig");
+pub const drm_output = @import("backend/drm/output.zig");
+pub const render = @import("render/types.zig");
+pub const cpu_renderer = @import("render/cpu.zig");
+pub const vulkan_renderer = @import("render/vulkan.zig");
+pub const vulkan_platform = @import("render/vulkan_platform.zig");
+pub const render_list = @import("scene/render_list.zig");
+pub const scene_damage = @import("scene/damage.zig");
 pub const headless_output = @import("output/headless.zig");
+pub const real_output = @import("output/drm.zig");
 pub const core_surface = @import("protocol/core_surface.zig");
 
 test {
@@ -30,6 +46,22 @@ test {
     _ = compositor;
     _ = timer;
     _ = loop;
+    _ = physical;
+    _ = backend_platform;
+    _ = session;
+    _ = gbm;
+    _ = drm_platform;
+    _ = drm;
+    _ = drm_framebuffer;
+    _ = drm_atomic;
+    _ = drm_output;
+    _ = render;
+    _ = cpu_renderer;
+    _ = vulkan_renderer;
+    _ = vulkan_platform;
+    _ = render_list;
+    _ = scene_damage;
     _ = headless_output;
+    _ = real_output;
     _ = core_surface;
 }
