@@ -14,6 +14,7 @@ pub const compositor = @import("runtime/compositor.zig");
 pub const timer = @import("runtime/timer.zig");
 pub const loop = @import("runtime/loop.zig");
 pub const physical = @import("runtime/physical.zig");
+pub const shutdown_signal = @import("runtime/shutdown_signal.zig");
 pub const backend_platform = @import("backend/platform.zig");
 pub const session = @import("backend/session.zig");
 pub const input_platform = @import("backend/input/platform.zig");
@@ -57,6 +58,7 @@ test {
     _ = timer;
     _ = loop;
     _ = physical;
+    _ = shutdown_signal;
     _ = backend_platform;
     _ = session;
     _ = input_platform;

@@ -31,6 +31,8 @@ pub fn main(init: std.process.Init) !void {
         return error.DrmHardwareUnavailable;
     }
     _ = linux.close(@intCast(dri_result));
+    var shutdown_signals = ouro.shutdown_signal.Watcher.install();
+    defer shutdown_signals.deinit();
 
     wayring.unix_socket.unlink(options.socket) catch {};
     defer wayring.unix_socket.unlink(options.socket) catch {};
@@ -124,7 +126,14 @@ pub fn main(init: std.process.Init) !void {
             @tagName(options.renderer),
         });
     var wayring_drained = false;
+    var signal_stop_started = false;
     while (!wayring_drained or !coordinator.backendDrainComplete()) {
+        if (!signal_stop_started and shutdown_signals.requested()) {
+            signal_stop_started = true;
+            coordinator.requestStop() catch |err| {
+                if (run_error == null) run_error = err;
+            };
+        }
         const progress = loop.turn(coordinator) catch |err| {
             if (run_error == null) run_error = err;
             coordinator.requestStop() catch |stop_err| {
