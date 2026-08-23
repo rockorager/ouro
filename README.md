@@ -24,6 +24,13 @@ responsibilities:
 - [Release callbacks](src/release.zig): requests are attached to the content
   update carrying their buffer and remain owned by it until Ouro no longer uses
   that buffer storage.
+- [Buffer import leases](src/buffer_import.zig): generation-safe bounded
+  registry slots retain importer-specific backing from attachment through
+  content-update application and presentation without putting SHM state in
+  semantic surfaces.
+- [Presentation lifetime](src/presentation.zig): imported handles, source
+  leases, and per-commit release callbacks remain together until successful
+  presentation completion or explicit output teardown.
 - [Viewport state](src/viewport.zig): pending crop and destination scale are
   validated against transformed, scaled content and published with the surface
   commit.

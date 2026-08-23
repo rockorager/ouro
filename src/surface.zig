@@ -3,6 +3,7 @@
 const std = @import("std");
 const objects = @import("wayring").objects;
 const viewport = @import("viewport.zig");
+const buffer_import = @import("buffer_import.zig");
 
 pub const RegionPool = @import("region.zig").Pool;
 pub const Region = @import("region.zig").Region;
@@ -17,6 +18,8 @@ pub const ReleaseQueue = @import("release.zig").Queue;
 pub const ReleaseBatch = @import("release.zig").Batch;
 pub const ContentUpdateScheduler = @import("content_update.zig").Scheduler;
 pub const ContentUpdateKind = @import("content_update.zig").Kind;
+pub const AttachmentLeaseState = buffer_import.AttachmentState;
+pub const BufferLease = buffer_import.Lease;
 pub const Viewport = viewport.Viewport;
 pub const ViewportState = viewport.State;
 pub const SurfaceSize = viewport.Size;
@@ -278,13 +281,16 @@ pub fn CommitState(comptime Key: type) type {
             regions: SurfaceRegions.Changes,
             frame_callbacks: ?FrameBatch,
             release_callbacks: ?ReleaseBatch,
+            attachment_lease: ?BufferLease,
 
-            /// Releases callback ownership when an unapplied CU is discarded.
+            /// Releases callback and import ownership when an unapplied CU is discarded.
             pub fn deinit(content: *Content) void {
                 if (content.frame_callbacks) |*batch| batch.deinit();
                 if (content.release_callbacks) |*batch| batch.deinit();
+                if (content.attachment_lease) |*lease| lease.deinit();
                 content.frame_callbacks = null;
                 content.release_callbacks = null;
+                content.attachment_lease = null;
             }
 
             /// Frame callbacks become ready only when this CU applies.
@@ -318,7 +324,66 @@ pub fn CommitState(comptime Key: type) type {
             child_dependencies: []const Scheduler.Token,
             constraints: u32,
         ) !Scheduler.Token {
+            return commitInner(
+                scheduler,
+                queue,
+                surface,
+                regions,
+                frames,
+                releases,
+                null,
+                kind,
+                child_dependencies,
+                constraints,
+            );
+        }
+
+        /// Commits an attachment lease into the same content update as its
+        /// semantic surface attachment. Every fallible preflight completes
+        /// before pending ownership is transferred.
+        pub fn commitWithAttachment(
+            scheduler: *Scheduler,
+            queue: *Scheduler.Queue,
+            surface: *Surface,
+            regions: *SurfaceRegions,
+            frames: *FrameQueue,
+            releases: *ReleaseQueue,
+            attachment: *AttachmentLeaseState,
+            kind: ContentUpdateKind,
+            child_dependencies: []const Scheduler.Token,
+            constraints: u32,
+        ) !Scheduler.Token {
+            return commitInner(
+                scheduler,
+                queue,
+                surface,
+                regions,
+                frames,
+                releases,
+                attachment,
+                kind,
+                child_dependencies,
+                constraints,
+            );
+        }
+
+        fn commitInner(
+            scheduler: *Scheduler,
+            queue: *Scheduler.Queue,
+            surface: *Surface,
+            regions: *SurfaceRegions,
+            frames: *FrameQueue,
+            releases: *ReleaseQueue,
+            attachment: ?*AttachmentLeaseState,
+            kind: ContentUpdateKind,
+            child_dependencies: []const Scheduler.Token,
+            constraints: u32,
+        ) !Scheduler.Token {
             try surface.validateCommit();
+            if (attachment) |state| try state.validateCommit(
+                surface.attach_changed,
+                surface.hasPendingBufferAttachment(),
+            );
             var scheduler_plan = try scheduler.prepareCommit(
                 queue,
                 kind,
@@ -334,6 +399,7 @@ pub fn CommitState(comptime Key: type) type {
                 .regions = region_plan.publish(),
                 .frame_callbacks = frames.detachPending(),
                 .release_callbacks = releases.publishCommit(),
+                .attachment_lease = if (attachment) |state| state.publishCommit() else null,
             };
             return scheduler.publishCommit(&scheduler_plan, content);
         }
@@ -514,19 +580,29 @@ test "transactional surface commit rolls back every preflight failure" {
     try std.testing.expectEqual(@as(usize, 1), releases.count);
     try std.testing.expectEqual(@as(usize, 0), queue.count);
 
+    const TestImports = buffer_import.Registry(u8);
+    const Dispose = struct {
+        fn backing(_: ?*anyopaque, _: u8) void {}
+    };
+    var imports = try TestImports.init(std.testing.allocator, 1, null, Dispose.backing);
+    defer imports.deinit(std.testing.allocator);
+    var attachment_lease: AttachmentLeaseState = .{};
+    defer attachment_lease.deinit();
     try surface.attach(7, .{
         .handle = .{ .id = 3, .generation = 1 },
         .width = 3,
         .height = 2,
     }, 0, 0);
+    attachment_lease.attach(try imports.acquire(1));
     try surface.setScale(2);
-    try std.testing.expectError(error.InvalidSize, State.commit(
+    try std.testing.expectError(error.InvalidSize, State.commitWithAttachment(
         &scheduler,
         &queue,
         &surface,
         &regions,
         &frames,
         &releases,
+        &attachment_lease,
         .desync,
         &.{},
         0,
@@ -538,10 +614,24 @@ test "transactional surface commit rolls back every preflight failure" {
     try std.testing.expectEqual(@as(usize, 1), frames.pending_count);
     try std.testing.expectEqual(@as(usize, 1), releases.count);
     try std.testing.expectEqual(@as(usize, 0), queue.count);
+    try std.testing.expect(attachment_lease.pending != null);
+    try std.testing.expectEqual(@as(usize, 0), imports.available());
 }
 
 test "discarding an unapplied transactional CU releases callback batches" {
     const State = CommitState(objects.Handle);
+    const TestImports = buffer_import.Registry(u8);
+    var disposed = false;
+    const Dispose = struct {
+        fn backing(context: ?*anyopaque, _: u8) void {
+            const value: *bool = @ptrCast(@alignCast(context.?));
+            value.* = true;
+        }
+    };
+    var imports = try TestImports.init(std.testing.allocator, 1, &disposed, Dispose.backing);
+    defer imports.deinit(std.testing.allocator);
+    var attachment_lease: AttachmentLeaseState = .{};
+    defer attachment_lease.deinit();
     var region_pool = try RegionPool.init(std.testing.allocator, 1);
     defer region_pool.deinit(std.testing.allocator);
     var regions = SurfaceRegions.init(&region_pool);
@@ -565,15 +655,17 @@ test "discarding an unapplied transactional CU releases callback batches" {
         .height = 2,
     };
     try surface.attach(7, buffer, 0, 0);
+    attachment_lease.attach(try imports.acquire(1));
     try frames.addPending(.{ .id = 4, .generation = 1 });
     try releases.request(.{ .id = 5, .generation = 1 });
-    _ = try State.commit(
+    _ = try State.commitWithAttachment(
         &scheduler,
         &queue,
         &surface,
         &regions,
         &frames,
         &releases,
+        &attachment_lease,
         .sync,
         &.{},
         0,
@@ -581,6 +673,8 @@ test "discarding an unapplied transactional CU releases callback batches" {
     State.deinitQueue(&queue);
     try std.testing.expectEqual(@as(usize, 1), frame_pool.available());
     try std.testing.expectEqual(@as(usize, 1), release_pool.available());
+    try std.testing.expect(disposed);
+    try std.testing.expectEqual(@as(usize, 1), imports.available());
 }
 
 test "surface validates offsets scale transform and permanent roles" {
