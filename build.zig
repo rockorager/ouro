@@ -46,7 +46,7 @@ pub fn build(b: *std.Build) void {
     });
     ouro.linkSystemLibrary("seat", .{});
     ouro.linkSystemLibrary("libinput", .{});
-    ouro.linkSystemLibrary("udev", .{});
+    ouro.linkSystemLibrary("libudev", .{});
     ouro.linkSystemLibrary("drm", .{});
     ouro.linkSystemLibrary("gbm", .{});
     ouro.linkSystemLibrary("pixman-1", .{});

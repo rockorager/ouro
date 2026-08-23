@@ -533,7 +533,11 @@ pub const Fixture = struct {
     }
     fn dispatchSeat(context: *anyopaque, _: *anyopaque) !void {
         const self: *Fixture = @ptrCast(@alignCast(context));
-        try consumeFd(self.session_fd);
+        var value: u64 = 0;
+        const result = linux.read(self.session_fd, @ptrCast(&value), @sizeOf(u64));
+        if (linux.errno(result) == .AGAIN) return;
+        if (linux.errno(result) != .SUCCESS or result != @sizeOf(u64))
+            return error.EventFdReadFailed;
         const callback = self.callback.?;
         switch (self.command) {
             .enable => callback.listener.enable(callback.userdata),

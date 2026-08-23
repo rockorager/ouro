@@ -116,6 +116,12 @@ pub const Session = struct {
         self.seat = try platform.openSeat(&self.callback);
         errdefer platform.closeSeat(self.seat) catch {};
         self.fd = try platform.getFd(self.seat);
+        // libseat_open_seat may read an enable event into libseat's userspace
+        // buffer while consuming its synchronous open reply. In that case the
+        // underlying fd is no longer readable, so waiting for the first poll
+        // CQE would strand the buffered callback indefinitely. Drain once
+        // nonblocking before readiness becomes poll-driven.
+        try platform.dispatch(self.seat);
         return self;
     }
 
@@ -563,6 +569,18 @@ test "session: initial enable uses heap-stable callback context and coalesces ca
     try std.testing.expectEqualSlices(Event, &.{.{ .enabled = 1 }}, session.events());
 }
 
+test "session: initial dispatch consumes an enable buffered while opening" {
+    var fake: FakePlatform = .{ .queued_enable = true };
+    const session = try Session.create(std.testing.allocator, fake.platform(), 1);
+    defer destroyWithoutPoll(session) catch unreachable;
+
+    try std.testing.expectEqual(@as(usize, 1), fake.dispatch_count);
+    try std.testing.expectEqual(State.enabling, session.state);
+    try session.processPending();
+    try std.testing.expectEqual(State.enabled, session.state);
+    try std.testing.expectEqualSlices(Event, &.{.{ .enabled = 1 }}, session.events());
+}
+
 test "session: device table closes through platform once and rejects stale handles" {
     var fake: FakePlatform = .{};
     const session = try createEnabled(&fake, 1);
@@ -627,6 +645,15 @@ test "session: partial initialization and device failures unwind exactly once" {
         Session.create(std.testing.allocator, fake.platform(), 1),
     );
     try std.testing.expectEqual(@as(usize, 1), fake.open_count);
+    try std.testing.expectEqual(@as(usize, 1), fake.close_count);
+
+    fake = .{ .fail_dispatch = true };
+    try std.testing.expectError(
+        error.FakeDispatch,
+        Session.create(std.testing.allocator, fake.platform(), 1),
+    );
+    try std.testing.expectEqual(@as(usize, 1), fake.open_count);
+    try std.testing.expectEqual(@as(usize, 1), fake.dispatch_count);
     try std.testing.expectEqual(@as(usize, 1), fake.close_count);
 
     fake = .{ .enable_on_open = true, .fail_open_device = true };
@@ -726,7 +753,7 @@ test "session: one-shot readiness joins shared submission and rearms after dispa
     const ready = try ring.copy_cqe();
     const ready_token = router.route(ready.user_data) orelse return error.UnknownToken;
     try session.completeReadiness(&router, &ring, ready_token, ready.res);
-    try std.testing.expectEqual(@as(usize, 1), fake.dispatch_count);
+    try std.testing.expectEqual(@as(usize, 2), fake.dispatch_count);
     try std.testing.expectEqual(@as(u32, 1), ring.sq_ready());
     try session.processPending();
     try std.testing.expectEqual(State.disabling, session.state);
