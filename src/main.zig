@@ -76,7 +76,7 @@ pub fn main(init: std.process.Init) !void {
             .encoder_capacity = 32,
             .crtc_capacity = 16,
             .plane_capacity = 64,
-            .format_capacity = 256,
+            .format_capacity = 8192,
             .event_capacity = 16,
         },
         .output = .{
