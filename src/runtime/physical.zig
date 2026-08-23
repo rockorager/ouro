@@ -1209,6 +1209,22 @@ pub fn Coordinator(comptime protocol: type) type {
         fn retryLayerOutcome(self: *Self, layer: *Layer) !bool {
             const token = layer.presentation orelse return error.MissingPresentation;
             var content = &(layer.content orelse return error.MissingContent);
+            if (content.surface.attachment) |*attachment| if (attachment.buffer) |buffer| {
+                const peer = layer.peer orelse return error.ClientDisconnected;
+                const objects = try self.root.runtime.clients.get(peer);
+                const actor = try self.root.runtime.clients.reactor.getActor(peer);
+                _ = Adapter.completeBufferReleaseOn(
+                    objects,
+                    &actor.transmit,
+                    buffer.handle,
+                ) catch |err| switch (err) {
+                    error.Exhausted => return false,
+                    else => return err,
+                };
+                // Successful admission or an already-destroyed exact resource
+                // both consume release ownership exactly once.
+                attachment.buffer = null;
+            };
             if (layer.callback_data) |data| {
                 const peer = layer.peer orelse return error.ClientDisconnected;
                 const surface = layer.surface orelse return error.StaleSurface;

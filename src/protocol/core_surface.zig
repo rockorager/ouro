@@ -545,6 +545,27 @@ pub fn Adapter(comptime protocol: type) type {
             try ProtocolCore.completeSync(server_objects, queue, callback, 0);
         }
 
+        /// Queues the standard wl_buffer.release event for the exact committed
+        /// resource generation. A client may destroy the wl_buffer while its
+        /// imported backing remains in flight; that stale resource requires no
+        /// event and is reported as not delivered.
+        pub fn completeBufferReleaseOn(
+            server_objects: anytype,
+            queue: *wayring.tx.Queue,
+            buffer: objects.Handle,
+        ) !bool {
+            if (server_objects.namespace.resolve(buffer) == null) return false;
+            try wayring.server.sendEvent(
+                protocol,
+                protocol.wl_buffer,
+                server_objects,
+                queue,
+                buffer,
+                .{ .release = .{} },
+            );
+            return true;
+        }
+
         fn bind(context: ?*anyopaque, binding: wayring.server.Binding) !?*anyopaque {
             _ = binding;
             return context;

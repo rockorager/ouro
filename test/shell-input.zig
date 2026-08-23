@@ -193,6 +193,9 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     try std.testing.expectEqual(@as(usize, 2), handler.pointer_motion);
     try std.testing.expectEqual(@as(usize, 1), handler.pointer_button);
     try std.testing.expectEqual(@as(usize, 1), handler.keyboard_key);
+    try std.testing.expectEqual(@as(usize, 1), handler.buffer_release);
+    try std.testing.expect(handler.buffer_release_order != 0);
+    try std.testing.expect(handler.buffer_release_order < handler.frame_done_order);
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
 
     const retained_app = coordinator.app_layer.sample.?;
@@ -346,6 +349,8 @@ const Handler = struct {
     pointer: ?wayring.objects.Handle = null,
     keyboard: ?wayring.objects.Handle = null,
     cursor_surface: ?wayring.objects.Handle = null,
+    mapped_buffer: ?wayring.objects.Handle = null,
+    frame_callback: ?wayring.objects.Handle = null,
     shell_created: bool = false,
     mapped: bool = false,
     input_requested: bool = false,
@@ -358,6 +363,10 @@ const Handler = struct {
     pointer_button: usize = 0,
     keyboard_enter: usize = 0,
     keyboard_key: usize = 0,
+    buffer_release: usize = 0,
+    completion_order: usize = 0,
+    buffer_release_order: usize = 0,
+    frame_done_order: usize = 0,
     event_failures: usize = 0,
 
     pub fn eventError(
@@ -446,6 +455,35 @@ const Handler = struct {
                 .key => self.keyboard_key += 1,
                 else => {},
             }
+        } else if (target.object.interface == &protocol.wl_buffer.info) {
+            switch (try protocol.wl_buffer.decodeEvent(message, fds)) {
+                .release => {
+                    self.buffer_release += 1;
+                    self.completion_order += 1;
+                    self.buffer_release_order = self.completion_order;
+                    try wayring.client.sendRequest(
+                        protocol.wl_buffer,
+                        self.objects,
+                        self.queue,
+                        self.mapped_buffer.?,
+                        .{ .destroy = .{} },
+                    );
+                    self.mapped_buffer = null;
+                },
+            }
+        } else if (target.object.interface == &ClientCore.Callback.info) {
+            switch (try ClientCore.decodeCallbackEvent(
+                self.objects,
+                self.frame_callback.?,
+                message,
+                fds,
+            )) {
+                .done => {
+                    self.completion_order += 1;
+                    self.frame_done_order = self.completion_order;
+                    self.frame_callback = null;
+                },
+            }
         } else if (target.object.interface == &ClientCore.Display.info) {
             switch (try ClientCore.decodeDisplayEvent(self.objects, message, fds)) {
                 .delete_id => {},
@@ -511,6 +549,13 @@ const Handler = struct {
                 .format = .argb8888,
             },
         )).id;
+        self.mapped_buffer = buffer;
+        self.frame_callback = (try protocol.wl_surface.construct_frame(
+            self.objects,
+            self.queue,
+            self.surface.?,
+            .{},
+        )).callback;
         try protocol.wl_surface.encodeRequest(self.queue, self.surface.?.id, .{
             .attach = .{ .buffer = buffer.id, .x = 0, .y = 0 },
         });
@@ -518,13 +563,6 @@ const Handler = struct {
             .damage_buffer = .{ .x = 0, .y = 0, .width = 3, .height = 2 },
         });
         try protocol.wl_surface.encodeRequest(self.queue, self.surface.?.id, .{ .commit = .{} });
-        try wayring.client.sendRequest(
-            protocol.wl_buffer,
-            self.objects,
-            self.queue,
-            buffer,
-            .{ .destroy = .{} },
-        );
         try wayring.client.sendRequest(
             protocol.wl_shm_pool,
             self.objects,
