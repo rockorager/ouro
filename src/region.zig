@@ -242,6 +242,22 @@ pub const SurfaceRegions = struct {
         regions.input_dirty = true;
     }
 
+    /// Evaluates the exact committed Wayland input-region program at one
+    /// surface-local point. Surface bounds remain the caller's responsibility.
+    pub fn inputContains(regions: *const SurfaceRegions, point: RectanglePoint) bool {
+        var contains = regions.current_input_infinite;
+        var operations = regions.current_input.iterator();
+        while (operations.next()) |operation| switch (operation) {
+            .add => |rectangle| if (rectangleContains(rectangle, point)) {
+                contains = true;
+            },
+            .subtract => |rectangle| if (rectangleContains(rectangle, point)) {
+                contains = false;
+            },
+        };
+        return contains;
+    }
+
     /// Prepares dirty region replacements without mutating current snapshots or
     /// dirty flags. This composes with other fallible commit preflight work.
     pub fn prepareCommit(regions: *SurfaceRegions) Error!Prepared {
@@ -270,6 +286,32 @@ pub const SurfaceRegions = struct {
         return prepared.publish();
     }
 };
+
+pub const RectanglePoint = struct { x: i32, y: i32 };
+
+fn rectangleContains(rectangle: Rectangle, point: RectanglePoint) bool {
+    return point.x >= rectangle.x and point.y >= rectangle.y and
+        @as(i64, point.x) < @as(i64, rectangle.x) + rectangle.width and
+        @as(i64, point.y) < @as(i64, rectangle.y) + rectangle.height;
+}
+
+test "interaction: committed input region preserves ordered add and subtract semantics" {
+    var pool = try Pool.init(std.testing.allocator, 9);
+    defer pool.deinit(std.testing.allocator);
+    var source = Region.init(&pool);
+    defer source.deinit();
+    try source.add(.{ .x = 2, .y = 2, .width = 8, .height = 8 });
+    try source.subtract(.{ .x = 4, .y = 4, .width = 4, .height = 4 });
+    try source.add(.{ .x = 5, .y = 5, .width = 1, .height = 1 });
+    var regions = SurfaceRegions.init(&pool);
+    defer regions.deinit();
+    try regions.setInput(&source);
+    _ = try regions.commit();
+    try std.testing.expect(!regions.inputContains(.{ .x = 1, .y = 1 }));
+    try std.testing.expect(regions.inputContains(.{ .x = 3, .y = 3 }));
+    try std.testing.expect(!regions.inputContains(.{ .x = 4, .y = 4 }));
+    try std.testing.expect(regions.inputContains(.{ .x = 5, .y = 5 }));
+}
 
 test "shared regions preserve ordered exact operations and copy transactionally" {
     var pool = try Pool.init(std.testing.allocator, 5);

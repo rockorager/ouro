@@ -21,6 +21,18 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "wayring", .module = wayring }},
     });
 
+    const wayland_protocols = b.dependency("wayland_protocols", .{});
+    const generate_xdg_protocol = b.addRunArtifact(scanner);
+    generate_xdg_protocol.addFileArg(wayland.path("protocol/wayland.xml"));
+    generate_xdg_protocol.addFileArg(wayland_protocols.path("stable/xdg-shell/xdg-shell.xml"));
+    const generated_xdg_protocol = generate_xdg_protocol.addOutputFileArg("wayland-xdg-shell.zig");
+    const xdg_protocol = b.createModule(.{
+        .root_source_file = generated_xdg_protocol,
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "wayring", .module = wayring }},
+    });
+
     const ouro = b.addModule("ouro", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -29,9 +41,11 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "wayring", .module = wayring },
             .{ .name = "core_protocol", .module = core_protocol },
+            .{ .name = "xdg_protocol", .module = xdg_protocol },
         },
     });
     ouro.linkSystemLibrary("seat", .{});
+    ouro.linkSystemLibrary("libinput", .{});
     ouro.linkSystemLibrary("udev", .{});
     ouro.linkSystemLibrary("drm", .{});
     ouro.linkSystemLibrary("gbm", .{});
@@ -48,6 +62,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "wayring", .module = wayring },
                 .{ .name = "ouro", .module = ouro },
                 .{ .name = "core_protocol", .module = core_protocol },
+                .{ .name = "xdg_protocol", .module = xdg_protocol },
             },
         }),
     });
@@ -65,6 +80,28 @@ pub fn build(b: *std.Build) void {
     const unit_tests = b.addTest(.{ .root_module = ouro });
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
+    const xdg_shell_tests = b.addTest(.{
+        .root_module = ouro,
+        .filters = &.{"xdg-shell:"},
+    });
+    const run_xdg_shell_tests = b.addRunArtifact(xdg_shell_tests);
+    const xdg_shell_test_step = b.step(
+        "test-xdg-shell",
+        "Run deterministic xdg-shell adapter tests",
+    );
+    xdg_shell_test_step.dependOn(&run_xdg_shell_tests.step);
+
+    const desktop_tests = b.addTest(.{
+        .root_module = ouro,
+        .filters = &.{"desktop:"},
+    });
+    const run_desktop_tests = b.addRunArtifact(desktop_tests);
+    const desktop_test_step = b.step(
+        "test-desktop",
+        "Run deterministic one-workspace desktop and layout tests",
+    );
+    desktop_test_step.dependOn(&run_desktop_tests.step);
+
     const session_tests = b.addTest(.{
         .root_module = ouro,
         .filters = &.{"session:"},
@@ -72,6 +109,39 @@ pub fn build(b: *std.Build) void {
     const run_session_tests = b.addRunArtifact(session_tests);
     const session_test_step = b.step("test-session", "Run libseat session ownership tests");
     session_test_step.dependOn(&run_session_tests.step);
+
+    const input_tests = b.addTest(.{
+        .root_module = ouro,
+        .filters = &.{"input:"},
+    });
+    const run_input_tests = b.addRunArtifact(input_tests);
+    const input_test_step = b.step(
+        "test-input-backend",
+        "Run deterministic libinput backend ownership tests",
+    );
+    input_test_step.dependOn(&run_input_tests.step);
+
+    const seat_tests = b.addTest(.{
+        .root_module = ouro,
+        .filters = &.{"seat:"},
+    });
+    const run_seat_tests = b.addRunArtifact(seat_tests);
+    const seat_test_step = b.step(
+        "test-seat",
+        "Run deterministic Wayland seat, focus, and serial tests",
+    );
+    seat_test_step.dependOn(&run_seat_tests.step);
+
+    const interaction_tests = b.addTest(.{
+        .root_module = ouro,
+        .filters = &.{"interaction:"},
+    });
+    const run_interaction_tests = b.addRunArtifact(interaction_tests);
+    const interaction_test_step = b.step(
+        "test-interaction",
+        "Run deterministic pointer hit-test, focus, grab, and cursor tests",
+    );
+    interaction_test_step.dependOn(&run_interaction_tests.step);
 
     const drm_tests = b.addTest(.{
         .root_module = ouro,
@@ -174,7 +244,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "wayring", .module = wayring },
                 .{ .name = "ouro", .module = ouro },
-                .{ .name = "core_protocol", .module = core_protocol },
+                .{ .name = "core_protocol", .module = xdg_protocol },
             },
         }),
     });
@@ -185,9 +255,30 @@ pub fn build(b: *std.Build) void {
     );
     drm_presentation_test_step.dependOn(&run_drm_presentation_tests.step);
 
+    const shell_input_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/shell-input.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "wayring", .module = wayring },
+                .{ .name = "ouro", .module = ouro },
+                .{ .name = "xdg_protocol", .module = xdg_protocol },
+                .{ .name = "core_protocol", .module = xdg_protocol },
+            },
+        }),
+    });
+    const run_shell_input_tests = b.addRunArtifact(shell_input_tests);
+    const shell_input_test_step = b.step(
+        "test-shell-input",
+        "Run generated-client physical XDG shell and normalized input vertical",
+    );
+    shell_input_test_step.dependOn(&run_shell_input_tests.step);
+
     const test_step = b.step("test", "Run unit and integration tests");
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_integration_tests.step);
     test_step.dependOn(&run_headless_presentation_tests.step);
     test_step.dependOn(&run_drm_presentation_tests.step);
+    test_step.dependOn(&run_shell_input_tests.step);
 }

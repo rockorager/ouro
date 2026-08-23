@@ -204,6 +204,21 @@ pub const Surface = struct {
         return surface.attach_changed and surface.pending_buffer != null;
     }
 
+    /// Returns the exact logical extent of the currently committed content.
+    pub fn committedSize(surface: Surface) SurfaceSize {
+        const buffer = surface.current_buffer orelse return .{ .width = 0, .height = 0 };
+        const swaps_axes = switch (surface.current_transform) {
+            .@"90", .@"270", .flipped_90, .flipped_270 => true,
+            else => false,
+        };
+        const scale: u32 = @intCast(surface.current_scale);
+        const content_size: SurfaceSize = if (swaps_axes)
+            .{ .width = buffer.height / scale, .height = buffer.width / scale }
+        else
+            .{ .width = buffer.width / scale, .height = buffer.height / scale };
+        return surface.viewport.current.surfaceSize(content_size);
+    }
+
     /// Validates the effective buffer geometry without mutating pending state.
     pub fn validateCommit(surface: Surface) Error!void {
         const buffer = if (surface.attach_changed)

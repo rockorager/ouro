@@ -93,12 +93,18 @@ test "output readiness exhaustion destroys output and releases device" {
     const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), config);
     var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
     try coordinator.start(&loop);
+    const initial_area = coordinator.desktop.workArea();
+    const initial_pointer = coordinator.interaction.pointerPosition();
+    const initial_commands = coordinator.desktop.pendingCommands();
     const injected = try coordinator.router.acquire(.copy);
     _ = try loop.turn(coordinator);
     try fixture.signalSession(.enable);
     try waitReady(&root.ring);
     try std.testing.expectError(error.Exhausted, loop.turn(coordinator));
     try std.testing.expect(coordinator.output == null);
+    try std.testing.expectEqual(initial_area, coordinator.desktop.workArea());
+    try std.testing.expectEqual(initial_pointer, coordinator.interaction.pointerPosition());
+    try std.testing.expectEqual(initial_commands, coordinator.desktop.pendingCommands());
     try std.testing.expectEqual(@as(?u32, 1), coordinator.next_output_generation);
     try std.testing.expectEqual(@as(usize, 1), fixture.device_closes);
     try std.testing.expectEqual(@as(usize, 2), fixture.framebuffer_removed);
@@ -159,21 +165,31 @@ fn runVertical(trigger: TerminalTrigger) !void {
     var first_frame: ?ouro.headless_output.FrameId = null;
     for (0..256) |_| {
         client_progress = try drainClient(&client_reactor, &client_driver, &client_handler);
+        var cursor_assigned = false;
+        if (coordinator.surface_id) |id| if (coordinator.interaction.cursor.surface == null) {
+            try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .device_added = .{
+                .device = .{ .slot = 0, .generation = 1, .seat_generation = 1 },
+                .capabilities = .{ .pointer = true },
+            } }));
+            coordinator.interaction.cursorRequest(id, .{ .x = 0, .y = 0 });
+            cursor_assigned = true;
+        };
         if (coordinator.stats.submitted == 1 and !observed_identity) {
             first_frame = coordinator.output.?.currentFrameId().?;
-            const sample = coordinator.pending_sample.?;
-            const binding = coordinator.pending_binding.?;
+            const sample = coordinator.cursor_layer.sample.?;
+            const binding = coordinator.cursor_layer.binding.?;
             try std.testing.expectEqual(binding.sample, sample.sample);
             try std.testing.expectEqual(binding.presentation, sample.presentation);
             try std.testing.expectEqual(@as(u64, 1), sample.sample.commit_sequence);
             try std.testing.expectEqual(
-                (@as(u64, coordinator.surface.?.generation) << 32) | coordinator.surface.?.id,
+                (@as(u64, coordinator.surface_id.?.generation) << 32) |
+                    coordinator.surface_id.?.index,
                 sample.sample.surface,
             );
             observed_identity = true;
         }
         if (client_handler.complete()) break;
-        if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
+        if (!cursor_assigned and root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
             try waitForEither(&root.ring, client_reactor.ring);
         _ = try loop.turn(coordinator);
     }
@@ -194,18 +210,25 @@ fn runVertical(trigger: TerminalTrigger) !void {
     // surface before the render deadline. Disable then proves that an applied
     // presentation with no possible physical outcome is abandoned exactly
     // once and cannot target the replacement surface.
+    const first_surface_id = coordinator.cursor_layer.id.?;
     try client_handler.replaceCommittedSurface();
     try submitClient(&client_reactor, &client_driver, &client_handler);
     for (0..128) |_| {
         _ = try drainClient(&client_reactor, &client_driver, &client_handler);
         _ = try loop.turn(coordinator);
-        if (coordinator.stats.applied == 2 and coordinator.pending_content != null) break;
+        if (coordinator.surface_id) |id| if (!std.meta.eql(id, first_surface_id) and
+            coordinator.interaction.cursor.surface == null)
+        {
+            coordinator.interaction.cursorRequest(id, .{ .x = 0, .y = 0 });
+            _ = try loop.turn(coordinator);
+        };
+        if (coordinator.stats.applied == 2 and coordinator.cursor_layer.content != null) break;
         if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
             try waitForEither(&root.ring, client_reactor.ring);
     }
     try std.testing.expectEqual(@as(usize, 2), coordinator.stats.applied);
     try std.testing.expectEqual(@as(usize, 1), coordinator.stats.submitted);
-    const abandoned_surface = coordinator.pending_surface.?;
+    const abandoned_surface = coordinator.cursor_layer.surface.?;
 
     try client_handler.replaceWithEmptySurface();
     try submitClient(&client_reactor, &client_driver, &client_handler);
@@ -279,11 +302,11 @@ fn runVertical(trigger: TerminalTrigger) !void {
     try std.testing.expect(wayring_drained);
     try std.testing.expect(client_progress.quiescent);
     try std.testing.expect(coordinator.backendDrainComplete());
-    try std.testing.expect(coordinator.pending_content == null);
+    try std.testing.expect(coordinator.cursor_layer.content == null);
     try std.testing.expectEqual(@as(usize, 1), coordinator.adapter.imports.available());
     try std.testing.expectEqual(@as(usize, 1), coordinator.adapter.frame_pool.available());
     try std.testing.expectEqual(@as(usize, 1), coordinator.adapter.release_pool.available());
-    try std.testing.expectEqual(@as(usize, 1), coordinator.presentations.available());
+    try std.testing.expectEqual(@as(usize, 2), coordinator.presentations.available());
     try std.testing.expectEqual(@as(usize, 1), client_handler.frame_done);
     try std.testing.expectEqual(@as(usize, 1), client_handler.release_done);
     try std.testing.expectEqual(@as(usize, 1), client_handler.frame_deleted);
@@ -405,9 +428,9 @@ const ClientHandler = struct {
     }
 };
 
-const SessionCommand = enum { enable, disable };
+pub const SessionCommand = enum { enable, disable };
 
-const Fixture = struct {
+pub const Fixture = struct {
     session_fd: linux.fd_t,
     drm_fd: linux.fd_t,
     callback: ?*ouro.backend_platform.CallbackContext = null,
@@ -427,21 +450,21 @@ const Fixture = struct {
     gbm_destroyed: usize = 0,
     discover_cards: bool = true,
 
-    fn init() !Fixture {
+    pub fn init() !Fixture {
         return .{ .session_fd = try eventFd(), .drm_fd = try eventFd() };
     }
 
-    fn deinit(self: *Fixture) void {
+    pub fn deinit(self: *Fixture) void {
         if (self.session_fd >= 0) _ = linux.close(self.session_fd);
         if (self.drm_fd >= 0) _ = linux.close(self.drm_fd);
     }
 
-    fn signalSession(self: *Fixture, command: SessionCommand) !void {
+    pub fn signalSession(self: *Fixture, command: SessionCommand) !void {
         self.command = command;
         try signalFd(self.session_fd);
     }
 
-    fn platforms(self: *Fixture) Coordinator.Platforms {
+    pub fn platforms(self: *Fixture) Coordinator.Platforms {
         return .{
             .session = .{ .context = self, .vtable = &session_vtable },
             .drm = .{ .context = self, .vtable = &drm_vtable },
@@ -451,6 +474,10 @@ const Fixture = struct {
                 .atomic = .{ .context = self, .vtable = &atomic_vtable },
             },
         };
+    }
+
+    pub fn signalOutput(self: *Fixture) !void {
+        try signalFd(self.drm_fd);
     }
 
     const session_vtable: ouro.backend_platform.Platform.VTable = .{
@@ -628,13 +655,13 @@ const Fixture = struct {
     }
 };
 
-fn coordinatorConfig() Coordinator.Config {
-    return .{ .router_capacity = 12, .timer_capacity = 2, .device_capacity = 1, .shm = .{ .limits = .{ .max_pool_bytes = 4096 }, .pool_capacity = 1, .buffer_capacity = 1, .formats = &shm_formats }, .surface = .{ .surface_capacity = 1, .region_capacity = 1, .region_operation_capacity = 1, .frame_callback_capacity = 1, .release_callback_capacity = 1, .content_update_capacity = 1, .dependency_capacity = 1, .attachment_capacity = 1, .copy_capacity = 1, .max_copy_bytes = pixels.len }, .drm = .{ .card_capacity = 1, .connector_capacity = 1, .mode_capacity = 1, .connector_encoder_capacity = 1, .encoder_capacity = 1, .crtc_capacity = 1, .plane_capacity = 1, .format_capacity = 1, .event_capacity = 4 }, .output = .{ .output_id = .{ .index = 0, .generation = 1 }, .scheduler = .{ .refresh_ns = 4 * std.time.ns_per_ms, .render_budget_ns = std.time.ns_per_ms }, .renderer = .pixman, .image_count = 2, .max_samples = 1, .max_source_bytes = pixels.len, .max_source_width = 3, .max_source_height = 2, .kms = .{ .event_capacity = 2 } } };
+pub fn coordinatorConfig() Coordinator.Config {
+    return .{ .router_capacity = 12, .timer_capacity = 2, .device_capacity = 1, .shm = .{ .limits = .{ .max_pool_bytes = 4096 }, .pool_capacity = 1, .buffer_capacity = 1, .formats = &shm_formats }, .surface = .{ .surface_capacity = 1, .region_capacity = 1, .region_operation_capacity = 1, .frame_callback_capacity = 1, .release_callback_capacity = 1, .content_update_capacity = 1, .dependency_capacity = 1, .attachment_capacity = 1, .copy_capacity = 1, .max_copy_bytes = pixels.len }, .drm = .{ .card_capacity = 1, .connector_capacity = 1, .mode_capacity = 1, .connector_encoder_capacity = 1, .encoder_capacity = 1, .crtc_capacity = 1, .plane_capacity = 1, .format_capacity = 1, .event_capacity = 4 }, .output = .{ .output_id = .{ .index = 0, .generation = 1 }, .scheduler = .{ .refresh_ns = 4 * std.time.ns_per_ms, .render_budget_ns = std.time.ns_per_ms }, .renderer = .pixman, .image_count = 2, .max_samples = 2, .max_source_bytes = pixels.len, .max_source_width = 3, .max_source_height = 2, .kms = .{ .event_capacity = 2 } } };
 }
-fn compositorConfig() Compositor.Config {
-    return .{ .ring = .{ .entries = 32, .flags = 0 }, .reactor = clientReactorConfig(), .runtime = .{ .actor = .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 }, .object_capacity = 16, .object_quota = 16, .buckets_per_client = 16, .max_globals = 2, .registry_capacity = 1 } };
+pub fn compositorConfig() Compositor.Config {
+    return .{ .ring = .{ .entries = 32, .flags = 0 }, .reactor = clientReactorConfig(), .runtime = .{ .actor = .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 }, .object_capacity = 16, .object_quota = 16, .buckets_per_client = 16, .max_globals = 4, .registry_capacity = 1 } };
 }
-fn clientReactorConfig() wayring.io_uring.Config {
+pub fn clientReactorConfig() wayring.io_uring.Config {
     return .{ .max_connections = 1, .receive_buffer_size = 4096, .receive_buffer_count = 4, .receive_control_capacity = 256, .fragment_block_size = 256, .fragment_block_count = 4, .transmit_block_size = 512, .transmit_block_count = 8, .descriptor_count = 4, .send_descriptor_capacity = 2 };
 }
 fn drainClient(reactor: *wayring.io_uring.Reactor, driver: *ClientDriver, handler: *ClientHandler) !ClientDriver.Progress {

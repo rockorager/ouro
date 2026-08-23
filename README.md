@@ -44,6 +44,14 @@ responsibilities:
 - [Content-update scheduling](src/content_update.zig): per-surface updates,
   direct-child dependencies, synchronization, constraints, and atomic
   application are represented by a bounded dependency graph.
+- [Wayland seat](src/protocol/seat.zig): fixed-capacity seat, pointer, and
+  keyboard resources aggregate normalized physical input, retain keymap FD
+  ownership, and deliver generation-safe focus and user-action serials through
+  resumable outbound commands.
+- [Desktop interaction](src/input/interaction.zig): pointer motion hit-tests
+  exact committed input regions against the copied desktop scene, retains
+  default/button-grab state and protocol-neutral focus commands, and places a
+  composited cursor without replacing render generations.
 
 [Transactional commit composition](src/surface.zig) ties surface, region,
 viewport, frame/release callback, and content-update state together so all
@@ -59,10 +67,11 @@ zig build test
 
 ## Physical-display compositor
 
-M2 packages the first runnable single-output compositor. It accepts one
-ordinary core `wl_surface`, copies unsafe/unsealed SHM through the shared
-io_uring runtime, composites it to the selected KMS output, and exits cleanly
-when that client disconnects:
+M3 composes the bounded shell, desktop, normalized input, seat, interaction,
+scene, and physical-output owners in one Coordinator event turn. An ordinary
+XDG client discovers the published globals, acknowledges its exact initial
+configure, maps unsealed SHM, enters the one-workspace tiled desktop, and
+receives generation-safe pointer and keyboard delivery:
 
 ```sh
 zig build run -- --socket=/tmp/ouro.sock --renderer=auto
@@ -75,9 +84,10 @@ Renderer selection is explicit:
 - `--renderer=vulkan` requires Vulkan and a primary KMS plane with
   `IN_FENCE_FD`. Vulkan exports a sync-file fence to KMS and never host-waits.
 
-The compositor currently has no shell policy, input, or multi-output support.
-It also requires a usable `/dev/dri` device and libseat backend. Real-hardware
-smoke is deliberately opt-in:
+The physical path remains single-output and requires a usable `/dev/dri` device
+and libseat backend. `Loop.turn` is the sole io_uring submitter; protocol,
+backend, render, and presentation callbacks only retain bounded work for that
+turn. Real-hardware smoke is deliberately opt-in:
 
 ```sh
 zig build run-drm-smoke -- --renderer=pixman
@@ -90,4 +100,7 @@ The presence of `/dev/dri` alone is not treated as success: no discovered card,
 connected connector, compatible CRTC, or primary plane is a terminal startup
 failure rather than a compositor that listens forever without an output.
 Deterministic physical-path coverage uses simulated libseat/DRM/GBM/KMS
-boundaries and is available as `zig build test-drm-presentation`.
+boundaries. Run the generated-client shell/input vertical with `zig build
+test-shell-input`; lower-level physical presentation, libinput ownership, seat,
+and interaction steps remain available as `test-drm-presentation`,
+`test-input-backend`, `test-seat`, and `test-interaction`.

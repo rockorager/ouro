@@ -1,0 +1,1012 @@
+//! Fixed-capacity owner for one-workspace desktop policy.
+//!
+//! The shell adapter owns protocol resources and transmission. This owner
+//! stores only copied value IDs, consumes shell-neutral events, and retains configure
+//! commands until the caller confirms that the shell accepted them.
+
+const std = @import("std");
+const geometry = @import("../scene/geometry.zig");
+const layout = @import("layout.zig");
+
+const none = std.math.maxInt(u32);
+
+pub const Config = struct {
+    toplevel_capacity: usize,
+    command_capacity: usize,
+    metadata_bytes: usize,
+
+    fn validate(config: Config) !void {
+        inline for (.{ config.toplevel_capacity, config.command_capacity, config.metadata_bytes }) |value|
+            if (value == 0 or value >= none) return error.InvalidConfig;
+        if (config.command_capacity < config.toplevel_capacity) return error.InvalidConfig;
+        _ = std.math.mul(usize, config.toplevel_capacity, config.metadata_bytes) catch
+            return error.InvalidConfig;
+    }
+};
+
+pub fn Desktop(comptime Shell: type) type {
+    return struct {
+        const Self = @This();
+
+        pub const ToplevelId = packed struct {
+            index: u32,
+            generation: u32,
+        };
+
+        pub const WorkspaceId = packed struct {
+            index: u32,
+            generation: u32,
+        };
+
+        pub const workspace_id: WorkspaceId = .{ .index = 0, .generation = 1 };
+
+        pub const Mode = enum { tiled, floating };
+
+        pub const Metadata = struct {
+            title: []const u8,
+            app_id: []const u8,
+            min_width: i32,
+            min_height: i32,
+            max_width: i32,
+            max_height: i32,
+        };
+
+        pub const SceneWindow = struct {
+            id: ToplevelId,
+            surface: Shell.SurfaceId,
+            geometry: geometry.Rect,
+            visible: bool,
+            stacking: u32,
+            mode: Mode,
+            content_ready: bool,
+        };
+
+        pub const Command = struct {
+            id: ToplevelId,
+            shell_id: Shell.ToplevelId,
+            configure: Shell.ToplevelConfigure,
+        };
+
+        const Header = struct {
+            active: bool = false,
+            retired: bool = false,
+            generation: u32 = 1,
+            next_free: u32 = none,
+        };
+
+        const Slot = struct {
+            header: Header = .{},
+            shell_id: Shell.ToplevelId = undefined,
+            surface: Shell.SurfaceId = undefined,
+            mode: Mode = .tiled,
+            floating: geometry.Rect = undefined,
+            scene: SceneWindow = undefined,
+            title: []u8 = &.{},
+            title_len: usize = 0,
+            app_id: []u8 = &.{},
+            app_id_len: usize = 0,
+            min_width: i32 = 0,
+            min_height: i32 = 0,
+            max_width: i32 = 0,
+            max_height: i32 = 0,
+            fullscreen: bool = false,
+            maximized: bool = false,
+            minimized: bool = false,
+            content_ready: bool = false,
+            configured: bool = false,
+            last_configure: Shell.ToplevelConfigure = .{ .width = 0, .height = 0 },
+        };
+
+        const Desired = struct {
+            active: bool = false,
+            rect: geometry.Rect = undefined,
+            visible: bool = false,
+            stacking: u32 = 0,
+            configure: Shell.ToplevelConfigure = .{ .width = 0, .height = 0 },
+        };
+
+        allocator: std.mem.Allocator,
+        slots: []Slot,
+        free: u32,
+        live: usize = 0,
+        work_area: geometry.Rect,
+        metadata_storage: []u8,
+        metadata_bytes: usize,
+        focus: []u32,
+        focus_len: usize = 0,
+        tile_order: []u32,
+        tile_len: usize = 0,
+        layout_items: []layout.Item,
+        placements: []layout.Placement,
+        desired: []Desired,
+        commands: []Command,
+        command_head: usize = 0,
+        command_len: usize = 0,
+        pending_event: ?Shell.Event = null,
+        destroyed: ?ToplevelId = null,
+
+        pub fn init(
+            allocator: std.mem.Allocator,
+            config: Config,
+            work_area: geometry.Rect,
+        ) !Self {
+            try config.validate();
+            try work_area.validate();
+            const slots = try allocator.alloc(Slot, config.toplevel_capacity);
+            errdefer allocator.free(slots);
+            const metadata_per_slot = try std.math.mul(usize, config.metadata_bytes, 2);
+            const storage_len = try std.math.mul(
+                usize,
+                config.toplevel_capacity,
+                metadata_per_slot,
+            );
+            const metadata_storage = try allocator.alloc(u8, storage_len);
+            errdefer allocator.free(metadata_storage);
+            const focus = try allocator.alloc(u32, config.toplevel_capacity);
+            errdefer allocator.free(focus);
+            const tile_order = try allocator.alloc(u32, config.toplevel_capacity);
+            errdefer allocator.free(tile_order);
+            const layout_items = try allocator.alloc(layout.Item, config.toplevel_capacity);
+            errdefer allocator.free(layout_items);
+            const placements = try allocator.alloc(layout.Placement, config.toplevel_capacity);
+            errdefer allocator.free(placements);
+            const desired = try allocator.alloc(Desired, config.toplevel_capacity);
+            errdefer allocator.free(desired);
+            const commands = try allocator.alloc(Command, config.command_capacity);
+            errdefer allocator.free(commands);
+
+            for (slots, 0..) |*slot, index| {
+                const start = index * config.metadata_bytes * 2;
+                slot.* = .{
+                    .header = .{
+                        .next_free = if (index + 1 < slots.len) @intCast(index + 1) else none,
+                    },
+                    .title = metadata_storage[start .. start + config.metadata_bytes],
+                    .app_id = metadata_storage[start + config.metadata_bytes .. start + config.metadata_bytes * 2],
+                };
+            }
+            @memset(desired, .{});
+            return .{
+                .allocator = allocator,
+                .slots = slots,
+                .free = 0,
+                .work_area = work_area,
+                .metadata_storage = metadata_storage,
+                .metadata_bytes = config.metadata_bytes,
+                .focus = focus,
+                .tile_order = tile_order,
+                .layout_items = layout_items,
+                .placements = placements,
+                .desired = desired,
+                .commands = commands,
+            };
+        }
+
+        pub fn deinit(desktop: *Self) void {
+            desktop.allocator.free(desktop.commands);
+            desktop.allocator.free(desktop.desired);
+            desktop.allocator.free(desktop.placements);
+            desktop.allocator.free(desktop.layout_items);
+            desktop.allocator.free(desktop.tile_order);
+            desktop.allocator.free(desktop.focus);
+            desktop.allocator.free(desktop.metadata_storage);
+            desktop.allocator.free(desktop.slots);
+            desktop.* = undefined;
+        }
+
+        /// Drains at most `limit` shell events. A capacity failure retains the
+        /// exact event locally, so destructive shell dequeue never loses it.
+        pub fn consume(desktop: *Self, shell: *Shell, limit: usize) !usize {
+            var count: usize = 0;
+            while (count < limit) {
+                if (desktop.destroyed != null) break;
+                const event = desktop.pending_event orelse shell.popEvent() orelse break;
+                desktop.applyEvent(shell, event) catch |cause| {
+                    desktop.pending_event = event;
+                    return cause;
+                };
+                desktop.pending_event = null;
+                count += 1;
+            }
+            return count;
+        }
+
+        pub fn peekCommand(desktop: *const Self) ?Command {
+            if (desktop.command_len == 0) return null;
+            return desktop.commands[desktop.command_head];
+        }
+
+        pub fn dropCommand(desktop: *Self) void {
+            if (desktop.command_len == 0) return;
+            desktop.command_head = (desktop.command_head + 1) % desktop.commands.len;
+            desktop.command_len -= 1;
+        }
+
+        /// Transfers one configure to the R16 outbound owner. If that owner is
+        /// backpressured, its error leaves the desktop command queued exactly
+        /// once for retry.
+        pub fn flushConfigure(desktop: *Self, shell: *Shell) !?u32 {
+            const command = desktop.peekCommand() orelse return null;
+            const serial = try shell.queueToplevelConfigure(command.shell_id, command.configure);
+            desktop.dropCommand();
+            return serial;
+        }
+
+        pub fn pendingCommands(desktop: *const Self) usize {
+            return desktop.command_len;
+        }
+
+        pub fn takeDestroyed(desktop: *Self) ?ToplevelId {
+            const id = desktop.destroyed;
+            desktop.destroyed = null;
+            return id;
+        }
+
+        pub fn focused(desktop: *const Self) ?ToplevelId {
+            if (desktop.focus_len == 0) return null;
+            return desktop.idFor(desktop.focus[0]);
+        }
+
+        pub fn focusToplevel(desktop: *Self, id: ToplevelId) !void {
+            const index = try desktop.resolveIndex(id);
+            if (desktop.slots[index].minimized) return error.NotVisible;
+            if (desktop.focus_len != 0 and desktop.focus[0] == index) return;
+            try desktop.requireCommandCapacity(desktop.live);
+            desktop.promoteFocus(index);
+            try desktop.reflow();
+        }
+
+        pub fn setFloating(desktop: *Self, id: ToplevelId, floating: bool) !void {
+            const index = try desktop.resolveIndex(id);
+            const mode: Mode = if (floating) .floating else .tiled;
+            if (desktop.slots[index].mode == mode) return;
+            try desktop.requireCommandCapacity(desktop.live);
+            const slot = &desktop.slots[index];
+            if (!floating and !slot.minimized and !slot.fullscreen and !slot.maximized)
+                try desktop.validateLayout(desktop.layoutCount() + 1, desktop.work_area);
+            slot.mode = mode;
+            if (floating) desktop.removeTile(index) else desktop.appendTile(index);
+            try desktop.reflow();
+        }
+
+        pub fn setFloatingGeometry(desktop: *Self, id: ToplevelId, rect: geometry.Rect) !void {
+            try rect.validate();
+            const index = try desktop.resolveIndex(id);
+            if (desktop.slots[index].mode != .floating) return error.NotFloating;
+            try desktop.requireCommandCapacity(1);
+            desktop.slots[index].floating = rect;
+            try desktop.reflow();
+        }
+
+        pub fn setWorkArea(desktop: *Self, rect: geometry.Rect) !void {
+            try desktop.validateWorkArea(rect);
+            desktop.applyWorkArea(rect);
+        }
+
+        /// Reserves all layout and configure capacity needed by a work-area
+        /// replacement without changing desktop policy or queued commands.
+        pub fn validateWorkArea(desktop: *const Self, rect: geometry.Rect) !void {
+            try rect.validate();
+            try desktop.validateLayout(desktop.layoutCount(), rect);
+            try desktop.requireCommandCapacity(desktop.live);
+        }
+
+        /// Publishes a work area accepted by `validateWorkArea`. Coordinator
+        /// turns are single-threaded, so the reserved reflow cannot fail.
+        pub fn applyWorkArea(desktop: *Self, rect: geometry.Rect) void {
+            desktop.validateWorkArea(rect) catch unreachable;
+            desktop.work_area = rect;
+            desktop.reflow() catch unreachable;
+        }
+
+        pub fn workArea(desktop: *const Self) geometry.Rect {
+            return desktop.work_area;
+        }
+
+        pub fn scene(desktop: *const Self, id: ToplevelId) !SceneWindow {
+            return desktop.slots[try desktop.resolveIndex(id)].scene;
+        }
+
+        pub fn sceneForSurface(desktop: *const Self, surface: Shell.SurfaceId) !SceneWindow {
+            for (desktop.slots) |slot| {
+                if (slot.header.active and std.meta.eql(slot.surface, surface)) return slot.scene;
+            }
+            return error.StaleSurface;
+        }
+
+        /// Copies a stable, back-to-front scene snapshot. No arena pointers
+        /// escape, and insufficient caller storage changes no desktop state.
+        pub fn sceneSnapshot(desktop: *const Self, output: []SceneWindow) ![]SceneWindow {
+            if (output.len < desktop.live) return error.Exhausted;
+            var len: usize = 0;
+            for (desktop.slots) |slot| {
+                if (!slot.header.active) continue;
+                var position = len;
+                while (position > 0 and output[position - 1].stacking > slot.scene.stacking) {
+                    output[position] = output[position - 1];
+                    position -= 1;
+                }
+                output[position] = slot.scene;
+                len += 1;
+            }
+            return output[0..len];
+        }
+
+        pub fn metadata(desktop: *const Self, id: ToplevelId) !Metadata {
+            const slot = &desktop.slots[try desktop.resolveIndex(id)];
+            return .{
+                .title = slot.title[0..slot.title_len],
+                .app_id = slot.app_id[0..slot.app_id_len],
+                .min_width = slot.min_width,
+                .min_height = slot.min_height,
+                .max_width = slot.max_width,
+                .max_height = slot.max_height,
+            };
+        }
+
+        pub fn idForShell(desktop: *const Self, shell_id: Shell.ToplevelId) !ToplevelId {
+            for (desktop.slots, 0..) |slot, index| {
+                if (slot.header.active and std.meta.eql(slot.shell_id, shell_id))
+                    return desktop.idFor(@intCast(index));
+            }
+            return error.StaleToplevel;
+        }
+
+        fn applyEvent(desktop: *Self, shell: *Shell, event: Shell.Event) !void {
+            switch (event) {
+                .toplevel_created => |value| try desktop.create(value.id, value.surface),
+                .metadata_changed => |shell_id| {
+                    const id = try desktop.idForShell(shell_id);
+                    const source = try shell.metadata(shell_id);
+                    try desktop.copyMetadata(id, source);
+                },
+                .state_requested => |request| try desktop.requestState(
+                    try desktop.idForShell(request.id),
+                    request.state,
+                    request.enabled,
+                ),
+                .commit_ready => |shell_id| {
+                    const index = try desktop.resolveIndex(try desktop.idForShell(shell_id));
+                    desktop.slots[index].content_ready = true;
+                    desktop.slots[index].scene.content_ready = true;
+                },
+                .toplevel_destroyed => |shell_id| try desktop.destroyShell(shell_id),
+            }
+        }
+
+        fn create(desktop: *Self, shell_id: Shell.ToplevelId, surface: Shell.SurfaceId) !void {
+            if (desktop.idForShell(shell_id)) |_| return error.DuplicateToplevel else |_| {}
+            if (desktop.free == none) return error.Exhausted;
+            try desktop.validateLayout(desktop.layoutCount() + 1, desktop.work_area);
+            try desktop.requireCommandCapacity(desktop.live + 1);
+            const index = desktop.acquire();
+            const slot = &desktop.slots[index];
+            slot.shell_id = shell_id;
+            slot.surface = surface;
+            slot.floating = desktop.defaultFloating();
+            slot.scene = .{
+                .id = desktop.idFor(index),
+                .surface = surface,
+                .geometry = desktop.work_area,
+                .visible = true,
+                .stacking = 0,
+                .mode = .tiled,
+                .content_ready = false,
+            };
+            desktop.live += 1;
+            desktop.appendTile(index);
+            desktop.promoteFocus(index);
+            try desktop.reflow();
+        }
+
+        fn destroyShell(desktop: *Self, shell_id: Shell.ToplevelId) !void {
+            const id = try desktop.idForShell(shell_id);
+            const index = try desktop.resolveIndex(id);
+            const reclaimable = desktop.commandCountFor(id);
+            if (desktop.commandAvailable() + reclaimable < desktop.live - 1)
+                return error.Backpressure;
+            desktop.removeCommandsFor(id);
+            desktop.removeFocus(index);
+            desktop.removeTile(index);
+            desktop.release(index);
+            desktop.live -= 1;
+            try desktop.reflow();
+            desktop.destroyed = id;
+        }
+
+        fn copyMetadata(desktop: *Self, id: ToplevelId, source: anytype) !void {
+            if (source.title.len > desktop.metadata_bytes or source.app_id.len > desktop.metadata_bytes)
+                return error.MetadataTooLong;
+            const slot = &desktop.slots[try desktop.resolveIndex(id)];
+            @memcpy(slot.title[0..source.title.len], source.title);
+            @memcpy(slot.app_id[0..source.app_id.len], source.app_id);
+            slot.title_len = source.title.len;
+            slot.app_id_len = source.app_id.len;
+            slot.min_width = source.min_width;
+            slot.min_height = source.min_height;
+            slot.max_width = source.max_width;
+            slot.max_height = source.max_height;
+        }
+
+        fn requestState(desktop: *Self, id: ToplevelId, state: Shell.RequestedState, enabled: bool) !void {
+            const index = try desktop.resolveIndex(id);
+            const slot = &desktop.slots[index];
+            const unchanged = switch (state) {
+                .fullscreen => slot.fullscreen == enabled,
+                .maximized => slot.maximized == enabled,
+                .minimized => slot.minimized == enabled,
+            };
+            if (unchanged) return;
+            try desktop.requireCommandCapacity(desktop.live);
+            var next_layout_count = desktop.layoutCount();
+            const was_eligible = desktop.isLayoutEligible(index);
+            const next_fullscreen = if (state == .fullscreen) enabled else slot.fullscreen;
+            const next_maximized = if (state == .maximized) enabled else slot.maximized;
+            const next_minimized = if (state == .minimized) enabled else slot.minimized;
+            const will_be_eligible = slot.mode == .tiled and !next_fullscreen and
+                !next_maximized and !next_minimized;
+            if (was_eligible and !will_be_eligible) next_layout_count -= 1;
+            if (!was_eligible and will_be_eligible) next_layout_count += 1;
+            try desktop.validateLayout(next_layout_count, desktop.work_area);
+            switch (state) {
+                .fullscreen => slot.fullscreen = enabled,
+                .maximized => slot.maximized = enabled,
+                .minimized => {
+                    slot.minimized = enabled;
+                    if (enabled) desktop.removeFocus(index) else desktop.promoteFocus(index);
+                },
+            }
+            try desktop.reflow();
+        }
+
+        fn reflow(desktop: *Self) !void {
+            @memset(desktop.desired, .{});
+            var item_len: usize = 0;
+            for (desktop.tile_order[0..desktop.tile_len]) |index| {
+                const slot = &desktop.slots[index];
+                if (!slot.minimized and !slot.fullscreen and !slot.maximized) {
+                    desktop.layout_items[item_len] = .{ .slot = index };
+                    item_len += 1;
+                }
+            }
+            const placements = try layout.plan(
+                desktop.layout_items[0..item_len],
+                desktop.work_area,
+                desktop.placements,
+            );
+            for (placements) |placement| {
+                desktop.desired[placement.slot] = .{
+                    .active = true,
+                    .rect = placement.rect,
+                    .visible = true,
+                };
+            }
+
+            var stacking: u32 = 0;
+            for (desktop.tile_order[0..desktop.tile_len]) |index| {
+                const slot = &desktop.slots[index];
+                if (slot.minimized) {
+                    desktop.desired[index] = .{
+                        .active = true,
+                        .rect = slot.scene.geometry,
+                        .visible = false,
+                    };
+                } else if (slot.fullscreen or slot.maximized) {
+                    desktop.desired[index] = .{
+                        .active = true,
+                        .rect = desktop.work_area,
+                        .visible = true,
+                    };
+                }
+                desktop.desired[index].stacking = stacking;
+                stacking += 1;
+            }
+            for (desktop.slots, 0..) |slot, index| {
+                if (!slot.header.active or slot.mode != .floating) continue;
+                desktop.desired[index] = .{
+                    .active = true,
+                    .rect = if (slot.fullscreen or slot.maximized) desktop.work_area else slot.floating,
+                    .visible = !slot.minimized,
+                    .stacking = stacking,
+                };
+                stacking += 1;
+            }
+            if (desktop.focus_len != 0) {
+                const focused_index = desktop.focus[0];
+                const focused_slot = &desktop.slots[focused_index];
+                if (focused_slot.mode == .floating or focused_slot.fullscreen or
+                    focused_slot.maximized)
+                {
+                    desktop.desired[focused_index].stacking = stacking;
+                }
+            }
+
+            for (desktop.slots, 0..) |*slot, index| {
+                if (!slot.header.active) continue;
+                const desired = &desktop.desired[index];
+                std.debug.assert(desired.active);
+                desired.configure = .{
+                    .width = desired.rect.width,
+                    .height = desired.rect.height,
+                    .states = .{
+                        .maximized = slot.maximized,
+                        .fullscreen = slot.fullscreen,
+                        .activated = desktop.focus_len != 0 and desktop.focus[0] == index,
+                        .tiled_left = slot.mode == .tiled and desired.rect.x == desktop.work_area.x,
+                        .tiled_right = slot.mode == .tiled and
+                            desired.rect.x + desired.rect.width == desktop.work_area.x + desktop.work_area.width,
+                        .tiled_top = slot.mode == .tiled and desired.rect.y == desktop.work_area.y,
+                        .tiled_bottom = slot.mode == .tiled and
+                            desired.rect.y + desired.rect.height == desktop.work_area.y + desktop.work_area.height,
+                        .suspended = slot.minimized,
+                    },
+                };
+                if (!slot.configured or !std.meta.eql(slot.last_configure, desired.configure)) {
+                    desktop.enqueue(.{
+                        .id = desktop.idFor(@intCast(index)),
+                        .shell_id = slot.shell_id,
+                        .configure = desired.configure,
+                    });
+                    slot.last_configure = desired.configure;
+                    slot.configured = true;
+                }
+                slot.scene = .{
+                    .id = desktop.idFor(@intCast(index)),
+                    .surface = slot.surface,
+                    .geometry = desired.rect,
+                    .visible = desired.visible,
+                    .stacking = desired.stacking,
+                    .mode = slot.mode,
+                    .content_ready = slot.content_ready,
+                };
+            }
+        }
+
+        fn defaultFloating(desktop: *const Self) geometry.Rect {
+            const width: i32 = @intCast(@max(1, @divTrunc(@as(i64, desktop.work_area.width) * 3, 4)));
+            const height: i32 = @intCast(@max(1, @divTrunc(@as(i64, desktop.work_area.height) * 3, 4)));
+            return .{
+                .x = desktop.work_area.x + @divTrunc(desktop.work_area.width - width, 2),
+                .y = desktop.work_area.y + @divTrunc(desktop.work_area.height - height, 2),
+                .width = width,
+                .height = height,
+            };
+        }
+
+        fn commandAvailable(desktop: *const Self) usize {
+            return desktop.commands.len - desktop.command_len;
+        }
+
+        fn isLayoutEligible(desktop: *const Self, index: u32) bool {
+            const slot = &desktop.slots[index];
+            return slot.mode == .tiled and !slot.minimized and
+                !slot.fullscreen and !slot.maximized;
+        }
+
+        fn layoutCount(desktop: *const Self) usize {
+            var count: usize = 0;
+            for (desktop.slots, 0..) |slot, index| {
+                if (slot.header.active and desktop.isLayoutEligible(@intCast(index))) count += 1;
+            }
+            return count;
+        }
+
+        fn validateLayout(desktop: *const Self, count: usize, area: geometry.Rect) !void {
+            _ = desktop;
+            if (count > 1 and (area.width < 2 or area.height < count - 1))
+                return error.WorkAreaTooSmall;
+        }
+
+        fn requireCommandCapacity(desktop: *const Self, count: usize) !void {
+            if (desktop.commandAvailable() < count) return error.Backpressure;
+        }
+
+        fn enqueue(desktop: *Self, command: Command) void {
+            std.debug.assert(desktop.command_len < desktop.commands.len);
+            const tail = (desktop.command_head + desktop.command_len) % desktop.commands.len;
+            desktop.commands[tail] = command;
+            desktop.command_len += 1;
+        }
+
+        fn commandCountFor(desktop: *const Self, id: ToplevelId) usize {
+            var count: usize = 0;
+            for (0..desktop.command_len) |offset| {
+                const index = (desktop.command_head + offset) % desktop.commands.len;
+                if (std.meta.eql(desktop.commands[index].id, id)) count += 1;
+            }
+            return count;
+        }
+
+        fn removeCommandsFor(desktop: *Self, id: ToplevelId) void {
+            var retained: usize = 0;
+            const original_len = desktop.command_len;
+            for (0..original_len) |offset| {
+                const source = (desktop.command_head + offset) % desktop.commands.len;
+                if (std.meta.eql(desktop.commands[source].id, id)) continue;
+                const destination = (desktop.command_head + retained) % desktop.commands.len;
+                desktop.commands[destination] = desktop.commands[source];
+                retained += 1;
+            }
+            desktop.command_len = retained;
+        }
+
+        fn acquire(desktop: *Self) u32 {
+            std.debug.assert(desktop.free != none);
+            const index = desktop.free;
+            const slot = &desktop.slots[index];
+            desktop.free = slot.header.next_free;
+            const generation = slot.header.generation;
+            const title = slot.title;
+            const app_id = slot.app_id;
+            slot.* = .{
+                .header = .{ .active = true, .generation = generation },
+                .title = title,
+                .app_id = app_id,
+            };
+            return index;
+        }
+
+        fn release(desktop: *Self, index: u32) void {
+            const slot = &desktop.slots[index];
+            const generation = slot.header.generation;
+            const title = slot.title;
+            const app_id = slot.app_id;
+            if (generation == std.math.maxInt(u32)) {
+                slot.* = .{
+                    .header = .{ .retired = true, .generation = generation },
+                    .title = title,
+                    .app_id = app_id,
+                };
+            } else {
+                slot.* = .{
+                    .header = .{ .generation = generation + 1, .next_free = desktop.free },
+                    .title = title,
+                    .app_id = app_id,
+                };
+                desktop.free = index;
+            }
+        }
+
+        fn resolveIndex(desktop: *const Self, id: ToplevelId) !u32 {
+            if (id.index >= desktop.slots.len) return error.StaleToplevel;
+            const slot = &desktop.slots[id.index];
+            if (!slot.header.active or slot.header.generation != id.generation)
+                return error.StaleToplevel;
+            return id.index;
+        }
+
+        fn idFor(desktop: *const Self, index: u32) ToplevelId {
+            return .{ .index = index, .generation = desktop.slots[index].header.generation };
+        }
+
+        fn promoteFocus(desktop: *Self, index: u32) void {
+            desktop.removeFocus(index);
+            std.mem.copyBackwards(u32, desktop.focus[1 .. desktop.focus_len + 1], desktop.focus[0..desktop.focus_len]);
+            desktop.focus[0] = index;
+            desktop.focus_len += 1;
+        }
+
+        fn removeFocus(desktop: *Self, index: u32) void {
+            for (desktop.focus[0..desktop.focus_len], 0..) |value, position| {
+                if (value != index) continue;
+                std.mem.copyForwards(
+                    u32,
+                    desktop.focus[position .. desktop.focus_len - 1],
+                    desktop.focus[position + 1 .. desktop.focus_len],
+                );
+                desktop.focus_len -= 1;
+                return;
+            }
+        }
+
+        fn appendTile(desktop: *Self, index: u32) void {
+            desktop.tile_order[desktop.tile_len] = index;
+            desktop.tile_len += 1;
+        }
+
+        fn removeTile(desktop: *Self, index: u32) void {
+            for (desktop.tile_order[0..desktop.tile_len], 0..) |value, position| {
+                if (value != index) continue;
+                std.mem.copyForwards(
+                    u32,
+                    desktop.tile_order[position .. desktop.tile_len - 1],
+                    desktop.tile_order[position + 1 .. desktop.tile_len],
+                );
+                desktop.tile_len -= 1;
+                return;
+            }
+        }
+    };
+}
+
+const TestShell = struct {
+    pub const SurfaceId = packed struct { index: u32, generation: u32 };
+    pub const ToplevelId = packed struct { index: u32, generation: u32 };
+    pub const RequestedState = enum { maximized, fullscreen, minimized };
+    pub const StateSet = packed struct(u16) {
+        maximized: bool = false,
+        fullscreen: bool = false,
+        resizing: bool = false,
+        activated: bool = false,
+        tiled_left: bool = false,
+        tiled_right: bool = false,
+        tiled_top: bool = false,
+        tiled_bottom: bool = false,
+        suspended: bool = false,
+        _padding: u7 = 0,
+    };
+    pub const ToplevelConfigure = struct {
+        width: i32,
+        height: i32,
+        states: StateSet = .{},
+    };
+    pub const Event = union(enum) {
+        toplevel_created: struct { id: ToplevelId, surface: SurfaceId },
+        metadata_changed: ToplevelId,
+        state_requested: struct { id: ToplevelId, state: RequestedState, enabled: bool },
+        commit_ready: ToplevelId,
+        toplevel_destroyed: ToplevelId,
+    };
+
+    events: [16]Event = undefined,
+    head: usize = 0,
+    len: usize = 0,
+    title: []const u8 = "",
+    app_id: []const u8 = "",
+    reject_configure: bool = false,
+    configure_serial: u32 = 40,
+    configured: ?ToplevelConfigure = null,
+
+    fn push(shell: *TestShell, event: Event) void {
+        shell.events[(shell.head + shell.len) % shell.events.len] = event;
+        shell.len += 1;
+    }
+
+    pub fn popEvent(shell: *TestShell) ?Event {
+        if (shell.len == 0) return null;
+        const event = shell.events[shell.head];
+        shell.head = (shell.head + 1) % shell.events.len;
+        shell.len -= 1;
+        return event;
+    }
+
+    pub fn metadata(shell: *TestShell, id: ToplevelId) !struct {
+        title: []const u8,
+        app_id: []const u8,
+        min_width: i32,
+        min_height: i32,
+        max_width: i32,
+        max_height: i32,
+    } {
+        _ = id;
+        return .{
+            .title = shell.title,
+            .app_id = shell.app_id,
+            .min_width = 10,
+            .min_height = 20,
+            .max_width = 0,
+            .max_height = 0,
+        };
+    }
+
+    pub fn queueToplevelConfigure(
+        shell: *TestShell,
+        id: ToplevelId,
+        value: ToplevelConfigure,
+    ) !u32 {
+        _ = id;
+        if (shell.reject_configure) return error.Exhausted;
+        shell.configure_serial += 1;
+        shell.configured = value;
+        return shell.configure_serial;
+    }
+};
+
+const TestDesktop = Desktop(TestShell);
+
+fn initTestDesktop(command_capacity: usize) !TestDesktop {
+    return TestDesktop.init(std.testing.allocator, .{
+        .toplevel_capacity = 3,
+        .command_capacity = command_capacity,
+        .metadata_bytes = 16,
+    }, .{ .x = 0, .y = 0, .width = 100, .height = 60 });
+}
+
+fn created(index: u32) TestShell.Event {
+    return .{ .toplevel_created = .{
+        .id = .{ .index = index, .generation = 1 },
+        .surface = .{ .index = index + 10, .generation = 2 },
+    } };
+}
+
+test "desktop: shell events produce exact tiling, focus, metadata, and configures" {
+    var desktop = try initTestDesktop(8);
+    defer desktop.deinit();
+    var shell = TestShell{};
+    shell.push(created(0));
+    shell.push(created(1));
+    try std.testing.expectEqual(@as(usize, 2), try desktop.consume(&shell, 8));
+
+    const first = try desktop.idForShell(.{ .index = 0, .generation = 1 });
+    const second = try desktop.idForShell(.{ .index = 1, .generation = 1 });
+    try std.testing.expectEqual(geometry.Rect{ .x = 0, .y = 0, .width = 50, .height = 60 }, (try desktop.scene(first)).geometry);
+    try std.testing.expectEqual(geometry.Rect{ .x = 50, .y = 0, .width = 50, .height = 60 }, (try desktop.scene(second)).geometry);
+    try std.testing.expectEqual(second, desktop.focused().?);
+    try std.testing.expectEqual(@as(usize, 3), desktop.pendingCommands());
+    var snapshot_storage: [3]TestDesktop.SceneWindow = undefined;
+    const snapshot = try desktop.sceneSnapshot(&snapshot_storage);
+    try std.testing.expectEqual(@as(usize, 2), snapshot.len);
+    try std.testing.expect(snapshot[0].stacking < snapshot[1].stacking);
+
+    shell.title = "terminal";
+    shell.app_id = "term";
+    shell.push(.{ .metadata_changed = .{ .index = 0, .generation = 1 } });
+    shell.push(.{ .commit_ready = .{ .index = 0, .generation = 1 } });
+    try std.testing.expectEqual(@as(usize, 2), try desktop.consume(&shell, 8));
+    try std.testing.expectEqualStrings("terminal", (try desktop.metadata(first)).title);
+    try std.testing.expect((try desktop.scene(first)).content_ready);
+}
+
+test "desktop: focus history and tiled-floating transitions are deterministic" {
+    var desktop = try initTestDesktop(16);
+    defer desktop.deinit();
+    var shell = TestShell{};
+    shell.push(created(0));
+    shell.push(created(1));
+    shell.push(created(2));
+    _ = try desktop.consume(&shell, 8);
+    while (desktop.peekCommand() != null) desktop.dropCommand();
+
+    const first = try desktop.idForShell(.{ .index = 0, .generation = 1 });
+    const third = try desktop.idForShell(.{ .index = 2, .generation = 1 });
+    try desktop.focusToplevel(first);
+    try desktop.setFloating(first, true);
+    try desktop.setFloatingGeometry(first, .{ .x = 5, .y = 6, .width = 30, .height = 20 });
+    try std.testing.expectEqual(first, desktop.focused().?);
+    try std.testing.expectEqual(geometry.Rect{ .x = 5, .y = 6, .width = 30, .height = 20 }, (try desktop.scene(first)).geometry);
+
+    shell.push(.{ .toplevel_destroyed = .{ .index = 0, .generation = 1 } });
+    _ = try desktop.consume(&shell, 1);
+    try std.testing.expectEqual(third, desktop.focused().?);
+    try std.testing.expectError(error.StaleToplevel, desktop.scene(first));
+}
+
+test "desktop: queued destroys preserve exact generations in order" {
+    var desktop = try initTestDesktop(16);
+    defer desktop.deinit();
+    var shell = TestShell{};
+    desktop.slots[0].header.generation = 7;
+    desktop.slots[1].header.generation = 11;
+    shell.push(created(0));
+    shell.push(created(1));
+    _ = try desktop.consume(&shell, 2);
+    while (desktop.peekCommand() != null) desktop.dropCommand();
+
+    shell.push(.{ .toplevel_destroyed = .{ .index = 0, .generation = 1 } });
+    shell.push(.{ .toplevel_destroyed = .{ .index = 1, .generation = 1 } });
+
+    try std.testing.expectEqual(@as(usize, 1), try desktop.consume(&shell, 8));
+    try std.testing.expectEqual(
+        TestDesktop.ToplevelId{ .index = 0, .generation = 7 },
+        desktop.takeDestroyed().?,
+    );
+    try std.testing.expectEqual(@as(usize, 1), try desktop.consume(&shell, 8));
+    try std.testing.expectEqual(
+        TestDesktop.ToplevelId{ .index = 1, .generation = 11 },
+        desktop.takeDestroyed().?,
+    );
+}
+
+test "desktop: capacity and command backpressure leave mutations transactional" {
+    var desktop = try initTestDesktop(3);
+    defer desktop.deinit();
+    var shell = TestShell{};
+    shell.push(created(0));
+    _ = try desktop.consume(&shell, 1);
+    const first = desktop.focused().?;
+    shell.push(created(1));
+    _ = try desktop.consume(&shell, 1);
+    const second = desktop.focused().?;
+    shell.push(created(2));
+    try std.testing.expectError(error.Backpressure, desktop.consume(&shell, 1));
+    try std.testing.expectEqual(second, desktop.focused().?);
+    try std.testing.expectError(
+        error.StaleToplevel,
+        desktop.idForShell(.{ .index = 2, .generation = 1 }),
+    );
+    desktop.dropCommand();
+    try std.testing.expectError(error.Backpressure, desktop.consume(&shell, 1));
+    try std.testing.expectEqual(second, desktop.focused().?);
+    while (desktop.peekCommand() != null) desktop.dropCommand();
+    try std.testing.expectEqual(@as(usize, 1), try desktop.consume(&shell, 1));
+    try std.testing.expect(!std.meta.eql(first, desktop.focused().?));
+    try std.testing.expect(!std.meta.eql(second, desktop.focused().?));
+}
+
+test "desktop: shell outbound backpressure retains configure ownership" {
+    var desktop = try initTestDesktop(3);
+    defer desktop.deinit();
+    var shell = TestShell{};
+    shell.push(created(0));
+    _ = try desktop.consume(&shell, 1);
+    shell.reject_configure = true;
+    try std.testing.expectError(error.Exhausted, desktop.flushConfigure(&shell));
+    try std.testing.expectEqual(@as(usize, 1), desktop.pendingCommands());
+    shell.reject_configure = false;
+    try std.testing.expectEqual(@as(?u32, 41), try desktop.flushConfigure(&shell));
+    try std.testing.expectEqual(@as(usize, 0), desktop.pendingCommands());
+    try std.testing.expect(shell.configured.?.states.activated);
+}
+
+test "desktop: invalid capacities are rejected before allocation" {
+    try std.testing.expectError(error.InvalidConfig, TestDesktop.init(
+        std.testing.allocator,
+        .{ .toplevel_capacity = 2, .command_capacity = 1, .metadata_bytes = 8 },
+        .{ .x = 0, .y = 0, .width = 10, .height = 10 },
+    ));
+}
+
+test "desktop: stale identity is rejected and exhausted generations retire" {
+    var desktop = try initTestDesktop(8);
+    defer desktop.deinit();
+    var shell = TestShell{};
+    desktop.slots[0].header.generation = std.math.maxInt(u32);
+    shell.push(created(0));
+    _ = try desktop.consume(&shell, 1);
+    const exhausted = desktop.focused().?;
+    shell.push(.{ .toplevel_destroyed = .{ .index = 0, .generation = 1 } });
+    _ = try desktop.consume(&shell, 1);
+    try std.testing.expect(desktop.slots[0].header.retired);
+    try std.testing.expectError(error.StaleToplevel, desktop.scene(exhausted));
+    try std.testing.expectEqual(@as(u32, 1), desktop.free);
+}
+
+test "desktop: toplevel capacity failure retains the exact shell event" {
+    var desktop = try TestDesktop.init(std.testing.allocator, .{
+        .toplevel_capacity = 1,
+        .command_capacity = 4,
+        .metadata_bytes = 8,
+    }, .{ .x = 0, .y = 0, .width = 10, .height = 10 });
+    defer desktop.deinit();
+    var shell = TestShell{};
+    shell.push(created(0));
+    shell.push(created(1));
+    _ = try desktop.consume(&shell, 1);
+    try std.testing.expectError(error.Exhausted, desktop.consume(&shell, 1));
+    try std.testing.expect(desktop.pending_event != null);
+    try std.testing.expectEqual(@as(usize, 1), desktop.live);
+}
+
+test "desktop: minimized and fullscreen requests update visibility and states" {
+    var desktop = try initTestDesktop(12);
+    defer desktop.deinit();
+    var shell = TestShell{};
+    shell.push(created(0));
+    shell.push(created(1));
+    _ = try desktop.consume(&shell, 2);
+    while (desktop.peekCommand() != null) desktop.dropCommand();
+    const first = try desktop.idForShell(.{ .index = 0, .generation = 1 });
+    const second = try desktop.idForShell(.{ .index = 1, .generation = 1 });
+    try desktop.focusToplevel(first);
+    while (desktop.peekCommand() != null) desktop.dropCommand();
+
+    shell.push(.{ .state_requested = .{
+        .id = .{ .index = 0, .generation = 1 },
+        .state = .fullscreen,
+        .enabled = true,
+    } });
+    _ = try desktop.consume(&shell, 1);
+    const fullscreen = try desktop.scene(first);
+    try std.testing.expectEqual(geometry.Rect{ .x = 0, .y = 0, .width = 100, .height = 60 }, fullscreen.geometry);
+    try std.testing.expect(fullscreen.stacking > (try desktop.scene(second)).stacking);
+    while (desktop.peekCommand() != null) desktop.dropCommand();
+
+    shell.push(.{ .state_requested = .{
+        .id = .{ .index = 0, .generation = 1 },
+        .state = .minimized,
+        .enabled = true,
+    } });
+    _ = try desktop.consume(&shell, 1);
+    try std.testing.expect(!(try desktop.scene(first)).visible);
+    try std.testing.expectEqual(second, desktop.focused().?);
+}

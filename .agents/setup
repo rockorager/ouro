@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-packages=(glslang-tools libdrm-dev libgbm-dev libpixman-1-dev libseat-dev libudev-dev libvulkan-dev pkg-config)
+packages=(glslang-tools libdrm-dev libgbm-dev libinput-dev libpixman-1-dev libseat-dev libudev-dev libvulkan-dev pkg-config)
 missing=()
 for package in "${packages[@]}"; do
     if ! dpkg-query -W -f='${db:Status-Abbrev}' "$package" 2>/dev/null | grep -q '^ii '; then
@@ -45,8 +45,8 @@ fi
 mkdir -p "$(dirname "$zig_bin")"
 ln -sfn "$zig_root/zig" "$zig_bin"
 
-printf 'Zig %s, libseat %s, libudev %s, libdrm %s, GBM %s, Pixman %s, and Vulkan %s are ready.\n' \
-    "$("$zig_bin" version)" "$(pkg-config --modversion libseat)" \
+printf 'Zig %s, libseat %s, libinput %s, libudev %s, libdrm %s, GBM %s, Pixman %s, and Vulkan %s are ready.\n' \
+    "$("$zig_bin" version)" "$(pkg-config --modversion libseat)" "$(pkg-config --modversion libinput)" \
     "$(pkg-config --modversion libudev)" "$(pkg-config --modversion libdrm)" \
     "$(pkg-config --modversion gbm)" "$(pkg-config --modversion pixman-1)" \
     "$(pkg-config --modversion vulkan)"

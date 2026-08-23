@@ -376,8 +376,11 @@ pub const Output = struct {
                 .presented => |event| {
                     if (self.pending_callback == null) {
                         const frame_id = self.in_flight_frame orelse return error.UnexpectedPageFlip;
-                        if (!std.meta.eql(event.image, self.kms_output.current.?))
-                            return error.UnexpectedPageFlip;
+                        // R11 validates the callback against the exact commit
+                        // record before publishing this event. Its current
+                        // scanout can already be null when a queued pause is
+                        // committed in the same event batch, so it is not a
+                        // stable identity source at this handoff boundary.
                         self.pending_callback = try self.scheduler.presentPhysical(
                             frame_id,
                             flipTimestampNs(event.seconds, event.microseconds),

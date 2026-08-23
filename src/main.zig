@@ -2,7 +2,7 @@
 const std = @import("std");
 const wayring = @import("wayring");
 const ouro = @import("ouro");
-const protocol = @import("core_protocol");
+const protocol = @import("xdg_protocol");
 
 const linux = std.os.linux;
 const Compositor = ouro.compositor.Compositor(protocol);
@@ -39,10 +39,17 @@ pub fn main(init: std.process.Init) !void {
         try wayring.unix_socket.listen(options.socket, 1),
         compositorConfig(),
     );
-    const coordinator = Coordinator.create(allocator, root, .{}, .{
+    const coordinator = Coordinator.create(allocator, root, .{
+        .input = ouro.input_platform.real,
+    }, .{
         .router_capacity = 16,
         .timer_capacity = 4,
-        .device_capacity = 4,
+        .device_capacity = 36,
+        .input = .{
+            .device_capacity = 16,
+            .event_capacity = 64,
+            .restricted_capacity = 32,
+        },
         .shm = .{
             .limits = .{ .max_pool_bytes = 16 * 1024 * 1024 },
             .pool_capacity = 8,
@@ -200,7 +207,7 @@ fn compositorConfig() Compositor.Config {
             .object_capacity = 128,
             .object_quota = 128,
             .buckets_per_client = 128,
-            .max_globals = 2,
+            .max_globals = 4,
             .registry_capacity = 1,
         },
     };

@@ -53,6 +53,20 @@ pub fn Adapter(comptime protocol: type) type {
         pub const Content = Commit.Content;
         pub const UpdateToken = Commit.Scheduler.Token;
 
+        pub const CommitHook = struct {
+            context: *anyopaque,
+            validate_fn: *const fn (*anyopaque, SurfaceId) anyerror!void,
+            committed_fn: *const fn (*anyopaque, SurfaceId) anyerror!void,
+        };
+
+        /// Protocol-neutral identity for a live Ouro surface slot. The slot
+        /// index is local to this adapter and the generation is inherited from
+        /// Wayring's complete resource handle.
+        pub const SurfaceId = struct {
+            index: u32,
+            generation: u32,
+        };
+
         const CopyState = union(enum) {
             pending,
             success: usize,
@@ -127,6 +141,7 @@ pub fn Adapter(comptime protocol: type) type {
         copies: []CopySlot,
         copy_storage: []u8,
         max_copy_bytes: usize,
+        commit_hook: ?CommitHook = null,
 
         pub fn init(
             allocator: std.mem.Allocator,
@@ -317,6 +332,83 @@ pub fn Adapter(comptime protocol: type) type {
             handle: objects.Handle,
         ) !*surface_state.Surface {
             return &(try adapter.resolveSurface(handle)).state;
+        }
+
+        pub fn getSurfaceObject(
+            adapter: *Self,
+            handle: objects.Handle,
+            object: *const objects.Object,
+        ) !*surface_state.Surface {
+            const slot = adapter.surfaceFromObject(object) orelse return error.StaleSurface;
+            if (!std.meta.eql(slot.resource, handle)) return error.StaleSurface;
+            return &slot.state;
+        }
+
+        pub fn surfaceId(adapter: *Self, handle: objects.Handle) !SurfaceId {
+            const slot = try adapter.resolveSurface(handle);
+            return .{
+                .index = adapter.surfaceIndex(slot),
+                .generation = handle.generation,
+            };
+        }
+
+        pub fn surfaceIdObject(
+            adapter: *Self,
+            handle: objects.Handle,
+            object: *const objects.Object,
+        ) !SurfaceId {
+            const slot = adapter.surfaceFromObject(object) orelse return error.StaleSurface;
+            if (!std.meta.eql(slot.resource, handle)) return error.StaleSurface;
+            return .{
+                .index = adapter.surfaceIndex(slot),
+                .generation = handle.generation,
+            };
+        }
+
+        pub fn getSurfaceById(adapter: *Self, id: SurfaceId) !*surface_state.Surface {
+            if (id.index >= adapter.surfaces.len) return error.StaleSurface;
+            const slot = &adapter.surfaces[id.index];
+            if (!slot.active or slot.resource.generation != id.generation)
+                return error.StaleSurface;
+            return &slot.state;
+        }
+
+        /// Installs the composition root's two-phase shell boundary. Validation
+        /// runs before the transactional core commit; publication runs only
+        /// after the core owner has accepted it.
+        pub fn setCommitHook(adapter: *Self, hook: CommitHook) !void {
+            if (adapter.commit_hook != null) return error.AlreadyInstalled;
+            adapter.commit_hook = hook;
+        }
+
+        /// Synchronous scene query over the exact committed input region. No
+        /// protocol resource pointer or region storage escapes this call.
+        pub fn inputContains(
+            adapter: *Self,
+            id: SurfaceId,
+            point: @import("../scene/geometry.zig").Point,
+        ) !bool {
+            if (id.index >= adapter.surfaces.len) return error.StaleSurface;
+            const slot = &adapter.surfaces[id.index];
+            if (!slot.active or slot.resource.generation != id.generation)
+                return error.StaleSurface;
+            const size = slot.state.committedSize();
+            if (point.x < 0 or point.y < 0 or
+                @as(u32, @intCast(point.x)) >= size.width or
+                @as(u32, @intCast(point.y)) >= size.height)
+                return false;
+            return slot.regions.inputContains(.{ .x = point.x, .y = point.y });
+        }
+
+        /// Protocol-adapter bridge for owners which must name a wl_surface on
+        /// the wire. Policy keeps only SurfaceId; the complete Wayring handle
+        /// is recovered and generation-checked at the protocol boundary.
+        pub fn surfaceHandle(adapter: *Self, id: SurfaceId) !objects.Handle {
+            if (id.index >= adapter.surfaces.len) return error.StaleSurface;
+            const slot = &adapter.surfaces[id.index];
+            if (!slot.active or slot.resource.generation != id.generation)
+                return error.StaleSurface;
+            return slot.resource;
         }
 
         /// M2 has no shell policy and therefore selects the first ordinary
@@ -569,6 +661,13 @@ pub fn Adapter(comptime protocol: type) type {
                     value.region,
                 ) catch |cause| return try adapter.failure(actor, resource.id, cause),
                 .commit => {
+                    const surface_id: SurfaceId = .{
+                        .index = adapter.surfaceIndex(slot),
+                        .generation = resource.generation,
+                    };
+                    if (adapter.commit_hook) |hook|
+                        hook.validate_fn(hook.context, surface_id) catch |cause|
+                            return try adapter.surfaceFailure(actor, resource.id, cause);
                     const pending_copy = adapter.pendingAttachmentCopy(slot) catch |cause|
                         return try adapter.surfaceFailure(actor, resource.id, cause);
                     const token = Commit.commitWithAttachment(
@@ -588,6 +687,9 @@ pub fn Adapter(comptime protocol: type) type {
                         cause,
                     );
                     if (pending_copy) |copy_slot| copy_slot.update = token;
+                    if (adapter.commit_hook) |hook|
+                        hook.committed_fn(hook.context, surface_id) catch |cause|
+                            return try adapter.surfaceFailure(actor, resource.id, cause);
                 },
                 .set_buffer_transform => |value| slot.state.setTransform(
                     @intCast(value.transform.value),
@@ -1692,6 +1794,48 @@ test "surface copies region request data before the region is destroyed" {
     try std.testing.expect(content.regions.opaque_changed);
 }
 
+test "interaction: core hit query uses exact committed region and surface generation" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const surface = try context.createSurface(10);
+    const region = try context.createRegion(11);
+    const buffer = try context.createShmBuffer(12, 13);
+
+    try test_protocol.wl_region.encodeRequest(&context.requests, region.id, .{
+        .add = .{ .x = 0, .y = 0, .width = 4, .height = 2 },
+    });
+    _ = try context.dispatchCore();
+    try test_protocol.wl_region.encodeRequest(&context.requests, region.id, .{
+        .subtract = .{ .x = 1, .y = 0, .width = 1, .height = 1 },
+    });
+    _ = try context.dispatchCore();
+    try test_protocol.wl_surface.encodeRequest(&context.requests, surface.id, .{
+        .set_input_region = .{ .region = region.id },
+    });
+    _ = try context.dispatchCore();
+    try test_protocol.wl_surface.encodeRequest(&context.requests, surface.id, .{
+        .attach = .{ .buffer = buffer.id, .x = 0, .y = 0 },
+    });
+    _ = try context.dispatchCore();
+    try test_protocol.wl_surface.encodeRequest(
+        &context.requests,
+        surface.id,
+        .{ .commit = .{} },
+    );
+    _ = try context.dispatchCore();
+
+    const id = try context.adapter.surfaceId(surface);
+    try std.testing.expect(try context.adapter.inputContains(id, .{ .x = 0, .y = 0 }));
+    try std.testing.expect(!(try context.adapter.inputContains(id, .{ .x = 1, .y = 0 })));
+    try std.testing.expect(!(try context.adapter.inputContains(id, .{ .x = 4, .y = 0 })));
+    var stale = id;
+    stale.generation +%= 1;
+    try std.testing.expectError(error.StaleSurface, context.adapter.inputContains(
+        stale,
+        .{ .x = 0, .y = 0 },
+    ));
+}
+
 test "invalid generated surface request posts the specified protocol error" {
     const context = try TestContext.init();
     defer context.deinit();
@@ -1734,6 +1878,43 @@ test "fixed surface capacity fails without publishing a partial object" {
     );
     try std.testing.expectEqual(wayring.dispatch.Control.stop, try context.dispatchCore());
     try std.testing.expect(context.server_objects.namespace.get(12) == null);
+}
+
+test "commit-hook admission failure precedes ordinary core surface mutation" {
+    const Hook = struct {
+        validated: usize = 0,
+        committed_count: usize = 0,
+
+        fn validate(pointer: *anyopaque, _: TestAdapter.SurfaceId) !void {
+            const hook: *@This() = @ptrCast(@alignCast(pointer));
+            hook.validated += 1;
+            return error.Exhausted;
+        }
+
+        fn committed(pointer: *anyopaque, _: TestAdapter.SurfaceId) !void {
+            const hook: *@This() = @ptrCast(@alignCast(pointer));
+            hook.committed_count += 1;
+        }
+    };
+    const context = try TestContext.init();
+    defer context.deinit();
+    const surface = try context.createSurface(10);
+    var hook: Hook = .{};
+    try context.adapter.setCommitHook(.{
+        .context = &hook,
+        .validate_fn = Hook.validate,
+        .committed_fn = Hook.committed,
+    });
+
+    try test_protocol.wl_surface.encodeRequest(
+        &context.requests,
+        surface.id,
+        .{ .commit = .{} },
+    );
+    try std.testing.expectEqual(wayring.dispatch.Control.stop, try context.dispatchCore());
+    try std.testing.expectEqual(@as(usize, 1), hook.validated);
+    try std.testing.expectEqual(@as(usize, 0), hook.committed_count);
+    try std.testing.expectEqual(@as(u64, 0), (try context.adapter.getSurface(surface)).sequence);
 }
 
 test "stale removal cannot release a reused surface slot" {

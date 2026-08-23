@@ -16,6 +16,8 @@ pub const loop = @import("runtime/loop.zig");
 pub const physical = @import("runtime/physical.zig");
 pub const backend_platform = @import("backend/platform.zig");
 pub const session = @import("backend/session.zig");
+pub const input_platform = @import("backend/input/platform.zig");
+pub const input_backend = @import("backend/input/backend.zig");
 pub const gbm = @import("backend/gbm.zig");
 pub const drm_platform = @import("backend/drm/platform.zig");
 pub const drm = @import("backend/drm/manager.zig");
@@ -31,6 +33,14 @@ pub const scene_damage = @import("scene/damage.zig");
 pub const headless_output = @import("output/headless.zig");
 pub const real_output = @import("output/drm.zig");
 pub const core_surface = @import("protocol/core_surface.zig");
+pub const xdg_shell = @import("protocol/xdg_shell.zig");
+pub const seat = @import("protocol/seat.zig");
+pub const scene_geometry = @import("scene/geometry.zig");
+pub const scene_hit_test = @import("scene/hit_test.zig");
+pub const scene_cursor = @import("scene/cursor.zig");
+pub const desktop_layout = @import("desktop/layout.zig");
+pub const desktop = @import("desktop/model.zig");
+pub const interaction = @import("input/interaction.zig");
 
 test {
     _ = surface;
@@ -49,6 +59,8 @@ test {
     _ = physical;
     _ = backend_platform;
     _ = session;
+    _ = input_platform;
+    _ = input_backend;
     _ = gbm;
     _ = drm_platform;
     _ = drm;
@@ -64,4 +76,12 @@ test {
     _ = headless_output;
     _ = real_output;
     _ = core_surface;
+    _ = xdg_shell;
+    _ = seat;
+    _ = scene_geometry;
+    _ = scene_hit_test;
+    _ = scene_cursor;
+    _ = desktop_layout;
+    _ = desktop;
+    _ = interaction;
 }

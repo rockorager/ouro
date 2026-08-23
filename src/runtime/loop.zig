@@ -139,10 +139,13 @@ pub fn Loop(comptime protocol: type) type {
         /// postpone a timer CQE already in that batch. If the handler declares
         /// `completions`, it receives both borrowed Ouro outcome slices as one
         /// batch and may update state or prepare SQEs before Wayring dispatch.
-        /// Wayring then performs completion routing, bounded request dispatch,
-        /// and pending I/O preparation. The sole submission is deliberately
-        /// last and includes initial accept, timer, completion-hook, shutdown,
-        /// and Wayring SQEs. The optional hook has this contract:
+        /// Wayring then performs completion routing and bounded request
+        /// dispatch. If declared, `prepare(*Handler) !void` runs afterward so
+        /// the coordinator can consume events produced by that dispatch and
+        /// schedule their protocol output in the same submission. The sole
+        /// submission is deliberately last and includes initial accept, timer,
+        /// completion/dispatch/prepare-hook, shutdown, and Wayring SQEs. The completion
+        /// hook has this contract:
         ///
         /// `fn completions(*Handler, []const TimerOutcome,
         ///     []const OuroCompletion) !void`
@@ -208,10 +211,20 @@ pub fn Loop(comptime protocol: type) type {
                     try handler.completions(completed_timers, completed_ouro);
             }
 
-            const wayring_progress = try self.driver.dispatch(
+            var wayring_progress = try self.driver.dispatch(
                 self.wayring_cqes[0..wayring_count],
                 handler,
             );
+            if (@hasDecl(@TypeOf(handler.*), "prepare")) {
+                try handler.prepare();
+                // Dispatch prepares before invoking request handlers. The
+                // coordinator hook can schedule peers in response to the
+                // terminal request in that batch, so prepare those newly
+                // scheduled sends before this turn's sole submission.
+                const prepared = try self.driver.prepare(handler);
+                wayring_progress.prepared += prepared.prepared;
+                wayring_progress.pending = prepared.pending;
+            }
             const submitted = try self.compositor.ring.submit();
             return .{
                 .reaped = copied,
