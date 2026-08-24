@@ -4,6 +4,7 @@ const std = @import("std");
 const wayring = @import("wayring");
 const completion = @import("completion.zig");
 const compositor = @import("compositor.zig");
+const shutdown_signal = @import("shutdown_signal.zig");
 const timer = @import("timer.zig");
 
 const linux = std.os.linux;
@@ -57,6 +58,7 @@ pub fn Loop(comptime protocol: type) type {
             unrouted_completions: []const Cqe,
             wayring: Driver.Progress,
             submitted: u32,
+            shutdown_requested: bool,
             /// More CQEs or deferred Wayring preparation remain for a future
             /// turn. The caller can use this to avoid blocking.
             needs_more_work: bool,
@@ -72,6 +74,8 @@ pub fn Loop(comptime protocol: type) type {
         timer_outcomes: []TimerOutcome,
         ouro_completions: []OuroCompletion,
         unrouted_completions: []Cqe,
+        shutdown: ?*shutdown_signal.Watcher = null,
+        shutdown_token: ?completion.Token = null,
 
         /// Allocates all turn storage and queues the initial listener accept.
         /// Nothing is submitted until the first call to `turn`.
@@ -116,6 +120,7 @@ pub fn Loop(comptime protocol: type) type {
         /// Requires completed shutdown and invalidates slices returned by the
         /// last turn.
         pub fn deinit(self: *Self) void {
+            std.debug.assert(self.shutdown_token == null);
             self.driver.deinit(self.allocator);
             self.allocator.free(self.unrouted_completions);
             self.allocator.free(self.ouro_completions);
@@ -125,11 +130,42 @@ pub fn Loop(comptime protocol: type) type {
             self.* = undefined;
         }
 
+        /// Queues the process-shutdown eventfd poll for the first turn's sole
+        /// submission. The poll remains owned until TERM/INT or an internal
+        /// shutdown request makes the descriptor readable.
+        pub fn installShutdown(self: *Self, watcher: *shutdown_signal.Watcher) !void {
+            if (self.shutdown != null) return error.AlreadyInstalled;
+            const token = try self.router.acquire(.shutdown);
+            errdefer self.router.retire(token) catch unreachable;
+            _ = try self.compositor.ring.poll_add(
+                token.encode(),
+                watcher.descriptor(),
+                linux.POLL.IN | linux.POLL.ERR | linux.POLL.HUP | linux.POLL.NVAL,
+            );
+            self.shutdown = watcher;
+            self.shutdown_token = token;
+        }
+
         /// Starts Wayring's abrupt listener/client drain. Cancellation SQEs are
         /// prepared by the next turn and all resulting CQEs must continue to be
         /// processed until `Progress.wayring.shutdown_complete` is true.
         pub fn requestShutdown(self: *Self) !void {
+            if (self.shutdown) |watcher| watcher.request();
             try self.driver.requestShutdown();
+        }
+
+        /// Waits without flushing or submitting SQEs. The preceding turn has
+        /// already submitted every prepared operation; this only blocks until
+        /// one completion is available for the following turn to consume.
+        pub fn waitForCompletion(self: *Self) !void {
+            if (self.compositor.ring.cq_ready() != 0) return;
+            _ = self.compositor.ring.enter(0, 1, linux.IORING_ENTER_GETEVENTS) catch |err| switch (err) {
+                // TERM/INT can interrupt the wait before the eventfd poll CQE
+                // is visible. The handler has made that descriptor readable,
+                // so the following ordinary turn or wait will consume it.
+                error.SignalInterrupt => return,
+                else => return err,
+            };
         }
 
         /// Performs one allocation-free turn and exactly one ring submission.
@@ -164,8 +200,21 @@ pub fn Loop(comptime protocol: type) type {
             var timer_count: usize = 0;
             var ouro_count: usize = 0;
             var unrouted_count: usize = 0;
+            var shutdown_requested = false;
             for (self.cqes[0..copied]) |cqe| {
                 if (self.router.route(cqe.user_data)) |token| {
+                    if (token.kind == .shutdown) {
+                        if (self.shutdown_token == null or
+                            !std.meta.eql(self.shutdown_token.?, token))
+                            return error.UnexpectedShutdownCompletion;
+                        if (cqe.res < 0 or @as(u32, @intCast(cqe.res)) & linux.POLL.IN == 0)
+                            return error.ShutdownPollFailed;
+                        if (!(try self.shutdown.?.consume())) return error.MissingShutdownWakeup;
+                        try self.router.retire(token);
+                        self.shutdown_token = null;
+                        shutdown_requested = true;
+                        continue;
+                    }
                     if (token.kind == .timer) {
                         const completed = try self.timers.complete(self.router, token, cqe.res);
                         self.timer_outcomes[timer_count] = .{
@@ -234,6 +283,7 @@ pub fn Loop(comptime protocol: type) type {
                 .unrouted_completions = self.unrouted_completions[0..unrouted_count],
                 .wayring = wayring_progress,
                 .submitted = submitted,
+                .shutdown_requested = shutdown_requested,
                 .needs_more_work = self.compositor.ring.cq_ready() != 0 or
                     wayring_progress.pending,
             };

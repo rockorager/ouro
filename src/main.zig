@@ -31,7 +31,7 @@ pub fn main(init: std.process.Init) !void {
         return error.DrmHardwareUnavailable;
     }
     _ = linux.close(@intCast(dri_result));
-    var shutdown_signals = ouro.shutdown_signal.Watcher.install();
+    var shutdown_signals = try ouro.shutdown_signal.Watcher.install();
     defer shutdown_signals.deinit();
 
     wayring.unix_socket.unlink(options.socket) catch {};
@@ -85,7 +85,7 @@ pub fn main(init: std.process.Init) !void {
             .output_id = .{ .index = 0, .generation = 1 },
             .scheduler = .{
                 .refresh_ns = 16_666_667,
-                .render_budget_ns = 5_000_000,
+                .render_budget_ns = 7_000_000,
             },
             .renderer = options.renderer,
             .image_count = 3,
@@ -113,12 +113,13 @@ pub fn main(init: std.process.Init) !void {
         return err;
     };
     var run_error: ?anyerror = null;
-    coordinator.start(&loop) catch |err| {
+    loop.installShutdown(&shutdown_signals) catch |err| {
         run_error = err;
-        coordinator.requestStop() catch |stop_err| {
-            run_error = stop_err;
-        };
     };
+    coordinator.start(&loop) catch |err| {
+        if (run_error == null) run_error = err;
+    };
+    if (run_error != null) coordinator.requestStop() catch {};
 
     if (run_error == null)
         std.log.info("Ouro listening on {s}; renderer policy={s}", .{
@@ -127,28 +128,32 @@ pub fn main(init: std.process.Init) !void {
         });
     var wayring_drained = false;
     var signal_stop_started = false;
+    var wait_for_completion = false;
     while (!wayring_drained or !coordinator.backendDrainComplete()) {
-        if (!signal_stop_started and shutdown_signals.requested()) {
-            signal_stop_started = true;
-            coordinator.requestStop() catch |err| {
-                if (run_error == null) run_error = err;
+        if (wait_for_completion) loop.waitForCompletion() catch |err| {
+            if (run_error == null) run_error = err;
+            coordinator.requestStop() catch |stop_err| {
+                if (run_error == null) run_error = stop_err;
             };
-        }
+            wait_for_completion = false;
+            continue;
+        };
         const progress = loop.turn(coordinator) catch |err| {
             if (run_error == null) run_error = err;
             coordinator.requestStop() catch |stop_err| {
                 if (run_error == null) run_error = stop_err;
             };
+            wait_for_completion = false;
             continue;
         };
         wayring_drained = progress.wayring.shutdown_complete;
-        if (!progress.needs_more_work and progress.reaped == 0) {
-            std.Io.sleep(init.io, .fromMilliseconds(1), .awake) catch |err| {
+        wait_for_completion = !progress.needs_more_work;
+        if (!signal_stop_started and progress.shutdown_requested) {
+            signal_stop_started = true;
+            coordinator.requestStop() catch |err| {
                 if (run_error == null) run_error = err;
-                coordinator.requestStop() catch |stop_err| {
-                    if (run_error == null) run_error = stop_err;
-                };
             };
+            wait_for_completion = false;
         }
     }
     loop.deinit();
