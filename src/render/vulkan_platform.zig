@@ -1,5 +1,6 @@
-//! Replaceable Vulkan ABI boundary. Only copied records, DMA-BUF FDs, and
-//! sync_file FDs cross it; renderer policy never sees a Vulkan object.
+//! Replaceable Vulkan ABI boundary. Borrowed source rows are synchronously
+//! packed into target-owned mapped storage; renderer policy never sees a Vulkan
+//! object. DMA-BUF and sync_file FD ownership remains explicit.
 
 const std = @import("std");
 const gbm = @import("../backend/gbm.zig");
@@ -36,7 +37,8 @@ pub const Frame = struct {
     output_format: render.PixelFormat,
     clear: render.Color,
     samples: []const Sample,
-    source_bytes: []const u8,
+    sources: []const render.Source,
+    source_byte_count: usize,
     render_damage: []const render.Rect,
 };
 
@@ -447,10 +449,35 @@ fn realDestroyTarget(_: *anyopaque, renderer: Renderer, target_value: Target) vo
 fn realDraw(_: *anyopaque, renderer: Renderer, target_value: Target, frame: Frame) !std.posix.fd_t {
     const self: *RealRenderer = @ptrCast(@alignCast(renderer));
     const target: *RealTarget = @ptrCast(@alignCast(target_value));
-    if (frame.samples.len > self.max_samples or frame.source_bytes.len > self.max_source_bytes)
+    if (frame.samples.len > self.max_samples or frame.sources.len != frame.samples.len or
+        frame.source_byte_count > self.max_source_bytes)
         return error.CapacityExceeded;
     if (frame.output.width != target.width or frame.output.height != target.height)
         return error.TargetMismatch;
+    var validated_bytes: usize = 0;
+    for (frame.sources, frame.samples) |source, sample| {
+        const packed_stride = std.math.mul(u32, source.size.width, 4) catch
+            return error.CapacityExceeded;
+        const length = std.math.mul(usize, packed_stride, source.size.height) catch
+            return error.CapacityExceeded;
+        const source_length = std.math.mul(usize, source.stride, source.size.height) catch
+            return error.CapacityExceeded;
+        const end = std.math.add(usize, validated_bytes, length) catch
+            return error.CapacityExceeded;
+        const source_offset = std.math.cast(u32, validated_bytes) orelse
+            return error.CapacityExceeded;
+        if (source.stride < packed_stride or source_length > source.bytes.len or
+            end > frame.source_byte_count or
+            !std.meta.eql(sample.source, [4]u32{
+                source_offset,
+                source.size.width,
+                source.size.height,
+                packed_stride,
+            }))
+            return error.CapacityExceeded;
+        validated_bytes = end;
+    }
+    if (validated_bytes != frame.source_byte_count) return error.CapacityExceeded;
     switch (target.state) {
         .ready => {},
         .in_flight => {
@@ -461,7 +488,21 @@ fn realDraw(_: *anyopaque, renderer: Renderer, target_value: Target, frame: Fram
         .queue_failed, .export_failed => return error.TargetTerminal,
     }
     @memcpy(@as([*]u8, @ptrCast(target.sample_map))[0 .. frame.samples.len * @sizeOf(Sample)], std.mem.sliceAsBytes(frame.samples));
-    @memcpy(@as([*]u8, @ptrCast(target.source_map))[0..frame.source_bytes.len], frame.source_bytes);
+    const source_map = @as([*]u8, @ptrCast(target.source_map))[0..frame.source_byte_count];
+    var offset: usize = 0;
+    for (frame.sources) |source| {
+        const packed_stride = source.size.width * 4;
+        for (0..source.size.height) |row| {
+            const source_start = @as(usize, source.stride) * row;
+            const packed_start = offset + @as(usize, packed_stride) * row;
+            @memcpy(
+                source_map[packed_start..][0..packed_stride],
+                source.bytes[source_start..][0..packed_stride],
+            );
+        }
+        offset += @as(usize, packed_stride) * source.size.height;
+    }
+    std.debug.assert(offset == source_map.len);
     try vk(c.vkResetCommandBuffer(target.command_buffer, 0), error.ResetCommandBufferFailed);
     var begin: c.VkCommandBufferBeginInfo = .{ .sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .pNext = null, .flags = c.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, .pInheritanceInfo = null };
     try vk(c.vkBeginCommandBuffer(target.command_buffer, &begin), error.BeginCommandBufferFailed);

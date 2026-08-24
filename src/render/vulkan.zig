@@ -50,7 +50,8 @@ pub const Renderer = struct {
     implementation: vk.Renderer,
     records: []TargetRecord,
     samples: []vk.Sample,
-    source_bytes: []u8,
+    sources: []render_types.Source,
+    max_source_bytes: usize,
     damage: []render_types.Rect,
 
     /// `drm_fd` is borrowed for device identity only. Vulkan selects the
@@ -76,8 +77,8 @@ pub const Renderer = struct {
         @memset(records, .{});
         const samples = try allocator.alloc(vk.Sample, config.max_samples);
         errdefer allocator.free(samples);
-        const source_bytes = try allocator.alloc(u8, config.max_source_bytes);
-        errdefer allocator.free(source_bytes);
+        const sources = try allocator.alloc(render_types.Source, config.max_samples);
+        errdefer allocator.free(sources);
         const damage = try allocator.alloc(render_types.Rect, config.max_damage_rects);
         errdefer allocator.free(damage);
         const implementation = try platform.create(drm_fd, .{
@@ -91,7 +92,8 @@ pub const Renderer = struct {
             .implementation = implementation,
             .records = records,
             .samples = samples,
-            .source_bytes = source_bytes,
+            .sources = sources,
+            .max_source_bytes = config.max_source_bytes,
             .damage = damage,
         };
     }
@@ -107,7 +109,7 @@ pub const Renderer = struct {
         }
         self.platform.destroy(self.implementation);
         self.allocator.free(self.damage);
-        self.allocator.free(self.source_bytes);
+        self.allocator.free(self.sources);
         self.allocator.free(self.samples);
         self.allocator.free(self.records);
         self.* = undefined;
@@ -161,17 +163,10 @@ pub const Renderer = struct {
             const start = byte_count;
             byte_count = std.math.add(usize, byte_count, length) catch
                 return error.SourceCapacityExceeded;
-            if (byte_count > self.source_bytes.len) return error.SourceCapacityExceeded;
-            for (0..source.source.size.height) |row| {
-                const source_start = @as(usize, source.source.stride) * row;
-                const packed_start = start + @as(usize, packed_stride) * row;
-                @memcpy(
-                    self.source_bytes[packed_start..][0..packed_stride],
-                    source.source.bytes[source_start..][0..packed_stride],
-                );
-            }
+            if (byte_count > self.max_source_bytes) return error.SourceCapacityExceeded;
             validated.source.stride = packed_stride;
             self.samples[sample_count] = try packSample(validated, @intCast(start), planned.destination);
+            self.sources[sample_count] = source.source;
             sample_count += 1;
         }
 
@@ -203,7 +198,8 @@ pub const Renderer = struct {
             .output_format = list.output_format,
             .clear = list.clear,
             .samples = self.samples[0..sample_count],
-            .source_bytes = self.source_bytes[0..byte_count],
+            .sources = self.sources[0..sample_count],
+            .source_byte_count = byte_count,
             .render_damage = self.damage[0..damage_count],
         }) catch |err| {
             if (err == error.CompletionExportFailedAfterSubmit) record.terminal = true;
@@ -709,8 +705,21 @@ const FakePlatform = struct {
     fn draw(context: *anyopaque, _: vk.Renderer, _: vk.Target, frame: vk.Frame) !std.posix.fd_t {
         const self: *FakePlatform = @ptrCast(@alignCast(context));
         self.draw_count += 1;
-        self.last_byte_count = frame.source_bytes.len;
-        @memcpy(self.last_bytes[0..frame.source_bytes.len], frame.source_bytes);
+        self.last_byte_count = frame.source_byte_count;
+        var offset: usize = 0;
+        for (frame.sources) |source| {
+            const packed_stride = source.size.width * 4;
+            for (0..source.size.height) |row| {
+                const source_start = @as(usize, source.stride) * row;
+                const packed_start = offset + @as(usize, packed_stride) * row;
+                @memcpy(
+                    self.last_bytes[packed_start..][0..packed_stride],
+                    source.bytes[source_start..][0..packed_stride],
+                );
+            }
+            offset += @as(usize, packed_stride) * source.size.height;
+        }
+        if (offset != frame.source_byte_count) return error.FakeSourceSize;
         self.last_sample_count = frame.samples.len;
         @memcpy(self.last_samples[0..frame.samples.len], frame.samples);
         if (frame.samples.len != 0) self.last_sample = frame.samples[0];
