@@ -85,7 +85,7 @@ pub fn main(init: std.process.Init) !void {
             .output_id = .{ .index = 0, .generation = 1 },
             .scheduler = .{
                 .refresh_ns = 16_666_667,
-                .render_budget_ns = 2_000_000,
+                .render_budget_ns = 5_000_000,
             },
             .renderer = options.renderer,
             .image_count = 3,

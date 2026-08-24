@@ -172,6 +172,7 @@ pub fn Scheduler(comptime PresentationToken: type) type {
         next_sequence: u64 = 1,
         retiring: bool = false,
         physical_submission: bool = false,
+        physical_phase_ns: ?Timestamp = null,
 
         pub fn init(
             allocator: std.mem.Allocator,
@@ -394,6 +395,9 @@ pub fn Scheduler(comptime PresentationToken: type) type {
         ) Error!Outcome {
             try self.requireFrame(frame_id, .submitted);
             if (!self.physical_submission) return error.InvalidStage;
+            // DRM flip timestamps share CLOCK_MONOTONIC with timer deadlines.
+            // The observed flip is the authoritative physical refresh phase.
+            self.physical_phase_ns = actual_ns;
             self.physical_submission = false;
             return self.finishFrame(.presented, actual_ns);
         }
@@ -461,12 +465,13 @@ pub fn Scheduler(comptime PresentationToken: type) type {
         fn nextTarget(self: *const Self, now_ns: Timestamp) Error!Timestamp {
             const threshold = std.math.add(Timestamp, now_ns, self.config.render_budget_ns) catch
                 return error.TimestampOverflow;
-            if (self.config.phase_ns > threshold) return self.config.phase_ns;
-            const elapsed = threshold - self.config.phase_ns;
+            const phase_ns = self.physical_phase_ns orelse self.config.phase_ns;
+            if (phase_ns > threshold) return phase_ns;
+            const elapsed = threshold - phase_ns;
             const periods = elapsed / self.config.refresh_ns + 1;
             const advance = std.math.mul(Timestamp, periods, self.config.refresh_ns) catch
                 return error.TimestampOverflow;
-            return std.math.add(Timestamp, self.config.phase_ns, advance) catch
+            return std.math.add(Timestamp, phase_ns, advance) catch
                 return error.TimestampOverflow;
         }
 
@@ -651,6 +656,34 @@ test "missed and exact render deadlines defer to a future refresh" {
     try exact.timerArmed(deferred, fakeHandle(2), 17);
     _ = try exact.remove();
     _ = try exact.timerEvent(fakeHandle(2), .canceled, 18);
+}
+
+test "physical presentation anchors future refresh targets" {
+    const config: Config = .{
+        .phase_ns = 5,
+        .refresh_ns = 10,
+        .render_budget_ns = 3,
+    };
+    var scheduler = try TestScheduler.init(std.testing.allocator, test_output, config, 1);
+    defer scheduler.deinit(std.testing.allocator);
+
+    try scheduler.request(.damage, 1);
+    const first = try armRender(&scheduler, 1, fakeHandle(1));
+    _ = try startRender(&scheduler, fakeHandle(1), 2);
+    try scheduler.captureSamples(first, &.{});
+    _ = try scheduler.renderComplete(first, 2);
+    try scheduler.submitPhysical(first, 2);
+    try std.testing.expectEqual(@as(Timestamp, 25), try scheduler.nextTarget(13));
+    _ = try scheduler.presentPhysical(first, 12);
+    try std.testing.expectEqual(@as(Timestamp, 22), try scheduler.nextTarget(13));
+
+    try scheduler.request(.damage, 13);
+    const next = (try scheduler.timerRequest(13)).?;
+    try std.testing.expectEqual(@as(Timestamp, 19), try nsFromDeadline(next.deadline));
+    try scheduler.timerArmed(next, fakeHandle(2), 13);
+    try std.testing.expectEqual(@as(Timestamp, 22), scheduler.frame.?.target_ns);
+    _ = try scheduler.remove();
+    _ = try scheduler.timerEvent(fakeHandle(2), .canceled, 14);
 }
 
 test "stale frame timer and output generations cannot alias" {
