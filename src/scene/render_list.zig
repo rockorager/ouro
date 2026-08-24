@@ -1,9 +1,9 @@
 //! Fixed-capacity publication of validated applied content for renderers.
 //!
-//! The builder copies source pixels into its own preallocated byte arena. Thus
-//! neither Wayring resource handles nor callback-lifetime SHM mappings cross
-//! the scene/renderer boundary. Returned lists borrow the builder until the
-//! next successful `build` or `deinit`.
+//! The builder publishes validated sample metadata and can either copy source
+//! pixels into its preallocated byte arena or borrow caller-owned stable bytes.
+//! Returned lists borrow the builder until its next successful publication or
+//! `deinit`; borrowed source bytes must additionally remain stable while used.
 
 const std = @import("std");
 const render = @import("../render/types.zig");
@@ -47,15 +47,11 @@ pub const Builder = struct {
         return self.samples.len * @sizeOf(render.SurfaceSample) + self.bytes.len;
     }
 
-    /// Validates the entire candidate before publishing or copying anything.
-    /// Source padding is retained; renderers may not assume tightly packed rows.
-    pub fn build(
-        self: *Builder,
+    fn validateCandidate(
+        self: Builder,
         output: render.Size,
-        output_format: render.PixelFormat,
-        clear: render.Color,
         applied: []const AppliedSurface,
-    ) Error!render.List {
+    ) Error!void {
         try render.validateOutput(output);
         if (applied.len > self.samples.len)
             return error.SampleCapacityExceeded;
@@ -72,6 +68,18 @@ pub const Builder = struct {
                     return error.DuplicateSampleIdentity;
             }
         }
+    }
+
+    /// Validates the entire candidate before publishing or copying anything.
+    /// Source padding is retained; renderers may not assume tightly packed rows.
+    pub fn build(
+        self: *Builder,
+        output: render.Size,
+        output_format: render.PixelFormat,
+        clear: render.Color,
+        applied: []const AppliedSurface,
+    ) Error!render.List {
+        try self.validateCandidate(output, applied);
 
         var offset: usize = 0;
         for (applied, 0..) |surface, index| {
@@ -83,6 +91,28 @@ pub const Builder = struct {
         }
         self.sample_count = applied.len;
         self.byte_count = offset;
+        return .{
+            .output = output,
+            .output_format = output_format,
+            .clear = clear,
+            .samples = self.samples[0..self.sample_count],
+        };
+    }
+
+    /// Publishes validated metadata without copying already-owned source bytes.
+    /// The caller must keep every source stable until the renderer has consumed
+    /// the returned list.
+    pub fn buildBorrowed(
+        self: *Builder,
+        output: render.Size,
+        output_format: render.PixelFormat,
+        clear: render.Color,
+        applied: []const AppliedSurface,
+    ) Error!render.List {
+        try self.validateCandidate(output, applied);
+        @memcpy(self.samples[0..applied.len], applied);
+        self.sample_count = applied.len;
+        self.byte_count = 0;
         return .{
             .output = output,
             .output_format = output_format,
@@ -120,6 +150,20 @@ test "render: list publication copies bytes and is transactional" {
     malformed.source.stride = 3;
     try std.testing.expectError(error.InvalidSource, builder.build(.{ .width = 1, .height = 1 }, .xrgb8888, .{ .r = 0, .g = 0, .b = 0 }, &.{malformed}));
     try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, list.samples[0].source.bytes);
+}
+
+test "render: borrowed list publication retains stable source bytes" {
+    var builder = try Builder.init(std.testing.allocator, 1, 8);
+    defer builder.deinit();
+    var source = [_]u8{ 1, 2, 3, 4 };
+    const list = try builder.buildBorrowed(.{ .width = 1, .height = 1 }, .xrgb8888, .{ .r = 0, .g = 0, .b = 0 }, &.{validSample(&source)});
+    source = [_]u8{ 9, 9, 9, 9 };
+    try std.testing.expectEqualSlices(u8, &.{ 9, 9, 9, 9 }, list.samples[0].source.bytes);
+
+    var malformed = validSample(&source);
+    malformed.source.stride = 3;
+    try std.testing.expectError(error.InvalidSource, builder.buildBorrowed(.{ .width = 1, .height = 1 }, .xrgb8888, .{ .r = 0, .g = 0, .b = 0 }, &.{malformed}));
+    try std.testing.expectEqualSlices(u8, &.{ 9, 9, 9, 9 }, list.samples[0].source.bytes);
 }
 
 test "render: list rejects identity geometry byte and sample capacities" {

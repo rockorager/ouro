@@ -280,8 +280,9 @@ pub const Output = struct {
     }
 
     /// Performs the complete synchronous event-turn render/commit transition.
-    /// `applied` must already come from the CU scheduler. The builder copies its
-    /// bytes, and every binding must exactly match one sampled presentation.
+    /// `applied` must already come from the CU scheduler and retain stable source
+    /// bytes through this call. Every binding must exactly match one sampled
+    /// presentation.
     pub fn renderFrame(
         self: *Output,
         frame_id: scheduler_api.FrameId,
@@ -293,7 +294,7 @@ pub const Output = struct {
         if (!self.accepting_frames or self.in_flight_frame != null or
             self.pending_callback != null)
             return error.InvalidState;
-        const list = self.builder.build(
+        const list = self.builder.buildBorrowed(
             self.planner.output,
             self.output_format,
             self.clear,
