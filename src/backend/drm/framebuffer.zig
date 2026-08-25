@@ -229,7 +229,7 @@ pub const Pool = struct {
         if (slot.mapping != null) return error.AlreadyMapped;
         if (slot.metadata.modifier != gbm.modifier_linear)
             return error.NotLinear;
-        const mapping = try self.gbm_platform.map(slot.bo);
+        const mapping = try self.gbm_platform.map(slot.bo, .write);
         const length = std.math.mul(usize, mapping.stride, slot.metadata.height) catch {
             self.gbm_platform.unmap(slot.bo, mapping.token);
             return error.MappingTooLarge;
@@ -617,7 +617,7 @@ const FakePlatform = struct {
     modifier: u64 = gbm.modifier_linear,
     bytes: [64 * 48]u8 = [_]u8{0} ** (64 * 48),
 
-    const gbm_vtable: gbm.Platform.VTable = .{ .create_device = createDevice, .destroy_device = destroyDevice, .create_bo = createBo, .destroy_bo = destroyBo, .metadata = metadata, .export_plane_fd = exportPlaneFd, .map = map, .unmap = unmap };
+    const gbm_vtable: gbm.Platform.VTable = .{ .create_device = createDevice, .destroy_device = destroyDevice, .create_bo = createBo, .import_bo = importBo, .destroy_bo = destroyBo, .metadata = metadata, .export_plane_fd = exportPlaneFd, .map = map, .unmap = unmap };
     const drm_vtable: Platform.VTable = .{ .add = add, .remove = remove };
 
     fn gbmPlatform(self: *FakePlatform) gbm.Platform {
@@ -651,6 +651,16 @@ const FakePlatform = struct {
         return @ptrFromInt(32 + self.bo_create_count * 16);
     }
 
+    fn importBo(context: *anyopaque, device: gbm.Device, import: gbm.Import) !gbm.Bo {
+        return createBo(context, device, .{
+            .width = import.width,
+            .height = import.height,
+            .format = import.format,
+            .modifier = import.modifier,
+            .explicit_modifier = true,
+        });
+    }
+
     fn destroyBo(context: *anyopaque, _: gbm.Bo) void {
         const self: *FakePlatform = @ptrCast(@alignCast(context));
         self.bo_destroy_count += 1;
@@ -679,7 +689,7 @@ const FakePlatform = struct {
         return error.NotAvailableInFake;
     }
 
-    fn map(context: *anyopaque, _: gbm.Bo) !gbm.Mapping {
+    fn map(context: *anyopaque, _: gbm.Bo, _: gbm.MapAccess) !gbm.Mapping {
         const self: *FakePlatform = @ptrCast(@alignCast(context));
         self.map_count += 1;
         return .{ .data = &self.bytes, .stride = 64, .token = @ptrFromInt(48) };

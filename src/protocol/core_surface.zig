@@ -121,7 +121,28 @@ pub fn Adapter(comptime protocol: type) type {
             info: wayring.shm.Buffer,
             storage: ShmStorage,
         };
-        const Imports = @import("../buffer_import.zig").Registry(ShmBacking);
+        pub const ExternalBuffer = struct {
+            context: *anyopaque,
+            token: u64,
+            width: u32,
+            height: u32,
+            format: u32,
+            modifier: u64,
+            plane_count: u8,
+            fds: [4]std.posix.fd_t = [_]std.posix.fd_t{-1} ** 4,
+            strides: [4]u32 = [_]u32{0} ** 4,
+            offsets: [4]u32 = [_]u32{0} ** 4,
+            release_fn: *const fn (*anyopaque, u64) void,
+        };
+        pub const ExternalImporter = struct {
+            context: *anyopaque,
+            acquire_fn: *const fn (*anyopaque, *const objects.Object) anyerror!?ExternalBuffer,
+        };
+        const ImportBacking = union(enum) {
+            shm: ShmBacking,
+            external: ExternalBuffer,
+        };
+        const Imports = @import("../buffer_import.zig").Registry(ImportBacking);
 
         const SurfaceSlot = struct {
             active: bool = false,
@@ -188,6 +209,7 @@ pub fn Adapter(comptime protocol: type) type {
         copy_storage: []u8,
         max_copy_bytes: usize,
         commit_hook: ?CommitHook = null,
+        external_importer: ?ExternalImporter = null,
 
         pub fn init(
             allocator: std.mem.Allocator,
@@ -240,7 +262,7 @@ pub fn Adapter(comptime protocol: type) type {
                 allocator,
                 config.attachment_capacity,
                 null,
-                disposeShmBacking,
+                disposeImportBacking,
             );
             errdefer imports.deinit(allocator);
             const copies = try allocator.alloc(CopySlot, config.copy_capacity);
@@ -651,6 +673,27 @@ pub fn Adapter(comptime protocol: type) type {
             format: wayring.shm.Format,
         };
 
+        pub const BufferSource = union(enum) {
+            shm: ShmSource,
+            external: ExternalBuffer,
+        };
+
+        pub fn setExternalImporter(adapter: *Self, importer: ExternalImporter) !void {
+            if (adapter.external_importer != null) return error.AlreadyConfigured;
+            adapter.external_importer = importer;
+        }
+
+        pub fn bufferSource(
+            adapter: *Self,
+            lease: surface_state.BufferLease,
+        ) !BufferSource {
+            const backing = try adapter.imports.get(lease);
+            return switch (backing.*) {
+                .shm => .{ .shm = try shmBackingSource(backing.shm) },
+                .external => |external| .{ .external = external },
+            };
+        }
+
         /// Returns renderer metadata with the retained zero-copy mapping for
         /// sealed SHM, or the stable bounded ordinary-SHM copy destination.
         pub fn shmSource(
@@ -658,6 +701,13 @@ pub fn Adapter(comptime protocol: type) type {
             lease: surface_state.BufferLease,
         ) !ShmSource {
             const backing = try adapter.imports.get(lease);
+            return switch (backing.*) {
+                .shm => |shm| shmBackingSource(shm),
+                .external => error.UnsupportedBuffer,
+            };
+        }
+
+        fn shmBackingSource(backing: ShmBacking) !ShmSource {
             const bytes = try switch (backing.storage) {
                 .direct => |direct| direct.store.bytes(direct.pin),
                 .copied => |owner| copied: {
@@ -1212,44 +1262,65 @@ pub fn Adapter(comptime protocol: type) type {
                 return error.UnknownObject;
             const object = server_objects.namespace.resolve(handle) orelse
                 return error.UnknownObject;
-            const token = adapter.shm.bufferToken(object) orelse return error.UnsupportedBuffer;
-            const info = try adapter.shm.store.bufferInfo(token);
-
-            // All fallible surface validation and bounded-admission checks must
-            // precede prepareCopy: once queued, its pin and destination must
-            // survive through a terminal CQE.
             if (version >= 5 and (x != 0 or y != 0)) return error.InvalidOffset;
-            if (info.width <= 0 or info.height <= 0) return error.InvalidSize;
             if (adapter.imports.available() == 0) return error.Exhausted;
 
-            const pin = try adapter.shm.store.pin(token);
-            var pin_owned = true;
-            errdefer if (pin_owned) adapter.shm.store.unpin(pin) catch unreachable;
-            const storage: ShmStorage = direct: {
-                _ = adapter.shm.store.bytes(pin) catch |cause| switch (cause) {
-                    error.UnsafeAccess => {
-                        try adapter.shm.store.unpin(pin);
-                        pin_owned = false;
-                        break :direct .{ .copied = try adapter.prepareCopy(token, info.extent) };
-                    },
-                    else => return cause,
+            if (adapter.shm.bufferToken(object)) |token| {
+                const info = try adapter.shm.store.bufferInfo(token);
+                // All fallible surface validation and bounded-admission checks
+                // must precede prepareCopy: once queued, its pin and
+                // destination survive through a terminal CQE.
+                if (info.width <= 0 or info.height <= 0) return error.InvalidSize;
+
+                const pin = try adapter.shm.store.pin(token);
+                var pin_owned = true;
+                errdefer if (pin_owned) adapter.shm.store.unpin(pin) catch unreachable;
+                const storage: ShmStorage = direct: {
+                    _ = adapter.shm.store.bytes(pin) catch |cause| switch (cause) {
+                        error.UnsafeAccess => {
+                            try adapter.shm.store.unpin(pin);
+                            pin_owned = false;
+                            break :direct .{ .copied = try adapter.prepareCopy(token, info.extent) };
+                        },
+                        else => return cause,
+                    };
+                    pin_owned = false;
+                    break :direct .{ .direct = .{
+                        .store = &adapter.shm.store,
+                        .pin = pin,
+                    } };
                 };
-                pin_owned = false;
-                break :direct .{ .direct = .{
-                    .store = &adapter.shm.store,
-                    .pin = pin,
-                } };
-            };
-            const backing: ShmBacking = .{ .info = info, .storage = storage };
-            var lease = adapter.imports.acquire(backing) catch |cause| {
-                disposeShmBacking(null, backing);
-                return cause;
-            };
+                const backing: ImportBacking = .{ .shm = .{ .info = info, .storage = storage } };
+                var lease = adapter.imports.acquire(backing) catch |cause| {
+                    disposeImportBacking(null, backing);
+                    return cause;
+                };
+                errdefer lease.deinit();
+                try slot.state.attach(version, .{
+                    .handle = handle,
+                    .width = info.width,
+                    .height = info.height,
+                }, x, y);
+                slot.attachment.attach(lease);
+                return;
+            }
+
+            const importer = adapter.external_importer orelse return error.UnsupportedBuffer;
+            const external = (try importer.acquire_fn(importer.context, object)) orelse
+                return error.UnsupportedBuffer;
+            var external_owned = true;
+            errdefer if (external_owned) external.release_fn(external.context, external.token);
+            if (external.width == 0 or external.height == 0 or external.plane_count == 0 or
+                external.plane_count > external.fds.len)
+                return error.InvalidSize;
+            const backing: ImportBacking = .{ .external = external };
+            var lease = try adapter.imports.acquire(backing);
+            external_owned = false;
             errdefer lease.deinit();
             try slot.state.attach(version, .{
                 .handle = handle,
-                .width = info.width,
-                .height = info.height,
+                .width = external.width,
+                .height = external.height,
             }, x, y);
             slot.attachment.attach(lease);
         }
@@ -1403,15 +1474,18 @@ pub fn Adapter(comptime protocol: type) type {
         fn pendingAttachmentCopy(adapter: *Self, surface: *SurfaceSlot) !?*CopySlot {
             const lease = surface.attachment.pending orelse return null;
             const backing = try adapter.imports.get(lease);
-            return switch (backing.storage) {
-                .direct => null,
-                .copied => |owner| {
-                    const slot = try resolveCopyOwner(owner);
-                    return switch (slot.state) {
-                        .pending => slot,
-                        .success => null,
-                        .failed => error.CopyFailed,
-                    };
+            return switch (backing.*) {
+                .external => null,
+                .shm => |shm| switch (shm.storage) {
+                    .direct => null,
+                    .copied => |owner| {
+                        const slot = try resolveCopyOwner(owner);
+                        return switch (slot.state) {
+                            .pending => slot,
+                            .success => null,
+                            .failed => error.CopyFailed,
+                        };
+                    },
                 },
             };
         }
@@ -1544,13 +1618,16 @@ pub fn Adapter(comptime protocol: type) type {
                 return error.StaleHandle).version;
         }
 
-        fn disposeShmBacking(_: ?*anyopaque, backing: ShmBacking) void {
-            switch (backing.storage) {
-                .direct => |direct| direct.store.unpin(direct.pin) catch unreachable,
-                .copied => |owner| {
-                    const slot = resolveCopyOwner(owner) catch unreachable;
-                    slot.owner_alive = false;
+        fn disposeImportBacking(_: ?*anyopaque, backing: ImportBacking) void {
+            switch (backing) {
+                .shm => |shm| switch (shm.storage) {
+                    .direct => |direct| direct.store.unpin(direct.pin) catch unreachable,
+                    .copied => |owner| {
+                        const slot = resolveCopyOwner(owner) catch unreachable;
+                        slot.owner_alive = false;
+                    },
                 },
+                .external => |external| external.release_fn(external.context, external.token),
             }
         }
 
@@ -2420,6 +2497,74 @@ test "unsealed SHM completion before commit publishes without a constraint" {
     const bytes = try context.adapter.shmBytes(content.attachment_lease.?);
     try std.testing.expectEqual(@as(usize, 32), bytes.len);
     try std.testing.expectEqual(@as(u8, 0xa5), bytes[0]);
+}
+
+test "external buffer attachment uses shared commit ownership" {
+    const FakeImporter = struct {
+        marker: u8 = 0,
+        acquired: usize = 0,
+        released: usize = 0,
+
+        fn acquire(context: *anyopaque, object: *const objects.Object) !?TestAdapter.ExternalBuffer {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (object.context != @as(?*anyopaque, @ptrCast(self))) return null;
+            self.acquired += 1;
+            return .{
+                .context = self,
+                .token = 42,
+                .width = 2,
+                .height = 1,
+                .format = 0x34325258,
+                .modifier = 0,
+                .plane_count = 1,
+                .fds = .{ 7, -1, -1, -1 },
+                .strides = .{ 8, 0, 0, 0 },
+                .release_fn = release,
+            };
+        }
+
+        fn release(context: *anyopaque, token: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            std.debug.assert(token == 42);
+            self.released += 1;
+        }
+    };
+
+    const context = try TestContext.init();
+    defer context.deinit();
+    var importer: FakeImporter = .{};
+    try context.adapter.setExternalImporter(.{
+        .context = &importer,
+        .acquire_fn = FakeImporter.acquire,
+    });
+    const buffer = try context.server_objects.insertClient(
+        6,
+        &test_protocol.wl_buffer.info,
+        1,
+        &importer,
+    );
+    const surface = try context.createSurface(10);
+    try test_protocol.wl_surface.encodeRequest(&context.requests, surface.id, .{
+        .attach = .{ .buffer = buffer.id, .x = 0, .y = 0 },
+    });
+    _ = try context.dispatchCore();
+    try test_protocol.wl_surface.encodeRequest(
+        &context.requests,
+        surface.id,
+        .{ .commit = .{} },
+    );
+    _ = try context.dispatchCore();
+
+    var output: [1]TestAdapter.Applied = undefined;
+    var content = (try context.adapter.tryApply(surface, &output))[0].payload;
+    try std.testing.expectEqual(@as(usize, 1), importer.acquired);
+    try std.testing.expectEqual(@as(usize, 0), importer.released);
+    const source = try context.adapter.bufferSource(content.attachment_lease.?);
+    try std.testing.expectEqual(TestAdapter.BufferSource.external, std.meta.activeTag(source));
+    try std.testing.expectEqual(@as(u64, 42), source.external.token);
+    try std.testing.expectEqual(@as(u32, 8), source.external.strides[0]);
+    content.deinit();
+    try std.testing.expectEqual(@as(usize, 1), importer.released);
 }
 
 test "surface removal drops copy ownership but preserves storage through CQE" {

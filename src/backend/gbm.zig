@@ -32,6 +32,19 @@ pub const Allocation = struct {
     explicit_modifier: bool,
 };
 
+pub const Import = struct {
+    width: u32,
+    height: u32,
+    format: u32,
+    modifier: u64,
+    plane_count: u8,
+    fds: [max_planes]std.posix.fd_t = [_]std.posix.fd_t{-1} ** max_planes,
+    strides: [max_planes]u32 = [_]u32{0} ** max_planes,
+    offsets: [max_planes]u32 = [_]u32{0} ** max_planes,
+};
+
+pub const MapAccess = enum { read, write };
+
 pub const Metadata = struct {
     width: u32,
     height: u32,
@@ -57,10 +70,11 @@ pub const Platform = struct {
         create_device: *const fn (*anyopaque, std.posix.fd_t) anyerror!Device,
         destroy_device: *const fn (*anyopaque, Device) void,
         create_bo: *const fn (*anyopaque, Device, Allocation) anyerror!Bo,
+        import_bo: *const fn (*anyopaque, Device, Import) anyerror!Bo,
         destroy_bo: *const fn (*anyopaque, Bo) void,
         metadata: *const fn (*anyopaque, Bo) anyerror!Metadata,
         export_plane_fd: *const fn (*anyopaque, Bo, u8) anyerror!std.posix.fd_t,
-        map: *const fn (*anyopaque, Bo) anyerror!Mapping,
+        map: *const fn (*anyopaque, Bo, MapAccess) anyerror!Mapping,
         unmap: *const fn (*anyopaque, Bo, MapToken) void,
     };
 
@@ -74,6 +88,10 @@ pub const Platform = struct {
 
     pub fn createBo(self: Platform, device: Device, allocation: Allocation) !Bo {
         return self.vtable.create_bo(self.context, device, allocation);
+    }
+
+    pub fn importBo(self: Platform, device: Device, import: Import) !Bo {
+        return self.vtable.import_bo(self.context, device, import);
     }
 
     pub fn destroyBo(self: Platform, bo: Bo) void {
@@ -90,8 +108,8 @@ pub const Platform = struct {
         return self.vtable.export_plane_fd(self.context, bo, plane);
     }
 
-    pub fn map(self: Platform, bo: Bo) !Mapping {
-        return self.vtable.map(self.context, bo);
+    pub fn map(self: Platform, bo: Bo, access: MapAccess) !Mapping {
+        return self.vtable.map(self.context, bo, access);
     }
 
     pub fn unmap(self: Platform, bo: Bo, token: MapToken) void {
@@ -106,6 +124,7 @@ const real_vtable: Platform.VTable = .{
     .create_device = realCreateDevice,
     .destroy_device = realDestroyDevice,
     .create_bo = realCreateBo,
+    .import_bo = realImportBo,
     .destroy_bo = realDestroyBo,
     .metadata = realMetadata,
     .export_plane_fd = realExportPlaneFd,
@@ -146,6 +165,37 @@ fn realCreateBo(_: *anyopaque, device: Device, allocation: Allocation) !Bo {
     return @ptrCast(bo orelse return error.CreateBoFailed);
 }
 
+fn realImportBo(_: *anyopaque, device: Device, import: Import) !Bo {
+    if (import.width == 0 or import.height == 0 or import.plane_count == 0 or
+        import.plane_count > max_planes)
+        return error.InvalidImport;
+    var data: c.gbm_import_fd_modifier_data = .{
+        .width = import.width,
+        .height = import.height,
+        .format = import.format,
+        .num_fds = import.plane_count,
+        .fds = [_]c_int{-1} ** max_planes,
+        .strides = [_]c_int{0} ** max_planes,
+        .offsets = [_]c_int{0} ** max_planes,
+        .modifier = import.modifier,
+    };
+    for (0..import.plane_count) |plane| {
+        if (import.fds[plane] < 0 or import.strides[plane] > std.math.maxInt(c_int) or
+            import.offsets[plane] > std.math.maxInt(c_int))
+            return error.InvalidImport;
+        data.fds[plane] = import.fds[plane];
+        data.strides[plane] = @intCast(import.strides[plane]);
+        data.offsets[plane] = @intCast(import.offsets[plane]);
+    }
+    const bo = c.gbm_bo_import(
+        @ptrCast(@alignCast(device)),
+        c.GBM_BO_IMPORT_FD_MODIFIER,
+        &data,
+        c.GBM_BO_USE_RENDERING,
+    );
+    return @ptrCast(bo orelse return error.ImportBoFailed);
+}
+
 fn usesExplicitModifierPath(allocation: Allocation) bool {
     return allocation.explicit_modifier and allocation.modifier != modifier_linear;
 }
@@ -181,7 +231,7 @@ fn realExportPlaneFd(_: *anyopaque, bo_value: Bo, plane: u8) !std.posix.fd_t {
     return fd;
 }
 
-fn realMap(_: *anyopaque, bo_value: Bo) !Mapping {
+fn realMap(_: *anyopaque, bo_value: Bo, access: MapAccess) !Mapping {
     const bo: *c.struct_gbm_bo = @ptrCast(@alignCast(bo_value));
     var stride: u32 = 0;
     var map_data: ?*anyopaque = null;
@@ -191,7 +241,10 @@ fn realMap(_: *anyopaque, bo_value: Bo) !Mapping {
         0,
         c.gbm_bo_get_width(bo),
         c.gbm_bo_get_height(bo),
-        c.GBM_BO_TRANSFER_WRITE,
+        switch (access) {
+            .read => c.GBM_BO_TRANSFER_READ,
+            .write => c.GBM_BO_TRANSFER_WRITE,
+        },
         &stride,
         &map_data,
     ) orelse return error.MapFailed;

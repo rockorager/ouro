@@ -172,6 +172,61 @@ pub const RenderDevice = struct {
     }
 };
 
+pub const ImportedSource = struct {
+    platform: gbm.Platform,
+    bo: gbm.Bo,
+    mapping: gbm.Mapping,
+    bytes: []const u8,
+    width: u32,
+    height: u32,
+    stride: u32,
+    format: render.PixelFormat,
+
+    pub fn deinit(source: *ImportedSource) void {
+        source.platform.unmap(source.bo, source.mapping.token);
+        source.platform.destroyBo(source.bo);
+        source.* = undefined;
+    }
+};
+
+/// Imports and read-maps one client DMA-BUF long enough for the renderer
+/// content store to take its immutable bounded copy. GBM owns any required
+/// driver staging and implicit synchronization for the mapping lifetime.
+pub fn mapImportedSource(
+    platform: gbm.Platform,
+    device: gbm.Device,
+    import: gbm.Import,
+) !ImportedSource {
+    if (import.plane_count != 1) return error.UnsupportedPlaneCount;
+    const format = formatFromDrm(import.format) orelse return error.UnsupportedFormat;
+    const bo = try platform.importBo(device, import);
+    errdefer platform.destroyBo(bo);
+    const metadata = try platform.getMetadata(bo);
+    if (metadata.width != import.width or metadata.height != import.height or
+        metadata.format != import.format or metadata.plane_count != import.plane_count)
+        return error.ImportMetadataMismatch;
+    if (import.modifier != gbm.modifier_invalid and
+        metadata.modifier != import.modifier and
+        !(import.modifier == gbm.modifier_linear and metadata.modifier == gbm.modifier_invalid))
+        return error.ImportMetadataMismatch;
+    const mapping = try platform.map(bo, .read);
+    errdefer platform.unmap(bo, mapping.token);
+    const row_bytes = std.math.mul(u32, import.width, 4) catch return error.InvalidSource;
+    if (mapping.stride < row_bytes) return error.InvalidSource;
+    const length = std.math.mul(usize, mapping.stride, import.height) catch
+        return error.InvalidSource;
+    return .{
+        .platform = platform,
+        .bo = bo,
+        .mapping = mapping,
+        .bytes = mapping.data[0..length],
+        .width = import.width,
+        .height = import.height,
+        .stride = mapping.stride,
+        .format = format,
+    };
+}
+
 const OutputPath = struct {
     pool: framebuffer.Pool,
     vulkan_targets: ?vulkan.Targets = null,
@@ -407,6 +462,10 @@ pub const Output = struct {
 
     pub fn rendererKind(self: *const Output) ?RendererKind {
         return self.render_device.rendererKind();
+    }
+
+    pub fn mapClientBuffer(self: *Output, import: gbm.Import) !ImportedSource {
+        return mapImportedSource(self.pool.gbm_platform, self.pool.device, import);
     }
 
     /// Transfers the initial output's renderer ownership to the composition
@@ -1086,6 +1145,7 @@ const SimFixture = struct {
     request_count: usize = 0,
     flip_userdata: ?*anyopaque = null,
     presented_count: usize = 0,
+    last_map_access: ?gbm.MapAccess = null,
     router: completion.Router = undefined,
     ring: linux.IoUring = undefined,
 
@@ -1093,6 +1153,7 @@ const SimFixture = struct {
         .create_device = createDevice,
         .destroy_device = destroyDevice,
         .create_bo = createBo,
+        .import_bo = importBo,
         .destroy_bo = destroyBo,
         .metadata = metadata,
         .export_plane_fd = exportPlaneFd,
@@ -1166,6 +1227,16 @@ const SimFixture = struct {
         self.bo_count += 1;
         return @ptrCast(&self.bytes[index]);
     }
+
+    fn importBo(context: *anyopaque, gbm_device: gbm.Device, import: gbm.Import) !gbm.Bo {
+        return createBo(context, gbm_device, .{
+            .width = import.width,
+            .height = import.height,
+            .format = import.format,
+            .modifier = import.modifier,
+            .explicit_modifier = true,
+        });
+    }
     fn destroyBo(context: *anyopaque, _: gbm.Bo) void {
         const self: *SimFixture = @ptrCast(@alignCast(context));
         self.bos_destroyed += 1;
@@ -1176,7 +1247,9 @@ const SimFixture = struct {
     fn exportPlaneFd(_: *anyopaque, _: gbm.Bo, _: u8) !std.posix.fd_t {
         return error.UnexpectedExport;
     }
-    fn map(_: *anyopaque, bo: gbm.Bo) !gbm.Mapping {
+    fn map(context: *anyopaque, bo: gbm.Bo, access: gbm.MapAccess) !gbm.Mapping {
+        const self: *SimFixture = @ptrCast(@alignCast(context));
+        self.last_map_access = access;
         return .{ .data = @ptrCast(bo), .stride = 4, .token = bo };
     }
     fn unmap(_: *anyopaque, _: gbm.Bo, _: gbm.MapToken) void {}
@@ -1227,6 +1300,25 @@ const SimFixture = struct {
         return error.UnexpectedRetirement;
     }
 };
+
+test "drm-sim: client DMA-BUF import is read mapped and released" {
+    var fixture: SimFixture = .{};
+    const platform: gbm.Platform = .{ .context = &fixture, .vtable = &SimFixture.gbm_vtable };
+    var source = try mapImportedSource(platform, &fixture, .{
+        .width = 1,
+        .height = 1,
+        .format = gbm.format_xrgb8888,
+        .modifier = gbm.modifier_linear,
+        .plane_count = 1,
+        .fds = .{ 9, -1, -1, -1 },
+        .strides = .{ 4, 0, 0, 0 },
+    });
+    try std.testing.expectEqual(gbm.MapAccess.read, fixture.last_map_access.?);
+    try std.testing.expectEqual(@as(usize, 4), source.bytes.len);
+    try std.testing.expectEqual(@as(u32, 4), source.stride);
+    source.deinit();
+    try std.testing.expectEqual(@as(usize, 1), fixture.bos_destroyed);
+}
 
 fn startSimFrame(output: *Output, now_ns: u64, handle: timer.Handle) !scheduler_api.FrameId {
     try output.request(.damage, now_ns);

@@ -28,6 +28,7 @@ const core_surface = @import("../protocol/core_surface.zig");
 const xdg_shell = @import("../protocol/xdg_shell.zig");
 const protocol_seat = @import("../protocol/seat.zig");
 const protocol_data_device = @import("../protocol/data_device.zig");
+const protocol_linux_dmabuf = @import("../protocol/linux_dmabuf.zig");
 const protocol_fractional_scale = @import("../protocol/fractional_scale.zig");
 const protocol_output = @import("../protocol/output.zig");
 const desktop_model = @import("../desktop/model.zig");
@@ -49,6 +50,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const Interaction = interaction_model.Interaction(Desktop);
         const SeatAdapter = protocol_seat.Adapter(protocol, Adapter);
         const DataDeviceAdapter = protocol_data_device.Adapter(protocol);
+        const DmabufAdapter = protocol_linux_dmabuf.Adapter(protocol);
         const FractionalScaleAdapter = protocol_fractional_scale.Adapter(protocol, Adapter);
         const OutputAdapter = protocol_output.Adapter(protocol);
 
@@ -142,6 +144,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .keymap = protocol_seat.default_keymap,
             },
             data_device: protocol_data_device.Config = .{},
+            linux_dmabuf: protocol_linux_dmabuf.Config = .{},
             fractional_scale: protocol_fractional_scale.Config = .{},
             protocol_output: protocol_output.Config = .{},
             drm: drm.Config,
@@ -187,6 +190,7 @@ pub fn Coordinator(comptime protocol: type) type {
         interaction: Interaction,
         seat_adapter: SeatAdapter,
         data_device_adapter: DataDeviceAdapter,
+        dmabuf_adapter: DmabufAdapter,
         fractional_scale_adapter: FractionalScaleAdapter,
         output_adapter: OutputAdapter,
         presentations: Presentations,
@@ -336,6 +340,9 @@ pub fn Coordinator(comptime protocol: type) type {
             errdefer self.seat_adapter.deinit();
             self.data_device_adapter = try DataDeviceAdapter.init(allocator, config.data_device);
             errdefer self.data_device_adapter.deinit();
+            self.dmabuf_adapter = try DmabufAdapter.init(allocator, config.linux_dmabuf);
+            errdefer self.dmabuf_adapter.deinit();
+            try self.adapter.setExternalImporter(self.dmabuf_adapter.externalImporter(Adapter));
             self.fractional_scale_adapter = try FractionalScaleAdapter.init(
                 allocator,
                 &self.adapter,
@@ -389,6 +396,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
             _ = try self.data_device_adapter.install(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
+            _ = try self.dmabuf_adapter.install(&root.runtime);
             try self.adapter.setCommitHook(.{
                 .context = self,
                 .validate_fn = validateSurfaceCommit,
@@ -451,6 +461,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.allocator.free(self.app_layers);
             self.output_adapter.deinit();
             self.fractional_scale_adapter.deinit();
+            self.dmabuf_adapter.deinit();
             self.data_device_adapter.deinit();
             self.seat_adapter.deinit();
             self.interaction.deinit();
@@ -584,6 +595,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 return control;
             }
             if (try self.data_device_adapter.request(peer, target, message, fds)) |control| {
+                try self.flushProtocol();
+                return control;
+            }
+            if (try self.dmabuf_adapter.request(peer, target, message, fds)) |control| {
                 try self.flushProtocol();
                 return control;
             }
@@ -1073,14 +1088,16 @@ pub fn Coordinator(comptime protocol: type) type {
             const shell_flushed = try self.shell_adapter.flushOn(objects, &actor.transmit);
             const seat_flushed = try self.seat_adapter.flushOn(objects, &actor.transmit);
             const data_device_flushed = try self.data_device_adapter.flushOn(peer, objects, &actor.transmit);
+            const dmabuf_flushed = try self.dmabuf_adapter.flushOn(peer, objects, &actor.transmit);
             const fractional_scale_flushed = try self.fractional_scale_adapter.flushOn(peer, objects, &actor.transmit);
             const output_flushed = try self.output_adapter.flushOn(peer, objects, &actor.transmit);
             const presentation_flushed = try self.adapter.flushPresentationClockOn(peer, objects, &actor.transmit);
             const discarded_flushed = try self.adapter.flushDiscardedFeedbackOn(peer, objects, &actor.transmit);
-            if (shell_flushed != 0 or seat_flushed != 0 or data_device_flushed != 0 or fractional_scale_flushed != 0 or output_flushed != 0 or presentation_flushed != 0 or discarded_flushed != 0 or
+            if (shell_flushed != 0 or seat_flushed != 0 or data_device_flushed != 0 or dmabuf_flushed != 0 or fractional_scale_flushed != 0 or output_flushed != 0 or presentation_flushed != 0 or discarded_flushed != 0 or
                 self.shell_adapter.pendingOutbound() != 0 or
                 self.seat_adapter.pendingOutbound() != 0 or
                 self.data_device_adapter.pendingOutbound() != 0 or
+                self.dmabuf_adapter.pendingOutbound(peer) or
                 self.fractional_scale_adapter.pendingOutbound(peer) or
                 self.output_adapter.pendingOutbound() != 0 or
                 self.adapter.pendingPresentationClock(peer) or
@@ -1282,18 +1299,45 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             _ = attachment.buffer orelse return error.MissingBuffer;
             const lease = content.attachment_lease orelse return error.MissingLease;
-            const source = try self.adapter.shmSource(lease);
-            if (source.bytes.len > (self.output_config.max_surface_bytes orelse
+            const source = try self.adapter.bufferSource(lease);
+            var imported_source: ?output_api.ImportedSource = null;
+            defer if (imported_source) |*imported| imported.deinit();
+            const borrowed_source: render.Source = switch (source) {
+                .shm => |shm| shm_source: {
+                    const pixel_format: render.PixelFormat = if (shm.format.value == protocol.wl_shm.format.argb8888.value) .argb8888_premultiplied else if (shm.format.value == protocol.wl_shm.format.xrgb8888.value) .xrgb8888 else return error.UnsupportedShmFormat;
+                    if (shm.stride > std.math.maxInt(u32)) return error.InvalidSource;
+                    break :shm_source .{
+                        .size = .{ .width = shm.width, .height = shm.height },
+                        .stride = @intCast(shm.stride),
+                        .format = pixel_format,
+                        .bytes = shm.bytes,
+                    };
+                },
+                .external => |external| external_source: {
+                    const output = self.output orelse
+                        return try self.discardPendingCandidate(layer, pending.id);
+                    imported_source = output.mapClientBuffer(.{
+                        .width = external.width,
+                        .height = external.height,
+                        .format = external.format,
+                        .modifier = external.modifier,
+                        .plane_count = external.plane_count,
+                        .fds = external.fds,
+                        .strides = external.strides,
+                        .offsets = external.offsets,
+                    }) catch return try self.discardPendingCandidate(layer, pending.id);
+                    const imported = &imported_source.?;
+                    break :external_source .{
+                        .size = .{ .width = imported.width, .height = imported.height },
+                        .stride = imported.stride,
+                        .format = imported.format,
+                        .bytes = imported.bytes,
+                    };
+                },
+            };
+            if (borrowed_source.bytes.len > (self.output_config.max_surface_bytes orelse
                 self.output_config.max_source_bytes))
                 return error.InvalidSource;
-            const pixel_format: render.PixelFormat = if (source.format.value == protocol.wl_shm.format.argb8888.value) .argb8888_premultiplied else if (source.format.value == protocol.wl_shm.format.xrgb8888.value) .xrgb8888 else return error.UnsupportedShmFormat;
-            if (source.stride > std.math.maxInt(u32)) return error.InvalidSource;
-            const borrowed_source: render.Source = .{
-                .size = .{ .width = source.width, .height = source.height },
-                .stride = @intCast(source.stride),
-                .format = pixel_format,
-                .bytes = source.bytes,
-            };
             const surface_id: @import("../output/headless.zig").SurfaceId = .{
                 .index = exact_surface_id.index,
                 .generation = exact_surface_id.generation,
@@ -1339,38 +1383,17 @@ pub fn Coordinator(comptime protocol: type) type {
                 .width = rendered_width,
                 .height = rendered_height,
             };
-            const crop = try sourceCrop(content.surface, source.width, source.height);
+            const crop = try sourceCrop(
+                content.surface,
+                borrowed_source.size.width,
+                borrowed_source.size.height,
+            );
             const clip = if (scene) |window|
                 if (window.visible) try clipToOutput(destination, output_size) else null
             else
                 try clipToOutput(destination, output_size);
             const visible_clip = clip orelse {
-                const token = self.presentations.admitImported(.{}) catch |err| switch (err) {
-                    error.Exhausted => return false,
-                    else => return err,
-                };
-                const published = .{
-                    .peer = candidate.peer,
-                    .surface = candidate.surface,
-                    .id = candidate.id,
-                    .content = content.*,
-                };
-                layer.candidate = null;
-                layer.content = published.content;
-                layer.peer = published.peer;
-                layer.surface = published.surface;
-                layer.id = published.id;
-                layer.presentation = token;
-                layer.source_release_pending = true;
-                layer.outcome_pending = true;
-                layer.feedback_outcome = .discarded;
-                layer.retire_after_outcome = true;
-                // Visibility changes at commit consumption, independently of
-                // live-client release encoding retained below.
-                layer.active = false;
-                self.finishPendingCandidate(pending.id);
-                _ = try self.retryLayerOutcome(layer);
-                return true;
+                return try self.discardPendingCandidate(layer, pending.id);
             };
             const render_device = self.render_device orelse return false;
             const upload_damage = renderUploadDamage(content.surface.upload_damage);
@@ -1440,6 +1463,39 @@ pub fn Coordinator(comptime protocol: type) type {
             self.finishPendingCandidate(pending.id);
             self.stats.applied += 1;
             _ = try self.retryLayerSourceRelease(layer);
+            return true;
+        }
+
+        /// Consumes a committed candidate which cannot produce visible output.
+        /// This is also the protocol-safe path for a DMA-BUF which was valid at
+        /// creation but can no longer be imported after output or driver state
+        /// changed: release it and discard feedback without disconnecting the
+        /// client or retrying a permanently unusable buffer forever.
+        fn discardPendingCandidate(
+            self: *Self,
+            layer: *Layer,
+            pending_id: Adapter.SurfaceId,
+        ) !bool {
+            const token = self.presentations.admitImported(.{}) catch |err| switch (err) {
+                error.Exhausted => return false,
+                else => return err,
+            };
+            const candidate = layer.candidate orelse return error.MissingCandidate;
+            layer.candidate = null;
+            layer.content = candidate.content;
+            layer.peer = candidate.peer;
+            layer.surface = candidate.surface;
+            layer.id = candidate.id;
+            layer.presentation = token;
+            layer.source_release_pending = true;
+            layer.outcome_pending = true;
+            layer.feedback_outcome = .discarded;
+            layer.retire_after_outcome = true;
+            // Visibility changes at commit consumption, independently of
+            // live-client release encoding retained below.
+            layer.active = false;
+            self.finishPendingCandidate(pending_id);
+            _ = try self.retryLayerOutcome(layer);
             return true;
         }
 
@@ -1864,6 +1920,7 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.shell_adapter.resourceRemoved(handle, object);
             _ = self.seat_adapter.resourceRemoved(handle, object);
             _ = self.data_device_adapter.resourceRemoved(handle, object);
+            _ = self.dmabuf_adapter.resourceRemoved(handle, object);
             _ = self.fractional_scale_adapter.resourceRemoved(handle, object);
             _ = self.output_adapter.resourceRemoved(handle, object);
             if (removed_surface_peer) |peer| self.output_adapter.surfaceRemoved(peer, handle);

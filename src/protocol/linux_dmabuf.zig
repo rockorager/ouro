@@ -650,6 +650,44 @@ pub fn Adapter(comptime protocol: type) type {
             try adapter.store.releaseLease(lease);
         }
 
+        pub fn externalImporter(adapter: *Self, comptime CoreSurface: type) CoreSurface.ExternalImporter {
+            const Bridge = struct {
+                fn acquire(
+                    context: *anyopaque,
+                    object: *const objects.Object,
+                ) !?CoreSurface.ExternalBuffer {
+                    const owner: *Self = @ptrCast(@alignCast(context));
+                    const handle = owner.bufferFromObject(object) orelse return null;
+                    const lease = try owner.store.retainBuffer(handle);
+                    errdefer owner.store.releaseLease(lease) catch unreachable;
+                    const value = try owner.store.leasedBuffer(lease);
+                    var result: CoreSurface.ExternalBuffer = .{
+                        .context = owner,
+                        .token = encodeLease(lease),
+                        .width = value.width,
+                        .height = value.height,
+                        .format = value.format,
+                        .modifier = value.planes[0].?.modifier,
+                        .plane_count = value.plane_count,
+                        .release_fn = @This().release,
+                    };
+                    for (0..value.plane_count) |plane_index| {
+                        const plane = value.planes[plane_index].?;
+                        result.fds[plane_index] = plane.fd;
+                        result.strides[plane_index] = plane.stride;
+                        result.offsets[plane_index] = plane.offset;
+                    }
+                    return result;
+                }
+
+                fn release(context: *anyopaque, token: u64) void {
+                    const owner: *Self = @ptrCast(@alignCast(context));
+                    owner.store.releaseLease(decodeLease(token)) catch unreachable;
+                }
+            };
+            return .{ .context = adapter, .acquire_fn = Bridge.acquire };
+        }
+
         pub fn resourceRemoved(adapter: *Self, handle: objects.Handle, object: objects.Object) bool {
             if (object.interface == &Dmabuf.info) {
                 const slot = fromContext(ManagerSlot, adapter.managers, object.context) orelse return false;
@@ -761,6 +799,14 @@ fn indexOf(comptime T: type, slots: []T, slot: *T) u32 {
 
 fn samePeer(a: wayring.io_uring.Peer, b: wayring.io_uring.Peer) bool {
     return a.slot == b.slot and a.generation == b.generation;
+}
+
+fn encodeLease(lease: Lease) u64 {
+    return (@as(u64, lease.generation) << 32) | lease.index;
+}
+
+fn decodeLease(token: u64) Lease {
+    return .{ .index = @truncate(token), .generation = @truncate(token >> 32) };
 }
 
 fn releaseSlot(comptime T: type, slot: *T, free_head: *u32, index: u32) void {
@@ -945,11 +991,19 @@ test "linux-dmabuf: async created event retains buffer across params teardown" {
     );
     try std.testing.expectEqual(buffer.header.resource.id, event.created.buffer);
 
+    const CoreSurface = @import("core_surface.zig").Adapter(protocol);
+    const importer = adapter.externalImporter(CoreSurface);
+    const live_buffer_object = server_objects.namespace.resolve(buffer.header.resource).?.*;
+    const external = (try importer.acquire_fn(importer.context, &live_buffer_object)).?;
+    try std.testing.expectEqual(@as(u64, modifier_linear), external.modifier);
+    try std.testing.expectEqual(fd, external.fds[0]);
+
     const params_object = server_objects.namespace.resolve(params.header.resource).?.*;
     try std.testing.expect(adapter.resourceRemoved(params.header.resource, params_object));
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(fd, linux.F.GETFD, 0)));
-    const buffer_object = server_objects.namespace.resolve(buffer.header.resource).?.*;
-    try std.testing.expect(adapter.resourceRemoved(buffer.header.resource, buffer_object));
+    try std.testing.expect(adapter.resourceRemoved(buffer.header.resource, live_buffer_object));
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(fd, linux.F.GETFD, 0)));
+    external.release_fn(external.context, external.token);
     try expectClosed(fd);
 }
 
