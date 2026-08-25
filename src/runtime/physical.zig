@@ -1432,7 +1432,9 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             _ = attachment.buffer orelse return error.MissingBuffer;
             const lease = content.attachment_lease orelse return error.MissingLease;
-            const source = try self.adapter.bufferSource(lease);
+            var source = try self.adapter.bufferSource(lease);
+            var source_access_owned = true;
+            defer if (source_access_owned) source.endShmAccess() catch {};
             var imported_source: ?output_api.ImportedSource = null;
             defer if (imported_source) |*imported| imported.deinit();
             const borrowed_source: render.Source = switch (source) {
@@ -1541,6 +1543,21 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             var prepared_owned = true;
             defer if (prepared_owned) render_device.content.cancel(prepared);
+            source.endShmAccess() catch |err| switch (err) {
+                error.InvalidBacking => {
+                    source_access_owned = false;
+                    const peer = candidate.peer orelse return error.ClientDisconnected;
+                    const actor = try self.root.runtime.clients.reactor.getActor(peer);
+                    try self.adapter.postInvalidShmBacking(actor, attachment.buffer.?.handle);
+                    _ = try self.loop.?.driver.schedule(peer);
+                    candidate.content.deinit();
+                    layer.candidate = null;
+                    self.finishPendingCandidate(pending.id);
+                    return true;
+                },
+                else => return err,
+            };
+            source_access_owned = false;
             const token = self.presentations.admitImported(.{}) catch |err| switch (err) {
                 error.Exhausted => return false,
                 else => return err,

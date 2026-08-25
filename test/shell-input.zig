@@ -48,6 +48,7 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     config.surface.dependency_capacity = 2;
     config.surface.attachment_capacity = 2;
     config.surface.copy_capacity = 2;
+    config.surface.guarded_shm_access = false;
     config.output.max_source_bytes = pixels.len + 4;
     const coordinator = try Coordinator.create(
         allocator,

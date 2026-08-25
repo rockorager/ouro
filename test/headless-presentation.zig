@@ -118,6 +118,7 @@ test "generated client presents ordinary SHM through the integrated headless run
             .attachment_capacity = 1,
             .copy_capacity = 1,
             .max_copy_bytes = pixel_bytes.len,
+            .guarded_shm_access = false,
         },
     );
     errdefer harness.adapter.deinit();
@@ -469,13 +470,16 @@ const ServerHandler = struct {
         var content = applied[0].payload;
         errdefer content.deinit();
         const lease = content.attachment_lease orelse return error.MissingLease;
-        const bytes = try harness.adapter.shmBytes(lease);
+        var source = try harness.adapter.shmSource(lease);
+        defer source.endAccess() catch {};
+        const bytes = source.bytes;
         try std.testing.expectEqualSlices(u8, &pixel_bytes, bytes);
         @memcpy(&harness.copied_bytes, bytes);
         const imported: Imported = .{
             .byte_len = bytes.len,
             .first_pixel = std.mem.readInt(u32, bytes[0..4], .little),
         };
+        try source.endAccess();
         harness.presentation = try harness.presentations.admit(
             imported,
             &content.attachment_lease,

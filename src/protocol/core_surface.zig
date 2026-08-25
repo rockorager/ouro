@@ -34,6 +34,7 @@ pub const Config = struct {
     attachment_capacity: usize,
     copy_capacity: usize,
     max_copy_bytes: usize,
+    guarded_shm_access: bool = true,
     compositor_version: u32 = 7,
 
     fn validate(config: Config) !void {
@@ -216,6 +217,7 @@ pub fn Adapter(comptime protocol: type) type {
         copies: []CopySlot,
         copy_storage: []u8,
         max_copy_bytes: usize,
+        guarded_shm_access: bool,
         commit_hook: ?CommitHook = null,
         external_importer: ?ExternalImporter = null,
 
@@ -321,6 +323,7 @@ pub fn Adapter(comptime protocol: type) type {
                 .copies = copies,
                 .copy_storage = copy_storage,
                 .max_copy_bytes = config.max_copy_bytes,
+                .guarded_shm_access = config.guarded_shm_access,
             };
         }
 
@@ -700,16 +703,47 @@ pub fn Adapter(comptime protocol: type) type {
             height: u32,
             stride: usize,
             format: wayring.shm.Format,
+            access: ?wayring.shm.Store.Access = null,
+
+            pub fn endAccess(source: *ShmSource) !void {
+                if (source.access) |*access| {
+                    defer source.access = null;
+                    defer source.bytes = &.{};
+                    try access.end();
+                }
+                source.access = null;
+                source.bytes = &.{};
+            }
         };
 
         pub const BufferSource = union(enum) {
             shm: ShmSource,
             external: ExternalBuffer,
+
+            pub fn endShmAccess(source: *BufferSource) !void {
+                switch (source.*) {
+                    .shm => |*shm| try shm.endAccess(),
+                    .external => {},
+                }
+            }
         };
 
         pub fn setExternalImporter(adapter: *Self, importer: ExternalImporter) !void {
             if (adapter.external_importer != null) return error.AlreadyConfigured;
             adapter.external_importer = importer;
+        }
+
+        pub fn postInvalidShmBacking(
+            _: *Self,
+            actor: *wayring.connection.Actor,
+            buffer: objects.Handle,
+        ) !void {
+            try ProtocolCore.postError(
+                actor,
+                buffer.id,
+                protocol.wl_shm.@"error".invalid_fd.value,
+                "error accessing SHM buffer",
+            );
         }
 
         pub fn bufferSource(
@@ -737,8 +771,12 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         fn shmBackingSource(backing: ShmBacking) !ShmSource {
-            const bytes = try switch (backing.storage) {
-                .direct => |direct| direct.store.bytes(direct.pin),
+            var access: ?wayring.shm.Store.Access = null;
+            const bytes = switch (backing.storage) {
+                .direct => |direct| guarded: {
+                    access = try direct.store.access(direct.pin);
+                    break :guarded access.?.bytes;
+                },
                 .copied => |owner| copied: {
                     const slot = try resolveCopyOwner(owner);
                     break :copied switch (slot.state) {
@@ -754,6 +792,7 @@ pub fn Adapter(comptime protocol: type) type {
                 .height = backing.info.height,
                 .stride = backing.info.stride,
                 .format = backing.info.format,
+                .access = access,
             };
         }
 
@@ -761,7 +800,21 @@ pub fn Adapter(comptime protocol: type) type {
             adapter: *Self,
             lease: surface_state.BufferLease,
         ) ![]const u8 {
-            return (try adapter.shmSource(lease)).bytes;
+            const backing = try adapter.imports.get(lease);
+            return switch (backing.*) {
+                .shm => |shm| switch (shm.storage) {
+                    .direct => |direct| direct.store.bytes(direct.pin),
+                    .copied => |owner| copied: {
+                        const slot = try resolveCopyOwner(owner);
+                        break :copied switch (slot.state) {
+                            .pending => return error.CopyPending,
+                            .failed => return error.CopyFailed,
+                            .success => |len| slot.destination[0..len],
+                        };
+                    },
+                },
+                .external => error.UnsupportedBuffer,
+            };
         }
 
         /// Handles one R1-routed `.copy` completion during R4's pre-submit
@@ -1305,6 +1358,22 @@ pub fn Adapter(comptime protocol: type) type {
                 var pin_owned = true;
                 errdefer if (pin_owned) adapter.shm.store.unpin(pin) catch unreachable;
                 const storage: ShmStorage = direct: {
+                    if (adapter.guarded_shm_access) {
+                        var access = adapter.shm.store.access(pin) catch |cause| switch (cause) {
+                            error.SignalSetupFailed => {
+                                try adapter.shm.store.unpin(pin);
+                                pin_owned = false;
+                                break :direct .{ .copied = try adapter.prepareCopy(token, info.extent) };
+                            },
+                            else => return cause,
+                        };
+                        try access.end();
+                        pin_owned = false;
+                        break :direct .{ .direct = .{
+                            .store = &adapter.shm.store,
+                            .pin = pin,
+                        } };
+                    }
                     _ = adapter.shm.store.bytes(pin) catch |cause| switch (cause) {
                         error.UnsafeAccess => {
                             try adapter.shm.store.unpin(pin);
@@ -1853,6 +1922,14 @@ const TestContext = struct {
     }
 
     fn initWithCopyLimits(copy_capacity: usize, max_copy_bytes: usize) !*TestContext {
+        return initWithAccess(copy_capacity, max_copy_bytes, false);
+    }
+
+    fn initWithAccess(
+        copy_capacity: usize,
+        max_copy_bytes: usize,
+        guarded_shm_access: bool,
+    ) !*TestContext {
         const context = try std.testing.allocator.create(TestContext);
         errdefer std.testing.allocator.destroy(context);
         context.blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 256, 16);
@@ -1913,6 +1990,7 @@ const TestContext = struct {
             .attachment_capacity = 2,
             .copy_capacity = copy_capacity,
             .max_copy_bytes = max_copy_bytes,
+            .guarded_shm_access = guarded_shm_access,
         });
         errdefer context.adapter.deinit();
         context.server_objects.setRemovalHook(.{
@@ -2500,6 +2578,40 @@ test "generated attach and commit retain SHM after wl_buffer destruction" {
         (try context.adapter.shmBytes(content.attachment_lease.?)).len,
     );
     content.deinit();
+}
+
+test "guarded ordinary SHM publishes directly without a copy completion" {
+    const context = try TestContext.initWithAccess(1, 64, true);
+    defer context.deinit();
+    const surface = try context.createSurface(10);
+    const buffer = try context.createShmBuffer(11, 12);
+
+    try test_protocol.wl_surface.encodeRequest(&context.requests, surface.id, .{
+        .attach = .{ .buffer = buffer.id, .x = 0, .y = 0 },
+    });
+    try std.testing.expectEqual(
+        wayring.dispatch.Control.continue_dispatch,
+        try context.dispatchCore(),
+    );
+    try test_protocol.wl_surface.encodeRequest(
+        &context.requests,
+        surface.id,
+        .{ .commit = .{} },
+    );
+    try std.testing.expectEqual(
+        wayring.dispatch.Control.continue_dispatch,
+        try context.dispatchCore(),
+    );
+
+    var output: [1]TestAdapter.Applied = undefined;
+    const applied = try context.adapter.tryApply(surface, &output);
+    try std.testing.expectEqual(@as(usize, 1), applied.len);
+    var content = applied[0].payload;
+    defer content.deinit();
+    var source = try context.adapter.shmSource(content.attachment_lease.?);
+    try std.testing.expectEqual(@as(usize, 32), source.bytes.len);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0xa5} ** 32), source.bytes);
+    try source.endAccess();
 }
 
 test "unsealed SHM completion before commit publishes without a constraint" {
