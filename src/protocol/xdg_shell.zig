@@ -95,10 +95,30 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             minimized,
         };
 
+        pub const PopupPlacement = struct {
+            width: i32,
+            height: i32,
+            anchor_x: i32,
+            anchor_y: i32,
+            anchor_width: i32,
+            anchor_height: i32,
+            anchor: u32,
+            gravity: u32,
+            constraint_adjustment: u32,
+            offset_x: i32,
+            offset_y: i32,
+        };
+
         /// Shell-neutral events. Metadata bytes remain adapter-owned and are
         /// read through `metadata`; callback-lifetime strings never escape.
         pub const Event = union(enum) {
             toplevel_created: struct { id: ToplevelId, surface: SurfaceId },
+            popup_created: struct {
+                id: PopupId,
+                surface: SurfaceId,
+                parent: SurfaceId,
+                placement: PopupPlacement,
+            },
             metadata_changed: ToplevelId,
             state_requested: struct {
                 id: ToplevelId,
@@ -112,7 +132,15 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 surface_offset_x: i32 = 0,
                 surface_offset_y: i32 = 0,
             },
+            popup_commit_ready: struct {
+                id: PopupId,
+                serial: u32,
+                has_window_geometry: bool = false,
+                surface_offset_x: i32 = 0,
+                surface_offset_y: i32 = 0,
+            },
             toplevel_destroyed: ToplevelId,
+            popup_destroyed: PopupId,
         };
 
         pub const Metadata = struct {
@@ -218,6 +246,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             xdg_surface_generation: u32 = 0,
             parent_surface_index: u32 = none,
             parent_surface_generation: u32 = 0,
+            placement: PopupPlacement = undefined,
         };
 
         const Outbound = union(enum) {
@@ -277,6 +306,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         event_head: usize = 0,
         event_len: usize = 0,
         live_toplevels: usize = 0,
+        live_popups: usize = 0,
         outbound: []OutboundSlot,
         outstanding: []Outstanding,
 
@@ -297,11 +327,12 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             errdefer allocator.free(toplevels);
             const popups = try allocator.alloc(PopupSlot, config.popup_capacity);
             errdefer allocator.free(popups);
-            const event_slots = try std.math.add(
+            const terminal_slots = try std.math.add(
                 usize,
-                config.event_capacity,
                 config.toplevel_capacity,
+                config.popup_capacity,
             );
+            const event_slots = try std.math.add(usize, config.event_capacity, terminal_slots);
             const events = try allocator.alloc(Event, event_slots);
             errdefer allocator.free(events);
             const outbound = try allocator.alloc(OutboundSlot, config.outbound_capacity);
@@ -524,8 +555,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 const surface = try adapter.core.getSurfaceById(slot.surface_id);
                 if (surface.hasPendingBufferAttachment() and slot.last_acked_serial == 0)
                     return error.UnconfiguredBuffer;
-                if (slot.role == .toplevel and
-                    !adapter.canPublishWithLive(adapter.live_toplevels))
+                if ((slot.role == .toplevel or slot.role == .popup) and
+                    !adapter.canPublishWithLive(adapter.live_toplevels, adapter.live_popups))
                     return error.Exhausted;
                 return;
             }
@@ -549,7 +580,14 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                         .surface_offset_x = if (slot.window_geometry) |geometry| geometry.x else 0,
                         .surface_offset_y = if (slot.window_geometry) |geometry| geometry.y else 0,
                     } }),
-                    .popup, .none => {},
+                    .popup => |popup| adapter.publishReserved(.{ .popup_commit_ready = .{
+                        .id = popup,
+                        .serial = slot.last_acked_serial,
+                        .has_window_geometry = slot.window_geometry != null,
+                        .surface_offset_x = if (slot.window_geometry) |geometry| geometry.x else 0,
+                        .surface_offset_y = if (slot.window_geometry) |geometry| geometry.y else 0,
+                    } }),
+                    .none => {},
                 }
                 return;
             }
@@ -904,7 +942,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     return try adapter.protocolError(actor, decoded.handle.id, XdgSurface.@"error".defunct_role_object.value, "xdg role object still exists"),
                 .get_toplevel => |payload| {
                     if (slot.had_role) return try adapter.protocolError(actor, decoded.handle.id, XdgSurface.@"error".already_constructed.value, "xdg role already constructed");
-                    if (!adapter.canPublishWithLive(adapter.live_toplevels + 1))
+                    if (!adapter.canPublishWithLive(adapter.live_toplevels + 1, adapter.live_popups))
                         return try adapter.noMemory(actor);
                     const surface = adapter.core.getSurfaceById(slot.surface_id) catch
                         return try adapter.protocolError(actor, decoded.handle.id, XdgSurface.@"error".not_constructed.value, "wl_surface is gone");
@@ -934,6 +972,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 },
                 .get_popup => |payload| {
                     if (slot.had_role) return try adapter.protocolError(actor, decoded.handle.id, XdgSurface.@"error".already_constructed.value, "xdg role already constructed");
+                    if (!adapter.canPublishWithLive(adapter.live_toplevels, adapter.live_popups + 1))
+                        return try adapter.noMemory(actor);
                     const positioner = adapter.positionerByObject(server_objects, payload.positioner) catch
                         return try adapter.invalidPositioner(actor, decoded.handle.id);
                     if (!positioner.state.configured_size or !positioner.state.configured_anchor_rect)
@@ -978,8 +1018,16 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     role.xdg_surface_generation = slot.header.generation;
                     role.parent_surface_index = indexOf(SurfaceSlot, adapter.surfaces, parent);
                     role.parent_surface_generation = parent.header.generation;
+                    role.placement = popupPlacement(positioner.state);
                     slot.role = .{ .popup = adapter.popupId(role) };
                     slot.had_role = true;
+                    adapter.live_popups += 1;
+                    adapter.publish(.{ .popup_created = .{
+                        .id = adapter.popupId(role),
+                        .surface = slot.surface_id,
+                        .parent = parent.surface_id,
+                        .placement = role.placement,
+                    } }) catch unreachable;
                 },
                 .set_window_geometry => |v| {
                     if (slot.role == .none)
@@ -1023,7 +1071,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     return try adapter.metadataFailure(actor, decoded.handle.id, cause),
                 .set_max_size => |v| {
                     if (v.width < 0 or v.height < 0) return try adapter.invalidToplevelSize(actor, decoded.handle.id);
-                    if (!adapter.canPublishWithLive(adapter.live_toplevels))
+                    if (!adapter.canPublishWithLive(adapter.live_toplevels, adapter.live_popups))
                         return try adapter.noMemory(actor);
                     slot.max_width = v.width;
                     slot.max_height = v.height;
@@ -1031,7 +1079,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 },
                 .set_min_size => |v| {
                     if (v.width < 0 or v.height < 0) return try adapter.invalidToplevelSize(actor, decoded.handle.id);
-                    if (!adapter.canPublishWithLive(adapter.live_toplevels))
+                    if (!adapter.canPublishWithLive(adapter.live_toplevels, adapter.live_popups))
                         return try adapter.noMemory(actor);
                     slot.min_width = v.width;
                     slot.min_height = v.height;
@@ -1078,11 +1126,27 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
 
         fn setMetadata(adapter: *Self, slot: *ToplevelSlot, title: bool, bytes: []const u8) !void {
             if (bytes.len > adapter.metadata_bytes) return error.MetadataTooLong;
-            if (!adapter.canPublishWithLive(adapter.live_toplevels)) return error.Exhausted;
+            if (!adapter.canPublishWithLive(adapter.live_toplevels, adapter.live_popups)) return error.Exhausted;
             const destination = if (title) slot.title else slot.app_id;
             @memcpy(destination[0..bytes.len], bytes);
             if (title) slot.title_len = bytes.len else slot.app_id_len = bytes.len;
             try adapter.publish(.{ .metadata_changed = adapter.toplevelId(slot) });
+        }
+
+        fn popupPlacement(state: PositionerState) PopupPlacement {
+            return .{
+                .width = state.width,
+                .height = state.height,
+                .anchor_x = state.anchor_x,
+                .anchor_y = state.anchor_y,
+                .anchor_width = state.anchor_width,
+                .anchor_height = state.anchor_height,
+                .anchor = state.anchor,
+                .gravity = state.gravity,
+                .constraint_adjustment = state.constraint_adjustment,
+                .offset_x = state.offset_x,
+                .offset_y = state.offset_y,
+            };
         }
 
         fn publishState(
@@ -1177,20 +1241,21 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         }
 
         fn publish(adapter: *Self, event: Event) !void {
-            if (!adapter.canPublishWithLive(adapter.live_toplevels)) return error.Exhausted;
+            if (!adapter.canPublishWithLive(adapter.live_toplevels, adapter.live_popups)) return error.Exhausted;
             adapter.publishReserved(event);
         }
 
         fn publishReserved(adapter: *Self, event: Event) void {
-            std.debug.assert(adapter.canPublishWithLive(adapter.live_toplevels));
+            std.debug.assert(adapter.canPublishWithLive(adapter.live_toplevels, adapter.live_popups));
             const tail = (adapter.event_head + adapter.event_len) % adapter.events.len;
             adapter.events[tail] = event;
             adapter.event_len += 1;
         }
 
-        fn canPublishWithLive(adapter: *const Self, live_toplevels: usize) bool {
-            std.debug.assert(live_toplevels <= adapter.events.len);
-            return adapter.event_len < adapter.events.len - live_toplevels;
+        fn canPublishWithLive(adapter: *const Self, live_toplevels: usize, live_popups: usize) bool {
+            const live = live_toplevels + live_popups;
+            std.debug.assert(live <= adapter.events.len);
+            return adapter.event_len < adapter.events.len - live;
         }
 
         fn publishTerminal(adapter: *Self, event: Event) void {
@@ -1276,6 +1341,9 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             } else |_| {}
             adapter.dropOutstanding(slot.xdg_surface_index, slot.xdg_surface_generation);
             adapter.dropOutboundPopup(id);
+            std.debug.assert(adapter.live_popups > 0);
+            adapter.live_popups -= 1;
+            adapter.publishTerminal(.{ .popup_destroyed = id });
             adapter.abandonPopup(index);
         }
         fn abandonPopup(adapter: *Self, index: u32) void {
@@ -1959,6 +2027,7 @@ test "xdg-shell: full commit event capacity rejects before core mutation" {
 
     try context.adapter.publishState(id, .maximized, true);
     try context.adapter.publishState(id, .fullscreen, true);
+    try context.adapter.publishState(id, .minimized, true);
     try std.testing.expectError(error.Exhausted, context.adapter.validateSurfaceCommit(surface_id));
     try std.testing.expectEqual(@as(u32, 0), context.core.state.committedSize().width);
     try std.testing.expect(context.core.state.hasPendingBufferAttachment());
@@ -1968,6 +2037,10 @@ test "xdg-shell: full commit event capacity rejects before core mutation" {
     _ = try context.core.state.commit();
     try context.adapter.publishSurfaceCommitted(surface_id);
     try std.testing.expectEqual(@as(u32, 80), context.core.state.committedSize().width);
+    try std.testing.expectEqual(id, switch (context.adapter.popEvent().?) {
+        .state_requested => |requested| requested.id,
+        else => return error.UnexpectedEvent,
+    });
     try std.testing.expectEqual(id, switch (context.adapter.popEvent().?) {
         .state_requested => |requested| requested.id,
         else => return error.UnexpectedEvent,
@@ -2172,6 +2245,17 @@ test "xdg-shell: generated popup requests validate positioner and parent role" {
 
     const popup = &context.adapter.popups[0];
     const id = context.adapter.popupId(popup);
+    const created = switch (context.adapter.popEvent() orelse return error.MissingEvent) {
+        .popup_created => |value| value,
+        else => return error.UnexpectedEvent,
+    };
+    try std.testing.expectEqual(id, created.id);
+    try std.testing.expectEqual(try context.core.surfaceId(context.core.second_handle), created.surface);
+    try std.testing.expectEqual(try context.core.surfaceId(context.core.handle), created.parent);
+    try std.testing.expectEqual(@as(i32, 120), created.placement.width);
+    try std.testing.expectEqual(@as(i32, 80), created.placement.height);
+    try std.testing.expectEqual(@as(i32, 4), created.placement.anchor_x);
+    try std.testing.expectEqual(@as(i32, 30), created.placement.anchor_height);
     const serial = try context.adapter.queuePopupConfigure(id, .{
         .x = 4,
         .y = 5,
@@ -2191,6 +2275,32 @@ test "xdg-shell: generated popup requests validate positioner and parent role" {
     const message = (try wayring.wire.Message.decode(snapshot.first)).?;
     const event = try test_protocol.xdg_popup.decodeEvent(message, &context.received_fds);
     try std.testing.expectEqual(@as(i32, 120), event.configure.width);
+
+    try test_protocol.xdg_surface.encodeRequest(&context.requests, 14, .{
+        .ack_configure = .{ .serial = serial },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try test_protocol.xdg_surface.encodeRequest(&context.requests, 14, .{
+        .set_window_geometry = .{ .x = 2, .y = 3, .width = 100, .height = 70 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try context.adapter.surfaceCommitted(try context.core.surfaceId(context.core.second_handle));
+    const committed = switch (context.adapter.popEvent() orelse return error.MissingEvent) {
+        .popup_commit_ready => |value| value,
+        else => return error.UnexpectedEvent,
+    };
+    try std.testing.expectEqual(id, committed.id);
+    try std.testing.expectEqual(serial, committed.serial);
+    try std.testing.expect(committed.has_window_geometry);
+    try std.testing.expectEqual(@as(i32, 2), committed.surface_offset_x);
+    try std.testing.expectEqual(@as(i32, 3), committed.surface_offset_y);
+
+    try test_protocol.xdg_popup.encodeRequest(&context.requests, 16, .{ .destroy = .{} });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try std.testing.expectEqual(id, switch (context.adapter.popEvent() orelse return error.MissingEvent) {
+        .popup_destroyed => |value| value,
+        else => return error.UnexpectedEvent,
+    });
 }
 
 test "xdg-shell: stale generations cannot address reused toplevel slots" {

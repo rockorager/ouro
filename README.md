@@ -53,6 +53,9 @@ responsibilities:
   scale, stable name, and description through version-correct `wl_output`
   snapshots and updates. Mapped surfaces receive resumable `enter`/`leave`
   associations across output suspension and recreation.
+- [XDG popups](src/protocol/xdg_shell.zig): bounded popup roles retain copied
+  positioner state, receive exact configure transactions, and compose above
+  their owning toplevel with flip, slide, and resize constraint adjustment.
 - [Desktop interaction](src/input/interaction.zig): pointer motion hit-tests
   exact committed input regions against the copied desktop scene, retains
   default/button-grab state and protocol-neutral focus commands, and places a
@@ -77,7 +80,7 @@ scene, and physical-output owners in one Coordinator event turn. An ordinary
 XDG client discovers the published globals, acknowledges its exact initial
 configure, maps unsealed SHM, enters the one-workspace tiled desktop, and
 receives generation-safe pointer motion, buttons, scrolling, and keyboard
-delivery:
+delivery. XDG popup surfaces are positioned and composed above their parent:
 
 ```sh
 zig build run -- --socket=/tmp/ouro.sock --renderer=auto

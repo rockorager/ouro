@@ -112,11 +112,12 @@ pub fn Coordinator(comptime protocol: type) type {
             },
             desktop: desktop_model.Config = .{
                 .toplevel_capacity = 8,
+                .popup_capacity = 8,
                 .command_capacity = 32,
                 .metadata_bytes = 256,
             },
             interaction: interaction_model.Config = .{
-                .window_capacity = 8,
+                .window_capacity = 16,
                 .device_capacity = 16,
                 .command_capacity = 32,
                 .bounds = .{ .x = 0, .y = 0, .width = 8192, .height = 8192 },
@@ -239,7 +240,13 @@ pub fn Coordinator(comptime protocol: type) type {
             self.app_layers = try allocator.alloc(Layer, config.output.max_samples - 1);
             errdefer allocator.free(self.app_layers);
             @memset(self.app_layers, .{});
-            self.scene_windows = try allocator.alloc(Desktop.SceneWindow, config.desktop.toplevel_capacity);
+            const scene_capacity = try std.math.add(
+                usize,
+                config.desktop.toplevel_capacity,
+                config.desktop.popup_capacity,
+            );
+            if (config.interaction.window_capacity < scene_capacity) return error.InvalidConfig;
+            self.scene_windows = try allocator.alloc(Desktop.SceneWindow, scene_capacity);
             errdefer allocator.free(self.scene_windows);
             self.frame_samples = try allocator.alloc(render_list.AppliedSurface, config.output.max_samples);
             errdefer allocator.free(self.frame_samples);
@@ -771,6 +778,10 @@ pub fn Coordinator(comptime protocol: type) type {
             while (true) {
                 if (self.desktop.takeDestroyed()) |id| {
                     self.interaction.toplevelDestroyed(id);
+                    continue;
+                }
+                if (self.desktop.takeDestroyedSurface()) |id| {
+                    self.interaction.surfaceDestroyed(id);
                     continue;
                 }
                 const consumed = self.desktop.consume(&self.shell_adapter, 1) catch |err| switch (err) {

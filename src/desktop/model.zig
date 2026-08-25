@@ -12,11 +12,12 @@ const none = std.math.maxInt(u32);
 
 pub const Config = struct {
     toplevel_capacity: usize,
+    popup_capacity: usize = 8,
     command_capacity: usize,
     metadata_bytes: usize,
 
     fn validate(config: Config) !void {
-        inline for (.{ config.toplevel_capacity, config.command_capacity, config.metadata_bytes }) |value|
+        inline for (.{ config.toplevel_capacity, config.popup_capacity, config.command_capacity, config.metadata_bytes }) |value|
             if (value == 0 or value >= none) return error.InvalidConfig;
         if (config.command_capacity < config.toplevel_capacity) return error.InvalidConfig;
         _ = std.math.mul(usize, config.toplevel_capacity, config.metadata_bytes) catch
@@ -69,6 +70,11 @@ pub fn Desktop(comptime Shell: type) type {
             configure: Shell.ToplevelConfigure,
         };
 
+        const PopupCommand = struct {
+            id: Shell.PopupId,
+            configure: Shell.PopupConfigure,
+        };
+
         const Header = struct {
             active: bool = false,
             retired: bool = false,
@@ -111,10 +117,30 @@ pub fn Desktop(comptime Shell: type) type {
             configure: Shell.ToplevelConfigure = .{ .width = 0, .height = 0 },
         };
 
+        const PopupSlot = struct {
+            active: bool = false,
+            generation: u32 = 1,
+            next_free: u32 = none,
+            shell_id: Shell.PopupId = undefined,
+            surface: Shell.SurfaceId = undefined,
+            parent: Shell.SurfaceId = undefined,
+            owner: ToplevelId = undefined,
+            placement: Shell.PopupPlacement = undefined,
+            configure: Shell.PopupConfigure = undefined,
+            expected_serial: ?u32 = null,
+            content_ready: bool = false,
+            has_window_geometry: bool = false,
+            surface_offset: geometry.Point = .{ .x = 0, .y = 0 },
+            scene: SceneWindow = undefined,
+        };
+
         allocator: std.mem.Allocator,
         slots: []Slot,
         free: u32,
         live: usize = 0,
+        popups: []PopupSlot,
+        popup_free: u32,
+        popup_live: usize = 0,
         work_area: geometry.Rect,
         metadata_storage: []u8,
         metadata_bytes: usize,
@@ -128,8 +154,12 @@ pub fn Desktop(comptime Shell: type) type {
         commands: []Command,
         command_head: usize = 0,
         command_len: usize = 0,
+        popup_commands: []PopupCommand,
+        popup_command_head: usize = 0,
+        popup_command_len: usize = 0,
         pending_event: ?Shell.Event = null,
         destroyed: ?ToplevelId = null,
+        destroyed_surface: ?Shell.SurfaceId = null,
         scene_changed: bool = false,
 
         pub fn init(
@@ -141,6 +171,8 @@ pub fn Desktop(comptime Shell: type) type {
             try work_area.validate();
             const slots = try allocator.alloc(Slot, config.toplevel_capacity);
             errdefer allocator.free(slots);
+            const popups = try allocator.alloc(PopupSlot, config.popup_capacity);
+            errdefer allocator.free(popups);
             const metadata_per_slot = try std.math.mul(usize, config.metadata_bytes, 2);
             const storage_len = try std.math.mul(
                 usize,
@@ -161,6 +193,8 @@ pub fn Desktop(comptime Shell: type) type {
             errdefer allocator.free(desired);
             const commands = try allocator.alloc(Command, config.command_capacity);
             errdefer allocator.free(commands);
+            const popup_commands = try allocator.alloc(PopupCommand, config.popup_capacity);
+            errdefer allocator.free(popup_commands);
 
             for (slots, 0..) |*slot, index| {
                 const start = index * config.metadata_bytes * 2;
@@ -172,11 +206,16 @@ pub fn Desktop(comptime Shell: type) type {
                     .app_id = metadata_storage[start + config.metadata_bytes .. start + config.metadata_bytes * 2],
                 };
             }
+            for (popups, 0..) |*slot, index| slot.* = .{
+                .next_free = if (index + 1 < popups.len) @intCast(index + 1) else none,
+            };
             @memset(desired, .{});
             return .{
                 .allocator = allocator,
                 .slots = slots,
                 .free = 0,
+                .popups = popups,
+                .popup_free = 0,
                 .work_area = work_area,
                 .metadata_storage = metadata_storage,
                 .metadata_bytes = config.metadata_bytes,
@@ -186,10 +225,12 @@ pub fn Desktop(comptime Shell: type) type {
                 .placements = placements,
                 .desired = desired,
                 .commands = commands,
+                .popup_commands = popup_commands,
             };
         }
 
         pub fn deinit(desktop: *Self) void {
+            desktop.allocator.free(desktop.popup_commands);
             desktop.allocator.free(desktop.commands);
             desktop.allocator.free(desktop.desired);
             desktop.allocator.free(desktop.placements);
@@ -197,6 +238,7 @@ pub fn Desktop(comptime Shell: type) type {
             desktop.allocator.free(desktop.tile_order);
             desktop.allocator.free(desktop.focus);
             desktop.allocator.free(desktop.metadata_storage);
+            desktop.allocator.free(desktop.popups);
             desktop.allocator.free(desktop.slots);
             desktop.* = undefined;
         }
@@ -206,7 +248,7 @@ pub fn Desktop(comptime Shell: type) type {
         pub fn consume(desktop: *Self, shell: *Shell, limit: usize) !usize {
             var count: usize = 0;
             while (count < limit) {
-                if (desktop.destroyed != null) break;
+                if (desktop.destroyed != null or desktop.destroyed_surface != null) break;
                 const event = desktop.pending_event orelse shell.popEvent() orelse break;
                 desktop.applyEvent(shell, event) catch |cause| {
                     desktop.pending_event = event;
@@ -233,6 +275,14 @@ pub fn Desktop(comptime Shell: type) type {
         /// backpressured, its error leaves the desktop command queued exactly
         /// once for retry.
         pub fn flushConfigure(desktop: *Self, shell: *Shell) !?u32 {
+            if (desktop.popup_command_len != 0) {
+                const command = desktop.popup_commands[desktop.popup_command_head];
+                const serial = try shell.queuePopupConfigure(command.id, command.configure);
+                if (desktop.popupByShell(command.id)) |slot| slot.expected_serial = serial else |_| {}
+                desktop.popup_command_head = (desktop.popup_command_head + 1) % desktop.popup_commands.len;
+                desktop.popup_command_len -= 1;
+                return serial;
+            }
             const command = desktop.peekCommand() orelse return null;
             const serial = try shell.queueToplevelConfigure(command.shell_id, command.configure);
             if (desktop.resolveIndex(command.id)) |index| {
@@ -247,12 +297,18 @@ pub fn Desktop(comptime Shell: type) type {
         }
 
         pub fn pendingCommands(desktop: *const Self) usize {
-            return desktop.command_len;
+            return desktop.command_len + desktop.popup_command_len;
         }
 
         pub fn takeDestroyed(desktop: *Self) ?ToplevelId {
             const id = desktop.destroyed;
             desktop.destroyed = null;
+            return id;
+        }
+
+        pub fn takeDestroyedSurface(desktop: *Self) ?Shell.SurfaceId {
+            const id = desktop.destroyed_surface;
+            desktop.destroyed_surface = null;
             return id;
         }
 
@@ -343,6 +399,9 @@ pub fn Desktop(comptime Shell: type) type {
         }
 
         pub fn sceneForSurface(desktop: *const Self, surface: Shell.SurfaceId) !SceneWindow {
+            for (desktop.popups) |slot| {
+                if (slot.active and std.meta.eql(slot.surface, surface)) return slot.scene;
+            }
             for (desktop.slots) |slot| {
                 if (slot.header.active and std.meta.eql(slot.surface, surface)) return slot.scene;
             }
@@ -352,7 +411,7 @@ pub fn Desktop(comptime Shell: type) type {
         /// Copies a stable, back-to-front scene snapshot. No arena pointers
         /// escape, and insufficient caller storage changes no desktop state.
         pub fn sceneSnapshot(desktop: *const Self, output: []SceneWindow) ![]SceneWindow {
-            if (output.len < desktop.live) return error.Exhausted;
+            if (output.len < desktop.live + desktop.popup_live) return error.Exhausted;
             var len: usize = 0;
             for (desktop.slots) |slot| {
                 if (!slot.header.active) continue;
@@ -364,6 +423,15 @@ pub fn Desktop(comptime Shell: type) type {
                 output[position] = slot.scene;
                 len += 1;
             }
+            for (desktop.popups) |slot| if (slot.active) {
+                var position = len;
+                while (position > 0 and output[position - 1].stacking > slot.scene.stacking) {
+                    output[position] = output[position - 1];
+                    position -= 1;
+                }
+                output[position] = slot.scene;
+                len += 1;
+            };
             return output[0..len];
         }
 
@@ -390,6 +458,9 @@ pub fn Desktop(comptime Shell: type) type {
         fn applyEvent(desktop: *Self, shell: *Shell, event: Shell.Event) !void {
             switch (event) {
                 .toplevel_created => |value| try desktop.create(value.id, value.surface),
+                .popup_created => |value| try desktop.createPopup(value),
+                .popup_commit_ready => |value| try desktop.commitPopup(value),
+                .popup_destroyed => |id| desktop.destroyPopup(id),
                 .metadata_changed => |shell_id| {
                     const id = try desktop.idForShell(shell_id);
                     const source = try shell.metadata(shell_id);
@@ -442,6 +513,92 @@ pub fn Desktop(comptime Shell: type) type {
             desktop.appendTile(index);
             desktop.promoteFocus(index);
             try desktop.reflow();
+        }
+
+        fn createPopup(desktop: *Self, value: anytype) !void {
+            if (desktop.popup_free == none or desktop.popup_command_len == desktop.popup_commands.len)
+                return error.Exhausted;
+            const parent = try desktop.sceneForSurface(value.parent);
+            const positioned = try placePopup(value.placement, parent.geometry, desktop.work_area);
+            const configure: Shell.PopupConfigure = .{
+                .x = positioned.x,
+                .y = positioned.y,
+                .width = positioned.width,
+                .height = positioned.height,
+            };
+            const index = desktop.popup_free;
+            const slot = &desktop.popups[index];
+            desktop.popup_free = slot.next_free;
+            const generation = slot.generation;
+            slot.* = .{
+                .active = true,
+                .generation = generation,
+                .shell_id = value.id,
+                .surface = value.surface,
+                .parent = value.parent,
+                .owner = parent.id,
+                .placement = value.placement,
+                .configure = configure,
+                .scene = .{
+                    .id = parent.id,
+                    .surface = value.surface,
+                    .geometry = popupAbsolute(configure, parent.geometry),
+                    .visible = false,
+                    .stacking = desktop.nextStacking(),
+                    .mode = .floating,
+                    .content_ready = false,
+                },
+            };
+            desktop.popup_live += 1;
+            const tail = (desktop.popup_command_head + desktop.popup_command_len) %
+                desktop.popup_commands.len;
+            desktop.popup_commands[tail] = .{ .id = value.id, .configure = configure };
+            desktop.popup_command_len += 1;
+        }
+
+        fn commitPopup(desktop: *Self, value: anytype) !void {
+            const slot = try desktop.popupByShell(value.id);
+            if (slot.expected_serial != value.serial) return;
+            const parent = desktop.sceneForSurface(slot.parent) catch return;
+            const next = SceneWindow{
+                .id = slot.owner,
+                .surface = slot.surface,
+                .geometry = popupAbsolute(slot.configure, parent.geometry),
+                .has_window_geometry = value.has_window_geometry,
+                .surface_offset = .{ .x = value.surface_offset_x, .y = value.surface_offset_y },
+                .visible = parent.visible,
+                .stacking = slot.scene.stacking,
+                .mode = .floating,
+                .content_ready = true,
+            };
+            desktop.scene_changed = !std.meta.eql(slot.scene, next) or desktop.scene_changed;
+            slot.scene = next;
+            slot.content_ready = true;
+            slot.has_window_geometry = value.has_window_geometry;
+            slot.surface_offset = next.surface_offset;
+            slot.expected_serial = null;
+        }
+
+        fn destroyPopup(desktop: *Self, id: Shell.PopupId) void {
+            const slot = desktop.popupByShell(id) catch return;
+            if (desktop.destroyed_surface != null) return;
+            const surface = slot.surface;
+            const index: u32 = @intCast((@intFromPtr(slot) - @intFromPtr(desktop.popups.ptr)) /
+                @sizeOf(PopupSlot));
+            desktop.removePopupCommand(id);
+            const generation = slot.generation;
+            if (generation == std.math.maxInt(u32)) {
+                slot.* = .{ .generation = generation };
+            } else {
+                slot.* = .{
+                    .generation = generation + 1,
+                    .next_free = desktop.popup_free,
+                };
+                desktop.popup_free = index;
+            }
+            desktop.popup_live -= 1;
+            desktop.scene_changed = true;
+            desktop.destroyed_surface = surface;
         }
 
         fn destroyShell(desktop: *Self, shell_id: Shell.ToplevelId) !void {
@@ -626,14 +783,43 @@ pub fn Desktop(comptime Shell: type) type {
 
         fn publishScene(desktop: *Self) void {
             var changed = false;
+            var max_toplevel_stacking: u32 = 0;
             for (desktop.slots) |*slot| {
                 if (!slot.header.active) continue;
                 changed = !std.meta.eql(slot.scene, slot.target_scene) or changed;
                 slot.scene = slot.target_scene;
+                max_toplevel_stacking = @max(max_toplevel_stacking, slot.scene.stacking);
                 if (slot.configured) slot.applied_configure = slot.last_configure;
                 slot.expected_serial = null;
                 slot.configure_ready = false;
             }
+            var min_popup_stacking: ?u32 = null;
+            for (desktop.popups) |popup| if (popup.active) {
+                min_popup_stacking = if (min_popup_stacking) |current|
+                    @min(current, popup.scene.stacking)
+                else
+                    popup.scene.stacking;
+            };
+            if (min_popup_stacking) |minimum| if (minimum <= max_toplevel_stacking) {
+                const shift = max_toplevel_stacking - minimum +| 1;
+                for (desktop.popups) |*popup| {
+                    if (popup.active) popup.scene.stacking +|= shift;
+                }
+                changed = true;
+            };
+            for (0..desktop.popup_live) |_| for (desktop.popups) |*popup| {
+                if (!popup.active or !popup.content_ready) continue;
+                const parent = desktop.sceneForSurface(popup.parent) catch {
+                    changed = popup.scene.visible or changed;
+                    popup.scene.visible = false;
+                    continue;
+                };
+                const next_geometry = popupAbsolute(popup.configure, parent.geometry);
+                changed = !std.meta.eql(popup.scene.geometry, next_geometry) or
+                    popup.scene.visible != parent.visible or changed;
+                popup.scene.geometry = next_geometry;
+                popup.scene.visible = parent.visible;
+            };
             desktop.scene_changed = changed or desktop.scene_changed;
         }
 
@@ -703,6 +889,36 @@ pub fn Desktop(comptime Shell: type) type {
                 retained += 1;
             }
             desktop.command_len = retained;
+        }
+
+        fn popupByShell(desktop: *Self, id: Shell.PopupId) !*PopupSlot {
+            for (desktop.popups) |*slot| if (slot.active and std.meta.eql(slot.shell_id, id))
+                return slot;
+            return error.StalePopup;
+        }
+
+        fn removePopupCommand(desktop: *Self, id: Shell.PopupId) void {
+            var retained: usize = 0;
+            const original_len = desktop.popup_command_len;
+            for (0..original_len) |offset| {
+                const source = (desktop.popup_command_head + offset) % desktop.popup_commands.len;
+                if (std.meta.eql(desktop.popup_commands[source].id, id)) continue;
+                const destination = (desktop.popup_command_head + retained) % desktop.popup_commands.len;
+                desktop.popup_commands[destination] = desktop.popup_commands[source];
+                retained += 1;
+            }
+            desktop.popup_command_len = retained;
+        }
+
+        fn nextStacking(desktop: *const Self) u32 {
+            var next: u32 = 0;
+            for (desktop.slots) |slot| {
+                if (slot.header.active) next = @max(next, slot.scene.stacking +| 1);
+            }
+            for (desktop.popups) |slot| {
+                if (slot.active) next = @max(next, slot.scene.stacking +| 1);
+            }
+            return next;
         }
 
         fn acquire(desktop: *Self) u32 {
@@ -794,9 +1010,143 @@ pub fn Desktop(comptime Shell: type) type {
     };
 }
 
+const PopupGeometry = struct { x: i32, y: i32, width: i32, height: i32 };
+
+fn placePopup(placement: anytype, parent: geometry.Rect, bounds: geometry.Rect) !PopupGeometry {
+    const width: i64 = placement.width;
+    const height: i64 = placement.height;
+    if (width <= 0 or height <= 0) return error.InvalidGeometry;
+    const anchor_x = popupAnchorPoint(placement.anchor, true, placement.anchor_x, placement.anchor_width);
+    const anchor_y = popupAnchorPoint(placement.anchor, false, placement.anchor_y, placement.anchor_height);
+    var x = popupOrigin(anchor_x, width, placement.gravity, true) + placement.offset_x;
+    var y = popupOrigin(anchor_y, height, placement.gravity, false) + placement.offset_y;
+    var adjusted_width = width;
+    var adjusted_height = height;
+    const left: i64 = @as(i64, bounds.x) - parent.x;
+    const top: i64 = @as(i64, bounds.y) - parent.y;
+    const right = left + bounds.width;
+    const bottom = top + bounds.height;
+
+    if ((x < left or x + width > right) and placement.constraint_adjustment & 4 != 0) {
+        const flipped_anchor = flipDirection(placement.anchor, true);
+        const flipped_gravity = flipDirection(placement.gravity, true);
+        const candidate = popupOrigin(
+            popupAnchorPoint(flipped_anchor, true, placement.anchor_x, placement.anchor_width),
+            width,
+            flipped_gravity,
+            true,
+        ) + placement.offset_x;
+        if (candidate >= left and candidate + width <= right) x = candidate;
+    }
+    if ((y < top or y + height > bottom) and placement.constraint_adjustment & 8 != 0) {
+        const flipped_anchor = flipDirection(placement.anchor, false);
+        const flipped_gravity = flipDirection(placement.gravity, false);
+        const candidate = popupOrigin(
+            popupAnchorPoint(flipped_anchor, false, placement.anchor_y, placement.anchor_height),
+            height,
+            flipped_gravity,
+            false,
+        ) + placement.offset_y;
+        if (candidate >= top and candidate + height <= bottom) y = candidate;
+    }
+    if (placement.constraint_adjustment & 1 != 0)
+        x = std.math.clamp(x, left, @max(left, right - width));
+    if (placement.constraint_adjustment & 2 != 0)
+        y = std.math.clamp(y, top, @max(top, bottom - height));
+    if (placement.constraint_adjustment & 16 != 0) {
+        const clipped_left = @max(x, left);
+        const clipped_right = @min(x + adjusted_width, right);
+        x = clipped_left;
+        adjusted_width = @max(1, clipped_right - clipped_left);
+    }
+    if (placement.constraint_adjustment & 32 != 0) {
+        const clipped_top = @max(y, top);
+        const clipped_bottom = @min(y + adjusted_height, bottom);
+        y = clipped_top;
+        adjusted_height = @max(1, clipped_bottom - clipped_top);
+    }
+    return .{
+        .x = std.math.cast(i32, x) orelse return error.InvalidGeometry,
+        .y = std.math.cast(i32, y) orelse return error.InvalidGeometry,
+        .width = std.math.cast(i32, adjusted_width) orelse return error.InvalidGeometry,
+        .height = std.math.cast(i32, adjusted_height) orelse return error.InvalidGeometry,
+    };
+}
+
+fn popupAnchorPoint(direction: u32, horizontal: bool, start: i32, size: i32) i64 {
+    const toward_start = if (horizontal)
+        direction == 3 or direction == 5 or direction == 6
+    else
+        direction == 1 or direction == 5 or direction == 7;
+    const toward_end = if (horizontal)
+        direction == 4 or direction == 7 or direction == 8
+    else
+        direction == 2 or direction == 6 or direction == 8;
+    if (toward_start) return start;
+    if (toward_end) return @as(i64, start) + size;
+    return @as(i64, start) + @divTrunc(@as(i64, size), 2);
+}
+
+fn popupOrigin(anchor: i64, size: i64, gravity: u32, horizontal: bool) i64 {
+    const toward_start = if (horizontal)
+        gravity == 3 or gravity == 5 or gravity == 6
+    else
+        gravity == 1 or gravity == 5 or gravity == 7;
+    const toward_end = if (horizontal)
+        gravity == 4 or gravity == 7 or gravity == 8
+    else
+        gravity == 2 or gravity == 6 or gravity == 8;
+    if (toward_start) return anchor - size;
+    if (toward_end) return anchor;
+    return anchor - @divTrunc(size, 2);
+}
+
+fn flipDirection(direction: u32, horizontal: bool) u32 {
+    return if (horizontal) switch (direction) {
+        3 => 4,
+        4 => 3,
+        5 => 7,
+        7 => 5,
+        6 => 8,
+        8 => 6,
+        else => direction,
+    } else switch (direction) {
+        1 => 2,
+        2 => 1,
+        5 => 6,
+        6 => 5,
+        7 => 8,
+        8 => 7,
+        else => direction,
+    };
+}
+
+fn popupAbsolute(configure: anytype, parent: geometry.Rect) geometry.Rect {
+    return .{
+        .x = parent.x +| configure.x,
+        .y = parent.y +| configure.y,
+        .width = configure.width,
+        .height = configure.height,
+    };
+}
+
 const TestShell = struct {
     pub const SurfaceId = packed struct { index: u32, generation: u32 };
     pub const ToplevelId = packed struct { index: u32, generation: u32 };
+    pub const PopupId = packed struct { index: u32, generation: u32 };
+    pub const PopupPlacement = struct {
+        width: i32,
+        height: i32,
+        anchor_x: i32,
+        anchor_y: i32,
+        anchor_width: i32,
+        anchor_height: i32,
+        anchor: u32,
+        gravity: u32,
+        constraint_adjustment: u32,
+        offset_x: i32,
+        offset_y: i32,
+    };
     pub const RequestedState = enum { maximized, fullscreen, minimized };
     pub const StateSet = packed struct(u16) {
         maximized: bool = false,
@@ -815,8 +1165,10 @@ const TestShell = struct {
         height: i32,
         states: StateSet = .{},
     };
+    pub const PopupConfigure = struct { x: i32, y: i32, width: i32, height: i32 };
     pub const Event = union(enum) {
         toplevel_created: struct { id: ToplevelId, surface: SurfaceId },
+        popup_created: struct { id: PopupId, surface: SurfaceId, parent: SurfaceId, placement: PopupPlacement },
         metadata_changed: ToplevelId,
         state_requested: struct { id: ToplevelId, state: RequestedState, enabled: bool },
         commit_ready: struct {
@@ -826,7 +1178,15 @@ const TestShell = struct {
             surface_offset_x: i32 = 0,
             surface_offset_y: i32 = 0,
         },
+        popup_commit_ready: struct {
+            id: PopupId,
+            serial: u32,
+            has_window_geometry: bool = false,
+            surface_offset_x: i32 = 0,
+            surface_offset_y: i32 = 0,
+        },
         toplevel_destroyed: ToplevelId,
+        popup_destroyed: PopupId,
     };
 
     events: [16]Event = undefined,
@@ -837,6 +1197,7 @@ const TestShell = struct {
     reject_configure: bool = false,
     configure_serial: u32 = 40,
     configured: ?ToplevelConfigure = null,
+    popup_configured: ?PopupConfigure = null,
 
     fn push(shell: *TestShell, event: Event) void {
         shell.events[(shell.head + shell.len) % shell.events.len] = event;
@@ -879,6 +1240,14 @@ const TestShell = struct {
         if (shell.reject_configure) return error.Exhausted;
         shell.configure_serial += 1;
         shell.configured = value;
+        return shell.configure_serial;
+    }
+
+    pub fn queuePopupConfigure(shell: *TestShell, id: PopupId, value: PopupConfigure) !u32 {
+        _ = id;
+        if (shell.reject_configure) return error.Exhausted;
+        shell.configure_serial += 1;
+        shell.popup_configured = value;
         return shell.configure_serial;
     }
 };
@@ -944,6 +1313,87 @@ test "desktop: shell events produce exact tiling, focus, metadata, and configure
     try std.testing.expectEqual(@as(usize, 2), try desktop.consume(&shell, 8));
     try std.testing.expectEqualStrings("terminal", (try desktop.metadata(first)).title);
     try std.testing.expect((try desktop.scene(first)).content_ready);
+}
+
+test "desktop: popup configure maps above its owning toplevel" {
+    var desktop = try initTestDesktop(8);
+    defer desktop.deinit();
+    var shell = TestShell{};
+    shell.push(created(0));
+    _ = try desktop.consume(&shell, 1);
+    try settleDesktop(&desktop, &shell);
+    const owner = try desktop.idForShell(.{ .index = 0, .generation = 1 });
+    const parent = (try desktop.scene(owner)).surface;
+    const popup_id: TestShell.PopupId = .{ .index = 0, .generation = 1 };
+    const popup_surface: TestShell.SurfaceId = .{ .index = 20, .generation = 2 };
+    shell.push(.{ .popup_created = .{
+        .id = popup_id,
+        .surface = popup_surface,
+        .parent = parent,
+        .placement = .{
+            .width = 20,
+            .height = 10,
+            .anchor_x = 10,
+            .anchor_y = 10,
+            .anchor_width = 20,
+            .anchor_height = 10,
+            .anchor = 8,
+            .gravity = 8,
+            .constraint_adjustment = 0,
+            .offset_x = 0,
+            .offset_y = 0,
+        },
+    } });
+    _ = try desktop.consume(&shell, 1);
+    const serial = (try desktop.flushConfigure(&shell)).?;
+    try std.testing.expectEqual(TestShell.PopupConfigure{
+        .x = 30,
+        .y = 20,
+        .width = 20,
+        .height = 10,
+    }, shell.popup_configured.?);
+    shell.push(.{ .popup_commit_ready = .{ .id = popup_id, .serial = serial } });
+    _ = try desktop.consume(&shell, 1);
+    const popup = try desktop.sceneForSurface(popup_surface);
+    try std.testing.expectEqual(owner, popup.id);
+    try std.testing.expectEqual(geometry.Rect{ .x = 30, .y = 20, .width = 20, .height = 10 }, popup.geometry);
+    try std.testing.expect(popup.visible and popup.content_ready);
+    var snapshot_storage: [4]TestDesktop.SceneWindow = undefined;
+    const snapshot = try desktop.sceneSnapshot(&snapshot_storage);
+    try std.testing.expectEqual(@as(usize, 2), snapshot.len);
+    try std.testing.expect(snapshot[0].stacking < snapshot[1].stacking);
+    try std.testing.expectEqual(popup_surface, snapshot[1].surface);
+
+    shell.push(.{ .popup_destroyed = popup_id });
+    _ = try desktop.consume(&shell, 1);
+    try std.testing.expectError(error.StaleSurface, desktop.sceneForSurface(popup_surface));
+    try std.testing.expect(desktop.takeSceneChanged());
+}
+
+test "desktop: popup placement flips before sliding or resizing" {
+    const placement: TestShell.PopupPlacement = .{
+        .width = 20,
+        .height = 20,
+        .anchor_x = 90,
+        .anchor_y = 50,
+        .anchor_width = 10,
+        .anchor_height = 10,
+        .anchor = 8,
+        .gravity = 8,
+        .constraint_adjustment = 4 | 8,
+        .offset_x = 0,
+        .offset_y = 0,
+    };
+    try std.testing.expectEqual(PopupGeometry{
+        .x = 70,
+        .y = 30,
+        .width = 20,
+        .height = 20,
+    }, try placePopup(
+        placement,
+        .{ .x = 0, .y = 0, .width = 100, .height = 60 },
+        .{ .x = 0, .y = 0, .width = 100, .height = 60 },
+    ));
 }
 
 test "desktop: scene transaction waits for every exact configure serial" {
