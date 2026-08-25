@@ -20,6 +20,7 @@ const drm_platform = @import("../backend/drm/platform.zig");
 const kms = @import("../backend/drm/output.zig");
 const output_api = @import("../output/drm.zig");
 const render = @import("../render/types.zig");
+const render_content = @import("../render/content.zig");
 const render_list = @import("../scene/render_list.zig");
 const damage = @import("../scene/damage.zig");
 const presentation = @import("../presentation.zig");
@@ -45,7 +46,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const Interaction = interaction_model.Interaction(Desktop);
         const SeatAdapter = protocol_seat.Adapter(protocol, Adapter);
 
-        const Imported = struct { source: render.Source };
+        const Imported = struct {};
         const Presentations = presentation.Queue(Imported);
         const PendingSurface = struct {
             handle: wayring.objects.Handle,
@@ -59,20 +60,21 @@ pub fn Coordinator(comptime protocol: type) type {
             content: Adapter.Content,
         };
         const Layer = struct {
-            storage: []u8,
             active: bool = false,
             peer: ?wayring.io_uring.Peer = null,
             surface: ?wayring.objects.Handle = null,
             id: ?Adapter.SurfaceId = null,
             content: ?Adapter.Content = null,
+            rendered: ?render_content.Handle = null,
             presentation: ?Presentations.Token = null,
             sample: ?render_list.AppliedSurface = null,
             binding: ?output_api.SampleBinding = null,
             change: ?damage.Change = null,
             candidate: ?Candidate = null,
+            source_release_pending: bool = false,
             outcome_pending: bool = false,
             callback_data: ?u32 = null,
-            retire_after_release: bool = false,
+            retire_after_outcome: bool = false,
         };
 
         pub const Platforms = struct {
@@ -165,6 +167,7 @@ pub fn Coordinator(comptime protocol: type) type {
         interaction: Interaction,
         seat_adapter: SeatAdapter,
         presentations: Presentations,
+        render_device: ?*output_api.RenderDevice = null,
         output: ?*output_api.Output = null,
         next_output_generation: ?u32,
         loop: ?*Loop = null,
@@ -204,6 +207,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.input = null;
             self.input_event_cursor = 0;
             self.input_interaction_accepted = false;
+            self.render_device = null;
             self.next_output_generation = config.output.output_id.generation;
             self.loop = null;
             self.peer = null;
@@ -215,10 +219,8 @@ pub fn Coordinator(comptime protocol: type) type {
             self.pending_surface_len = 0;
             if (config.output.max_samples < 2 or config.output.max_source_bytes == 0)
                 return error.InvalidConfig;
-            self.app_layer = .{ .storage = try allocator.alloc(u8, config.output.max_source_bytes) };
-            errdefer allocator.free(self.app_layer.storage);
-            self.cursor_layer = .{ .storage = try allocator.alloc(u8, config.output.max_source_bytes) };
-            errdefer allocator.free(self.cursor_layer.storage);
+            self.app_layer = .{};
+            self.cursor_layer = .{};
             self.output_drain_started = false;
             self.stopping = false;
             self.session_disable_pending = false;
@@ -319,11 +321,13 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         /// Requires completed Wayring and backend drains. Teardown order is
-        /// Output(R11→renderer→R10), input, DRM manager/device, Session, then
+        /// Output(R11→targets→R10), renderer, input, DRM manager/device, Session, then
         /// protocol and bounded runtime support storage.
         pub fn destroy(self: *Self) !void {
             if (!self.backendDrainComplete()) return error.DrainIncomplete;
             var first_error: ?anyerror = null;
+            if (self.render_device) |device| device.destroy();
+            self.render_device = null;
             if (self.input) |input| input.destroy() catch |err| {
                 first_error = err;
             };
@@ -335,8 +339,6 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             self.presentations.deinit(self.allocator);
             self.allocator.free(self.pending_surfaces);
-            self.allocator.free(self.cursor_layer.storage);
-            self.allocator.free(self.app_layer.storage);
             self.seat_adapter.deinit();
             self.interaction.deinit();
             self.desktop.deinit();
@@ -819,13 +821,25 @@ pub fn Coordinator(comptime protocol: type) type {
             errdefer {
                 if (!output_committed) self.cleanupUnstartedOutput();
             }
-            self.output = try output_api.Output.create(
-                self.allocator,
-                self.platforms.output,
-                kms.Device.fromManager(&self.manager),
-                snapshot,
-                output_config,
-            );
+            self.output = if (self.render_device) |render_device|
+                try output_api.Output.createWithRenderDevice(
+                    self.allocator,
+                    self.platforms.output,
+                    kms.Device.fromManager(&self.manager),
+                    snapshot,
+                    output_config,
+                    render_device,
+                )
+            else
+                try output_api.Output.create(
+                    self.allocator,
+                    self.platforms.output,
+                    kms.Device.fromManager(&self.manager),
+                    snapshot,
+                    output_config,
+                );
+            if (self.render_device == null)
+                self.render_device = self.output.?.takeRenderDevice();
             const work_area: @import("../scene/geometry.zig").Rect = .{
                 .x = 0,
                 .y = 0,
@@ -873,7 +887,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 sample.clip = clipToOutput(sample.destination, output_size) catch unreachable orelse {
                     if (self.app_layer.outcome_pending) {
                         self.app_layer.active = false;
-                        self.app_layer.retire_after_release = true;
+                        self.app_layer.retire_after_outcome = true;
                     } else {
                         self.abandonLayer(&self.app_layer);
                     }
@@ -968,21 +982,26 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = attachment.buffer orelse return error.MissingBuffer;
             const lease = content.attachment_lease orelse return error.MissingLease;
             const source = try self.adapter.shmSource(lease);
-            if (source.bytes.len > layer.storage.len) return error.InvalidSource;
+            if (source.bytes.len > self.output_config.max_source_bytes)
+                return error.InvalidSource;
             const pixel_format: render.PixelFormat = if (source.format.value == protocol.wl_shm.format.argb8888.value) .argb8888_premultiplied else if (source.format.value == protocol.wl_shm.format.xrgb8888.value) .xrgb8888 else return error.UnsupportedShmFormat;
             if (source.stride > std.math.maxInt(u32)) return error.InvalidSource;
-            const imported = Imported{ .source = .{
+            const borrowed_source: render.Source = .{
                 .size = .{ .width = source.width, .height = source.height },
                 .stride = @intCast(source.stride),
                 .format = pixel_format,
-                .bytes = layer.storage[0..source.bytes.len],
-            } };
+                .bytes = source.bytes,
+            };
             const surface_id: @import("../output/headless.zig").SurfaceId = .{
                 .index = exact_surface_id.index,
                 .generation = exact_surface_id.generation,
             };
             if (surface_id.generation == 0 or content.surface.sequence == 0)
                 return error.InvalidIdentity;
+            const sample_identity: render.SampleIdentity = .{
+                .surface = (@as(u64, surface_id.generation) << 32) | surface_id.index,
+                .commit_sequence = content.surface.sequence,
+            };
             const destination_size = content.surface.size;
             if (destination_size.width == 0 or destination_size.height == 0)
                 return error.InvalidDestination;
@@ -1009,11 +1028,7 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             const crop = try sourceCrop(content.surface, source.width, source.height);
             const clip = try clipToOutput(destination, output_size) orelse {
-                const token = self.presentations.admit(
-                    imported,
-                    &content.attachment_lease,
-                    &content.release_callbacks,
-                ) catch |err| switch (err) {
+                const token = self.presentations.admitImported(.{}) catch |err| switch (err) {
                     error.Exhausted => return false,
                     else => return err,
                 };
@@ -1029,8 +1044,9 @@ pub fn Coordinator(comptime protocol: type) type {
                 layer.surface = published.surface;
                 layer.id = published.id;
                 layer.presentation = token;
+                layer.source_release_pending = true;
                 layer.outcome_pending = true;
-                layer.retire_after_release = true;
+                layer.retire_after_outcome = true;
                 // Visibility changes at commit consumption, independently of
                 // live-client release encoding retained below.
                 layer.active = false;
@@ -1038,11 +1054,20 @@ pub fn Coordinator(comptime protocol: type) type {
                 _ = try self.retryLayerOutcome(layer);
                 return true;
             };
-            const token = self.presentations.admit(
-                imported,
-                &content.attachment_lease,
-                &content.release_callbacks,
+            const render_device = self.render_device orelse return false;
+            const upload_damage = renderUploadDamage(content.surface.upload_damage);
+            const prepared = render_device.content.prepareReplacing(
+                layer.rendered,
+                sample_identity,
+                borrowed_source,
+                upload_damage,
             ) catch |err| switch (err) {
+                error.VersionCapacityExceeded, error.ByteCapacityExceeded => return false,
+                else => return err,
+            };
+            var prepared_owned = true;
+            defer if (prepared_owned) render_device.content.cancel(prepared);
+            const token = self.presentations.admitImported(.{}) catch |err| switch (err) {
                 error.Exhausted => return false,
                 else => return err,
             };
@@ -1051,14 +1076,17 @@ pub fn Coordinator(comptime protocol: type) type {
                 content.surface.sequence,
                 output_api.presentationIdentity(token),
             ) catch unreachable;
-            // All source, geometry, crop, identity, and presentation admission
-            // has succeeded. Only this non-fallible edge may replace retained
-            // bytes belonging to the currently displayed layer.
-            @memcpy(layer.storage[0..source.bytes.len], source.bytes);
+            // All source, geometry, upload, identity, and presentation
+            // admission has succeeded. Only this non-fallible edge publishes
+            // the renderer-owned version, consuming a compatible previous
+            // handle in place when it is uniquely owned by this layer.
+            const rendered = render_device.content.publish(prepared);
+            prepared_owned = false;
             const sample: render_list.AppliedSurface = .{
                 .sample = binding.sample,
                 .presentation = binding.presentation,
-                .source = imported.source,
+                .source = render_device.content.resolve(rendered) catch unreachable,
+                .upload_damage = upload_damage,
                 .crop = crop,
                 .destination = destination,
                 .clip = clip,
@@ -1071,6 +1099,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 .content = content.*,
             };
             layer.candidate = null;
+            if (!prepared.replaces) if (layer.rendered) |previous|
+                render_device.content.release(previous);
             layer.change = .{
                 .current = damage.SurfaceState.fromSample(sample, .{
                     .width = destination_size.width,
@@ -1081,14 +1111,17 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             layer.active = true;
             layer.content = published.content;
+            layer.rendered = rendered;
             layer.peer = published.peer;
             layer.surface = published.surface;
             layer.id = published.id;
             layer.presentation = token;
+            layer.source_release_pending = true;
             layer.sample = sample;
             layer.binding = binding;
             self.finishPendingCandidate(pending.id);
             self.stats.applied += 1;
+            _ = try self.retryLayerSourceRelease(layer);
             return true;
         }
 
@@ -1195,7 +1228,9 @@ pub fn Coordinator(comptime protocol: type) type {
         fn retryRetainedOutcomes(self: *Self) !bool {
             var changed = false;
             inline for (.{ &self.app_layer, &self.cursor_layer }) |layer| {
-                if (layer.outcome_pending) {
+                if (layer.source_release_pending)
+                    _ = try self.retryLayerSourceRelease(layer);
+                if (layer.outcome_pending and !layer.source_release_pending) {
                     changed = (try self.retryLayerOutcome(layer)) or changed;
                 }
             }
@@ -1209,22 +1244,12 @@ pub fn Coordinator(comptime protocol: type) type {
         fn retryLayerOutcome(self: *Self, layer: *Layer) !bool {
             const token = layer.presentation orelse return error.MissingPresentation;
             var content = &(layer.content orelse return error.MissingContent);
-            if (content.surface.attachment) |*attachment| if (attachment.buffer) |buffer| {
-                const peer = layer.peer orelse return error.ClientDisconnected;
-                const objects = try self.root.runtime.clients.get(peer);
-                const actor = try self.root.runtime.clients.reactor.getActor(peer);
-                _ = Adapter.completeBufferReleaseOn(
-                    objects,
-                    &actor.transmit,
-                    buffer.handle,
-                ) catch |err| switch (err) {
-                    error.Exhausted => return false,
-                    else => return err,
-                };
-                // Successful admission or an already-destroyed exact resource
-                // both consume release ownership exactly once.
-                attachment.buffer = null;
-            };
+            if (layer.source_release_pending and
+                !try self.retryLayerSourceRelease(layer)) return false;
+            std.debug.assert(content.attachment_lease == null);
+            std.debug.assert(content.release_callbacks == null);
+            std.debug.assert(content.surface.attachment == null or
+                content.surface.attachment.?.buffer == null);
             if (layer.callback_data) |data| {
                 const peer = layer.peer orelse return error.ClientDisconnected;
                 const surface = layer.surface orelse return error.StaleSurface;
@@ -1241,24 +1266,65 @@ pub fn Coordinator(comptime protocol: type) type {
                 }) {}
                 layer.callback_data = null;
             }
-            self.stats.releases += self.presentations.queueReleases(
-                token,
-                self,
-                queueRelease,
-            ) catch |err| switch (err) {
-                error.Exhausted => return false,
-                else => return err,
-            };
             try self.presentations.finish(token);
             content.deinit();
             layer.content = null;
             layer.presentation = null;
             layer.outcome_pending = false;
-            if (layer.retire_after_release) {
+            if (layer.retire_after_outcome) {
                 self.abandonLayer(layer);
                 return true;
             }
             return false;
+        }
+
+        /// Renderer-owned content has already copied every borrowed source byte.
+        /// Drop backing ownership immediately, then queue protocol releases with
+        /// retryable transport backpressure independently of presentation.
+        fn retryLayerSourceRelease(self: *Self, layer: *Layer) !bool {
+            var content = &(layer.content orelse return error.MissingContent);
+            if (content.attachment_lease) |*lease| {
+                lease.deinit();
+                content.attachment_lease = null;
+            }
+            const peer = layer.peer orelse return error.ClientDisconnected;
+            const live_peer = self.peer orelse return error.ClientDisconnected;
+            if (!samePeer(peer, live_peer)) return error.ClientDisconnected;
+            const objects = try self.root.runtime.clients.get(peer);
+            const actor = try self.root.runtime.clients.reactor.getActor(peer);
+            var notification_queued = false;
+            if (content.surface.attachment) |*attachment| if (attachment.buffer) |buffer| {
+                notification_queued = Adapter.completeBufferReleaseOn(
+                    objects,
+                    &actor.transmit,
+                    buffer.handle,
+                ) catch |err| switch (err) {
+                    error.Exhausted => return false,
+                    else => return err,
+                };
+                // Successful admission or an already-destroyed exact resource
+                // both consume release ownership exactly once.
+                attachment.buffer = null;
+            };
+            if (content.release_callbacks) |*batch| {
+                while (batch.peek()) |callback| {
+                    Adapter.completeReleaseOn(objects, &actor.transmit, callback) catch |err| switch (err) {
+                        error.Exhausted => {
+                            if (notification_queued)
+                                _ = try self.loop.?.driver.schedule(peer);
+                            return false;
+                        },
+                        else => return err,
+                    };
+                    notification_queued = true;
+                    batch.consume(callback) catch unreachable;
+                    self.stats.releases += 1;
+                }
+                content.release_callbacks = null;
+            }
+            if (notification_queued) _ = try self.loop.?.driver.schedule(peer);
+            layer.source_release_pending = false;
+            return true;
         }
 
         fn layerForPresentation(
@@ -1278,14 +1344,6 @@ pub fn Coordinator(comptime protocol: type) type {
             const surface = layer.surface orelse return false;
             const id = self.adapter.surfaceId(surface) catch return false;
             return layer.id != null and std.meta.eql(id, layer.id.?);
-        }
-
-        fn queueRelease(context: ?*anyopaque, callback: wayring.objects.Handle) !void {
-            const self: *Self = @ptrCast(@alignCast(context.?));
-            const peer = self.peer orelse return error.ClientDisconnected;
-            const objects = try self.root.runtime.clients.get(peer);
-            const actor = try self.root.runtime.clients.reactor.getActor(peer);
-            try Adapter.completeReleaseOn(objects, &actor.transmit, callback);
         }
 
         fn armTimer(self: *Self) !void {
@@ -1366,8 +1424,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (layer.presentation) |token| self.presentations.discard(token) catch unreachable;
             if (layer.content) |*content| content.deinit();
             if (layer.candidate) |*candidate| candidate.content.deinit();
-            const storage = layer.storage;
-            layer.* = .{ .storage = storage };
+            if (layer.rendered) |rendered| if (self.render_device) |render_device|
+                render_device.content.release(rendered);
+            layer.* = .{};
         }
 
         fn cleanupUnstartedOutput(self: *Self) void {
@@ -1412,6 +1471,9 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.seat_adapter.resourceRemoved(handle, object);
             if (removed_surface) |id| {
                 self.dropPendingSurface(id);
+                if (self.render_device) |render_device| render_device.content.destroySurface(
+                    (@as(u64, id.generation) << 32) | id.index,
+                );
                 inline for (.{ &self.app_layer, &self.cursor_layer }) |layer| {
                     if (layer.candidate) |*candidate| {
                         if (std.meta.eql(candidate.id, id) and
@@ -1514,6 +1576,21 @@ fn consumeRetainedBatch(
         cursor.* += 1;
         total.* += 1;
     }
+}
+
+fn renderUploadDamage(source: anytype) render.UploadDamage {
+    var result: render.UploadDamage = .{};
+    std.debug.assert(source.count <= result.rects.len);
+    for (source.items()) |rect| {
+        result.rects[result.count] = .{
+            .min_x = rect.min_x,
+            .min_y = rect.min_y,
+            .max_x = rect.max_x,
+            .max_y = rect.max_y,
+        };
+        result.count += 1;
+    }
+    return result;
 }
 
 fn sourceCrop(update: anytype, width: u32, height: u32) !render.SourceRect {

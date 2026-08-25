@@ -89,10 +89,33 @@ pub const Source = struct {
     bytes: []const u8,
 };
 
+pub const upload_damage_rect_capacity = 8;
+
+pub const UploadRect = struct {
+    min_x: i64 = 0,
+    min_y: i64 = 0,
+    max_x: i64 = 0,
+    max_y: i64 = 0,
+};
+
+/// Bounded canonical upload region in native buffer pixels. This remains
+/// separate from scene and output-repair damage so persistent renderer content
+/// can advance without repainting unrelated output pixels.
+pub const UploadDamage = struct {
+    rects: [upload_damage_rect_capacity]UploadRect =
+        [_]UploadRect{.{}} ** upload_damage_rect_capacity,
+    count: u8 = 0,
+
+    pub fn items(damage: *const UploadDamage) []const UploadRect {
+        return damage.rects[0..damage.count];
+    }
+};
+
 pub const SurfaceSample = struct {
     sample: SampleIdentity,
     presentation: PresentationIdentity,
     source: Source,
+    upload_damage: UploadDamage = .{},
     crop: SourceRect,
     destination: Rect,
     clip: Rect,
@@ -100,8 +123,9 @@ pub const SurfaceSample = struct {
     global_alpha: u8 = 255,
 };
 
-/// Damage is intentionally absent in M2. A renderer clears the complete output
-/// and composites every sample on every accepted render.
+/// Output repaint damage is intentionally absent here; R13 plans it separately.
+/// Per-sample upload damage advances persistent renderer content and never
+/// substitutes for scene or output-buffer repair damage.
 pub const List = struct {
     output: Size,
     output_format: PixelFormat,
@@ -178,6 +202,15 @@ pub fn validateSample(sample: SurfaceSample) ValidationError!usize {
     const length = std.math.mul(usize, sample.source.stride, sample.source.size.height) catch
         return error.InvalidSource;
     if (sample.source.bytes.len < length) return error.InvalidSource;
+    if (sample.upload_damage.count > upload_damage_rect_capacity) return error.InvalidSource;
+    for (sample.upload_damage.items(), 0..) |damage, index| {
+        if (damage.min_x < 0 or damage.min_y < 0 or
+            damage.max_x <= damage.min_x or damage.max_y <= damage.min_y or
+            damage.max_x > sample.source.size.width or
+            damage.max_y > sample.source.size.height)
+            return error.InvalidSource;
+        for (sample.upload_damage.items()[0..index]) |earlier| if (uploadRectsOverlap(damage, earlier)) return error.InvalidSource;
+    }
 
     if (sample.crop.x < 0 or sample.crop.y < 0 or
         sample.crop.width <= 0 or sample.crop.height <= 0)
@@ -199,4 +232,9 @@ fn validRect(rect: Rect) bool {
     _ = std.math.add(i32, rect.y, std.math.cast(i32, rect.height) orelse return false) catch
         return false;
     return true;
+}
+
+fn uploadRectsOverlap(a: UploadRect, b: UploadRect) bool {
+    return a.min_x < b.max_x and b.min_x < a.max_x and
+        a.min_y < b.max_y and b.min_y < a.max_y;
 }

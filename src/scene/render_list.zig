@@ -149,6 +149,20 @@ test "render: list publication copies bytes and is transactional" {
     var malformed = validSample(&source);
     malformed.source.stride = 3;
     try std.testing.expectError(error.InvalidSource, builder.build(.{ .width = 1, .height = 1 }, .xrgb8888, .{ .r = 0, .g = 0, .b = 0 }, &.{malformed}));
+    malformed = validSample(&source);
+    malformed.upload_damage = .{
+        .rects = [_]render.UploadRect{
+            .{ .min_x = 0, .min_y = 0, .max_x = 1, .max_y = 1 },
+            .{ .min_x = 0, .min_y = 0, .max_x = 1, .max_y = 1 },
+        } ++ [_]render.UploadRect{.{}} ** (render.upload_damage_rect_capacity - 2),
+        .count = 2,
+    };
+    try std.testing.expectError(error.InvalidSource, builder.build(
+        .{ .width = 1, .height = 1 },
+        .xrgb8888,
+        .{ .r = 0, .g = 0, .b = 0 },
+        &.{malformed},
+    ));
     try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, list.samples[0].source.bytes);
 }
 

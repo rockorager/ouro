@@ -44,13 +44,23 @@ const TargetRecord = struct {
     metadata: gbm.Metadata = undefined,
 };
 
+/// One output swapchain's imported Vulkan targets. Slot numbers are local to
+/// this set, so separate outputs can safely use the same framebuffer slots.
+/// The owning renderer must outlive the set and destroy it before its pool.
+pub const Targets = struct {
+    allocator: std.mem.Allocator,
+    owner: vk.Renderer,
+    records: []TargetRecord,
+};
+
 pub const Renderer = struct {
     allocator: std.mem.Allocator,
     platform: vk.Platform,
     implementation: vk.Renderer,
-    records: []TargetRecord,
+    target_capacity: usize,
+    attached_target_capacity: usize = 0,
     samples: []vk.Sample,
-    sources: []render_types.Source,
+    sources: []render_types.SurfaceSample,
     max_source_bytes: usize,
     damage: []render_types.Rect,
 
@@ -72,12 +82,9 @@ pub const Renderer = struct {
         const descriptor_count = std.math.mul(usize, config.max_targets, 2) catch
             return error.InvalidConfig;
         if (descriptor_count > std.math.maxInt(u32)) return error.InvalidConfig;
-        const records = try allocator.alloc(TargetRecord, config.max_targets);
-        errdefer allocator.free(records);
-        @memset(records, .{});
         const samples = try allocator.alloc(vk.Sample, config.max_samples);
         errdefer allocator.free(samples);
-        const sources = try allocator.alloc(render_types.Source, config.max_samples);
+        const sources = try allocator.alloc(render_types.SurfaceSample, config.max_samples);
         errdefer allocator.free(sources);
         const damage = try allocator.alloc(render_types.Rect, config.max_damage_rects);
         errdefer allocator.free(damage);
@@ -90,7 +97,8 @@ pub const Renderer = struct {
             .allocator = allocator,
             .platform = platform,
             .implementation = implementation,
-            .records = records,
+            .target_capacity = config.max_targets,
+            .attached_target_capacity = 0,
             .samples = samples,
             .sources = sources,
             .max_source_bytes = config.max_source_bytes,
@@ -98,20 +106,42 @@ pub const Renderer = struct {
         };
     }
 
+    pub fn createTargets(self: *Renderer, capacity: usize) !Targets {
+        if (capacity == 0 or capacity > self.target_capacity - self.attached_target_capacity)
+            return error.TargetCapacityExceeded;
+        const records = try self.allocator.alloc(TargetRecord, capacity);
+        @memset(records, .{});
+        self.attached_target_capacity += capacity;
+        return .{
+            .allocator = self.allocator,
+            .owner = self.implementation,
+            .records = records,
+        };
+    }
+
+    /// Requires every target to be out of KMS ownership. Platform destruction
+    /// performs the terminal fence wait before releasing imported BO state.
+    pub fn destroyTargets(self: *Renderer, targets: *Targets) void {
+        std.debug.assert(targets.owner == self.implementation);
+        var index = targets.records.len;
+        while (index != 0) {
+            index -= 1;
+            if (targets.records[index].imported) |target|
+                self.platform.destroyTarget(self.implementation, target);
+        }
+        self.attached_target_capacity -= targets.records.len;
+        targets.allocator.free(targets.records);
+        targets.* = undefined;
+    }
+
     /// Requires the R11/R10 output path to be drained. The real boundary waits
     /// only during this terminal teardown, never during a render event turn.
     pub fn deinit(self: *Renderer) void {
-        var index = self.records.len;
-        while (index != 0) {
-            index -= 1;
-            if (self.records[index].imported) |target|
-                self.platform.destroyTarget(self.implementation, target);
-        }
+        std.debug.assert(self.attached_target_capacity == 0);
         self.platform.destroy(self.implementation);
         self.allocator.free(self.damage);
         self.allocator.free(self.sources);
         self.allocator.free(self.samples);
-        self.allocator.free(self.records);
         self.* = undefined;
     }
 
@@ -121,6 +151,7 @@ pub const Renderer = struct {
     /// drain/deinit this renderer, and only then discard the R10 handle.
     pub fn render(
         self: *Renderer,
+        targets: *Targets,
         target: Target,
         handle: framebuffer.Handle,
         list: render_types.List,
@@ -128,15 +159,16 @@ pub const Renderer = struct {
     ) !std.posix.fd_t {
         try render_types.validateList(list);
         try render_types.validateOutput(plan.output);
+        if (targets.owner != self.implementation) return error.TargetOwnerMismatch;
         if (plan.samples.len > self.samples.len) return error.SampleCapacityExceeded;
-        if (handle.slot >= self.records.len) return error.TargetCapacityExceeded;
+        if (handle.slot >= targets.records.len) return error.TargetCapacityExceeded;
         const image = try target.image_fn(target.context, handle);
         if (image.state != .acquired or image.metadata.width != plan.output.width or
             image.metadata.height != plan.output.height or
             (formatFromDrm(image.metadata.format) orelse return error.TargetMismatch) != list.output_format)
             return error.TargetMismatch;
         if (image.metadata.plane_count != 1) return error.UnsupportedPlaneCount;
-        const record = &self.records[handle.slot];
+        const record = &targets.records[handle.slot];
         if (record.terminal) return error.TargetTerminal;
 
         var byte_count: usize = 0;
@@ -166,7 +198,7 @@ pub const Renderer = struct {
             if (byte_count > self.max_source_bytes) return error.SourceCapacityExceeded;
             validated.source.stride = packed_stride;
             self.samples[sample_count] = try packSample(validated, @intCast(start), planned.destination);
-            self.sources[sample_count] = source.source;
+            self.sources[sample_count] = source;
             sample_count += 1;
         }
 
@@ -211,12 +243,13 @@ pub const Renderer = struct {
 
     pub fn renderPool(
         self: *Renderer,
+        targets: *Targets,
         pool: *framebuffer.Pool,
         handle: framebuffer.Handle,
         list: render_types.List,
         plan: render_types.DamagePlan,
     ) !std.posix.fd_t {
-        return self.render(Target.fromPool(pool), handle, list, plan);
+        return self.render(targets, Target.fromPool(pool), handle, list, plan);
     }
 };
 
@@ -354,6 +387,7 @@ test "render-vulkan: fixed target cache retains source bytes and cleans up exact
         .max_source_bytes = 16,
         .max_targets = 1,
     });
+    var targets = try renderer.createTargets(1);
     var source = [_]u8{ 1, 2, 3, 4 };
     var target = FakeTarget{};
     const render_target = target.target();
@@ -361,7 +395,7 @@ test "render-vulkan: fixed target cache retains source bytes and cleans up exact
     const first_list = testList(&source, &first_sample);
     var first_planned: render_types.PlannedSample = undefined;
     var first_damage: render_types.Rect = undefined;
-    const completion = try renderer.render(render_target, .{ .slot = 0, .generation = 1 }, first_list, testPlan(first_list, &first_planned, &first_damage, true));
+    const completion = try renderer.render(&targets, render_target, .{ .slot = 0, .generation = 1 }, first_list, testPlan(first_list, &first_planned, &first_damage, true));
     _ = linux.close(completion);
     source = .{ 9, 9, 9, 9 };
     try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, fake.last_bytes[0..fake.last_byte_count]);
@@ -370,14 +404,58 @@ test "render-vulkan: fixed target cache retains source bytes and cleans up exact
     const second_list = testList(&source, &second_sample);
     var second_planned: render_types.PlannedSample = undefined;
     var second_damage: render_types.Rect = undefined;
-    const second = try renderer.render(render_target, .{ .slot = 0, .generation = 2 }, second_list, testPlan(second_list, &second_planned, &second_damage, true));
+    const second = try renderer.render(&targets, render_target, .{ .slot = 0, .generation = 2 }, second_list, testPlan(second_list, &second_planned, &second_damage, true));
     _ = linux.close(second);
     try std.testing.expectEqual(@as(usize, 1), target.export_count);
     try std.testing.expectEqual(@as(usize, 1), fake.import_count);
     try std.testing.expectEqual(@as(usize, 2), fake.draw_count);
-    renderer.deinit();
+    renderer.destroyTargets(&targets);
     try std.testing.expectEqual(@as(usize, 1), fake.destroy_target_count);
+    renderer.deinit();
     try std.testing.expectEqual(@as(usize, 1), fake.destroy_count);
+}
+
+test "render-vulkan: output target sets isolate equal framebuffer slots" {
+    var fake = FakePlatform{};
+    var renderer = try Renderer.init(std.testing.allocator, fake.platform(), 41, .{
+        .max_samples = 1,
+        .max_source_bytes = 4,
+        .max_targets = 2,
+    });
+    var first_targets = try renderer.createTargets(1);
+    var second_targets = try renderer.createTargets(1);
+    try std.testing.expectError(error.TargetCapacityExceeded, renderer.createTargets(1));
+
+    const bytes = [_]u8{ 1, 2, 3, 4 };
+    var sample: render_types.SurfaceSample = undefined;
+    const list = testList(&bytes, &sample);
+    var planned: render_types.PlannedSample = undefined;
+    var damage: render_types.Rect = undefined;
+    const plan = testPlan(list, &planned, &damage, true);
+    var first_target = FakeTarget{};
+    var second_target = FakeTarget{};
+    _ = linux.close(try renderer.render(
+        &first_targets,
+        first_target.target(),
+        .{ .slot = 0, .generation = 1 },
+        list,
+        plan,
+    ));
+    _ = linux.close(try renderer.render(
+        &second_targets,
+        second_target.target(),
+        .{ .slot = 0, .generation = 1 },
+        list,
+        plan,
+    ));
+    try std.testing.expectEqual(@as(usize, 2), fake.import_count);
+
+    renderer.destroyTargets(&first_targets);
+    var replacement_targets = try renderer.createTargets(1);
+    renderer.destroyTargets(&replacement_targets);
+    renderer.destroyTargets(&second_targets);
+    try std.testing.expectEqual(@as(usize, 2), fake.destroy_target_count);
+    renderer.deinit();
 }
 
 test "render-vulkan: failed import closes DMA-BUF and leaves image acquired" {
@@ -388,6 +466,8 @@ test "render-vulkan: failed import closes DMA-BUF and leaves image acquired" {
         .max_targets = 1,
     });
     defer renderer.deinit();
+    var targets = try renderer.createTargets(1);
+    defer renderer.destroyTargets(&targets);
     var target = FakeTarget{};
     const bytes = [_]u8{ 0, 0, 0, 255 };
     var value: render_types.SurfaceSample = undefined;
@@ -396,7 +476,7 @@ test "render-vulkan: failed import closes DMA-BUF and leaves image acquired" {
     var damage: render_types.Rect = undefined;
     try std.testing.expectError(
         error.FakeImport,
-        renderer.render(target.target(), .{ .slot = 0, .generation = 1 }, list, testPlan(list, &planned, &damage, true)),
+        renderer.render(&targets, target.target(), .{ .slot = 0, .generation = 1 }, list, testPlan(list, &planned, &damage, true)),
     );
     try std.testing.expect(target.acquired);
     try std.testing.expect(fake.draw_count == 0);
@@ -412,6 +492,8 @@ test "render-vulkan: damage plan selects exact source and clips planned i64 geom
         .max_damage_rects = 1,
     });
     defer renderer.deinit();
+    var targets = try renderer.createTargets(1);
+    defer renderer.destroyTargets(&targets);
     const first_bytes = [_]u8{ 1, 2, 3, 4 };
     const second_bytes = [_]u8{ 5, 6, 7, 8 };
     var samples = [_]render_types.SurfaceSample{ undefined, undefined };
@@ -431,7 +513,7 @@ test "render-vulkan: damage plan selects exact source and clips planned i64 geom
     const damage = [_]render_types.Rect{.{ .x = 0, .y = 0, .width = 1, .height = 1 }};
     const plan = damagePlan(&planned, &damage, false);
     var target = FakeTarget{};
-    const completion = try renderer.render(target.target(), .{ .slot = 0, .generation = 1 }, list, plan);
+    const completion = try renderer.render(&targets, target.target(), .{ .slot = 0, .generation = 1 }, list, plan);
     _ = linux.close(completion);
     try std.testing.expectEqualSlices(u8, &second_bytes, fake.last_bytes[0..fake.last_byte_count]);
     try std.testing.expectEqual(@as(i32, 0), fake.last_sample.destination[0]);
@@ -443,9 +525,10 @@ test "render-vulkan: damage plan selects exact source and clips planned i64 geom
     const duplicate_damage = [_]render_types.Rect{ damage[0], damage[0] };
     try std.testing.expectError(
         error.DamageCapacityExceeded,
-        renderer.render(target.target(), .{ .slot = 0, .generation = 1 }, list, damagePlan(&planned, &duplicate_damage, false)),
+        renderer.render(&targets, target.target(), .{ .slot = 0, .generation = 1 }, list, damagePlan(&planned, &duplicate_damage, false)),
     );
     const full_completion = try renderer.render(
+        &targets,
         target.target(),
         .{ .slot = 0, .generation = 1 },
         list,
@@ -457,7 +540,7 @@ test "render-vulkan: damage plan selects exact source and clips planned i64 geom
     planned.sample.surface = 99;
     try std.testing.expectError(
         error.PlannedIdentityMismatch,
-        renderer.render(target.target(), .{ .slot = 0, .generation = 1 }, list, damagePlan(&planned, &damage, false)),
+        renderer.render(&targets, target.target(), .{ .slot = 0, .generation = 1 }, list, damagePlan(&planned, &damage, false)),
     );
 }
 
@@ -469,6 +552,8 @@ test "render-vulkan: odd source strides repack to aligned contiguous shader word
         .max_targets = 1,
     });
     defer renderer.deinit();
+    var targets = try renderer.createTargets(1);
+    defer renderer.destroyTargets(&targets);
     const first_bytes = [_]u8{ 1, 2, 3, 4, 0xaa };
     const second_bytes = [_]u8{ 5, 6, 7, 8, 0xbb, 0xcc, 0xdd };
     var samples = [_]render_types.SurfaceSample{ undefined, undefined };
@@ -491,7 +576,7 @@ test "render-vulkan: odd source strides repack to aligned contiguous shader word
     var plan = damagePlan(&planned[0], &damage, true);
     plan.samples = &planned;
     var target = FakeTarget{};
-    const completion = try renderer.render(target.target(), .{ .slot = 0, .generation = 1 }, list, plan);
+    const completion = try renderer.render(&targets, target.target(), .{ .slot = 0, .generation = 1 }, list, plan);
     _ = linux.close(completion);
     try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, fake.last_bytes[0..fake.last_byte_count]);
     try std.testing.expectEqual([4]u32{ 0, 1, 1, 4 }, fake.last_samples[0].source);
@@ -506,6 +591,8 @@ test "render-vulkan: post-submit completion export failure is terminal and class
         .max_targets = 1,
     });
     defer renderer.deinit();
+    var targets = try renderer.createTargets(1);
+    defer renderer.destroyTargets(&targets);
     const bytes = [_]u8{ 1, 2, 3, 4 };
     var sample: render_types.SurfaceSample = undefined;
     const list = testList(&bytes, &sample);
@@ -515,11 +602,11 @@ test "render-vulkan: post-submit completion export failure is terminal and class
     var target = FakeTarget{};
     try std.testing.expectError(
         error.CompletionExportFailedAfterSubmit,
-        renderer.render(target.target(), .{ .slot = 0, .generation = 1 }, list, plan),
+        renderer.render(&targets, target.target(), .{ .slot = 0, .generation = 1 }, list, plan),
     );
     try std.testing.expectError(
         error.TargetTerminal,
-        renderer.render(target.target(), .{ .slot = 0, .generation = 1 }, list, plan),
+        renderer.render(&targets, target.target(), .{ .slot = 0, .generation = 1 }, list, plan),
     );
     try std.testing.expectEqual(@as(usize, 1), fake.draw_count);
 }
@@ -707,7 +794,8 @@ const FakePlatform = struct {
         self.draw_count += 1;
         self.last_byte_count = frame.source_byte_count;
         var offset: usize = 0;
-        for (frame.sources) |source| {
+        for (frame.sources) |sample| {
+            const source = sample.source;
             const packed_stride = source.size.width * 4;
             for (0..source.size.height) |row| {
                 const source_start = @as(usize, source.stride) * row;

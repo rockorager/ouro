@@ -228,6 +228,10 @@ fn runVertical(trigger: TerminalTrigger) !void {
     }
     try std.testing.expectEqual(@as(usize, 2), coordinator.stats.applied);
     try std.testing.expectEqual(@as(usize, 1), coordinator.stats.submitted);
+    try std.testing.expect(!coordinator.cursor_layer.source_release_pending);
+    try std.testing.expect(coordinator.cursor_layer.content.?.attachment_lease == null);
+    try std.testing.expect(coordinator.cursor_layer.content.?.release_callbacks == null);
+    try std.testing.expect(coordinator.cursor_layer.content.?.surface.attachment.?.buffer == null);
     const abandoned_surface = coordinator.cursor_layer.surface.?;
 
     try client_handler.replaceWithEmptySurface();
@@ -308,9 +312,11 @@ fn runVertical(trigger: TerminalTrigger) !void {
     try std.testing.expectEqual(@as(usize, 1), coordinator.adapter.release_pool.available());
     try std.testing.expectEqual(@as(usize, 2), coordinator.presentations.available());
     try std.testing.expectEqual(@as(usize, 1), client_handler.frame_done);
-    try std.testing.expectEqual(@as(usize, 1), client_handler.release_done);
+    // The second commit secured renderer-owned content before it was abandoned,
+    // so source release is delivered even though no frame callback is due.
+    try std.testing.expectEqual(@as(usize, 2), client_handler.release_done);
     try std.testing.expectEqual(@as(usize, 1), client_handler.frame_deleted);
-    try std.testing.expectEqual(@as(usize, 1), client_handler.release_deleted);
+    try std.testing.expectEqual(@as(usize, 2), client_handler.release_deleted);
     try std.testing.expectEqual(
         @as(usize, if (trigger == .session_disable) 2 else 1),
         fixture.device_closes,

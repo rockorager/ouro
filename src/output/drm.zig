@@ -13,6 +13,7 @@ const framebuffer = @import("../backend/drm/framebuffer.zig");
 const atomic = @import("../backend/drm/atomic.zig");
 const kms = @import("../backend/drm/output.zig");
 const render = @import("../render/types.zig");
+const render_content = @import("../render/content.zig");
 const cpu = @import("../render/cpu.zig");
 const vulkan = @import("../render/vulkan.zig");
 const vulkan_platform = @import("../render/vulkan_platform.zig");
@@ -28,6 +29,8 @@ pub const Config = struct {
     scheduler: scheduler_api.Config,
     renderer: RendererPreference = .vulkan_then_pixman,
     image_count: usize = framebuffer.default_capacity,
+    /// Total imported output images across every output sharing one renderer.
+    max_render_targets: usize = framebuffer.default_capacity * 4,
     max_samples: usize,
     max_source_bytes: usize,
     max_source_width: u32,
@@ -112,8 +115,37 @@ const Renderer = union(RendererKind) {
     }
 };
 
-const RenderPath = struct {
+pub const RenderDevice = struct {
+    allocator: std.mem.Allocator,
+    card: drm.Card,
+    content: render_content.Store,
+    renderer: ?Renderer,
+
+    pub fn rendererKind(self: *const RenderDevice) ?RendererKind {
+        return if (self.renderer) |value| std.meta.activeTag(value) else null;
+    }
+
+    pub fn matches(self: *const RenderDevice, card: *const drm.Card) bool {
+        return std.mem.eql(u8, self.card.stablePath(), card.stablePath());
+    }
+
+    /// Requires every output target set to have been destroyed first.
+    pub fn destroy(self: *RenderDevice) void {
+        self.content.deinit();
+        if (self.renderer) |*renderer| renderer.deinit();
+        self.renderer = null;
+        const allocator = self.allocator;
+        allocator.destroy(self);
+    }
+};
+
+const OutputPath = struct {
     pool: framebuffer.Pool,
+    vulkan_targets: ?vulkan.Targets = null,
+};
+
+const InitialRenderPath = struct {
+    output: OutputPath,
     renderer: Renderer,
 };
 
@@ -148,7 +180,9 @@ pub fn sessionAction(event: @import("../backend/session.zig").Event) SessionActi
 pub const Output = struct {
     allocator: std.mem.Allocator,
     pool: framebuffer.Pool,
-    renderer: ?Renderer,
+    render_device: *RenderDevice,
+    owns_render_device: bool,
+    vulkan_targets: ?vulkan.Targets,
     builder: render_list.Builder,
     planner: damage.Planner,
     scheduler: Scheduler,
@@ -169,20 +203,115 @@ pub const Output = struct {
         snapshot: drm.Snapshot,
         config: Config,
     ) !*Output {
-        if (config.image_count == 0 or config.max_samples == 0 or
+        if (config.image_count == 0 or config.max_render_targets < config.image_count or
+            config.max_samples == 0 or
             config.max_source_bytes == 0)
             return error.InvalidConfig;
         const fd = try device.fd(snapshot.handle);
-        const self = try allocator.create(Output);
-        errdefer allocator.destroy(self);
-
         var path = try initRenderPath(allocator, platforms, fd, snapshot, config);
-        errdefer {
+        var path_owned = true;
+        errdefer if (path_owned) {
+            if (path.output.vulkan_targets) |*targets| switch (path.renderer) {
+                .vulkan => |*renderer| renderer.destroyTargets(targets),
+                .pixman => unreachable,
+            };
             path.renderer.deinit();
+            path.output.pool.deinit() catch {};
+        };
+        const render_device = try allocator.create(RenderDevice);
+        var render_device_owned = true;
+        errdefer if (render_device_owned) allocator.destroy(render_device);
+        const content_version_capacity = std.math.add(
+            usize,
+            config.max_samples,
+            1,
+        ) catch return error.InvalidConfig;
+        var content = try render_content.Store.init(allocator, .{
+            .version_capacity = content_version_capacity,
+            .byte_capacity = std.math.mul(
+                usize,
+                config.max_source_bytes,
+                content_version_capacity,
+            ) catch return error.InvalidConfig,
+        });
+        var content_owned = true;
+        errdefer if (content_owned) content.deinit();
+        render_device.* = .{
+            .allocator = allocator,
+            .card = snapshot.card,
+            .content = content,
+            .renderer = path.renderer,
+        };
+        render_device_owned = false;
+        content_owned = false;
+        path_owned = false;
+        return createWithPath(
+            allocator,
+            platforms,
+            device,
+            snapshot,
+            config,
+            render_device,
+            true,
+            path.output,
+        ) catch |err| {
+            render_device.destroy();
+            return err;
+        };
+    }
+
+    pub fn createWithRenderDevice(
+        allocator: std.mem.Allocator,
+        platforms: Platforms,
+        device: kms.Device,
+        snapshot: drm.Snapshot,
+        config: Config,
+        render_device: *RenderDevice,
+    ) !*Output {
+        if (config.image_count == 0 or config.max_render_targets < config.image_count or
+            config.max_samples == 0 or
+            config.max_source_bytes == 0)
+            return error.InvalidConfig;
+        if (!render_device.matches(&snapshot.card)) return error.RenderDeviceMismatch;
+        const fd = try device.fd(snapshot.handle);
+        const path = try initOutputPath(allocator, platforms, fd, snapshot, config, render_device);
+        return createWithPath(
+            allocator,
+            platforms,
+            device,
+            snapshot,
+            config,
+            render_device,
+            false,
+            path,
+        );
+    }
+
+    fn createWithPath(
+        allocator: std.mem.Allocator,
+        platforms: Platforms,
+        device: kms.Device,
+        snapshot: drm.Snapshot,
+        config: Config,
+        render_device: *RenderDevice,
+        owns_render_device: bool,
+        path_value: OutputPath,
+    ) !*Output {
+        var path = path_value;
+        errdefer {
+            if (path.vulkan_targets) |*targets| switch (render_device.renderer orelse
+                unreachable) {
+                .vulkan => |*renderer| renderer.destroyTargets(targets),
+                .pixman => unreachable,
+            };
             path.pool.deinit() catch {};
         }
+        const self = try allocator.create(Output);
+        errdefer allocator.destroy(self);
         self.pool = path.pool;
-        self.renderer = path.renderer;
+        self.render_device = render_device;
+        self.owns_render_device = owns_render_device;
+        self.vulkan_targets = path.vulkan_targets;
         const mode = snapshot.selectedMode();
         const logical_output: render.Size = .{ .width = mode.hdisplay, .height = mode.vdisplay };
         self.output_format = formatFromDrm(self.pool.allocation.format) orelse
@@ -234,19 +363,35 @@ pub const Output = struct {
         if (!self.drainComplete() or self.pending_callback != null)
             return error.DrainIncomplete;
         try self.kms_output.destroy();
-        if (self.renderer) |*value| value.deinit();
-        self.renderer = null;
+        if (self.render_device.renderer) |*value| {
+            if (self.vulkan_targets) |*targets| switch (value.*) {
+                .vulkan => |*renderer| renderer.destroyTargets(targets),
+                .pixman => unreachable,
+            };
+            self.vulkan_targets = null;
+        }
         try self.pool.deinit();
         self.allocator.free(self.sample_storage);
         self.scheduler.deinit(self.allocator);
         self.planner.deinit();
         self.builder.deinit();
         const allocator = self.allocator;
+        const render_device = self.render_device;
+        const owns_render_device = self.owns_render_device;
         allocator.destroy(self);
+        if (owns_render_device) render_device.destroy();
     }
 
     pub fn rendererKind(self: *const Output) ?RendererKind {
-        return if (self.renderer) |value| std.meta.activeTag(value) else null;
+        return self.render_device.rendererKind();
+    }
+
+    /// Transfers the initial output's renderer ownership to the composition
+    /// root so it can outlive this and subsequent output instances.
+    pub fn takeRenderDevice(self: *Output) *RenderDevice {
+        std.debug.assert(self.owns_render_device);
+        self.owns_render_device = false;
+        return self.render_device;
     }
 
     pub fn outputId(self: *const Output) scheduler_api.OutputId {
@@ -311,7 +456,7 @@ pub const Output = struct {
         };
 
         var in_fence: ?std.posix.fd_t = null;
-        const renderer = &(self.renderer orelse {
+        const renderer = &(self.render_device.renderer orelse {
             return self.retireAndDiscard(frame_id, error.RendererUnavailable, handle);
         });
         switch (renderer.*) {
@@ -319,13 +464,23 @@ pub const Output = struct {
                 return self.retireAndDiscard(frame_id, cause, handle);
             },
             .vulkan => |*value| {
-                in_fence = value.renderPool(&self.pool, handle, list, plan) catch |cause| {
+                if (self.vulkan_targets == null)
+                    return self.retireAndDiscard(frame_id, error.RendererUnavailable, handle);
+                in_fence = value.renderPool(
+                    &self.vulkan_targets.?,
+                    &self.pool,
+                    handle,
+                    list,
+                    plan,
+                ) catch |cause| {
                     if (cause == error.CompletionExportFailedAfterSubmit) {
                         // The GPU has accepted work without exporting the only
                         // synchronization primitive. Renderer teardown is the
                         // terminal wait and must happen while Pool/BO lives.
+                        value.destroyTargets(&self.vulkan_targets.?);
+                        self.vulkan_targets = null;
                         renderer.deinit();
-                        self.renderer = null;
+                        self.render_device.renderer = null;
                     }
                     return self.retireAndDiscard(frame_id, cause, handle);
                 };
@@ -498,7 +653,7 @@ fn retireAction(removal: anytype) ?RetireAction {
     };
 }
 
-fn initRenderPath(allocator: std.mem.Allocator, platforms: Platforms, fd: std.posix.fd_t, snapshot: drm.Snapshot, config: Config) !RenderPath {
+fn initRenderPath(allocator: std.mem.Allocator, platforms: Platforms, fd: std.posix.fd_t, snapshot: drm.Snapshot, config: Config) !InitialRenderPath {
     return switch (config.renderer) {
         .pixman => initPixman(allocator, platforms, fd, snapshot, config),
         .vulkan => initVulkan(allocator, platforms, fd, snapshot, config),
@@ -507,7 +662,67 @@ fn initRenderPath(allocator: std.mem.Allocator, platforms: Platforms, fd: std.po
     };
 }
 
-fn initPixman(allocator: std.mem.Allocator, platforms: Platforms, fd: std.posix.fd_t, snapshot: drm.Snapshot, config: Config) !RenderPath {
+fn initOutputPath(
+    allocator: std.mem.Allocator,
+    platforms: Platforms,
+    fd: std.posix.fd_t,
+    snapshot: drm.Snapshot,
+    config: Config,
+    render_device: *RenderDevice,
+) !OutputPath {
+    const renderer = &(render_device.renderer orelse return error.RendererUnavailable);
+    return switch (renderer.*) {
+        .pixman => initPixmanOutput(allocator, platforms, fd, snapshot, config),
+        .vulkan => |*value| initVulkanOutput(
+            allocator,
+            platforms,
+            fd,
+            snapshot,
+            config,
+            value,
+        ),
+    };
+}
+
+fn initPixmanOutput(allocator: std.mem.Allocator, platforms: Platforms, fd: std.posix.fd_t, snapshot: drm.Snapshot, config: Config) !OutputPath {
+    return .{
+        .pool = try cpu.initTargetPool(
+            allocator,
+            platforms.gbm,
+            platforms.framebuffer,
+            fd,
+            snapshot,
+            config.image_count,
+        ),
+    };
+}
+
+fn initVulkanOutput(
+    allocator: std.mem.Allocator,
+    platforms: Platforms,
+    fd: std.posix.fd_t,
+    snapshot: drm.Snapshot,
+    config: Config,
+    renderer: *vulkan.Renderer,
+) !OutputPath {
+    if (snapshot.selectedPlane().properties.in_fence_fd == 0)
+        return error.InFenceUnsupported;
+    var pool = try vulkan.initTargetPool(
+        allocator,
+        platforms.gbm,
+        platforms.framebuffer,
+        fd,
+        snapshot,
+        config.image_count,
+    );
+    errdefer pool.deinit() catch {};
+    return .{
+        .pool = pool,
+        .vulkan_targets = try renderer.createTargets(config.image_count),
+    };
+}
+
+fn initPixman(allocator: std.mem.Allocator, platforms: Platforms, fd: std.posix.fd_t, snapshot: drm.Snapshot, config: Config) !InitialRenderPath {
     var pool = try cpu.initTargetPool(allocator, platforms.gbm, platforms.framebuffer, fd, snapshot, config.image_count);
     errdefer pool.deinit() catch {};
     const renderer = try cpu.Renderer.init(allocator, .{
@@ -515,10 +730,13 @@ fn initPixman(allocator: std.mem.Allocator, platforms: Platforms, fd: std.posix.
         .max_source_width = config.max_source_width,
         .max_source_height = config.max_source_height,
     });
-    return .{ .pool = pool, .renderer = .{ .pixman = renderer } };
+    return .{
+        .output = .{ .pool = pool },
+        .renderer = .{ .pixman = renderer },
+    };
 }
 
-fn initVulkan(allocator: std.mem.Allocator, platforms: Platforms, fd: std.posix.fd_t, snapshot: drm.Snapshot, config: Config) !RenderPath {
+fn initVulkan(allocator: std.mem.Allocator, platforms: Platforms, fd: std.posix.fd_t, snapshot: drm.Snapshot, config: Config) !InitialRenderPath {
     if (snapshot.selectedPlane().properties.in_fence_fd == 0)
         return error.InFenceUnsupported;
     var pool = try vulkan.initTargetPool(allocator, platforms.gbm, platforms.framebuffer, fd, snapshot, config.image_count);
@@ -526,10 +744,19 @@ fn initVulkan(allocator: std.mem.Allocator, platforms: Platforms, fd: std.posix.
     const renderer = try vulkan.Renderer.init(allocator, platforms.vulkan, fd, .{
         .max_samples = config.max_samples,
         .max_source_bytes = config.max_source_bytes,
-        .max_targets = config.image_count,
+        .max_targets = config.max_render_targets,
         .max_damage_rects = config.max_render_damage,
     });
-    return .{ .pool = pool, .renderer = .{ .vulkan = renderer } };
+    var owned_renderer = renderer;
+    errdefer owned_renderer.deinit();
+    const targets = try owned_renderer.createTargets(config.image_count);
+    return .{
+        .output = .{
+            .pool = pool,
+            .vulkan_targets = targets,
+        },
+        .renderer = .{ .vulkan = owned_renderer },
+    };
 }
 
 fn bindSamples(list: render.List, bindings: []const SampleBinding, output: []scheduler_api.Sample(render.PresentationIdentity)) !void {
@@ -624,6 +851,63 @@ test "drm-sim: Session generations select create and quiesce actions" {
     try std.testing.expectEqual(SessionAction.create_output, sessionAction(.{ .enabled = 2 }));
     try std.testing.expectEqual(SessionAction.quiesce_output, sessionAction(.{ .disabling = 2 }));
     try std.testing.expectEqual(SessionAction.none, sessionAction(.{ .disabled = 2 }));
+}
+
+test "drm-sim: render device survives output target recreation" {
+    var fixture = SimFixture{};
+    const platforms = fixture.platforms();
+    const snapshot = fixture.snapshot();
+    var config: Config = .{
+        .output_id = .{ .index = 0, .generation = 1 },
+        .scheduler = .{ .refresh_ns = 10, .render_budget_ns = 3 },
+        .renderer = .pixman,
+        .image_count = 2,
+        .max_samples = 1,
+        .max_source_bytes = 4,
+        .max_source_width = 1,
+        .max_source_height = 1,
+    };
+    const first = try Output.create(
+        std.testing.allocator,
+        platforms,
+        fixture.device(),
+        snapshot,
+        config,
+    );
+    const render_device = first.takeRenderDevice();
+    try std.testing.expectEqual(RendererKind.pixman, render_device.rendererKind().?);
+    const pixels = [_]u8{ 1, 2, 3, 4 };
+    const content = render_device.content.publish(try render_device.content.prepare(
+        .{ .surface = 1, .commit_sequence = 1 },
+        .{
+            .size = .{ .width = 1, .height = 1 },
+            .stride = 4,
+            .format = .xrgb8888,
+            .bytes = &pixels,
+        },
+        .{},
+    ));
+    try drainIdleSimOutput(first, &fixture);
+    try std.testing.expectEqual(RendererKind.pixman, render_device.rendererKind().?);
+
+    config.output_id.generation = 2;
+    const second = try Output.createWithRenderDevice(
+        std.testing.allocator,
+        platforms,
+        fixture.device(),
+        snapshot,
+        config,
+        render_device,
+    );
+    try std.testing.expect(second.render_device == render_device);
+    try std.testing.expectEqualSlices(u8, &pixels, (try render_device.content.resolve(content)).bytes);
+    try drainIdleSimOutput(second, &fixture);
+    render_device.content.release(content);
+    render_device.destroy();
+    fixture.ring.deinit();
+    fixture.router.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 4), fixture.bos_destroyed);
+    try std.testing.expectEqual(@as(usize, 4), fixture.framebuffers_removed);
 }
 
 test "drm-sim: pre-capture failures retire scheduler and remain removable" {
@@ -770,12 +1054,12 @@ test "drm-sim: physical Pixman owner starts and drains in strict order" {
 }
 
 const SimFixture = struct {
-    bytes: [2][4]u8 align(4) = .{ [_]u8{0} ** 4, [_]u8{0} ** 4 },
+    bytes: [4][4]u8 align(4) = [_][4]u8{[_]u8{0} ** 4} ** 4,
     bo_count: usize = 0,
     bos_destroyed: usize = 0,
     framebuffers_removed: usize = 0,
     pool_removal_started_before_bo: bool = false,
-    requests: [2]u8 = .{ 0, 0 },
+    requests: [4]u8 = .{ 0, 0, 0, 0 },
     request_count: usize = 0,
     flip_userdata: ?*anyopaque = null,
     presented_count: usize = 0,
@@ -926,4 +1210,17 @@ fn startSimFrame(output: *Output, now_ns: u64, handle: timer.Handle) !scheduler_
     const request_value = (try output.timerRequest(now_ns)).?;
     try output.timerArmed(request_value, handle, now_ns);
     return (try output.timerEvent(handle, .fired, request_value.frame.sequence + now_ns + 5)).?.frame;
+}
+
+fn drainIdleSimOutput(output: *Output, fixture: *SimFixture) !void {
+    try std.testing.expect((try output.requestPause()) == null);
+    const callbacks: WaylandCallbacks = .{
+        .context = fixture,
+        .presented_fn = SimFixture.unexpectedPresented,
+        .retired_fn = SimFixture.unexpectedRetired,
+    };
+    try output.processKmsEvents(callbacks);
+    try output.beginDrain(&fixture.router, &fixture.ring);
+    try output.processKmsEvents(callbacks);
+    try output.destroy();
 }

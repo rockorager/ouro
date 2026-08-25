@@ -1,0 +1,84 @@
+#version 450
+
+// Sampled-image compute compositor ABI is defined by vulkan_platform.Sample
+// and Push. The descriptor index is dynamically uniform: every invocation
+// advances through the same ordered sample loop.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0, rgba8) uniform writeonly image2D target_image;
+
+struct Sample {
+    uvec4 source;       // reserved, width, height, reserved
+    ivec4 crop;         // signed 16.16 x, y, width, height
+    ivec4 destination;  // x, y, width, height
+    ivec4 clip;         // x, y, width, height
+    uvec4 attributes;   // format, transform, global alpha, reserved
+    ivec4 affine;       // xx, xy, x0, yx in signed 16.16
+    ivec4 affine_tail;  // yy, y0, reserved, reserved
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer Samples { Sample items[]; };
+layout(set = 0, binding = 3) uniform sampler2D source_images[8];
+
+layout(push_constant) uniform Frame {
+    uvec4 clear_color;  // straight alpha, red, green, blue
+    uvec4 output_info;  // width, height, format, sample count
+    uvec4 damage;       // x, y, width, height
+} frame;
+
+uint multiply_unorm(uint value, uint alpha) {
+    return (value * alpha + 127u) / 255u;
+}
+
+uvec4 load_pixel(Sample item, uint index, ivec2 coordinate) {
+    uvec4 value = uvec4(round(texelFetch(source_images[index], coordinate, 0) * 255.0));
+    if (item.attributes.x == 1u) value.a = 255u;
+    uint global_alpha = item.attributes.z;
+    return uvec4(
+        multiply_unorm(value.r, global_alpha),
+        multiply_unorm(value.g, global_alpha),
+        multiply_unorm(value.b, global_alpha),
+        multiply_unorm(value.a, global_alpha)
+    );
+}
+
+ivec2 source_coordinate(Sample item, ivec2 local) {
+    ivec2 fixed_coordinate = ivec2(
+        item.affine.x * local.x + item.affine.y * local.y + item.affine.z,
+        item.affine.w * local.x + item.affine_tail.x * local.y + item.affine_tail.y
+    );
+    return fixed_coordinate >> 16;
+}
+
+void main() {
+    ivec2 local_damage = ivec2(gl_GlobalInvocationID.xy);
+    if (local_damage.x >= int(frame.damage.z) || local_damage.y >= int(frame.damage.w)) return;
+    ivec2 pixel = ivec2(frame.damage.xy) + local_damage;
+
+    uint alpha = frame.output_info.z == 1u ? 255u : frame.clear_color.x;
+    uvec4 color = uvec4(
+        multiply_unorm(frame.clear_color.y, alpha),
+        multiply_unorm(frame.clear_color.z, alpha),
+        multiply_unorm(frame.clear_color.w, alpha),
+        alpha
+    );
+    for (uint index = 0u; index < frame.output_info.w; ++index) {
+        Sample item = items[index];
+        ivec2 destination_end = item.destination.xy + item.destination.zw;
+        ivec2 clip_end = item.clip.xy + item.clip.zw;
+        if (any(lessThan(pixel, item.destination.xy)) || any(greaterThanEqual(pixel, destination_end)) ||
+            any(lessThan(pixel, item.clip.xy)) || any(greaterThanEqual(pixel, clip_end))) continue;
+        ivec2 coordinate = source_coordinate(item, pixel - item.destination.xy);
+        if (any(lessThan(coordinate, ivec2(0))) ||
+            coordinate.x >= int(item.source.y) || coordinate.y >= int(item.source.z)) continue;
+        uvec4 source_pixel = load_pixel(item, index, coordinate);
+        uint inverse_alpha = 255u - source_pixel.a;
+        color = min(uvec4(255u), source_pixel + uvec4(
+            multiply_unorm(color.r, inverse_alpha),
+            multiply_unorm(color.g, inverse_alpha),
+            multiply_unorm(color.b, inverse_alpha),
+            multiply_unorm(color.a, inverse_alpha)
+        ));
+    }
+    imageStore(target_image, pixel, vec4(color.b, color.g, color.r, color.a) / 255.0);
+}

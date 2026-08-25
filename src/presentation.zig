@@ -1,4 +1,4 @@
-//! Bounded ownership of imported buffers awaiting presentation completion.
+//! Bounded generational presentation ownership.
 
 const std = @import("std");
 const objects = @import("wayring").objects;
@@ -20,10 +20,10 @@ pub const QueueRelease = *const fn (
     callback: objects.Handle,
 ) anyerror!void;
 
-/// Fixed-capacity in-flight presentation storage. An admitted entry owns the
-/// renderer/importer handle, source backing lease, and per-commit release batch
-/// until successful completion or explicit discard. The queue must remain at a
-/// stable address while entries are active.
+/// Fixed-capacity in-flight presentation storage. Callers that still need a
+/// source backing until completion can transfer its lease and release batch;
+/// callers with independently owned content can admit only the imported handle.
+/// The queue must remain at a stable address while entries are active.
 pub fn Queue(comptime Imported: type) type {
     return struct {
         const Self = @This();
@@ -40,7 +40,7 @@ pub fn Queue(comptime Imported: type) type {
             generation: u32 = 1,
             next_free: u32 = none,
             imported: Imported = undefined,
-            lease: buffer_import.Lease = undefined,
+            lease: ?buffer_import.Lease = null,
             release_callbacks: ?release.Batch = null,
         };
 
@@ -110,6 +110,22 @@ pub fn Queue(comptime Imported: type) type {
             return .{ .queue = queue, .index = index, .generation = slot.generation };
         }
 
+        /// Admits presentation identity after the caller has independently
+        /// secured content lifetime. No client source backing is retained.
+        pub fn admitImported(queue: *Self, imported: Imported) Error!Token {
+            if (queue.free_head == none) return error.Exhausted;
+            const index = queue.free_head;
+            const slot = &queue.slots[index];
+            queue.free_head = slot.next_free;
+            slot.* = .{
+                .active = true,
+                .generation = slot.generation,
+                .imported = imported,
+            };
+            queue.active_count += 1;
+            return .{ .queue = queue, .index = index, .generation = slot.generation };
+        }
+
         pub fn getImported(queue: *Self, token: Token) Error!*Imported {
             return &(try queue.resolve(token)).imported;
         }
@@ -163,10 +179,11 @@ pub fn Queue(comptime Imported: type) type {
             const slot = &queue.slots[index];
             if (slot.release_callbacks) |*batch| batch.deinit();
             queue.dispose(queue.dispose_context, slot.imported);
-            slot.lease.deinit();
+            if (slot.lease) |*lease| lease.deinit();
             slot.active = false;
             slot.generation +%= 1;
             slot.next_free = queue.free_head;
+            slot.lease = null;
             slot.release_callbacks = null;
             queue.free_head = index;
             queue.active_count -= 1;
@@ -252,8 +269,10 @@ test "presentation admission and release queuing are transactional" {
     );
     try presentations.finish(presentation);
     try std.testing.expectError(error.StalePresentation, presentations.finish(presentation));
+    const imported_only = try presentations.admitImported(9);
+    try presentations.finish(imported_only);
     try std.testing.expectEqual(@as(usize, 2), backing_disposals);
-    try std.testing.expectEqual(@as(usize, 2), imported_disposals);
+    try std.testing.expectEqual(@as(usize, 3), imported_disposals);
     try std.testing.expectEqual(@as(usize, 2), release_pool.available());
 }
 

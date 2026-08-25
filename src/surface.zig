@@ -104,6 +104,57 @@ pub const Damage = struct {
     }
 };
 
+pub const upload_damage_rect_capacity = 8;
+
+/// Allocation-free upload region. Rectangles remain disjoint; overlapping
+/// requests merge conservatively, and capacity overflow collapses to one bound.
+pub const UploadDamage = struct {
+    rects: [upload_damage_rect_capacity]Damage =
+        [_]Damage{.{}} ** upload_damage_rect_capacity,
+    count: u8 = 0,
+
+    pub fn items(damage: *const UploadDamage) []const Damage {
+        return damage.rects[0..damage.count];
+    }
+
+    fn add(upload: *UploadDamage, x: i32, y: i32, width: i32, height: i32) void {
+        if (width <= 0 or height <= 0) return;
+        upload.addDamage(.{
+            .min_x = x,
+            .min_y = y,
+            .max_x = @as(i64, x) + width,
+            .max_y = @as(i64, y) + height,
+            .empty = false,
+        });
+    }
+
+    fn addDamage(upload: *UploadDamage, value: Damage) void {
+        if (value.empty) return;
+        var merged = value;
+        var index: usize = 0;
+        while (index < upload.count) {
+            if (!overlaps(upload.rects[index], merged)) {
+                index += 1;
+                continue;
+            }
+            unionDamage(&merged, upload.rects[index]);
+            upload.count -= 1;
+            upload.rects[index] = upload.rects[upload.count];
+            // The larger merged bound can overlap an earlier rectangle that
+            // did not overlap the original input, so recheck the whole region.
+            index = 0;
+        }
+        if (upload.count < upload.rects.len) {
+            upload.rects[upload.count] = merged;
+            upload.count += 1;
+            return;
+        }
+        for (upload.items()) |rect| unionDamage(&merged, rect);
+        upload.rects[0] = merged;
+        upload.count = 1;
+    }
+};
+
 pub const Transform = enum(u3) {
     normal,
     @"90",
@@ -139,6 +190,9 @@ pub const Update = struct {
     attachment: ?Attachment,
     surface_damage: Damage,
     buffer_damage: Damage,
+    /// Both protocol damage domains mapped to native buffer pixels. This is the
+    /// renderer import/update domain; scene/output damage remains separate.
+    upload_damage: UploadDamage,
     transform: Transform,
     scale: i32,
     offset: Point,
@@ -159,6 +213,8 @@ pub const Surface = struct {
     attach_changed: bool = false,
     pending_surface_damage: Damage = .{},
     pending_buffer_damage: Damage = .{},
+    pending_surface_upload_damage: UploadDamage = .{},
+    pending_buffer_upload_damage: UploadDamage = .{},
     pending_transform: Transform = .normal,
     pending_scale: i32 = 1,
     pending_offset: Point = .{},
@@ -181,10 +237,12 @@ pub const Surface = struct {
 
     pub fn damage(surface: *Surface, x: i32, y: i32, width: i32, height: i32) void {
         surface.pending_surface_damage.add(x, y, width, height);
+        surface.pending_surface_upload_damage.add(x, y, width, height);
     }
 
     pub fn damageBuffer(surface: *Surface, x: i32, y: i32, width: i32, height: i32) void {
         surface.pending_buffer_damage.add(x, y, width, height);
+        surface.pending_buffer_upload_damage.add(x, y, width, height);
     }
 
     pub fn setTransform(surface: *Surface, value: i32) Error!void {
@@ -250,11 +308,20 @@ pub const Surface = struct {
         surface.current_scale = surface.pending_scale;
         const content_size = surface.contentSize(surface.current_buffer);
         const viewport_state = surface.viewport.publishCommit();
+        const upload_damage = canonicalBufferDamage(
+            surface.pending_surface_upload_damage,
+            surface.pending_buffer_upload_damage,
+            surface.current_buffer,
+            surface.current_transform,
+            surface.current_scale,
+            viewport_state,
+        );
         const update: Update = .{
             .sequence = surface.sequence,
             .attachment = attachment,
             .surface_damage = surface.pending_surface_damage,
             .buffer_damage = surface.pending_buffer_damage,
+            .upload_damage = upload_damage,
             .transform = surface.current_transform,
             .scale = surface.current_scale,
             .offset = surface.pending_offset,
@@ -266,6 +333,8 @@ pub const Surface = struct {
         surface.attach_changed = false;
         surface.pending_surface_damage = .{};
         surface.pending_buffer_damage = .{};
+        surface.pending_surface_upload_damage = .{};
+        surface.pending_buffer_upload_damage = .{};
         surface.pending_offset = .{};
         return update;
     }
@@ -286,6 +355,192 @@ pub const Surface = struct {
         try surface.role.validateDestroy();
     }
 };
+
+/// Converts `wl_surface.damage` from final surface coordinates back through
+/// viewport destination/source, buffer scale, and inverse buffer transform,
+/// then combines it with `damage_buffer`. Rectangles are conservatively rounded
+/// outward and clipped to the native buffer extent.
+fn canonicalBufferDamage(
+    surface_damage: UploadDamage,
+    buffer_damage: UploadDamage,
+    buffer: ?Buffer,
+    transform: Transform,
+    scale_value: i32,
+    viewport_state: ViewportState,
+) UploadDamage {
+    const value = buffer orelse return .{};
+    var result: UploadDamage = .{};
+    for (buffer_damage.items()) |damage|
+        result.addDamage(clipDamage(damage, value.width, value.height));
+    for (surface_damage.items()) |damage| result.addDamage(mapSurfaceDamage(
+        damage,
+        value,
+        transform,
+        @intCast(scale_value),
+        viewport_state,
+    ));
+    return result;
+}
+
+fn mapSurfaceDamage(
+    damage: Damage,
+    buffer: Buffer,
+    transform: Transform,
+    scale: u32,
+    viewport_state: ViewportState,
+) Damage {
+    if (damage.empty) return .{};
+    const swaps_axes = transformSwapsAxes(transform);
+    const transformed_width: u32 = if (swaps_axes) buffer.height else buffer.width;
+    const transformed_height: u32 = if (swaps_axes) buffer.width else buffer.height;
+    const content_width = transformed_width / scale;
+    const content_height = transformed_height / scale;
+    const configured_source = viewport_state.source();
+    const source_start_x: i128 = if (configured_source) |source| source.x else 0;
+    const source_start_y: i128 = if (configured_source) |source| source.y else 0;
+    const source_width: i128 = if (configured_source) |source|
+        source.width
+    else
+        @as(i128, content_width) * viewport.fixed_one;
+    const source_height: i128 = if (configured_source) |source|
+        source.height
+    else
+        @as(i128, content_height) * viewport.fixed_one;
+    const destination = viewport_state.destination() orelse if (configured_source) |source|
+        SurfaceSize{
+            .width = @intCast(@divExact(source.width, viewport.fixed_one)),
+            .height = @intCast(@divExact(source.height, viewport.fixed_one)),
+        }
+    else
+        SurfaceSize{ .width = content_width, .height = content_height };
+    const clipped = clipEdges(
+        damage,
+        destination.width,
+        destination.height,
+    ) orelse return .{};
+
+    const source_x = mapInterval(
+        clipped[0],
+        clipped[2],
+        source_start_x,
+        source_width,
+        destination.width,
+    );
+    const source_y = mapInterval(
+        clipped[1],
+        clipped[3],
+        source_start_y,
+        source_height,
+        destination.height,
+    );
+    const transformed_x = fixedToPixels(source_x, scale, transformed_width);
+    const transformed_y = fixedToPixels(source_y, scale, transformed_height);
+    return inverseTransformDamage(
+        transformed_x,
+        transformed_y,
+        buffer.width,
+        buffer.height,
+        transform,
+    );
+}
+
+fn transformSwapsAxes(transform: Transform) bool {
+    return switch (transform) {
+        .@"90", .@"270", .flipped_90, .flipped_270 => true,
+        else => false,
+    };
+}
+
+fn clipDamage(damage: Damage, width: u32, height: u32) Damage {
+    const edges = clipEdges(damage, width, height) orelse return .{};
+    return damageFromEdges(edges[0], edges[1], edges[2], edges[3]);
+}
+
+fn clipEdges(damage: Damage, width: u32, height: u32) ?[4]i128 {
+    if (damage.empty) return null;
+    const left = @max(@as(i128, 0), damage.min_x);
+    const top = @max(@as(i128, 0), damage.min_y);
+    const right = @min(@as(i128, width), damage.max_x);
+    const bottom = @min(@as(i128, height), damage.max_y);
+    if (right <= left or bottom <= top) return null;
+    return .{ left, top, right, bottom };
+}
+
+fn mapInterval(
+    start: i128,
+    end: i128,
+    source_start: i128,
+    source_extent: i128,
+    destination_extent: u32,
+) [2]i128 {
+    const denominator: i128 = destination_extent;
+    return .{
+        source_start + @divFloor(start * source_extent, denominator),
+        source_start + divCeil(end * source_extent, denominator),
+    };
+}
+
+fn fixedToPixels(interval: [2]i128, scale: u32, extent: u32) [2]i128 {
+    const one: i128 = viewport.fixed_one;
+    return .{
+        @max(@as(i128, 0), @divFloor(interval[0] * scale, one)),
+        @min(@as(i128, extent), divCeil(interval[1] * scale, one)),
+    };
+}
+
+fn divCeil(numerator: i128, denominator: i128) i128 {
+    return -@divFloor(-numerator, denominator);
+}
+
+fn inverseTransformDamage(
+    x: [2]i128,
+    y: [2]i128,
+    width: u32,
+    height: u32,
+    transform: Transform,
+) Damage {
+    const w: i128 = width;
+    const h: i128 = height;
+    const edges: [4]i128 = switch (transform) {
+        .normal => .{ x[0], y[0], x[1], y[1] },
+        .@"90" => .{ y[0], h - x[1], y[1], h - x[0] },
+        .@"180" => .{ w - x[1], h - y[1], w - x[0], h - y[0] },
+        .@"270" => .{ w - y[1], x[0], w - y[0], x[1] },
+        .flipped => .{ w - x[1], y[0], w - x[0], y[1] },
+        .flipped_90 => .{ y[0], x[0], y[1], x[1] },
+        .flipped_180 => .{ x[0], h - y[1], x[1], h - y[0] },
+        .flipped_270 => .{ w - y[1], h - x[1], w - y[0], h - x[0] },
+    };
+    return damageFromEdges(edges[0], edges[1], edges[2], edges[3]);
+}
+
+fn damageFromEdges(left: i128, top: i128, right: i128, bottom: i128) Damage {
+    if (right <= left or bottom <= top) return .{};
+    return .{
+        .min_x = @intCast(left),
+        .min_y = @intCast(top),
+        .max_x = @intCast(right),
+        .max_y = @intCast(bottom),
+        .empty = false,
+    };
+}
+
+fn unionDamage(destination: *Damage, source: Damage) void {
+    if (source.empty) return;
+    if (destination.empty) {
+        destination.* = source;
+        return;
+    }
+    destination.min_x = @min(destination.min_x, source.min_x);
+    destination.min_y = @min(destination.min_y, source.min_y);
+    destination.max_x = @max(destination.max_x, source.max_x);
+    destination.max_y = @max(destination.max_y, source.max_y);
+}
+
+fn overlaps(a: Damage, b: Damage) bool {
+    return !a.empty and !b.empty and a.min_x < b.max_x and b.min_x < a.max_x and
+        a.min_y < b.max_y and b.min_y < a.max_y;
+}
 
 /// Transactional composition of one wl_surface commit with shared state pools
 /// and the version-7 content-update scheduler.
@@ -485,6 +740,127 @@ test "surface viewport validates transformed and scaled content atomically" {
     surface.viewport.clear();
     const cleared = try surface.commit();
     try std.testing.expectEqual(SurfaceSize{ .width = 6, .height = 10 }, cleared.size);
+}
+
+test "surface commit canonicalizes upload damage through every buffer transform" {
+    const expected = [_]Damage{
+        damageRect(0, 0, 1, 1),
+        damageRect(0, 2, 1, 1),
+        damageRect(3, 2, 1, 1),
+        damageRect(3, 0, 1, 1),
+        damageRect(3, 0, 1, 1),
+        damageRect(0, 0, 1, 1),
+        damageRect(0, 2, 1, 1),
+        damageRect(3, 2, 1, 1),
+    };
+    for (expected, 0..) |want, transform| {
+        var surface: Surface = .{};
+        try surface.attach(7, .{
+            .handle = .{ .id = 9, .generation = 3 },
+            .width = 4,
+            .height = 3,
+        }, 0, 0);
+        try surface.setTransform(@intCast(transform));
+        surface.damage(0, 0, 1, 1);
+        const update = try surface.commit();
+        try expectUploadDamage(&.{want}, update.upload_damage);
+    }
+}
+
+test "surface commit maps viewport damage outward and unions clipped buffer damage" {
+    var surface: Surface = .{};
+    try surface.attach(7, .{
+        .handle = .{ .id = 9, .generation = 3 },
+        .width = 20,
+        .height = 12,
+    }, 0, 0);
+    try surface.setTransform(1);
+    try surface.setScale(2);
+    try surface.viewport.setSource(256, 512, 1024, 1536);
+    try surface.viewport.setDestination(8, 12);
+    surface.damage(2, 2, 2, 2);
+    surface.damageBuffer(13, -2, 10, 3);
+
+    const update = try surface.commit();
+    try expectUploadDamage(&.{
+        damageRect(13, 0, 7, 1),
+        damageRect(6, 6, 2, 2),
+    }, update.upload_damage);
+    try std.testing.expectEqual(damageRect(2, 2, 2, 2), update.surface_damage);
+    try std.testing.expectEqual(damageRect(13, -2, 10, 3), update.buffer_damage);
+}
+
+test "surface commit conservatively rounds fractional viewport upload damage" {
+    var surface: Surface = .{};
+    try surface.attach(7, .{
+        .handle = .{ .id = 9, .generation = 3 },
+        .width = 4,
+        .height = 2,
+    }, 0, 0);
+    try surface.viewport.setSource(128, 0, 384, 256);
+    try surface.viewport.setDestination(3, 1);
+    surface.damage(1, 0, 1, 1);
+
+    const update = try surface.commit();
+    try expectUploadDamage(&.{damageRect(1, 0, 1, 1)}, update.upload_damage);
+}
+
+test "surface commit maps damage for buffers wider than viewport fixed point" {
+    var surface: Surface = .{};
+    try surface.attach(7, .{
+        .handle = .{ .id = 9, .generation = 3 },
+        .width = 8_388_608,
+        .height = 1,
+    }, 0, 0);
+    surface.damage(0, 0, 1, 1);
+
+    const update = try surface.commit();
+    try expectUploadDamage(&.{damageRect(0, 0, 1, 1)}, update.upload_damage);
+}
+
+test "surface commit preserves sparse upload rectangles and bounds overflow" {
+    var surface: Surface = .{};
+    try surface.attach(7, .{
+        .handle = .{ .id = 9, .generation = 3 },
+        .width = 1920,
+        .height = 1200,
+    }, 0, 0);
+    surface.damageBuffer(32, 32, 32, 32);
+    surface.damageBuffer(1856, 1136, 32, 32);
+    const sparse = try surface.commit();
+    try expectUploadDamage(&.{
+        damageRect(32, 32, 32, 32),
+        damageRect(1856, 1136, 32, 32),
+    }, sparse.upload_damage);
+
+    for (0..upload_damage_rect_capacity + 1) |index|
+        surface.damageBuffer(@intCast(index * 2), 0, 1, 1);
+    const bounded = try surface.commit();
+    try expectUploadDamage(&.{damageRect(0, 0, 17, 1)}, bounded.upload_damage);
+}
+
+test "surface upload damage merges transitive overlap" {
+    var damage: UploadDamage = .{};
+    damage.addDamage(damageRect(0, 0, 10, 10));
+    damage.addDamage(damageRect(20, 5, 10, 10));
+    damage.addDamage(damageRect(5, 11, 20, 9));
+    try expectUploadDamage(&.{damageRect(0, 0, 30, 20)}, damage);
+}
+
+fn damageRect(x: i64, y: i64, width: i64, height: i64) Damage {
+    return .{
+        .min_x = x,
+        .min_y = y,
+        .max_x = x + width,
+        .max_y = y + height,
+        .empty = false,
+    };
+}
+
+fn expectUploadDamage(expected: []const Damage, actual: UploadDamage) !void {
+    try std.testing.expectEqual(expected.len, actual.count);
+    for (expected, actual.items()) |want, value|
+        try std.testing.expectEqual(want, value);
 }
 
 test "transactional surface commit publishes callback ownership with its CU" {
