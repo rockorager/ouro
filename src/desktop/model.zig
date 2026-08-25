@@ -429,6 +429,18 @@ pub fn Desktop(comptime Shell: type) type {
             return desktop.slots[try desktop.resolveIndex(id)].shell_id;
         }
 
+        pub fn reconfigureShellToplevel(desktop: *Self, shell_id: Shell.ToplevelId) !void {
+            const id = try desktop.idForShell(shell_id);
+            if (desktop.commandCountFor(id) != 0) return;
+            try desktop.requireCommandCapacity(1);
+            const slot = &desktop.slots[try desktop.resolveIndex(id)];
+            desktop.enqueue(.{
+                .id = id,
+                .shell_id = slot.shell_id,
+                .configure = slot.last_configure,
+            });
+        }
+
         pub fn focusToplevel(desktop: *Self, id: ToplevelId) !void {
             const index = try desktop.resolveIndex(id);
             if (desktop.slots[index].minimized) return error.NotVisible;

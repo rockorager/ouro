@@ -735,6 +735,26 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             return adapter.managerId(slot);
         }
 
+        pub fn toplevelIdOn(adapter: *Self, server_objects: anytype, object_id: u32) !ToplevelId {
+            const handle = server_objects.namespace.lookupHandle(object_id) orelse
+                return error.StaleToplevel;
+            const object = server_objects.namespace.resolve(handle) orelse
+                return error.StaleToplevel;
+            return adapter.toplevelIdResource(handle, object);
+        }
+
+        pub fn toplevelIdResource(
+            adapter: *Self,
+            handle: objects.Handle,
+            object: *const objects.Object,
+        ) !ToplevelId {
+            if (object.interface != &Toplevel.info) return error.StaleToplevel;
+            const slot = fromContext(ToplevelSlot, adapter.toplevels, object.context) orelse
+                return error.StaleToplevel;
+            if (!std.meta.eql(slot.header.resource, handle)) return error.StaleToplevel;
+            return adapter.toplevelId(slot);
+        }
+
         pub fn queuePing(adapter: *Self, id: ManagerId) !u32 {
             const slot = try adapter.resolveManager(id.index, id.generation);
             if (slot.ping_serial != null) return error.PingPending;

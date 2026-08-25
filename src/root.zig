@@ -42,6 +42,7 @@ pub const seat = @import("protocol/seat.zig");
 pub const data_device = @import("protocol/data_device.zig");
 pub const linux_dmabuf = @import("protocol/linux_dmabuf.zig");
 pub const xdg_activation = @import("protocol/xdg_activation.zig");
+pub const xdg_decoration = @import("protocol/xdg_decoration.zig");
 pub const protocol_output = @import("protocol/output.zig");
 pub const scene_geometry = @import("scene/geometry.zig");
 pub const scene_hit_test = @import("scene/hit_test.zig");
@@ -93,6 +94,7 @@ test {
     _ = data_device;
     _ = linux_dmabuf;
     _ = xdg_activation;
+    _ = xdg_decoration;
     _ = protocol_output;
     _ = scene_geometry;
     _ = scene_hit_test;
