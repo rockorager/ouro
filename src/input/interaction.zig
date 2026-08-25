@@ -244,6 +244,26 @@ pub fn Interaction(comptime Desktop: type) type {
             self.keyboard_focus = target;
         }
 
+        /// Applies a compositor-policy focus request, such as a validated
+        /// xdg-activation token, through the same desktop and seat command
+        /// boundary as an implicit pointer grab.
+        pub fn activateToplevel(
+            self: *Self,
+            desktop: *Desktop,
+            toplevel: ToplevelId,
+            surface: SurfaceId,
+        ) !void {
+            try self.ensureCommandCapacity(1);
+            try desktop.focusToplevel(toplevel);
+            const target: Target = .{
+                .toplevel = toplevel,
+                .surface = surface,
+                .point = .{ .x = 0, .y = 0 },
+            };
+            self.keyboard_focus = target;
+            self.enqueue(.{ .keyboard_focus = target });
+        }
+
         /// Cancels every state edge naming an exact destroyed surface. Seat
         /// resource teardown independently drops stale wire operations; this
         /// terminal command handles still-live protocol focus on device loss.
@@ -949,6 +969,18 @@ test "interaction: default press updates desktop and enters exact button grab" {
         .pressed = false,
     } });
     try std.testing.expect(interaction.interactionMode() == .default);
+}
+
+test "interaction: activation focuses the exact toplevel and queues keyboard focus" {
+    var interaction = try initTestInteraction(1);
+    defer interaction.deinit();
+    var desktop = testDesktop();
+    const window = desktop.windows[1];
+
+    try interaction.activateToplevel(&desktop, window.id, window.surface);
+
+    try std.testing.expectEqual(window.id, desktop.focused.?);
+    try std.testing.expectEqual(targetFor(window), interaction.peekCommand().?.keyboard_focus);
 }
 
 test "interaction: interactive resize follows pointer and ends on button release" {

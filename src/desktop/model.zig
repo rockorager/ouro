@@ -553,6 +553,13 @@ pub fn Desktop(comptime Shell: type) type {
             return error.StaleSurface;
         }
 
+        pub fn toplevelSceneForSurface(desktop: *const Self, surface: Shell.SurfaceId) !SceneWindow {
+            for (desktop.slots) |slot| {
+                if (slot.header.active and std.meta.eql(slot.surface, surface)) return slot.scene;
+            }
+            return error.StaleToplevel;
+        }
+
         pub fn popupGrabTarget(desktop: *const Self) ?struct {
             toplevel: ToplevelId,
             surface: Shell.SurfaceId,
@@ -1621,6 +1628,8 @@ test "desktop: popup configure maps above its owning toplevel" {
     try std.testing.expectEqual(owner, popup.id);
     try std.testing.expectEqual(geometry.Rect{ .x = 30, .y = 20, .width = 20, .height = 10 }, popup.geometry);
     try std.testing.expect(popup.visible and popup.content_ready);
+    try std.testing.expectError(error.StaleToplevel, desktop.toplevelSceneForSurface(popup_surface));
+    try std.testing.expectEqual(owner, (try desktop.toplevelSceneForSurface(parent)).id);
     var snapshot_storage: [4]TestDesktop.SceneWindow = undefined;
     const snapshot = try desktop.sceneSnapshot(&snapshot_storage);
     try std.testing.expectEqual(@as(usize, 2), snapshot.len);

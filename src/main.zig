@@ -226,7 +226,7 @@ fn compositorConfig() Compositor.Config {
             .object_capacity = 128,
             .object_quota = 128,
             .buckets_per_client = 128,
-            .max_globals = 10,
+            .max_globals = 11,
             .registry_capacity = 4,
         },
     };

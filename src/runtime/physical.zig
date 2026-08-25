@@ -29,6 +29,7 @@ const xdg_shell = @import("../protocol/xdg_shell.zig");
 const protocol_seat = @import("../protocol/seat.zig");
 const protocol_data_device = @import("../protocol/data_device.zig");
 const protocol_linux_dmabuf = @import("../protocol/linux_dmabuf.zig");
+const protocol_xdg_activation = @import("../protocol/xdg_activation.zig");
 const protocol_fractional_scale = @import("../protocol/fractional_scale.zig");
 const protocol_output = @import("../protocol/output.zig");
 const desktop_model = @import("../desktop/model.zig");
@@ -51,6 +52,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const SeatAdapter = protocol_seat.Adapter(protocol, Adapter);
         const DataDeviceAdapter = protocol_data_device.Adapter(protocol);
         const DmabufAdapter = protocol_linux_dmabuf.Adapter(protocol);
+        const ActivationAdapter = protocol_xdg_activation.Adapter(protocol, Adapter);
         const FractionalScaleAdapter = protocol_fractional_scale.Adapter(protocol, Adapter);
         const OutputAdapter = protocol_output.Adapter(protocol);
 
@@ -145,6 +147,7 @@ pub fn Coordinator(comptime protocol: type) type {
             },
             data_device: protocol_data_device.Config = .{},
             linux_dmabuf: protocol_linux_dmabuf.Config = .{},
+            xdg_activation: protocol_xdg_activation.Config = .{},
             fractional_scale: protocol_fractional_scale.Config = .{},
             protocol_output: protocol_output.Config = .{},
             drm: drm.Config,
@@ -191,6 +194,7 @@ pub fn Coordinator(comptime protocol: type) type {
         seat_adapter: SeatAdapter,
         data_device_adapter: DataDeviceAdapter,
         dmabuf_adapter: DmabufAdapter,
+        activation_adapter: ActivationAdapter,
         fractional_scale_adapter: FractionalScaleAdapter,
         output_adapter: OutputAdapter,
         presentations: Presentations,
@@ -343,6 +347,12 @@ pub fn Coordinator(comptime protocol: type) type {
             self.dmabuf_adapter = try DmabufAdapter.init(allocator, config.linux_dmabuf);
             errdefer self.dmabuf_adapter.deinit();
             try self.adapter.setExternalImporter(self.dmabuf_adapter.externalImporter(Adapter));
+            self.activation_adapter = try ActivationAdapter.init(
+                allocator,
+                &self.adapter,
+                config.xdg_activation,
+            );
+            errdefer self.activation_adapter.deinit();
             self.fractional_scale_adapter = try FractionalScaleAdapter.init(
                 allocator,
                 &self.adapter,
@@ -352,6 +362,10 @@ pub fn Coordinator(comptime protocol: type) type {
             self.data_device_adapter.setSerialValidator(.{
                 .context = self,
                 .validate = validateSelection,
+            });
+            self.activation_adapter.setSerialValidator(.{
+                .context = self,
+                .validate = validateActivation,
             });
             self.shell_adapter.setGrabValidator(.{
                 .context = self,
@@ -399,6 +413,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
             _ = try self.dmabuf_adapter.install(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
+            _ = try self.activation_adapter.install(&root.runtime);
             try self.adapter.setCommitHook(.{
                 .context = self,
                 .validate_fn = validateSurfaceCommit,
@@ -461,6 +478,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.allocator.free(self.app_layers);
             self.output_adapter.deinit();
             self.fractional_scale_adapter.deinit();
+            self.activation_adapter.deinit();
             self.dmabuf_adapter.deinit();
             self.data_device_adapter.deinit();
             self.seat_adapter.deinit();
@@ -599,6 +617,13 @@ pub fn Coordinator(comptime protocol: type) type {
                 return control;
             }
             if (try self.dmabuf_adapter.request(peer, target, message, fds)) |control| {
+                try self.flushProtocol();
+                return control;
+            }
+            if (try self.activation_adapter.request(peer, target, message, fds)) |control| {
+                try self.processActivationEvents();
+                try self.advanceShell();
+                try self.applyInteractionCommands();
                 try self.flushProtocol();
                 return control;
             }
@@ -1052,6 +1077,38 @@ pub fn Coordinator(comptime protocol: type) type {
             return self.seat_adapter.validateSelection(peer, seat_object, serial);
         }
 
+        fn validateActivation(
+            context: *anyopaque,
+            peer: wayring.io_uring.Peer,
+            seat_object: u32,
+            serial: u32,
+            surface: Adapter.SurfaceId,
+        ) bool {
+            const self: *Self = @ptrCast(@alignCast(context));
+            return self.seat_adapter.validateActivation(
+                peer,
+                seat_object,
+                serial,
+                surface,
+            );
+        }
+
+        fn processActivationEvents(self: *Self) !void {
+            while (self.activation_adapter.popEvent()) |event| switch (event) {
+                .activate => |surface| {
+                    const scene = self.desktop.toplevelSceneForSurface(surface) catch continue;
+                    self.interaction.activateToplevel(
+                        &self.desktop,
+                        scene.id,
+                        scene.surface,
+                    ) catch |err| switch (err) {
+                        error.NotVisible, error.StaleToplevel => continue,
+                        else => return err,
+                    };
+                },
+            };
+        }
+
         fn processSeatEvents(self: *Self) !void {
             while (self.seat_adapter.popEvent()) |event| switch (event) {
                 .cursor_requested => |request_value| {
@@ -1089,15 +1146,17 @@ pub fn Coordinator(comptime protocol: type) type {
             const seat_flushed = try self.seat_adapter.flushOn(objects, &actor.transmit);
             const data_device_flushed = try self.data_device_adapter.flushOn(peer, objects, &actor.transmit);
             const dmabuf_flushed = try self.dmabuf_adapter.flushOn(peer, objects, &actor.transmit);
+            const activation_flushed = try self.activation_adapter.flushOn(peer, objects, &actor.transmit);
             const fractional_scale_flushed = try self.fractional_scale_adapter.flushOn(peer, objects, &actor.transmit);
             const output_flushed = try self.output_adapter.flushOn(peer, objects, &actor.transmit);
             const presentation_flushed = try self.adapter.flushPresentationClockOn(peer, objects, &actor.transmit);
             const discarded_flushed = try self.adapter.flushDiscardedFeedbackOn(peer, objects, &actor.transmit);
-            if (shell_flushed != 0 or seat_flushed != 0 or data_device_flushed != 0 or dmabuf_flushed != 0 or fractional_scale_flushed != 0 or output_flushed != 0 or presentation_flushed != 0 or discarded_flushed != 0 or
+            if (shell_flushed != 0 or seat_flushed != 0 or data_device_flushed != 0 or dmabuf_flushed != 0 or activation_flushed != 0 or fractional_scale_flushed != 0 or output_flushed != 0 or presentation_flushed != 0 or discarded_flushed != 0 or
                 self.shell_adapter.pendingOutbound() != 0 or
                 self.seat_adapter.pendingOutbound() != 0 or
                 self.data_device_adapter.pendingOutbound() != 0 or
                 self.dmabuf_adapter.pendingOutbound(peer) or
+                self.activation_adapter.pendingOutbound(peer) or
                 self.fractional_scale_adapter.pendingOutbound(peer) or
                 self.output_adapter.pendingOutbound() != 0 or
                 self.adapter.pendingPresentationClock(peer) or
@@ -1921,6 +1980,7 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.seat_adapter.resourceRemoved(handle, object);
             _ = self.data_device_adapter.resourceRemoved(handle, object);
             _ = self.dmabuf_adapter.resourceRemoved(handle, object);
+            _ = self.activation_adapter.resourceRemoved(handle, object);
             _ = self.fractional_scale_adapter.resourceRemoved(handle, object);
             _ = self.output_adapter.resourceRemoved(handle, object);
             if (removed_surface_peer) |peer| self.output_adapter.surfaceRemoved(peer, handle);
