@@ -72,8 +72,9 @@ pub fn Desktop(comptime Shell: type) type {
 
         const PopupCommand = struct {
             id: Shell.PopupId,
-            configure: Shell.PopupConfigure,
+            configure: Shell.PopupConfigure = undefined,
             reposition_token: ?u32 = null,
+            done: bool = false,
         };
 
         const Header = struct {
@@ -131,6 +132,7 @@ pub fn Desktop(comptime Shell: type) type {
             pending_configure: ?Shell.PopupConfigure = null,
             expected_serial: ?u32 = null,
             content_ready: bool = false,
+            grabbed: bool = false,
             has_window_geometry: bool = false,
             surface_offset: geometry.Point = .{ .x = 0, .y = 0 },
             scene: SceneWindow = undefined,
@@ -159,6 +161,8 @@ pub fn Desktop(comptime Shell: type) type {
         popup_commands: []PopupCommand,
         popup_command_head: usize = 0,
         popup_command_len: usize = 0,
+        popup_grab: ?Shell.PopupId = null,
+        popup_dismiss: ?Shell.PopupId = null,
         pending_event: ?Shell.Event = null,
         destroyed: ?ToplevelId = null,
         destroyed_surface: ?Shell.SurfaceId = null,
@@ -195,7 +199,11 @@ pub fn Desktop(comptime Shell: type) type {
             errdefer allocator.free(desired);
             const commands = try allocator.alloc(Command, config.command_capacity);
             errdefer allocator.free(commands);
-            const popup_commands = try allocator.alloc(PopupCommand, config.popup_capacity);
+            // One trailing slot is reserved for topmost-first popup dismissal,
+            // so destruction can always publish the next terminal edge.
+            const popup_command_slots = std.math.add(usize, config.popup_capacity, 1) catch
+                return error.InvalidConfig;
+            const popup_commands = try allocator.alloc(PopupCommand, popup_command_slots);
             errdefer allocator.free(popup_commands);
 
             for (slots, 0..) |*slot, index| {
@@ -279,6 +287,12 @@ pub fn Desktop(comptime Shell: type) type {
         pub fn flushConfigure(desktop: *Self, shell: *Shell) !?u32 {
             if (desktop.popup_command_len != 0) {
                 const command = desktop.popup_commands[desktop.popup_command_head];
+                if (command.done) {
+                    try shell.queuePopupDone(command.id);
+                    desktop.popup_command_head = (desktop.popup_command_head + 1) % desktop.popup_commands.len;
+                    desktop.popup_command_len -= 1;
+                    return null;
+                }
                 const serial = if (command.reposition_token) |token|
                     try shell.queuePopupReposition(command.id, command.configure, token)
                 else
@@ -416,6 +430,27 @@ pub fn Desktop(comptime Shell: type) type {
             return error.StaleSurface;
         }
 
+        pub fn popupGrabTarget(desktop: *const Self) ?struct {
+            toplevel: ToplevelId,
+            surface: Shell.SurfaceId,
+        } {
+            const id = desktop.popup_grab orelse return null;
+            for (desktop.popups) |slot| if (slot.active and std.meta.eql(slot.shell_id, id))
+                return .{ .toplevel = slot.owner, .surface = slot.surface };
+            return null;
+        }
+
+        /// Dismisses the active popup stack after a press outside every client
+        /// surface. popup_done is delivered topmost-first as each role is
+        /// destroyed, preserving xdg-shell's stack discipline.
+        pub fn dismissPopupGrab(desktop: *Self) !bool {
+            const id = desktop.popup_grab orelse return false;
+            try desktop.enqueuePopupDone(id);
+            desktop.popup_grab = null;
+            desktop.popup_dismiss = id;
+            return true;
+        }
+
         /// Copies a stable, back-to-front scene snapshot. No arena pointers
         /// escape, and insufficient caller storage changes no desktop state.
         pub fn sceneSnapshot(desktop: *const Self, output: []SceneWindow) ![]SceneWindow {
@@ -469,6 +504,11 @@ pub fn Desktop(comptime Shell: type) type {
                 .popup_created => |value| try desktop.createPopup(value),
                 .popup_commit_ready => |value| try desktop.commitPopup(value),
                 .popup_reposition_requested => |value| try desktop.repositionPopup(value),
+                .popup_grab_requested => |id| {
+                    const slot = try desktop.popupByShell(id);
+                    slot.grabbed = true;
+                    desktop.popup_grab = id;
+                },
                 .popup_destroyed => |id| desktop.destroyPopup(id),
                 .metadata_changed => |shell_id| {
                     const id = try desktop.idForShell(shell_id);
@@ -525,7 +565,8 @@ pub fn Desktop(comptime Shell: type) type {
         }
 
         fn createPopup(desktop: *Self, value: anytype) !void {
-            if (desktop.popup_free == none or desktop.popup_command_len == desktop.popup_commands.len)
+            if (desktop.popup_free == none or
+                desktop.popup_command_len >= desktop.popup_commands.len - 1)
                 return error.Exhausted;
             const parent = try desktop.sceneForSurface(value.parent);
             const positioned = try placePopup(value.placement, parent.geometry, desktop.work_area);
@@ -592,7 +633,7 @@ pub fn Desktop(comptime Shell: type) type {
         }
 
         fn repositionPopup(desktop: *Self, value: anytype) !void {
-            if (desktop.popup_command_len == desktop.popup_commands.len) return error.Exhausted;
+            if (desktop.popup_command_len >= desktop.popup_commands.len - 1) return error.Exhausted;
             const slot = try desktop.popupByShell(value.id);
             const parent = try desktop.sceneForSurface(slot.parent);
             const positioned = try placePopup(value.placement, parent.geometry, desktop.work_area);
@@ -617,6 +658,9 @@ pub fn Desktop(comptime Shell: type) type {
             const slot = desktop.popupByShell(id) catch return;
             if (desktop.destroyed_surface != null) return;
             const surface = slot.surface;
+            const parent = slot.parent;
+            const was_grab = if (desktop.popup_grab) |grab| std.meta.eql(grab, id) else false;
+            const was_dismiss = if (desktop.popup_dismiss) |dismiss| std.meta.eql(dismiss, id) else false;
             const index: u32 = @intCast((@intFromPtr(slot) - @intFromPtr(desktop.popups.ptr)) /
                 @sizeOf(PopupSlot));
             desktop.removePopupCommand(id);
@@ -633,6 +677,20 @@ pub fn Desktop(comptime Shell: type) type {
             desktop.popup_live -= 1;
             desktop.scene_changed = true;
             desktop.destroyed_surface = surface;
+            const parent_popup = desktop.popupBySurface(parent);
+            if (was_dismiss) {
+                if (parent_popup) |popup| {
+                    desktop.enqueuePopupDone(popup.shell_id) catch unreachable;
+                    desktop.popup_dismiss = popup.shell_id;
+                } else {
+                    desktop.popup_dismiss = null;
+                }
+            } else if (was_grab) {
+                desktop.popup_grab = if (parent_popup) |popup|
+                    if (popup.grabbed) popup.shell_id else null
+                else
+                    null;
+            }
         }
 
         fn destroyShell(desktop: *Self, shell_id: Shell.ToplevelId) !void {
@@ -944,6 +1002,20 @@ pub fn Desktop(comptime Shell: type) type {
             desktop.popup_command_len = retained;
         }
 
+        fn enqueuePopupDone(desktop: *Self, id: Shell.PopupId) !void {
+            if (desktop.popup_command_len == desktop.popup_commands.len) return error.Exhausted;
+            const tail = (desktop.popup_command_head + desktop.popup_command_len) %
+                desktop.popup_commands.len;
+            desktop.popup_commands[tail] = .{ .id = id, .done = true };
+            desktop.popup_command_len += 1;
+        }
+
+        fn popupBySurface(desktop: *Self, surface: Shell.SurfaceId) ?*PopupSlot {
+            for (desktop.popups) |*slot| if (slot.active and std.meta.eql(slot.surface, surface))
+                return slot;
+            return null;
+        }
+
         fn nextStacking(desktop: *const Self) u32 {
             var next: u32 = 0;
             for (desktop.slots) |slot| {
@@ -1220,6 +1292,7 @@ const TestShell = struct {
             surface_offset_y: i32 = 0,
         },
         popup_reposition_requested: struct { id: PopupId, placement: PopupPlacement, token: u32 },
+        popup_grab_requested: PopupId,
         toplevel_destroyed: ToplevelId,
         popup_destroyed: PopupId,
     };
@@ -1233,6 +1306,7 @@ const TestShell = struct {
     configure_serial: u32 = 40,
     configured: ?ToplevelConfigure = null,
     popup_configured: ?PopupConfigure = null,
+    popup_done: ?PopupId = null,
 
     fn push(shell: *TestShell, event: Event) void {
         shell.events[(shell.head + shell.len) % shell.events.len] = event;
@@ -1289,6 +1363,11 @@ const TestShell = struct {
     pub fn queuePopupReposition(shell: *TestShell, id: PopupId, value: PopupConfigure, token: u32) !u32 {
         _ = token;
         return shell.queuePopupConfigure(id, value);
+    }
+
+    pub fn queuePopupDone(shell: *TestShell, id: PopupId) !void {
+        if (shell.reject_configure) return error.Exhausted;
+        shell.popup_done = id;
     }
 };
 
@@ -1433,6 +1512,16 @@ test "desktop: popup configure maps above its owning toplevel" {
         geometry.Rect{ .x = 20, .y = 20, .width = 10, .height = 10 },
         (try desktop.sceneForSurface(popup_surface)).geometry,
     );
+
+    shell.push(.{ .popup_grab_requested = popup_id });
+    _ = try desktop.consume(&shell, 1);
+    const grab = desktop.popupGrabTarget() orelse return error.MissingPopupGrab;
+    try std.testing.expectEqual(owner, grab.toplevel);
+    try std.testing.expectEqual(popup_surface, grab.surface);
+    try std.testing.expect(try desktop.dismissPopupGrab());
+    try std.testing.expect(desktop.popupGrabTarget() == null);
+    try std.testing.expectEqual(@as(?u32, null), try desktop.flushConfigure(&shell));
+    try std.testing.expectEqual(popup_id, shell.popup_done.?);
 
     shell.push(.{ .popup_destroyed = popup_id });
     _ = try desktop.consume(&shell, 1);

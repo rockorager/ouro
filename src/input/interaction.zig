@@ -52,6 +52,7 @@ pub fn Interaction(comptime Desktop: type) type {
         pub const Mode = union(enum) {
             default,
             button_grab: Target,
+            popup_grab: struct { toplevel: ToplevelId, surface: SurfaceId },
         };
 
         const Device = struct {
@@ -72,6 +73,7 @@ pub fn Interaction(comptime Desktop: type) type {
         command_len: usize = 0,
         pointer_devices: usize = 0,
         hover: ?Target = null,
+        pointer_inside: bool = false,
         keyboard_focus: ?Target = null,
         mode: Mode = .default,
         cursor: Cursor = .{},
@@ -185,6 +187,17 @@ pub fn Interaction(comptime Desktop: type) type {
             self.cursor.request(surface, hotspot);
         }
 
+        pub fn setPopupGrab(self: *Self, target: anytype) void {
+            if (target) |value| {
+                self.mode = .{ .popup_grab = .{
+                    .toplevel = value.toplevel,
+                    .surface = value.surface,
+                } };
+            } else if (self.mode == .popup_grab) {
+                self.mode = .default;
+            }
+        }
+
         /// Cancels every state edge naming an exact destroyed surface. Seat
         /// resource teardown independently drops stale wire operations; this
         /// terminal command handles still-live protocol focus on device loss.
@@ -216,7 +229,7 @@ pub fn Interaction(comptime Desktop: type) type {
             const point: geometry.Point = .{ .x = fixedFloor(next_x), .y = fixedFloor(next_y) };
             const windows = try desktop.sceneSnapshot(self.windows);
             const hit = hit_test.topmost(SceneWindow, windows, point, surfaces);
-            const target: ?Target = if (hit) |value| target: {
+            var target: ?Target = if (hit) |value| target: {
                 const local_x = next_x - @as(i64, point.x - value.local.x) * 256;
                 const local_y = next_y - @as(i64, point.y - value.local.y) * 256;
                 break :target .{
@@ -228,10 +241,30 @@ pub fn Interaction(comptime Desktop: type) type {
                     },
                 };
             } else null;
+            const inside = target != null;
+            if (target == null) switch (self.mode) {
+                .popup_grab => |grab| for (windows) |window| {
+                    if (!window.visible or !window.content_ready or
+                        !std.meta.eql(window.surface, grab.surface)) continue;
+                    target = .{
+                        .toplevel = grab.toplevel,
+                        .surface = grab.surface,
+                        .point = .{
+                            .x = std.math.cast(i32, next_x - @as(i64, window.geometry.x) * 256) orelse
+                                return error.InvalidGeometry,
+                            .y = std.math.cast(i32, next_y - @as(i64, window.geometry.y) * 256) orelse
+                                return error.InvalidGeometry,
+                        },
+                    };
+                    break;
+                },
+                else => {},
+            };
             self.enqueue(.{ .pointer_focus = target });
             self.x_fixed = next_x;
             self.y_fixed = next_y;
             self.hover = target;
+            self.pointer_inside = inside;
             self.cursor.move(point);
         }
 
@@ -249,6 +282,9 @@ pub fn Interaction(comptime Desktop: type) type {
             if (was == pressed) return;
             const aggregate_was = self.anyDeviceButton(button);
             const aggregate_after = pressed or self.otherDeviceButton(device, button);
+            const dismisses_popup = !aggregate_was and aggregate_after and
+                self.mode == .popup_grab and !self.pointer_inside;
+            if (dismisses_popup) _ = try desktop.dismissPopupGrab();
             const begins_grab = !aggregate_was and aggregate_after and self.mode == .default and
                 self.hover != null;
             if (begins_grab) {
@@ -261,7 +297,9 @@ pub fn Interaction(comptime Desktop: type) type {
                 self.mode = .{ .button_grab = target };
                 self.keyboard_focus = target;
                 self.enqueue(.{ .keyboard_focus = target });
-            } else if (!aggregate_after and !self.anyPressedButton()) {
+            } else if (dismisses_popup) {
+                self.mode = .default;
+            } else if (!aggregate_after and !self.anyPressedButton() and self.mode == .button_grab) {
                 self.mode = .default;
             }
         }
@@ -288,7 +326,7 @@ pub fn Interaction(comptime Desktop: type) type {
         fn removeDevice(self: *Self, id: input.DeviceId) !void {
             const device = self.findDevice(id) orelse return error.StaleDevice;
             const pointer = device.capabilities.pointer;
-            const cancel_grab = pointer and self.mode != .default;
+            const cancel_grab = pointer and self.mode == .button_grab;
             device.* = .{};
             if (pointer) self.pointer_devices -= 1;
             const lost_pointer = pointer and self.pointer_devices == 0;
@@ -313,6 +351,8 @@ pub fn Interaction(comptime Desktop: type) type {
             const keyboard = matches(self.keyboard_focus, toplevel, surface);
             const grab = switch (self.mode) {
                 .button_grab => |target| matches(target, toplevel, surface),
+                .popup_grab => |target| (toplevel == null or std.meta.eql(target.toplevel, toplevel.?)) and
+                    (surface == null or std.meta.eql(target.surface, surface.?)),
                 .default => false,
             };
             if (!pointer and !keyboard and !grab) return;
@@ -487,6 +527,7 @@ const TestDesktop = struct {
     len: usize = 2,
     focused: ?TestId = null,
     reject_focus: bool = false,
+    popup_dismissed: bool = false,
 
     pub fn sceneSnapshot(self: *const @This(), output: []SceneWindow) ![]SceneWindow {
         if (output.len < self.len) return error.Exhausted;
@@ -502,6 +543,11 @@ const TestDesktop = struct {
             return;
         };
         return error.StaleToplevel;
+    }
+
+    pub fn dismissPopupGrab(self: *@This()) !bool {
+        self.popup_dismissed = true;
+        return true;
     }
 };
 
@@ -882,4 +928,36 @@ test "interaction: output replacement clamps retained pointer and cursor" {
     try std.testing.expectEqual(geometry.Point{ .x = 2, .y = 1 }, interaction.pointerPosition());
     try std.testing.expectEqual(interaction.pointerPosition(), interaction.cursor.position);
     try std.testing.expectEqual(replacement, interaction.bounds);
+}
+
+test "interaction: popup grab retains outside delivery and dismisses on press" {
+    var interaction = try initTestInteraction(3);
+    defer interaction.deinit();
+    var desktop = testDesktop();
+    var surfaces = TestSurfaces{ .hole_surface = desktop.windows[0].surface };
+    try addPointer(&interaction, &desktop, &surfaces);
+    interaction.setPopupGrab(@as(?struct { toplevel: TestId, surface: TestId }, .{
+        .toplevel = desktop.windows[1].id,
+        .surface = desktop.windows[1].surface,
+    }));
+    try interaction.consume(&desktop, &surfaces, .{ .pointer_motion = .{
+        .device = device_a,
+        .time_usec = 1,
+        .dx = 34,
+        .dy = 24,
+    } });
+    const focus = interaction.peekCommand().?.pointer_focus.?;
+    try std.testing.expectEqual(desktop.windows[1].surface, focus.surface);
+    try std.testing.expectEqual(@as(i32, 25 * 256), focus.point.x);
+    try std.testing.expectEqual(@as(i32, 20 * 256), focus.point.y);
+    interaction.dropCommand();
+
+    try interaction.consume(&desktop, &surfaces, .{ .pointer_button = .{
+        .device = device_a,
+        .time_usec = 2,
+        .button = 272,
+        .pressed = true,
+    } });
+    try std.testing.expect(desktop.popup_dismissed);
+    try std.testing.expect(interaction.interactionMode() == .default);
 }

@@ -68,6 +68,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             index: u32,
             generation: u32,
         };
+        pub const GrabValidator = struct {
+            context: *anyopaque,
+            validate: *const fn (*anyopaque, wayring.io_uring.Peer, u32, u32) bool,
+        };
 
         const WindowGeometry = struct {
             x: i32,
@@ -144,6 +148,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 placement: PopupPlacement,
                 token: u32,
             },
+            popup_grab_requested: PopupId,
             toplevel_destroyed: ToplevelId,
             popup_destroyed: PopupId,
         };
@@ -252,6 +257,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             parent_surface_index: u32 = none,
             parent_surface_generation: u32 = 0,
             placement: PopupPlacement = undefined,
+            grabbed: bool = false,
         };
 
         const Outbound = union(enum) {
@@ -315,6 +321,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         live_popups: usize = 0,
         outbound: []OutboundSlot,
         outstanding: []Outstanding,
+        grab_validator: ?GrabValidator = null,
 
         pub fn init(
             allocator: std.mem.Allocator,
@@ -414,6 +421,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             );
             adapter.global = global;
             return global;
+        }
+
+        pub fn setGrabValidator(adapter: *Self, validator: GrabValidator) void {
+            adapter.grab_validator = validator;
         }
 
         fn bind(context: ?*anyopaque, binding: wayring.server.Binding) !?*anyopaque {
@@ -1144,7 +1155,26 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             switch (decoded.value) {
                 .destroy => if (adapter.popupHasChild(slot))
                     return try adapter.protocolError(actor, decoded.handle.id, WmBase.@"error".not_the_topmost_popup.value, "popup has a live child"),
-                .grab => {},
+                .grab => |v| {
+                    if (slot.grabbed or adapter.popupHasChild(slot))
+                        return try adapter.protocolError(actor, decoded.handle.id, Popup.@"error".invalid_grab.value, "popup is not the topmost ungrabbed popup");
+                    const surface = adapter.resolveRoleSurface(
+                        slot.xdg_surface_index,
+                        slot.xdg_surface_generation,
+                    ) catch return try adapter.protocolError(actor, decoded.handle.id, Popup.@"error".invalid_grab.value, "popup surface is stale");
+                    const manager = adapter.resolveManager(
+                        surface.manager_index,
+                        surface.manager_generation,
+                    ) catch return try adapter.protocolError(actor, decoded.handle.id, Popup.@"error".invalid_grab.value, "popup client is stale");
+                    const validator = adapter.grab_validator orelse
+                        return try adapter.protocolError(actor, decoded.handle.id, Popup.@"error".invalid_grab.value, "popup grab validation unavailable");
+                    if (!validator.validate(validator.context, manager.peer, v.seat, v.serial))
+                        return try adapter.protocolError(actor, decoded.handle.id, Popup.@"error".invalid_grab.value, "invalid popup grab serial");
+                    if (!adapter.canPublishWithLive(adapter.live_toplevels, adapter.live_popups))
+                        return try adapter.noMemory(actor);
+                    slot.grabbed = true;
+                    adapter.publish(.{ .popup_grab_requested = adapter.popupId(slot) }) catch unreachable;
+                },
                 .reposition => |v| {
                     const positioner = adapter.positionerByObject(server_objects, v.positioner) catch
                         return try adapter.invalidPositioner(actor, decoded.handle.id);
@@ -1717,6 +1747,16 @@ const FakeCore = struct {
 
 const TestAdapter = Adapter(test_protocol, FakeCore);
 const TestCore = wayring.server.Core(test_protocol);
+
+fn validateTestGrab(
+    _: *anyopaque,
+    peer: wayring.io_uring.Peer,
+    seat_object: u32,
+    serial: u32,
+) bool {
+    return std.meta.eql(peer, wayring.io_uring.Peer{ .slot = 0, .generation = 1 }) and
+        seat_object == 19 and serial == 77;
+}
 
 const TestContext = struct {
     blocks: wayring.pool.SharedBlocks,
@@ -2296,6 +2336,19 @@ test "xdg-shell: generated popup requests validate positioner and parent role" {
     try std.testing.expectEqual(@as(i32, 80), created.placement.height);
     try std.testing.expectEqual(@as(i32, 4), created.placement.anchor_x);
     try std.testing.expectEqual(@as(i32, 30), created.placement.anchor_height);
+    _ = try context.server_objects.insertClient(19, &test_protocol.wl_seat.info, 9, null);
+    context.adapter.setGrabValidator(.{
+        .context = &context.adapter,
+        .validate = validateTestGrab,
+    });
+    try test_protocol.xdg_popup.encodeRequest(&context.requests, 16, .{
+        .grab = .{ .seat = 19, .serial = 77 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try std.testing.expectEqual(id, switch (context.adapter.popEvent() orelse return error.MissingEvent) {
+        .popup_grab_requested => |value| value,
+        else => return error.UnexpectedEvent,
+    });
     const serial = try context.adapter.queuePopupConfigure(id, .{
         .x = 4,
         .y = 5,

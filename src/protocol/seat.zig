@@ -111,6 +111,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         const SeatSlot = struct {
             header: Header = .{},
             peer: wayring.io_uring.Peer = undefined,
+            last_implicit_grab_serial: u32 = 0,
         };
         const PointerSlot = struct {
             header: Header = .{},
@@ -473,6 +474,38 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         pub fn makeTarget(adapter: *Self, peer: wayring.io_uring.Peer, surface: SurfaceId) !FocusTarget {
             _ = try adapter.core.getSurfaceById(surface);
             return .{ .client = clientId(peer), .surface = surface };
+        }
+
+        /// Validates an input serial against the exact wl_seat resource named
+        /// by an xdg_popup.grab request. Pointer-enter serials intentionally do
+        /// not qualify: only a delivered button press establishes this token.
+        pub fn validatePopupGrab(
+            adapter: *Self,
+            peer: wayring.io_uring.Peer,
+            seat_object: u32,
+            serial: u32,
+        ) bool {
+            if (serial == 0) return false;
+            const runtime = adapter.runtime orelse return false;
+            const server_objects = runtime.clients.get(peer) catch return false;
+            return adapter.validatePopupGrabOn(server_objects, peer, seat_object, serial);
+        }
+
+        fn validatePopupGrabOn(
+            adapter: *Self,
+            server_objects: anytype,
+            peer: wayring.io_uring.Peer,
+            seat_object: u32,
+            serial: u32,
+        ) bool {
+            if (serial == 0) return false;
+            const handle = server_objects.namespace.lookupHandle(seat_object) orelse return false;
+            const object = server_objects.namespace.resolve(handle) orelse return false;
+            if (object.interface != &Seat.info) return false;
+            const seat = fromContext(SeatSlot, adapter.seats, object.context) orelse return false;
+            return std.meta.eql(seat.header.resource, handle) and
+                std.meta.eql(seat.peer, peer) and
+                seat.last_implicit_grab_serial == serial;
         }
 
         pub fn setPointerFocus(adapter: *Self, target: ?FocusTarget, point: Point) !void {
@@ -934,6 +967,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 } }) catch unreachable;
             };
             adapter.setLastPointerSerial(delivery.client, serial);
+            if (value.pressed) adapter.setImplicitGrabSerial(delivery.client, serial);
             if (!value.pressed and !anySet(&adapter.pressed_buttons)) {
                 adapter.pointer_grab = .idle;
                 try adapter.transitionPointer(adapter.pointer_focus);
@@ -1186,6 +1220,16 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             for (adapter.pointers) |*pointer| {
                 if (pointer.header.active and sameClient(pointer.client, client))
                     pointer.last_serial = serial;
+            }
+        }
+
+        fn setImplicitGrabSerial(adapter: *Self, client: ClientId, serial: u32) void {
+            for (adapter.pointers) |pointer| {
+                if (!pointer.header.active or !sameClient(pointer.client, client)) continue;
+                if (pointer.seat_index >= adapter.seats.len) continue;
+                const seat = &adapter.seats[pointer.seat_index];
+                if (seat.header.active and seat.header.generation == pointer.seat_generation)
+                    seat.last_implicit_grab_serial = serial;
             }
         }
 
@@ -1626,6 +1670,40 @@ test "seat: serial wrap skips zero and live client pointer serials" {
 
     try std.testing.expectEqual(std.math.maxInt(u32), adapter.issueSerial());
     try std.testing.expectEqual(@as(u32, 2), adapter.issueSerial());
+}
+
+test "seat: popup grabs require the exact seat and delivered press serial" {
+    var core: FakeCore = .{};
+    var adapter = try testAdapter(&core);
+    defer adapter.deinit();
+    var server_objects = try wayring.objects.ServerObjects.init(
+        std.testing.allocator,
+        8,
+        4,
+        &TestCore.Display.info,
+        null,
+    );
+    defer server_objects.deinit(std.testing.allocator);
+    const peer: wayring.io_uring.Peer = .{ .slot = 1, .generation = 7 };
+    const seat = try acquire(TestAdapter.SeatSlot, adapter.seats, &adapter.seat_free);
+    seat.peer = peer;
+    seat.last_implicit_grab_serial = 81;
+    seat.header.resource = try server_objects.insertClient(2, &test_protocol.wl_seat.info, 9, seat);
+    const other = try acquire(TestAdapter.SeatSlot, adapter.seats, &adapter.seat_free);
+    other.peer = peer;
+    other.last_implicit_grab_serial = 82;
+    other.header.resource = try server_objects.insertClient(3, &test_protocol.wl_seat.info, 9, other);
+
+    try std.testing.expect(adapter.validatePopupGrabOn(&server_objects, peer, 2, 81));
+    try std.testing.expect(!adapter.validatePopupGrabOn(&server_objects, peer, 2, 82));
+    try std.testing.expect(!adapter.validatePopupGrabOn(&server_objects, peer, 3, 81));
+    try std.testing.expect(!adapter.validatePopupGrabOn(
+        &server_objects,
+        .{ .slot = peer.slot, .generation = peer.generation + 1 },
+        2,
+        81,
+    ));
+    try std.testing.expect(!adapter.validatePopupGrabOn(&server_objects, peer, 2, 0));
 }
 
 test "seat: pointer grab retains focus and device removal cancels it" {

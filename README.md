@@ -55,12 +55,13 @@ responsibilities:
   associations across output suspension and recreation.
 - [XDG popups](src/protocol/xdg_shell.zig): bounded popup roles retain copied
   positioner state, receive exact initial and reposition configure transactions,
-  and compose above their owning toplevel with flip, slide, and resize
-  constraint adjustment.
+  validate explicit grabs against exact seat/user-action serials, and compose
+  above their owning toplevel with flip, slide, and resize constraint adjustment.
 - [Desktop interaction](src/input/interaction.zig): pointer motion hit-tests
   exact committed input regions against the copied desktop scene, retains
-  default/button-grab state and protocol-neutral focus commands, and places a
-  composited cursor without replacing render generations.
+  default, button-grab, and popup-grab state with protocol-neutral focus
+  commands, dismisses popup stacks topmost-first on outside presses, and places
+  a composited cursor without replacing render generations.
 
 [Transactional commit composition](src/surface.zig) ties surface, region,
 viewport, frame/release callback, and content-update state together so all
@@ -81,7 +82,9 @@ scene, and physical-output owners in one Coordinator event turn. An ordinary
 XDG client discovers the published globals, acknowledges its exact initial
 configure, maps unsealed SHM, enters the one-workspace tiled desktop, and
 receives generation-safe pointer motion, buttons, scrolling, and keyboard
-delivery. XDG popup surfaces are positioned and composed above their parent:
+delivery. XDG popup surfaces are positioned and composed above their parent;
+explicit grabs retain pointer delivery outside client surfaces and publish
+ordered `popup_done` dismissal without bypassing ordinary button grabs.
 
 ```sh
 zig build run -- --socket=/tmp/ouro.sock --renderer=auto

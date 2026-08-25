@@ -310,6 +310,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 config.protocol_seat,
             );
             errdefer self.seat_adapter.deinit();
+            self.shell_adapter.setGrabValidator(.{
+                .context = self,
+                .validate = validatePopupGrab,
+            });
             self.output_adapter = try OutputAdapter.init(allocator, config.protocol_output);
             errdefer self.output_adapter.deinit();
             self.presentations = try Presentations.init(
@@ -765,6 +769,7 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             self.input_interaction_accepted = false;
             self.stats.input_events += 1;
+            try self.advanceShell();
             switch (event) {
                 .pointer_motion, .device_added, .device_removed => try self.requestCursorRedraw(),
                 else => {},
@@ -797,6 +802,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     else => return err,
                 }) |_| self.stats.configures += 1;
             }
+            self.interaction.setPopupGrab(self.desktop.popupGrabTarget());
             try self.syncDesktopTimer();
             if (self.desktop.takeSceneChanged()) try self.desktopSceneChanged();
         }
@@ -883,6 +889,16 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.peer orelse return error.ClientDisconnected,
                 surface,
             );
+        }
+
+        fn validatePopupGrab(
+            context: *anyopaque,
+            peer: wayring.io_uring.Peer,
+            seat_object: u32,
+            serial: u32,
+        ) bool {
+            const self: *Self = @ptrCast(@alignCast(context));
+            return self.seat_adapter.validatePopupGrab(peer, seat_object, serial);
         }
 
         fn processSeatEvents(self: *Self) !void {
