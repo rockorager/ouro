@@ -46,8 +46,9 @@ responsibilities:
   application are represented by a bounded dependency graph.
 - [Wayland seat](src/protocol/seat.zig): fixed-capacity seat, pointer, and
   keyboard resources aggregate normalized physical input, retain keymap FD
-  ownership, and deliver generation-safe focus, user-action serials, and
-  high-resolution wheel or touch scrolling through resumable outbound commands.
+  ownership, derive depressed and locked modifiers from the published keymap,
+  and deliver generation-safe focus, user-action serials, and high-resolution
+  wheel or touch scrolling through resumable outbound commands.
 - [Wayland output](src/protocol/output.zig): clients discover the selected
   physical output's geometry, current and preferred DRM mode, refresh rate,
   scale, stable name, and description through version-correct `wl_output`

@@ -15,6 +15,23 @@ const objects = wayring.objects;
 const none = std.math.maxInt(u32);
 const code_count = 0x300;
 const state_words = code_count / 64;
+const key_left_ctrl = 29;
+const key_left_shift = 42;
+const key_right_shift = 54;
+const key_left_alt = 56;
+const key_caps_lock = 58;
+const key_num_lock = 69;
+const key_right_ctrl = 97;
+const key_right_alt = 100;
+const key_left_meta = 125;
+const key_right_meta = 126;
+const mod_shift: u32 = 1 << 0;
+const mod_lock: u32 = 1 << 1;
+const mod_control: u32 = 1 << 2;
+const mod_alt: u32 = 1 << 3;
+const mod_num: u32 = 1 << 4;
+const mod_meta: u32 = 1 << 6;
+const mod_alt_gr: u32 = 1 << 7;
 
 pub const SeatClientId = packed struct {
     slot: u32,
@@ -193,6 +210,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         pointer_point: Point = .{ .x = 0, .y = 0 },
         keyboard_focus: ?FocusTarget = null,
         modifiers: ModifierState = .{},
+        caps_lock_active: bool = false,
+        num_lock_active: bool = false,
         pointer_grab: GrabState = .idle,
 
         pub fn init(allocator: std.mem.Allocator, core: *CoreSurface, config: Config) !Self {
@@ -893,8 +912,11 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 release_count += 1;
             };
             const keyboard_target = adapter.keyboard_focus;
+            const next_modifiers = adapter.modifierState(keys_after);
             var outbound_needed = release_count * adapter.keyboardResourceCount(keyboard_target) +
                 adapter.capabilityPublicationCount(old, current);
+            if (!std.meta.eql(adapter.modifiers, next_modifiers))
+                outbound_needed += adapter.keyboardResourceCount(keyboard_target);
             if (cancel_grab) {
                 if (publish_cancellation and adapter.event_len >= adapter.events.len - 1)
                     return error.Exhausted;
@@ -907,6 +929,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             adapter.pointer_devices = pointer_devices;
             adapter.keyboard_devices = keyboard_devices;
             adapter.pressed_keys = keys_after;
+            const modifiers_changed = !std.meta.eql(adapter.modifiers, next_modifiers);
+            adapter.modifiers = next_modifiers;
             if (!cancel_grab) adapter.pressed_buttons = buttons_after;
             if (keyboard_target) |target| {
                 for (0..code_count) |code| if (bitSet(&old_keys, @intCast(code)) and
@@ -923,6 +947,16 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                             .pressed = false,
                         } }) catch unreachable;
                 };
+                if (modifiers_changed) {
+                    const serial = adapter.issueSerial();
+                    for (adapter.keyboards, 0..) |keyboard, index| if (adapter.keyboardBelongs(&keyboard, target.client))
+                        adapter.enqueue(target.client, .{ .keyboard_modifiers = .{
+                            .keyboard = .{ .index = @intCast(index), .generation = keyboard.header.generation },
+                            .serial = serial,
+                            .target = target,
+                            .state = next_modifiers,
+                        } }) catch unreachable;
+                }
             }
             adapter.enqueueCapabilities(old, current) catch unreachable;
         }
@@ -1043,9 +1077,27 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             const aggregate_after = value.pressed or adapter.otherDeviceHasKey(device, value.key);
             const aggregate_changed = aggregate_was != aggregate_after;
             const target = if (aggregate_changed) adapter.keyboard_focus else null;
-            try adapter.ensureOutbound(adapter.keyboardResourceCount(target));
+            var next_keys = adapter.pressed_keys;
+            writeBit(&next_keys, value.key, aggregate_after);
+            const toggles_lock = aggregate_changed and value.pressed;
+            const next_caps_lock = if (toggles_lock and value.key == key_caps_lock)
+                !adapter.caps_lock_active
+            else
+                adapter.caps_lock_active;
+            const next_num_lock = if (toggles_lock and value.key == key_num_lock)
+                !adapter.num_lock_active
+            else
+                adapter.num_lock_active;
+            const next_modifiers = modifierStateFor(next_keys, next_caps_lock, next_num_lock);
+            const modifiers_changed = !std.meta.eql(adapter.modifiers, next_modifiers);
+            const resource_count = adapter.keyboardResourceCount(target);
+            try adapter.ensureOutbound(resource_count *
+                (1 + @as(usize, @intFromBool(modifiers_changed))));
             writeBit(&device.keys, value.key, value.pressed);
             adapter.rebuildPressed();
+            adapter.caps_lock_active = next_caps_lock;
+            adapter.num_lock_active = next_num_lock;
+            adapter.modifiers = next_modifiers;
             if (!aggregate_changed or target == null) return;
             const delivery = target.?;
             const serial = adapter.issueSerial();
@@ -1058,6 +1110,33 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     .key = value.key,
                     .pressed = value.pressed,
                 } }) catch unreachable;
+            if (modifiers_changed) {
+                const modifier_serial = adapter.issueSerial();
+                for (adapter.keyboards, 0..) |slot, index| if (adapter.keyboardBelongs(&slot, delivery.client))
+                    adapter.enqueue(delivery.client, .{ .keyboard_modifiers = .{
+                        .keyboard = .{ .index = @intCast(index), .generation = slot.header.generation },
+                        .serial = modifier_serial,
+                        .target = delivery,
+                        .state = next_modifiers,
+                    } }) catch unreachable;
+            }
+        }
+
+        fn modifierState(adapter: *const Self, keys: [state_words]u64) ModifierState {
+            return modifierStateFor(keys, adapter.caps_lock_active, adapter.num_lock_active);
+        }
+
+        fn modifierStateFor(keys: [state_words]u64, caps_lock: bool, num_lock: bool) ModifierState {
+            var depressed: u32 = 0;
+            if (bitSet(&keys, key_left_shift) or bitSet(&keys, key_right_shift)) depressed |= mod_shift;
+            if (bitSet(&keys, key_left_ctrl) or bitSet(&keys, key_right_ctrl)) depressed |= mod_control;
+            if (bitSet(&keys, key_left_alt)) depressed |= mod_alt;
+            if (bitSet(&keys, key_right_alt)) depressed |= mod_alt_gr;
+            if (bitSet(&keys, key_left_meta) or bitSet(&keys, key_right_meta)) depressed |= mod_meta;
+            return .{
+                .depressed = depressed,
+                .locked = (if (caps_lock) mod_lock else 0) | (if (num_lock) mod_num else 0),
+            };
         }
 
         fn transitionPointer(adapter: *Self, target: ?FocusTarget) !void {
@@ -1733,6 +1812,74 @@ test "seat: pointer grab retains focus and device removal cancels it" {
     const event = adapter.popEvent() orelse return error.MissingCancellation;
     try std.testing.expectEqual(TestAdapter.Event.pointer_grab_cancelled, std.meta.activeTag(event));
     try std.testing.expect(adapter.pointer_delivery == null);
+}
+
+test "seat: physical modifier and lock state follows the published keymap" {
+    var core: FakeCore = .{};
+    var adapter = try testAdapter(&core);
+    defer adapter.deinit();
+    const peer: wayring.io_uring.Peer = .{ .slot = 1, .generation = 7 };
+    const client = clientId(peer);
+    const target = try adapter.makeTarget(peer, .{ .index = 0, .generation = 1 });
+    const keyboard = try acquire(TestAdapter.KeyboardSlot, adapter.keyboards, &adapter.keyboard_free);
+    keyboard.client = client;
+    const device: input.DeviceId = .{ .slot = 0, .generation = 2, .seat_generation = 8 };
+    try adapter.consume(.{ .device_added = .{
+        .device = device,
+        .capabilities = .{ .keyboard = true },
+    } });
+    try adapter.setKeyboardFocus(target);
+    clearTestOutbound(&adapter);
+
+    try adapter.consume(.{ .keyboard_key = .{
+        .device = device,
+        .time_usec = 1,
+        .key = key_left_shift,
+        .pressed = true,
+    } });
+    try std.testing.expectEqual(mod_shift, adapter.modifiers.depressed);
+    try std.testing.expectEqual(@as(usize, 1), countTestOutbound(&adapter, .keyboard_key));
+    try std.testing.expectEqual(@as(usize, 1), countTestOutbound(&adapter, .keyboard_modifiers));
+    clearTestOutbound(&adapter);
+
+    try adapter.consume(.{ .keyboard_key = .{
+        .device = device,
+        .time_usec = 2,
+        .key = key_caps_lock,
+        .pressed = true,
+    } });
+    try std.testing.expectEqual(mod_shift, adapter.modifiers.depressed);
+    try std.testing.expectEqual(mod_lock, adapter.modifiers.locked);
+    try std.testing.expectEqual(@as(usize, 1), countTestOutbound(&adapter, .keyboard_modifiers));
+    clearTestOutbound(&adapter);
+
+    try adapter.consume(.{ .keyboard_key = .{
+        .device = device,
+        .time_usec = 3,
+        .key = key_left_shift,
+        .pressed = false,
+    } });
+    try std.testing.expectEqual(@as(u32, 0), adapter.modifiers.depressed);
+    try std.testing.expectEqual(mod_lock, adapter.modifiers.locked);
+    try std.testing.expectEqual(@as(usize, 1), countTestOutbound(&adapter, .keyboard_modifiers));
+    clearTestOutbound(&adapter);
+
+    try adapter.consume(.{ .keyboard_key = .{
+        .device = device,
+        .time_usec = 4,
+        .key = key_caps_lock,
+        .pressed = false,
+    } });
+    try std.testing.expectEqual(@as(usize, 0), countTestOutbound(&adapter, .keyboard_modifiers));
+    clearTestOutbound(&adapter);
+    try adapter.consume(.{ .keyboard_key = .{
+        .device = device,
+        .time_usec = 5,
+        .key = key_caps_lock,
+        .pressed = true,
+    } });
+    try std.testing.expectEqual(@as(u32, 0), adapter.modifiers.locked);
+    try std.testing.expectEqual(@as(usize, 1), countTestOutbound(&adapter, .keyboard_modifiers));
 }
 
 test "seat: pointer axis delivers wheel precision and finger stops" {
