@@ -369,6 +369,28 @@ pub fn Desktop(comptime Shell: type) type {
             try desktop.reflow();
         }
 
+        pub fn focusNext(desktop: *Self) !void {
+            const current = desktop.focused() orelse return;
+            const current_index = try desktop.resolveIndex(current);
+            for (1..desktop.slots.len + 1) |offset| {
+                const index = (current_index + offset) % desktop.slots.len;
+                if (desktop.slots[index].header.active and !desktop.slots[index].minimized)
+                    return desktop.focusToplevel(desktop.idFor(@intCast(index)));
+            }
+        }
+
+        pub fn toggleFocusedFullscreen(desktop: *Self) !void {
+            const id = desktop.focused() orelse return;
+            const index = try desktop.resolveIndex(id);
+            try desktop.requestState(id, .fullscreen, !desktop.slots[index].fullscreen);
+        }
+
+        pub fn toggleFocusedFloating(desktop: *Self) !void {
+            const id = desktop.focused() orelse return;
+            const index = try desktop.resolveIndex(id);
+            try desktop.setFloating(id, desktop.slots[index].mode != .floating);
+        }
+
         pub fn setFloating(desktop: *Self, id: ToplevelId, floating: bool) !void {
             const index = try desktop.resolveIndex(id);
             const mode: Mode = if (floating) .floating else .tiled;
@@ -1643,7 +1665,6 @@ test "desktop: focus history and tiled-floating transitions are deterministic" {
     try settleDesktop(&desktop, &shell);
 
     const first = try desktop.idForShell(.{ .index = 0, .generation = 1 });
-    const third = try desktop.idForShell(.{ .index = 2, .generation = 1 });
     try desktop.focusToplevel(first);
     try desktop.setFloating(first, true);
     try desktop.setFloatingGeometry(first, .{ .x = 5, .y = 6, .width = 30, .height = 20 });
@@ -1651,9 +1672,19 @@ test "desktop: focus history and tiled-floating transitions are deterministic" {
     try std.testing.expectEqual(first, desktop.focused().?);
     try std.testing.expectEqual(geometry.Rect{ .x = 5, .y = 6, .width = 30, .height = 20 }, (try desktop.scene(first)).geometry);
 
+    try desktop.focusNext();
+    const second = try desktop.idForShell(.{ .index = 1, .generation = 1 });
+    try std.testing.expectEqual(second, desktop.focused().?);
+    try desktop.toggleFocusedFullscreen();
+    try desktop.toggleFocusedFloating();
+    const second_index = try desktop.resolveIndex(second);
+    try std.testing.expect(desktop.slots[second_index].fullscreen);
+    try std.testing.expectEqual(TestDesktop.Mode.floating, desktop.slots[second_index].mode);
+    try desktop.focusToplevel(first);
+
     shell.push(.{ .toplevel_destroyed = .{ .index = 0, .generation = 1 } });
     _ = try desktop.consume(&shell, 1);
-    try std.testing.expectEqual(third, desktop.focused().?);
+    try std.testing.expectEqual(second, desktop.focused().?);
     try std.testing.expectError(error.StaleToplevel, desktop.scene(first));
 }
 

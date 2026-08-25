@@ -14,6 +14,11 @@ const cursor_model = @import("../scene/cursor.zig");
 
 const code_count = 0x300;
 const state_words = code_count / 64;
+const key_tab = 15;
+const key_f = 33;
+const key_space = 57;
+const key_left_meta = 125;
+const key_right_meta = 126;
 
 pub const Config = struct {
     window_capacity: usize,
@@ -48,6 +53,7 @@ pub fn Interaction(comptime Desktop: type) type {
             pointer_focus: ?Target,
             keyboard_focus: Target,
             cancel: Cancellation,
+            key_consumed,
         };
         pub const Mode = union(enum) {
             default,
@@ -60,6 +66,8 @@ pub fn Interaction(comptime Desktop: type) type {
             id: input.DeviceId = undefined,
             capabilities: input_platform.Capabilities = .{},
             buttons: [state_words]u64 = [_]u64{0} ** state_words,
+            keys: [state_words]u64 = [_]u64{0} ** state_words,
+            swallowed_keys: [state_words]u64 = [_]u64{0} ** state_words,
         };
 
         allocator: std.mem.Allocator,
@@ -138,7 +146,12 @@ pub fn Interaction(comptime Desktop: type) type {
                     value.pressed,
                 ),
                 .pointer_axis => |value| _ = try self.resolveDevice(value.device),
-                .keyboard_key => |value| _ = try self.resolveDevice(value.device),
+                .keyboard_key => |value| try self.keyboardKey(
+                    desktop,
+                    value.device,
+                    value.key,
+                    value.pressed,
+                ),
             }
         }
 
@@ -323,6 +336,34 @@ pub fn Interaction(comptime Desktop: type) type {
             }
         }
 
+        fn keyboardKey(
+            self: *Self,
+            desktop: *Desktop,
+            device_id: input.DeviceId,
+            key: u32,
+            pressed: bool,
+        ) !void {
+            if (key >= code_count) return error.InvalidCode;
+            const device = try self.resolveDevice(device_id);
+            if (!device.capabilities.keyboard) return error.MissingCapability;
+            const was = bitSet(&device.keys, key);
+            if (was == pressed) return;
+            const release_binding = !pressed and bitSet(&device.swallowed_keys, key);
+            const meta = self.anyDeviceKey(key_left_meta) or self.anyDeviceKey(key_right_meta) or
+                (pressed and (key == key_left_meta or key == key_right_meta));
+            const binding = pressed and meta and isBindingKey(key);
+            if (binding or release_binding) try self.ensureCommandCapacity(1);
+            if (binding) switch (key) {
+                key_tab => try desktop.focusNext(),
+                key_f => try desktop.toggleFocusedFullscreen(),
+                key_space => try desktop.toggleFocusedFloating(),
+                else => unreachable,
+            };
+            writeBit(&device.keys, key, pressed);
+            writeBit(&device.swallowed_keys, key, binding);
+            if (binding or release_binding) self.enqueue(.key_consumed);
+        }
+
         fn removeDevice(self: *Self, id: input.DeviceId) !void {
             const device = self.findDevice(id) orelse return error.StaleDevice;
             const pointer = device.capabilities.pointer;
@@ -440,6 +481,12 @@ pub fn Interaction(comptime Desktop: type) type {
             return false;
         }
 
+        fn anyDeviceKey(self: *const Self, key: u32) bool {
+            for (self.devices) |*device| if (device.active and bitSet(&device.keys, key))
+                return true;
+            return false;
+        }
+
         fn otherDeviceButton(self: *const Self, excluded: *const Device, button: u32) bool {
             for (self.devices) |*device| if (device.active and device != excluded and
                 bitSet(&device.buttons, button))
@@ -463,6 +510,7 @@ pub fn Interaction(comptime Desktop: type) type {
                 .pointer_focus => |target| matches(target, toplevel, surface),
                 .keyboard_focus => |target| matches(target, toplevel, surface),
                 .cancel => false,
+                .key_consumed => false,
             };
         }
 
@@ -512,6 +560,10 @@ fn writeBit(words: *[state_words]u64, code: u32, value: bool) void {
     if (value) words[code / 64] |= mask else words[code / 64] &= ~mask;
 }
 
+fn isBindingKey(key: u32) bool {
+    return key == key_tab or key == key_f or key == key_space;
+}
+
 const TestId = packed struct { index: u32, generation: u32 };
 const TestDesktop = struct {
     pub const SceneWindow = struct {
@@ -528,6 +580,9 @@ const TestDesktop = struct {
     focused: ?TestId = null,
     reject_focus: bool = false,
     popup_dismissed: bool = false,
+    focus_next_count: usize = 0,
+    fullscreen_count: usize = 0,
+    floating_count: usize = 0,
 
     pub fn sceneSnapshot(self: *const @This(), output: []SceneWindow) ![]SceneWindow {
         if (output.len < self.len) return error.Exhausted;
@@ -548,6 +603,18 @@ const TestDesktop = struct {
     pub fn dismissPopupGrab(self: *@This()) !bool {
         self.popup_dismissed = true;
         return true;
+    }
+
+    pub fn focusNext(self: *@This()) !void {
+        self.focus_next_count += 1;
+    }
+
+    pub fn toggleFocusedFullscreen(self: *@This()) !void {
+        self.fullscreen_count += 1;
+    }
+
+    pub fn toggleFocusedFloating(self: *@This()) !void {
+        self.floating_count += 1;
     }
 };
 
@@ -960,4 +1027,44 @@ test "interaction: popup grab retains outside delivery and dismisses on press" {
     } });
     try std.testing.expect(desktop.popup_dismissed);
     try std.testing.expect(interaction.interactionMode() == .default);
+}
+
+test "interaction: compositor bindings consume exact press and release pairs" {
+    var interaction = try initTestInteraction(2);
+    defer interaction.deinit();
+    var desktop = testDesktop();
+    var surfaces = TestSurfaces{};
+    try interaction.consume(&desktop, &surfaces, .{ .device_added = .{
+        .device = device_a,
+        .capabilities = .{ .keyboard = true },
+    } });
+    try interaction.consume(&desktop, &surfaces, .{ .keyboard_key = .{
+        .device = device_a,
+        .time_usec = 1,
+        .key = key_left_meta,
+        .pressed = true,
+    } });
+    try std.testing.expectEqual(@as(usize, 0), interaction.pendingCommands());
+
+    inline for ([_]u32{ key_tab, key_f, key_space }) |key| {
+        try interaction.consume(&desktop, &surfaces, .{ .keyboard_key = .{
+            .device = device_a,
+            .time_usec = 2,
+            .key = key,
+            .pressed = true,
+        } });
+        try std.testing.expect(interaction.peekCommand().? == .key_consumed);
+        interaction.dropCommand();
+        try interaction.consume(&desktop, &surfaces, .{ .keyboard_key = .{
+            .device = device_a,
+            .time_usec = 3,
+            .key = key,
+            .pressed = false,
+        } });
+        try std.testing.expect(interaction.peekCommand().? == .key_consumed);
+        interaction.dropCommand();
+    }
+    try std.testing.expectEqual(@as(usize, 1), desktop.focus_next_count);
+    try std.testing.expectEqual(@as(usize, 1), desktop.fullscreen_count);
+    try std.testing.expectEqual(@as(usize, 1), desktop.floating_count);
 }

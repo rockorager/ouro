@@ -166,6 +166,7 @@ pub fn Coordinator(comptime protocol: type) type {
         input: ?*input_api.Backend = null,
         input_event_cursor: usize = 0,
         input_interaction_accepted: bool = false,
+        input_keyboard_consumed: bool = false,
         manager: drm.Manager,
         shm: Shm,
         adapter: Adapter,
@@ -753,6 +754,7 @@ pub fn Coordinator(comptime protocol: type) type {
         /// the caller must retry that exact value before offering another.
         pub fn acceptNormalizedInput(self: *Self, event: input_api.Event) !bool {
             if (!self.input_interaction_accepted) {
+                self.input_keyboard_consumed = false;
                 self.interaction.consume(&self.desktop, &self.adapter, event) catch |err| switch (err) {
                     error.Backpressure, error.Exhausted => return false,
                     else => return err,
@@ -763,11 +765,13 @@ pub fn Coordinator(comptime protocol: type) type {
                 error.Exhausted => return false,
                 else => return err,
             };
-            self.seat_adapter.consume(event) catch |err| switch (err) {
-                error.Exhausted => return false,
-                else => return err,
-            };
+            if (!self.input_keyboard_consumed)
+                self.seat_adapter.consume(event) catch |err| switch (err) {
+                    error.Exhausted => return false,
+                    else => return err,
+                };
             self.input_interaction_accepted = false;
+            self.input_keyboard_consumed = false;
             self.stats.input_events += 1;
             try self.advanceShell();
             switch (event) {
@@ -878,6 +882,7 @@ pub fn Coordinator(comptime protocol: type) type {
                         if (cancel.keyboard_focus) try self.seat_adapter.setKeyboardFocus(null);
                         if (cancel.pointer_grab) try self.seat_adapter.cancelPointerGrab();
                     },
+                    .key_consumed => self.input_keyboard_consumed = true,
                 }
                 self.interaction.dropCommand();
                 self.stats.interaction_commands += 1;
