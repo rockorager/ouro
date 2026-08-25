@@ -78,6 +78,7 @@ pub fn Coordinator(comptime protocol: type) type {
             source_release_pending: bool = false,
             outcome_pending: bool = false,
             callback_data: ?u32 = null,
+            feedback_outcome: ?Adapter.PresentationOutcome = null,
             retire_after_outcome: bool = false,
         };
 
@@ -346,6 +347,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
             _ = try self.adapter.installViewporter();
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
+            _ = try self.adapter.installPresentation();
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
             _ = try self.shell_adapter.install(&root.runtime);
@@ -1003,11 +1007,15 @@ pub fn Coordinator(comptime protocol: type) type {
             const seat_flushed = try self.seat_adapter.flushOn(objects, &actor.transmit);
             const data_device_flushed = try self.data_device_adapter.flushOn(peer, objects, &actor.transmit);
             const output_flushed = try self.output_adapter.flushOn(objects, &actor.transmit);
-            if (shell_flushed != 0 or seat_flushed != 0 or data_device_flushed != 0 or output_flushed != 0 or
+            const presentation_flushed = try self.adapter.flushPresentationClockOn(objects, &actor.transmit);
+            const discarded_flushed = try self.adapter.flushDiscardedFeedbackOn(objects, &actor.transmit);
+            if (shell_flushed != 0 or seat_flushed != 0 or data_device_flushed != 0 or output_flushed != 0 or presentation_flushed != 0 or discarded_flushed != 0 or
                 self.shell_adapter.pendingOutbound() != 0 or
                 self.seat_adapter.pendingOutbound() != 0 or
                 self.data_device_adapter.pendingOutbound() != 0 or
-                self.output_adapter.pendingOutbound() != 0)
+                self.output_adapter.pendingOutbound() != 0 or
+                self.adapter.pendingPresentationClock() or
+                self.adapter.pendingDiscardedFeedback())
                 _ = try self.loop.?.driver.schedule(peer);
         }
 
@@ -1286,6 +1294,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 layer.presentation = token;
                 layer.source_release_pending = true;
                 layer.outcome_pending = true;
+                layer.feedback_outcome = .discarded;
                 layer.retire_after_outcome = true;
                 // Visibility changes at commit consumption, independently of
                 // live-client release encoding retained below.
@@ -1452,6 +1461,14 @@ pub fn Coordinator(comptime protocol: type) type {
                     _ = try self.adapter.activateFrames(surface, content);
                     layer.callback_data = callbackData(outcome.actual_ns.?);
                 }
+                layer.feedback_outcome = if (was_presented)
+                    .{ .presented = .{
+                        .actual_ns = outcome.actual_ns.?,
+                        .refresh_ns = @intCast(self.output_config.scheduler.refresh_ns),
+                        .flags = 1 | 2 | 4,
+                    } }
+                else
+                    .discarded;
                 layer.outcome_pending = true;
             }
             for (self.app_layers) |*layer|
@@ -1492,6 +1509,23 @@ pub fn Coordinator(comptime protocol: type) type {
             std.debug.assert(content.release_callbacks == null);
             std.debug.assert(content.surface.attachment == null or
                 content.surface.attachment.?.buffer == null);
+            if (content.presentation_feedback != null) {
+                const peer = layer.peer orelse return error.ClientDisconnected;
+                const objects = try self.root.runtime.clients.get(peer);
+                const actor = try self.root.runtime.clients.reactor.getActor(peer);
+                var output_storage: [64]u32 = undefined;
+                const output_resources = try self.output_adapter.resourceIds(&output_storage);
+                _ = self.adapter.completePresentationFeedbackOn(
+                    objects,
+                    &actor.transmit,
+                    content,
+                    output_resources,
+                    layer.feedback_outcome orelse return error.MissingPresentationOutcome,
+                ) catch |err| switch (err) {
+                    error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return false,
+                    else => return err,
+                };
+            }
             if (layer.callback_data) |data| {
                 const peer = layer.peer orelse return error.ClientDisconnected;
                 const surface = layer.surface orelse return error.StaleSurface;
@@ -1513,6 +1547,7 @@ pub fn Coordinator(comptime protocol: type) type {
             layer.content = null;
             layer.presentation = null;
             layer.outcome_pending = false;
+            layer.feedback_outcome = null;
             if (layer.retire_after_outcome) {
                 self.abandonLayer(layer);
                 return true;

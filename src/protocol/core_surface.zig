@@ -16,6 +16,8 @@ pub const Config = struct {
     surface_capacity: usize,
     region_capacity: usize,
     viewport_capacity: usize = 8,
+    presentation_resource_capacity: usize = 4,
+    presentation_feedback_capacity: usize = 64,
     region_operation_capacity: usize,
     frame_callback_capacity: usize,
     release_callback_capacity: usize,
@@ -30,6 +32,9 @@ pub const Config = struct {
         if (config.surface_capacity == 0 or config.surface_capacity >= none or
             config.region_capacity == 0 or config.region_capacity >= none or
             config.viewport_capacity == 0 or config.viewport_capacity >= none or
+            config.presentation_resource_capacity == 0 or
+            config.presentation_resource_capacity >= none or
+            config.presentation_feedback_capacity == 0 or
             config.attachment_capacity == 0 or config.copy_capacity == 0 or
             config.copy_capacity >= none or config.max_copy_bytes == 0)
             return error.InvalidConfig;
@@ -51,11 +56,22 @@ pub fn Adapter(comptime protocol: type) type {
         const RegionInterface = protocol.wl_region;
         const Viewporter = protocol.wp_viewporter;
         const ViewportInterface = protocol.wp_viewport;
+        const Presentation = protocol.wp_presentation;
+        const PresentationFeedback = protocol.wp_presentation_feedback;
         const Commit = surface_state.CommitState(objects.Handle);
 
         pub const Applied = Commit.Scheduler.Applied;
         pub const Content = Commit.Content;
         pub const UpdateToken = Commit.Scheduler.Token;
+        pub const PresentationOutcome = union(enum) {
+            presented: struct {
+                actual_ns: u64,
+                refresh_ns: u32,
+                sequence: u64 = 0,
+                flags: u32,
+            },
+            discarded,
+        };
 
         pub const CommitHook = struct {
             context: *anyopaque,
@@ -118,6 +134,7 @@ pub fn Adapter(comptime protocol: type) type {
             attachment: surface_state.AttachmentLeaseState = .{},
             updates: Commit.Scheduler.Queue = undefined,
             viewport_resource: ?objects.Handle = null,
+            presentation_feedback: surface_state.PresentationFeedbackPending = undefined,
         };
 
         const RegionSlot = struct {
@@ -134,6 +151,13 @@ pub fn Adapter(comptime protocol: type) type {
             surface: SurfaceId = .{ .index = 0, .generation = 0 },
         };
 
+        const PresentationResource = struct {
+            active: bool = false,
+            next_free: u32 = none,
+            resource: objects.Handle = .{ .id = 0, .generation = 0 },
+            clock_pending: bool = true,
+        };
+
         allocator: std.mem.Allocator,
         shm: *Shm,
         ring: *std.os.linux.IoUring,
@@ -141,16 +165,21 @@ pub fn Adapter(comptime protocol: type) type {
         runtime: ?*Runtime = null,
         global: ?objects.Handle = null,
         viewporter_global: ?objects.Handle = null,
+        presentation_global: ?objects.Handle = null,
         compositor_version: u32,
         surfaces: []SurfaceSlot,
         regions: []RegionSlot,
         viewports: []ViewportSlot,
+        presentation_resources: []PresentationResource,
         surface_free: u32,
         region_free: u32,
         viewport_free: u32,
+        presentation_resource_free: u32,
         region_pool: surface_state.RegionPool,
         frame_pool: surface_state.FramePool,
         release_pool: surface_state.ReleasePool,
+        presentation_feedback_pool: surface_state.PresentationFeedbackPool,
+        discarded_feedback: ?surface_state.PresentationFeedbackPending = null,
         scheduler: Commit.Scheduler,
         imports: Imports,
         copies: []CopySlot,
@@ -174,6 +203,11 @@ pub fn Adapter(comptime protocol: type) type {
             errdefer allocator.free(regions);
             const viewports = try allocator.alloc(ViewportSlot, config.viewport_capacity);
             errdefer allocator.free(viewports);
+            const presentation_resources = try allocator.alloc(
+                PresentationResource,
+                config.presentation_resource_capacity,
+            );
+            errdefer allocator.free(presentation_resources);
             var region_pool = try surface_state.RegionPool.init(
                 allocator,
                 config.region_operation_capacity,
@@ -189,6 +223,11 @@ pub fn Adapter(comptime protocol: type) type {
                 config.release_callback_capacity,
             );
             errdefer release_pool.deinit(allocator);
+            var presentation_feedback_pool = try surface_state.PresentationFeedbackPool.init(
+                allocator,
+                config.presentation_feedback_capacity,
+            );
+            errdefer presentation_feedback_pool.deinit(allocator);
             var scheduler = try Commit.Scheduler.init(
                 allocator,
                 config.content_update_capacity,
@@ -221,6 +260,9 @@ pub fn Adapter(comptime protocol: type) type {
             for (viewports, 0..) |*slot, index| slot.* = .{
                 .next_free = if (index + 1 < viewports.len) @intCast(index + 1) else none,
             };
+            for (presentation_resources, 0..) |*slot, index| slot.* = .{
+                .next_free = if (index + 1 < presentation_resources.len) @intCast(index + 1) else none,
+            };
             for (copies, 0..) |*slot, index| slot.* = .{
                 .destination = copy_storage[index * config.max_copy_bytes .. (index + 1) * config.max_copy_bytes],
             };
@@ -233,12 +275,15 @@ pub fn Adapter(comptime protocol: type) type {
                 .surfaces = surfaces,
                 .regions = regions,
                 .viewports = viewports,
+                .presentation_resources = presentation_resources,
                 .surface_free = 0,
                 .region_free = 0,
                 .viewport_free = 0,
+                .presentation_resource_free = 0,
                 .region_pool = region_pool,
                 .frame_pool = frame_pool,
                 .release_pool = release_pool,
+                .presentation_feedback_pool = presentation_feedback_pool,
                 .scheduler = scheduler,
                 .imports = imports,
                 .copies = copies,
@@ -257,16 +302,22 @@ pub fn Adapter(comptime protocol: type) type {
             for (adapter.viewports, 0..) |slot, index| {
                 if (slot.active) adapter.releaseViewport(@intCast(index));
             }
+            for (adapter.presentation_resources, 0..) |slot, index| {
+                if (slot.active) adapter.releasePresentationResource(@intCast(index));
+            }
             for (adapter.copies) |slot| std.debug.assert(!slot.active or
                 (!slot.owner_alive and slot.state != .pending));
             adapter.imports.deinit(adapter.allocator);
             adapter.scheduler.deinit(adapter.allocator);
+            if (adapter.discarded_feedback) |*pending| pending.deinit();
             adapter.release_pool.deinit(adapter.allocator);
+            adapter.presentation_feedback_pool.deinit(adapter.allocator);
             adapter.frame_pool.deinit(adapter.allocator);
             adapter.region_pool.deinit(adapter.allocator);
             adapter.allocator.free(adapter.regions);
             adapter.allocator.free(adapter.surfaces);
             adapter.allocator.free(adapter.viewports);
+            adapter.allocator.free(adapter.presentation_resources);
             adapter.allocator.free(adapter.copy_storage);
             adapter.allocator.free(adapter.copies);
             adapter.* = undefined;
@@ -301,6 +352,19 @@ pub fn Adapter(comptime protocol: type) type {
                 bind,
             );
             adapter.viewporter_global = global;
+            return global;
+        }
+
+        pub fn installPresentation(adapter: *Self) !objects.Handle {
+            const runtime = adapter.runtime orelse return error.NotInstalled;
+            if (adapter.presentation_global != null) return error.AlreadyInstalled;
+            const global = try runtime.addGlobalWithBinder(
+                &Presentation.info,
+                2,
+                adapter,
+                bindPresentation,
+            );
+            adapter.presentation_global = global;
             return global;
         }
 
@@ -350,6 +414,10 @@ pub fn Adapter(comptime protocol: type) type {
                 const slot = adapter.viewportFromObject(target.object) orelse return null;
                 return try adapter.viewportRequest(actor, server_objects, slot, message, fds);
             }
+            if (interface == &Presentation.info) {
+                const resource = adapter.presentationResourceFromObject(target.object) orelse return null;
+                return try adapter.presentationRequest(actor, server_objects, resource, message, fds);
+            }
             return null;
         }
 
@@ -379,8 +447,73 @@ pub fn Adapter(comptime protocol: type) type {
                 adapter.releaseViewport(adapter.viewportIndex(slot));
                 return true;
             }
+            if (object.interface == &Presentation.info) {
+                const resource = adapter.presentationResourceFromObject(&object) orelse return false;
+                if (!std.meta.eql(resource.resource, handle)) return false;
+                adapter.releasePresentationResource(adapter.presentationResourceIndex(resource));
+                return true;
+            }
+            if (object.interface == &PresentationFeedback.info) return true;
             return (object.interface == &Compositor.info or object.interface == &Viewporter.info) and
                 object.context == @as(?*anyopaque, @ptrCast(adapter));
+        }
+
+        pub fn flushPresentationClockOn(
+            adapter: *Self,
+            server_objects: anytype,
+            queue: *wayring.tx.Queue,
+        ) !usize {
+            var completed: usize = 0;
+            for (adapter.presentation_resources) |*resource| {
+                if (!resource.active or !resource.clock_pending) continue;
+                if (server_objects.namespace.resolve(resource.resource) == null) continue;
+                Presentation.encodeEvent(queue, resource.resource.id, .{
+                    .clock_id = .{ .clk_id = @intFromEnum(std.os.linux.CLOCK.MONOTONIC) },
+                }) catch |err| switch (err) {
+                    error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return completed,
+                    else => return err,
+                };
+                resource.clock_pending = false;
+                completed += 1;
+            }
+            return completed;
+        }
+
+        pub fn pendingPresentationClock(adapter: *const Self) bool {
+            for (adapter.presentation_resources) |resource|
+                if (resource.active and resource.clock_pending) return true;
+            return false;
+        }
+
+        pub fn flushDiscardedFeedbackOn(
+            adapter: *Self,
+            server_objects: anytype,
+            queue: *wayring.tx.Queue,
+        ) !usize {
+            var completed: usize = 0;
+            const pending = adapter.discardedFeedback();
+            while (pending.peek()) |callback| {
+                if (server_objects.namespace.resolve(callback) != null) {
+                    wayring.server.sendEvent(
+                        protocol,
+                        PresentationFeedback,
+                        server_objects,
+                        queue,
+                        callback,
+                        .{ .discarded = .{} },
+                    ) catch |err| switch (err) {
+                        error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return completed,
+                        else => return err,
+                    };
+                }
+                try pending.consume(callback);
+                completed += 1;
+            }
+            return completed;
+        }
+
+        pub fn pendingDiscardedFeedback(adapter: *const Self) bool {
+            return if (adapter.discarded_feedback) |pending| pending.count != 0 else false;
         }
 
         pub fn getSurface(
@@ -592,6 +725,61 @@ pub fn Adapter(comptime protocol: type) type {
             return true;
         }
 
+        /// Emits every sync_output followed by one terminal feedback event
+        /// resumably.
+        /// Per-callback output cursors prevent duplicate events when the
+        /// transport queue fills between protocol messages.
+        pub fn completePresentationFeedbackOn(
+            adapter: *Self,
+            server_objects: anytype,
+            queue: *wayring.tx.Queue,
+            content: *Content,
+            output_resources: []const u32,
+            outcome: PresentationOutcome,
+        ) !bool {
+            _ = adapter;
+            const batch = &(content.presentation_feedback orelse return true);
+            while (batch.peek()) |item| {
+                if (server_objects.namespace.resolve(item.callback) == null) {
+                    try batch.consume(item.callback);
+                    continue;
+                }
+                var cursor = item.output_cursor;
+                while (outcome == .presented and cursor < output_resources.len) : (cursor += 1) {
+                    try PresentationFeedback.encodeEvent(queue, item.callback.id, .{
+                        .sync_output = .{ .output = output_resources[cursor] },
+                    });
+                    try batch.advanceOutput(item.callback, cursor + 1);
+                }
+                const event: PresentationFeedback.Event = switch (outcome) {
+                    .discarded => .{ .discarded = .{} },
+                    .presented => |value| presented: {
+                        const seconds = value.actual_ns / std.time.ns_per_s;
+                        break :presented .{ .presented = .{
+                            .tv_sec_hi = @truncate(seconds >> 32),
+                            .tv_sec_lo = @truncate(seconds),
+                            .tv_nsec = @intCast(value.actual_ns % std.time.ns_per_s),
+                            .refresh = value.refresh_ns,
+                            .seq_hi = @truncate(value.sequence >> 32),
+                            .seq_lo = @truncate(value.sequence),
+                            .flags = PresentationFeedback.kind.fromInt(value.flags),
+                        } };
+                    },
+                };
+                try wayring.server.sendEvent(
+                    protocol,
+                    PresentationFeedback,
+                    server_objects,
+                    queue,
+                    item.callback,
+                    event,
+                );
+                try batch.consume(item.callback);
+            }
+            content.presentation_feedback = null;
+            return true;
+        }
+
         /// Generated-event helper for a parent presentation callback wrapper.
         pub fn completeReleaseOn(
             server_objects: anytype,
@@ -625,6 +813,13 @@ pub fn Adapter(comptime protocol: type) type {
         fn bind(context: ?*anyopaque, binding: wayring.server.Binding) !?*anyopaque {
             _ = binding;
             return context;
+        }
+
+        fn bindPresentation(context: ?*anyopaque, binding: wayring.server.Binding) !?*anyopaque {
+            const adapter: *Self = @ptrCast(@alignCast(context orelse return error.InvalidContext));
+            const resource = adapter.acquirePresentationResource() catch return error.OutOfMemory;
+            resource.resource = binding.resource;
+            return resource;
         }
 
         fn compositorRequest(
@@ -747,13 +942,14 @@ pub fn Adapter(comptime protocol: type) type {
                             return try adapter.surfaceFailure(actor, resource.id, cause);
                     const pending_copy = adapter.pendingAttachmentCopy(slot) catch |cause|
                         return try adapter.surfaceFailure(actor, resource.id, cause);
-                    const token = Commit.commitWithAttachment(
+                    const token = Commit.commitWithAttachmentAndFeedback(
                         &adapter.scheduler,
                         &slot.updates,
                         &slot.state,
                         &slot.regions,
                         &slot.frames,
                         &slot.releases,
+                        &slot.presentation_feedback,
                         &slot.attachment,
                         .desync,
                         &.{},
@@ -938,6 +1134,41 @@ pub fn Adapter(comptime protocol: type) type {
             return .continue_dispatch;
         }
 
+        fn presentationRequest(
+            adapter: *Self,
+            actor: *wayring.connection.Actor,
+            server_objects: anytype,
+            _: *PresentationResource,
+            message: wayring.wire.Message,
+            fds: *wayring.ancillary.FdQueue,
+        ) !wayring.dispatch.Control {
+            const decoded = try wayring.server.decodeRequest(Presentation, server_objects, message, fds);
+            switch (decoded.value) {
+                .destroy => {},
+                .feedback => |value| {
+                    const surface_handle = server_objects.namespace.lookupHandle(value.surface) orelse
+                        return try adapter.protocolError(actor, decoded.handle.id, 0, "invalid feedback surface");
+                    const surface_object = server_objects.namespace.resolve(surface_handle) orelse
+                        return try adapter.protocolError(actor, decoded.handle.id, 0, "invalid feedback surface");
+                    const surface = adapter.surfaceFromObject(surface_object) orelse
+                        return try adapter.protocolError(actor, decoded.handle.id, 0, "invalid feedback surface");
+                    if (!std.meta.eql(surface.resource, surface_handle))
+                        return try adapter.protocolError(actor, decoded.handle.id, 0, "invalid feedback surface");
+                    if (adapter.presentation_feedback_pool.available() == 0)
+                        return try adapter.noMemory(actor);
+                    const admitted = Presentation.admit_feedback(
+                        server_objects,
+                        decoded.handle,
+                        value,
+                        .{ .callback = null },
+                    ) catch |cause| return try adapter.failure(actor, decoded.handle.id, cause);
+                    surface.presentation_feedback.request(admitted.callback) catch unreachable;
+                },
+            }
+            try decoded.finish(protocol, server_objects, &actor.transmit);
+            return .continue_dispatch;
+        }
+
         fn attach(
             adapter: *Self,
             server_objects: anytype,
@@ -1030,6 +1261,9 @@ pub fn Adapter(comptime protocol: type) type {
                 .regions = surface_state.SurfaceRegions.init(&adapter.region_pool),
                 .frames = surface_state.FrameQueue.init(&adapter.frame_pool),
                 .releases = surface_state.ReleaseQueue.init(&adapter.release_pool),
+                .presentation_feedback = surface_state.PresentationFeedbackPending.init(
+                    &adapter.presentation_feedback_pool,
+                ),
             };
             return slot;
         }
@@ -1038,13 +1272,30 @@ pub fn Adapter(comptime protocol: type) type {
             const slot = &adapter.surfaces[index];
             if (!slot.active) return;
             // The queue is initialized only after generated object admission.
-            if (slot.resource.id != 0) Commit.deinitQueue(&slot.updates);
+            if (slot.resource.id != 0) {
+                slot.presentation_feedback.moveTo(adapter.discardedFeedback());
+                slot.updates.deinitWithContext(adapter, discardContentFeedback);
+            }
             slot.attachment.deinit();
             slot.releases.deinit();
+            slot.presentation_feedback.deinit();
             slot.frames.deinit();
             slot.regions.deinit();
             slot.* = .{ .next_free = adapter.surface_free };
             adapter.surface_free = index;
+        }
+
+        fn discardContentFeedback(context: *anyopaque, content: *Content) void {
+            const adapter: *Self = @ptrCast(@alignCast(context));
+            content.discardFeedbackTo(adapter.discardedFeedback());
+        }
+
+        fn discardedFeedback(adapter: *Self) *surface_state.PresentationFeedbackPending {
+            if (adapter.discarded_feedback == null)
+                adapter.discarded_feedback = surface_state.PresentationFeedbackPending.init(
+                    &adapter.presentation_feedback_pool,
+                );
+            return &adapter.discarded_feedback.?;
         }
 
         fn acquireRegion(adapter: *Self) !*RegionSlot {
@@ -1082,6 +1333,22 @@ pub fn Adapter(comptime protocol: type) type {
             adapter.clearViewport(slot);
             slot.* = .{ .next_free = adapter.viewport_free };
             adapter.viewport_free = index;
+        }
+
+        fn acquirePresentationResource(adapter: *Self) !*PresentationResource {
+            if (adapter.presentation_resource_free == none) return error.Exhausted;
+            const index = adapter.presentation_resource_free;
+            const resource = &adapter.presentation_resources[index];
+            adapter.presentation_resource_free = resource.next_free;
+            resource.* = .{ .active = true };
+            return resource;
+        }
+
+        fn releasePresentationResource(adapter: *Self, index: u32) void {
+            const resource = &adapter.presentation_resources[index];
+            if (!resource.active) return;
+            resource.* = .{ .next_free = adapter.presentation_resource_free };
+            adapter.presentation_resource_free = index;
         }
 
         fn clearViewport(adapter: *Self, slot: *ViewportSlot) void {
@@ -1203,6 +1470,13 @@ pub fn Adapter(comptime protocol: type) type {
             return bindingFromContext(ViewportSlot, adapter.viewports, object.context);
         }
 
+        fn presentationResourceFromObject(
+            adapter: *Self,
+            object: *const objects.Object,
+        ) ?*PresentationResource {
+            return bindingFromContext(PresentationResource, adapter.presentation_resources, object.context);
+        }
+
         fn surfaceIndex(adapter: *Self, slot: *SurfaceSlot) u32 {
             return @intCast((@intFromPtr(slot) - @intFromPtr(adapter.surfaces.ptr)) /
                 @sizeOf(SurfaceSlot));
@@ -1216,6 +1490,11 @@ pub fn Adapter(comptime protocol: type) type {
         fn viewportIndex(adapter: *Self, slot: *ViewportSlot) u32 {
             return @intCast((@intFromPtr(slot) - @intFromPtr(adapter.viewports.ptr)) /
                 @sizeOf(ViewportSlot));
+        }
+
+        fn presentationResourceIndex(adapter: *Self, resource: *PresentationResource) u32 {
+            return @intCast((@intFromPtr(resource) - @intFromPtr(adapter.presentation_resources.ptr)) /
+                @sizeOf(PresentationResource));
         }
 
         fn bindingFromContext(
@@ -1431,6 +1710,7 @@ const TestContext = struct {
     adapter: TestAdapter,
     compositor: objects.Handle,
     viewporter: objects.Handle,
+    presentation_resource: objects.Handle,
     shm_resource: objects.Handle,
 
     fn init() !*TestContext {
@@ -1488,6 +1768,8 @@ const TestContext = struct {
             .surface_capacity = 2,
             .region_capacity = 2,
             .viewport_capacity = 2,
+            .presentation_resource_capacity = 2,
+            .presentation_feedback_capacity = 4,
             .region_operation_capacity = 16,
             .frame_callback_capacity = 4,
             .release_callback_capacity = 4,
@@ -1514,6 +1796,14 @@ const TestContext = struct {
             1,
             &context.adapter,
         );
+        const presentation_context = try context.adapter.acquirePresentationResource();
+        context.presentation_resource = try context.server_objects.insertClient(
+            5,
+            &test_protocol.wp_presentation.info,
+            2,
+            presentation_context,
+        );
+        presentation_context.resource = context.presentation_resource;
         context.shm_resource = try context.server_objects.insertClient(
             3,
             &test_protocol.wl_shm.info,
@@ -1766,6 +2056,120 @@ test "viewporter: generated requests publish and clear double-buffered crop stat
     _ = try context.dispatchCore();
     try std.testing.expectEqual(@import("../viewport.zig").State{}, state.viewport.current);
     _ = try context.createViewport(surface, 14);
+}
+
+test "presentation-time: binding publishes the monotonic clock" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try context.adapter.flushPresentationClockOn(&context.server_objects, &context.actor.transmit),
+    );
+    var descriptor_scratch: [1]linux.fd_t = undefined;
+    var control: [64]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+    const snapshot = try context.actor.transmit.snapshot(&descriptor_scratch, &control);
+    const message = (try wayring.wire.Message.decode(snapshot.first)).?;
+    const event = try test_protocol.wp_presentation.decodeEvent(message, &context.received_fds);
+    try std.testing.expectEqual(
+        @as(u32, @intFromEnum(linux.CLOCK.MONOTONIC)),
+        event.clock_id.clk_id,
+    );
+}
+
+test "presentation-time: feedback follows its exact commit through presented completion" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const surface = try context.createSurface(10);
+    var output_context: u8 = 0;
+    const output = try context.server_objects.insertClient(
+        20,
+        &test_protocol.wl_output.info,
+        4,
+        &output_context,
+    );
+    try test_protocol.wp_presentation.encodeRequest(
+        &context.requests,
+        context.presentation_resource.id,
+        .{ .feedback = .{ .surface = surface.id, .callback = 11 } },
+    );
+    _ = try context.dispatchCore();
+    const feedback = context.server_objects.namespace.lookupHandle(11).?;
+    try test_protocol.wl_surface.encodeRequest(&context.requests, surface.id, .{ .commit = .{} });
+    _ = try context.dispatchCore();
+    var applied_storage: [1]TestAdapter.Applied = undefined;
+    var content = (try context.adapter.tryApply(surface, &applied_storage))[0].payload;
+    defer content.deinit();
+    try std.testing.expect(content.presentation_feedback != null);
+    try std.testing.expect(try context.adapter.completePresentationFeedbackOn(
+        &context.server_objects,
+        &context.actor.transmit,
+        &content,
+        &.{output.id},
+        .{ .presented = .{
+            .actual_ns = 3 * std.time.ns_per_s + 500_000_007,
+            .refresh_ns = 16_666_667,
+            .sequence = 42,
+            .flags = 7,
+        } },
+    ));
+    try std.testing.expect(content.presentation_feedback == null);
+    try std.testing.expect(context.server_objects.namespace.resolve(feedback) == null);
+
+    var descriptor_scratch: [1]linux.fd_t = undefined;
+    var control: [64]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+    var snapshot = try context.actor.transmit.snapshot(&descriptor_scratch, &control);
+    var message = (try wayring.wire.Message.decode(snapshot.first)).?;
+    const sync_event = try test_protocol.wp_presentation_feedback.decodeEvent(message, &context.received_fds);
+    try std.testing.expectEqual(output.id, sync_event.sync_output.output);
+    try context.actor.transmit.begin(snapshot);
+    try context.actor.transmit.complete(message.header.size);
+
+    snapshot = try context.actor.transmit.snapshot(&descriptor_scratch, &control);
+    message = (try wayring.wire.Message.decode(snapshot.first)).?;
+    const presented = (try test_protocol.wp_presentation_feedback.decodeEvent(
+        message,
+        &context.received_fds,
+    )).presented;
+    try std.testing.expectEqual(@as(u32, 0), presented.tv_sec_hi);
+    try std.testing.expectEqual(@as(u32, 3), presented.tv_sec_lo);
+    try std.testing.expectEqual(@as(u32, 500_000_007), presented.tv_nsec);
+    try std.testing.expectEqual(@as(u32, 16_666_667), presented.refresh);
+    try std.testing.expectEqual(@as(u32, 42), presented.seq_lo);
+    try std.testing.expectEqual(@as(u32, 7), presented.flags.value);
+}
+
+test "presentation-time: destroying a surface discards committed feedback" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const surface = try context.createSurface(10);
+    try test_protocol.wp_presentation.encodeRequest(
+        &context.requests,
+        context.presentation_resource.id,
+        .{ .feedback = .{ .surface = surface.id, .callback = 11 } },
+    );
+    _ = try context.dispatchCore();
+    try test_protocol.wl_surface.encodeRequest(&context.requests, surface.id, .{ .commit = .{} });
+    _ = try context.dispatchCore();
+    try test_protocol.wl_surface.encodeRequest(&context.requests, surface.id, .{ .destroy = .{} });
+    _ = try context.dispatchCore();
+    {
+        var descriptor_scratch: [1]linux.fd_t = undefined;
+        var control: [64]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+        const snapshot = try context.actor.transmit.snapshot(&descriptor_scratch, &control);
+        try context.actor.transmit.begin(snapshot);
+        try context.actor.transmit.complete(snapshot.byteCount());
+    }
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try context.adapter.flushDiscardedFeedbackOn(&context.server_objects, &context.actor.transmit),
+    );
+    var descriptor_scratch: [1]linux.fd_t = undefined;
+    var control: [64]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+    const snapshot = try context.actor.transmit.snapshot(&descriptor_scratch, &control);
+    const message = (try wayring.wire.Message.decode(snapshot.first)).?;
+    try std.testing.expect(
+        (try test_protocol.wp_presentation_feedback.decodeEvent(message, &context.received_fds)) == .discarded,
+    );
 }
 
 test "viewporter: duplicate viewport is rejected without publishing an object" {

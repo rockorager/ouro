@@ -314,6 +314,17 @@ pub fn Adapter(comptime protocol: type) type {
             return completed;
         }
 
+        pub fn resourceIds(adapter: *const Self, output: []u32) ![]const u32 {
+            var count: usize = 0;
+            for (adapter.resources) |resource| {
+                if (!resource.active) continue;
+                if (count == output.len) return error.OutputTooSmall;
+                output[count] = resource.handle.id;
+                count += 1;
+            }
+            return output[0..count];
+        }
+
         fn flushAssociations(
             adapter: *Self,
             server_objects: anytype,

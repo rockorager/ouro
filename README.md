@@ -35,6 +35,9 @@ responsibilities:
 - [Presentation lifetime](src/presentation.zig): imported handles, source
   leases, and per-commit release callbacks remain together until successful
   presentation completion or explicit output teardown.
+- [Presentation feedback](src/presentation_feedback.zig): bounded
+  `wp_presentation` requests follow their exact surface commit to KMS page-flip
+  timestamps, matching output resources, or an explicit discarded outcome.
 - [Viewport state](src/viewport.zig): bounded `wp_viewporter` objects apply
   pending crop and destination scale, validate them against transformed,
   scaled content, and publish them with the surface commit.

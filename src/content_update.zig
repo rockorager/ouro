@@ -105,6 +105,23 @@ pub fn Scheduler(comptime Key: type, comptime Payload: type) type {
                 queue.* = undefined;
             }
 
+            pub fn deinitWithContext(
+                queue: *Queue,
+                context: *anyopaque,
+                comptime discard: fn (*anyopaque, *Payload) void,
+            ) void {
+                while (queue.head != none) {
+                    const index = queue.head;
+                    queue.head = queue.scheduler.nodes[index].queue_next;
+                    discard(context, &queue.scheduler.nodes[index].payload);
+                    queue.scheduler.releaseEdges(index);
+                    queue.scheduler.releaseNode(index);
+                }
+                queue.tail = none;
+                queue.count = 0;
+                queue.* = undefined;
+            }
+
             pub fn newestSync(queue: Queue) ?Token {
                 if (queue.tail == none or queue.scheduler.nodes[queue.tail].kind != .sync)
                     return null;

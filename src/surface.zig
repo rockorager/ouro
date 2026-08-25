@@ -16,6 +16,9 @@ pub const SubsurfaceGraph = @import("subsurface.zig").Graph;
 pub const ReleasePool = @import("release.zig").Pool;
 pub const ReleaseQueue = @import("release.zig").Queue;
 pub const ReleaseBatch = @import("release.zig").Batch;
+pub const PresentationFeedbackPool = @import("presentation_feedback.zig").Pool;
+pub const PresentationFeedbackPending = @import("presentation_feedback.zig").Pending;
+pub const PresentationFeedbackBatch = @import("presentation_feedback.zig").Batch;
 pub const ContentUpdateScheduler = @import("content_update.zig").Scheduler;
 pub const ContentUpdateKind = @import("content_update.zig").Kind;
 pub const AttachmentLeaseState = buffer_import.AttachmentState;
@@ -551,15 +554,18 @@ pub fn CommitState(comptime Key: type) type {
             regions: SurfaceRegions.Changes,
             frame_callbacks: ?FrameBatch,
             release_callbacks: ?ReleaseBatch,
+            presentation_feedback: ?PresentationFeedbackBatch,
             attachment_lease: ?BufferLease,
 
             /// Releases callback and import ownership when an unapplied CU is discarded.
             pub fn deinit(content: *Content) void {
                 if (content.frame_callbacks) |*batch| batch.deinit();
                 if (content.release_callbacks) |*batch| batch.deinit();
+                if (content.presentation_feedback) |*batch| batch.deinit();
                 if (content.attachment_lease) |*lease| lease.deinit();
                 content.frame_callbacks = null;
                 content.release_callbacks = null;
+                content.presentation_feedback = null;
                 content.attachment_lease = null;
             }
 
@@ -571,6 +577,15 @@ pub fn CommitState(comptime Key: type) type {
                     return activated;
                 }
                 return 0;
+            }
+
+            pub fn discardFeedbackTo(
+                content: *Content,
+                pending: *PresentationFeedbackPending,
+            ) void {
+                if (content.presentation_feedback) |*batch| pending.absorb(batch);
+                content.presentation_feedback = null;
+                content.deinit();
             }
         };
 
@@ -602,6 +617,7 @@ pub fn CommitState(comptime Key: type) type {
                 frames,
                 releases,
                 null,
+                null,
                 kind,
                 child_dependencies,
                 constraints,
@@ -630,6 +646,35 @@ pub fn CommitState(comptime Key: type) type {
                 regions,
                 frames,
                 releases,
+                null,
+                attachment,
+                kind,
+                child_dependencies,
+                constraints,
+            );
+        }
+
+        pub fn commitWithAttachmentAndFeedback(
+            scheduler: *Scheduler,
+            queue: *Scheduler.Queue,
+            surface: *Surface,
+            regions: *SurfaceRegions,
+            frames: *FrameQueue,
+            releases: *ReleaseQueue,
+            feedback: *PresentationFeedbackPending,
+            attachment: *AttachmentLeaseState,
+            kind: ContentUpdateKind,
+            child_dependencies: []const Scheduler.Token,
+            constraints: u32,
+        ) !Scheduler.Token {
+            return commitInner(
+                scheduler,
+                queue,
+                surface,
+                regions,
+                frames,
+                releases,
+                feedback,
                 attachment,
                 kind,
                 child_dependencies,
@@ -644,6 +689,7 @@ pub fn CommitState(comptime Key: type) type {
             regions: *SurfaceRegions,
             frames: *FrameQueue,
             releases: *ReleaseQueue,
+            feedback: ?*PresentationFeedbackPending,
             attachment: ?*AttachmentLeaseState,
             kind: ContentUpdateKind,
             child_dependencies: []const Scheduler.Token,
@@ -669,6 +715,7 @@ pub fn CommitState(comptime Key: type) type {
                 .regions = region_plan.publish(),
                 .frame_callbacks = frames.detachPending(),
                 .release_callbacks = releases.publishCommit(),
+                .presentation_feedback = if (feedback) |pending| pending.publishCommit() else null,
                 .attachment_lease = if (attachment) |state| state.publishCommit() else null,
             };
             return scheduler.publishCommit(&scheduler_plan, content);
