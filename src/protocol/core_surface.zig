@@ -8,9 +8,17 @@ const std = @import("std");
 const wayring = @import("wayring");
 const completion = @import("../runtime/completion.zig");
 const surface_state = @import("../surface.zig");
+const region_state = @import("../region.zig");
 
 const objects = wayring.objects;
 const none = std.math.maxInt(u32);
+
+pub const InputSnapshot = struct {
+    width: u32,
+    height: u32,
+    infinite: bool,
+    operations: []const region_state.Operation,
+};
 
 pub const Config = struct {
     surface_capacity: usize,
@@ -632,6 +640,27 @@ pub fn Adapter(comptime protocol: type) type {
                 @as(u32, @intCast(point.y)) >= size.height)
                 return false;
             return slot.regions.inputContains(.{ .x = point.x, .y = point.y });
+        }
+
+        /// Copies committed bounds and input-region operations into
+        /// caller-owned storage for exact input-policy calculations.
+        pub fn copyCommittedInput(
+            adapter: *Self,
+            id: SurfaceId,
+            destination: []region_state.Operation,
+        ) !InputSnapshot {
+            if (id.index >= adapter.surfaces.len) return error.StaleSurface;
+            const slot = &adapter.surfaces[id.index];
+            if (!slot.active or slot.resource.generation != id.generation)
+                return error.StaleSurface;
+            const size = slot.state.committedSize();
+            const snapshot = try slot.regions.copyCurrentInput(destination);
+            return .{
+                .width = size.width,
+                .height = size.height,
+                .infinite = snapshot.infinite,
+                .operations = snapshot.operations,
+            };
         }
 
         /// Protocol-adapter bridge for owners which must name a wl_surface on

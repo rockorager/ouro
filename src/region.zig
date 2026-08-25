@@ -22,6 +22,11 @@ pub const Operation = union(enum) {
     subtract: Rectangle,
 };
 
+pub const Snapshot = struct {
+    infinite: bool,
+    operations: []const Operation,
+};
+
 const Node = struct {
     operation: Operation = undefined,
     next: u32 = none,
@@ -126,6 +131,17 @@ pub const Region = struct {
 
     pub fn iterator(region: *const Region) Iterator {
         return .{ .region = region, .next_index = region.head };
+    }
+
+    /// Copies the exact ordered operation program into caller-owned storage.
+    /// Insufficient capacity leaves `destination` untouched.
+    pub fn copyOperations(region: *const Region, destination: []Operation) Error![]const Operation {
+        if (destination.len < region.count) return error.Exhausted;
+        var operations = region.iterator();
+        var count: usize = 0;
+        while (operations.next()) |operation| : (count += 1)
+            destination[count] = operation;
+        return destination[0..count];
     }
 
     /// Replaces this region with an exact copy. Exhaustion leaves it unchanged.
@@ -258,6 +274,18 @@ pub const SurfaceRegions = struct {
         return contains;
     }
 
+    /// Copies the committed input-region program. The returned slice belongs
+    /// to the caller, so no mutable surface storage escapes this query.
+    pub fn copyCurrentInput(
+        regions: *const SurfaceRegions,
+        destination: []Operation,
+    ) Error!Snapshot {
+        return .{
+            .infinite = regions.current_input_infinite,
+            .operations = try regions.current_input.copyOperations(destination),
+        };
+    }
+
     /// Prepares dirty region replacements without mutating current snapshots or
     /// dirty flags. This composes with other fallible commit preflight work.
     pub fn prepareCommit(regions: *SurfaceRegions) Error!Prepared {
@@ -334,6 +362,34 @@ test "shared regions preserve ordered exact operations and copy transactionally"
     try source.add(.{ .x = 8, .y = 9, .width = 1, .height = 1 });
     try std.testing.expectError(error.Exhausted, copy.cloneFrom(&source));
     try std.testing.expectEqual(@as(usize, 2), copy.count);
+}
+
+test "committed input snapshot copies exact operations transactionally" {
+    var pool = try Pool.init(std.testing.allocator, 6);
+    defer pool.deinit(std.testing.allocator);
+    var source = Region.init(&pool);
+    defer source.deinit();
+    try source.add(.{ .x = 1, .y = 2, .width = 10, .height = 20 });
+    try source.subtract(.{ .x = 3, .y = 4, .width = 5, .height = 6 });
+    var regions = SurfaceRegions.init(&pool);
+    defer regions.deinit();
+    try regions.setInput(&source);
+    _ = try regions.commit();
+
+    var too_small = [_]Operation{
+        .{ .add = .{ .x = 99, .y = 98, .width = 2, .height = 1 } },
+    };
+    const sentinel = too_small[0];
+    try std.testing.expectError(error.Exhausted, regions.copyCurrentInput(&too_small));
+    try std.testing.expectEqual(sentinel, too_small[0]);
+
+    var copied: [2]Operation = undefined;
+    const snapshot = try regions.copyCurrentInput(&copied);
+    try std.testing.expect(!snapshot.infinite);
+    try std.testing.expectEqualSlices(Operation, &.{
+        .{ .add = .{ .x = 1, .y = 2, .width = 10, .height = 20 } },
+        .{ .subtract = .{ .x = 3, .y = 4, .width = 5, .height = 6 } },
+    }, snapshot.operations);
 }
 
 test "surface region commit is atomic under shared pool pressure" {

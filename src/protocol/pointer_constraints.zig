@@ -50,6 +50,10 @@ pub fn Store(comptime SurfaceId: type, comptime PointerId: type) type {
             locked: ConstraintId,
             confined: ConstraintId,
         };
+        pub const RegionSnapshot = struct {
+            unrestricted: bool,
+            operations: []const region.Operation,
+        };
 
         const Slot = struct {
             active: bool = false,
@@ -227,6 +231,23 @@ pub fn Store(comptime SurfaceId: type, comptime PointerId: type) type {
 
         pub fn cursorHint(self: *Self, constraint_id: ConstraintId) !?Point {
             return (try self.resolve(constraint_id)).current_hint;
+        }
+
+        pub fn copyRegion(
+            self: *Self,
+            constraint_id: ConstraintId,
+            destination: []region.Operation,
+        ) !RegionSnapshot {
+            const slot = try self.resolve(constraint_id);
+            if (destination.len < slot.current_region_len) return error.Exhausted;
+            @memcpy(
+                destination[0..slot.current_region_len],
+                slot.current_region[0..slot.current_region_len],
+            );
+            return .{
+                .unrestricted = slot.current_region_null,
+                .operations = destination[0..slot.current_region_len],
+            };
         }
 
         pub fn popEvent(self: *Self) ?Event {
@@ -435,6 +456,10 @@ test "pointer constraints: commit publishes copied regions and locked hints" {
     store.commitSurface(surface);
     try std.testing.expect(!(try store.contains(id, .{ .x = 2, .y = 2 })));
     try std.testing.expect(try store.contains(id, .{ .x = 102, .y = 102 }));
+    var copied: [2]region.Operation = undefined;
+    const snapshot = try store.copyRegion(id, &copied);
+    try std.testing.expect(!snapshot.unrestricted);
+    try std.testing.expectEqualSlices(region.Operation, &replacement, snapshot.operations);
     try std.testing.expectEqual(TestStore.Point{ .x = 7, .y = 8 }, (try store.cursorHint(id)).?);
     try std.testing.expectError(
         error.AlreadyConstrained,
