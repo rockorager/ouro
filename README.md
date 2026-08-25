@@ -54,8 +54,9 @@ responsibilities:
   snapshots and updates. Mapped surfaces receive resumable `enter`/`leave`
   associations across output suspension and recreation.
 - [XDG popups](src/protocol/xdg_shell.zig): bounded popup roles retain copied
-  positioner state, receive exact configure transactions, and compose above
-  their owning toplevel with flip, slide, and resize constraint adjustment.
+  positioner state, receive exact initial and reposition configure transactions,
+  and compose above their owning toplevel with flip, slide, and resize
+  constraint adjustment.
 - [Desktop interaction](src/input/interaction.zig): pointer motion hit-tests
   exact committed input regions against the copied desktop scene, retains
   default/button-grab state and protocol-neutral focus commands, and places a

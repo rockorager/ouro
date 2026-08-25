@@ -139,6 +139,11 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 surface_offset_x: i32 = 0,
                 surface_offset_y: i32 = 0,
             },
+            popup_reposition_requested: struct {
+                id: PopupId,
+                placement: PopupPlacement,
+                token: u32,
+            },
             toplevel_destroyed: ToplevelId,
             popup_destroyed: PopupId,
         };
@@ -260,7 +265,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 id: PopupId,
                 value: PopupConfigure,
                 serial: u32,
-                phase: u1 = 0,
+                reposition_token: ?u32 = null,
+                phase: u2 = 0,
             },
             close: ToplevelId,
             popup_done: PopupId,
@@ -632,6 +638,24 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             id: PopupId,
             value: PopupConfigure,
         ) !u32 {
+            return adapter.queuePopupConfigureToken(id, value, null);
+        }
+
+        pub fn queuePopupReposition(
+            adapter: *Self,
+            id: PopupId,
+            value: PopupConfigure,
+            token: u32,
+        ) !u32 {
+            return adapter.queuePopupConfigureToken(id, value, token);
+        }
+
+        fn queuePopupConfigureToken(
+            adapter: *Self,
+            id: PopupId,
+            value: PopupConfigure,
+            token: ?u32,
+        ) !u32 {
             if (value.width <= 0 or value.height <= 0) return error.InvalidSize;
             const role = try adapter.resolvePopup(id);
             const surface = try adapter.resolveRoleSurface(role.xdg_surface_index, role.xdg_surface_generation);
@@ -647,6 +671,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .id = id,
                 .value = value,
                 .serial = serial,
+                .reposition_token = token,
             } }) catch |cause| {
                 outstanding.* = .{};
                 return cause;
@@ -767,14 +792,21 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                         role.xdg_surface_index,
                         role.xdg_surface_generation,
                     ) catch return true;
-                    if (command.phase == 0) {
+                    if (command.phase == 0 and command.reposition_token != null) {
+                        try Popup.encodeEvent(queue, role.header.resource.id, .{
+                            .repositioned = .{ .token = command.reposition_token.? },
+                        });
+                        command.phase = 1;
+                        return false;
+                    }
+                    if (command.phase <= 1) {
                         try Popup.encodeEvent(queue, role.header.resource.id, .{ .configure = .{
                             .x = command.value.x,
                             .y = command.value.y,
                             .width = command.value.width,
                             .height = command.value.height,
                         } });
-                        command.phase = 1;
+                        command.phase = 2;
                         return false;
                     }
                     try XdgSurface.encodeEvent(queue, surface.header.resource.id, .{
@@ -1118,6 +1150,14 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                         return try adapter.invalidPositioner(actor, decoded.handle.id);
                     if (!positioner.state.configured_size or !positioner.state.configured_anchor_rect)
                         return try adapter.invalidPositioner(actor, decoded.handle.id);
+                    if (!adapter.canPublishWithLive(adapter.live_toplevels, adapter.live_popups))
+                        return try adapter.noMemory(actor);
+                    slot.placement = popupPlacement(positioner.state);
+                    adapter.publish(.{ .popup_reposition_requested = .{
+                        .id = adapter.popupId(slot),
+                        .placement = slot.placement,
+                        .token = v.token,
+                    } }) catch unreachable;
                 },
             }
             try decoded.finish(protocol, server_objects, &actor.transmit);
@@ -2294,6 +2334,50 @@ test "xdg-shell: generated popup requests validate positioner and parent role" {
     try std.testing.expect(committed.has_window_geometry);
     try std.testing.expectEqual(@as(i32, 2), committed.surface_offset_x);
     try std.testing.expectEqual(@as(i32, 3), committed.surface_offset_y);
+
+    try test_protocol.xdg_wm_base.encodeRequest(&context.requests, context.manager.id, .{
+        .create_positioner = .{ .id = 17 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try test_protocol.xdg_positioner.encodeRequest(&context.requests, 17, .{
+        .set_size = .{ .width = 40, .height = 20 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try test_protocol.xdg_positioner.encodeRequest(&context.requests, 17, .{
+        .set_anchor_rect = .{ .x = 8, .y = 9, .width = 10, .height = 11 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try test_protocol.xdg_popup.encodeRequest(&context.requests, 16, .{
+        .reposition = .{ .positioner = 17, .token = 99 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    const reposition = switch (context.adapter.popEvent() orelse return error.MissingEvent) {
+        .popup_reposition_requested => |value| value,
+        else => return error.UnexpectedEvent,
+    };
+    try std.testing.expectEqual(id, reposition.id);
+    try std.testing.expectEqual(@as(u32, 99), reposition.token);
+    try std.testing.expectEqual(@as(i32, 40), reposition.placement.width);
+
+    _ = try context.adapter.queuePopupReposition(id, .{
+        .x = 8,
+        .y = 9,
+        .width = 40,
+        .height = 20,
+    }, reposition.token);
+    var reposition_output = wayring.tx.Queue.init(&context.blocks, 64, &context.descriptors, 0);
+    defer reposition_output.deinit();
+    try std.testing.expectEqual(@as(usize, 1), try context.adapter.flushOn(
+        &context.server_objects,
+        &reposition_output,
+    ));
+    const reposition_snapshot = try reposition_output.snapshot(&descriptor_scratch, &control);
+    const reposition_message = (try wayring.wire.Message.decode(reposition_snapshot.first)).?;
+    const repositioned = try test_protocol.xdg_popup.decodeEvent(
+        reposition_message,
+        &context.received_fds,
+    );
+    try std.testing.expectEqual(@as(u32, 99), repositioned.repositioned.token);
 
     try test_protocol.xdg_popup.encodeRequest(&context.requests, 16, .{ .destroy = .{} });
     try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
