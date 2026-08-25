@@ -463,7 +463,9 @@ pub fn Adapter(comptime protocol: type) type {
                     };
                 },
                 .set_actions => |payload| {
-                    if (offer.kind == .selection or !offer.current)
+                    const ask = protocol.wl_data_device_manager.dnd_action.ask.value;
+                    const post_drop_ask = offer.dropped and offer.selected_action == ask;
+                    if (offer.kind == .selection or (!offer.current and !post_drop_ask))
                         return try self.protocolError(actor, decoded.handle.id, Offer.@"error".invalid_offer.value, "offer is not an active drag target");
                     const valid_actions = dragActionMask();
                     const actions = payload.dnd_actions.value;
@@ -475,17 +477,22 @@ pub fn Adapter(comptime protocol: type) type {
                         return try self.protocolError(actor, decoded.handle.id, Offer.@"error".invalid_action.value, "invalid preferred drag action");
                     const source = self.resolveSource(offer.source) catch
                         return try self.protocolError(actor, decoded.handle.id, Offer.@"error".invalid_offer.value, "drag source is gone");
-                    const selected = selectDragAction(sourceActions(server_objects, source), actions, preferred);
+                    const source_actions = sourceActions(server_objects, source);
+                    if (post_drop_ask and (preferred == 0 or preferred == ask or preferred & source_actions == 0))
+                        return try self.protocolError(actor, decoded.handle.id, Offer.@"error".invalid_action.value, "ask drop requires a final source-supported action");
+                    const selected = selectDragAction(source_actions, actions, preferred);
                     if (selected != offer.selected_action) {
-                        if (self.outboundFree() < 2) return try self.noMemory(actor);
+                        const needed: usize = if (post_drop_ask) 1 else 2;
+                        if (self.outboundFree() < needed) return try self.noMemory(actor);
                         self.enqueue(source.peer, .{ .source_action = .{
                             .source = offer.source,
                             .action = selected,
                         } }) catch unreachable;
-                        self.enqueue(offer.peer, .{ .offer_action = .{
-                            .offer = self.offerId(offer),
-                            .action = selected,
-                        } }) catch unreachable;
+                        if (!post_drop_ask)
+                            self.enqueue(offer.peer, .{ .offer_action = .{
+                                .offer = self.offerId(offer),
+                                .action = selected,
+                            } }) catch unreachable;
                     }
                     offer.destination_actions = actions;
                     offer.preferred_action = preferred;
@@ -642,8 +649,10 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         fn finishOffer(self: *Self, offer: *OfferSlot) !void {
+            const ask = protocol.wl_data_device_manager.dnd_action.ask.value;
             if (offer.kind != .drag or !offer.dropped or offer.finished or
-                offer.accepted_mime == null or (offer.actions_required and offer.selected_action == 0))
+                offer.accepted_mime == null or (offer.actions_required and
+                (offer.selected_action == 0 or offer.selected_action == ask)))
                 return error.InvalidFinish;
             const source = self.resolveSource(offer.source) catch return error.SourceGone;
             try self.enqueue(source.peer, .{ .source_finished = offer.source });
