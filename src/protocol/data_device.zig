@@ -180,6 +180,7 @@ pub fn Adapter(comptime protocol: type) type {
         validator: ?SerialValidator = null,
         drag_validator: ?DragValidator = null,
         drag: ?Drag = null,
+        drag_cancel_pending: bool = false,
 
         pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
             try config.validate();
@@ -616,6 +617,7 @@ pub fn Adapter(comptime protocol: type) type {
             if (drag.source) |source|
                 self.enqueue(drag.peer, .{ .source_cancelled = source }) catch unreachable;
             self.drag = null;
+            self.drag_cancel_pending = false;
         }
 
         /// Ends the implicit grab with a successful drop when any current
@@ -647,6 +649,12 @@ pub fn Adapter(comptime protocol: type) type {
             if (drag.source) |source|
                 self.enqueue(drag.peer, .{ .source_drop_performed = source }) catch unreachable;
             self.drag = null;
+            self.drag_cancel_pending = false;
+        }
+
+        fn progressDragCancellation(self: *Self) void {
+            if (!self.drag_cancel_pending) return;
+            self.cancelDrag() catch {};
         }
 
         fn finishOffer(self: *Self, offer: *OfferSlot) !void {
@@ -692,6 +700,7 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         pub fn flushOn(self: *Self, peer: wayring.io_uring.Peer, server_objects: anytype, queue: *wayring.tx.Queue) !usize {
+            self.progressDragCancellation();
             var completed: usize = 0;
             if (self.outbound_len == 0) return completed;
             while (self.oldestOutbound(peer)) |slot| {
@@ -702,15 +711,17 @@ pub fn Adapter(comptime protocol: type) type {
                 if (!done) continue;
                 self.dropOutboundSlot(slot);
                 completed += 1;
+                self.progressDragCancellation();
             }
             return completed;
         }
 
         pub fn pendingOutbound(self: *const Self) usize {
-            return self.outbound_len;
+            return self.outbound_len + @intFromBool(self.drag_cancel_pending);
         }
 
         pub fn pendingOutboundOn(self: *const Self, peer: wayring.io_uring.Peer) bool {
+            if (self.drag_cancel_pending) return true;
             if (self.outbound_len == 0) return false;
             for (self.outbound) |slot|
                 if (slot.active and std.meta.eql(slot.peer, peer)) return true;
@@ -888,6 +899,7 @@ pub fn Adapter(comptime protocol: type) type {
                 const id = self.deviceId(device);
                 self.dropDeviceOutbound(id);
                 release(DeviceSlot, self.devices, &self.device_free, id.index);
+                self.progressDragCancellation();
                 return true;
             }
             if (object.interface == &Offer.info) {
@@ -906,10 +918,14 @@ pub fn Adapter(comptime protocol: type) type {
                     if (std.meta.eql(selection, id)) self.selection = null;
                 }
                 if (self.drag) |drag| {
-                    if (drag.source != null and std.meta.eql(drag.source.?, id)) self.drag.?.source = null;
+                    if (drag.source != null and std.meta.eql(drag.source.?, id)) {
+                        self.drag.?.source = null;
+                        self.drag_cancel_pending = true;
+                    }
                 }
                 self.dropSourceOutbound(id);
                 release(SourceSlot, self.sources, &self.source_free, id.index);
+                self.progressDragCancellation();
                 return true;
             }
             return false;
@@ -1300,6 +1316,50 @@ test "data device: accepted drag drops once and retains finish publication" {
     try std.testing.expectEqual(@as(usize, 3), adapter.pendingOutbound());
     try std.testing.expectEqual(TestAdapter.Outbound.source_finished, std.meta.activeTag(adapter.outbound[2].value));
     try std.testing.expectError(error.InvalidFinish, adapter.finishOffer(offer));
+}
+
+test "data device: source destruction retains drag cancellation through backpressure" {
+    var adapter = try testAdapter(.{
+        .manager_capacity = 1,
+        .source_capacity = 1,
+        .device_capacity = 1,
+        .offer_capacity = 1,
+        .mime_capacity = 1,
+        .mime_bytes = 32,
+        .outbound_capacity = 1,
+    });
+    defer adapter.deinit();
+    const peer: wayring.io_uring.Peer = .{ .slot = 6, .generation = 3 };
+    const source = try acquire(TestAdapter.SourceSlot, adapter.sources, &adapter.source_free);
+    source.peer = peer;
+    source.header.resource = .{ .id = 8, .generation = 1 };
+    const source_id = adapter.sourceId(source);
+    const device = try acquire(TestAdapter.DeviceSlot, adapter.devices, &adapter.device_free);
+    device.peer = peer;
+    const device_id = adapter.deviceId(device);
+    adapter.drag = .{
+        .peer = peer,
+        .source = source_id,
+        .origin_object = 7,
+        .target = .{ .peer = peer, .surface_object = 9, .x = 10, .y = 11 },
+    };
+    try adapter.enqueue(peer, .{ .drag_motion = .{ .device = device_id, .time = 1, .x = 2, .y = 3 } });
+
+    try std.testing.expect(adapter.resourceRemoved(source.header.resource, .{
+        .interface = &test_protocol.wl_data_source.info,
+        .version = 3,
+        .context = source,
+    }));
+    try std.testing.expect(adapter.drag != null);
+    try std.testing.expect(adapter.drag.?.source == null);
+    try std.testing.expect(adapter.drag_cancel_pending);
+    try std.testing.expectEqual(@as(usize, 2), adapter.pendingOutbound());
+
+    adapter.outbound[0].active = false;
+    adapter.progressDragCancellation();
+    try std.testing.expect(adapter.drag == null);
+    try std.testing.expect(!adapter.drag_cancel_pending);
+    try std.testing.expectEqual(TestAdapter.Outbound.drag_leave, std.meta.activeTag(adapter.outbound[0].value));
 }
 
 test "data device: copied MIME types and offer capacity make replacement transactional" {
