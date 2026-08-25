@@ -52,6 +52,7 @@ pub const scene_cursor = @import("scene/cursor.zig");
 pub const desktop_layout = @import("desktop/layout.zig");
 pub const desktop = @import("desktop/model.zig");
 pub const interaction = @import("input/interaction.zig");
+pub const confinement = @import("input/confinement.zig");
 
 test {
     _ = surface;
@@ -106,4 +107,5 @@ test {
     _ = desktop_layout;
     _ = desktop;
     _ = interaction;
+    _ = confinement;
 }
