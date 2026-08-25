@@ -28,6 +28,7 @@ const core_surface = @import("../protocol/core_surface.zig");
 const xdg_shell = @import("../protocol/xdg_shell.zig");
 const protocol_seat = @import("../protocol/seat.zig");
 const protocol_data_device = @import("../protocol/data_device.zig");
+const protocol_fractional_scale = @import("../protocol/fractional_scale.zig");
 const protocol_output = @import("../protocol/output.zig");
 const desktop_model = @import("../desktop/model.zig");
 const interaction_model = @import("../input/interaction.zig");
@@ -48,6 +49,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const Interaction = interaction_model.Interaction(Desktop);
         const SeatAdapter = protocol_seat.Adapter(protocol, Adapter);
         const DataDeviceAdapter = protocol_data_device.Adapter(protocol);
+        const FractionalScaleAdapter = protocol_fractional_scale.Adapter(protocol, Adapter);
         const OutputAdapter = protocol_output.Adapter(protocol);
 
         const Imported = struct {};
@@ -135,6 +137,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .keymap = protocol_seat.default_keymap,
             },
             data_device: protocol_data_device.Config = .{},
+            fractional_scale: protocol_fractional_scale.Config = .{},
             protocol_output: protocol_output.Config = .{},
             drm: drm.Config,
             output: output_api.Config,
@@ -179,6 +182,7 @@ pub fn Coordinator(comptime protocol: type) type {
         interaction: Interaction,
         seat_adapter: SeatAdapter,
         data_device_adapter: DataDeviceAdapter,
+        fractional_scale_adapter: FractionalScaleAdapter,
         output_adapter: OutputAdapter,
         presentations: Presentations,
         render_device: ?*output_api.RenderDevice = null,
@@ -318,6 +322,12 @@ pub fn Coordinator(comptime protocol: type) type {
             errdefer self.seat_adapter.deinit();
             self.data_device_adapter = try DataDeviceAdapter.init(allocator, config.data_device);
             errdefer self.data_device_adapter.deinit();
+            self.fractional_scale_adapter = try FractionalScaleAdapter.init(
+                allocator,
+                &self.adapter,
+                config.fractional_scale,
+            );
+            errdefer self.fractional_scale_adapter.deinit();
             self.data_device_adapter.setSerialValidator(.{
                 .context = self,
                 .validate = validateSelection,
@@ -347,6 +357,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
             _ = try self.adapter.installViewporter();
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
+            _ = try self.fractional_scale_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
             _ = try self.adapter.installPresentation();
@@ -422,6 +435,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.allocator.free(self.scene_windows);
             self.allocator.free(self.app_layers);
             self.output_adapter.deinit();
+            self.fractional_scale_adapter.deinit();
             self.data_device_adapter.deinit();
             self.seat_adapter.deinit();
             self.interaction.deinit();
@@ -509,6 +523,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.advanceShell();
                 try self.flushProtocol();
                 try self.applyReady();
+                return control;
+            }
+            if (try self.fractional_scale_adapter.request(peer, target, message, fds)) |control| {
+                try self.flushProtocol();
                 return control;
             }
             if (try self.shell_adapter.request(peer, target, message, fds)) |control| {
@@ -1006,13 +1024,15 @@ pub fn Coordinator(comptime protocol: type) type {
             const shell_flushed = try self.shell_adapter.flushOn(objects, &actor.transmit);
             const seat_flushed = try self.seat_adapter.flushOn(objects, &actor.transmit);
             const data_device_flushed = try self.data_device_adapter.flushOn(peer, objects, &actor.transmit);
+            const fractional_scale_flushed = try self.fractional_scale_adapter.flushOn(objects, &actor.transmit);
             const output_flushed = try self.output_adapter.flushOn(objects, &actor.transmit);
             const presentation_flushed = try self.adapter.flushPresentationClockOn(objects, &actor.transmit);
             const discarded_flushed = try self.adapter.flushDiscardedFeedbackOn(objects, &actor.transmit);
-            if (shell_flushed != 0 or seat_flushed != 0 or data_device_flushed != 0 or output_flushed != 0 or presentation_flushed != 0 or discarded_flushed != 0 or
+            if (shell_flushed != 0 or seat_flushed != 0 or data_device_flushed != 0 or fractional_scale_flushed != 0 or output_flushed != 0 or presentation_flushed != 0 or discarded_flushed != 0 or
                 self.shell_adapter.pendingOutbound() != 0 or
                 self.seat_adapter.pendingOutbound() != 0 or
                 self.data_device_adapter.pendingOutbound() != 0 or
+                self.fractional_scale_adapter.pendingOutbound() or
                 self.output_adapter.pendingOutbound() != 0 or
                 self.adapter.pendingPresentationClock() or
                 self.adapter.pendingDiscardedFeedback())
@@ -1783,6 +1803,7 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.shell_adapter.resourceRemoved(handle, object);
             _ = self.seat_adapter.resourceRemoved(handle, object);
             _ = self.data_device_adapter.resourceRemoved(handle, object);
+            _ = self.fractional_scale_adapter.resourceRemoved(handle, object);
             _ = self.output_adapter.resourceRemoved(handle, object);
             if (removed_surface) |id| {
                 self.dropPendingSurface(id);

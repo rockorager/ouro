@@ -10,6 +10,7 @@ pub const viewport = @import("viewport.zig");
 pub const buffer_import = @import("buffer_import.zig");
 pub const presentation = @import("presentation.zig");
 pub const presentation_feedback = @import("presentation_feedback.zig");
+pub const fractional_scale = @import("protocol/fractional_scale.zig");
 pub const completion = @import("runtime/completion.zig");
 pub const compositor = @import("runtime/compositor.zig");
 pub const timer = @import("runtime/timer.zig");
@@ -58,6 +59,7 @@ test {
     _ = buffer_import;
     _ = presentation;
     _ = presentation_feedback;
+    _ = fractional_scale;
     _ = completion;
     _ = compositor;
     _ = timer;

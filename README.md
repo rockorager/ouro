@@ -41,6 +41,9 @@ responsibilities:
 - [Viewport state](src/viewport.zig): bounded `wp_viewporter` objects apply
   pending crop and destination scale, validate them against transformed,
   scaled content, and publish them with the surface commit.
+- [Fractional scale](src/protocol/fractional_scale.zig): bounded per-surface
+  `wp_fractional_scale_v1` objects publish Ouro's preferred render scale and
+  pair with viewporter destination sizing.
 - [Subsurface state](src/subsurface.zig): Ouro owns the parent/child graph,
   synchronized commit caching, position, stacking, visibility, and sync/desync
   transitions.
