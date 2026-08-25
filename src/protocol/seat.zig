@@ -197,6 +197,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         keyboards: []KeyboardSlot,
         devices: []DeviceSlot,
         outbound: []OutboundSlot,
+        outbound_len: usize = 0,
         events: []Event,
         event_head: usize = 0,
         event_len: usize = 0,
@@ -787,21 +788,19 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         }
 
         pub fn pendingOutbound(adapter: *const Self) usize {
-            var count: usize = 0;
-            for (adapter.outbound) |slot| if (slot.active) {
-                count += 1;
-            };
-            return count;
+            return adapter.outbound_len;
         }
 
         pub fn flushOn(adapter: *Self, server_objects: anytype, queue: *wayring.tx.Queue) !usize {
             var completed: usize = 0;
+            if (adapter.outbound_len == 0) return completed;
             while (adapter.oldestOutboundFor(server_objects)) |slot| {
                 const done = adapter.emitOutbound(server_objects, queue, slot.value) catch |err| switch (err) {
                     error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return completed,
                     else => return err,
                 };
                 slot.active = false;
+                adapter.outbound_len -= 1;
                 if (done) completed += 1;
             }
             return completed;
@@ -1291,7 +1290,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 else => {},
             }
             for (adapter.outbound) |*slot| {
-                if (slot.active and outboundTargets(slot.value, id)) slot.active = false;
+                if (slot.active and outboundTargets(slot.value, id)) {
+                    slot.active = false;
+                    adapter.outbound_len -= 1;
+                }
             }
         }
 
@@ -1444,17 +1446,14 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             for (adapter.outbound) |*slot| if (!slot.active) {
                 slot.* = .{ .active = true, .sequence = adapter.next_sequence, .client = client, .value = value };
                 adapter.next_sequence +%= 1;
+                adapter.outbound_len += 1;
                 return;
             };
             return error.Exhausted;
         }
 
         fn ensureOutbound(adapter: *const Self, needed: usize) !void {
-            var free: usize = 0;
-            for (adapter.outbound) |slot| if (!slot.active) {
-                free += 1;
-            };
-            if (free < needed) return error.Exhausted;
+            if (adapter.outbound.len - adapter.outbound_len < needed) return error.Exhausted;
         }
 
         fn oldestOutboundFor(adapter: *Self, server_objects: anytype) ?*OutboundSlot {
@@ -1572,12 +1571,16 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             const generation = adapter.seats[index].header.generation;
             for (adapter.outbound) |*slot| if (slot.active) switch (slot.value) {
                 .seat_capabilities => |value| {
-                    if (value.seat.index == index and value.seat.generation == generation)
+                    if (value.seat.index == index and value.seat.generation == generation) {
                         slot.active = false;
+                        adapter.outbound_len -= 1;
+                    }
                 },
                 .seat_name => |value| {
-                    if (value.index == index and value.generation == generation)
+                    if (value.index == index and value.generation == generation) {
                         slot.active = false;
+                        adapter.outbound_len -= 1;
+                    }
                 },
                 else => {},
             };
@@ -1606,7 +1609,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     else => null,
                 };
                 if (id == null) continue;
-                if (id.?.index == index and id.?.generation == generation) slot.active = false;
+                if (id.?.index == index and id.?.generation == generation) {
+                    slot.active = false;
+                    adapter.outbound_len -= 1;
+                }
             };
         }
 
@@ -1826,6 +1832,7 @@ fn testAdapterWithCapacity(core: *FakeCore, outbound_capacity: usize, event_capa
 
 fn clearTestOutbound(adapter: *TestAdapter) void {
     for (adapter.outbound) |*slot| slot.active = false;
+    adapter.outbound_len = 0;
 }
 
 fn countTestOutbound(adapter: *const TestAdapter, tag: std.meta.Tag(TestAdapter.Outbound)) usize {

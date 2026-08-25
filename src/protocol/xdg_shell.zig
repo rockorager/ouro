@@ -328,6 +328,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         live_toplevels: usize = 0,
         live_popups: usize = 0,
         outbound: []OutboundSlot,
+        outbound_len: usize = 0,
         outstanding: []Outstanding,
         grab_validator: ?GrabValidator = null,
         interactive_grab_validator: ?InteractiveGrabValidator = null,
@@ -774,11 +775,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         }
 
         pub fn pendingOutbound(adapter: *const Self) usize {
-            var count: usize = 0;
-            for (adapter.outbound) |slot| if (slot.active) {
-                count += 1;
-            };
-            return count;
+            return adapter.outbound_len;
         }
 
         /// Emits only commands owned by this client's object namespace, in
@@ -790,6 +787,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             queue: *wayring.tx.Queue,
         ) !usize {
             var completed: usize = 0;
+            if (adapter.outbound_len == 0) return completed;
             while (adapter.oldestOutboundFor(server_objects)) |slot| {
                 const done = adapter.emitOutbound(queue, &slot.value) catch |cause| switch (cause) {
                     error.Exhausted,
@@ -800,6 +798,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 };
                 if (!done) continue;
                 slot.active = false;
+                adapter.outbound_len -= 1;
                 completed += 1;
             }
             return completed;
@@ -1341,6 +1340,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     .value = value,
                 };
                 adapter.next_outbound_sequence +%= 1;
+                adapter.outbound_len += 1;
                 return;
             };
             return error.Exhausted;
@@ -1355,6 +1355,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     slot.manager_generation,
                 ) catch {
                     slot.active = false;
+                    adapter.outbound_len -= 1;
                     continue;
                 };
                 const object = server_objects.namespace.resolve(manager.header.resource) orelse continue;
@@ -1497,10 +1498,16 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         fn dropOutboundToplevel(adapter: *Self, id: ToplevelId) void {
             for (adapter.outbound) |*slot| if (slot.active) switch (slot.value) {
                 .toplevel_configure => |v| {
-                    if (std.meta.eql(v.id, id)) slot.active = false;
+                    if (std.meta.eql(v.id, id)) {
+                        slot.active = false;
+                        adapter.outbound_len -= 1;
+                    }
                 },
                 .close => |v| {
-                    if (std.meta.eql(v, id)) slot.active = false;
+                    if (std.meta.eql(v, id)) {
+                        slot.active = false;
+                        adapter.outbound_len -= 1;
+                    }
                 },
                 else => {},
             };
@@ -1508,10 +1515,16 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         fn dropOutboundPopup(adapter: *Self, id: PopupId) void {
             for (adapter.outbound) |*slot| if (slot.active) switch (slot.value) {
                 .popup_configure => |v| {
-                    if (std.meta.eql(v.id, id)) slot.active = false;
+                    if (std.meta.eql(v.id, id)) {
+                        slot.active = false;
+                        adapter.outbound_len -= 1;
+                    }
                 },
                 .popup_done => |v| {
-                    if (std.meta.eql(v, id)) slot.active = false;
+                    if (std.meta.eql(v, id)) {
+                        slot.active = false;
+                        adapter.outbound_len -= 1;
+                    }
                 },
                 else => {},
             };
@@ -1519,7 +1532,11 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         fn dropOutboundManager(adapter: *Self, index: u32, generation: u32) void {
             for (adapter.outbound) |*slot| {
                 if (slot.active and slot.manager_index == index and
-                    slot.manager_generation == generation) slot.active = false;
+                    slot.manager_generation == generation)
+                {
+                    slot.active = false;
+                    adapter.outbound_len -= 1;
+                }
             }
         }
 
