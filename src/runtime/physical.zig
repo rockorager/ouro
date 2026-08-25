@@ -1025,18 +1025,18 @@ pub fn Coordinator(comptime protocol: type) type {
             const shell_flushed = try self.shell_adapter.flushOn(objects, &actor.transmit);
             const seat_flushed = try self.seat_adapter.flushOn(objects, &actor.transmit);
             const data_device_flushed = try self.data_device_adapter.flushOn(peer, objects, &actor.transmit);
-            const fractional_scale_flushed = try self.fractional_scale_adapter.flushOn(objects, &actor.transmit);
+            const fractional_scale_flushed = try self.fractional_scale_adapter.flushOn(peer, objects, &actor.transmit);
             const output_flushed = try self.output_adapter.flushOn(peer, objects, &actor.transmit);
-            const presentation_flushed = try self.adapter.flushPresentationClockOn(objects, &actor.transmit);
-            const discarded_flushed = try self.adapter.flushDiscardedFeedbackOn(objects, &actor.transmit);
+            const presentation_flushed = try self.adapter.flushPresentationClockOn(peer, objects, &actor.transmit);
+            const discarded_flushed = try self.adapter.flushDiscardedFeedbackOn(peer, objects, &actor.transmit);
             if (shell_flushed != 0 or seat_flushed != 0 or data_device_flushed != 0 or fractional_scale_flushed != 0 or output_flushed != 0 or presentation_flushed != 0 or discarded_flushed != 0 or
                 self.shell_adapter.pendingOutbound() != 0 or
                 self.seat_adapter.pendingOutbound() != 0 or
                 self.data_device_adapter.pendingOutbound() != 0 or
-                self.fractional_scale_adapter.pendingOutbound() or
+                self.fractional_scale_adapter.pendingOutbound(peer) or
                 self.output_adapter.pendingOutbound() != 0 or
-                self.adapter.pendingPresentationClock() or
-                self.adapter.pendingDiscardedFeedback())
+                self.adapter.pendingPresentationClock(peer) or
+                self.adapter.pendingDiscardedFeedback(peer))
                 _ = try self.loop.?.driver.schedule(peer);
         }
 

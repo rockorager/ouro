@@ -156,6 +156,7 @@ pub fn Adapter(comptime protocol: type) type {
             active: bool = false,
             next_free: u32 = none,
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
+            peer: wayring.io_uring.Peer = undefined,
             clock_pending: bool = true,
         };
 
@@ -461,12 +462,14 @@ pub fn Adapter(comptime protocol: type) type {
 
         pub fn flushPresentationClockOn(
             adapter: *Self,
+            peer: wayring.io_uring.Peer,
             server_objects: anytype,
             queue: *wayring.tx.Queue,
         ) !usize {
             var completed: usize = 0;
             for (adapter.presentation_resources) |*resource| {
-                if (!resource.active or !resource.clock_pending) continue;
+                if (!resource.active or !samePeer(resource.peer, peer) or
+                    !resource.clock_pending) continue;
                 if (server_objects.namespace.resolve(resource.resource) == null) continue;
                 Presentation.encodeEvent(queue, resource.resource.id, .{
                     .clock_id = .{ .clk_id = @intFromEnum(std.os.linux.CLOCK.MONOTONIC) },
@@ -480,20 +483,25 @@ pub fn Adapter(comptime protocol: type) type {
             return completed;
         }
 
-        pub fn pendingPresentationClock(adapter: *const Self) bool {
+        pub fn pendingPresentationClock(
+            adapter: *const Self,
+            peer: wayring.io_uring.Peer,
+        ) bool {
             for (adapter.presentation_resources) |resource|
-                if (resource.active and resource.clock_pending) return true;
+                if (resource.active and samePeer(resource.peer, peer) and
+                    resource.clock_pending) return true;
             return false;
         }
 
         pub fn flushDiscardedFeedbackOn(
             adapter: *Self,
+            peer: wayring.io_uring.Peer,
             server_objects: anytype,
             queue: *wayring.tx.Queue,
         ) !usize {
             var completed: usize = 0;
             const pending = adapter.discardedFeedback();
-            while (pending.peek()) |callback| {
+            while (pending.peekForPeer(peer)) |callback| {
                 if (server_objects.namespace.resolve(callback) != null) {
                     wayring.server.sendEvent(
                         protocol,
@@ -507,14 +515,20 @@ pub fn Adapter(comptime protocol: type) type {
                         else => return err,
                     };
                 }
-                try pending.consume(callback);
+                try pending.consumeForPeer(peer, callback);
                 completed += 1;
             }
             return completed;
         }
 
-        pub fn pendingDiscardedFeedback(adapter: *const Self) bool {
-            return if (adapter.discarded_feedback) |pending| pending.count != 0 else false;
+        pub fn pendingDiscardedFeedback(
+            adapter: *const Self,
+            peer: wayring.io_uring.Peer,
+        ) bool {
+            return if (adapter.discarded_feedback) |pending|
+                pending.peekForPeer(peer) != null
+            else
+                false;
         }
 
         pub fn getSurface(
@@ -828,6 +842,7 @@ pub fn Adapter(comptime protocol: type) type {
             const adapter: *Self = @ptrCast(@alignCast(context orelse return error.InvalidContext));
             const resource = adapter.acquirePresentationResource() catch return error.OutOfMemory;
             resource.resource = binding.resource;
+            resource.peer = binding.peer;
             return resource;
         }
 
@@ -1172,7 +1187,7 @@ pub fn Adapter(comptime protocol: type) type {
                         value,
                         .{ .callback = null },
                     ) catch |cause| return try adapter.failure(actor, decoded.handle.id, cause);
-                    surface.presentation_feedback.request(admitted.callback) catch unreachable;
+                    surface.presentation_feedback.request(admitted.callback, surface.peer) catch unreachable;
                 },
             }
             try decoded.finish(protocol, server_objects, &actor.transmit);
@@ -1695,6 +1710,10 @@ pub fn Adapter(comptime protocol: type) type {
     };
 }
 
+fn samePeer(a: wayring.io_uring.Peer, b: wayring.io_uring.Peer) bool {
+    return a.slot == b.slot and a.generation == b.generation;
+}
+
 const test_protocol = @import("core_protocol");
 const TestAdapter = Adapter(test_protocol);
 const TestShm = wayring.server.Shm(test_protocol);
@@ -1807,6 +1826,10 @@ const TestContext = struct {
             &context.adapter,
         );
         const presentation_context = try context.adapter.acquirePresentationResource();
+        presentation_context.peer = .{
+            .slot = context.actor.slot,
+            .generation = context.actor.generation,
+        };
         context.presentation_resource = try context.server_objects.insertClient(
             5,
             &test_protocol.wp_presentation.info,
@@ -2082,9 +2105,31 @@ test "viewporter: generated requests publish and clear double-buffered crop stat
 test "presentation-time: binding publishes the monotonic clock" {
     const context = try TestContext.init();
     defer context.deinit();
+    const peer: wayring.io_uring.Peer = .{
+        .slot = context.actor.slot,
+        .generation = context.actor.generation,
+    };
+    const other: wayring.io_uring.Peer = .{
+        .slot = context.actor.slot + 1,
+        .generation = context.actor.generation,
+    };
+    try std.testing.expect(!context.adapter.pendingPresentationClock(other));
+    try std.testing.expect(context.adapter.pendingPresentationClock(peer));
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        try context.adapter.flushPresentationClockOn(
+            other,
+            &context.server_objects,
+            &context.actor.transmit,
+        ),
+    );
     try std.testing.expectEqual(
         @as(usize, 1),
-        try context.adapter.flushPresentationClockOn(&context.server_objects, &context.actor.transmit),
+        try context.adapter.flushPresentationClockOn(
+            peer,
+            &context.server_objects,
+            &context.actor.transmit,
+        ),
     );
     var descriptor_scratch: [1]linux.fd_t = undefined;
     var control: [64]u8 align(@alignOf(linux.cmsghdr)) = undefined;
@@ -2173,6 +2218,16 @@ test "presentation-time: destroying a surface discards committed feedback" {
     _ = try context.dispatchCore();
     try test_protocol.wl_surface.encodeRequest(&context.requests, surface.id, .{ .destroy = .{} });
     _ = try context.dispatchCore();
+    const peer: wayring.io_uring.Peer = .{
+        .slot = context.actor.slot,
+        .generation = context.actor.generation,
+    };
+    const other: wayring.io_uring.Peer = .{
+        .slot = context.actor.slot + 1,
+        .generation = context.actor.generation,
+    };
+    try std.testing.expect(!context.adapter.pendingDiscardedFeedback(other));
+    try std.testing.expect(context.adapter.pendingDiscardedFeedback(peer));
     {
         var descriptor_scratch: [1]linux.fd_t = undefined;
         var control: [64]u8 align(@alignOf(linux.cmsghdr)) = undefined;
@@ -2182,7 +2237,11 @@ test "presentation-time: destroying a surface discards committed feedback" {
     }
     try std.testing.expectEqual(
         @as(usize, 1),
-        try context.adapter.flushDiscardedFeedbackOn(&context.server_objects, &context.actor.transmit),
+        try context.adapter.flushDiscardedFeedbackOn(
+            peer,
+            &context.server_objects,
+            &context.actor.transmit,
+        ),
     );
     var descriptor_scratch: [1]linux.fd_t = undefined;
     var control: [64]u8 align(@alignOf(linux.cmsghdr)) = undefined;

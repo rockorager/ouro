@@ -1,12 +1,14 @@
 //! Shared bounded per-commit wp_presentation_feedback ownership.
 
 const std = @import("std");
-const objects = @import("wayring").objects;
+const wayring = @import("wayring");
+const objects = wayring.objects;
 
 const none = std.math.maxInt(u32);
 
 const Node = struct {
     callback: objects.Handle = undefined,
+    peer: wayring.io_uring.Peer = undefined,
     next: u32 = none,
     output_cursor: usize = 0,
 };
@@ -36,11 +38,11 @@ pub const Pool = struct {
         return pool.nodes.len - pool.active_count;
     }
 
-    fn acquire(pool: *Pool, callback: objects.Handle) !u32 {
+    fn acquire(pool: *Pool, callback: objects.Handle, peer: wayring.io_uring.Peer) !u32 {
         if (pool.free_head == none) return error.Exhausted;
         const index = pool.free_head;
         pool.free_head = pool.nodes[index].next;
-        pool.nodes[index] = .{ .callback = callback };
+        pool.nodes[index] = .{ .callback = callback, .peer = peer };
         pool.active_count += 1;
         return index;
     }
@@ -71,8 +73,12 @@ pub const Pending = struct {
         pending.* = undefined;
     }
 
-    pub fn request(pending: *Pending, callback: objects.Handle) !void {
-        const index = try pending.pool.acquire(callback);
+    pub fn request(
+        pending: *Pending,
+        callback: objects.Handle,
+        peer: wayring.io_uring.Peer,
+    ) !void {
+        const index = try pending.pool.acquire(callback, peer);
         if (pending.tail == none) pending.head = index else pending.pool.nodes[pending.tail].next = index;
         pending.tail = index;
         pending.count += 1;
@@ -113,6 +119,18 @@ pub const Pending = struct {
         return pending.pool.nodes[pending.head].callback;
     }
 
+    pub fn peekForPeer(
+        pending: Pending,
+        peer: wayring.io_uring.Peer,
+    ) ?objects.Handle {
+        var index = pending.head;
+        while (index != none) : (index = pending.pool.nodes[index].next) {
+            const node = pending.pool.nodes[index];
+            if (samePeer(node.peer, peer)) return node.callback;
+        }
+        return null;
+    }
+
     pub fn consume(pending: *Pending, callback: objects.Handle) !void {
         if (pending.head == none) return error.Empty;
         const index = pending.head;
@@ -122,7 +140,37 @@ pub const Pending = struct {
         if (pending.head == none) pending.tail = none;
         pending.pool.release(index);
     }
+
+    pub fn consumeForPeer(
+        pending: *Pending,
+        peer: wayring.io_uring.Peer,
+        callback: objects.Handle,
+    ) !void {
+        var previous: u32 = none;
+        var index = pending.head;
+        while (index != none) : (index = pending.pool.nodes[index].next) {
+            const node = pending.pool.nodes[index];
+            if (!samePeer(node.peer, peer)) {
+                previous = index;
+                continue;
+            }
+            if (!std.meta.eql(node.callback, callback)) return error.WrongCallback;
+            if (previous == none)
+                pending.head = node.next
+            else
+                pending.pool.nodes[previous].next = node.next;
+            if (pending.tail == index) pending.tail = previous;
+            pending.count -= 1;
+            pending.pool.release(index);
+            return;
+        }
+        return error.Empty;
+    }
 };
+
+fn samePeer(a: wayring.io_uring.Peer, b: wayring.io_uring.Peer) bool {
+    return a.slot == b.slot and a.generation == b.generation;
+}
 
 pub const Item = struct {
     callback: objects.Handle,
@@ -175,12 +223,30 @@ test "presentation feedback remains commit-owned across partial output publicati
     defer pending.deinit();
     const first: objects.Handle = .{ .id = 3, .generation = 1 };
     const second: objects.Handle = .{ .id = 4, .generation = 2 };
-    try pending.request(first);
-    try pending.request(second);
+    const peer: wayring.io_uring.Peer = .{ .slot = 1, .generation = 2 };
+    try pending.request(first, peer);
+    try pending.request(second, peer);
     var batch = pending.publishCommit().?;
     defer batch.deinit();
     try batch.advanceOutput(first, 2);
     try std.testing.expectEqual(@as(usize, 2), batch.peek().?.output_cursor);
     try batch.consume(first);
     try std.testing.expectEqual(second, batch.peek().?.callback);
+}
+
+test "discarded presentation feedback remains peer scoped" {
+    var pool = try Pool.init(std.testing.allocator, 3);
+    defer pool.deinit(std.testing.allocator);
+    var pending = Pending.init(&pool);
+    defer pending.deinit();
+    const peer_a: wayring.io_uring.Peer = .{ .slot = 1, .generation = 2 };
+    const peer_b: wayring.io_uring.Peer = .{ .slot = 2, .generation = 3 };
+    const a: objects.Handle = .{ .id = 4, .generation = 1 };
+    const b: objects.Handle = .{ .id = 4, .generation = 1 };
+    try pending.request(a, peer_a);
+    try pending.request(b, peer_b);
+    try std.testing.expectEqual(b, pending.peekForPeer(peer_b).?);
+    try pending.consumeForPeer(peer_b, b);
+    try std.testing.expectEqual(a, pending.peekForPeer(peer_a).?);
+    try std.testing.expect(pending.peekForPeer(peer_b) == null);
 }

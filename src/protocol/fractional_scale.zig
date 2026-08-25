@@ -29,6 +29,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             next_free: u32 = none,
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
             surface: CoreSurface.SurfaceId = .{ .index = 0, .generation = 0 },
+            peer: wayring.io_uring.Peer = undefined,
             event_pending: bool = true,
         };
 
@@ -125,6 +126,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                         };
                         slot.resource = admitted.id;
                         slot.surface = surface;
+                        slot.peer = try adapter.core.surfacePeer(surface);
                     },
                 }
                 try decoded.finish(protocol, server_objects, &actor.transmit);
@@ -145,12 +147,13 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
 
         pub fn flushOn(
             adapter: *Self,
+            peer: wayring.io_uring.Peer,
             server_objects: anytype,
             queue: *wayring.tx.Queue,
         ) !usize {
             var completed: usize = 0;
             for (adapter.slots) |*slot| {
-                if (!slot.active or !slot.event_pending) continue;
+                if (!slot.active or !samePeer(slot.peer, peer) or !slot.event_pending) continue;
                 if (server_objects.namespace.resolve(slot.resource) == null) continue;
                 Scale.encodeEvent(queue, slot.resource.id, .{ .preferred_scale = .{
                     .scale = adapter.preferred_scale,
@@ -164,8 +167,9 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             return completed;
         }
 
-        pub fn pendingOutbound(adapter: *const Self) bool {
-            for (adapter.slots) |slot| if (slot.active and slot.event_pending) return true;
+        pub fn pendingOutbound(adapter: *const Self, peer: wayring.io_uring.Peer) bool {
+            for (adapter.slots) |slot|
+                if (slot.active and samePeer(slot.peer, peer) and slot.event_pending) return true;
             return false;
         }
 
@@ -230,6 +234,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
     };
 }
 
+fn samePeer(a: wayring.io_uring.Peer, b: wayring.io_uring.Peer) bool {
+    return a.slot == b.slot and a.generation == b.generation;
+}
+
 test "fractional scale: bounded slots retain one pending preferred scale" {
     const protocol = @import("core_protocol");
     const FakeCore = struct {
@@ -243,7 +251,11 @@ test "fractional scale: bounded slots retain one pending preferred scale" {
     });
     defer adapter.deinit();
     const slot = try adapter.acquire();
+    const peer: wayring.io_uring.Peer = .{ .slot = 1, .generation = 2 };
+    slot.peer = peer;
     try std.testing.expect(slot.event_pending);
+    try std.testing.expect(adapter.pendingOutbound(peer));
+    try std.testing.expect(!adapter.pendingOutbound(.{ .slot = 2, .generation = 2 }));
     try std.testing.expectError(error.Exhausted, adapter.acquire());
     adapter.release(0);
     try std.testing.expectEqual(@as(u32, 0), adapter.free_head);
