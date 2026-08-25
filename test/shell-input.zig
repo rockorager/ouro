@@ -260,7 +260,9 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     try root.deinit();
 }
 
-test "shell-input: two mapped toplevels render in desktop stacking order" {
+const two_toplevel_cycle_count = 42;
+
+test "shell-input: two mapped toplevels sustain independent commit cycles" {
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-two-toplevels-{d}.sock", .{linux.getpid()});
@@ -270,6 +272,9 @@ test "shell-input: two mapped toplevels render in desktop stacking order" {
     var fixture = try physical_fixture.Fixture.init();
     defer fixture.deinit();
     var root_config = physical_fixture.compositorConfig();
+    root_config.reactor.receive_buffer_size = 8192;
+    root_config.reactor.receive_buffer_count = 8;
+    root_config.reactor.receive_control_capacity = 512;
     root_config.runtime.object_capacity = 32;
     root_config.runtime.object_quota = 32;
     root_config.runtime.actor.received_fd_budget = 2;
@@ -356,19 +361,19 @@ test "shell-input: two mapped toplevels render in desktop stacking order" {
             try std.testing.expectEqual(@as(u32, 1), second.sample.?.destination.width);
             observed = true;
         }
-        if (observed and coordinator.stats.presented == 1 and
-            handler.buffer_releases == 2 and handler.frame_done == 2) break;
+        if (observed and coordinator.stats.presented == two_toplevel_cycle_count and
+            handler.buffer_releases == two_toplevel_cycle_count * 2 and
+            handler.frame_done == two_toplevel_cycle_count * 2) break;
         if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0) {
-            if (observed) break;
             try waitForEither(&root.ring, client_reactor.ring);
         }
     }
     try std.testing.expect(observed);
-    try std.testing.expectEqual(@as(usize, 2), coordinator.stats.applied);
-    try std.testing.expectEqual(@as(usize, 1), coordinator.stats.submitted);
-    try std.testing.expectEqual(@as(usize, 1), coordinator.stats.presented);
-    try std.testing.expectEqual(@as(usize, 2), handler.buffer_releases);
-    try std.testing.expectEqual(@as(usize, 2), handler.frame_done);
+    try std.testing.expectEqual(@as(usize, two_toplevel_cycle_count * 2), coordinator.stats.applied);
+    try std.testing.expectEqual(@as(usize, two_toplevel_cycle_count), coordinator.stats.submitted);
+    try std.testing.expectEqual(@as(usize, two_toplevel_cycle_count), coordinator.stats.presented);
+    try std.testing.expectEqual(@as(usize, two_toplevel_cycle_count * 2), handler.buffer_releases);
+    try std.testing.expectEqual(@as(usize, two_toplevel_cycle_count * 2), handler.frame_done);
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
 
     const windows = try coordinator.desktop.sceneSnapshot(coordinator.scene_windows);
@@ -510,6 +515,7 @@ const MultiHandler = struct {
     shell_created: bool = false,
     buffer_releases: usize = 0,
     frame_done: usize = 0,
+    cycles_started: [2]usize = .{ 0, 0 },
     event_failures: usize = 0,
 
     pub fn eventError(
@@ -569,6 +575,7 @@ const MultiHandler = struct {
                         .{ .destroy = .{} },
                     );
                     self.buffers[index] = null;
+                    try self.maybeStartCycle(index);
                 },
             }
         } else if (target.object.interface == &ClientCore.Callback.info) {
@@ -583,6 +590,7 @@ const MultiHandler = struct {
                 .done => {
                     self.frame_done += 1;
                     self.callbacks[index] = null;
+                    try self.maybeStartCycle(index);
                 },
             }
         } else if (target.object.interface == &ClientCore.Display.info) {
@@ -679,6 +687,13 @@ const MultiHandler = struct {
             .{ .destroy = .{} },
         );
         self.mapped[index] = true;
+        self.cycles_started[index] += 1;
+    }
+
+    fn maybeStartCycle(self: *MultiHandler, index: usize) !void {
+        if (self.cycles_started[index] >= two_toplevel_cycle_count or
+            self.buffers[index] != null or self.callbacks[index] != null) return;
+        try self.mapSurface(index);
     }
 
     fn indexFor(
