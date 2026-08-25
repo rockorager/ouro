@@ -589,6 +589,32 @@ pub fn Adapter(comptime protocol: type) type {
             };
         }
 
+        pub fn surfaceIdOn(adapter: *Self, server_objects: anytype, object_id: u32) !SurfaceId {
+            const handle = server_objects.namespace.lookupHandle(object_id) orelse
+                return error.StaleSurface;
+            const object = server_objects.namespace.resolve(handle) orelse
+                return error.StaleSurface;
+            return adapter.surfaceIdObject(handle, object);
+        }
+
+        /// Copies a live wl_region's exact operation program during request
+        /// dispatch. The resource itself never escapes the core adapter.
+        pub fn copyRegionOn(
+            adapter: *Self,
+            server_objects: anytype,
+            object_id: u32,
+            destination: []region_state.Operation,
+        ) ![]const region_state.Operation {
+            const handle = server_objects.namespace.lookupHandle(object_id) orelse
+                return error.StaleRegion;
+            const object = server_objects.namespace.resolve(handle) orelse
+                return error.StaleRegion;
+            if (object.interface != &RegionInterface.info) return error.StaleRegion;
+            const slot = adapter.regionFromObject(object) orelse return error.StaleRegion;
+            if (!std.meta.eql(slot.resource, handle)) return error.StaleRegion;
+            return slot.region.copyOperations(destination);
+        }
+
         pub fn surfaceIdObject(
             adapter: *Self,
             handle: objects.Handle,
