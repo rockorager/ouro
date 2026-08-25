@@ -44,6 +44,7 @@ pub fn Adapter(comptime protocol: type) type {
             active: bool = false,
             generation: u32 = 1,
             next_free: u32 = none,
+            peer: wayring.io_uring.Peer = undefined,
             handle: objects.Handle = .{ .id = 0, .generation = 0 },
             version: u32 = 0,
         };
@@ -51,6 +52,7 @@ pub fn Adapter(comptime protocol: type) type {
             active: bool = false,
             desired: bool = false,
             next_free: u32 = none,
+            peer: wayring.io_uring.Peer = undefined,
             surface: objects.Handle = .{ .id = 0, .generation = 0 },
             entered: u64 = 0,
         };
@@ -154,6 +156,7 @@ pub fn Adapter(comptime protocol: type) type {
             const adapter: *Self = @ptrCast(@alignCast(context orelse return error.InvalidContext));
             const index = adapter.acquireResource() catch return error.OutOfMemory;
             const resource = &adapter.resources[index];
+            resource.peer = binding.peer;
             resource.handle = binding.resource;
             resource.version = binding.version;
             adapter.queueSnapshot(adapter.idFor(index)) catch {
@@ -205,7 +208,11 @@ pub fn Adapter(comptime protocol: type) type {
         /// Reconciles the mapped surface set without directly writing the
         /// transport. `flushOn` retains each enter/leave transition until its
         /// generated event is accepted.
-        pub fn reconcileSurfaces(adapter: *Self, surfaces: []const objects.Handle) !void {
+        pub fn reconcileSurfaces(
+            adapter: *Self,
+            peer: wayring.io_uring.Peer,
+            surfaces: []const objects.Handle,
+        ) !void {
             if (surfaces.len > adapter.associations.len) return error.Exhausted;
             for (surfaces, 0..) |surface, index| {
                 if (surface.id == 0 or surface.generation == 0) return error.InvalidSurface;
@@ -214,20 +221,21 @@ pub fn Adapter(comptime protocol: type) type {
             }
             var required: usize = 0;
             for (surfaces) |surface| {
-                if (adapter.findAssociation(surface) == null) required += 1;
+                if (adapter.findAssociation(peer, surface) == null) required += 1;
             }
             var free: usize = 0;
             for (adapter.associations) |association| free += @intFromBool(!association.active);
             if (required > free) return error.Exhausted;
 
             for (adapter.associations) |*association| {
-                if (association.active) association.desired = false;
+                if (association.active and samePeer(association.peer, peer)) association.desired = false;
             }
             for (surfaces) |surface| {
-                if (adapter.findAssociation(surface)) |association| {
+                if (adapter.findAssociation(peer, surface)) |association| {
                     association.desired = true;
                 } else {
                     const association = adapter.acquireAssociation() catch unreachable;
+                    association.peer = peer;
                     association.surface = surface;
                     association.desired = true;
                 }
@@ -235,7 +243,8 @@ pub fn Adapter(comptime protocol: type) type {
             var index: usize = 0;
             while (index < adapter.associations.len) : (index += 1) {
                 const association = &adapter.associations[index];
-                if (association.active and !association.desired and association.entered == 0)
+                if (association.active and samePeer(association.peer, peer) and
+                    !association.desired and association.entered == 0)
                     adapter.releaseAssociation(@intCast(index));
             }
         }
@@ -249,7 +258,8 @@ pub fn Adapter(comptime protocol: type) type {
         ) !?wayring.dispatch.Control {
             if (target.object.interface != &Output.info) return null;
             const resource = adapter.fromContext(target.object.context) orelse return null;
-            if (!resource.active or resource.handle.id != message.header.object_id) return null;
+            if (!resource.active or !samePeer(resource.peer, peer) or
+                resource.handle.id != message.header.object_id) return null;
             const runtime = adapter.runtime orelse return error.NotInstalled;
             const actor = try runtime.clients.reactor.getActor(peer);
             const server_objects = try runtime.clients.get(peer);
@@ -262,11 +272,6 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         pub fn resourceRemoved(adapter: *Self, handle: objects.Handle, object: objects.Object) bool {
-            if (object.interface == &protocol.wl_surface.info) {
-                if (adapter.findAssociation(handle)) |association|
-                    adapter.releaseAssociation(adapter.associationIndex(association));
-                return false;
-            }
             if (object.interface != &Output.info) return false;
             const resource = adapter.fromContext(object.context) orelse return false;
             if (!std.meta.eql(resource.handle, handle)) return false;
@@ -285,6 +290,15 @@ pub fn Adapter(comptime protocol: type) type {
             return true;
         }
 
+        pub fn surfaceRemoved(
+            adapter: *Self,
+            peer: wayring.io_uring.Peer,
+            handle: objects.Handle,
+        ) void {
+            if (adapter.findAssociation(peer, handle)) |association|
+                adapter.releaseAssociation(adapter.associationIndex(association));
+        }
+
         pub fn pendingOutbound(adapter: *const Self) usize {
             var count: usize = 0;
             for (adapter.outbound) |slot| count += @intFromBool(slot.active);
@@ -300,9 +314,14 @@ pub fn Adapter(comptime protocol: type) type {
             return count;
         }
 
-        pub fn flushOn(adapter: *Self, server_objects: anytype, queue: *wayring.tx.Queue) !usize {
+        pub fn flushOn(
+            adapter: *Self,
+            peer: wayring.io_uring.Peer,
+            server_objects: anytype,
+            queue: *wayring.tx.Queue,
+        ) !usize {
             var completed: usize = 0;
-            while (adapter.oldestOutbound()) |slot| {
+            while (adapter.oldestOutbound(peer)) |slot| {
                 adapter.emit(queue, slot.*) catch |err| switch (err) {
                     error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return completed,
                     else => return err,
@@ -310,14 +329,18 @@ pub fn Adapter(comptime protocol: type) type {
                 slot.active = false;
                 completed += 1;
             }
-            completed += try adapter.flushAssociations(server_objects, queue);
+            completed += try adapter.flushAssociations(peer, server_objects, queue);
             return completed;
         }
 
-        pub fn resourceIds(adapter: *const Self, output: []u32) ![]const u32 {
+        pub fn resourceIds(
+            adapter: *const Self,
+            peer: wayring.io_uring.Peer,
+            output: []u32,
+        ) ![]const u32 {
             var count: usize = 0;
             for (adapter.resources) |resource| {
-                if (!resource.active) continue;
+                if (!resource.active or !samePeer(resource.peer, peer)) continue;
                 if (count == output.len) return error.OutputTooSmall;
                 output[count] = resource.handle.id;
                 count += 1;
@@ -327,6 +350,7 @@ pub fn Adapter(comptime protocol: type) type {
 
         fn flushAssociations(
             adapter: *Self,
+            peer: wayring.io_uring.Peer,
             server_objects: anytype,
             queue: *wayring.tx.Queue,
         ) !usize {
@@ -334,7 +358,7 @@ pub fn Adapter(comptime protocol: type) type {
             var association_index: usize = 0;
             while (association_index < adapter.associations.len) : (association_index += 1) {
                 const association = &adapter.associations[association_index];
-                if (!association.active) continue;
+                if (!association.active or !samePeer(association.peer, peer)) continue;
                 const surface = server_objects.namespace.resolve(association.surface) orelse {
                     adapter.releaseAssociation(@intCast(association_index));
                     continue;
@@ -344,7 +368,7 @@ pub fn Adapter(comptime protocol: type) type {
                     continue;
                 }
                 for (adapter.resources, 0..) |resource, resource_index| {
-                    if (!resource.active) continue;
+                    if (!resource.active or !samePeer(resource.peer, peer)) continue;
                     const bit = @as(u64, 1) << @intCast(resource_index);
                     const entered = association.entered & bit != 0;
                     const should_enter = adapter.available and association.desired;
@@ -448,9 +472,14 @@ pub fn Adapter(comptime protocol: type) type {
             adapter.association_free = index;
         }
 
-        fn findAssociation(adapter: *Self, surface: objects.Handle) ?*Association {
+        fn findAssociation(
+            adapter: *Self,
+            peer: wayring.io_uring.Peer,
+            surface: objects.Handle,
+        ) ?*Association {
             for (adapter.associations) |*association|
-                if (association.active and std.meta.eql(association.surface, surface))
+                if (association.active and samePeer(association.peer, peer) and
+                    std.meta.eql(association.surface, surface))
                     return association;
             return null;
         }
@@ -480,10 +509,13 @@ pub fn Adapter(comptime protocol: type) type {
             return error.Exhausted;
         }
 
-        fn oldestOutbound(adapter: *Self) ?*Outbound {
+        fn oldestOutbound(adapter: *Self, peer: wayring.io_uring.Peer) ?*Outbound {
             var oldest: ?*Outbound = null;
             for (adapter.outbound) |*slot| {
-                if (slot.active and (oldest == null or slot.sequence < oldest.?.sequence))
+                if (!slot.active) continue;
+                const resource = adapter.resolve(slot.resource) catch continue;
+                if (samePeer(resource.peer, peer) and
+                    (oldest == null or slot.sequence < oldest.?.sequence))
                     oldest = slot;
             }
             return oldest;
@@ -522,4 +554,42 @@ pub fn Adapter(comptime protocol: type) type {
             return resource;
         }
     };
+}
+
+fn samePeer(a: wayring.io_uring.Peer, b: wayring.io_uring.Peer) bool {
+    return a.slot == b.slot and a.generation == b.generation;
+}
+
+test "output: resources and surface associations are peer scoped" {
+    const TestAdapter = Adapter(@import("core_protocol"));
+    var adapter = try TestAdapter.init(std.testing.allocator, .{
+        .resource_capacity = 2,
+        .association_capacity = 2,
+        .outbound_capacity = 18,
+    });
+    defer adapter.deinit();
+    const peer_a: wayring.io_uring.Peer = .{ .slot = 1, .generation = 4 };
+    const peer_b: wayring.io_uring.Peer = .{ .slot = 2, .generation = 7 };
+    const resource_a = try adapter.acquireResource();
+    adapter.resources[resource_a].peer = peer_a;
+    adapter.resources[resource_a].handle = .{ .id = 9, .generation = 2 };
+    const resource_b = try adapter.acquireResource();
+    adapter.resources[resource_b].peer = peer_b;
+    adapter.resources[resource_b].handle = .{ .id = 9, .generation = 3 };
+    try adapter.enqueue(adapter.idFor(resource_b), .geometry);
+    try adapter.enqueue(adapter.idFor(resource_a), .geometry);
+    try std.testing.expectEqual(adapter.idFor(resource_a), adapter.oldestOutbound(peer_a).?.resource);
+    try std.testing.expectEqual(adapter.idFor(resource_b), adapter.oldestOutbound(peer_b).?.resource);
+
+    var ids: [2]u32 = undefined;
+    try std.testing.expectEqualSlices(u32, &.{9}, try adapter.resourceIds(peer_a, &ids));
+    try std.testing.expectEqualSlices(u32, &.{9}, try adapter.resourceIds(peer_b, &ids));
+    const surface: objects.Handle = .{ .id = 12, .generation = 5 };
+    try adapter.reconcileSurfaces(peer_a, &.{surface});
+    try adapter.reconcileSurfaces(peer_b, &.{surface});
+    try std.testing.expect(adapter.findAssociation(peer_a, surface) != null);
+    try std.testing.expect(adapter.findAssociation(peer_b, surface) != null);
+    try adapter.reconcileSurfaces(peer_a, &.{});
+    try std.testing.expect(adapter.findAssociation(peer_a, surface) == null);
+    try std.testing.expect(adapter.findAssociation(peer_b, surface).?.desired);
 }

@@ -1026,7 +1026,7 @@ pub fn Coordinator(comptime protocol: type) type {
             const seat_flushed = try self.seat_adapter.flushOn(objects, &actor.transmit);
             const data_device_flushed = try self.data_device_adapter.flushOn(peer, objects, &actor.transmit);
             const fractional_scale_flushed = try self.fractional_scale_adapter.flushOn(objects, &actor.transmit);
-            const output_flushed = try self.output_adapter.flushOn(objects, &actor.transmit);
+            const output_flushed = try self.output_adapter.flushOn(peer, objects, &actor.transmit);
             const presentation_flushed = try self.adapter.flushPresentationClockOn(objects, &actor.transmit);
             const discarded_flushed = try self.adapter.flushDiscardedFeedbackOn(objects, &actor.transmit);
             if (shell_flushed != 0 or seat_flushed != 0 or data_device_flushed != 0 or fractional_scale_flushed != 0 or output_flushed != 0 or presentation_flushed != 0 or discarded_flushed != 0 or
@@ -1535,7 +1535,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 const objects = try self.root.runtime.clients.get(peer);
                 const actor = try self.root.runtime.clients.reactor.getActor(peer);
                 var output_storage: [64]u32 = undefined;
-                const output_resources = try self.output_adapter.resourceIds(&output_storage);
+                const output_resources = try self.output_adapter.resourceIds(peer, &output_storage);
                 _ = self.adapter.completePresentationFeedbackOn(
                     objects,
                     &actor.transmit,
@@ -1695,7 +1695,11 @@ pub fn Coordinator(comptime protocol: type) type {
                     return error.StaleSurface;
                 count += 1;
             }
-            try self.output_adapter.reconcileSurfaces(self.association_surfaces[0..count]);
+            const peer = self.peer orelse return;
+            try self.output_adapter.reconcileSurfaces(
+                peer,
+                self.association_surfaces[0..count],
+            );
         }
 
         fn consumeRetireAction(self: *Self, action: output_api.RetireAction) !void {
@@ -1795,6 +1799,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 object.interface.name,
                 "wl_surface",
             )) self.adapter.surfaceIdObject(handle, &object) catch null else null;
+            const removed_surface_peer = if (removed_surface_candidate) |id|
+                self.adapter.surfacePeer(id) catch null
+            else
+                null;
             var removed_surface: ?Adapter.SurfaceId = null;
             if (removed_surface_candidate) |id| {
                 if (self.adapter.surfaceHandle(id)) |_| {
@@ -1806,6 +1814,7 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.data_device_adapter.resourceRemoved(handle, object);
             _ = self.fractional_scale_adapter.resourceRemoved(handle, object);
             _ = self.output_adapter.resourceRemoved(handle, object);
+            if (removed_surface_peer) |peer| self.output_adapter.surfaceRemoved(peer, handle);
             if (removed_surface) |id| {
                 self.dropPendingSurface(id);
                 if (self.render_device) |render_device| render_device.content.destroySurface(
