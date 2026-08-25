@@ -173,7 +173,9 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
             first_cursor_destination = cursor.destination;
             two_layers_observed = true;
         }
-        if (coordinator.stats.presented == 2 and !motion_redraw_sent) {
+        if (coordinator.stats.presented == 2 and !motion_redraw_sent and
+            handler.drag_cancelled == 1 and input.cursor == input.event_count)
+        {
             try input.publish(&.{.{ .pointer_motion = .{
                 .device = 42,
                 .time_usec = 5_000,

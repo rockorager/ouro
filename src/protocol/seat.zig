@@ -813,11 +813,20 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         }
 
         pub fn popEvent(adapter: *Self) ?Event {
+            const value = adapter.peekEvent() orelse return null;
+            adapter.dropEvent();
+            return value;
+        }
+
+        pub fn peekEvent(adapter: *const Self) ?Event {
             if (adapter.event_len == 0) return null;
-            const value = adapter.events[adapter.event_head];
+            return adapter.events[adapter.event_head];
+        }
+
+        pub fn dropEvent(adapter: *Self) void {
+            std.debug.assert(adapter.event_len != 0);
             adapter.event_head = (adapter.event_head + 1) % adapter.events.len;
             adapter.event_len -= 1;
-            return value;
         }
 
         pub fn pendingOutbound(adapter: *const Self) usize {

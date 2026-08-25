@@ -1312,17 +1312,20 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn processSeatEvents(self: *Self) !void {
-            while (self.seat_adapter.popEvent()) |event| switch (event) {
-                .cursor_requested => |request_value| {
-                    self.interaction.cursorRequest(
-                        request_value.surface,
-                        .{ .x = request_value.hotspot.x, .y = request_value.hotspot.y },
-                    );
-                    try self.applyReady();
-                    try self.requestCursorRedraw();
-                },
-                .pointer_grab_cancelled => {},
-            };
+            while (self.seat_adapter.peekEvent()) |event| {
+                switch (event) {
+                    .cursor_requested => |request_value| {
+                        self.interaction.cursorRequest(
+                            request_value.surface,
+                            .{ .x = request_value.hotspot.x, .y = request_value.hotspot.y },
+                        );
+                        try self.applyReady();
+                        try self.requestCursorRedraw();
+                    },
+                    .pointer_grab_cancelled => try self.data_device_adapter.cancelDrag(),
+                }
+                self.seat_adapter.dropEvent();
+            }
         }
 
         fn requestCursorRedraw(self: *Self) !void {
