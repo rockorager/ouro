@@ -112,6 +112,11 @@ pub fn Adapter(comptime protocol: type) type {
             peer: wayring.io_uring.Peer = undefined,
             value: Outbound = undefined,
         };
+        const Drag = struct {
+            peer: wayring.io_uring.Peer,
+            source: ?Id,
+            origin_object: u32,
+        };
 
         allocator: std.mem.Allocator,
         runtime: ?*Runtime = null,
@@ -135,6 +140,7 @@ pub fn Adapter(comptime protocol: type) type {
         focus: ?wayring.io_uring.Peer = null,
         validator: ?SerialValidator = null,
         drag_validator: ?DragValidator = null,
+        drag: ?Drag = null,
 
         pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
             try config.validate();
@@ -336,14 +342,20 @@ pub fn Adapter(comptime protocol: type) type {
                         payload.serial,
                         payload.origin,
                     )) break :drag;
-                    const object_id = payload.source orelse break :drag;
-                    const source = self.sourceByObject(server_objects, object_id) orelse
-                        return try self.protocolError(actor, decoded.handle.id, Device.@"error".used_source.value, "invalid drag source");
-                    if (!std.meta.eql(source.peer, peer) or source.used)
-                        return try self.protocolError(actor, decoded.handle.id, Device.@"error".used_source.value, "data source was already used");
-                    self.enqueue(source.peer, .{ .source_cancelled = self.sourceId(source) }) catch
-                        return try self.noMemory(actor);
-                    source.used = true;
+                    if (self.drag != null) break :drag;
+                    const source_id: ?Id = if (payload.source) |object_id| source: {
+                        const source = self.sourceByObject(server_objects, object_id) orelse
+                            return try self.protocolError(actor, decoded.handle.id, Device.@"error".used_source.value, "invalid drag source");
+                        if (!std.meta.eql(source.peer, peer) or source.used)
+                            return try self.protocolError(actor, decoded.handle.id, Device.@"error".used_source.value, "data source was already used");
+                        source.used = true;
+                        break :source self.sourceId(source);
+                    } else null;
+                    self.drag = .{
+                        .peer = peer,
+                        .source = source_id,
+                        .origin_object = payload.origin,
+                    };
                 },
                 .set_selection => |payload| selection: {
                     const validator = self.validator orelse break :selection;
@@ -406,6 +418,19 @@ pub fn Adapter(comptime protocol: type) type {
             self.focus = focus;
             if (focus) |peer| for (self.devices) |*device| if (device.header.active and std.meta.eql(device.peer, peer))
                 self.enqueueSelection(device) catch unreachable;
+        }
+
+        pub fn dragActive(self: *const Self) bool {
+            return self.drag != null;
+        }
+
+        /// Ends an active drag which has no accepted destination. The source
+        /// cancellation remains retained until transport publication; an
+        /// internal drag with no source simply terminates.
+        pub fn cancelDrag(self: *Self) !void {
+            const drag = self.drag orelse return;
+            if (drag.source) |source| try self.enqueue(drag.peer, .{ .source_cancelled = source });
+            self.drag = null;
         }
 
         fn replaceSelection(self: *Self, next: ?Id, cancel_old: bool) !void {
@@ -525,6 +550,9 @@ pub fn Adapter(comptime protocol: type) type {
                 const id = self.sourceId(source);
                 if (self.selection) |selection| {
                     if (std.meta.eql(selection, id)) self.selection = null;
+                }
+                if (self.drag) |drag| {
+                    if (drag.source != null and std.meta.eql(drag.source.?, id)) self.drag = null;
                 }
                 self.dropSourceOutbound(id);
                 release(SourceSlot, self.sources, &self.source_free, id.index);

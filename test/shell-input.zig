@@ -97,6 +97,7 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     try fixture.signalSession(.enable);
     var input_sent = false;
     var key_sent = false;
+    var drag_release_sent = false;
     var motion_redraw_sent = false;
     var two_layers_observed = false;
     var first_cursor_destination: ?ouro.render.Rect = null;
@@ -142,6 +143,17 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
                 } },
             });
             key_sent = true;
+        }
+        if (key_sent and !drag_release_sent and coordinator.data_device_adapter.dragActive() and
+            input.cursor == input.event_count)
+        {
+            try input.publish(&.{.{ .pointer_button = .{
+                .device = 42,
+                .time_usec = 4_500,
+                .button = 0x110,
+                .pressed = false,
+            } }});
+            drag_release_sent = true;
         }
         if (coordinator.stats.submitted == 2 and !two_layers_observed) {
             const app = coordinator.app_layers[0].sample.?;
@@ -196,21 +208,21 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     try std.testing.expectEqual(@as(usize, 2), coordinator.stats.applied);
     try std.testing.expectEqual(@as(usize, 3), coordinator.stats.submitted);
     try std.testing.expectEqual(@as(usize, 3), coordinator.stats.presented);
-    try std.testing.expectEqual(@as(usize, 6), coordinator.stats.input_events);
-    try std.testing.expectEqual(@as(usize, 4), input.dispatch_count);
-    try std.testing.expectEqual(@as(usize, 10), input.next_count);
+    try std.testing.expectEqual(@as(usize, 7), coordinator.stats.input_events);
+    try std.testing.expectEqual(@as(usize, 5), input.dispatch_count);
+    try std.testing.expectEqual(@as(usize, 12), input.next_count);
     try std.testing.expect(handler.pointer_enter != 0);
     try std.testing.expect(handler.keyboard_enter != 0);
     try std.testing.expect(handler.pointer_motion != 0);
     try std.testing.expect(handler.pointer_button != 0);
     try std.testing.expect(handler.keyboard_key != 0);
     try std.testing.expectEqual(@as(usize, 2), handler.pointer_motion);
-    try std.testing.expectEqual(@as(usize, 1), handler.pointer_button);
+    try std.testing.expectEqual(@as(usize, 2), handler.pointer_button);
     try std.testing.expectEqual(@as(usize, 1), handler.drag_cancelled);
     try std.testing.expectEqual(@as(usize, 1), handler.pointer_axis_source);
     try std.testing.expectEqual(@as(usize, 1), handler.pointer_axis);
     try std.testing.expectEqual(@as(usize, 1), handler.pointer_axis_value120);
-    try std.testing.expectEqual(@as(usize, 4), handler.pointer_frame);
+    try std.testing.expectEqual(@as(usize, 5), handler.pointer_frame);
     try std.testing.expectEqual(@as(i32, 15 * 256), handler.pointer_axis_fixed);
     try std.testing.expectEqual(@as(i32, 120), handler.pointer_axis_value120_value);
     try std.testing.expectEqual(@as(usize, 1), handler.keyboard_key);

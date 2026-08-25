@@ -196,6 +196,7 @@ pub fn Coordinator(comptime protocol: type) type {
         input_interaction_accepted: bool = false,
         input_relative_accepted: bool = false,
         input_keyboard_consumed: bool = false,
+        input_seat_accepted: bool = false,
         input_delivery_prepared: bool = false,
         input_delivery_event: ?input_api.Event = null,
         manager: drm.Manager,
@@ -268,6 +269,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.input_interaction_accepted = false;
             self.input_relative_accepted = false;
             self.input_keyboard_consumed = false;
+            self.input_seat_accepted = false;
             self.input_delivery_prepared = false;
             self.input_delivery_event = null;
             self.render_device = null;
@@ -992,20 +994,30 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.relative_pointer_adapter.consume(event) catch return false;
                 self.input_relative_accepted = true;
             }
-            if (!self.input_keyboard_consumed) if (self.input_delivery_event) |delivery_event|
-                switch (delivery_event) {
-                    .pointer_motion => self.seat_adapter.consumePointerMotionAt(
-                        delivery_event,
-                        self.seat_adapter.pointerState().point,
-                    ),
-                    else => self.seat_adapter.consume(delivery_event),
-                } catch |err| switch (err) {
-                    error.Exhausted => return false,
-                    else => return err,
-                };
+            if (!self.input_seat_accepted) {
+                if (!self.input_keyboard_consumed) if (self.input_delivery_event) |delivery_event|
+                    switch (delivery_event) {
+                        .pointer_motion => self.seat_adapter.consumePointerMotionAt(
+                            delivery_event,
+                            self.seat_adapter.pointerState().point,
+                        ),
+                        else => self.seat_adapter.consume(delivery_event),
+                    } catch |err| switch (err) {
+                        error.Exhausted => return false,
+                        else => return err,
+                    };
+                self.input_seat_accepted = true;
+            }
+            switch (event) {
+                .pointer_button => |button| if (!button.pressed and
+                    self.seat_adapter.grabState() == .idle)
+                    self.data_device_adapter.cancelDrag() catch return false,
+                else => {},
+            }
             self.input_interaction_accepted = false;
             self.input_relative_accepted = false;
             self.input_keyboard_consumed = false;
+            self.input_seat_accepted = false;
             self.input_delivery_prepared = false;
             self.input_delivery_event = null;
             self.stats.input_events += 1;
