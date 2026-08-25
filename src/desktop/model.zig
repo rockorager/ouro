@@ -260,6 +260,21 @@ pub fn Desktop(comptime Shell: type) type {
             return changed;
         }
 
+        pub fn transactionPending(desktop: *const Self) bool {
+            for (desktop.slots) |slot| {
+                if (!slot.header.active or !slot.configured) continue;
+                if (slot.applied_configure == null or
+                    !std.meta.eql(slot.applied_configure.?, slot.last_configure)) return true;
+            }
+            return false;
+        }
+
+        pub fn expireTransaction(desktop: *Self) bool {
+            if (!desktop.transactionPending()) return false;
+            desktop.publishScene();
+            return true;
+        }
+
         pub fn focused(desktop: *const Self) ?ToplevelId {
             if (desktop.focus_len == 0) return null;
             return desktop.idFor(desktop.focus[0]);
@@ -597,6 +612,10 @@ pub fn Desktop(comptime Shell: type) type {
                     if (slot.expected_serial == null or !slot.configure_ready) return;
                 }
             }
+            desktop.publishScene();
+        }
+
+        fn publishScene(desktop: *Self) void {
             var changed = false;
             for (desktop.slots) |*slot| {
                 if (!slot.header.active) continue;
@@ -955,6 +974,38 @@ test "desktop: scene transaction waits for every exact configure serial" {
         (try desktop.scene(second)).geometry,
     );
     try std.testing.expect(desktop.takeSceneChanged());
+}
+
+test "desktop: expired transaction publishes latest target and ignores late readiness" {
+    var desktop = try initTestDesktop(8);
+    defer desktop.deinit();
+    var shell = TestShell{};
+    shell.push(created(0));
+    shell.push(created(1));
+    _ = try desktop.consume(&shell, 2);
+    while (desktop.pendingCommands() != 0) _ = try desktop.flushConfigure(&shell);
+
+    const first = try desktop.idForShell(.{ .index = 0, .generation = 1 });
+    const second = try desktop.idForShell(.{ .index = 1, .generation = 1 });
+    const first_serial = desktop.slots[try desktop.resolveIndex(first)].expected_serial.?;
+    const second_serial = desktop.slots[try desktop.resolveIndex(second)].expected_serial.?;
+    shell.push(.{ .commit_ready = .{
+        .id = .{ .index = 0, .generation = 1 },
+        .serial = first_serial,
+    } });
+    _ = try desktop.consume(&shell, 1);
+    try std.testing.expect(desktop.transactionPending());
+    try std.testing.expect(desktop.expireTransaction());
+    try std.testing.expect(!desktop.transactionPending());
+    try std.testing.expect(desktop.takeSceneChanged());
+    try std.testing.expectEqual(@as(i32, 50), (try desktop.scene(first)).geometry.width);
+
+    shell.push(.{ .commit_ready = .{
+        .id = .{ .index = 1, .generation = 1 },
+        .serial = second_serial,
+    } });
+    _ = try desktop.consume(&shell, 1);
+    try std.testing.expect(!desktop.takeSceneChanged());
 }
 
 test "desktop: focus history and tiled-floating transitions are deterministic" {

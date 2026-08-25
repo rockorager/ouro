@@ -87,6 +87,7 @@ pub fn Coordinator(comptime protocol: type) type {
         pub const Config = struct {
             router_capacity: usize,
             timer_capacity: usize,
+            desktop_transaction_timeout_ns: u64 = 250 * std.time.ns_per_ms,
             device_capacity: usize,
             seat: []const u8 = "seat0",
             input: input_api.Config = .{
@@ -143,6 +144,7 @@ pub fn Coordinator(comptime protocol: type) type {
             input_events: usize = 0,
             shell_events: usize = 0,
             configures: usize = 0,
+            transaction_timeouts: usize = 0,
             interaction_commands: usize = 0,
         };
 
@@ -151,6 +153,7 @@ pub fn Coordinator(comptime protocol: type) type {
         platforms: Platforms,
         output_config: output_api.Config,
         input_config: input_api.Config,
+        desktop_transaction_timeout_ns: u64,
         seat: [64]u8 = undefined,
         seat_len: u8,
         router: completion.Router,
@@ -182,6 +185,8 @@ pub fn Coordinator(comptime protocol: type) type {
         frame_samples: []render_list.AppliedSurface,
         frame_bindings: []output_api.SampleBinding,
         frame_changes: []damage.Change,
+        desktop_timer: ?timer.Handle = null,
+        desktop_timer_canceling: bool = false,
         cursor_layer: Layer,
         output_drain_started: bool = false,
         stopping: bool = false,
@@ -202,6 +207,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.root = root;
             self.platforms = platforms;
             self.output_config = config.output;
+            self.desktop_transaction_timeout_ns = config.desktop_transaction_timeout_ns;
             if (config.seat.len == 0 or config.seat.len > self.seat.len)
                 return error.InvalidSeat;
             self.input_config = config.input;
@@ -221,7 +227,8 @@ pub fn Coordinator(comptime protocol: type) type {
             errdefer allocator.free(self.pending_surfaces);
             self.pending_surface_head = 0;
             self.pending_surface_len = 0;
-            if (config.output.max_samples < 2 or config.output.max_source_bytes == 0)
+            if (config.timer_capacity < 4 or config.desktop_transaction_timeout_ns == 0 or
+                config.output.max_samples < 2 or config.output.max_source_bytes == 0)
                 return error.InvalidConfig;
             self.app_layers = try allocator.alloc(Layer, config.output.max_samples - 1);
             errdefer allocator.free(self.app_layers);
@@ -234,6 +241,8 @@ pub fn Coordinator(comptime protocol: type) type {
             errdefer allocator.free(self.frame_bindings);
             self.frame_changes = try allocator.alloc(damage.Change, config.output.max_samples);
             errdefer allocator.free(self.frame_changes);
+            self.desktop_timer = null;
+            self.desktop_timer_canceling = false;
             self.cursor_layer = .{};
             self.output_drain_started = false;
             self.stopping = false;
@@ -324,6 +333,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.stopping = true;
                 if (self.loop) |value| try value.requestShutdown();
             }
+            try self.syncDesktopTimer();
             try self.pauseOutput();
             try self.advanceDrain();
         }
@@ -331,7 +341,7 @@ pub fn Coordinator(comptime protocol: type) type {
         pub fn backendDrainComplete(self: *const Self) bool {
             return self.stopping and self.output == null and
                 (self.input == null or self.input.?.drainComplete()) and
-                self.session.drainComplete();
+                self.session.drainComplete() and self.timers.idle();
         }
 
         /// Requires completed Wayring and backend drains. Teardown order is
@@ -481,14 +491,20 @@ pub fn Coordinator(comptime protocol: type) type {
                 },
                 else => return error.UnexpectedCompletion,
             };
-            for (timer_outcomes) |outcome| if (self.output) |output| {
-                const request_value = try output.timerEvent(
-                    outcome.handle,
-                    outcome.event,
-                    try monotonicNs(),
-                ) orelse continue;
-                try self.renderFrame(request_value.frame);
-            };
+            for (timer_outcomes) |outcome| {
+                if (self.desktop_timer) |handle| if (std.meta.eql(handle, outcome.handle)) {
+                    try self.desktopTimerEvent(outcome.event);
+                    continue;
+                };
+                if (self.output) |output| {
+                    const request_value = try output.timerEvent(
+                        outcome.handle,
+                        outcome.event,
+                        try monotonicNs(),
+                    ) orelse continue;
+                    try self.renderFrame(request_value.frame);
+                }
+            }
             try self.processSession();
             try self.processOutput();
             try self.armTimer();
@@ -743,11 +759,50 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             while (self.desktop.pendingCommands() != 0) {
                 if (self.desktop.flushConfigure(&self.shell_adapter) catch |err| switch (err) {
-                    error.Exhausted => return,
+                    error.Exhausted => break,
                     else => return err,
                 }) |_| self.stats.configures += 1;
             }
+            try self.syncDesktopTimer();
             if (self.desktop.takeSceneChanged()) try self.desktopSceneChanged();
+        }
+
+        fn syncDesktopTimer(self: *Self) !void {
+            const pending = self.desktop.transactionPending() and
+                self.desktop.pendingCommands() == 0 and !self.stopping;
+            if (pending) {
+                if (self.desktop_timer == null) {
+                    const now = try monotonicNs();
+                    const deadline_ns = std.math.add(
+                        u64,
+                        now,
+                        self.desktop_transaction_timeout_ns,
+                    ) catch return error.InvalidDeadline;
+                    self.desktop_timer = try self.timers.arm(
+                        &self.router,
+                        &self.root.ring,
+                        try deadlineFromNs(deadline_ns),
+                    );
+                    self.desktop_timer_canceling = false;
+                }
+                return;
+            }
+            if (self.desktop_timer) |handle| if (!self.desktop_timer_canceling) {
+                try self.timers.cancel(&self.router, &self.root.ring, handle);
+                self.desktop_timer_canceling = true;
+            };
+        }
+
+        fn desktopTimerEvent(self: *Self, event: timer.Event) !void {
+            if (event == .pending_cleanup or event == .cleanup_complete) return;
+            const was_canceling = self.desktop_timer_canceling;
+            self.desktop_timer = null;
+            self.desktop_timer_canceling = false;
+            if (event == .fired and !was_canceling and self.desktop.expireTransaction()) {
+                self.stats.transaction_timeouts += 1;
+                if (self.desktop.takeSceneChanged()) try self.desktopSceneChanged();
+            }
+            try self.syncDesktopTimer();
         }
 
         fn desktopSceneChanged(self: *Self) !void {
@@ -1717,6 +1772,15 @@ fn monotonicNs() !u64 {
         try std.math.mul(u64, @intCast(now.sec), std.time.ns_per_s),
         @intCast(now.nsec),
     );
+}
+
+fn deadlineFromNs(ns: u64) !timer.Deadline {
+    const seconds = ns / std.time.ns_per_s;
+    if (seconds > std.math.maxInt(i64)) return error.InvalidDeadline;
+    return .{
+        .sec = @intCast(seconds),
+        .nsec = @intCast(ns % std.time.ns_per_s),
+    };
 }
 
 test "seat: physical input batch retries only the failed suffix" {

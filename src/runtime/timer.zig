@@ -83,6 +83,10 @@ pub const Timers = struct {
         return timers.free_count;
     }
 
+    pub fn idle(timers: Timers) bool {
+        return timers.active_count == 0;
+    }
+
     /// Prepares, but does not submit, an absolute CLOCK_MONOTONIC timeout.
     /// The deadline and operation state live in fixed storage until the
     /// timeout's terminal CQE, including when cancellation races expiration.
