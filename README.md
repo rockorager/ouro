@@ -32,6 +32,9 @@ responsibilities:
   registry slots retain importer-specific backing from attachment through
   content-update application and presentation without putting SHM state in
   semantic surfaces.
+- [Linux DMA-BUF](src/protocol/linux_dmabuf.zig): bounded parameter and buffer
+  resources retain imported plane descriptors and GBM leases through the
+  existing immutable content-copy and release lifecycle.
 - [Presentation lifetime](src/presentation.zig): imported handles, source
   leases, and per-commit release callbacks remain together until successful
   presentation completion or explicit output teardown.
@@ -68,6 +71,10 @@ responsibilities:
   positioner state, receive exact initial and reposition configure transactions,
   validate explicit grabs against exact seat/user-action serials, and compose
   above their owning toplevel with flip, slide, and resize constraint adjustment.
+- [XDG activation](src/protocol/xdg_activation.zig): bounded opaque tokens
+  require the exact focused surface and latest user-action serial, remain valid
+  across launcher/client boundaries, and activate a target toplevel exactly
+  once through the normal desktop and keyboard-focus policy boundary.
 - [Desktop interaction](src/input/interaction.zig): pointer motion hit-tests
   exact committed input regions against the copied desktop scene, retains
   default, button-grab, popup-grab, and validated interactive move/resize state
