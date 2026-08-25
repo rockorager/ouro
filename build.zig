@@ -16,6 +16,7 @@ pub fn build(b: *std.Build) void {
     generate_core_protocol.addFileArg(wayland.path("protocol/wayland.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("stable/viewporter/viewporter.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("stable/presentation-time/presentation-time.xml"));
+    generate_core_protocol.addFileArg(wayland_protocols.path("stable/linux-dmabuf/linux-dmabuf-v1.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("staging/fractional-scale/fractional-scale-v1.xml"));
     const generated_core_protocol = generate_core_protocol.addOutputFileArg("wayland-core.zig");
     const core_protocol = b.createModule(.{
@@ -29,6 +30,7 @@ pub fn build(b: *std.Build) void {
     generate_xdg_protocol.addFileArg(wayland_protocols.path("stable/xdg-shell/xdg-shell.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("stable/viewporter/viewporter.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("stable/presentation-time/presentation-time.xml"));
+    generate_xdg_protocol.addFileArg(wayland_protocols.path("stable/linux-dmabuf/linux-dmabuf-v1.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("staging/fractional-scale/fractional-scale-v1.xml"));
     const generated_xdg_protocol = generate_xdg_protocol.addOutputFileArg("wayland-xdg-shell.zig");
     const xdg_protocol = b.createModule(.{
