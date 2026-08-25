@@ -10,9 +10,11 @@ pub fn build(b: *std.Build) void {
     const wayring = wayring_dependency.module("wayring");
 
     const wayland = b.dependency("wayland", .{});
+    const wayland_protocols = b.dependency("wayland_protocols", .{});
     const scanner = wayring_dependency.artifact("wayring-scanner");
     const generate_core_protocol = b.addRunArtifact(scanner);
     generate_core_protocol.addFileArg(wayland.path("protocol/wayland.xml"));
+    generate_core_protocol.addFileArg(wayland_protocols.path("stable/viewporter/viewporter.xml"));
     const generated_core_protocol = generate_core_protocol.addOutputFileArg("wayland-core.zig");
     const core_protocol = b.createModule(.{
         .root_source_file = generated_core_protocol,
@@ -20,11 +22,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{.{ .name = "wayring", .module = wayring }},
     });
-
-    const wayland_protocols = b.dependency("wayland_protocols", .{});
     const generate_xdg_protocol = b.addRunArtifact(scanner);
     generate_xdg_protocol.addFileArg(wayland.path("protocol/wayland.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("stable/xdg-shell/xdg-shell.xml"));
+    generate_xdg_protocol.addFileArg(wayland_protocols.path("stable/viewporter/viewporter.xml"));
     const generated_xdg_protocol = generate_xdg_protocol.addOutputFileArg("wayland-xdg-shell.zig");
     const xdg_protocol = b.createModule(.{
         .root_source_file = generated_xdg_protocol,

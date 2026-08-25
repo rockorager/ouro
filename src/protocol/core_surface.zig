@@ -15,6 +15,7 @@ const none = std.math.maxInt(u32);
 pub const Config = struct {
     surface_capacity: usize,
     region_capacity: usize,
+    viewport_capacity: usize = 8,
     region_operation_capacity: usize,
     frame_callback_capacity: usize,
     release_callback_capacity: usize,
@@ -28,6 +29,7 @@ pub const Config = struct {
     fn validate(config: Config) !void {
         if (config.surface_capacity == 0 or config.surface_capacity >= none or
             config.region_capacity == 0 or config.region_capacity >= none or
+            config.viewport_capacity == 0 or config.viewport_capacity >= none or
             config.attachment_capacity == 0 or config.copy_capacity == 0 or
             config.copy_capacity >= none or config.max_copy_bytes == 0)
             return error.InvalidConfig;
@@ -47,6 +49,8 @@ pub fn Adapter(comptime protocol: type) type {
         const Compositor = protocol.wl_compositor;
         const SurfaceInterface = protocol.wl_surface;
         const RegionInterface = protocol.wl_region;
+        const Viewporter = protocol.wp_viewporter;
+        const ViewportInterface = protocol.wp_viewport;
         const Commit = surface_state.CommitState(objects.Handle);
 
         pub const Applied = Commit.Scheduler.Applied;
@@ -113,6 +117,7 @@ pub fn Adapter(comptime protocol: type) type {
             releases: surface_state.ReleaseQueue = undefined,
             attachment: surface_state.AttachmentLeaseState = .{},
             updates: Commit.Scheduler.Queue = undefined,
+            viewport_resource: ?objects.Handle = null,
         };
 
         const RegionSlot = struct {
@@ -122,17 +127,27 @@ pub fn Adapter(comptime protocol: type) type {
             region: surface_state.Region = undefined,
         };
 
+        const ViewportSlot = struct {
+            active: bool = false,
+            next_free: u32 = none,
+            resource: objects.Handle = .{ .id = 0, .generation = 0 },
+            surface: SurfaceId = .{ .index = 0, .generation = 0 },
+        };
+
         allocator: std.mem.Allocator,
         shm: *Shm,
         ring: *std.os.linux.IoUring,
         router: *completion.Router,
         runtime: ?*Runtime = null,
         global: ?objects.Handle = null,
+        viewporter_global: ?objects.Handle = null,
         compositor_version: u32,
         surfaces: []SurfaceSlot,
         regions: []RegionSlot,
+        viewports: []ViewportSlot,
         surface_free: u32,
         region_free: u32,
+        viewport_free: u32,
         region_pool: surface_state.RegionPool,
         frame_pool: surface_state.FramePool,
         release_pool: surface_state.ReleasePool,
@@ -157,6 +172,8 @@ pub fn Adapter(comptime protocol: type) type {
             errdefer allocator.free(surfaces);
             const regions = try allocator.alloc(RegionSlot, config.region_capacity);
             errdefer allocator.free(regions);
+            const viewports = try allocator.alloc(ViewportSlot, config.viewport_capacity);
+            errdefer allocator.free(viewports);
             var region_pool = try surface_state.RegionPool.init(
                 allocator,
                 config.region_operation_capacity,
@@ -201,6 +218,9 @@ pub fn Adapter(comptime protocol: type) type {
             for (regions, 0..) |*slot, index| slot.* = .{
                 .next_free = if (index + 1 < regions.len) @intCast(index + 1) else none,
             };
+            for (viewports, 0..) |*slot, index| slot.* = .{
+                .next_free = if (index + 1 < viewports.len) @intCast(index + 1) else none,
+            };
             for (copies, 0..) |*slot, index| slot.* = .{
                 .destination = copy_storage[index * config.max_copy_bytes .. (index + 1) * config.max_copy_bytes],
             };
@@ -212,8 +232,10 @@ pub fn Adapter(comptime protocol: type) type {
                 .compositor_version = config.compositor_version,
                 .surfaces = surfaces,
                 .regions = regions,
+                .viewports = viewports,
                 .surface_free = 0,
                 .region_free = 0,
+                .viewport_free = 0,
                 .region_pool = region_pool,
                 .frame_pool = frame_pool,
                 .release_pool = release_pool,
@@ -232,6 +254,9 @@ pub fn Adapter(comptime protocol: type) type {
             for (adapter.regions, 0..) |slot, index| {
                 if (slot.active) adapter.releaseRegion(@intCast(index));
             }
+            for (adapter.viewports, 0..) |slot, index| {
+                if (slot.active) adapter.releaseViewport(@intCast(index));
+            }
             for (adapter.copies) |slot| std.debug.assert(!slot.active or
                 (!slot.owner_alive and slot.state != .pending));
             adapter.imports.deinit(adapter.allocator);
@@ -241,6 +266,7 @@ pub fn Adapter(comptime protocol: type) type {
             adapter.region_pool.deinit(adapter.allocator);
             adapter.allocator.free(adapter.regions);
             adapter.allocator.free(adapter.surfaces);
+            adapter.allocator.free(adapter.viewports);
             adapter.allocator.free(adapter.copy_storage);
             adapter.allocator.free(adapter.copies);
             adapter.* = undefined;
@@ -259,6 +285,22 @@ pub fn Adapter(comptime protocol: type) type {
                 bind,
             );
             adapter.global = global;
+            return global;
+        }
+
+        /// Publishes wp_viewporter after the compositor global's registry
+        /// update has completed. Runtime permits only one active global-table
+        /// mutation, so the composition root installs these in separate turns.
+        pub fn installViewporter(adapter: *Self) !objects.Handle {
+            const runtime = adapter.runtime orelse return error.NotInstalled;
+            if (adapter.viewporter_global != null) return error.AlreadyInstalled;
+            const global = try runtime.addGlobalWithBinder(
+                &Viewporter.info,
+                1,
+                adapter,
+                bind,
+            );
+            adapter.viewporter_global = global;
             return global;
         }
 
@@ -300,6 +342,14 @@ pub fn Adapter(comptime protocol: type) type {
                 const slot = adapter.regionFromObject(target.object) orelse return null;
                 return try adapter.regionRequest(actor, server_objects, slot, message, fds);
             }
+            if (interface == &Viewporter.info) {
+                if (target.object.context != @as(?*anyopaque, @ptrCast(adapter))) return null;
+                return try adapter.viewporterRequest(actor, server_objects, message, fds);
+            }
+            if (interface == &ViewportInterface.info) {
+                const slot = adapter.viewportFromObject(target.object) orelse return null;
+                return try adapter.viewportRequest(actor, server_objects, slot, message, fds);
+            }
             return null;
         }
 
@@ -323,7 +373,13 @@ pub fn Adapter(comptime protocol: type) type {
                 adapter.releaseRegion(adapter.regionIndex(slot));
                 return true;
             }
-            return object.interface == &Compositor.info and
+            if (object.interface == &ViewportInterface.info) {
+                const slot = adapter.viewportFromObject(&object) orelse return false;
+                if (!std.meta.eql(slot.resource, handle)) return false;
+                adapter.releaseViewport(adapter.viewportIndex(slot));
+                return true;
+            }
+            return (object.interface == &Compositor.info or object.interface == &Viewporter.info) and
                 object.context == @as(?*anyopaque, @ptrCast(adapter));
         }
 
@@ -702,11 +758,7 @@ pub fn Adapter(comptime protocol: type) type {
                         .desync,
                         &.{},
                         if (pending_copy == null) 0 else 1,
-                    ) catch |cause| return try adapter.surfaceFailure(
-                        actor,
-                        resource.id,
-                        cause,
-                    );
+                    ) catch |cause| return try adapter.surfaceCommitFailure(actor, slot, cause);
                     if (pending_copy) |copy_slot| copy_slot.update = token;
                     if (adapter.commit_hook) |hook|
                         hook.committed_fn(hook.context, surface_id) catch |cause|
@@ -780,6 +832,107 @@ pub fn Adapter(comptime protocol: type) type {
                     decoded.handle.id,
                     cause,
                 ),
+            }
+            try decoded.finish(protocol, server_objects, &actor.transmit);
+            return .continue_dispatch;
+        }
+
+        fn viewporterRequest(
+            adapter: *Self,
+            actor: *wayring.connection.Actor,
+            server_objects: anytype,
+            message: wayring.wire.Message,
+            fds: *wayring.ancillary.FdQueue,
+        ) !wayring.dispatch.Control {
+            const decoded = try wayring.server.decodeRequest(Viewporter, server_objects, message, fds);
+            switch (decoded.value) {
+                .destroy => {},
+                .get_viewport => |value| {
+                    const surface_handle = server_objects.namespace.lookupHandle(value.surface) orelse
+                        return try adapter.protocolError(
+                            actor,
+                            decoded.handle.id,
+                            Viewporter.@"error".viewport_exists.value,
+                            "invalid viewport surface",
+                        );
+                    const surface_object = server_objects.namespace.resolve(surface_handle) orelse
+                        return try adapter.protocolError(
+                            actor,
+                            decoded.handle.id,
+                            Viewporter.@"error".viewport_exists.value,
+                            "invalid viewport surface",
+                        );
+                    const surface = adapter.surfaceFromObject(surface_object) orelse
+                        return try adapter.protocolError(
+                            actor,
+                            decoded.handle.id,
+                            Viewporter.@"error".viewport_exists.value,
+                            "invalid viewport surface",
+                        );
+                    if (!std.meta.eql(surface.resource, surface_handle))
+                        return try adapter.protocolError(
+                            actor,
+                            decoded.handle.id,
+                            Viewporter.@"error".viewport_exists.value,
+                            "invalid viewport surface",
+                        );
+                    if (surface.viewport_resource != null)
+                        return try adapter.protocolError(
+                            actor,
+                            decoded.handle.id,
+                            Viewporter.@"error".viewport_exists.value,
+                            "viewport already exists",
+                        );
+                    const slot = adapter.acquireViewport() catch
+                        return try adapter.noMemory(actor);
+                    const admitted = Viewporter.admit_get_viewport(
+                        server_objects,
+                        decoded.handle,
+                        value,
+                        .{ .id = slot },
+                    ) catch |cause| {
+                        adapter.releaseViewport(adapter.viewportIndex(slot));
+                        return try adapter.failure(actor, decoded.handle.id, cause);
+                    };
+                    slot.resource = admitted.id;
+                    slot.surface = .{
+                        .index = adapter.surfaceIndex(surface),
+                        .generation = surface.resource.generation,
+                    };
+                    surface.viewport_resource = admitted.id;
+                },
+            }
+            try decoded.finish(protocol, server_objects, &actor.transmit);
+            return .continue_dispatch;
+        }
+
+        fn viewportRequest(
+            adapter: *Self,
+            actor: *wayring.connection.Actor,
+            server_objects: anytype,
+            slot: *ViewportSlot,
+            message: wayring.wire.Message,
+            fds: *wayring.ancillary.FdQueue,
+        ) !wayring.dispatch.Control {
+            const decoded = try wayring.server.decodeRequest(ViewportInterface, server_objects, message, fds);
+            switch (decoded.value) {
+                .destroy => adapter.clearViewport(slot),
+                .set_source => |value| {
+                    const surface = adapter.viewportSurface(slot) catch
+                        return try adapter.viewportFailure(actor, decoded.handle.id, error.StaleSurface);
+                    surface.state.viewport.setSource(
+                        value.x,
+                        value.y,
+                        value.width,
+                        value.height,
+                    ) catch |cause| return try adapter.viewportFailure(actor, decoded.handle.id, cause);
+                },
+                .set_destination => |value| {
+                    const surface = adapter.viewportSurface(slot) catch
+                        return try adapter.viewportFailure(actor, decoded.handle.id, error.StaleSurface);
+                    surface.state.viewport.setDestination(value.width, value.height) catch |cause|
+                        return try adapter.viewportFailure(actor, decoded.handle.id, cause);
+                },
             }
             try decoded.finish(protocol, server_objects, &actor.transmit);
             return .continue_dispatch;
@@ -914,6 +1067,40 @@ pub fn Adapter(comptime protocol: type) type {
             adapter.region_free = index;
         }
 
+        fn acquireViewport(adapter: *Self) !*ViewportSlot {
+            if (adapter.viewport_free == none) return error.Exhausted;
+            const index = adapter.viewport_free;
+            const slot = &adapter.viewports[index];
+            adapter.viewport_free = slot.next_free;
+            slot.* = .{ .active = true };
+            return slot;
+        }
+
+        fn releaseViewport(adapter: *Self, index: u32) void {
+            const slot = &adapter.viewports[index];
+            if (!slot.active) return;
+            adapter.clearViewport(slot);
+            slot.* = .{ .next_free = adapter.viewport_free };
+            adapter.viewport_free = index;
+        }
+
+        fn clearViewport(adapter: *Self, slot: *ViewportSlot) void {
+            const surface = adapter.viewportSurface(slot) catch return;
+            if (surface.viewport_resource) |resource| {
+                if (!std.meta.eql(resource, slot.resource)) return;
+                surface.state.viewport.clear();
+                surface.viewport_resource = null;
+            }
+        }
+
+        fn viewportSurface(adapter: *Self, slot: *const ViewportSlot) !*SurfaceSlot {
+            if (slot.surface.index >= adapter.surfaces.len) return error.StaleSurface;
+            const surface = &adapter.surfaces[slot.surface.index];
+            if (!surface.active or surface.resource.generation != slot.surface.generation)
+                return error.StaleSurface;
+            return surface;
+        }
+
         fn resolveSurface(adapter: *Self, handle: objects.Handle) !*SurfaceSlot {
             for (adapter.surfaces) |*slot| {
                 if (slot.active and std.meta.eql(slot.resource, handle)) return slot;
@@ -1012,6 +1199,10 @@ pub fn Adapter(comptime protocol: type) type {
             return bindingFromContext(RegionSlot, adapter.regions, object.context);
         }
 
+        fn viewportFromObject(adapter: *Self, object: *const objects.Object) ?*ViewportSlot {
+            return bindingFromContext(ViewportSlot, adapter.viewports, object.context);
+        }
+
         fn surfaceIndex(adapter: *Self, slot: *SurfaceSlot) u32 {
             return @intCast((@intFromPtr(slot) - @intFromPtr(adapter.surfaces.ptr)) /
                 @sizeOf(SurfaceSlot));
@@ -1020,6 +1211,11 @@ pub fn Adapter(comptime protocol: type) type {
         fn regionIndex(adapter: *Self, slot: *RegionSlot) u32 {
             return @intCast((@intFromPtr(slot) - @intFromPtr(adapter.regions.ptr)) /
                 @sizeOf(RegionSlot));
+        }
+
+        fn viewportIndex(adapter: *Self, slot: *ViewportSlot) u32 {
+            return @intCast((@intFromPtr(slot) - @intFromPtr(adapter.viewports.ptr)) /
+                @sizeOf(ViewportSlot));
         }
 
         fn bindingFromContext(
@@ -1136,6 +1332,54 @@ pub fn Adapter(comptime protocol: type) type {
             };
         }
 
+        fn surfaceCommitFailure(
+            adapter: *Self,
+            actor: *wayring.connection.Actor,
+            surface: *SurfaceSlot,
+            cause: anyerror,
+        ) !wayring.dispatch.Control {
+            if (surface.viewport_resource) |resource| switch (cause) {
+                error.InvalidValue, error.InvalidSize, error.OutOfBuffer => return adapter.viewportFailure(actor, resource.id, cause),
+                else => {},
+            };
+            return adapter.surfaceFailure(actor, surface.resource.id, cause);
+        }
+
+        fn viewportFailure(
+            adapter: *Self,
+            actor: *wayring.connection.Actor,
+            object_id: u32,
+            cause: anyerror,
+        ) !wayring.dispatch.Control {
+            return switch (cause) {
+                error.InvalidValue => adapter.protocolError(
+                    actor,
+                    object_id,
+                    ViewportInterface.@"error".bad_value.value,
+                    "invalid viewport value",
+                ),
+                error.InvalidSize => adapter.protocolError(
+                    actor,
+                    object_id,
+                    ViewportInterface.@"error".bad_size.value,
+                    "non-integral viewport source size",
+                ),
+                error.OutOfBuffer => adapter.protocolError(
+                    actor,
+                    object_id,
+                    ViewportInterface.@"error".out_of_buffer.value,
+                    "viewport source exceeds buffer",
+                ),
+                error.StaleSurface => adapter.protocolError(
+                    actor,
+                    object_id,
+                    ViewportInterface.@"error".no_surface.value,
+                    "viewport surface no longer exists",
+                ),
+                else => adapter.protocolError(actor, object_id, 0, "invalid viewport request"),
+            };
+        }
+
         fn regionFailure(
             adapter: *Self,
             actor: *wayring.connection.Actor,
@@ -1186,6 +1430,7 @@ const TestContext = struct {
     router: completion.Router,
     adapter: TestAdapter,
     compositor: objects.Handle,
+    viewporter: objects.Handle,
     shm_resource: objects.Handle,
 
     fn init() !*TestContext {
@@ -1242,6 +1487,7 @@ const TestContext = struct {
         context.adapter = try TestAdapter.init(std.testing.allocator, &context.shm, &context.ring, &context.router, .{
             .surface_capacity = 2,
             .region_capacity = 2,
+            .viewport_capacity = 2,
             .region_operation_capacity = 16,
             .frame_callback_capacity = 4,
             .release_callback_capacity = 4,
@@ -1260,6 +1506,12 @@ const TestContext = struct {
             2,
             &test_protocol.wl_compositor.info,
             7,
+            &context.adapter,
+        );
+        context.viewporter = try context.server_objects.insertClient(
+            4,
+            &test_protocol.wp_viewporter.info,
+            1,
             &context.adapter,
         );
         context.shm_resource = try context.server_objects.insertClient(
@@ -1312,6 +1564,20 @@ const TestContext = struct {
         );
         return context.server_objects.namespace.lookupHandle(id) orelse
             error.MissingRegion;
+    }
+
+    fn createViewport(context: *TestContext, surface: objects.Handle, id: u32) !objects.Handle {
+        try test_protocol.wp_viewporter.encodeRequest(
+            &context.requests,
+            context.viewporter.id,
+            .{ .get_viewport = .{ .id = id, .surface = surface.id } },
+        );
+        try std.testing.expectEqual(
+            wayring.dispatch.Control.continue_dispatch,
+            try context.dispatchCore(),
+        );
+        return context.server_objects.namespace.lookupHandle(id) orelse
+            error.MissingViewport;
     }
 
     fn createShmBuffer(context: *TestContext, pool_id: u32, buffer_id: u32) !objects.Handle {
@@ -1463,6 +1729,129 @@ fn testMemfd(size: usize) !linux.fd_t {
     if (size >= payload.len and linux.write(fd, &payload, payload.len) != payload.len)
         return error.SystemCallFailed;
     return fd;
+}
+
+test "viewporter: generated requests publish and clear double-buffered crop state" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const surface = try context.createSurface(10);
+    const viewport = try context.createViewport(surface, 11);
+    const buffer = try context.createShmBuffer(12, 13);
+
+    try test_protocol.wl_surface.encodeRequest(&context.requests, surface.id, .{
+        .attach = .{ .buffer = buffer.id, .x = 0, .y = 0 },
+    });
+    _ = try context.dispatchCore();
+    try context.completeNextCopy();
+    try test_protocol.wp_viewport.encodeRequest(&context.requests, viewport.id, .{
+        .set_source = .{ .x = 256, .y = 0, .width = 512, .height = 256 },
+    });
+    _ = try context.dispatchCore();
+    try test_protocol.wp_viewport.encodeRequest(&context.requests, viewport.id, .{
+        .set_destination = .{ .width = 2, .height = 1 },
+    });
+    _ = try context.dispatchCore();
+    try test_protocol.wl_surface.encodeRequest(&context.requests, surface.id, .{ .commit = .{} });
+    _ = try context.dispatchCore();
+    const state = try context.adapter.getSurface(surface);
+    try std.testing.expectEqual(
+        @import("../viewport.zig").Size{ .width = 2, .height = 1 },
+        state.viewport.current.destination().?,
+    );
+
+    try test_protocol.wp_viewport.encodeRequest(&context.requests, viewport.id, .{ .destroy = .{} });
+    _ = try context.dispatchCore();
+    try std.testing.expectEqual(@import("../viewport.zig").State{}, state.viewport.pending);
+    try test_protocol.wl_surface.encodeRequest(&context.requests, surface.id, .{ .commit = .{} });
+    _ = try context.dispatchCore();
+    try std.testing.expectEqual(@import("../viewport.zig").State{}, state.viewport.current);
+    _ = try context.createViewport(surface, 14);
+}
+
+test "viewporter: duplicate viewport is rejected without publishing an object" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const surface = try context.createSurface(10);
+    _ = try context.createViewport(surface, 11);
+
+    try test_protocol.wp_viewporter.encodeRequest(&context.requests, context.viewporter.id, .{
+        .get_viewport = .{ .id = 12, .surface = surface.id },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.stop, try context.dispatchCore());
+    try std.testing.expect(context.server_objects.namespace.get(12) == null);
+}
+
+test "viewporter: commit validation errors target the viewport object" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const surface = try context.createSurface(10);
+    const viewport = try context.createViewport(surface, 11);
+    const buffer = try context.createShmBuffer(12, 13);
+
+    try test_protocol.wl_surface.encodeRequest(&context.requests, surface.id, .{
+        .attach = .{ .buffer = buffer.id, .x = 0, .y = 0 },
+    });
+    _ = try context.dispatchCore();
+    try context.completeNextCopy();
+    try test_protocol.wp_viewport.encodeRequest(&context.requests, viewport.id, .{
+        .set_source = .{ .x = 0, .y = 0, .width = 257, .height = 256 },
+    });
+    _ = try context.dispatchCore();
+    try test_protocol.wl_surface.encodeRequest(&context.requests, surface.id, .{ .commit = .{} });
+    try std.testing.expectEqual(wayring.dispatch.Control.stop, try context.dispatchCore());
+
+    var descriptor_scratch: [1]linux.fd_t = undefined;
+    var control: [64]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+    const snapshot = try context.actor.transmit.snapshot(&descriptor_scratch, &control);
+    const message = (try wayring.wire.Message.decode(snapshot.first)).?;
+    const event = try TestCore.Display.decodeEvent(message, &context.received_fds);
+    switch (event) {
+        .@"error" => |value| {
+            try std.testing.expectEqual(viewport.id, value.object_id);
+            try std.testing.expectEqual(
+                test_protocol.wp_viewport.@"error".bad_size.value,
+                value.code,
+            );
+        },
+        else => return error.ExpectedProtocolError,
+    }
+}
+
+test "viewporter: requests after wl_surface destruction report no_surface" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const surface = try context.createSurface(10);
+    const viewport = try context.createViewport(surface, 11);
+
+    try test_protocol.wl_surface.encodeRequest(&context.requests, surface.id, .{ .destroy = .{} });
+    _ = try context.dispatchCore();
+    {
+        var descriptor_scratch: [1]linux.fd_t = undefined;
+        var control: [64]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+        const snapshot = try context.actor.transmit.snapshot(&descriptor_scratch, &control);
+        try context.actor.transmit.begin(snapshot);
+        try context.actor.transmit.complete(snapshot.byteCount());
+    }
+    try test_protocol.wp_viewport.encodeRequest(&context.requests, viewport.id, .{
+        .set_destination = .{ .width = 2, .height = 1 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.stop, try context.dispatchCore());
+
+    var descriptor_scratch: [1]linux.fd_t = undefined;
+    var control: [64]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+    const snapshot = try context.actor.transmit.snapshot(&descriptor_scratch, &control);
+    const message = (try wayring.wire.Message.decode(snapshot.first)).?;
+    const event = try TestCore.Display.decodeEvent(message, &context.received_fds);
+    switch (event) {
+        .@"error" => |value| {
+            try std.testing.expectEqual(viewport.id, value.object_id);
+            try std.testing.expectEqual(
+                test_protocol.wp_viewport.@"error".no_surface.value,
+                value.code,
+            );
+        },
+        else => return error.ExpectedProtocolError,
+    }
 }
 
 test "generated attach and commit retain SHM after wl_buffer destruction" {

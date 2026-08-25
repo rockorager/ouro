@@ -61,6 +61,7 @@ pub fn main(init: std.process.Init) !void {
         .surface = .{
             .surface_capacity = 8,
             .region_capacity = 8,
+            .viewport_capacity = 8,
             .region_operation_capacity = 64,
             .frame_callback_capacity = 64,
             .release_callback_capacity = 64,
@@ -222,7 +223,7 @@ fn compositorConfig() Compositor.Config {
             .object_capacity = 128,
             .object_quota = 128,
             .buckets_per_client = 128,
-            .max_globals = 6,
+            .max_globals = 7,
             .registry_capacity = 1,
         },
     };

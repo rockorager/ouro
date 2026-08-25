@@ -35,9 +35,9 @@ responsibilities:
 - [Presentation lifetime](src/presentation.zig): imported handles, source
   leases, and per-commit release callbacks remain together until successful
   presentation completion or explicit output teardown.
-- [Viewport state](src/viewport.zig): pending crop and destination scale are
-  validated against transformed, scaled content and published with the surface
-  commit.
+- [Viewport state](src/viewport.zig): bounded `wp_viewporter` objects apply
+  pending crop and destination scale, validate them against transformed,
+  scaled content, and publish them with the surface commit.
 - [Subsurface state](src/subsurface.zig): Ouro owns the parent/child graph,
   synchronized commit caching, position, stacking, visibility, and sync/desync
   transitions.
