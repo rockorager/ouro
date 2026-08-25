@@ -27,6 +27,7 @@ const presentation = @import("../presentation.zig");
 const core_surface = @import("../protocol/core_surface.zig");
 const xdg_shell = @import("../protocol/xdg_shell.zig");
 const protocol_seat = @import("../protocol/seat.zig");
+const protocol_data_device = @import("../protocol/data_device.zig");
 const protocol_output = @import("../protocol/output.zig");
 const desktop_model = @import("../desktop/model.zig");
 const interaction_model = @import("../input/interaction.zig");
@@ -46,6 +47,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const Desktop = desktop_model.Desktop(ShellAdapter);
         const Interaction = interaction_model.Interaction(Desktop);
         const SeatAdapter = protocol_seat.Adapter(protocol, Adapter);
+        const DataDeviceAdapter = protocol_data_device.Adapter(protocol);
         const OutputAdapter = protocol_output.Adapter(protocol);
 
         const Imported = struct {};
@@ -131,6 +133,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .event_capacity = 16,
                 .keymap = protocol_seat.default_keymap,
             },
+            data_device: protocol_data_device.Config = .{},
             protocol_output: protocol_output.Config = .{},
             drm: drm.Config,
             output: output_api.Config,
@@ -174,6 +177,7 @@ pub fn Coordinator(comptime protocol: type) type {
         desktop: Desktop,
         interaction: Interaction,
         seat_adapter: SeatAdapter,
+        data_device_adapter: DataDeviceAdapter,
         output_adapter: OutputAdapter,
         presentations: Presentations,
         render_device: ?*output_api.RenderDevice = null,
@@ -311,6 +315,12 @@ pub fn Coordinator(comptime protocol: type) type {
                 config.protocol_seat,
             );
             errdefer self.seat_adapter.deinit();
+            self.data_device_adapter = try DataDeviceAdapter.init(allocator, config.data_device);
+            errdefer self.data_device_adapter.deinit();
+            self.data_device_adapter.setSerialValidator(.{
+                .context = self,
+                .validate = validateSelection,
+            });
             self.shell_adapter.setGrabValidator(.{
                 .context = self,
                 .validate = validatePopupGrab,
@@ -338,6 +348,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
             _ = try self.seat_adapter.install(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
+            _ = try self.data_device_adapter.install(&root.runtime);
             try self.adapter.setCommitHook(.{
                 .context = self,
                 .validate_fn = validateSurfaceCommit,
@@ -398,6 +411,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.allocator.free(self.scene_windows);
             self.allocator.free(self.app_layers);
             self.output_adapter.deinit();
+            self.data_device_adapter.deinit();
             self.seat_adapter.deinit();
             self.interaction.deinit();
             self.desktop.deinit();
@@ -493,6 +507,10 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             if (try self.seat_adapter.request(peer, target, message, fds)) |control| {
                 try self.processSeatEvents();
+                try self.flushProtocol();
+                return control;
+            }
+            if (try self.data_device_adapter.request(peer, target, message, fds)) |control| {
                 try self.flushProtocol();
                 return control;
             }
@@ -873,13 +891,18 @@ pub fn Coordinator(comptime protocol: type) type {
                             .{ .x = 0, .y = 0 };
                         try self.seat_adapter.setPointerFocus(seat_target, point);
                     },
-                    .keyboard_focus => |target| try self.seat_adapter.setKeyboardFocus(
-                        try self.seatTarget(target.surface),
-                    ),
+                    .keyboard_focus => |target| {
+                        const seat_target = try self.seatTarget(target.surface);
+                        try self.seat_adapter.setKeyboardFocus(seat_target);
+                        try self.data_device_adapter.setFocus(self.peer orelse return error.ClientDisconnected);
+                    },
                     .cancel => |cancel| {
                         if (cancel.pointer_focus)
                             try self.seat_adapter.setPointerFocus(null, .{ .x = 0, .y = 0 });
-                        if (cancel.keyboard_focus) try self.seat_adapter.setKeyboardFocus(null);
+                        if (cancel.keyboard_focus) {
+                            try self.seat_adapter.setKeyboardFocus(null);
+                            try self.data_device_adapter.setFocus(null);
+                        }
                         if (cancel.pointer_grab) try self.seat_adapter.cancelPointerGrab();
                     },
                     .key_consumed => self.input_keyboard_consumed = true,
@@ -904,6 +927,16 @@ pub fn Coordinator(comptime protocol: type) type {
         ) bool {
             const self: *Self = @ptrCast(@alignCast(context));
             return self.seat_adapter.validatePopupGrab(peer, seat_object, serial);
+        }
+
+        fn validateSelection(
+            context: *anyopaque,
+            peer: wayring.io_uring.Peer,
+            seat_object: u32,
+            serial: u32,
+        ) bool {
+            const self: *Self = @ptrCast(@alignCast(context));
+            return self.seat_adapter.validateSelection(peer, seat_object, serial);
         }
 
         fn processSeatEvents(self: *Self) !void {
@@ -937,10 +970,12 @@ pub fn Coordinator(comptime protocol: type) type {
             const actor = try self.root.runtime.clients.reactor.getActor(peer);
             const shell_flushed = try self.shell_adapter.flushOn(objects, &actor.transmit);
             const seat_flushed = try self.seat_adapter.flushOn(objects, &actor.transmit);
+            const data_device_flushed = try self.data_device_adapter.flushOn(peer, objects, &actor.transmit);
             const output_flushed = try self.output_adapter.flushOn(objects, &actor.transmit);
-            if (shell_flushed != 0 or seat_flushed != 0 or output_flushed != 0 or
+            if (shell_flushed != 0 or seat_flushed != 0 or data_device_flushed != 0 or output_flushed != 0 or
                 self.shell_adapter.pendingOutbound() != 0 or
                 self.seat_adapter.pendingOutbound() != 0 or
+                self.data_device_adapter.pendingOutbound() != 0 or
                 self.output_adapter.pendingOutbound() != 0)
                 _ = try self.loop.?.driver.schedule(peer);
         }
@@ -1681,6 +1716,7 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             _ = self.shell_adapter.resourceRemoved(handle, object);
             _ = self.seat_adapter.resourceRemoved(handle, object);
+            _ = self.data_device_adapter.resourceRemoved(handle, object);
             _ = self.output_adapter.resourceRemoved(handle, object);
             if (removed_surface) |id| {
                 self.dropPendingSurface(id);

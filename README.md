@@ -49,6 +49,10 @@ responsibilities:
   ownership, derive depressed and locked modifiers from the published keymap,
   and deliver generation-safe focus, user-action serials, and high-resolution
   wheel or touch scrolling through resumable outbound commands.
+- [Clipboard selection](src/protocol/data_device.zig): bounded data sources,
+  devices, and offers validate exact seat action serials, publish selection on
+  keyboard focus, and retain receive descriptors across transport backpressure.
+  Drag-and-drop is not yet implemented.
 - [Wayland output](src/protocol/output.zig): clients discover the selected
   physical output's geometry, current and preferred DRM mode, refresh rate,
   scale, stable name, and description through version-correct `wl_output`
