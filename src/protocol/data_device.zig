@@ -81,6 +81,7 @@ pub fn Adapter(comptime protocol: type) type {
             mime_storage: []u8 = &.{},
             used: bool = false,
             drag_actions_set: bool = false,
+            drag_actions: u32 = 0,
         };
         const DeviceSlot = struct {
             header: Header = .{},
@@ -95,6 +96,9 @@ pub fn Adapter(comptime protocol: type) type {
             source: Id = undefined,
             kind: OfferKind = .selection,
             current: bool = false,
+            destination_actions: u32 = 0,
+            preferred_action: u32 = 0,
+            selected_action: u32 = 0,
         };
         const Publication = struct {
             device: Id,
@@ -121,6 +125,8 @@ pub fn Adapter(comptime protocol: type) type {
             drag_leave: Id,
             source_cancelled: Id,
             source_target: struct { source: Id, mime_index: ?usize },
+            source_action: struct { source: Id, action: u32 },
+            offer_action: struct { offer: Id, action: u32 },
             source_send: struct { source: Id, mime_index: usize, fd: linux.fd_t },
         };
         const OutboundSlot = struct {
@@ -349,6 +355,7 @@ pub fn Adapter(comptime protocol: type) type {
                     if (payload.dnd_actions.value & ~valid_actions != 0)
                         return try self.protocolError(actor, decoded.handle.id, Source.@"error".invalid_action_mask.value, "invalid drag action mask");
                     source.drag_actions_set = true;
+                    source.drag_actions = payload.dnd_actions.value;
                 },
             }
             try decoded.finish(protocol, server_objects, &actor.transmit);
@@ -440,8 +447,35 @@ pub fn Adapter(comptime protocol: type) type {
                     } }) catch return try self.noMemory(actor);
                 },
                 .finish => return try self.protocolError(actor, decoded.handle.id, Offer.@"error".invalid_finish.value, "selection offers cannot be finished"),
-                .set_actions => if (offer.kind == .selection)
-                    return try self.protocolError(actor, decoded.handle.id, Offer.@"error".invalid_offer.value, "selection offers have no drag actions"),
+                .set_actions => |payload| {
+                    if (offer.kind == .selection or !offer.current)
+                        return try self.protocolError(actor, decoded.handle.id, Offer.@"error".invalid_offer.value, "offer is not an active drag target");
+                    const valid_actions = dragActionMask();
+                    const actions = payload.dnd_actions.value;
+                    const preferred = payload.preferred_action.value;
+                    if (actions & ~valid_actions != 0)
+                        return try self.protocolError(actor, decoded.handle.id, Offer.@"error".invalid_action_mask.value, "invalid destination action mask");
+                    if ((preferred & ~valid_actions) != 0 or @popCount(preferred) > 1 or
+                        (preferred != 0 and preferred & actions == 0))
+                        return try self.protocolError(actor, decoded.handle.id, Offer.@"error".invalid_action.value, "invalid preferred drag action");
+                    const source = self.resolveSource(offer.source) catch
+                        return try self.protocolError(actor, decoded.handle.id, Offer.@"error".invalid_offer.value, "drag source is gone");
+                    const selected = selectDragAction(sourceActions(server_objects, source), actions, preferred);
+                    if (selected != offer.selected_action) {
+                        if (self.outboundFree() < 2) return try self.noMemory(actor);
+                        self.enqueue(source.peer, .{ .source_action = .{
+                            .source = offer.source,
+                            .action = selected,
+                        } }) catch unreachable;
+                        self.enqueue(offer.peer, .{ .offer_action = .{
+                            .offer = self.offerId(offer),
+                            .action = selected,
+                        } }) catch unreachable;
+                    }
+                    offer.destination_actions = actions;
+                    offer.preferred_action = preferred;
+                    offer.selected_action = selected;
+                },
             }
             try decoded.finish(protocol, server_objects, &actor.transmit);
             return .continue_dispatch;
@@ -487,10 +521,30 @@ pub fn Adapter(comptime protocol: type) type {
 
             const old_count = if (drag.target) |old| self.deviceCount(old.peer) else 0;
             const new_count = if (target) |new| self.deviceCount(new.peer) else 0;
-            if (self.outboundFree() < old_count + new_count) return error.Exhausted;
+            var old_action_count: usize = 0;
+            if (drag.target) |old| {
+                for (self.offers) |offer| {
+                    old_action_count += @as(usize, @intFromBool(offer.header.active and offer.kind == .drag and
+                        offer.current and offer.selected_action != 0 and std.meta.eql(offer.peer, old.peer))) * 2;
+                }
+            }
+            if (self.outboundFree() < old_count + old_action_count + new_count) return error.Exhausted;
             if (drag.source != null and self.offerFree() < new_count) return error.Exhausted;
 
             if (drag.target) |old| {
+                for (self.offers) |*offer| if (offer.header.active and offer.kind == .drag and
+                    offer.current and offer.selected_action != 0 and std.meta.eql(offer.peer, old.peer))
+                {
+                    self.enqueue(drag.peer, .{ .source_action = .{
+                        .source = offer.source,
+                        .action = 0,
+                    } }) catch unreachable;
+                    self.enqueue(old.peer, .{ .offer_action = .{
+                        .offer = self.offerId(offer),
+                        .action = 0,
+                    } }) catch unreachable;
+                    offer.selected_action = 0;
+                };
                 for (self.devices) |*device| if (device.header.active and
                     std.meta.eql(device.peer, old.peer))
                     self.enqueue(old.peer, .{ .drag_leave = self.deviceId(device) }) catch unreachable;
@@ -604,6 +658,22 @@ pub fn Adapter(comptime protocol: type) type {
                     } });
                     return true;
                 },
+                .source_action => |value| {
+                    const source = self.resolveSource(value.source) catch return true;
+                    const object = server_objects.namespace.resolve(source.header.resource) orelse return true;
+                    if (object.version < 3) return true;
+                    try wayring.server.sendEvent(protocol, Source, server_objects, queue, source.header.resource, .{ .action = .{
+                        .dnd_action = .fromWire(value.action),
+                    } });
+                    return true;
+                },
+                .offer_action => |value| {
+                    const offer = self.resolveOffer(value.offer) catch return true;
+                    try wayring.server.sendEvent(protocol, Offer, server_objects, queue, offer.header.resource, .{ .action = .{
+                        .dnd_action = .fromWire(value.action),
+                    } });
+                    return true;
+                },
                 .source_send => |*value| {
                     const source = self.resolveSource(value.source) catch {
                         if (value.fd >= 0) _ = linux.close(value.fd);
@@ -679,6 +749,16 @@ pub fn Adapter(comptime protocol: type) type {
                         value.mime_index += 1;
                         return false;
                     }
+                    if (value.phase == 1) {
+                        const object = server_objects.namespace.resolve(offer.header.resource) orelse return true;
+                        value.phase = 2;
+                        if (object.version >= 3) {
+                            try wayring.server.sendEvent(protocol, Offer, server_objects, queue, offer.header.resource, .{ .source_actions = .{
+                                .source_actions = .fromWire(sourceActions(server_objects, source)),
+                            } });
+                            return false;
+                        }
+                    }
                     try wayring.server.sendEvent(protocol, Device, server_objects, queue, device.header.resource, .{ .enter = .{
                         .serial = value.serial,
                         .surface = value.surface_object,
@@ -686,7 +766,7 @@ pub fn Adapter(comptime protocol: type) type {
                         .y = value.y,
                         .id = offer.header.resource.id,
                     } });
-                    value.phase = 2;
+                    value.phase = 3;
                     return true;
                 },
                 .drag_motion => |value| {
@@ -716,7 +796,14 @@ pub fn Adapter(comptime protocol: type) type {
                 release(DeviceSlot, self.devices, &self.device_free, id.index);
                 return true;
             }
-            if (object.interface == &Offer.info) return self.removeResource(OfferSlot, self.offers, &self.offer_free, handle, object);
+            if (object.interface == &Offer.info) {
+                const offer = fromContext(OfferSlot, self.offers, object.context) orelse return false;
+                if (!std.meta.eql(offer.header.resource, handle)) return false;
+                const id = self.offerId(offer);
+                self.dropOfferOutbound(id);
+                release(OfferSlot, self.offers, &self.offer_free, id.index);
+                return true;
+            }
             if (object.interface == &Source.info) {
                 const source = fromContext(SourceSlot, self.sources, object.context) orelse return false;
                 if (!std.meta.eql(source.header.resource, handle)) return false;
@@ -853,7 +940,26 @@ pub fn Adapter(comptime protocol: type) type {
                     self.abandonDragPublicationOffer(value);
                     value.source = null;
                 },
+                .source_action => |value| {
+                    if (std.meta.eql(value.source, id)) slot.active = false;
+                },
+                .offer_action => |value| {
+                    const offer = self.resolveOffer(value.offer) catch {
+                        slot.active = false;
+                        continue;
+                    };
+                    if (std.meta.eql(offer.source, id)) slot.active = false;
+                },
                 .drag_motion, .drag_leave => {},
+            };
+        }
+
+        fn dropOfferOutbound(self: *Self, id: Id) void {
+            for (self.outbound) |*slot| if (slot.active) switch (slot.value) {
+                .offer_action => |value| if (std.meta.eql(value.offer, id)) {
+                    slot.active = false;
+                },
+                else => {},
             };
         }
 
@@ -872,6 +978,13 @@ pub fn Adapter(comptime protocol: type) type {
                 },
                 .drag_leave => |device| {
                     if (std.meta.eql(device, id)) slot.active = false;
+                },
+                .offer_action => |value| {
+                    const offer = self.resolveOffer(value.offer) catch {
+                        slot.active = false;
+                        continue;
+                    };
+                    if (std.meta.eql(offer.device, id)) slot.active = false;
                 },
                 else => {},
             };
@@ -897,6 +1010,31 @@ pub fn Adapter(comptime protocol: type) type {
         }
         fn releaseOffer(self: *Self, index: u32) void {
             release(OfferSlot, self.offers, &self.offer_free, index);
+        }
+
+        fn dragActionMask() u32 {
+            return protocol.wl_data_device_manager.dnd_action.copy.value |
+                protocol.wl_data_device_manager.dnd_action.move.value |
+                protocol.wl_data_device_manager.dnd_action.ask.value;
+        }
+
+        fn sourceActions(server_objects: anytype, source: *const SourceSlot) u32 {
+            const object = server_objects.namespace.resolve(source.header.resource) orelse return 0;
+            return if (object.version < 3)
+                protocol.wl_data_device_manager.dnd_action.copy.value
+            else
+                source.drag_actions;
+        }
+
+        fn selectDragAction(source: u32, destination: u32, preferred: u32) u32 {
+            const available = source & destination;
+            if (preferred != 0 and preferred & available != 0) return preferred;
+            inline for (.{
+                protocol.wl_data_device_manager.dnd_action.copy.value,
+                protocol.wl_data_device_manager.dnd_action.move.value,
+                protocol.wl_data_device_manager.dnd_action.ask.value,
+            }) |action| if (available & action != 0) return action;
+            return protocol.wl_data_device_manager.dnd_action.none.value;
         }
 
         fn noMemory(self: *Self, actor: *wayring.connection.Actor) !wayring.dispatch.Control {
@@ -991,6 +1129,23 @@ const TestAdapter = Adapter(test_protocol);
 
 fn testAdapter(config: Config) !TestAdapter {
     return TestAdapter.init(std.testing.allocator, config);
+}
+
+test "data device: drag action matching honors preference then stable policy" {
+    const action = test_protocol.wl_data_device_manager.dnd_action;
+    const copy_move = action.copy.value | action.move.value;
+    try std.testing.expectEqual(
+        action.move.value,
+        TestAdapter.selectDragAction(copy_move, copy_move, action.move.value),
+    );
+    try std.testing.expectEqual(
+        action.copy.value,
+        TestAdapter.selectDragAction(copy_move, copy_move, 0),
+    );
+    try std.testing.expectEqual(
+        action.none.value,
+        TestAdapter.selectDragAction(action.copy.value, action.move.value, action.move.value),
+    );
 }
 
 test "data device: copied MIME types and offer capacity make replacement transactional" {

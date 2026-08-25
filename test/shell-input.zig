@@ -224,6 +224,7 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     try std.testing.expectEqual(@as(usize, 1), handler.drag_cancelled);
     try std.testing.expectEqual(@as(usize, 1), handler.drag_data_offer);
     try std.testing.expectEqual(@as(usize, 1), handler.drag_mime_offer);
+    try std.testing.expectEqual(@as(usize, 1), handler.drag_source_actions);
     try std.testing.expectEqual(@as(usize, 1), handler.drag_enter);
     try std.testing.expectEqual(@as(usize, 1), handler.drag_leave);
     try std.testing.expectEqual(@as(usize, 1), handler.pointer_axis_source);
@@ -1031,6 +1032,7 @@ const Handler = struct {
     drag_cancelled: usize = 0,
     drag_data_offer: usize = 0,
     drag_mime_offer: usize = 0,
+    drag_source_actions: usize = 0,
     drag_enter: usize = 0,
     drag_leave: usize = 0,
     keyboard_enter: usize = 0,
@@ -1262,6 +1264,12 @@ const Handler = struct {
                     try std.testing.expectEqualStrings("text/plain", value.mime_type);
                     self.drag_mime_offer += 1;
                 },
+                .source_actions => |value| {
+                    const expected = protocol.wl_data_device_manager.dnd_action.copy.value |
+                        protocol.wl_data_device_manager.dnd_action.move.value;
+                    try std.testing.expectEqual(expected, value.source_actions.value);
+                    self.drag_source_actions += 1;
+                },
                 else => {},
             }
         } else if (target.object.interface == &protocol.wl_data_source.info) {
@@ -1335,6 +1343,12 @@ const Handler = struct {
         )).id;
         try protocol.wl_data_source.encodeRequest(self.queue, self.data_source.?.id, .{
             .offer = .{ .mime_type = "text/plain" },
+        });
+        try protocol.wl_data_source.encodeRequest(self.queue, self.data_source.?.id, .{
+            .set_actions = .{ .dnd_actions = .fromWire(
+                protocol.wl_data_device_manager.dnd_action.copy.value |
+                    protocol.wl_data_device_manager.dnd_action.move.value,
+            ) },
         });
         self.data_device = (try protocol.wl_data_device_manager.construct_get_data_device(
             self.objects,
