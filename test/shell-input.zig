@@ -197,7 +197,8 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
         if (coordinator.stats.presented == 3 and handler.pointer_motion == 2 and
             handler.pointer_button != 0 and handler.pointer_axis != 0 and
             handler.pointer_axis_value120 != 0 and handler.keyboard_key != 0 and
-            handler.drag_cancelled == 1) break;
+            handler.drag_cancelled == 1 and handler.drag_enter == 1 and
+            handler.drag_leave == 1) break;
         if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0) {
             try waitForEither(&root.ring, client_reactor.ring);
         }
@@ -221,6 +222,10 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     try std.testing.expectEqual(@as(usize, 2), handler.pointer_motion);
     try std.testing.expectEqual(@as(usize, 2), handler.pointer_button);
     try std.testing.expectEqual(@as(usize, 1), handler.drag_cancelled);
+    try std.testing.expectEqual(@as(usize, 1), handler.drag_data_offer);
+    try std.testing.expectEqual(@as(usize, 1), handler.drag_mime_offer);
+    try std.testing.expectEqual(@as(usize, 1), handler.drag_enter);
+    try std.testing.expectEqual(@as(usize, 1), handler.drag_leave);
     try std.testing.expectEqual(@as(usize, 1), handler.pointer_axis_source);
     try std.testing.expectEqual(@as(usize, 1), handler.pointer_axis);
     try std.testing.expectEqual(@as(usize, 1), handler.pointer_axis_value120);
@@ -1024,6 +1029,10 @@ const Handler = struct {
     pointer_axis_fixed: i32 = 0,
     pointer_axis_value120_value: i32 = 0,
     drag_cancelled: usize = 0,
+    drag_data_offer: usize = 0,
+    drag_mime_offer: usize = 0,
+    drag_enter: usize = 0,
+    drag_leave: usize = 0,
     keyboard_enter: usize = 0,
     keyboard_key: usize = 0,
     buffer_release: usize = 0,
@@ -1229,7 +1238,32 @@ const Handler = struct {
                 else => {},
             }
         } else if (target.object.interface == &protocol.wl_data_device.info) {
-            _ = try protocol.wl_data_device.decodeEvent(message, fds);
+            switch (try protocol.wl_data_device.decodeEvent(message, fds)) {
+                .data_offer => |value| {
+                    _ = try protocol.wl_data_device.admit_event_data_offer(
+                        self.objects,
+                        self.data_device.?,
+                        value,
+                        .{},
+                    );
+                    self.drag_data_offer += 1;
+                },
+                .enter => |value| {
+                    try std.testing.expectEqual(self.surface.?.id, value.surface);
+                    try std.testing.expect(value.id != null);
+                    self.drag_enter += 1;
+                },
+                .leave => self.drag_leave += 1,
+                else => {},
+            }
+        } else if (target.object.interface == &protocol.wl_data_offer.info) {
+            switch (try protocol.wl_data_offer.decodeEvent(message, fds)) {
+                .offer => |value| {
+                    try std.testing.expectEqualStrings("text/plain", value.mime_type);
+                    self.drag_mime_offer += 1;
+                },
+                else => {},
+            }
         } else if (target.object.interface == &protocol.wl_data_source.info) {
             switch (try protocol.wl_data_source.decodeEvent(message, fds)) {
                 .cancelled => self.drag_cancelled += 1,

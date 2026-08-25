@@ -1,8 +1,7 @@
-//! Bounded wl_data_device clipboard/selection owner.
+//! Bounded wl_data_device selection and drag-and-drop owner.
 //!
-//! Drag-and-drop is deliberately outside this first milestone. Selection
-//! sources, MIME offers, focus publication, and receive FDs retain exact
-//! resource generations and survive transport backpressure.
+//! Sources, MIME offers, focus/target publication, and receive FDs retain
+//! exact resource generations and survive transport backpressure.
 
 const std = @import("std");
 const wayring = @import("wayring");
@@ -88,11 +87,14 @@ pub fn Adapter(comptime protocol: type) type {
             peer: wayring.io_uring.Peer = undefined,
             seat_object: u32 = 0,
         };
+        const OfferKind = enum { selection, drag };
         const OfferSlot = struct {
             header: Header = .{},
             peer: wayring.io_uring.Peer = undefined,
             device: Id = undefined,
             source: Id = undefined,
+            kind: OfferKind = .selection,
+            current: bool = false,
         };
         const Publication = struct {
             device: Id,
@@ -101,9 +103,24 @@ pub fn Adapter(comptime protocol: type) type {
             phase: u2 = 0,
             mime_index: usize = 0,
         };
+        const DragPublication = struct {
+            device: Id,
+            source: ?Id,
+            offer: ?Id,
+            surface_object: u32,
+            serial: u32,
+            x: i32,
+            y: i32,
+            phase: u2 = 0,
+            mime_index: usize = 0,
+        };
         const Outbound = union(enum) {
             selection: Publication,
+            drag_enter: DragPublication,
+            drag_motion: struct { device: Id, time: u32, x: i32, y: i32 },
+            drag_leave: Id,
             source_cancelled: Id,
+            source_target: struct { source: Id, mime_index: ?usize },
             source_send: struct { source: Id, mime_index: usize, fd: linux.fd_t },
         };
         const OutboundSlot = struct {
@@ -116,6 +133,14 @@ pub fn Adapter(comptime protocol: type) type {
             peer: wayring.io_uring.Peer,
             source: ?Id,
             origin_object: u32,
+            target: ?DragTarget = null,
+        };
+
+        pub const DragTarget = struct {
+            peer: wayring.io_uring.Peer,
+            surface_object: u32,
+            x: i32,
+            y: i32,
         };
 
         allocator: std.mem.Allocator,
@@ -402,9 +427,21 @@ pub fn Adapter(comptime protocol: type) type {
                     };
                 },
                 .destroy => {},
-                .accept => {},
+                .accept => |payload| if (offer.kind == .drag and offer.current) {
+                    const source = self.resolveSource(offer.source) catch
+                        return try self.protocolError(actor, decoded.handle.id, Offer.@"error".invalid_offer.value, "drag source is gone");
+                    const mime_index = if (payload.mime_type) |mime_type|
+                        self.findMime(source, mime_type)
+                    else
+                        null;
+                    self.enqueue(source.peer, .{ .source_target = .{
+                        .source = offer.source,
+                        .mime_index = mime_index,
+                    } }) catch return try self.noMemory(actor);
+                },
                 .finish => return try self.protocolError(actor, decoded.handle.id, Offer.@"error".invalid_finish.value, "selection offers cannot be finished"),
-                .set_actions => return try self.protocolError(actor, decoded.handle.id, Offer.@"error".invalid_offer.value, "selection offers have no drag actions"),
+                .set_actions => if (offer.kind == .selection)
+                    return try self.protocolError(actor, decoded.handle.id, Offer.@"error".invalid_offer.value, "selection offers have no drag actions"),
             }
             try decoded.finish(protocol, server_objects, &actor.transmit);
             return .continue_dispatch;
@@ -424,12 +461,83 @@ pub fn Adapter(comptime protocol: type) type {
             return self.drag != null;
         }
 
+        pub fn updateDragTarget(
+            self: *Self,
+            target: ?DragTarget,
+            serial: u32,
+            time: u32,
+            emit_motion: bool,
+        ) !void {
+            const drag = self.drag orelse return;
+            if (optionalDragTargetIdentityEqual(drag.target, target)) {
+                if (!emit_motion) return;
+                const value = target orelse return;
+                const count = self.deviceCount(value.peer);
+                if (self.outboundFree() < count) return error.Exhausted;
+                for (self.devices) |*device| if (device.header.active and
+                    std.meta.eql(device.peer, value.peer))
+                    self.enqueue(value.peer, .{ .drag_motion = .{
+                        .device = self.deviceId(device),
+                        .time = time,
+                        .x = value.x,
+                        .y = value.y,
+                    } }) catch unreachable;
+                return;
+            }
+
+            const old_count = if (drag.target) |old| self.deviceCount(old.peer) else 0;
+            const new_count = if (target) |new| self.deviceCount(new.peer) else 0;
+            if (self.outboundFree() < old_count + new_count) return error.Exhausted;
+            if (drag.source != null and self.offerFree() < new_count) return error.Exhausted;
+
+            if (drag.target) |old| {
+                for (self.devices) |*device| if (device.header.active and
+                    std.meta.eql(device.peer, old.peer))
+                    self.enqueue(old.peer, .{ .drag_leave = self.deviceId(device) }) catch unreachable;
+                self.clearCurrentDragOffers(old.peer);
+            }
+            self.drag.?.target = target;
+            if (target) |new| for (self.devices) |*device| if (device.header.active and
+                std.meta.eql(device.peer, new.peer))
+            {
+                var offer_id: ?Id = null;
+                if (drag.source) |source| {
+                    const offer = acquire(OfferSlot, self.offers, &self.offer_free) catch unreachable;
+                    offer.peer = new.peer;
+                    offer.device = self.deviceId(device);
+                    offer.source = source;
+                    offer.kind = .drag;
+                    offer.current = true;
+                    offer_id = self.offerId(offer);
+                }
+                self.enqueue(new.peer, .{ .drag_enter = .{
+                    .device = self.deviceId(device),
+                    .source = drag.source,
+                    .offer = offer_id,
+                    .surface_object = new.surface_object,
+                    .serial = serial,
+                    .x = new.x,
+                    .y = new.y,
+                } }) catch unreachable;
+            };
+        }
+
         /// Ends an active drag which has no accepted destination. The source
         /// cancellation remains retained until transport publication; an
         /// internal drag with no source simply terminates.
         pub fn cancelDrag(self: *Self) !void {
             const drag = self.drag orelse return;
-            if (drag.source) |source| try self.enqueue(drag.peer, .{ .source_cancelled = source });
+            const leave_count = if (drag.target) |target| self.deviceCount(target.peer) else 0;
+            const source_count: usize = @intFromBool(drag.source != null);
+            if (self.outboundFree() < leave_count + source_count) return error.Exhausted;
+            if (drag.target) |target| {
+                for (self.devices) |*device| if (device.header.active and
+                    std.meta.eql(device.peer, target.peer))
+                    self.enqueue(target.peer, .{ .drag_leave = self.deviceId(device) }) catch unreachable;
+                self.clearCurrentDragOffers(target.peer);
+            }
+            if (drag.source) |source|
+                self.enqueue(drag.peer, .{ .source_cancelled = source }) catch unreachable;
             self.drag = null;
         }
 
@@ -489,6 +597,13 @@ pub fn Adapter(comptime protocol: type) type {
                     try wayring.server.sendEvent(protocol, Source, server_objects, queue, source.header.resource, .{ .cancelled = .{} });
                     return true;
                 },
+                .source_target => |value| {
+                    const source = self.resolveSource(value.source) catch return true;
+                    try wayring.server.sendEvent(protocol, Source, server_objects, queue, source.header.resource, .{ .target = .{
+                        .mime_type = if (value.mime_index) |index| self.mime(source, index) else null,
+                    } });
+                    return true;
+                },
                 .source_send => |*value| {
                     const source = self.resolveSource(value.source) catch {
                         if (value.fd >= 0) _ = linux.close(value.fd);
@@ -530,6 +645,64 @@ pub fn Adapter(comptime protocol: type) type {
                     value.phase = 2;
                     return true;
                 },
+                .drag_enter => |*value| {
+                    const device = self.resolveDevice(value.device) catch {
+                        self.abandonDragPublicationOffer(value);
+                        return true;
+                    };
+                    if (value.source == null) {
+                        try wayring.server.sendEvent(protocol, Device, server_objects, queue, device.header.resource, .{ .enter = .{
+                            .serial = value.serial,
+                            .surface = value.surface_object,
+                            .x = value.x,
+                            .y = value.y,
+                            .id = null,
+                        } });
+                        return true;
+                    }
+                    const source = self.resolveSource(value.source.?) catch {
+                        self.abandonDragPublicationOffer(value);
+                        value.source = null;
+                        return false;
+                    };
+                    const offer = self.resolveOffer(value.offer.?) catch return true;
+                    if (value.phase == 0) {
+                        const created = try Device.construct_event_data_offer(protocol, server_objects, queue, device.header.resource, .{ .id = .{ .context = offer } });
+                        offer.header.resource = created.id;
+                        value.phase = 1;
+                        return false;
+                    }
+                    if (value.mime_index < source.mime_count) {
+                        try wayring.server.sendEvent(protocol, Offer, server_objects, queue, offer.header.resource, .{ .offer = .{
+                            .mime_type = self.mime(source, value.mime_index),
+                        } });
+                        value.mime_index += 1;
+                        return false;
+                    }
+                    try wayring.server.sendEvent(protocol, Device, server_objects, queue, device.header.resource, .{ .enter = .{
+                        .serial = value.serial,
+                        .surface = value.surface_object,
+                        .x = value.x,
+                        .y = value.y,
+                        .id = offer.header.resource.id,
+                    } });
+                    value.phase = 2;
+                    return true;
+                },
+                .drag_motion => |value| {
+                    const device = self.resolveDevice(value.device) catch return true;
+                    try wayring.server.sendEvent(protocol, Device, server_objects, queue, device.header.resource, .{ .motion = .{
+                        .time = value.time,
+                        .x = value.x,
+                        .y = value.y,
+                    } });
+                    return true;
+                },
+                .drag_leave => |id| {
+                    const device = self.resolveDevice(id) catch return true;
+                    try wayring.server.sendEvent(protocol, Device, server_objects, queue, device.header.resource, .{ .leave = .{} });
+                    return true;
+                },
             }
         }
 
@@ -552,7 +725,7 @@ pub fn Adapter(comptime protocol: type) type {
                     if (std.meta.eql(selection, id)) self.selection = null;
                 }
                 if (self.drag) |drag| {
-                    if (drag.source != null and std.meta.eql(drag.source.?, id)) self.drag = null;
+                    if (drag.source != null and std.meta.eql(drag.source.?, id)) self.drag.?.source = null;
                 }
                 self.dropSourceOutbound(id);
                 release(SourceSlot, self.sources, &self.source_free, id.index);
@@ -640,7 +813,25 @@ pub fn Adapter(comptime protocol: type) type {
             value.offer = null;
         }
 
+        fn abandonDragPublicationOffer(self: *Self, value: *DragPublication) void {
+            const id = value.offer orelse return;
+            const offer = self.resolveOffer(id) catch return;
+            if (offer.header.resource.id == 0) self.releaseOffer(id.index);
+            value.offer = null;
+        }
+
+        fn clearCurrentDragOffers(self: *Self, peer: wayring.io_uring.Peer) void {
+            for (self.offers) |*offer| {
+                if (offer.header.active and offer.kind == .drag and
+                    offer.current and std.meta.eql(offer.peer, peer)) offer.current = false;
+            }
+        }
+
         fn dropSourceOutbound(self: *Self, id: Id) void {
+            for (self.offers) |*offer| {
+                if (offer.header.active and offer.kind == .drag and
+                    std.meta.eql(offer.source, id)) offer.current = false;
+            }
             for (self.outbound) |*slot| if (slot.active) switch (slot.value) {
                 .source_cancelled => |source| {
                     if (std.meta.eql(source, id)) slot.active = false;
@@ -655,6 +846,14 @@ pub fn Adapter(comptime protocol: type) type {
                         value.source = null;
                     }
                 },
+                .source_target => |value| {
+                    if (std.meta.eql(value.source, id)) slot.active = false;
+                },
+                .drag_enter => |*value| if (value.source != null and std.meta.eql(value.source.?, id)) {
+                    self.abandonDragPublicationOffer(value);
+                    value.source = null;
+                },
+                .drag_motion, .drag_leave => {},
             };
         }
 
@@ -663,6 +862,16 @@ pub fn Adapter(comptime protocol: type) type {
                 .selection => |*value| if (std.meta.eql(value.device, id)) {
                     self.abandonPublicationOffer(value);
                     slot.active = false;
+                },
+                .drag_enter => |*value| if (std.meta.eql(value.device, id)) {
+                    self.abandonDragPublicationOffer(value);
+                    slot.active = false;
+                },
+                .drag_motion => |value| {
+                    if (std.meta.eql(value.device, id)) slot.active = false;
+                },
+                .drag_leave => |device| {
+                    if (std.meta.eql(device, id)) slot.active = false;
                 },
                 else => {},
             };
@@ -770,6 +979,11 @@ fn indexOf(comptime T: type, slots: []T, slot: *T) u32 {
 fn optionalPeerEqual(a: ?wayring.io_uring.Peer, b: ?wayring.io_uring.Peer) bool {
     if (a == null or b == null) return a == null and b == null;
     return std.meta.eql(a.?, b.?);
+}
+
+fn optionalDragTargetIdentityEqual(a: anytype, b: @TypeOf(a)) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.meta.eql(a.?.peer, b.?.peer) and a.?.surface_object == b.?.surface_object;
 }
 
 const test_protocol = @import("core_protocol");

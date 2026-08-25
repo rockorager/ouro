@@ -197,6 +197,7 @@ pub fn Coordinator(comptime protocol: type) type {
         input_relative_accepted: bool = false,
         input_keyboard_consumed: bool = false,
         input_seat_accepted: bool = false,
+        input_drag_accepted: bool = false,
         input_delivery_prepared: bool = false,
         input_delivery_event: ?input_api.Event = null,
         manager: drm.Manager,
@@ -270,6 +271,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.input_relative_accepted = false;
             self.input_keyboard_consumed = false;
             self.input_seat_accepted = false;
+            self.input_drag_accepted = false;
             self.input_delivery_prepared = false;
             self.input_delivery_event = null;
             self.render_device = null;
@@ -1008,6 +1010,19 @@ pub fn Coordinator(comptime protocol: type) type {
                     };
                 self.input_seat_accepted = true;
             }
+            if (!self.input_drag_accepted) {
+                switch (event) {
+                    .pointer_motion => |motion| self.syncDragTarget(motion.time_usec, true) catch |err| switch (err) {
+                        error.Exhausted => return false,
+                    },
+                    .pointer_button => |button| if (!button.pressed)
+                        self.syncDragTarget(button.time_usec, false) catch |err| switch (err) {
+                            error.Exhausted => return false,
+                        },
+                    else => {},
+                }
+                self.input_drag_accepted = true;
+            }
             switch (event) {
                 .pointer_button => |button| if (!button.pressed and
                     self.seat_adapter.grabState() == .idle)
@@ -1018,6 +1033,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.input_relative_accepted = false;
             self.input_keyboard_consumed = false;
             self.input_seat_accepted = false;
+            self.input_drag_accepted = false;
             self.input_delivery_prepared = false;
             self.input_delivery_event = null;
             self.stats.input_events += 1;
@@ -1029,6 +1045,26 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.processSeatEvents();
             try self.flushProtocol();
             return true;
+        }
+
+        fn syncDragTarget(self: *Self, time_usec: u64, emit_motion: bool) !void {
+            if (!self.data_device_adapter.dragActive()) return;
+            const pointer = self.seat_adapter.pointerState();
+            const target: ?DataDeviceAdapter.DragTarget = if (pointer.focus) |focus| target: {
+                const handle = self.adapter.surfaceHandle(focus.surface) catch break :target null;
+                break :target .{
+                    .peer = self.adapter.surfacePeer(focus.surface) catch break :target null,
+                    .surface_object = handle.id,
+                    .x = pointer.point.x,
+                    .y = pointer.point.y,
+                };
+            } else null;
+            try self.data_device_adapter.updateDragTarget(
+                target,
+                self.seat_adapter.nextSerial(),
+                @truncate(time_usec / 1000),
+                emit_motion,
+            );
         }
 
         fn pointerDeliveryEvent(self: *Self, event: input_api.Event) !?input_api.Event {

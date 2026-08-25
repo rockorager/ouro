@@ -524,6 +524,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             return .{ .focus = adapter.pointer_focus, .point = adapter.pointer_point };
         }
 
+        pub fn nextSerial(adapter: *Self) u32 {
+            return adapter.issueSerial();
+        }
+
         /// Validates an input serial against the exact wl_seat resource named
         /// by an xdg_popup.grab request. Pointer-enter serials intentionally do
         /// not qualify: only a delivered button press establishes this token.
