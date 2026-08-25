@@ -29,6 +29,86 @@ test "client disconnect before render deadline abandons pending presentation" {
     try runVertical(.client_disconnect);
 }
 
+test "physical coordinator keeps serving until its final client disconnects" {
+    const allocator = std.testing.allocator;
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-r15-clients-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+
+    var root_config = compositorConfig();
+    root_config.reactor.max_connections = 2;
+    const root = try Compositor.create(
+        allocator,
+        try wayring.unix_socket.listen(path, 2),
+        root_config,
+    );
+    var coordinator_config = coordinatorConfig();
+    coordinator_config.client_capacity = 2;
+    const coordinator = try Coordinator.create(
+        allocator,
+        root,
+        fixture.platforms(),
+        coordinator_config,
+    );
+    var loop = try Loop.init(
+        allocator,
+        root,
+        &coordinator.router,
+        &coordinator.timers,
+        coordinator,
+        .{ .completion_batch = 16 },
+    );
+    try coordinator.start(&loop);
+    _ = try loop.turn(coordinator);
+
+    const first = try wayring.unix_socket.connect(path);
+    var first_open = true;
+    defer if (first_open) {
+        _ = linux.close(first);
+    };
+    const second = try wayring.unix_socket.connect(path);
+    var second_open = true;
+    defer if (second_open) {
+        _ = linux.close(second);
+    };
+    for (0..32) |_| {
+        if (coordinator.client_count == 2) break;
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+        _ = try loop.turn(coordinator);
+    }
+    try std.testing.expectEqual(@as(usize, 2), coordinator.client_count);
+    const first_peer = coordinator.peer.?;
+
+    _ = linux.close(first);
+    first_open = false;
+    for (0..32) |_| {
+        if (coordinator.client_count == 1) break;
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+        _ = try loop.turn(coordinator);
+    }
+    try std.testing.expectEqual(@as(usize, 1), coordinator.client_count);
+    try std.testing.expect(!coordinator.stopping);
+    try std.testing.expect(!std.meta.eql(first_peer, coordinator.peer.?));
+
+    _ = linux.close(second);
+    second_open = false;
+    for (0..32) |_| {
+        if (coordinator.client_count == 0) break;
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+        _ = try loop.turn(coordinator);
+    }
+    try std.testing.expectEqual(@as(usize, 0), coordinator.client_count);
+    try std.testing.expect(coordinator.stopping);
+    try drainServer(root, coordinator, &loop);
+
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
 test "no discovered DRM card fails startup and drains honestly" {
     const allocator = std.testing.allocator;
     var fixture = try Fixture.init();

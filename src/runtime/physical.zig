@@ -59,6 +59,10 @@ pub fn Coordinator(comptime protocol: type) type {
             id: Adapter.SurfaceId,
             commits: usize,
         };
+        const Client = struct {
+            active: bool = false,
+            peer: wayring.io_uring.Peer = undefined,
+        };
         const Candidate = struct {
             peer: ?wayring.io_uring.Peer,
             surface: wayring.objects.Handle,
@@ -94,6 +98,7 @@ pub fn Coordinator(comptime protocol: type) type {
         pub const Config = struct {
             router_capacity: usize,
             timer_capacity: usize,
+            client_capacity: usize = 4,
             desktop_transaction_timeout_ns: u64 = 250 * std.time.ns_per_ms,
             device_capacity: usize,
             seat: []const u8 = "seat0",
@@ -189,6 +194,10 @@ pub fn Coordinator(comptime protocol: type) type {
         output: ?*output_api.Output = null,
         next_output_generation: ?u32,
         loop: ?*Loop = null,
+        clients: []Client,
+        client_count: usize = 0,
+        /// First live client, retained temporarily for compatibility with the
+        /// bounded physical harness while ownership migrates to exact peers.
         peer: ?wayring.io_uring.Peer = null,
         surface: ?wayring.objects.Handle = null,
         surface_id: ?Adapter.SurfaceId = null,
@@ -236,6 +245,11 @@ pub fn Coordinator(comptime protocol: type) type {
             self.render_device = null;
             self.next_output_generation = config.output.output_id.generation;
             self.loop = null;
+            if (config.client_capacity == 0) return error.InvalidConfig;
+            self.clients = try allocator.alloc(Client, config.client_capacity);
+            errdefer allocator.free(self.clients);
+            @memset(self.clients, .{});
+            self.client_count = 0;
             self.peer = null;
             self.surface = null;
             self.surface_id = null;
@@ -428,6 +442,7 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             self.presentations.deinit(self.allocator);
             self.allocator.free(self.pending_surfaces);
+            self.allocator.free(self.clients);
             self.allocator.free(self.association_surfaces);
             self.allocator.free(self.frame_changes);
             self.allocator.free(self.frame_bindings);
@@ -451,33 +466,61 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         pub fn connected(self: *Self, peer: wayring.io_uring.Peer) void {
-            if (self.peer != null) {
+            if (self.peerLive(peer)) return;
+            var available: ?*Client = null;
+            for (self.clients) |*client| if (!client.active) {
+                available = client;
+                break;
+            };
+            const client = available orelse {
                 _ = self.root.runtime.clients.prepareClose(peer) catch {};
                 return;
-            }
-            self.peer = peer;
+            };
+            client.* = .{ .active = true, .peer = peer };
+            self.client_count += 1;
+            if (self.peer == null) self.peer = peer;
             const objects = self.root.runtime.clients.get(peer) catch return;
             objects.setRemovalHook(.{ .context = self, .notify = resourceRemoved });
         }
 
-        /// The current physical executable has one terminal client session:
-        /// disconnect requests the same bounded backend shutdown as SIGTERM.
         pub fn disconnected(self: *Self, peer: wayring.io_uring.Peer) void {
-            if (self.peer) |current| {
-                if (samePeer(current, peer)) self.peer = null;
-            }
-            self.requestStop() catch |err| {
-                std.log.err("physical compositor shutdown failed: {s}", .{@errorName(err)});
+            for (self.clients) |*client| if (client.active and samePeer(client.peer, peer)) {
+                client.* = .{};
+                self.client_count -= 1;
+                break;
             };
+            if (self.peer) |current| if (samePeer(current, peer)) {
+                self.peer = null;
+                for (self.clients) |client| if (client.active) {
+                    self.peer = client.peer;
+                    break;
+                };
+            };
+            if (self.client_count == 0) self.requestStop() catch |err|
+                std.log.err("physical compositor shutdown failed: {s}", .{@errorName(err)});
         }
 
         pub fn protocolError(
-            self: *Self,
-            _: wayring.io_uring.Peer,
+            _: *Self,
+            peer: wayring.io_uring.Peer,
             failure: ServerCore.RequestFailure,
         ) void {
-            std.log.err("Wayland protocol error: {s}", .{@errorName(failure.cause)});
-            self.requestStop() catch {};
+            std.log.err(
+                "Wayland client {d}:{d} protocol error: {s}",
+                .{ peer.slot, peer.generation, @errorName(failure.cause) },
+            );
+        }
+
+        fn peerLive(self: *const Self, peer: wayring.io_uring.Peer) bool {
+            for (self.clients) |client|
+                if (client.active and samePeer(client.peer, peer)) return true;
+            return false;
+        }
+
+        fn scheduleClients(self: *Self) !void {
+            for (self.clients) |client| {
+                if (client.active) _ = try self.loop.?.driver.schedule(client.peer);
+            }
         }
 
         pub fn request(
@@ -487,6 +530,7 @@ pub fn Coordinator(comptime protocol: type) type {
             message: wayring.wire.Message,
             fds: *wayring.ancillary.FdQueue,
         ) !wayring.dispatch.Control {
+            if (!self.peerLive(peer)) return error.ClientDisconnected;
             const actor = try self.root.runtime.clients.reactor.getActor(peer);
             const objects = try self.root.runtime.clients.get(peer);
             if (target.object.interface == &ServerCore.Display.info) {
@@ -777,7 +821,7 @@ pub fn Coordinator(comptime protocol: type) type {
             while (self.input_event_cursor < events.len) {
                 const event = events[self.input_event_cursor];
                 if (!(try self.acceptNormalizedInput(event))) {
-                    if (self.peer) |peer| _ = try self.loop.?.driver.schedule(peer);
+                    try self.scheduleClients();
                     return;
                 }
                 self.input_event_cursor += 1;
@@ -1019,7 +1063,11 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn flushProtocol(self: *Self) !void {
-            const peer = self.peer orelse return;
+            for (self.clients) |client| if (client.active)
+                try self.flushProtocolOn(client.peer);
+        }
+
+        fn flushProtocolOn(self: *Self, peer: wayring.io_uring.Peer) !void {
             const objects = try self.root.runtime.clients.get(peer);
             const actor = try self.root.runtime.clients.reactor.getActor(peer);
             const shell_flushed = try self.shell_adapter.flushOn(objects, &actor.transmit);
@@ -1455,14 +1503,14 @@ pub fn Coordinator(comptime protocol: type) type {
         fn presented(context: *anyopaque, outcome: output_api.FrameOutcome, callback_data: u32) !void {
             const self: *Self = @ptrCast(@alignCast(context));
             try self.finishOutcome(outcome, true);
-            if (self.peer) |peer| _ = try self.loop.?.driver.schedule(peer);
+            try self.scheduleClients();
             _ = callback_data;
         }
 
         fn retired(context: *anyopaque, outcome: output_api.FrameOutcome) !void {
             const self: *Self = @ptrCast(@alignCast(context));
             try self.finishOutcome(outcome, false);
-            if (self.peer) |peer| _ = try self.loop.?.driver.schedule(peer);
+            try self.scheduleClients();
         }
 
         fn finishOutcome(self: *Self, outcome: output_api.FrameOutcome, was_presented: bool) !void {
@@ -1471,8 +1519,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 const binding = layer.binding orelse return error.SampleBindingMismatch;
                 if (!std.meta.eql(sampled.surface, binding.surface)) return error.SampleBindingMismatch;
                 const content = &(layer.content orelse return error.MissingContent);
-                const owner_live = self.peer != null and layer.peer != null and
-                    samePeer(self.peer.?, layer.peer.?) and self.layerSurfaceLive(layer);
+                const owner_live = layer.peer != null and self.peerLive(layer.peer.?) and
+                    self.layerSurfaceLive(layer);
                 if (!owner_live) {
                     self.abandonLayer(layer);
                     continue;
@@ -1586,8 +1634,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 content.attachment_lease = null;
             }
             const peer = layer.peer orelse return error.ClientDisconnected;
-            const live_peer = self.peer orelse return error.ClientDisconnected;
-            if (!samePeer(peer, live_peer)) return error.ClientDisconnected;
+            if (!self.peerLive(peer)) return error.ClientDisconnected;
             const objects = try self.root.runtime.clients.get(peer);
             const actor = try self.root.runtime.clients.reactor.getActor(peer);
             var notification_queued = false;
@@ -1684,22 +1731,27 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn syncOutputAssociations(self: *Self) !void {
-            var count: usize = 0;
-            for (self.app_layers) |layer| {
-                if (!layer.active) continue;
-                self.association_surfaces[count] = layer.surface orelse return error.StaleSurface;
-                count += 1;
-            }
-            if (self.cursor_layer.active) {
-                self.association_surfaces[count] = self.cursor_layer.surface orelse
-                    return error.StaleSurface;
-                count += 1;
-            }
-            const peer = self.peer orelse return;
-            try self.output_adapter.reconcileSurfaces(
-                peer,
-                self.association_surfaces[0..count],
-            );
+            for (self.clients) |client| if (client.active) {
+                var count: usize = 0;
+                for (self.app_layers) |layer| {
+                    if (!layer.active or layer.peer == null or
+                        !samePeer(layer.peer.?, client.peer)) continue;
+                    self.association_surfaces[count] = layer.surface orelse
+                        return error.StaleSurface;
+                    count += 1;
+                }
+                if (self.cursor_layer.active and self.cursor_layer.peer != null and
+                    samePeer(self.cursor_layer.peer.?, client.peer))
+                {
+                    self.association_surfaces[count] = self.cursor_layer.surface orelse
+                        return error.StaleSurface;
+                    count += 1;
+                }
+                try self.output_adapter.reconcileSurfaces(
+                    client.peer,
+                    self.association_surfaces[0..count],
+                );
+            };
         }
 
         fn consumeRetireAction(self: *Self, action: output_api.RetireAction) !void {

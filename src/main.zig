@@ -38,7 +38,7 @@ pub fn main(init: std.process.Init) !void {
     defer wayring.unix_socket.unlink(options.socket) catch {};
     const root = try Compositor.create(
         allocator,
-        try wayring.unix_socket.listen(options.socket, 1),
+        try wayring.unix_socket.listen(options.socket, 4),
         compositorConfig(),
     );
     const coordinator = Coordinator.create(allocator, root, .{
@@ -46,6 +46,7 @@ pub fn main(init: std.process.Init) !void {
     }, .{
         .router_capacity = 16,
         .timer_capacity = 4,
+        .client_capacity = 4,
         .device_capacity = 36,
         .input = .{
             .device_capacity = 16,
@@ -205,7 +206,7 @@ fn compositorConfig() Compositor.Config {
     return .{
         .ring = .{ .entries = 64, .flags = 0 },
         .reactor = .{
-            .max_connections = 1,
+            .max_connections = 4,
             .receive_buffer_size = 8192,
             .receive_buffer_count = 8,
             .receive_control_capacity = 512,
