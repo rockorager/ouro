@@ -402,6 +402,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 .context = self,
                 .validate = validateSelection,
             });
+            self.data_device_adapter.setDragValidator(.{
+                .context = self,
+                .validate = validateDrag,
+            });
             self.activation_adapter.setSerialValidator(.{
                 .context = self,
                 .validate = validateActivation,
@@ -1226,6 +1230,26 @@ pub fn Coordinator(comptime protocol: type) type {
         ) bool {
             const self: *Self = @ptrCast(@alignCast(context));
             return self.seat_adapter.validateSelection(peer, seat_object, serial);
+        }
+
+        fn validateDrag(
+            context: *anyopaque,
+            peer: wayring.io_uring.Peer,
+            seat_object: u32,
+            serial: u32,
+            origin_object: u32,
+        ) bool {
+            const self: *Self = @ptrCast(@alignCast(context));
+            const server_objects = self.root.runtime.clients.get(peer) catch return false;
+            const handle = server_objects.namespace.lookupHandle(origin_object) orelse return false;
+            const object = server_objects.namespace.resolve(handle) orelse return false;
+            const surface = self.adapter.surfaceIdObject(handle, object) catch return false;
+            return self.seat_adapter.validateInteractiveGrab(
+                peer,
+                seat_object,
+                serial,
+                surface,
+            );
         }
 
         fn validateActivation(

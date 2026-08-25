@@ -29,10 +29,14 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     defer fixture.deinit();
     var input = try FakeInput.init();
     defer input.deinit();
+    var root_config = physical_fixture.compositorConfig();
+    root_config.runtime.object_capacity = 32;
+    root_config.runtime.object_quota = 32;
+    root_config.runtime.buckets_per_client = 32;
     const root = try Compositor.create(
         allocator,
         try wayring.unix_socket.listen(path, 1),
-        physical_fixture.compositorConfig(),
+        root_config,
     );
     var platforms = fixture.platforms();
     platforms.input = input.platform();
@@ -178,7 +182,8 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
         }
         if (coordinator.stats.presented == 3 and handler.pointer_motion == 2 and
             handler.pointer_button != 0 and handler.pointer_axis != 0 and
-            handler.pointer_axis_value120 != 0 and handler.keyboard_key != 0) break;
+            handler.pointer_axis_value120 != 0 and handler.keyboard_key != 0 and
+            handler.drag_cancelled == 1) break;
         if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0) {
             try waitForEither(&root.ring, client_reactor.ring);
         }
@@ -201,6 +206,7 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     try std.testing.expect(handler.keyboard_key != 0);
     try std.testing.expectEqual(@as(usize, 2), handler.pointer_motion);
     try std.testing.expectEqual(@as(usize, 1), handler.pointer_button);
+    try std.testing.expectEqual(@as(usize, 1), handler.drag_cancelled);
     try std.testing.expectEqual(@as(usize, 1), handler.pointer_axis_source);
     try std.testing.expectEqual(@as(usize, 1), handler.pointer_axis);
     try std.testing.expectEqual(@as(usize, 1), handler.pointer_axis_value120);
@@ -975,6 +981,9 @@ const Handler = struct {
     shm: ?wayring.objects.Handle = null,
     wm_base: ?wayring.objects.Handle = null,
     seat: ?wayring.objects.Handle = null,
+    data_device_manager: ?wayring.objects.Handle = null,
+    data_device: ?wayring.objects.Handle = null,
+    data_source: ?wayring.objects.Handle = null,
     output: ?wayring.objects.Handle = null,
     surface: ?wayring.objects.Handle = null,
     xdg_surface: ?wayring.objects.Handle = null,
@@ -1000,6 +1009,7 @@ const Handler = struct {
     pointer_frame: usize = 0,
     pointer_axis_fixed: i32 = 0,
     pointer_axis_value120_value: i32 = 0,
+    drag_cancelled: usize = 0,
     keyboard_enter: usize = 0,
     keyboard_key: usize = 0,
     buffer_release: usize = 0,
@@ -1041,6 +1051,7 @@ const Handler = struct {
                 .global_remove => {},
             }
             try self.maybeCreateShell();
+            try self.maybeCreateDataDevice();
         } else if (target.object.interface == &protocol.wl_shm.info) {
             _ = try protocol.wl_shm.decodeEvent(message, fds);
         } else if (target.object.interface == &protocol.wl_output.info) {
@@ -1154,6 +1165,26 @@ const Handler = struct {
                 .button => |value| {
                     self.pointer_button += 1;
                     if (self.cursor_surface == null) try self.queueCursor(value.serial);
+                    if (value.state.value == protocol.wl_pointer.button_state.pressed.value and
+                        self.drag_cancelled == 0)
+                    {
+                        try protocol.wl_data_device.encodeRequest(self.queue, self.data_device.?.id, .{
+                            .start_drag = .{
+                                .source = self.data_source.?.id,
+                                .origin = self.surface.?.id,
+                                .icon = null,
+                                .serial = value.serial +% 1,
+                            },
+                        });
+                        try protocol.wl_data_device.encodeRequest(self.queue, self.data_device.?.id, .{
+                            .start_drag = .{
+                                .source = self.data_source.?.id,
+                                .origin = self.surface.?.id,
+                                .icon = null,
+                                .serial = value.serial,
+                            },
+                        });
+                    }
                 },
                 .axis_source => |value| {
                     try std.testing.expectEqual(protocol.wl_pointer.axis_source.wheel.value, value.axis_source.value);
@@ -1181,6 +1212,13 @@ const Handler = struct {
                 },
                 .enter => self.keyboard_enter += 1,
                 .key => self.keyboard_key += 1,
+                else => {},
+            }
+        } else if (target.object.interface == &protocol.wl_data_device.info) {
+            _ = try protocol.wl_data_device.decodeEvent(message, fds);
+        } else if (target.object.interface == &protocol.wl_data_source.info) {
+            switch (try protocol.wl_data_source.decodeEvent(message, fds)) {
+                .cancelled => self.drag_cancelled += 1,
                 else => {},
             }
         } else if (target.object.interface == &protocol.wl_buffer.info) {
@@ -1233,8 +1271,29 @@ const Handler = struct {
             self.wm_base = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.xdg_wm_base.info, @min(value.version, 7), null);
         if (std.mem.eql(u8, value.interface, protocol.wl_seat.info.name))
             self.seat = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_seat.info, @min(value.version, 9), null);
+        if (std.mem.eql(u8, value.interface, protocol.wl_data_device_manager.info.name))
+            self.data_device_manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_data_device_manager.info, @min(value.version, 3), null);
         if (std.mem.eql(u8, value.interface, protocol.wl_output.info.name))
             self.output = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_output.info, @min(value.version, 4), null);
+    }
+
+    fn maybeCreateDataDevice(self: *Handler) !void {
+        if (self.data_device != null or self.data_device_manager == null or self.seat == null) return;
+        self.data_source = (try protocol.wl_data_device_manager.construct_create_data_source(
+            self.objects,
+            self.queue,
+            self.data_device_manager.?,
+            .{},
+        )).id;
+        try protocol.wl_data_source.encodeRequest(self.queue, self.data_source.?.id, .{
+            .offer = .{ .mime_type = "text/plain" },
+        });
+        self.data_device = (try protocol.wl_data_device_manager.construct_get_data_device(
+            self.objects,
+            self.queue,
+            self.data_device_manager.?,
+            .{ .seat = self.seat.?.id },
+        )).id;
     }
 
     fn maybeCreateShell(self: *Handler) !void {

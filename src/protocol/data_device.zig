@@ -51,6 +51,16 @@ pub fn Adapter(comptime protocol: type) type {
             context: *anyopaque,
             validate: *const fn (*anyopaque, wayring.io_uring.Peer, u32, u32) bool,
         };
+        pub const DragValidator = struct {
+            context: *anyopaque,
+            validate: *const fn (
+                *anyopaque,
+                wayring.io_uring.Peer,
+                u32,
+                u32,
+                u32,
+            ) bool,
+        };
 
         const Id = packed struct { index: u32, generation: u32 };
         const Header = struct {
@@ -124,6 +134,7 @@ pub fn Adapter(comptime protocol: type) type {
         selection: ?Id = null,
         focus: ?wayring.io_uring.Peer = null,
         validator: ?SerialValidator = null,
+        drag_validator: ?DragValidator = null,
 
         pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
             try config.validate();
@@ -193,6 +204,10 @@ pub fn Adapter(comptime protocol: type) type {
 
         pub fn setSerialValidator(self: *Self, validator: SerialValidator) void {
             self.validator = validator;
+        }
+
+        pub fn setDragValidator(self: *Self, validator: DragValidator) void {
+            self.drag_validator = validator;
         }
 
         fn bind(context: ?*anyopaque, binding: wayring.server.Binding) !?*anyopaque {
@@ -312,7 +327,16 @@ pub fn Adapter(comptime protocol: type) type {
         fn deviceRequest(self: *Self, actor: *wayring.connection.Actor, server_objects: anytype, peer: wayring.io_uring.Peer, device: *DeviceSlot, message: wayring.wire.Message, fds: *wayring.ancillary.FdQueue) !wayring.dispatch.Control {
             const decoded = try wayring.server.decodeRequest(Device, server_objects, message, fds);
             switch (decoded.value) {
-                .start_drag => |payload| if (payload.source) |object_id| {
+                .start_drag => |payload| drag: {
+                    const validator = self.drag_validator orelse break :drag;
+                    if (!validator.validate(
+                        validator.context,
+                        peer,
+                        device.seat_object,
+                        payload.serial,
+                        payload.origin,
+                    )) break :drag;
+                    const object_id = payload.source orelse break :drag;
                     const source = self.sourceByObject(server_objects, object_id) orelse
                         return try self.protocolError(actor, decoded.handle.id, Device.@"error".used_source.value, "invalid drag source");
                     if (!std.meta.eql(source.peer, peer) or source.used)
