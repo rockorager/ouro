@@ -766,7 +766,7 @@ fn submitClient(reactor: *wayring.io_uring.Reactor, driver: *ClientDriver, handl
     _ = try driver.prepare(handler);
     _ = try reactor.ring.submit();
 }
-fn drainServer(root: *Compositor, coordinator: *Coordinator, loop: *Loop) !void {
+pub fn drainServer(root: *Compositor, coordinator: *Coordinator, loop: *Loop) !void {
     var wayring_drained = false;
     for (0..128) |_| {
         const progress = try loop.turn(coordinator);

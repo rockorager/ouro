@@ -460,6 +460,176 @@ test "shell-input: two mapped toplevels sustain independent commit cycles" {
     try root.deinit();
 }
 
+test "shell-input: one client disconnect does not interrupt another client" {
+    const allocator = std.testing.allocator;
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-two-clients-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+
+    var fixture = try physical_fixture.Fixture.init();
+    defer fixture.deinit();
+    var root_config = physical_fixture.compositorConfig();
+    root_config.reactor.max_connections = 2;
+    root_config.reactor.receive_buffer_size = 8192;
+    root_config.reactor.receive_buffer_count = 8;
+    root_config.reactor.receive_control_capacity = 512;
+    root_config.runtime.object_capacity = 32;
+    root_config.runtime.object_quota = 32;
+    root_config.runtime.registry_capacity = 2;
+    root_config.runtime.actor.received_fd_budget = 2;
+    const root = try Compositor.create(
+        allocator,
+        try wayring.unix_socket.listen(path, 2),
+        root_config,
+    );
+    var config = physical_fixture.coordinatorConfig();
+    config.client_capacity = 2;
+    config.shm.pool_capacity = 2;
+    config.shm.buffer_capacity = 2;
+    config.surface.surface_capacity = 2;
+    config.surface.frame_callback_capacity = 2;
+    config.surface.content_update_capacity = 3;
+    config.surface.dependency_capacity = 2;
+    config.surface.attachment_capacity = 2;
+    config.surface.copy_capacity = 2;
+    config.output.max_samples = 3;
+    config.output.max_source_bytes = pixels.len * 2;
+    const coordinator = try Coordinator.create(
+        allocator,
+        root,
+        fixture.platforms(),
+        config,
+    );
+    var loop = try Loop.init(
+        allocator,
+        root,
+        &coordinator.router,
+        &coordinator.timers,
+        coordinator,
+        .{ .completion_batch = 16 },
+    );
+    try coordinator.start(&loop);
+
+    var first_reactor: wayring.io_uring.Reactor = undefined;
+    try first_reactor.initOwned(
+        allocator,
+        .{ .entries = 16, .flags = 0 },
+        physical_fixture.clientReactorConfig(),
+    );
+    var first = try ClientConnection.attach(
+        allocator,
+        &first_reactor,
+        try wayring.unix_socket.connect(path),
+        .{ .received_fd_budget = 2, .transmit_byte_budget = 4096, .transmit_fd_budget = 2 },
+        .{ .max_objects = 32, .max_client_ids = 31 },
+    );
+    const first_actor = try first.actor();
+    var first_driver = ClientDriver.init(&first);
+    const first_registry = try ClientCore.getRegistry(
+        &first.objects,
+        &first_actor.transmit,
+        null,
+    );
+    var first_handler: MultiHandler = .{
+        .objects = &first.objects,
+        .queue = &first_actor.transmit,
+        .registry = first_registry,
+        .surface_count = 1,
+        .cycle_count = 2,
+    };
+    try submitMultiClient(&first_reactor, &first_driver, &first_handler);
+
+    var second_reactor: wayring.io_uring.Reactor = undefined;
+    try second_reactor.initOwned(
+        allocator,
+        .{ .entries = 16, .flags = 0 },
+        physical_fixture.clientReactorConfig(),
+    );
+    var second = try ClientConnection.attach(
+        allocator,
+        &second_reactor,
+        try wayring.unix_socket.connect(path),
+        .{ .received_fd_budget = 2, .transmit_byte_budget = 4096, .transmit_fd_budget = 2 },
+        .{ .max_objects = 32, .max_client_ids = 31 },
+    );
+    const second_actor = try second.actor();
+    var second_driver = ClientDriver.init(&second);
+    const second_registry = try ClientCore.getRegistry(
+        &second.objects,
+        &second_actor.transmit,
+        null,
+    );
+    var second_handler: MultiHandler = .{
+        .objects = &second.objects,
+        .queue = &second_actor.transmit,
+        .registry = second_registry,
+        .surface_count = 1,
+        .cycle_count = 6,
+    };
+    try submitMultiClient(&second_reactor, &second_driver, &second_handler);
+
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    var first_progress: ClientDriver.Progress = .{};
+    var second_progress: ClientDriver.Progress = .{};
+    for (0..256) |_| {
+        first_progress = try drainMultiClient(&first_reactor, &first_driver, &first_handler);
+        second_progress = try drainMultiClient(&second_reactor, &second_driver, &second_handler);
+        _ = try loop.turn(coordinator);
+        if (first_handler.frame_done == 2 and first_handler.buffer_releases == 2 and
+            second_handler.frame_done >= 2 and second_handler.buffer_releases >= 2) break;
+        if (root.ring.cq_ready() == 0 and first_reactor.ring.cq_ready() == 0 and
+            second_reactor.ring.cq_ready() == 0)
+            try waitForAny(&root.ring, first_reactor.ring, second_reactor.ring);
+    }
+    try std.testing.expectEqual(@as(usize, 2), coordinator.client_count);
+    try std.testing.expectEqual(@as(usize, 2), first_handler.frame_done);
+    try std.testing.expectEqual(@as(usize, 2), first_handler.buffer_releases);
+
+    _ = try first.prepareClose();
+    try submitMultiClient(&first_reactor, &first_driver, &first_handler);
+    for (0..32) |_| {
+        first_progress = try drainMultiClient(&first_reactor, &first_driver, &first_handler);
+        if (first_progress.quiescent) break;
+        if (first_reactor.ring.cq_ready() == 0) try waitServer(first_reactor.ring);
+    }
+    try std.testing.expect(first_progress.quiescent);
+    try first.deinit(allocator);
+    first_reactor.deinit(allocator);
+
+    for (0..256) |_| {
+        second_progress = try drainMultiClient(&second_reactor, &second_driver, &second_handler);
+        _ = try loop.turn(coordinator);
+        if (coordinator.client_count == 1 and second_handler.frame_done == 6 and
+            second_handler.buffer_releases == 6) break;
+        if (root.ring.cq_ready() == 0 and second_reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, second_reactor.ring);
+    }
+    try std.testing.expectEqual(@as(usize, 1), coordinator.client_count);
+    try std.testing.expect(!coordinator.stopping);
+    try std.testing.expectEqual(@as(usize, 6), second_handler.frame_done);
+    try std.testing.expectEqual(@as(usize, 6), second_handler.buffer_releases);
+    try std.testing.expectEqual(@as(usize, 0), first_handler.event_failures);
+    try std.testing.expectEqual(@as(usize, 0), second_handler.event_failures);
+
+    _ = try second.prepareClose();
+    try submitMultiClient(&second_reactor, &second_driver, &second_handler);
+    for (0..32) |_| {
+        second_progress = try drainMultiClient(&second_reactor, &second_driver, &second_handler);
+        if (second_progress.quiescent) break;
+        if (second_reactor.ring.cq_ready() == 0) try waitServer(second_reactor.ring);
+    }
+    try std.testing.expect(second_progress.quiescent);
+    try second.deinit(allocator);
+    second_reactor.deinit(allocator);
+    try physical_fixture.drainServer(root, coordinator, &loop);
+
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
 const FakeInput = struct {
     fd: linux.fd_t,
     events: [8]ouro.input_platform.RawEvent = undefined,
@@ -553,6 +723,8 @@ const MultiHandler = struct {
     frame_done: usize = 0,
     cycles_started: [2]usize = .{ 0, 0 },
     event_failures: usize = 0,
+    surface_count: usize = 2,
+    cycle_count: usize = two_toplevel_cycle_count,
 
     pub fn eventError(
         self: *MultiHandler,
@@ -650,7 +822,7 @@ const MultiHandler = struct {
     fn maybeCreateShells(self: *MultiHandler) !void {
         if (self.shell_created or self.compositor == null or self.shm == null or self.wm_base == null)
             return;
-        for (0..self.surfaces.len) |index| {
+        for (0..self.surface_count) |index| {
             self.surfaces[index] = (try protocol.wl_compositor.construct_create_surface(
                 self.objects,
                 self.queue,
@@ -727,7 +899,7 @@ const MultiHandler = struct {
     }
 
     fn maybeStartCycle(self: *MultiHandler, index: usize) !void {
-        if (self.cycles_started[index] >= two_toplevel_cycle_count or
+        if (self.cycles_started[index] >= self.cycle_count or
             self.buffers[index] != null or self.callbacks[index] != null) return;
         try self.mapSurface(index);
     }
@@ -1210,6 +1382,15 @@ fn submitClient(
 fn waitForEither(server: *linux.IoUring, client: *linux.IoUring) !void {
     for (0..10_000_000) |_| {
         if (server.cq_ready() != 0 or client.cq_ready() != 0) return;
+        _ = linux.sched_yield();
+    }
+    return error.CompletionTimeout;
+}
+
+fn waitForAny(first: *linux.IoUring, second: *linux.IoUring, third: *linux.IoUring) !void {
+    for (0..10_000_000) |_| {
+        if (first.cq_ready() != 0 or second.cq_ready() != 0 or third.cq_ready() != 0)
+            return;
         _ = linux.sched_yield();
     }
     return error.CompletionTimeout;

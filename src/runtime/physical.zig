@@ -506,8 +506,8 @@ pub fn Coordinator(comptime protocol: type) type {
             failure: ServerCore.RequestFailure,
         ) void {
             std.log.err(
-                "Wayland client {d}:{d} protocol error: {s}",
-                .{ peer.slot, peer.generation, @errorName(failure.cause) },
+                "Wayland client {d}:{d} object {?d} protocol error: {s}",
+                .{ peer.slot, peer.generation, failure.object_id, @errorName(failure.cause) },
             );
         }
 
