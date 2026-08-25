@@ -77,7 +77,7 @@ responsibilities:
 
 Initial compositor keybindings use the Logo key: `Logo+Tab` focuses the next
 window, `Logo+Q` requests that the focused client close, `Logo+F` toggles
-fullscreen, and `Logo+Space` toggles floating layout. `Logo+J/K` focuses
+fullscreen, `Logo+M` toggles maximized state, and `Logo+Space` toggles floating layout. `Logo+J/K` focuses
 forward/backward; adding Shift moves the focused tiled window in that direction.
 Matched key press/release pairs are consumed before client seat delivery.
 

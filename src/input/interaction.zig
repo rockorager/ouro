@@ -17,6 +17,7 @@ const state_words = code_count / 64;
 const key_tab = 15;
 const key_q = 16;
 const key_f = 33;
+const key_m = 50;
 const key_space = 57;
 const key_j = 36;
 const key_k = 37;
@@ -409,6 +410,7 @@ pub fn Interaction(comptime Desktop: type) type {
                 key_tab => try desktop.focusNext(),
                 key_q => {},
                 key_f => try desktop.toggleFocusedFullscreen(),
+                key_m => try desktop.toggleFocusedMaximized(),
                 key_space => try desktop.toggleFocusedFloating(),
                 key_j => if (shift) try desktop.moveFocusedTile(.next) else try desktop.focusNext(),
                 key_k => if (shift) try desktop.moveFocusedTile(.previous) else try desktop.focusPrevious(),
@@ -679,7 +681,7 @@ fn writeBit(words: *[state_words]u64, code: u32, value: bool) void {
 }
 
 fn isBindingKey(key: u32) bool {
-    return key == key_tab or key == key_q or key == key_f or key == key_space or
+    return key == key_tab or key == key_q or key == key_f or key == key_m or key == key_space or
         key == key_j or key == key_k;
 }
 
@@ -716,6 +718,7 @@ const TestDesktop = struct {
     move_next_count: usize = 0,
     move_previous_count: usize = 0,
     fullscreen_count: usize = 0,
+    maximized_count: usize = 0,
     floating_count: usize = 0,
     interactive_rect: ?geometry.Rect = null,
     resizing: bool = false,
@@ -762,6 +765,10 @@ const TestDesktop = struct {
 
     pub fn toggleFocusedFullscreen(self: *@This()) !void {
         self.fullscreen_count += 1;
+    }
+
+    pub fn toggleFocusedMaximized(self: *@This()) !void {
+        self.maximized_count += 1;
     }
 
     pub fn toggleFocusedFloating(self: *@This()) !void {
@@ -1296,7 +1303,7 @@ test "interaction: compositor bindings consume exact press and release pairs" {
     } });
     try std.testing.expectEqual(@as(usize, 0), interaction.pendingCommands());
 
-    inline for ([_]u32{ key_tab, key_f, key_space }) |key| {
+    inline for ([_]u32{ key_tab, key_f, key_m, key_space }) |key| {
         try interaction.consume(&desktop, &surfaces, .{ .keyboard_key = .{
             .device = device_a,
             .time_usec = 2,
@@ -1316,6 +1323,7 @@ test "interaction: compositor bindings consume exact press and release pairs" {
     }
     try std.testing.expectEqual(@as(usize, 1), desktop.focus_next_count);
     try std.testing.expectEqual(@as(usize, 1), desktop.fullscreen_count);
+    try std.testing.expectEqual(@as(usize, 1), desktop.maximized_count);
     try std.testing.expectEqual(@as(usize, 1), desktop.floating_count);
 
     inline for ([_]u32{ key_j, key_k }) |key| {

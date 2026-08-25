@@ -480,6 +480,12 @@ pub fn Desktop(comptime Shell: type) type {
             try desktop.requestState(id, .fullscreen, !desktop.slots[index].fullscreen);
         }
 
+        pub fn toggleFocusedMaximized(desktop: *Self) !void {
+            const id = desktop.focused() orelse return;
+            const index = try desktop.resolveIndex(id);
+            try desktop.requestState(id, .maximized, !desktop.slots[index].maximized);
+        }
+
         pub fn toggleFocusedFloating(desktop: *Self) !void {
             const id = desktop.focused() orelse return;
             const index = try desktop.resolveIndex(id);
@@ -1792,9 +1798,11 @@ test "desktop: focus history and tiled-floating transitions are deterministic" {
     const second = try desktop.idForShell(.{ .index = 1, .generation = 1 });
     try std.testing.expectEqual(second, desktop.focused().?);
     try desktop.toggleFocusedFullscreen();
+    try desktop.toggleFocusedMaximized();
     try desktop.toggleFocusedFloating();
     const second_index = try desktop.resolveIndex(second);
     try std.testing.expect(desktop.slots[second_index].fullscreen);
+    try std.testing.expect(desktop.slots[second_index].maximized);
     try std.testing.expectEqual(TestDesktop.Mode.floating, desktop.slots[second_index].mode);
     try desktop.focusToplevel(first);
 
