@@ -48,6 +48,10 @@ responsibilities:
   keyboard resources aggregate normalized physical input, retain keymap FD
   ownership, and deliver generation-safe focus and user-action serials through
   resumable outbound commands.
+- [Wayland output](src/protocol/output.zig): clients discover the selected
+  physical output's geometry, current and preferred DRM mode, refresh rate,
+  scale, stable name, and description through version-correct `wl_output`
+  snapshots and updates.
 - [Desktop interaction](src/input/interaction.zig): pointer motion hit-tests
   exact committed input regions against the copied desktop scene, retains
   default/button-grab state and protocol-neutral focus commands, and places a

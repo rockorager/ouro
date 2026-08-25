@@ -196,6 +196,15 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     try std.testing.expectEqual(@as(usize, 1), handler.buffer_release);
     try std.testing.expect(handler.buffer_release_order != 0);
     try std.testing.expect(handler.buffer_release_order < handler.frame_done_order);
+    try std.testing.expect(handler.output_geometry);
+    try std.testing.expectEqual(@as(i32, 1), handler.output_physical_width);
+    try std.testing.expectEqual(@as(i32, 1), handler.output_physical_height);
+    try std.testing.expect(handler.output_mode);
+    try std.testing.expect(handler.output_scale);
+    try std.testing.expect(handler.output_name);
+    try std.testing.expect(handler.output_description);
+    try std.testing.expect(handler.output_done != 0);
+    try std.testing.expect(handler.output_released);
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
 
     const retained_app = coordinator.app_layers[0].sample.?;
@@ -235,6 +244,7 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     }
     try std.testing.expect(!coordinator.cursor_layer.active);
     try std.testing.expect(coordinator.app_layers[0].active);
+    try std.testing.expect(handler.output_deleted);
 
     coordinator.disconnected(coordinator.peer.?);
     _ = try client.prepareClose();
@@ -715,6 +725,7 @@ const Handler = struct {
     shm: ?wayring.objects.Handle = null,
     wm_base: ?wayring.objects.Handle = null,
     seat: ?wayring.objects.Handle = null,
+    output: ?wayring.objects.Handle = null,
     surface: ?wayring.objects.Handle = null,
     xdg_surface: ?wayring.objects.Handle = null,
     toplevel: ?wayring.objects.Handle = null,
@@ -739,6 +750,16 @@ const Handler = struct {
     completion_order: usize = 0,
     buffer_release_order: usize = 0,
     frame_done_order: usize = 0,
+    output_geometry: bool = false,
+    output_physical_width: i32 = 0,
+    output_physical_height: i32 = 0,
+    output_mode: bool = false,
+    output_scale: bool = false,
+    output_name: bool = false,
+    output_description: bool = false,
+    output_done: usize = 0,
+    output_released: bool = false,
+    output_deleted: bool = false,
     event_failures: usize = 0,
 
     pub fn eventError(
@@ -764,6 +785,55 @@ const Handler = struct {
             try self.maybeCreateShell();
         } else if (target.object.interface == &protocol.wl_shm.info) {
             _ = try protocol.wl_shm.decodeEvent(message, fds);
+        } else if (target.object.interface == &protocol.wl_output.info) {
+            switch (try protocol.wl_output.decodeEvent(message, fds)) {
+                .geometry => |value| {
+                    try std.testing.expectEqual(@as(i32, 0), value.x);
+                    try std.testing.expectEqual(@as(i32, 0), value.y);
+                    try std.testing.expect(value.physical_width == 0 or value.physical_width == 1);
+                    try std.testing.expect(value.physical_height == 0 or value.physical_height == 1);
+                    try std.testing.expectEqual(protocol.wl_output.subpixel.unknown, value.subpixel);
+                    try std.testing.expectEqualStrings("Ouro", value.make);
+                    try std.testing.expectEqualStrings("Unknown", value.model);
+                    try std.testing.expectEqual(protocol.wl_output.transform.normal, value.transform);
+                    self.output_physical_width = value.physical_width;
+                    self.output_physical_height = value.physical_height;
+                    self.output_geometry = true;
+                },
+                .mode => |value| {
+                    try std.testing.expect(value.flags.contains(protocol.wl_output.mode.current));
+                    try std.testing.expect(value.flags.contains(protocol.wl_output.mode.preferred));
+                    try std.testing.expectEqual(@as(i32, 3), value.width);
+                    try std.testing.expectEqual(@as(i32, 2), value.height);
+                    try std.testing.expectEqual(@as(i32, 60_000), value.refresh);
+                    self.output_mode = true;
+                },
+                .scale => |value| {
+                    try std.testing.expectEqual(@as(i32, 1), value.factor);
+                    self.output_scale = true;
+                },
+                .name => |value| {
+                    try std.testing.expectEqualStrings("ouro-0", value.name);
+                    self.output_name = true;
+                },
+                .description => |value| {
+                    try std.testing.expectEqualStrings("Ouro output", value.description);
+                    self.output_description = true;
+                },
+                .done => {
+                    self.output_done += 1;
+                    if (self.output_mode and !self.output_released) {
+                        try wayring.client.sendRequest(
+                            protocol.wl_output,
+                            self.objects,
+                            self.queue,
+                            self.output.?,
+                            .{ .release = .{} },
+                        );
+                        self.output_released = true;
+                    }
+                },
+            }
         } else if (target.object.interface == &protocol.xdg_toplevel.info) {
             switch (try protocol.xdg_toplevel.decodeEvent(message, fds)) {
                 .configure => {},
@@ -858,7 +928,10 @@ const Handler = struct {
             }
         } else if (target.object.interface == &ClientCore.Display.info) {
             switch (try ClientCore.decodeDisplayEvent(self.objects, message, fds)) {
-                .delete_id => {},
+                .delete_id => |value| {
+                    if (self.output != null and value.id == self.output.?.id)
+                        self.output_deleted = true;
+                },
                 .@"error" => return error.ServerProtocolError,
             }
         } else return error.UnexpectedEvent;
@@ -874,6 +947,8 @@ const Handler = struct {
             self.wm_base = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.xdg_wm_base.info, @min(value.version, 7), null);
         if (std.mem.eql(u8, value.interface, protocol.wl_seat.info.name))
             self.seat = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_seat.info, @min(value.version, 9), null);
+        if (std.mem.eql(u8, value.interface, protocol.wl_output.info.name))
+            self.output = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_output.info, @min(value.version, 4), null);
     }
 
     fn maybeCreateShell(self: *Handler) !void {

@@ -27,6 +27,7 @@ const presentation = @import("../presentation.zig");
 const core_surface = @import("../protocol/core_surface.zig");
 const xdg_shell = @import("../protocol/xdg_shell.zig");
 const protocol_seat = @import("../protocol/seat.zig");
+const protocol_output = @import("../protocol/output.zig");
 const desktop_model = @import("../desktop/model.zig");
 const interaction_model = @import("../input/interaction.zig");
 
@@ -45,6 +46,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const Desktop = desktop_model.Desktop(ShellAdapter);
         const Interaction = interaction_model.Interaction(Desktop);
         const SeatAdapter = protocol_seat.Adapter(protocol, Adapter);
+        const OutputAdapter = protocol_output.Adapter(protocol);
 
         const Imported = struct {};
         const Presentations = presentation.Queue(Imported);
@@ -128,6 +130,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .event_capacity = 16,
                 .keymap = protocol_seat.default_keymap,
             },
+            protocol_output: protocol_output.Config = .{},
             drm: drm.Config,
             output: output_api.Config,
         };
@@ -169,6 +172,7 @@ pub fn Coordinator(comptime protocol: type) type {
         desktop: Desktop,
         interaction: Interaction,
         seat_adapter: SeatAdapter,
+        output_adapter: OutputAdapter,
         presentations: Presentations,
         render_device: ?*output_api.RenderDevice = null,
         output: ?*output_api.Output = null,
@@ -292,6 +296,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 config.protocol_seat,
             );
             errdefer self.seat_adapter.deinit();
+            self.output_adapter = try OutputAdapter.init(allocator, config.protocol_output);
+            errdefer self.output_adapter.deinit();
             self.presentations = try Presentations.init(
                 allocator,
                 config.output.max_samples,
@@ -307,6 +313,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
             _ = try self.shell_adapter.install(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
+            _ = try self.output_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
             _ = try self.seat_adapter.install(&root.runtime);
@@ -368,6 +377,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.allocator.free(self.frame_samples);
             self.allocator.free(self.scene_windows);
             self.allocator.free(self.app_layers);
+            self.output_adapter.deinit();
             self.seat_adapter.deinit();
             self.interaction.deinit();
             self.desktop.deinit();
@@ -463,6 +473,10 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             if (try self.seat_adapter.request(peer, target, message, fds)) |control| {
                 try self.processSeatEvents();
+                try self.flushProtocol();
+                return control;
+            }
+            if (try self.output_adapter.request(peer, target, message, fds)) |control| {
                 try self.flushProtocol();
                 return control;
             }
@@ -882,9 +896,11 @@ pub fn Coordinator(comptime protocol: type) type {
             const actor = try self.root.runtime.clients.reactor.getActor(peer);
             const shell_flushed = try self.shell_adapter.flushOn(objects, &actor.transmit);
             const seat_flushed = try self.seat_adapter.flushOn(objects, &actor.transmit);
-            if (shell_flushed != 0 or seat_flushed != 0 or
+            const output_flushed = try self.output_adapter.flushOn(&actor.transmit);
+            if (shell_flushed != 0 or seat_flushed != 0 or output_flushed != 0 or
                 self.shell_adapter.pendingOutbound() != 0 or
-                self.seat_adapter.pendingOutbound() != 0)
+                self.seat_adapter.pendingOutbound() != 0 or
+                self.output_adapter.pendingOutbound() != 0)
                 _ = try self.loop.?.driver.schedule(peer);
         }
 
@@ -938,6 +954,15 @@ pub fn Coordinator(comptime protocol: type) type {
             self.interaction.applyBounds(work_area);
             const retained_visibility_changed = self.refreshRetainedLayersForOutput();
             self.output_drain_started = false;
+            const connector = snapshot.selectedConnector();
+            const mode = snapshot.selectedMode();
+            try self.output_adapter.publishMode(
+                self.output.?.planner.output.width,
+                self.output.?.planner.output.height,
+                try std.math.mul(u32, mode.vrefresh, 1000),
+                connector.width_mm,
+                connector.height_mm,
+            );
             self.next_output_generation = if (generation == std.math.maxInt(u32))
                 null
             else
@@ -1598,6 +1623,7 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             _ = self.shell_adapter.resourceRemoved(handle, object);
             _ = self.seat_adapter.resourceRemoved(handle, object);
+            _ = self.output_adapter.resourceRemoved(handle, object);
             if (removed_surface) |id| {
                 self.dropPendingSurface(id);
                 if (self.render_device) |render_device| render_device.content.destroySurface(

@@ -37,6 +37,7 @@ pub const real_output = @import("output/drm.zig");
 pub const core_surface = @import("protocol/core_surface.zig");
 pub const xdg_shell = @import("protocol/xdg_shell.zig");
 pub const seat = @import("protocol/seat.zig");
+pub const protocol_output = @import("protocol/output.zig");
 pub const scene_geometry = @import("scene/geometry.zig");
 pub const scene_hit_test = @import("scene/hit_test.zig");
 pub const scene_cursor = @import("scene/cursor.zig");
@@ -82,6 +83,7 @@ test {
     _ = core_surface;
     _ = xdg_shell;
     _ = seat;
+    _ = protocol_output;
     _ = scene_geometry;
     _ = scene_hit_test;
     _ = scene_cursor;
