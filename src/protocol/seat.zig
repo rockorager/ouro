@@ -118,6 +118,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             cursor_requested: CursorRequest,
             pointer_grab_cancelled: FocusTarget,
         };
+        pub const PointerId = struct { index: u32, generation: u32 };
 
         const Header = struct {
             active: bool = false,
@@ -171,7 +172,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             keyboard_key: struct { keyboard: Id, serial: u32, target: FocusTarget, time: u32, key: u32, pressed: bool },
             keyboard_modifiers: struct { keyboard: Id, serial: u32, target: FocusTarget, state: ModifierState },
         };
-        const Id = struct { index: u32, generation: u32 };
+        const Id = PointerId;
         const OutboundSlot = struct {
             active: bool = false,
             sequence: u64 = 0,
@@ -494,6 +495,24 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         pub fn makeTarget(adapter: *Self, peer: wayring.io_uring.Peer, surface: SurfaceId) !FocusTarget {
             _ = try adapter.core.getSurfaceById(surface);
             return .{ .client = clientId(peer), .surface = surface };
+        }
+
+        pub fn pointerIdOn(adapter: *Self, server_objects: anytype, object_id: u32) !PointerId {
+            const handle = server_objects.namespace.lookupHandle(object_id) orelse
+                return error.StalePointer;
+            const object = server_objects.namespace.resolve(handle) orelse
+                return error.StalePointer;
+            if (object.interface != &Pointer.info) return error.StalePointer;
+            const slot = fromContext(PointerSlot, adapter.pointers, object.context) orelse
+                return error.StalePointer;
+            if (!std.meta.eql(slot.header.resource, handle)) return error.StalePointer;
+            return adapter.pointerId(slot);
+        }
+
+        pub fn pointerFocused(adapter: *Self, id: PointerId) bool {
+            const pointer = adapter.resolvePointer(id) catch return false;
+            const focus = adapter.pointer_delivery orelse return false;
+            return sameClient(pointer.client, focus.client);
         }
 
         /// Validates an input serial against the exact wl_seat resource named
@@ -1858,6 +1877,39 @@ test "seat: serial wrap skips zero and live client pointer serials" {
 
     try std.testing.expectEqual(std.math.maxInt(u32), adapter.issueSerial());
     try std.testing.expectEqual(@as(u32, 2), adapter.issueSerial());
+}
+
+test "seat: relative pointer lookup retains exact resource generation and focus" {
+    var core: FakeCore = .{};
+    var adapter = try testAdapter(&core);
+    defer adapter.deinit();
+    var server_objects = try wayring.objects.ServerObjects.init(
+        std.testing.allocator,
+        8,
+        4,
+        &TestCore.Display.info,
+        null,
+    );
+    defer server_objects.deinit(std.testing.allocator);
+    const peer: wayring.io_uring.Peer = .{ .slot = 1, .generation = 7 };
+    const pointer = try acquire(TestAdapter.PointerSlot, adapter.pointers, &adapter.pointer_free);
+    pointer.client = clientId(peer);
+    pointer.header.resource = try server_objects.insertClient(
+        2,
+        &test_protocol.wl_pointer.info,
+        9,
+        pointer,
+    );
+    const id = try adapter.pointerIdOn(&server_objects, 2);
+    try std.testing.expectEqual(adapter.pointerId(pointer), id);
+    try std.testing.expect(!adapter.pointerFocused(id));
+    adapter.pointer_delivery = .{
+        .client = clientId(peer),
+        .surface = .{ .index = 0, .generation = 1 },
+    };
+    try std.testing.expect(adapter.pointerFocused(id));
+    release(TestAdapter.PointerSlot, adapter.pointers, &adapter.pointer_free, id.index);
+    try std.testing.expect(!adapter.pointerFocused(id));
 }
 
 test "seat: popup grabs require the exact seat and delivered press serial" {

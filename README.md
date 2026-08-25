@@ -58,6 +58,9 @@ responsibilities:
   ownership, derive depressed and locked modifiers from the published keymap,
   and deliver generation-safe focus, user-action serials, and high-resolution
   wheel or touch scrolling through resumable outbound commands.
+- [Relative pointer](src/protocol/relative_pointer.zig): focused wl_pointer
+  resources receive unclipped relative motion with exact microsecond timestamps
+  through a bounded, backpressure-safe event queue.
 - [Clipboard selection](src/protocol/data_device.zig): bounded data sources,
   devices, and offers validate exact seat action serials, publish selection on
   keyboard focus, and retain receive descriptors across transport backpressure.
