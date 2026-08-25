@@ -15,6 +15,7 @@ const cursor_model = @import("../scene/cursor.zig");
 const code_count = 0x300;
 const state_words = code_count / 64;
 const key_tab = 15;
+const key_q = 16;
 const key_f = 33;
 const key_space = 57;
 const key_left_meta = 125;
@@ -54,6 +55,7 @@ pub fn Interaction(comptime Desktop: type) type {
             keyboard_focus: Target,
             cancel: Cancellation,
             key_consumed,
+            close: ToplevelId,
         };
         const InteractiveOperation = struct {
             target: Target,
@@ -394,9 +396,12 @@ pub fn Interaction(comptime Desktop: type) type {
             const meta = self.anyDeviceKey(key_left_meta) or self.anyDeviceKey(key_right_meta) or
                 (pressed and (key == key_left_meta or key == key_right_meta));
             const binding = pressed and meta and isBindingKey(key);
-            if (binding or release_binding) try self.ensureCommandCapacity(1);
+            const close_target = if (binding and key == key_q) desktop.focusedToplevel() else null;
+            if (binding or release_binding)
+                try self.ensureCommandCapacity(1 + @as(usize, @intFromBool(close_target != null)));
             if (binding) switch (key) {
                 key_tab => try desktop.focusNext(),
+                key_q => {},
                 key_f => try desktop.toggleFocusedFullscreen(),
                 key_space => try desktop.toggleFocusedFloating(),
                 else => unreachable,
@@ -404,6 +409,7 @@ pub fn Interaction(comptime Desktop: type) type {
             writeBit(&device.keys, key, pressed);
             writeBit(&device.swallowed_keys, key, binding);
             if (binding or release_binding) self.enqueue(.key_consumed);
+            if (close_target) |id| self.enqueue(.{ .close = id });
         }
 
         fn removeDevice(self: *Self, desktop: *Desktop, id: input.DeviceId) !void {
@@ -614,6 +620,7 @@ pub fn Interaction(comptime Desktop: type) type {
                 .keyboard_focus => |target| matches(target, toplevel, surface),
                 .cancel => false,
                 .key_consumed => false,
+                .close => |id| toplevel != null and std.meta.eql(id, toplevel.?),
             };
         }
 
@@ -664,7 +671,7 @@ fn writeBit(words: *[state_words]u64, code: u32, value: bool) void {
 }
 
 fn isBindingKey(key: u32) bool {
-    return key == key_tab or key == key_f or key == key_space;
+    return key == key_tab or key == key_q or key == key_f or key == key_space;
 }
 
 const TestId = packed struct { index: u32, generation: u32 };
@@ -724,6 +731,10 @@ const TestDesktop = struct {
 
     pub fn focusNext(self: *@This()) !void {
         self.focus_next_count += 1;
+    }
+
+    pub fn focusedToplevel(self: *const @This()) ?TestId {
+        return self.focused;
     }
 
     pub fn toggleFocusedFullscreen(self: *@This()) !void {
@@ -1283,4 +1294,39 @@ test "interaction: compositor bindings consume exact press and release pairs" {
     try std.testing.expectEqual(@as(usize, 1), desktop.focus_next_count);
     try std.testing.expectEqual(@as(usize, 1), desktop.fullscreen_count);
     try std.testing.expectEqual(@as(usize, 1), desktop.floating_count);
+}
+
+test "interaction: close binding retains the exact focused toplevel" {
+    var interaction = try initTestInteraction(2);
+    defer interaction.deinit();
+    var desktop = testDesktop();
+    var surfaces = TestSurfaces{};
+    desktop.focused = desktop.windows[1].id;
+    try interaction.consume(&desktop, &surfaces, .{ .device_added = .{
+        .device = device_a,
+        .capabilities = .{ .keyboard = true },
+    } });
+    try interaction.consume(&desktop, &surfaces, .{ .keyboard_key = .{
+        .device = device_a,
+        .time_usec = 1,
+        .key = key_left_meta,
+        .pressed = true,
+    } });
+    try interaction.consume(&desktop, &surfaces, .{ .keyboard_key = .{
+        .device = device_a,
+        .time_usec = 2,
+        .key = key_q,
+        .pressed = true,
+    } });
+    try std.testing.expect(interaction.peekCommand().? == .key_consumed);
+    interaction.dropCommand();
+    try std.testing.expectEqual(desktop.windows[1].id, interaction.peekCommand().?.close);
+    interaction.dropCommand();
+    try interaction.consume(&desktop, &surfaces, .{ .keyboard_key = .{
+        .device = device_a,
+        .time_usec = 3,
+        .key = key_q,
+        .pressed = false,
+    } });
+    try std.testing.expect(interaction.peekCommand().? == .key_consumed);
 }

@@ -925,6 +925,7 @@ pub fn Coordinator(comptime protocol: type) type {
                         if (cancel.pointer_grab) try self.seat_adapter.cancelPointerGrab();
                     },
                     .key_consumed => self.input_keyboard_consumed = true,
+                    .close => |id| try self.shell_adapter.queueClose(try self.desktop.shellToplevel(id)),
                 }
                 self.interaction.dropCommand();
                 self.stats.interaction_commands += 1;

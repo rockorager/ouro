@@ -421,6 +421,14 @@ pub fn Desktop(comptime Shell: type) type {
             return desktop.idFor(desktop.focus[0]);
         }
 
+        pub fn focusedToplevel(desktop: *const Self) ?ToplevelId {
+            return desktop.focused();
+        }
+
+        pub fn shellToplevel(desktop: *const Self, id: ToplevelId) !Shell.ToplevelId {
+            return desktop.slots[try desktop.resolveIndex(id)].shell_id;
+        }
+
         pub fn focusToplevel(desktop: *Self, id: ToplevelId) !void {
             const index = try desktop.resolveIndex(id);
             if (desktop.slots[index].minimized) return error.NotVisible;
