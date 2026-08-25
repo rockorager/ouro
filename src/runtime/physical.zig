@@ -177,7 +177,11 @@ pub fn Coordinator(comptime protocol: type) type {
         pending_surfaces: []PendingSurface,
         pending_surface_head: usize = 0,
         pending_surface_len: usize = 0,
-        app_layer: Layer,
+        app_layers: []Layer,
+        scene_windows: []Desktop.SceneWindow,
+        frame_samples: []render_list.AppliedSurface,
+        frame_bindings: []output_api.SampleBinding,
+        frame_changes: []damage.Change,
         cursor_layer: Layer,
         output_drain_started: bool = false,
         stopping: bool = false,
@@ -219,7 +223,17 @@ pub fn Coordinator(comptime protocol: type) type {
             self.pending_surface_len = 0;
             if (config.output.max_samples < 2 or config.output.max_source_bytes == 0)
                 return error.InvalidConfig;
-            self.app_layer = .{};
+            self.app_layers = try allocator.alloc(Layer, config.output.max_samples - 1);
+            errdefer allocator.free(self.app_layers);
+            @memset(self.app_layers, .{});
+            self.scene_windows = try allocator.alloc(Desktop.SceneWindow, config.desktop.toplevel_capacity);
+            errdefer allocator.free(self.scene_windows);
+            self.frame_samples = try allocator.alloc(render_list.AppliedSurface, config.output.max_samples);
+            errdefer allocator.free(self.frame_samples);
+            self.frame_bindings = try allocator.alloc(output_api.SampleBinding, config.output.max_samples);
+            errdefer allocator.free(self.frame_bindings);
+            self.frame_changes = try allocator.alloc(damage.Change, config.output.max_samples);
+            errdefer allocator.free(self.frame_changes);
             self.cursor_layer = .{};
             self.output_drain_started = false;
             self.stopping = false;
@@ -339,6 +353,11 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             self.presentations.deinit(self.allocator);
             self.allocator.free(self.pending_surfaces);
+            self.allocator.free(self.frame_changes);
+            self.allocator.free(self.frame_bindings);
+            self.allocator.free(self.frame_samples);
+            self.allocator.free(self.scene_windows);
+            self.allocator.free(self.app_layers);
             self.seat_adapter.deinit();
             self.interaction.deinit();
             self.desktop.deinit();
@@ -859,17 +878,18 @@ pub fn Coordinator(comptime protocol: type) type {
                 generation + 1;
             self.stats.selected_outputs += 1;
             output_committed = true;
-            if (self.app_layer.active or self.cursor_layer.active or retained_visibility_changed)
+            if (self.anyAppLayerActive() or self.cursor_layer.active or retained_visibility_changed)
                 try self.output.?.request(.damage, try monotonicNs());
             try self.armTimer();
         }
 
         fn refreshRetainedLayersForOutput(self: *Self) bool {
             const output_size = self.output.?.planner.output;
-            if (self.app_layer.active) {
-                const id = self.app_layer.id orelse unreachable;
+            var visibility_changed = false;
+            for (self.app_layers) |*layer| if (layer.active) {
+                const id = layer.id orelse unreachable;
                 const scene = self.desktop.sceneForSurface(id) catch null;
-                var sample = self.app_layer.sample.?;
+                var sample = layer.sample.?;
                 if (scene) |window| {
                     sample.destination = .{
                         .x = window.geometry.x,
@@ -885,25 +905,26 @@ pub fn Coordinator(comptime protocol: type) type {
                     };
                 }
                 sample.clip = clipToOutput(sample.destination, output_size) catch unreachable orelse {
-                    if (self.app_layer.outcome_pending) {
-                        self.app_layer.active = false;
-                        self.app_layer.retire_after_outcome = true;
+                    if (layer.outcome_pending) {
+                        layer.active = false;
+                        layer.retire_after_outcome = true;
                     } else {
-                        self.abandonLayer(&self.app_layer);
+                        self.abandonLayer(layer);
                     }
-                    return true;
+                    visibility_changed = true;
+                    continue;
                 };
-                self.app_layer.sample = sample;
-                self.app_layer.change = .{
+                layer.sample = sample;
+                layer.change = .{
                     .current = damage.SurfaceState.fromSample(sample, .{
                         .width = sample.destination.width,
                         .height = sample.destination.height,
                     }),
                     .invalidate_bounds = true,
                 };
-            }
+            };
             if (self.cursor_layer.active) self.cursor_layer.change.?.invalidate_bounds = true;
-            return false;
+            return visibility_changed;
         }
 
         fn applyReady(self: *Self) !void {
@@ -943,7 +964,7 @@ pub fn Coordinator(comptime protocol: type) type {
             else
                 false;
             const layer = if (in_desktop)
-                &self.app_layer
+                self.appLayerForSurface(exact_surface_id) orelse return false
             else if (requested_cursor)
                 &self.cursor_layer
             else
@@ -982,7 +1003,8 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = attachment.buffer orelse return error.MissingBuffer;
             const lease = content.attachment_lease orelse return error.MissingLease;
             const source = try self.adapter.shmSource(lease);
-            if (source.bytes.len > self.output_config.max_source_bytes)
+            if (source.bytes.len > (self.output_config.max_surface_bytes orelse
+                self.output_config.max_source_bytes))
                 return error.InvalidSource;
             const pixel_format: render.PixelFormat = if (source.format.value == protocol.wl_shm.format.argb8888.value) .argb8888_premultiplied else if (source.format.value == protocol.wl_shm.format.xrgb8888.value) .xrgb8888 else return error.UnsupportedShmFormat;
             if (source.stride > std.math.maxInt(u32)) return error.InvalidSource;
@@ -1027,7 +1049,11 @@ pub fn Coordinator(comptime protocol: type) type {
                 .height = rendered_height,
             };
             const crop = try sourceCrop(content.surface, source.width, source.height);
-            const clip = try clipToOutput(destination, output_size) orelse {
+            const clip = if (scene) |window|
+                if (window.visible) try clipToOutput(destination, output_size) else null
+            else
+                try clipToOutput(destination, output_size);
+            const visible_clip = clip orelse {
                 const token = self.presentations.admitImported(.{}) catch |err| switch (err) {
                     error.Exhausted => return false,
                     else => return err,
@@ -1089,7 +1115,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .upload_damage = upload_damage,
                 .crop = crop,
                 .destination = destination,
-                .clip = clip,
+                .clip = visible_clip,
                 .transform = @enumFromInt(@intFromEnum(content.surface.transform)),
             };
             const published = .{
@@ -1127,14 +1153,15 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn renderFrame(self: *Self, frame: @import("../output/headless.zig").FrameId) !void {
             const output = self.output orelse return;
-            var samples: [2]render_list.AppliedSurface = undefined;
-            var bindings: [2]output_api.SampleBinding = undefined;
-            var changes: [2]damage.Change = undefined;
             var count: usize = 0;
-            if (self.app_layer.active) {
-                samples[count] = self.app_layer.sample.?;
-                bindings[count] = self.app_layer.binding.?;
-                changes[count] = self.app_layer.change.?;
+            const windows = try self.desktop.sceneSnapshot(self.scene_windows);
+            for (windows) |window| {
+                if (!window.visible) continue;
+                const layer = self.findAppLayer(window.surface) orelse continue;
+                if (!layer.active) continue;
+                self.frame_samples[count] = layer.sample.?;
+                self.frame_bindings[count] = layer.binding.?;
+                self.frame_changes[count] = layer.change.?;
                 count += 1;
             }
             if (self.cursor_layer.active) {
@@ -1142,16 +1169,16 @@ pub fn Coordinator(comptime protocol: type) type {
                     .surface = self.cursor_layer.id.?,
                     .sample = self.cursor_layer.sample.?,
                 }, output.planner.output)) |cursor_sample| {
-                    samples[count] = cursor_sample;
-                    bindings[count] = self.cursor_layer.binding.?;
-                    changes[count] = self.cursor_layer.change.?;
-                    changes[count].current = damage.SurfaceState.fromSample(cursor_sample, .{
+                    self.frame_samples[count] = cursor_sample;
+                    self.frame_bindings[count] = self.cursor_layer.binding.?;
+                    self.frame_changes[count] = self.cursor_layer.change.?;
+                    self.frame_changes[count].current = damage.SurfaceState.fromSample(cursor_sample, .{
                         .width = cursor_sample.destination.width,
                         .height = cursor_sample.destination.height,
                     });
-                    changes[count].invalidate_bounds = true;
+                    self.frame_changes[count].invalidate_bounds = true;
                     self.cursor_layer.sample = cursor_sample;
-                    self.cursor_layer.change = changes[count];
+                    self.cursor_layer.change = self.frame_changes[count];
                     count += 1;
                 }
             }
@@ -1162,9 +1189,9 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             switch (try output.renderFrame(
                 frame,
-                samples[0..count],
-                changes[0..count],
-                bindings[0..count],
+                self.frame_samples[0..count],
+                self.frame_changes[0..count],
+                self.frame_bindings[0..count],
                 try monotonicNs(),
             )) {
                 .submitted => self.stats.submitted += 1,
@@ -1197,18 +1224,13 @@ pub fn Coordinator(comptime protocol: type) type {
         fn finishOutcome(self: *Self, outcome: output_api.FrameOutcome, was_presented: bool) !void {
             for (outcome.sampled) |sampled| {
                 const layer = self.layerForPresentation(sampled.presentation) orelse continue;
-                const token = layer.presentation.?;
                 const binding = layer.binding orelse return error.SampleBindingMismatch;
                 if (!std.meta.eql(sampled.surface, binding.surface)) return error.SampleBindingMismatch;
-                var content = &(layer.content orelse return error.MissingContent);
+                const content = &(layer.content orelse return error.MissingContent);
                 const owner_live = self.peer != null and layer.peer != null and
                     samePeer(self.peer.?, layer.peer.?) and self.layerSurfaceLive(layer);
                 if (!owner_live) {
-                    try self.presentations.discard(token);
-                    content.deinit();
-                    layer.content = null;
-                    layer.presentation = null;
-                    layer.active = false;
+                    self.abandonLayer(layer);
                     continue;
                 }
                 const surface = layer.surface.?;
@@ -1218,8 +1240,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 }
                 layer.outcome_pending = true;
             }
-            inline for (.{ &self.app_layer, &self.cursor_layer }) |layer|
+            for (self.app_layers) |*layer|
                 if (layer.active and !self.layerSurfaceLive(layer)) self.abandonLayer(layer);
+            if (self.cursor_layer.active and !self.layerSurfaceLive(&self.cursor_layer))
+                self.abandonLayer(&self.cursor_layer);
             if (was_presented) self.stats.presented += 1 else self.stats.retired += 1;
             _ = try self.retryRetainedOutcomes();
             try self.applyReady();
@@ -1227,13 +1251,17 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn retryRetainedOutcomes(self: *Self) !bool {
             var changed = false;
-            inline for (.{ &self.app_layer, &self.cursor_layer }) |layer| {
+            for (self.app_layers) |*layer| {
                 if (layer.source_release_pending)
                     _ = try self.retryLayerSourceRelease(layer);
                 if (layer.outcome_pending and !layer.source_release_pending) {
                     changed = (try self.retryLayerOutcome(layer)) or changed;
                 }
             }
+            if (self.cursor_layer.source_release_pending)
+                _ = try self.retryLayerSourceRelease(&self.cursor_layer);
+            if (self.cursor_layer.outcome_pending and !self.cursor_layer.source_release_pending)
+                changed = (try self.retryLayerOutcome(&self.cursor_layer)) or changed;
             if (changed) if (self.output) |output| {
                 try output.request(.damage, try monotonicNs());
                 try self.armTimer();
@@ -1331,13 +1359,32 @@ pub fn Coordinator(comptime protocol: type) type {
             self: *Self,
             identity: render.PresentationIdentity,
         ) ?*Layer {
-            if (self.app_layer.presentation) |token|
-                if (std.meta.eql(output_api.presentationIdentity(token), identity))
-                    return &self.app_layer;
+            for (self.app_layers) |*layer| if (layer.presentation) |token|
+                if (std.meta.eql(output_api.presentationIdentity(token), identity)) return layer;
             if (self.cursor_layer.presentation) |token|
                 if (std.meta.eql(output_api.presentationIdentity(token), identity))
                     return &self.cursor_layer;
             return null;
+        }
+
+        fn appLayerForSurface(self: *Self, id: Adapter.SurfaceId) ?*Layer {
+            for (self.app_layers) |*layer| {
+                if (layer.id) |current| if (std.meta.eql(current, id)) return layer;
+                if (layer.candidate) |candidate| if (std.meta.eql(candidate.id, id)) return layer;
+            }
+            for (self.app_layers) |*layer| if (layerVacant(layer)) return layer;
+            return null;
+        }
+
+        fn findAppLayer(self: *Self, id: Adapter.SurfaceId) ?*Layer {
+            for (self.app_layers) |*layer|
+                if (layer.id) |current| if (std.meta.eql(current, id)) return layer;
+            return null;
+        }
+
+        fn anyAppLayerActive(self: *const Self) bool {
+            for (self.app_layers) |layer| if (layer.active) return true;
+            return false;
         }
 
         fn layerSurfaceLive(self: *Self, layer: *const Layer) bool {
@@ -1417,7 +1464,7 @@ pub fn Coordinator(comptime protocol: type) type {
         /// has reached a state where no physical outcome can still reference it.
         fn abandonPending(self: *Self) void {
             self.abandonLayer(&self.cursor_layer);
-            self.abandonLayer(&self.app_layer);
+            for (self.app_layers) |*layer| self.abandonLayer(layer);
         }
 
         fn abandonLayer(self: *Self, layer: *Layer) void {
@@ -1474,7 +1521,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (self.render_device) |render_device| render_device.content.destroySurface(
                     (@as(u64, id.generation) << 32) | id.index,
                 );
-                inline for (.{ &self.app_layer, &self.cursor_layer }) |layer| {
+                for (self.app_layers) |*layer| {
                     if (layer.candidate) |*candidate| {
                         if (std.meta.eql(candidate.id, id) and
                             std.meta.eql(candidate.surface, handle))
@@ -1484,6 +1531,14 @@ pub fn Coordinator(comptime protocol: type) type {
                         }
                     }
                 }
+                if (self.cursor_layer.candidate) |*candidate| {
+                    if (std.meta.eql(candidate.id, id) and
+                        std.meta.eql(candidate.surface, handle))
+                    {
+                        candidate.content.deinit();
+                        self.cursor_layer.candidate = null;
+                    }
+                }
                 // Damage while the retained cursor layer is still visible. In
                 // particular, an in-flight frame keeps the layer alive until
                 // its outcome, but the queued successor must omit it.
@@ -1491,10 +1546,13 @@ pub fn Coordinator(comptime protocol: type) type {
                     std.meta.eql(self.cursor_layer.id.?, id))
                     self.requestCursorRedraw() catch {};
                 self.interaction.surfaceDestroyed(id);
-                inline for (.{ &self.app_layer, &self.cursor_layer }) |layer|
+                for (self.app_layers) |*layer|
                     if (layer.id != null and std.meta.eql(layer.id.?, id) and
                         (self.output == null or self.output.?.in_flight_frame == null))
                         self.abandonLayer(layer);
+                if (self.cursor_layer.id != null and std.meta.eql(self.cursor_layer.id.?, id) and
+                    (self.output == null or self.output.?.in_flight_frame == null))
+                    self.abandonLayer(&self.cursor_layer);
             }
             _ = self.adapter.resourceRemoved(handle, object);
             if (self.surface) |surface| {
@@ -1513,6 +1571,14 @@ pub fn Coordinator(comptime protocol: type) type {
             self.stats.imported_disposals += 1;
         }
     };
+}
+
+fn layerVacant(layer: anytype) bool {
+    return !layer.active and layer.peer == null and layer.surface == null and
+        layer.id == null and layer.content == null and layer.rendered == null and
+        layer.presentation == null and layer.sample == null and layer.binding == null and
+        layer.change == null and layer.candidate == null and !layer.source_release_pending and
+        !layer.outcome_pending and layer.callback_data == null and !layer.retire_after_outcome;
 }
 
 fn tokenOwnedBySession(session: *const session_api.Session, token: completion.Token) bool {

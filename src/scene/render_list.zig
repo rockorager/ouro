@@ -37,6 +37,14 @@ pub const Builder = struct {
         return .{ .allocator = allocator, .samples = samples, .bytes = bytes };
     }
 
+    pub fn initBorrowed(allocator: std.mem.Allocator, sample_capacity: usize) Error!Builder {
+        if (sample_capacity == 0) return error.InvalidConfig;
+        const samples = try allocator.alloc(render.SurfaceSample, sample_capacity);
+        errdefer allocator.free(samples);
+        const bytes = try allocator.alloc(u8, 0);
+        return .{ .allocator = allocator, .samples = samples, .bytes = bytes };
+    }
+
     pub fn deinit(self: *Builder) void {
         self.allocator.free(self.bytes);
         self.allocator.free(self.samples);
@@ -51,6 +59,7 @@ pub const Builder = struct {
         self: Builder,
         output: render.Size,
         applied: []const AppliedSurface,
+        copy_sources: bool,
     ) Error!void {
         try render.validateOutput(output);
         if (applied.len > self.samples.len)
@@ -59,10 +68,12 @@ pub const Builder = struct {
         var required_bytes: usize = 0;
         for (applied, 0..) |surface, index| {
             const length = try render.validateSample(surface);
-            required_bytes = std.math.add(usize, required_bytes, length) catch
-                return error.ByteCapacityExceeded;
-            if (required_bytes > self.bytes.len)
-                return error.ByteCapacityExceeded;
+            if (copy_sources) {
+                required_bytes = std.math.add(usize, required_bytes, length) catch
+                    return error.ByteCapacityExceeded;
+                if (required_bytes > self.bytes.len)
+                    return error.ByteCapacityExceeded;
+            }
             for (applied[0..index]) |earlier| {
                 if (std.meta.eql(earlier.sample, surface.sample))
                     return error.DuplicateSampleIdentity;
@@ -79,7 +90,7 @@ pub const Builder = struct {
         clear: render.Color,
         applied: []const AppliedSurface,
     ) Error!render.List {
-        try self.validateCandidate(output, applied);
+        try self.validateCandidate(output, applied, true);
 
         var offset: usize = 0;
         for (applied, 0..) |surface, index| {
@@ -109,7 +120,7 @@ pub const Builder = struct {
         clear: render.Color,
         applied: []const AppliedSurface,
     ) Error!render.List {
-        try self.validateCandidate(output, applied);
+        try self.validateCandidate(output, applied, false);
         @memcpy(self.samples[0..applied.len], applied);
         self.sample_count = applied.len;
         self.byte_count = 0;
@@ -167,7 +178,7 @@ test "render: list publication copies bytes and is transactional" {
 }
 
 test "render: borrowed list publication retains stable source bytes" {
-    var builder = try Builder.init(std.testing.allocator, 1, 8);
+    var builder = try Builder.initBorrowed(std.testing.allocator, 1);
     defer builder.deinit();
     var source = [_]u8{ 1, 2, 3, 4 };
     const list = try builder.buildBorrowed(.{ .width = 1, .height = 1 }, .xrgb8888, .{ .r = 0, .g = 0, .b = 0 }, &.{validSample(&source)});

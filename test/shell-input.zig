@@ -132,11 +132,11 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
             key_sent = true;
         }
         if (coordinator.stats.submitted == 2 and !two_layers_observed) {
-            const app = coordinator.app_layer.sample.?;
+            const app = coordinator.app_layers[0].sample.?;
             const cursor = coordinator.cursor_layer.sample.?;
             const submitted = coordinator.output.?.sample_storage[0..2];
-            try std.testing.expectEqual(coordinator.app_layer.binding.?.surface, submitted[0].surface);
-            try std.testing.expectEqual(app.sample, coordinator.app_layer.binding.?.sample);
+            try std.testing.expectEqual(coordinator.app_layers[0].binding.?.surface, submitted[0].surface);
+            try std.testing.expectEqual(app.sample, coordinator.app_layers[0].binding.?.sample);
             try std.testing.expectEqual(app.presentation, submitted[0].presentation);
             try std.testing.expectEqual(coordinator.cursor_layer.binding.?.surface, submitted[1].surface);
             try std.testing.expectEqual(cursor.sample, coordinator.cursor_layer.binding.?.sample);
@@ -159,10 +159,10 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
             motion_redraw_sent = true;
         }
         if (coordinator.stats.submitted == 3) {
-            const app = coordinator.app_layer.sample.?;
+            const app = coordinator.app_layers[0].sample.?;
             const cursor = coordinator.cursor_layer.sample.?;
             const submitted = coordinator.output.?.sample_storage[0..2];
-            try std.testing.expectEqual(coordinator.app_layer.binding.?.surface, submitted[0].surface);
+            try std.testing.expectEqual(coordinator.app_layers[0].binding.?.surface, submitted[0].surface);
             try std.testing.expectEqual(app.presentation, submitted[0].presentation);
             try std.testing.expectEqual(coordinator.cursor_layer.binding.?.surface, submitted[1].surface);
             try std.testing.expectEqual(cursor.presentation, submitted[1].presentation);
@@ -198,7 +198,7 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     try std.testing.expect(handler.buffer_release_order < handler.frame_done_order);
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
 
-    const retained_app = coordinator.app_layer.sample.?;
+    const retained_app = coordinator.app_layers[0].sample.?;
     const retained_cursor = coordinator.cursor_layer.sample.?;
     const first_output_generation = coordinator.output.?.outputId().generation;
     try fixture.signalSession(.disable);
@@ -208,9 +208,9 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
         if (root.ring.cq_ready() == 0) try waitServer(&root.ring);
     }
     try std.testing.expect(coordinator.output == null);
-    try std.testing.expect(coordinator.app_layer.active);
+    try std.testing.expect(coordinator.app_layers[0].active);
     try std.testing.expect(coordinator.cursor_layer.active);
-    try std.testing.expectEqual(retained_app.sample, coordinator.app_layer.sample.?.sample);
+    try std.testing.expectEqual(retained_app.sample, coordinator.app_layers[0].sample.?.sample);
     try std.testing.expectEqual(retained_cursor.sample, coordinator.cursor_layer.sample.?.sample);
     try fixture.signalSession(.enable);
     for (0..128) |_| {
@@ -221,7 +221,7 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     try std.testing.expectEqual(@as(usize, 4), coordinator.stats.submitted);
     try std.testing.expectEqual(@as(usize, 4), coordinator.stats.presented);
     try std.testing.expect(coordinator.output.?.outputId().generation != first_output_generation);
-    try std.testing.expectEqual(retained_app.sample, coordinator.app_layer.sample.?.sample);
+    try std.testing.expectEqual(retained_app.sample, coordinator.app_layers[0].sample.?.sample);
     try std.testing.expectEqual(retained_cursor.sample, coordinator.cursor_layer.sample.?.sample);
 
     try handler.destroyCursor();
@@ -234,7 +234,7 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
             try waitForEither(&root.ring, client_reactor.ring);
     }
     try std.testing.expect(!coordinator.cursor_layer.active);
-    try std.testing.expect(coordinator.app_layer.active);
+    try std.testing.expect(coordinator.app_layers[0].active);
 
     coordinator.disconnected(coordinator.peer.?);
     _ = try client.prepareClose();
@@ -252,6 +252,165 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     try std.testing.expect(client_progress.quiescent);
     try std.testing.expect(coordinator.backendDrainComplete());
     try std.testing.expectEqual(@as(usize, 2), coordinator.stats.output_drains);
+
+    try client.deinit(allocator);
+    client_reactor.deinit(allocator);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
+test "shell-input: two mapped toplevels render in desktop stacking order" {
+    const allocator = std.testing.allocator;
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-two-toplevels-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+
+    var fixture = try physical_fixture.Fixture.init();
+    defer fixture.deinit();
+    var root_config = physical_fixture.compositorConfig();
+    root_config.runtime.object_capacity = 32;
+    root_config.runtime.object_quota = 32;
+    root_config.runtime.actor.received_fd_budget = 2;
+    const root = try Compositor.create(
+        allocator,
+        try wayring.unix_socket.listen(path, 1),
+        root_config,
+    );
+    var config = physical_fixture.coordinatorConfig();
+    config.shm.pool_capacity = 2;
+    config.shm.buffer_capacity = 2;
+    config.surface.surface_capacity = 2;
+    config.surface.frame_callback_capacity = 2;
+    config.surface.content_update_capacity = 2;
+    config.surface.dependency_capacity = 2;
+    config.surface.attachment_capacity = 2;
+    config.surface.copy_capacity = 2;
+    config.output.max_samples = 3;
+    config.output.max_source_bytes = pixels.len * 2;
+    const coordinator = try Coordinator.create(
+        allocator,
+        root,
+        fixture.platforms(),
+        config,
+    );
+    var loop = try Loop.init(
+        allocator,
+        root,
+        &coordinator.router,
+        &coordinator.timers,
+        coordinator,
+        .{ .completion_batch = 16 },
+    );
+    try coordinator.start(&loop);
+
+    var client_reactor: wayring.io_uring.Reactor = undefined;
+    try client_reactor.initOwned(
+        allocator,
+        .{ .entries = 16, .flags = 0 },
+        physical_fixture.clientReactorConfig(),
+    );
+    var client = try ClientConnection.attach(
+        allocator,
+        &client_reactor,
+        try wayring.unix_socket.connect(path),
+        .{ .received_fd_budget = 2, .transmit_byte_budget = 4096, .transmit_fd_budget = 2 },
+        .{ .max_objects = 32, .max_client_ids = 31 },
+    );
+    const actor = try client.actor();
+    var driver = ClientDriver.init(&client);
+    const registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null);
+    var handler: MultiHandler = .{
+        .objects = &client.objects,
+        .queue = &actor.transmit,
+        .registry = registry,
+    };
+    try submitMultiClient(&client_reactor, &driver, &handler);
+
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    var client_progress: ClientDriver.Progress = .{};
+    var observed = false;
+    for (0..512) |_| {
+        client_progress = try drainMultiClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (!observed and coordinator.stats.submitted == 1) {
+            var active: usize = 0;
+            for (coordinator.app_layers) |layer| if (layer.active) {
+                active += 1;
+            };
+            try std.testing.expectEqual(@as(usize, 2), active);
+            const submitted = coordinator.output.?.sample_storage[0..2];
+            try std.testing.expect(!std.meta.eql(submitted[0].surface, submitted[1].surface));
+            const windows = try coordinator.desktop.sceneSnapshot(coordinator.scene_windows);
+            const first = findLayer(coordinator.app_layers, windows[0].surface) orelse
+                return error.MissingFirstLayer;
+            const second = findLayer(coordinator.app_layers, windows[1].surface) orelse
+                return error.MissingSecondLayer;
+            try std.testing.expectEqual(first.binding.?.surface, submitted[0].surface);
+            try std.testing.expectEqual(second.binding.?.surface, submitted[1].surface);
+            try std.testing.expectEqual(@as(i32, 0), first.sample.?.destination.x);
+            try std.testing.expectEqual(@as(u32, 2), first.sample.?.destination.width);
+            try std.testing.expectEqual(@as(i32, 2), second.sample.?.destination.x);
+            try std.testing.expectEqual(@as(u32, 1), second.sample.?.destination.width);
+            observed = true;
+        }
+        if (observed and coordinator.stats.presented == 1 and
+            handler.buffer_releases == 2 and handler.frame_done == 2) break;
+        if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0) {
+            if (observed) break;
+            try waitForEither(&root.ring, client_reactor.ring);
+        }
+    }
+    try std.testing.expect(observed);
+    try std.testing.expectEqual(@as(usize, 2), coordinator.stats.applied);
+    try std.testing.expectEqual(@as(usize, 1), coordinator.stats.submitted);
+    try std.testing.expectEqual(@as(usize, 1), coordinator.stats.presented);
+    try std.testing.expectEqual(@as(usize, 2), handler.buffer_releases);
+    try std.testing.expectEqual(@as(usize, 2), handler.frame_done);
+    try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+
+    const windows = try coordinator.desktop.sceneSnapshot(coordinator.scene_windows);
+    try std.testing.expectEqual(windows[1].id, coordinator.desktop.focused().?);
+    const pointer_device: ouro.input_backend.DeviceId = .{
+        .slot = 0,
+        .generation = 1,
+        .seat_generation = 1,
+    };
+    try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .device_added = .{
+        .device = pointer_device,
+        .capabilities = .{ .pointer = true },
+    } }));
+    try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_motion = .{
+        .device = pointer_device,
+        .time_usec = 1,
+        .dx = 0.25,
+        .dy = 0,
+    } }));
+    try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_button = .{
+        .device = pointer_device,
+        .time_usec = 2,
+        .button = 0x110,
+        .pressed = true,
+    } }));
+    try std.testing.expectEqual(windows[0].id, coordinator.desktop.focused().?);
+
+    coordinator.disconnected(coordinator.peer.?);
+    _ = try client.prepareClose();
+    try submitMultiClient(&client_reactor, &driver, &handler);
+    var wayring_drained = false;
+    for (0..256) |_| {
+        client_progress = try drainMultiClient(&client_reactor, &driver, &handler);
+        const progress = try loop.turn(coordinator);
+        wayring_drained = progress.wayring.shutdown_complete;
+        if (wayring_drained and client_progress.quiescent and coordinator.backendDrainComplete()) break;
+        if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, client_reactor.ring);
+    }
+    try std.testing.expect(wayring_drained);
+    try std.testing.expect(client_progress.quiescent);
+    try std.testing.expect(coordinator.backendDrainComplete());
 
     try client.deinit(allocator);
     client_reactor.deinit(allocator);
@@ -333,6 +492,196 @@ const FakeInput = struct {
     }
     fn suspendContext(_: *anyopaque, _: *anyopaque) !void {}
     fn resumeContext(_: *anyopaque, _: *anyopaque) !void {}
+};
+
+const MultiHandler = struct {
+    objects: *wayring.objects.ClientObjects,
+    queue: *wayring.tx.Queue,
+    registry: wayring.objects.Handle,
+    compositor: ?wayring.objects.Handle = null,
+    shm: ?wayring.objects.Handle = null,
+    wm_base: ?wayring.objects.Handle = null,
+    surfaces: [2]?wayring.objects.Handle = .{ null, null },
+    xdg_surfaces: [2]?wayring.objects.Handle = .{ null, null },
+    toplevels: [2]?wayring.objects.Handle = .{ null, null },
+    buffers: [2]?wayring.objects.Handle = .{ null, null },
+    callbacks: [2]?wayring.objects.Handle = .{ null, null },
+    mapped: [2]bool = .{ false, false },
+    shell_created: bool = false,
+    buffer_releases: usize = 0,
+    frame_done: usize = 0,
+    event_failures: usize = 0,
+
+    pub fn eventError(
+        self: *MultiHandler,
+        _: wayring.io_uring.Peer,
+        _: ClientCore.EventFailure,
+    ) void {
+        self.event_failures += 1;
+    }
+
+    pub fn event(
+        self: *MultiHandler,
+        target: wayring.objects.Dispatch,
+        message: wayring.wire.Message,
+        fds: *wayring.ancillary.FdQueue,
+    ) !wayring.dispatch.Control {
+        if (target.object.interface == &ClientCore.Registry.info) {
+            switch (try ClientCore.decodeRegistryEvent(self.objects, self.registry, message, fds)) {
+                .global => |value| try self.bindGlobal(value),
+                .global_remove => {},
+            }
+            try self.maybeCreateShells();
+        } else if (target.object.interface == &protocol.wl_shm.info) {
+            _ = try protocol.wl_shm.decodeEvent(message, fds);
+        } else if (target.object.interface == &protocol.xdg_toplevel.info) {
+            _ = try protocol.xdg_toplevel.decodeEvent(message, fds);
+        } else if (target.object.interface == &protocol.xdg_surface.info) {
+            const index = self.indexFor(self.xdg_surfaces, message.header.object_id) orelse
+                return error.UnknownXdgSurface;
+            switch (try protocol.xdg_surface.decodeEvent(message, fds)) {
+                .configure => |value| {
+                    try protocol.xdg_surface.encodeRequest(self.queue, self.xdg_surfaces[index].?.id, .{
+                        .ack_configure = .{ .serial = value.serial },
+                    });
+                    if (!self.mapped[index]) try self.mapSurface(index);
+                },
+            }
+        } else if (target.object.interface == &protocol.wl_buffer.info) {
+            const index = self.indexFor(self.buffers, message.header.object_id) orelse
+                return error.UnknownBuffer;
+            switch (try protocol.wl_buffer.decodeEvent(message, fds)) {
+                .release => {
+                    self.buffer_releases += 1;
+                    try wayring.client.sendRequest(
+                        protocol.wl_buffer,
+                        self.objects,
+                        self.queue,
+                        self.buffers[index].?,
+                        .{ .destroy = .{} },
+                    );
+                    self.buffers[index] = null;
+                },
+            }
+        } else if (target.object.interface == &ClientCore.Callback.info) {
+            const index = self.indexFor(self.callbacks, message.header.object_id) orelse
+                return error.UnknownCallback;
+            switch (try ClientCore.decodeCallbackEvent(
+                self.objects,
+                self.callbacks[index].?,
+                message,
+                fds,
+            )) {
+                .done => {
+                    self.frame_done += 1;
+                    self.callbacks[index] = null;
+                },
+            }
+        } else if (target.object.interface == &ClientCore.Display.info) {
+            switch (try ClientCore.decodeDisplayEvent(self.objects, message, fds)) {
+                .delete_id => {},
+                .@"error" => return error.ServerProtocolError,
+            }
+        } else return error.UnexpectedEvent;
+        return .continue_dispatch;
+    }
+
+    fn bindGlobal(self: *MultiHandler, value: anytype) !void {
+        if (std.mem.eql(u8, value.interface, protocol.wl_compositor.info.name))
+            self.compositor = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_compositor.info, @min(value.version, 7), null);
+        if (std.mem.eql(u8, value.interface, protocol.wl_shm.info.name))
+            self.shm = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_shm.info, @min(value.version, 2), null);
+        if (std.mem.eql(u8, value.interface, protocol.xdg_wm_base.info.name))
+            self.wm_base = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.xdg_wm_base.info, @min(value.version, 7), null);
+    }
+
+    fn maybeCreateShells(self: *MultiHandler) !void {
+        if (self.shell_created or self.compositor == null or self.shm == null or self.wm_base == null)
+            return;
+        for (0..self.surfaces.len) |index| {
+            self.surfaces[index] = (try protocol.wl_compositor.construct_create_surface(
+                self.objects,
+                self.queue,
+                self.compositor.?,
+                .{},
+            )).id;
+            self.xdg_surfaces[index] = (try protocol.xdg_wm_base.construct_get_xdg_surface(
+                self.objects,
+                self.queue,
+                self.wm_base.?,
+                .{ .surface = self.surfaces[index].?.id },
+            )).id;
+            self.toplevels[index] = (try protocol.xdg_surface.construct_get_toplevel(
+                self.objects,
+                self.queue,
+                self.xdg_surfaces[index].?,
+                .{},
+            )).id;
+            try protocol.wl_surface.encodeRequest(
+                self.queue,
+                self.surfaces[index].?.id,
+                .{ .commit = .{} },
+            );
+        }
+        self.shell_created = true;
+    }
+
+    fn mapSurface(self: *MultiHandler, index: usize) !void {
+        const descriptor = try ordinaryMemfd(4096, 16, &pixels);
+        const pool = try protocol.wl_shm.construct_create_pool(
+            self.objects,
+            self.queue,
+            self.shm.?,
+            .{ .fd = descriptor, .size = 4096 },
+        );
+        self.buffers[index] = (try protocol.wl_shm_pool.construct_create_buffer(
+            self.objects,
+            self.queue,
+            pool.id,
+            .{
+                .offset = 16,
+                .width = 3,
+                .height = 2,
+                .stride = 16,
+                .format = .argb8888,
+            },
+        )).id;
+        self.callbacks[index] = (try protocol.wl_surface.construct_frame(
+            self.objects,
+            self.queue,
+            self.surfaces[index].?,
+            .{},
+        )).callback;
+        try protocol.wl_surface.encodeRequest(self.queue, self.surfaces[index].?.id, .{
+            .attach = .{ .buffer = self.buffers[index].?.id, .x = 0, .y = 0 },
+        });
+        try protocol.wl_surface.encodeRequest(self.queue, self.surfaces[index].?.id, .{
+            .damage_buffer = .{ .x = 0, .y = 0, .width = 3, .height = 2 },
+        });
+        try protocol.wl_surface.encodeRequest(
+            self.queue,
+            self.surfaces[index].?.id,
+            .{ .commit = .{} },
+        );
+        try wayring.client.sendRequest(
+            protocol.wl_shm_pool,
+            self.objects,
+            self.queue,
+            pool.id,
+            .{ .destroy = .{} },
+        );
+        self.mapped[index] = true;
+    }
+
+    fn indexFor(
+        _: *const MultiHandler,
+        handles: [2]?wayring.objects.Handle,
+        object_id: u32,
+    ) ?usize {
+        for (handles, 0..) |handle, index|
+            if (handle != null and handle.?.id == object_id) return index;
+        return null;
+    }
 };
 
 const Handler = struct {
@@ -622,6 +971,44 @@ const Handler = struct {
         self.cursor_surface = null;
     }
 };
+
+fn findLayer(layers: anytype, id: anytype) ?@TypeOf(&layers[0]) {
+    for (layers) |*layer|
+        if (layer.id != null and std.meta.eql(layer.id.?, id)) return layer;
+    return null;
+}
+
+fn drainMultiClient(
+    reactor: *wayring.io_uring.Reactor,
+    driver: *ClientDriver,
+    handler: *MultiHandler,
+) !ClientDriver.Progress {
+    var completions: [16]linux.io_uring_cqe = undefined;
+    const count = if (reactor.ring.cq_ready() == 0)
+        0
+    else
+        try reactor.ring.copy_cqes(&completions, 0);
+    var progress = try driver.dispatch(completions[0..count], handler);
+    if (handler.queue.queuedBytes() != 0) {
+        _ = try driver.schedule();
+        const prepared = try driver.prepare(handler);
+        progress.prepared += prepared.prepared;
+        progress.pending = prepared.pending;
+        progress.quiescent = prepared.quiescent;
+    }
+    if (progress.prepared != 0 or progress.pending) _ = try reactor.ring.submit();
+    return progress;
+}
+
+fn submitMultiClient(
+    reactor: *wayring.io_uring.Reactor,
+    driver: *ClientDriver,
+    handler: *MultiHandler,
+) !void {
+    _ = try driver.schedule();
+    _ = try driver.prepare(handler);
+    _ = try reactor.ring.submit();
+}
 
 fn drainClient(
     reactor: *wayring.io_uring.Reactor,

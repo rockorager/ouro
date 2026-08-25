@@ -32,7 +32,11 @@ pub const Config = struct {
     /// Total imported output images across every output sharing one renderer.
     max_render_targets: usize = framebuffer.default_capacity * 4,
     max_samples: usize,
+    /// Aggregate packed source bytes available to one fallback render frame.
     max_source_bytes: usize,
+    /// Maximum bytes retained for one surface version. Defaults to the frame
+    /// capacity for compatibility with single-surface configurations.
+    max_surface_bytes: ?usize = null,
     max_source_width: u32,
     max_source_height: u32,
     max_client_damage: usize = 32,
@@ -114,6 +118,35 @@ const Renderer = union(RendererKind) {
         }
     }
 };
+
+fn surfaceByteCapacity(config: Config) usize {
+    return config.max_surface_bytes orelse config.max_source_bytes;
+}
+
+fn validateConfig(config: Config) !void {
+    const surface_bytes = surfaceByteCapacity(config);
+    if (config.image_count == 0 or config.max_render_targets < config.image_count or
+        config.max_samples == 0 or config.max_source_bytes == 0 or surface_bytes == 0 or
+        surface_bytes > config.max_source_bytes)
+        return error.InvalidConfig;
+}
+
+test "drm-output: retained surface capacity fits aggregate frame capacity" {
+    const base: Config = .{
+        .output_id = .{ .index = 0, .generation = 1 },
+        .scheduler = .{ .refresh_ns = 10, .render_budget_ns = 3 },
+        .renderer = .pixman,
+        .image_count = 2,
+        .max_samples = 2,
+        .max_source_bytes = 8,
+        .max_source_width = 1,
+        .max_source_height = 1,
+    };
+    try validateConfig(base);
+    var invalid = base;
+    invalid.max_surface_bytes = 9;
+    try std.testing.expectError(error.InvalidConfig, validateConfig(invalid));
+}
 
 pub const RenderDevice = struct {
     allocator: std.mem.Allocator,
@@ -203,10 +236,7 @@ pub const Output = struct {
         snapshot: drm.Snapshot,
         config: Config,
     ) !*Output {
-        if (config.image_count == 0 or config.max_render_targets < config.image_count or
-            config.max_samples == 0 or
-            config.max_source_bytes == 0)
-            return error.InvalidConfig;
+        try validateConfig(config);
         const fd = try device.fd(snapshot.handle);
         var path = try initRenderPath(allocator, platforms, fd, snapshot, config);
         var path_owned = true;
@@ -230,7 +260,7 @@ pub const Output = struct {
             .version_capacity = content_version_capacity,
             .byte_capacity = std.math.mul(
                 usize,
-                config.max_source_bytes,
+                surfaceByteCapacity(config),
                 content_version_capacity,
             ) catch return error.InvalidConfig,
         });
@@ -268,10 +298,7 @@ pub const Output = struct {
         config: Config,
         render_device: *RenderDevice,
     ) !*Output {
-        if (config.image_count == 0 or config.max_render_targets < config.image_count or
-            config.max_samples == 0 or
-            config.max_source_bytes == 0)
-            return error.InvalidConfig;
+        try validateConfig(config);
         if (!render_device.matches(&snapshot.card)) return error.RenderDeviceMismatch;
         const fd = try device.fd(snapshot.handle);
         const path = try initOutputPath(allocator, platforms, fd, snapshot, config, render_device);
@@ -316,11 +343,7 @@ pub const Output = struct {
         const logical_output: render.Size = .{ .width = mode.hdisplay, .height = mode.vdisplay };
         self.output_format = formatFromDrm(self.pool.allocation.format) orelse
             return error.UnsupportedOutputFormat;
-        self.builder = try render_list.Builder.init(
-            allocator,
-            config.max_samples,
-            config.max_source_bytes,
-        );
+        self.builder = try render_list.Builder.initBorrowed(allocator, config.max_samples);
         errdefer self.builder.deinit();
         self.planner = try damage.Planner.init(allocator, logical_output, config.output_transform, .{
             .image_count = config.image_count,
