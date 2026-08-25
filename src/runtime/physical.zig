@@ -1026,7 +1026,7 @@ pub fn Coordinator(comptime protocol: type) type {
             switch (event) {
                 .pointer_button => |button| if (!button.pressed and
                     self.seat_adapter.grabState() == .idle)
-                    self.data_device_adapter.cancelDrag() catch return false,
+                    self.data_device_adapter.dropDrag() catch return false,
                 else => {},
             }
             self.input_interaction_accepted = false;

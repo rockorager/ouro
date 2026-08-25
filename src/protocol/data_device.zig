@@ -99,6 +99,10 @@ pub fn Adapter(comptime protocol: type) type {
             destination_actions: u32 = 0,
             preferred_action: u32 = 0,
             selected_action: u32 = 0,
+            accepted_mime: ?usize = null,
+            actions_required: bool = true,
+            dropped: bool = false,
+            finished: bool = false,
         };
         const Publication = struct {
             device: Id,
@@ -123,7 +127,10 @@ pub fn Adapter(comptime protocol: type) type {
             drag_enter: DragPublication,
             drag_motion: struct { device: Id, time: u32, x: i32, y: i32 },
             drag_leave: Id,
+            drag_drop: Id,
             source_cancelled: Id,
+            source_drop_performed: Id,
+            source_finished: Id,
             source_target: struct { source: Id, mime_index: ?usize },
             source_action: struct { source: Id, action: u32 },
             offer_action: struct { offer: Id, action: u32 },
@@ -414,6 +421,8 @@ pub fn Adapter(comptime protocol: type) type {
 
         fn offerRequest(self: *Self, actor: *wayring.connection.Actor, server_objects: anytype, offer: *OfferSlot, message: wayring.wire.Message, fds: *wayring.ancillary.FdQueue) !wayring.dispatch.Control {
             const decoded = try wayring.server.decodeRequest(Offer, server_objects, message, fds);
+            if (offer.finished and std.meta.activeTag(decoded.value) != .destroy)
+                return try self.protocolError(actor, decoded.handle.id, Offer.@"error".invalid_offer.value, "finished drag offer only accepts destroy");
             switch (decoded.value) {
                 .receive => |payload| {
                     const source = self.resolveSource(offer.source) catch {
@@ -441,12 +450,18 @@ pub fn Adapter(comptime protocol: type) type {
                         self.findMime(source, mime_type)
                     else
                         null;
+                    offer.accepted_mime = mime_index;
                     self.enqueue(source.peer, .{ .source_target = .{
                         .source = offer.source,
                         .mime_index = mime_index,
                     } }) catch return try self.noMemory(actor);
                 },
-                .finish => return try self.protocolError(actor, decoded.handle.id, Offer.@"error".invalid_finish.value, "selection offers cannot be finished"),
+                .finish => {
+                    self.finishOffer(offer) catch |err| switch (err) {
+                        error.Exhausted => return try self.noMemory(actor),
+                        error.InvalidFinish, error.SourceGone => return try self.protocolError(actor, decoded.handle.id, Offer.@"error".invalid_finish.value, "drag offer cannot be finished"),
+                    };
+                },
                 .set_actions => |payload| {
                     if (offer.kind == .selection or !offer.current)
                         return try self.protocolError(actor, decoded.handle.id, Offer.@"error".invalid_offer.value, "offer is not an active drag target");
@@ -595,6 +610,46 @@ pub fn Adapter(comptime protocol: type) type {
             self.drag = null;
         }
 
+        /// Ends the implicit grab with a successful drop when any current
+        /// destination accepted both a MIME type and the negotiated action.
+        /// Otherwise this follows the retained cancellation path.
+        pub fn dropDrag(self: *Self) !void {
+            const drag = self.drag orelse return;
+            const target = drag.target orelse return self.cancelDrag();
+            var accepted: usize = 0;
+            for (self.offers) |offer| {
+                accepted += @as(usize, @intFromBool(offer.header.active and offer.kind == .drag and
+                    offer.current and std.meta.eql(offer.peer, target.peer) and
+                    offer.accepted_mime != null and (!offer.actions_required or offer.selected_action != 0)));
+            }
+            const internal_drop = drag.source == null and std.meta.eql(drag.peer, target.peer);
+            if (accepted == 0 and !internal_drop) return self.cancelDrag();
+            const device_count = self.deviceCount(target.peer);
+            const source_count: usize = @intFromBool(drag.source != null);
+            if (self.outboundFree() < device_count + source_count) return error.Exhausted;
+            for (self.devices) |*device| if (device.header.active and std.meta.eql(device.peer, target.peer))
+                self.enqueue(target.peer, .{ .drag_drop = self.deviceId(device) }) catch unreachable;
+            for (self.offers) |*offer| if (offer.header.active and offer.kind == .drag and
+                offer.current and std.meta.eql(offer.peer, target.peer))
+            {
+                offer.dropped = offer.accepted_mime != null and
+                    (!offer.actions_required or offer.selected_action != 0);
+                offer.current = false;
+            };
+            if (drag.source) |source|
+                self.enqueue(drag.peer, .{ .source_drop_performed = source }) catch unreachable;
+            self.drag = null;
+        }
+
+        fn finishOffer(self: *Self, offer: *OfferSlot) !void {
+            if (offer.kind != .drag or !offer.dropped or offer.finished or
+                offer.accepted_mime == null or (offer.actions_required and offer.selected_action == 0))
+                return error.InvalidFinish;
+            const source = self.resolveSource(offer.source) catch return error.SourceGone;
+            try self.enqueue(source.peer, .{ .source_finished = offer.source });
+            offer.finished = true;
+        }
+
         fn replaceSelection(self: *Self, next: ?Id, cancel_old: bool) !void {
             const old = self.selection;
             const focus_count = if (self.focus) |peer| self.deviceCount(peer) else 0;
@@ -651,6 +706,20 @@ pub fn Adapter(comptime protocol: type) type {
                     try wayring.server.sendEvent(protocol, Source, server_objects, queue, source.header.resource, .{ .cancelled = .{} });
                     return true;
                 },
+                .source_drop_performed => |id| {
+                    const source = self.resolveSource(id) catch return true;
+                    const object = server_objects.namespace.resolve(source.header.resource) orelse return true;
+                    if (object.version < 3) return true;
+                    try wayring.server.sendEvent(protocol, Source, server_objects, queue, source.header.resource, .{ .dnd_drop_performed = .{} });
+                    return true;
+                },
+                .source_finished => |id| {
+                    const source = self.resolveSource(id) catch return true;
+                    const object = server_objects.namespace.resolve(source.header.resource) orelse return true;
+                    if (object.version < 3) return true;
+                    try wayring.server.sendEvent(protocol, Source, server_objects, queue, source.header.resource, .{ .dnd_finished = .{} });
+                    return true;
+                },
                 .source_target => |value| {
                     const source = self.resolveSource(value.source) catch return true;
                     try wayring.server.sendEvent(protocol, Source, server_objects, queue, source.header.resource, .{ .target = .{
@@ -701,6 +770,8 @@ pub fn Adapter(comptime protocol: type) type {
                     if (value.phase == 0) {
                         const created = try Device.construct_event_data_offer(protocol, server_objects, queue, device.header.resource, .{ .id = .{ .context = offer } });
                         offer.header.resource = created.id;
+                        const object = server_objects.namespace.resolve(created.id) orelse return true;
+                        offer.actions_required = object.version >= 3;
                         value.phase = 1;
                         return false;
                     }
@@ -781,6 +852,11 @@ pub fn Adapter(comptime protocol: type) type {
                 .drag_leave => |id| {
                     const device = self.resolveDevice(id) catch return true;
                     try wayring.server.sendEvent(protocol, Device, server_objects, queue, device.header.resource, .{ .leave = .{} });
+                    return true;
+                },
+                .drag_drop => |id| {
+                    const device = self.resolveDevice(id) catch return true;
+                    try wayring.server.sendEvent(protocol, Device, server_objects, queue, device.header.resource, .{ .drop = .{} });
                     return true;
                 },
             }
@@ -923,6 +999,9 @@ pub fn Adapter(comptime protocol: type) type {
                 .source_cancelled => |source| {
                     if (std.meta.eql(source, id)) slot.active = false;
                 },
+                .source_drop_performed, .source_finished => |source| {
+                    if (std.meta.eql(source, id)) slot.active = false;
+                },
                 .source_send => |value| if (std.meta.eql(value.source, id)) {
                     if (value.fd >= 0) _ = linux.close(value.fd);
                     slot.active = false;
@@ -950,7 +1029,7 @@ pub fn Adapter(comptime protocol: type) type {
                     };
                     if (std.meta.eql(offer.source, id)) slot.active = false;
                 },
-                .drag_motion, .drag_leave => {},
+                .drag_motion, .drag_leave, .drag_drop => {},
             };
         }
 
@@ -977,6 +1056,9 @@ pub fn Adapter(comptime protocol: type) type {
                     if (std.meta.eql(value.device, id)) slot.active = false;
                 },
                 .drag_leave => |device| {
+                    if (std.meta.eql(device, id)) slot.active = false;
+                },
+                .drag_drop => |device| {
                     if (std.meta.eql(device, id)) slot.active = false;
                 },
                 .offer_action => |value| {
@@ -1146,6 +1228,53 @@ test "data device: drag action matching honors preference then stable policy" {
         action.none.value,
         TestAdapter.selectDragAction(action.copy.value, action.move.value, action.move.value),
     );
+}
+
+test "data device: accepted drag drops once and retains finish publication" {
+    var adapter = try testAdapter(.{
+        .manager_capacity = 1,
+        .source_capacity = 1,
+        .device_capacity = 1,
+        .offer_capacity = 1,
+        .mime_capacity = 1,
+        .mime_bytes = 32,
+        .outbound_capacity = 3,
+    });
+    defer adapter.deinit();
+    const peer: wayring.io_uring.Peer = .{ .slot = 4, .generation = 2 };
+    const source = try acquire(TestAdapter.SourceSlot, adapter.sources, &adapter.source_free);
+    source.peer = peer;
+    const source_id = adapter.sourceId(source);
+    const device = try acquire(TestAdapter.DeviceSlot, adapter.devices, &adapter.device_free);
+    device.peer = peer;
+    const offer = try acquire(TestAdapter.OfferSlot, adapter.offers, &adapter.offer_free);
+    offer.peer = peer;
+    offer.device = adapter.deviceId(device);
+    offer.source = source_id;
+    offer.kind = .drag;
+    offer.current = true;
+    offer.accepted_mime = 0;
+    offer.selected_action = test_protocol.wl_data_device_manager.dnd_action.copy.value;
+    adapter.drag = .{
+        .peer = peer,
+        .source = source_id,
+        .origin_object = 7,
+        .target = .{ .peer = peer, .surface_object = 9, .x = 10, .y = 11 },
+    };
+
+    try adapter.dropDrag();
+    try std.testing.expect(adapter.drag == null);
+    try std.testing.expect(!offer.current);
+    try std.testing.expect(offer.dropped);
+    try std.testing.expectEqual(@as(usize, 2), adapter.pendingOutbound());
+    try std.testing.expectEqual(TestAdapter.Outbound.drag_drop, std.meta.activeTag(adapter.outbound[0].value));
+    try std.testing.expectEqual(TestAdapter.Outbound.source_drop_performed, std.meta.activeTag(adapter.outbound[1].value));
+
+    try adapter.finishOffer(offer);
+    try std.testing.expect(offer.finished);
+    try std.testing.expectEqual(@as(usize, 3), adapter.pendingOutbound());
+    try std.testing.expectEqual(TestAdapter.Outbound.source_finished, std.meta.activeTag(adapter.outbound[2].value));
+    try std.testing.expectError(error.InvalidFinish, adapter.finishOffer(offer));
 }
 
 test "data device: copied MIME types and offer capacity make replacement transactional" {
