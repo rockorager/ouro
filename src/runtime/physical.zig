@@ -32,10 +32,12 @@ const protocol_linux_dmabuf = @import("../protocol/linux_dmabuf.zig");
 const protocol_xdg_activation = @import("../protocol/xdg_activation.zig");
 const protocol_xdg_decoration = @import("../protocol/xdg_decoration.zig");
 const protocol_relative_pointer = @import("../protocol/relative_pointer.zig");
+const protocol_pointer_constraints = @import("../protocol/pointer_constraints.zig");
 const protocol_fractional_scale = @import("../protocol/fractional_scale.zig");
 const protocol_output = @import("../protocol/output.zig");
 const desktop_model = @import("../desktop/model.zig");
 const interaction_model = @import("../input/interaction.zig");
+const confinement = @import("../input/confinement.zig");
 
 const linux = std.os.linux;
 
@@ -57,6 +59,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const ActivationAdapter = protocol_xdg_activation.Adapter(protocol, Adapter);
         const DecorationAdapter = protocol_xdg_decoration.Adapter(protocol, ShellAdapter);
         const RelativePointerAdapter = protocol_relative_pointer.Adapter(protocol, SeatAdapter);
+        const PointerConstraintsAdapter = protocol_pointer_constraints.Adapter(protocol, Adapter, SeatAdapter);
         const FractionalScaleAdapter = protocol_fractional_scale.Adapter(protocol, Adapter);
         const OutputAdapter = protocol_output.Adapter(protocol);
 
@@ -154,6 +157,7 @@ pub fn Coordinator(comptime protocol: type) type {
             xdg_activation: protocol_xdg_activation.Config = .{},
             xdg_decoration: protocol_xdg_decoration.Config = .{},
             relative_pointer: protocol_relative_pointer.Config = .{},
+            pointer_constraints: protocol_pointer_constraints.WireConfig = .{},
             fractional_scale: protocol_fractional_scale.Config = .{},
             protocol_output: protocol_output.Config = .{},
             drm: drm.Config,
@@ -192,6 +196,8 @@ pub fn Coordinator(comptime protocol: type) type {
         input_interaction_accepted: bool = false,
         input_relative_accepted: bool = false,
         input_keyboard_consumed: bool = false,
+        input_delivery_prepared: bool = false,
+        input_delivery_event: ?input_api.Event = null,
         manager: drm.Manager,
         shm: Shm,
         adapter: Adapter,
@@ -204,6 +210,7 @@ pub fn Coordinator(comptime protocol: type) type {
         activation_adapter: ActivationAdapter,
         decoration_adapter: DecorationAdapter,
         relative_pointer_adapter: RelativePointerAdapter,
+        pointer_constraints_adapter: PointerConstraintsAdapter,
         fractional_scale_adapter: FractionalScaleAdapter,
         output_adapter: OutputAdapter,
         presentations: Presentations,
@@ -259,6 +266,10 @@ pub fn Coordinator(comptime protocol: type) type {
             self.input = null;
             self.input_event_cursor = 0;
             self.input_interaction_accepted = false;
+            self.input_relative_accepted = false;
+            self.input_keyboard_consumed = false;
+            self.input_delivery_prepared = false;
+            self.input_delivery_event = null;
             self.render_device = null;
             self.next_output_generation = config.output.output_id.generation;
             self.loop = null;
@@ -357,6 +368,13 @@ pub fn Coordinator(comptime protocol: type) type {
                 config.relative_pointer,
             );
             errdefer self.relative_pointer_adapter.deinit();
+            self.pointer_constraints_adapter = try PointerConstraintsAdapter.init(
+                allocator,
+                &self.adapter,
+                &self.seat_adapter,
+                config.pointer_constraints,
+            );
+            errdefer self.pointer_constraints_adapter.deinit();
             self.data_device_adapter = try DataDeviceAdapter.init(allocator, config.data_device);
             errdefer self.data_device_adapter.deinit();
             self.dmabuf_adapter = try DmabufAdapter.init(allocator, config.linux_dmabuf);
@@ -443,6 +461,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
             _ = try self.relative_pointer_adapter.install(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
+            _ = try self.pointer_constraints_adapter.install(&root.runtime);
             try self.adapter.setCommitHook(.{
                 .context = self,
                 .validate_fn = validateSurfaceCommit,
@@ -509,6 +530,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.activation_adapter.deinit();
             self.dmabuf_adapter.deinit();
             self.data_device_adapter.deinit();
+            self.pointer_constraints_adapter.deinit();
             self.relative_pointer_adapter.deinit();
             self.seat_adapter.deinit();
             self.interaction.deinit();
@@ -669,6 +691,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.flushProtocol();
                 return control;
             }
+            if (try self.pointer_constraints_adapter.request(peer, target, message, fds)) |control| {
+                try self.flushProtocol();
+                return control;
+            }
             if (try self.output_adapter.request(peer, target, message, fds)) |control| {
                 try self.flushProtocol();
                 return control;
@@ -742,6 +768,12 @@ pub fn Coordinator(comptime protocol: type) type {
                 error.StaleSurface => {},
                 else => return err,
             };
+            const pointer = self.seat_adapter.pointerState();
+            try self.pointer_constraints_adapter.validateSurfaceCommit(
+                id,
+                if (pointer.focus) |focus| focus.surface else null,
+                .{ .x = pointer.point.x, .y = pointer.point.y },
+            );
             try validatePendingRingAdmission(
                 self.pending_surfaces,
                 self.pending_surface_head,
@@ -752,6 +784,12 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn surfaceCommitted(context: *anyopaque, id: Adapter.SurfaceId) !void {
             const self: *Self = @ptrCast(@alignCast(context));
+            self.pointer_constraints_adapter.surfaceCommitted(id);
+            const pointer = self.seat_adapter.pointerState();
+            try self.pointer_constraints_adapter.updateFocus(
+                if (pointer.focus) |focus| focus.surface else null,
+                .{ .x = pointer.point.x, .y = pointer.point.y },
+            );
             if (self.shell_adapter.ownsSurface(id))
                 self.shell_adapter.publishSurfaceCommitted(id) catch unreachable;
             self.surface = self.adapter.surfaceHandle(id) catch unreachable;
@@ -926,12 +964,20 @@ pub fn Coordinator(comptime protocol: type) type {
         /// physical tests. A false result retains the event between owners;
         /// the caller must retry that exact value before offering another.
         pub fn acceptNormalizedInput(self: *Self, event: input_api.Event) !bool {
-            if (!self.input_interaction_accepted) {
-                self.input_keyboard_consumed = false;
-                self.interaction.consume(&self.desktop, &self.adapter, event) catch |err| switch (err) {
-                    error.Backpressure, error.Exhausted => return false,
+            if (!self.input_delivery_prepared) {
+                self.input_delivery_event = self.pointerDeliveryEvent(event) catch |err| switch (err) {
+                    error.Exhausted => return false,
                     else => return err,
                 };
+                self.input_delivery_prepared = true;
+            }
+            if (!self.input_interaction_accepted) {
+                self.input_keyboard_consumed = false;
+                if (self.input_delivery_event) |delivery_event|
+                    self.interaction.consume(&self.desktop, &self.adapter, delivery_event) catch |err| switch (err) {
+                        error.Backpressure, error.Exhausted => return false,
+                        else => return err,
+                    };
                 self.input_interaction_accepted = true;
             }
             self.applyInteractionCommands() catch |err| switch (err) {
@@ -942,14 +988,22 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.relative_pointer_adapter.consume(event) catch return false;
                 self.input_relative_accepted = true;
             }
-            if (!self.input_keyboard_consumed)
-                self.seat_adapter.consume(event) catch |err| switch (err) {
+            if (!self.input_keyboard_consumed) if (self.input_delivery_event) |delivery_event|
+                switch (delivery_event) {
+                    .pointer_motion => self.seat_adapter.consumePointerMotionAt(
+                        delivery_event,
+                        self.seat_adapter.pointerState().point,
+                    ),
+                    else => self.seat_adapter.consume(delivery_event),
+                } catch |err| switch (err) {
                     error.Exhausted => return false,
                     else => return err,
                 };
             self.input_interaction_accepted = false;
             self.input_relative_accepted = false;
             self.input_keyboard_consumed = false;
+            self.input_delivery_prepared = false;
+            self.input_delivery_event = null;
             self.stats.input_events += 1;
             try self.advanceShell();
             switch (event) {
@@ -959,6 +1013,47 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.processSeatEvents();
             try self.flushProtocol();
             return true;
+        }
+
+        fn pointerDeliveryEvent(self: *Self, event: input_api.Event) !?input_api.Event {
+            const motion = switch (event) {
+                .pointer_motion => |value| value,
+                else => return event,
+            };
+            try self.interaction.validatePointerMotion(motion.device, motion.dx, motion.dy);
+            return switch (self.pointer_constraints_adapter.motionPolicy()) {
+                .free => event,
+                .locked => null,
+                .confined => |constraint_id| confined: {
+                    const pointer = self.seat_adapter.pointerState();
+                    _ = pointer.focus orelse return error.InvalidConstraintFocus;
+                    const motion_start: confinement.FixedPoint = .{
+                        .x = pointer.point.x,
+                        .y = pointer.point.y,
+                    };
+                    const motion_end: confinement.FixedPoint = .{
+                        .x = motion_start.x +| normalizedFixedDelta(motion.dx),
+                        .y = motion_start.y +| normalizedFixedDelta(motion.dy),
+                    };
+                    const clipped = self.pointer_constraints_adapter.clipMotion(
+                        constraint_id,
+                        motion_start,
+                        motion_end,
+                    ) catch |err| switch (err) {
+                        // A committed effective-region change can invalidate
+                        // the retained start before focus is recomputed. Never
+                        // let that stale edge bypass an engaged confinement.
+                        error.StartOutside => break :confined null,
+                        else => return err,
+                    };
+                    break :confined .{ .pointer_motion = .{
+                        .device = motion.device,
+                        .time_usec = motion.time_usec,
+                        .dx = fixedNormalizedDelta(clipped.x - motion_start.x),
+                        .dy = fixedNormalizedDelta(clipped.y - motion_start.y),
+                    } };
+                },
+            };
         }
 
         fn advanceShell(self: *Self) !void {
@@ -1062,6 +1157,10 @@ pub fn Coordinator(comptime protocol: type) type {
                         else
                             .{ .x = 0, .y = 0 };
                         try self.seat_adapter.setPointerFocus(seat_target, point);
+                        try self.pointer_constraints_adapter.updateFocus(
+                            if (target) |value| value.surface else null,
+                            .{ .x = point.x, .y = point.y },
+                        );
                     },
                     .keyboard_focus => |target| {
                         const peer = try self.adapter.surfacePeer(target.surface);
@@ -1072,6 +1171,11 @@ pub fn Coordinator(comptime protocol: type) type {
                     .cancel => |cancel| {
                         if (cancel.pointer_focus)
                             try self.seat_adapter.setPointerFocus(null, .{ .x = 0, .y = 0 });
+                        if (cancel.pointer_focus)
+                            try self.pointer_constraints_adapter.updateFocus(
+                                null,
+                                .{ .x = 0, .y = 0 },
+                            );
                         if (cancel.keyboard_focus) {
                             try self.seat_adapter.setKeyboardFocus(null);
                             try self.data_device_adapter.setFocus(null);
@@ -1219,11 +1323,12 @@ pub fn Coordinator(comptime protocol: type) type {
             const dmabuf_flushed = try self.dmabuf_adapter.flushOn(peer, objects, &actor.transmit);
             const activation_flushed = try self.activation_adapter.flushOn(peer, objects, &actor.transmit);
             const relative_pointer_flushed = try self.relative_pointer_adapter.flushOn(peer, objects, &actor.transmit);
+            const pointer_constraints_flushed = try self.pointer_constraints_adapter.flushOn(peer, objects, &actor.transmit);
             const fractional_scale_flushed = try self.fractional_scale_adapter.flushOn(peer, objects, &actor.transmit);
             const output_flushed = try self.output_adapter.flushOn(peer, objects, &actor.transmit);
             const presentation_flushed = try self.adapter.flushPresentationClockOn(peer, objects, &actor.transmit);
             const discarded_flushed = try self.adapter.flushDiscardedFeedbackOn(peer, objects, &actor.transmit);
-            if (decoration_flushed != 0 or shell_flushed != 0 or seat_flushed != 0 or data_device_flushed != 0 or dmabuf_flushed != 0 or activation_flushed != 0 or relative_pointer_flushed != 0 or fractional_scale_flushed != 0 or output_flushed != 0 or presentation_flushed != 0 or discarded_flushed != 0 or
+            if (decoration_flushed != 0 or shell_flushed != 0 or seat_flushed != 0 or data_device_flushed != 0 or dmabuf_flushed != 0 or activation_flushed != 0 or relative_pointer_flushed != 0 or pointer_constraints_flushed != 0 or fractional_scale_flushed != 0 or output_flushed != 0 or presentation_flushed != 0 or discarded_flushed != 0 or
                 self.decoration_adapter.pendingOutbound(peer) or
                 self.shell_adapter.pendingOutbound() != 0 or
                 self.seat_adapter.pendingOutbound() != 0 or
@@ -1231,6 +1336,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.dmabuf_adapter.pendingOutbound(peer) or
                 self.activation_adapter.pendingOutbound(peer) or
                 self.relative_pointer_adapter.pendingOutbound(peer) or
+                self.pointer_constraints_adapter.pendingOutbound(peer) or
                 self.fractional_scale_adapter.pendingOutbound(peer) or
                 self.output_adapter.pendingOutbound() != 0 or
                 self.adapter.pendingPresentationClock(peer) or
@@ -2075,10 +2181,12 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.activation_adapter.resourceRemoved(handle, object);
             _ = self.decoration_adapter.resourceRemoved(handle, object);
             _ = self.relative_pointer_adapter.resourceRemoved(handle, object);
+            _ = self.pointer_constraints_adapter.resourceRemoved(handle, object);
             _ = self.fractional_scale_adapter.resourceRemoved(handle, object);
             _ = self.output_adapter.resourceRemoved(handle, object);
             if (removed_surface_peer) |peer| self.output_adapter.surfaceRemoved(peer, handle);
             if (removed_surface) |id| {
+                self.pointer_constraints_adapter.surfaceRemoved(id);
                 self.dropPendingSurface(id);
                 if (self.render_device) |render_device| render_device.content.destroySurface(
                     (@as(u64, id.generation) << 32) | id.index,
@@ -2133,6 +2241,17 @@ pub fn Coordinator(comptime protocol: type) type {
             self.stats.imported_disposals += 1;
         }
     };
+}
+
+fn normalizedFixedDelta(value: f64) i64 {
+    const scaled = value * 256.0;
+    if (scaled >= @as(f64, @floatFromInt(std.math.maxInt(i64)))) return std.math.maxInt(i64);
+    if (scaled <= @as(f64, @floatFromInt(std.math.minInt(i64)))) return std.math.minInt(i64);
+    return @intFromFloat(scaled);
+}
+
+fn fixedNormalizedDelta(value: i64) f64 {
+    return @as(f64, @floatFromInt(value)) / 256.0;
 }
 
 fn layerVacant(layer: anytype) bool {

@@ -95,6 +95,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             client: ClientId,
             surface: SurfaceId,
         };
+        pub const PointerState = struct {
+            focus: ?FocusTarget,
+            point: Point,
+        };
         pub const Point = struct { x: i32, y: i32 };
         const Axis = enum { vertical, horizontal };
         pub const ModifierState = struct {
@@ -516,6 +520,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             return sameClient(pointer.client, focus.client);
         }
 
+        pub fn pointerState(adapter: *const Self) PointerState {
+            return .{ .focus = adapter.pointer_focus, .point = adapter.pointer_point };
+        }
+
         /// Validates an input serial against the exact wl_seat resource named
         /// by an xdg_popup.grab request. Pointer-enter serials intentionally do
         /// not qualify: only a delivered button press establishes this token.
@@ -704,31 +712,56 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             switch (event) {
                 .device_added => |value| try adapter.addDevice(value.device, value.capabilities),
                 .device_removed => |id| try adapter.removeDevice(id),
-                .pointer_motion => |value| {
-                    _ = try adapter.resolveDevice(value.device);
-                    const target = adapter.deliveryTarget() orelse return;
-                    const count = adapter.pointerResourceCount(target.client) * 2;
-                    try adapter.ensureOutbound(count);
-                    adapter.pointer_point.x +|= fixedFromDelta(value.dx);
-                    adapter.pointer_point.y +|= fixedFromDelta(value.dy);
-                    for (adapter.pointers, 0..) |slot, index| if (adapter.pointerBelongs(&slot, target.client)) {
-                        const id: Id = .{ .index = @intCast(index), .generation = slot.header.generation };
-                        adapter.enqueue(target.client, .{ .pointer_motion = .{
-                            .pointer = id,
-                            .target = target,
-                            .time = millis(value.time_usec),
-                            .point = adapter.pointer_point,
-                        } }) catch unreachable;
-                        adapter.enqueue(target.client, .{ .pointer_frame = .{
-                            .pointer = id,
-                            .target = target,
-                        } }) catch unreachable;
-                    };
-                },
+                .pointer_motion => |value| try adapter.pointerMotion(value, null),
                 .pointer_button => |value| try adapter.pointerButton(value),
                 .pointer_axis => |value| try adapter.pointerAxis(value),
                 .keyboard_key => |value| try adapter.keyboardKey(value),
             }
+        }
+
+        /// Queues a normalized pointer motion at an exact compositor-derived
+        /// surface-local point. The physical runtime uses this after hit
+        /// testing so the protocol owner does not integrate the same delta a
+        /// second time.
+        pub fn consumePointerMotionAt(
+            adapter: *Self,
+            event: input.Event,
+            point: Point,
+        ) !void {
+            switch (event) {
+                .pointer_motion => |value| try adapter.pointerMotion(value, point),
+                else => return error.NotPointerMotion,
+            }
+        }
+
+        fn pointerMotion(
+            adapter: *Self,
+            value: anytype,
+            exact_point: ?Point,
+        ) !void {
+            _ = try adapter.resolveDevice(value.device);
+            const target = adapter.deliveryTarget() orelse return;
+            const count = adapter.pointerResourceCount(target.client) * 2;
+            try adapter.ensureOutbound(count);
+            if (exact_point) |point| {
+                adapter.pointer_point = point;
+            } else {
+                adapter.pointer_point.x +|= fixedFromDelta(value.dx);
+                adapter.pointer_point.y +|= fixedFromDelta(value.dy);
+            }
+            for (adapter.pointers, 0..) |slot, index| if (adapter.pointerBelongs(&slot, target.client)) {
+                const id: Id = .{ .index = @intCast(index), .generation = slot.header.generation };
+                adapter.enqueue(target.client, .{ .pointer_motion = .{
+                    .pointer = id,
+                    .target = target,
+                    .time = millis(value.time_usec),
+                    .point = adapter.pointer_point,
+                } }) catch unreachable;
+                adapter.enqueue(target.client, .{ .pointer_frame = .{
+                    .pointer = id,
+                    .target = target,
+                } }) catch unreachable;
+            };
         }
 
         pub fn cancelPointerGrab(adapter: *Self) !void {

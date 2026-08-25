@@ -189,6 +189,17 @@ pub fn Interaction(comptime Desktop: type) type {
             return .{ .x = fixedFloor(self.x_fixed), .y = fixedFloor(self.y_fixed) };
         }
 
+        pub fn validatePointerMotion(
+            self: *Self,
+            device_id: input.DeviceId,
+            dx: f64,
+            dy: f64,
+        ) !void {
+            const device = try self.resolveDevice(device_id);
+            if (!device.capabilities.pointer) return error.MissingCapability;
+            if (!std.math.isFinite(dx) or !std.math.isFinite(dy)) return error.InvalidMotion;
+        }
+
         /// Preflights an output-derived pointer domain without changing any
         /// retained focus, pointer, or cursor state.
         pub fn validateBounds(_: *const Self, bounds: geometry.Rect) !void {
@@ -286,9 +297,7 @@ pub fn Interaction(comptime Desktop: type) type {
             dx: f64,
             dy: f64,
         ) !void {
-            const device = try self.resolveDevice(device_id);
-            if (!device.capabilities.pointer) return error.MissingCapability;
-            if (!std.math.isFinite(dx) or !std.math.isFinite(dy)) return error.InvalidMotion;
+            try self.validatePointerMotion(device_id, dx, dy);
             try self.ensureCommandCapacity(1);
             const next_x = clampFixed(self.x_fixed +| fixedDelta(dx), self.bounds.x, self.bounds.width);
             const next_y = clampFixed(self.y_fixed +| fixedDelta(dy), self.bounds.y, self.bounds.height);

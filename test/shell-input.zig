@@ -430,9 +430,60 @@ test "shell-input: two mapped toplevels sustain independent commit cycles" {
         .dx = 0.25,
         .dy = 0,
     } }));
-    try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_button = .{
+    try std.testing.expectEqual(@as(i32, 64), coordinator.seat_adapter.pointerState().point.x);
+    const pointer_focus = coordinator.seat_adapter.pointerState().focus.?;
+    const lock = try coordinator.pointer_constraints_adapter.state.create(
+        .locked,
+        .persistent,
+        pointer_focus.surface,
+        0,
+        null,
+    );
+    try coordinator.pointer_constraints_adapter.updateFocus(
+        pointer_focus.surface,
+        .{
+            .x = coordinator.seat_adapter.pointerState().point.x,
+            .y = coordinator.seat_adapter.pointerState().point.y,
+        },
+    );
+    const locked_point = coordinator.seat_adapter.pointerState().point;
+    try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_motion = .{
         .device = pointer_device,
         .time_usec = 2,
+        .dx = 1.5,
+        .dy = 0.5,
+    } }));
+    try std.testing.expectEqual(locked_point, coordinator.seat_adapter.pointerState().point);
+    try coordinator.pointer_constraints_adapter.state.destroy(lock);
+
+    const constraint_region = [_]ouro.region.Operation{
+        .{ .add = .{ .x = 0, .y = 0, .width = 1, .height = 2 } },
+    };
+    const confined = try coordinator.pointer_constraints_adapter.state.create(
+        .confined,
+        .persistent,
+        pointer_focus.surface,
+        0,
+        &constraint_region,
+    );
+    try coordinator.pointer_constraints_adapter.updateFocus(
+        pointer_focus.surface,
+        .{
+            .x = coordinator.seat_adapter.pointerState().point.x,
+            .y = coordinator.seat_adapter.pointerState().point.y,
+        },
+    );
+    try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_motion = .{
+        .device = pointer_device,
+        .time_usec = 3,
+        .dx = 4,
+        .dy = 0,
+    } }));
+    try std.testing.expectEqual(@as(i32, 255), coordinator.seat_adapter.pointerState().point.x);
+    try coordinator.pointer_constraints_adapter.state.destroy(confined);
+    try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_button = .{
+        .device = pointer_device,
+        .time_usec = 4,
         .button = 0x110,
         .pressed = true,
     } }));

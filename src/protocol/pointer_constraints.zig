@@ -1,13 +1,13 @@
 //! Protocol-neutral bounded pointer-constraint state.
 //!
-//! This owner deliberately remains unadvertised until the physical input path
-//! can apply exact confinement. It establishes generation-safe lock/confine
-//! lifetime, copied region state, surface-commit publication, and activation
-//! events without claiming incomplete wire support.
+//! The protocol-neutral store and wire adapter establish generation-safe
+//! lock/confine lifetime, copied region state, surface-commit publication,
+//! exact physical motion policy, and retained activation events.
 
 const std = @import("std");
 const wayring = @import("wayring");
 const region = @import("../region.zig");
+const confinement = @import("../input/confinement.zig");
 const objects = wayring.objects;
 
 const none = std.math.maxInt(u32);
@@ -33,13 +33,21 @@ pub const Config = struct {
             config.constraint_capacity,
             operations_per_slot,
         ) catch return error.InvalidConfig;
+        const minimum_events = std.math.mul(
+            usize,
+            config.constraint_capacity,
+            2,
+        ) catch return error.InvalidConfig;
+        if (config.event_capacity < minimum_events) return error.InvalidConfig;
     }
 };
 
 pub const WireConfig = struct {
     constraint_capacity: usize = 16,
     region_operation_capacity: usize = 16,
+    input_region_operation_capacity: usize = 64,
     event_capacity: usize = 32,
+    global_version: u32 = 1,
 };
 
 pub fn Store(comptime SurfaceId: type, comptime PointerId: type) type {
@@ -190,6 +198,31 @@ pub fn Store(comptime SurfaceId: type, comptime PointerId: type) type {
             }
         }
 
+        /// Preflights the focus transitions caused by publishing a surface's
+        /// pending constraint regions. The surface commit owner calls this
+        /// before mutating any double-buffered state.
+        pub fn validateSurfaceCommit(
+            self: *Self,
+            committed_surface: SurfaceId,
+            pointer: PointerId,
+            focus_surface: ?SurfaceId,
+            point: Point,
+        ) !void {
+            var required_events: usize = 0;
+            for (self.slots) |*slot| {
+                if (!slot.active or !std.meta.eql(slot.pointer, pointer)) continue;
+                const qualifies = !slot.defunct and focus_surface != null and
+                    std.meta.eql(slot.surface, focus_surface.?) and
+                    self.containsSlotVersion(
+                        slot,
+                        point,
+                        std.meta.eql(slot.surface, committed_surface) and slot.region_dirty,
+                    );
+                if (qualifies != slot.engaged) required_events += 1;
+            }
+            try self.ensureOrdinaryEventCapacity(required_events);
+        }
+
         pub fn updateFocus(
             self: *Self,
             pointer: PointerId,
@@ -203,7 +236,7 @@ pub fn Store(comptime SurfaceId: type, comptime PointerId: type) type {
                     std.meta.eql(slot.surface, surface.?) and self.containsSlot(slot, point);
                 if (qualifies != slot.engaged) required_events += 1;
             }
-            if (required_events > self.events.len - self.event_len) return error.Exhausted;
+            try self.ensureOrdinaryEventCapacity(required_events);
 
             for (self.slots) |*slot| {
                 if (!slot.active or !std.meta.eql(slot.pointer, pointer)) continue;
@@ -239,6 +272,10 @@ pub fn Store(comptime SurfaceId: type, comptime PointerId: type) type {
 
         pub fn cursorHint(self: *Self, constraint_id: ConstraintId) !?Point {
             return (try self.resolve(constraint_id)).current_hint;
+        }
+
+        pub fn constraintSurface(self: *Self, constraint_id: ConstraintId) !SurfaceId {
+            return (try self.resolve(constraint_id)).surface;
         }
 
         pub fn copyRegion(
@@ -279,14 +316,14 @@ pub fn Store(comptime SurfaceId: type, comptime PointerId: type) type {
             return self.event_len != 0;
         }
 
-        pub fn surfaceRemoved(self: *Self, surface: SurfaceId) !void {
+        pub fn surfaceRemoved(self: *Self, surface: SurfaceId) void {
             var required_events: usize = 0;
             for (self.slots) |*slot| {
                 if (slot.active and slot.engaged and std.meta.eql(slot.surface, surface)) {
                     required_events += 1;
                 }
             }
-            if (required_events > self.events.len - self.event_len) return error.Exhausted;
+            std.debug.assert(required_events <= self.events.len - self.event_len);
 
             for (self.slots) |*slot| {
                 if (!slot.active or !std.meta.eql(slot.surface, surface)) continue;
@@ -299,14 +336,14 @@ pub fn Store(comptime SurfaceId: type, comptime PointerId: type) type {
             }
         }
 
-        pub fn pointerRemoved(self: *Self, pointer: PointerId) !void {
+        pub fn pointerRemoved(self: *Self, pointer: PointerId) void {
             var required_events: usize = 0;
             for (self.slots) |*slot| {
                 if (slot.active and slot.engaged and std.meta.eql(slot.pointer, pointer)) {
                     required_events += 1;
                 }
             }
-            if (required_events > self.events.len - self.event_len) return error.Exhausted;
+            std.debug.assert(required_events <= self.events.len - self.event_len);
 
             for (self.slots) |*slot| {
                 if (!slot.active or !std.meta.eql(slot.pointer, pointer)) continue;
@@ -349,9 +386,47 @@ pub fn Store(comptime SurfaceId: type, comptime PointerId: type) type {
         }
 
         fn containsSlot(_: *Self, slot: *const Slot, point: Point) bool {
-            if (slot.current_region_null) return true;
+            return containsRegion(
+                slot.current_region_null,
+                slot.current_region[0..slot.current_region_len],
+                point,
+            );
+        }
+
+        fn containsSlotVersion(
+            _: *Self,
+            slot: *const Slot,
+            point: Point,
+            pending: bool,
+        ) bool {
+            return if (pending)
+                containsRegion(
+                    slot.pending_region_null,
+                    slot.pending_region[0..slot.pending_region_len],
+                    point,
+                )
+            else
+                containsRegion(
+                    slot.current_region_null,
+                    slot.current_region[0..slot.current_region_len],
+                    point,
+                );
+        }
+
+        fn ensureOrdinaryEventCapacity(self: *const Self, required_events: usize) !void {
+            const ordinary_capacity = self.events.len - self.slots.len;
+            if (self.event_len > ordinary_capacity or
+                required_events > ordinary_capacity - self.event_len) return error.Exhausted;
+        }
+
+        fn containsRegion(
+            unrestricted: bool,
+            operations: []const region.Operation,
+            point: Point,
+        ) bool {
+            if (unrestricted) return true;
             var inside = false;
-            for (slot.current_region[0..slot.current_region_len]) |operation| switch (operation) {
+            for (operations) |operation| switch (operation) {
                 .add => |rectangle| if (rectangleContains(rectangle, point)) {
                     inside = true;
                 },
@@ -438,12 +513,12 @@ pub fn Store(comptime SurfaceId: type, comptime PointerId: type) type {
     };
 }
 
-/// Owns decoded protocol resources around `Store` without advertising a
-/// global. Runtime publication is intentionally deferred until the physical
-/// motion path applies lock suppression and exact confinement.
+/// Owns the advertised protocol resources around `Store` and bridges retained
+/// constraint state to exact committed surface/input geometry.
 pub fn Adapter(comptime protocol: type, comptime Core: type, comptime Seat: type) type {
     return struct {
         const Self = @This();
+        const Runtime = wayring.server.Runtime(protocol);
         const ProtocolCore = wayring.server.Core(protocol);
         const Manager = protocol.zwp_pointer_constraints_v1;
         const LockedPointer = protocol.zwp_locked_pointer_v1;
@@ -466,9 +541,14 @@ pub fn Adapter(comptime protocol: type, comptime Core: type, comptime Seat: type
         allocator: std.mem.Allocator,
         core: *Core,
         seat: *Seat,
+        runtime: ?*Runtime = null,
+        global: ?objects.Handle = null,
+        global_version: u32,
         state: State,
         resources: []ResourceSlot,
         region_scratch: []region.Operation,
+        input_region_scratch: []region.Operation,
+        boundary_scratch: []u64,
         free_head: u32 = 0,
 
         pub fn init(
@@ -477,6 +557,9 @@ pub fn Adapter(comptime protocol: type, comptime Core: type, comptime Seat: type
             seat: *Seat,
             config: WireConfig,
         ) !Self {
+            if (config.global_version != 1 or config.input_region_operation_capacity == 0)
+                return error.InvalidConfig;
+            try Manager.info.validateVersion(config.global_version);
             var state = try State.init(allocator, .{
                 .constraint_capacity = config.constraint_capacity,
                 .region_operation_capacity = config.region_operation_capacity,
@@ -486,6 +569,19 @@ pub fn Adapter(comptime protocol: type, comptime Core: type, comptime Seat: type
             const resources = try allocator.alloc(ResourceSlot, config.constraint_capacity);
             errdefer allocator.free(resources);
             const region_scratch = try allocator.alloc(region.Operation, config.region_operation_capacity);
+            errdefer allocator.free(region_scratch);
+            const input_region_scratch = try allocator.alloc(
+                region.Operation,
+                config.input_region_operation_capacity,
+            );
+            errdefer allocator.free(input_region_scratch);
+            const boundary_scratch = try allocator.alloc(
+                u64,
+                try confinement.scratchCapacity(
+                    config.input_region_operation_capacity,
+                    config.region_operation_capacity,
+                ),
+            );
             for (resources, 0..) |*slot, slot_index| slot.* = .{
                 .next_free = if (slot_index + 1 < resources.len) @intCast(slot_index + 1) else none,
             };
@@ -493,17 +589,53 @@ pub fn Adapter(comptime protocol: type, comptime Core: type, comptime Seat: type
                 .allocator = allocator,
                 .core = core,
                 .seat = seat,
+                .global_version = config.global_version,
                 .state = state,
                 .resources = resources,
                 .region_scratch = region_scratch,
+                .input_region_scratch = input_region_scratch,
+                .boundary_scratch = boundary_scratch,
             };
         }
 
         pub fn deinit(self: *Self) void {
+            self.allocator.free(self.boundary_scratch);
+            self.allocator.free(self.input_region_scratch);
             self.allocator.free(self.region_scratch);
             self.allocator.free(self.resources);
             self.state.deinit();
             self.* = undefined;
+        }
+
+        pub fn install(self: *Self, runtime: *Runtime) !objects.Handle {
+            if (self.runtime != null) return error.AlreadyInstalled;
+            self.runtime = runtime;
+            errdefer self.runtime = null;
+            const global = try runtime.addGlobalWithBinder(
+                &Manager.info,
+                self.global_version,
+                self,
+                bind,
+            );
+            self.global = global;
+            return global;
+        }
+
+        fn bind(context: ?*anyopaque, _: wayring.server.Binding) !?*anyopaque {
+            return context orelse error.InvalidContext;
+        }
+
+        pub fn request(
+            self: *Self,
+            peer: wayring.io_uring.Peer,
+            target: objects.Dispatch,
+            message: wayring.wire.Message,
+            fds: *wayring.ancillary.FdQueue,
+        ) !?wayring.dispatch.Control {
+            const runtime = self.runtime orelse return error.NotInstalled;
+            const actor = try runtime.clients.reactor.getActor(peer);
+            const server_objects = try runtime.clients.get(peer);
+            return self.requestOn(actor, server_objects, peer, target, message, fds);
         }
 
         pub fn requestOn(
@@ -595,15 +727,45 @@ pub fn Adapter(comptime protocol: type, comptime Core: type, comptime Seat: type
             self.state.commitSurface(surface);
         }
 
-        pub fn surfaceRemoved(self: *Self, surface: Core.SurfaceId) !void {
-            try self.state.surfaceRemoved(surface);
+        pub fn validateSurfaceCommit(
+            self: *Self,
+            committed_surface: Core.SurfaceId,
+            focus_surface: ?Core.SurfaceId,
+            point: FocusPoint,
+        ) !void {
+            try self.state.validateSurfaceCommit(
+                committed_surface,
+                0,
+                try self.effectiveFocus(focus_surface, point),
+                .{ .x = @divFloor(point.x, 256), .y = @divFloor(point.y, 256) },
+            );
+        }
+
+        pub fn surfaceRemoved(self: *Self, surface: Core.SurfaceId) void {
+            self.state.surfaceRemoved(surface);
         }
 
         pub fn updateFocus(self: *Self, surface: ?Core.SurfaceId, point: FocusPoint) !void {
-            try self.state.updateFocus(0, surface, .{
+            try self.state.updateFocus(0, try self.effectiveFocus(surface, point), .{
                 .x = @divFloor(point.x, 256),
                 .y = @divFloor(point.y, 256),
             });
+        }
+
+        fn effectiveFocus(
+            self: *Self,
+            surface: ?Core.SurfaceId,
+            point: FocusPoint,
+        ) !?Core.SurfaceId {
+            const id = surface orelse return null;
+            const input = try self.core.copyCommittedInput(id, self.input_region_scratch);
+            if (!confinement.contains(
+                .{ .x = point.x, .y = point.y },
+                .{ .width = input.width, .height = input.height },
+                .{ .infinite = input.infinite, .operations = input.operations },
+                .{ .infinite = true, .operations = &.{} },
+            )) return null;
+            return id;
         }
 
         pub fn motionPolicy(self: *Self) MotionPolicy {
@@ -616,6 +778,25 @@ pub fn Adapter(comptime protocol: type, comptime Core: type, comptime Seat: type
             destination: []region.Operation,
         ) !State.RegionSnapshot {
             return self.state.copyRegion(constraint_id, destination);
+        }
+
+        pub fn clipMotion(
+            self: *Self,
+            constraint_id: ConstraintId,
+            start: confinement.FixedPoint,
+            end: confinement.FixedPoint,
+        ) !confinement.FixedPoint {
+            const surface = try self.state.constraintSurface(constraint_id);
+            const input = try self.core.copyCommittedInput(surface, self.input_region_scratch);
+            const constraint = try self.state.copyRegion(constraint_id, self.region_scratch);
+            return confinement.clip(
+                start,
+                end,
+                .{ .width = input.width, .height = input.height },
+                .{ .infinite = input.infinite, .operations = input.operations },
+                .{ .infinite = constraint.unrestricted, .operations = constraint.operations },
+                self.boundary_scratch,
+            );
         }
 
         pub fn flushOn(
@@ -733,7 +914,6 @@ pub fn Adapter(comptime protocol: type, comptime Core: type, comptime Seat: type
                     "surface already has a pointer constraint",
                 ),
                 error.Exhausted => return try self.noMemory(actor),
-                else => return cause,
             };
             errdefer self.state.destroy(constraint_id) catch {};
             const admitted = if (kind == .locked)
@@ -907,6 +1087,45 @@ test "pointer constraints: commit publishes copied regions and locked hints" {
     );
 }
 
+test "pointer constraints: surface commit preflights region activation events" {
+    const SurfaceId = packed struct { index: u32, generation: u32 };
+    const PointerId = packed struct { index: u32, generation: u32 };
+    const TestStore = Store(SurfaceId, PointerId);
+    var store = try TestStore.init(std.testing.allocator, .{
+        .constraint_capacity = 1,
+        .region_operation_capacity = 1,
+        .event_capacity = 2,
+    });
+    defer store.deinit();
+    const surface: SurfaceId = .{ .index = 1, .generation = 2 };
+    const pointer: PointerId = .{ .index = 3, .generation = 4 };
+    const initial = [_]region.Operation{
+        .{ .add = .{ .x = 0, .y = 0, .width = 10, .height = 10 } },
+    };
+    const replacement = [_]region.Operation{
+        .{ .add = .{ .x = 20, .y = 20, .width = 10, .height = 10 } },
+    };
+    const id = try store.create(.confined, .persistent, surface, pointer, &initial);
+    try store.updateFocus(pointer, surface, .{ .x = 5, .y = 5 });
+    try store.setRegion(id, &replacement);
+
+    try std.testing.expectError(
+        error.Exhausted,
+        store.validateSurfaceCommit(surface, pointer, surface, .{ .x = 5, .y = 5 }),
+    );
+    try std.testing.expectEqual(TestStore.MotionPolicy{ .confined = id }, store.motionPolicy(pointer));
+    _ = store.popEvent();
+
+    try store.validateSurfaceCommit(surface, pointer, surface, .{ .x = 5, .y = 5 });
+    store.commitSurface(surface);
+    try store.updateFocus(pointer, surface, .{ .x = 5, .y = 5 });
+    try std.testing.expectEqual(
+        TestStore.Event{ .deactivated = .{ .id = id, .kind = .confined } },
+        store.popEvent().?,
+    );
+    try std.testing.expectEqual(TestStore.MotionPolicy.free, store.motionPolicy(pointer));
+}
+
 test "pointer constraints: focus activation and oneshot deactivation are exact" {
     const SurfaceId = packed struct { index: u32, generation: u32 };
     const PointerId = packed struct { index: u32, generation: u32 };
@@ -944,7 +1163,7 @@ test "pointer constraints: focus transitions are atomic under event backpressure
     var store = try TestStore.init(std.testing.allocator, .{
         .constraint_capacity = 2,
         .region_operation_capacity = 1,
-        .event_capacity = 1,
+        .event_capacity = 4,
     });
     defer store.deinit();
     const surface_a: SurfaceId = .{ .index = 1, .generation = 1 };
@@ -954,12 +1173,15 @@ test "pointer constraints: focus transitions are atomic under event backpressure
     _ = try store.create(.confined, .persistent, surface_b, pointer, null);
 
     try store.updateFocus(pointer, surface_a, .{ .x = 0, .y = 0 });
-    _ = store.popEvent();
     try std.testing.expectError(
         error.Exhausted,
         store.updateFocus(pointer, surface_b, .{ .x = 0, .y = 0 }),
     );
     try std.testing.expectEqual(TestStore.MotionPolicy{ .locked = a }, store.motionPolicy(pointer));
+    try std.testing.expectEqual(
+        TestStore.Event{ .activated = .{ .id = a, .kind = .locked } },
+        store.popEvent().?,
+    );
     try std.testing.expectEqual(@as(?TestStore.Event, null), store.popEvent());
 }
 
@@ -970,7 +1192,7 @@ test "pointer constraints: teardown is exact and generations reject stale ids" {
     var store = try TestStore.init(std.testing.allocator, .{
         .constraint_capacity = 1,
         .region_operation_capacity = 1,
-        .event_capacity = 1,
+        .event_capacity = 2,
     });
     defer store.deinit();
     const surface: SurfaceId = .{ .index = 1, .generation = 1 };
@@ -978,11 +1200,11 @@ test "pointer constraints: teardown is exact and generations reject stale ids" {
     const old_id = try store.create(.locked, .persistent, surface, pointer, null);
     try store.updateFocus(pointer, surface, .{ .x = 0, .y = 0 });
 
-    try std.testing.expectError(error.Exhausted, store.surfaceRemoved(surface));
-    try std.testing.expectEqual(TestStore.MotionPolicy{ .locked = old_id }, store.motionPolicy(pointer));
-    _ = store.popEvent();
-
-    try store.surfaceRemoved(surface);
+    store.surfaceRemoved(surface);
+    try std.testing.expectEqual(
+        TestStore.Event{ .activated = .{ .id = old_id, .kind = .locked } },
+        store.popEvent().?,
+    );
     try std.testing.expectEqual(
         TestStore.Event{ .deactivated = .{ .id = old_id, .kind = .locked } },
         store.popEvent().?,
@@ -1019,6 +1241,24 @@ test "pointer constraints: wire owner retains activation until publication" {
         ) ![]const region.Operation {
             return destination[0..0];
         }
+
+        pub fn copyCommittedInput(
+            _: *@This(),
+            _: SurfaceId,
+            destination: []region.Operation,
+        ) !struct {
+            width: u32,
+            height: u32,
+            infinite: bool,
+            operations: []const region.Operation,
+        } {
+            return .{
+                .width = 10,
+                .height = 10,
+                .infinite = true,
+                .operations = destination[0..0],
+            };
+        }
     };
     const FakeSeat = struct {
         pub const PointerId = packed struct { index: u32, generation: u32 };
@@ -1034,7 +1274,7 @@ test "pointer constraints: wire owner retains activation until publication" {
     var adapter = try TestAdapter.init(std.testing.allocator, &core, &seat, .{
         .constraint_capacity = 1,
         .region_operation_capacity = 1,
-        .event_capacity = 1,
+        .event_capacity = 2,
     });
     defer adapter.deinit();
     var server_objects = try wayring.objects.ServerObjects.init(
