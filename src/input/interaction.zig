@@ -477,6 +477,7 @@ const TestDesktop = struct {
         id: TestId,
         surface: TestId,
         geometry: geometry.Rect,
+        surface_offset: geometry.Point = .{ .x = 0, .y = 0 },
         visible: bool,
         content_ready: bool,
     };

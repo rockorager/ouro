@@ -141,7 +141,7 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
             try std.testing.expectEqual(coordinator.cursor_layer.binding.?.surface, submitted[1].surface);
             try std.testing.expectEqual(cursor.sample, coordinator.cursor_layer.binding.?.sample);
             try std.testing.expectEqual(cursor.presentation, submitted[1].presentation);
-            try std.testing.expectEqual(@as(i32, 0), app.destination.x);
+            try std.testing.expectEqual(@as(i32, -1), app.destination.x);
             try std.testing.expectEqual(@as(i32, 0), app.destination.y);
             try std.testing.expectEqual(@as(u32, 3), app.destination.width);
             try std.testing.expectEqual(@as(u32, 2), app.destination.height);
@@ -882,6 +882,9 @@ const Handler = struct {
             self.xdg_surface.?,
             .{},
         )).id;
+        try protocol.xdg_surface.encodeRequest(self.queue, self.xdg_surface.?.id, .{
+            .set_window_geometry = .{ .x = 1, .y = 0, .width = 2, .height = 2 },
+        });
         try protocol.wl_surface.encodeRequest(self.queue, self.surface.?.id, .{ .commit = .{} });
         self.shell_created = true;
     }

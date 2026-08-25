@@ -30,8 +30,16 @@ pub fn topmost(
         if (!window.visible or !window.content_ready or !window.geometry.contains(point))
             continue;
         const local: geometry.Point = .{
-            .x = point.x - window.geometry.x,
-            .y = point.y - window.geometry.y,
+            .x = std.math.add(
+                i32,
+                std.math.sub(i32, point.x, window.geometry.x) catch continue,
+                window.surface_offset.x,
+            ) catch continue,
+            .y = std.math.add(
+                i32,
+                std.math.sub(i32, point.y, window.geometry.y) catch continue,
+                window.surface_offset.y,
+            ) catch continue,
         };
         if (!(surfaces.inputContains(window.surface, local) catch continue)) continue;
         return .{ .toplevel = window.id, .surface = window.surface, .local = local };
@@ -44,6 +52,7 @@ const TestWindow = struct {
     id: TestId,
     surface: TestId,
     geometry: geometry.Rect,
+    surface_offset: geometry.Point = .{ .x = 0, .y = 0 },
     visible: bool,
     content_ready: bool,
 };
@@ -70,6 +79,7 @@ test "interaction: hit test selects exact topmost visible committed identity" {
         .id = .{ .index = 2, .generation = 8 },
         .surface = .{ .index = 12, .generation = 9 },
         .geometry = .{ .x = 5, .y = 5, .width = 20, .height = 20 },
+        .surface_offset = .{ .x = 1, .y = 2 },
         .visible = true,
         .content_ready = true,
     };
@@ -77,9 +87,9 @@ test "interaction: hit test selects exact topmost visible committed identity" {
     const hit = topmost(TestWindow, &.{ bottom, top }, .{ .x = 7, .y = 8 }, &surfaces).?;
     try std.testing.expectEqual(top.id, hit.toplevel);
     try std.testing.expectEqual(top.surface, hit.surface);
-    try std.testing.expectEqual(geometry.Point{ .x = 2, .y = 3 }, hit.local);
+    try std.testing.expectEqual(geometry.Point{ .x = 3, .y = 5 }, hit.local);
 
-    surfaces.hole = .{ .x = 2, .y = 3 };
+    surfaces.hole = .{ .x = 3, .y = 5 };
     const through_hole = topmost(TestWindow, &.{ bottom, top }, .{ .x = 7, .y = 8 }, &surfaces).?;
     try std.testing.expectEqual(bottom.surface, through_hole.surface);
 }

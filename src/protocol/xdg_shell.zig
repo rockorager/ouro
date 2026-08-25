@@ -69,6 +69,13 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             generation: u32,
         };
 
+        const WindowGeometry = struct {
+            x: i32,
+            y: i32,
+            width: i32,
+            height: i32,
+        };
+
         pub const StateSet = packed struct(u16) {
             maximized: bool = false,
             fullscreen: bool = false,
@@ -98,7 +105,13 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 state: RequestedState,
                 enabled: bool,
             },
-            commit_ready: struct { id: ToplevelId, serial: u32 },
+            commit_ready: struct {
+                id: ToplevelId,
+                serial: u32,
+                has_window_geometry: bool = false,
+                surface_offset_x: i32 = 0,
+                surface_offset_y: i32 = 0,
+            },
             toplevel_destroyed: ToplevelId,
         };
 
@@ -181,6 +194,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             role: Role = .none,
             had_role: bool = false,
             last_acked_serial: u32 = 0,
+            window_geometry: ?WindowGeometry = null,
+            pending_window_geometry: ?WindowGeometry = null,
         };
 
         const ToplevelSlot = struct {
@@ -522,10 +537,17 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         pub fn publishSurfaceCommitted(adapter: *Self, id: SurfaceId) !void {
             for (adapter.surfaces) |*slot| {
                 if (!slot.header.active or !std.meta.eql(slot.surface_id, id)) continue;
+                if (slot.pending_window_geometry) |geometry| {
+                    slot.window_geometry = geometry;
+                    slot.pending_window_geometry = null;
+                }
                 switch (slot.role) {
                     .toplevel => |toplevel| adapter.publishReserved(.{ .commit_ready = .{
                         .id = toplevel,
                         .serial = slot.last_acked_serial,
+                        .has_window_geometry = slot.window_geometry != null,
+                        .surface_offset_x = if (slot.window_geometry) |geometry| geometry.x else 0,
+                        .surface_offset_y = if (slot.window_geometry) |geometry| geometry.y else 0,
                     } }),
                     .popup, .none => {},
                 }
@@ -964,6 +986,12 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                         return try adapter.protocolError(actor, decoded.handle.id, XdgSurface.@"error".not_constructed.value, "xdg role not constructed");
                     if (v.width <= 0 or v.height <= 0)
                         return try adapter.protocolError(actor, decoded.handle.id, XdgSurface.@"error".invalid_size.value, "invalid window geometry");
+                    slot.pending_window_geometry = .{
+                        .x = v.x,
+                        .y = v.y,
+                        .width = v.width,
+                        .height = v.height,
+                    };
                 },
                 .ack_configure => |v| {
                     if (slot.role == .none)
@@ -1843,6 +1871,11 @@ test "xdg-shell: configure emission resumes between role and surface events" {
         error.UnconfiguredBuffer,
         context.adapter.surfaceCommitted(context.adapter.surfaces[0].surface_id),
     );
+    try test_protocol.xdg_surface.encodeRequest(&context.requests, 11, .{
+        .set_window_geometry = .{ .x = -12, .y = 7, .width = 780, .height = 560 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try std.testing.expect(context.adapter.surfaces[0].window_geometry == null);
     const serial = try context.adapter.queueToplevelConfigure(id, .{
         .width = 800,
         .height = 600,
@@ -1898,6 +1931,18 @@ test "xdg-shell: configure emission resumes between role and surface events" {
     };
     try std.testing.expectEqual(id, ready.id);
     try std.testing.expectEqual(serial, ready.serial);
+    try std.testing.expect(ready.has_window_geometry);
+    try std.testing.expectEqual(@as(i32, -12), ready.surface_offset_x);
+    try std.testing.expectEqual(@as(i32, 7), ready.surface_offset_y);
+    try std.testing.expectEqual(
+        TestAdapter.WindowGeometry{ .x = -12, .y = 7, .width = 780, .height = 560 },
+        context.adapter.surfaces[0].window_geometry.?,
+    );
+    try context.adapter.surfaceCommitted(context.adapter.surfaces[0].surface_id);
+    try std.testing.expectEqual(
+        TestAdapter.WindowGeometry{ .x = -12, .y = 7, .width = 780, .height = 560 },
+        context.adapter.surfaces[0].window_geometry.?,
+    );
 }
 
 test "xdg-shell: full commit event capacity rejects before core mutation" {

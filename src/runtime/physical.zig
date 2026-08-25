@@ -956,19 +956,27 @@ pub fn Coordinator(comptime protocol: type) type {
                 const id = layer.id orelse unreachable;
                 const scene = self.desktop.sceneForSurface(id) catch null;
                 var sample = layer.sample.?;
+                const natural_size = layer.change.?.current.?.surface_size;
                 if (scene) |window| {
-                    sample.destination = .{
-                        .x = window.geometry.x,
-                        .y = window.geometry.y,
-                        .width = @intCast(@min(
-                            window.geometry.width,
-                            @as(i32, @intCast(output_size.width)),
-                        )),
-                        .height = @intCast(@min(
-                            window.geometry.height,
-                            @as(i32, @intCast(output_size.height)),
-                        )),
-                    };
+                    if (window.has_window_geometry) {
+                        sample.destination.x = alignedOrigin(window.geometry.x, window.surface_offset.x);
+                        sample.destination.y = alignedOrigin(window.geometry.y, window.surface_offset.y);
+                        sample.destination.width = natural_size.width;
+                        sample.destination.height = natural_size.height;
+                    } else {
+                        sample.destination = .{
+                            .x = window.geometry.x,
+                            .y = window.geometry.y,
+                            .width = @intCast(@min(
+                                window.geometry.width,
+                                @as(i32, @intCast(output_size.width)),
+                            )),
+                            .height = @intCast(@min(
+                                window.geometry.height,
+                                @as(i32, @intCast(output_size.height)),
+                            )),
+                        };
+                    }
                 }
                 sample.clip = clipToOutput(sample.destination, output_size) catch unreachable orelse {
                     if (layer.outcome_pending) {
@@ -982,10 +990,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 };
                 layer.sample = sample;
                 layer.change = .{
-                    .current = damage.SurfaceState.fromSample(sample, .{
-                        .width = sample.destination.width,
-                        .height = sample.destination.height,
-                    }),
+                    .current = damage.SurfaceState.fromSample(sample, natural_size),
                     .invalidate_bounds = true,
                 };
             };
@@ -1098,13 +1103,24 @@ pub fn Coordinator(comptime protocol: type) type {
             else
                 .{ .width = destination_size.width, .height = destination_size.height };
             const scene = self.desktop.sceneForSurface(exact_surface_id) catch null;
-            const destination_x = if (scene) |window| window.geometry.x else 0;
-            const destination_y = if (scene) |window| window.geometry.y else 0;
-            const rendered_width: u32 = if (scene) |window|
+            const has_window_geometry = if (scene) |window| window.has_window_geometry else false;
+            const destination_x = if (scene) |window| if (has_window_geometry)
+                alignedOrigin(window.geometry.x, window.surface_offset.x)
+            else
+                window.geometry.x else 0;
+            const destination_y = if (scene) |window| if (has_window_geometry)
+                alignedOrigin(window.geometry.y, window.surface_offset.y)
+            else
+                window.geometry.y else 0;
+            const rendered_width: u32 = if (has_window_geometry)
+                destination_size.width
+            else if (scene) |window|
                 @intCast(@min(window.geometry.width, @as(i32, @intCast(output_size.width))))
             else
                 @min(destination_size.width, output_size.width);
-            const rendered_height: u32 = if (scene) |window|
+            const rendered_height: u32 = if (has_window_geometry)
+                destination_size.height
+            else if (scene) |window|
                 @intCast(@min(window.geometry.height, @as(i32, @intCast(output_size.height))))
             else
                 @min(destination_size.height, output_size.height);
@@ -1759,6 +1775,14 @@ fn fixed24To16(value: i32) !i32 {
     return std.math.mul(i32, value, 256) catch error.InvalidCrop;
 }
 
+fn alignedOrigin(target: i32, geometry_offset: i32) i32 {
+    return @intCast(std.math.clamp(
+        @as(i64, target) - geometry_offset,
+        std.math.minInt(i32),
+        std.math.maxInt(i32),
+    ));
+}
+
 fn callbackData(timestamp_ns: u64) u32 {
     return @truncate(timestamp_ns / std.time.ns_per_ms);
 }
@@ -1842,6 +1866,18 @@ test "physical: scene clip is the checked destination output intersection" {
         .{ .x = 9, .y = 0, .width = 2, .height = 2 },
         output,
     )) == null);
+}
+
+test "physical: window geometry origin alignment clamps hostile offsets" {
+    try std.testing.expectEqual(@as(i32, -1), alignedOrigin(0, 1));
+    try std.testing.expectEqual(std.math.minInt(i32), alignedOrigin(
+        std.math.minInt(i32),
+        std.math.maxInt(i32),
+    ));
+    try std.testing.expectEqual(std.math.maxInt(i32), alignedOrigin(
+        std.math.maxInt(i32),
+        std.math.minInt(i32),
+    ));
 }
 
 test "physical: wrapped pending removal preserves exact order and counts" {

@@ -55,6 +55,8 @@ pub fn Desktop(comptime Shell: type) type {
             id: ToplevelId,
             surface: Shell.SurfaceId,
             geometry: geometry.Rect,
+            has_window_geometry: bool = false,
+            surface_offset: geometry.Point = .{ .x = 0, .y = 0 },
             visible: bool,
             stacking: u32,
             mode: Mode,
@@ -403,6 +405,11 @@ pub fn Desktop(comptime Shell: type) type {
                     desktop.slots[index].content_ready = true;
                     desktop.slots[index].scene.content_ready = true;
                     desktop.slots[index].target_scene.content_ready = true;
+                    desktop.slots[index].target_scene.has_window_geometry = commit.has_window_geometry;
+                    desktop.slots[index].target_scene.surface_offset = .{
+                        .x = commit.surface_offset_x,
+                        .y = commit.surface_offset_y,
+                    };
                     if (desktop.slots[index].expected_serial == commit.serial)
                         desktop.slots[index].configure_ready = true;
                     desktop.publishReadyScene();
@@ -594,6 +601,8 @@ pub fn Desktop(comptime Shell: type) type {
                     .id = desktop.idFor(@intCast(index)),
                     .surface = slot.surface,
                     .geometry = desired.rect,
+                    .has_window_geometry = slot.target_scene.has_window_geometry,
+                    .surface_offset = slot.target_scene.surface_offset,
                     .visible = desired.visible,
                     .stacking = desired.stacking,
                     .mode = slot.mode,
@@ -810,7 +819,13 @@ const TestShell = struct {
         toplevel_created: struct { id: ToplevelId, surface: SurfaceId },
         metadata_changed: ToplevelId,
         state_requested: struct { id: ToplevelId, state: RequestedState, enabled: bool },
-        commit_ready: struct { id: ToplevelId, serial: u32 },
+        commit_ready: struct {
+            id: ToplevelId,
+            serial: u32,
+            has_window_geometry: bool = false,
+            surface_offset_x: i32 = 0,
+            surface_offset_y: i32 = 0,
+        },
         toplevel_destroyed: ToplevelId,
     };
 
