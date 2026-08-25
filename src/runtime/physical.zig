@@ -325,6 +325,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 .context = self,
                 .validate = validatePopupGrab,
             });
+            self.shell_adapter.setInteractiveGrabValidator(.{
+                .context = self,
+                .validate = validateInteractiveGrab,
+            });
             self.output_adapter = try OutputAdapter.init(allocator, config.protocol_output);
             errdefer self.output_adapter.deinit();
             self.presentations = try Presentations.init(
@@ -811,6 +815,18 @@ pub fn Coordinator(comptime protocol: type) type {
                     self.interaction.surfaceDestroyed(id);
                     continue;
                 }
+                if (self.desktop.peekInteractiveRequest()) |interactive_request| {
+                    self.interaction.beginInteractive(&self.desktop, interactive_request) catch |err| switch (err) {
+                        error.Exhausted, error.Backpressure => break,
+                        error.StaleToplevel => {
+                            self.desktop.dropInteractiveRequest();
+                            continue;
+                        },
+                        else => return err,
+                    };
+                    self.desktop.dropInteractiveRequest();
+                    continue;
+                }
                 const consumed = self.desktop.consume(&self.shell_adapter, 1) catch |err| switch (err) {
                     error.Exhausted, error.Backpressure => break,
                     else => return err,
@@ -927,6 +943,17 @@ pub fn Coordinator(comptime protocol: type) type {
         ) bool {
             const self: *Self = @ptrCast(@alignCast(context));
             return self.seat_adapter.validatePopupGrab(peer, seat_object, serial);
+        }
+
+        fn validateInteractiveGrab(
+            context: *anyopaque,
+            peer: wayring.io_uring.Peer,
+            seat_object: u32,
+            serial: u32,
+            surface: Adapter.SurfaceId,
+        ) bool {
+            const self: *Self = @ptrCast(@alignCast(context));
+            return self.seat_adapter.validateInteractiveGrab(peer, seat_object, serial, surface);
         }
 
         fn validateSelection(

@@ -43,6 +43,22 @@ pub fn Desktop(comptime Shell: type) type {
 
         pub const Mode = enum { tiled, floating };
 
+        pub const InteractiveKind = union(enum) {
+            move,
+            resize: Shell.ResizeEdge,
+        };
+        pub const InteractiveRequest = struct {
+            id: ToplevelId,
+            kind: InteractiveKind,
+        };
+        pub const InteractiveGeometry = struct {
+            rect: geometry.Rect,
+            min_width: i32,
+            min_height: i32,
+            max_width: i32,
+            max_height: i32,
+        };
+
         pub const Metadata = struct {
             title: []const u8,
             app_id: []const u8,
@@ -103,6 +119,7 @@ pub fn Desktop(comptime Shell: type) type {
             fullscreen: bool = false,
             maximized: bool = false,
             minimized: bool = false,
+            resizing: bool = false,
             content_ready: bool = false,
             configured: bool = false,
             last_configure: Shell.ToplevelConfigure = .{ .width = 0, .height = 0 },
@@ -164,6 +181,7 @@ pub fn Desktop(comptime Shell: type) type {
         popup_grab: ?Shell.PopupId = null,
         popup_dismiss: ?Shell.PopupId = null,
         pending_event: ?Shell.Event = null,
+        interactive_request: ?InteractiveRequest = null,
         destroyed: ?ToplevelId = null,
         destroyed_surface: ?Shell.SurfaceId = null,
         scene_changed: bool = false,
@@ -332,6 +350,49 @@ pub fn Desktop(comptime Shell: type) type {
             const id = desktop.destroyed_surface;
             desktop.destroyed_surface = null;
             return id;
+        }
+
+        pub fn peekInteractiveRequest(desktop: *const Self) ?InteractiveRequest {
+            return desktop.interactive_request;
+        }
+
+        pub fn dropInteractiveRequest(desktop: *Self) void {
+            desktop.interactive_request = null;
+        }
+
+        pub fn beginInteractive(desktop: *Self, request: InteractiveRequest) !?InteractiveGeometry {
+            const index = try desktop.resolveIndex(request.id);
+            const slot = &desktop.slots[index];
+            if (slot.minimized or slot.fullscreen or slot.maximized) return null;
+            try desktop.requireCommandCapacity(desktop.live);
+            if (slot.mode == .tiled) {
+                slot.floating = slot.scene.geometry;
+                slot.mode = .floating;
+                desktop.removeTile(index);
+            }
+            slot.resizing = request.kind == .resize;
+            desktop.promoteFocus(index);
+            try desktop.reflow();
+            return .{
+                .rect = slot.floating,
+                .min_width = @max(slot.min_width, 1),
+                .min_height = @max(slot.min_height, 1),
+                .max_width = slot.max_width,
+                .max_height = slot.max_height,
+            };
+        }
+
+        pub fn updateInteractive(desktop: *Self, id: ToplevelId, rect: geometry.Rect) !void {
+            try desktop.setFloatingGeometry(id, rect);
+        }
+
+        pub fn endInteractive(desktop: *Self, id: ToplevelId) !void {
+            const index = desktop.resolveIndex(id) catch return;
+            const slot = &desktop.slots[index];
+            if (!slot.resizing) return;
+            try desktop.requireCommandCapacity(1);
+            slot.resizing = false;
+            try desktop.reflow();
         }
 
         pub fn takeSceneChanged(desktop: *Self) bool {
@@ -542,6 +603,20 @@ pub fn Desktop(comptime Shell: type) type {
                     request.state,
                     request.enabled,
                 ),
+                .move_requested => |shell_id| {
+                    if (desktop.interactive_request != null) return error.Backpressure;
+                    desktop.interactive_request = .{
+                        .id = try desktop.idForShell(shell_id),
+                        .kind = .move,
+                    };
+                },
+                .resize_requested => |request| {
+                    if (desktop.interactive_request != null) return error.Backpressure;
+                    desktop.interactive_request = .{
+                        .id = try desktop.idForShell(request.id),
+                        .kind = .{ .resize = request.edge },
+                    };
+                },
                 .commit_ready => |commit| {
                     const index = try desktop.resolveIndex(try desktop.idForShell(commit.id));
                     desktop.slots[index].content_ready = true;
@@ -721,6 +796,9 @@ pub fn Desktop(comptime Shell: type) type {
             const reclaimable = desktop.commandCountFor(id);
             if (desktop.commandAvailable() + reclaimable < desktop.live - 1)
                 return error.Backpressure;
+            if (desktop.interactive_request) |request| {
+                if (std.meta.eql(request.id, id)) desktop.interactive_request = null;
+            }
             desktop.removeCommandsFor(id);
             desktop.removeFocus(index);
             desktop.removeTile(index);
@@ -848,6 +926,7 @@ pub fn Desktop(comptime Shell: type) type {
                         .maximized = slot.maximized,
                         .fullscreen = slot.fullscreen,
                         .activated = desktop.focus_len != 0 and desktop.focus[0] == index,
+                        .resizing = slot.resizing,
                         .tiled_left = slot.mode == .tiled and desired.rect.x == desktop.work_area.x,
                         .tiled_right = slot.mode == .tiled and
                             desired.rect.x + desired.rect.width == desktop.work_area.x + desktop.work_area.width,
@@ -1262,6 +1341,7 @@ const TestShell = struct {
     pub const SurfaceId = packed struct { index: u32, generation: u32 };
     pub const ToplevelId = packed struct { index: u32, generation: u32 };
     pub const PopupId = packed struct { index: u32, generation: u32 };
+    pub const ResizeEdge = enum { top, bottom, left, top_left, bottom_left, right, top_right, bottom_right };
     pub const PopupPlacement = struct {
         width: i32,
         height: i32,
@@ -1299,6 +1379,8 @@ const TestShell = struct {
         popup_created: struct { id: PopupId, surface: SurfaceId, parent: SurfaceId, placement: PopupPlacement },
         metadata_changed: ToplevelId,
         state_requested: struct { id: ToplevelId, state: RequestedState, enabled: bool },
+        move_requested: ToplevelId,
+        resize_requested: struct { id: ToplevelId, edge: ResizeEdge },
         commit_ready: struct {
             id: ToplevelId,
             serial: u32,
@@ -1686,6 +1768,32 @@ test "desktop: focus history and tiled-floating transitions are deterministic" {
     _ = try desktop.consume(&shell, 1);
     try std.testing.expectEqual(second, desktop.focused().?);
     try std.testing.expectError(error.StaleToplevel, desktop.scene(first));
+}
+
+test "desktop: interactive resize preserves geometry and publishes resizing state" {
+    var desktop = try initTestDesktop(8);
+    defer desktop.deinit();
+    var shell = TestShell{};
+    shell.push(created(0));
+    try std.testing.expectEqual(@as(usize, 1), try desktop.consume(&shell, 1));
+    try settleDesktop(&desktop, &shell);
+    const id = try desktop.idForShell(.{ .index = 0, .generation = 1 });
+    const before = (try desktop.scene(id)).geometry;
+    shell.push(.{ .resize_requested = .{
+        .id = .{ .index = 0, .generation = 1 },
+        .edge = .bottom_right,
+    } });
+    try std.testing.expectEqual(@as(usize, 1), try desktop.consume(&shell, 1));
+    const request = desktop.peekInteractiveRequest().?;
+    const interactive = (try desktop.beginInteractive(request)).?;
+    desktop.dropInteractiveRequest();
+    try std.testing.expectEqual(before, interactive.rect);
+    try std.testing.expect(desktop.slots[id.index].mode == .floating);
+    try std.testing.expect(desktop.slots[id.index].last_configure.states.resizing);
+    try desktop.updateInteractive(id, .{ .x = before.x, .y = before.y, .width = 80, .height = 40 });
+    try std.testing.expectEqual(@as(i32, 80), desktop.slots[id.index].floating.width);
+    try desktop.endInteractive(id);
+    try std.testing.expect(!desktop.slots[id.index].last_configure.states.resizing);
 }
 
 test "desktop: queued destroys preserve exact generations in order" {

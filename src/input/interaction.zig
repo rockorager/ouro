@@ -55,10 +55,18 @@ pub fn Interaction(comptime Desktop: type) type {
             cancel: Cancellation,
             key_consumed,
         };
+        const InteractiveOperation = struct {
+            target: Target,
+            kind: Desktop.InteractiveKind,
+            start_x_fixed: i64,
+            start_y_fixed: i64,
+            geometry: Desktop.InteractiveGeometry,
+        };
         pub const Mode = union(enum) {
             default,
             button_grab: Target,
             popup_grab: struct { toplevel: ToplevelId, surface: SurfaceId },
+            interactive: InteractiveOperation,
         };
 
         const Device = struct {
@@ -131,7 +139,7 @@ pub fn Interaction(comptime Desktop: type) type {
         ) !void {
             switch (event) {
                 .device_added => |value| try self.addDevice(value.device, value.capabilities),
-                .device_removed => |id| try self.removeDevice(id),
+                .device_removed => |id| try self.removeDevice(desktop, id),
                 .pointer_motion => |value| try self.pointerMotion(
                     desktop,
                     surfaces,
@@ -202,6 +210,7 @@ pub fn Interaction(comptime Desktop: type) type {
 
         pub fn setPopupGrab(self: *Self, target: anytype) void {
             if (target) |value| {
+                if (self.mode == .interactive) return;
                 self.mode = .{ .popup_grab = .{
                     .toplevel = value.toplevel,
                     .surface = value.surface,
@@ -209,6 +218,23 @@ pub fn Interaction(comptime Desktop: type) type {
             } else if (self.mode == .popup_grab) {
                 self.mode = .default;
             }
+        }
+
+        pub fn beginInteractive(self: *Self, desktop: *Desktop, request: Desktop.InteractiveRequest) !void {
+            const target = switch (self.mode) {
+                .button_grab => |value| value,
+                else => return,
+            };
+            if (!std.meta.eql(target.toplevel, request.id)) return;
+            const value = try desktop.beginInteractive(request) orelse return;
+            self.mode = .{ .interactive = .{
+                .target = target,
+                .kind = request.kind,
+                .start_x_fixed = self.x_fixed,
+                .start_y_fixed = self.y_fixed,
+                .geometry = value,
+            } };
+            self.keyboard_focus = target;
         }
 
         /// Cancels every state edge naming an exact destroyed surface. Seat
@@ -239,6 +265,15 @@ pub fn Interaction(comptime Desktop: type) type {
             try self.ensureCommandCapacity(1);
             const next_x = clampFixed(self.x_fixed +| fixedDelta(dx), self.bounds.x, self.bounds.width);
             const next_y = clampFixed(self.y_fixed +| fixedDelta(dy), self.bounds.y, self.bounds.height);
+            const interactive_rect: ?geometry.Rect = if (self.mode == .interactive) rect: {
+                const operation = self.mode.interactive;
+                break :rect interactiveRect(
+                    operation,
+                    fixedFloor(next_x) - fixedFloor(operation.start_x_fixed),
+                    fixedFloor(next_y) - fixedFloor(operation.start_y_fixed),
+                    self.bounds,
+                ) catch return error.InvalidGeometry;
+            } else null;
             const point: geometry.Point = .{ .x = fixedFloor(next_x), .y = fixedFloor(next_y) };
             const windows = try desktop.sceneSnapshot(self.windows);
             const hit = hit_test.topmost(SceneWindow, windows, point, surfaces);
@@ -273,6 +308,8 @@ pub fn Interaction(comptime Desktop: type) type {
                 },
                 else => {},
             };
+            if (interactive_rect) |rect|
+                try desktop.updateInteractive(self.mode.interactive.target.toplevel, rect);
             self.enqueue(.{ .pointer_focus = target });
             self.x_fixed = next_x;
             self.y_fixed = next_y;
@@ -304,6 +341,9 @@ pub fn Interaction(comptime Desktop: type) type {
                 try self.ensureCommandCapacity(1);
                 try desktop.focusToplevel(self.hover.?.toplevel);
             }
+            const ends_interactive = !aggregate_after and !self.anyOtherPressedButton(device, button) and
+                self.mode == .interactive;
+            if (ends_interactive) try desktop.endInteractive(self.mode.interactive.target.toplevel);
             writeBit(&device.buttons, button, pressed);
             if (begins_grab) {
                 const target = self.hover.?;
@@ -312,7 +352,9 @@ pub fn Interaction(comptime Desktop: type) type {
                 self.enqueue(.{ .keyboard_focus = target });
             } else if (dismisses_popup) {
                 self.mode = .default;
-            } else if (!aggregate_after and !self.anyPressedButton() and self.mode == .button_grab) {
+            } else if (!aggregate_after and !self.anyPressedButton() and
+                (self.mode == .button_grab or self.mode == .interactive))
+            {
                 self.mode = .default;
             }
         }
@@ -364,10 +406,12 @@ pub fn Interaction(comptime Desktop: type) type {
             if (binding or release_binding) self.enqueue(.key_consumed);
         }
 
-        fn removeDevice(self: *Self, id: input.DeviceId) !void {
+        fn removeDevice(self: *Self, desktop: *Desktop, id: input.DeviceId) !void {
             const device = self.findDevice(id) orelse return error.StaleDevice;
             const pointer = device.capabilities.pointer;
-            const cancel_grab = pointer and self.mode == .button_grab;
+            const cancel_grab = pointer and (self.mode == .button_grab or self.mode == .interactive);
+            if (pointer and self.mode == .interactive)
+                try desktop.endInteractive(self.mode.interactive.target.toplevel);
             device.* = .{};
             if (pointer) self.pointer_devices -= 1;
             const lost_pointer = pointer and self.pointer_devices == 0;
@@ -394,6 +438,7 @@ pub fn Interaction(comptime Desktop: type) type {
                 .button_grab => |target| matches(target, toplevel, surface),
                 .popup_grab => |target| (toplevel == null or std.meta.eql(target.toplevel, toplevel.?)) and
                     (surface == null or std.meta.eql(target.surface, surface.?)),
+                .interactive => |operation| matches(operation.target, toplevel, surface),
                 .default => false,
             };
             if (!pointer and !keyboard and !grab) return;
@@ -501,6 +546,64 @@ pub fn Interaction(comptime Desktop: type) type {
             return false;
         }
 
+        fn anyOtherPressedButton(self: *const Self, changed: *const Device, button: u32) bool {
+            for (self.devices) |*device| if (device.active) {
+                for (device.buttons, 0..) |word, word_index| {
+                    var value = word;
+                    if (device == changed and word_index == button / 64)
+                        value &= ~(@as(u64, 1) << @intCast(button % 64));
+                    if (value != 0) return true;
+                }
+            };
+            return false;
+        }
+
+        fn interactiveRect(operation: InteractiveOperation, dx: i32, dy: i32, bounds: geometry.Rect) !geometry.Rect {
+            const original = operation.geometry.rect;
+            if (operation.kind == .move) {
+                const min_x = @as(i64, bounds.x) - original.width + 1;
+                const max_x = @as(i64, bounds.x) + bounds.width - 1;
+                const min_y = @as(i64, bounds.y) - original.height + 1;
+                const max_y = @as(i64, bounds.y) + bounds.height - 1;
+                return .{
+                    .x = std.math.cast(i32, std.math.clamp(@as(i64, original.x) + dx, min_x, max_x)) orelse return error.InvalidGeometry,
+                    .y = std.math.cast(i32, std.math.clamp(@as(i64, original.y) + dy, min_y, max_y)) orelse return error.InvalidGeometry,
+                    .width = original.width,
+                    .height = original.height,
+                };
+            }
+            const edge = operation.kind.resize;
+            var left: i64 = original.x;
+            var right: i64 = @as(i64, original.x) + original.width;
+            var top: i64 = original.y;
+            var bottom: i64 = @as(i64, original.y) + original.height;
+            const moves_left = edge == .left or edge == .top_left or edge == .bottom_left;
+            const moves_right = edge == .right or edge == .top_right or edge == .bottom_right;
+            const moves_top = edge == .top or edge == .top_left or edge == .top_right;
+            const moves_bottom = edge == .bottom or edge == .bottom_left or edge == .bottom_right;
+            if (moves_left) left += dx;
+            if (moves_right) right += dx;
+            if (moves_top) top += dy;
+            if (moves_bottom) bottom += dy;
+            constrainAxis(&left, &right, moves_left, operation.geometry.min_width, operation.geometry.max_width);
+            constrainAxis(&top, &bottom, moves_top, operation.geometry.min_height, operation.geometry.max_height);
+            const width = right - left;
+            const height = bottom - top;
+            return .{
+                .x = std.math.cast(i32, left) orelse return error.InvalidGeometry,
+                .y = std.math.cast(i32, top) orelse return error.InvalidGeometry,
+                .width = std.math.cast(i32, width) orelse return error.InvalidGeometry,
+                .height = std.math.cast(i32, height) orelse return error.InvalidGeometry,
+            };
+        }
+
+        fn constrainAxis(start: *i64, end: *i64, moves_start: bool, minimum: i32, maximum: i32) void {
+            const min_size: i64 = @max(minimum, 1);
+            const max_size: i64 = if (maximum > 0) @max(maximum, minimum) else std.math.maxInt(i32);
+            const size = std.math.clamp(end.* - start.*, min_size, max_size);
+            if (moves_start) start.* = end.* - size else end.* = start.* + size;
+        }
+
         fn commandMatches(
             command: Command,
             toplevel: ?ToplevelId,
@@ -566,6 +669,18 @@ fn isBindingKey(key: u32) bool {
 
 const TestId = packed struct { index: u32, generation: u32 };
 const TestDesktop = struct {
+    pub const InteractiveKind = union(enum) {
+        move,
+        resize: enum { top, bottom, left, top_left, bottom_left, right, top_right, bottom_right },
+    };
+    pub const InteractiveRequest = struct { id: TestId, kind: InteractiveKind };
+    pub const InteractiveGeometry = struct {
+        rect: geometry.Rect,
+        min_width: i32,
+        min_height: i32,
+        max_width: i32,
+        max_height: i32,
+    };
     pub const SceneWindow = struct {
         id: TestId,
         surface: TestId,
@@ -583,6 +698,8 @@ const TestDesktop = struct {
     focus_next_count: usize = 0,
     fullscreen_count: usize = 0,
     floating_count: usize = 0,
+    interactive_rect: ?geometry.Rect = null,
+    resizing: bool = false,
 
     pub fn sceneSnapshot(self: *const @This(), output: []SceneWindow) ![]SceneWindow {
         if (output.len < self.len) return error.Exhausted;
@@ -615,6 +732,28 @@ const TestDesktop = struct {
 
     pub fn toggleFocusedFloating(self: *@This()) !void {
         self.floating_count += 1;
+    }
+
+    pub fn beginInteractive(self: *@This(), request: InteractiveRequest) !?InteractiveGeometry {
+        for (self.windows[0..self.len]) |window| if (std.meta.eql(window.id, request.id)) {
+            self.resizing = request.kind == .resize;
+            return .{
+                .rect = window.geometry,
+                .min_width = 5,
+                .min_height = 4,
+                .max_width = 50,
+                .max_height = 40,
+            };
+        };
+        return error.StaleToplevel;
+    }
+
+    pub fn updateInteractive(self: *@This(), _: TestId, rect: geometry.Rect) !void {
+        self.interactive_rect = rect;
+    }
+
+    pub fn endInteractive(self: *@This(), _: TestId) !void {
+        self.resizing = false;
     }
 };
 
@@ -769,6 +908,83 @@ test "interaction: default press updates desktop and enters exact button grab" {
         .pressed = false,
     } });
     try std.testing.expect(interaction.interactionMode() == .default);
+}
+
+test "interaction: interactive resize follows pointer and ends on button release" {
+    var interaction = try initTestInteraction(4);
+    defer interaction.deinit();
+    var desktop = testDesktop();
+    var surfaces = TestSurfaces{};
+    try addPointer(&interaction, &desktop, &surfaces);
+    const target = targetFor(desktop.windows[1]);
+    interaction.mode = .{ .button_grab = target };
+    writeBit(&interaction.devices[0].buttons, 272, true);
+    try interaction.beginInteractive(&desktop, .{
+        .id = target.toplevel,
+        .kind = .{ .resize = .bottom_right },
+    });
+    try std.testing.expect(interaction.interactionMode() == .interactive);
+    try interaction.consume(&desktop, &surfaces, .{ .pointer_motion = .{
+        .device = device_a,
+        .time_usec = 1,
+        .dx = 8,
+        .dy = 6,
+    } });
+    try std.testing.expectEqual(
+        geometry.Rect{ .x = 10, .y = 5, .width = 28, .height = 26 },
+        desktop.interactive_rect.?,
+    );
+    interaction.dropCommand();
+    try interaction.consume(&desktop, &surfaces, .{ .pointer_button = .{
+        .device = device_a,
+        .time_usec = 2,
+        .button = 272,
+        .pressed = false,
+    } });
+    try std.testing.expect(interaction.interactionMode() == .default);
+    try std.testing.expect(!desktop.resizing);
+}
+
+test "interaction: interactive geometry clamps moves and constrained left-edge resizes" {
+    const target = targetFor(testDesktop().windows[1]);
+    const bounds: geometry.Rect = .{ .x = 0, .y = 0, .width = 40, .height = 30 };
+    const limits: TestDesktop.InteractiveGeometry = .{
+        .rect = .{ .x = 10, .y = 5, .width = 20, .height = 20 },
+        .min_width = 5,
+        .min_height = 4,
+        .max_width = 50,
+        .max_height = 40,
+    };
+    try std.testing.expectEqual(
+        geometry.Rect{ .x = 39, .y = 29, .width = 20, .height = 20 },
+        try TestInteraction.interactiveRect(.{
+            .target = target,
+            .kind = .move,
+            .start_x_fixed = 0,
+            .start_y_fixed = 0,
+            .geometry = limits,
+        }, 100, 100, bounds),
+    );
+    try std.testing.expectEqual(
+        geometry.Rect{ .x = 25, .y = 5, .width = 5, .height = 20 },
+        try TestInteraction.interactiveRect(.{
+            .target = target,
+            .kind = .{ .resize = .left },
+            .start_x_fixed = 0,
+            .start_y_fixed = 0,
+            .geometry = limits,
+        }, 100, 0, bounds),
+    );
+    try std.testing.expectEqual(
+        geometry.Rect{ .x = -20, .y = 5, .width = 50, .height = 20 },
+        try TestInteraction.interactiveRect(.{
+            .target = target,
+            .kind = .{ .resize = .left },
+            .start_x_fixed = 0,
+            .start_y_fixed = 0,
+            .geometry = limits,
+        }, -100, 0, bounds),
+    );
 }
 
 test "interaction: failed desktop focus leaves press and grab unchanged" {

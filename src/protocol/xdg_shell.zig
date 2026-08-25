@@ -72,6 +72,12 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             context: *anyopaque,
             validate: *const fn (*anyopaque, wayring.io_uring.Peer, u32, u32) bool,
         };
+        pub const InteractiveGrabValidator = struct {
+            context: *anyopaque,
+            validate: *const fn (*anyopaque, wayring.io_uring.Peer, u32, u32, SurfaceId) bool,
+        };
+
+        pub const ResizeEdge = enum { top, bottom, left, top_left, bottom_left, right, top_right, bottom_right };
 
         const WindowGeometry = struct {
             x: i32,
@@ -129,6 +135,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 state: RequestedState,
                 enabled: bool,
             },
+            move_requested: ToplevelId,
+            resize_requested: struct { id: ToplevelId, edge: ResizeEdge },
             commit_ready: struct {
                 id: ToplevelId,
                 serial: u32,
@@ -322,6 +330,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         outbound: []OutboundSlot,
         outstanding: []Outstanding,
         grab_validator: ?GrabValidator = null,
+        interactive_grab_validator: ?InteractiveGrabValidator = null,
 
         pub fn init(
             allocator: std.mem.Allocator,
@@ -425,6 +434,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
 
         pub fn setGrabValidator(adapter: *Self, validator: GrabValidator) void {
             adapter.grab_validator = validator;
+        }
+
+        pub fn setInteractiveGrabValidator(adapter: *Self, validator: InteractiveGrabValidator) void {
+            adapter.interactive_grab_validator = validator;
         }
 
         fn bind(context: ?*anyopaque, binding: wayring.server.Binding) !?*anyopaque {
@@ -1107,7 +1120,28 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             const id = adapter.toplevelId(slot);
             switch (decoded.value) {
                 .destroy => {},
-                .set_parent, .show_window_menu, .move, .resize => {},
+                .set_parent, .show_window_menu => {},
+                .move => |v| {
+                    if (adapter.validateToplevelGrab(slot, v.seat, v.serial))
+                        adapter.publish(.{ .move_requested = id }) catch return try adapter.noMemory(actor);
+                },
+                .resize => |v| {
+                    const edge: ?ResizeEdge = switch (v.edges.value) {
+                        Toplevel.resize_edge.none.value => null,
+                        Toplevel.resize_edge.top.value => .top,
+                        Toplevel.resize_edge.bottom.value => .bottom,
+                        Toplevel.resize_edge.left.value => .left,
+                        Toplevel.resize_edge.top_left.value => .top_left,
+                        Toplevel.resize_edge.bottom_left.value => .bottom_left,
+                        Toplevel.resize_edge.right.value => .right,
+                        Toplevel.resize_edge.top_right.value => .top_right,
+                        Toplevel.resize_edge.bottom_right.value => .bottom_right,
+                        else => return try adapter.protocolError(actor, decoded.handle.id, Toplevel.@"error".invalid_resize_edge.value, "invalid resize edge"),
+                    };
+                    if (edge != null and adapter.validateToplevelGrab(slot, v.seat, v.serial))
+                        adapter.publish(.{ .resize_requested = .{ .id = id, .edge = edge.? } }) catch
+                            return try adapter.noMemory(actor);
+                },
                 .set_title => |v| adapter.setMetadata(slot, true, v.title) catch |cause|
                     return try adapter.metadataFailure(actor, decoded.handle.id, cause),
                 .set_app_id => |v| adapter.setMetadata(slot, false, v.app_id) catch |cause|
@@ -1201,6 +1235,19 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             @memcpy(destination[0..bytes.len], bytes);
             if (title) slot.title_len = bytes.len else slot.app_id_len = bytes.len;
             try adapter.publish(.{ .metadata_changed = adapter.toplevelId(slot) });
+        }
+
+        fn validateToplevelGrab(adapter: *Self, slot: *ToplevelSlot, seat: u32, serial: u32) bool {
+            const surface = adapter.resolveRoleSurface(
+                slot.xdg_surface_index,
+                slot.xdg_surface_generation,
+            ) catch return false;
+            const manager = adapter.resolveManager(
+                surface.manager_index,
+                surface.manager_generation,
+            ) catch return false;
+            const validator = adapter.interactive_grab_validator orelse return false;
+            return validator.validate(validator.context, manager.peer, seat, serial, surface.surface_id);
         }
 
         fn popupPlacement(state: PositionerState) PopupPlacement {
@@ -1756,6 +1803,16 @@ fn validateTestGrab(
 ) bool {
     return std.meta.eql(peer, wayring.io_uring.Peer{ .slot = 0, .generation = 1 }) and
         seat_object == 19 and serial == 77;
+}
+
+fn validateTestInteractiveGrab(
+    context: *anyopaque,
+    peer: wayring.io_uring.Peer,
+    seat_object: u32,
+    serial: u32,
+    _: TestAdapter.SurfaceId,
+) bool {
+    return validateTestGrab(context, peer, seat_object, serial);
 }
 
 const TestContext = struct {
@@ -2454,6 +2511,39 @@ test "xdg-shell: stale generations cannot address reused toplevel slots" {
     try std.testing.expectEqual(stale.index, current.index);
     try std.testing.expect(stale.generation != current.generation);
     try std.testing.expectError(error.StaleToplevel, context.adapter.metadata(stale));
+}
+
+test "xdg-shell: interactive move and resize require validated grabs" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const id = try context.createToplevel();
+    context.adapter.setInteractiveGrabValidator(.{ .context = context, .validate = validateTestInteractiveGrab });
+    var seat_context: u8 = 0;
+    _ = try context.server_objects.insertClient(19, &test_protocol.wl_seat.info, 9, &seat_context);
+
+    try test_protocol.xdg_toplevel.encodeRequest(&context.requests, 12, .{
+        .move = .{ .seat = 19, .serial = 76 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try std.testing.expect(context.adapter.popEvent() == null);
+    try test_protocol.xdg_toplevel.encodeRequest(&context.requests, 12, .{
+        .move = .{ .seat = 19, .serial = 77 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try std.testing.expectEqual(id, switch (context.adapter.popEvent() orelse return error.MissingEvent) {
+        .move_requested => |value| value,
+        else => return error.UnexpectedEvent,
+    });
+    try test_protocol.xdg_toplevel.encodeRequest(&context.requests, 12, .{
+        .resize = .{ .seat = 19, .serial = 77, .edges = .bottom_right },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    const resize = switch (context.adapter.popEvent() orelse return error.MissingEvent) {
+        .resize_requested => |value| value,
+        else => return error.UnexpectedEvent,
+    };
+    try std.testing.expectEqual(id, resize.id);
+    try std.testing.expectEqual(TestAdapter.ResizeEdge.bottom_right, resize.edge);
 }
 
 test "xdg-shell: wl_surface removal drops only the exact linked generation" {

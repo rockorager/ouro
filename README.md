@@ -64,9 +64,10 @@ responsibilities:
   above their owning toplevel with flip, slide, and resize constraint adjustment.
 - [Desktop interaction](src/input/interaction.zig): pointer motion hit-tests
   exact committed input regions against the copied desktop scene, retains
-  default, button-grab, and popup-grab state with protocol-neutral focus
-  commands, dismisses popup stacks topmost-first on outside presses, and places
-  a composited cursor without replacing render generations.
+  default, button-grab, popup-grab, and validated interactive move/resize state
+  with protocol-neutral focus commands, applies client size constraints while
+  resizing floating windows, dismisses popup stacks topmost-first on outside
+  presses, and places a composited cursor without replacing render generations.
 
 Initial compositor keybindings use the Logo key: `Logo+Tab` focuses the next
 window, `Logo+F` toggles fullscreen, and `Logo+Space` toggles floating layout.

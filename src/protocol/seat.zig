@@ -523,6 +523,37 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             return adapter.validateSelectionOn(server_objects, peer, seat_object, serial);
         }
 
+        pub fn validateInteractiveGrab(
+            adapter: *Self,
+            peer: wayring.io_uring.Peer,
+            seat_object: u32,
+            serial: u32,
+            surface: SurfaceId,
+        ) bool {
+            if (serial == 0) return false;
+            const runtime = adapter.runtime orelse return false;
+            const server_objects = runtime.clients.get(peer) catch return false;
+            return adapter.validateInteractiveGrabOn(server_objects, peer, seat_object, serial, surface);
+        }
+
+        fn validateInteractiveGrabOn(
+            adapter: *Self,
+            server_objects: anytype,
+            peer: wayring.io_uring.Peer,
+            seat_object: u32,
+            serial: u32,
+            surface: SurfaceId,
+        ) bool {
+            if (serial == 0) return false;
+            const seat = adapter.seatByObject(server_objects, peer, seat_object) orelse return false;
+            if (seat.last_implicit_grab_serial != serial) return false;
+            return switch (adapter.pointer_grab) {
+                .active => |target| sameClient(target.client, clientId(peer)) and
+                    std.meta.eql(target.surface, surface),
+                else => false,
+            };
+        }
+
         fn validateSelectionOn(
             adapter: *Self,
             server_objects: anytype,
@@ -1866,6 +1897,53 @@ test "seat: clipboard selections require the exact seat and latest user action s
         91,
     ));
     try std.testing.expect(!adapter.validateSelectionOn(&server_objects, peer, 2, 0));
+}
+
+test "seat: interactive grabs require the exact active pointer-grab surface" {
+    var core: FakeCore = .{};
+    var adapter = try testAdapter(&core);
+    defer adapter.deinit();
+    var server_objects = try wayring.objects.ServerObjects.init(
+        std.testing.allocator,
+        8,
+        4,
+        &TestCore.Display.info,
+        null,
+    );
+    defer server_objects.deinit(std.testing.allocator);
+    const peer: wayring.io_uring.Peer = .{ .slot = 1, .generation = 7 };
+    const seat = try acquire(TestAdapter.SeatSlot, adapter.seats, &adapter.seat_free);
+    seat.peer = peer;
+    seat.last_implicit_grab_serial = 101;
+    seat.header.resource = try server_objects.insertClient(2, &test_protocol.wl_seat.info, 9, seat);
+    const target: TestAdapter.FocusTarget = .{
+        .client = clientId(peer),
+        .surface = .{ .index = 3, .generation = 4 },
+    };
+    adapter.pointer_grab = .{ .active = target };
+
+    try std.testing.expect(adapter.validateInteractiveGrabOn(
+        &server_objects,
+        peer,
+        2,
+        101,
+        target.surface,
+    ));
+    try std.testing.expect(!adapter.validateInteractiveGrabOn(
+        &server_objects,
+        peer,
+        2,
+        101,
+        .{ .index = target.surface.index + 1, .generation = target.surface.generation },
+    ));
+    adapter.pointer_grab = .idle;
+    try std.testing.expect(!adapter.validateInteractiveGrabOn(
+        &server_objects,
+        peer,
+        2,
+        101,
+        target.surface,
+    ));
 }
 
 test "seat: pointer grab retains focus and device removal cancels it" {
