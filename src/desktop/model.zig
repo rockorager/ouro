@@ -448,6 +448,32 @@ pub fn Desktop(comptime Shell: type) type {
             }
         }
 
+        pub fn focusPrevious(desktop: *Self) !void {
+            const current = desktop.focused() orelse return;
+            const current_index = try desktop.resolveIndex(current);
+            for (1..desktop.slots.len + 1) |offset| {
+                const index = (current_index + desktop.slots.len - offset) % desktop.slots.len;
+                if (desktop.slots[index].header.active and !desktop.slots[index].minimized)
+                    return desktop.focusToplevel(desktop.idFor(@intCast(index)));
+            }
+        }
+
+        pub fn moveFocusedTile(desktop: *Self, direction: enum { next, previous }) !void {
+            const id = desktop.focused() orelse return;
+            const focused_index = try desktop.resolveIndex(id);
+            if (desktop.slots[focused_index].mode != .tiled or desktop.tile_len < 2) return;
+            var position: usize = 0;
+            while (position < desktop.tile_len and desktop.tile_order[position] != focused_index) : (position += 1) {}
+            if (position == desktop.tile_len) return error.InvalidTileOrder;
+            try desktop.requireCommandCapacity(desktop.live);
+            const other = switch (direction) {
+                .next => (position + 1) % desktop.tile_len,
+                .previous => (position + desktop.tile_len - 1) % desktop.tile_len,
+            };
+            std.mem.swap(u32, &desktop.tile_order[position], &desktop.tile_order[other]);
+            try desktop.reflow();
+        }
+
         pub fn toggleFocusedFullscreen(desktop: *Self) !void {
             const id = desktop.focused() orelse return;
             const index = try desktop.resolveIndex(id);
@@ -1802,6 +1828,29 @@ test "desktop: interactive resize preserves geometry and publishes resizing stat
     try std.testing.expectEqual(@as(i32, 80), desktop.slots[id.index].floating.width);
     try desktop.endInteractive(id);
     try std.testing.expect(!desktop.slots[id.index].last_configure.states.resizing);
+}
+
+test "desktop: keyboard tile movement reorders layout transactionally" {
+    var desktop = try initTestDesktop(12);
+    defer desktop.deinit();
+    var shell = TestShell{};
+    shell.push(created(0));
+    shell.push(created(1));
+    shell.push(created(2));
+    _ = try desktop.consume(&shell, 3);
+    try settleDesktop(&desktop, &shell);
+
+    const focused = desktop.focused().?;
+    try std.testing.expectEqual(@as(u32, 2), focused.index);
+    try desktop.focusPrevious();
+    try std.testing.expectEqual(@as(u32, 1), desktop.focused().?.index);
+    while (desktop.peekCommand() != null) desktop.dropCommand();
+
+    try desktop.moveFocusedTile(.previous);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 0, 2 }, desktop.tile_order[0..3]);
+    while (desktop.peekCommand() != null) desktop.dropCommand();
+    try desktop.moveFocusedTile(.next);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2 }, desktop.tile_order[0..3]);
 }
 
 test "desktop: queued destroys preserve exact generations in order" {

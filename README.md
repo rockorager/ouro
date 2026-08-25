@@ -77,8 +77,9 @@ responsibilities:
 
 Initial compositor keybindings use the Logo key: `Logo+Tab` focuses the next
 window, `Logo+Q` requests that the focused client close, `Logo+F` toggles
-fullscreen, and `Logo+Space` toggles floating layout. Matched key press/release
-pairs are consumed before client seat delivery.
+fullscreen, and `Logo+Space` toggles floating layout. `Logo+J/K` focuses
+forward/backward; adding Shift moves the focused tiled window in that direction.
+Matched key press/release pairs are consumed before client seat delivery.
 
 [Transactional commit composition](src/surface.zig) ties surface, region,
 viewport, frame/release callback, and content-update state together so all

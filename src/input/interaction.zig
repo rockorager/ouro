@@ -18,6 +18,10 @@ const key_tab = 15;
 const key_q = 16;
 const key_f = 33;
 const key_space = 57;
+const key_j = 36;
+const key_k = 37;
+const key_left_shift = 42;
+const key_right_shift = 54;
 const key_left_meta = 125;
 const key_right_meta = 126;
 
@@ -395,6 +399,8 @@ pub fn Interaction(comptime Desktop: type) type {
             const release_binding = !pressed and bitSet(&device.swallowed_keys, key);
             const meta = self.anyDeviceKey(key_left_meta) or self.anyDeviceKey(key_right_meta) or
                 (pressed and (key == key_left_meta or key == key_right_meta));
+            const shift = self.anyDeviceKey(key_left_shift) or self.anyDeviceKey(key_right_shift) or
+                (pressed and (key == key_left_shift or key == key_right_shift));
             const binding = pressed and meta and isBindingKey(key);
             const close_target = if (binding and key == key_q) desktop.focusedToplevel() else null;
             if (binding or release_binding)
@@ -404,6 +410,8 @@ pub fn Interaction(comptime Desktop: type) type {
                 key_q => {},
                 key_f => try desktop.toggleFocusedFullscreen(),
                 key_space => try desktop.toggleFocusedFloating(),
+                key_j => if (shift) try desktop.moveFocusedTile(.next) else try desktop.focusNext(),
+                key_k => if (shift) try desktop.moveFocusedTile(.previous) else try desktop.focusPrevious(),
                 else => unreachable,
             };
             writeBit(&device.keys, key, pressed);
@@ -671,7 +679,8 @@ fn writeBit(words: *[state_words]u64, code: u32, value: bool) void {
 }
 
 fn isBindingKey(key: u32) bool {
-    return key == key_tab or key == key_q or key == key_f or key == key_space;
+    return key == key_tab or key == key_q or key == key_f or key == key_space or
+        key == key_j or key == key_k;
 }
 
 const TestId = packed struct { index: u32, generation: u32 };
@@ -703,6 +712,9 @@ const TestDesktop = struct {
     reject_focus: bool = false,
     popup_dismissed: bool = false,
     focus_next_count: usize = 0,
+    focus_previous_count: usize = 0,
+    move_next_count: usize = 0,
+    move_previous_count: usize = 0,
     fullscreen_count: usize = 0,
     floating_count: usize = 0,
     interactive_rect: ?geometry.Rect = null,
@@ -731,6 +743,17 @@ const TestDesktop = struct {
 
     pub fn focusNext(self: *@This()) !void {
         self.focus_next_count += 1;
+    }
+
+    pub fn focusPrevious(self: *@This()) !void {
+        self.focus_previous_count += 1;
+    }
+
+    pub fn moveFocusedTile(self: *@This(), direction: enum { next, previous }) !void {
+        switch (direction) {
+            .next => self.move_next_count += 1,
+            .previous => self.move_previous_count += 1,
+        }
     }
 
     pub fn focusedToplevel(self: *const @This()) ?TestId {
@@ -1294,6 +1317,51 @@ test "interaction: compositor bindings consume exact press and release pairs" {
     try std.testing.expectEqual(@as(usize, 1), desktop.focus_next_count);
     try std.testing.expectEqual(@as(usize, 1), desktop.fullscreen_count);
     try std.testing.expectEqual(@as(usize, 1), desktop.floating_count);
+
+    inline for ([_]u32{ key_j, key_k }) |key| {
+        try interaction.consume(&desktop, &surfaces, .{ .keyboard_key = .{
+            .device = device_a,
+            .time_usec = 4,
+            .key = key,
+            .pressed = true,
+        } });
+        try std.testing.expect(interaction.peekCommand().? == .key_consumed);
+        interaction.dropCommand();
+        try interaction.consume(&desktop, &surfaces, .{ .keyboard_key = .{
+            .device = device_a,
+            .time_usec = 5,
+            .key = key,
+            .pressed = false,
+        } });
+        interaction.dropCommand();
+    }
+    try std.testing.expectEqual(@as(usize, 2), desktop.focus_next_count);
+    try std.testing.expectEqual(@as(usize, 1), desktop.focus_previous_count);
+
+    try interaction.consume(&desktop, &surfaces, .{ .keyboard_key = .{
+        .device = device_a,
+        .time_usec = 6,
+        .key = key_left_shift,
+        .pressed = true,
+    } });
+    inline for ([_]u32{ key_j, key_k }) |key| {
+        try interaction.consume(&desktop, &surfaces, .{ .keyboard_key = .{
+            .device = device_a,
+            .time_usec = 7,
+            .key = key,
+            .pressed = true,
+        } });
+        interaction.dropCommand();
+        try interaction.consume(&desktop, &surfaces, .{ .keyboard_key = .{
+            .device = device_a,
+            .time_usec = 8,
+            .key = key,
+            .pressed = false,
+        } });
+        interaction.dropCommand();
+    }
+    try std.testing.expectEqual(@as(usize, 1), desktop.move_next_count);
+    try std.testing.expectEqual(@as(usize, 1), desktop.move_previous_count);
 }
 
 test "interaction: close binding retains the exact focused toplevel" {
