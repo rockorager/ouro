@@ -5,6 +5,7 @@
 const std = @import("std");
 const gbm = @import("../backend/gbm.zig");
 const render = @import("types.zig");
+const render_content = @import("content.zig");
 
 const c = @cImport({
     @cInclude("sys/sysmacros.h");
@@ -19,6 +20,8 @@ pub const Config = struct {
     max_samples: usize,
     max_source_bytes: usize,
     max_targets: usize,
+    content_bytes: usize = 1,
+    content_allocations: usize = 1,
 };
 
 /// Exact std430 ABI consumed by `vulkan_composite.comp`.
@@ -52,6 +55,7 @@ pub const Platform = struct {
         import_target: *const fn (*anyopaque, Renderer, gbm.Metadata, std.posix.fd_t) anyerror!Target,
         destroy_target: *const fn (*anyopaque, Renderer, Target) void,
         draw: *const fn (*anyopaque, Renderer, Target, Frame) anyerror!std.posix.fd_t,
+        content_provider: *const fn (*anyopaque, Renderer) ?render_content.Provider,
     };
 
     pub fn create(self: Platform, fd: std.posix.fd_t, config: Config) !Renderer {
@@ -70,6 +74,9 @@ pub const Platform = struct {
     pub fn draw(self: Platform, renderer: Renderer, target: Target, frame: Frame) !std.posix.fd_t {
         return self.vtable.draw(self.context, renderer, target, frame);
     }
+    pub fn contentProvider(self: Platform, renderer: Renderer) ?render_content.Provider {
+        return self.vtable.content_provider(self.context, renderer);
+    }
 };
 
 var real_context: u8 = 0;
@@ -81,6 +88,7 @@ const real_vtable: Platform.VTable = .{
     .import_target = realImportTarget,
     .destroy_target = realDestroyTarget,
     .draw = realDraw,
+    .content_provider = realContentProvider,
 };
 
 const device_extensions = [_][*:0]const u8{
@@ -110,12 +118,22 @@ const CacheEntry = struct {
     texture: Texture = undefined,
 };
 
+const UploadAllocation = struct {
+    active: bool = false,
+    generation: u32 = 0,
+    offset: usize = 0,
+    size: usize = 0,
+    references: usize = 0,
+};
+
 const Upload = struct {
     x: u32,
     y: u32,
     width: u32,
     height: u32,
     staging_offset: usize,
+    row_length: u32,
+    direct: bool,
 };
 
 const PreparedTexture = struct {
@@ -129,6 +147,7 @@ const PreparedTexture = struct {
     surface: u64,
     commit_sequence: u64,
     format: render.PixelFormat,
+    content_token: ?u64 = null,
 };
 
 const RealRenderer = struct {
@@ -154,6 +173,11 @@ const RealRenderer = struct {
     max_source_bytes: usize,
     copy_offset_alignment: usize,
     staging_buffer_size: usize,
+    content_buffer: c.VkBuffer,
+    content_memory: c.VkDeviceMemory,
+    content_map: *anyopaque,
+    content_buffer_size: usize,
+    content_allocations: []UploadAllocation,
 };
 
 const TargetState = enum { ready, in_flight, queue_failed, export_failed };
@@ -180,6 +204,8 @@ const RealTarget = struct {
     state: TargetState = .ready,
     fence_needs_reset: bool = false,
     initialized_layout: bool = false,
+    content_leases: []u64,
+    content_lease_count: usize = 0,
 };
 
 const Push = extern struct {
@@ -243,6 +269,8 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
         sample_size == 0 or sample_size > physical_properties.limits.maxStorageBufferRange or
         config.max_source_bytes == 0 or
         config.max_source_bytes > physical_properties.limits.maxStorageBufferRange or
+        config.content_bytes == 0 or config.content_allocations == 0 or
+        config.content_allocations > std.math.maxInt(u32) or
         config.max_targets == 0 or config.max_targets > std.math.maxInt(u32) or
         descriptor_count > std.math.maxInt(u32) or
         physical_properties.limits.maxPerStageDescriptorStorageBuffers < 2 or
@@ -453,12 +481,35 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
             self.copy_offset_alignment - 1,
         ) catch return error.InvalidConfig,
     ) catch return error.InvalidConfig;
+    self.content_buffer_size = std.math.add(
+        usize,
+        config.content_bytes,
+        std.math.mul(
+            usize,
+            config.content_allocations,
+            self.copy_offset_alignment - 1,
+        ) catch return error.InvalidConfig,
+    ) catch return error.InvalidConfig;
+    self.content_allocations = try allocator.alloc(UploadAllocation, config.content_allocations);
+    @memset(self.content_allocations, .{});
+    errdefer allocator.free(self.content_allocations);
+    try createHostBuffer(
+        self,
+        self.content_buffer_size,
+        &self.content_buffer,
+        &self.content_memory,
+        &self.content_map,
+    );
     return @ptrCast(self);
 }
 
 fn realDestroy(_: *anyopaque, renderer: Renderer) void {
     const self: *RealRenderer = @ptrCast(@alignCast(renderer));
     _ = c.vkDeviceWaitIdle(self.device);
+    for (self.content_allocations) |allocation|
+        std.debug.assert(!allocation.active);
+    destroyBuffer(self, self.content_buffer, self.content_memory);
+    std.heap.c_allocator.free(self.content_allocations);
     for (self.cache) |entry| if (entry.occupied) destroyTexture(self, entry.texture);
     std.heap.c_allocator.free(self.prepared);
     std.heap.c_allocator.free(self.cache);
@@ -473,6 +524,87 @@ fn realDestroy(_: *anyopaque, renderer: Renderer) void {
     std.heap.c_allocator.destroy(self);
 }
 
+fn realContentProvider(_: *anyopaque, renderer: Renderer) ?render_content.Provider {
+    const self: *RealRenderer = @ptrCast(@alignCast(renderer));
+    if (!self.sampled_enabled) return null;
+    return .{
+        .context = self,
+        .allocate_fn = allocateContent,
+        .release_fn = releaseContentOwner,
+        .pinned_fn = contentPinned,
+    };
+}
+
+fn allocateContent(context: *anyopaque, size: usize) !render_content.Allocation {
+    const self: *RealRenderer = @ptrCast(@alignCast(context));
+    const index = for (self.content_allocations, 0..) |allocation, candidate| {
+        if (!allocation.active) break candidate;
+    } else return error.ContentAllocationCapacityExceeded;
+    var offset: usize = 0;
+    while (true) {
+        offset = std.mem.alignForward(usize, offset, self.copy_offset_alignment);
+        const end = std.math.add(usize, offset, size) catch
+            return error.ContentByteCapacityExceeded;
+        if (end > self.content_buffer_size) return error.ContentByteCapacityExceeded;
+        var conflict_end: ?usize = null;
+        for (self.content_allocations) |allocation| {
+            if (!allocation.active) continue;
+            const allocation_end = allocation.offset + allocation.size;
+            if (offset < allocation_end and end > allocation.offset)
+                conflict_end = @max(conflict_end orelse 0, allocation_end);
+        }
+        if (conflict_end) |next| {
+            offset = next;
+            continue;
+        }
+        break;
+    }
+    const allocation = &self.content_allocations[index];
+    allocation.generation +%= 1;
+    if (allocation.generation == 0) allocation.generation = 1;
+    allocation.active = true;
+    allocation.offset = offset;
+    allocation.size = size;
+    allocation.references = 1;
+    const token = (@as(u64, allocation.generation) << 32) | @as(u32, @intCast(index));
+    return .{
+        .bytes = @as([*]u8, @ptrCast(self.content_map))[offset..][0..size],
+        .upload = .{ .owner = self, .token = token, .offset = offset },
+    };
+}
+
+fn contentAllocation(self: *RealRenderer, token: u64) ?*UploadAllocation {
+    const index: u32 = @truncate(token);
+    const generation: u32 = @truncate(token >> 32);
+    if (index >= self.content_allocations.len) return null;
+    const allocation = &self.content_allocations[index];
+    if (!allocation.active or allocation.generation != generation) return null;
+    return allocation;
+}
+
+fn retainContent(self: *RealRenderer, token: u64) !void {
+    const allocation = contentAllocation(self, token) orelse return error.StaleContentBacking;
+    allocation.references = std.math.add(usize, allocation.references, 1) catch
+        return error.ContentReferenceOverflow;
+}
+
+fn releaseContent(self: *RealRenderer, token: u64) void {
+    const allocation = contentAllocation(self, token) orelse unreachable;
+    std.debug.assert(allocation.references != 0);
+    allocation.references -= 1;
+    if (allocation.references == 0) allocation.active = false;
+}
+
+fn releaseContentOwner(context: *anyopaque, token: u64) void {
+    releaseContent(@ptrCast(@alignCast(context)), token);
+}
+
+fn contentPinned(context: *anyopaque, token: u64) bool {
+    const self: *RealRenderer = @ptrCast(@alignCast(context));
+    const allocation = contentAllocation(self, token) orelse return false;
+    return allocation.references > 1;
+}
+
 fn realImportTarget(_: *anyopaque, renderer: Renderer, metadata: gbm.Metadata, dma_buf_fd: std.posix.fd_t) !Target {
     const self: *RealRenderer = @ptrCast(@alignCast(renderer));
     const allocator = std.heap.c_allocator;
@@ -485,6 +617,9 @@ fn realImportTarget(_: *anyopaque, renderer: Renderer, metadata: gbm.Metadata, d
     target.retired_textures = try allocator.alloc(Texture, self.max_samples);
     target.retired_texture_count = 0;
     errdefer allocator.free(target.retired_textures);
+    target.content_leases = try allocator.alloc(u64, self.max_samples);
+    target.content_lease_count = 0;
+    errdefer allocator.free(target.content_leases);
     if (metadata.plane_count != 1) return error.UnsupportedPlaneCount;
     try requireTargetFormat(self.physical_device, metadata);
 
@@ -614,6 +749,7 @@ fn realDestroyTarget(_: *anyopaque, renderer: Renderer, target_value: Target) vo
     const target: *RealTarget = @ptrCast(@alignCast(target_value));
     if (target.state == .in_flight or target.state == .export_failed)
         _ = c.vkWaitForFences(self.device, 1, &target.fence, c.VK_TRUE, std.math.maxInt(u64));
+    drainContentLeases(self, target);
     drainRetiredTextures(self, target);
     c.vkDestroySemaphore(self.device, target.semaphore, null);
     c.vkDestroyFence(self.device, target.fence, null);
@@ -625,6 +761,7 @@ fn realDestroyTarget(_: *anyopaque, renderer: Renderer, target_value: Target) vo
     c.vkDestroyImage(self.device, target.image, null);
     c.vkFreeMemory(self.device, target.image_memory, null);
     std.heap.c_allocator.free(target.retired_textures);
+    std.heap.c_allocator.free(target.content_leases);
     std.heap.c_allocator.destroy(target);
 }
 
@@ -664,6 +801,10 @@ fn prepareTextures(self: *RealRenderer, frame: Frame) !PreparedBatch {
         else
             existing.?.texture;
         const prepared_index = count;
+        const direct_upload = if (surface.source.upload) |upload|
+            if (upload.owner == @as(*anyopaque, @ptrCast(self))) upload else null
+        else
+            null;
         self.prepared[prepared_index] = .{
             .cache_index = cache_index,
             .source_index = source_index,
@@ -673,25 +814,49 @@ fn prepareTextures(self: *RealRenderer, frame: Frame) !PreparedBatch {
             .surface = surface.sample.surface,
             .commit_sequence = surface.sample.commit_sequence,
             .format = surface.source.format,
+            .content_token = if (direct_upload) |upload| upload.token else null,
         };
         count += 1;
 
         const upload_damage = textureUpload(created, existing, surface);
         for (upload_damage.items()) |rect| {
-            staging_bytes = std.mem.alignForward(
-                usize,
-                staging_bytes,
-                self.copy_offset_alignment,
-            );
             const width: usize = @intCast(rect.max_x - rect.min_x);
             const height: usize = @intCast(rect.max_y - rect.min_y);
             const row_bytes = std.math.mul(usize, width, 4) catch
                 return error.CapacityExceeded;
             const byte_count = std.math.mul(usize, row_bytes, height) catch
                 return error.CapacityExceeded;
-            const end = std.math.add(usize, staging_bytes, byte_count) catch
-                return error.CapacityExceeded;
-            if (end > self.staging_buffer_size) return error.CapacityExceeded;
+            const upload_offset, const row_length, const direct = if (direct_upload) |backing| direct: {
+                const row_offset = std.math.mul(
+                    usize,
+                    surface.source.stride,
+                    @intCast(rect.min_y),
+                ) catch return error.CapacityExceeded;
+                const column_offset = std.math.mul(
+                    usize,
+                    @intCast(rect.min_x),
+                    4,
+                ) catch return error.CapacityExceeded;
+                const offset = std.math.add(
+                    usize,
+                    backing.offset,
+                    std.math.add(usize, row_offset, column_offset) catch
+                        return error.CapacityExceeded,
+                ) catch return error.CapacityExceeded;
+                break :direct .{ offset, surface.source.stride / 4, true };
+            } else fallback: {
+                staging_bytes = std.mem.alignForward(
+                    usize,
+                    staging_bytes,
+                    self.copy_offset_alignment,
+                );
+                const end = std.math.add(usize, staging_bytes, byte_count) catch
+                    return error.CapacityExceeded;
+                if (end > self.staging_buffer_size) return error.CapacityExceeded;
+                const offset = staging_bytes;
+                staging_bytes = end;
+                break :fallback .{ offset, @as(u32, @intCast(width)), false };
+            };
             self.prepared[prepared_index].uploads[
                 self.prepared[prepared_index].upload_count
             ] = .{
@@ -699,10 +864,11 @@ fn prepareTextures(self: *RealRenderer, frame: Frame) !PreparedBatch {
                 .y = @intCast(rect.min_y),
                 .width = @intCast(rect.max_x - rect.min_x),
                 .height = @intCast(rect.max_y - rect.min_y),
-                .staging_offset = staging_bytes,
+                .staging_offset = upload_offset,
+                .row_length = row_length,
+                .direct = direct,
             };
             self.prepared[prepared_index].upload_count += 1;
-            staging_bytes = end;
         }
     }
     return .{ .count = count, .staging_bytes = staging_bytes };
@@ -823,6 +989,7 @@ fn realDraw(_: *anyopaque, renderer: Renderer, target_value: Target, frame: Fram
             if (c.vkGetFenceStatus(self.device, target.fence) != c.VK_SUCCESS) return error.TargetBusy;
             target.state = .ready;
             target.fence_needs_reset = true;
+            drainContentLeases(self, target);
         },
         .queue_failed, .export_failed => return error.TargetTerminal,
     }
@@ -933,6 +1100,23 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
     const batch = try prepareTextures(self, frame);
     var prepared_owned = true;
     defer if (prepared_owned) cleanupPreparedTextures(self, batch.count);
+    var content_tokens: [sampled_image_capacity]u64 = undefined;
+    var content_token_count: usize = 0;
+    var content_tokens_owned = true;
+    defer if (content_tokens_owned) for (content_tokens[0..content_token_count]) |token|
+        releaseContent(self, token);
+
+    for (self.prepared[0..batch.count]) |prepared| {
+        if (prepared.upload_count == 0) continue;
+        const token = prepared.content_token orelse continue;
+        var present = false;
+        for (content_tokens[0..content_token_count]) |existing|
+            present = present or existing == token;
+        if (present) continue;
+        try retainContent(self, token);
+        content_tokens[content_token_count] = token;
+        content_token_count += 1;
+    }
 
     @memcpy(
         @as([*]u8, @ptrCast(target.sample_map))[0 .. frame.samples.len * @sizeOf(Sample)],
@@ -942,6 +1126,7 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
     for (self.prepared[0..batch.count]) |prepared| {
         const source = frame.sources[prepared.source_index].source;
         for (prepared.uploads[0..prepared.upload_count]) |upload| {
+            if (upload.direct) continue;
             const row_bytes = @as(usize, upload.width) * 4;
             for (0..upload.height) |row| {
                 const source_start = @as(usize, source.stride) * (upload.y + row) +
@@ -1028,8 +1213,8 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
         for (prepared.uploads[0..prepared.upload_count]) |upload| {
             var copy: c.VkBufferImageCopy = .{
                 .bufferOffset = upload.staging_offset,
-                .bufferRowLength = upload.width,
-                .bufferImageHeight = upload.height,
+                .bufferRowLength = upload.row_length,
+                .bufferImageHeight = 0,
                 .imageSubresource = .{
                     .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT,
                     .mipLevel = 0,
@@ -1041,7 +1226,7 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
             };
             c.vkCmdCopyBufferToImage(
                 target.command_buffer,
-                target.source_buffer,
+                if (upload.direct) self.content_buffer else target.source_buffer,
                 prepared.texture.image,
                 c.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 1,
@@ -1184,6 +1369,10 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
     }
     target.state = .in_flight;
     target.initialized_layout = true;
+    std.debug.assert(target.content_lease_count == 0);
+    @memcpy(target.content_leases[0..content_token_count], content_tokens[0..content_token_count]);
+    target.content_lease_count = content_token_count;
+    content_tokens_owned = false;
 
     for (self.prepared[0..batch.count]) |prepared| {
         const cache = &self.cache[prepared.cache_index];
@@ -1224,6 +1413,12 @@ fn drainRetiredTextures(self: *RealRenderer, target: *RealTarget) void {
     for (target.retired_textures[0..target.retired_texture_count]) |texture|
         destroyTexture(self, texture);
     target.retired_texture_count = 0;
+}
+
+fn drainContentLeases(self: *RealRenderer, target: *RealTarget) void {
+    for (target.content_leases[0..target.content_lease_count]) |token|
+        releaseContent(self, token);
+    target.content_lease_count = 0;
 }
 
 fn choosePhysicalDevice(instance: c.VkInstance, drm_fd: std.posix.fd_t) !c.VkPhysicalDevice {

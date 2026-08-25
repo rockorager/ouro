@@ -26,6 +26,30 @@ pub const Config = struct {
     byte_capacity: usize,
 };
 
+pub const Allocation = struct {
+    bytes: []u8,
+    upload: ?render.UploadBacking = null,
+};
+
+pub const Provider = struct {
+    context: *anyopaque,
+    allocate_fn: *const fn (*anyopaque, usize) anyerror!Allocation,
+    release_fn: *const fn (*anyopaque, u64) void,
+    pinned_fn: *const fn (*anyopaque, u64) bool,
+
+    pub fn allocate(self: Provider, size: usize) !Allocation {
+        return self.allocate_fn(self.context, size);
+    }
+
+    pub fn release(self: Provider, token: u64) void {
+        self.release_fn(self.context, token);
+    }
+
+    pub fn pinned(self: Provider, token: u64) bool {
+        return self.pinned_fn(self.context, token);
+    }
+};
+
 const State = enum { free, prepared, published, replacing };
 
 const Replacement = struct {
@@ -48,8 +72,17 @@ pub const Store = struct {
     slots: []Slot,
     byte_capacity: usize,
     used_bytes: usize = 0,
+    provider: ?Provider = null,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Store {
+        return initWithProvider(allocator, config, null);
+    }
+
+    pub fn initWithProvider(
+        allocator: std.mem.Allocator,
+        config: Config,
+        provider: ?Provider,
+    ) !Store {
         if (config.version_capacity == 0 or
             config.version_capacity > std.math.maxInt(u32) or
             config.byte_capacity == 0)
@@ -60,12 +93,13 @@ pub const Store = struct {
             .allocator = allocator,
             .slots = slots,
             .byte_capacity = config.byte_capacity,
+            .provider = provider,
         };
     }
 
     pub fn deinit(self: *Store) void {
         for (self.slots) |slot| if (slot.state != .free)
-            self.allocator.free(@constCast(slot.source.bytes));
+            self.releaseBytes(slot.source);
         self.allocator.free(self.slots);
         self.* = undefined;
     }
@@ -103,16 +137,29 @@ pub const Store = struct {
             ) catch return error.NonAdjacentCommit;
             if (identity.commit_sequence != next) return error.NonAdjacentCommit;
         }
-        const index = self.freeSlot() orelse return error.VersionCapacityExceeded;
-        if (packed_length > self.byte_capacity - self.used_bytes)
-            return error.ByteCapacityExceeded;
-        const bytes = try self.allocator.alloc(u8, packed_length);
-        errdefer self.allocator.free(bytes);
-
         const compatible = if (predecessor) |slot|
             std.meta.eql(slot.source.size, source.size) and slot.source.format == source.format
         else
             false;
+        const index = self.freeSlot() orelse return error.VersionCapacityExceeded;
+        if (packed_length > self.byte_capacity - self.used_bytes)
+            return error.ByteCapacityExceeded;
+        // Full candidates can be copied straight into device upload memory.
+        // Partial histories remain CPU-owned so future adjacent commits can
+        // patch them in place without racing a GPU read or cloning the frame.
+        const allocation = try self.allocateBytes(
+            packed_length,
+            !compatible or coversSource(damage, source.size),
+        );
+        const bytes = allocation.bytes;
+        errdefer self.releaseBytes(.{
+            .size = source.size,
+            .stride = packed_stride,
+            .format = source.format,
+            .bytes = bytes,
+            .upload = allocation.upload,
+        });
+
         if (compatible and !coversSource(damage, source.size)) {
             @memcpy(bytes, predecessor.?.source.bytes);
             copyDamage(bytes, packed_stride, source, damage);
@@ -130,6 +177,7 @@ pub const Store = struct {
             .stride = packed_stride,
             .format = source.format,
             .bytes = bytes,
+            .upload = allocation.upload,
         };
         slot.current = false;
         self.used_bytes += packed_length;
@@ -175,6 +223,8 @@ pub const Store = struct {
         if (!std.meta.eql(slot.source.size, source.size) or
             slot.source.format != source.format or slot.source.bytes.len != packed_length)
             return self.prepare(identity, source, damage);
+        if (self.provider) |provider| if (slot.source.upload) |upload|
+            if (provider.pinned(upload.token)) return self.prepare(identity, source, damage);
         slot.state = .replacing;
         slot.replacement = .{
             .identity = identity,
@@ -285,9 +335,23 @@ pub const Store = struct {
 
     fn free(self: *Store, slot: *Slot) void {
         self.used_bytes -= slot.source.bytes.len;
-        self.allocator.free(@constCast(slot.source.bytes));
+        self.releaseBytes(slot.source);
         const generation = slot.generation;
         slot.* = .{ .generation = generation };
+    }
+
+    fn allocateBytes(self: *Store, size: usize, native: bool) !Allocation {
+        if (native) if (self.provider) |provider| return provider.allocate(size);
+        const bytes = try self.allocator.alloc(u8, size);
+        return .{ .bytes = bytes };
+    }
+
+    fn releaseBytes(self: *Store, source: render.Source) void {
+        if (source.upload) |upload| if (self.provider) |provider| {
+            provider.release(upload.token);
+            return;
+        };
+        self.allocator.free(@constCast(source.bytes));
     }
 };
 
@@ -357,6 +421,59 @@ fn testSource(bytes: []const u8, width: u32, height: u32, stride: u32) render.So
         .bytes = bytes,
     };
 }
+
+const TestProvider = struct {
+    storage: [64]u8 = undefined,
+    used: usize = 0,
+    references: [4]u8 = @splat(0),
+
+    fn provider(self: *TestProvider) Provider {
+        return .{
+            .context = self,
+            .allocate_fn = allocate,
+            .release_fn = release,
+            .pinned_fn = pinned,
+        };
+    }
+
+    fn allocate(context: *anyopaque, size: usize) !Allocation {
+        const self: *TestProvider = @ptrCast(@alignCast(context));
+        if (self.used + size > self.storage.len) return error.OutOfMemory;
+        var index: usize = 0;
+        while (index < self.references.len and self.references[index] != 0) : (index += 1) {}
+        if (index == self.references.len) return error.OutOfMemory;
+        const offset = self.used;
+        self.used += size;
+        self.references[index] = 1;
+        return .{
+            .bytes = self.storage[offset..][0..size],
+            .upload = .{
+                .owner = context,
+                .token = index + 1,
+                .offset = offset,
+            },
+        };
+    }
+
+    fn release(context: *anyopaque, token: u64) void {
+        const self: *TestProvider = @ptrCast(@alignCast(context));
+        const index: usize = @intCast(token - 1);
+        std.debug.assert(self.references[index] > 0);
+        self.references[index] -= 1;
+    }
+
+    fn pinned(context: *anyopaque, token: u64) bool {
+        const self: *TestProvider = @ptrCast(@alignCast(context));
+        const index: usize = @intCast(token - 1);
+        return self.references[index] > 1;
+    }
+
+    fn retain(self: *TestProvider, token: u64) void {
+        const index: usize = @intCast(token - 1);
+        std.debug.assert(self.references[index] > 0);
+        self.references[index] += 1;
+    }
+};
 
 test "render-content: alternating buffers patch one logical surface history" {
     var store = try Store.init(std.testing.allocator, .{ .version_capacity = 3, .byte_capacity = 48 });
@@ -509,6 +626,55 @@ test "render-content: unique replacement is transactional and allocation-free" {
         3, 3, 3, 3, 4, 4, 4, 4,
     }, (try store.resolve(current)).bytes);
     store.release(current);
+}
+
+test "render-content: GPU-pinned provider backing uses transactional copy-on-write" {
+    var backing: TestProvider = .{};
+    var store = try Store.initWithProvider(
+        std.testing.allocator,
+        .{ .version_capacity = 2, .byte_capacity = 16 },
+        backing.provider(),
+    );
+    defer store.deinit();
+    const first = [_]u8{ 1, 2, 3, 4, 9, 10, 11, 12 };
+    const old = store.publish(try store.prepare(
+        .{ .surface = 1, .commit_sequence = 1 },
+        testSource(&first, 2, 1, 8),
+        .{},
+    ));
+    const old_source = try store.resolve(old);
+    const old_token = old_source.upload.?.token;
+    backing.retain(old_token);
+
+    const second = [_]u8{ 5, 6, 7, 8, 13, 14, 15, 16 };
+    const cancelled = try store.prepareReplacing(
+        old,
+        .{ .surface = 1, .commit_sequence = 2 },
+        testSource(&second, 2, 1, 8),
+        testDamage(&.{.{ .min_x = 0, .min_y = 0, .max_x = 1, .max_y = 1 }}),
+    );
+    try std.testing.expect(!cancelled.replaces);
+    store.cancel(cancelled);
+    try std.testing.expectEqualSlices(u8, &first, (try store.resolve(old)).bytes);
+    try std.testing.expectEqual(@as(u8, 2), backing.references[0]);
+    try std.testing.expectEqual(@as(u8, 0), backing.references[1]);
+
+    const prepared = try store.prepareReplacing(
+        old,
+        .{ .surface = 1, .commit_sequence = 2 },
+        testSource(&second, 2, 1, 8),
+        testDamage(&.{.{ .min_x = 0, .min_y = 0, .max_x = 1, .max_y = 1 }}),
+    );
+    const current = store.publish(prepared);
+    const current_source = try store.resolve(current);
+    try std.testing.expect(current_source.upload == null);
+    try std.testing.expectEqualSlices(u8, &.{ 5, 6, 7, 8, 9, 10, 11, 12 }, current_source.bytes);
+    store.release(old);
+    try std.testing.expectEqual(@as(u8, 1), backing.references[0]);
+    store.release(current);
+    try std.testing.expectEqual(@as(u8, 0), backing.references[1]);
+    TestProvider.release(&backing, old_token);
+    try std.testing.expectEqual(@as(u8, 0), backing.references[0]);
 }
 
 test "render-content: stale generation destruction does not invalidate handles" {

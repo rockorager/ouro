@@ -82,11 +82,21 @@ pub const PresentationIdentity = struct {
     generation: u32,
 };
 
+/// Optional backend-native upload allocation. CPU bytes remain the canonical
+/// renderer-neutral source; the owning backend may consume this exact mapped
+/// allocation directly while retaining `token` through GPU completion.
+pub const UploadBacking = struct {
+    owner: *anyopaque,
+    token: u64,
+    offset: usize,
+};
+
 pub const Source = struct {
     size: Size,
     stride: u32,
     format: PixelFormat,
     bytes: []const u8,
+    upload: ?UploadBacking = null,
 };
 
 pub const upload_damage_rect_capacity = 8;

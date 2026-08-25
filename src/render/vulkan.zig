@@ -17,6 +17,8 @@ pub const Config = struct {
     max_source_bytes: usize,
     max_targets: usize = framebuffer.default_capacity,
     max_damage_rects: usize = 32,
+    content_bytes: usize = 1,
+    content_allocations: usize = 1,
 };
 
 pub const Target = struct {
@@ -75,7 +77,8 @@ pub const Renderer = struct {
         if (config.max_samples == 0 or config.max_source_bytes == 0 or
             config.max_targets == 0 or config.max_targets > std.math.maxInt(u32) or
             config.max_samples > std.math.maxInt(u32) or
-            config.max_source_bytes > std.math.maxInt(u32) or config.max_damage_rects == 0)
+            config.max_source_bytes > std.math.maxInt(u32) or config.max_damage_rects == 0 or
+            config.content_bytes == 0 or config.content_allocations == 0)
             return error.InvalidConfig;
         _ = std.math.mul(usize, config.max_samples, @sizeOf(vk.Sample)) catch
             return error.InvalidConfig;
@@ -92,6 +95,8 @@ pub const Renderer = struct {
             .max_samples = config.max_samples,
             .max_source_bytes = config.max_source_bytes,
             .max_targets = config.max_targets,
+            .content_bytes = config.content_bytes,
+            .content_allocations = config.content_allocations,
         });
         return .{
             .allocator = allocator,
@@ -117,6 +122,10 @@ pub const Renderer = struct {
             .owner = self.implementation,
             .records = records,
         };
+    }
+
+    pub fn contentProvider(self: *Renderer) ?@import("content.zig").Provider {
+        return self.platform.contentProvider(self.implementation);
     }
 
     /// Requires every target to be out of KMS ownership. Platform destruction
@@ -764,7 +773,14 @@ const FakePlatform = struct {
     last_sample_count: usize = 0,
     last_damage: render_types.Rect = undefined,
 
-    const vtable: vk.Platform.VTable = .{ .create = create, .destroy = destroy, .import_target = importTarget, .destroy_target = destroyTarget, .draw = draw };
+    const vtable: vk.Platform.VTable = .{
+        .create = create,
+        .destroy = destroy,
+        .import_target = importTarget,
+        .destroy_target = destroyTarget,
+        .draw = draw,
+        .content_provider = contentProvider,
+    };
     fn platform(self: *FakePlatform) vk.Platform {
         return .{ .context = self, .vtable = &vtable };
     }
@@ -773,6 +789,9 @@ const FakePlatform = struct {
         const self: *FakePlatform = @ptrCast(@alignCast(context));
         self.create_count += 1;
         return context;
+    }
+    fn contentProvider(_: *anyopaque, _: vk.Renderer) ?@import("content.zig").Provider {
+        return null;
     }
     fn destroy(context: *anyopaque, _: vk.Renderer) void {
         const self: *FakePlatform = @ptrCast(@alignCast(context));

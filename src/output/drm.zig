@@ -311,14 +311,18 @@ pub const Output = struct {
             config.max_samples,
             1,
         ) catch return error.InvalidConfig;
-        var content = try render_content.Store.init(allocator, .{
+        const content_provider = switch (path.renderer) {
+            .pixman => null,
+            .vulkan => |*renderer| renderer.contentProvider(),
+        };
+        var content = try render_content.Store.initWithProvider(allocator, .{
             .version_capacity = content_version_capacity,
             .byte_capacity = std.math.mul(
                 usize,
                 surfaceByteCapacity(config),
                 content_version_capacity,
             ) catch return error.InvalidConfig,
-        });
+        }, content_provider);
         var content_owned = true;
         errdefer if (content_owned) content.deinit();
         render_device.* = .{
@@ -557,12 +561,12 @@ pub const Output = struct {
                 ) catch |cause| {
                     if (cause == error.CompletionExportFailedAfterSubmit) {
                         // The GPU has accepted work without exporting the only
-                        // synchronization primitive. Renderer teardown is the
-                        // terminal wait and must happen while Pool/BO lives.
+                        // synchronization primitive. Target teardown is the
+                        // terminal wait and releases every submitted content
+                        // lease while Pool/BO still lives. The device-owned
+                        // content arena remains alive with RenderDevice.
                         value.destroyTargets(&self.vulkan_targets.?);
                         self.vulkan_targets = null;
-                        renderer.deinit();
-                        self.render_device.renderer = null;
                     }
                     return self.retireAndDiscard(frame_id, cause, handle);
                 };
@@ -823,11 +827,37 @@ fn initVulkan(allocator: std.mem.Allocator, platforms: Platforms, fd: std.posix.
         return error.InFenceUnsupported;
     var pool = try vulkan.initTargetPool(allocator, platforms.gbm, platforms.framebuffer, fd, snapshot, config.image_count);
     errdefer pool.deinit() catch {};
+    const content_version_capacity = std.math.add(usize, config.max_samples, 1) catch
+        return error.InvalidConfig;
+    const content_store_bytes = std.math.mul(
+        usize,
+        surfaceByteCapacity(config),
+        content_version_capacity,
+    ) catch return error.InvalidConfig;
+    const retained_upload_bytes = std.math.mul(
+        usize,
+        config.max_source_bytes,
+        config.max_render_targets,
+    ) catch return error.InvalidConfig;
     const renderer = try vulkan.Renderer.init(allocator, platforms.vulkan, fd, .{
         .max_samples = config.max_samples,
         .max_source_bytes = config.max_source_bytes,
         .max_targets = config.max_render_targets,
         .max_damage_rects = config.max_render_damage,
+        .content_bytes = std.math.add(
+            usize,
+            content_store_bytes,
+            retained_upload_bytes,
+        ) catch return error.InvalidConfig,
+        .content_allocations = std.math.add(
+            usize,
+            content_version_capacity,
+            std.math.mul(
+                usize,
+                config.max_render_targets,
+                config.max_samples,
+            ) catch return error.InvalidConfig,
+        ) catch return error.InvalidConfig,
     });
     var owned_renderer = renderer;
     errdefer owned_renderer.deinit();
