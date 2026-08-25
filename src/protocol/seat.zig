@@ -8,6 +8,7 @@
 const std = @import("std");
 const wayring = @import("wayring");
 const input = @import("../backend/input/backend.zig");
+const input_platform = @import("../backend/input/platform.zig");
 
 const linux = std.os.linux;
 const objects = wayring.objects;
@@ -78,6 +79,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             surface: SurfaceId,
         };
         pub const Point = struct { x: i32, y: i32 };
+        const Axis = enum { vertical, horizontal };
         pub const ModifierState = struct {
             depressed: u32 = 0,
             latched: u32 = 0,
@@ -138,6 +140,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             pointer_leave: struct { pointer: Id, serial: u32, target: FocusTarget },
             pointer_motion: struct { pointer: Id, target: FocusTarget, time: u32, point: Point },
             pointer_button: struct { pointer: Id, target: ?FocusTarget, serial: u32, time: u32, button: u32, pressed: bool },
+            pointer_axis_source: struct { pointer: Id, target: FocusTarget, source: input_platform.AxisSource },
+            pointer_axis: struct { pointer: Id, target: FocusTarget, time: u32, axis: Axis, value: i32 },
+            pointer_axis_stop: struct { pointer: Id, target: FocusTarget, time: u32, axis: Axis },
+            pointer_axis_value120: struct { pointer: Id, target: FocusTarget, axis: Axis, value120: i32 },
             pointer_frame: struct { pointer: Id, target: ?FocusTarget },
             keyboard_keymap: Id,
             keyboard_repeat: Id,
@@ -563,6 +569,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     };
                 },
                 .pointer_button => |value| try adapter.pointerButton(value),
+                .pointer_axis => |value| try adapter.pointerAxis(value),
                 .keyboard_key => |value| try adapter.keyboardKey(value),
             }
         }
@@ -692,6 +699,54 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                         .button = v.button,
                         .state = if (v.pressed) Pointer.button_state.pressed else Pointer.button_state.released,
                     } });
+                },
+                .pointer_axis_source => |v| {
+                    const slot = adapter.resolvePointer(v.pointer) catch return true;
+                    _ = adapter.surfaceObject(server_objects, v.target) catch return true;
+                    const object = server_objects.namespace.resolve(slot.header.resource) orelse return true;
+                    if (object.version >= 5) try Pointer.encodeEvent(queue, slot.header.resource.id, .{
+                        .axis_source = .{ .axis_source = switch (v.source) {
+                            .wheel => Pointer.axis_source.wheel,
+                            .finger => Pointer.axis_source.finger,
+                            .continuous => Pointer.axis_source.continuous,
+                        } },
+                    });
+                },
+                .pointer_axis => |v| {
+                    const slot = adapter.resolvePointer(v.pointer) catch return true;
+                    _ = adapter.surfaceObject(server_objects, v.target) catch return true;
+                    try Pointer.encodeEvent(queue, slot.header.resource.id, .{ .axis = .{
+                        .time = v.time,
+                        .axis = protocolAxis(v.axis, Pointer),
+                        .value = v.value,
+                    } });
+                },
+                .pointer_axis_stop => |v| {
+                    const slot = adapter.resolvePointer(v.pointer) catch return true;
+                    _ = adapter.surfaceObject(server_objects, v.target) catch return true;
+                    const object = server_objects.namespace.resolve(slot.header.resource) orelse return true;
+                    if (object.version >= 5) try Pointer.encodeEvent(queue, slot.header.resource.id, .{
+                        .axis_stop = .{ .time = v.time, .axis = protocolAxis(v.axis, Pointer) },
+                    });
+                },
+                .pointer_axis_value120 => |v| {
+                    const slot = adapter.resolvePointer(v.pointer) catch return true;
+                    _ = adapter.surfaceObject(server_objects, v.target) catch return true;
+                    const object = server_objects.namespace.resolve(slot.header.resource) orelse return true;
+                    if (object.version >= 8) {
+                        try Pointer.encodeEvent(queue, slot.header.resource.id, .{ .axis_value120 = .{
+                            .axis = protocolAxis(v.axis, Pointer),
+                            .value120 = v.value120,
+                        } });
+                    } else if (object.version >= 5) {
+                        const discrete = @divTrunc(v.value120, 120);
+                        if (discrete != 0) try Pointer.encodeEvent(queue, slot.header.resource.id, .{
+                            .axis_discrete = .{
+                                .axis = protocolAxis(v.axis, Pointer),
+                                .discrete = discrete,
+                            },
+                        });
+                    }
                 },
                 .pointer_frame => |v| {
                     const slot = adapter.resolvePointer(v.pointer) catch return true;
@@ -883,6 +938,66 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 adapter.pointer_grab = .idle;
                 try adapter.transitionPointer(adapter.pointer_focus);
             }
+        }
+
+        fn pointerAxis(adapter: *Self, value: anytype) !void {
+            _ = try adapter.resolveDevice(value.device);
+            const target = adapter.deliveryTarget() orelse return;
+            const time = millis(value.time_usec);
+            var axis_commands: usize = 0;
+            inline for (.{ value.vertical, value.horizontal }) |axis| if (axis) |present| {
+                if (present.value == 0) {
+                    if (value.source != .wheel) axis_commands += 1;
+                } else {
+                    axis_commands += 1 + @as(usize, @intFromBool(axisValue120(present.value120) != null));
+                }
+            };
+            if (axis_commands == 0) return;
+            const command_count = axis_commands + 2;
+            const resource_count = adapter.pointerResourceCount(target.client);
+            try adapter.ensureOutbound(command_count * resource_count);
+            for (adapter.pointers, 0..) |slot, index| if (adapter.pointerBelongs(&slot, target.client)) {
+                const pointer: Id = .{ .index = @intCast(index), .generation = slot.header.generation };
+                adapter.enqueue(target.client, .{ .pointer_axis_source = .{
+                    .pointer = pointer,
+                    .target = target,
+                    .source = value.source,
+                } }) catch unreachable;
+                inline for (.{
+                    .{ Axis.vertical, value.vertical },
+                    .{ Axis.horizontal, value.horizontal },
+                }) |entry| if (entry[1]) |present| {
+                    if (present.value == 0) {
+                        if (value.source != .wheel) adapter.enqueue(target.client, .{
+                            .pointer_axis_stop = .{
+                                .pointer = pointer,
+                                .target = target,
+                                .time = time,
+                                .axis = entry[0],
+                            },
+                        }) catch unreachable;
+                    } else {
+                        if (axisValue120(present.value120)) |value120|
+                            adapter.enqueue(target.client, .{ .pointer_axis_value120 = .{
+                                .pointer = pointer,
+                                .target = target,
+                                .axis = entry[0],
+                                .value120 = value120,
+                            } }) catch unreachable;
+                        adapter.enqueue(target.client, .{ .pointer_axis = .{
+                            .pointer = pointer,
+                            .target = target,
+                            .time = time,
+                            .axis = entry[0],
+                            .value = fixedFromDelta(present.value),
+                        } }) catch unreachable;
+                    }
+                };
+                adapter.enqueue(target.client, .{ .pointer_frame = .{
+                    .pointer = pointer,
+                    .target = target,
+                } }) catch unreachable;
+            };
         }
 
         fn keyboardKey(adapter: *Self, value: anytype) !void {
@@ -1226,6 +1341,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     .pointer_leave => |v| if (kind == .pointer) v.pointer else null,
                     .pointer_motion => |v| if (kind == .pointer) v.pointer else null,
                     .pointer_button => |v| if (kind == .pointer) v.pointer else null,
+                    .pointer_axis_source => |v| if (kind == .pointer) v.pointer else null,
+                    .pointer_axis => |v| if (kind == .pointer) v.pointer else null,
+                    .pointer_axis_stop => |v| if (kind == .pointer) v.pointer else null,
+                    .pointer_axis_value120 => |v| if (kind == .pointer) v.pointer else null,
                     .pointer_frame => |v| if (kind == .pointer) v.pointer else null,
                     .keyboard_keymap => |v| if (kind == .keyboard) v else null,
                     .keyboard_repeat => |v| if (kind == .keyboard) v else null,
@@ -1346,6 +1465,20 @@ fn fixedFromDelta(value: f64) i32 {
     if (scaled <= @as(f64, @floatFromInt(std.math.minInt(i32)))) return std.math.minInt(i32);
     return @intFromFloat(scaled);
 }
+fn axisValue120(value: ?f64) ?i32 {
+    const present = value orelse return null;
+    const rounded = @round(present);
+    if (rounded == 0) return null;
+    if (rounded >= @as(f64, @floatFromInt(std.math.maxInt(i32)))) return std.math.maxInt(i32);
+    if (rounded <= @as(f64, @floatFromInt(std.math.minInt(i32)))) return std.math.minInt(i32);
+    return @intFromFloat(rounded);
+}
+fn protocolAxis(axis: anytype, comptime Pointer: type) Pointer.axis {
+    return switch (axis) {
+        .vertical => Pointer.axis.vertical_scroll,
+        .horizontal => Pointer.axis.horizontal_scroll,
+    };
+}
 fn bitSet(words: anytype, code: u32) bool {
     return words[code / 64] & (@as(u64, 1) << @intCast(code % 64)) != 0;
 }
@@ -1384,6 +1517,10 @@ fn outboundTargets(value: anytype, surface: anytype) bool {
         .pointer_leave => |v| std.meta.eql(v.target.surface, surface),
         .pointer_motion => |v| std.meta.eql(v.target.surface, surface),
         .pointer_button => |v| v.target != null and std.meta.eql(v.target.?.surface, surface),
+        .pointer_axis_source => |v| std.meta.eql(v.target.surface, surface),
+        .pointer_axis => |v| std.meta.eql(v.target.surface, surface),
+        .pointer_axis_stop => |v| std.meta.eql(v.target.surface, surface),
+        .pointer_axis_value120 => |v| std.meta.eql(v.target.surface, surface),
         .pointer_frame => |v| v.target != null and std.meta.eql(v.target.?.surface, surface),
         .keyboard_enter => |v| std.meta.eql(v.target.surface, surface),
         .keyboard_leave => |v| std.meta.eql(v.target.surface, surface),
@@ -1518,6 +1655,48 @@ test "seat: pointer grab retains focus and device removal cancels it" {
     const event = adapter.popEvent() orelse return error.MissingCancellation;
     try std.testing.expectEqual(TestAdapter.Event.pointer_grab_cancelled, std.meta.activeTag(event));
     try std.testing.expect(adapter.pointer_delivery == null);
+}
+
+test "seat: pointer axis delivers wheel precision and finger stops" {
+    var core: FakeCore = .{};
+    var adapter = try testAdapter(&core);
+    defer adapter.deinit();
+    const peer: wayring.io_uring.Peer = .{ .slot = 1, .generation = 7 };
+    const target = try adapter.makeTarget(peer, .{ .index = 0, .generation = 1 });
+    const pointer = try acquire(TestAdapter.PointerSlot, adapter.pointers, &adapter.pointer_free);
+    pointer.client = clientId(peer);
+    try adapter.setPointerFocus(target, .{ .x = 0, .y = 0 });
+    clearTestOutbound(&adapter);
+    const device: input.DeviceId = .{ .slot = 0, .generation = 2, .seat_generation = 8 };
+    try adapter.consume(.{ .device_added = .{
+        .device = device,
+        .capabilities = .{ .pointer = true },
+    } });
+    clearTestOutbound(&adapter);
+
+    try adapter.consume(.{ .pointer_axis = .{
+        .device = device,
+        .time_usec = 10_000,
+        .source = .wheel,
+        .vertical = .{ .value = 15, .value120 = 120 },
+        .horizontal = null,
+    } });
+    try std.testing.expectEqual(@as(usize, 1), countTestOutbound(&adapter, .pointer_axis_source));
+    try std.testing.expectEqual(@as(usize, 1), countTestOutbound(&adapter, .pointer_axis));
+    try std.testing.expectEqual(@as(usize, 1), countTestOutbound(&adapter, .pointer_axis_value120));
+    try std.testing.expectEqual(@as(usize, 1), countTestOutbound(&adapter, .pointer_frame));
+
+    clearTestOutbound(&adapter);
+    try adapter.consume(.{ .pointer_axis = .{
+        .device = device,
+        .time_usec = 11_000,
+        .source = .finger,
+        .vertical = .{ .value = 0, .value120 = null },
+        .horizontal = null,
+    } });
+    try std.testing.expectEqual(@as(usize, 1), countTestOutbound(&adapter, .pointer_axis_source));
+    try std.testing.expectEqual(@as(usize, 1), countTestOutbound(&adapter, .pointer_axis_stop));
+    try std.testing.expectEqual(@as(usize, 1), countTestOutbound(&adapter, .pointer_frame));
 }
 
 test "seat: stale surface generation cannot become focus" {

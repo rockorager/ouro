@@ -26,6 +26,13 @@ pub const Event = union(enum) {
     device_removed: DeviceId,
     pointer_motion: struct { device: DeviceId, time_usec: u64, dx: f64, dy: f64 },
     pointer_button: struct { device: DeviceId, time_usec: u64, button: u32, pressed: bool },
+    pointer_axis: struct {
+        device: DeviceId,
+        time_usec: u64,
+        source: platform_api.AxisSource,
+        vertical: ?platform_api.AxisValue,
+        horizontal: ?platform_api.AxisValue,
+    },
     keyboard_key: struct { device: DeviceId, time_usec: u64, key: u32, pressed: bool },
 };
 
@@ -354,6 +361,22 @@ pub const Backend = struct {
                     .time_usec = value.time_usec,
                     .button = value.button,
                     .pressed = value.pressed,
+                } });
+            },
+            .pointer_axis => |value| {
+                if (value.vertical == null and value.horizontal == null)
+                    return error.InvalidAxis;
+                inline for (.{ value.vertical, value.horizontal }) |axis| if (axis) |present| {
+                    if (!std.math.isFinite(present.value) or
+                        (present.value120 != null and !std.math.isFinite(present.value120.?)))
+                        return error.InvalidAxis;
+                };
+                self.push(.{ .pointer_axis = .{
+                    .device = try self.idForReference(value.device),
+                    .time_usec = value.time_usec,
+                    .source = value.source,
+                    .vertical = value.vertical,
+                    .horizontal = value.horizontal,
                 } });
             },
             .keyboard_key => |value| {
@@ -704,9 +727,16 @@ test "input: pointer button motion and keyboard events retain generation identit
         .button = 0x110,
         .pressed = true,
     } });
-    input_fake.append(.{ .keyboard_key = .{
+    input_fake.append(.{ .pointer_axis = .{
         .device = 7,
         .time_usec = 13,
+        .source = .wheel,
+        .vertical = .{ .value = 15, .value120 = 120 },
+        .horizontal = null,
+    } });
+    input_fake.append(.{ .keyboard_key = .{
+        .device = 7,
+        .time_usec = 14,
         .key = 42,
         .pressed = true,
     } });
@@ -714,7 +744,13 @@ test "input: pointer button motion and keyboard events retain generation identit
     const id = backend.events()[0].device_added.device;
     try std.testing.expectEqual(id, backend.events()[1].pointer_motion.device);
     try std.testing.expectEqual(id, backend.events()[2].pointer_button.device);
-    try std.testing.expectEqual(id, backend.events()[3].keyboard_key.device);
+    const axis = backend.events()[3].pointer_axis;
+    try std.testing.expectEqual(id, axis.device);
+    try std.testing.expectEqual(platform_api.AxisSource.wheel, axis.source);
+    try std.testing.expectEqual(@as(f64, 15), axis.vertical.?.value);
+    try std.testing.expectEqual(@as(?f64, 120), axis.vertical.?.value120);
+    try std.testing.expectEqual(@as(?platform_api.AxisValue, null), axis.horizontal);
+    try std.testing.expectEqual(id, backend.events()[4].keyboard_key.device);
     try std.testing.expect(try backend.isPressed(id, 0x110));
     try std.testing.expect(try backend.isPressed(id, 42));
 }

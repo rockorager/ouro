@@ -135,6 +135,7 @@ pub fn Interaction(comptime Desktop: type) type {
                     value.button,
                     value.pressed,
                 ),
+                .pointer_axis => |value| _ = try self.resolveDevice(value.device),
                 .keyboard_key => |value| _ = try self.resolveDevice(value.device),
             }
         }

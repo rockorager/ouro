@@ -122,9 +122,16 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
                     .button = 0x110,
                     .pressed = true,
                 } },
-                .{ .keyboard_key = .{
+                .{ .pointer_axis = .{
                     .device = 42,
                     .time_usec = 3_000,
+                    .source = .wheel,
+                    .vertical = .{ .value = 15, .value120 = 120 },
+                    .horizontal = null,
+                } },
+                .{ .keyboard_key = .{
+                    .device = 42,
+                    .time_usec = 4_000,
                     .key = 30,
                     .pressed = true,
                 } },
@@ -152,7 +159,7 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
         if (coordinator.stats.presented == 2 and !motion_redraw_sent) {
             try input.publish(&.{.{ .pointer_motion = .{
                 .device = 42,
-                .time_usec = 4_000,
+                .time_usec = 5_000,
                 .dx = -1,
                 .dy = 0,
             } }});
@@ -169,7 +176,8 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
             try std.testing.expect(!std.meta.eql(first_cursor_destination.?, cursor.destination));
         }
         if (coordinator.stats.presented == 3 and handler.pointer_motion == 2 and
-            handler.pointer_button != 0 and handler.keyboard_key != 0) break;
+            handler.pointer_button != 0 and handler.pointer_axis != 0 and
+            handler.pointer_axis_value120 != 0 and handler.keyboard_key != 0) break;
         if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0) {
             try waitForEither(&root.ring, client_reactor.ring);
         }
@@ -182,9 +190,9 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     try std.testing.expectEqual(@as(usize, 2), coordinator.stats.applied);
     try std.testing.expectEqual(@as(usize, 3), coordinator.stats.submitted);
     try std.testing.expectEqual(@as(usize, 3), coordinator.stats.presented);
-    try std.testing.expectEqual(@as(usize, 5), coordinator.stats.input_events);
+    try std.testing.expectEqual(@as(usize, 6), coordinator.stats.input_events);
     try std.testing.expectEqual(@as(usize, 4), input.dispatch_count);
-    try std.testing.expectEqual(@as(usize, 9), input.next_count);
+    try std.testing.expectEqual(@as(usize, 10), input.next_count);
     try std.testing.expect(handler.pointer_enter != 0);
     try std.testing.expect(handler.keyboard_enter != 0);
     try std.testing.expect(handler.pointer_motion != 0);
@@ -192,6 +200,12 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     try std.testing.expect(handler.keyboard_key != 0);
     try std.testing.expectEqual(@as(usize, 2), handler.pointer_motion);
     try std.testing.expectEqual(@as(usize, 1), handler.pointer_button);
+    try std.testing.expectEqual(@as(usize, 1), handler.pointer_axis_source);
+    try std.testing.expectEqual(@as(usize, 1), handler.pointer_axis);
+    try std.testing.expectEqual(@as(usize, 1), handler.pointer_axis_value120);
+    try std.testing.expectEqual(@as(usize, 4), handler.pointer_frame);
+    try std.testing.expectEqual(@as(i32, 15 * 256), handler.pointer_axis_fixed);
+    try std.testing.expectEqual(@as(i32, 120), handler.pointer_axis_value120_value);
     try std.testing.expectEqual(@as(usize, 1), handler.keyboard_key);
     try std.testing.expectEqual(@as(usize, 1), handler.buffer_release);
     try std.testing.expect(handler.buffer_release_order != 0);
@@ -756,6 +770,12 @@ const Handler = struct {
     pointer_enter: usize = 0,
     pointer_motion: usize = 0,
     pointer_button: usize = 0,
+    pointer_axis_source: usize = 0,
+    pointer_axis: usize = 0,
+    pointer_axis_value120: usize = 0,
+    pointer_frame: usize = 0,
+    pointer_axis_fixed: i32 = 0,
+    pointer_axis_value120_value: i32 = 0,
     keyboard_enter: usize = 0,
     keyboard_key: usize = 0,
     buffer_release: usize = 0,
@@ -911,6 +931,22 @@ const Handler = struct {
                     self.pointer_button += 1;
                     if (self.cursor_surface == null) try self.queueCursor(value.serial);
                 },
+                .axis_source => |value| {
+                    try std.testing.expectEqual(protocol.wl_pointer.axis_source.wheel.value, value.axis_source.value);
+                    self.pointer_axis_source += 1;
+                },
+                .axis => |value| {
+                    try std.testing.expectEqual(protocol.wl_pointer.axis.vertical_scroll.value, value.axis.value);
+                    try std.testing.expectEqual(@as(u32, 3), value.time);
+                    self.pointer_axis += 1;
+                    self.pointer_axis_fixed = value.value;
+                },
+                .axis_value120 => |value| {
+                    try std.testing.expectEqual(protocol.wl_pointer.axis.vertical_scroll.value, value.axis.value);
+                    self.pointer_axis_value120 += 1;
+                    self.pointer_axis_value120_value = value.value120;
+                },
+                .frame => self.pointer_frame += 1,
                 else => {},
             }
         } else if (target.object.interface == &protocol.wl_keyboard.info) {

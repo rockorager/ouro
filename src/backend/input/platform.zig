@@ -18,11 +18,24 @@ pub const Capabilities = packed struct {
     _padding: u6 = 0,
 };
 
+pub const AxisSource = enum { wheel, finger, continuous };
+pub const AxisValue = struct {
+    value: f64,
+    value120: ?f64 = null,
+};
+
 pub const RawEvent = union(enum) {
     device_added: struct { device: DeviceRef, capabilities: Capabilities },
     device_removed: DeviceRef,
     pointer_motion: struct { device: DeviceRef, time_usec: u64, dx: f64, dy: f64 },
     pointer_button: struct { device: DeviceRef, time_usec: u64, button: u32, pressed: bool },
+    pointer_axis: struct {
+        device: DeviceRef,
+        time_usec: u64,
+        source: AxisSource,
+        vertical: ?AxisValue,
+        horizontal: ?AxisValue,
+    },
     keyboard_key: struct { device: DeviceRef, time_usec: u64, key: u32, pressed: bool },
     ignored,
 };
@@ -185,6 +198,27 @@ fn realNextEvent(_: *anyopaque, value: *anyopaque) !?RawEvent {
                     c.LIBINPUT_BUTTON_STATE_PRESSED,
             } };
         },
+        c.LIBINPUT_EVENT_POINTER_SCROLL_WHEEL,
+        c.LIBINPUT_EVENT_POINTER_SCROLL_FINGER,
+        c.LIBINPUT_EVENT_POINTER_SCROLL_CONTINUOUS,
+        => blk: {
+            const pointer = c.libinput_event_get_pointer_event(event) orelse
+                return error.InvalidEvent;
+            const event_type = c.libinput_event_get_type(event);
+            const source: AxisSource = if (event_type == c.LIBINPUT_EVENT_POINTER_SCROLL_WHEEL)
+                .wheel
+            else if (event_type == c.LIBINPUT_EVENT_POINTER_SCROLL_FINGER)
+                .finger
+            else
+                .continuous;
+            break :blk .{ .pointer_axis = .{
+                .device = device,
+                .time_usec = c.libinput_event_pointer_get_time_usec(pointer),
+                .source = source,
+                .vertical = axisValue(pointer, source, c.LIBINPUT_POINTER_AXIS_SCROLL_VERTICAL),
+                .horizontal = axisValue(pointer, source, c.LIBINPUT_POINTER_AXIS_SCROLL_HORIZONTAL),
+            } };
+        },
         c.LIBINPUT_EVENT_KEYBOARD_KEY => blk: {
             const keyboard = c.libinput_event_get_keyboard_event(event) orelse
                 return error.InvalidEvent;
@@ -197,6 +231,21 @@ fn realNextEvent(_: *anyopaque, value: *anyopaque) !?RawEvent {
             } };
         },
         else => .ignored,
+    };
+}
+
+fn axisValue(
+    event: *c.struct_libinput_event_pointer,
+    source: AxisSource,
+    axis: c.enum_libinput_pointer_axis,
+) ?AxisValue {
+    if (c.libinput_event_pointer_has_axis(event, axis) == 0) return null;
+    return .{
+        .value = c.libinput_event_pointer_get_scroll_value(event, axis),
+        .value120 = if (source == .wheel)
+            c.libinput_event_pointer_get_scroll_value_v120(event, axis)
+        else
+            null,
     };
 }
 

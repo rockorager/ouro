@@ -46,8 +46,8 @@ responsibilities:
   application are represented by a bounded dependency graph.
 - [Wayland seat](src/protocol/seat.zig): fixed-capacity seat, pointer, and
   keyboard resources aggregate normalized physical input, retain keymap FD
-  ownership, and deliver generation-safe focus and user-action serials through
-  resumable outbound commands.
+  ownership, and deliver generation-safe focus, user-action serials, and
+  high-resolution wheel or touch scrolling through resumable outbound commands.
 - [Wayland output](src/protocol/output.zig): clients discover the selected
   physical output's geometry, current and preferred DRM mode, refresh rate,
   scale, stable name, and description through version-correct `wl_output`
@@ -76,7 +76,8 @@ M3 composes the bounded shell, desktop, normalized input, seat, interaction,
 scene, and physical-output owners in one Coordinator event turn. An ordinary
 XDG client discovers the published globals, acknowledges its exact initial
 configure, maps unsealed SHM, enters the one-workspace tiled desktop, and
-receives generation-safe pointer and keyboard delivery:
+receives generation-safe pointer motion, buttons, scrolling, and keyboard
+delivery:
 
 ```sh
 zig build run -- --socket=/tmp/ouro.sock --renderer=auto
