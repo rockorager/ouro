@@ -81,6 +81,7 @@ pub fn Desktop(comptime Shell: type) type {
             mode: Mode = .tiled,
             floating: geometry.Rect = undefined,
             scene: SceneWindow = undefined,
+            target_scene: SceneWindow = undefined,
             title: []u8 = &.{},
             title_len: usize = 0,
             app_id: []u8 = &.{},
@@ -95,6 +96,9 @@ pub fn Desktop(comptime Shell: type) type {
             content_ready: bool = false,
             configured: bool = false,
             last_configure: Shell.ToplevelConfigure = .{ .width = 0, .height = 0 },
+            applied_configure: ?Shell.ToplevelConfigure = null,
+            expected_serial: ?u32 = null,
+            configure_ready: bool = false,
         };
 
         const Desired = struct {
@@ -124,6 +128,7 @@ pub fn Desktop(comptime Shell: type) type {
         command_len: usize = 0,
         pending_event: ?Shell.Event = null,
         destroyed: ?ToplevelId = null,
+        scene_changed: bool = false,
 
         pub fn init(
             allocator: std.mem.Allocator,
@@ -228,6 +233,13 @@ pub fn Desktop(comptime Shell: type) type {
         pub fn flushConfigure(desktop: *Self, shell: *Shell) !?u32 {
             const command = desktop.peekCommand() orelse return null;
             const serial = try shell.queueToplevelConfigure(command.shell_id, command.configure);
+            if (desktop.resolveIndex(command.id)) |index| {
+                const slot = &desktop.slots[index];
+                if (std.meta.eql(slot.last_configure, command.configure)) {
+                    slot.expected_serial = serial;
+                    slot.configure_ready = false;
+                }
+            } else |_| {}
             desktop.dropCommand();
             return serial;
         }
@@ -240,6 +252,12 @@ pub fn Desktop(comptime Shell: type) type {
             const id = desktop.destroyed;
             desktop.destroyed = null;
             return id;
+        }
+
+        pub fn takeSceneChanged(desktop: *Self) bool {
+            const changed = desktop.scene_changed;
+            desktop.scene_changed = false;
+            return changed;
         }
 
         pub fn focused(desktop: *const Self) ?ToplevelId {
@@ -365,10 +383,14 @@ pub fn Desktop(comptime Shell: type) type {
                     request.state,
                     request.enabled,
                 ),
-                .commit_ready => |shell_id| {
-                    const index = try desktop.resolveIndex(try desktop.idForShell(shell_id));
+                .commit_ready => |commit| {
+                    const index = try desktop.resolveIndex(try desktop.idForShell(commit.id));
                     desktop.slots[index].content_ready = true;
                     desktop.slots[index].scene.content_ready = true;
+                    desktop.slots[index].target_scene.content_ready = true;
+                    if (desktop.slots[index].expected_serial == commit.serial)
+                        desktop.slots[index].configure_ready = true;
+                    desktop.publishReadyScene();
                 },
                 .toplevel_destroyed => |shell_id| try desktop.destroyShell(shell_id),
             }
@@ -393,6 +415,7 @@ pub fn Desktop(comptime Shell: type) type {
                 .mode = .tiled,
                 .content_ready = false,
             };
+            slot.target_scene = slot.scene;
             desktop.live += 1;
             desktop.appendTile(index);
             desktop.promoteFocus(index);
@@ -549,8 +572,10 @@ pub fn Desktop(comptime Shell: type) type {
                     });
                     slot.last_configure = desired.configure;
                     slot.configured = true;
+                    slot.expected_serial = null;
+                    slot.configure_ready = false;
                 }
-                slot.scene = .{
+                slot.target_scene = .{
                     .id = desktop.idFor(@intCast(index)),
                     .surface = slot.surface,
                     .geometry = desired.rect,
@@ -560,6 +585,28 @@ pub fn Desktop(comptime Shell: type) type {
                     .content_ready = slot.content_ready,
                 };
             }
+            desktop.publishReadyScene();
+        }
+
+        fn publishReadyScene(desktop: *Self) void {
+            for (desktop.slots) |slot| {
+                if (!slot.header.active or !slot.configured) continue;
+                if (slot.applied_configure == null or
+                    !std.meta.eql(slot.applied_configure.?, slot.last_configure))
+                {
+                    if (slot.expected_serial == null or !slot.configure_ready) return;
+                }
+            }
+            var changed = false;
+            for (desktop.slots) |*slot| {
+                if (!slot.header.active) continue;
+                changed = !std.meta.eql(slot.scene, slot.target_scene) or changed;
+                slot.scene = slot.target_scene;
+                if (slot.configured) slot.applied_configure = slot.last_configure;
+                slot.expected_serial = null;
+                slot.configure_ready = false;
+            }
+            desktop.scene_changed = changed or desktop.scene_changed;
         }
 
         fn defaultFloating(desktop: *const Self) geometry.Rect {
@@ -744,7 +791,7 @@ const TestShell = struct {
         toplevel_created: struct { id: ToplevelId, surface: SurfaceId },
         metadata_changed: ToplevelId,
         state_requested: struct { id: ToplevelId, state: RequestedState, enabled: bool },
-        commit_ready: ToplevelId,
+        commit_ready: struct { id: ToplevelId, serial: u32 },
         toplevel_destroyed: ToplevelId,
     };
 
@@ -819,6 +866,18 @@ fn created(index: u32) TestShell.Event {
     } };
 }
 
+fn settleDesktop(desktop: *TestDesktop, shell: *TestShell) !void {
+    while (desktop.pendingCommands() != 0) _ = try desktop.flushConfigure(shell);
+    for (desktop.slots) |slot| {
+        if (!slot.header.active) continue;
+        if (slot.expected_serial) |serial| shell.push(.{ .commit_ready = .{
+            .id = slot.shell_id,
+            .serial = serial,
+        } });
+    }
+    _ = try desktop.consume(shell, shell.len);
+}
+
 test "desktop: shell events produce exact tiling, focus, metadata, and configures" {
     var desktop = try initTestDesktop(8);
     defer desktop.deinit();
@@ -829,10 +888,13 @@ test "desktop: shell events produce exact tiling, focus, metadata, and configure
 
     const first = try desktop.idForShell(.{ .index = 0, .generation = 1 });
     const second = try desktop.idForShell(.{ .index = 1, .generation = 1 });
+    try std.testing.expectEqual(geometry.Rect{ .x = 0, .y = 0, .width = 100, .height = 60 }, (try desktop.scene(first)).geometry);
+    try std.testing.expectEqual(@as(usize, 3), desktop.pendingCommands());
+    try settleDesktop(&desktop, &shell);
     try std.testing.expectEqual(geometry.Rect{ .x = 0, .y = 0, .width = 50, .height = 60 }, (try desktop.scene(first)).geometry);
     try std.testing.expectEqual(geometry.Rect{ .x = 50, .y = 0, .width = 50, .height = 60 }, (try desktop.scene(second)).geometry);
     try std.testing.expectEqual(second, desktop.focused().?);
-    try std.testing.expectEqual(@as(usize, 3), desktop.pendingCommands());
+    try std.testing.expectEqual(@as(usize, 0), desktop.pendingCommands());
     var snapshot_storage: [3]TestDesktop.SceneWindow = undefined;
     const snapshot = try desktop.sceneSnapshot(&snapshot_storage);
     try std.testing.expectEqual(@as(usize, 2), snapshot.len);
@@ -841,10 +903,58 @@ test "desktop: shell events produce exact tiling, focus, metadata, and configure
     shell.title = "terminal";
     shell.app_id = "term";
     shell.push(.{ .metadata_changed = .{ .index = 0, .generation = 1 } });
-    shell.push(.{ .commit_ready = .{ .index = 0, .generation = 1 } });
+    shell.push(.{ .commit_ready = .{
+        .id = .{ .index = 0, .generation = 1 },
+        .serial = 0,
+    } });
     try std.testing.expectEqual(@as(usize, 2), try desktop.consume(&shell, 8));
     try std.testing.expectEqualStrings("terminal", (try desktop.metadata(first)).title);
     try std.testing.expect((try desktop.scene(first)).content_ready);
+}
+
+test "desktop: scene transaction waits for every exact configure serial" {
+    var desktop = try initTestDesktop(8);
+    defer desktop.deinit();
+    var shell = TestShell{};
+    shell.push(created(0));
+    shell.push(created(1));
+    _ = try desktop.consume(&shell, 2);
+
+    const first = try desktop.idForShell(.{ .index = 0, .generation = 1 });
+    const second = try desktop.idForShell(.{ .index = 1, .generation = 1 });
+    while (desktop.pendingCommands() != 0) _ = try desktop.flushConfigure(&shell);
+    const first_serial = desktop.slots[try desktop.resolveIndex(first)].expected_serial.?;
+    const second_serial = desktop.slots[try desktop.resolveIndex(second)].expected_serial.?;
+
+    shell.push(.{ .commit_ready = .{
+        .id = .{ .index = 0, .generation = 1 },
+        .serial = first_serial,
+    } });
+    shell.push(.{ .commit_ready = .{
+        .id = .{ .index = 1, .generation = 1 },
+        .serial = second_serial - 1,
+    } });
+    _ = try desktop.consume(&shell, 2);
+    try std.testing.expectEqual(
+        geometry.Rect{ .x = 0, .y = 0, .width = 100, .height = 60 },
+        (try desktop.scene(first)).geometry,
+    );
+    try std.testing.expect(!desktop.takeSceneChanged());
+
+    shell.push(.{ .commit_ready = .{
+        .id = .{ .index = 1, .generation = 1 },
+        .serial = second_serial,
+    } });
+    _ = try desktop.consume(&shell, 1);
+    try std.testing.expectEqual(
+        geometry.Rect{ .x = 0, .y = 0, .width = 50, .height = 60 },
+        (try desktop.scene(first)).geometry,
+    );
+    try std.testing.expectEqual(
+        geometry.Rect{ .x = 50, .y = 0, .width = 50, .height = 60 },
+        (try desktop.scene(second)).geometry,
+    );
+    try std.testing.expect(desktop.takeSceneChanged());
 }
 
 test "desktop: focus history and tiled-floating transitions are deterministic" {
@@ -855,13 +965,14 @@ test "desktop: focus history and tiled-floating transitions are deterministic" {
     shell.push(created(1));
     shell.push(created(2));
     _ = try desktop.consume(&shell, 8);
-    while (desktop.peekCommand() != null) desktop.dropCommand();
+    try settleDesktop(&desktop, &shell);
 
     const first = try desktop.idForShell(.{ .index = 0, .generation = 1 });
     const third = try desktop.idForShell(.{ .index = 2, .generation = 1 });
     try desktop.focusToplevel(first);
     try desktop.setFloating(first, true);
     try desktop.setFloatingGeometry(first, .{ .x = 5, .y = 6, .width = 30, .height = 20 });
+    try settleDesktop(&desktop, &shell);
     try std.testing.expectEqual(first, desktop.focused().?);
     try std.testing.expectEqual(geometry.Rect{ .x = 5, .y = 6, .width = 30, .height = 20 }, (try desktop.scene(first)).geometry);
 
@@ -880,7 +991,7 @@ test "desktop: queued destroys preserve exact generations in order" {
     shell.push(created(0));
     shell.push(created(1));
     _ = try desktop.consume(&shell, 2);
-    while (desktop.peekCommand() != null) desktop.dropCommand();
+    try settleDesktop(&desktop, &shell);
 
     shell.push(.{ .toplevel_destroyed = .{ .index = 0, .generation = 1 } });
     shell.push(.{ .toplevel_destroyed = .{ .index = 1, .generation = 1 } });
@@ -988,7 +1099,7 @@ test "desktop: minimized and fullscreen requests update visibility and states" {
     const first = try desktop.idForShell(.{ .index = 0, .generation = 1 });
     const second = try desktop.idForShell(.{ .index = 1, .generation = 1 });
     try desktop.focusToplevel(first);
-    while (desktop.peekCommand() != null) desktop.dropCommand();
+    try settleDesktop(&desktop, &shell);
 
     shell.push(.{ .state_requested = .{
         .id = .{ .index = 0, .generation = 1 },
@@ -996,6 +1107,7 @@ test "desktop: minimized and fullscreen requests update visibility and states" {
         .enabled = true,
     } });
     _ = try desktop.consume(&shell, 1);
+    try settleDesktop(&desktop, &shell);
     const fullscreen = try desktop.scene(first);
     try std.testing.expectEqual(geometry.Rect{ .x = 0, .y = 0, .width = 100, .height = 60 }, fullscreen.geometry);
     try std.testing.expect(fullscreen.stacking > (try desktop.scene(second)).stacking);
@@ -1007,6 +1119,7 @@ test "desktop: minimized and fullscreen requests update visibility and states" {
         .enabled = true,
     } });
     _ = try desktop.consume(&shell, 1);
+    try settleDesktop(&desktop, &shell);
     try std.testing.expect(!(try desktop.scene(first)).visible);
     try std.testing.expectEqual(second, desktop.focused().?);
 }

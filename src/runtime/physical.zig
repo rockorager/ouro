@@ -747,6 +747,17 @@ pub fn Coordinator(comptime protocol: type) type {
                     else => return err,
                 }) |_| self.stats.configures += 1;
             }
+            if (self.desktop.takeSceneChanged()) try self.desktopSceneChanged();
+        }
+
+        fn desktopSceneChanged(self: *Self) !void {
+            const output = self.output orelse return;
+            _ = self.refreshRetainedLayersForOutput();
+            output.request(.damage, try monotonicNs()) catch |err| switch (err) {
+                error.OutputPaused => return,
+                else => return err,
+            };
+            try self.armTimer();
         }
 
         fn applyInteractionCommands(self: *Self) !void {

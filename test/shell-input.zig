@@ -283,7 +283,7 @@ test "shell-input: two mapped toplevels render in desktop stacking order" {
     config.shm.buffer_capacity = 2;
     config.surface.surface_capacity = 2;
     config.surface.frame_callback_capacity = 2;
-    config.surface.content_update_capacity = 2;
+    config.surface.content_update_capacity = 3;
     config.surface.dependency_capacity = 2;
     config.surface.attachment_capacity = 2;
     config.surface.copy_capacity = 2;
@@ -544,7 +544,15 @@ const MultiHandler = struct {
                     try protocol.xdg_surface.encodeRequest(self.queue, self.xdg_surfaces[index].?.id, .{
                         .ack_configure = .{ .serial = value.serial },
                     });
-                    if (!self.mapped[index]) try self.mapSurface(index);
+                    if (!self.mapped[index]) {
+                        try self.mapSurface(index);
+                    } else {
+                        try protocol.wl_surface.encodeRequest(
+                            self.queue,
+                            self.surfaces[index].?.id,
+                            .{ .commit = .{} },
+                        );
+                    }
                 },
             }
         } else if (target.object.interface == &protocol.wl_buffer.info) {

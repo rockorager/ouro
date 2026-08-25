@@ -98,7 +98,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 state: RequestedState,
                 enabled: bool,
             },
-            commit_ready: ToplevelId,
+            commit_ready: struct { id: ToplevelId, serial: u32 },
             toplevel_destroyed: ToplevelId,
         };
 
@@ -523,7 +523,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             for (adapter.surfaces) |*slot| {
                 if (!slot.header.active or !std.meta.eql(slot.surface_id, id)) continue;
                 switch (slot.role) {
-                    .toplevel => |toplevel| adapter.publishReserved(.{ .commit_ready = toplevel }),
+                    .toplevel => |toplevel| adapter.publishReserved(.{ .commit_ready = .{
+                        .id = toplevel,
+                        .serial = slot.last_acked_serial,
+                    } }),
                     .popup, .none => {},
                 }
                 return;
@@ -1889,10 +1892,12 @@ test "xdg-shell: configure emission resumes between role and surface events" {
     try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
     try std.testing.expectEqual(serial, try context.adapter.lastAckedConfigure(id));
     try context.adapter.surfaceCommitted(context.adapter.surfaces[0].surface_id);
-    try std.testing.expectEqual(id, switch (context.adapter.popEvent().?) {
-        .commit_ready => |ready| ready,
+    const ready = switch (context.adapter.popEvent().?) {
+        .commit_ready => |value| value,
         else => return error.UnexpectedEvent,
-    });
+    };
+    try std.testing.expectEqual(id, ready.id);
+    try std.testing.expectEqual(serial, ready.serial);
 }
 
 test "xdg-shell: full commit event capacity rejects before core mutation" {
@@ -1922,10 +1927,12 @@ test "xdg-shell: full commit event capacity rejects before core mutation" {
         .state_requested => |requested| requested.id,
         else => return error.UnexpectedEvent,
     });
-    try std.testing.expectEqual(id, switch (context.adapter.popEvent().?) {
-        .commit_ready => |ready| ready,
+    const ready = switch (context.adapter.popEvent().?) {
+        .commit_ready => |value| value,
         else => return error.UnexpectedEvent,
-    });
+    };
+    try std.testing.expectEqual(id, ready.id);
+    try std.testing.expectEqual(@as(u32, 1), ready.serial);
 }
 
 test "xdg-shell: flushing is client scoped with overlapping object IDs" {
