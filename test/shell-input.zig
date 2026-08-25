@@ -204,7 +204,9 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     try std.testing.expect(handler.output_name);
     try std.testing.expect(handler.output_description);
     try std.testing.expect(handler.output_done != 0);
-    try std.testing.expect(handler.output_released);
+    try std.testing.expectEqual(@as(usize, 2), handler.output_enter);
+    try std.testing.expectEqual(@as(usize, 0), handler.output_leave);
+    try std.testing.expect(!handler.output_released);
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
 
     const retained_app = coordinator.app_layers[0].sample.?;
@@ -212,33 +214,43 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     const first_output_generation = coordinator.output.?.outputId().generation;
     try fixture.signalSession(.disable);
     for (0..128) |_| {
+        client_progress = try drainClient(&client_reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
-        if (coordinator.output == null and coordinator.session.state == .disabled) break;
-        if (root.ring.cq_ready() == 0) try waitServer(&root.ring);
+        if (coordinator.output == null and coordinator.session.state == .disabled and
+            handler.output_leave == 2) break;
+        if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, client_reactor.ring);
     }
     try std.testing.expect(coordinator.output == null);
+    try std.testing.expectEqual(@as(usize, 2), handler.output_leave);
     try std.testing.expect(coordinator.app_layers[0].active);
     try std.testing.expect(coordinator.cursor_layer.active);
     try std.testing.expectEqual(retained_app.sample, coordinator.app_layers[0].sample.?.sample);
     try std.testing.expectEqual(retained_cursor.sample, coordinator.cursor_layer.sample.?.sample);
     try fixture.signalSession(.enable);
     for (0..128) |_| {
+        client_progress = try drainClient(&client_reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
-        if (coordinator.stats.presented == 4) break;
-        if (root.ring.cq_ready() == 0) try waitServer(&root.ring);
+        if (coordinator.stats.presented == 4 and handler.output_enter == 4 and
+            handler.output_deleted) break;
+        if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, client_reactor.ring);
     }
     try std.testing.expectEqual(@as(usize, 4), coordinator.stats.submitted);
     try std.testing.expectEqual(@as(usize, 4), coordinator.stats.presented);
     try std.testing.expect(coordinator.output.?.outputId().generation != first_output_generation);
     try std.testing.expectEqual(retained_app.sample, coordinator.app_layers[0].sample.?.sample);
     try std.testing.expectEqual(retained_cursor.sample, coordinator.cursor_layer.sample.?.sample);
+    try std.testing.expectEqual(@as(usize, 4), handler.output_enter);
+    try std.testing.expect(handler.output_released);
+    try std.testing.expect(handler.output_deleted);
 
     try handler.destroyCursor();
     try submitClient(&client_reactor, &driver, &handler);
     for (0..64) |_| {
         client_progress = try drainClient(&client_reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
-        if (!coordinator.cursor_layer.active) break;
+        if (!coordinator.cursor_layer.active and handler.output_deleted) break;
         if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
             try waitForEither(&root.ring, client_reactor.ring);
     }
@@ -758,6 +770,8 @@ const Handler = struct {
     output_name: bool = false,
     output_description: bool = false,
     output_done: usize = 0,
+    output_enter: usize = 0,
+    output_leave: usize = 0,
     output_released: bool = false,
     output_deleted: bool = false,
     event_failures: usize = 0,
@@ -822,7 +836,14 @@ const Handler = struct {
                 },
                 .done => {
                     self.output_done += 1;
-                    if (self.output_mode and !self.output_released) {
+                },
+            }
+        } else if (target.object.interface == &protocol.wl_surface.info) {
+            switch (try protocol.wl_surface.decodeEvent(message, fds)) {
+                .enter => |value| {
+                    try std.testing.expectEqual(self.output.?.id, value.output);
+                    self.output_enter += 1;
+                    if (self.output_enter == 4 and !self.output_released) {
                         try wayring.client.sendRequest(
                             protocol.wl_output,
                             self.objects,
@@ -833,6 +854,11 @@ const Handler = struct {
                         self.output_released = true;
                     }
                 },
+                .leave => |value| {
+                    try std.testing.expectEqual(self.output.?.id, value.output);
+                    self.output_leave += 1;
+                },
+                else => {},
             }
         } else if (target.object.interface == &protocol.xdg_toplevel.info) {
             switch (try protocol.xdg_toplevel.decodeEvent(message, fds)) {

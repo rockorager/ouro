@@ -8,6 +8,7 @@ const none = std.math.maxInt(u32);
 
 pub const Config = struct {
     resource_capacity: usize = 4,
+    association_capacity: usize = 16,
     outbound_capacity: usize = 64,
     global_version: u32 = 4,
     name: []const u8 = "ouro-0",
@@ -19,7 +20,8 @@ pub const Config = struct {
     scale: i32 = 1,
 
     fn validate(config: Config) !void {
-        if (config.resource_capacity == 0 or config.resource_capacity >= none or
+        if (config.resource_capacity == 0 or config.resource_capacity > 64 or
+            config.association_capacity == 0 or config.association_capacity >= none or
             config.resource_capacity > config.outbound_capacity / 9 or
             config.outbound_capacity >= none or config.scale <= 0)
             return error.InvalidConfig;
@@ -45,6 +47,13 @@ pub fn Adapter(comptime protocol: type) type {
             handle: objects.Handle = .{ .id = 0, .generation = 0 },
             version: u32 = 0,
         };
+        const Association = struct {
+            active: bool = false,
+            desired: bool = false,
+            next_free: u32 = none,
+            surface: objects.Handle = .{ .id = 0, .generation = 0 },
+            entered: u64 = 0,
+        };
         const Mode = struct { width: i32, height: i32, refresh_millihz: i32 };
         const Event = enum { geometry, mode, scale, name, description, done };
         const Outbound = struct {
@@ -66,8 +75,11 @@ pub fn Adapter(comptime protocol: type) type {
         physical_height_mm: i32,
         scale: i32,
         mode: ?Mode = null,
+        available: bool = false,
         resources: []Resource,
         resource_free: u32,
+        associations: []Association,
+        association_free: u32,
         outbound: []Outbound,
         next_sequence: u64 = 1,
 
@@ -76,6 +88,8 @@ pub fn Adapter(comptime protocol: type) type {
             try Output.info.validateVersion(config.global_version);
             const resources = try allocator.alloc(Resource, config.resource_capacity);
             errdefer allocator.free(resources);
+            const associations = try allocator.alloc(Association, config.association_capacity);
+            errdefer allocator.free(associations);
             const outbound = try allocator.alloc(Outbound, config.outbound_capacity);
             errdefer allocator.free(outbound);
             const name = try allocator.dupe(u8, config.name);
@@ -88,6 +102,9 @@ pub fn Adapter(comptime protocol: type) type {
             errdefer allocator.free(model);
             for (resources, 0..) |*resource, index| resource.* = .{
                 .next_free = if (index + 1 < resources.len) @intCast(index + 1) else none,
+            };
+            for (associations, 0..) |*association, index| association.* = .{
+                .next_free = if (index + 1 < associations.len) @intCast(index + 1) else none,
             };
             @memset(outbound, .{});
             return .{
@@ -102,6 +119,8 @@ pub fn Adapter(comptime protocol: type) type {
                 .scale = config.scale,
                 .resources = resources,
                 .resource_free = 0,
+                .associations = associations,
+                .association_free = 0,
                 .outbound = outbound,
             };
         }
@@ -112,6 +131,7 @@ pub fn Adapter(comptime protocol: type) type {
             adapter.allocator.free(adapter.description);
             adapter.allocator.free(adapter.name);
             adapter.allocator.free(adapter.outbound);
+            adapter.allocator.free(adapter.associations);
             adapter.allocator.free(adapter.resources);
             adapter.* = undefined;
         }
@@ -169,12 +189,55 @@ pub fn Adapter(comptime protocol: type) type {
                 .height = @intCast(height),
                 .refresh_millihz = @intCast(refresh_millihz),
             };
+            adapter.available = true;
             for (adapter.resources, 0..) |resource, index| if (resource.active) {
                 const id = adapter.idFor(@intCast(index));
                 adapter.enqueue(id, .geometry) catch unreachable;
                 adapter.enqueue(id, .mode) catch unreachable;
                 if (resource.version >= 2) adapter.enqueue(id, .done) catch unreachable;
             };
+        }
+
+        pub fn setAvailable(adapter: *Self, available: bool) void {
+            adapter.available = available;
+        }
+
+        /// Reconciles the mapped surface set without directly writing the
+        /// transport. `flushOn` retains each enter/leave transition until its
+        /// generated event is accepted.
+        pub fn reconcileSurfaces(adapter: *Self, surfaces: []const objects.Handle) !void {
+            if (surfaces.len > adapter.associations.len) return error.Exhausted;
+            for (surfaces, 0..) |surface, index| {
+                if (surface.id == 0 or surface.generation == 0) return error.InvalidSurface;
+                for (surfaces[0..index]) |previous|
+                    if (std.meta.eql(surface, previous)) return error.DuplicateSurface;
+            }
+            var required: usize = 0;
+            for (surfaces) |surface| {
+                if (adapter.findAssociation(surface) == null) required += 1;
+            }
+            var free: usize = 0;
+            for (adapter.associations) |association| free += @intFromBool(!association.active);
+            if (required > free) return error.Exhausted;
+
+            for (adapter.associations) |*association| {
+                if (association.active) association.desired = false;
+            }
+            for (surfaces) |surface| {
+                if (adapter.findAssociation(surface)) |association| {
+                    association.desired = true;
+                } else {
+                    const association = adapter.acquireAssociation() catch unreachable;
+                    association.surface = surface;
+                    association.desired = true;
+                }
+            }
+            var index: usize = 0;
+            while (index < adapter.associations.len) : (index += 1) {
+                const association = &adapter.associations[index];
+                if (association.active and !association.desired and association.entered == 0)
+                    adapter.releaseAssociation(@intCast(index));
+            }
         }
 
         pub fn request(
@@ -199,11 +262,25 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         pub fn resourceRemoved(adapter: *Self, handle: objects.Handle, object: objects.Object) bool {
+            if (object.interface == &protocol.wl_surface.info) {
+                if (adapter.findAssociation(handle)) |association|
+                    adapter.releaseAssociation(adapter.associationIndex(association));
+                return false;
+            }
             if (object.interface != &Output.info) return false;
             const resource = adapter.fromContext(object.context) orelse return false;
             if (!std.meta.eql(resource.handle, handle)) return false;
             const id = adapter.idFor(adapter.indexFor(resource));
             adapter.dropOutbound(id);
+            const bit = @as(u64, 1) << @intCast(id.index);
+            var association_index: usize = 0;
+            while (association_index < adapter.associations.len) : (association_index += 1) {
+                const association = &adapter.associations[association_index];
+                if (!association.active) continue;
+                association.entered &= ~bit;
+                if (!association.desired and association.entered == 0)
+                    adapter.releaseAssociation(@intCast(association_index));
+            }
             adapter.releaseResource(id.index);
             return true;
         }
@@ -211,10 +288,19 @@ pub fn Adapter(comptime protocol: type) type {
         pub fn pendingOutbound(adapter: *const Self) usize {
             var count: usize = 0;
             for (adapter.outbound) |slot| count += @intFromBool(slot.active);
+            for (adapter.associations) |association| {
+                if (!association.active) continue;
+                for (adapter.resources, 0..) |resource, index| {
+                    if (!resource.active) continue;
+                    const bit = @as(u64, 1) << @intCast(index);
+                    const entered = association.entered & bit != 0;
+                    count += @intFromBool(entered != (adapter.available and association.desired));
+                }
+            }
             return count;
         }
 
-        pub fn flushOn(adapter: *Self, queue: *wayring.tx.Queue) !usize {
+        pub fn flushOn(adapter: *Self, server_objects: anytype, queue: *wayring.tx.Queue) !usize {
             var completed: usize = 0;
             while (adapter.oldestOutbound()) |slot| {
                 adapter.emit(queue, slot.*) catch |err| switch (err) {
@@ -223,6 +309,54 @@ pub fn Adapter(comptime protocol: type) type {
                 };
                 slot.active = false;
                 completed += 1;
+            }
+            completed += try adapter.flushAssociations(server_objects, queue);
+            return completed;
+        }
+
+        fn flushAssociations(
+            adapter: *Self,
+            server_objects: anytype,
+            queue: *wayring.tx.Queue,
+        ) !usize {
+            var completed: usize = 0;
+            var association_index: usize = 0;
+            while (association_index < adapter.associations.len) : (association_index += 1) {
+                const association = &adapter.associations[association_index];
+                if (!association.active) continue;
+                const surface = server_objects.namespace.resolve(association.surface) orelse {
+                    adapter.releaseAssociation(@intCast(association_index));
+                    continue;
+                };
+                if (surface.interface != &protocol.wl_surface.info) {
+                    adapter.releaseAssociation(@intCast(association_index));
+                    continue;
+                }
+                for (adapter.resources, 0..) |resource, resource_index| {
+                    if (!resource.active) continue;
+                    const bit = @as(u64, 1) << @intCast(resource_index);
+                    const entered = association.entered & bit != 0;
+                    const should_enter = adapter.available and association.desired;
+                    if (entered == should_enter) continue;
+                    protocol.wl_surface.encodeEvent(
+                        queue,
+                        association.surface.id,
+                        if (should_enter)
+                            .{ .enter = .{ .output = resource.handle.id } }
+                        else
+                            .{ .leave = .{ .output = resource.handle.id } },
+                    ) catch |err| switch (err) {
+                        error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return completed,
+                        else => return err,
+                    };
+                    if (should_enter)
+                        association.entered |= bit
+                    else
+                        association.entered &= ~bit;
+                    completed += 1;
+                }
+                if (!association.desired and association.entered == 0)
+                    adapter.releaseAssociation(@intCast(association_index));
             }
             return completed;
         }
@@ -289,8 +423,36 @@ pub fn Adapter(comptime protocol: type) type {
             adapter.resource_free = index;
         }
 
+        fn acquireAssociation(adapter: *Self) !*Association {
+            if (adapter.association_free == none) return error.Exhausted;
+            const index = adapter.association_free;
+            const association = &adapter.associations[index];
+            adapter.association_free = association.next_free;
+            association.* = .{ .active = true };
+            return association;
+        }
+
+        fn releaseAssociation(adapter: *Self, index: u32) void {
+            adapter.associations[index] = .{ .next_free = adapter.association_free };
+            adapter.association_free = index;
+        }
+
+        fn findAssociation(adapter: *Self, surface: objects.Handle) ?*Association {
+            for (adapter.associations) |*association|
+                if (association.active and std.meta.eql(association.surface, surface))
+                    return association;
+            return null;
+        }
+
+        fn associationIndex(adapter: *const Self, association: *const Association) u32 {
+            return @intCast((@intFromPtr(association) - @intFromPtr(adapter.associations.ptr)) /
+                @sizeOf(Association));
+        }
+
         fn ensureOutbound(adapter: *const Self, needed: usize) !void {
-            if (adapter.pendingOutbound() + needed > adapter.outbound.len) return error.Exhausted;
+            var pending: usize = 0;
+            for (adapter.outbound) |slot| pending += @intFromBool(slot.active);
+            if (pending + needed > adapter.outbound.len) return error.Exhausted;
         }
 
         fn enqueue(adapter: *Self, resource: Id, event: Event) !void {

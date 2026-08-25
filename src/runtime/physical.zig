@@ -189,6 +189,7 @@ pub fn Coordinator(comptime protocol: type) type {
         frame_samples: []render_list.AppliedSurface,
         frame_bindings: []output_api.SampleBinding,
         frame_changes: []damage.Change,
+        association_surfaces: []wayring.objects.Handle,
         desktop_timer: ?timer.Handle = null,
         desktop_timer_canceling: bool = false,
         cursor_layer: Layer,
@@ -232,7 +233,8 @@ pub fn Coordinator(comptime protocol: type) type {
             self.pending_surface_head = 0;
             self.pending_surface_len = 0;
             if (config.timer_capacity < 4 or config.desktop_transaction_timeout_ns == 0 or
-                config.output.max_samples < 2 or config.output.max_source_bytes == 0)
+                config.output.max_samples < 2 or config.output.max_source_bytes == 0 or
+                config.protocol_output.association_capacity < config.output.max_samples)
                 return error.InvalidConfig;
             self.app_layers = try allocator.alloc(Layer, config.output.max_samples - 1);
             errdefer allocator.free(self.app_layers);
@@ -245,6 +247,11 @@ pub fn Coordinator(comptime protocol: type) type {
             errdefer allocator.free(self.frame_bindings);
             self.frame_changes = try allocator.alloc(damage.Change, config.output.max_samples);
             errdefer allocator.free(self.frame_changes);
+            self.association_surfaces = try allocator.alloc(
+                wayring.objects.Handle,
+                config.output.max_samples,
+            );
+            errdefer allocator.free(self.association_surfaces);
             self.desktop_timer = null;
             self.desktop_timer_canceling = false;
             self.cursor_layer = .{};
@@ -372,6 +379,7 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             self.presentations.deinit(self.allocator);
             self.allocator.free(self.pending_surfaces);
+            self.allocator.free(self.association_surfaces);
             self.allocator.free(self.frame_changes);
             self.allocator.free(self.frame_bindings);
             self.allocator.free(self.frame_samples);
@@ -538,6 +546,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 else => return err,
             };
             try self.processSeatEvents();
+            try self.syncOutputAssociations();
             try self.flushProtocol();
             try self.advanceDrain();
         }
@@ -896,7 +905,7 @@ pub fn Coordinator(comptime protocol: type) type {
             const actor = try self.root.runtime.clients.reactor.getActor(peer);
             const shell_flushed = try self.shell_adapter.flushOn(objects, &actor.transmit);
             const seat_flushed = try self.seat_adapter.flushOn(objects, &actor.transmit);
-            const output_flushed = try self.output_adapter.flushOn(&actor.transmit);
+            const output_flushed = try self.output_adapter.flushOn(objects, &actor.transmit);
             if (shell_flushed != 0 or seat_flushed != 0 or output_flushed != 0 or
                 self.shell_adapter.pendingOutbound() != 0 or
                 self.seat_adapter.pendingOutbound() != 0 or
@@ -1515,8 +1524,24 @@ pub fn Coordinator(comptime protocol: type) type {
         fn pauseOutput(self: *Self) !void {
             const output = self.output orelse return;
             if (!output.accepting_frames) return;
+            self.output_adapter.setAvailable(false);
             if (try output.requestPause()) |action| try self.consumeRetireAction(action);
             try self.processOutput();
+        }
+
+        fn syncOutputAssociations(self: *Self) !void {
+            var count: usize = 0;
+            for (self.app_layers) |layer| {
+                if (!layer.active) continue;
+                self.association_surfaces[count] = layer.surface orelse return error.StaleSurface;
+                count += 1;
+            }
+            if (self.cursor_layer.active) {
+                self.association_surfaces[count] = self.cursor_layer.surface orelse
+                    return error.StaleSurface;
+                count += 1;
+            }
+            try self.output_adapter.reconcileSurfaces(self.association_surfaces[0..count]);
         }
 
         fn consumeRetireAction(self: *Self, action: output_api.RetireAction) !void {
@@ -1585,6 +1610,7 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn cleanupUnstartedOutput(self: *Self) void {
             const output = self.output orelse return;
+            self.output_adapter.setAvailable(false);
             if (output.accepting_frames) {
                 if (output.requestPause() catch unreachable) |action|
                     self.consumeRetireAction(action) catch unreachable;

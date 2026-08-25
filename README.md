@@ -51,7 +51,8 @@ responsibilities:
 - [Wayland output](src/protocol/output.zig): clients discover the selected
   physical output's geometry, current and preferred DRM mode, refresh rate,
   scale, stable name, and description through version-correct `wl_output`
-  snapshots and updates.
+  snapshots and updates. Mapped surfaces receive resumable `enter`/`leave`
+  associations across output suspension and recreation.
 - [Desktop interaction](src/input/interaction.zig): pointer motion hit-tests
   exact committed input regions against the copied desktop scene, retains
   default/button-grab state and protocol-neutral focus commands, and places a
