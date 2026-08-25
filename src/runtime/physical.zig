@@ -933,9 +933,10 @@ pub fn Coordinator(comptime protocol: type) type {
                         try self.seat_adapter.setPointerFocus(seat_target, point);
                     },
                     .keyboard_focus => |target| {
+                        const peer = try self.adapter.surfacePeer(target.surface);
                         const seat_target = try self.seatTarget(target.surface);
                         try self.seat_adapter.setKeyboardFocus(seat_target);
-                        try self.data_device_adapter.setFocus(self.peer orelse return error.ClientDisconnected);
+                        try self.data_device_adapter.setFocus(peer);
                     },
                     .cancel => |cancel| {
                         if (cancel.pointer_focus)
@@ -956,7 +957,7 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn seatTarget(self: *Self, surface: Adapter.SurfaceId) !SeatAdapter.FocusTarget {
             return try self.seat_adapter.makeTarget(
-                self.peer orelse return error.ClientDisconnected,
+                try self.adapter.surfacePeer(surface),
                 surface,
             );
         }
@@ -1216,7 +1217,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (applied.len == 0) return false;
                 self.pendingCommitApplied(pending.id);
                 layer.candidate = .{
-                    .peer = self.peer,
+                    .peer = try self.adapter.surfacePeer(exact_surface_id),
                     .surface = surface,
                     .id = exact_surface_id,
                     .content = applied[0].payload,

@@ -127,6 +127,7 @@ pub fn Adapter(comptime protocol: type) type {
             active: bool = false,
             next_free: u32 = none,
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
+            peer: wayring.io_uring.Peer = undefined,
             state: surface_state.Surface = .{},
             regions: surface_state.SurfaceRegions = undefined,
             frames: surface_state.FrameQueue = undefined,
@@ -562,6 +563,14 @@ pub fn Adapter(comptime protocol: type) type {
             return &slot.state;
         }
 
+        pub fn surfacePeer(adapter: *Self, id: SurfaceId) !wayring.io_uring.Peer {
+            if (id.index >= adapter.surfaces.len) return error.StaleSurface;
+            const slot = &adapter.surfaces[id.index];
+            if (!slot.active or slot.resource.generation != id.generation)
+                return error.StaleSurface;
+            return slot.peer;
+        }
+
         /// Installs the composition root's two-phase shell boundary. Validation
         /// runs before the transactional core commit; publication runs only
         /// after the core owner has accepted it.
@@ -849,6 +858,7 @@ pub fn Adapter(comptime protocol: type) type {
                         return try adapter.failure(actor, decoded.handle.id, cause);
                     };
                     slot.resource = admitted.id;
+                    slot.peer = .{ .slot = actor.slot, .generation = actor.generation };
                     slot.updates = Commit.Scheduler.Queue.init(&adapter.scheduler, admitted.id);
                 },
                 .create_region => |value| {
@@ -2019,6 +2029,17 @@ fn testMemfd(size: usize) !linux.fd_t {
     if (size >= payload.len and linux.write(fd, &payload, payload.len) != payload.len)
         return error.SystemCallFailed;
     return fd;
+}
+
+test "core surface: created surface retains exact connection peer" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const surface = try context.createSurface(10);
+    const id = try context.adapter.surfaceId(surface);
+    try std.testing.expectEqual(
+        wayring.io_uring.Peer{ .slot = context.actor.slot, .generation = context.actor.generation },
+        try context.adapter.surfacePeer(id),
+    );
 }
 
 test "viewporter: generated requests publish and clear double-buffered crop state" {
