@@ -2363,6 +2363,7 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.pointer_constraints_adapter.resourceRemoved(handle, object);
             _ = self.fractional_scale_adapter.resourceRemoved(handle, object);
             _ = self.output_adapter.resourceRemoved(handle, object);
+            if (removed_surface_peer) |peer| self.data_device_adapter.surfaceRemoved(peer, handle.id);
             if (removed_surface_peer) |peer| self.output_adapter.surfaceRemoved(peer, handle);
             if (removed_surface) |id| {
                 self.pointer_constraints_adapter.surfaceRemoved(id);

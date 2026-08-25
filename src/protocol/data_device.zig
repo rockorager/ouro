@@ -519,6 +519,13 @@ pub fn Adapter(comptime protocol: type) type {
             return self.drag != null;
         }
 
+        pub fn surfaceRemoved(self: *Self, peer: wayring.io_uring.Peer, object_id: u32) void {
+            const drag = self.drag orelse return;
+            if (!std.meta.eql(drag.peer, peer) or drag.origin_object != object_id) return;
+            self.drag_cancel_pending = true;
+            self.progressDragCancellation();
+        }
+
         pub fn updateDragTarget(
             self: *Self,
             target: ?DragTarget,
@@ -1360,6 +1367,29 @@ test "data device: source destruction retains drag cancellation through backpres
     try std.testing.expect(adapter.drag == null);
     try std.testing.expect(!adapter.drag_cancel_pending);
     try std.testing.expectEqual(TestAdapter.Outbound.drag_leave, std.meta.activeTag(adapter.outbound[0].value));
+}
+
+test "data device: removing the exact drag origin cancels the session" {
+    var adapter = try testAdapter(.{
+        .manager_capacity = 1,
+        .source_capacity = 1,
+        .device_capacity = 1,
+        .offer_capacity = 1,
+        .mime_capacity = 1,
+        .mime_bytes = 32,
+        .outbound_capacity = 1,
+    });
+    defer adapter.deinit();
+    const peer: wayring.io_uring.Peer = .{ .slot = 1, .generation = 8 };
+    adapter.drag = .{ .peer = peer, .source = null, .origin_object = 17 };
+
+    adapter.surfaceRemoved(.{ .slot = 1, .generation = 9 }, 17);
+    try std.testing.expect(adapter.drag != null);
+    adapter.surfaceRemoved(peer, 18);
+    try std.testing.expect(adapter.drag != null);
+    adapter.surfaceRemoved(peer, 17);
+    try std.testing.expect(adapter.drag == null);
+    try std.testing.expect(!adapter.drag_cancel_pending);
 }
 
 test "data device: copied MIME types and offer capacity make replacement transactional" {
