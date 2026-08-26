@@ -90,7 +90,6 @@ test "reactor failure unwinds the ring and consumes the listener descriptor" {
         .{
             .ring = .{ .entries = 8 },
             .reactor = .{
-                .max_connections = 1,
                 .receive_buffer_size = 4096,
                 .receive_buffer_count = 3,
                 .receive_control_capacity = 64,

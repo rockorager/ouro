@@ -3,11 +3,15 @@
 //! object. DMA-BUF and sync_file FD ownership remains explicit.
 
 const std = @import("std");
+const linux = std.os.linux;
 const gbm = @import("../backend/gbm.zig");
 const render = @import("types.zig");
 const render_content = @import("content.zig");
 
 const c = @cImport({
+    @cInclude("drm_fourcc.h");
+    @cInclude("linux/dma-buf.h");
+    @cInclude("sys/ioctl.h");
     @cInclude("sys/sysmacros.h");
     @cInclude("sys/stat.h");
     @cInclude("vulkan/vulkan.h");
@@ -126,6 +130,31 @@ const UploadAllocation = struct {
     references: usize = 0,
 };
 
+const NativeAllocation = struct {
+    active: bool = false,
+    generation: u32 = 0,
+    references: usize = 0,
+    texture: Texture = undefined,
+    ready: ?render.SampleIdentity = null,
+};
+
+const ImportedImage = struct {
+    occupied: bool = false,
+    generation: u32 = 0,
+    references: usize = 0,
+    source: render.ExternalSource = undefined,
+    image: c.VkImage = undefined,
+    memory: c.VkDeviceMemory = undefined,
+};
+
+const PendingAcquire = struct {
+    occupied: bool = false,
+    native_token: u64 = 0,
+    identity: render.SampleIdentity = undefined,
+    imported_token: u64 = 0,
+    fd: std.posix.fd_t = -1,
+};
+
 const Upload = struct {
     x: u32,
     y: u32,
@@ -148,6 +177,8 @@ const PreparedTexture = struct {
     commit_sequence: u64,
     format: render.PixelFormat,
     content_token: ?u64 = null,
+    native_token: ?u64 = null,
+    imported_token: ?u64 = null,
 };
 
 const RealRenderer = struct {
@@ -168,6 +199,7 @@ const RealRenderer = struct {
     sampled_enabled: bool,
     get_memory_fd_properties: c.PFN_vkGetMemoryFdPropertiesKHR,
     get_semaphore_fd: c.PFN_vkGetSemaphoreFdKHR,
+    import_semaphore_fd: c.PFN_vkImportSemaphoreFdKHR,
     max_samples: usize,
     sample_buffer_size: usize,
     max_source_bytes: usize,
@@ -178,6 +210,10 @@ const RealRenderer = struct {
     content_map: *anyopaque,
     content_buffer_size: usize,
     content_allocations: []UploadAllocation,
+    native_allocations: []NativeAllocation,
+    imported_images: []ImportedImage,
+    imported_cursor: usize,
+    pending_acquires: []PendingAcquire,
 };
 
 const TargetState = enum { ready, in_flight, queue_failed, export_failed };
@@ -197,6 +233,8 @@ const RealTarget = struct {
     command_buffer: c.VkCommandBuffer,
     fence: c.VkFence,
     semaphore: c.VkSemaphore,
+    source_semaphore: c.VkSemaphore,
+    acquire_semaphores: []c.VkSemaphore,
     retired_textures: []Texture,
     retired_texture_count: usize = 0,
     width: u32,
@@ -206,6 +244,10 @@ const RealTarget = struct {
     initialized_layout: bool = false,
     content_leases: []u64,
     content_lease_count: usize = 0,
+    native_leases: []u64,
+    native_lease_count: usize = 0,
+    imported_leases: []u64,
+    imported_lease_count: usize = 0,
 };
 
 const Push = extern struct {
@@ -320,6 +362,7 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
     c.vkGetDeviceQueue(self.device, self.queue_family, 0, &self.queue);
     self.get_memory_fd_properties = @ptrCast(c.vkGetDeviceProcAddr(self.device, "vkGetMemoryFdPropertiesKHR") orelse return error.MissingMemoryFdPropertiesFunction);
     self.get_semaphore_fd = @ptrCast(c.vkGetDeviceProcAddr(self.device, "vkGetSemaphoreFdKHR") orelse return error.MissingSemaphoreFdFunction);
+    self.import_semaphore_fd = @ptrCast(c.vkGetDeviceProcAddr(self.device, "vkImportSemaphoreFdKHR") orelse return error.MissingSemaphoreFdFunction);
 
     const bindings = [_]c.VkDescriptorSetLayoutBinding{
         descriptorBinding(0, c.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE),
@@ -493,6 +536,18 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
     self.content_allocations = try allocator.alloc(UploadAllocation, config.content_allocations);
     @memset(self.content_allocations, .{});
     errdefer allocator.free(self.content_allocations);
+    self.native_allocations = try allocator.alloc(NativeAllocation, config.content_allocations);
+    @memset(self.native_allocations, .{});
+    errdefer allocator.free(self.native_allocations);
+    const imported_capacity = std.math.mul(usize, config.content_allocations, 2) catch
+        return error.InvalidConfig;
+    self.imported_images = try allocator.alloc(ImportedImage, imported_capacity);
+    @memset(self.imported_images, .{});
+    self.imported_cursor = 0;
+    errdefer allocator.free(self.imported_images);
+    self.pending_acquires = try allocator.alloc(PendingAcquire, config.content_allocations);
+    @memset(self.pending_acquires, .{});
+    errdefer allocator.free(self.pending_acquires);
     try createHostBuffer(
         self,
         self.content_buffer_size,
@@ -508,6 +563,18 @@ fn realDestroy(_: *anyopaque, renderer: Renderer) void {
     _ = c.vkDeviceWaitIdle(self.device);
     for (self.content_allocations) |allocation|
         std.debug.assert(!allocation.active);
+    for (self.native_allocations) |allocation| {
+        std.debug.assert(!allocation.active);
+        if (allocation.generation != 0) destroyTexture(self, allocation.texture);
+    }
+    std.heap.c_allocator.free(self.native_allocations);
+    for (self.imported_images) |*image| {
+        std.debug.assert(!image.occupied or image.references == 1);
+        destroyImportedImage(self, image);
+    }
+    std.heap.c_allocator.free(self.imported_images);
+    for (self.pending_acquires) |pending| std.debug.assert(!pending.occupied);
+    std.heap.c_allocator.free(self.pending_acquires);
     destroyBuffer(self, self.content_buffer, self.content_memory);
     std.heap.c_allocator.free(self.content_allocations);
     for (self.cache) |entry| if (entry.occupied) destroyTexture(self, entry.texture);
@@ -532,7 +599,48 @@ fn realContentProvider(_: *anyopaque, renderer: Renderer) ?render_content.Provid
         .allocate_fn = allocateContent,
         .release_fn = releaseContentOwner,
         .pinned_fn = contentPinned,
+        .allocate_native_fn = allocateNative,
+        .prepare_native_fn = prepareNative,
+        .cancel_native_fn = cancelNative,
+        .release_native_fn = releaseNativeOwner,
+        .pinned_native_fn = nativePinned,
+        .ready_native_fn = nativeReady,
     };
+}
+
+fn prepareNative(
+    context: *anyopaque,
+    native: render.NativeBacking,
+    identity: render.SampleIdentity,
+    source: render.ExternalSource,
+) !void {
+    const self: *RealRenderer = @ptrCast(@alignCast(context));
+    const allocation = nativeAllocation(self, native.token) orelse
+        return error.StaleNativeBacking;
+    if (native.owner != context) return error.ForeignNativeBacking;
+    const imported_token = try importedImage(
+        self,
+        source,
+        allocation.texture.size,
+        inferExternalFormat(source.drm_format) orelse return error.UnsupportedExternalFormat,
+    );
+    const acquire_fd = try exportDmaBufFence(source.fds[0]);
+    errdefer _ = linux.close(acquire_fd);
+    const pending = for (self.pending_acquires) |*candidate| {
+        if (!candidate.occupied) break candidate;
+    } else return error.AcquireCapacityExceeded;
+    pending.* = .{
+        .occupied = true,
+        .native_token = native.token,
+        .identity = identity,
+        .imported_token = imported_token,
+        .fd = acquire_fd,
+    };
+}
+
+fn cancelNative(context: *anyopaque, native: render.NativeBacking, identity: render.SampleIdentity) void {
+    const self: *RealRenderer = @ptrCast(@alignCast(context));
+    cancelPendingAcquire(self, native.token, identity);
 }
 
 fn allocateContent(context: *anyopaque, size: usize) !render_content.Allocation {
@@ -605,6 +713,309 @@ fn contentPinned(context: *anyopaque, token: u64) bool {
     return allocation.references > 1;
 }
 
+fn nativeAllocation(self: *RealRenderer, token: u64) ?*NativeAllocation {
+    const index: u32 = @truncate(token);
+    const generation: u32 = @truncate(token >> 32);
+    if (index >= self.native_allocations.len) return null;
+    const allocation = &self.native_allocations[index];
+    if (!allocation.active or allocation.generation != generation) return null;
+    return allocation;
+}
+
+fn allocateNative(context: *anyopaque, size: render.Size, _: render.PixelFormat) !render.NativeBacking {
+    const self: *RealRenderer = @ptrCast(@alignCast(context));
+    const index = for (self.native_allocations, 0..) |allocation, candidate| {
+        if (!allocation.active) break candidate;
+    } else return error.ContentAllocationCapacityExceeded;
+    const allocation = &self.native_allocations[index];
+    if (allocation.generation != 0) destroyTexture(self, allocation.texture);
+    allocation.texture = try createTexture(self, size);
+    allocation.generation +%= 1;
+    if (allocation.generation == 0) allocation.generation = 1;
+    allocation.active = true;
+    allocation.references = 1;
+    allocation.ready = null;
+    return .{ .owner = self, .token = (@as(u64, allocation.generation) << 32) | @as(u32, @intCast(index)) };
+}
+
+fn retainNative(self: *RealRenderer, token: u64) !void {
+    const allocation = nativeAllocation(self, token) orelse return error.StaleNativeBacking;
+    allocation.references = std.math.add(usize, allocation.references, 1) catch return error.ContentReferenceOverflow;
+}
+
+fn releaseNative(self: *RealRenderer, token: u64) void {
+    const allocation = nativeAllocation(self, token) orelse return;
+    std.debug.assert(allocation.references != 0);
+    allocation.references -= 1;
+    if (allocation.references == 0) {
+        cancelPendingAcquires(self, token);
+        allocation.active = false;
+    }
+}
+
+fn releaseNativeOwner(context: *anyopaque, token: u64) void {
+    releaseNative(@ptrCast(@alignCast(context)), token);
+}
+
+fn nativePinned(context: *anyopaque, token: u64) bool {
+    const allocation = nativeAllocation(@ptrCast(@alignCast(context)), token) orelse return false;
+    return allocation.references > 1;
+}
+
+fn nativeReady(context: *anyopaque, token: u64, identity: render.SampleIdentity) bool {
+    const allocation = nativeAllocation(@ptrCast(@alignCast(context)), token) orelse return false;
+    return if (allocation.ready) |ready| std.meta.eql(ready, identity) else false;
+}
+
+fn importedImage(self: *RealRenderer, source: render.ExternalSource, size: render.Size, format: render.PixelFormat) !u64 {
+    if (source.plane_count != 1 or source.fds[0] < 0 or source.strides[0] == 0)
+        return error.UnsupportedExternalSource;
+    const vk_format: c.VkFormat = switch (format) {
+        .xrgb8888, .argb8888_premultiplied => c.VK_FORMAT_B8G8R8A8_UNORM,
+    };
+    const expected_drm: u32 = switch (format) {
+        .xrgb8888 => c.DRM_FORMAT_XRGB8888,
+        .argb8888_premultiplied => c.DRM_FORMAT_ARGB8888,
+    };
+    if (source.drm_format != expected_drm) return error.UnsupportedExternalFormat;
+    for (self.imported_images, 0..) |*entry, index| if (entry.occupied and
+        entry.source.context == source.context and entry.source.token == source.token)
+    {
+        if (!std.meta.eql(entry.source, source)) return error.ExternalIdentityMismatch;
+        return importedToken(entry, index);
+    };
+
+    const index = for (self.imported_images, 0..) |entry, candidate| {
+        if (!entry.occupied) break candidate;
+    } else evict: {
+        for (0..self.imported_images.len) |_| {
+            const candidate = self.imported_cursor;
+            self.imported_cursor = (self.imported_cursor + 1) % self.imported_images.len;
+            if (self.imported_images[candidate].references == 1) break :evict candidate;
+        }
+        return error.ExternalImageCapacityExceeded;
+    };
+    const entry = &self.imported_images[index];
+    destroyImportedImage(self, entry);
+
+    var layout: c.VkSubresourceLayout = .{
+        .offset = source.offsets[0],
+        .size = 0,
+        .rowPitch = source.strides[0],
+        .arrayPitch = 0,
+        .depthPitch = 0,
+    };
+    var modifier: c.VkImageDrmFormatModifierExplicitCreateInfoEXT = .{
+        .sType = c.VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
+        .pNext = null,
+        .drmFormatModifier = source.modifier,
+        .drmFormatModifierPlaneCount = 1,
+        .pPlaneLayouts = &layout,
+    };
+    var external: c.VkExternalMemoryImageCreateInfo = .{
+        .sType = c.VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+        .pNext = &modifier,
+        .handleTypes = c.VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+    };
+    var info: c.VkImageCreateInfo = .{
+        .sType = c.VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .pNext = &external,
+        .flags = 0,
+        .imageType = c.VK_IMAGE_TYPE_2D,
+        .format = vk_format,
+        .extent = .{ .width = size.width, .height = size.height, .depth = 1 },
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = c.VK_SAMPLE_COUNT_1_BIT,
+        .tiling = c.VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+        .usage = c.VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        .sharingMode = c.VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = 0,
+        .pQueueFamilyIndices = null,
+        .initialLayout = c.VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    var image: c.VkImage = undefined;
+    try vk(c.vkCreateImage(self.device, &info, null, &image), error.CreateExternalImageFailed);
+    errdefer c.vkDestroyImage(self.device, image, null);
+    var requirements: c.VkMemoryRequirements = undefined;
+    c.vkGetImageMemoryRequirements(self.device, image, &requirements);
+    const duplicate = try duplicateFd(source.fds[0]);
+    var duplicate_owned = true;
+    defer if (duplicate_owned) {
+        _ = linux.close(duplicate);
+    };
+    var properties: c.VkMemoryFdPropertiesKHR = .{
+        .sType = c.VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR,
+        .pNext = null,
+        .memoryTypeBits = 0,
+    };
+    try vk(self.get_memory_fd_properties.?(
+        self.device,
+        c.VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+        duplicate,
+        &properties,
+    ), error.GetMemoryFdPropertiesFailed);
+    const bits = intersectMemoryTypeBits(requirements.memoryTypeBits, properties.memoryTypeBits);
+    if (bits == 0) return error.NoCompatibleMemoryType;
+    var dedicated: c.VkMemoryDedicatedAllocateInfo = .{
+        .sType = c.VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+        .pNext = null,
+        .image = image,
+        .buffer = null,
+    };
+    var import: c.VkImportMemoryFdInfoKHR = .{
+        .sType = c.VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
+        .pNext = &dedicated,
+        .handleType = c.VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+        .fd = duplicate,
+    };
+    var allocation: c.VkMemoryAllocateInfo = .{
+        .sType = c.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .pNext = &import,
+        .allocationSize = requirements.size,
+        .memoryTypeIndex = try memoryType(self, bits, 0),
+    };
+    var memory: c.VkDeviceMemory = undefined;
+    try vk(c.vkAllocateMemory(self.device, &allocation, null, &memory), error.ImportExternalMemoryFailed);
+    duplicate_owned = false;
+    errdefer c.vkFreeMemory(self.device, memory, null);
+    try vk(c.vkBindImageMemory(self.device, image, memory, 0), error.BindExternalMemoryFailed);
+    entry.generation +%= 1;
+    if (entry.generation == 0) entry.generation = 1;
+    entry.* = .{
+        .occupied = true,
+        .generation = entry.generation,
+        .references = 1,
+        .source = source,
+        .image = image,
+        .memory = memory,
+    };
+    return importedToken(entry, index);
+}
+
+fn importedToken(entry: *const ImportedImage, index: usize) u64 {
+    return (@as(u64, entry.generation) << 32) | @as(u32, @intCast(index));
+}
+
+fn importedFromToken(self: *RealRenderer, token: u64) ?*ImportedImage {
+    const index: u32 = @truncate(token);
+    const generation: u32 = @truncate(token >> 32);
+    if (index >= self.imported_images.len) return null;
+    const entry = &self.imported_images[index];
+    if (!entry.occupied or entry.generation != generation) return null;
+    return entry;
+}
+
+fn inferExternalFormat(drm_format: u32) ?render.PixelFormat {
+    if (drm_format == c.DRM_FORMAT_XRGB8888) return .xrgb8888;
+    if (drm_format == c.DRM_FORMAT_ARGB8888) return .argb8888_premultiplied;
+    return null;
+}
+
+fn pendingAcquire(
+    self: *RealRenderer,
+    native_token: u64,
+    identity: render.SampleIdentity,
+) ?*PendingAcquire {
+    for (self.pending_acquires) |*pending| if (pending.occupied and
+        pending.native_token == native_token and std.meta.eql(pending.identity, identity))
+        return pending;
+    return null;
+}
+
+fn takePendingAcquire(
+    self: *RealRenderer,
+    native_token: u64,
+    identity: render.SampleIdentity,
+) ?PendingAcquire {
+    const pending = pendingAcquire(self, native_token, identity) orelse return null;
+    const result = pending.*;
+    pending.* = .{};
+    return result;
+}
+
+fn cancelPendingAcquire(self: *RealRenderer, native_token: u64, identity: render.SampleIdentity) void {
+    const pending = pendingAcquire(self, native_token, identity) orelse return;
+    _ = linux.close(pending.fd);
+    pending.* = .{};
+}
+
+fn cancelPendingAcquires(self: *RealRenderer, native_token: u64) void {
+    for (self.pending_acquires) |*pending| if (pending.occupied and
+        pending.native_token == native_token)
+    {
+        _ = linux.close(pending.fd);
+        pending.* = .{};
+    };
+}
+
+fn retainImported(self: *RealRenderer, token: u64) !void {
+    const entry = importedFromToken(self, token) orelse return error.StaleExternalImage;
+    entry.references = std.math.add(usize, entry.references, 1) catch
+        return error.ContentReferenceOverflow;
+}
+
+fn releaseImported(self: *RealRenderer, token: u64) void {
+    const entry = importedFromToken(self, token) orelse unreachable;
+    std.debug.assert(entry.references > 1);
+    entry.references -= 1;
+}
+
+fn destroyImportedImage(self: *RealRenderer, entry: *ImportedImage) void {
+    if (!entry.occupied) return;
+    std.debug.assert(entry.references == 1);
+    c.vkDestroyImage(self.device, entry.image, null);
+    c.vkFreeMemory(self.device, entry.memory, null);
+    const generation = entry.generation;
+    entry.* = .{ .generation = generation };
+}
+
+fn duplicateFd(fd: std.posix.fd_t) !std.posix.fd_t {
+    const result = linux.fcntl(fd, linux.F.DUPFD_CLOEXEC, 0);
+    return switch (linux.errno(result)) {
+        .SUCCESS => @intCast(result),
+        .MFILE => error.ProcessFdQuotaExceeded,
+        .NFILE => error.SystemFdQuotaExceeded,
+        .BADF => error.InvalidExternalFd,
+        else => |err| std.posix.unexpectedErrno(err),
+    };
+}
+
+fn exportDmaBufFence(fd: std.posix.fd_t) !std.posix.fd_t {
+    var export_file: c.struct_dma_buf_export_sync_file = .{
+        .flags = c.DMA_BUF_SYNC_READ,
+        .fd = -1,
+    };
+    if (c.ioctl(fd, c.DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &export_file) != 0 or
+        export_file.fd < 0) return error.ExportAcquireFenceFailed;
+    return export_file.fd;
+}
+
+fn importDmaBufFence(fd: std.posix.fd_t, sync_fd: std.posix.fd_t) !void {
+    var import_file: c.struct_dma_buf_import_sync_file = .{
+        .flags = c.DMA_BUF_SYNC_READ,
+        .fd = sync_fd,
+    };
+    if (c.ioctl(fd, c.DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &import_file) != 0)
+        return error.ImportCompletionFenceFailed;
+}
+
+fn createExportSemaphore(self: *RealRenderer) !c.VkSemaphore {
+    var export_info: c.VkExportSemaphoreCreateInfo = .{
+        .sType = c.VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
+        .pNext = null,
+        .handleTypes = c.VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+    };
+    var info: c.VkSemaphoreCreateInfo = .{
+        .sType = c.VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+        .pNext = &export_info,
+        .flags = 0,
+    };
+    var semaphore: c.VkSemaphore = undefined;
+    try vk(c.vkCreateSemaphore(self.device, &info, null, &semaphore), error.CreateSemaphoreFailed);
+    return semaphore;
+}
+
 fn realImportTarget(_: *anyopaque, renderer: Renderer, metadata: gbm.Metadata, dma_buf_fd: std.posix.fd_t) !Target {
     const self: *RealRenderer = @ptrCast(@alignCast(renderer));
     const allocator = std.heap.c_allocator;
@@ -620,6 +1031,19 @@ fn realImportTarget(_: *anyopaque, renderer: Renderer, metadata: gbm.Metadata, d
     target.content_leases = try allocator.alloc(u64, self.max_samples);
     target.content_lease_count = 0;
     errdefer allocator.free(target.content_leases);
+    target.native_leases = try allocator.alloc(u64, self.max_samples);
+    target.native_lease_count = 0;
+    errdefer allocator.free(target.native_leases);
+    target.imported_leases = try allocator.alloc(u64, self.max_samples);
+    target.imported_lease_count = 0;
+    errdefer allocator.free(target.imported_leases);
+    target.acquire_semaphores = try allocator.alloc(c.VkSemaphore, self.max_samples);
+    var acquire_semaphore_count: usize = 0;
+    errdefer {
+        for (target.acquire_semaphores[0..acquire_semaphore_count]) |semaphore|
+            c.vkDestroySemaphore(self.device, semaphore, null);
+        allocator.free(target.acquire_semaphores);
+    }
     if (metadata.plane_count != 1) return error.UnsupportedPlaneCount;
     try requireTargetFormat(self.physical_device, metadata);
 
@@ -736,6 +1160,14 @@ fn realImportTarget(_: *anyopaque, renderer: Renderer, metadata: gbm.Metadata, d
     var export_info: c.VkExportSemaphoreCreateInfo = .{ .sType = c.VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO, .pNext = null, .handleTypes = c.VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT };
     var semaphore_info: c.VkSemaphoreCreateInfo = .{ .sType = c.VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &export_info, .flags = 0 };
     try vk(c.vkCreateSemaphore(self.device, &semaphore_info, null, &target.semaphore), error.CreateSemaphoreFailed);
+    errdefer c.vkDestroySemaphore(self.device, target.semaphore, null);
+    try vk(c.vkCreateSemaphore(self.device, &semaphore_info, null, &target.source_semaphore), error.CreateSemaphoreFailed);
+    errdefer c.vkDestroySemaphore(self.device, target.source_semaphore, null);
+    semaphore_info.pNext = null;
+    for (target.acquire_semaphores) |*semaphore| {
+        try vk(c.vkCreateSemaphore(self.device, &semaphore_info, null, semaphore), error.CreateSemaphoreFailed);
+        acquire_semaphore_count += 1;
+    }
     target.width = metadata.width;
     target.height = metadata.height;
     target.state = .ready;
@@ -750,7 +1182,12 @@ fn realDestroyTarget(_: *anyopaque, renderer: Renderer, target_value: Target) vo
     if (target.state == .in_flight or target.state == .export_failed)
         _ = c.vkWaitForFences(self.device, 1, &target.fence, c.VK_TRUE, std.math.maxInt(u64));
     drainContentLeases(self, target);
+    drainNativeLeases(self, target);
+    drainImportedLeases(self, target);
     drainRetiredTextures(self, target);
+    for (target.acquire_semaphores) |semaphore|
+        c.vkDestroySemaphore(self.device, semaphore, null);
+    c.vkDestroySemaphore(self.device, target.source_semaphore, null);
     c.vkDestroySemaphore(self.device, target.semaphore, null);
     c.vkDestroyFence(self.device, target.fence, null);
     c.vkDestroyCommandPool(self.device, target.command_pool, null);
@@ -762,6 +1199,9 @@ fn realDestroyTarget(_: *anyopaque, renderer: Renderer, target_value: Target) vo
     c.vkFreeMemory(self.device, target.image_memory, null);
     std.heap.c_allocator.free(target.retired_textures);
     std.heap.c_allocator.free(target.content_leases);
+    std.heap.c_allocator.free(target.native_leases);
+    std.heap.c_allocator.free(target.imported_leases);
+    std.heap.c_allocator.free(target.acquire_semaphores);
     std.heap.c_allocator.destroy(target);
 }
 
@@ -784,9 +1224,13 @@ fn prepareTextures(self: *RealRenderer, frame: Frame) !PreparedBatch {
             continue;
         }
 
-        const existing_index = cacheIndex(self.cache, surface.sample.surface);
+        const native = if (surface.source.native) |backing| nativeAllocation(self, backing.token) orelse
+            return error.StaleNativeBacking else null;
+        if (surface.source.native) |backing| if (backing.owner != @as(*anyopaque, @ptrCast(self)))
+            return error.ForeignNativeBacking;
+        const existing_index = if (native == null) cacheIndex(self.cache, surface.sample.surface) else null;
         const cache_index = existing_index orelse
-            (freeCacheIndex(self.cache, self.prepared[0..count]) orelse
+            (if (native != null) std.math.maxInt(usize) else freeCacheIndex(self.cache, self.prepared[0..count]) orelse
                 evictableCacheIndex(self.cache, frame, self.prepared[0..count]) orelse
                 return error.TextureCapacityExceeded);
         const existing = if (existing_index) |index| self.cache[index] else null;
@@ -795,8 +1239,10 @@ fn prepareTextures(self: *RealRenderer, frame: Frame) !PreparedBatch {
                 entry.format == surface.source.format
         else
             false;
-        const created = existing == null or !compatible or cache_index != existing_index.?;
-        const texture = if (created)
+        const created = native == null and (existing == null or !compatible or cache_index != existing_index.?);
+        const texture = if (native) |allocation|
+            allocation.texture
+        else if (created)
             try createTexture(self, surface.source.size)
         else
             existing.?.texture;
@@ -805,20 +1251,30 @@ fn prepareTextures(self: *RealRenderer, frame: Frame) !PreparedBatch {
             if (upload.owner == @as(*anyopaque, @ptrCast(self))) upload else null
         else
             null;
+        const upload_damage = if (native) |allocation|
+            nativeTextureUpload(allocation, surface)
+        else
+            textureUpload(created, existing, surface);
+        const imported_token = if (native != null and upload_damage.count != 0)
+            (pendingAcquire(self, surface.source.native.?.token, surface.sample) orelse
+                return error.MissingAcquireFence).imported_token
+        else
+            null;
         self.prepared[prepared_index] = .{
             .cache_index = cache_index,
             .source_index = source_index,
             .texture = texture,
             .created = created,
-            .retire_previous = created and self.cache[cache_index].occupied,
+            .retire_previous = native == null and created and self.cache[cache_index].occupied,
             .surface = surface.sample.surface,
             .commit_sequence = surface.sample.commit_sequence,
             .format = surface.source.format,
             .content_token = if (direct_upload) |upload| upload.token else null,
+            .native_token = if (surface.source.native) |backing| backing.token else null,
+            .imported_token = imported_token,
         };
         count += 1;
 
-        const upload_damage = textureUpload(created, existing, surface);
         for (upload_damage.items()) |rect| {
             const width: usize = @intCast(rect.max_x - rect.min_x);
             const height: usize = @intCast(rect.max_y - rect.min_y);
@@ -826,7 +1282,9 @@ fn prepareTextures(self: *RealRenderer, frame: Frame) !PreparedBatch {
                 return error.CapacityExceeded;
             const byte_count = std.math.mul(usize, row_bytes, height) catch
                 return error.CapacityExceeded;
-            const upload_offset, const row_length, const direct = if (direct_upload) |backing| direct: {
+            const upload_offset, const row_length, const direct = if (native != null)
+                .{ @as(usize, 0), @as(u32, 0), false }
+            else if (direct_upload) |backing| direct: {
                 const row_offset = std.math.mul(
                     usize,
                     surface.source.stride,
@@ -931,6 +1389,15 @@ fn textureUpload(
     return fullUpload(surface.source.size);
 }
 
+fn nativeTextureUpload(allocation: *const NativeAllocation, surface: render.SurfaceSample) render.UploadDamage {
+    if (!allocation.texture.initialized or allocation.ready == null) return fullUpload(surface.source.size);
+    const ready = allocation.ready.?;
+    if (std.meta.eql(ready, surface.sample)) return .{};
+    if (ready.surface == surface.sample.surface and ready.commit_sequence +% 1 == surface.sample.commit_sequence)
+        return clippedUpload(surface.upload_damage, surface.source.size);
+    return fullUpload(surface.source.size);
+}
+
 fn clippedUpload(damage: render.UploadDamage, size: render.Size) render.UploadDamage {
     var clipped: render.UploadDamage = .{};
     for (damage.items()) |rect| {
@@ -963,7 +1430,7 @@ fn realDraw(_: *anyopaque, renderer: Renderer, target_value: Target, frame: Fram
         const source = surface.source;
         const packed_stride = std.math.mul(u32, source.size.width, 4) catch
             return error.CapacityExceeded;
-        const length = std.math.mul(usize, packed_stride, source.size.height) catch
+        const length = if (source.native != null) 0 else std.math.mul(usize, packed_stride, source.size.height) catch
             return error.CapacityExceeded;
         const source_length = std.math.mul(usize, source.stride, source.size.height) catch
             return error.CapacityExceeded;
@@ -971,7 +1438,7 @@ fn realDraw(_: *anyopaque, renderer: Renderer, target_value: Target, frame: Fram
             return error.CapacityExceeded;
         const source_offset = std.math.cast(u32, validated_bytes) orelse
             return error.CapacityExceeded;
-        if (source.stride < packed_stride or source_length > source.bytes.len or
+        if (source.stride < packed_stride or (source.native == null and source_length > source.bytes.len) or
             end > frame.source_byte_count or
             !std.meta.eql(sample.source, [4]u32{
                 source_offset,
@@ -990,6 +1457,8 @@ fn realDraw(_: *anyopaque, renderer: Renderer, target_value: Target, frame: Fram
             target.state = .ready;
             target.fence_needs_reset = true;
             drainContentLeases(self, target);
+            drainNativeLeases(self, target);
+            drainImportedLeases(self, target);
         },
         .queue_failed, .export_failed => return error.TargetTerminal,
     }
@@ -1008,6 +1477,8 @@ fn realDraw(_: *anyopaque, renderer: Renderer, target_value: Target, frame: Fram
         };
         if (completion) |fd| return fd;
     }
+    for (frame.sources) |surface| if (surface.source.native != null)
+        return error.NativeSampledPathUnavailable;
     @memcpy(@as([*]u8, @ptrCast(target.sample_map))[0 .. frame.samples.len * @sizeOf(Sample)], std.mem.sliceAsBytes(frame.samples));
     const source_map = @as([*]u8, @ptrCast(target.source_map))[0..frame.source_byte_count];
     var offset: usize = 0;
@@ -1105,6 +1576,19 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
     var content_tokens_owned = true;
     defer if (content_tokens_owned) for (content_tokens[0..content_token_count]) |token|
         releaseContent(self, token);
+    var native_tokens: [sampled_image_capacity]u64 = undefined;
+    var native_token_count: usize = 0;
+    var native_tokens_owned = true;
+    defer if (native_tokens_owned) for (native_tokens[0..native_token_count]) |token|
+        releaseNative(self, token);
+    var imported_tokens: [sampled_image_capacity]u64 = undefined;
+    var imported_token_count: usize = 0;
+    var imported_tokens_owned = true;
+    defer if (imported_tokens_owned) for (imported_tokens[0..imported_token_count]) |token|
+        releaseImported(self, token);
+    var wait_semaphores: [sampled_image_capacity]c.VkSemaphore = undefined;
+    var wait_stages: [sampled_image_capacity]c.VkPipelineStageFlags = undefined;
+    var wait_count: usize = 0;
 
     for (self.prepared[0..batch.count]) |prepared| {
         if (prepared.upload_count == 0) continue;
@@ -1117,6 +1601,49 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
         content_tokens[content_token_count] = token;
         content_token_count += 1;
     }
+    for (self.prepared[0..batch.count]) |prepared| {
+        const native_token = prepared.native_token orelse continue;
+        var native_present = false;
+        for (native_tokens[0..native_token_count]) |existing|
+            native_present = native_present or existing == native_token;
+        if (!native_present) {
+            try retainNative(self, native_token);
+            native_tokens[native_token_count] = native_token;
+            native_token_count += 1;
+        }
+        const imported_token = prepared.imported_token orelse continue;
+        var imported_present = false;
+        for (imported_tokens[0..imported_token_count]) |existing|
+            imported_present = imported_present or existing == imported_token;
+        if (!imported_present) {
+            try retainImported(self, imported_token);
+            imported_tokens[imported_token_count] = imported_token;
+            imported_token_count += 1;
+        }
+        const pending = takePendingAcquire(self, native_token, .{
+            .surface = prepared.surface,
+            .commit_sequence = prepared.commit_sequence,
+        }) orelse return error.MissingAcquireFence;
+        const acquire_fd = pending.fd;
+        var acquire_owned = true;
+        defer if (acquire_owned) {
+            _ = linux.close(acquire_fd);
+        };
+        if (pending.imported_token != imported_token) return error.ExternalIdentityMismatch;
+        var import_info: c.VkImportSemaphoreFdInfoKHR = .{
+            .sType = c.VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR,
+            .pNext = null,
+            .semaphore = target.acquire_semaphores[wait_count],
+            .flags = c.VK_SEMAPHORE_IMPORT_TEMPORARY_BIT,
+            .handleType = c.VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+            .fd = acquire_fd,
+        };
+        try vk(self.import_semaphore_fd.?(self.device, &import_info), error.ImportAcquireFenceFailed);
+        acquire_owned = false;
+        wait_semaphores[wait_count] = target.acquire_semaphores[wait_count];
+        wait_stages[wait_count] = c.VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        wait_count += 1;
+    }
 
     @memcpy(
         @as([*]u8, @ptrCast(target.sample_map))[0 .. frame.samples.len * @sizeOf(Sample)],
@@ -1125,6 +1652,7 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
     const staging = @as([*]u8, @ptrCast(target.source_map))[0..batch.staging_bytes];
     for (self.prepared[0..batch.count]) |prepared| {
         const source = frame.sources[prepared.source_index].source;
+        if (prepared.native_token != null) continue;
         for (prepared.uploads[0..prepared.upload_count]) |upload| {
             if (upload.direct) continue;
             const row_bytes = @as(usize, upload.width) * 4;
@@ -1180,6 +1708,12 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
     try vk(c.vkBeginCommandBuffer(target.command_buffer, &begin), error.BeginCommandBufferFailed);
     for (self.prepared[0..batch.count]) |prepared| {
         if (prepared.upload_count == 0) continue;
+        if (prepared.imported_token) |token| {
+            const imported = importedFromToken(self, token) orelse
+                return error.StaleExternalImage;
+            recordNativeCopies(self, target.command_buffer, prepared, imported);
+            continue;
+        }
         var before: c.VkImageMemoryBarrier = .{
             .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             .pNext = null,
@@ -1355,13 +1889,13 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
     var submit: c.VkSubmitInfo = .{
         .sType = c.VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .pNext = null,
-        .waitSemaphoreCount = 0,
-        .pWaitSemaphores = null,
-        .pWaitDstStageMask = null,
+        .waitSemaphoreCount = @intCast(wait_count),
+        .pWaitSemaphores = if (wait_count == 0) null else &wait_semaphores,
+        .pWaitDstStageMask = if (wait_count == 0) null else &wait_stages,
         .commandBufferCount = 1,
         .pCommandBuffers = &target.command_buffer,
-        .signalSemaphoreCount = 1,
-        .pSignalSemaphores = &target.semaphore,
+        .signalSemaphoreCount = if (imported_token_count == 0) 1 else 2,
+        .pSignalSemaphores = &[_]c.VkSemaphore{ target.semaphore, target.source_semaphore },
     };
     if (c.vkQueueSubmit(self.queue, 1, &submit, target.fence) != c.VK_SUCCESS) {
         target.state = .queue_failed;
@@ -1373,8 +1907,19 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
     @memcpy(target.content_leases[0..content_token_count], content_tokens[0..content_token_count]);
     target.content_lease_count = content_token_count;
     content_tokens_owned = false;
+    std.debug.assert(target.native_lease_count == 0);
+    @memcpy(target.native_leases[0..native_token_count], native_tokens[0..native_token_count]);
+    target.native_lease_count = native_token_count;
+    native_tokens_owned = false;
+    std.debug.assert(target.imported_lease_count == 0);
+    @memcpy(target.imported_leases[0..imported_token_count], imported_tokens[0..imported_token_count]);
+    target.imported_lease_count = imported_token_count;
+    imported_tokens_owned = false;
 
+    // Queue submission transfers ownership of every prepared object. Publish
+    // those leases before any post-submit synchronization operation can fail.
     for (self.prepared[0..batch.count]) |prepared| {
+        if (prepared.native_token != null) continue;
         const cache = &self.cache[prepared.cache_index];
         if (prepared.retire_previous) {
             std.debug.assert(target.retired_texture_count < target.retired_textures.len);
@@ -1393,6 +1938,46 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
     }
     prepared_owned = false;
 
+    var source_safe = imported_token_count == 0;
+    var source_exported = imported_token_count == 0;
+    if (imported_token_count != 0) source_sync: {
+        var source_fd_info: c.VkSemaphoreGetFdInfoKHR = .{
+            .sType = c.VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
+            .pNext = null,
+            .semaphore = target.source_semaphore,
+            .handleType = c.VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+        };
+        var source_completion_fd: c_int = -1;
+        if (self.get_semaphore_fd.?(self.device, &source_fd_info, &source_completion_fd) != c.VK_SUCCESS or
+            source_completion_fd < 0) break :source_sync;
+        source_exported = true;
+        defer _ = linux.close(source_completion_fd);
+        for (self.prepared[0..batch.count]) |prepared| {
+            if (prepared.imported_token == null) continue;
+            const source = frame.sources[prepared.source_index].source.external orelse
+                break :source_sync;
+            importDmaBufFence(source.fds[0], source_completion_fd) catch break :source_sync;
+        }
+        source_safe = true;
+    }
+    if (!source_safe) {
+        try vk(
+            c.vkWaitForFences(self.device, 1, &target.fence, c.VK_TRUE, std.math.maxInt(u64)),
+            error.SourceCompletionWaitFailed,
+        );
+        source_safe = true;
+    }
+    std.debug.assert(source_safe);
+    if (!source_exported) {
+        const replacement = createExportSemaphore(self) catch {
+            markNativeReady(self, self.prepared[0..batch.count]);
+            target.state = .export_failed;
+            return error.CompletionExportFailedAfterSubmit;
+        };
+        c.vkDestroySemaphore(self.device, target.source_semaphore, null);
+        target.source_semaphore = replacement;
+    }
+    markNativeReady(self, self.prepared[0..batch.count]);
     var fd_info: c.VkSemaphoreGetFdInfoKHR = .{
         .sType = c.VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
         .pNext = null,
@@ -1409,6 +1994,135 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
     return completion_fd;
 }
 
+fn markNativeReady(self: *RealRenderer, prepared_batch: []const PreparedTexture) void {
+    for (prepared_batch) |prepared| if (prepared.native_token) |token| {
+        const allocation = nativeAllocation(self, token) orelse unreachable;
+        if (prepared.upload_count != 0) {
+            allocation.texture.initialized = true;
+            allocation.ready = .{
+                .surface = prepared.surface,
+                .commit_sequence = prepared.commit_sequence,
+            };
+        }
+    };
+}
+
+fn recordNativeCopies(
+    self: *RealRenderer,
+    command_buffer: c.VkCommandBuffer,
+    prepared: PreparedTexture,
+    imported: *ImportedImage,
+) void {
+    const source_before: c.VkImageMemoryBarrier = .{
+        .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .pNext = null,
+        .srcAccessMask = 0,
+        .dstAccessMask = c.VK_ACCESS_TRANSFER_READ_BIT,
+        .oldLayout = c.VK_IMAGE_LAYOUT_GENERAL,
+        .newLayout = c.VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        .srcQueueFamilyIndex = c.VK_QUEUE_FAMILY_FOREIGN_EXT,
+        .dstQueueFamilyIndex = self.queue_family,
+        .image = imported.image,
+        .subresourceRange = colorRange(),
+    };
+    const destination_before: c.VkImageMemoryBarrier = .{
+        .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .pNext = null,
+        .srcAccessMask = if (prepared.texture.initialized) c.VK_ACCESS_SHADER_READ_BIT else 0,
+        .dstAccessMask = c.VK_ACCESS_TRANSFER_WRITE_BIT,
+        .oldLayout = if (prepared.texture.initialized)
+            c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+        else
+            c.VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = c.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .srcQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
+        .image = prepared.texture.image,
+        .subresourceRange = colorRange(),
+    };
+    const before = [_]c.VkImageMemoryBarrier{ source_before, destination_before };
+    c.vkCmdPipelineBarrier(
+        command_buffer,
+        if (prepared.texture.initialized)
+            c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+        else
+            c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        c.VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0,
+        0,
+        null,
+        0,
+        null,
+        before.len,
+        &before,
+    );
+    for (prepared.uploads[0..prepared.upload_count]) |upload| {
+        var copy: c.VkImageCopy = .{
+            .srcSubresource = .{
+                .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT,
+                .mipLevel = 0,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+            .srcOffset = .{ .x = @intCast(upload.x), .y = @intCast(upload.y), .z = 0 },
+            .dstSubresource = .{
+                .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT,
+                .mipLevel = 0,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+            .dstOffset = .{ .x = @intCast(upload.x), .y = @intCast(upload.y), .z = 0 },
+            .extent = .{ .width = upload.width, .height = upload.height, .depth = 1 },
+        };
+        c.vkCmdCopyImage(
+            command_buffer,
+            imported.image,
+            c.VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            prepared.texture.image,
+            c.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            1,
+            &copy,
+        );
+    }
+    const source_after: c.VkImageMemoryBarrier = .{
+        .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .pNext = null,
+        .srcAccessMask = c.VK_ACCESS_TRANSFER_READ_BIT,
+        .dstAccessMask = 0,
+        .oldLayout = c.VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        .newLayout = c.VK_IMAGE_LAYOUT_GENERAL,
+        .srcQueueFamilyIndex = self.queue_family,
+        .dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_FOREIGN_EXT,
+        .image = imported.image,
+        .subresourceRange = colorRange(),
+    };
+    const destination_after: c.VkImageMemoryBarrier = .{
+        .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .pNext = null,
+        .srcAccessMask = c.VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = c.VK_ACCESS_SHADER_READ_BIT,
+        .oldLayout = c.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .newLayout = c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        .srcQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
+        .image = prepared.texture.image,
+        .subresourceRange = colorRange(),
+    };
+    const after = [_]c.VkImageMemoryBarrier{ source_after, destination_after };
+    c.vkCmdPipelineBarrier(
+        command_buffer,
+        c.VK_PIPELINE_STAGE_TRANSFER_BIT,
+        c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0,
+        0,
+        null,
+        0,
+        null,
+        after.len,
+        &after,
+    );
+}
+
 fn drainRetiredTextures(self: *RealRenderer, target: *RealTarget) void {
     for (target.retired_textures[0..target.retired_texture_count]) |texture|
         destroyTexture(self, texture);
@@ -1419,6 +2133,18 @@ fn drainContentLeases(self: *RealRenderer, target: *RealTarget) void {
     for (target.content_leases[0..target.content_lease_count]) |token|
         releaseContent(self, token);
     target.content_lease_count = 0;
+}
+
+fn drainNativeLeases(self: *RealRenderer, target: *RealTarget) void {
+    for (target.native_leases[0..target.native_lease_count]) |token|
+        releaseNative(self, token);
+    target.native_lease_count = 0;
+}
+
+fn drainImportedLeases(self: *RealRenderer, target: *RealTarget) void {
+    for (target.imported_leases[0..target.imported_lease_count]) |token|
+        releaseImported(self, token);
+    target.imported_lease_count = 0;
 }
 
 fn choosePhysicalDevice(instance: c.VkInstance, drm_fd: std.posix.fd_t) !c.VkPhysicalDevice {
@@ -1456,7 +2182,11 @@ fn requireSyncFdSemaphore(device: c.VkPhysicalDevice) !void {
         .externalSemaphoreFeatures = 0,
     };
     c.vkGetPhysicalDeviceExternalSemaphoreProperties(device, &info, &properties);
-    if (properties.externalSemaphoreFeatures & c.VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT == 0 or
+    if (properties.externalSemaphoreFeatures &
+        (c.VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT |
+            c.VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT) !=
+        (c.VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT |
+            c.VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT) or
         properties.compatibleHandleTypes & c.VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT == 0)
         return error.SyncFdSemaphoreUnsupported;
 }
@@ -1777,6 +2507,34 @@ test "render-vulkan: adjacent sparse damage retains separate texture uploads" {
     const uploads = textureUpload(false, existing, sample);
     try std.testing.expectEqual(@as(u8, 2), uploads.count);
     try std.testing.expectEqualSlices(render.UploadRect, sample.upload_damage.items(), uploads.items());
+}
+
+test "render-vulkan: native snapshots preserve exact adjacent damage history" {
+    const pixels = [_]u8{0} ** 64;
+    var sample = testSurfaceSample(2, &pixels, testUploadDamage(&.{
+        .{ .min_x = 0, .min_y = 0, .max_x = 1, .max_y = 1 },
+        .{ .min_x = 3, .min_y = 3, .max_x = 4, .max_y = 4 },
+    }));
+    var allocation: NativeAllocation = .{
+        .texture = .{
+            .image = undefined,
+            .memory = undefined,
+            .view = undefined,
+            .size = sample.source.size,
+        },
+    };
+    try std.testing.expectEqual(fullUpload(sample.source.size), nativeTextureUpload(&allocation, sample));
+    allocation.texture.initialized = true;
+    allocation.ready = .{ .surface = sample.sample.surface, .commit_sequence = 1 };
+    try std.testing.expectEqualSlices(
+        render.UploadRect,
+        sample.upload_damage.items(),
+        nativeTextureUpload(&allocation, sample).items(),
+    );
+    allocation.ready = sample.sample;
+    try std.testing.expectEqual(@as(u8, 0), nativeTextureUpload(&allocation, sample).count);
+    sample.sample.commit_sequence = 4;
+    try std.testing.expectEqual(fullUpload(sample.source.size), nativeTextureUpload(&allocation, sample));
 }
 
 test "render-vulkan: texture cache evicts only a surface absent from the frame" {

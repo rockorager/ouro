@@ -548,7 +548,6 @@ test "shell-input: one client disconnect does not interrupt another client" {
     var fixture = try physical_fixture.Fixture.init();
     defer fixture.deinit();
     var root_config = physical_fixture.compositorConfig();
-    root_config.reactor.max_connections = 2;
     root_config.reactor.receive_buffer_size = 8192;
     root_config.reactor.receive_buffer_count = 8;
     root_config.reactor.receive_control_capacity = 512;
@@ -562,7 +561,6 @@ test "shell-input: one client disconnect does not interrupt another client" {
         root_config,
     );
     var config = physical_fixture.coordinatorConfig();
-    config.client_capacity = 2;
     config.shm.pool_capacity = 2;
     config.shm.buffer_capacity = 2;
     config.surface.surface_capacity = 2;

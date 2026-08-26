@@ -20,6 +20,11 @@ const vulkan_platform = @import("../render/vulkan_platform.zig");
 const render_list = @import("../scene/render_list.zig");
 const damage = @import("../scene/damage.zig");
 const scheduler_api = @import("headless.zig");
+const c = @cImport({
+    @cInclude("linux/dma-buf.h");
+    @cInclude("sys/ioctl.h");
+    @cInclude("sys/stat.h");
+});
 
 pub const RendererPreference = enum { pixman, vulkan, vulkan_then_pixman };
 pub const RendererKind = enum { pixman, vulkan };
@@ -173,9 +178,15 @@ pub const RenderDevice = struct {
 };
 
 pub const ImportedSource = struct {
-    platform: gbm.Platform,
-    bo: gbm.Bo,
-    mapping: gbm.Mapping,
+    access: union(enum) {
+        direct: std.posix.fd_t,
+        gbm: struct {
+            platform: gbm.Platform,
+            bo: gbm.Bo,
+            mapping: gbm.Mapping,
+            destroy_bo: bool,
+        },
+    },
     bytes: []const u8,
     width: u32,
     height: u32,
@@ -183,10 +194,30 @@ pub const ImportedSource = struct {
     format: render.PixelFormat,
 
     pub fn deinit(source: *ImportedSource) void {
-        source.platform.unmap(source.bo, source.mapping.token);
-        source.platform.destroyBo(source.bo);
+        switch (source.access) {
+            .direct => |fd| endDirectRead(fd) catch unreachable,
+            .gbm => |access| {
+                access.platform.unmap(access.bo, access.mapping.token);
+                if (access.destroy_bo) access.platform.destroyBo(access.bo);
+            },
+        }
         source.* = undefined;
     }
+};
+
+const ImportIdentity = struct {
+    context: *anyopaque,
+    token: u64,
+};
+
+const CachedImport = struct {
+    occupied: bool = false,
+    identity: ImportIdentity = undefined,
+    descriptor: gbm.Import = undefined,
+    backing: union(enum) {
+        direct: []align(std.heap.page_size_min) u8,
+        gbm: gbm.Bo,
+    } = undefined,
 };
 
 /// Imports and read-maps one client DMA-BUF long enough for the renderer
@@ -197,8 +228,14 @@ pub fn mapImportedSource(
     device: gbm.Device,
     import: gbm.Import,
 ) !ImportedSource {
+    const bo = try importClientBo(platform, device, import);
+    errdefer platform.destroyBo(bo);
+    return mapImportedBo(platform, bo, import, true);
+}
+
+fn importClientBo(platform: gbm.Platform, device: gbm.Device, import: gbm.Import) !gbm.Bo {
     if (import.plane_count != 1) return error.UnsupportedPlaneCount;
-    const format = formatFromDrm(import.format) orelse return error.UnsupportedFormat;
+    _ = formatFromDrm(import.format) orelse return error.UnsupportedFormat;
     const bo = try platform.importBo(device, import);
     errdefer platform.destroyBo(bo);
     const metadata = try platform.getMetadata(bo);
@@ -209,6 +246,16 @@ pub fn mapImportedSource(
         metadata.modifier != import.modifier and
         !(import.modifier == gbm.modifier_linear and metadata.modifier == gbm.modifier_invalid))
         return error.ImportMetadataMismatch;
+    return bo;
+}
+
+fn mapImportedBo(
+    platform: gbm.Platform,
+    bo: gbm.Bo,
+    import: gbm.Import,
+    destroy_bo: bool,
+) !ImportedSource {
+    const format = formatFromDrm(import.format) orelse return error.UnsupportedFormat;
     const mapping = try platform.map(bo, .read);
     errdefer platform.unmap(bo, mapping.token);
     const row_bytes = std.math.mul(u32, import.width, 4) catch return error.InvalidSource;
@@ -216,15 +263,82 @@ pub fn mapImportedSource(
     const length = std.math.mul(usize, mapping.stride, import.height) catch
         return error.InvalidSource;
     return .{
-        .platform = platform,
-        .bo = bo,
-        .mapping = mapping,
+        .access = .{ .gbm = .{
+            .platform = platform,
+            .bo = bo,
+            .mapping = mapping,
+            .destroy_bo = destroy_bo,
+        } },
         .bytes = mapping.data[0..length],
         .width = import.width,
         .height = import.height,
         .stride = mapping.stride,
         .format = format,
     };
+}
+
+fn directMap(import: gbm.Import) ![]align(std.heap.page_size_min) u8 {
+    if (import.plane_count != 1 or import.modifier != gbm.modifier_linear)
+        return error.UnsupportedDirectMap;
+    _ = formatFromDrm(import.format) orelse return error.UnsupportedFormat;
+    const row_bytes = std.math.mul(u32, import.width, 4) catch return error.InvalidSource;
+    if (import.width == 0 or import.height == 0 or import.strides[0] < row_bytes)
+        return error.InvalidSource;
+    const length = std.math.mul(usize, import.strides[0], import.height) catch
+        return error.InvalidSource;
+    const end = std.math.add(
+        usize,
+        import.offsets[0],
+        length,
+    ) catch return error.InvalidSource;
+    var stat: c.struct_stat = undefined;
+    if (c.fstat(import.fds[0], &stat) != 0 or stat.st_size < 0 or
+        end > @as(usize, @intCast(stat.st_size)))
+        return error.InvalidSource;
+    return std.posix.mmap(
+        null,
+        end,
+        .{ .READ = true },
+        .{ .TYPE = .SHARED },
+        import.fds[0],
+        0,
+    );
+}
+
+fn mapDirect(mapping: []align(std.heap.page_size_min) u8, import: gbm.Import) !ImportedSource {
+    const length = std.math.mul(usize, import.strides[0], import.height) catch
+        return error.InvalidSource;
+    const end = std.math.add(usize, import.offsets[0], length) catch
+        return error.InvalidSource;
+    if (end > mapping.len) return error.InvalidSource;
+    const format = formatFromDrm(import.format) orelse return error.UnsupportedFormat;
+    try beginDirectRead(import.fds[0]);
+    return .{
+        .access = .{ .direct = import.fds[0] },
+        .bytes = mapping[import.offsets[0]..end],
+        .width = import.width,
+        .height = import.height,
+        .stride = import.strides[0],
+        .format = format,
+    };
+}
+
+fn beginDirectRead(fd: std.posix.fd_t) !void {
+    var descriptors = [_]std.posix.pollfd{.{
+        .fd = fd,
+        .events = linux.POLL.IN,
+        .revents = 0,
+    }};
+    if (try std.posix.poll(&descriptors, -1) != 1 or
+        descriptors[0].revents & (linux.POLL.ERR | linux.POLL.NVAL) != 0)
+        return error.DmaBufWaitFailed;
+    var sync: c.struct_dma_buf_sync = .{ .flags = c.DMA_BUF_SYNC_START | c.DMA_BUF_SYNC_READ };
+    if (c.ioctl(fd, c.DMA_BUF_IOCTL_SYNC, &sync) != 0) return error.DmaBufSyncFailed;
+}
+
+fn endDirectRead(fd: std.posix.fd_t) !void {
+    var sync: c.struct_dma_buf_sync = .{ .flags = c.DMA_BUF_SYNC_END | c.DMA_BUF_SYNC_READ };
+    if (c.ioctl(fd, c.DMA_BUF_IOCTL_SYNC, &sync) != 0) return error.DmaBufSyncFailed;
 }
 
 const OutputPath = struct {
@@ -275,6 +389,8 @@ pub const Output = struct {
     planner: damage.Planner,
     scheduler: Scheduler,
     sample_storage: []scheduler_api.Sample(render.PresentationIdentity),
+    import_cache: []CachedImport,
+    import_cache_cursor: usize,
     kms_output: *kms.Output,
     output_format: render.PixelFormat,
     clear: render.Color,
@@ -420,6 +536,11 @@ pub const Output = struct {
             config.max_samples,
         );
         errdefer allocator.free(self.sample_storage);
+        const import_cache_capacity = std.math.mul(usize, config.max_samples, 2) catch
+            return error.InvalidConfig;
+        self.import_cache = try allocator.alloc(CachedImport, import_cache_capacity);
+        @memset(self.import_cache, .{});
+        errdefer allocator.free(self.import_cache);
         self.kms_output = try kms.Output.create(
             allocator,
             platforms.atomic,
@@ -434,6 +555,7 @@ pub const Output = struct {
         self.in_flight_frame = null;
         self.pending_callback = null;
         self.event_cursor = 0;
+        self.import_cache_cursor = 0;
         self.paused = false;
         return self;
     }
@@ -452,6 +574,8 @@ pub const Output = struct {
             };
             self.vulkan_targets = null;
         }
+        for (self.import_cache) |*entry| self.destroyCachedImport(entry);
+        self.allocator.free(self.import_cache);
         try self.pool.deinit();
         self.allocator.free(self.sample_storage);
         self.scheduler.deinit(self.allocator);
@@ -468,8 +592,60 @@ pub const Output = struct {
         return self.render_device.rendererKind();
     }
 
-    pub fn mapClientBuffer(self: *Output, import: gbm.Import) !ImportedSource {
-        return mapImportedSource(self.pool.gbm_platform, self.pool.device, import);
+    pub fn mapClientBuffer(
+        self: *Output,
+        identity: ImportIdentity,
+        import: gbm.Import,
+    ) !ImportedSource {
+        for (self.import_cache) |*entry| if (entry.occupied and
+            entry.identity.context == identity.context and entry.identity.token == identity.token)
+        {
+            if (!std.meta.eql(entry.descriptor, import)) return error.ImportIdentityMismatch;
+            return switch (entry.backing) {
+                .direct => |mapping| mapDirect(mapping, import),
+                .gbm => |bo| promoted: {
+                    if (directMap(import)) |mapping| {
+                        if (mapDirect(mapping, import)) |mapped| {
+                            self.pool.gbm_platform.destroyBo(bo);
+                            entry.backing = .{ .direct = mapping };
+                            break :promoted mapped;
+                        } else |_| std.posix.munmap(mapping);
+                    } else |_| {}
+                    break :promoted mapImportedBo(self.pool.gbm_platform, bo, import, false);
+                },
+            };
+        };
+
+        const bo = try importClientBo(self.pool.gbm_platform, self.pool.device, import);
+        errdefer self.pool.gbm_platform.destroyBo(bo);
+        var mapped = try mapImportedBo(self.pool.gbm_platform, bo, import, false);
+        errdefer mapped.deinit();
+        const destination = self.importCacheDestination();
+        self.destroyCachedImport(destination);
+        destination.* = .{
+            .occupied = true,
+            .identity = identity,
+            .descriptor = import,
+            .backing = .{ .gbm = bo },
+        };
+        return mapped;
+    }
+
+    fn importCacheDestination(self: *Output) *CachedImport {
+        const destination: *CachedImport = for (self.import_cache) |*entry| {
+            if (!entry.occupied) break entry;
+        } else &self.import_cache[self.import_cache_cursor];
+        self.import_cache_cursor = (self.import_cache_cursor + 1) % self.import_cache.len;
+        return destination;
+    }
+
+    fn destroyCachedImport(self: *Output, entry: *CachedImport) void {
+        if (!entry.occupied) return;
+        switch (entry.backing) {
+            .direct => |mapping| std.posix.munmap(mapping),
+            .gbm => |bo| self.pool.gbm_platform.destroyBo(bo),
+        }
+        entry.* = .{};
     }
 
     /// Transfers the initial output's renderer ownership to the composition
@@ -885,7 +1061,7 @@ fn bindSamples(list: render.List, bindings: []const SampleBinding, output: []sch
     }
 }
 
-fn formatFromDrm(value: u32) ?render.PixelFormat {
+pub fn formatFromDrm(value: u32) ?render.PixelFormat {
     if (value == gbm.format_xrgb8888) return .xrgb8888;
     if (value == gbm.format_argb8888) return .argb8888_premultiplied;
     return null;
@@ -1348,6 +1524,50 @@ test "drm-sim: client DMA-BUF import is read mapped and released" {
     try std.testing.expectEqual(@as(u32, 4), source.stride);
     source.deinit();
     try std.testing.expectEqual(@as(usize, 1), fixture.bos_destroyed);
+}
+
+test "drm-sim: persistent DMA-BUF import cache reuses and boundedly evicts BOs" {
+    var fixture: SimFixture = .{};
+    const platform: gbm.Platform = .{ .context = &fixture, .vtable = &SimFixture.gbm_vtable };
+    var cache: [2]CachedImport = @splat(.{});
+    var output: Output = undefined;
+    output.pool.gbm_platform = platform;
+    output.pool.device = &fixture;
+    output.import_cache = &cache;
+    output.import_cache_cursor = 0;
+    const descriptor: gbm.Import = .{
+        .width = 1,
+        .height = 1,
+        .format = gbm.format_xrgb8888,
+        .modifier = gbm.modifier_linear,
+        .plane_count = 1,
+        .fds = .{ 9, -1, -1, -1 },
+        .strides = .{ 4, 0, 0, 0 },
+    };
+    const owner: *anyopaque = &fixture;
+
+    var first = try output.mapClientBuffer(.{ .context = owner, .token = 1 }, descriptor);
+    first.deinit();
+    var reused = try output.mapClientBuffer(.{ .context = owner, .token = 1 }, descriptor);
+    reused.deinit();
+    try std.testing.expectEqual(@as(usize, 1), fixture.bo_count);
+    try std.testing.expectEqual(@as(usize, 0), fixture.bos_destroyed);
+
+    var second = try output.mapClientBuffer(.{ .context = owner, .token = 2 }, descriptor);
+    second.deinit();
+    var third = try output.mapClientBuffer(.{ .context = owner, .token = 3 }, descriptor);
+    third.deinit();
+    try std.testing.expectEqual(@as(usize, 3), fixture.bo_count);
+    try std.testing.expectEqual(@as(usize, 1), fixture.bos_destroyed);
+
+    var changed = descriptor;
+    changed.strides[0] = 8;
+    try std.testing.expectError(
+        error.ImportIdentityMismatch,
+        output.mapClientBuffer(.{ .context = owner, .token = 3 }, changed),
+    );
+    for (&cache) |*entry| output.destroyCachedImport(entry);
+    try std.testing.expectEqual(@as(usize, 3), fixture.bos_destroyed);
 }
 
 fn startSimFrame(output: *Output, now_ns: u64, handle: timer.Handle) !scheduler_api.FrameId {

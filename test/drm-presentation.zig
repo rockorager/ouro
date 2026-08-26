@@ -42,15 +42,13 @@ test "physical coordinator keeps serving until its final client disconnects" {
     wayring.unix_socket.unlink(path) catch {};
     defer wayring.unix_socket.unlink(path) catch {};
 
-    var root_config = compositorConfig();
-    root_config.reactor.max_connections = 2;
+    const root_config = compositorConfig();
     const root = try Compositor.create(
         allocator,
         try wayring.unix_socket.listen(path, 2),
         root_config,
     );
-    var coordinator_config = coordinatorConfig();
-    coordinator_config.client_capacity = 2;
+    const coordinator_config = coordinatorConfig();
     const coordinator = try Coordinator.create(
         allocator,
         root,
@@ -880,7 +878,7 @@ pub fn compositorConfig() Compositor.Config {
     return .{ .ring = .{ .entries = 32, .flags = 0 }, .reactor = clientReactorConfig(), .runtime = .{ .actor = .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 }, .object_capacity = 16, .object_quota = 16, .buckets_per_client = 16, .max_globals = 14, .registry_capacity = 1 } };
 }
 pub fn clientReactorConfig() wayring.io_uring.Config {
-    return .{ .max_connections = 1, .receive_buffer_size = 4096, .receive_buffer_count = 4, .receive_control_capacity = 256, .fragment_block_size = 256, .fragment_block_count = 4, .transmit_block_size = 512, .transmit_block_count = 8, .descriptor_count = 4, .send_descriptor_capacity = 2 };
+    return .{ .receive_buffer_size = 4096, .receive_buffer_count = 4, .receive_control_capacity = 256, .fragment_block_size = 256, .fragment_block_count = 4, .transmit_block_size = 512, .transmit_block_count = 8, .descriptor_count = 4, .send_descriptor_capacity = 2 };
 }
 fn drainClient(reactor: *wayring.io_uring.Reactor, driver: *ClientDriver, handler: *ClientHandler) !ClientDriver.Progress {
     var completions: [16]linux.io_uring_cqe = undefined;

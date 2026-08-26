@@ -44,7 +44,6 @@ test "SHM attachment survives buffer destruction through import and release" {
     defer ring.deinit();
     var reactor: wayring.io_uring.Reactor = undefined;
     try reactor.initBorrowed(std.testing.allocator, &ring, .{
-        .max_connections = 2,
         .receive_buffer_size = 4096,
         .receive_buffer_count = 4,
         .receive_control_capacity = 256,

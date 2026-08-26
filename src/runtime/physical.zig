@@ -130,7 +130,6 @@ pub fn Coordinator(comptime protocol: type) type {
         pub const Config = struct {
             router_capacity: usize,
             timer_capacity: usize,
-            client_capacity: usize = 4,
             desktop_transaction_timeout_ns: u64 = 250 * std.time.ns_per_ms,
             device_capacity: usize,
             seat: []const u8 = "seat0",
@@ -243,7 +242,7 @@ pub fn Coordinator(comptime protocol: type) type {
         output: ?*output_api.Output = null,
         next_output_generation: ?u32,
         loop: ?*Loop = null,
-        clients: []Client,
+        clients: std.ArrayListUnmanaged(Client) = .empty,
         client_count: usize = 0,
         /// First live client, retained temporarily for compatibility with the
         /// bounded physical harness while ownership migrates to exact peers.
@@ -300,10 +299,8 @@ pub fn Coordinator(comptime protocol: type) type {
             self.render_device = null;
             self.next_output_generation = config.output.output_id.generation;
             self.loop = null;
-            if (config.client_capacity == 0) return error.InvalidConfig;
-            self.clients = try allocator.alloc(Client, config.client_capacity);
-            errdefer allocator.free(self.clients);
-            @memset(self.clients, .{});
+            self.clients = .empty;
+            errdefer self.clients.deinit(allocator);
             self.client_count = 0;
             self.peer = null;
             self.surface = null;
@@ -559,7 +556,7 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             self.presentations.deinit(self.allocator);
             self.allocator.free(self.pending_surfaces);
-            self.allocator.free(self.clients);
+            self.clients.deinit(self.allocator);
             self.allocator.free(self.association_surfaces);
             self.allocator.free(self.frame_changes);
             self.allocator.free(self.frame_bindings);
@@ -591,13 +588,16 @@ pub fn Coordinator(comptime protocol: type) type {
         pub fn connected(self: *Self, peer: wayring.io_uring.Peer) void {
             if (self.peerLive(peer)) return;
             var available: ?*Client = null;
-            for (self.clients) |*client| if (!client.active) {
+            for (self.clients.items) |*client| if (!client.active) {
                 available = client;
                 break;
             };
-            const client = available orelse {
-                _ = self.root.runtime.clients.prepareClose(peer) catch {};
-                return;
+            const client = available orelse client: {
+                self.clients.append(self.allocator, .{}) catch {
+                    _ = self.root.runtime.clients.prepareClose(peer) catch {};
+                    return;
+                };
+                break :client &self.clients.items[self.clients.items.len - 1];
             };
             client.* = .{ .active = true, .peer = peer };
             self.client_count += 1;
@@ -607,14 +607,14 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         pub fn disconnected(self: *Self, peer: wayring.io_uring.Peer) void {
-            for (self.clients) |*client| if (client.active and samePeer(client.peer, peer)) {
+            for (self.clients.items) |*client| if (client.active and samePeer(client.peer, peer)) {
                 client.* = .{};
                 self.client_count -= 1;
                 break;
             };
             if (self.peer) |current| if (samePeer(current, peer)) {
                 self.peer = null;
-                for (self.clients) |client| if (client.active) {
+                for (self.clients.items) |client| if (client.active) {
                     self.peer = client.peer;
                     break;
                 };
@@ -635,13 +635,13 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn peerLive(self: *const Self, peer: wayring.io_uring.Peer) bool {
-            for (self.clients) |client|
+            for (self.clients.items) |client|
                 if (client.active and samePeer(client.peer, peer)) return true;
             return false;
         }
 
         fn scheduleClients(self: *Self) !void {
-            for (self.clients) |client| {
+            for (self.clients.items) |client| {
                 if (client.active) _ = try self.loop.?.driver.schedule(client.peer);
             }
         }
@@ -1469,7 +1469,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 else => return err,
             };
             try self.advanceShell();
-            for (self.clients) |client| if (client.active and client.protocol_ready != 0)
+            for (self.clients.items) |client| if (client.active and client.protocol_ready != 0)
                 try self.flushProtocolOn(client.peer);
         }
 
@@ -1509,7 +1509,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn clientFor(self: *Self, peer: wayring.io_uring.Peer) ?*Client {
-            for (self.clients) |*client|
+            for (self.clients.items) |*client|
                 if (client.active and samePeer(client.peer, peer)) return client;
             return null;
         }
@@ -1520,13 +1520,13 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn markProtocolAll(self: *Self, ready: u16) void {
-            for (self.clients) |*client| {
+            for (self.clients.items) |*client| {
                 if (client.active) client.protocol_ready |= ready;
             }
         }
 
         fn markPointerConstraintsProtocol(self: *Self) void {
-            for (self.clients) |*client| {
+            for (self.clients.items) |*client| {
                 if (client.active and
                     self.pointer_constraints_adapter.pendingOutbound(client.peer))
                     client.protocol_ready |= ProtocolReady.pointer_constraints;
@@ -1772,7 +1772,7 @@ pub fn Coordinator(comptime protocol: type) type {
             defer if (source_access_owned) source.endShmAccess() catch {};
             var imported_source: ?output_api.ImportedSource = null;
             defer if (imported_source) |*imported| imported.deinit();
-            const borrowed_source: render.Source = switch (source) {
+            var borrowed_source: render.Source = switch (source) {
                 .shm => |shm| shm_source: {
                     const pixel_format: render.PixelFormat = if (shm.format.value == protocol.wl_shm.format.argb8888.value) .argb8888_premultiplied else if (shm.format.value == protocol.wl_shm.format.xrgb8888.value) .xrgb8888 else return error.UnsupportedShmFormat;
                     if (shm.stride > std.math.maxInt(u32)) return error.InvalidSource;
@@ -1784,28 +1784,32 @@ pub fn Coordinator(comptime protocol: type) type {
                     };
                 },
                 .external => |external| external_source: {
-                    const output = self.output orelse
+                    const pixel_format = output_api.formatFromDrm(external.format) orelse
                         return try self.discardPendingCandidate(layer, pending.id);
-                    imported_source = output.mapClientBuffer(.{
-                        .width = external.width,
-                        .height = external.height,
-                        .format = external.format,
-                        .modifier = external.modifier,
-                        .plane_count = external.plane_count,
-                        .fds = external.fds,
-                        .strides = external.strides,
-                        .offsets = external.offsets,
-                    }) catch return try self.discardPendingCandidate(layer, pending.id);
-                    const imported = &imported_source.?;
                     break :external_source .{
-                        .size = .{ .width = imported.width, .height = imported.height },
-                        .stride = imported.stride,
-                        .format = imported.format,
-                        .bytes = imported.bytes,
+                        .size = .{ .width = external.width, .height = external.height },
+                        .stride = external.strides[0],
+                        .format = pixel_format,
+                        .bytes = &.{},
+                        .external = .{
+                            .context = external.context,
+                            .token = external.token,
+                            .drm_format = external.format,
+                            .modifier = external.modifier,
+                            .plane_count = external.plane_count,
+                            .fds = external.fds,
+                            .strides = external.strides,
+                            .offsets = external.offsets,
+                        },
                     };
                 },
             };
-            if (borrowed_source.bytes.len > (self.output_config.max_surface_bytes orelse
+            const logical_source_bytes = std.math.mul(
+                usize,
+                borrowed_source.stride,
+                borrowed_source.size.height,
+            ) catch return error.InvalidSource;
+            if (logical_source_bytes > (self.output_config.max_surface_bytes orelse
                 self.output_config.max_source_bytes))
                 return error.InvalidSource;
             const surface_id: @import("../output/headless.zig").SurfaceId = .{
@@ -1867,14 +1871,51 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             const render_device = self.render_device orelse return false;
             const upload_damage = renderUploadDamage(content.surface.upload_damage);
-            const prepared = render_device.content.prepareReplacing(
-                layer.rendered,
-                sample_identity,
-                borrowed_source,
-                upload_damage,
-            ) catch |err| switch (err) {
-                error.VersionCapacityExceeded, error.ByteCapacityExceeded => return false,
-                else => return err,
+            const prepared = native: {
+                if (borrowed_source.external != null) {
+                    if (render_device.content.prepareReplacingExternal(
+                        layer.rendered,
+                        sample_identity,
+                        borrowed_source,
+                        upload_damage,
+                    )) |prepared| break :native prepared else |_| {
+                        const external = switch (source) {
+                            .external => |external| external,
+                            .shm => unreachable,
+                        };
+                        const output = self.output orelse
+                            return try self.discardPendingCandidate(layer, pending.id);
+                        imported_source = output.mapClientBuffer(.{
+                            .context = external.context,
+                            .token = external.token,
+                        }, .{
+                            .width = external.width,
+                            .height = external.height,
+                            .format = external.format,
+                            .modifier = external.modifier,
+                            .plane_count = external.plane_count,
+                            .fds = external.fds,
+                            .strides = external.strides,
+                            .offsets = external.offsets,
+                        }) catch return try self.discardPendingCandidate(layer, pending.id);
+                        const imported = &imported_source.?;
+                        borrowed_source = .{
+                            .size = .{ .width = imported.width, .height = imported.height },
+                            .stride = imported.stride,
+                            .format = imported.format,
+                            .bytes = imported.bytes,
+                        };
+                    }
+                }
+                break :native render_device.content.prepareReplacing(
+                    layer.rendered,
+                    sample_identity,
+                    borrowed_source,
+                    upload_damage,
+                ) catch |err| switch (err) {
+                    error.VersionCapacityExceeded, error.ByteCapacityExceeded => return false,
+                    else => return err,
+                };
             };
             var prepared_owned = true;
             defer if (prepared_owned) render_device.content.cancel(prepared);
@@ -1947,7 +1988,8 @@ pub fn Coordinator(comptime protocol: type) type {
             layer.binding = binding;
             self.finishPendingCandidate(pending.id);
             self.stats.applied += 1;
-            _ = try self.retryLayerSourceRelease(layer);
+            if (render_device.content.ready(rendered))
+                _ = try self.retryLayerSourceRelease(layer);
             return true;
         }
 
@@ -2027,7 +2069,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.frame_bindings[0..count],
                 try monotonicNs(),
             )) {
-                .submitted => self.stats.submitted += 1,
+                .submitted => {
+                    self.stats.submitted += 1;
+                    _ = try self.retryRetainedOutcomes();
+                },
                 .retired => |failure| try self.finishOutcome(failure.frame, false),
             }
         }
@@ -2169,6 +2214,10 @@ pub fn Coordinator(comptime protocol: type) type {
         /// Drop backing ownership immediately, then queue protocol releases with
         /// retryable transport backpressure independently of presentation.
         fn retryLayerSourceRelease(self: *Self, layer: *Layer) !bool {
+            if (layer.rendered) |rendered| {
+                const render_device = self.render_device orelse return false;
+                if (!render_device.content.ready(rendered)) return false;
+            }
             var content = &(layer.content orelse return error.MissingContent);
             if (content.attachment_lease) |*lease| {
                 lease.deinit();
@@ -2273,7 +2322,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn syncOutputAssociations(self: *Self) !void {
-            for (self.clients) |client| if (client.active) {
+            for (self.clients.items) |client| if (client.active) {
                 var count: usize = 0;
                 for (self.app_layers) |layer| {
                     if (!layer.active or layer.peer == null or

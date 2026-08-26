@@ -36,6 +36,12 @@ pub const Provider = struct {
     allocate_fn: *const fn (*anyopaque, usize) anyerror!Allocation,
     release_fn: *const fn (*anyopaque, u64) void,
     pinned_fn: *const fn (*anyopaque, u64) bool,
+    allocate_native_fn: ?*const fn (*anyopaque, render.Size, render.PixelFormat) anyerror!render.NativeBacking = null,
+    prepare_native_fn: ?*const fn (*anyopaque, render.NativeBacking, render.SampleIdentity, render.ExternalSource) anyerror!void = null,
+    cancel_native_fn: ?*const fn (*anyopaque, render.NativeBacking, render.SampleIdentity) void = null,
+    release_native_fn: ?*const fn (*anyopaque, u64) void = null,
+    pinned_native_fn: ?*const fn (*anyopaque, u64) bool = null,
+    ready_native_fn: ?*const fn (*anyopaque, u64, render.SampleIdentity) bool = null,
 
     pub fn allocate(self: Provider, size: usize) !Allocation {
         return self.allocate_fn(self.context, size);
@@ -65,6 +71,7 @@ const Slot = struct {
     source: render.Source = undefined,
     current: bool = false,
     replacement: ?Replacement = null,
+    accounted_bytes: usize = 0,
 };
 
 pub const Store = struct {
@@ -179,8 +186,77 @@ pub const Store = struct {
             .bytes = bytes,
             .upload = allocation.upload,
         };
+        slot.accounted_bytes = packed_length;
         slot.current = false;
         self.used_bytes += packed_length;
+        return .{ .index = @intCast(index), .generation = slot.generation };
+    }
+
+    /// Transactionally imports an external DMA-BUF into an immutable native
+    /// destination. A compatible unpinned adjacent version can reuse that
+    /// destination; no renderer operation occurs until the renderer observes
+    /// the published source.
+    pub fn prepareReplacingExternal(
+        self: *Store,
+        previous: ?Handle,
+        identity: render.SampleIdentity,
+        source: render.Source,
+        damage: render.UploadDamage,
+    ) !Prepared {
+        try validateExternal(identity, source);
+        const logical_bytes = std.math.mul(usize, source.stride, source.size.height) catch
+            return error.InvalidSource;
+
+        if (previous) |handle| reuse: {
+            if (handle.index >= self.slots.len) return error.StaleContent;
+            const slot = &self.slots[handle.index];
+            if (slot.state != .published or slot.generation != handle.generation or !slot.current)
+                return error.StaleContent;
+            if (slot.identity.surface != identity.surface) break :reuse;
+            if (identity.commit_sequence <= slot.identity.commit_sequence) return error.StaleCommit;
+            const next = std.math.add(u64, slot.identity.commit_sequence, 1) catch
+                return error.NonAdjacentCommit;
+            if (identity.commit_sequence != next) return error.NonAdjacentCommit;
+            if (slot.source.native == null or !std.meta.eql(slot.source.size, source.size) or
+                slot.source.stride != source.stride or slot.source.format != source.format or
+                slot.accounted_bytes != logical_bytes)
+                break :reuse;
+            const provider = self.provider orelse return error.NativeProviderUnavailable;
+            const pinned_fn = provider.pinned_native_fn orelse return error.NativeProviderUnavailable;
+            if (pinned_fn(provider.context, slot.source.native.?.token)) break :reuse;
+            const prepare_fn = provider.prepare_native_fn orelse return error.NativeProviderUnavailable;
+            try prepare_fn(provider.context, slot.source.native.?, identity, source.external.?);
+            slot.state = .replacing;
+            slot.replacement = .{ .identity = identity, .source = source, .damage = damage };
+            return .{ .index = handle.index, .generation = handle.generation, .replaces = true };
+        }
+
+        const predecessor = self.currentSlot(identity.surface);
+        if (predecessor) |slot| {
+            if (identity.commit_sequence <= slot.identity.commit_sequence) return error.StaleCommit;
+            const next = std.math.add(u64, slot.identity.commit_sequence, 1) catch
+                return error.NonAdjacentCommit;
+            if (identity.commit_sequence != next) return error.NonAdjacentCommit;
+        }
+        const index = self.freeSlot() orelse return error.VersionCapacityExceeded;
+        if (logical_bytes > self.byte_capacity - self.used_bytes) return error.ByteCapacityExceeded;
+        const provider = self.provider orelse return error.NativeProviderUnavailable;
+        const allocate_fn = provider.allocate_native_fn orelse return error.NativeProviderUnavailable;
+        const prepare_fn = provider.prepare_native_fn orelse return error.NativeProviderUnavailable;
+        _ = provider.release_native_fn orelse return error.NativeProviderUnavailable;
+        const native = try allocate_fn(provider.context, source.size, source.format);
+        errdefer if (provider.release_native_fn) |release_fn| release_fn(provider.context, native.token);
+        try prepare_fn(provider.context, native, identity, source.external.?);
+        var slot = &self.slots[index];
+        slot.generation +%= 1;
+        if (slot.generation == 0) slot.generation = 1;
+        slot.state = .prepared;
+        slot.identity = identity;
+        slot.source = source;
+        slot.source.native = native;
+        slot.accounted_bytes = logical_bytes;
+        slot.current = false;
+        self.used_bytes += logical_bytes;
         return .{ .index = @intCast(index), .generation = slot.generation };
     }
 
@@ -240,6 +316,14 @@ pub const Store = struct {
 
     pub fn cancel(self: *Store, prepared: Prepared) void {
         const slot = self.preparedSlot(prepared) orelse return;
+        if (slot.source.native) |native| if (self.provider) |provider|
+            if (provider.cancel_native_fn) |cancel_fn| {
+                const identity = if (prepared.replaces)
+                    slot.replacement.?.identity
+                else
+                    slot.identity;
+                cancel_fn(provider.context, native, identity);
+            };
         if (prepared.replaces) {
             slot.replacement = null;
             slot.state = .published;
@@ -255,6 +339,15 @@ pub const Store = struct {
         const slot = self.preparedSlot(prepared) orelse unreachable;
         if (prepared.replaces) {
             const replacement = slot.replacement orelse unreachable;
+            if (slot.source.native != null) {
+                slot.generation +%= 1;
+                if (slot.generation == 0) slot.generation = 1;
+                slot.identity = replacement.identity;
+                slot.source.external = replacement.source.external;
+                slot.replacement = null;
+                slot.state = .published;
+                return .{ .index = prepared.index, .generation = slot.generation };
+            }
             const packed_stride = slot.source.stride;
             if (coversSource(replacement.damage, replacement.source.size)) {
                 copyFull(@constCast(slot.source.bytes), packed_stride, replacement.source);
@@ -290,6 +383,17 @@ pub const Store = struct {
             slot.generation != handle.generation)
             return error.StaleContent;
         return slot.source;
+    }
+
+    pub fn ready(self: *const Store, handle: Handle) bool {
+        if (handle.index >= self.slots.len) return false;
+        const slot = &self.slots[handle.index];
+        if ((slot.state != .published and slot.state != .replacing) or
+            slot.generation != handle.generation) return false;
+        const native = slot.source.native orelse return true;
+        const provider = self.provider orelse return false;
+        const ready_fn = provider.ready_native_fn orelse return false;
+        return ready_fn(provider.context, native.token, slot.identity);
     }
 
     pub fn release(self: *Store, handle: Handle) void {
@@ -334,7 +438,7 @@ pub const Store = struct {
     }
 
     fn free(self: *Store, slot: *Slot) void {
-        self.used_bytes -= slot.source.bytes.len;
+        self.used_bytes -= slot.accounted_bytes;
         self.releaseBytes(slot.source);
         const generation = slot.generation;
         slot.* = .{ .generation = generation };
@@ -347,6 +451,10 @@ pub const Store = struct {
     }
 
     fn releaseBytes(self: *Store, source: render.Source) void {
+        if (source.native) |native| if (self.provider) |provider| {
+            if (provider.release_native_fn) |release_fn| release_fn(provider.context, native.token);
+            return;
+        };
         if (source.upload) |upload| if (self.provider) |provider| {
             provider.release(upload.token);
             return;
@@ -354,6 +462,18 @@ pub const Store = struct {
         self.allocator.free(@constCast(source.bytes));
     }
 };
+
+fn validateExternal(identity: render.SampleIdentity, source: render.Source) !void {
+    if (identity.surface == 0 or identity.commit_sequence == 0) return error.InvalidIdentity;
+    const external = source.external orelse return error.InvalidSource;
+    if (source.native != null or source.upload != null or source.bytes.len != 0 or
+        source.size.width == 0 or source.size.height == 0 or source.stride == 0 or
+        external.token == 0 or external.drm_format == 0 or
+        external.plane_count == 0 or external.plane_count > 4)
+        return error.InvalidSource;
+    for (0..external.plane_count) |plane| if (external.fds[plane] < 0 or
+        external.strides[plane] == 0) return error.InvalidSource;
+}
 
 fn copyFull(destination: []u8, packed_stride: u32, source: render.Source) void {
     for (0..source.size.height) |row| {
@@ -474,6 +594,83 @@ const TestProvider = struct {
         self.references[index] += 1;
     }
 };
+
+const NativeTestProvider = struct {
+    cpu: TestProvider = .{},
+    next_token: u64 = 10,
+    allocations: usize = 0,
+    releases: usize = 0,
+    pinned_token: u64 = 0,
+    ready_token: u64 = 0,
+    ready_identity: render.SampleIdentity = .{ .surface = 0, .commit_sequence = 0 },
+
+    fn provider(self: *NativeTestProvider) Provider {
+        return .{
+            .context = self,
+            .allocate_fn = cpuAllocate,
+            .release_fn = cpuRelease,
+            .pinned_fn = cpuPinned,
+            .allocate_native_fn = allocateNative,
+            .prepare_native_fn = prepareNative,
+            .cancel_native_fn = cancelNative,
+            .release_native_fn = releaseNative,
+            .pinned_native_fn = pinnedNative,
+            .ready_native_fn = readyNative,
+        };
+    }
+    fn cpuAllocate(context: *anyopaque, size: usize) !Allocation {
+        const self: *NativeTestProvider = @ptrCast(@alignCast(context));
+        return TestProvider.allocate(&self.cpu, size);
+    }
+    fn cpuRelease(context: *anyopaque, token: u64) void {
+        const self: *NativeTestProvider = @ptrCast(@alignCast(context));
+        TestProvider.release(&self.cpu, token);
+    }
+    fn cpuPinned(context: *anyopaque, token: u64) bool {
+        const self: *NativeTestProvider = @ptrCast(@alignCast(context));
+        return TestProvider.pinned(&self.cpu, token);
+    }
+    fn allocateNative(context: *anyopaque, _: render.Size, _: render.PixelFormat) !render.NativeBacking {
+        const self: *NativeTestProvider = @ptrCast(@alignCast(context));
+        const token = self.next_token;
+        self.next_token += 1;
+        self.allocations += 1;
+        return .{ .owner = context, .token = token };
+    }
+    fn prepareNative(_: *anyopaque, _: render.NativeBacking, _: render.SampleIdentity, _: render.ExternalSource) !void {}
+    fn cancelNative(_: *anyopaque, _: render.NativeBacking, _: render.SampleIdentity) void {}
+    fn releaseNative(context: *anyopaque, _: u64) void {
+        const self: *NativeTestProvider = @ptrCast(@alignCast(context));
+        self.releases += 1;
+    }
+    fn pinnedNative(context: *anyopaque, token: u64) bool {
+        const self: *NativeTestProvider = @ptrCast(@alignCast(context));
+        return self.pinned_token == token;
+    }
+    fn readyNative(context: *anyopaque, token: u64, identity: render.SampleIdentity) bool {
+        const self: *NativeTestProvider = @ptrCast(@alignCast(context));
+        return self.ready_token == token and std.meta.eql(self.ready_identity, identity);
+    }
+};
+
+fn externalSource(context: *anyopaque, token: u64) render.Source {
+    return .{
+        .size = .{ .width = 2, .height = 2 },
+        .stride = 8,
+        .format = .xrgb8888,
+        .bytes = &.{},
+        .external = .{
+            .context = context,
+            .token = token,
+            .drm_format = 0x34325258,
+            .modifier = 0,
+            .plane_count = 1,
+            .fds = .{ 3, -1, -1, -1 },
+            .strides = .{ 8, 0, 0, 0 },
+            .offsets = .{ 0, 0, 0, 0 },
+        },
+    };
+}
 
 test "render-content: alternating buffers patch one logical surface history" {
     var store = try Store.init(std.testing.allocator, .{ .version_capacity = 3, .byte_capacity = 48 });
@@ -691,4 +888,88 @@ test "render-content: stale generation destruction does not invalidate handles" 
     try std.testing.expectEqualSlices(u8, &bytes, (try store.resolve(handle)).bytes);
     store.release(handle);
     try std.testing.expectError(error.StaleContent, store.resolve(handle));
+}
+
+test "render-content: external allocation publication readiness and exact accounting" {
+    var backing: NativeTestProvider = .{};
+    var store = try Store.initWithProvider(
+        std.testing.allocator,
+        .{ .version_capacity = 2, .byte_capacity = 16 },
+        backing.provider(),
+    );
+    defer store.deinit();
+    const baseline = store.allocatedBytes();
+    const identity: render.SampleIdentity = .{ .surface = 8, .commit_sequence = 1 };
+    const prepared = try store.prepareReplacingExternal(null, identity, externalSource(&backing, 101), .{});
+    try std.testing.expectEqual(@as(usize, 1), backing.allocations);
+    try std.testing.expectEqual(baseline + 16, store.allocatedBytes());
+    const handle = store.publish(prepared);
+    const source = try store.resolve(handle);
+    try std.testing.expectEqual(@as(u64, 10), source.native.?.token);
+    try std.testing.expectEqual(@as(u64, 101), source.external.?.token);
+    try std.testing.expect(!store.ready(handle));
+    backing.ready_token = 10;
+    backing.ready_identity = identity;
+    try std.testing.expect(store.ready(handle));
+    backing.ready_identity.commit_sequence = 2;
+    try std.testing.expect(!store.ready(handle));
+    try std.testing.expectError(error.StaleCommit, store.prepareReplacingExternal(
+        handle,
+        identity,
+        externalSource(&backing, 102),
+        .{},
+    ));
+    store.release(handle);
+    try std.testing.expectEqual(baseline, store.allocatedBytes());
+    try std.testing.expectEqual(@as(usize, 1), backing.releases);
+    try std.testing.expect(!store.ready(handle));
+}
+
+test "render-content: external adjacent replacement cancel reuse and pinned fallback" {
+    var backing: NativeTestProvider = .{};
+    var store = try Store.initWithProvider(
+        std.testing.allocator,
+        .{ .version_capacity = 2, .byte_capacity = 32 },
+        backing.provider(),
+    );
+    defer store.deinit();
+    const old = store.publish(try store.prepareReplacingExternal(
+        null,
+        .{ .surface = 3, .commit_sequence = 1 },
+        externalSource(&backing, 201),
+        .{},
+    ));
+    const cancelled = try store.prepareReplacingExternal(
+        old,
+        .{ .surface = 3, .commit_sequence = 2 },
+        externalSource(&backing, 202),
+        .{},
+    );
+    try std.testing.expect(cancelled.replaces);
+    store.cancel(cancelled);
+    try std.testing.expectEqual(@as(u64, 201), (try store.resolve(old)).external.?.token);
+    try std.testing.expectEqual(@as(usize, 1), backing.allocations);
+
+    const current = store.publish(try store.prepareReplacingExternal(
+        old,
+        .{ .surface = 3, .commit_sequence = 2 },
+        externalSource(&backing, 202),
+        .{},
+    ));
+    try std.testing.expectEqual(@as(u64, 10), (try store.resolve(current)).native.?.token);
+    try std.testing.expectEqual(@as(u64, 202), (try store.resolve(current)).external.?.token);
+    backing.pinned_token = 10;
+    const fallback = try store.prepareReplacingExternal(
+        current,
+        .{ .surface = 3, .commit_sequence = 3 },
+        externalSource(&backing, 203),
+        .{},
+    );
+    try std.testing.expect(!fallback.replaces);
+    try std.testing.expectEqual(@as(usize, 2), backing.allocations);
+    store.cancel(fallback);
+    try std.testing.expectEqual(@as(usize, 1), backing.releases);
+    try std.testing.expectEqual(@as(u64, 202), (try store.resolve(current)).external.?.token);
+    store.release(current);
+    try std.testing.expectEqual(@as(usize, 2), backing.releases);
 }

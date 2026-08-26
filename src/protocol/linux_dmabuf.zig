@@ -33,16 +33,10 @@ pub const Error = error{
 };
 
 pub const Config = struct {
-    manager_capacity: usize = 4,
-    params_capacity: usize = 16,
-    buffer_capacity: usize = 16,
     global_version: u32 = 3,
 
     fn validate(config: Config) Error!void {
-        if (config.manager_capacity == 0 or config.manager_capacity >= none or
-            config.params_capacity == 0 or config.params_capacity >= none or
-            config.buffer_capacity == 0 or config.buffer_capacity >= none or
-            config.global_version == 0 or config.global_version > 3)
+        if (config.global_version == 0 or config.global_version > 3)
             return error.InvalidConfig;
     }
 };
@@ -76,6 +70,7 @@ pub const Buffer = struct {
 const ParamsSlot = struct {
     active: bool = false,
     generation: u32 = 1,
+    index: u32 = none,
     next_free: u32 = none,
     used: bool = false,
     planes: [max_planes]?Plane = [_]?Plane{null} ** max_planes,
@@ -85,6 +80,7 @@ const BufferSlot = struct {
     active: bool = false,
     resource_alive: bool = false,
     generation: u32 = 1,
+    index: u32 = none,
     next_free: u32 = none,
     leases: usize = 0,
     value: Buffer = undefined,
@@ -92,47 +88,33 @@ const BufferSlot = struct {
 
 pub const Store = struct {
     allocator: std.mem.Allocator,
-    params: []ParamsSlot,
-    buffers: []BufferSlot,
-    params_free: u32,
-    buffers_free: u32,
+    params: std.ArrayListUnmanaged(*ParamsSlot) = .empty,
+    buffers: std.ArrayListUnmanaged(*BufferSlot) = .empty,
+    params_free: u32 = none,
+    buffers_free: u32 = none,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) Error!Store {
         try config.validate();
-        const params = allocator.alloc(ParamsSlot, config.params_capacity) catch
-            return error.Exhausted;
-        errdefer allocator.free(params);
-        const buffers = allocator.alloc(BufferSlot, config.buffer_capacity) catch
-            return error.Exhausted;
-        for (params, 0..) |*slot, index| slot.* = .{
-            .next_free = if (index + 1 < params.len) @intCast(index + 1) else none,
-        };
-        for (buffers, 0..) |*slot, index| slot.* = .{
-            .next_free = if (index + 1 < buffers.len) @intCast(index + 1) else none,
-        };
-        return .{
-            .allocator = allocator,
-            .params = params,
-            .buffers = buffers,
-            .params_free = 0,
-            .buffers_free = 0,
-        };
+        return .{ .allocator = allocator };
     }
 
     pub fn deinit(store: *Store) void {
-        for (store.params) |*slot| if (slot.active) closePlanes(&slot.planes);
-        for (store.buffers) |*slot| if (slot.active) closePlanes(&slot.value.planes);
-        store.allocator.free(store.buffers);
-        store.allocator.free(store.params);
+        for (store.params.items) |slot| {
+            if (slot.active) closePlanes(&slot.planes);
+            store.allocator.destroy(slot);
+        }
+        for (store.buffers.items) |slot| {
+            if (slot.active) closePlanes(&slot.value.planes);
+            store.allocator.destroy(slot);
+        }
+        store.buffers.deinit(store.allocator);
+        store.params.deinit(store.allocator);
         store.* = undefined;
     }
 
     pub fn createParams(store: *Store) Error!Handle {
-        if (store.params_free == none) return error.Exhausted;
-        const index = store.params_free;
-        const slot = &store.params[index];
-        store.params_free = slot.next_free;
-        slot.* = .{ .active = true, .generation = slot.generation };
+        const slot = try acquireStoreSlot(ParamsSlot, store.allocator, &store.params, &store.params_free);
+        const index = slot.index;
         return .{ .index = index, .generation = slot.generation };
     }
 
@@ -193,15 +175,13 @@ pub const Store = struct {
         const end = std.math.add(u64, plane.offset, last_row) catch
             return error.OutOfBounds;
         _ = std.math.add(u64, end, row_bytes) catch return error.OutOfBounds;
-        if (store.buffers_free == none) return error.Exhausted;
-
-        const index = store.buffers_free;
-        const slot = &store.buffers[index];
-        store.buffers_free = slot.next_free;
+        const slot = try acquireStoreSlot(BufferSlot, store.allocator, &store.buffers, &store.buffers_free);
+        const index = slot.index;
         slot.* = .{
             .active = true,
             .resource_alive = true,
             .generation = slot.generation,
+            .index = index,
             .value = .{
                 .width = @intCast(width),
                 .height = @intCast(height),
@@ -260,22 +240,22 @@ pub const Store = struct {
     }
 
     fn resolveParams(store: *Store, handle: Handle) Error!*ParamsSlot {
-        if (handle.index >= store.params.len) return error.StaleHandle;
-        const slot = &store.params[handle.index];
+        if (handle.index >= store.params.items.len) return error.StaleHandle;
+        const slot = store.params.items[handle.index];
         if (!slot.active or slot.generation != handle.generation)
             return error.StaleHandle;
         return slot;
     }
 
     fn resolveBuffer(store: *Store, index: u32, generation: u32) Error!*BufferSlot {
-        if (index >= store.buffers.len) return error.StaleHandle;
-        const slot = &store.buffers[index];
+        if (index >= store.buffers.items.len) return error.StaleHandle;
+        const slot = store.buffers.items[index];
         if (!slot.active or slot.generation != generation) return error.StaleHandle;
         return slot;
     }
 
     fn releaseBufferSlot(store: *Store, index: u32) void {
-        const slot = &store.buffers[index];
+        const slot = store.buffers.items[index];
         std.debug.assert(slot.active and !slot.resource_alive and slot.leases == 0);
         closePlanes(&slot.value.planes);
         releaseSlot(BufferSlot, slot, &store.buffers_free, index);
@@ -298,6 +278,7 @@ pub fn Adapter(comptime protocol: type) type {
         const Header = struct {
             active: bool = false,
             generation: u32 = 1,
+            index: u32 = none,
             next_free: u32 = none,
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
         };
@@ -328,12 +309,9 @@ pub fn Adapter(comptime protocol: type) type {
         global: ?objects.Handle = null,
         global_version: u32,
         store: Store,
-        managers: []ManagerSlot,
-        params: []ParamsResource,
-        buffers: []BufferResource,
-        manager_free: u32 = 0,
-        params_free: u32 = 0,
-        buffer_free: u32 = 0,
+        managers: SlotPool(ManagerSlot),
+        params: SlotPool(ParamsResource),
+        buffers: SlotPool(BufferResource),
         pending_len: usize = 0,
 
         pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
@@ -341,30 +319,21 @@ pub fn Adapter(comptime protocol: type) type {
             try Dmabuf.info.validateVersion(config.global_version);
             var store = try Store.init(allocator, config);
             errdefer store.deinit();
-            const managers = try allocator.alloc(ManagerSlot, config.manager_capacity);
-            errdefer allocator.free(managers);
-            const params = try allocator.alloc(ParamsResource, config.params_capacity);
-            errdefer allocator.free(params);
-            const buffers = try allocator.alloc(BufferResource, config.buffer_capacity);
-            errdefer allocator.free(buffers);
-            initHeaders(ManagerSlot, managers);
-            initHeaders(ParamsResource, params);
-            initHeaders(BufferResource, buffers);
             return .{
                 .allocator = allocator,
                 .global_version = config.global_version,
                 .store = store,
-                .managers = managers,
-                .params = params,
-                .buffers = buffers,
+                .managers = .{ .allocator = allocator },
+                .params = .{ .allocator = allocator },
+                .buffers = .{ .allocator = allocator },
             };
         }
 
         pub fn deinit(adapter: *Self) void {
             adapter.store.deinit();
-            adapter.allocator.free(adapter.buffers);
-            adapter.allocator.free(adapter.params);
-            adapter.allocator.free(adapter.managers);
+            adapter.buffers.deinit();
+            adapter.params.deinit();
+            adapter.managers.deinit();
             adapter.* = undefined;
         }
 
@@ -384,7 +353,7 @@ pub fn Adapter(comptime protocol: type) type {
 
         fn bind(context: ?*anyopaque, binding: wayring.server.Binding) !?*anyopaque {
             const adapter: *Self = @ptrCast(@alignCast(context orelse return error.InvalidContext));
-            const slot = acquire(ManagerSlot, adapter.managers, &adapter.manager_free) catch
+            const slot = adapter.managers.acquire() catch
                 return error.OutOfMemory;
             slot.header.resource = binding.resource;
             slot.peer = binding.peer;
@@ -417,18 +386,18 @@ pub fn Adapter(comptime protocol: type) type {
             const handle = server_objects.namespace.lookupHandle(message.header.object_id) orelse
                 return null;
             if (target.object.interface == &Dmabuf.info) {
-                const manager = fromContext(ManagerSlot, adapter.managers, target.object.context) orelse
+                const manager = adapter.managers.fromContext(target.object.context) orelse
                     return null;
                 if (!std.meta.eql(manager.header.resource, handle)) return null;
                 const decoded = try wayring.server.decodeRequest(Dmabuf, server_objects, message, fds);
                 switch (decoded.value) {
                     .destroy => {},
                     .create_params => |payload| {
-                        const slot = acquire(ParamsResource, adapter.params, &adapter.params_free) catch
+                        const slot = adapter.params.acquire() catch
                             return try adapter.noMemory(actor);
                         slot.peer = manager.peer;
                         slot.state = adapter.store.createParams() catch {
-                            release(ParamsResource, adapter.params, &adapter.params_free, indexOf(ParamsResource, adapter.params, slot));
+                            adapter.params.release(slot);
                             return try adapter.noMemory(actor);
                         };
                         const admitted = Dmabuf.admit_create_params(
@@ -438,7 +407,7 @@ pub fn Adapter(comptime protocol: type) type {
                             .{ .params_id = slot },
                         ) catch |cause| {
                             adapter.store.destroyParams(slot.state) catch unreachable;
-                            release(ParamsResource, adapter.params, &adapter.params_free, indexOf(ParamsResource, adapter.params, slot));
+                            adapter.params.release(slot);
                             return try adapter.failure(actor, decoded.handle.id, cause);
                         };
                         slot.header.resource = admitted.params_id;
@@ -449,13 +418,13 @@ pub fn Adapter(comptime protocol: type) type {
                 return .continue_dispatch;
             }
             if (target.object.interface == &Params.info) {
-                const slot = fromContext(ParamsResource, adapter.params, target.object.context) orelse
+                const slot = adapter.params.fromContext(target.object.context) orelse
                     return null;
                 if (!std.meta.eql(slot.header.resource, handle)) return null;
                 return try adapter.paramsRequest(actor, server_objects, slot, message, fds);
             }
             if (target.object.interface == &WlBuffer.info) {
-                const slot = fromContext(BufferResource, adapter.buffers, target.object.context) orelse
+                const slot = adapter.buffers.fromContext(target.object.context) orelse
                     return null;
                 if (!std.meta.eql(slot.header.resource, handle)) return null;
                 const decoded = try wayring.server.decodeRequest(WlBuffer, server_objects, message, fds);
@@ -506,10 +475,15 @@ pub fn Adapter(comptime protocol: type) type {
                         },
                         else => return try adapter.paramsError(actor, decoded.handle.id, cause),
                     };
-                    const buffer = acquire(BufferResource, adapter.buffers, &adapter.buffer_free) catch
-                        unreachable;
+                    const buffer = adapter.buffers.acquire() catch {
+                        adapter.store.destroyBuffer(created) catch unreachable;
+                        slot.pending = .failed;
+                        adapter.pending_len += 1;
+                        try decoded.finish(protocol, server_objects, &actor.transmit);
+                        return .continue_dispatch;
+                    };
                     buffer.state = created;
-                    slot.pending = .{ .created = indexOf(BufferResource, adapter.buffers, buffer) };
+                    slot.pending = .{ .created = buffer.header.index };
                     adapter.pending_len += 1;
                 },
                 .create_immed => |payload| {
@@ -523,8 +497,10 @@ pub fn Adapter(comptime protocol: type) type {
                         error.InvalidWlBuffer
                     else
                         cause);
-                    const buffer = acquire(BufferResource, adapter.buffers, &adapter.buffer_free) catch
-                        unreachable;
+                    const buffer = adapter.buffers.acquire() catch {
+                        adapter.store.destroyBuffer(created) catch unreachable;
+                        return try adapter.paramsError(actor, decoded.handle.id, error.InvalidWlBuffer);
+                    };
                     buffer.state = created;
                     const admitted = Params.admit_create_immed(
                         server_objects,
@@ -533,7 +509,7 @@ pub fn Adapter(comptime protocol: type) type {
                         .{ .buffer_id = buffer },
                     ) catch |cause| {
                         adapter.store.destroyBuffer(created) catch unreachable;
-                        release(BufferResource, adapter.buffers, &adapter.buffer_free, indexOf(BufferResource, adapter.buffers, buffer));
+                        adapter.buffers.release(buffer);
                         return try adapter.failure(actor, decoded.handle.id, cause);
                     };
                     buffer.header.resource = admitted.buffer_id;
@@ -552,7 +528,7 @@ pub fn Adapter(comptime protocol: type) type {
         ) !usize {
             var completed: usize = 0;
             if (adapter.pending_len == 0) return completed;
-            for (adapter.managers) |*manager| {
+            for (adapter.managers.entries.items) |manager| {
                 if (!manager.header.active or !samePeer(manager.peer, peer)) continue;
                 if (manager.advertisement >= 4) continue;
                 while (manager.advertisement < 4) {
@@ -589,7 +565,7 @@ pub fn Adapter(comptime protocol: type) type {
                 }
                 adapter.pending_len -= 1;
             }
-            for (adapter.params) |*slot| {
+            for (adapter.params.entries.items) |slot| {
                 if (!slot.header.active or !samePeer(slot.peer, peer)) continue;
                 switch (slot.pending) {
                     .none => {},
@@ -610,7 +586,7 @@ pub fn Adapter(comptime protocol: type) type {
                         completed += 1;
                     },
                     .created => |buffer_index| {
-                        const buffer = &adapter.buffers[buffer_index];
+                        const buffer = adapter.buffers.at(buffer_index) orelse unreachable;
                         const admitted = Params.construct_event_created(
                             protocol,
                             server_objects,
@@ -633,10 +609,10 @@ pub fn Adapter(comptime protocol: type) type {
 
         pub fn pendingOutbound(adapter: *const Self, peer: wayring.io_uring.Peer) bool {
             if (adapter.pending_len == 0) return false;
-            for (adapter.managers) |slot|
+            for (adapter.managers.entries.items) |slot|
                 if (slot.header.active and samePeer(slot.peer, peer) and slot.advertisement < 4)
                     return true;
-            for (adapter.params) |slot|
+            for (adapter.params.entries.items) |slot|
                 if (slot.header.active and samePeer(slot.peer, peer) and slot.pending != .none)
                     return true;
             return false;
@@ -644,7 +620,7 @@ pub fn Adapter(comptime protocol: type) type {
 
         pub fn bufferFromObject(adapter: *Self, object: *const objects.Object) ?Handle {
             if (object.interface != &WlBuffer.info) return null;
-            const slot = fromContext(BufferResource, adapter.buffers, object.context) orelse return null;
+            const slot = adapter.buffers.fromContext(object.context) orelse return null;
             return slot.state;
         }
 
@@ -700,31 +676,31 @@ pub fn Adapter(comptime protocol: type) type {
 
         pub fn resourceRemoved(adapter: *Self, handle: objects.Handle, object: objects.Object) bool {
             if (object.interface == &Dmabuf.info) {
-                const slot = fromContext(ManagerSlot, adapter.managers, object.context) orelse return false;
+                const slot = adapter.managers.fromContext(object.context) orelse return false;
                 if (!std.meta.eql(slot.header.resource, handle)) return false;
                 if (slot.advertisement < 4) adapter.pending_len -= 1;
-                release(ManagerSlot, adapter.managers, &adapter.manager_free, indexOf(ManagerSlot, adapter.managers, slot));
+                adapter.managers.release(slot);
                 return true;
             }
             if (object.interface == &Params.info) {
-                const slot = fromContext(ParamsResource, adapter.params, object.context) orelse return false;
+                const slot = adapter.params.fromContext(object.context) orelse return false;
                 if (!std.meta.eql(slot.header.resource, handle)) return false;
                 if (slot.pending != .none) adapter.pending_len -= 1;
                 if (slot.pending == .created) {
                     const buffer_index = slot.pending.created;
-                    const buffer = &adapter.buffers[buffer_index];
+                    const buffer = adapter.buffers.at(buffer_index) orelse unreachable;
                     adapter.store.destroyBuffer(buffer.state) catch unreachable;
-                    release(BufferResource, adapter.buffers, &adapter.buffer_free, buffer_index);
+                    adapter.buffers.release(buffer);
                 }
                 adapter.store.destroyParams(slot.state) catch unreachable;
-                release(ParamsResource, adapter.params, &adapter.params_free, indexOf(ParamsResource, adapter.params, slot));
+                adapter.params.release(slot);
                 return true;
             }
             if (object.interface == &WlBuffer.info) {
-                const slot = fromContext(BufferResource, adapter.buffers, object.context) orelse return false;
+                const slot = adapter.buffers.fromContext(object.context) orelse return false;
                 if (!std.meta.eql(slot.header.resource, handle)) return false;
                 adapter.store.destroyBuffer(slot.state) catch unreachable;
-                release(BufferResource, adapter.buffers, &adapter.buffer_free, indexOf(BufferResource, adapter.buffers, slot));
+                adapter.buffers.release(slot);
                 return true;
             }
             return false;
@@ -769,44 +745,62 @@ pub fn Adapter(comptime protocol: type) type {
     };
 }
 
-fn initHeaders(comptime T: type, slots: []T) void {
-    for (slots, 0..) |*slot, index| slot.* = .{ .header = .{
-        .next_free = if (index + 1 < slots.len) @intCast(index + 1) else none,
-    } };
-}
+fn SlotPool(comptime T: type) type {
+    return struct {
+        allocator: std.mem.Allocator,
+        entries: std.ArrayListUnmanaged(*T) = .empty,
+        free_head: u32 = none,
 
-fn acquire(comptime T: type, slots: []T, free_head: *u32) !*T {
-    if (free_head.* == none) return error.Exhausted;
-    const index = free_head.*;
-    const slot = &slots[index];
-    free_head.* = slot.header.next_free;
-    slot.* = .{ .header = .{ .active = true, .generation = slot.header.generation } };
-    return slot;
-}
+        fn deinit(pool: *@This()) void {
+            for (pool.entries.items) |entry| pool.allocator.destroy(entry);
+            pool.entries.deinit(pool.allocator);
+            pool.* = undefined;
+        }
 
-fn release(comptime T: type, slots: []T, free_head: *u32, index: u32) void {
-    const slot = &slots[index];
-    slot.header.active = false;
-    slot.header.generation +%= 1;
-    if (slot.header.generation == 0) slot.header.generation = 1;
-    slot.header.next_free = free_head.*;
-    free_head.* = index;
-}
+        fn acquire(pool: *@This()) !*T {
+            if (pool.free_head != none) {
+                const slot = pool.entries.items[pool.free_head];
+                pool.free_head = slot.header.next_free;
+                slot.* = .{ .header = .{
+                    .active = true,
+                    .generation = slot.header.generation,
+                    .index = slot.header.index,
+                } };
+                return slot;
+            }
+            if (pool.entries.items.len >= none) return error.Exhausted;
+            const slot = try pool.allocator.create(T);
+            errdefer pool.allocator.destroy(slot);
+            const index: u32 = @intCast(pool.entries.items.len);
+            slot.* = .{ .header = .{ .active = true, .index = index } };
+            try pool.entries.append(pool.allocator, slot);
+            return slot;
+        }
 
-fn fromContext(comptime T: type, slots: []T, context: ?*anyopaque) ?*T {
-    const pointer = context orelse return null;
-    const address = @intFromPtr(pointer);
-    const start = @intFromPtr(slots.ptr);
-    const size = std.math.mul(usize, slots.len, @sizeOf(T)) catch return null;
-    const end = std.math.add(usize, start, size) catch return null;
-    if (address < start or address >= end or (address - start) % @sizeOf(T) != 0)
-        return null;
-    const slot = &slots[(address - start) / @sizeOf(T)];
-    return if (slot.header.active and @intFromPtr(slot) == address) slot else null;
-}
+        fn release(pool: *@This(), slot: *T) void {
+            std.debug.assert(slot.header.active);
+            const index = slot.header.index;
+            std.debug.assert(index < pool.entries.items.len and pool.entries.items[index] == slot);
+            slot.header.active = false;
+            slot.header.generation +%= 1;
+            if (slot.header.generation == 0) slot.header.generation = 1;
+            slot.header.next_free = pool.free_head;
+            pool.free_head = index;
+        }
 
-fn indexOf(comptime T: type, slots: []T, slot: *T) u32 {
-    return @intCast((@intFromPtr(slot) - @intFromPtr(slots.ptr)) / @sizeOf(T));
+        fn at(pool: *@This(), index: u32) ?*T {
+            if (index >= pool.entries.items.len) return null;
+            const slot = pool.entries.items[index];
+            return if (slot.header.active) slot else null;
+        }
+
+        fn fromContext(pool: *@This(), context: ?*anyopaque) ?*T {
+            const pointer = context orelse return null;
+            for (pool.entries.items) |slot|
+                if (slot.header.active and @intFromPtr(slot) == @intFromPtr(pointer)) return slot;
+            return null;
+        }
+    };
 }
 
 fn samePeer(a: wayring.io_uring.Peer, b: wayring.io_uring.Peer) bool {
@@ -821,7 +815,33 @@ fn decodeLease(token: u64) Lease {
     return .{ .index = @truncate(token), .generation = @truncate(token >> 32) };
 }
 
+fn acquireStoreSlot(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    slots: *std.ArrayListUnmanaged(*T),
+    free_head: *u32,
+) Error!*T {
+    if (free_head.* != none) {
+        const slot = slots.items[free_head.*];
+        free_head.* = slot.next_free;
+        slot.* = .{
+            .active = true,
+            .generation = slot.generation,
+            .index = slot.index,
+        };
+        return slot;
+    }
+    if (slots.items.len >= none) return error.Exhausted;
+    const slot = allocator.create(T) catch return error.Exhausted;
+    errdefer allocator.destroy(slot);
+    const index: u32 = @intCast(slots.items.len);
+    slot.* = .{ .active = true, .index = index };
+    slots.append(allocator, slot) catch return error.Exhausted;
+    return slot;
+}
+
 fn releaseSlot(comptime T: type, slot: *T, free_head: *u32, index: u32) void {
+    std.debug.assert(slot.index == index);
     slot.active = false;
     slot.generation +%= 1;
     if (slot.generation == 0) slot.generation = 1;
@@ -857,14 +877,41 @@ test "linux-dmabuf: generated wire adapter is complete" {
     adapter.deinit();
 }
 
+test "linux-dmabuf: resource and descriptor stores grow without moving live entries" {
+    const TestAdapter = Adapter(@import("core_protocol"));
+    var adapter = try TestAdapter.init(std.testing.allocator, .{});
+    defer adapter.deinit();
+
+    const first_manager = try adapter.managers.acquire();
+    const first_address = @intFromPtr(first_manager);
+    for (0..31) |_| _ = try adapter.managers.acquire();
+    try std.testing.expectEqual(first_address, @intFromPtr(first_manager));
+    try std.testing.expect(adapter.managers.fromContext(first_manager) == first_manager);
+
+    var params: [32]Handle = undefined;
+    var buffers: [32]Handle = undefined;
+    for (&params, &buffers) |*params_handle, *buffer_handle| {
+        params_handle.* = try adapter.store.createParams();
+        const fd = try eventFd();
+        try adapter.store.addPlane(params_handle.*, fd, 0, 0, 4, modifier_linear);
+        buffer_handle.* = try adapter.store.createBuffer(
+            params_handle.*,
+            1,
+            1,
+            drm_format_argb8888,
+            0,
+        );
+    }
+    const first_buffer = try adapter.store.buffer(buffers[0]);
+    for (params) |handle| try adapter.store.destroyParams(handle);
+    try std.testing.expect(first_buffer == try adapter.store.buffer(buffers[0]));
+    for (buffers) |handle| try adapter.store.destroyBuffer(handle);
+}
+
 test "linux-dmabuf: legacy advertisements survive transmit backpressure" {
     const protocol = @import("core_protocol");
     const TestAdapter = Adapter(protocol);
-    var adapter = try TestAdapter.init(std.testing.allocator, .{
-        .manager_capacity = 1,
-        .params_capacity = 1,
-        .buffer_capacity = 1,
-    });
+    var adapter = try TestAdapter.init(std.testing.allocator, .{});
     defer adapter.deinit();
     var server_objects = try wayring.objects.ServerObjects.init(
         std.testing.allocator,
@@ -879,7 +926,7 @@ test "linux-dmabuf: legacy advertisements survive transmit backpressure" {
     var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 1);
     defer descriptors.deinit(std.testing.allocator);
     const peer: wayring.io_uring.Peer = .{ .slot = 2, .generation = 7 };
-    const manager = try acquire(TestAdapter.ManagerSlot, adapter.managers, &adapter.manager_free);
+    const manager = try adapter.managers.acquire();
     adapter.pending_len += 1;
     manager.peer = peer;
     manager.version = 3;
@@ -933,11 +980,7 @@ test "linux-dmabuf: legacy advertisements survive transmit backpressure" {
 test "linux-dmabuf: async created event retains buffer across params teardown" {
     const protocol = @import("core_protocol");
     const TestAdapter = Adapter(protocol);
-    var adapter = try TestAdapter.init(std.testing.allocator, .{
-        .manager_capacity = 1,
-        .params_capacity = 1,
-        .buffer_capacity = 1,
-    });
+    var adapter = try TestAdapter.init(std.testing.allocator, .{});
     defer adapter.deinit();
     var server_objects = try wayring.objects.ServerObjects.init(
         std.testing.allocator,
@@ -953,7 +996,7 @@ test "linux-dmabuf: async created event retains buffer across params teardown" {
     defer descriptors.deinit(std.testing.allocator);
     const peer: wayring.io_uring.Peer = .{ .slot = 1, .generation = 8 };
 
-    const params = try acquire(TestAdapter.ParamsResource, adapter.params, &adapter.params_free);
+    const params = try adapter.params.acquire();
     params.peer = peer;
     params.state = try adapter.store.createParams();
     params.header.resource = try server_objects.insertClient(
@@ -971,9 +1014,9 @@ test "linux-dmabuf: async created event retains buffer across params teardown" {
         drm_format_argb8888,
         0,
     );
-    const buffer = try acquire(TestAdapter.BufferResource, adapter.buffers, &adapter.buffer_free);
+    const buffer = try adapter.buffers.acquire();
     buffer.state = state;
-    params.pending = .{ .created = indexOf(TestAdapter.BufferResource, adapter.buffers, buffer) };
+    params.pending = .{ .created = buffer.header.index };
     adapter.pending_len += 1;
 
     var blocked = wayring.tx.Queue.init(&blocks, 8, &descriptors, 0);
@@ -1022,7 +1065,7 @@ test "linux-dmabuf: async created event retains buffer across params teardown" {
 }
 
 test "linux-dmabuf: params transfer descriptor ownership to persistent buffer" {
-    var store = try Store.init(std.testing.allocator, .{ .params_capacity = 1, .buffer_capacity = 1 });
+    var store = try Store.init(std.testing.allocator, .{});
     defer store.deinit();
     const params = try store.createParams();
     const fd = try eventFd();
@@ -1038,7 +1081,7 @@ test "linux-dmabuf: params transfer descriptor ownership to persistent buffer" {
 }
 
 test "linux-dmabuf: retained attachment outlives destroyed buffer resource" {
-    var store = try Store.init(std.testing.allocator, .{ .params_capacity = 1, .buffer_capacity = 1 });
+    var store = try Store.init(std.testing.allocator, .{});
     defer store.deinit();
     const params = try store.createParams();
     const fd = try eventFd();
@@ -1056,7 +1099,7 @@ test "linux-dmabuf: retained attachment outlives destroyed buffer resource" {
 }
 
 test "linux-dmabuf: rejected and canceled params close every received descriptor" {
-    var store = try Store.init(std.testing.allocator, .{ .params_capacity = 1, .buffer_capacity = 1 });
+    var store = try Store.init(std.testing.allocator, .{});
     defer store.deinit();
     const params = try store.createParams();
     const retained = try eventFd();
@@ -1072,7 +1115,7 @@ test "linux-dmabuf: rejected and canceled params close every received descriptor
 }
 
 test "linux-dmabuf: one-shot validation is generation safe" {
-    var store = try Store.init(std.testing.allocator, .{ .params_capacity = 1, .buffer_capacity = 1 });
+    var store = try Store.init(std.testing.allocator, .{});
     defer store.deinit();
     const first = try store.createParams();
     const fd = try eventFd();

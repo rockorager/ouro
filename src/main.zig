@@ -38,7 +38,7 @@ pub fn main(init: std.process.Init) !void {
     defer wayring.unix_socket.unlink(options.socket) catch {};
     const root = try Compositor.create(
         allocator,
-        try wayring.unix_socket.listen(options.socket, 4),
+        try wayring.unix_socket.listen(options.socket, 128),
         compositorConfig(),
     );
     const coordinator = Coordinator.create(allocator, root, .{
@@ -46,7 +46,6 @@ pub fn main(init: std.process.Init) !void {
     }, .{
         .router_capacity = 16,
         .timer_capacity = 4,
-        .client_capacity = 4,
         .device_capacity = 36,
         .input = .{
             .device_capacity = 16,
@@ -55,7 +54,7 @@ pub fn main(init: std.process.Init) !void {
         },
         .shm = .{
             .limits = .{ .max_pool_bytes = 16 * 1024 * 1024 },
-            .pool_capacity = 8,
+            .pool_capacity = 16,
             .buffer_capacity = 16,
             .formats = &shm_formats,
         },
@@ -63,7 +62,7 @@ pub fn main(init: std.process.Init) !void {
             .surface_capacity = 8,
             .region_capacity = 8,
             .viewport_capacity = 8,
-            .presentation_resource_capacity = 4,
+            .presentation_resource_capacity = 8,
             .presentation_feedback_capacity = 64,
             .region_operation_capacity = 64,
             .frame_callback_capacity = 64,
@@ -74,6 +73,18 @@ pub fn main(init: std.process.Init) !void {
             .copy_capacity = 4,
             .max_copy_bytes = 16 * 1024 * 1024,
         },
+        .shell = .{
+            .manager_capacity = 8,
+            .positioner_capacity = 8,
+            .surface_capacity = 8,
+            .toplevel_capacity = 8,
+            .popup_capacity = 8,
+            .event_capacity = 32,
+            .outbound_capacity = 32,
+            .outstanding_configure_capacity = 16,
+            .metadata_bytes = 256,
+        },
+        .linux_dmabuf = .{},
         .drm = .{
             .card_capacity = 8,
             .connector_capacity = 32,
@@ -93,7 +104,7 @@ pub fn main(init: std.process.Init) !void {
             },
             .renderer = options.renderer,
             .image_count = 3,
-            .max_samples = 8,
+            .max_samples = 9,
             .max_source_bytes = 32 * 1024 * 1024,
             .max_surface_bytes = 16 * 1024 * 1024,
             .max_source_width = 8192,
@@ -206,7 +217,6 @@ fn compositorConfig() Compositor.Config {
     return .{
         .ring = .{ .entries = 64, .flags = 0 },
         .reactor = .{
-            .max_connections = 4,
             .receive_buffer_size = 8192,
             .receive_buffer_count = 8,
             .receive_control_capacity = 512,

@@ -199,12 +199,17 @@ pub const Renderer = struct {
             _ = try render_types.validateSample(validated);
             const packed_stride = std.math.mul(u32, source.source.size.width, 4) catch
                 return error.SourceCapacityExceeded;
-            const length = std.math.mul(usize, packed_stride, source.source.size.height) catch
-                return error.SourceCapacityExceeded;
+            const length = if (source.source.native != null)
+                0
+            else
+                std.math.mul(usize, packed_stride, source.source.size.height) catch
+                    return error.SourceCapacityExceeded;
             const start = byte_count;
             byte_count = std.math.add(usize, byte_count, length) catch
                 return error.SourceCapacityExceeded;
             if (byte_count > self.max_source_bytes) return error.SourceCapacityExceeded;
+            // Native samples retain their dimensions/stride in the packed ABI,
+            // but consume no bytes in the CPU source buffer.
             validated.source.stride = packed_stride;
             self.samples[sample_count] = try packSample(validated, @intCast(start), planned.destination);
             self.sources[sample_count] = source;

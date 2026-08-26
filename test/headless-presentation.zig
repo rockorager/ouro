@@ -47,7 +47,6 @@ test "generated client presents ordinary SHM through the integrated headless run
     const root = try Compositor.create(allocator, listener, .{
         .ring = .{ .entries = 32, .flags = 0 },
         .reactor = .{
-            .max_connections = 1,
             .receive_buffer_size = 4096,
             .receive_buffer_count = 4,
             .receive_control_capacity = 256,
@@ -161,7 +160,6 @@ test "generated client presents ordinary SHM through the integrated headless run
 
     var client_reactor: wayring.io_uring.Reactor = undefined;
     try client_reactor.initOwned(allocator, .{ .entries = 16, .flags = 0 }, .{
-        .max_connections = 1,
         .receive_buffer_size = 4096,
         .receive_buffer_count = 4,
         .receive_control_capacity = 256,
