@@ -1,4 +1,4 @@
-monitor = @OUTPUT@,@MODE@@REFRESH@,0x0,1
+monitor = @OUTPUT@,@MODE_REFRESH@,0x0,1
 
 animations {
     enabled = false

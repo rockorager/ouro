@@ -126,8 +126,22 @@ pub fn build(b: *std.Build) void {
     const benchmark_presentation_code_output = benchmark_presentation_code.addOutputFileArg(
         "presentation-time-protocol.c",
     );
+    const benchmark_dmabuf_xml = wayland_protocols.path(
+        "stable/linux-dmabuf/linux-dmabuf-v1.xml",
+    );
+    const benchmark_dmabuf_header = b.addSystemCommand(&.{ benchmark_scanner, "client-header" });
+    benchmark_dmabuf_header.addFileArg(benchmark_dmabuf_xml);
+    const benchmark_dmabuf_header_output = benchmark_dmabuf_header.addOutputFileArg(
+        "linux-dmabuf-v1-client-protocol.h",
+    );
+    const benchmark_dmabuf_code = b.addSystemCommand(&.{ benchmark_scanner, "private-code" });
+    benchmark_dmabuf_code.addFileArg(benchmark_dmabuf_xml);
+    const benchmark_dmabuf_code_output = benchmark_dmabuf_code.addOutputFileArg(
+        "linux-dmabuf-v1-protocol.c",
+    );
     benchmark_client.root_module.addIncludePath(benchmark_xdg_header_output.dirname());
     benchmark_client.root_module.addIncludePath(benchmark_presentation_header_output.dirname());
+    benchmark_client.root_module.addIncludePath(benchmark_dmabuf_header_output.dirname());
     benchmark_client.root_module.addCSourceFile(.{
         .file = benchmark_xdg_code_output,
         .flags = &.{"-std=c11"},
@@ -137,12 +151,18 @@ pub fn build(b: *std.Build) void {
         .flags = &.{"-std=c11"},
     });
     benchmark_client.root_module.addCSourceFile(.{
+        .file = benchmark_dmabuf_code_output,
+        .flags = &.{"-std=c11"},
+    });
+    benchmark_client.root_module.addCSourceFile(.{
         .file = b.path("benchmark/client.c"),
         .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
     });
     benchmark_client.root_module.linkSystemLibrary("wayland-client", .{
         .use_pkg_config = .force,
     });
+    benchmark_client.root_module.linkSystemLibrary("gbm", .{ .use_pkg_config = .force });
+    benchmark_client.root_module.linkSystemLibrary("libdrm", .{ .use_pkg_config = .force });
     const install_benchmark_client = b.addInstallArtifact(benchmark_client, .{
         .dest_dir = .{ .override = .{ .custom = "benchmark" } },
     });

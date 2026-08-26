@@ -1,4 +1,4 @@
-output @OUTPUT@ mode @MODE@@REFRESH@Hz position 0 0 scale 1
+output @OUTPUT@ mode @MODE_REFRESH@ position 0 0 scale 1
 seat seat0 hide_cursor 100000
 xwayland disable
 default_border none

@@ -62,12 +62,16 @@ done
 }
 [[ -e $drm_device ]] || { echo "DRM device does not exist: $drm_device" >&2; exit 1; }
 
-for command in seatd-launch sway Hyprland python3 sed sha256sum realpath fuser pgrep; do
+for command in seatd-launch sway Hyprland python3 sed sha256sum realpath fuser pgrep pkg-config; do
     command -v "$command" >/dev/null || {
         echo "required comparator tool is unavailable: $command" >&2
         exit 1
     }
 done
+pkg-config --exists wayland-client gbm libdrm || {
+    echo "benchmark client requires wayland-client, gbm, and libdrm" >&2
+    exit 1
+}
 if [[ $perf_enabled == on ]] && ! command -v perf >/dev/null; then
     echo "--perf=on requested but perf is unavailable" >&2
     exit 1
@@ -107,6 +111,9 @@ client_binary="$repo/zig-out/benchmark/ouro-benchmark-client"
     printf 'sway_binary_sha256=%s\n' "$(sha256sum "$(command -v sway)" | cut -d' ' -f1)"
     printf 'hyprland_binary=%s\n' "$(command -v Hyprland)"
     printf 'hyprland_binary_sha256=%s\n' "$(sha256sum "$(command -v Hyprland)" | cut -d' ' -f1)"
+    printf 'wayland_client_version=%s\n' "$(pkg-config --modversion wayland-client)"
+    printf 'gbm_version=%s\n' "$(pkg-config --modversion gbm)"
+    printf 'libdrm_version=%s\n' "$(pkg-config --modversion libdrm)"
     printf 'kernel=%s\n' "$(uname -srmo)"
     printf 'drm_device=%s\noutput=%s\nmode=%s\nrefresh=%s\n' \
         "$drm_device" "$output" "$mode" "$refresh"
@@ -188,10 +195,10 @@ find_compositor_pid() {
 render_configs() {
     local directory=$1
     sed -e "s|@OUTPUT@|$output|g" -e "s|@MODE@|$mode|g" \
-        -e "s|@REFRESH@|$refresh|g" \
+        -e "s|@MODE_REFRESH@|${mode}@${refresh}Hz|g" \
         "$repo/benchmark/sway.conf.in" >"$directory/sway.conf"
     sed -e "s|@OUTPUT@|$output|g" -e "s|@MODE@|$mode|g" \
-        -e "s|@REFRESH@|$refresh|g" \
+        -e "s|@MODE_REFRESH@|${mode}@${refresh}|g" \
         "$repo/benchmark/hyprland.conf.in" >"$directory/hyprland.conf"
 }
 
@@ -250,6 +257,7 @@ run_case() {
         local log="$directory/client-$index.log"
         mkfifo "$fifo"
         "$client_binary" "$socket" "$client_mode" "$width" "$height" "$frames" "$warmup" \
+            "$drm_device" \
             <"$fifo" >"$log" 2>&1 &
         client_pids+=("$!")
         local fd

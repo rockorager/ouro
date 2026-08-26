@@ -1,7 +1,10 @@
 #define _GNU_SOURCE
 
 #include <errno.h>
+#include <fcntl.h>
+#include <gbm.h>
 #include <inttypes.h>
+#include <libdrm/drm_fourcc.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -15,13 +18,20 @@
 #include <unistd.h>
 #include <wayland-client.h>
 
+#include "linux-dmabuf-v1-client-protocol.h"
 #include "presentation-time-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 
 enum workload {
+    WORKLOAD_STATIC,
     WORKLOAD_FULL,
     WORKLOAD_TINY,
     WORKLOAD_SPARSE,
+};
+
+enum backing {
+    BACKING_SHM,
+    BACKING_DMABUF,
 };
 
 struct client;
@@ -30,6 +40,7 @@ struct frame_buffer {
     struct client *client;
     struct wl_buffer *proxy;
     uint32_t *pixels;
+    struct gbm_bo *bo;
     size_t size;
     int fd;
     bool available;
@@ -50,6 +61,10 @@ struct client {
     struct wl_shm *shm;
     struct xdg_wm_base *wm_base;
     struct wp_presentation *presentation;
+    struct zwp_linux_dmabuf_v1 *dmabuf;
+    uint32_t dmabuf_version;
+    struct gbm_device *gbm;
+    int drm_fd;
     struct wl_surface *surface;
     struct xdg_surface *xdg_surface;
     struct xdg_toplevel *toplevel;
@@ -58,6 +73,8 @@ struct client {
     int32_t width;
     int32_t height;
     enum workload workload;
+    enum backing backing;
+    bool churn;
     bool configured;
     uint64_t callbacks;
     uint64_t releases;
@@ -232,6 +249,14 @@ static void registry_global(
         client->wm_base = wl_registry_bind(registry, name, &xdg_wm_base_interface, 1);
     } else if (strcmp(interface, wp_presentation_interface.name) == 0) {
         client->presentation = wl_registry_bind(registry, name, &wp_presentation_interface, 1);
+    } else if (strcmp(interface, zwp_linux_dmabuf_v1_interface.name) == 0) {
+        client->dmabuf_version = version < 3 ? version : 3;
+        client->dmabuf = wl_registry_bind(
+            registry,
+            name,
+            &zwp_linux_dmabuf_v1_interface,
+            client->dmabuf_version
+        );
     }
 }
 
@@ -246,7 +271,46 @@ static const struct wl_registry_listener registry_listener = {
     .global_remove = registry_remove,
 };
 
-static void create_buffer(struct client *client, struct frame_buffer *buffer, uint32_t index) {
+static void write_buffer(struct frame_buffer *buffer) {
+    struct client *client = buffer->client;
+    if (client->backing == BACKING_SHM) {
+        memcpy(buffer->pixels, client->canonical_pixels, buffer->size);
+        return;
+    }
+    uint32_t stride = 0;
+    void *map_data = NULL;
+    uint8_t *pixels = gbm_bo_map(
+        buffer->bo,
+        0,
+        0,
+        (uint32_t)client->width,
+        (uint32_t)client->height,
+        GBM_BO_TRANSFER_WRITE,
+        &stride,
+        &map_data
+    );
+    if (pixels == NULL) fail("map DMA-BUF");
+    const size_t row_bytes = (size_t)client->width * 4;
+    for (int32_t row = 0; row < client->height; row++)
+        memcpy(
+            pixels + (size_t)row * stride,
+            client->canonical_pixels + (size_t)row * (size_t)client->width,
+            row_bytes
+        );
+    gbm_bo_unmap(buffer->bo, map_data);
+}
+
+static void destroy_buffer(struct frame_buffer *buffer) {
+    struct client *client = buffer->client;
+    if (buffer->proxy != NULL) wl_buffer_destroy(buffer->proxy);
+    if (buffer->pixels != NULL && buffer->pixels != MAP_FAILED)
+        munmap(buffer->pixels, buffer->size);
+    if (buffer->fd >= 0) close(buffer->fd);
+    if (buffer->bo != NULL) gbm_bo_destroy(buffer->bo);
+    *buffer = (struct frame_buffer){ .client = client, .fd = -1 };
+}
+
+static void create_shm_buffer(struct client *client, struct frame_buffer *buffer) {
     buffer->client = client;
     buffer->fd = -1;
     buffer->size = (size_t)client->width * (size_t)client->height * 4;
@@ -255,7 +319,7 @@ static void create_buffer(struct client *client, struct frame_buffer *buffer, ui
         fail("create SHM buffer");
     buffer->pixels = mmap(NULL, buffer->size, PROT_READ | PROT_WRITE, MAP_SHARED, buffer->fd, 0);
     if (buffer->pixels == MAP_FAILED) fail("map SHM buffer");
-    memcpy(buffer->pixels, client->canonical_pixels, buffer->size);
+    write_buffer(buffer);
     struct wl_shm_pool *pool = wl_shm_create_pool(client->shm, buffer->fd, (int32_t)buffer->size);
     if (pool == NULL) protocol_fail("create SHM pool");
     buffer->proxy = wl_shm_pool_create_buffer(
@@ -271,10 +335,63 @@ static void create_buffer(struct client *client, struct frame_buffer *buffer, ui
     if (buffer->proxy == NULL ||
         wl_buffer_add_listener(buffer->proxy, &buffer_listener, buffer) != 0)
         protocol_fail("create SHM wl_buffer");
-    (void)index;
 }
 
-static void setup(struct client *client, const char *socket_path) {
+static void create_dmabuf_buffer(struct client *client, struct frame_buffer *buffer) {
+    static const uint64_t modifiers[] = { DRM_FORMAT_MOD_LINEAR };
+    buffer->client = client;
+    buffer->fd = -1;
+    buffer->size = (size_t)client->width * (size_t)client->height * 4;
+    buffer->bo = gbm_bo_create_with_modifiers2(
+        client->gbm,
+        (uint32_t)client->width,
+        (uint32_t)client->height,
+        GBM_FORMAT_XRGB8888,
+        modifiers,
+        1,
+        GBM_BO_USE_RENDERING
+    );
+    if (buffer->bo == NULL || gbm_bo_get_plane_count(buffer->bo) != 1 ||
+        gbm_bo_get_modifier(buffer->bo) != DRM_FORMAT_MOD_LINEAR)
+        protocol_fail("allocate linear single-plane DMA-BUF");
+    write_buffer(buffer);
+    const uint64_t modifier = gbm_bo_get_modifier(buffer->bo);
+    const int fd = gbm_bo_get_fd_for_plane(buffer->bo, 0);
+    if (fd < 0) fail("export DMA-BUF");
+    struct zwp_linux_buffer_params_v1 *params = zwp_linux_dmabuf_v1_create_params(client->dmabuf);
+    if (params == NULL) protocol_fail("create DMA-BUF parameters");
+    zwp_linux_buffer_params_v1_add(
+        params,
+        fd,
+        0,
+        gbm_bo_get_offset(buffer->bo, 0),
+        gbm_bo_get_stride_for_plane(buffer->bo, 0),
+        (uint32_t)(modifier >> 32),
+        (uint32_t)modifier
+    );
+    buffer->proxy = zwp_linux_buffer_params_v1_create_immed(
+        params,
+        client->width,
+        client->height,
+        DRM_FORMAT_XRGB8888,
+        0
+    );
+    zwp_linux_buffer_params_v1_destroy(params);
+    close(fd);
+    buffer->available = true;
+    if (buffer->proxy == NULL ||
+        wl_buffer_add_listener(buffer->proxy, &buffer_listener, buffer) != 0)
+        protocol_fail("create DMA-BUF wl_buffer");
+}
+
+static void create_buffer(struct client *client, struct frame_buffer *buffer) {
+    if (client->backing == BACKING_DMABUF)
+        create_dmabuf_buffer(client, buffer);
+    else
+        create_shm_buffer(client, buffer);
+}
+
+static void setup(struct client *client, const char *socket_path, const char *drm_path) {
     client->display = connect_path(socket_path);
     struct wl_registry *registry = wl_display_get_registry(client->display);
     if (registry == NULL ||
@@ -282,9 +399,18 @@ static void setup(struct client *client, const char *socket_path) {
         wl_display_roundtrip(client->display) < 0)
         fail("discover globals");
     wl_registry_destroy(registry);
-    if (client->compositor == NULL || client->shm == NULL || client->wm_base == NULL ||
-        client->presentation == NULL)
-        protocol_fail("wl_compositor, wl_shm, xdg_wm_base, and wp_presentation are required");
+    if (client->compositor == NULL || client->wm_base == NULL || client->presentation == NULL)
+        protocol_fail("wl_compositor, xdg_wm_base, and wp_presentation are required");
+    if (client->backing == BACKING_SHM && client->shm == NULL)
+        protocol_fail("wl_shm is required for SHM workloads");
+    if (client->backing == BACKING_DMABUF) {
+        if (client->dmabuf == NULL || client->dmabuf_version < 2)
+            protocol_fail("linux-dmabuf v2 is required for DMA-BUF workloads");
+        client->drm_fd = open(drm_path, O_RDWR | O_CLOEXEC);
+        if (client->drm_fd < 0) fail("open DMA-BUF allocation device");
+        client->gbm = gbm_create_device(client->drm_fd);
+        if (client->gbm == NULL) fail("create GBM device");
+    }
     if (xdg_wm_base_add_listener(client->wm_base, &wm_base_listener, client) != 0 ||
         wp_presentation_add_listener(client->presentation, &presentation_listener, client) != 0)
         protocol_fail("install global listener");
@@ -305,8 +431,11 @@ static void setup(struct client *client, const char *socket_path) {
     if (client->canonical_pixels == NULL) fail("allocate canonical pixels");
     for (size_t index = 0; index < buffer_size / 4; index++)
         client->canonical_pixels[index] = UINT32_C(0xff204060) ^ (uint32_t)index;
-    for (uint32_t index = 0; index < 2; index++)
-        create_buffer(client, &client->buffers[index], index);
+    for (uint32_t index = 0; index < 2; index++) {
+        client->buffers[index].client = client;
+        client->buffers[index].fd = -1;
+        if (!client->churn) create_buffer(client, &client->buffers[index]);
+    }
 }
 
 static void mutate_rect(
@@ -324,11 +453,19 @@ static void mutate_rect(
 
 static void submit_frame(struct client *client, uint64_t sequence, struct frame_wait *wait) {
     struct frame_buffer *buffer = &client->buffers[sequence % 2];
+    if (client->churn) {
+        while (buffer->proxy != NULL && !buffer->available)
+            if (wl_display_dispatch(client->display) < 0) fail("wait to churn buffer");
+        destroy_buffer(buffer);
+        create_buffer(client, buffer);
+    }
     while (!buffer->available)
         if (wl_display_dispatch(client->display) < 0) fail("wait for buffer release");
     buffer->available = false;
 
     switch (client->workload) {
+        case WORKLOAD_STATIC:
+            break;
         case WORKLOAD_FULL:
             mutate_rect(client, 0, 0, client->width, client->height);
             break;
@@ -347,7 +484,7 @@ static void submit_frame(struct client *client, uint64_t sequence, struct frame_
             break;
         }
     }
-    memcpy(buffer->pixels, client->canonical_pixels, buffer->size);
+    if (client->workload != WORKLOAD_STATIC) write_buffer(buffer);
 
     *wait = (struct frame_wait){ .client = client };
     struct wl_callback *callback = wl_surface_frame(client->surface);
@@ -361,6 +498,9 @@ static void submit_frame(struct client *client, uint64_t sequence, struct frame_
         protocol_fail("create frame completion objects");
     wl_surface_attach(client->surface, buffer->proxy, 0, 0);
     switch (client->workload) {
+        case WORKLOAD_STATIC:
+            wl_surface_damage_buffer(client->surface, 0, 0, 1, 1);
+            break;
         case WORKLOAD_FULL:
             wl_surface_damage_buffer(client->surface, 0, 0, client->width, client->height);
             break;
@@ -386,44 +526,72 @@ static void submit_frame(struct client *client, uint64_t sequence, struct frame_
         }
     }
     wl_surface_commit(client->surface);
-    while (!wait->callback_done || (!wait->presented && !wait->discarded) || !buffer->available)
+    while (!wait->callback_done || (!wait->presented && !wait->discarded) ||
+        (client->backing == BACKING_SHM && !buffer->available))
         if (wl_display_dispatch(client->display) < 0) fail("wait for presented frame");
     if (wait->discarded) protocol_fail("frame was discarded");
 }
 
 static void cleanup(struct client *client) {
-    for (size_t index = 0; index < 2; index++) {
-        struct frame_buffer *buffer = &client->buffers[index];
-        if (buffer->proxy != NULL) wl_buffer_destroy(buffer->proxy);
-        if (buffer->pixels != NULL && buffer->pixels != MAP_FAILED)
-            munmap(buffer->pixels, buffer->size);
-        if (buffer->fd >= 0) close(buffer->fd);
-    }
+    for (size_t index = 0; index < 2; index++) destroy_buffer(&client->buffers[index]);
     if (client->toplevel != NULL) xdg_toplevel_destroy(client->toplevel);
     if (client->xdg_surface != NULL) xdg_surface_destroy(client->xdg_surface);
     if (client->surface != NULL) wl_surface_destroy(client->surface);
     if (client->presentation != NULL) wp_presentation_destroy(client->presentation);
+    if (client->dmabuf != NULL) zwp_linux_dmabuf_v1_destroy(client->dmabuf);
     if (client->wm_base != NULL) xdg_wm_base_destroy(client->wm_base);
     if (client->shm != NULL) wl_shm_destroy(client->shm);
     if (client->compositor != NULL) wl_compositor_destroy(client->compositor);
+    if (client->gbm != NULL) gbm_device_destroy(client->gbm);
+    if (client->drm_fd >= 0) close(client->drm_fd);
     free(client->canonical_pixels);
     wl_display_flush(client->display);
     wl_display_disconnect(client->display);
 }
 
-static enum workload parse_workload(const char *name) {
-    if (strcmp(name, "shm-full") == 0) return WORKLOAD_FULL;
-    if (strcmp(name, "shm-tiny") == 0) return WORKLOAD_TINY;
-    if (strcmp(name, "shm-sparse") == 0) return WORKLOAD_SPARSE;
+static void parse_workload(struct client *client, const char *name) {
+    client->backing = BACKING_SHM;
+    if (strcmp(name, "shm-static") == 0) {
+        client->workload = WORKLOAD_STATIC;
+        return;
+    }
+    if (strcmp(name, "shm-full") == 0) {
+        client->workload = WORKLOAD_FULL;
+        return;
+    }
+    if (strcmp(name, "shm-tiny") == 0) {
+        client->workload = WORKLOAD_TINY;
+        return;
+    }
+    if (strcmp(name, "shm-sparse") == 0) {
+        client->workload = WORKLOAD_SPARSE;
+        return;
+    }
+    if (strcmp(name, "shm-churn") == 0) {
+        client->workload = WORKLOAD_SPARSE;
+        client->churn = true;
+        return;
+    }
+    if (strcmp(name, "dmabuf-sparse") == 0) {
+        client->workload = WORKLOAD_SPARSE;
+        client->backing = BACKING_DMABUF;
+        return;
+    }
+    if (strcmp(name, "dmabuf-churn") == 0) {
+        client->workload = WORKLOAD_SPARSE;
+        client->backing = BACKING_DMABUF;
+        client->churn = true;
+        return;
+    }
     fprintf(stderr, "ouro-benchmark-client: unknown workload: %s\n", name);
     exit(2);
 }
 
 int main(int argc, char **argv) {
-    if (argc != 7) {
+    if (argc != 8) {
         fprintf(
             stderr,
-            "usage: %s SOCKET shm-full|shm-tiny|shm-sparse WIDTH HEIGHT FRAMES WARMUP\n",
+            "usage: %s SOCKET WORKLOAD WIDTH HEIGHT FRAMES WARMUP DRM_DEVICE\n",
             argv[0]
         );
         return 2;
@@ -431,8 +599,9 @@ int main(int argc, char **argv) {
     struct client client = {
         .width = (int32_t)parse_positive(argv[3], "width"),
         .height = (int32_t)parse_positive(argv[4], "height"),
-        .workload = parse_workload(argv[2]),
+        .drm_fd = -1,
     };
+    parse_workload(&client, argv[2]);
     const uint64_t frames = parse_positive(argv[5], "frames");
     const uint64_t warmup = parse_positive(argv[6], "warmup");
     const uint64_t max_waits = SIZE_MAX / sizeof(struct frame_wait);
@@ -444,7 +613,7 @@ int main(int argc, char **argv) {
     );
     if (waits == NULL) fail("allocate presentation feedback state");
     if (client.width > 8192 || client.height > 8192) protocol_fail("dimensions exceed 8192");
-    setup(&client, argv[1]);
+    setup(&client, argv[1], argv[7]);
     for (uint64_t sequence = 0; sequence < warmup; sequence++)
         submit_frame(&client, sequence, &waits[sequence]);
 

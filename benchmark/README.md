@@ -7,22 +7,28 @@ test` and never installs packages or changes persistent system configuration.
 
 ## Method
 
-`client.c` owns workload semantics. Every client uses two persistent, unsealed
-XRGB8888 SHM buffers, each backed by its own pool. A frame is accepted only
-after all three lifecycle signals arrive:
+`client.c` owns workload semantics. Persistent workloads use two reusable
+XRGB8888 buffers. SHM buffers are unsealed and each has its own pool. DMA-BUF
+buffers are single-plane linear GBM allocations exported from the benchmark's
+configured DRM device. Churn workloads replace the selected buffer only after
+its exact release. Every measured commit requires:
 
 - the frame callback;
-- the exact buffer release;
 - a non-discarded `wp_presentation` feedback event.
 
-The next commit is submitted only after those signals complete. The measured
-gate therefore does not depend on compositor-specific frame callback admission
-behavior, and every measured commit must reach physical presentation rather
-than being superseded. This intentionally measures a sequential presented-frame
-workload; compositor cadence can differ and must be read before aggregate CPU.
-The client reports both observation time and the presentation clock's
-first-to-last interval. Multiple clients finish at one shared runner gate; the
-slowest client defines that run's wall boundary.
+The exact buffer release is additionally required before that buffer is reused
+or destroyed.
+
+The next commit is submitted only after callback and presentation complete.
+SHM also waits for the current release; DMA-BUF may advance to its other buffer
+while the compositor retains the current import, but never reuses or destroys a
+busy buffer. The measured gate therefore does not depend on compositor-specific
+frame callback admission behavior, and every measured commit must reach physical
+presentation rather than being superseded. This intentionally measures a
+sequential presented-frame workload; compositor cadence can differ and must be
+read before aggregate CPU. The client reports both observation time and the
+presentation clock's first-to-last interval. Multiple clients finish at one
+shared runner gate; the slowest client defines that run's wall boundary.
 
 `run.sh` performs orchestration outside the timed client: isolated runtime and
 seat ownership, fixed post-socket readiness, exact compositor PID snapshots,
@@ -30,8 +36,8 @@ optional `perf stat`, independent termination, and raw artifact retention.
 Direct scanout is disabled for Sway and Hyprland so the workload exercises
 composition. Ouro is required to start with `--renderer=vulkan`.
 
-The client intentionally copies its canonical image into the selected SHM
-buffer before every commit. Perf and `/proc` counters attach only to the
+Except for `shm-static`, the client copies its canonical image into the selected
+SHM or DMA-BUF before every commit. Perf and `/proc` counters attach only to the
 compositor, so client-side preparation is excluded while every compositor sees
 identical source bytes and damage.
 
@@ -46,9 +52,26 @@ Workloads are declared in `workloads.sh`:
 - `shm-tiny`: mutate and damage one fixed 64×64 rectangle;
 - `shm-sparse`: mutate and damage two distant 32×32 rectangles;
 - `shm-dual-sparse`: two independent 640×720 clients running sparse damage.
+- `shm-static`: alternate unchanged buffers with 1×1 damage, the smallest
+  cross-compositor presentation-paced fixed-overhead proxy;
+- `shm-scale-{1,2,8}`: equal 640×360 sparse clients for client-population
+  scaling without treating an arbitrary population as a compositor limit;
+- `shm-buffer-churn`: replace one SHM pool and buffer per sparse frame;
+- `dmabuf-sparse`: mutate two persistent linear DMA-BUFs with sparse damage;
+- `dmabuf-scale-{1,2,8}`: equal 640×360 persistent DMA-BUF clients for
+  client-population scaling;
+- `dmabuf-churn`: allocate, import, and retire one linear DMA-BUF per frame.
 
-DMA-BUF and lifecycle/churn workloads should extend the same client result
-schema rather than introduce separate timing harnesses.
+DMA-BUF workloads require linux-dmabuf v2 or newer because measured churn uses
+`create_immed`. The client requires an explicit linear XRGB8888 GBM allocation;
+unsupported hardware is a rejected comparison rather than a silent SHM
+fallback. CPU counters cover only the compositor, while gate time necessarily
+includes client-side allocation and mapping. Compare persistent and churn rows
+with that distinction in mind.
+
+True zero-damage commits are intentionally excluded: packaged Sway does not
+complete the release/presentation lifecycle for that no-op sequence, so it
+cannot satisfy the suite's cross-compositor physical-presentation gate.
 
 ## Running
 
