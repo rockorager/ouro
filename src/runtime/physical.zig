@@ -38,8 +38,10 @@ const protocol_output = @import("../protocol/output.zig");
 const desktop_model = @import("../desktop/model.zig");
 const interaction_model = @import("../input/interaction.zig");
 const confinement = @import("../input/confinement.zig");
+const surface_state = @import("../surface.zig");
 
 const linux = std.os.linux;
+const drag_icon_role_id: surface_state.RoleId = 0x646e_645f_6963_6f6e;
 
 pub fn Coordinator(comptime protocol: type) type {
     return struct {
@@ -426,6 +428,10 @@ pub fn Coordinator(comptime protocol: type) type {
             self.data_device_adapter.setDragValidator(.{
                 .context = self,
                 .validate = validateDrag,
+            });
+            self.data_device_adapter.setDragIconAssigner(.{
+                .context = self,
+                .assign = assignDragIcon,
             });
             self.activation_adapter.setSerialValidator(.{
                 .context = self,
@@ -1350,6 +1356,20 @@ pub fn Coordinator(comptime protocol: type) type {
                 serial,
                 surface,
             );
+        }
+
+        fn assignDragIcon(
+            context: *anyopaque,
+            peer: wayring.io_uring.Peer,
+            icon_object: u32,
+        ) bool {
+            const self: *Self = @ptrCast(@alignCast(context));
+            const server_objects = self.root.runtime.clients.get(peer) catch return false;
+            const handle = server_objects.namespace.lookupHandle(icon_object) orelse return false;
+            const object = server_objects.namespace.resolve(handle) orelse return false;
+            const icon = self.adapter.getSurfaceObject(handle, object) catch return false;
+            icon.role.assign(drag_icon_role_id, false) catch return false;
+            return true;
         }
 
         fn validateActivation(

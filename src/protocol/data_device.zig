@@ -60,6 +60,10 @@ pub fn Adapter(comptime protocol: type) type {
                 u32,
             ) bool,
         };
+        pub const DragIconAssigner = struct {
+            context: *anyopaque,
+            assign: *const fn (*anyopaque, wayring.io_uring.Peer, u32) bool,
+        };
 
         const Id = packed struct { index: u32, generation: u32 };
         const Header = struct {
@@ -146,6 +150,7 @@ pub fn Adapter(comptime protocol: type) type {
             peer: wayring.io_uring.Peer,
             source: ?Id,
             origin_object: u32,
+            icon_object: ?u32 = null,
             target: ?DragTarget = null,
         };
 
@@ -179,6 +184,7 @@ pub fn Adapter(comptime protocol: type) type {
         focus: ?wayring.io_uring.Peer = null,
         validator: ?SerialValidator = null,
         drag_validator: ?DragValidator = null,
+        drag_icon_assigner: ?DragIconAssigner = null,
         drag: ?Drag = null,
         drag_cancel_pending: bool = false,
         drag_target_clear_pending: bool = false,
@@ -255,6 +261,10 @@ pub fn Adapter(comptime protocol: type) type {
 
         pub fn setDragValidator(self: *Self, validator: DragValidator) void {
             self.drag_validator = validator;
+        }
+
+        pub fn setDragIconAssigner(self: *Self, assigner: DragIconAssigner) void {
+            self.drag_icon_assigner = assigner;
         }
 
         fn bind(context: ?*anyopaque, binding: wayring.server.Binding) !?*anyopaque {
@@ -390,13 +400,20 @@ pub fn Adapter(comptime protocol: type) type {
                             return try self.protocolError(actor, decoded.handle.id, Device.@"error".used_source.value, "invalid drag source");
                         if (!std.meta.eql(source.peer, peer) or source.used)
                             return try self.protocolError(actor, decoded.handle.id, Device.@"error".used_source.value, "data source was already used");
-                        source.used = true;
                         break :source self.sourceId(source);
                     } else null;
+                    if (payload.icon) |icon| {
+                        const assigner = self.drag_icon_assigner orelse
+                            return try self.protocolError(actor, decoded.handle.id, Device.@"error".role.value, "drag icons are unavailable");
+                        if (!assigner.assign(assigner.context, peer, icon))
+                            return try self.protocolError(actor, decoded.handle.id, Device.@"error".role.value, "drag icon surface already has another role");
+                    }
+                    if (source_id) |id| (self.resolveSource(id) catch unreachable).used = true;
                     self.drag = .{
                         .peer = peer,
                         .source = source_id,
                         .origin_object = payload.origin,
+                        .icon_object = payload.icon,
                     };
                 },
                 .set_selection => |payload| selection: {
@@ -524,6 +541,11 @@ pub fn Adapter(comptime protocol: type) type {
             const drag = self.drag orelse return;
             if (std.meta.eql(drag.peer, peer) and drag.origin_object == object_id) {
                 self.drag_cancel_pending = true;
+            } else if (std.meta.eql(drag.peer, peer) and drag.icon_object != null and
+                drag.icon_object.? == object_id)
+            {
+                self.drag.?.icon_object = null;
+                return;
             } else if (drag.target) |target| {
                 if (!std.meta.eql(target.peer, peer) or target.surface_object != object_id) return;
                 self.drag_target_clear_pending = true;
@@ -1401,7 +1423,7 @@ test "data device: removing the exact drag origin cancels the session" {
     const foreign_peer: wayring.io_uring.Peer = .{ .slot = 2, .generation = 4 };
     const device = try acquire(TestAdapter.DeviceSlot, adapter.devices, &adapter.device_free);
     device.peer = peer;
-    adapter.drag = .{ .peer = peer, .source = null, .origin_object = 17 };
+    adapter.drag = .{ .peer = peer, .source = null, .origin_object = 17, .icon_object = 19 };
     try adapter.updateDragTarget(.{ .peer = foreign_peer, .surface_object = 23, .x = 4, .y = 5 }, 1, 2, false);
     try std.testing.expect(adapter.drag.?.target == null);
     try adapter.updateDragTarget(.{ .peer = peer, .surface_object = 23, .x = 4, .y = 5 }, 1, 2, false);
@@ -1411,6 +1433,9 @@ test "data device: removing the exact drag origin cancels the session" {
     try std.testing.expect(adapter.drag != null);
     adapter.surfaceRemoved(peer, 18);
     try std.testing.expect(adapter.drag != null);
+    adapter.surfaceRemoved(peer, 19);
+    try std.testing.expect(adapter.drag != null);
+    try std.testing.expect(adapter.drag.?.icon_object == null);
     adapter.surfaceRemoved(peer, 23);
     try std.testing.expect(adapter.drag != null);
     try std.testing.expect(adapter.drag.?.target != null);
