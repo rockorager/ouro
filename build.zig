@@ -25,6 +25,7 @@ pub fn build(b: *std.Build) void {
     generate_core_protocol.addFileArg(wayland_protocols.path("unstable/relative-pointer/relative-pointer-unstable-v1.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("unstable/pointer-constraints/pointer-constraints-unstable-v1.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("unstable/primary-selection/primary-selection-unstable-v1.xml"));
+    generate_core_protocol.addFileArg(wayland_protocols.path("staging/cursor-shape/cursor-shape-v1.xml"));
     const generated_core_protocol = generate_core_protocol.addOutputFileArg("wayland-core.zig");
     const core_protocol = b.createModule(.{
         .root_source_file = generated_core_protocol,
@@ -46,6 +47,7 @@ pub fn build(b: *std.Build) void {
     generate_xdg_protocol.addFileArg(wayland_protocols.path("unstable/relative-pointer/relative-pointer-unstable-v1.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("unstable/pointer-constraints/pointer-constraints-unstable-v1.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("unstable/primary-selection/primary-selection-unstable-v1.xml"));
+    generate_xdg_protocol.addFileArg(wayland_protocols.path("staging/cursor-shape/cursor-shape-v1.xml"));
     const generated_xdg_protocol = generate_xdg_protocol.addOutputFileArg("wayland-xdg-shell.zig");
     const xdg_protocol = b.createModule(.{
         .root_source_file = generated_xdg_protocol,

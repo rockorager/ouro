@@ -48,6 +48,7 @@ pub const linux_dmabuf = @import("protocol/linux_dmabuf.zig");
 pub const xdg_activation = @import("protocol/xdg_activation.zig");
 pub const xdg_decoration = @import("protocol/xdg_decoration.zig");
 pub const relative_pointer = @import("protocol/relative_pointer.zig");
+pub const cursor_shape = @import("protocol/cursor_shape.zig");
 pub const pointer_constraints = @import("protocol/pointer_constraints.zig");
 pub const protocol_output = @import("protocol/output.zig");
 pub const scene_geometry = @import("scene/geometry.zig");
@@ -108,6 +109,7 @@ test {
     _ = xdg_activation;
     _ = xdg_decoration;
     _ = relative_pointer;
+    _ = cursor_shape;
     _ = pointer_constraints;
     _ = protocol_output;
     _ = scene_geometry;
