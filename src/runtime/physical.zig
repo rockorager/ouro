@@ -46,6 +46,7 @@ const protocol_color_management = @import("../protocol/color_management.zig");
 const protocol_color_representation = @import("../protocol/color_representation.zig");
 const protocol_output = @import("../protocol/output.zig");
 const protocol_xdg_output = @import("../protocol/xdg_output.zig");
+const protocol_layer_shell = @import("../protocol/layer_shell.zig");
 const protocol_cursor_shape = @import("../protocol/cursor_shape.zig");
 const protocol_text_input = @import("../protocol/text_input.zig");
 const cursor_theme = @import("../cursor_theme.zig");
@@ -88,6 +89,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const ColorRepresentationAdapter = protocol_color_representation.Adapter(protocol, Adapter);
         const OutputAdapter = protocol_output.Adapter(protocol);
         const XdgOutputAdapter = protocol_xdg_output.Adapter(protocol, OutputAdapter);
+        const LayerShellAdapter = protocol_layer_shell.Adapter(protocol, Adapter, OutputAdapter);
         const CursorShapeAdapter = protocol_cursor_shape.Adapter(protocol);
         const TextInputAdapter = protocol_text_input.Adapter(protocol);
 
@@ -104,6 +106,7 @@ pub fn Coordinator(comptime protocol: type) type {
             offset_y: i32 = 0,
             subsurface: bool = false,
         };
+        const LayerEdge = enum { top, bottom, left, right };
         const RemovedLayer = struct {
             id: Adapter.SurfaceId,
             state: damage.SurfaceState,
@@ -117,6 +120,11 @@ pub fn Coordinator(comptime protocol: type) type {
                 windows: []const Window,
                 point: geometry.Point,
             ) ?hit_test.Hit(Window) {
+                if (Window == Desktop.SceneWindow) {
+                    if (scene.coordinator.layerShellHit(point, true, scene)) |hit| return hit;
+                    if (hit_test.topmostTree(Window, windows, point, scene)) |hit| return hit;
+                    return scene.coordinator.layerShellHit(point, false, scene);
+                }
                 return hit_test.topmostTree(Window, windows, point, scene);
             }
 
@@ -157,11 +165,12 @@ pub fn Coordinator(comptime protocol: type) type {
             const shortcuts_inhibit: u32 = 1 << 16;
             const xdg_foreign: u32 = 1 << 17;
             const xdg_output: u32 = 1 << 18;
+            const layer_shell: u32 = 1 << 19;
             const all: u32 = decoration | shell | seat | data_device | dmabuf |
                 activation | relative_pointer | fractional_scale | output | core |
                 pointer_constraints | color_management | color_representation |
                 primary_selection | text_input | pointer_gestures |
-                shortcuts_inhibit | xdg_foreign | xdg_output;
+                shortcuts_inhibit | xdg_foreign | xdg_output | layer_shell;
         };
         const Client = struct {
             active: bool = false,
@@ -267,6 +276,7 @@ pub fn Coordinator(comptime protocol: type) type {
             enable_color_protocols: bool = false,
             protocol_output: protocol_output.Config = .{},
             xdg_output: protocol_xdg_output.Config = .{},
+            layer_shell: protocol_layer_shell.Config = .{},
             cursor_shape: protocol_cursor_shape.Config = .{},
             cursor_cache: cursor_theme.Cache.Config = .{
                 // Every protocol shape (including the default fallback) has a slot.
@@ -346,6 +356,7 @@ pub fn Coordinator(comptime protocol: type) type {
         color_representation_adapter: ColorRepresentationAdapter,
         output_adapter: OutputAdapter,
         xdg_output_adapter: XdgOutputAdapter,
+        layer_shell_adapter: LayerShellAdapter,
         cursor_shape_adapter: CursorShapeAdapter,
         cursor_cache: cursor_theme.Cache,
         themed_cursor: theme_cursor.Cursor = .{},
@@ -381,6 +392,7 @@ pub fn Coordinator(comptime protocol: type) type {
         removed_layers: []RemovedLayer,
         removed_layer_len: usize = 0,
         association_surfaces: []wayring.objects.Handle,
+        layer_surface_ids: []LayerShellAdapter.LayerSurfaceId,
         desktop_timer: ?timer.Handle = null,
         desktop_timer_canceling: bool = false,
         cursor_layer: Layer,
@@ -489,6 +501,11 @@ pub fn Coordinator(comptime protocol: type) type {
                 config.output.max_samples,
             );
             errdefer allocator.free(self.association_surfaces);
+            self.layer_surface_ids = try allocator.alloc(
+                LayerShellAdapter.LayerSurfaceId,
+                config.layer_shell.resource_capacity,
+            );
+            errdefer allocator.free(self.layer_surface_ids);
             self.desktop_timer = null;
             self.desktop_timer_canceling = false;
             self.color_protocols_enabled = config.enable_color_protocols and config.output.renderer == .vulkan;
@@ -687,6 +704,13 @@ pub fn Coordinator(comptime protocol: type) type {
                 config.xdg_output,
             );
             errdefer self.xdg_output_adapter.deinit();
+            self.layer_shell_adapter = try LayerShellAdapter.init(
+                allocator,
+                &self.adapter,
+                &self.output_adapter,
+                config.layer_shell,
+            );
+            errdefer self.layer_shell_adapter.deinit();
             self.cursor_cache = try cursor_theme.Cache.init(allocator, config.cursor_cache);
             errdefer self.cursor_cache.deinit();
             self.cursor_shape_adapter = try CursorShapeAdapter.init(allocator, .{
@@ -739,6 +763,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
             _ = try self.xdg_output_adapter.install(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
+            _ = try self.layer_shell_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
             _ = try self.seat_adapter.install(&root.runtime);
@@ -848,6 +875,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.allocator.free(self.ready_update_surfaces);
             self.allocator.free(self.pending_surfaces);
             self.clients.deinit(self.allocator);
+            self.allocator.free(self.layer_surface_ids);
             self.allocator.free(self.association_surfaces);
             self.allocator.free(self.frame_changes);
             self.allocator.free(self.removed_layers);
@@ -858,6 +886,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.cursor_shape_adapter.deinit();
             self.cursor_cache.deinit();
             self.allocator.free(self.cursor_path);
+            self.layer_shell_adapter.deinit();
             self.xdg_output_adapter.deinit();
             self.output_adapter.deinit();
             self.fractional_scale_adapter.deinit();
@@ -1125,6 +1154,12 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.flushProtocol();
                 return control;
             }
+            if (try self.layer_shell_adapter.request(peer, target, message, fds)) |control| {
+                if (self.layer_shell_adapter.pendingOutbound(peer))
+                    self.markProtocol(peer, ProtocolReady.layer_shell);
+                try self.flushProtocol();
+                return control;
+            }
             if (try self.output_adapter.request(peer, target, message, fds)) |control| {
                 if (self.output_adapter.pendingOutboundOn(peer))
                     self.markProtocol(peer, ProtocolReady.output);
@@ -1228,6 +1263,12 @@ pub fn Coordinator(comptime protocol: type) type {
                 error.StaleSurface => {},
                 else => return err,
             };
+            self.layer_shell_adapter.validateSurfaceCommit(id) catch |err| switch (err) {
+                error.StaleSurface => {},
+                else => return err,
+            };
+            if (self.layer_shell_adapter.ownsSurface(id))
+                try self.desktop.validateWorkArea(try self.layerWorkArea(id));
             const pointer = self.seat_adapter.pointerState();
             try self.pointer_constraints_adapter.validateSurfaceCommit(
                 id,
@@ -1250,6 +1291,24 @@ pub fn Coordinator(comptime protocol: type) type {
             self.markPointerConstraintsProtocol();
             if (self.shell_adapter.ownsSurface(id))
                 self.shell_adapter.publishSurfaceCommitted(id) catch unreachable;
+            if (self.layer_shell_adapter.ownsSurface(id)) {
+                self.layer_shell_adapter.publishSurfaceCommitted(id) catch unreachable;
+                self.desktop.applyWorkArea(self.layerWorkArea(null) catch unreachable);
+                const layer_state = self.layer_shell_adapter.stateForSurface(id) orelse unreachable;
+                const configure_size = self.layerConfigureSize(layer_state) catch unreachable;
+                self.layer_shell_adapter.updatePendingConfigureSize(
+                    id,
+                    configure_size.width,
+                    configure_size.height,
+                ) catch |err| switch (err) {
+                    error.NoPendingConfigure => {},
+                    else => unreachable,
+                };
+                self.syncLayerKeyboardFocus() catch unreachable;
+                const peer = self.adapter.surfacePeer(id) catch unreachable;
+                if (self.layer_shell_adapter.pendingOutbound(peer))
+                    self.markProtocol(peer, ProtocolReady.layer_shell);
+            }
             self.surface = self.adapter.surfaceHandle(id) catch unreachable;
             self.surface_id = id;
             try self.enqueuePendingSurface(.{ .handle = self.surface.?, .id = id, .commits = 1 });
@@ -1772,18 +1831,9 @@ pub fn Coordinator(comptime protocol: type) type {
                         );
                     },
                     .keyboard_focus => |target| {
-                        const peer = try self.adapter.surfacePeer(target.surface);
-                        const seat_target = try self.seatTarget(target.surface);
-                        const text_input_focus: protocol_text_input.Focus = .{
-                            .peer = peer,
-                            .surface = (try self.adapter.surfaceResource(target.surface)).id,
-                        };
-                        try self.text_input_adapter.validateFocus(text_input_focus);
-                        try self.seat_adapter.setKeyboardFocus(seat_target);
-                        try self.data_device_adapter.setFocus(peer);
-                        try self.primary_selection_adapter.setFocus(peer);
-                        try self.text_input_adapter.setFocus(text_input_focus);
-                        self.shortcuts_inhibit_adapter.setFocus(.{ .peer = peer, .surface = target.surface });
+                        try self.setKeyboardSurface(
+                            self.exclusiveLayerSurface() orelse target.surface,
+                        );
                     },
                     .cancel => |cancel| {
                         if (cancel.pointer_focus)
@@ -1794,12 +1844,7 @@ pub fn Coordinator(comptime protocol: type) type {
                                 .{ .x = 0, .y = 0 },
                             );
                         if (cancel.keyboard_focus) {
-                            try self.text_input_adapter.validateFocus(null);
-                            try self.seat_adapter.setKeyboardFocus(null);
-                            try self.data_device_adapter.setFocus(null);
-                            try self.primary_selection_adapter.setFocus(null);
-                            try self.text_input_adapter.setFocus(null);
-                            self.shortcuts_inhibit_adapter.setFocus(null);
+                            try self.setKeyboardSurface(self.exclusiveLayerSurface());
                         }
                         if (cancel.pointer_grab) try self.seat_adapter.cancelPointerGrab();
                     },
@@ -1828,6 +1873,51 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.adapter.surfacePeer(surface),
                 surface,
             );
+        }
+
+        fn exclusiveLayerSurface(self: *Self) ?Adapter.SurfaceId {
+            const ids = self.layer_shell_adapter.ids(self.layer_surface_ids) catch return null;
+            var selected: ?Adapter.SurfaceId = null;
+            var selected_layer: LayerShellAdapter.Layer = .background;
+            for (ids) |id| {
+                const state = self.layer_shell_adapter.state(id) catch continue;
+                if (!state.mapped or state.keyboard_interactivity != .exclusive or
+                    (state.layer != .top and state.layer != .overlay)) continue;
+                if (selected == null or @intFromEnum(state.layer) >= @intFromEnum(selected_layer)) {
+                    selected = state.surface;
+                    selected_layer = state.layer;
+                }
+            }
+            return selected;
+        }
+
+        fn syncLayerKeyboardFocus(self: *Self) !void {
+            if (self.exclusiveLayerSurface()) |surface| {
+                try self.setKeyboardSurface(surface);
+            } else if (self.desktop.focused()) |focused| {
+                try self.setKeyboardSurface((try self.desktop.scene(focused)).surface);
+            } else {
+                try self.setKeyboardSurface(null);
+            }
+        }
+
+        fn setKeyboardSurface(self: *Self, surface: ?Adapter.SurfaceId) !void {
+            const focus: ?protocol_text_input.Focus = if (surface) |id| focus: {
+                const peer = try self.adapter.surfacePeer(id);
+                break :focus .{
+                    .peer = peer,
+                    .surface = (try self.adapter.surfaceResource(id)).id,
+                };
+            } else null;
+            try self.text_input_adapter.validateFocus(focus);
+            try self.seat_adapter.setKeyboardFocus(if (surface) |id| try self.seatTarget(id) else null);
+            try self.data_device_adapter.setFocus(if (focus) |value| value.peer else null);
+            try self.primary_selection_adapter.setFocus(if (focus) |value| value.peer else null);
+            try self.text_input_adapter.setFocus(focus);
+            self.shortcuts_inhibit_adapter.setFocus(if (surface) |id| .{
+                .peer = focus.?.peer,
+                .surface = id,
+            } else null);
         }
 
         fn validateShortcutSeat(context: ?*anyopaque, peer: wayring.io_uring.Peer, seat: u32) bool {
@@ -2084,6 +2174,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 flushed += try self.output_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.xdg_output != 0)
                 flushed += try self.xdg_output_adapter.flushOn(peer, objects, &actor.transmit);
+            if (client.protocol_ready & ProtocolReady.layer_shell != 0)
+                flushed += try self.layer_shell_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.core != 0) {
                 flushed += try self.adapter.flushPresentationClockOn(peer, objects, &actor.transmit);
                 flushed += try self.adapter.flushDiscardedFeedbackOn(peer, objects, &actor.transmit);
@@ -2188,6 +2280,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (ready & ProtocolReady.xdg_output != 0 and
                 !self.xdg_output_adapter.pendingOutbound(client.peer))
                 ready &= ~ProtocolReady.xdg_output;
+            if (ready & ProtocolReady.layer_shell != 0 and
+                !self.layer_shell_adapter.pendingOutbound(client.peer))
+                ready &= ~ProtocolReady.layer_shell;
             if (ready & ProtocolReady.core != 0 and
                 !self.adapter.pendingPresentationClock(client.peer) and
                 !self.adapter.pendingDiscardedFeedback(client.peer))
@@ -2255,7 +2350,9 @@ pub fn Coordinator(comptime protocol: type) type {
                 connector.height_mm,
             );
             self.xdg_output_adapter.publishMode();
-            self.markProtocolAll(ProtocolReady.output | ProtocolReady.xdg_output);
+            try self.recomputeLayerConfigures();
+            self.markProtocolAll(ProtocolReady.output | ProtocolReady.xdg_output |
+                ProtocolReady.layer_shell);
             self.next_output_generation = if (generation == std.math.maxInt(u32))
                 null
             else
@@ -2785,26 +2882,19 @@ pub fn Coordinator(comptime protocol: type) type {
         fn renderFrame(self: *Self, frame: @import("../output/headless.zig").FrameId) !void {
             const output = self.output orelse return;
             var sample_count: usize = 0;
-            var change_count: usize = 0;
+            try self.appendLayerShell(.background, &sample_count, output.planner.output);
+            try self.appendLayerShell(.bottom, &sample_count, output.planner.output);
             const windows = try self.desktop.sceneSnapshotGrowing(
                 self.allocator,
                 &self.scene_windows,
             );
             for (windows) |window| {
                 if (!window.visible) continue;
-                const surfaces = try self.sceneOrder(window.surface);
-                for (surfaces) |surface| {
-                    const layer = self.findAppLayer(surface) orelse continue;
-                    if (!layer.active) continue;
-                    if (!try self.refreshSubsurfaceLayer(layer, output.planner.output)) continue;
-                    try self.ensureFrameStorage(@max(sample_count, change_count) + 1);
-                    self.frame_samples[sample_count] = layer.sample.?;
-                    self.frame_bindings[sample_count] = layer.binding.?;
-                    self.frame_changes[change_count] = layer.change.?;
-                    sample_count += 1;
-                    change_count += 1;
-                }
+                try self.appendSceneRoot(window.surface, &sample_count, output.planner.output);
             }
+            try self.appendLayerShell(.top, &sample_count, output.planner.output);
+            try self.appendLayerShell(.overlay, &sample_count, output.planner.output);
+            var change_count = sample_count;
             for (self.removed_layers[0..self.removed_layer_len]) |removed| {
                 try self.ensureFrameStorage(@max(sample_count, change_count) + 1);
                 self.frame_changes[change_count] = .{ .previous = removed.state };
@@ -2884,6 +2974,39 @@ pub fn Coordinator(comptime protocol: type) type {
                     _ = try self.retryRetainedOutcomes();
                 },
                 .retired => |failure| try self.finishOutcome(failure.frame, false),
+            }
+        }
+
+        fn appendLayerShell(
+            self: *Self,
+            selected: LayerShellAdapter.Layer,
+            count: *usize,
+            output_size: render.Size,
+        ) !void {
+            const ids = try self.layer_shell_adapter.ids(self.layer_surface_ids);
+            for (ids) |id| {
+                const state = try self.layer_shell_adapter.state(id);
+                if (!state.mapped or state.layer != selected) continue;
+                try self.appendSceneRoot(state.surface, count, output_size);
+            }
+        }
+
+        fn appendSceneRoot(
+            self: *Self,
+            root: Adapter.SurfaceId,
+            count: *usize,
+            output_size: render.Size,
+        ) !void {
+            const surfaces = try self.sceneOrder(root);
+            for (surfaces) |surface| {
+                const layer = self.findAppLayer(surface) orelse continue;
+                if (!layer.active) continue;
+                if (!try self.refreshSubsurfaceLayer(layer, output_size)) continue;
+                try self.ensureFrameStorage(count.* + 1);
+                self.frame_samples[count.*] = layer.sample.?;
+                self.frame_bindings[count.*] = layer.binding.?;
+                self.frame_changes[count.*] = layer.change.?;
+                count.* += 1;
             }
         }
 
@@ -3210,15 +3333,219 @@ pub fn Coordinator(comptime protocol: type) type {
         fn surfaceScene(self: *Self, id: Adapter.SurfaceId) ?SurfaceScene {
             if (self.desktop.sceneForSurface(id) catch null) |root|
                 return .{ .root = root };
+            if (self.layerShellScene(id)) |root| return .{ .root = root };
             if (!(self.subcompositor_adapter.visible(id) catch return null)) return null;
             const placement = self.subcompositor_adapter.placement(id) catch return null;
-            const root = self.desktop.sceneForSurface(placement.root) catch return null;
+            const root = self.desktop.sceneForSurface(placement.root) catch
+                (self.layerShellScene(placement.root) orelse return null);
             return .{
                 .root = root,
                 .offset_x = placement.offset.x,
                 .offset_y = placement.offset.y,
                 .subsurface = true,
             };
+        }
+
+        fn layerShellScene(self: *Self, id: Adapter.SurfaceId) ?Desktop.SceneWindow {
+            const state = self.layer_shell_adapter.stateForSurface(id) orelse return null;
+            if (!state.mapped) return null;
+            const rect = self.layerGeometry(state) catch return null;
+            return .{
+                // Interaction targets require a desktop-shaped identity even
+                // when `managed` is false. Keep it valid and outside the
+                // bounded toplevel index domain so destruction matching cannot
+                // confuse a layer surface with an ordinary window.
+                .id = .{
+                    .index = state.surface.index | (@as(u32, 1) << 31),
+                    .generation = state.surface.generation,
+                },
+                .surface = id,
+                .managed = false,
+                .keyboard_focusable = state.keyboard_interactivity != .none,
+                .geometry = rect,
+                .visible = true,
+                .stacking = @intFromEnum(state.layer),
+                .mode = .floating,
+                .content_ready = true,
+            };
+        }
+
+        fn layerShellHit(
+            self: *Self,
+            point: geometry.Point,
+            above_desktop: bool,
+            input_scene: *InputScene,
+        ) ?hit_test.Hit(Desktop.SceneWindow) {
+            const ids = self.layer_shell_adapter.ids(self.layer_surface_ids) catch return null;
+            var layer_value: i32 = if (above_desktop) 3 else 1;
+            const limit: i32 = if (above_desktop) 2 else 0;
+            while (true) : (layer_value += if (above_desktop) -1 else -1) {
+                var index = ids.len;
+                while (index != 0) {
+                    index -= 1;
+                    const state = self.layer_shell_adapter.state(ids[index]) catch continue;
+                    if (!state.mapped or @intFromEnum(state.layer) != layer_value) continue;
+                    const window = self.layerShellScene(state.surface) orelse continue;
+                    if (hit_test.topmostTree(
+                        Desktop.SceneWindow,
+                        @as(*const [1]Desktop.SceneWindow, &window),
+                        point,
+                        input_scene,
+                    )) |hit| return hit;
+                }
+                if (layer_value == limit) break;
+            }
+            return null;
+        }
+
+        fn outputBounds(self: *const Self) !geometry.Rect {
+            const output = self.output orelse return error.NoOutput;
+            return .{
+                .x = 0,
+                .y = 0,
+                .width = @intCast(output.planner.output.width),
+                .height = @intCast(output.planner.output.height),
+            };
+        }
+
+        fn layerWorkArea(self: *Self, pending_surface: ?Adapter.SurfaceId) !geometry.Rect {
+            var area = try self.outputBounds();
+            const ids = try self.layer_shell_adapter.ids(self.layer_surface_ids);
+            for (ids) |layer_id| {
+                var state = try self.layer_shell_adapter.state(layer_id);
+                var mapped = state.mapped;
+                if (pending_surface != null and std.meta.eql(state.surface, pending_surface.?)) {
+                    state = self.layer_shell_adapter.pendingStateForSurface(state.surface) orelse
+                        return error.StaleSurface;
+                    const surface = try self.adapter.getSurfaceById(state.surface);
+                    if (surface.attach_changed) mapped = surface.pending_buffer != null;
+                }
+                if (!mapped or state.exclusive_zone <= 0) continue;
+                const edge = exclusiveEdge(state) orelse continue;
+                const margin = switch (edge) {
+                    .top => state.margins.top,
+                    .bottom => state.margins.bottom,
+                    .left => state.margins.left,
+                    .right => state.margins.right,
+                };
+                const requested = std.math.add(i32, state.exclusive_zone, margin) catch
+                    return error.InvalidExclusiveZone;
+                if (requested <= 0) continue;
+                switch (edge) {
+                    .top => {
+                        const amount = @min(requested, area.height - 1);
+                        area.y += amount;
+                        area.height -= amount;
+                    },
+                    .bottom => area.height -= @min(requested, area.height - 1),
+                    .left => {
+                        const amount = @min(requested, area.width - 1);
+                        area.x += amount;
+                        area.width -= amount;
+                    },
+                    .right => area.width -= @min(requested, area.width - 1),
+                }
+            }
+            return area;
+        }
+
+        fn exclusiveEdge(state: LayerShellAdapter.State) ?LayerEdge {
+            if (state.exclusive_edge) |edge| {
+                if (edge.top) return .top;
+                if (edge.bottom) return .bottom;
+                if (edge.left) return .left;
+                if (edge.right) return .right;
+            }
+            const anchors = state.anchors;
+            if (anchors.top and !anchors.bottom and anchors.left == anchors.right) return .top;
+            if (anchors.bottom and !anchors.top and anchors.left == anchors.right) return .bottom;
+            if (anchors.left and !anchors.right and anchors.top == anchors.bottom) return .left;
+            if (anchors.right and !anchors.left and anchors.top == anchors.bottom) return .right;
+            return null;
+        }
+
+        fn layerGeometry(self: *Self, state: LayerShellAdapter.State) !geometry.Rect {
+            const bounds = try self.outputBounds();
+            const area = if (state.exclusive_zone == 0) self.desktop.workArea() else bounds;
+            const surface = try self.adapter.getSurfaceById(state.surface);
+            const size = surface.committedSize();
+            if (size.width == 0 or size.height == 0 or
+                size.width > std.math.maxInt(i32) or size.height > std.math.maxInt(i32))
+                return error.InvalidSize;
+            const width: i32 = @intCast(size.width);
+            const height: i32 = @intCast(size.height);
+            const horizontal_space = try std.math.sub(
+                i32,
+                try std.math.sub(i32, area.width, state.margins.left),
+                state.margins.right,
+            );
+            const vertical_space = try std.math.sub(
+                i32,
+                try std.math.sub(i32, area.height, state.margins.top),
+                state.margins.bottom,
+            );
+            const x = if (state.anchors.left and !state.anchors.right)
+                try std.math.add(i32, area.x, state.margins.left)
+            else if (state.anchors.right and !state.anchors.left)
+                try std.math.sub(
+                    i32,
+                    try std.math.add(i32, area.x, area.width),
+                    try std.math.add(i32, width, state.margins.right),
+                )
+            else
+                try std.math.add(
+                    i32,
+                    try std.math.add(i32, area.x, state.margins.left),
+                    @divTrunc(horizontal_space - width, 2),
+                );
+            const y = if (state.anchors.top and !state.anchors.bottom)
+                try std.math.add(i32, area.y, state.margins.top)
+            else if (state.anchors.bottom and !state.anchors.top)
+                try std.math.sub(
+                    i32,
+                    try std.math.add(i32, area.y, area.height),
+                    try std.math.add(i32, height, state.margins.bottom),
+                )
+            else
+                try std.math.add(
+                    i32,
+                    try std.math.add(i32, area.y, state.margins.top),
+                    @divTrunc(vertical_space - height, 2),
+                );
+            return .{ .x = x, .y = y, .width = width, .height = height };
+        }
+
+        fn layerConfigureSize(self: *Self, state: LayerShellAdapter.State) !render.Size {
+            const area = if (state.exclusive_zone == 0)
+                try self.layerWorkArea(null)
+            else
+                try self.outputBounds();
+            const available_width = try std.math.sub(
+                i32,
+                try std.math.sub(i32, area.width, state.margins.left),
+                state.margins.right,
+            );
+            const available_height = try std.math.sub(
+                i32,
+                try std.math.sub(i32, area.height, state.margins.top),
+                state.margins.bottom,
+            );
+            return .{
+                .width = if (state.width != 0) state.width else @intCast(@max(available_width, 0)),
+                .height = if (state.height != 0) state.height else @intCast(@max(available_height, 0)),
+            };
+        }
+
+        fn recomputeLayerConfigures(self: *Self) !void {
+            const ids = try self.layer_shell_adapter.ids(self.layer_surface_ids);
+            for (ids) |id| {
+                const state = try self.layer_shell_adapter.state(id);
+                const size = try self.layerConfigureSize(state);
+                self.layer_shell_adapter.queueConfigure(id, size.width, size.height) catch |err| switch (err) {
+                    error.NotConfigured => {},
+                    else => return err,
+                };
+            }
         }
 
         fn findAppLayer(self: *Self, id: Adapter.SurfaceId) ?*Layer {
@@ -3439,6 +3766,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.interaction.surfaceDestroyed(id);
             }
             if (removed_surface) |id| self.queueLayerRemoval(id);
+            const removed_layer_surface = self.layer_shell_adapter.surfaceForResource(handle, object);
+            if (removed_layer_surface) |id| self.queueLayerRemoval(id);
             self.decoration_adapter.toplevelRemoved(handle, object);
             _ = self.shell_adapter.resourceRemoved(handle, object);
             _ = self.seat_adapter.resourceRemoved(handle, object);
@@ -3456,11 +3785,17 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.fractional_scale_adapter.resourceRemoved(handle, object);
             _ = self.color_management_adapter.resourceRemoved(handle, object);
             _ = self.color_representation_adapter.resourceRemoved(handle, object);
+            const layer_shell_removed = self.layer_shell_adapter.resourceRemoved(handle, object);
             _ = self.xdg_output_adapter.resourceRemoved(handle, object);
             _ = self.output_adapter.resourceRemoved(handle, object);
             _ = self.cursor_shape_adapter.resourceRemoved(handle, object);
             _ = self.text_input_adapter.resourceRemoved(handle, object);
             _ = self.subcompositor_adapter.resourceRemoved(handle, object);
+            if (layer_shell_removed and self.output != null) {
+                self.desktop.applyWorkArea(self.layerWorkArea(null) catch self.outputBounds() catch unreachable);
+                self.syncLayerKeyboardFocus() catch {};
+                self.output.?.request(.damage, monotonicNs() catch 0) catch {};
+            }
             if (removed_surface_peer) |peer| self.data_device_adapter.surfaceRemoved(peer, handle.id);
             if (removed_surface_peer) |peer| self.output_adapter.surfaceRemoved(peer, handle);
             if (removed_surface) |id| {

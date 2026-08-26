@@ -70,6 +70,8 @@ pub fn Desktop(comptime Shell: type) type {
         pub const SceneWindow = struct {
             id: ToplevelId,
             surface: Shell.SurfaceId,
+            managed: bool = true,
+            keyboard_focusable: bool = true,
             geometry: geometry.Rect,
             has_window_geometry: bool = false,
             surface_offset: geometry.Point = .{ .x = 0, .y = 0 },

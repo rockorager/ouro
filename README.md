@@ -81,6 +81,11 @@ responsibilities:
   publish the selected output's actual compositor-space extent, stable name,
   and description, with `zxdg_output_v1.done` for versions 1–2 and the
   associated `wl_output.done` atomicity marker for version 3.
+- [Layer shell](src/protocol/layer_shell.zig): bounded
+  `zwlr_layer_shell_v1` roles retain double-buffered anchors, margins,
+  exclusive zones, layer, and keyboard-interactivity state; publish exact
+  acknowledged configure transactions; reserve desktop work area; and compose
+  background, bottom, top, and overlay surfaces in protocol order.
 - [XDG popups](src/protocol/xdg_shell.zig): bounded popup roles retain copied
   positioner state, receive exact initial and reposition configure transactions,
   validate explicit grabs against exact seat/user-action serials, and compose

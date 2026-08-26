@@ -11,6 +11,8 @@ pub fn Hit(comptime Window: type) type {
     return struct {
         toplevel: @TypeOf(@as(Window, undefined).id),
         surface: @TypeOf(@as(Window, undefined).surface),
+        managed: bool = true,
+        keyboard_focusable: bool = true,
         local: geometry.Point,
     };
 }
@@ -42,7 +44,16 @@ pub fn topmost(
             ) catch continue,
         };
         if (!(surfaces.inputContains(window.surface, local) catch continue)) continue;
-        return .{ .toplevel = window.id, .surface = window.surface, .local = local };
+        return .{
+            .toplevel = window.id,
+            .surface = window.surface,
+            .managed = if (@hasField(Window, "managed")) window.managed else true,
+            .keyboard_focusable = if (@hasField(Window, "keyboard_focusable"))
+                window.keyboard_focusable
+            else
+                true,
+            .local = local,
+        };
     }
     return null;
 }
@@ -99,7 +110,16 @@ pub fn topmostTree(
                 };
             };
             if (!(scene.inputContains(surface, local) catch continue)) continue;
-            return .{ .toplevel = window.id, .surface = surface, .local = local };
+            return .{
+                .toplevel = window.id,
+                .surface = surface,
+                .managed = if (@hasField(Window, "managed")) window.managed else true,
+                .keyboard_focusable = if (@hasField(Window, "keyboard_focusable"))
+                    window.keyboard_focusable
+                else
+                    true,
+                .local = local,
+            };
         }
     }
     return null;

@@ -45,6 +45,8 @@ pub fn Interaction(comptime Desktop: type) type {
         pub const Target = struct {
             toplevel: ToplevelId,
             surface: SurfaceId,
+            managed: bool = true,
+            keyboard_focusable: bool = true,
             /// Surface-local wl_fixed (24.8) coordinates.
             point: FixedPoint,
         };
@@ -350,6 +352,8 @@ pub fn Interaction(comptime Desktop: type) type {
                 break :target .{
                     .toplevel = value.toplevel,
                     .surface = value.surface,
+                    .managed = value.managed,
+                    .keyboard_focusable = value.keyboard_focusable,
                     .point = .{
                         .x = std.math.cast(i32, local_x) orelse return error.InvalidGeometry,
                         .y = std.math.cast(i32, local_y) orelse return error.InvalidGeometry,
@@ -406,7 +410,7 @@ pub fn Interaction(comptime Desktop: type) type {
                 self.hover != null;
             if (begins_grab) {
                 try self.ensureCommandCapacity(1);
-                try desktop.focusToplevel(self.hover.?.toplevel);
+                if (self.hover.?.managed) try desktop.focusToplevel(self.hover.?.toplevel);
             }
             const ends_interactive = !aggregate_after and !self.anyOtherPressedButton(device, button) and
                 self.mode == .interactive;
@@ -415,8 +419,10 @@ pub fn Interaction(comptime Desktop: type) type {
             if (begins_grab) {
                 const target = self.hover.?;
                 self.mode = .{ .button_grab = target };
-                self.keyboard_focus = target;
-                self.enqueue(.{ .keyboard_focus = target });
+                if (target.keyboard_focusable) {
+                    self.keyboard_focus = target;
+                    self.enqueue(.{ .keyboard_focus = target });
+                }
             } else if (dismisses_popup) {
                 self.mode = .default;
             } else if (!aggregate_after and !self.anyPressedButton() and
@@ -782,6 +788,8 @@ const TestDesktop = struct {
         surface_offset: geometry.Point = .{ .x = 0, .y = 0 },
         visible: bool,
         content_ready: bool,
+        managed: bool = true,
+        keyboard_focusable: bool = true,
     };
 
     windows: [2]SceneWindow,
@@ -1077,6 +1085,64 @@ test "interaction: default press updates desktop and enters exact button grab" {
         .pressed = false,
     } });
     try std.testing.expect(interaction.interactionMode() == .default);
+}
+
+test "interaction: unmanaged surface press preserves desktop focus policy" {
+    var interaction = try initTestInteraction(4);
+    defer interaction.deinit();
+    var desktop = testDesktop();
+    desktop.windows[1].managed = false;
+    var surfaces = TestSurfaces{};
+    try addPointer(&interaction, &desktop, &surfaces);
+    try interaction.consume(&desktop, &surfaces, .{ .pointer_motion = .{
+        .device = device_a,
+        .time_usec = 1,
+        .dx = 12,
+        .dy = 7,
+    } });
+    const target = interaction.peekCommand().?.pointer_focus.?;
+    try std.testing.expect(!target.managed);
+    interaction.dropCommand();
+
+    try interaction.consume(&desktop, &surfaces, .{ .pointer_button = .{
+        .device = device_a,
+        .time_usec = 2,
+        .button = 272,
+        .pressed = true,
+    } });
+    try std.testing.expectEqual(@as(?TestId, null), desktop.focused);
+    try std.testing.expectEqual(target, interaction.peekCommand().?.keyboard_focus);
+    try std.testing.expectEqual(target, interaction.interactionMode().button_grab);
+}
+
+test "interaction: non-focusable unmanaged surface press omits keyboard focus" {
+    var interaction = try initTestInteraction(4);
+    defer interaction.deinit();
+    var desktop = testDesktop();
+    desktop.windows[1].managed = false;
+    desktop.windows[1].keyboard_focusable = false;
+    var surfaces = TestSurfaces{};
+    try addPointer(&interaction, &desktop, &surfaces);
+    try interaction.consume(&desktop, &surfaces, .{ .pointer_motion = .{
+        .device = device_a,
+        .time_usec = 1,
+        .dx = 12,
+        .dy = 7,
+    } });
+    const target = interaction.peekCommand().?.pointer_focus.?;
+    try std.testing.expect(!target.managed);
+    try std.testing.expect(!target.keyboard_focusable);
+    interaction.dropCommand();
+
+    try interaction.consume(&desktop, &surfaces, .{ .pointer_button = .{
+        .device = device_a,
+        .time_usec = 2,
+        .button = 272,
+        .pressed = true,
+    } });
+    try std.testing.expectEqual(@as(?TestId, null), desktop.focused);
+    try std.testing.expectEqual(@as(usize, 0), interaction.pendingCommands());
+    try std.testing.expectEqual(target, interaction.interactionMode().button_grab);
 }
 
 test "interaction: activation focuses the exact toplevel and queues keyboard focus" {
