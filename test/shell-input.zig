@@ -53,6 +53,7 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     config.surface.attachment_capacity = 2;
     config.surface.copy_capacity = 2;
     config.surface.guarded_shm_access = false;
+    config.output.max_samples = 3;
     config.output.max_source_bytes = pixels.len + 4;
     const coordinator = try Coordinator.create(
         allocator,
@@ -566,7 +567,7 @@ test "shell-input: synchronized subsurface publishes with parent and receives po
     config.surface.dependency_capacity = 2;
     config.surface.attachment_capacity = 2;
     config.surface.copy_capacity = 2;
-    config.output.max_samples = 2;
+    config.output.max_samples = 3;
     config.output.max_source_bytes = pixels.len * 2;
     const coordinator = try Coordinator.create(
         allocator,

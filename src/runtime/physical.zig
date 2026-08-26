@@ -41,6 +41,9 @@ const protocol_fractional_scale = @import("../protocol/fractional_scale.zig");
 const protocol_color_management = @import("../protocol/color_management.zig");
 const protocol_color_representation = @import("../protocol/color_representation.zig");
 const protocol_output = @import("../protocol/output.zig");
+const protocol_cursor_shape = @import("../protocol/cursor_shape.zig");
+const cursor_theme = @import("../cursor_theme.zig");
+const theme_cursor = @import("../scene/theme_cursor.zig");
 const desktop_model = @import("../desktop/model.zig");
 const interaction_model = @import("../input/interaction.zig");
 const confinement = @import("../input/confinement.zig");
@@ -74,6 +77,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const ColorManagementAdapter = protocol_color_management.Adapter(protocol, Adapter);
         const ColorRepresentationAdapter = protocol_color_representation.Adapter(protocol, Adapter);
         const OutputAdapter = protocol_output.Adapter(protocol);
+        const CursorShapeAdapter = protocol_cursor_shape.Adapter(protocol);
 
         const Imported = struct {};
         const Presentations = presentation.Queue(Imported);
@@ -239,6 +243,16 @@ pub fn Coordinator(comptime protocol: type) type {
             color_representation: protocol_color_representation.Config = .{},
             enable_color_protocols: bool = false,
             protocol_output: protocol_output.Config = .{},
+            cursor_shape: protocol_cursor_shape.Config = .{},
+            cursor_cache: cursor_theme.Cache.Config = .{
+                // Every protocol shape (including the default fallback) has a slot.
+                .file_capacity = protocol_cursor_shape.shape_names.len,
+                .path_capacity = 256,
+                .max_file_bytes = 4 * 1024 * 1024,
+                .max_total_bytes = 32 * 1024 * 1024,
+            },
+            cursor_directory: []const u8 = "/usr/share/icons/Adwaita/cursors",
+            cursor_size: u32 = 24,
             drm: drm.Config,
             output: output_api.Config,
         };
@@ -301,6 +315,14 @@ pub fn Coordinator(comptime protocol: type) type {
         color_protocols_enabled: bool = false,
         color_representation_adapter: ColorRepresentationAdapter,
         output_adapter: OutputAdapter,
+        cursor_shape_adapter: CursorShapeAdapter,
+        cursor_cache: cursor_theme.Cache,
+        themed_cursor: theme_cursor.Cursor = .{},
+        themed_cursor_previous: ?damage.SurfaceState = null,
+        client_cursor_hidden_previous: ?damage.SurfaceState = null,
+        cursor_path: []u8,
+        cursor_directory_len: usize,
+        cursor_size: u32,
         presentations: Presentations,
         render_device: ?*output_api.RenderDevice = null,
         output: ?*output_api.Output = null,
@@ -441,6 +463,27 @@ pub fn Coordinator(comptime protocol: type) type {
             self.icc_poll = null;
             self.icc_poll_canceling = false;
             self.cursor_layer = .{};
+            const cursor_path_requirement = std.math.add(
+                usize,
+                config.cursor_directory.len,
+                1,
+            ) catch return error.InvalidConfig;
+            const cursor_shape_path_requirement = std.math.add(
+                usize,
+                cursor_path_requirement,
+                longestCursorShapeName(),
+            ) catch return error.InvalidConfig;
+            if (config.cursor_size == 0 or config.cursor_directory.len == 0 or
+                cursor_shape_path_requirement > config.cursor_cache.path_capacity)
+                return error.InvalidConfig;
+            self.cursor_path = try allocator.alloc(u8, config.cursor_cache.path_capacity);
+            errdefer allocator.free(self.cursor_path);
+            @memcpy(self.cursor_path[0..config.cursor_directory.len], config.cursor_directory);
+            self.cursor_directory_len = config.cursor_directory.len;
+            self.cursor_size = config.cursor_size;
+            self.themed_cursor = .{};
+            self.themed_cursor_previous = null;
+            self.client_cursor_hidden_previous = null;
             self.output_drain_started = false;
             self.stopping = false;
             self.session_disable_pending = false;
@@ -576,6 +619,13 @@ pub fn Coordinator(comptime protocol: type) type {
             });
             self.output_adapter = try OutputAdapter.init(allocator, config.protocol_output);
             errdefer self.output_adapter.deinit();
+            self.cursor_cache = try cursor_theme.Cache.init(allocator, config.cursor_cache);
+            errdefer self.cursor_cache.deinit();
+            self.cursor_shape_adapter = try CursorShapeAdapter.init(allocator, .{
+                .context = self,
+                .validateFn = validateCursorShape,
+            }, config.cursor_shape);
+            errdefer self.cursor_shape_adapter.deinit();
             self.presentations = try Presentations.init(
                 allocator,
                 try std.math.add(
@@ -642,6 +692,11 @@ pub fn Coordinator(comptime protocol: type) type {
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
             _ = try self.pointer_constraints_adapter.install(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
+            _ = try self.cursor_shape_adapter.install(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
             try self.adapter.setCommitHook(.{
                 .context = self,
                 .validate_fn = validateSurfaceCommit,
@@ -714,6 +769,9 @@ pub fn Coordinator(comptime protocol: type) type {
             self.allocator.free(self.frame_samples);
             self.allocator.free(self.scene_windows);
             self.allocator.free(self.app_layers);
+            self.cursor_shape_adapter.deinit();
+            self.cursor_cache.deinit();
+            self.allocator.free(self.cursor_path);
             self.output_adapter.deinit();
             self.fractional_scale_adapter.deinit();
             self.color_representation_adapter.deinit();
@@ -761,6 +819,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         pub fn disconnected(self: *Self, peer: wayring.io_uring.Peer) void {
+            self.cursor_shape_adapter.disconnected(peer);
             self.primary_selection_adapter.disconnected(peer);
             for (self.clients.items) |*client| if (client.active and samePeer(client.peer, peer)) {
                 client.* = .{};
@@ -884,6 +943,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (self.seat_adapter.pendingOutboundOn(objects))
                     self.markProtocol(peer, ProtocolReady.seat);
                 try self.flushProtocol();
+                return control;
+            }
+            if (try self.cursor_shape_adapter.request(peer, target, message, fds)) |control| {
+                try self.processCursorShapeEvents();
                 return control;
             }
             if (try self.data_device_adapter.request(peer, target, message, fds)) |control| {
@@ -1568,6 +1631,41 @@ pub fn Coordinator(comptime protocol: type) type {
             return self.seat_adapter.validateInteractiveGrab(peer, seat_object, serial, surface);
         }
 
+        fn validateCursorShape(
+            context: ?*anyopaque,
+            peer: wayring.io_uring.Peer,
+            pointer_object: u32,
+            serial: u32,
+        ) bool {
+            const self: *Self = @ptrCast(@alignCast(context orelse return false));
+            const server_objects = self.root.runtime.clients.get(peer) catch return false;
+            return self.seat_adapter.validateCursorShapeOn(server_objects, peer, pointer_object, serial);
+        }
+
+        fn cursorImage(self: *Self, name: []const u8) ?cursor_theme.Image {
+            const suffix = std.fmt.bufPrint(self.cursor_path[self.cursor_directory_len..], "/{s}", .{name}) catch return null;
+            const path = self.cursor_path[0 .. self.cursor_directory_len + suffix.len];
+            return self.cursor_cache.load(path, self.cursor_size) catch null;
+        }
+
+        fn processCursorShapeEvents(self: *Self) !void {
+            while (self.cursor_shape_adapter.peekEvent()) |event| {
+                const image = self.cursorImage(event.shape.name()) orelse
+                    self.cursorImage(protocol_cursor_shape.fallback_name);
+                if (image) |value| {
+                    if (self.cursor_layer.active) {
+                        if (self.cursor_layer.change) |change| {
+                            if (change.current) |current| self.client_cursor_hidden_previous = current;
+                        }
+                    }
+                    self.interaction.cursorRequest(null, .{ .x = 0, .y = 0 });
+                    _ = self.themed_cursor.setImage(value);
+                    try self.requestCursorRedraw();
+                }
+                self.cursor_shape_adapter.dropEvent();
+            }
+        }
+
         fn validateSelection(
             context: *anyopaque,
             peer: wayring.io_uring.Peer,
@@ -1663,6 +1761,8 @@ pub fn Coordinator(comptime protocol: type) type {
             while (self.seat_adapter.peekEvent()) |event| {
                 switch (event) {
                     .cursor_requested => |request_value| {
+                        _ = self.themed_cursor.setImage(null);
+                        self.client_cursor_hidden_previous = null;
                         self.interaction.cursorRequest(
                             request_value.surface,
                             .{ .x = request_value.hotspot.x, .y = request_value.hotspot.y },
@@ -1677,7 +1777,8 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn requestCursorRedraw(self: *Self) !void {
-            if (!self.cursor_layer.active) return;
+            if (!self.cursor_layer.active and self.themed_cursor.image == null and
+                self.themed_cursor_previous == null) return;
             if (self.output) |output| {
                 output.request(.damage, try monotonicNs()) catch |err| switch (err) {
                     error.OutputPaused => return,
@@ -2422,7 +2523,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.frame_changes[change_count] = .{ .previous = removed.state };
                 change_count += 1;
             }
-            if (self.cursor_layer.active) {
+            if (self.cursor_layer.active and self.themed_cursor.image == null) {
                 if (try self.interaction.cursor.composite(.{
                     .surface = self.cursor_layer.id.?,
                     .sample = self.cursor_layer.sample.?,
@@ -2442,6 +2543,39 @@ pub fn Coordinator(comptime protocol: type) type {
                     change_count += 1;
                 }
             }
+            self.themed_cursor.move(self.interaction.cursor.position);
+            self.themed_cursor.setPointerAvailable(self.interaction.cursor.pointer_available);
+            var next_themed_cursor_previous = self.themed_cursor_previous;
+            if (self.themed_cursor.image != null) {
+                if (try self.themed_cursor.sample(output.planner.output)) |sample| {
+                    try self.ensureFrameStorage(@max(sample_count, change_count) + 1);
+                    self.frame_samples[sample_count] = sample;
+                    self.frame_bindings[sample_count] = self.themed_cursor.sampleBinding(output_api.SampleBinding);
+                    self.frame_changes[change_count] = try self.themed_cursor.damageChange(
+                        self.themed_cursor_previous,
+                        output.planner.output,
+                    );
+                    self.frame_changes[change_count].invalidate_bounds = true;
+                    next_themed_cursor_previous = self.frame_changes[change_count].current;
+                    sample_count += 1;
+                    change_count += 1;
+                } else if (self.themed_cursor_previous != null) {
+                    try self.ensureFrameStorage(@max(sample_count, change_count) + 1);
+                    self.frame_changes[change_count] = .{ .previous = self.themed_cursor_previous };
+                    next_themed_cursor_previous = null;
+                    change_count += 1;
+                }
+            } else if (self.themed_cursor_previous != null) {
+                try self.ensureFrameStorage(@max(sample_count, change_count) + 1);
+                self.frame_changes[change_count] = .{ .previous = self.themed_cursor_previous };
+                next_themed_cursor_previous = null;
+                change_count += 1;
+            }
+            if (self.client_cursor_hidden_previous) |previous| {
+                try self.ensureFrameStorage(@max(sample_count, change_count) + 1);
+                self.frame_changes[change_count] = .{ .previous = previous };
+                change_count += 1;
+            }
             if (sample_count == 0 and change_count == 0) {
                 const result = try output.renderFrame(frame, &.{}, &.{}, &.{}, try monotonicNs());
                 if (result == .retired) try self.finishOutcome(result.retired.frame, false);
@@ -2457,6 +2591,8 @@ pub fn Coordinator(comptime protocol: type) type {
             switch (render_result) {
                 .submitted => {
                     self.stats.submitted += 1;
+                    self.themed_cursor_previous = next_themed_cursor_previous;
+                    self.client_cursor_hidden_previous = null;
                     self.removed_layer_len = 0;
                     _ = try self.retryRetainedOutcomes();
                 },
@@ -3029,6 +3165,7 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.color_management_adapter.resourceRemoved(handle, object);
             _ = self.color_representation_adapter.resourceRemoved(handle, object);
             _ = self.output_adapter.resourceRemoved(handle, object);
+            _ = self.cursor_shape_adapter.resourceRemoved(handle, object);
             _ = self.subcompositor_adapter.resourceRemoved(handle, object);
             if (removed_surface_peer) |peer| self.data_device_adapter.surfaceRemoved(peer, handle.id);
             if (removed_surface_peer) |peer| self.output_adapter.surfaceRemoved(peer, handle);
@@ -3090,6 +3227,12 @@ pub fn Coordinator(comptime protocol: type) type {
             self.stats.imported_disposals += 1;
         }
     };
+}
+
+fn longestCursorShapeName() usize {
+    var longest: usize = 0;
+    for (protocol_cursor_shape.shape_names) |name| longest = @max(longest, name.len);
+    return longest;
 }
 
 fn normalizedFixedDelta(value: f64) i64 {
