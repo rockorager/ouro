@@ -83,6 +83,7 @@ struct client {
     enum backing backing;
     bool churn;
     bool configured;
+    bool draining;
     uint64_t callbacks;
     uint64_t releases;
     uint64_t presented;
@@ -217,6 +218,7 @@ static const struct xdg_wm_base_listener wm_base_listener = {
 
 static void xdg_surface_configure(void *data, struct xdg_surface *surface, uint32_t serial) {
     struct client *client = data;
+    if (client->draining) return;
     xdg_surface_ack_configure(surface, serial);
     client->configured = true;
 }
@@ -702,6 +704,7 @@ int main(int argc, char **argv) {
     );
     fflush(stdout);
     if (read(STDIN_FILENO, &gate, 1) != 1) fail("read cleanup gate");
+    client.draining = true;
     wl_surface_attach(client.surface, NULL, 0, 0);
     wl_surface_commit(client.surface);
     for (size_t index = 0; index < BUFFER_COUNT; index++)
@@ -710,6 +713,9 @@ int main(int argc, char **argv) {
     const uint64_t expected_releases = warmup + frames;
     if (client.releases != expected_releases)
         protocol_fail("not every submitted buffer was released");
+    printf("DRAINED releases=%" PRIu64 "\n", client.releases);
+    fflush(stdout);
+    if (read(STDIN_FILENO, &gate, 1) != 1) fail("read destroy gate");
     printf("CLEANUP releases=%" PRIu64 "\n", client.releases);
     fflush(stdout);
     cleanup(&client);

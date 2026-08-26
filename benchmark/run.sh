@@ -353,6 +353,25 @@ run_case() {
         perf_pid=
     fi
 
+    for fd in "${client_fds[@]}"; do printf x >&"$fd"; done
+    for _ in {1..600}; do
+        local drained=0
+        for ((index = 1; index <= clients; index++)); do
+            grep -q '^DRAINED releases='"$((frames + warmup))"'$' \
+                "$directory/client-$index.log" 2>/dev/null && ((drained += 1))
+        done
+        ((drained == clients)) && break
+        for pid in "${client_pids[@]}"; do
+            kill -0 "$pid" 2>/dev/null || {
+                cat "$directory"/client-*.log >&2
+                return 1
+            }
+        done
+        sleep .05
+    done
+    for ((index = 1; index <= clients; index++)); do
+        grep -q '^DRAINED releases='"$((frames + warmup))"'$' "$directory/client-$index.log"
+    done
     for fd in "${client_fds[@]}"; do
         printf x >&"$fd"
         eval "exec ${fd}>&-"

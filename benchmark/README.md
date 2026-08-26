@@ -17,7 +17,9 @@ its exact release. Every measured commit requires:
 - a non-discarded `wp_presentation` feedback event.
 
 The exact buffer release is additionally required before that buffer is reused
-or destroyed.
+or destroyed. Multi-client teardown uses a separate drain barrier before the
+destroy gate so one departing client cannot trigger compositor reconfiguration
+while peers are still dispatching their final buffer release.
 
 By default, the next commit is paced by its frame callback while presentation
 feedback is collected asynchronously. Buffers are never reused or destroyed
