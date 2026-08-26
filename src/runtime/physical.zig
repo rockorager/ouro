@@ -100,6 +100,7 @@ pub fn Coordinator(comptime protocol: type) type {
             surface: wayring.objects.Handle,
             id: Adapter.SurfaceId,
             content: Adapter.Content,
+            superseded: bool = false,
         };
         const Layer = struct {
             active: bool = false,
@@ -250,6 +251,9 @@ pub fn Coordinator(comptime protocol: type) type {
         surface: ?wayring.objects.Handle = null,
         surface_id: ?Adapter.SurfaceId = null,
         pending_surfaces: []PendingSurface,
+        ready_update_surfaces: []wayring.objects.Handle,
+        applied_updates: []Adapter.Applied,
+        applied_layers: []*Layer,
         pending_surface_head: usize = 0,
         pending_surface_len: usize = 0,
         app_layers: []Layer,
@@ -307,13 +311,33 @@ pub fn Coordinator(comptime protocol: type) type {
             self.surface_id = null;
             self.pending_surfaces = try allocator.alloc(PendingSurface, config.surface.surface_capacity);
             errdefer allocator.free(self.pending_surfaces);
+            self.ready_update_surfaces = try allocator.alloc(
+                wayring.objects.Handle,
+                config.surface.content_update_capacity,
+            );
+            errdefer allocator.free(self.ready_update_surfaces);
+            self.applied_updates = try allocator.alloc(
+                Adapter.Applied,
+                config.surface.content_update_capacity,
+            );
+            errdefer allocator.free(self.applied_updates);
+            self.applied_layers = try allocator.alloc(
+                *Layer,
+                config.surface.content_update_capacity,
+            );
+            errdefer allocator.free(self.applied_layers);
             self.pending_surface_head = 0;
             self.pending_surface_len = 0;
             if (config.timer_capacity < 4 or config.desktop_transaction_timeout_ns == 0 or
                 config.output.max_samples < 2 or config.output.max_source_bytes == 0 or
                 config.protocol_output.association_capacity < config.output.max_samples)
                 return error.InvalidConfig;
-            self.app_layers = try allocator.alloc(Layer, config.output.max_samples - 1);
+            const app_layer_capacity = try std.math.add(
+                usize,
+                config.surface.surface_capacity,
+                config.surface.content_update_capacity,
+            );
+            self.app_layers = try allocator.alloc(Layer, app_layer_capacity);
             errdefer allocator.free(self.app_layers);
             @memset(self.app_layers, .{});
             const scene_capacity = try std.math.add(
@@ -457,7 +481,11 @@ pub fn Coordinator(comptime protocol: type) type {
             errdefer self.output_adapter.deinit();
             self.presentations = try Presentations.init(
                 allocator,
-                config.output.max_samples,
+                try std.math.add(
+                    usize,
+                    config.output.max_samples,
+                    config.surface.content_update_capacity,
+                ),
                 self,
                 disposeImported,
             );
@@ -555,6 +583,9 @@ pub fn Coordinator(comptime protocol: type) type {
                 first_error = err;
             };
             self.presentations.deinit(self.allocator);
+            self.allocator.free(self.applied_layers);
+            self.allocator.free(self.applied_updates);
+            self.allocator.free(self.ready_update_surfaces);
             self.allocator.free(self.pending_surfaces);
             self.clients.deinit(self.allocator);
             self.allocator.free(self.association_surfaces);
@@ -907,7 +938,8 @@ pub fn Coordinator(comptime protocol: type) type {
             for (0..self.pending_surface_len) |offset| {
                 const index = (self.pending_surface_head + offset) % self.pending_surfaces.len;
                 if (std.meta.eql(self.pending_surfaces[index].id, id)) {
-                    if (self.pending_surfaces[index].commits == 0) self.dropPendingSurface(id);
+                    if (self.pending_surfaces[index].commits == 0 and
+                        !self.candidatePending(id)) self.dropPendingSurface(id);
                     return;
                 }
             }
@@ -921,6 +953,15 @@ pub fn Coordinator(comptime protocol: type) type {
             self.pending_surfaces[tail] = pending;
             self.pending_surface_head = (self.pending_surface_head + 1) % self.pending_surfaces.len;
             return pending;
+        }
+
+        fn candidatePending(self: *const Self, id: Adapter.SurfaceId) bool {
+            for (self.app_layers) |layer|
+                if (layer.candidate) |candidate|
+                    if (std.meta.eql(candidate.id, id)) return true;
+            if (self.cursor_layer.candidate) |candidate|
+                if (std.meta.eql(candidate.id, id)) return true;
+            return false;
         }
 
         fn dropPendingSurface(self: *Self, id: Adapter.SurfaceId) void {
@@ -1728,7 +1769,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 std.meta.eql(id, exact_surface_id)
             else
                 false;
-            const layer = if (in_desktop)
+            var layer = if (in_desktop)
                 self.appLayerForSurface(exact_surface_id) orelse return false
             else if (requested_cursor)
                 &self.cursor_layer
@@ -1739,24 +1780,19 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (!candidateMatches(candidate, pending)) return false;
             }
             if (layer.candidate == null) {
-                var storage: [1]Adapter.Applied = undefined;
-                const applied = self.adapter.tryApply(surface, &storage) catch |err| switch (err) {
-                    error.StaleSurface => {
-                        self.dropPendingSurface(pending.id);
-                        return false;
-                    },
-                    else => return err,
-                };
-                if (applied.len == 0) return false;
-                self.pendingCommitApplied(pending.id);
-                layer.candidate = .{
-                    .peer = try self.adapter.surfacePeer(exact_surface_id),
-                    .surface = surface,
-                    .id = exact_surface_id,
-                    .content = applied[0].payload,
-                };
+                if (!try self.admitReadyBatch(surface)) return false;
+                layer = if (in_desktop)
+                    self.appLayerForSurface(exact_surface_id) orelse return false
+                else
+                    &self.cursor_layer;
+                if (layer.candidate == null or
+                    !candidateMatches(layer.candidate.?, pending)) return false;
             }
             const candidate = &layer.candidate.?;
+            if (candidate.superseded) {
+                _ = try self.adapter.activateFrames(candidate.surface, &candidate.content);
+                return self.discardPendingCandidate(layer, pending.id);
+            }
             var content = &candidate.content;
             const attachment = content.surface.attachment orelse {
                 content.deinit();
@@ -1990,6 +2026,70 @@ pub fn Coordinator(comptime protocol: type) type {
             self.stats.applied += 1;
             if (render_device.content.ready(rendered))
                 _ = try self.retryLayerSourceRelease(layer);
+            return true;
+        }
+
+        fn admitReadyBatch(self: *Self, trigger: wayring.objects.Handle) !bool {
+            const ready = self.adapter.readyUpdateSurfaces(
+                trigger,
+                self.ready_update_surfaces,
+            ) catch |err| switch (err) {
+                error.StaleSurface => return false,
+                else => return err,
+            };
+            if (ready.len == 0) return false;
+            var superseded_count: usize = 0;
+            for (ready, 0..) |surface, index| {
+                const id = self.adapter.surfaceId(surface) catch return false;
+                const is_last = lastSurfaceOccurrence(ready, index);
+                const layer = if (!is_last)
+                    self.availableAppLayer(null, index) orelse return false
+                else if (self.interaction.cursor.surface != null and
+                    std.meta.eql(self.interaction.cursor.surface.?, id))
+                    if (self.layerAvailableForBatch(&self.cursor_layer, index))
+                        &self.cursor_layer
+                    else
+                        return false
+                else if (self.desktop.sceneForSurface(id) catch null != null)
+                    self.availableAppLayer(id, index) orelse return false
+                else
+                    return false;
+                self.applied_layers[index] = layer;
+                superseded_count += @intFromBool(!is_last);
+            }
+            if (self.presentations.available() < superseded_count) return false;
+            const applied = try self.adapter.tryApply(trigger, self.applied_updates);
+            std.debug.assert(applied.len == ready.len);
+            for (applied, 0..) |*update, index| {
+                const id = try self.adapter.surfaceId(update.surface);
+                self.pendingCommitApplied(id);
+                self.applied_layers[index].candidate = .{
+                    .peer = try self.adapter.surfacePeer(id),
+                    .surface = update.surface,
+                    .id = id,
+                    .content = update.payload,
+                    .superseded = !lastSurfaceOccurrence(ready, index),
+                };
+            }
+            return true;
+        }
+
+        fn availableAppLayer(
+            self: *Self,
+            preferred: ?Adapter.SurfaceId,
+            used: usize,
+        ) ?*Layer {
+            if (preferred) |id| for (self.app_layers) |*layer|
+                if (layer.id != null and std.meta.eql(layer.id.?, id) and
+                    self.layerAvailableForBatch(layer, used)) return layer;
+            for (self.app_layers) |*layer|
+                if (layerVacant(layer) and self.layerAvailableForBatch(layer, used)) return layer;
+            return null;
+        }
+
+        fn layerAvailableForBatch(self: *Self, layer: *Layer, used: usize) bool {
+            if (layer.presentation != null or layer.candidate != null) return false;
+            for (self.applied_layers[0..used]) |assigned| if (assigned == layer) return false;
             return true;
         }
 
@@ -2275,9 +2375,10 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn appLayerForSurface(self: *Self, id: Adapter.SurfaceId) ?*Layer {
+            for (self.app_layers) |*layer|
+                if (layer.candidate) |candidate| if (std.meta.eql(candidate.id, id)) return layer;
             for (self.app_layers) |*layer| {
                 if (layer.id) |current| if (std.meta.eql(current, id)) return layer;
-                if (layer.candidate) |candidate| if (std.meta.eql(candidate.id, id)) return layer;
             }
             for (self.app_layers) |*layer| if (layerVacant(layer)) return layer;
             return null;
@@ -2584,6 +2685,12 @@ fn removePendingRingEntry(entries: anytype, head: *usize, len: *usize, id: anyty
 fn candidateMatches(candidate: anytype, pending: anytype) bool {
     return std.meta.eql(candidate.id, pending.id) and
         std.meta.eql(candidate.surface, pending.handle);
+}
+
+fn lastSurfaceOccurrence(surfaces: []const wayring.objects.Handle, index: usize) bool {
+    for (surfaces[index + 1 ..]) |later|
+        if (std.meta.eql(surfaces[index], later)) return false;
+    return true;
 }
 
 fn sameToken(a: completion.Token, b: completion.Token) bool {

@@ -418,7 +418,7 @@ fn runVertical(trigger: TerminalTrigger, source: ClientSource) !void {
     try std.testing.expectEqual(@as(usize, 1), coordinator.adapter.imports.available());
     try std.testing.expectEqual(@as(usize, 1), coordinator.adapter.frame_pool.available());
     try std.testing.expectEqual(@as(usize, 1), coordinator.adapter.release_pool.available());
-    try std.testing.expectEqual(@as(usize, 2), coordinator.presentations.available());
+    try std.testing.expectEqual(@as(usize, 3), coordinator.presentations.available());
     try std.testing.expectEqual(@as(usize, 1), client_handler.frame_done);
     // The second commit secured renderer-owned content before it was abandoned,
     // so source release is delivered even though no frame callback is due.
