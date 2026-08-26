@@ -33,6 +33,10 @@ test "generated DMA-BUF traverses GBM import and the physical coordinator" {
     try runVertical(.client_disconnect, .dmabuf);
 }
 
+test "generated single pixel buffer scales through the physical coordinator" {
+    try runVertical(.client_disconnect, .single_pixel);
+}
+
 test "physical coordinator keeps serving until its final client disconnects" {
     const allocator = std.testing.allocator;
     var fixture = try Fixture.init();
@@ -204,7 +208,7 @@ test "output readiness exhaustion destroys output and releases device" {
 }
 
 const TerminalTrigger = enum { session_disable, client_disconnect };
-const ClientSource = enum { shm, dmabuf };
+const ClientSource = enum { shm, dmabuf, single_pixel };
 
 fn runVertical(trigger: TerminalTrigger, source: ClientSource) !void {
     const allocator = std.testing.allocator;
@@ -270,6 +274,14 @@ fn runVertical(trigger: TerminalTrigger, source: ClientSource) !void {
                     coordinator.surface_id.?.index,
                 sample.sample.surface,
             );
+            if (source == .single_pixel) {
+                const rendered = try coordinator.render_device.?.content.resolve(
+                    coordinator.cursor_layer.rendered.?,
+                );
+                try std.testing.expectEqualSlices(u8, &.{ 4, 3, 2, 255 }, rendered.bytes);
+                try std.testing.expectEqual(@as(u32, 3), sample.destination.width);
+                try std.testing.expectEqual(@as(u32, 2), sample.destination.height);
+            }
             observed_identity = true;
         }
         if (client_handler.complete()) break;
@@ -314,7 +326,7 @@ fn runVertical(trigger: TerminalTrigger, source: ClientSource) !void {
             coordinator.interaction.cursorRequest(id, .{ .x = 0, .y = 0 });
             _ = try loop.turn(coordinator);
         };
-        const second_consumed = if (source == .shm)
+        const second_consumed = if (source != .dmabuf)
             coordinator.stats.applied == 2 and coordinator.cursor_layer.content != null
         else
             fixture.import_attempts == 2 and coordinator.pending_surface_len == 0 and
@@ -323,8 +335,8 @@ fn runVertical(trigger: TerminalTrigger, source: ClientSource) !void {
         if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
             try waitForEither(&root.ring, client_reactor.ring);
     }
-    const abandoned_surface = if (source == .shm) coordinator.cursor_layer.surface.? else coordinator.surface.?;
-    if (source == .shm) {
+    const abandoned_surface = if (source != .dmabuf) coordinator.cursor_layer.surface.? else coordinator.surface.?;
+    if (source != .dmabuf) {
         try std.testing.expectEqual(@as(usize, 2), coordinator.stats.applied);
         try std.testing.expect(!coordinator.cursor_layer.source_release_pending);
         try std.testing.expect(coordinator.cursor_layer.content.?.attachment_lease == null);
@@ -445,6 +457,8 @@ const ClientHandler = struct {
     compositor: ?wayring.objects.Handle = null,
     shm: ?wayring.objects.Handle = null,
     dmabuf: ?wayring.objects.Handle = null,
+    single_pixel_manager: ?wayring.objects.Handle = null,
+    viewporter: ?wayring.objects.Handle = null,
     surface: ?wayring.objects.Handle = null,
     frame: ?wayring.objects.Handle = null,
     release: ?wayring.objects.Handle = null,
@@ -466,13 +480,18 @@ const ClientHandler = struct {
                 .global => |global| {
                     if (std.mem.eql(u8, global.interface, protocol.wl_compositor.info.name))
                         self.compositor = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wl_compositor.info, @min(global.version, 7), null);
-                    if (std.mem.eql(u8, global.interface, protocol.wl_shm.info.name))
+                    if (self.source == .shm and std.mem.eql(u8, global.interface, protocol.wl_shm.info.name))
                         self.shm = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wl_shm.info, @min(global.version, 2), null);
-                    if (std.mem.eql(u8, global.interface, protocol.zwp_linux_dmabuf_v1.info.name))
+                    if (self.source == .dmabuf and std.mem.eql(u8, global.interface, protocol.zwp_linux_dmabuf_v1.info.name))
                         self.dmabuf = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.zwp_linux_dmabuf_v1.info, @min(global.version, 3), null);
+                    if (self.source == .single_pixel and std.mem.eql(u8, global.interface, protocol.wp_single_pixel_buffer_manager_v1.info.name))
+                        self.single_pixel_manager = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wp_single_pixel_buffer_manager_v1.info, @min(global.version, 1), null);
+                    if (self.source == .single_pixel and std.mem.eql(u8, global.interface, protocol.wp_viewporter.info.name))
+                        self.viewporter = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wp_viewporter.info, @min(global.version, 1), null);
                     const source_ready = switch (self.source) {
                         .shm => self.shm != null,
                         .dmabuf => self.dmabuf != null,
+                        .single_pixel => self.single_pixel_manager != null and self.viewporter != null,
                     };
                     if (self.compositor != null and source_ready and !self.queued) try self.queueWork();
                 },
@@ -536,12 +555,39 @@ const ClientHandler = struct {
         const buffer = switch (self.source) {
             .shm => try self.createShmBuffer(),
             .dmabuf => try self.createDmabufBuffer(),
+            .single_pixel => try self.createSinglePixelBuffer(),
         };
+        const viewport = if (self.source == .single_pixel)
+            (try protocol.wp_viewporter.construct_get_viewport(
+                self.objects,
+                self.queue,
+                self.viewporter.?,
+                .{ .surface = surface.id },
+            )).id
+        else
+            null;
+        if (viewport) |handle| try protocol.wp_viewport.encodeRequest(
+            self.queue,
+            handle.id,
+            .{ .set_destination = .{ .width = 3, .height = 2 } },
+        );
         try wayring.client.sendRequest(protocol.wl_surface, self.objects, self.queue, surface, .{ .attach = .{ .buffer = buffer.id, .x = 0, .y = 0 } });
-        try wayring.client.sendRequest(protocol.wl_surface, self.objects, self.queue, surface, .{ .damage_buffer = .{ .x = 0, .y = 0, .width = 3, .height = 2 } });
+        try wayring.client.sendRequest(protocol.wl_surface, self.objects, self.queue, surface, .{ .damage_buffer = .{
+            .x = 0,
+            .y = 0,
+            .width = if (self.source == .single_pixel) 1 else 3,
+            .height = if (self.source == .single_pixel) 1 else 2,
+        } });
         self.frame = (try protocol.wl_surface.construct_frame(self.objects, self.queue, surface, .{})).callback;
         self.release = (try protocol.wl_surface.construct_get_release(self.objects, self.queue, surface, .{})).callback;
         try wayring.client.sendRequest(protocol.wl_surface, self.objects, self.queue, surface, .{ .commit = .{} });
+        if (viewport) |handle| try wayring.client.sendRequest(
+            protocol.wp_viewport,
+            self.objects,
+            self.queue,
+            handle,
+            .{ .destroy = .{} },
+        );
         try wayring.client.sendRequest(protocol.wl_buffer, self.objects, self.queue, buffer, .{ .destroy = .{} });
     }
 
@@ -603,6 +649,20 @@ const ClientHandler = struct {
             .{ .destroy = .{} },
         );
         return buffer;
+    }
+
+    fn createSinglePixelBuffer(self: *ClientHandler) !wayring.objects.Handle {
+        return (try protocol.wp_single_pixel_buffer_manager_v1.construct_create_u32_rgba_buffer(
+            self.objects,
+            self.queue,
+            self.single_pixel_manager.?,
+            .{
+                .r = 0x0202_0202,
+                .g = 0x0303_0303,
+                .b = 0x0404_0404,
+                .a = std.math.maxInt(u32),
+            },
+        )).id;
     }
 };
 
@@ -875,7 +935,7 @@ pub fn coordinatorConfig() Coordinator.Config {
     return .{ .router_capacity = 12, .timer_capacity = 4, .device_capacity = 1, .shm = .{ .limits = .{ .max_pool_bytes = 4096 }, .pool_capacity = 1, .buffer_capacity = 1, .formats = &shm_formats }, .surface = .{ .surface_capacity = 1, .region_capacity = 1, .viewport_capacity = 1, .presentation_resource_capacity = 1, .presentation_feedback_capacity = 2, .region_operation_capacity = 1, .frame_callback_capacity = 1, .release_callback_capacity = 1, .content_update_capacity = 1, .dependency_capacity = 1, .attachment_capacity = 1, .copy_capacity = 1, .max_copy_bytes = pixels.len }, .drm = .{ .card_capacity = 1, .connector_capacity = 1, .mode_capacity = 1, .connector_encoder_capacity = 1, .encoder_capacity = 1, .crtc_capacity = 1, .plane_capacity = 1, .format_capacity = 1, .event_capacity = 4 }, .output = .{ .output_id = .{ .index = 0, .generation = 1 }, .scheduler = .{ .refresh_ns = 4 * std.time.ns_per_ms, .render_budget_ns = std.time.ns_per_ms }, .renderer = .pixman, .image_count = 2, .max_samples = 2, .max_source_bytes = pixels.len, .max_source_width = 3, .max_source_height = 2, .kms = .{ .event_capacity = 2 } } };
 }
 pub fn compositorConfig() Compositor.Config {
-    return .{ .ring = .{ .entries = 32, .flags = 0 }, .reactor = clientReactorConfig(), .runtime = .{ .actor = .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 }, .object_capacity = 16, .object_quota = 16, .buckets_per_client = 16, .max_globals = 27, .registry_capacity = 1 } };
+    return .{ .ring = .{ .entries = 32, .flags = 0 }, .reactor = clientReactorConfig(), .runtime = .{ .actor = .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 }, .object_capacity = 16, .object_quota = 16, .buckets_per_client = 16, .max_globals = 28, .registry_capacity = 1 } };
 }
 pub fn clientReactorConfig() wayring.io_uring.Config {
     return .{ .receive_buffer_size = 4096, .receive_buffer_count = 4, .receive_control_capacity = 256, .fragment_block_size = 256, .fragment_block_count = 4, .transmit_block_size = 512, .transmit_block_count = 8, .descriptor_count = 4, .send_descriptor_capacity = 2 };

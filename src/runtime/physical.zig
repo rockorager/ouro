@@ -801,6 +801,9 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = try self.adapter.installViewporter();
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
+            _ = try self.adapter.installSinglePixelBuffer();
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
             _ = try self.fractional_scale_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
@@ -2800,6 +2803,12 @@ pub fn Coordinator(comptime protocol: type) type {
                         .bytes = shm.bytes,
                     };
                 },
+                .single_pixel => |pixel| .{
+                    .size = .{ .width = 1, .height = 1 },
+                    .stride = 4,
+                    .format = .argb8888_premultiplied,
+                    .bytes = pixel.bytes,
+                },
                 .external => |external| external_source: {
                     const pixel_format = output_api.formatFromDrm(external.format) orelse
                         return try self.discardPendingCandidate(layer, pending.id);
@@ -2925,7 +2934,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     } else |_| {
                         const external = switch (source) {
                             .external => |external| external,
-                            .shm => unreachable,
+                            .shm, .single_pixel => unreachable,
                         };
                         const output = self.output orelse
                             return try self.discardPendingCandidate(layer, pending.id);

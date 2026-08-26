@@ -44,6 +44,10 @@ responsibilities:
 - [Viewport state](src/viewport.zig): bounded `wp_viewporter` objects apply
   pending crop and destination scale, validate them against transformed,
   scaled content, and publish them with the surface commit.
+- [Single-pixel buffers](src/protocol/core_surface.zig): bounded
+  `wp_single_pixel_buffer_v1` resources normalize protocol RGBA components into
+  immutable premultiplied 1×1 content and retain that content independently of
+  the client buffer resource through attachment, rendering, and release.
 - [Fractional scale](src/protocol/fractional_scale.zig): bounded per-surface
   `wp_fractional_scale_v1` objects publish Ouro's preferred render scale and
   pair with viewporter destination sizing.

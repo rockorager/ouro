@@ -24,6 +24,7 @@ pub const Config = struct {
     surface_capacity: usize,
     region_capacity: usize,
     viewport_capacity: usize = 8,
+    single_pixel_buffer_capacity: usize = 8,
     presentation_resource_capacity: usize = 4,
     presentation_feedback_capacity: usize = 64,
     region_operation_capacity: usize,
@@ -41,6 +42,8 @@ pub const Config = struct {
         if (config.surface_capacity == 0 or config.surface_capacity >= none or
             config.region_capacity == 0 or config.region_capacity >= none or
             config.viewport_capacity == 0 or config.viewport_capacity >= none or
+            config.single_pixel_buffer_capacity == 0 or
+            config.single_pixel_buffer_capacity >= none or
             config.presentation_resource_capacity == 0 or
             config.presentation_resource_capacity >= none or
             config.presentation_feedback_capacity == 0 or
@@ -65,6 +68,8 @@ pub fn Adapter(comptime protocol: type) type {
         const RegionInterface = protocol.wl_region;
         const Viewporter = protocol.wp_viewporter;
         const ViewportInterface = protocol.wp_viewport;
+        const SinglePixelManager = protocol.wp_single_pixel_buffer_manager_v1;
+        const WlBuffer = protocol.wl_buffer;
         const Presentation = protocol.wp_presentation;
         const PresentationFeedback = protocol.wp_presentation_feedback;
         const Commit = surface_state.CommitState(objects.Handle);
@@ -147,6 +152,7 @@ pub fn Adapter(comptime protocol: type) type {
             info: wayring.shm.Buffer,
             storage: ShmStorage,
         };
+        const SinglePixelBacking = [4]u8;
         pub const ExternalBuffer = struct {
             context: *anyopaque,
             token: u64,
@@ -166,6 +172,7 @@ pub fn Adapter(comptime protocol: type) type {
         };
         const ImportBacking = union(enum) {
             shm: ShmBacking,
+            single_pixel: SinglePixelBacking,
             external: ExternalBuffer,
         };
         const Imports = @import("../buffer_import.zig").Registry(ImportBacking);
@@ -199,6 +206,13 @@ pub fn Adapter(comptime protocol: type) type {
             surface: SurfaceId = .{ .index = 0, .generation = 0 },
         };
 
+        const SinglePixelSlot = struct {
+            active: bool = false,
+            next_free: u32 = none,
+            resource: objects.Handle = .{ .id = 0, .generation = 0 },
+            bytes: SinglePixelBacking = .{ 0, 0, 0, 0 },
+        };
+
         const PresentationResource = struct {
             active: bool = false,
             next_free: u32 = none,
@@ -214,15 +228,18 @@ pub fn Adapter(comptime protocol: type) type {
         runtime: ?*Runtime = null,
         global: ?objects.Handle = null,
         viewporter_global: ?objects.Handle = null,
+        single_pixel_global: ?objects.Handle = null,
         presentation_global: ?objects.Handle = null,
         compositor_version: u32,
         surfaces: []*SurfaceSlot,
         regions: []*RegionSlot,
         viewports: []*ViewportSlot,
+        single_pixels: []*SinglePixelSlot,
         presentation_resources: []*PresentationResource,
         surface_free: u32,
         region_free: u32,
         viewport_free: u32,
+        single_pixel_free: u32,
         presentation_resource_free: u32,
         region_pool: surface_state.RegionPool,
         frame_pool: surface_state.FramePool,
@@ -261,6 +278,12 @@ pub fn Adapter(comptime protocol: type) type {
             errdefer freeSlots(RegionSlot, allocator, regions);
             const viewports = try allocSlots(ViewportSlot, allocator, config.viewport_capacity);
             errdefer freeSlots(ViewportSlot, allocator, viewports);
+            const single_pixels = try allocSlots(
+                SinglePixelSlot,
+                allocator,
+                config.single_pixel_buffer_capacity,
+            );
+            errdefer freeSlots(SinglePixelSlot, allocator, single_pixels);
             const presentation_resources = try allocSlots(
                 PresentationResource,
                 allocator,
@@ -319,6 +342,9 @@ pub fn Adapter(comptime protocol: type) type {
             for (viewports, 0..) |slot, index| slot.* = .{
                 .next_free = if (index + 1 < viewports.len) @intCast(index + 1) else none,
             };
+            for (single_pixels, 0..) |slot, index| slot.* = .{
+                .next_free = if (index + 1 < single_pixels.len) @intCast(index + 1) else none,
+            };
             for (presentation_resources, 0..) |slot, index| slot.* = .{
                 .next_free = if (index + 1 < presentation_resources.len) @intCast(index + 1) else none,
             };
@@ -334,10 +360,12 @@ pub fn Adapter(comptime protocol: type) type {
                 .surfaces = surfaces,
                 .regions = regions,
                 .viewports = viewports,
+                .single_pixels = single_pixels,
                 .presentation_resources = presentation_resources,
                 .surface_free = 0,
                 .region_free = 0,
                 .viewport_free = 0,
+                .single_pixel_free = 0,
                 .presentation_resource_free = 0,
                 .region_pool = region_pool,
                 .frame_pool = frame_pool,
@@ -363,6 +391,9 @@ pub fn Adapter(comptime protocol: type) type {
             for (adapter.viewports, 0..) |slot, index| {
                 if (slot.active) adapter.releaseViewport(@intCast(index));
             }
+            for (adapter.single_pixels, 0..) |slot, index| {
+                if (slot.active) adapter.releaseSinglePixel(@intCast(index));
+            }
             for (adapter.presentation_resources, 0..) |slot, index| {
                 if (slot.active) adapter.releasePresentationResource(@intCast(index));
             }
@@ -379,6 +410,7 @@ pub fn Adapter(comptime protocol: type) type {
             freeSlots(SurfaceSlot, adapter.allocator, adapter.surfaces);
             adapter.allocator.free(adapter.commit_dependencies);
             freeSlots(ViewportSlot, adapter.allocator, adapter.viewports);
+            freeSlots(SinglePixelSlot, adapter.allocator, adapter.single_pixels);
             freeSlots(PresentationResource, adapter.allocator, adapter.presentation_resources);
             adapter.allocator.free(adapter.copy_storage);
             adapter.allocator.free(adapter.copies);
@@ -430,6 +462,19 @@ pub fn Adapter(comptime protocol: type) type {
             return global;
         }
 
+        pub fn installSinglePixelBuffer(adapter: *Self) !objects.Handle {
+            const runtime = adapter.runtime orelse return error.NotInstalled;
+            if (adapter.single_pixel_global != null) return error.AlreadyInstalled;
+            const global = try runtime.addGlobalWithBinder(
+                &SinglePixelManager.info,
+                1,
+                adapter,
+                bind,
+            );
+            adapter.single_pixel_global = global;
+            return global;
+        }
+
         /// Driver-facing dispatch entry point. Null means another protocol
         /// owner should inspect the request.
         pub fn request(
@@ -476,6 +521,14 @@ pub fn Adapter(comptime protocol: type) type {
                 const slot = adapter.viewportFromObject(target.object) orelse return null;
                 return try adapter.viewportRequest(actor, server_objects, slot, message, fds);
             }
+            if (interface == &SinglePixelManager.info) {
+                if (target.object.context != @as(?*anyopaque, @ptrCast(adapter))) return null;
+                return try adapter.singlePixelManagerRequest(actor, server_objects, message, fds);
+            }
+            if (interface == &WlBuffer.info) {
+                const slot = adapter.singlePixelFromObject(target.object) orelse return null;
+                return try adapter.singlePixelBufferRequest(actor, server_objects, slot, message, fds);
+            }
             if (interface == &Presentation.info) {
                 const resource = adapter.presentationResourceFromObject(target.object) orelse return null;
                 return try adapter.presentationRequest(actor, server_objects, resource, message, fds);
@@ -509,6 +562,12 @@ pub fn Adapter(comptime protocol: type) type {
                 adapter.releaseViewport(adapter.viewportIndex(slot));
                 return true;
             }
+            if (object.interface == &WlBuffer.info) {
+                const slot = adapter.singlePixelFromObject(&object) orelse return false;
+                if (!std.meta.eql(slot.resource, handle)) return false;
+                adapter.releaseSinglePixel(adapter.singlePixelIndex(slot));
+                return true;
+            }
             if (object.interface == &Presentation.info) {
                 const resource = adapter.presentationResourceFromObject(&object) orelse return false;
                 if (!std.meta.eql(resource.resource, handle)) return false;
@@ -516,7 +575,8 @@ pub fn Adapter(comptime protocol: type) type {
                 return true;
             }
             if (object.interface == &PresentationFeedback.info) return true;
-            return (object.interface == &Compositor.info or object.interface == &Viewporter.info) and
+            return (object.interface == &Compositor.info or object.interface == &Viewporter.info or
+                object.interface == &SinglePixelManager.info) and
                 object.context == @as(?*anyopaque, @ptrCast(adapter));
         }
 
@@ -817,12 +877,13 @@ pub fn Adapter(comptime protocol: type) type {
 
         pub const BufferSource = union(enum) {
             shm: ShmSource,
+            single_pixel: struct { bytes: []const u8 },
             external: ExternalBuffer,
 
             pub fn endShmAccess(source: *BufferSource) !void {
                 switch (source.*) {
                     .shm => |*shm| try shm.endAccess(),
-                    .external => {},
+                    .single_pixel, .external => {},
                 }
             }
         };
@@ -852,6 +913,7 @@ pub fn Adapter(comptime protocol: type) type {
             const backing = try adapter.imports.get(lease);
             return switch (backing.*) {
                 .shm => .{ .shm = try shmBackingSource(backing.shm) },
+                .single_pixel => .{ .single_pixel = .{ .bytes = &backing.single_pixel } },
                 .external => |external| .{ .external = external },
             };
         }
@@ -865,7 +927,7 @@ pub fn Adapter(comptime protocol: type) type {
             const backing = try adapter.imports.get(lease);
             return switch (backing.*) {
                 .shm => |shm| shmBackingSource(shm),
-                .external => error.UnsupportedBuffer,
+                .single_pixel, .external => error.UnsupportedBuffer,
             };
         }
 
@@ -912,7 +974,7 @@ pub fn Adapter(comptime protocol: type) type {
                         };
                     },
                 },
-                .external => error.UnsupportedBuffer,
+                .single_pixel, .external => error.UnsupportedBuffer,
             };
         }
 
@@ -1381,6 +1443,67 @@ pub fn Adapter(comptime protocol: type) type {
             return .continue_dispatch;
         }
 
+        fn singlePixelManagerRequest(
+            adapter: *Self,
+            actor: *wayring.connection.Actor,
+            server_objects: anytype,
+            message: wayring.wire.Message,
+            fds: *wayring.ancillary.FdQueue,
+        ) !wayring.dispatch.Control {
+            const decoded = try wayring.server.decodeRequest(
+                SinglePixelManager,
+                server_objects,
+                message,
+                fds,
+            );
+            switch (decoded.value) {
+                .destroy => {},
+                .create_u32_rgba_buffer => |value| {
+                    const slot = adapter.acquireSinglePixel() catch
+                        return try adapter.noMemory(actor);
+                    const admitted = SinglePixelManager.admit_create_u32_rgba_buffer(
+                        server_objects,
+                        decoded.handle,
+                        value,
+                        .{ .id = slot },
+                    ) catch |cause| {
+                        adapter.releaseSinglePixel(adapter.singlePixelIndex(slot));
+                        return try adapter.failure(actor, decoded.handle.id, cause);
+                    };
+                    slot.resource = admitted.id;
+                    slot.bytes = .{
+                        normalizedComponent(value.b),
+                        normalizedComponent(value.g),
+                        normalizedComponent(value.r),
+                        normalizedComponent(value.a),
+                    };
+                },
+            }
+            try decoded.finish(protocol, server_objects, &actor.transmit);
+            return .continue_dispatch;
+        }
+
+        fn singlePixelBufferRequest(
+            _: *Self,
+            actor: *wayring.connection.Actor,
+            server_objects: anytype,
+            _: *SinglePixelSlot,
+            message: wayring.wire.Message,
+            fds: *wayring.ancillary.FdQueue,
+        ) !wayring.dispatch.Control {
+            const decoded = try wayring.server.decodeRequest(
+                WlBuffer,
+                server_objects,
+                message,
+                fds,
+            );
+            switch (decoded.value) {
+                .destroy => {},
+            }
+            try decoded.finish(protocol, server_objects, &actor.transmit);
+            return .continue_dispatch;
+        }
+
         fn viewportRequest(
             adapter: *Self,
             actor: *wayring.connection.Actor,
@@ -1526,6 +1649,19 @@ pub fn Adapter(comptime protocol: type) type {
                 return;
             }
 
+            if (adapter.singlePixelFromObject(object)) |pixel| {
+                if (!std.meta.eql(pixel.resource, handle)) return error.StaleHandle;
+                var lease = try adapter.imports.acquire(.{ .single_pixel = pixel.bytes });
+                errdefer lease.deinit();
+                try slot.state.attach(version, .{
+                    .handle = handle,
+                    .width = 1,
+                    .height = 1,
+                }, x, y);
+                slot.attachment.attach(lease);
+                return;
+            }
+
             const importer = adapter.external_importer orelse return error.UnsupportedBuffer;
             const external = (try importer.acquire_fn(importer.context, object)) orelse
                 return error.UnsupportedBuffer;
@@ -1652,6 +1788,22 @@ pub fn Adapter(comptime protocol: type) type {
             adapter.viewport_free = index;
         }
 
+        fn acquireSinglePixel(adapter: *Self) !*SinglePixelSlot {
+            if (adapter.single_pixel_free == none) return error.Exhausted;
+            const index = adapter.single_pixel_free;
+            const slot = adapter.single_pixels[index];
+            adapter.single_pixel_free = slot.next_free;
+            slot.* = .{ .active = true };
+            return slot;
+        }
+
+        fn releaseSinglePixel(adapter: *Self, index: u32) void {
+            const slot = adapter.single_pixels[index];
+            if (!slot.active) return;
+            slot.* = .{ .next_free = adapter.single_pixel_free };
+            adapter.single_pixel_free = index;
+        }
+
         fn acquirePresentationResource(adapter: *Self) !*PresentationResource {
             if (adapter.presentation_resource_free == none) try adapter.growSlots(PresentationResource, &adapter.presentation_resources, &adapter.presentation_resource_free);
             const index = adapter.presentation_resource_free;
@@ -1696,7 +1848,7 @@ pub fn Adapter(comptime protocol: type) type {
             const lease = surface.attachment.pending orelse return null;
             const backing = try adapter.imports.get(lease);
             return switch (backing.*) {
-                .external => null,
+                .single_pixel, .external => null,
                 .shm => |shm| switch (shm.storage) {
                     .direct => null,
                     .copied => |owner| {
@@ -1790,6 +1942,11 @@ pub fn Adapter(comptime protocol: type) type {
             return bindingFromContext(ViewportSlot, adapter.viewports, object.context);
         }
 
+        fn singlePixelFromObject(adapter: *Self, object: *const objects.Object) ?*SinglePixelSlot {
+            if (object.interface != &WlBuffer.info) return null;
+            return bindingFromContext(SinglePixelSlot, adapter.single_pixels, object.context);
+        }
+
         fn presentationResourceFromObject(
             adapter: *Self,
             object: *const objects.Object,
@@ -1807,6 +1964,10 @@ pub fn Adapter(comptime protocol: type) type {
 
         fn viewportIndex(adapter: *Self, slot: *ViewportSlot) u32 {
             return slotIndex(ViewportSlot, adapter.viewports, slot);
+        }
+
+        fn singlePixelIndex(adapter: *Self, slot: *SinglePixelSlot) u32 {
+            return slotIndex(SinglePixelSlot, adapter.single_pixels, slot);
         }
 
         fn presentationResourceIndex(adapter: *Self, resource: *PresentationResource) u32 {
@@ -1884,6 +2045,7 @@ pub fn Adapter(comptime protocol: type) type {
                         slot.owner_alive = false;
                     },
                 },
+                .single_pixel => {},
                 .external => |external| external.release_fn(external.context, external.token),
             }
         }
@@ -2044,6 +2206,11 @@ pub fn Adapter(comptime protocol: type) type {
     };
 }
 
+fn normalizedComponent(value: u32) u8 {
+    const maximum = std.math.maxInt(u32);
+    return @intCast((@as(u64, value) * std.math.maxInt(u8) + maximum / 2) / maximum);
+}
+
 fn samePeer(a: wayring.io_uring.Peer, b: wayring.io_uring.Peer) bool {
     return a.slot == b.slot and a.generation == b.generation;
 }
@@ -2139,6 +2306,7 @@ const TestContext = struct {
             .surface_capacity = 2,
             .region_capacity = 2,
             .viewport_capacity = 2,
+            .single_pixel_buffer_capacity = 1,
             .presentation_resource_capacity = 2,
             .presentation_feedback_capacity = 4,
             .region_operation_capacity = 16,
@@ -2865,6 +3033,80 @@ test "external buffer attachment uses shared commit ownership" {
     try std.testing.expectEqual(@as(u32, 8), source.external.strides[0]);
     content.deinit();
     try std.testing.expectEqual(@as(usize, 1), importer.released);
+}
+
+test "single pixel buffers retain normalized color after resource destruction" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const manager = try context.server_objects.insertClient(
+        30,
+        &test_protocol.wp_single_pixel_buffer_manager_v1.info,
+        1,
+        &context.adapter,
+    );
+    try test_protocol.wp_single_pixel_buffer_manager_v1.encodeRequest(
+        &context.requests,
+        manager.id,
+        .{ .create_u32_rgba_buffer = .{
+            .id = 11,
+            .r = std.math.maxInt(u32),
+            .g = 0x8080_8080,
+            .b = 0,
+            .a = 0x0101_0101,
+        } },
+    );
+    _ = try context.dispatchCore();
+    const buffer = context.server_objects.namespace.lookupHandle(11) orelse
+        return error.MissingBuffer;
+    const surface = try context.createSurface(10);
+    try test_protocol.wl_surface.encodeRequest(&context.requests, surface.id, .{
+        .attach = .{ .buffer = buffer.id, .x = 0, .y = 0 },
+    });
+    _ = try context.dispatchCore();
+    try test_protocol.wl_surface.encodeRequest(
+        &context.requests,
+        surface.id,
+        .{ .commit = .{} },
+    );
+    _ = try context.dispatchCore();
+
+    var output: [1]TestAdapter.Applied = undefined;
+    var content = (try context.adapter.tryApply(surface, &output))[0].payload;
+    defer content.deinit();
+    try test_protocol.wl_buffer.encodeRequest(
+        &context.requests,
+        buffer.id,
+        .{ .destroy = .{} },
+    );
+    _ = try context.dispatchCore();
+    try std.testing.expect(context.server_objects.namespace.resolve(buffer) == null);
+
+    const source = try context.adapter.bufferSource(content.attachment_lease.?);
+    try std.testing.expectEqual(TestAdapter.BufferSource.single_pixel, std.meta.activeTag(source));
+    try std.testing.expectEqualSlices(u8, &.{ 0, 128, 255, 1 }, source.single_pixel.bytes);
+    try std.testing.expectEqual(@as(u32, 1), content.surface.size.width);
+    try std.testing.expectEqual(@as(u32, 1), content.surface.size.height);
+
+    try test_protocol.wp_single_pixel_buffer_manager_v1.encodeRequest(
+        &context.requests,
+        manager.id,
+        .{ .create_u32_rgba_buffer = .{
+            .id = 12,
+            .r = 0,
+            .g = 0,
+            .b = 0,
+            .a = 0,
+        } },
+    );
+    _ = try context.dispatchCore();
+    const replacement = context.server_objects.namespace.lookupHandle(12) orelse
+        return error.MissingBuffer;
+    try test_protocol.wl_buffer.encodeRequest(
+        &context.requests,
+        replacement.id,
+        .{ .destroy = .{} },
+    );
+    _ = try context.dispatchCore();
 }
 
 test "surface removal drops copy ownership but preserves storage through CQE" {
