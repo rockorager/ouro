@@ -200,6 +200,19 @@ pub fn Graph(comptime Key: type, comptime Payload: type) type {
             return output[0..used];
         }
 
+        /// Flattens one rooted surface tree into renderer back-to-front order.
+        /// Children below each parent precede it; children above it follow it.
+        /// Invisible and defunct associations are omitted transactionally.
+        pub fn sceneOrder(graph: Self, root: Key, output: []Key) Error![]Key {
+            const root_index = graph.find(root) orelse return error.NotSubsurface;
+            const required = graph.visibleSubtreeCount(root_index);
+            if (output.len < required) return error.OutputTooSmall;
+            var used: usize = 0;
+            graph.appendScene(root_index, output, &used);
+            std.debug.assert(used == required);
+            return output[0..used];
+        }
+
         pub fn position(graph: Self, child: Key) Error!Position {
             return graph.surfaces[try graph.relationship(child)].current_position;
         }
@@ -636,6 +649,54 @@ pub fn Graph(comptime Key: type, comptime Payload: type) type {
                 node.position_changed = false;
             }
         }
+
+        fn visibleSubtreeCount(graph: Self, index: u32) usize {
+            var count: usize = 1;
+            var child = graph.surfaces[index].first_child;
+            while (child != none) : (child = graph.surfaces[child].next_sibling) {
+                const node = graph.surfaces[child];
+                if (node.visible and !node.destroyed and !node.role_inactive)
+                    count += graph.visibleSubtreeCount(child);
+            }
+            return count;
+        }
+
+        fn appendScene(graph: Self, index: u32, output: []Key, used: *usize) void {
+            graph.appendChildrenReverse(
+                graph.surfaces[index].first_child,
+                false,
+                output,
+                used,
+            );
+            output[used.*] = graph.surfaces[index].surface;
+            used.* += 1;
+            graph.appendChildrenReverse(
+                graph.surfaces[index].first_child,
+                true,
+                output,
+                used,
+            );
+        }
+
+        fn appendChildrenReverse(
+            graph: Self,
+            child: u32,
+            above_parent: bool,
+            output: []Key,
+            used: *usize,
+        ) void {
+            if (child == none) return;
+            graph.appendChildrenReverse(
+                graph.surfaces[child].next_sibling,
+                above_parent,
+                output,
+                used,
+            );
+            const node = graph.surfaces[child];
+            if (node.visible and !node.destroyed and !node.role_inactive and
+                node.above_parent == above_parent)
+                graph.appendScene(child, output, used);
+        }
     };
 }
 
@@ -841,6 +902,12 @@ test "subsurface stacking is validated and parent double buffered" {
     try std.testing.expectError(error.InvalidSibling, graph.placeAbove(first, first));
     try std.testing.expectError(error.InvalidSibling, graph.placeAbove(first, handle(9)));
     try std.testing.expectError(error.OutputTooSmall, graph.stack(root, entries[0..2]));
+    var scene: [4]objects.Handle = undefined;
+    try std.testing.expectEqualSlices(
+        objects.Handle,
+        &.{root},
+        try graph.sceneOrder(root, &scene),
+    );
 
     // Restacking is invisible until the parent's next content update.
     current = try graph.stack(root, &entries);
@@ -854,6 +921,11 @@ test "subsurface stacking is validated and parent double buffered" {
     try std.testing.expect(!current[1].above_parent);
     try std.testing.expectEqual(second, current[2].surface);
     try std.testing.expect(!current[2].above_parent);
+    try std.testing.expectEqualSlices(
+        objects.Handle,
+        &.{ second, first, root, third },
+        try graph.sceneOrder(root, &scene),
+    );
 }
 
 test "relationship and cache operations are transactional under pressure" {

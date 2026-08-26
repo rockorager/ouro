@@ -286,6 +286,14 @@ pub fn Adapter(comptime protocol: type, comptime Core: type) type {
             return self.graph.stack(parent, output);
         }
 
+        pub fn sceneOrder(
+            self: *Self,
+            root: Core.SurfaceId,
+            output: []Core.SurfaceId,
+        ) ![]Core.SurfaceId {
+            return self.graph.sceneOrder(root, output);
+        }
+
         pub fn position(self: *Self, child: Core.SurfaceId) !Graph.Position {
             return self.graph.position(child);
         }
