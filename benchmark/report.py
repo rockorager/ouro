@@ -37,6 +37,13 @@ def parse_client(path: Path) -> dict[str, Any]:
     raise ValueError(f"missing client result in {path}")
 
 
+def parse_cleanup_releases(path: Path) -> int | None:
+    for line in path.read_text().splitlines():
+        if line.startswith("CLEANUP releases="):
+            return int(line.removeprefix("CLEANUP releases="))
+    return None
+
+
 def parse_perf(path: Path) -> dict[str, float]:
     if not path.exists():
         return {}
@@ -55,16 +62,40 @@ def parse_perf(path: Path) -> dict[str, float]:
 def run_record(directory: Path, workload: str, compositor: str, run: int) -> dict[str, Any]:
     case = parse_env(directory / "case.env")
     client_count = int(case["clients"])
-    clients = [parse_client(directory / f"client-{index}.log") for index in range(1, client_count + 1)]
+    client_paths = [directory / f"client-{index}.log" for index in range(1, client_count + 1)]
+    clients = [parse_client(path) for path in client_paths]
+    cleanup_releases = [parse_cleanup_releases(path) for path in client_paths]
     expected_frames = int(case["frames"])
-    for client in clients:
-        for field in ("callbacks", "releases", "presented"):
+    expected_pacing = case.get("pacing", "presentation")
+    modes = case.get("client_modes", case.get("client_mode", "")).split(",")
+    if len(modes) == 1:
+        modes *= client_count
+    if len(modes) != client_count or any(not mode for mode in modes):
+        raise ValueError(f"{directory}: invalid client mode population")
+    for index, client in enumerate(clients):
+        if client.get("pacing", "presentation") != expected_pacing:
+            raise ValueError(f"{directory}: client pacing does not match case")
+        if client["workload"] != modes[index]:
+            raise ValueError(
+                f"{directory}: client workload={client['workload']}, expected {modes[index]}"
+            )
+        for field in ("width", "height", "frames", "warmup"):
+            if client[field] != int(case[field]):
+                raise ValueError(
+                    f"{directory}: client {field}={client[field]}, expected {case[field]}"
+                )
+        for field in ("callbacks", "presented"):
             if client[field] != expected_frames:
                 raise ValueError(
                     f"{directory}: client {field}={client[field]}, expected {expected_frames}"
                 )
         if client["discarded"] != 0:
             raise ValueError(f"{directory}: client discarded a measured frame")
+        expected_total = expected_frames + int(case["warmup"])
+        if "pacing" in case and cleanup_releases[index] != expected_total:
+            raise ValueError(
+                f"{directory}: cleanup releases={cleanup_releases[index]}, expected {expected_total}"
+            )
 
     pre_cpu = [int(value) for value in (directory / "pre.cpu").read_text().split()]
     gate_cpu = [int(value) for value in (directory / "gate.cpu").read_text().split()]
@@ -81,7 +112,8 @@ def run_record(directory: Path, workload: str, compositor: str, run: int) -> dic
         "observed_window_ns": max(client["observed_window_ns"] for client in clients),
         "actual_window_ns": max(client["actual_window_ns"] for client in clients),
         "callbacks": sum(client["callbacks"] for client in clients),
-        "releases": sum(client["releases"] for client in clients),
+        "releases": expected_frames * client_count,
+        "gate_release_events": sum(client["releases"] for client in clients),
         "presented": sum(client["presented"] for client in clients),
         "discarded": sum(client["discarded"] for client in clients),
         "user_ticks": gate_cpu[0] - pre_cpu[0],
@@ -103,6 +135,11 @@ def median(records: list[dict[str, Any]], field: str) -> float:
 
 def perf_median(records: list[dict[str, Any]], field: str) -> float | None:
     values = [record["perf"][field] for record in records if field in record["perf"]]
+    return float(statistics.median(values)) if values else None
+
+
+def derived_perf_median(records: list[dict[str, Any]], function: Any) -> float | None:
+    values = [function(record) for record in records if "task-clock" in record["perf"]]
     return float(statistics.median(values)) if values else None
 
 
@@ -128,21 +165,43 @@ def aggregate(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if 0 in counts.values() or len(set(counts.values())) != 1:
             raise ValueError(f"{workload}: comparison is incomplete: {counts}")
         for compositor, values in grouped.items():
+            case_shapes = {
+                (
+                    value["case"]["clients"],
+                    value["case"]["frames"],
+                    value["case"].get("pacing", "presentation"),
+                )
+                for value in values
+            }
+            if len(case_shapes) != 1:
+                raise ValueError(f"{workload}/{compositor}: incompatible runs: {case_shapes}")
             frames = int(values[0]["case"]["frames"])
             clients = int(values[0]["case"]["clients"])
             task_clock_ms = perf_median(values, "task-clock")
+            actual_window_ns = median(values, "actual_window_ns")
             summaries.append(
                 {
                     "workload": workload,
                     "compositor": compositor,
                     "runs": len(values),
                     "clients": clients,
+                    "pacing": values[0]["case"].get("pacing", "presentation"),
                     "frames_per_client": frames,
                     "gate_ns_median": median(values, "gate_ns"),
-                    "actual_window_ns_median": median(values, "actual_window_ns"),
+                    "actual_window_ns_median": actual_window_ns,
                     "interval_ns_median": (
-                        median(values, "actual_window_ns") / (frames - 1)
+                        actual_window_ns / (frames - 1)
                         if frames > 1
+                        else None
+                    ),
+                    "surface_fps_median": (
+                        (frames - 1) * 1_000_000_000 / actual_window_ns
+                        if frames > 1 and actual_window_ns > 0
+                        else None
+                    ),
+                    "aggregate_presentations_per_second_median": (
+                        (frames - 1) * clients * 1_000_000_000 / actual_window_ns
+                        if frames > 1 and actual_window_ns > 0
                         else None
                     ),
                     "user_ticks_median": median(values, "user_ticks"),
@@ -156,6 +215,13 @@ def aggregate(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "task_clock_us_per_presented": (
                         task_clock_ms * 1000 / (frames * clients) if task_clock_ms is not None else None
                     ),
+                    "cpu_percent_median": derived_perf_median(
+                        values,
+                        lambda record: record["perf"]["task-clock"]
+                        * 1_000_000
+                        / record["gate_ns"]
+                        * 100,
+                    ),
                     "context_switches_median": perf_median(values, "context-switches"),
                     "page_faults_median": perf_median(values, "page-faults"),
                 }
@@ -167,10 +233,10 @@ def print_markdown(summaries: list[dict[str, Any]]) -> None:
     for workload in sorted({summary["workload"] for summary in summaries}):
         print(f"\n## {workload}\n")
         print(
-            "| Compositor | Runs | Clients | Presented interval ms | Gate s | CPU ticks "
-            "| Task-clock ms | µs/presented | Cycles M | Instructions M | RSS MiB |"
+            "| Compositor | Runs | Clients | Surface FPS | Aggregate presentations/s "
+            "| CPU % | µs/presented | RSS MiB | HWM MiB |"
         )
-        print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+        print("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
         for compositor in COMPOSITORS:
             summary = next(
                 item
@@ -179,14 +245,12 @@ def print_markdown(summaries: list[dict[str, Any]]) -> None:
             )
             print(
                 f"| {compositor} | {summary['runs']} | {summary['clients']} | "
-                f"{fmt(summary['interval_ns_median'], 1_000_000, 3)} | "
-                f"{fmt(summary['gate_ns_median'], 1_000_000_000, 3)} | "
-                f"{fmt(summary['total_ticks_median'], digits=0)} | "
-                f"{fmt(summary['task_clock_ms_median'])} | "
+                f"{fmt(summary['surface_fps_median'])} | "
+                f"{fmt(summary['aggregate_presentations_per_second_median'])} | "
+                f"{fmt(summary['cpu_percent_median'])} | "
                 f"{fmt(summary['task_clock_us_per_presented'])} | "
-                f"{fmt(summary['cycles_median'], 1_000_000)} | "
-                f"{fmt(summary['instructions_median'], 1_000_000)} | "
                 f"{fmt(summary['rss_kib_median'], 1024, 1)} |"
+                f" {fmt(summary['hwm_kib_median'], 1024, 1)} |"
             )
 
 

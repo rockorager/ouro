@@ -22,6 +22,8 @@
 #include "presentation-time-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 
+#define BUFFER_COUNT 3
+
 enum workload {
     WORKLOAD_STATIC,
     WORKLOAD_FULL,
@@ -32,6 +34,11 @@ enum workload {
 enum backing {
     BACKING_SHM,
     BACKING_DMABUF,
+};
+
+enum pacing {
+    PACING_CALLBACK,
+    PACING_PRESENTATION,
 };
 
 struct client;
@@ -68,7 +75,7 @@ struct client {
     struct wl_surface *surface;
     struct xdg_surface *xdg_surface;
     struct xdg_toplevel *toplevel;
-    struct frame_buffer buffers[2];
+    struct frame_buffer buffers[BUFFER_COUNT];
     uint32_t *canonical_pixels;
     int32_t width;
     int32_t height;
@@ -431,10 +438,14 @@ static void setup(struct client *client, const char *socket_path, const char *dr
     if (client->canonical_pixels == NULL) fail("allocate canonical pixels");
     for (size_t index = 0; index < buffer_size / 4; index++)
         client->canonical_pixels[index] = UINT32_C(0xff204060) ^ (uint32_t)index;
-    for (uint32_t index = 0; index < 2; index++) {
+    for (uint32_t index = 0; index < BUFFER_COUNT; index++) {
         client->buffers[index].client = client;
         client->buffers[index].fd = -1;
-        if (!client->churn) create_buffer(client, &client->buffers[index]);
+        if (!client->churn) {
+            create_buffer(client, &client->buffers[index]);
+            if (wl_display_roundtrip(client->display) < 0)
+                fail("publish persistent buffer");
+        }
     }
 }
 
@@ -451,8 +462,13 @@ static void mutate_rect(
                 UINT32_C(0x00010101);
 }
 
-static void submit_frame(struct client *client, uint64_t sequence, struct frame_wait *wait) {
-    struct frame_buffer *buffer = &client->buffers[sequence % 2];
+static void submit_frame(
+    struct client *client,
+    uint64_t sequence,
+    struct frame_wait *wait,
+    enum pacing pacing
+) {
+    struct frame_buffer *buffer = &client->buffers[sequence % BUFFER_COUNT];
     if (client->churn) {
         while (buffer->proxy != NULL && !buffer->available)
             if (wl_display_dispatch(client->display) < 0) fail("wait to churn buffer");
@@ -526,14 +542,16 @@ static void submit_frame(struct client *client, uint64_t sequence, struct frame_
         }
     }
     wl_surface_commit(client->surface);
-    while (!wait->callback_done || (!wait->presented && !wait->discarded) ||
-        (client->backing == BACKING_SHM && !buffer->available))
+    while (!wait->callback_done ||
+        (pacing == PACING_PRESENTATION && !wait->presented && !wait->discarded) ||
+        (pacing == PACING_PRESENTATION && client->backing == BACKING_SHM && !buffer->available))
         if (wl_display_dispatch(client->display) < 0) fail("wait for presented frame");
-    if (wait->discarded) protocol_fail("frame was discarded");
+    if (pacing == PACING_PRESENTATION && wait->discarded)
+        protocol_fail("frame was discarded");
 }
 
 static void cleanup(struct client *client) {
-    for (size_t index = 0; index < 2; index++) destroy_buffer(&client->buffers[index]);
+    for (size_t index = 0; index < BUFFER_COUNT; index++) destroy_buffer(&client->buffers[index]);
     if (client->toplevel != NULL) xdg_toplevel_destroy(client->toplevel);
     if (client->xdg_surface != NULL) xdg_surface_destroy(client->xdg_surface);
     if (client->surface != NULL) wl_surface_destroy(client->surface);
@@ -550,36 +568,35 @@ static void cleanup(struct client *client) {
 }
 
 static void parse_workload(struct client *client, const char *name) {
-    client->backing = BACKING_SHM;
-    if (strcmp(name, "shm-static") == 0) {
+    const char *workload;
+    if (strncmp(name, "shm-", 4) == 0) {
+        client->backing = BACKING_SHM;
+        workload = name + 4;
+    } else if (strncmp(name, "dmabuf-", 7) == 0) {
+        client->backing = BACKING_DMABUF;
+        workload = name + 7;
+    } else {
+        fprintf(stderr, "ouro-benchmark-client: unknown backing: %s\n", name);
+        exit(2);
+    }
+    if (strcmp(workload, "static") == 0) {
         client->workload = WORKLOAD_STATIC;
         return;
     }
-    if (strcmp(name, "shm-full") == 0) {
+    if (strcmp(workload, "full") == 0) {
         client->workload = WORKLOAD_FULL;
         return;
     }
-    if (strcmp(name, "shm-tiny") == 0) {
+    if (strcmp(workload, "tiny") == 0) {
         client->workload = WORKLOAD_TINY;
         return;
     }
-    if (strcmp(name, "shm-sparse") == 0) {
+    if (strcmp(workload, "sparse") == 0) {
         client->workload = WORKLOAD_SPARSE;
         return;
     }
-    if (strcmp(name, "shm-churn") == 0) {
+    if (strcmp(workload, "churn") == 0) {
         client->workload = WORKLOAD_SPARSE;
-        client->churn = true;
-        return;
-    }
-    if (strcmp(name, "dmabuf-sparse") == 0) {
-        client->workload = WORKLOAD_SPARSE;
-        client->backing = BACKING_DMABUF;
-        return;
-    }
-    if (strcmp(name, "dmabuf-churn") == 0) {
-        client->workload = WORKLOAD_SPARSE;
-        client->backing = BACKING_DMABUF;
         client->churn = true;
         return;
     }
@@ -587,11 +604,18 @@ static void parse_workload(struct client *client, const char *name) {
     exit(2);
 }
 
+static enum pacing parse_pacing(const char *name) {
+    if (strcmp(name, "callback") == 0) return PACING_CALLBACK;
+    if (strcmp(name, "presentation") == 0) return PACING_PRESENTATION;
+    fprintf(stderr, "ouro-benchmark-client: unknown pacing: %s\n", name);
+    exit(2);
+}
+
 int main(int argc, char **argv) {
-    if (argc != 8) {
+    if (argc != 9) {
         fprintf(
             stderr,
-            "usage: %s SOCKET WORKLOAD WIDTH HEIGHT FRAMES WARMUP DRM_DEVICE\n",
+            "usage: %s SOCKET WORKLOAD WIDTH HEIGHT FRAMES WARMUP DRM_DEVICE PACING\n",
             argv[0]
         );
         return 2;
@@ -602,6 +626,7 @@ int main(int argc, char **argv) {
         .drm_fd = -1,
     };
     parse_workload(&client, argv[2]);
+    const enum pacing pacing = parse_pacing(argv[8]);
     const uint64_t frames = parse_positive(argv[5], "frames");
     const uint64_t warmup = parse_positive(argv[6], "warmup");
     const uint64_t max_waits = SIZE_MAX / sizeof(struct frame_wait);
@@ -615,7 +640,7 @@ int main(int argc, char **argv) {
     if (client.width > 8192 || client.height > 8192) protocol_fail("dimensions exceed 8192");
     setup(&client, argv[1], argv[7]);
     for (uint64_t sequence = 0; sequence < warmup; sequence++)
-        submit_frame(&client, sequence, &waits[sequence]);
+        submit_frame(&client, sequence, &waits[sequence], PACING_PRESENTATION);
 
     puts("READY");
     fflush(stdout);
@@ -632,17 +657,21 @@ int main(int argc, char **argv) {
     uint64_t last_observed_ns = 0;
     for (uint64_t sequence = 0; sequence < frames; sequence++) {
         struct frame_wait *wait = &waits[warmup + sequence];
-        submit_frame(&client, warmup + sequence, wait);
-        if (sequence == 0) {
-            first_actual_ns = wait->actual_ns;
-            first_observed_ns = wait->observed_ns;
-        }
-        last_actual_ns = wait->actual_ns;
-        last_observed_ns = wait->observed_ns;
+        submit_frame(&client, warmup + sequence, wait, pacing);
     }
+    for (uint64_t sequence = 0; sequence < frames; sequence++) {
+        struct frame_wait *wait = &waits[warmup + sequence];
+        while (!wait->presented && !wait->discarded)
+            if (wl_display_dispatch(client.display) < 0) fail("drain presentation feedback");
+        if (wait->discarded) protocol_fail("frame was discarded");
+    }
+    first_actual_ns = waits[warmup].actual_ns;
+    first_observed_ns = waits[warmup].observed_ns;
+    last_actual_ns = waits[warmup + frames - 1].actual_ns;
+    last_observed_ns = waits[warmup + frames - 1].observed_ns;
     const uint64_t gated_ns = monotonic_ns();
     printf(
-        "{\"workload\":\"%s\",\"width\":%d,\"height\":%d,"
+        "{\"workload\":\"%s\",\"pacing\":\"%s\",\"width\":%d,\"height\":%d,"
         "\"frames\":%" PRIu64 ",\"warmup\":%" PRIu64 ","
         "\"callbacks\":%" PRIu64 ",\"releases\":%" PRIu64 ","
         "\"presented\":%" PRIu64 ",\"discarded\":%" PRIu64 ","
@@ -652,6 +681,7 @@ int main(int argc, char **argv) {
         "\"actual_window_ns\":%" PRIu64 ",\"first_actual_ns\":%" PRIu64 ","
         "\"last_actual_ns\":%" PRIu64 "}\n",
         argv[2],
+        argv[8],
         client.width,
         client.height,
         frames,
@@ -672,6 +702,16 @@ int main(int argc, char **argv) {
     );
     fflush(stdout);
     if (read(STDIN_FILENO, &gate, 1) != 1) fail("read cleanup gate");
+    wl_surface_attach(client.surface, NULL, 0, 0);
+    wl_surface_commit(client.surface);
+    for (size_t index = 0; index < BUFFER_COUNT; index++)
+        while (!client.buffers[index].available)
+            if (wl_display_dispatch(client.display) < 0) fail("drain buffer releases");
+    const uint64_t expected_releases = warmup + frames;
+    if (client.releases != expected_releases)
+        protocol_fail("not every submitted buffer was released");
+    printf("CLEANUP releases=%" PRIu64 "\n", client.releases);
+    fflush(stdout);
     cleanup(&client);
     free(waits);
     return 0;

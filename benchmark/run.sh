@@ -6,23 +6,28 @@ source "$repo/benchmark/workloads.sh"
 cd "$repo"
 
 runs=3
-selected_workload=all
+selected_workload=
+selected_suite=quick
 results="$repo/benchmark-results/$(date -u +%Y%m%dT%H%M%SZ)"
 drm_device=/dev/dri/card1
 output=eDP-1
 mode=1920x1200
 refresh=60
 readiness_seconds=2
-frames_override=
+frames_override=300
 perf_enabled=auto
+pacing=callback
 
 usage() {
     cat <<'EOF'
 usage: benchmark/run.sh [options]
 
+  --suite NAME            quick, standard, all, shm, dmabuf, scale, churn, mixed,
+                          or capacity (default: quick)
   --runs N                repetitions per compositor/workload (default: 3)
-  --workload NAME         one workload from benchmark/workloads.sh (default: all)
-  --frames N              override each workload's frame count
+  --workload NAME         run one workload instead of a suite
+  --frames N              frames per client (default: 300)
+  --pacing MODE           callback or presentation (default: callback)
   --results DIR           output directory
   --drm-device PATH       DRM card used by all compositors (default: /dev/dri/card1)
   --output NAME           connector name (default: eDP-1)
@@ -36,8 +41,10 @@ EOF
 while (($#)); do
     case "$1" in
         --runs) runs=$2; shift 2 ;;
+        --suite) selected_suite=$2; selected_workload=; shift 2 ;;
         --workload) selected_workload=$2; shift 2 ;;
         --frames) frames_override=$2; shift 2 ;;
+        --pacing) pacing=$2; shift 2 ;;
         --results) results=$2; shift 2 ;;
         --drm-device) drm_device=$2; shift 2 ;;
         --output) output=$2; shift 2 ;;
@@ -60,6 +67,14 @@ done
     echo "--perf must be auto, on, or off" >&2
     exit 2
 }
+[[ $pacing == callback || $pacing == presentation ]] || {
+    echo "--pacing must be callback or presentation" >&2
+    exit 2
+}
+case "$selected_suite" in
+    quick|standard|all|shm|dmabuf|scale|churn|mixed|capacity) ;;
+    *) echo "unknown suite: $selected_suite" >&2; exit 2 ;;
+esac
 [[ -e $drm_device ]] || { echo "DRM device does not exist: $drm_device" >&2; exit 1; }
 
 for command in seatd-launch sway Hyprland python3 sed sha256sum realpath fuser pgrep pkg-config; do
@@ -117,7 +132,8 @@ client_binary="$repo/zig-out/benchmark/ouro-benchmark-client"
     printf 'kernel=%s\n' "$(uname -srmo)"
     printf 'drm_device=%s\noutput=%s\nmode=%s\nrefresh=%s\n' \
         "$drm_device" "$output" "$mode" "$refresh"
-    printf 'readiness_seconds=%s\nperf_policy=%s\n' "$readiness_seconds" "$perf_enabled"
+    printf 'readiness_seconds=%s\nperf_policy=%s\npacing=%s\nsuite=%s\n' \
+        "$readiness_seconds" "$perf_enabled" "$pacing" "$selected_suite"
     printf 'initial_vt=%s\n' "$initial_vt"
 } >"$results/metadata.env"
 git -C "$repo" status --porcelain=v1 >"$results/ouro-status.txt"
@@ -127,6 +143,7 @@ compositor_pid=
 perf_pid=
 client_pids=()
 client_fds=()
+case_runtime=
 
 cleanup_case() {
     set +e
@@ -150,6 +167,8 @@ cleanup_case() {
     perf_pid=
     client_pids=()
     client_fds=()
+    [[ -n $case_runtime ]] && rm -rf "$case_runtime"
+    case_runtime=
     set -e
 }
 trap cleanup_case EXIT INT TERM
@@ -203,17 +222,26 @@ render_configs() {
 }
 
 run_case() {
-    local workload_name=$1 client_mode=$2 clients=$3 width=$4 height=$5 frames=$6 warmup=$7
+    local workload_name=$1 client_modes=$2 clients=$3 width=$4 height=$5 frames=$6 warmup=$7
     local compositor=$8 repetition=$9
     local directory="$results/$workload_name/$compositor/run-$repetition"
-    local runtime="$directory/runtime"
-    local expected_socket="$runtime/wayland-0"
+    local runtime
+    local expected_socket
     local socket
-    mkdir -p "$runtime"
+    local -a modes
+    IFS=, read -r -a modes <<<"$client_modes"
+    if ((${#modes[@]} != 1 && ${#modes[@]} != clients)); then
+        echo "$workload_name: client mode count must be one or match client count" >&2
+        return 1
+    fi
+    mkdir -p "$directory"
+    runtime=$(mktemp -d "${TMPDIR:-/tmp}/ouro-benchmark-runtime.XXXXXX")
+    case_runtime=$runtime
+    expected_socket="$runtime/wayland-0"
     chmod 700 "$runtime"
     render_configs "$directory"
-    printf 'workload=%s\nclient_mode=%s\nclients=%s\nwidth=%s\nheight=%s\nframes=%s\nwarmup=%s\n' \
-        "$workload_name" "$client_mode" "$clients" "$width" "$height" "$frames" "$warmup" \
+    printf 'workload=%s\nclient_modes=%s\nclients=%s\nwidth=%s\nheight=%s\nframes=%s\nwarmup=%s\npacing=%s\n' \
+        "$workload_name" "$client_modes" "$clients" "$width" "$height" "$frames" "$warmup" "$pacing" \
         >"$directory/case.env"
 
     case "$compositor" in
@@ -255,9 +283,11 @@ run_case() {
     for ((index = 1; index <= clients; index++)); do
         local fifo="$directory/client-$index.in"
         local log="$directory/client-$index.log"
+        local client_mode=${modes[0]}
+        if ((${#modes[@]} > 1)); then client_mode=${modes[index - 1]}; fi
         mkfifo "$fifo"
         "$client_binary" "$socket" "$client_mode" "$width" "$height" "$frames" "$warmup" \
-            "$drm_device" \
+            "$drm_device" "$pacing" \
             <"$fifo" >"$log" 2>&1 &
         client_pids+=("$!")
         local fd
@@ -328,6 +358,9 @@ run_case() {
         eval "exec ${fd}>&-"
     done
     for pid in "${client_pids[@]}"; do wait "$pid"; done
+    for ((index = 1; index <= clients; index++)); do
+        grep -q '^CLEANUP releases='"$((frames + warmup))"'$' "$directory/client-$index.log"
+    done
     client_pids=()
     client_fds=()
     kill -TERM "$compositor_pid" 2>/dev/null || true
@@ -344,20 +377,24 @@ run_case() {
 
 matched=0
 for definition in "${benchmark_workloads[@]}"; do
-    read -r workload_name client_mode clients width height frames warmup <<<"$definition"
-    if [[ $selected_workload != all && $selected_workload != "$workload_name" ]]; then continue; fi
+    read -r workload_name client_modes clients width height frames warmup <<<"$definition"
+    if [[ -n $selected_workload ]]; then
+        [[ $selected_workload == "$workload_name" ]] || continue
+    else
+        benchmark_suite_contains "$selected_suite" "$workload_name" || continue
+    fi
     matched=1
-    [[ -n $frames_override ]] && frames=$frames_override
+    frames=$frames_override
     for ((repetition = 1; repetition <= runs; repetition++)); do
         for compositor in ouro sway hyprland; do
             printf '==> %s run %d: %s\n' "$workload_name" "$repetition" "$compositor"
-            run_case "$workload_name" "$client_mode" "$clients" "$width" "$height" \
+            run_case "$workload_name" "$client_modes" "$clients" "$width" "$height" \
                 "$frames" "$warmup" "$compositor" "$repetition"
             cleanup_case
         done
     done
 done
-((matched == 1)) || { echo "unknown workload: $selected_workload" >&2; exit 2; }
+((matched == 1)) || { echo "no workload matched the selection" >&2; exit 2; }
 
 if pgrep -x ouro >/dev/null || pgrep -x sway >/dev/null || pgrep -x Hyprland >/dev/null; then
     echo "a compositor survived benchmark teardown" >&2
