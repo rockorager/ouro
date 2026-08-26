@@ -88,6 +88,22 @@ pub fn Adapter(comptime protocol: type) type {
             committed_fn: *const fn (*anyopaque, SurfaceId) anyerror!void,
         };
 
+        pub const ContentCommitPlan = struct {
+            kind: surface_state.ContentUpdateKind = .desync,
+            dependency_count: usize = 0,
+        };
+
+        /// Supplies synchronization and direct-child dependencies without
+        /// moving transactional surface ownership out of this adapter.
+        pub const ContentCommitHook = struct {
+            context: *anyopaque,
+            plan_fn: *const fn (
+                *anyopaque,
+                SurfaceId,
+                []UpdateToken,
+            ) anyerror!ContentCommitPlan,
+        };
+
         /// Protocol-neutral identity for a live Ouro surface slot. The slot
         /// index is local to this adapter and the generation is inherited from
         /// Wayring's complete resource handle.
@@ -216,9 +232,11 @@ pub fn Adapter(comptime protocol: type) type {
         imports: Imports,
         copies: []CopySlot,
         copy_storage: []u8,
+        commit_dependencies: []UpdateToken,
         max_copy_bytes: usize,
         guarded_shm_access: bool,
         commit_hook: ?CommitHook = null,
+        content_commit_hook: ?ContentCommitHook = null,
         external_importer: ?ExternalImporter = null,
 
         pub fn init(
@@ -233,6 +251,11 @@ pub fn Adapter(comptime protocol: type) type {
 
             const surfaces = try allocator.alloc(SurfaceSlot, config.surface_capacity);
             errdefer allocator.free(surfaces);
+            const commit_dependencies = try allocator.alloc(
+                UpdateToken,
+                config.surface_capacity,
+            );
+            errdefer allocator.free(commit_dependencies);
             const regions = try allocator.alloc(RegionSlot, config.region_capacity);
             errdefer allocator.free(regions);
             const viewports = try allocator.alloc(ViewportSlot, config.viewport_capacity);
@@ -322,6 +345,7 @@ pub fn Adapter(comptime protocol: type) type {
                 .imports = imports,
                 .copies = copies,
                 .copy_storage = copy_storage,
+                .commit_dependencies = commit_dependencies,
                 .max_copy_bytes = config.max_copy_bytes,
                 .guarded_shm_access = config.guarded_shm_access,
             };
@@ -351,6 +375,7 @@ pub fn Adapter(comptime protocol: type) type {
             adapter.region_pool.deinit(adapter.allocator);
             adapter.allocator.free(adapter.regions);
             adapter.allocator.free(adapter.surfaces);
+            adapter.allocator.free(adapter.commit_dependencies);
             adapter.allocator.free(adapter.viewports);
             adapter.allocator.free(adapter.presentation_resources);
             adapter.allocator.free(adapter.copy_storage);
@@ -650,6 +675,30 @@ pub fn Adapter(comptime protocol: type) type {
         pub fn setCommitHook(adapter: *Self, hook: CommitHook) !void {
             if (adapter.commit_hook != null) return error.AlreadyInstalled;
             adapter.commit_hook = hook;
+        }
+
+        pub fn setContentCommitHook(adapter: *Self, hook: ContentCommitHook) !void {
+            if (adapter.content_commit_hook != null) return error.AlreadyInstalled;
+            adapter.content_commit_hook = hook;
+        }
+
+        pub fn newestSynchronizedUpdate(
+            adapter: *Self,
+            id: SurfaceId,
+        ) !?UpdateToken {
+            if (id.index >= adapter.surfaces.len) return error.StaleSurface;
+            const slot = &adapter.surfaces[id.index];
+            if (!slot.active or slot.resource.generation != id.generation)
+                return error.StaleSurface;
+            return slot.updates.newestSync();
+        }
+
+        pub fn transitionSurfaceDesync(adapter: *Self, id: SurfaceId) !usize {
+            if (id.index >= adapter.surfaces.len) return error.StaleSurface;
+            const slot = &adapter.surfaces[id.index];
+            if (!slot.active or slot.resource.generation != id.generation)
+                return error.StaleSurface;
+            return adapter.scheduler.transitionDesync(&slot.updates);
         }
 
         /// Synchronous scene query over the exact committed input region. No
@@ -1123,6 +1172,24 @@ pub fn Adapter(comptime protocol: type) type {
                     if (adapter.commit_hook) |hook|
                         hook.validate_fn(hook.context, surface_id) catch |cause|
                             return try adapter.surfaceFailure(actor, resource.id, cause);
+                    const content_plan = if (adapter.content_commit_hook) |hook|
+                        hook.plan_fn(
+                            hook.context,
+                            surface_id,
+                            adapter.commit_dependencies,
+                        ) catch |cause| return try adapter.surfaceFailure(
+                            actor,
+                            resource.id,
+                            cause,
+                        )
+                    else
+                        ContentCommitPlan{};
+                    if (content_plan.dependency_count > adapter.commit_dependencies.len)
+                        return try adapter.surfaceFailure(
+                            actor,
+                            resource.id,
+                            error.OutputTooSmall,
+                        );
                     const pending_copy = adapter.pendingAttachmentCopy(slot) catch |cause|
                         return try adapter.surfaceFailure(actor, resource.id, cause);
                     const token = Commit.commitWithAttachmentAndFeedback(
@@ -1134,8 +1201,8 @@ pub fn Adapter(comptime protocol: type) type {
                         &slot.releases,
                         &slot.presentation_feedback,
                         &slot.attachment,
-                        .desync,
-                        &.{},
+                        content_plan.kind,
+                        adapter.commit_dependencies[0..content_plan.dependency_count],
                         if (pending_copy == null) 0 else 1,
                     ) catch |cause| return try adapter.surfaceCommitFailure(actor, slot, cause);
                     if (pending_copy) |copy_slot| copy_slot.update = token;
@@ -3121,6 +3188,67 @@ test "commit-hook admission failure precedes ordinary core surface mutation" {
     try std.testing.expectEqual(@as(usize, 1), hook.validated);
     try std.testing.expectEqual(@as(usize, 0), hook.committed_count);
     try std.testing.expectEqual(@as(u64, 0), (try context.adapter.getSurface(surface)).sequence);
+}
+
+test "content commit hook synchronizes a child update with its parent" {
+    const Hook = struct {
+        adapter: *TestAdapter,
+        child: TestAdapter.SurfaceId,
+        parent: TestAdapter.SurfaceId,
+
+        fn plan(
+            pointer: *anyopaque,
+            surface: TestAdapter.SurfaceId,
+            dependencies: []TestAdapter.UpdateToken,
+        ) !TestAdapter.ContentCommitPlan {
+            const hook: *@This() = @ptrCast(@alignCast(pointer));
+            if (std.meta.eql(surface, hook.child)) return .{ .kind = .sync };
+            if (!std.meta.eql(surface, hook.parent)) return .{};
+            if (try hook.adapter.newestSynchronizedUpdate(hook.child)) |update| {
+                if (dependencies.len == 0) return error.OutputTooSmall;
+                dependencies[0] = update;
+                return .{ .dependency_count = 1 };
+            }
+            return .{};
+        }
+    };
+    const context = try TestContext.init();
+    defer context.deinit();
+    const child = try context.createSurface(10);
+    const parent = try context.createSurface(11);
+    var hook: Hook = .{
+        .adapter = &context.adapter,
+        .child = try context.adapter.surfaceId(child),
+        .parent = try context.adapter.surfaceId(parent),
+    };
+    try context.adapter.setContentCommitHook(.{
+        .context = &hook,
+        .plan_fn = Hook.plan,
+    });
+
+    try test_protocol.wl_surface.encodeRequest(
+        &context.requests,
+        child.id,
+        .{ .commit = .{} },
+    );
+    _ = try context.dispatchCore();
+    var applied: [2]TestAdapter.Applied = undefined;
+    try std.testing.expectEqual(@as(usize, 0), (try context.adapter.tryApply(
+        child,
+        &applied,
+    )).len);
+
+    try test_protocol.wl_surface.encodeRequest(
+        &context.requests,
+        parent.id,
+        .{ .commit = .{} },
+    );
+    _ = try context.dispatchCore();
+    const updates = try context.adapter.tryApply(parent, &applied);
+    defer for (updates) |*update| update.payload.deinit();
+    try std.testing.expectEqual(@as(usize, 2), updates.len);
+    try std.testing.expectEqual(child, updates[0].surface);
+    try std.testing.expectEqual(parent, updates[1].surface);
 }
 
 test "stale removal cannot release a reused surface slot" {
