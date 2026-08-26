@@ -120,6 +120,7 @@ pub fn Adapter(comptime protocol: type) type {
         fn create(self: *Self, actor: *wayring.connection.Actor, server_objects: anytype, peer: wayring.io_uring.Peer, manager: objects.Handle, value: anytype, comptime input_only: bool) !?wayring.dispatch.Control {
             if (!self.validator.validate(peer, value.seat))
                 return try self.protocolError(actor, manager.id, "invalid idle-notification seat");
+            const now = try self.clock.now();
             const slot = self.acquire() catch return try self.noMemory(actor);
             const admitted = if (input_only)
                 Manager.admit_get_input_idle_notification(server_objects, manager, value, .{ .id = slot })
@@ -133,7 +134,7 @@ pub fn Adapter(comptime protocol: type) type {
             slot.peer = peer;
             slot.input_only = input_only;
             slot.timeout_ns = @as(u64, value.timeout) * std.time.ns_per_ms;
-            slot.last_activity_ns = try self.clock.now();
+            slot.last_activity_ns = now;
             return null;
         }
 

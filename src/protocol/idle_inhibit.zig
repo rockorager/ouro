@@ -130,6 +130,17 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             return self.active_len;
         }
 
+        pub fn surfaces(self: *const Self, output: []CoreSurface.SurfaceId) ![]const CoreSurface.SurfaceId {
+            var count: usize = 0;
+            for (self.slots) |slot| {
+                if (!slot.active) continue;
+                if (count == output.len) return error.OutputTooSmall;
+                output[count] = slot.surface;
+                count += 1;
+            }
+            return output[0..count];
+        }
+
         pub fn resourceRemoved(self: *Self, handle: objects.Handle, object: objects.Object) bool {
             if (object.interface == &Inhibitor.info) {
                 const slot = self.fromObject(&object) orelse return false;

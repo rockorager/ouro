@@ -38,6 +38,7 @@ const protocol_xdg_decoration = @import("../protocol/xdg_decoration.zig");
 const protocol_relative_pointer = @import("../protocol/relative_pointer.zig");
 const protocol_pointer_gestures = @import("../protocol/pointer_gestures.zig");
 const protocol_idle_inhibit = @import("../protocol/idle_inhibit.zig");
+const protocol_idle_notify = @import("../protocol/idle_notify.zig");
 const protocol_shortcuts_inhibit = @import("../protocol/keyboard_shortcuts_inhibit.zig");
 const protocol_xdg_foreign = @import("../protocol/xdg_foreign.zig");
 const protocol_pointer_constraints = @import("../protocol/pointer_constraints.zig");
@@ -82,6 +83,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const RelativePointerAdapter = protocol_relative_pointer.Adapter(protocol, SeatAdapter);
         const PointerGesturesAdapter = protocol_pointer_gestures.Adapter(protocol);
         const IdleInhibitAdapter = protocol_idle_inhibit.Adapter(protocol, Adapter);
+        const IdleNotifyAdapter = protocol_idle_notify.Adapter(protocol);
         const ShortcutsInhibitAdapter = protocol_shortcuts_inhibit.Adapter(protocol, Adapter);
         const ForeignAdapter = protocol_xdg_foreign.Adapter(protocol, Adapter, ShellAdapter);
         const PointerConstraintsAdapter = protocol_pointer_constraints.Adapter(protocol, Adapter, SeatAdapter);
@@ -171,11 +173,13 @@ pub fn Coordinator(comptime protocol: type) type {
             const xdg_output: u32 = 1 << 18;
             const layer_shell: u32 = 1 << 19;
             const session_lock: u32 = 1 << 20;
+            const idle_notify: u32 = 1 << 21;
             const all: u32 = decoration | shell | seat | data_device | dmabuf |
                 activation | relative_pointer | fractional_scale | output | core |
                 pointer_constraints | color_management | color_representation |
                 primary_selection | text_input | pointer_gestures |
-                shortcuts_inhibit | xdg_foreign | xdg_output | layer_shell | session_lock;
+                shortcuts_inhibit | xdg_foreign | xdg_output | layer_shell | session_lock |
+                idle_notify;
         };
         const Client = struct {
             active: bool = false,
@@ -272,6 +276,7 @@ pub fn Coordinator(comptime protocol: type) type {
             relative_pointer: protocol_relative_pointer.Config = .{},
             pointer_gestures: protocol_pointer_gestures.Config = .{},
             idle_inhibit: protocol_idle_inhibit.Config = .{},
+            idle_notify: protocol_idle_notify.Config = .{},
             shortcuts_inhibit: protocol_shortcuts_inhibit.Config = .{},
             xdg_foreign: protocol_xdg_foreign.Config = .{},
             pointer_constraints: protocol_pointer_constraints.WireConfig = .{},
@@ -329,6 +334,7 @@ pub fn Coordinator(comptime protocol: type) type {
         input_interaction_accepted: bool = false,
         input_relative_accepted: bool = false,
         input_gesture_accepted: bool = false,
+        input_idle_accepted: bool = false,
         input_keyboard_consumed: bool = false,
         input_seat_accepted: bool = false,
         input_drag_accepted: bool = false,
@@ -351,6 +357,7 @@ pub fn Coordinator(comptime protocol: type) type {
         relative_pointer_adapter: RelativePointerAdapter,
         pointer_gestures_adapter: PointerGesturesAdapter,
         idle_inhibit_adapter: IdleInhibitAdapter,
+        idle_notify_adapter: IdleNotifyAdapter,
         shortcuts_inhibit_adapter: ShortcutsInhibitAdapter,
         foreign_adapter: ForeignAdapter,
         pointer_constraints_adapter: PointerConstraintsAdapter,
@@ -401,10 +408,14 @@ pub fn Coordinator(comptime protocol: type) type {
         association_surfaces: []wayring.objects.Handle,
         layer_surface_ids: []LayerShellAdapter.LayerSurfaceId,
         lock_surface_ids: []SessionLockAdapter.LockSurfaceId,
+        inhibitor_surface_ids: []Adapter.SurfaceId,
         session_lock_frame: ?@import("../output/headless.zig").FrameId = null,
         session_lock_input_ready: bool = false,
         desktop_timer: ?timer.Handle = null,
         desktop_timer_canceling: bool = false,
+        idle_timer: ?timer.Handle = null,
+        idle_timer_canceling: bool = false,
+        idle_timer_deadline_ns: ?u64 = null,
         cursor_layer: Layer,
         output_drain_started: bool = false,
         stopping: bool = false,
@@ -436,6 +447,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.input_event_cursor = 0;
             self.input_interaction_accepted = false;
             self.input_relative_accepted = false;
+            self.input_idle_accepted = false;
             self.input_gesture_accepted = false;
             self.input_keyboard_consumed = false;
             self.input_seat_accepted = false;
@@ -521,11 +533,19 @@ pub fn Coordinator(comptime protocol: type) type {
                 config.session_lock.surface_capacity,
             );
             errdefer allocator.free(self.lock_surface_ids);
+            self.inhibitor_surface_ids = try allocator.alloc(
+                Adapter.SurfaceId,
+                config.idle_inhibit.inhibitor_capacity,
+            );
+            errdefer allocator.free(self.inhibitor_surface_ids);
             self.desktop_timer = null;
             self.desktop_timer_canceling = false;
             self.color_protocols_enabled = config.enable_color_protocols and config.output.renderer == .vulkan;
             self.icc_poll = null;
             self.icc_poll_canceling = false;
+            self.idle_timer = null;
+            self.idle_timer_canceling = false;
+            self.idle_timer_deadline_ns = null;
             self.cursor_layer = .{};
             const cursor_path_requirement = std.math.add(
                 usize,
@@ -620,6 +640,13 @@ pub fn Coordinator(comptime protocol: type) type {
                 config.idle_inhibit,
             );
             errdefer self.idle_inhibit_adapter.deinit();
+            self.idle_notify_adapter = try IdleNotifyAdapter.init(
+                allocator,
+                .{ .context = self, .validateFn = validateShortcutSeat },
+                .{ .nowFn = idleNow },
+                config.idle_notify,
+            );
+            errdefer self.idle_notify_adapter.deinit();
             self.shortcuts_inhibit_adapter = try ShortcutsInhibitAdapter.init(
                 allocator,
                 &self.adapter,
@@ -823,6 +850,9 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = try self.idle_inhibit_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
+            _ = try self.idle_notify_adapter.install(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
             _ = try self.shortcuts_inhibit_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
@@ -865,6 +895,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.icc_poll_canceling = true;
             };
             try self.syncDesktopTimer();
+            try self.syncIdleTimer();
             try self.pauseOutput();
             try self.advanceDrain();
         }
@@ -901,6 +932,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.allocator.free(self.pending_surfaces);
             self.clients.deinit(self.allocator);
             self.allocator.free(self.lock_surface_ids);
+            self.allocator.free(self.inhibitor_surface_ids);
             self.allocator.free(self.layer_surface_ids);
             self.allocator.free(self.association_surfaces);
             self.allocator.free(self.frame_changes);
@@ -926,6 +958,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.primary_selection_adapter.deinit();
             self.data_device_adapter.deinit();
             self.pointer_constraints_adapter.deinit();
+            self.idle_notify_adapter.deinit();
             self.idle_inhibit_adapter.deinit();
             self.shortcuts_inhibit_adapter.deinit();
             self.foreign_adapter.deinit();
@@ -972,6 +1005,8 @@ pub fn Coordinator(comptime protocol: type) type {
             self.cursor_shape_adapter.disconnected(peer);
             self.pointer_gestures_adapter.disconnected(peer);
             self.idle_inhibit_adapter.disconnected(peer);
+            self.idle_notify_adapter.disconnected(peer);
+            self.syncIdleNotifications() catch {};
             self.shortcuts_inhibit_adapter.disconnected(peer);
             self.foreign_adapter.disconnected(peer);
             self.text_input_adapter.disconnected(peer);
@@ -1156,8 +1191,17 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             if (try self.pointer_gestures_adapter.request(peer, target, message, fds)) |control|
                 return control;
-            if (try self.idle_inhibit_adapter.request(peer, target, message, fds)) |control|
+            if (try self.idle_inhibit_adapter.request(peer, target, message, fds)) |control| {
+                try self.syncIdleNotifications();
                 return control;
+            }
+            if (try self.idle_notify_adapter.request(peer, target, message, fds)) |control| {
+                try self.syncIdleNotifications();
+                if (self.idle_notify_adapter.pendingOutbound(peer))
+                    self.markProtocol(peer, ProtocolReady.idle_notify);
+                try self.flushProtocol();
+                return control;
+            }
             if (try self.shortcuts_inhibit_adapter.request(peer, target, message, fds)) |control| {
                 if (self.shortcuts_inhibit_adapter.pendingOutbound(peer))
                     self.markProtocol(peer, ProtocolReady.shortcuts_inhibit);
@@ -1230,6 +1274,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 else => return error.UnexpectedCompletion,
             };
             for (timer_outcomes) |outcome| {
+                if (self.idle_timer) |handle| if (std.meta.eql(handle, outcome.handle)) {
+                    try self.idleTimerEvent(outcome.event);
+                    continue;
+                };
                 if (self.desktop_timer) |handle| if (std.meta.eql(handle, outcome.handle)) {
                     try self.desktopTimerEvent(outcome.event);
                     continue;
@@ -1354,6 +1402,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.surface = self.adapter.surfaceHandle(id) catch unreachable;
             self.surface_id = id;
             try self.enqueuePendingSurface(.{ .handle = self.surface.?, .id = id, .commits = 1 });
+            self.syncIdleNotifications() catch {};
         }
 
         fn pendingSurfaceContains(self: *const Self, id: Adapter.SurfaceId) bool {
@@ -1551,6 +1600,16 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.sessionLockChanged();
                 if (!self.session_lock_input_ready) return false;
             }
+            if (!self.input_idle_accepted) {
+                switch (event) {
+                    .device_added, .device_removed => {},
+                    else => self.idle_notify_adapter.activity(try monotonicNs()) catch |err| switch (err) {
+                        error.Exhausted => return false,
+                    },
+                }
+                self.input_idle_accepted = true;
+                try self.syncIdleNotifications();
+            }
             if (!self.input_delivery_prepared) {
                 self.input_delivery_event = self.pointerDeliveryEvent(event) catch |err| switch (err) {
                     error.Exhausted => return false,
@@ -1630,6 +1689,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.input_interaction_accepted = false;
             self.input_relative_accepted = false;
             self.input_gesture_accepted = false;
+            self.input_idle_accepted = false;
             self.input_keyboard_consumed = false;
             self.input_seat_accepted = false;
             self.input_drag_accepted = false;
@@ -1840,6 +1900,56 @@ pub fn Coordinator(comptime protocol: type) type {
             };
         }
 
+        fn idleInhibited(self: *Self) bool {
+            const surfaces = self.idle_inhibit_adapter.surfaces(self.inhibitor_surface_ids) catch
+                return true;
+            for (surfaces) |surface| {
+                const scene = self.surfaceScene(surface) orelse continue;
+                if (scene.root.visible) return true;
+            }
+            return false;
+        }
+
+        fn syncIdleNotifications(self: *Self) !void {
+            const now = try monotonicNs();
+            try self.idle_notify_adapter.setInhibited(self.idleInhibited(), now);
+            try self.idle_notify_adapter.advance(now);
+            for (self.clients.items) |client|
+                if (client.active and self.idle_notify_adapter.pendingOutbound(client.peer))
+                    self.markProtocol(client.peer, ProtocolReady.idle_notify);
+            try self.syncIdleTimer();
+        }
+
+        fn syncIdleTimer(self: *Self) !void {
+            const deadline = if (self.stopping) null else self.idle_notify_adapter.nextDeadline();
+            if (self.idle_timer) |handle| {
+                if (!self.idle_timer_canceling and self.idle_timer_deadline_ns != deadline) {
+                    try self.timers.cancel(&self.router, &self.root.ring, handle);
+                    self.idle_timer_canceling = true;
+                }
+                return;
+            }
+            const value = deadline orelse return;
+            self.idle_timer = try self.timers.arm(
+                &self.router,
+                &self.root.ring,
+                try deadlineFromNs(value),
+            );
+            self.idle_timer_deadline_ns = value;
+            self.idle_timer_canceling = false;
+        }
+
+        fn idleTimerEvent(self: *Self, event: timer.Event) !void {
+            if (event == .pending_cleanup or event == .cleanup_complete) return;
+            self.idle_timer = null;
+            self.idle_timer_deadline_ns = null;
+            self.idle_timer_canceling = false;
+            self.syncIdleNotifications() catch |err| switch (err) {
+                error.Exhausted => self.markProtocolAll(ProtocolReady.idle_notify),
+                else => return err,
+            };
+        }
+
         fn desktopTimerEvent(self: *Self, event: timer.Event) !void {
             if (event == .pending_cleanup or event == .cleanup_complete) return;
             const was_canceling = self.desktop_timer_canceling;
@@ -1853,6 +1963,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn desktopSceneChanged(self: *Self) !void {
+            try self.syncIdleNotifications();
             const output = self.output orelse return;
             _ = self.refreshRetainedLayersForOutput();
             output.request(.damage, try monotonicNs()) catch |err| switch (err) {
@@ -2004,6 +2115,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 };
                 try self.armTimer();
             }
+            try self.syncIdleNotifications();
         }
 
         fn setKeyboardSurface(self: *Self, surface: ?Adapter.SurfaceId) !void {
@@ -2029,6 +2141,10 @@ pub fn Coordinator(comptime protocol: type) type {
             const self: *Self = @ptrCast(@alignCast(context orelse return false));
             const objects = self.root.runtime.clients.get(peer) catch return false;
             return self.seat_adapter.validateSeatOn(objects, peer, seat);
+        }
+
+        fn idleNow(_: ?*anyopaque) anyerror!u64 {
+            return monotonicNs();
         }
 
         fn validatePopupGrab(
@@ -2283,6 +2399,12 @@ pub fn Coordinator(comptime protocol: type) type {
                 flushed += try self.layer_shell_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.session_lock != 0)
                 flushed += try self.session_lock_adapter.flushOn(peer, objects, &actor.transmit);
+            if (client.protocol_ready & ProtocolReady.idle_notify != 0)
+                flushed += try self.idle_notify_adapter.flushOn(peer, objects, &actor.transmit);
+            self.syncIdleNotifications() catch |err| switch (err) {
+                error.Exhausted => {},
+                else => return err,
+            };
             if (client.protocol_ready & ProtocolReady.core != 0) {
                 flushed += try self.adapter.flushPresentationClockOn(peer, objects, &actor.transmit);
                 flushed += try self.adapter.flushDiscardedFeedbackOn(peer, objects, &actor.transmit);
@@ -2393,6 +2515,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (ready & ProtocolReady.session_lock != 0 and
                 !self.session_lock_adapter.pendingOutbound(client.peer))
                 ready &= ~ProtocolReady.session_lock;
+            if (ready & ProtocolReady.idle_notify != 0 and
+                !self.idle_notify_adapter.pendingOutbound(client.peer))
+                ready &= ~ProtocolReady.idle_notify;
             if (ready & ProtocolReady.core != 0 and
                 !self.adapter.pendingPresentationClock(client.peer) and
                 !self.adapter.pendingDiscardedFeedback(client.peer))
@@ -4002,7 +4127,8 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.decoration_adapter.resourceRemoved(handle, object);
             _ = self.relative_pointer_adapter.resourceRemoved(handle, object);
             _ = self.pointer_gestures_adapter.resourceRemoved(handle, object);
-            _ = self.idle_inhibit_adapter.resourceRemoved(handle, object);
+            const idle_inhibit_removed = self.idle_inhibit_adapter.resourceRemoved(handle, object);
+            const idle_notify_removed = self.idle_notify_adapter.resourceRemoved(handle, object);
             _ = self.shortcuts_inhibit_adapter.resourceRemoved(handle, object);
             _ = self.foreign_adapter.resourceRemoved(handle, object);
             _ = self.pointer_constraints_adapter.resourceRemoved(handle, object);
@@ -4022,6 +4148,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.output.?.request(.damage, monotonicNs() catch 0) catch {};
             }
             if (session_lock_removed) self.sessionLockChanged() catch {};
+            if (idle_inhibit_removed or idle_notify_removed) self.syncIdleNotifications() catch {};
             if (removed_surface_peer) |peer| self.data_device_adapter.surfaceRemoved(peer, handle.id);
             if (removed_surface_peer) |peer| self.output_adapter.surfaceRemoved(peer, handle);
             if (removed_surface) |id| {

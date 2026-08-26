@@ -68,6 +68,10 @@ responsibilities:
 - [Relative pointer](src/protocol/relative_pointer.zig): focused wl_pointer
   resources receive unclipped relative motion with exact microsecond timestamps
   through a bounded, backpressure-safe event queue.
+- [Idle notification](src/protocol/idle_notify.zig): bounded
+  `ext_idle_notification_v1` objects use one shared monotonic deadline,
+  preserve `idled`/`resumed` ordering under transport backpressure, and honor
+  visible-surface inhibitors without delaying version-2 input-only timers.
 - [Clipboard selection](src/protocol/data_device.zig): bounded data sources,
   devices, and offers validate exact seat action serials, publish selection on
   keyboard focus, and retain receive descriptors across transport backpressure.
