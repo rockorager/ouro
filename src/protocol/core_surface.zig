@@ -102,6 +102,7 @@ pub fn Adapter(comptime protocol: type) type {
                 SurfaceId,
                 []UpdateToken,
             ) anyerror!ContentCommitPlan,
+            committed_fn: *const fn (*anyopaque, SurfaceId) void,
         };
 
         /// Protocol-neutral identity for a live Ouro surface slot. The slot
@@ -1206,6 +1207,8 @@ pub fn Adapter(comptime protocol: type) type {
                         if (pending_copy == null) 0 else 1,
                     ) catch |cause| return try adapter.surfaceCommitFailure(actor, slot, cause);
                     if (pending_copy) |copy_slot| copy_slot.update = token;
+                    if (adapter.content_commit_hook) |hook|
+                        hook.committed_fn(hook.context, surface_id);
                     if (adapter.commit_hook) |hook|
                         hook.committed_fn(hook.context, surface_id) catch |cause|
                             return try adapter.surfaceFailure(actor, resource.id, cause);
@@ -3211,6 +3214,8 @@ test "content commit hook synchronizes a child update with its parent" {
             }
             return .{};
         }
+
+        fn committed(_: *anyopaque, _: TestAdapter.SurfaceId) void {}
     };
     const context = try TestContext.init();
     defer context.deinit();
@@ -3224,6 +3229,7 @@ test "content commit hook synchronizes a child update with its parent" {
     try context.adapter.setContentCommitHook(.{
         .context = &hook,
         .plan_fn = Hook.plan,
+        .committed_fn = Hook.committed,
     });
 
     try test_protocol.wl_surface.encodeRequest(

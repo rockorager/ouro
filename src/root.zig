@@ -37,6 +37,7 @@ pub const scene_damage = @import("scene/damage.zig");
 pub const headless_output = @import("output/headless.zig");
 pub const real_output = @import("output/drm.zig");
 pub const core_surface = @import("protocol/core_surface.zig");
+pub const subcompositor = @import("protocol/subcompositor.zig");
 pub const xdg_shell = @import("protocol/xdg_shell.zig");
 pub const seat = @import("protocol/seat.zig");
 pub const data_device = @import("protocol/data_device.zig");
@@ -92,6 +93,7 @@ test {
     _ = headless_output;
     _ = real_output;
     _ = core_surface;
+    _ = subcompositor;
     _ = xdg_shell;
     _ = seat;
     _ = data_device;

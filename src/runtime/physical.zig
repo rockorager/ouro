@@ -25,6 +25,7 @@ const render_list = @import("../scene/render_list.zig");
 const damage = @import("../scene/damage.zig");
 const presentation = @import("../presentation.zig");
 const core_surface = @import("../protocol/core_surface.zig");
+const protocol_subcompositor = @import("../protocol/subcompositor.zig");
 const xdg_shell = @import("../protocol/xdg_shell.zig");
 const protocol_seat = @import("../protocol/seat.zig");
 const protocol_data_device = @import("../protocol/data_device.zig");
@@ -52,6 +53,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const ServerCore = wayring.server.Core(protocol);
         const Shm = wayring.server.Shm(protocol);
         const Adapter = core_surface.Adapter(protocol);
+        const SubcompositorAdapter = protocol_subcompositor.Adapter(protocol, Adapter);
         const ShellAdapter = xdg_shell.Adapter(protocol, Adapter);
         const Desktop = desktop_model.Desktop(ShellAdapter);
         const Interaction = interaction_model.Interaction(Desktop);
@@ -139,6 +141,7 @@ pub fn Coordinator(comptime protocol: type) type {
             },
             shm: Shm.Config,
             surface: core_surface.Config,
+            subcompositor: protocol_subcompositor.Config = .{},
             shell: xdg_shell.Config = .{
                 .manager_capacity = 4,
                 .positioner_capacity = 8,
@@ -222,6 +225,7 @@ pub fn Coordinator(comptime protocol: type) type {
         manager: drm.Manager,
         shm: Shm,
         adapter: Adapter,
+        subcompositor_adapter: SubcompositorAdapter,
         shell_adapter: ShellAdapter,
         desktop: Desktop,
         interaction: Interaction,
@@ -373,6 +377,13 @@ pub fn Coordinator(comptime protocol: type) type {
                 config.surface,
             );
             errdefer self.adapter.deinit();
+            self.subcompositor_adapter = try SubcompositorAdapter.init(
+                allocator,
+                &self.adapter,
+                config.subcompositor,
+            );
+            errdefer self.subcompositor_adapter.deinit();
+            try self.subcompositor_adapter.connect();
             self.shell_adapter = try ShellAdapter.init(allocator, &self.adapter, config.shell);
             errdefer self.shell_adapter.deinit();
             self.desktop = try Desktop.init(allocator, config.desktop, config.interaction.bounds);
@@ -564,6 +575,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.pointer_constraints_adapter.deinit();
             self.relative_pointer_adapter.deinit();
             self.seat_adapter.deinit();
+            self.subcompositor_adapter.deinit();
             self.interaction.deinit();
             self.desktop.deinit();
             self.shell_adapter.deinit();
@@ -681,6 +693,10 @@ pub fn Coordinator(comptime protocol: type) type {
                     self.adapter.pendingDiscardedFeedback(peer))
                     self.markProtocol(peer, ProtocolReady.core);
                 try self.flushProtocol();
+                try self.applyReady();
+                return control;
+            }
+            if (try self.subcompositor_adapter.request(peer, target, message, fds)) |control| {
                 try self.applyReady();
                 return control;
             }
@@ -2401,6 +2417,7 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.pointer_constraints_adapter.resourceRemoved(handle, object);
             _ = self.fractional_scale_adapter.resourceRemoved(handle, object);
             _ = self.output_adapter.resourceRemoved(handle, object);
+            _ = self.subcompositor_adapter.resourceRemoved(handle, object);
             if (removed_surface_peer) |peer| self.data_device_adapter.surfaceRemoved(peer, handle.id);
             if (removed_surface_peer) |peer| self.output_adapter.surfaceRemoved(peer, handle);
             if (removed_surface) |id| {

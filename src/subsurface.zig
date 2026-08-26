@@ -292,6 +292,15 @@ pub fn Graph(comptime Key: type, comptime Payload: type) type {
             return output[0..used];
         }
 
+        /// Publishes only the relationship state double-buffered on this
+        /// surface. Content payload ordering is owned by content_update.zig;
+        /// protocol integrations using that scheduler must not cache a second
+        /// copy of each surface commit in this graph.
+        pub fn commitStructure(graph: *Self, surface: Key) void {
+            const index = graph.find(surface) orelse return;
+            graph.latchParentState(index);
+        }
+
         /// Commits one content update. Effectively synchronized updates are
         /// retained in the shared pool. A desynchronized update is returned
         /// together with synchronized descendant updates latched by it.
