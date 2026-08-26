@@ -150,3 +150,15 @@ boundaries. Run the generated-client shell/input vertical with `zig build
 test-shell-input`; lower-level physical presentation, libinput ownership, seat,
 and interaction steps remain available as `test-drm-presentation`,
 `test-input-backend`, `test-seat`, and `test-interaction`.
+
+## Compositor benchmarks
+
+The opt-in hardware benchmark suite runs identical presentation-aware SHM
+workloads against Ouro, Sway, and Hyprland. It records exact compositor process
+counters and rejects incomplete three-way comparisons. See
+[benchmark/README.md](benchmark/README.md) for workload contracts, hardware
+options, and interpretation.
+
+```sh
+benchmark/run.sh --workload shm-sparse --runs 3
+```

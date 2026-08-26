@@ -92,6 +92,66 @@ pub fn build(b: *std.Build) void {
     );
     smoke_step.dependOn(&run_executable.step);
 
+    const benchmark_client = b.addExecutable(.{
+        .name = "ouro-benchmark-client",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const benchmark_scanner = b.graph.environ_map.get("WAYLAND_SCANNER") orelse
+        "wayland-scanner";
+    const benchmark_xdg_xml = wayland_protocols.path("stable/xdg-shell/xdg-shell.xml");
+    const benchmark_xdg_header = b.addSystemCommand(&.{ benchmark_scanner, "client-header" });
+    benchmark_xdg_header.addFileArg(benchmark_xdg_xml);
+    const benchmark_xdg_header_output = benchmark_xdg_header.addOutputFileArg(
+        "xdg-shell-client-protocol.h",
+    );
+    const benchmark_xdg_code = b.addSystemCommand(&.{ benchmark_scanner, "private-code" });
+    benchmark_xdg_code.addFileArg(benchmark_xdg_xml);
+    const benchmark_xdg_code_output = benchmark_xdg_code.addOutputFileArg(
+        "xdg-shell-protocol.c",
+    );
+    const benchmark_presentation_xml = wayland_protocols.path(
+        "stable/presentation-time/presentation-time.xml",
+    );
+    const benchmark_presentation_header = b.addSystemCommand(&.{ benchmark_scanner, "client-header" });
+    benchmark_presentation_header.addFileArg(benchmark_presentation_xml);
+    const benchmark_presentation_header_output = benchmark_presentation_header.addOutputFileArg(
+        "presentation-time-client-protocol.h",
+    );
+    const benchmark_presentation_code = b.addSystemCommand(&.{ benchmark_scanner, "private-code" });
+    benchmark_presentation_code.addFileArg(benchmark_presentation_xml);
+    const benchmark_presentation_code_output = benchmark_presentation_code.addOutputFileArg(
+        "presentation-time-protocol.c",
+    );
+    benchmark_client.root_module.addIncludePath(benchmark_xdg_header_output.dirname());
+    benchmark_client.root_module.addIncludePath(benchmark_presentation_header_output.dirname());
+    benchmark_client.root_module.addCSourceFile(.{
+        .file = benchmark_xdg_code_output,
+        .flags = &.{"-std=c11"},
+    });
+    benchmark_client.root_module.addCSourceFile(.{
+        .file = benchmark_presentation_code_output,
+        .flags = &.{"-std=c11"},
+    });
+    benchmark_client.root_module.addCSourceFile(.{
+        .file = b.path("benchmark/client.c"),
+        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+    });
+    benchmark_client.root_module.linkSystemLibrary("wayland-client", .{
+        .use_pkg_config = .force,
+    });
+    const install_benchmark_client = b.addInstallArtifact(benchmark_client, .{
+        .dest_dir = .{ .override = .{ .custom = "benchmark" } },
+    });
+    const benchmark_client_step = b.step(
+        "benchmark-client",
+        "Build the presentation-aware hardware benchmark client",
+    );
+    benchmark_client_step.dependOn(&install_benchmark_client.step);
+
     const unit_tests = b.addTest(.{ .root_module = ouro });
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
