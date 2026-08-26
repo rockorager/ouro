@@ -181,6 +181,7 @@ pub fn Adapter(comptime protocol: type) type {
         drag_validator: ?DragValidator = null,
         drag: ?Drag = null,
         drag_cancel_pending: bool = false,
+        drag_target_clear_pending: bool = false,
 
         pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
             try config.validate();
@@ -521,19 +522,27 @@ pub fn Adapter(comptime protocol: type) type {
 
         pub fn surfaceRemoved(self: *Self, peer: wayring.io_uring.Peer, object_id: u32) void {
             const drag = self.drag orelse return;
-            if (!std.meta.eql(drag.peer, peer) or drag.origin_object != object_id) return;
-            self.drag_cancel_pending = true;
+            if (std.meta.eql(drag.peer, peer) and drag.origin_object == object_id) {
+                self.drag_cancel_pending = true;
+            } else if (drag.target) |target| {
+                if (!std.meta.eql(target.peer, peer) or target.surface_object != object_id) return;
+                self.drag_target_clear_pending = true;
+            } else return;
             self.progressDragCancellation();
         }
 
         pub fn updateDragTarget(
             self: *Self,
-            target: ?DragTarget,
+            requested_target: ?DragTarget,
             serial: u32,
             time: u32,
             emit_motion: bool,
         ) !void {
             const drag = self.drag orelse return;
+            const target = if (requested_target) |value|
+                if (drag.source == null and !std.meta.eql(drag.peer, value.peer)) null else value
+            else
+                null;
             if (optionalDragTargetIdentityEqual(drag.target, target)) {
                 if (!emit_motion) return;
                 const value = target orelse return;
@@ -582,6 +591,7 @@ pub fn Adapter(comptime protocol: type) type {
                 self.clearCurrentDragOffers(old.peer);
             }
             self.drag.?.target = target;
+            self.drag_target_clear_pending = false;
             if (target) |new| for (self.devices) |*device| if (device.header.active and
                 std.meta.eql(device.peer, new.peer))
             {
@@ -625,6 +635,7 @@ pub fn Adapter(comptime protocol: type) type {
                 self.enqueue(drag.peer, .{ .source_cancelled = source }) catch unreachable;
             self.drag = null;
             self.drag_cancel_pending = false;
+            self.drag_target_clear_pending = false;
         }
 
         /// Ends the implicit grab with a successful drop when any current
@@ -657,9 +668,13 @@ pub fn Adapter(comptime protocol: type) type {
                 self.enqueue(drag.peer, .{ .source_drop_performed = source }) catch unreachable;
             self.drag = null;
             self.drag_cancel_pending = false;
+            self.drag_target_clear_pending = false;
         }
 
         fn progressDragCancellation(self: *Self) void {
+            if (self.drag_target_clear_pending) {
+                self.updateDragTarget(null, 0, 0, false) catch return;
+            }
             if (!self.drag_cancel_pending) return;
             self.cancelDrag() catch {};
         }
@@ -724,11 +739,13 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         pub fn pendingOutbound(self: *const Self) usize {
-            return self.outbound_len + @intFromBool(self.drag_cancel_pending);
+            return self.outbound_len +
+                @intFromBool(self.drag_cancel_pending) +
+                @intFromBool(self.drag_target_clear_pending);
         }
 
         pub fn pendingOutboundOn(self: *const Self, peer: wayring.io_uring.Peer) bool {
-            if (self.drag_cancel_pending) return true;
+            if (self.drag_cancel_pending or self.drag_target_clear_pending) return true;
             if (self.outbound_len == 0) return false;
             for (self.outbound) |slot|
                 if (slot.active and std.meta.eql(slot.peer, peer)) return true;
@@ -1362,7 +1379,7 @@ test "data device: source destruction retains drag cancellation through backpres
     try std.testing.expect(adapter.drag_cancel_pending);
     try std.testing.expectEqual(@as(usize, 2), adapter.pendingOutbound());
 
-    adapter.outbound[0].active = false;
+    adapter.dropOutboundSlot(&adapter.outbound[0]);
     adapter.progressDragCancellation();
     try std.testing.expect(adapter.drag == null);
     try std.testing.expect(!adapter.drag_cancel_pending);
@@ -1381,12 +1398,29 @@ test "data device: removing the exact drag origin cancels the session" {
     });
     defer adapter.deinit();
     const peer: wayring.io_uring.Peer = .{ .slot = 1, .generation = 8 };
+    const foreign_peer: wayring.io_uring.Peer = .{ .slot = 2, .generation = 4 };
+    const device = try acquire(TestAdapter.DeviceSlot, adapter.devices, &adapter.device_free);
+    device.peer = peer;
     adapter.drag = .{ .peer = peer, .source = null, .origin_object = 17 };
+    try adapter.updateDragTarget(.{ .peer = foreign_peer, .surface_object = 23, .x = 4, .y = 5 }, 1, 2, false);
+    try std.testing.expect(adapter.drag.?.target == null);
+    try adapter.updateDragTarget(.{ .peer = peer, .surface_object = 23, .x = 4, .y = 5 }, 1, 2, false);
+    try std.testing.expect(adapter.drag.?.target != null);
 
     adapter.surfaceRemoved(.{ .slot = 1, .generation = 9 }, 17);
     try std.testing.expect(adapter.drag != null);
     adapter.surfaceRemoved(peer, 18);
     try std.testing.expect(adapter.drag != null);
+    adapter.surfaceRemoved(peer, 23);
+    try std.testing.expect(adapter.drag != null);
+    try std.testing.expect(adapter.drag.?.target != null);
+    try std.testing.expect(adapter.drag_target_clear_pending);
+    try std.testing.expectEqual(@as(usize, 2), adapter.pendingOutbound());
+    adapter.dropOutboundSlot(&adapter.outbound[0]);
+    adapter.progressDragCancellation();
+    try std.testing.expect(adapter.drag.?.target == null);
+    try std.testing.expect(!adapter.drag_target_clear_pending);
+    try std.testing.expectEqual(TestAdapter.Outbound.drag_leave, std.meta.activeTag(adapter.outbound[0].value));
     adapter.surfaceRemoved(peer, 17);
     try std.testing.expect(adapter.drag == null);
     try std.testing.expect(!adapter.drag_cancel_pending);
