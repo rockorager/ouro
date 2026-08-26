@@ -586,8 +586,24 @@ pub fn Scheduler(comptime Key: type, comptime Payload: type) type {
             owner.head = next;
             owner.count -= 1;
             if (next == none) owner.tail = none;
+            if (next != none) scheduler.detachQueuePredecessor(next, token);
             scheduler.releaseEdges(index);
             scheduler.releaseNode(index);
+        }
+
+        fn detachQueuePredecessor(scheduler: *Self, successor: u32, predecessor: Token) void {
+            var link = &scheduler.nodes[successor].dependency_head;
+            while (link.* != none) {
+                const edge_index = link.*;
+                const edge = scheduler.edges[edge_index];
+                if (!edge.child_claim and std.meta.eql(edge.dependency, predecessor)) {
+                    link.* = edge.next;
+                    scheduler.releaseEdge(edge_index);
+                    return;
+                }
+                link = &scheduler.edges[edge_index].next;
+            }
+            unreachable;
         }
     };
 }
@@ -624,6 +640,39 @@ test "content updates apply complete dependency graphs atomically" {
     try std.testing.expectEqual(@as(u32, 10), result[2].payload);
     try std.testing.expectEqual(@as(usize, 0), parent.count);
     try std.testing.expectEqual(@as(usize, 0), child.count);
+}
+
+test "content updates detach an applied head from its queued successor" {
+    var scheduler = try TestScheduler.init(std.testing.allocator, 2, 1);
+    defer scheduler.deinit(std.testing.allocator);
+    var queue = TestScheduler.Queue.init(&scheduler, 7);
+    defer queue.deinit();
+
+    const first = try scheduler.commit(&queue, 11, .desync, &.{}, 0);
+    const second = try scheduler.commit(&queue, 22, .desync, &.{}, 0);
+    var ready_storage: [2]u32 = undefined;
+    var applied_storage: [2]TestScheduler.Applied = undefined;
+
+    try std.testing.expectEqualSlices(
+        u32,
+        &.{7},
+        try scheduler.readySurfaces(&queue, &ready_storage),
+    );
+    const first_applied = try scheduler.tryApply(&queue, &applied_storage);
+    try std.testing.expectEqual(@as(usize, 1), first_applied.len);
+    try std.testing.expectEqual(first, first_applied[0].update);
+    try std.testing.expectEqual(@as(u32, 11), first_applied[0].payload);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.active_edges);
+
+    try std.testing.expectEqualSlices(
+        u32,
+        &.{7},
+        try scheduler.readySurfaces(&queue, &ready_storage),
+    );
+    const second_applied = try scheduler.tryApply(&queue, &applied_storage);
+    try std.testing.expectEqual(@as(usize, 1), second_applied.len);
+    try std.testing.expectEqual(second, second_applied[0].update);
+    try std.testing.expectEqual(@as(u32, 22), second_applied[0].payload);
 }
 
 test "constraints block a graph without mutation" {

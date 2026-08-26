@@ -679,6 +679,132 @@ test "shell-input: two mapped toplevels sustain independent commit cycles" {
     try root.deinit();
 }
 
+test "shell-input: layer surface adopts and presents an xdg popup" {
+    const allocator = std.testing.allocator;
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-layer-popup-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+
+    var fixture = try physical_fixture.Fixture.init();
+    defer fixture.deinit();
+    var root_config = physical_fixture.compositorConfig();
+    root_config.runtime.object_capacity = 48;
+    root_config.runtime.object_quota = 48;
+    const root = try Compositor.create(
+        allocator,
+        try wayring.unix_socket.listen(path, 1),
+        root_config,
+    );
+    var config = physical_fixture.coordinatorConfig();
+    config.shm.pool_capacity = 2;
+    config.shm.buffer_capacity = 2;
+    config.surface.surface_capacity = 2;
+    config.surface.frame_callback_capacity = 2;
+    config.surface.release_callback_capacity = 2;
+    config.surface.content_update_capacity = 2;
+    config.surface.dependency_capacity = 2;
+    config.surface.attachment_capacity = 2;
+    config.surface.copy_capacity = 2;
+    config.output.max_samples = 3;
+    config.output.max_source_bytes = pixels.len * 2;
+    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), config);
+    var loop = try Loop.init(
+        allocator,
+        root,
+        &coordinator.router,
+        &coordinator.timers,
+        coordinator,
+        .{ .completion_batch = 16 },
+    );
+    try coordinator.start(&loop);
+
+    var client_reactor: wayring.io_uring.Reactor = undefined;
+    try client_reactor.initOwned(
+        allocator,
+        .{ .entries = 16, .flags = 0 },
+        physical_fixture.clientReactorConfig(),
+    );
+    var client = try ClientConnection.attach(
+        allocator,
+        &client_reactor,
+        try wayring.unix_socket.connect(path),
+        .{ .received_fd_budget = 2, .transmit_byte_budget = 4096, .transmit_fd_budget = 2 },
+        .{ .max_objects = 48, .max_client_ids = 47 },
+    );
+    const actor = try client.actor();
+    var driver = ClientDriver.init(&client);
+    const registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null);
+    var handler: LayerPopupHandler = .{
+        .objects = &client.objects,
+        .queue = &actor.transmit,
+        .registry = registry,
+    };
+    try submitLayerPopupClient(&client_reactor, &driver, &handler);
+
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    var client_progress: ClientDriver.Progress = .{};
+    var observed = false;
+    for (0..512) |_| {
+        client_progress = try drainLayerPopupClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (!observed and handler.layer_mapped and handler.popup_mapped and
+            coordinator.stats.presented >= 1)
+        {
+            const layer_ids = try coordinator.layer_shell_adapter.ids(coordinator.layer_surface_ids);
+            try std.testing.expectEqual(@as(usize, 1), layer_ids.len);
+            const layer_state = try coordinator.layer_shell_adapter.state(layer_ids[0]);
+            var popup_storage: [2]@TypeOf(coordinator.scene_windows[0]) = undefined;
+            const popups = try coordinator.desktop.externalPopupSnapshot(
+                layer_state.surface,
+                &popup_storage,
+            );
+            try std.testing.expectEqual(@as(usize, 1), popups.len);
+            try std.testing.expect(popups[0].visible and popups[0].content_ready);
+            try std.testing.expectEqual(
+                handler.popup_surface.?.id,
+                (try coordinator.adapter.surfaceHandle(popups[0].surface)).id,
+            );
+            const submitted = coordinator.output.?.sample_storage[0..2];
+            const layer = findLayer(coordinator.app_layers, layer_state.surface) orelse
+                return error.MissingLayerSurface;
+            const popup = findLayer(coordinator.app_layers, popups[0].surface) orelse
+                return error.MissingPopupSurface;
+            try std.testing.expectEqual(layer.binding.?.surface, submitted[0].surface);
+            try std.testing.expectEqual(popup.binding.?.surface, submitted[1].surface);
+            try std.testing.expectEqual(@as(usize, 0), (try coordinator.desktop.sceneSnapshot(coordinator.scene_windows)).len);
+            observed = true;
+        }
+        if (observed and handler.releases == 2) break;
+        if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, client_reactor.ring);
+    }
+    try std.testing.expect(observed);
+    try std.testing.expectEqual(@as(usize, 2), handler.releases);
+    try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+
+    coordinator.disconnected(coordinator.peer.?);
+    _ = try client.prepareClose();
+    try submitLayerPopupClient(&client_reactor, &driver, &handler);
+    var drained = false;
+    for (0..256) |_| {
+        client_progress = try drainLayerPopupClient(&client_reactor, &driver, &handler);
+        const progress = try loop.turn(coordinator);
+        drained = progress.wayring.shutdown_complete and client_progress.quiescent and
+            coordinator.backendDrainComplete();
+        if (drained) break;
+        if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, client_reactor.ring);
+    }
+    try std.testing.expect(drained);
+    try client.deinit(allocator);
+    client_reactor.deinit(allocator);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
 test "shell-input: synchronized subsurface publishes with parent and receives pointer focus" {
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;
@@ -1346,6 +1472,224 @@ const MultiHandler = struct {
     }
 };
 
+const LayerPopupHandler = struct {
+    objects: *wayring.objects.ClientObjects,
+    queue: *wayring.tx.Queue,
+    registry: wayring.objects.Handle,
+    compositor: ?wayring.objects.Handle = null,
+    shm: ?wayring.objects.Handle = null,
+    wm_base: ?wayring.objects.Handle = null,
+    layer_shell: ?wayring.objects.Handle = null,
+    layer_surface: ?wayring.objects.Handle = null,
+    layer_wl_surface: ?wayring.objects.Handle = null,
+    popup_surface: ?wayring.objects.Handle = null,
+    popup_xdg_surface: ?wayring.objects.Handle = null,
+    popup: ?wayring.objects.Handle = null,
+    buffers: [2]?wayring.objects.Handle = .{ null, null },
+    created: bool = false,
+    layer_mapped: bool = false,
+    popup_mapped: bool = false,
+    releases: usize = 0,
+    event_failures: usize = 0,
+
+    pub fn eventError(
+        self: *LayerPopupHandler,
+        _: wayring.io_uring.Peer,
+        _: ClientCore.EventFailure,
+    ) void {
+        self.event_failures += 1;
+    }
+
+    pub fn event(
+        self: *LayerPopupHandler,
+        target: wayring.objects.Dispatch,
+        message: wayring.wire.Message,
+        fds: *wayring.ancillary.FdQueue,
+    ) !wayring.dispatch.Control {
+        if (target.object.interface == &ClientCore.Registry.info) {
+            switch (try ClientCore.decodeRegistryEvent(self.objects, self.registry, message, fds)) {
+                .global => |value| try self.bindGlobal(value),
+                .global_remove => {},
+            }
+            try self.maybeCreate();
+        } else if (target.object.interface == &protocol.wl_shm.info) {
+            _ = try protocol.wl_shm.decodeEvent(message, fds);
+        } else if (target.object.interface == &protocol.zwlr_layer_surface_v1.info) {
+            switch (try protocol.zwlr_layer_surface_v1.decodeEvent(message, fds)) {
+                .configure => |value| {
+                    try protocol.zwlr_layer_surface_v1.encodeRequest(
+                        self.queue,
+                        self.layer_surface.?.id,
+                        .{ .ack_configure = .{ .serial = value.serial } },
+                    );
+                    if (!self.layer_mapped) {
+                        try self.mapSurface(0, self.layer_wl_surface.?);
+                        try self.createPopup();
+                        self.layer_mapped = true;
+                    }
+                },
+                .closed => return error.LayerClosed,
+            }
+        } else if (target.object.interface == &protocol.xdg_popup.info) {
+            _ = try protocol.xdg_popup.decodeEvent(message, fds);
+        } else if (target.object.interface == &protocol.xdg_surface.info) {
+            switch (try protocol.xdg_surface.decodeEvent(message, fds)) {
+                .configure => |value| {
+                    try protocol.xdg_surface.encodeRequest(
+                        self.queue,
+                        self.popup_xdg_surface.?.id,
+                        .{ .ack_configure = .{ .serial = value.serial } },
+                    );
+                    if (!self.popup_mapped) {
+                        try self.mapSurface(1, self.popup_surface.?);
+                        self.popup_mapped = true;
+                    }
+                },
+            }
+        } else if (target.object.interface == &protocol.wl_buffer.info) {
+            const index: usize = if (self.buffers[0] != null and
+                self.buffers[0].?.id == message.header.object_id) 0 else 1;
+            switch (try protocol.wl_buffer.decodeEvent(message, fds)) {
+                .release => {
+                    self.releases += 1;
+                    try wayring.client.sendRequest(
+                        protocol.wl_buffer,
+                        self.objects,
+                        self.queue,
+                        self.buffers[index].?,
+                        .{ .destroy = .{} },
+                    );
+                    self.buffers[index] = null;
+                },
+            }
+        } else if (target.object.interface == &ClientCore.Display.info) {
+            switch (try ClientCore.decodeDisplayEvent(self.objects, message, fds)) {
+                .delete_id => {},
+                .@"error" => return error.ServerProtocolError,
+            }
+        } else return error.UnexpectedEvent;
+        return .continue_dispatch;
+    }
+
+    fn bindGlobal(self: *LayerPopupHandler, value: anytype) !void {
+        if (std.mem.eql(u8, value.interface, protocol.wl_compositor.info.name))
+            self.compositor = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_compositor.info, @min(value.version, 7), null);
+        if (std.mem.eql(u8, value.interface, protocol.wl_shm.info.name))
+            self.shm = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_shm.info, @min(value.version, 2), null);
+        if (std.mem.eql(u8, value.interface, protocol.xdg_wm_base.info.name))
+            self.wm_base = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.xdg_wm_base.info, @min(value.version, 7), null);
+        if (std.mem.eql(u8, value.interface, protocol.zwlr_layer_shell_v1.info.name))
+            self.layer_shell = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.zwlr_layer_shell_v1.info, @min(value.version, 5), null);
+    }
+
+    fn maybeCreate(self: *LayerPopupHandler) !void {
+        if (self.created or self.compositor == null or self.shm == null or
+            self.wm_base == null or self.layer_shell == null) return;
+        self.layer_wl_surface = (try protocol.wl_compositor.construct_create_surface(
+            self.objects,
+            self.queue,
+            self.compositor.?,
+            .{},
+        )).id;
+        self.layer_surface = (try protocol.zwlr_layer_shell_v1.construct_get_layer_surface(
+            self.objects,
+            self.queue,
+            self.layer_shell.?,
+            .{
+                .surface = self.layer_wl_surface.?.id,
+                .output = null,
+                .layer = .top,
+                .namespace = "ouro-test",
+            },
+        )).id;
+        try protocol.zwlr_layer_surface_v1.encodeRequest(self.queue, self.layer_surface.?.id, .{
+            .set_size = .{ .width = 3, .height = 2 },
+        });
+        try protocol.zwlr_layer_surface_v1.encodeRequest(self.queue, self.layer_surface.?.id, .{
+            .set_anchor = .{ .anchor = .{ .value = 5 } },
+        });
+
+        try protocol.wl_surface.encodeRequest(self.queue, self.layer_wl_surface.?.id, .{ .commit = .{} });
+        self.created = true;
+    }
+
+    fn createPopup(self: *LayerPopupHandler) !void {
+        self.popup_surface = (try protocol.wl_compositor.construct_create_surface(
+            self.objects,
+            self.queue,
+            self.compositor.?,
+            .{},
+        )).id;
+        self.popup_xdg_surface = (try protocol.xdg_wm_base.construct_get_xdg_surface(
+            self.objects,
+            self.queue,
+            self.wm_base.?,
+            .{ .surface = self.popup_surface.?.id },
+        )).id;
+        const positioner = try protocol.xdg_wm_base.construct_create_positioner(
+            self.objects,
+            self.queue,
+            self.wm_base.?,
+            .{},
+        );
+        try protocol.xdg_positioner.encodeRequest(self.queue, positioner.id.id, .{
+            .set_size = .{ .width = 1, .height = 1 },
+        });
+        try protocol.xdg_positioner.encodeRequest(self.queue, positioner.id.id, .{
+            .set_anchor_rect = .{ .x = 1, .y = 0, .width = 1, .height = 1 },
+        });
+        self.popup = (try protocol.xdg_surface.construct_get_popup(
+            self.objects,
+            self.queue,
+            self.popup_xdg_surface.?,
+            .{ .parent = null, .positioner = positioner.id.id },
+        )).id;
+        try protocol.zwlr_layer_surface_v1.encodeRequest(self.queue, self.layer_surface.?.id, .{
+            .get_popup = .{ .popup = self.popup.?.id },
+        });
+    }
+
+    fn mapSurface(
+        self: *LayerPopupHandler,
+        index: usize,
+        surface: wayring.objects.Handle,
+    ) !void {
+        const descriptor = try ordinaryMemfd(4096, 16, &pixels);
+        const pool = try protocol.wl_shm.construct_create_pool(
+            self.objects,
+            self.queue,
+            self.shm.?,
+            .{ .fd = descriptor, .size = 4096 },
+        );
+        self.buffers[index] = (try protocol.wl_shm_pool.construct_create_buffer(
+            self.objects,
+            self.queue,
+            pool.id,
+            .{
+                .offset = 16,
+                .width = if (index == 0) 3 else 1,
+                .height = if (index == 0) 2 else 1,
+                .stride = 16,
+                .format = .argb8888,
+            },
+        )).id;
+        try protocol.wl_surface.encodeRequest(self.queue, surface.id, .{
+            .attach = .{ .buffer = self.buffers[index].?.id, .x = 0, .y = 0 },
+        });
+        try protocol.wl_surface.encodeRequest(self.queue, surface.id, .{
+            .damage_buffer = .{ .x = 0, .y = 0, .width = 3, .height = 2 },
+        });
+        try protocol.wl_surface.encodeRequest(self.queue, surface.id, .{ .commit = .{} });
+        try wayring.client.sendRequest(
+            protocol.wl_shm_pool,
+            self.objects,
+            self.queue,
+            pool.id,
+            .{ .destroy = .{} },
+        );
+    }
+};
+
 const Handler = struct {
     objects: *wayring.objects.ClientObjects,
     queue: *wayring.tx.Queue,
@@ -1928,6 +2272,38 @@ fn submitMultiClient(
     reactor: *wayring.io_uring.Reactor,
     driver: *ClientDriver,
     handler: *MultiHandler,
+) !void {
+    _ = try driver.schedule();
+    _ = try driver.prepare(handler);
+    _ = try reactor.ring.submit();
+}
+
+fn drainLayerPopupClient(
+    reactor: *wayring.io_uring.Reactor,
+    driver: *ClientDriver,
+    handler: *LayerPopupHandler,
+) !ClientDriver.Progress {
+    var completions: [16]linux.io_uring_cqe = undefined;
+    const count = if (reactor.ring.cq_ready() == 0)
+        0
+    else
+        try reactor.ring.copy_cqes(&completions, 0);
+    var progress = try driver.dispatch(completions[0..count], handler);
+    if (handler.queue.queuedBytes() != 0) {
+        _ = try driver.schedule();
+        const prepared = try driver.prepare(handler);
+        progress.prepared += prepared.prepared;
+        progress.pending = prepared.pending;
+        progress.quiescent = prepared.quiescent;
+    }
+    if (progress.prepared != 0 or progress.pending) _ = try reactor.ring.submit();
+    return progress;
+}
+
+fn submitLayerPopupClient(
+    reactor: *wayring.io_uring.Reactor,
+    driver: *ClientDriver,
+    handler: *LayerPopupHandler,
 ) !void {
     _ = try driver.schedule();
     _ = try driver.prepare(handler);
