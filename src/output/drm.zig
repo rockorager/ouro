@@ -707,6 +707,9 @@ pub const Output = struct {
             self.clear,
             applied,
         ) catch |cause| return self.retireUnstartedRender(frame_id, cause);
+        if (bindings.len > self.sample_storage.len)
+            self.sample_storage = self.allocator.realloc(self.sample_storage, bindings.len) catch |cause|
+                return self.retireUnstartedRender(frame_id, cause);
         bindSamples(list, bindings, self.sample_storage) catch |cause|
             return self.retireUnstartedRender(frame_id, cause);
         try self.scheduler.captureSamples(frame_id, self.sample_storage[0..bindings.len]);

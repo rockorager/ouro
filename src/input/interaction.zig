@@ -1,4 +1,4 @@
-//! Fixed-capacity desktop interaction owner.
+//! Dynamically sized desktop interaction owner.
 //!
 //! This module keeps physical device aggregation, desktop policy mutation, and
 //! protocol publication separate. It hit-tests copied scene values, updates
@@ -311,7 +311,14 @@ pub fn Interaction(comptime Desktop: type) type {
                 ) catch return error.InvalidGeometry;
             } else null;
             const point: geometry.Point = .{ .x = fixedFloor(next_x), .y = fixedFloor(next_y) };
-            const windows = try desktop.sceneSnapshot(self.windows);
+            const windows = while (true) {
+                break desktop.sceneSnapshot(self.windows) catch {
+                    const capacity = std.math.mul(usize, self.windows.len, 2) catch
+                        return error.OutOfMemory;
+                    self.windows = try self.allocator.realloc(self.windows, capacity);
+                    continue;
+                };
+            };
             const hit = surfaces.topmost(SceneWindow, windows, point);
             var target: ?Target = if (hit) |value| target: {
                 const local_x = next_x - @as(i64, point.x - value.local.x) * 256;
@@ -497,12 +504,23 @@ pub fn Interaction(comptime Desktop: type) type {
             });
         }
 
-        fn ensureCommandCapacity(self: *const Self, count: usize) !void {
+        fn ensureCommandCapacity(self: *Self, count: usize) !void {
             // A pending terminal edge is the trailing publication barrier.
             // Ordinary work waits until it drains, so later cancellation flags
             // can coalesce into that edge without changing command ordering.
             if (self.cancellationIndex() != null) return error.Backpressure;
-            if (self.command_len + count > self.commands.len - 1) return error.Backpressure;
+            const needed = std.math.add(usize, self.command_len, count + 1) catch
+                return error.OutOfMemory;
+            if (needed <= self.commands.len) return;
+            var capacity = self.commands.len;
+            while (capacity < needed) capacity = std.math.mul(usize, capacity, 2) catch
+                return error.OutOfMemory;
+            const replacement = try self.allocator.alloc(Command, capacity);
+            for (0..self.command_len) |offset|
+                replacement[offset] = self.commands[(self.command_head + offset) % self.commands.len];
+            self.allocator.free(self.commands);
+            self.commands = replacement;
+            self.command_head = 0;
         }
 
         fn enqueue(self: *Self, command: Command) void {
@@ -926,7 +944,7 @@ test "interaction: pointer motion selects exact topmost input surface" {
     try std.testing.expectEqual(interaction.pointerPosition(), interaction.cursor.position);
 }
 
-test "interaction: committed input hole falls through and motion backpressure is transactional" {
+test "interaction: command storage grows while preserving motion order" {
     var interaction = try initTestInteraction(1);
     defer interaction.deinit();
     var desktop = testDesktop();
@@ -939,11 +957,11 @@ test "interaction: committed input hole falls through and motion backpressure is
         .dy = 7,
     } });
     try std.testing.expectEqual(desktop.windows[0].surface, interaction.peekCommand().?.pointer_focus.?.surface);
-    const before = interaction.pointerPosition();
-    try std.testing.expectError(error.Backpressure, interaction.consume(&desktop, &surfaces, .{
+    try interaction.consume(&desktop, &surfaces, .{
         .pointer_motion = .{ .device = device_a, .time_usec = 2, .dx = 5, .dy = 5 },
-    }));
-    try std.testing.expectEqual(before, interaction.pointerPosition());
+    });
+    try std.testing.expectEqual(@as(usize, 2), interaction.pendingCommands());
+    try std.testing.expectEqual(geometry.Point{ .x = 18, .y = 13 }, interaction.pointerPosition());
 }
 
 test "interaction: default press updates desktop and enters exact button grab" {

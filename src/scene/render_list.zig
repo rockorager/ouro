@@ -1,4 +1,4 @@
-//! Fixed-capacity publication of validated applied content for renderers.
+//! Dynamically-sized publication of validated applied content for renderers.
 //!
 //! The builder publishes validated sample metadata and can either copy source
 //! pixels into its preallocated byte arena or borrow caller-owned stable bytes.
@@ -12,7 +12,6 @@ pub const AppliedSurface = render.SurfaceSample;
 
 pub const Error = std.mem.Allocator.Error || render.ValidationError || error{
     InvalidConfig,
-    SampleCapacityExceeded,
     ByteCapacityExceeded,
     DuplicateSampleIdentity,
 };
@@ -62,9 +61,6 @@ pub const Builder = struct {
         copy_sources: bool,
     ) Error!void {
         try render.validateOutput(output);
-        if (applied.len > self.samples.len)
-            return error.SampleCapacityExceeded;
-
         var required_bytes: usize = 0;
         for (applied, 0..) |surface, index| {
             const length = try render.validateSample(surface);
@@ -91,6 +87,8 @@ pub const Builder = struct {
         applied: []const AppliedSurface,
     ) Error!render.List {
         try self.validateCandidate(output, applied, true);
+        if (applied.len > self.samples.len)
+            self.samples = try self.allocator.realloc(self.samples, applied.len);
 
         var offset: usize = 0;
         for (applied, 0..) |surface, index| {
@@ -121,6 +119,8 @@ pub const Builder = struct {
         applied: []const AppliedSurface,
     ) Error!render.List {
         try self.validateCandidate(output, applied, false);
+        if (applied.len > self.samples.len)
+            self.samples = try self.allocator.realloc(self.samples, applied.len);
         @memcpy(self.samples[0..applied.len], applied);
         self.sample_count = applied.len;
         self.byte_count = 0;
@@ -191,7 +191,7 @@ test "render: borrowed list publication retains stable source bytes" {
     try std.testing.expectEqualSlices(u8, &.{ 9, 9, 9, 9 }, list.samples[0].source.bytes);
 }
 
-test "render: list rejects identity geometry byte and sample capacities" {
+test "render: list rejects identity geometry and byte capacity" {
     var builder = try Builder.init(std.testing.allocator, 1, 4);
     defer builder.deinit();
     const bytes = [_]u8{0} ** 8;
@@ -204,5 +204,15 @@ test "render: list rejects identity geometry byte and sample capacities" {
     sample = validSample(&bytes);
     sample.source.size.height = 2;
     try std.testing.expectError(error.ByteCapacityExceeded, builder.build(.{ .width = 1, .height = 1 }, .xrgb8888, .{ .r = 0, .g = 0, .b = 0 }, &.{sample}));
-    try std.testing.expectError(error.SampleCapacityExceeded, builder.build(.{ .width = 1, .height = 1 }, .xrgb8888, .{ .r = 0, .g = 0, .b = 0 }, &.{ validSample(&bytes), validSample(&bytes) }));
+}
+
+test "render: list sample metadata grows beyond initial capacity" {
+    var builder = try Builder.initBorrowed(std.testing.allocator, 1);
+    defer builder.deinit();
+    const bytes = [_]u8{ 0, 0, 0, 0 };
+    var samples = [_]AppliedSurface{ validSample(&bytes), validSample(&bytes) };
+    samples[1].sample.surface = 2;
+    const list = try builder.buildBorrowed(.{ .width = 1, .height = 1 }, .xrgb8888, .{ .r = 0, .g = 0, .b = 0 }, &samples);
+    try std.testing.expectEqual(@as(usize, 2), list.samples.len);
+    try std.testing.expect(builder.samples.len >= 2);
 }

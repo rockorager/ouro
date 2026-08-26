@@ -1,4 +1,4 @@
-//! Fixed-capacity, generation-safe xdg-shell protocol owner.
+//! Dynamically growing, generation-safe xdg-shell protocol owner.
 //!
 //! Wayring owns wire objects and transport. This adapter owns xdg roles,
 //! configure and ping serial state, exact wl_surface associations, and the
@@ -14,6 +14,7 @@ const none = std.math.maxInt(u32);
 const native_endian = @import("builtin").cpu.arch.endian();
 
 pub const Config = struct {
+    // Capacities are initial allocation sizes; all stores grow as needed.
     manager_capacity: usize,
     positioner_capacity: usize,
     surface_capacity: usize,
@@ -39,8 +40,6 @@ pub const Config = struct {
             config.metadata_bytes,
         }) |capacity| if (capacity == 0 or capacity >= none) return error.InvalidConfig;
         if (config.initial_serial == 0) return error.InvalidConfig;
-        _ = std.math.mul(usize, config.toplevel_capacity, config.metadata_bytes) catch
-            return error.InvalidConfig;
     }
 };
 
@@ -322,17 +321,16 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         global_version: u32,
         next_serial: u32,
         next_outbound_sequence: u64 = 1,
-        managers: []ManagerSlot,
-        positioners: []PositionerSlot,
-        surfaces: []SurfaceSlot,
-        toplevels: []ToplevelSlot,
-        popups: []PopupSlot,
+        managers: []*ManagerSlot,
+        positioners: []*PositionerSlot,
+        surfaces: []*SurfaceSlot,
+        toplevels: []*ToplevelSlot,
+        popups: []*PopupSlot,
         manager_free: u32,
         positioner_free: u32,
         surface_free: u32,
         toplevel_free: u32,
         popup_free: u32,
-        metadata_storage: []u8,
         metadata_bytes: usize,
         events: []Event,
         event_head: usize = 0,
@@ -352,16 +350,16 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         ) !Self {
             try config.validate();
             try WmBase.info.validateVersion(config.global_version);
-            const managers = try allocator.alloc(ManagerSlot, config.manager_capacity);
-            errdefer allocator.free(managers);
-            const positioners = try allocator.alloc(PositionerSlot, config.positioner_capacity);
-            errdefer allocator.free(positioners);
-            const surfaces = try allocator.alloc(SurfaceSlot, config.surface_capacity);
-            errdefer allocator.free(surfaces);
-            const toplevels = try allocator.alloc(ToplevelSlot, config.toplevel_capacity);
-            errdefer allocator.free(toplevels);
-            const popups = try allocator.alloc(PopupSlot, config.popup_capacity);
-            errdefer allocator.free(popups);
+            const managers = try allocSlots(ManagerSlot, allocator, config.manager_capacity);
+            errdefer freeSlots(ManagerSlot, allocator, managers);
+            const positioners = try allocSlots(PositionerSlot, allocator, config.positioner_capacity);
+            errdefer freeSlots(PositionerSlot, allocator, positioners);
+            const surfaces = try allocSlots(SurfaceSlot, allocator, config.surface_capacity);
+            errdefer freeSlots(SurfaceSlot, allocator, surfaces);
+            const toplevels = try allocSlots(ToplevelSlot, allocator, config.toplevel_capacity);
+            errdefer freeSlots(ToplevelSlot, allocator, toplevels);
+            const popups = try allocSlots(PopupSlot, allocator, config.popup_capacity);
+            errdefer freeSlots(PopupSlot, allocator, popups);
             const terminal_slots = try std.math.add(
                 usize,
                 config.toplevel_capacity,
@@ -374,24 +372,11 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             errdefer allocator.free(outbound);
             const outstanding = try allocator.alloc(Outstanding, config.outstanding_configure_capacity);
             errdefer allocator.free(outstanding);
-            const metadata_per_slot = try std.math.mul(usize, config.metadata_bytes, 2);
-            const metadata_len = try std.math.mul(
-                usize,
-                config.toplevel_capacity,
-                metadata_per_slot,
-            );
-            const metadata_storage = try allocator.alloc(u8, metadata_len);
-            errdefer allocator.free(metadata_storage);
-
-            initHeaders(ManagerSlot, managers);
-            initHeaders(PositionerSlot, positioners);
-            initHeaders(SurfaceSlot, surfaces);
-            initHeaders(ToplevelSlot, toplevels);
-            initHeaders(PopupSlot, popups);
-            for (toplevels, 0..) |*slot, index| {
-                const start = index * config.metadata_bytes * 2;
-                slot.title = metadata_storage[start .. start + config.metadata_bytes];
-                slot.app_id = metadata_storage[start + config.metadata_bytes .. start + config.metadata_bytes * 2];
+            for (toplevels) |slot| {
+                slot.title = try allocator.alloc(u8, config.metadata_bytes);
+                errdefer allocator.free(slot.title);
+                slot.app_id = try allocator.alloc(u8, config.metadata_bytes);
+                errdefer allocator.free(slot.app_id);
             }
             @memset(outbound, .{});
             @memset(outstanding, .{});
@@ -410,7 +395,6 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .surface_free = 0,
                 .toplevel_free = 0,
                 .popup_free = 0,
-                .metadata_storage = metadata_storage,
                 .metadata_bytes = config.metadata_bytes,
                 .events = events,
                 .outbound = outbound,
@@ -422,12 +406,15 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             adapter.allocator.free(adapter.outstanding);
             adapter.allocator.free(adapter.outbound);
             adapter.allocator.free(adapter.events);
-            adapter.allocator.free(adapter.metadata_storage);
-            adapter.allocator.free(adapter.popups);
-            adapter.allocator.free(adapter.toplevels);
-            adapter.allocator.free(adapter.surfaces);
-            adapter.allocator.free(adapter.positioners);
-            adapter.allocator.free(adapter.managers);
+            freeSlots(PopupSlot, adapter.allocator, adapter.popups);
+            for (adapter.toplevels) |slot| {
+                adapter.allocator.free(slot.title);
+                adapter.allocator.free(slot.app_id);
+            }
+            freeSlots(ToplevelSlot, adapter.allocator, adapter.toplevels);
+            freeSlots(SurfaceSlot, adapter.allocator, adapter.surfaces);
+            freeSlots(PositionerSlot, adapter.allocator, adapter.positioners);
+            freeSlots(ManagerSlot, adapter.allocator, adapter.managers);
             adapter.* = undefined;
         }
 
@@ -593,7 +580,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         /// Core invokes the post-commit half immediately on the same thread, so
         /// this admission reserves that capacity across the core mutation.
         pub fn validateSurfaceCommit(adapter: *Self, id: SurfaceId) !void {
-            for (adapter.surfaces) |*slot| {
+            for (adapter.surfaces) |slot| {
                 if (!slot.header.active or !std.meta.eql(slot.surface_id, id)) continue;
                 const surface = try adapter.core.getSurfaceById(slot.surface_id);
                 if (surface.hasPendingBufferAttachment() and slot.last_acked_serial == 0)
@@ -609,7 +596,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         /// Post-commit half of the core transaction boundary. Publication is
         /// deferred until core state and attachment ownership are committed.
         pub fn publishSurfaceCommitted(adapter: *Self, id: SurfaceId) !void {
-            for (adapter.surfaces) |*slot| {
+            for (adapter.surfaces) |slot| {
                 if (!slot.header.active or !std.meta.eql(slot.surface_id, id)) continue;
                 if (slot.pending_window_geometry) |geometry| {
                     slot.window_geometry = geometry;
@@ -674,7 +661,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             if (value.width < 0 or value.height < 0) return error.InvalidSize;
             const role = try adapter.resolveToplevel(id);
             const surface = try adapter.resolveRoleSurface(role.xdg_surface_index, role.xdg_surface_generation);
-            const outstanding = adapter.acquireOutstanding() orelse return error.Exhausted;
+            const outstanding = try adapter.acquireOutstanding();
             const serial = adapter.issueSerial();
             outstanding.* = .{
                 .active = true,
@@ -719,7 +706,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             if (value.width <= 0 or value.height <= 0) return error.InvalidSize;
             const role = try adapter.resolvePopup(id);
             const surface = try adapter.resolveRoleSurface(role.xdg_surface_index, role.xdg_surface_generation);
-            const outstanding = adapter.acquireOutstanding() orelse return error.Exhausted;
+            const outstanding = try adapter.acquireOutstanding();
             const serial = adapter.issueSerial();
             outstanding.* = .{
                 .active = true,
@@ -1421,7 +1408,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 adapter.outbound_len += 1;
                 return;
             };
-            return error.Exhausted;
+            const old_len = adapter.outbound.len;
+            adapter.outbound = try adapter.allocator.realloc(adapter.outbound, old_len + 1);
+            adapter.outbound[old_len] = .{};
+            return adapter.enqueueOutbound(manager_index, manager_generation, value);
         }
 
         fn oldestOutboundFor(adapter: *Self, server_objects: anytype) ?*OutboundSlot {
@@ -1444,9 +1434,12 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             return result;
         }
 
-        fn acquireOutstanding(adapter: *Self) ?*Outstanding {
+        fn acquireOutstanding(adapter: *Self) !*Outstanding {
             for (adapter.outstanding) |*entry| if (!entry.active) return entry;
-            return null;
+            const old_len = adapter.outstanding.len;
+            adapter.outstanding = try adapter.allocator.realloc(adapter.outstanding, old_len + 1);
+            adapter.outstanding[old_len] = .{};
+            return &adapter.outstanding[old_len];
         }
 
         fn markConfigureSent(adapter: *Self, serial: u32) void {
@@ -1468,10 +1461,17 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             adapter.event_len += 1;
         }
 
-        fn canPublishWithLive(adapter: *const Self, live_toplevels: usize, live_popups: usize) bool {
+        fn canPublishWithLive(adapter: *Self, live_toplevels: usize, live_popups: usize) bool {
             const live = live_toplevels + live_popups;
-            std.debug.assert(live <= adapter.events.len);
-            return adapter.event_len < adapter.events.len - live;
+            if (live < adapter.events.len and adapter.event_len < adapter.events.len - live) return true;
+            const needed = adapter.event_len + live + 1;
+            const grown = adapter.allocator.alloc(Event, needed) catch return false;
+            for (0..adapter.event_len) |i|
+                grown[i] = adapter.events[(adapter.event_head + i) % adapter.events.len];
+            adapter.allocator.free(adapter.events);
+            adapter.events = grown;
+            adapter.event_head = 0;
+            return true;
         }
 
         fn publishTerminal(adapter: *Self, event: Event) void {
@@ -1482,24 +1482,38 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         }
 
         fn acquireManager(adapter: *Self) !*ManagerSlot {
-            return acquire(ManagerSlot, adapter.managers, &adapter.manager_free);
+            return acquireGrowing(ManagerSlot, adapter.allocator, &adapter.managers, &adapter.manager_free);
         }
         fn acquirePositioner(adapter: *Self) !*PositionerSlot {
-            return acquire(PositionerSlot, adapter.positioners, &adapter.positioner_free);
+            return acquireGrowing(PositionerSlot, adapter.allocator, &adapter.positioners, &adapter.positioner_free);
         }
         fn acquireXdgSurface(adapter: *Self) !*SurfaceSlot {
-            return acquire(SurfaceSlot, adapter.surfaces, &adapter.surface_free);
+            return acquireGrowing(SurfaceSlot, adapter.allocator, &adapter.surfaces, &adapter.surface_free);
         }
         fn acquireToplevel(adapter: *Self) !*ToplevelSlot {
-            const slot = try acquire(ToplevelSlot, adapter.toplevels, &adapter.toplevel_free);
-            const index = indexOf(ToplevelSlot, adapter.toplevels, slot);
-            const start = index * adapter.metadata_bytes * 2;
-            slot.title = adapter.metadata_storage[start .. start + adapter.metadata_bytes];
-            slot.app_id = adapter.metadata_storage[start + adapter.metadata_bytes .. start + adapter.metadata_bytes * 2];
+            const old_len = adapter.toplevels.len;
+            const old_title: []u8 = if (adapter.toplevel_free != none) adapter.toplevels[adapter.toplevel_free].title else &.{};
+            const old_app_id: []u8 = if (adapter.toplevel_free != none) adapter.toplevels[adapter.toplevel_free].app_id else &.{};
+            const slot = try acquireGrowing(ToplevelSlot, adapter.allocator, &adapter.toplevels, &adapter.toplevel_free);
+            if (adapter.toplevels.len != old_len) {
+                slot.title = adapter.allocator.alloc(u8, adapter.metadata_bytes) catch |err| {
+                    release(ToplevelSlot, adapter.toplevels, &adapter.toplevel_free, @intCast(old_len));
+                    return err;
+                };
+                slot.app_id = adapter.allocator.alloc(u8, adapter.metadata_bytes) catch |err| {
+                    adapter.allocator.free(slot.title);
+                    slot.title = &.{};
+                    release(ToplevelSlot, adapter.toplevels, &adapter.toplevel_free, @intCast(old_len));
+                    return err;
+                };
+            } else {
+                slot.title = old_title;
+                slot.app_id = old_app_id;
+            }
             return slot;
         }
         fn acquirePopup(adapter: *Self) !*PopupSlot {
-            return acquire(PopupSlot, adapter.popups, &adapter.popup_free);
+            return acquireGrowing(PopupSlot, adapter.allocator, &adapter.popups, &adapter.popup_free);
         }
 
         fn releaseManager(adapter: *Self, index: u32) void {
@@ -1510,7 +1524,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             release(PositionerSlot, adapter.positioners, &adapter.positioner_free, index);
         }
         fn releaseXdgSurface(adapter: *Self, index: u32) void {
-            const slot = &adapter.surfaces[index];
+            const slot = adapter.surfaces[index];
             if (!slot.header.active) return;
             switch (slot.role) {
                 .none => {},
@@ -1521,7 +1535,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             release(SurfaceSlot, adapter.surfaces, &adapter.surface_free, index);
         }
         fn releaseToplevel(adapter: *Self, index: u32) void {
-            const slot = &adapter.toplevels[index];
+            const slot = adapter.toplevels[index];
             if (!slot.header.active) return;
             const id = adapter.toplevelId(slot);
             adapter.unmapToplevel(id);
@@ -1566,7 +1580,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             const slot = adapter.resolveToplevel(id) catch return;
             const replacement = slot.parent;
             slot.parent = null;
-            for (adapter.toplevels) |*child| {
+            for (adapter.toplevels) |child| {
                 if (!child.header.active or child.parent == null or
                     !std.meta.eql(child.parent.?, id)) continue;
                 child.parent = replacement;
@@ -1574,7 +1588,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         }
 
         fn abandonToplevel(adapter: *Self, index: u32) void {
-            const slot = &adapter.toplevels[index];
+            const slot = adapter.toplevels[index];
             const title = slot.title;
             const app_id = slot.app_id;
             release(ToplevelSlot, adapter.toplevels, &adapter.toplevel_free, index);
@@ -1582,7 +1596,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             slot.app_id = app_id;
         }
         fn releasePopup(adapter: *Self, index: u32) void {
-            const slot = &adapter.popups[index];
+            const slot = adapter.popups[index];
             if (!slot.header.active) return;
             const id = adapter.popupId(slot);
             if (adapter.resolveRoleSurface(slot.xdg_surface_index, slot.xdg_surface_generation)) |surface| {
@@ -1656,34 +1670,34 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
 
         fn resolveToplevel(adapter: *Self, id: ToplevelId) !*ToplevelSlot {
             if (id.index >= adapter.toplevels.len) return error.StaleToplevel;
-            const slot = &adapter.toplevels[id.index];
+            const slot = adapter.toplevels[id.index];
             if (!slot.header.active or slot.header.generation != id.generation)
                 return error.StaleToplevel;
             return slot;
         }
         fn resolvePopup(adapter: *Self, id: PopupId) !*PopupSlot {
             if (id.index >= adapter.popups.len) return error.StalePopup;
-            const slot = &adapter.popups[id.index];
+            const slot = adapter.popups[id.index];
             if (!slot.header.active or slot.header.generation != id.generation)
                 return error.StalePopup;
             return slot;
         }
         fn resolveRoleSurface(adapter: *Self, index: u32, generation: u32) !*SurfaceSlot {
             if (index >= adapter.surfaces.len) return error.StaleSurface;
-            const slot = &adapter.surfaces[index];
+            const slot = adapter.surfaces[index];
             if (!slot.header.active or slot.header.generation != generation)
                 return error.StaleSurface;
             return slot;
         }
         fn resolveManager(adapter: *Self, index: u32, generation: u32) !*ManagerSlot {
             if (index >= adapter.managers.len) return error.StaleManager;
-            const slot = &adapter.managers[index];
+            const slot = adapter.managers[index];
             if (!slot.header.active or slot.header.generation != generation)
                 return error.StaleManager;
             return slot;
         }
         fn findXdgSurface(adapter: *Self, surface_id: SurfaceId) ?*SurfaceSlot {
-            for (adapter.surfaces) |*slot| if (slot.header.active and
+            for (adapter.surfaces) |slot| if (slot.header.active and
                 std.meta.eql(slot.surface_id, surface_id)) return slot;
             return null;
         }
@@ -1722,7 +1736,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         }
 
         fn topmostPopup(adapter: *Self, manager_index: u32, manager_generation: u32) ?*PopupSlot {
-            for (adapter.popups) |*popup| {
+            for (adapter.popups) |popup| {
                 if (!popup.header.active or adapter.popupHasChild(popup)) continue;
                 const surface = adapter.resolveRoleSurface(
                     popup.xdg_surface_index,
@@ -1800,11 +1814,17 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
 const toplevel_role_id: surface_state.RoleId = 0x7864_675f_746f_706c;
 const popup_role_id: surface_state.RoleId = 0x7864_675f_706f_7075;
 
-fn initHeaders(comptime T: type, slots: []T) void {
-    for (slots, 0..) |*slot, index| {
-        slot.* = .{};
-        slot.header.next_free = if (index + 1 < slots.len) @intCast(index + 1) else none;
+fn allocSlots(comptime T: type, allocator: std.mem.Allocator, len: usize) ![]*T {
+    const slots = try allocator.alloc(*T, len);
+    errdefer allocator.free(slots);
+    var initialized: usize = 0;
+    errdefer for (slots[0..initialized]) |slot| allocator.destroy(slot);
+    while (initialized < len) : (initialized += 1) {
+        slots[initialized] = try allocator.create(T);
+        slots[initialized].* = .{};
+        slots[initialized].header.next_free = if (initialized + 1 < len) @intCast(initialized + 1) else none;
     }
+    return slots;
 }
 
 fn optionalToplevelEqual(a: anytype, b: @TypeOf(a)) bool {
@@ -1812,18 +1832,31 @@ fn optionalToplevelEqual(a: anytype, b: @TypeOf(a)) bool {
     return std.meta.eql(a.?, b.?);
 }
 
-fn acquire(comptime T: type, slots: []T, free: *u32) !*T {
-    if (free.* == none) return error.Exhausted;
+fn freeSlots(comptime T: type, allocator: std.mem.Allocator, slots: []*T) void {
+    for (slots) |slot| allocator.destroy(slot);
+    allocator.free(slots);
+}
+
+fn acquireGrowing(comptime T: type, allocator: std.mem.Allocator, slots: *[]*T, free: *u32) !*T {
+    if (free.* == none) {
+        if (slots.*.len >= none) return error.OutOfMemory;
+        const slot = try allocator.create(T);
+        errdefer allocator.destroy(slot);
+        slot.* = .{};
+        slots.* = try allocator.realloc(slots.*, slots.*.len + 1);
+        slots.*[slots.*.len - 1] = slot;
+        free.* = @intCast(slots.*.len - 1);
+    }
     const index = free.*;
-    const slot = &slots[index];
+    const slot = slots.*[index];
     free.* = slot.header.next_free;
     const generation = slot.header.generation;
     slot.* = .{ .header = .{ .active = true, .generation = generation } };
     return slot;
 }
 
-fn release(comptime T: type, slots: []T, free: *u32, index: u32) void {
-    const slot = &slots[index];
+fn release(comptime T: type, slots: []*T, free: *u32, index: u32) void {
+    const slot = slots[index];
     if (!slot.header.active) return;
     const generation = slot.header.generation;
     if (generation == std.math.maxInt(u32)) {
@@ -1837,20 +1870,16 @@ fn release(comptime T: type, slots: []T, free: *u32, index: u32) void {
     }
 }
 
-fn fromContext(comptime T: type, slots: []T, context: ?*anyopaque) ?*T {
+fn fromContext(comptime T: type, slots: []*T, context: ?*anyopaque) ?*T {
     const pointer = context orelse return null;
-    const address = @intFromPtr(pointer);
-    const start = @intFromPtr(slots.ptr);
-    const bytes = std.math.mul(usize, slots.len, @sizeOf(T)) catch return null;
-    const end = std.math.add(usize, start, bytes) catch return null;
-    if (address < start or address >= end or (address - start) % @sizeOf(T) != 0) return null;
-    const slot = &slots[(address - start) / @sizeOf(T)];
-    if (!slot.header.active or @intFromPtr(slot) != address) return null;
-    return slot;
+    for (slots) |slot| if (@intFromPtr(slot) == @intFromPtr(pointer))
+        return if (slot.header.active) slot else null;
+    return null;
 }
 
-fn indexOf(comptime T: type, slots: []T, slot: *T) u32 {
-    return @intCast((@intFromPtr(slot) - @intFromPtr(slots.ptr)) / @sizeOf(T));
+fn indexOf(comptime T: type, slots: []*T, slot: *T) u32 {
+    for (slots, 0..) |candidate, index| if (candidate == slot) return @intCast(index);
+    unreachable;
 }
 
 fn validAxis(value: u32) bool {
@@ -1964,6 +1993,53 @@ const FakeCore = struct {
 
 const TestAdapter = Adapter(test_protocol, FakeCore);
 const TestCore = wayring.server.Core(test_protocol);
+
+test "xdg-shell: stores grow beyond their initial capacities with stable object pointers" {
+    var core: FakeCore = undefined;
+    var adapter = try TestAdapter.init(std.testing.allocator, &core, .{
+        .manager_capacity = 1,
+        .positioner_capacity = 1,
+        .surface_capacity = 1,
+        .toplevel_capacity = 1,
+        .popup_capacity = 1,
+        .event_capacity = 1,
+        .outbound_capacity = 1,
+        .outstanding_configure_capacity = 1,
+        .metadata_bytes = 8,
+    });
+    defer adapter.deinit();
+
+    const manager = try adapter.acquireManager();
+    const manager_address = @intFromPtr(manager);
+    _ = try adapter.acquireManager();
+    try std.testing.expectEqual(manager_address, @intFromPtr(adapter.managers[0]));
+    try adapter.enqueueOutbound(0, manager.header.generation, .{ .ping = .{
+        .manager_index = 0,
+        .manager_generation = manager.header.generation,
+        .serial = 1,
+    } });
+    try adapter.enqueueOutbound(0, manager.header.generation, .{ .ping = .{
+        .manager_index = 0,
+        .manager_generation = manager.header.generation,
+        .serial = 2,
+    } });
+    try std.testing.expect(adapter.outbound.len > 1);
+    _ = try adapter.acquirePositioner();
+    _ = try adapter.acquirePositioner();
+    _ = try adapter.acquireXdgSurface();
+    _ = try adapter.acquireXdgSurface();
+    const toplevel = try adapter.acquireToplevel();
+    const metadata_address = @intFromPtr(toplevel.title.ptr);
+    _ = try adapter.acquireToplevel();
+    try std.testing.expectEqual(metadata_address, @intFromPtr(adapter.toplevels[0].title.ptr));
+    _ = try adapter.acquirePopup();
+    _ = try adapter.acquirePopup();
+    try std.testing.expect(adapter.canPublishWithLive(1, 1));
+    try std.testing.expect(adapter.events.len > 1);
+    (try adapter.acquireOutstanding()).active = true;
+    (try adapter.acquireOutstanding()).active = true;
+    try std.testing.expect(adapter.outstanding.len > 1);
+}
 
 fn validateTestGrab(
     _: *anyopaque,
@@ -2507,7 +2583,7 @@ test "xdg-shell: pre-v5 toplevel configure omits wm capabilities" {
     try std.testing.expectEqual(@as(i32, 80), event.configure.width);
 }
 
-test "xdg-shell: full commit event capacity rejects before core mutation" {
+test "xdg-shell: commit event storage grows before core mutation" {
     const context = try TestContext.initWithEventCapacity(1);
     defer context.deinit();
     const id = try context.createToplevel();
@@ -2522,15 +2598,18 @@ test "xdg-shell: full commit event capacity rejects before core mutation" {
     try context.adapter.publishState(id, .maximized, true);
     try context.adapter.publishState(id, .fullscreen, true);
     try context.adapter.publishState(id, .minimized, true);
-    try std.testing.expectError(error.Exhausted, context.adapter.validateSurfaceCommit(surface_id));
+    try context.adapter.validateSurfaceCommit(surface_id);
+    try std.testing.expect(context.adapter.events.len > 4);
     try std.testing.expectEqual(@as(u32, 0), context.core.state.committedSize().width);
     try std.testing.expect(context.core.state.hasPendingBufferAttachment());
 
-    _ = context.adapter.popEvent();
-    try context.adapter.validateSurfaceCommit(surface_id);
     _ = try context.core.state.commit();
     try context.adapter.publishSurfaceCommitted(surface_id);
     try std.testing.expectEqual(@as(u32, 80), context.core.state.committedSize().width);
+    try std.testing.expectEqual(id, switch (context.adapter.popEvent().?) {
+        .state_requested => |requested| requested.id,
+        else => return error.UnexpectedEvent,
+    });
     try std.testing.expectEqual(id, switch (context.adapter.popEvent().?) {
         .state_requested => |requested| requested.id,
         else => return error.UnexpectedEvent,
@@ -2757,7 +2836,7 @@ test "xdg-shell: generated popup requests validate positioner and parent role" {
     try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
     try std.testing.expectEqual(popup_role_id, context.core.second_state.role.id);
 
-    const popup = &context.adapter.popups[0];
+    const popup = context.adapter.popups[0];
     const id = context.adapter.popupId(popup);
     const created = switch (context.adapter.popEvent() orelse return error.MissingEvent) {
         .popup_created => |value| value,
@@ -2983,7 +3062,7 @@ test "xdg-shell: unobserved create and destruction are both lossless at capacity
         .get_toplevel = .{ .id = 12 },
     });
     try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
-    const id = context.adapter.toplevelId(&context.adapter.toplevels[0]);
+    const id = context.adapter.toplevelId(context.adapter.toplevels[0]);
     try test_protocol.xdg_toplevel.encodeRequest(&context.requests, 12, .{ .destroy = .{} });
     try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
 

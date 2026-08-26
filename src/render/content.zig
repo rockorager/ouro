@@ -1,4 +1,4 @@
-//! Bounded renderer-side ownership of committed surface pixels.
+//! Byte-bounded renderer-side ownership of committed surface pixels.
 //!
 //! Callers prepare a complete candidate transactionally, then publish it at
 //! the same non-fallible edge as scene/presentation metadata. A uniquely-owned
@@ -133,7 +133,8 @@ pub const Store = struct {
             return error.InvalidSource;
         if (source_length > source.bytes.len) return error.InvalidSource;
 
-        const predecessor = self.currentSlot(identity.surface);
+        const predecessor_index = self.currentSlotIndex(identity.surface);
+        const predecessor = if (predecessor_index) |index| &self.slots[index] else null;
         if (predecessor) |slot| {
             if (identity.commit_sequence <= slot.identity.commit_sequence)
                 return error.StaleCommit;
@@ -148,9 +149,9 @@ pub const Store = struct {
             std.meta.eql(slot.source.size, source.size) and slot.source.format == source.format
         else
             false;
-        const index = self.freeSlot() orelse return error.VersionCapacityExceeded;
         if (packed_length > self.byte_capacity - self.used_bytes)
             return error.ByteCapacityExceeded;
+        const index = try self.claimSlot();
         // Full candidates can be copied straight into device upload memory.
         // Partial histories remain CPU-owned so future adjacent commits can
         // patch them in place without racing a GPU read or cloning the frame.
@@ -168,7 +169,7 @@ pub const Store = struct {
         });
 
         if (compatible and !coversSource(damage, source.size)) {
-            @memcpy(bytes, predecessor.?.source.bytes);
+            @memcpy(bytes, self.slots[predecessor_index.?].source.bytes);
             copyDamage(bytes, packed_stride, source, damage);
         } else {
             copyFull(bytes, packed_stride, source);
@@ -238,8 +239,8 @@ pub const Store = struct {
                 return error.NonAdjacentCommit;
             if (identity.commit_sequence != next) return error.NonAdjacentCommit;
         }
-        const index = self.freeSlot() orelse return error.VersionCapacityExceeded;
         if (logical_bytes > self.byte_capacity - self.used_bytes) return error.ByteCapacityExceeded;
+        const index = try self.claimSlot();
         const provider = self.provider orelse return error.NativeProviderUnavailable;
         const allocate_fn = provider.allocate_native_fn orelse return error.NativeProviderUnavailable;
         const prepare_fn = provider.prepare_native_fn orelse return error.NativeProviderUnavailable;
@@ -424,9 +425,28 @@ pub const Store = struct {
         return null;
     }
 
+    fn currentSlotIndex(self: *const Store, surface: u64) ?usize {
+        for (self.slots, 0..) |slot, index| if (slot.state == .published and
+            slot.current and slot.identity.surface == surface)
+            return index;
+        return null;
+    }
+
     fn freeSlot(self: *const Store) ?usize {
         for (self.slots, 0..) |slot, index| if (slot.state == .free) return index;
         return null;
+    }
+
+    fn claimSlot(self: *Store) !usize {
+        if (self.freeSlot()) |index| return index;
+        if (self.slots.len == std.math.maxInt(u32))
+            return error.VersionCapacityExceeded;
+        const old_len = self.slots.len;
+        const doubled = std.math.mul(usize, old_len, 2) catch std.math.maxInt(u32);
+        const new_len = @min(doubled, std.math.maxInt(u32));
+        self.slots = try self.allocator.realloc(self.slots, new_len);
+        @memset(self.slots[old_len..], .{});
+        return old_len;
     }
 
     fn preparedSlot(self: *Store, prepared: Prepared) ?*Slot {
@@ -765,7 +785,7 @@ test "render-content: prepare failure and cancellation preserve published conten
         testSource(&second, 1, 1, 4),
         testDamage(&.{.{ .min_x = 0, .min_y = 0, .max_x = 1, .max_y = 1 }}),
     );
-    try std.testing.expectError(error.VersionCapacityExceeded, store.prepare(
+    try std.testing.expectError(error.ByteCapacityExceeded, store.prepare(
         .{ .surface = 2, .commit_sequence = 1 },
         testSource(&second, 1, 1, 4),
         .{},
@@ -773,6 +793,34 @@ test "render-content: prepare failure and cancellation preserve published conten
     store.cancel(prepared);
     try std.testing.expectEqualSlices(u8, &first, (try store.resolve(handle)).bytes);
     store.release(handle);
+}
+
+test "render-content: versions grow beyond initial capacity with stable handles" {
+    var store = try Store.init(std.testing.allocator, .{ .version_capacity = 1, .byte_capacity = 12 });
+    defer store.deinit();
+    const bytes = [_]u8{ 1, 2, 3, 4 };
+    const first = store.publish(try store.prepare(
+        .{ .surface = 1, .commit_sequence = 1 },
+        testSource(&bytes, 1, 1, 4),
+        .{},
+    ));
+    const second = store.publish(try store.prepare(
+        .{ .surface = 2, .commit_sequence = 1 },
+        testSource(&bytes, 1, 1, 4),
+        .{},
+    ));
+    const third = store.publish(try store.prepare(
+        .{ .surface = 3, .commit_sequence = 1 },
+        testSource(&bytes, 1, 1, 4),
+        .{},
+    ));
+    try std.testing.expect(store.slots.len >= 3);
+    try std.testing.expectEqualSlices(u8, &bytes, (try store.resolve(first)).bytes);
+    try std.testing.expectEqualSlices(u8, &bytes, (try store.resolve(second)).bytes);
+    try std.testing.expectEqualSlices(u8, &bytes, (try store.resolve(third)).bytes);
+    store.release(first);
+    store.release(second);
+    store.release(third);
 }
 
 test "render-content: unique replacement is transactional and allocation-free" {

@@ -5,7 +5,7 @@
 // advances through the same ordered sample loop.
 
 layout(local_size_x = 8, local_size_y = 8) in;
-layout(set = 0, binding = 0, rgba8) uniform writeonly image2D target_image;
+layout(set = 0, binding = 0, rgba8) uniform image2D target_image;
 
 struct Sample {
     uvec4 source;       // reserved, width, height, reserved
@@ -18,7 +18,7 @@ struct Sample {
 };
 
 layout(std430, set = 0, binding = 1) readonly buffer Samples { Sample items[]; };
-layout(set = 0, binding = 3) uniform sampler2D source_images[8];
+layout(set = 0, binding = 3) uniform sampler2D source_images[32];
 
 layout(push_constant) uniform Frame {
     uvec4 clear_color;  // straight alpha, red, green, blue
@@ -55,14 +55,20 @@ void main() {
     if (local_damage.x >= int(frame.damage.z) || local_damage.y >= int(frame.damage.w)) return;
     ivec2 pixel = ivec2(frame.damage.xy) + local_damage;
 
+    // output_info.w's high bit is the continuation flag. A continuation loads
+    // the prior batch's premultiplied result instead of clearing the pixel.
+    bool continuation = (frame.output_info.w & 0x80000000u) != 0u;
+    uint sample_count = frame.output_info.w & 0x7fffffffu;
     uint alpha = frame.output_info.z == 1u ? 255u : frame.clear_color.x;
-    uvec4 color = uvec4(
-        multiply_unorm(frame.clear_color.y, alpha),
-        multiply_unorm(frame.clear_color.z, alpha),
-        multiply_unorm(frame.clear_color.w, alpha),
-        alpha
-    );
-    for (uint index = 0u; index < frame.output_info.w; ++index) {
+    uvec4 color = continuation
+        ? uvec4(round(imageLoad(target_image, pixel) * 255.0)).bgra
+        : uvec4(
+            multiply_unorm(frame.clear_color.y, alpha),
+            multiply_unorm(frame.clear_color.z, alpha),
+            multiply_unorm(frame.clear_color.w, alpha),
+            alpha
+        );
+    for (uint index = 0u; index < sample_count; ++index) {
         Sample item = items[index];
         ivec2 destination_end = item.destination.xy + item.destination.zw;
         ivec2 clip_end = item.clip.xy + item.clip.zw;

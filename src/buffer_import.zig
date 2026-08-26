@@ -84,6 +84,7 @@ pub fn Registry(comptime Backing: type) type {
         };
 
         slots: []Slot,
+        allocator: std.mem.Allocator,
         free_head: u32,
         active_count: usize = 0,
         dispose_context: ?*anyopaque,
@@ -102,6 +103,7 @@ pub fn Registry(comptime Backing: type) type {
             };
             return .{
                 .slots = slots,
+                .allocator = allocator,
                 .free_head = 0,
                 .dispose_context = dispose_context,
                 .dispose = dispose,
@@ -119,7 +121,7 @@ pub fn Registry(comptime Backing: type) type {
         }
 
         pub fn acquire(registry: *Self, backing: Backing) Error!Lease {
-            if (registry.free_head == none) return error.Exhausted;
+            if (registry.free_head == none) try registry.grow();
             const index = registry.free_head;
             const slot = &registry.slots[index];
             registry.free_head = slot.next_free;
@@ -131,6 +133,17 @@ pub fn Registry(comptime Backing: type) type {
                 .token = .{ .index = index, .generation = slot.generation },
                 .release_fn = releaseErased,
             };
+        }
+
+        fn grow(registry: *Self) Error!void {
+            const old_len = registry.slots.len;
+            const new_len = @min(@as(usize, none), std.math.mul(usize, old_len, 2) catch none);
+            if (new_len <= old_len) return error.OutOfMemory;
+            registry.slots = try registry.allocator.realloc(registry.slots, new_len);
+            for (registry.slots[old_len..], old_len..) |*slot, index| slot.* = .{
+                .next_free = if (index + 1 < new_len) @intCast(index + 1) else none,
+            };
+            registry.free_head = @intCast(old_len);
         }
 
         pub fn get(registry: *Self, lease: Lease) Error!*Backing {
@@ -213,4 +226,18 @@ test "attachment validation preserves pending lease ownership" {
     try std.testing.expectEqual(@as(usize, 0), registry.available());
     state.deinit();
     try std.testing.expectEqual(@as(usize, 1), registry.available());
+}
+
+test "registry grows beyond its initial capacity" {
+    const TestRegistry = Registry(u8);
+    const Dispose = struct {
+        fn backing(_: ?*anyopaque, _: u8) void {}
+    };
+    var registry = try TestRegistry.init(std.testing.allocator, 1, null, Dispose.backing);
+    defer registry.deinit(std.testing.allocator);
+    var first = try registry.acquire(1);
+    var second = try registry.acquire(2);
+    try std.testing.expect(registry.slots.len > 1);
+    first.deinit();
+    second.deinit();
 }

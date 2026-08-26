@@ -35,6 +35,7 @@ const Node = struct {
 /// Physical command nodes shared by every mutable region and surface snapshot
 /// in one compositor shard.
 pub const Pool = struct {
+    allocator: std.mem.Allocator,
     nodes: []Node,
     free_head: u32,
     active_count: usize = 0,
@@ -46,7 +47,7 @@ pub const Pool = struct {
             @intCast(index + 1)
         else
             none;
-        return .{ .nodes = nodes, .free_head = 0 };
+        return .{ .allocator = allocator, .nodes = nodes, .free_head = 0 };
     }
 
     pub fn deinit(pool: *Pool, allocator: std.mem.Allocator) void {
@@ -64,12 +65,23 @@ pub const Pool = struct {
     }
 
     fn acquire(pool: *Pool, operation: Operation) Error!u32 {
-        if (pool.free_head == none) return error.Exhausted;
+        if (pool.free_head == none) try pool.grow();
         const index = pool.free_head;
         pool.free_head = pool.nodes[index].next;
         pool.nodes[index] = .{ .operation = operation };
         pool.active_count += 1;
         return index;
+    }
+
+    fn grow(pool: *Pool) Error!void {
+        const old_len = pool.nodes.len;
+        const new_len = @min(@as(usize, none), std.math.mul(usize, old_len, 2) catch none);
+        if (new_len <= old_len) return error.OutOfMemory;
+        pool.nodes = try pool.allocator.realloc(pool.nodes, new_len);
+        for (pool.nodes[old_len..], old_len..) |*node, index| node.* = .{
+            .next = if (index + 1 < new_len) @intCast(index + 1) else none,
+        };
+        pool.free_head = @intCast(old_len);
     }
 
     fn release(pool: *Pool, index: u32) void {
@@ -341,7 +353,7 @@ test "interaction: committed input region preserves ordered add and subtract sem
     try std.testing.expect(regions.inputContains(.{ .x = 5, .y = 5 }));
 }
 
-test "shared regions preserve ordered exact operations and copy transactionally" {
+test "shared regions grow while preserving ordered exact operations" {
     var pool = try Pool.init(std.testing.allocator, 5);
     defer pool.deinit(std.testing.allocator);
     var source = Region.init(&pool);
@@ -360,8 +372,9 @@ test "shared regions preserve ordered exact operations and copy transactionally"
     }));
 
     try source.add(.{ .x = 8, .y = 9, .width = 1, .height = 1 });
-    try std.testing.expectError(error.Exhausted, copy.cloneFrom(&source));
-    try std.testing.expectEqual(@as(usize, 2), copy.count);
+    try copy.cloneFrom(&source);
+    try std.testing.expectEqual(@as(usize, 3), copy.count);
+    try std.testing.expect(pool.nodes.len > 5);
 }
 
 test "committed input snapshot copies exact operations transactionally" {
@@ -392,7 +405,7 @@ test "committed input snapshot copies exact operations transactionally" {
     }, snapshot.operations);
 }
 
-test "surface region commit is atomic under shared pool pressure" {
+test "surface region commit grows shared pool atomically" {
     var pool = try Pool.init(std.testing.allocator, 5);
     defer pool.deinit(std.testing.allocator);
     var source = Region.init(&pool);
@@ -406,17 +419,13 @@ test "surface region commit is atomic under shared pool pressure" {
     var blocker = Region.init(&pool);
     defer blocker.deinit();
     try blocker.add(.{ .x = 9, .y = 9, .width = 1, .height = 1 });
-    try std.testing.expectError(error.Exhausted, regions.commit());
-    try std.testing.expectEqual(@as(usize, 0), regions.current_opaque.count);
-    try std.testing.expectEqual(@as(usize, 0), regions.current_input.count);
-    try std.testing.expect(regions.opaque_dirty and regions.input_dirty);
-    blocker.clear();
-
     const changes = try regions.commit();
     try std.testing.expect(changes.opaque_changed and changes.input_changed);
     try std.testing.expectEqual(@as(usize, 1), regions.current_opaque.count);
     try std.testing.expectEqual(@as(usize, 1), regions.current_input.count);
     try std.testing.expect(!regions.current_input_infinite);
+    try std.testing.expect(pool.nodes.len > 5);
+    blocker.clear();
 
     try regions.setInput(null);
     const null_change = try regions.commit();

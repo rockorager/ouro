@@ -99,16 +99,7 @@ pub fn Coordinator(comptime protocol: type) type {
             }
 
             pub fn order(scene: *InputScene, root: Adapter.SurfaceId) ![]const Adapter.SurfaceId {
-                return scene.coordinator.subcompositor_adapter.sceneOrder(
-                    root,
-                    scene.coordinator.subsurface_scene_order,
-                ) catch |err| switch (err) {
-                    error.NotSubsurface => single_surface: {
-                        scene.coordinator.subsurface_scene_order[0] = root;
-                        break :single_surface scene.coordinator.subsurface_scene_order[0..1];
-                    },
-                    else => return err,
-                };
+                return scene.coordinator.sceneOrder(root);
             }
 
             pub fn placement(scene: *InputScene, surface: Adapter.SurfaceId) !geometry.Point {
@@ -388,8 +379,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.pending_surface_len = 0;
             if (config.timer_capacity < 4 or config.desktop_transaction_timeout_ns == 0 or
                 config.output.max_samples < 2 or config.output.max_source_bytes == 0 or
-                config.output.max_samples < config.surface.surface_capacity or
-                config.protocol_output.association_capacity < config.output.max_samples)
+                config.protocol_output.association_capacity == 0)
                 return error.InvalidConfig;
             const app_layer_capacity = try std.math.add(
                 usize,
@@ -404,7 +394,6 @@ pub fn Coordinator(comptime protocol: type) type {
                 config.desktop.toplevel_capacity,
                 config.desktop.popup_capacity,
             );
-            if (config.interaction.window_capacity < scene_capacity) return error.InvalidConfig;
             self.scene_windows = try allocator.alloc(Desktop.SceneWindow, scene_capacity);
             errdefer allocator.free(self.scene_windows);
             self.frame_samples = try allocator.alloc(render_list.AppliedSurface, config.output.max_samples);
@@ -841,10 +830,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 return control;
             }
             if (try self.decoration_adapter.request(peer, target, message, fds)) |control| {
-                self.processDecorationEvents() catch |err| switch (err) {
-                    error.Backpressure => {},
-                    else => return err,
-                };
+                try self.processDecorationEvents();
                 try self.advanceShell();
                 if (self.decoration_adapter.pendingOutbound(peer))
                     self.markProtocol(peer, ProtocolReady.decoration);
@@ -944,12 +930,9 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (pointer.focus) |focus| focus.surface else null,
                 .{ .x = pointer.point.x, .y = pointer.point.y },
             );
-            try validatePendingRingAdmission(
-                self.pending_surfaces,
-                self.pending_surface_head,
-                self.pending_surface_len,
-                id,
-            );
+            if (self.pending_surface_len == self.pending_surfaces.len and
+                !self.pendingSurfaceContains(id))
+                try self.growPendingSurfaces();
         }
 
         fn surfaceCommitted(context: *anyopaque, id: Adapter.SurfaceId) !void {
@@ -965,7 +948,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.shell_adapter.publishSurfaceCommitted(id) catch unreachable;
             self.surface = self.adapter.surfaceHandle(id) catch unreachable;
             self.surface_id = id;
-            self.enqueuePendingSurface(.{ .handle = self.surface.?, .id = id, .commits = 1 });
+            try self.enqueuePendingSurface(.{ .handle = self.surface.?, .id = id, .commits = 1 });
         }
 
         fn pendingSurfaceContains(self: *const Self, id: Adapter.SurfaceId) bool {
@@ -977,7 +960,7 @@ pub fn Coordinator(comptime protocol: type) type {
             );
         }
 
-        fn enqueuePendingSurface(self: *Self, pending: PendingSurface) void {
+        fn enqueuePendingSurface(self: *Self, pending: PendingSurface) !void {
             for (0..self.pending_surface_len) |offset| {
                 const index = (self.pending_surface_head + offset) % self.pending_surfaces.len;
                 if (std.meta.eql(self.pending_surfaces[index].id, pending.id)) {
@@ -985,11 +968,25 @@ pub fn Coordinator(comptime protocol: type) type {
                     return;
                 }
             }
-            std.debug.assert(self.pending_surface_len < self.pending_surfaces.len);
+            if (self.pending_surface_len == self.pending_surfaces.len)
+                try self.growPendingSurfaces();
             const tail = (self.pending_surface_head + self.pending_surface_len) %
                 self.pending_surfaces.len;
             self.pending_surfaces[tail] = pending;
             self.pending_surface_len += 1;
+        }
+
+        fn growPendingSurfaces(self: *Self) !void {
+            const capacity = std.math.mul(usize, self.pending_surfaces.len, 2) catch
+                return error.OutOfMemory;
+            const replacement = try self.allocator.alloc(PendingSurface, capacity);
+            for (0..self.pending_surface_len) |offset| {
+                const index = (self.pending_surface_head + offset) % self.pending_surfaces.len;
+                replacement[offset] = self.pending_surfaces[index];
+            }
+            self.allocator.free(self.pending_surfaces);
+            self.pending_surfaces = replacement;
+            self.pending_surface_head = 0;
         }
 
         fn pendingCommitApplied(self: *Self, id: Adapter.SurfaceId) void {
@@ -1296,7 +1293,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 }
                 if (self.desktop.peekInteractiveRequest()) |interactive_request| {
                     self.interaction.beginInteractive(&self.desktop, interactive_request) catch |err| switch (err) {
-                        error.Exhausted, error.Backpressure => break,
+                        error.Exhausted => break,
                         error.StaleToplevel => {
                             self.desktop.dropInteractiveRequest();
                             continue;
@@ -1314,10 +1311,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.stats.shell_events += consumed;
             }
             while (self.desktop.pendingCommands() != 0) {
-                if (self.desktop.flushConfigure(&self.shell_adapter) catch |err| switch (err) {
-                    error.Exhausted => break,
-                    else => return err,
-                }) |_| self.stats.configures += 1;
+                if (try self.desktop.flushConfigure(&self.shell_adapter)) |_|
+                    self.stats.configures += 1;
             }
             self.interaction.setPopupGrab(self.desktop.popupGrabTarget());
             try self.syncDesktopTimer();
@@ -1577,10 +1572,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn flushProtocol(self: *Self) !void {
-            self.processDecorationEvents() catch |err| switch (err) {
-                error.Backpressure => {},
-                else => return err,
-            };
+            try self.processDecorationEvents();
             try self.advanceShell();
             for (self.clients.items) |client| if (client.active and client.protocol_ready != 0)
                 try self.flushProtocolOn(client.peer);
@@ -1873,7 +1865,7 @@ pub fn Coordinator(comptime protocol: type) type {
             else
                 false;
             var layer = if (surface_scene != null)
-                self.appLayerForSurface(exact_surface_id) orelse return false
+                try self.appLayerForSurface(exact_surface_id)
             else if (requested_cursor)
                 &self.cursor_layer
             else
@@ -1885,7 +1877,7 @@ pub fn Coordinator(comptime protocol: type) type {
             if (layer.candidate == null) {
                 if (!try self.admitReadyBatch(surface)) return false;
                 layer = if (surface_scene != null)
-                    self.appLayerForSurface(exact_surface_id) orelse return false
+                    try self.appLayerForSurface(exact_surface_id)
                 else
                     &self.cursor_layer;
                 if (layer.candidate == null or
@@ -1904,7 +1896,9 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.finishPendingCandidate(pending.id);
                 return true;
             };
-            _ = attachment.buffer orelse return error.MissingBuffer;
+            if (attachment.buffer == null) {
+                return self.discardPendingCandidate(layer, pending.id);
+            }
             const lease = content.attachment_lease orelse return error.MissingLease;
             var source = try self.adapter.bufferSource(lease);
             var source_access_owned = true;
@@ -2247,60 +2241,62 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn renderFrame(self: *Self, frame: @import("../output/headless.zig").FrameId) !void {
             const output = self.output orelse return;
-            var count: usize = 0;
-            const windows = try self.desktop.sceneSnapshot(self.scene_windows);
+            var sample_count: usize = 0;
+            var change_count: usize = 0;
+            const windows = try self.desktop.sceneSnapshotGrowing(
+                self.allocator,
+                &self.scene_windows,
+            );
             for (windows) |window| {
                 if (!window.visible) continue;
-                const surfaces = self.subcompositor_adapter.sceneOrder(
-                    window.surface,
-                    self.subsurface_scene_order,
-                ) catch |err| switch (err) {
-                    error.NotSubsurface => single_surface: {
-                        self.subsurface_scene_order[0] = window.surface;
-                        break :single_surface self.subsurface_scene_order[0..1];
-                    },
-                    else => return err,
-                };
+                const surfaces = try self.sceneOrder(window.surface);
                 for (surfaces) |surface| {
                     const layer = self.findAppLayer(surface) orelse continue;
                     if (!layer.active) continue;
                     if (!try self.refreshSubsurfaceLayer(layer, output.planner.output)) continue;
-                    if (count == self.frame_samples.len) return error.OutputTooSmall;
-                    self.frame_samples[count] = layer.sample.?;
-                    self.frame_bindings[count] = layer.binding.?;
-                    self.frame_changes[count] = layer.change.?;
-                    count += 1;
+                    try self.ensureFrameStorage(@max(sample_count, change_count) + 1);
+                    self.frame_samples[sample_count] = layer.sample.?;
+                    self.frame_bindings[sample_count] = layer.binding.?;
+                    self.frame_changes[change_count] = layer.change.?;
+                    sample_count += 1;
+                    change_count += 1;
                 }
+            }
+            for (self.removed_layers[0..self.removed_layer_len]) |removed| {
+                try self.ensureFrameStorage(@max(sample_count, change_count) + 1);
+                self.frame_changes[change_count] = .{ .previous = removed.state };
+                change_count += 1;
             }
             if (self.cursor_layer.active) {
                 if (try self.interaction.cursor.composite(.{
                     .surface = self.cursor_layer.id.?,
                     .sample = self.cursor_layer.sample.?,
                 }, output.planner.output)) |cursor_sample| {
-                    if (count == self.frame_samples.len) return error.OutputTooSmall;
-                    self.frame_samples[count] = cursor_sample;
-                    self.frame_bindings[count] = self.cursor_layer.binding.?;
-                    self.frame_changes[count] = self.cursor_layer.change.?;
-                    self.frame_changes[count].current = damage.SurfaceState.fromSample(cursor_sample, .{
+                    try self.ensureFrameStorage(@max(sample_count, change_count) + 1);
+                    self.frame_samples[sample_count] = cursor_sample;
+                    self.frame_bindings[sample_count] = self.cursor_layer.binding.?;
+                    self.frame_changes[change_count] = self.cursor_layer.change.?;
+                    self.frame_changes[change_count].current = damage.SurfaceState.fromSample(cursor_sample, .{
                         .width = cursor_sample.destination.width,
                         .height = cursor_sample.destination.height,
                     });
-                    self.frame_changes[count].invalidate_bounds = true;
+                    self.frame_changes[change_count].invalidate_bounds = true;
                     self.cursor_layer.sample = cursor_sample;
-                    self.cursor_layer.change = self.frame_changes[count];
-                    count += 1;
+                    self.cursor_layer.change = self.frame_changes[change_count];
+                    sample_count += 1;
+                    change_count += 1;
                 }
             }
-            var change_count = count;
-            for (self.removed_layers[0..self.removed_layer_len]) |removed| {
-                self.frame_changes[change_count] = .{ .previous = removed.state };
-                change_count += 1;
+            if (sample_count == 0 and change_count == 0) {
+                const result = try output.renderFrame(frame, &.{}, &.{}, &.{}, try monotonicNs());
+                if (result == .retired) try self.finishOutcome(result.retired.frame, false);
+                return;
             }
             switch (try output.renderFrame(
                 frame,
-                self.frame_samples[0..count],
+                self.frame_samples[0..sample_count],
                 self.frame_changes[0..change_count],
-                self.frame_bindings[0..count],
+                self.frame_bindings[0..sample_count],
                 try monotonicNs(),
             )) {
                 .submitted => {
@@ -2347,6 +2343,43 @@ pub fn Coordinator(comptime protocol: type) type {
                 .invalidate_bounds = true,
             };
             return true;
+        }
+
+        fn ensureFrameStorage(self: *Self, needed: usize) !void {
+            if (self.frame_samples.len >= needed) return;
+            var capacity = self.frame_samples.len;
+            while (capacity < needed) capacity = std.math.mul(usize, capacity, 2) catch
+                return error.OutOfMemory;
+            self.frame_samples = try self.allocator.realloc(self.frame_samples, capacity);
+            self.frame_bindings = try self.allocator.realloc(self.frame_bindings, capacity);
+            self.frame_changes = try self.allocator.realloc(self.frame_changes, capacity);
+        }
+
+        fn sceneOrder(self: *Self, root: Adapter.SurfaceId) ![]Adapter.SurfaceId {
+            while (true) {
+                return self.subcompositor_adapter.sceneOrder(
+                    root,
+                    self.subsurface_scene_order,
+                ) catch |err| switch (err) {
+                    error.NotSubsurface => single_surface: {
+                        self.subsurface_scene_order[0] = root;
+                        break :single_surface self.subsurface_scene_order[0..1];
+                    },
+                    error.OutputTooSmall => {
+                        const capacity = std.math.mul(
+                            usize,
+                            self.subsurface_scene_order.len,
+                            2,
+                        ) catch return error.OutOfMemory;
+                        self.subsurface_scene_order = try self.allocator.realloc(
+                            self.subsurface_scene_order,
+                            capacity,
+                        );
+                        continue;
+                    },
+                    else => return err,
+                };
+            }
         }
 
         fn processOutput(self: *Self) !void {
@@ -2546,14 +2579,18 @@ pub fn Coordinator(comptime protocol: type) type {
             return null;
         }
 
-        fn appLayerForSurface(self: *Self, id: Adapter.SurfaceId) ?*Layer {
+        fn appLayerForSurface(self: *Self, id: Adapter.SurfaceId) !*Layer {
             for (self.app_layers) |*layer|
                 if (layer.candidate) |candidate| if (std.meta.eql(candidate.id, id)) return layer;
             for (self.app_layers) |*layer| {
                 if (layer.id) |current| if (std.meta.eql(current, id)) return layer;
             }
             for (self.app_layers) |*layer| if (layerVacant(layer)) return layer;
-            return null;
+            const old_len = self.app_layers.len;
+            const capacity = std.math.mul(usize, old_len, 2) catch return error.OutOfMemory;
+            self.app_layers = try self.allocator.realloc(self.app_layers, capacity);
+            @memset(self.app_layers[old_len..], .{});
+            return &self.app_layers[old_len];
         }
 
         fn surfaceScene(self: *Self, id: Adapter.SurfaceId) ?SurfaceScene {
@@ -2609,6 +2646,13 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn syncOutputAssociations(self: *Self) !void {
+            const needed = std.math.add(usize, self.app_layers.len, 1) catch
+                return error.OutOfMemory;
+            if (self.association_surfaces.len < needed)
+                self.association_surfaces = try self.allocator.realloc(
+                    self.association_surfaces,
+                    needed,
+                );
             for (self.clients.items) |client| if (client.active) {
                 var count: usize = 0;
                 for (self.app_layers) |layer| {
@@ -2704,7 +2748,13 @@ pub fn Coordinator(comptime protocol: type) type {
             const layer = self.findAppLayer(id) orelse return;
             if (!layer.active) return;
             const state = (layer.change orelse return).current orelse return;
-            std.debug.assert(self.removed_layer_len < self.removed_layers.len);
+            if (self.removed_layer_len == self.removed_layers.len) {
+                const capacity = std.math.mul(usize, self.removed_layers.len, 2) catch return;
+                self.removed_layers = self.allocator.realloc(
+                    self.removed_layers,
+                    capacity,
+                ) catch return;
+            }
             self.removed_layers[self.removed_layer_len] = .{ .id = id, .state = state };
             self.removed_layer_len += 1;
             if (self.output) |output| {
@@ -2866,11 +2916,6 @@ fn pendingRingContains(entries: anytype, head: usize, len: usize, id: anytype) b
         if (std.meta.eql(entries[index].id, id)) return true;
     }
     return false;
-}
-
-fn validatePendingRingAdmission(entries: anytype, head: usize, len: usize, id: anytype) !void {
-    if (len == entries.len and !pendingRingContains(entries, head, len, id))
-        return error.Exhausted;
 }
 
 fn removePendingRingEntry(entries: anytype, head: *usize, len: *usize, id: anytype) void {
@@ -3096,27 +3141,6 @@ test "physical: wrapped pending removal preserves exact order and counts" {
     const second = (head + 1) % entries.len;
     try std.testing.expectEqual(Id{ .index = 30, .generation = 3 }, entries[second].id);
     try std.testing.expectEqual(@as(usize, 33), entries[second].commits);
-}
-
-test "physical: full pending admission distinguishes exact retained surface" {
-    const Id = struct { index: u32, generation: u32 };
-    const Entry = struct { id: Id };
-    const entries = [_]Entry{
-        .{ .id = .{ .index = 1, .generation = 7 } },
-        .{ .id = .{ .index = 2, .generation = 9 } },
-    };
-    try validatePendingRingAdmission(
-        &entries,
-        1,
-        entries.len,
-        Id{ .index = 1, .generation = 7 },
-    );
-    try std.testing.expectError(error.Exhausted, validatePendingRingAdmission(
-        &entries,
-        1,
-        entries.len,
-        Id{ .index = 3, .generation = 11 },
-    ));
 }
 
 test "physical: retained candidate matches only its exact pending owner" {

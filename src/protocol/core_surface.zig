@@ -216,10 +216,10 @@ pub fn Adapter(comptime protocol: type) type {
         viewporter_global: ?objects.Handle = null,
         presentation_global: ?objects.Handle = null,
         compositor_version: u32,
-        surfaces: []SurfaceSlot,
-        regions: []RegionSlot,
-        viewports: []ViewportSlot,
-        presentation_resources: []PresentationResource,
+        surfaces: []*SurfaceSlot,
+        regions: []*RegionSlot,
+        viewports: []*ViewportSlot,
+        presentation_resources: []*PresentationResource,
         surface_free: u32,
         region_free: u32,
         viewport_free: u32,
@@ -250,22 +250,23 @@ pub fn Adapter(comptime protocol: type) type {
             try config.validate();
             try Compositor.info.validateVersion(config.compositor_version);
 
-            const surfaces = try allocator.alloc(SurfaceSlot, config.surface_capacity);
-            errdefer allocator.free(surfaces);
+            const surfaces = try allocSlots(SurfaceSlot, allocator, config.surface_capacity);
+            errdefer freeSlots(SurfaceSlot, allocator, surfaces);
             const commit_dependencies = try allocator.alloc(
                 UpdateToken,
                 config.surface_capacity,
             );
             errdefer allocator.free(commit_dependencies);
-            const regions = try allocator.alloc(RegionSlot, config.region_capacity);
-            errdefer allocator.free(regions);
-            const viewports = try allocator.alloc(ViewportSlot, config.viewport_capacity);
-            errdefer allocator.free(viewports);
-            const presentation_resources = try allocator.alloc(
+            const regions = try allocSlots(RegionSlot, allocator, config.region_capacity);
+            errdefer freeSlots(RegionSlot, allocator, regions);
+            const viewports = try allocSlots(ViewportSlot, allocator, config.viewport_capacity);
+            errdefer freeSlots(ViewportSlot, allocator, viewports);
+            const presentation_resources = try allocSlots(
                 PresentationResource,
+                allocator,
                 config.presentation_resource_capacity,
             );
-            errdefer allocator.free(presentation_resources);
+            errdefer freeSlots(PresentationResource, allocator, presentation_resources);
             var region_pool = try surface_state.RegionPool.init(
                 allocator,
                 config.region_operation_capacity,
@@ -309,16 +310,16 @@ pub fn Adapter(comptime protocol: type) type {
             const copy_storage = try allocator.alloc(u8, storage_len);
             errdefer allocator.free(copy_storage);
 
-            for (surfaces, 0..) |*slot, index| slot.* = .{
+            for (surfaces, 0..) |slot, index| slot.* = .{
                 .next_free = if (index + 1 < surfaces.len) @intCast(index + 1) else none,
             };
-            for (regions, 0..) |*slot, index| slot.* = .{
+            for (regions, 0..) |slot, index| slot.* = .{
                 .next_free = if (index + 1 < regions.len) @intCast(index + 1) else none,
             };
-            for (viewports, 0..) |*slot, index| slot.* = .{
+            for (viewports, 0..) |slot, index| slot.* = .{
                 .next_free = if (index + 1 < viewports.len) @intCast(index + 1) else none,
             };
-            for (presentation_resources, 0..) |*slot, index| slot.* = .{
+            for (presentation_resources, 0..) |slot, index| slot.* = .{
                 .next_free = if (index + 1 < presentation_resources.len) @intCast(index + 1) else none,
             };
             for (copies, 0..) |*slot, index| slot.* = .{
@@ -374,11 +375,11 @@ pub fn Adapter(comptime protocol: type) type {
             adapter.presentation_feedback_pool.deinit(adapter.allocator);
             adapter.frame_pool.deinit(adapter.allocator);
             adapter.region_pool.deinit(adapter.allocator);
-            adapter.allocator.free(adapter.regions);
-            adapter.allocator.free(adapter.surfaces);
+            freeSlots(RegionSlot, adapter.allocator, adapter.regions);
+            freeSlots(SurfaceSlot, adapter.allocator, adapter.surfaces);
             adapter.allocator.free(adapter.commit_dependencies);
-            adapter.allocator.free(adapter.viewports);
-            adapter.allocator.free(adapter.presentation_resources);
+            freeSlots(ViewportSlot, adapter.allocator, adapter.viewports);
+            freeSlots(PresentationResource, adapter.allocator, adapter.presentation_resources);
             adapter.allocator.free(adapter.copy_storage);
             adapter.allocator.free(adapter.copies);
             adapter.* = undefined;
@@ -526,7 +527,7 @@ pub fn Adapter(comptime protocol: type) type {
             queue: *wayring.tx.Queue,
         ) !usize {
             var completed: usize = 0;
-            for (adapter.presentation_resources) |*resource| {
+            for (adapter.presentation_resources) |resource| {
                 if (!resource.active or !samePeer(resource.peer, peer) or
                     !resource.clock_pending) continue;
                 if (server_objects.namespace.resolve(resource.resource) == null) continue;
@@ -656,7 +657,7 @@ pub fn Adapter(comptime protocol: type) type {
 
         pub fn getSurfaceById(adapter: *Self, id: SurfaceId) !*surface_state.Surface {
             if (id.index >= adapter.surfaces.len) return error.StaleSurface;
-            const slot = &adapter.surfaces[id.index];
+            const slot = adapter.surfaces[id.index];
             if (!slot.active or slot.resource.generation != id.generation)
                 return error.StaleSurface;
             return &slot.state;
@@ -664,7 +665,7 @@ pub fn Adapter(comptime protocol: type) type {
 
         pub fn surfacePeer(adapter: *Self, id: SurfaceId) !wayring.io_uring.Peer {
             if (id.index >= adapter.surfaces.len) return error.StaleSurface;
-            const slot = &adapter.surfaces[id.index];
+            const slot = adapter.surfaces[id.index];
             if (!slot.active or slot.resource.generation != id.generation)
                 return error.StaleSurface;
             return slot.peer;
@@ -688,7 +689,7 @@ pub fn Adapter(comptime protocol: type) type {
             id: SurfaceId,
         ) !?UpdateToken {
             if (id.index >= adapter.surfaces.len) return error.StaleSurface;
-            const slot = &adapter.surfaces[id.index];
+            const slot = adapter.surfaces[id.index];
             if (!slot.active or slot.resource.generation != id.generation)
                 return error.StaleSurface;
             return slot.updates.newestSync();
@@ -696,7 +697,7 @@ pub fn Adapter(comptime protocol: type) type {
 
         pub fn transitionSurfaceDesync(adapter: *Self, id: SurfaceId) !usize {
             if (id.index >= adapter.surfaces.len) return error.StaleSurface;
-            const slot = &adapter.surfaces[id.index];
+            const slot = adapter.surfaces[id.index];
             if (!slot.active or slot.resource.generation != id.generation)
                 return error.StaleSurface;
             return adapter.scheduler.transitionDesync(&slot.updates);
@@ -710,7 +711,7 @@ pub fn Adapter(comptime protocol: type) type {
             point: @import("../scene/geometry.zig").Point,
         ) !bool {
             if (id.index >= adapter.surfaces.len) return error.StaleSurface;
-            const slot = &adapter.surfaces[id.index];
+            const slot = adapter.surfaces[id.index];
             if (!slot.active or slot.resource.generation != id.generation)
                 return error.StaleSurface;
             const size = slot.state.committedSize();
@@ -729,7 +730,7 @@ pub fn Adapter(comptime protocol: type) type {
             destination: []region_state.Operation,
         ) !InputSnapshot {
             if (id.index >= adapter.surfaces.len) return error.StaleSurface;
-            const slot = &adapter.surfaces[id.index];
+            const slot = adapter.surfaces[id.index];
             if (!slot.active or slot.resource.generation != id.generation)
                 return error.StaleSurface;
             const size = slot.state.committedSize();
@@ -747,7 +748,7 @@ pub fn Adapter(comptime protocol: type) type {
         /// is recovered and generation-checked at the protocol boundary.
         pub fn surfaceHandle(adapter: *Self, id: SurfaceId) !objects.Handle {
             if (id.index >= adapter.surfaces.len) return error.StaleSurface;
-            const slot = &adapter.surfaces[id.index];
+            const slot = adapter.surfaces[id.index];
             if (!slot.active or slot.resource.generation != id.generation)
                 return error.StaleSurface;
             return slot.resource;
@@ -1158,7 +1159,8 @@ pub fn Adapter(comptime protocol: type) type {
                 ),
                 .frame => |value| {
                     if (adapter.frame_pool.available() == 0)
-                        return try adapter.noMemory(actor);
+                        surface_state.growCallbackPool(adapter.allocator, &adapter.frame_pool) catch
+                            return try adapter.noMemory(actor);
                     const admitted = SurfaceInterface.admit_frame(
                         server_objects,
                         resource,
@@ -1187,8 +1189,10 @@ pub fn Adapter(comptime protocol: type) type {
                     if (adapter.commit_hook) |hook|
                         hook.validate_fn(hook.context, surface_id) catch |cause|
                             return try adapter.surfaceFailure(actor, resource.id, cause);
-                    const content_plan = if (adapter.content_commit_hook) |hook|
-                        hook.plan_fn(
+                    const content_plan = if (adapter.content_commit_hook) |hook| plan: {
+                        adapter.ensureCommitDependencies(adapter.surfaces.len) catch |cause|
+                            return try adapter.surfaceFailure(actor, resource.id, cause);
+                        break :plan hook.plan_fn(
                             hook.context,
                             surface_id,
                             adapter.commit_dependencies,
@@ -1196,9 +1200,8 @@ pub fn Adapter(comptime protocol: type) type {
                             actor,
                             resource.id,
                             cause,
-                        )
-                    else
-                        ContentCommitPlan{};
+                        );
+                    } else ContentCommitPlan{};
                     if (content_plan.dependency_count > adapter.commit_dependencies.len)
                         return try adapter.surfaceFailure(
                             actor,
@@ -1245,7 +1248,8 @@ pub fn Adapter(comptime protocol: type) type {
                 .offset => |value| slot.state.setOffset(value.x, value.y),
                 .get_release => |value| {
                     if (adapter.release_pool.available() == 0)
-                        return try adapter.noMemory(actor);
+                        surface_state.growCallbackPool(adapter.allocator, &adapter.release_pool) catch
+                            return try adapter.noMemory(actor);
                     const admitted = SurfaceInterface.admit_get_release(
                         server_objects,
                         resource,
@@ -1422,7 +1426,8 @@ pub fn Adapter(comptime protocol: type) type {
                     if (!std.meta.eql(surface.resource, surface_handle))
                         return try adapter.protocolError(actor, decoded.handle.id, 0, "invalid feedback surface");
                     if (adapter.presentation_feedback_pool.available() == 0)
-                        return try adapter.noMemory(actor);
+                        surface_state.growCallbackPool(adapter.allocator, &adapter.presentation_feedback_pool) catch
+                            return try adapter.noMemory(actor);
                     const admitted = Presentation.admit_feedback(
                         server_objects,
                         decoded.handle,
@@ -1556,9 +1561,9 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         fn acquireSurface(adapter: *Self) !*SurfaceSlot {
-            if (adapter.surface_free == none) return error.Exhausted;
+            if (adapter.surface_free == none) try adapter.growSlots(SurfaceSlot, &adapter.surfaces, &adapter.surface_free);
             const index = adapter.surface_free;
-            const slot = &adapter.surfaces[index];
+            const slot = adapter.surfaces[index];
             adapter.surface_free = slot.next_free;
             slot.* = .{
                 .active = true,
@@ -1573,7 +1578,7 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         fn releaseSurface(adapter: *Self, index: u32) void {
-            const slot = &adapter.surfaces[index];
+            const slot = adapter.surfaces[index];
             if (!slot.active) return;
             // The queue is initialized only after generated object admission.
             if (slot.resource.id != 0) {
@@ -1603,9 +1608,9 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         fn acquireRegion(adapter: *Self) !*RegionSlot {
-            if (adapter.region_free == none) return error.Exhausted;
+            if (adapter.region_free == none) try adapter.growSlots(RegionSlot, &adapter.regions, &adapter.region_free);
             const index = adapter.region_free;
-            const slot = &adapter.regions[index];
+            const slot = adapter.regions[index];
             adapter.region_free = slot.next_free;
             slot.* = .{
                 .active = true,
@@ -1615,7 +1620,7 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         fn releaseRegion(adapter: *Self, index: u32) void {
-            const slot = &adapter.regions[index];
+            const slot = adapter.regions[index];
             if (!slot.active) return;
             slot.region.deinit();
             slot.* = .{ .next_free = adapter.region_free };
@@ -1623,16 +1628,16 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         fn acquireViewport(adapter: *Self) !*ViewportSlot {
-            if (adapter.viewport_free == none) return error.Exhausted;
+            if (adapter.viewport_free == none) try adapter.growSlots(ViewportSlot, &adapter.viewports, &adapter.viewport_free);
             const index = adapter.viewport_free;
-            const slot = &adapter.viewports[index];
+            const slot = adapter.viewports[index];
             adapter.viewport_free = slot.next_free;
             slot.* = .{ .active = true };
             return slot;
         }
 
         fn releaseViewport(adapter: *Self, index: u32) void {
-            const slot = &adapter.viewports[index];
+            const slot = adapter.viewports[index];
             if (!slot.active) return;
             adapter.clearViewport(slot);
             slot.* = .{ .next_free = adapter.viewport_free };
@@ -1640,16 +1645,16 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         fn acquirePresentationResource(adapter: *Self) !*PresentationResource {
-            if (adapter.presentation_resource_free == none) return error.Exhausted;
+            if (adapter.presentation_resource_free == none) try adapter.growSlots(PresentationResource, &adapter.presentation_resources, &adapter.presentation_resource_free);
             const index = adapter.presentation_resource_free;
-            const resource = &adapter.presentation_resources[index];
+            const resource = adapter.presentation_resources[index];
             adapter.presentation_resource_free = resource.next_free;
             resource.* = .{ .active = true };
             return resource;
         }
 
         fn releasePresentationResource(adapter: *Self, index: u32) void {
-            const resource = &adapter.presentation_resources[index];
+            const resource = adapter.presentation_resources[index];
             if (!resource.active) return;
             resource.* = .{ .next_free = adapter.presentation_resource_free };
             adapter.presentation_resource_free = index;
@@ -1666,14 +1671,14 @@ pub fn Adapter(comptime protocol: type) type {
 
         fn viewportSurface(adapter: *Self, slot: *const ViewportSlot) !*SurfaceSlot {
             if (slot.surface.index >= adapter.surfaces.len) return error.StaleSurface;
-            const surface = &adapter.surfaces[slot.surface.index];
+            const surface = adapter.surfaces[slot.surface.index];
             if (!surface.active or surface.resource.generation != slot.surface.generation)
                 return error.StaleSurface;
             return surface;
         }
 
         fn resolveSurface(adapter: *Self, handle: objects.Handle) !*SurfaceSlot {
-            for (adapter.surfaces) |*slot| {
+            for (adapter.surfaces) |slot| {
                 if (slot.active and std.meta.eql(slot.resource, handle)) return slot;
             }
             return error.StaleSurface;
@@ -1785,40 +1790,76 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         fn surfaceIndex(adapter: *Self, slot: *SurfaceSlot) u32 {
-            return @intCast((@intFromPtr(slot) - @intFromPtr(adapter.surfaces.ptr)) /
-                @sizeOf(SurfaceSlot));
+            return slotIndex(SurfaceSlot, adapter.surfaces, slot);
         }
 
         fn regionIndex(adapter: *Self, slot: *RegionSlot) u32 {
-            return @intCast((@intFromPtr(slot) - @intFromPtr(adapter.regions.ptr)) /
-                @sizeOf(RegionSlot));
+            return slotIndex(RegionSlot, adapter.regions, slot);
         }
 
         fn viewportIndex(adapter: *Self, slot: *ViewportSlot) u32 {
-            return @intCast((@intFromPtr(slot) - @intFromPtr(adapter.viewports.ptr)) /
-                @sizeOf(ViewportSlot));
+            return slotIndex(ViewportSlot, adapter.viewports, slot);
         }
 
         fn presentationResourceIndex(adapter: *Self, resource: *PresentationResource) u32 {
-            return @intCast((@intFromPtr(resource) - @intFromPtr(adapter.presentation_resources.ptr)) /
-                @sizeOf(PresentationResource));
+            return slotIndex(PresentationResource, adapter.presentation_resources, resource);
+        }
+
+        fn allocSlots(comptime T: type, allocator: std.mem.Allocator, count: usize) ![]*T {
+            const slots = try allocator.alloc(*T, count);
+            errdefer allocator.free(slots);
+            var initialized: usize = 0;
+            errdefer for (slots[0..initialized]) |slot| allocator.destroy(slot);
+            while (initialized < count) : (initialized += 1)
+                slots[initialized] = try allocator.create(T);
+            return slots;
+        }
+
+        fn freeSlots(comptime T: type, allocator: std.mem.Allocator, slots: []*T) void {
+            for (slots) |slot| allocator.destroy(slot);
+            allocator.free(slots);
+        }
+
+        fn growSlots(adapter: *Self, comptime T: type, slots: *[]*T, free_head: *u32) !void {
+            const old_len = slots.len;
+            if (old_len >= none - 1) return error.OutOfMemory;
+            const new_len = @min(@as(usize, none - 1), old_len + @max(old_len, 1));
+            slots.* = try adapter.allocator.realloc(slots.*, new_len);
+            var initialized = old_len;
+            errdefer {
+                for (slots.*[old_len..initialized]) |slot| adapter.allocator.destroy(slot);
+                slots.* = adapter.allocator.realloc(slots.*, old_len) catch slots.*[0..old_len];
+            }
+            while (initialized < new_len) : (initialized += 1) {
+                const slot = try adapter.allocator.create(T);
+                slot.* = .{ .next_free = if (initialized + 1 < new_len) @intCast(initialized + 1) else none };
+                slots.*[initialized] = slot;
+            }
+            free_head.* = @intCast(old_len);
+        }
+
+        fn slotIndex(comptime T: type, slots: []*T, target: *T) u32 {
+            for (slots, 0..) |slot, index| if (slot == target) return @intCast(index);
+            unreachable;
+        }
+
+        fn ensureCommitDependencies(adapter: *Self, minimum: usize) !void {
+            if (adapter.commit_dependencies.len >= minimum) return;
+            adapter.commit_dependencies = try adapter.allocator.realloc(
+                adapter.commit_dependencies,
+                minimum,
+            );
         }
 
         fn bindingFromContext(
             comptime T: type,
-            bindings: []T,
+            bindings: []*T,
             context: ?*anyopaque,
         ) ?*T {
             const pointer = context orelse return null;
-            const address = @intFromPtr(pointer);
-            const start = @intFromPtr(bindings.ptr);
-            const bytes = std.math.mul(usize, bindings.len, @sizeOf(T)) catch return null;
-            const end = std.math.add(usize, start, bytes) catch return null;
-            if (address < start or address >= end or (address - start) % @sizeOf(T) != 0)
-                return null;
-            const binding = &bindings[(address - start) / @sizeOf(T)];
-            if (!binding.active or @intFromPtr(binding) != address) return null;
-            return binding;
+            for (bindings) |binding| if (@intFromPtr(binding) == @intFromPtr(pointer))
+                return if (binding.active) binding else null;
+            return null;
         }
 
         fn targetVersion(server_objects: anytype, handle: objects.Handle) !u32 {
@@ -3050,6 +3091,49 @@ test "release callback and attachment publish in the same content update" {
     try std.testing.expectEqual(callback, content.release_callbacks.?.peek().?);
 }
 
+test "null attachment publishes an unmap update without a buffer lease" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const surface = try context.createSurface(10);
+    const buffer = try context.createShmBuffer(11, 12);
+
+    try test_protocol.wl_surface.encodeRequest(&context.requests, surface.id, .{
+        .attach = .{ .buffer = buffer.id, .x = 0, .y = 0 },
+    });
+    _ = try context.dispatchCore();
+    try test_protocol.wl_surface.encodeRequest(
+        &context.requests,
+        surface.id,
+        .{ .commit = .{} },
+    );
+    _ = try context.dispatchCore();
+    try context.completeNextCopy();
+    var output: [1]TestAdapter.Applied = undefined;
+    var mapped = (try context.adapter.tryApply(surface, &output))[0].payload;
+    try std.testing.expect(mapped.surface.attachment.?.buffer != null);
+    try std.testing.expect(mapped.attachment_lease != null);
+    mapped.deinit();
+
+    try test_protocol.wl_surface.encodeRequest(&context.requests, surface.id, .{
+        .attach = .{ .buffer = null, .x = 0, .y = 0 },
+    });
+    _ = try context.dispatchCore();
+    try test_protocol.wl_surface.encodeRequest(
+        &context.requests,
+        surface.id,
+        .{ .commit = .{} },
+    );
+    _ = try context.dispatchCore();
+
+    var unmapped = (try context.adapter.tryApply(surface, &output))[0].payload;
+    defer unmapped.deinit();
+    try std.testing.expect(unmapped.surface.attachment != null);
+    try std.testing.expect(unmapped.surface.attachment.?.buffer == null);
+    try std.testing.expect(unmapped.attachment_lease == null);
+    try std.testing.expectEqual(@as(u32, 0), unmapped.surface.size.width);
+    try std.testing.expectEqual(@as(u32, 0), unmapped.surface.size.height);
+}
+
 test "surface copies region request data before the region is destroyed" {
     const context = try TestContext.init();
     defer context.deinit();
@@ -3155,19 +3239,23 @@ test "invalid generated surface request posts the specified protocol error" {
     }
 }
 
-test "fixed surface capacity fails without publishing a partial object" {
+test "surface region and viewport slots grow without moving live resources" {
     const context = try TestContext.init();
     defer context.deinit();
-    _ = try context.createSurface(10);
+    const first = try context.createSurface(10);
+    const first_pointer = try context.adapter.getSurface(first);
     _ = try context.createSurface(11);
+    _ = try context.createSurface(12);
+    try std.testing.expectEqual(first_pointer, try context.adapter.getSurface(first));
 
-    try test_protocol.wl_compositor.encodeRequest(
-        &context.requests,
-        context.compositor.id,
-        .{ .create_surface = .{ .id = 12 } },
-    );
-    try std.testing.expectEqual(wayring.dispatch.Control.stop, try context.dispatchCore());
-    try std.testing.expect(context.server_objects.namespace.get(12) == null);
+    _ = try context.createRegion(13);
+    _ = try context.createRegion(14);
+    _ = try context.createRegion(15);
+
+    _ = try context.createViewport(first, 16);
+    _ = try context.createViewport(try context.createSurface(17), 18);
+    _ = try context.createViewport(try context.createSurface(19), 20);
+    try std.testing.expectEqual(first_pointer, try context.adapter.getSurface(first));
 }
 
 test "commit-hook admission failure precedes ordinary core surface mutation" {

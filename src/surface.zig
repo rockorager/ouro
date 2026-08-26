@@ -27,6 +27,20 @@ pub const Viewport = viewport.Viewport;
 pub const ViewportState = viewport.State;
 pub const SurfaceSize = viewport.Size;
 
+/// Grow the shared callback pools while preserving their index-based queues.
+/// Configured capacities are initial reservations rather than protocol limits.
+pub fn growCallbackPool(allocator: std.mem.Allocator, pool: anytype) !void {
+    const old_len = pool.nodes.len;
+    if (old_len >= std.math.maxInt(u32) - 1) return error.OutOfMemory;
+    const new_len = @min(std.math.maxInt(u32) - 1, old_len + @max(old_len, 1));
+    pool.nodes = try allocator.realloc(pool.nodes, new_len);
+    for (pool.nodes[old_len..], old_len..) |*node, index| {
+        node.* = .{};
+        node.next = if (index + 1 < new_len) @intCast(index + 1) else pool.free_head;
+    }
+    pool.free_head = @intCast(old_len);
+}
+
 pub const Error = viewport.Error || error{
     InvalidRole,
     WrongRole,

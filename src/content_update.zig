@@ -131,6 +131,7 @@ pub fn Scheduler(comptime Key: type, comptime Payload: type) type {
 
         nodes: []Node,
         edges: []Edge,
+        allocator: std.mem.Allocator,
         node_free: u32,
         edge_free: u32,
         active_nodes: usize = 0,
@@ -158,6 +159,7 @@ pub fn Scheduler(comptime Key: type, comptime Payload: type) type {
             return .{
                 .nodes = nodes,
                 .edges = edges,
+                .allocator = allocator,
                 .node_free = 0,
                 .edge_free = 0,
             };
@@ -208,8 +210,8 @@ pub fn Scheduler(comptime Key: type, comptime Payload: type) type {
                 }
                 if (!duplicate and !node.child_claimed) edge_count += 1;
             }
-            if (scheduler.node_free == none) return error.NodeExhausted;
-            if (scheduler.availableEdges() < edge_count) return error.EdgeExhausted;
+            if (scheduler.node_free == none) try scheduler.growNodes();
+            if (scheduler.availableEdges() < edge_count) try scheduler.growEdges(edge_count);
             return .{
                 .queue = queue,
                 .previous = if (queue.tail == none) null else scheduler.nodeToken(queue.tail),
@@ -218,6 +220,31 @@ pub fn Scheduler(comptime Key: type, comptime Payload: type) type {
                 .constraints = constraints,
                 .required_edges = edge_count,
             };
+        }
+
+        fn growNodes(scheduler: *Self) Error!void {
+            const old_len = scheduler.nodes.len;
+            const new_len = @min(@as(usize, none), std.math.mul(usize, old_len, 2) catch none);
+            if (new_len <= old_len) return error.OutOfMemory;
+            scheduler.nodes = try scheduler.allocator.realloc(scheduler.nodes, new_len);
+            for (scheduler.nodes[old_len..], old_len..) |*node, index| node.* = .{
+                .free_next = if (index + 1 < new_len) @intCast(index + 1) else none,
+            };
+            scheduler.node_free = @intCast(old_len);
+        }
+
+        fn growEdges(scheduler: *Self, required: usize) Error!void {
+            const old_len = scheduler.edges.len;
+            var new_len = old_len;
+            while (new_len - scheduler.active_edges < required) {
+                new_len = @min(@as(usize, none), std.math.mul(usize, new_len, 2) catch none);
+                if (new_len <= old_len) return error.OutOfMemory;
+            }
+            scheduler.edges = try scheduler.allocator.realloc(scheduler.edges, new_len);
+            for (scheduler.edges[old_len..], old_len..) |*edge, index| edge.* = .{
+                .next = if (index + 1 < new_len) @intCast(index + 1) else scheduler.edge_free,
+            };
+            scheduler.edge_free = @intCast(old_len);
         }
 
         /// Publishes a prepared update without a failure path.
@@ -680,7 +707,7 @@ test "desync transition removes incoming edges to promoted SCUs" {
     try std.testing.expectEqual(@as(usize, 1), (try scheduler.tryApply(&child, &applied)).len);
 }
 
-test "node and edge pressure do not partially append" {
+test "node and edge storage grows without partially appending" {
     var scheduler = try TestScheduler.init(std.testing.allocator, 3, 1);
     defer scheduler.deinit(std.testing.allocator);
     var parent = TestScheduler.Queue.init(&scheduler, 1);
@@ -689,11 +716,9 @@ test "node and edge pressure do not partially append" {
     defer child.deinit();
     const child_update = try scheduler.commit(&child, 20, .sync, &.{}, 0);
     _ = try scheduler.commit(&parent, 10, .desync, &.{child_update}, 0);
-    try std.testing.expectError(
-        error.EdgeExhausted,
-        scheduler.commit(&parent, 11, .desync, &.{}, 0),
-    );
-    try std.testing.expectEqual(@as(usize, 1), parent.count);
-    try std.testing.expectEqual(@as(usize, 1), scheduler.availableNodes());
-    try std.testing.expectEqual(@as(usize, 0), scheduler.availableEdges());
+    _ = try scheduler.commit(&parent, 11, .desync, &.{}, 0);
+    _ = try scheduler.commit(&parent, 12, .desync, &.{}, 0);
+    try std.testing.expectEqual(@as(usize, 3), parent.count);
+    try std.testing.expect(scheduler.nodes.len > 3);
+    try std.testing.expect(scheduler.edges.len > 1);
 }

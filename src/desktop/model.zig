@@ -1,4 +1,4 @@
-//! Fixed-capacity owner for one-workspace desktop policy.
+//! Dynamically sized owner for one-workspace desktop policy.
 //!
 //! The shell adapter owns protocol resources and transmission. This owner
 //! stores only copied value IDs, consumes shell-neutral events, and retains configure
@@ -19,7 +19,6 @@ pub const Config = struct {
     fn validate(config: Config) !void {
         inline for (.{ config.toplevel_capacity, config.popup_capacity, config.command_capacity, config.metadata_bytes }) |value|
             if (value == 0 or value >= none) return error.InvalidConfig;
-        if (config.command_capacity < config.toplevel_capacity) return error.InvalidConfig;
         _ = std.math.mul(usize, config.toplevel_capacity, config.metadata_bytes) catch
             return error.InvalidConfig;
     }
@@ -534,7 +533,7 @@ pub fn Desktop(comptime Shell: type) type {
 
         /// Reserves all layout and configure capacity needed by a work-area
         /// replacement without changing desktop policy or queued commands.
-        pub fn validateWorkArea(desktop: *const Self, rect: geometry.Rect) !void {
+        pub fn validateWorkArea(desktop: *Self, rect: geometry.Rect) !void {
             try rect.validate();
             try desktop.validateLayout(desktop.layoutCount(), rect);
             try desktop.requireCommandCapacity(desktop.live);
@@ -619,6 +618,24 @@ pub fn Desktop(comptime Shell: type) type {
                 len += 1;
             };
             return output[0..len];
+        }
+
+        /// Grows caller-owned snapshot storage as needed, then fills it using
+        /// the stable slice API. The caller remains responsible for freeing it.
+        pub fn sceneSnapshotGrowing(
+            desktop: *const Self,
+            allocator: std.mem.Allocator,
+            storage: *[]SceneWindow,
+        ) ![]SceneWindow {
+            const needed = std.math.add(usize, desktop.live, desktop.popup_live) catch
+                return error.OutOfMemory;
+            if (storage.len < needed) {
+                var capacity = storage.len;
+                while (capacity < needed) capacity = std.math.mul(usize, capacity, 2) catch
+                    return error.OutOfMemory;
+                storage.* = try allocator.realloc(storage.*, capacity);
+            }
+            return desktop.sceneSnapshot(storage.*);
         }
 
         pub fn metadata(desktop: *const Self, id: ToplevelId) !Metadata {
@@ -709,7 +726,7 @@ pub fn Desktop(comptime Shell: type) type {
 
         fn create(desktop: *Self, shell_id: Shell.ToplevelId, surface: Shell.SurfaceId) !void {
             if (desktop.idForShell(shell_id)) |_| return error.DuplicateToplevel else |_| {}
-            if (desktop.free == none) return error.Exhausted;
+            if (desktop.free == none) try desktop.growToplevels();
             try desktop.validateLayout(desktop.layoutCount() + 1, desktop.work_area);
             try desktop.requireCommandCapacity(desktop.live + 1);
             const index = desktop.acquire();
@@ -734,9 +751,8 @@ pub fn Desktop(comptime Shell: type) type {
         }
 
         fn createPopup(desktop: *Self, value: anytype) !void {
-            if (desktop.popup_free == none or
-                desktop.popup_command_len >= desktop.popup_commands.len - 1)
-                return error.Exhausted;
+            if (desktop.popup_free == none) try desktop.growPopups();
+            try desktop.requirePopupCommandCapacity(1);
             const parent = try desktop.sceneForSurface(value.parent);
             const positioned = try placePopup(value.placement, parent.geometry, desktop.work_area);
             const configure: Shell.PopupConfigure = .{
@@ -802,7 +818,7 @@ pub fn Desktop(comptime Shell: type) type {
         }
 
         fn repositionPopup(desktop: *Self, value: anytype) !void {
-            if (desktop.popup_command_len >= desktop.popup_commands.len - 1) return error.Exhausted;
+            try desktop.requirePopupCommandCapacity(1);
             const slot = try desktop.popupByShell(value.id);
             const parent = try desktop.sceneForSurface(slot.parent);
             const positioned = try placePopup(value.placement, parent.geometry, desktop.work_area);
@@ -1164,8 +1180,34 @@ pub fn Desktop(comptime Shell: type) type {
                 return error.WorkAreaTooSmall;
         }
 
-        fn requireCommandCapacity(desktop: *const Self, count: usize) !void {
-            if (desktop.commandAvailable() < count) return error.Backpressure;
+        fn requireCommandCapacity(desktop: *Self, count: usize) !void {
+            const needed = std.math.add(usize, desktop.command_len, count) catch
+                return error.OutOfMemory;
+            if (needed <= desktop.commands.len) return;
+            var capacity = desktop.commands.len;
+            while (capacity < needed) capacity = std.math.mul(usize, capacity, 2) catch
+                return error.OutOfMemory;
+            const replacement = try desktop.allocator.alloc(Command, capacity);
+            for (0..desktop.command_len) |offset|
+                replacement[offset] = desktop.commands[(desktop.command_head + offset) % desktop.commands.len];
+            desktop.allocator.free(desktop.commands);
+            desktop.commands = replacement;
+            desktop.command_head = 0;
+        }
+
+        fn requirePopupCommandCapacity(desktop: *Self, count: usize) !void {
+            const needed = std.math.add(usize, desktop.popup_command_len, count + 1) catch
+                return error.OutOfMemory;
+            if (needed <= desktop.popup_commands.len) return;
+            var capacity = desktop.popup_commands.len;
+            while (capacity < needed) capacity = std.math.mul(usize, capacity, 2) catch
+                return error.OutOfMemory;
+            const replacement = try desktop.allocator.alloc(PopupCommand, capacity);
+            for (0..desktop.popup_command_len) |offset|
+                replacement[offset] = desktop.popup_commands[(desktop.popup_command_head + offset) % desktop.popup_commands.len];
+            desktop.allocator.free(desktop.popup_commands);
+            desktop.popup_commands = replacement;
+            desktop.popup_command_head = 0;
         }
 
         fn enqueue(desktop: *Self, command: Command) void {
@@ -1239,6 +1281,75 @@ pub fn Desktop(comptime Shell: type) type {
                 if (slot.active) next = @max(next, slot.scene.stacking +| 1);
             }
             return next;
+        }
+
+        fn growToplevels(desktop: *Self) !void {
+            const old_len = desktop.slots.len;
+            const new_len = std.math.mul(usize, old_len, 2) catch return error.OutOfMemory;
+            if (new_len >= none) return error.OutOfMemory;
+            const slots = try desktop.allocator.alloc(Slot, new_len);
+            errdefer desktop.allocator.free(slots);
+            const storage_len = std.math.mul(usize, new_len, desktop.metadata_bytes * 2) catch
+                return error.OutOfMemory;
+            const storage = try desktop.allocator.alloc(u8, storage_len);
+            errdefer desktop.allocator.free(storage);
+            const focus = try desktop.allocator.alloc(u32, new_len);
+            errdefer desktop.allocator.free(focus);
+            const tile_order = try desktop.allocator.alloc(u32, new_len);
+            errdefer desktop.allocator.free(tile_order);
+            const layout_items = try desktop.allocator.alloc(layout.Item, new_len);
+            errdefer desktop.allocator.free(layout_items);
+            const placements = try desktop.allocator.alloc(layout.Placement, new_len);
+            errdefer desktop.allocator.free(placements);
+            const desired = try desktop.allocator.alloc(Desired, new_len);
+            errdefer desktop.allocator.free(desired);
+
+            for (slots, 0..) |*slot, index| {
+                const start = index * desktop.metadata_bytes * 2;
+                if (index < old_len) {
+                    slot.* = desktop.slots[index];
+                    @memcpy(storage[start .. start + desktop.metadata_bytes], slot.title);
+                    @memcpy(storage[start + desktop.metadata_bytes .. start + desktop.metadata_bytes * 2], slot.app_id);
+                } else slot.* = .{ .header = .{
+                    .next_free = if (index + 1 < new_len) @intCast(index + 1) else none,
+                } };
+                slot.title = storage[start .. start + desktop.metadata_bytes];
+                slot.app_id = storage[start + desktop.metadata_bytes .. start + desktop.metadata_bytes * 2];
+            }
+            @memcpy(focus[0..desktop.focus_len], desktop.focus[0..desktop.focus_len]);
+            @memcpy(tile_order[0..desktop.tile_len], desktop.tile_order[0..desktop.tile_len]);
+            @memcpy(desired[0..old_len], desktop.desired);
+            @memset(desired[old_len..], .{});
+
+            desktop.allocator.free(desktop.desired);
+            desktop.allocator.free(desktop.placements);
+            desktop.allocator.free(desktop.layout_items);
+            desktop.allocator.free(desktop.tile_order);
+            desktop.allocator.free(desktop.focus);
+            desktop.allocator.free(desktop.metadata_storage);
+            desktop.allocator.free(desktop.slots);
+            desktop.slots = slots;
+            desktop.metadata_storage = storage;
+            desktop.focus = focus;
+            desktop.tile_order = tile_order;
+            desktop.layout_items = layout_items;
+            desktop.placements = placements;
+            desktop.desired = desired;
+            desktop.free = @intCast(old_len);
+        }
+
+        fn growPopups(desktop: *Self) !void {
+            const old_len = desktop.popups.len;
+            const new_len = std.math.mul(usize, old_len, 2) catch return error.OutOfMemory;
+            if (new_len >= none) return error.OutOfMemory;
+            const popups = try desktop.allocator.alloc(PopupSlot, new_len);
+            @memcpy(popups[0..old_len], desktop.popups);
+            for (popups[old_len..], old_len..) |*slot, index| slot.* = .{
+                .next_free = if (index + 1 < new_len) @intCast(index + 1) else none,
+            };
+            desktop.allocator.free(desktop.popups);
+            desktop.popups = popups;
+            desktop.popup_free = @intCast(old_len);
         }
 
         fn acquire(desktop: *Self) u32 {
@@ -2030,7 +2141,7 @@ test "desktop: queued destroys preserve exact generations in order" {
     );
 }
 
-test "desktop: capacity and command backpressure leave mutations transactional" {
+test "desktop: toplevel and command storage grow transactionally" {
     var desktop = try initTestDesktop(3);
     defer desktop.deinit();
     var shell = TestShell{};
@@ -2041,19 +2152,12 @@ test "desktop: capacity and command backpressure leave mutations transactional" 
     _ = try desktop.consume(&shell, 1);
     const second = desktop.focused().?;
     shell.push(created(2));
-    try std.testing.expectError(error.Backpressure, desktop.consume(&shell, 1));
-    try std.testing.expectEqual(second, desktop.focused().?);
-    try std.testing.expectError(
-        error.StaleToplevel,
-        desktop.idForShell(.{ .index = 2, .generation = 1 }),
-    );
-    desktop.dropCommand();
-    try std.testing.expectError(error.Backpressure, desktop.consume(&shell, 1));
-    try std.testing.expectEqual(second, desktop.focused().?);
-    while (desktop.peekCommand() != null) desktop.dropCommand();
-    try std.testing.expectEqual(@as(usize, 1), try desktop.consume(&shell, 1));
+    shell.push(created(3));
+    try std.testing.expectEqual(@as(usize, 2), try desktop.consume(&shell, 2));
     try std.testing.expect(!std.meta.eql(first, desktop.focused().?));
     try std.testing.expect(!std.meta.eql(second, desktop.focused().?));
+    try std.testing.expect(desktop.slots.len > 3);
+    try std.testing.expect(desktop.commands.len > 3);
 }
 
 test "desktop: shell outbound backpressure retains configure ownership" {
@@ -2071,14 +2175,6 @@ test "desktop: shell outbound backpressure retains configure ownership" {
     try std.testing.expect(shell.configured.?.states.activated);
 }
 
-test "desktop: invalid capacities are rejected before allocation" {
-    try std.testing.expectError(error.InvalidConfig, TestDesktop.init(
-        std.testing.allocator,
-        .{ .toplevel_capacity = 2, .command_capacity = 1, .metadata_bytes = 8 },
-        .{ .x = 0, .y = 0, .width = 10, .height = 10 },
-    ));
-}
-
 test "desktop: stale identity is rejected and exhausted generations retire" {
     var desktop = try initTestDesktop(8);
     defer desktop.deinit();
@@ -2094,7 +2190,7 @@ test "desktop: stale identity is rejected and exhausted generations retire" {
     try std.testing.expectEqual(@as(u32, 1), desktop.free);
 }
 
-test "desktop: toplevel capacity failure retains the exact shell event" {
+test "desktop: initial toplevel capacity grows without retaining the shell event" {
     var desktop = try TestDesktop.init(std.testing.allocator, .{
         .toplevel_capacity = 1,
         .command_capacity = 4,
@@ -2105,9 +2201,9 @@ test "desktop: toplevel capacity failure retains the exact shell event" {
     shell.push(created(0));
     shell.push(created(1));
     _ = try desktop.consume(&shell, 1);
-    try std.testing.expectError(error.Exhausted, desktop.consume(&shell, 1));
-    try std.testing.expect(desktop.pending_event != null);
-    try std.testing.expectEqual(@as(usize, 1), desktop.live);
+    try std.testing.expectEqual(@as(usize, 1), try desktop.consume(&shell, 1));
+    try std.testing.expect(desktop.pending_event == null);
+    try std.testing.expectEqual(@as(usize, 2), desktop.live);
 }
 
 test "desktop: minimized and fullscreen requests update visibility and states" {

@@ -12,6 +12,8 @@ benchmark_workloads=(
     "shm-scale-2          shm-sparse                           2       640   360    1000   3"
     "shm-scale-8          shm-sparse                           8       640   360    1000   3"
     "shm-scale-16         shm-sparse                           16      640   360    1000   3"
+    "shm-scale-32         shm-sparse                           32      640   360    1000   3"
+    "shm-scale-64         shm-sparse                           64      640   360    1000   3"
     "shm-buffer-churn     shm-churn                            1       1280  720    600    3"
     "shm-churn-2          shm-churn                            2       640   360    600    3"
     "shm-churn-8          shm-churn                            8       640   360    600    3"
@@ -24,6 +26,8 @@ benchmark_workloads=(
     "dmabuf-scale-2       dmabuf-sparse                        2       640   360    1000   3"
     "dmabuf-scale-8       dmabuf-sparse                        8       640   360    1000   3"
     "dmabuf-scale-16      dmabuf-sparse                        16      640   360    1000   3"
+    "dmabuf-scale-32      dmabuf-sparse                        32      640   360    1000   3"
+    "dmabuf-scale-64      dmabuf-sparse                        64      640   360    1000   3"
     "dmabuf-churn         dmabuf-churn                         1       1280  720    300    3"
     "dmabuf-churn-2       dmabuf-churn                         2       640   360    300    3"
     "dmabuf-churn-8       dmabuf-churn                         8       640   360    300    3"
@@ -47,13 +51,13 @@ benchmark_suite_contains() {
                 $workload == dmabuf-scale-8 || $workload == dmabuf-churn ||
                 $workload == mixed-scale-8 ]]
             ;;
-        all) [[ $workload != shm-scale-16 && $workload != dmabuf-scale-16 ]] ;;
-        shm) [[ $workload == shm-* && $workload != shm-scale-16 ]] ;;
-        dmabuf) [[ $workload == dmabuf-* && $workload != dmabuf-scale-16 ]] ;;
+        all) [[ $workload != *-scale-16 && $workload != *-scale-32 && $workload != *-scale-64 ]] ;;
+        shm) [[ $workload == shm-* && $workload != *-scale-16 && $workload != *-scale-32 && $workload != *-scale-64 ]] ;;
+        dmabuf) [[ $workload == dmabuf-* && $workload != *-scale-16 && $workload != *-scale-32 && $workload != *-scale-64 ]] ;;
         scale) [[ $workload == *-scale-[128] ]] ;;
         churn) [[ $workload == *churn* ]] ;;
         mixed) [[ $workload == mixed-* ]] ;;
-        capacity) [[ $workload == shm-scale-16 || $workload == dmabuf-scale-16 ]] ;;
+        capacity) [[ $workload == *-scale-16 || $workload == *-scale-32 || $workload == *-scale-64 ]] ;;
         *) return 1 ;;
     esac
 }

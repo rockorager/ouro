@@ -64,6 +64,7 @@ pub const Renderer = struct {
     samples: []vk.Sample,
     sources: []render_types.SurfaceSample,
     max_source_bytes: usize,
+    packs_sources: bool,
     damage: []render_types.Rect,
 
     /// `drm_fd` is borrowed for device identity only. Vulkan selects the
@@ -107,6 +108,7 @@ pub const Renderer = struct {
             .samples = samples,
             .sources = sources,
             .max_source_bytes = config.max_source_bytes,
+            .packs_sources = platform.packsSources(implementation),
             .damage = damage,
         };
     }
@@ -169,7 +171,16 @@ pub const Renderer = struct {
         try render_types.validateList(list);
         try render_types.validateOutput(plan.output);
         if (targets.owner != self.implementation) return error.TargetOwnerMismatch;
-        if (plan.samples.len > self.samples.len) return error.SampleCapacityExceeded;
+        if (plan.samples.len > std.math.maxInt(u32)) return error.SampleCapacityExceeded;
+        if (plan.samples.len > self.samples.len) {
+            const new_samples = try self.allocator.alloc(vk.Sample, plan.samples.len);
+            errdefer self.allocator.free(new_samples);
+            const new_sources = try self.allocator.alloc(render_types.SurfaceSample, plan.samples.len);
+            self.allocator.free(self.samples);
+            self.allocator.free(self.sources);
+            self.samples = new_samples;
+            self.sources = new_sources;
+        }
         if (handle.slot >= targets.records.len) return error.TargetCapacityExceeded;
         const image = try target.image_fn(target.context, handle);
         if (image.state != .acquired or image.metadata.width != plan.output.width or
@@ -199,7 +210,8 @@ pub const Renderer = struct {
             _ = try render_types.validateSample(validated);
             const packed_stride = std.math.mul(u32, source.source.size.width, 4) catch
                 return error.SourceCapacityExceeded;
-            const length = if (source.source.native != null)
+            const length = if (!self.packs_sources or
+                source.source.native != null or source.source.upload != null)
                 0
             else
                 std.math.mul(usize, packed_stride, source.source.size.height) catch
@@ -597,6 +609,50 @@ test "render-vulkan: odd source strides repack to aligned contiguous shader word
     try std.testing.expectEqual([4]u32{ 4, 1, 1, 4 }, fake.last_samples[1].source);
 }
 
+test "render-vulkan: direct upload sources do not consume fallback frame bytes" {
+    var fake = FakePlatform{};
+    var renderer = try Renderer.init(std.testing.allocator, fake.platform(), 41, .{
+        .max_samples = 2,
+        .max_source_bytes = 4,
+        .max_targets = 1,
+    });
+    defer renderer.deinit();
+    var targets = try renderer.createTargets(1);
+    defer renderer.destroyTargets(&targets);
+    const bytes = [_]u8{ 1, 2, 3, 4 };
+    var samples = [_]render_types.SurfaceSample{ undefined, undefined };
+    _ = testList(&bytes, &samples[0]);
+    samples[0].source.upload = .{ .owner = &fake, .token = 1, .offset = 0 };
+    samples[1] = samples[0];
+    samples[1].sample.surface = 2;
+    samples[1].source.upload.?.token = 2;
+    const list: render_types.List = .{
+        .output = .{ .width = 1, .height = 1 },
+        .output_format = .xrgb8888,
+        .clear = .{ .r = 0, .g = 0, .b = 0 },
+        .samples = &samples,
+    };
+    const planned = [_]render_types.PlannedSample{
+        plannedFromSample(samples[0], 0),
+        plannedFromSample(samples[1], 1),
+    };
+    const damage = [_]render_types.Rect{.{ .x = 0, .y = 0, .width = 1, .height = 1 }};
+    var plan = damagePlan(&planned[0], &damage, true);
+    plan.samples = &planned;
+    var target = FakeTarget{};
+    const completion = try renderer.render(
+        &targets,
+        target.target(),
+        .{ .slot = 0, .generation = 1 },
+        list,
+        plan,
+    );
+    _ = linux.close(completion);
+    try std.testing.expectEqual(@as(usize, 0), fake.last_byte_count);
+    try std.testing.expectEqual([4]u32{ 0, 1, 1, 4 }, fake.last_samples[0].source);
+    try std.testing.expectEqual([4]u32{ 0, 1, 1, 4 }, fake.last_samples[1].source);
+}
+
 test "render-vulkan: post-submit completion export failure is terminal and classified" {
     var fake = FakePlatform{ .fail_after_submit = true };
     var renderer = try Renderer.init(std.testing.allocator, fake.platform(), 41, .{
@@ -766,6 +822,7 @@ const FakeTarget = struct {
 const FakePlatform = struct {
     fail_import: bool = false,
     fail_after_submit: bool = false,
+    pack_sources: bool = true,
     create_count: usize = 0,
     import_count: usize = 0,
     draw_count: usize = 0,
@@ -785,6 +842,7 @@ const FakePlatform = struct {
         .destroy_target = destroyTarget,
         .draw = draw,
         .content_provider = contentProvider,
+        .packs_sources = packsSources,
     };
     fn platform(self: *FakePlatform) vk.Platform {
         return .{ .context = self, .vtable = &vtable };
@@ -797,6 +855,10 @@ const FakePlatform = struct {
     }
     fn contentProvider(_: *anyopaque, _: vk.Renderer) ?@import("content.zig").Provider {
         return null;
+    }
+    fn packsSources(context: *anyopaque, _: vk.Renderer) bool {
+        const self: *FakePlatform = @ptrCast(@alignCast(context));
+        return self.pack_sources;
     }
     fn destroy(context: *anyopaque, _: vk.Renderer) void {
         const self: *FakePlatform = @ptrCast(@alignCast(context));
@@ -821,6 +883,7 @@ const FakePlatform = struct {
         for (frame.sources) |sample| {
             const source = sample.source;
             const packed_stride = source.size.width * 4;
+            if (source.native != null or source.upload != null) continue;
             for (0..source.size.height) |row| {
                 const source_start = @as(usize, source.stride) * row;
                 const packed_start = offset + @as(usize, packed_stride) * row;

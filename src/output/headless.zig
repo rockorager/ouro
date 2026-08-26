@@ -161,6 +161,7 @@ pub fn Scheduler(comptime PresentationToken: type) type {
 
         output: OutputId,
         config: Config,
+        allocator: std.mem.Allocator,
         samples: []SampleType,
         sample_count: usize = 0,
         samples_captured: bool = false,
@@ -185,6 +186,7 @@ pub fn Scheduler(comptime PresentationToken: type) type {
             return .{
                 .output = output,
                 .config = config,
+                .allocator = allocator,
                 .samples = try allocator.alloc(SampleType, max_samples),
             };
         }
@@ -350,7 +352,8 @@ pub fn Scheduler(comptime PresentationToken: type) type {
         ) Error!void {
             try self.requireFrame(frame_id, .rendering);
             if (self.samples_captured) return error.SamplesAlreadyCaptured;
-            if (sampled.len > self.samples.len) return error.TooManySamples;
+            if (sampled.len > self.samples.len)
+                self.samples = try self.allocator.realloc(self.samples, sampled.len);
             @memcpy(self.samples[0..sampled.len], sampled);
             self.sample_count = sampled.len;
             self.samples_captured = true;
@@ -610,6 +613,21 @@ test "ordinary headless frame presents exact samples once" {
     try std.testing.expectEqualSlices(Sample(u32), &samples, outcome.sampled);
     try std.testing.expectEqual(Stage.idle, scheduler.currentStage());
     try std.testing.expect((try scheduler.timerEvent(fakeHandle(2), .fired, 10)) == null);
+}
+
+test "headless captured samples grow beyond initial capacity" {
+    var scheduler = try testInit(1);
+    defer scheduler.deinit(std.testing.allocator);
+    try scheduler.request(.damage, 1);
+    const frame_id = try armRender(&scheduler, 1, fakeHandle(1));
+    _ = try startRender(&scheduler, fakeHandle(1), 7);
+    const samples = [_]Sample(u32){
+        .{ .surface = .{ .index = 1, .generation = 1 }, .presentation = 1 },
+        .{ .surface = .{ .index = 2, .generation = 1 }, .presentation = 2 },
+    };
+    try scheduler.captureSamples(frame_id, &samples);
+    try std.testing.expectEqualSlices(Sample(u32), &samples, scheduler.samples[0..scheduler.sample_count]);
+    _ = try scheduler.failRender(frame_id);
 }
 
 test "multiple requests coalesce during and after a frame" {

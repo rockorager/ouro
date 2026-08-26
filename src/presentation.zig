@@ -1,4 +1,4 @@
-//! Bounded generational presentation ownership.
+//! Dynamically growing generational presentation ownership.
 
 const std = @import("std");
 const objects = @import("wayring").objects;
@@ -20,7 +20,7 @@ pub const QueueRelease = *const fn (
     callback: objects.Handle,
 ) anyerror!void;
 
-/// Fixed-capacity in-flight presentation storage. Callers that still need a
+/// Dynamically growing in-flight presentation storage. Callers that still need a
 /// source backing until completion can transfer its lease and release batch;
 /// callers with independently owned content can admit only the imported handle.
 /// The queue must remain at a stable address while entries are active.
@@ -45,6 +45,7 @@ pub fn Queue(comptime Imported: type) type {
         };
 
         slots: []Slot,
+        allocator: std.mem.Allocator,
         free_head: u32,
         active_count: usize = 0,
         dispose_context: ?*anyopaque,
@@ -63,6 +64,7 @@ pub fn Queue(comptime Imported: type) type {
             };
             return .{
                 .slots = slots,
+                .allocator = allocator,
                 .free_head = 0,
                 .dispose_context = dispose_context,
                 .dispose = dispose,
@@ -92,8 +94,8 @@ pub fn Queue(comptime Imported: type) type {
             lease: *?buffer_import.Lease,
             release_callbacks: *?release.Batch,
         ) Error!Token {
-            if (queue.free_head == none) return error.Exhausted;
             const owned_lease = lease.* orelse return error.MissingLease;
+            if (queue.free_head == none) try queue.grow();
             const index = queue.free_head;
             const slot = &queue.slots[index];
             queue.free_head = slot.next_free;
@@ -113,7 +115,7 @@ pub fn Queue(comptime Imported: type) type {
         /// Admits presentation identity after the caller has independently
         /// secured content lifetime. No client source backing is retained.
         pub fn admitImported(queue: *Self, imported: Imported) Error!Token {
-            if (queue.free_head == none) return error.Exhausted;
+            if (queue.free_head == none) try queue.grow();
             const index = queue.free_head;
             const slot = &queue.slots[index];
             queue.free_head = slot.next_free;
@@ -173,6 +175,18 @@ pub fn Queue(comptime Imported: type) type {
             if (!slot.active or slot.generation != token.generation)
                 return error.StalePresentation;
             return slot;
+        }
+
+        fn grow(queue: *Self) Error!void {
+            if (queue.slots.len == none) return error.Exhausted;
+            const old_len = queue.slots.len;
+            const doubled = std.math.mul(usize, old_len, 2) catch none;
+            const new_len = @min(doubled, none);
+            queue.slots = try queue.allocator.realloc(queue.slots, new_len);
+            for (queue.slots[old_len..], old_len..) |*slot, index| slot.* = .{
+                .next_free = if (index + 1 < new_len) @intCast(index + 1) else none,
+            };
+            queue.free_head = @intCast(old_len);
         }
 
         fn releaseSlot(queue: *Self, index: u32) void {
@@ -236,15 +250,13 @@ test "presentation admission and release queuing are transactional" {
     try std.testing.expect(callbacks == null);
     try std.testing.expectEqual(@as(u16, 7), (try presentations.getImported(presentation)).*);
 
-    var rejected_lease: ?buffer_import.Lease = try backings.acquire(2);
+    var grown_lease: ?buffer_import.Lease = try backings.acquire(2);
     var no_callbacks: ?release.Batch = null;
-    try std.testing.expectError(
-        error.Exhausted,
-        presentations.admit(8, &rejected_lease, &no_callbacks),
-    );
-    try std.testing.expect(rejected_lease != null);
-    rejected_lease.?.deinit();
-    Dispose.imported(&imported_disposals, 8);
+    const grown = try presentations.admit(8, &grown_lease, &no_callbacks);
+    try std.testing.expect(grown_lease == null);
+    try std.testing.expectEqual(@as(u16, 7), (try presentations.getImported(presentation)).*);
+    try std.testing.expectEqual(@as(u16, 8), (try presentations.getImported(grown)).*);
+    try presentations.finish(grown);
 
     const ReleaseState = struct {
         calls: usize = 0,

@@ -1,6 +1,6 @@
-//! Allocation-free R13 scene-damage transformation and scanout-image repair.
+//! R13 scene-damage transformation and scanout-image repair.
 //!
-//! `prepare` only writes preallocated scratch storage. `publish` is called
+//! `prepare` grows sample metadata as needed and otherwise writes scratch storage. `publish` is called
 //! after rendering is accepted and is the sole operation that advances image
 //! validity: the rendered image becomes current, while every other image
 //! accumulates only this frame's client/scene damage (never repair damage).
@@ -79,7 +79,6 @@ pub const Error = std.mem.Allocator.Error || render.ValidationError || error{
     StaleImage,
     PlanPending,
     NoPlanPending,
-    SampleCapacityExceeded,
     MissingCurrentSample,
     CurrentSampleMismatch,
     DuplicateCurrentChange,
@@ -240,9 +239,10 @@ pub const Planner = struct {
         try self.validateHandle(handle);
         try render.validateList(list);
         if (!std.meta.eql(list.output, self.output)) return error.InvalidOutput;
-        if (list.samples.len > self.planned_samples.len)
-            return error.SampleCapacityExceeded;
         try validateChanges(list, changes);
+        if (list.samples.len > std.math.maxInt(u32)) return error.InvalidConfig;
+        if (list.samples.len > self.planned_samples.len)
+            self.planned_samples = try self.allocator.realloc(self.planned_samples, list.samples.len);
 
         self.client.clear();
         self.scene.clear();
@@ -906,4 +906,19 @@ test "damage: prepare publish and cancel make no allocator calls" {
     try planner.publish();
     try std.testing.expectEqual(@as(usize, 7), failing.allocations);
     try std.testing.expect(!failing.has_induced_failure);
+}
+
+test "damage: planned samples grow beyond initial capacity" {
+    var config = testConfig(1);
+    config.max_samples = 1;
+    var planner = try Planner.init(std.testing.allocator, .{ .width = 100, .height = 100 }, .normal, config);
+    defer planner.deinit();
+    const pixel = [_]u8{0} ** 4;
+    const samples = [_]render.SurfaceSample{
+        testSample(1, 1, &pixel, .{ .x = 0, .y = 0, .width = 1, .height = 1 }),
+        testSample(2, 1, &pixel, .{ .x = 1, .y = 0, .width = 1, .height = 1 }),
+    };
+    const plan = try planner.prepare(.{ .slot = 0, .generation = 1 }, testList(&samples), &.{});
+    try std.testing.expectEqual(@as(usize, 2), plan.samples.len);
+    try planner.cancel();
 }
