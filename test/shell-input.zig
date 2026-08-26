@@ -538,6 +538,159 @@ test "shell-input: two mapped toplevels sustain independent commit cycles" {
     try root.deinit();
 }
 
+test "shell-input: synchronized subsurface publishes with parent and receives pointer focus" {
+    const allocator = std.testing.allocator;
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-subsurface-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+
+    var fixture = try physical_fixture.Fixture.init();
+    defer fixture.deinit();
+    var root_config = physical_fixture.compositorConfig();
+    root_config.runtime.object_capacity = 32;
+    root_config.runtime.object_quota = 32;
+    root_config.runtime.actor.received_fd_budget = 2;
+    const root = try Compositor.create(
+        allocator,
+        try wayring.unix_socket.listen(path, 1),
+        root_config,
+    );
+    var config = physical_fixture.coordinatorConfig();
+    config.shm.pool_capacity = 2;
+    config.shm.buffer_capacity = 2;
+    config.surface.surface_capacity = 2;
+    config.surface.frame_callback_capacity = 2;
+    config.surface.release_callback_capacity = 2;
+    config.surface.content_update_capacity = 2;
+    config.surface.dependency_capacity = 2;
+    config.surface.attachment_capacity = 2;
+    config.surface.copy_capacity = 2;
+    config.output.max_samples = 2;
+    config.output.max_source_bytes = pixels.len * 2;
+    const coordinator = try Coordinator.create(
+        allocator,
+        root,
+        fixture.platforms(),
+        config,
+    );
+    var loop = try Loop.init(
+        allocator,
+        root,
+        &coordinator.router,
+        &coordinator.timers,
+        coordinator,
+        .{ .completion_batch = 16 },
+    );
+    try coordinator.start(&loop);
+
+    var client_reactor: wayring.io_uring.Reactor = undefined;
+    try client_reactor.initOwned(
+        allocator,
+        .{ .entries = 16, .flags = 0 },
+        physical_fixture.clientReactorConfig(),
+    );
+    var client = try ClientConnection.attach(
+        allocator,
+        &client_reactor,
+        try wayring.unix_socket.connect(path),
+        .{ .received_fd_budget = 2, .transmit_byte_budget = 4096, .transmit_fd_budget = 2 },
+        .{ .max_objects = 32, .max_client_ids = 31 },
+    );
+    const actor = try client.actor();
+    var driver = ClientDriver.init(&client);
+    const registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null);
+    var handler: MultiHandler = .{
+        .objects = &client.objects,
+        .queue = &actor.transmit,
+        .registry = registry,
+        .cycle_count = 1,
+        .subsurface_mode = true,
+    };
+    try submitMultiClient(&client_reactor, &driver, &handler);
+
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    var client_progress: ClientDriver.Progress = .{};
+    var observed = false;
+    for (0..512) |_| {
+        client_progress = try drainMultiClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (!observed and coordinator.stats.submitted == 1) {
+            const root_id = try coordinator.adapter.surfaceId(handler.surfaces[0].?);
+            const child_id = try coordinator.adapter.surfaceId(handler.surfaces[1].?);
+            const root_layer = findLayer(coordinator.app_layers, root_id) orelse
+                return error.MissingRootLayer;
+            const child_layer = findLayer(coordinator.app_layers, child_id) orelse
+                return error.MissingChildLayer;
+            const submitted = coordinator.output.?.sample_storage[0..2];
+            try std.testing.expectEqual(root_layer.binding.?.surface, submitted[0].surface);
+            try std.testing.expectEqual(child_layer.binding.?.surface, submitted[1].surface);
+            try std.testing.expectEqual(@as(i32, 1), child_layer.sample.?.destination.x);
+            try std.testing.expectEqual(@as(i32, 0), child_layer.sample.?.destination.y);
+            observed = true;
+        }
+        if (observed and coordinator.stats.presented == 1 and
+            handler.buffer_releases == 2 and handler.frame_done == 2) break;
+        if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, client_reactor.ring);
+    }
+    try std.testing.expect(observed);
+    try std.testing.expect(handler.subcompositor != null);
+    try std.testing.expect(handler.subsurfaces[1] != null);
+    try std.testing.expectEqual(@as(usize, 2), coordinator.stats.applied);
+    try std.testing.expectEqual(@as(usize, 1), coordinator.stats.submitted);
+    try std.testing.expectEqual(@as(usize, 1), coordinator.stats.presented);
+    try std.testing.expectEqual(@as(usize, 2), handler.buffer_releases);
+    try std.testing.expectEqual(@as(usize, 2), handler.frame_done);
+    try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+
+    const pointer_device: ouro.input_backend.DeviceId = .{
+        .slot = 0,
+        .generation = 1,
+        .seat_generation = 1,
+    };
+    try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .device_added = .{
+        .device = pointer_device,
+        .capabilities = .{ .pointer = true },
+    } }));
+    try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_motion = .{
+        .device = pointer_device,
+        .time_usec = 1,
+        .dx = 1.25,
+        .dy = 0.25,
+    } }));
+    const pointer = coordinator.seat_adapter.pointerState();
+    try std.testing.expectEqual(
+        try coordinator.adapter.surfaceId(handler.surfaces[1].?),
+        pointer.focus.?.surface,
+    );
+    try std.testing.expectEqual(@as(i32, 64), pointer.point.x);
+    try std.testing.expectEqual(@as(i32, 64), pointer.point.y);
+
+    coordinator.disconnected(coordinator.peer.?);
+    _ = try client.prepareClose();
+    try submitMultiClient(&client_reactor, &driver, &handler);
+    var wayring_drained = false;
+    for (0..256) |_| {
+        client_progress = try drainMultiClient(&client_reactor, &driver, &handler);
+        const progress = try loop.turn(coordinator);
+        wayring_drained = progress.wayring.shutdown_complete;
+        if (wayring_drained and client_progress.quiescent and coordinator.backendDrainComplete()) break;
+        if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, client_reactor.ring);
+    }
+    try std.testing.expect(wayring_drained);
+    try std.testing.expect(client_progress.quiescent);
+    try std.testing.expect(coordinator.backendDrainComplete());
+
+    try client.deinit(allocator);
+    client_reactor.deinit(allocator);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
 test "shell-input: one client disconnect does not interrupt another client" {
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;
@@ -786,9 +939,11 @@ const MultiHandler = struct {
     queue: *wayring.tx.Queue,
     registry: wayring.objects.Handle,
     compositor: ?wayring.objects.Handle = null,
+    subcompositor: ?wayring.objects.Handle = null,
     shm: ?wayring.objects.Handle = null,
     wm_base: ?wayring.objects.Handle = null,
     surfaces: [2]?wayring.objects.Handle = .{ null, null },
+    subsurfaces: [2]?wayring.objects.Handle = .{ null, null },
     xdg_surfaces: [2]?wayring.objects.Handle = .{ null, null },
     toplevels: [2]?wayring.objects.Handle = .{ null, null },
     buffers: [2]?wayring.objects.Handle = .{ null, null },
@@ -801,6 +956,7 @@ const MultiHandler = struct {
     event_failures: usize = 0,
     surface_count: usize = 2,
     cycle_count: usize = two_toplevel_cycle_count,
+    subsurface_mode: bool = false,
 
     pub fn eventError(
         self: *MultiHandler,
@@ -835,6 +991,7 @@ const MultiHandler = struct {
                         .ack_configure = .{ .serial = value.serial },
                     });
                     if (!self.mapped[index]) {
+                        if (self.subsurface_mode) try self.mapSurface(1);
                         try self.mapSurface(index);
                     } else {
                         try protocol.wl_surface.encodeRequest(
@@ -889,6 +1046,8 @@ const MultiHandler = struct {
     fn bindGlobal(self: *MultiHandler, value: anytype) !void {
         if (std.mem.eql(u8, value.interface, protocol.wl_compositor.info.name))
             self.compositor = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_compositor.info, @min(value.version, 7), null);
+        if (std.mem.eql(u8, value.interface, protocol.wl_subcompositor.info.name))
+            self.subcompositor = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_subcompositor.info, @min(value.version, 1), null);
         if (std.mem.eql(u8, value.interface, protocol.wl_shm.info.name))
             self.shm = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_shm.info, @min(value.version, 2), null);
         if (std.mem.eql(u8, value.interface, protocol.xdg_wm_base.info.name))
@@ -898,6 +1057,7 @@ const MultiHandler = struct {
     fn maybeCreateShells(self: *MultiHandler) !void {
         if (self.shell_created or self.compositor == null or self.shm == null or self.wm_base == null)
             return;
+        if (self.subsurface_mode and self.subcompositor == null) return;
         for (0..self.surface_count) |index| {
             self.surfaces[index] = (try protocol.wl_compositor.construct_create_surface(
                 self.objects,
@@ -905,6 +1065,7 @@ const MultiHandler = struct {
                 self.compositor.?,
                 .{},
             )).id;
+            if (self.subsurface_mode and index != 0) continue;
             self.xdg_surfaces[index] = (try protocol.xdg_wm_base.construct_get_xdg_surface(
                 self.objects,
                 self.queue,
@@ -921,6 +1082,27 @@ const MultiHandler = struct {
                 self.queue,
                 self.surfaces[index].?.id,
                 .{ .commit = .{} },
+            );
+        }
+        if (self.subsurface_mode) {
+            self.subsurfaces[1] = (try protocol.wl_subcompositor.construct_get_subsurface(
+                self.objects,
+                self.queue,
+                self.subcompositor.?,
+                .{
+                    .surface = self.surfaces[1].?.id,
+                    .parent = self.surfaces[0].?.id,
+                },
+            )).id;
+            try protocol.wl_subsurface.encodeRequest(
+                self.queue,
+                self.subsurfaces[1].?.id,
+                .{ .set_position = .{ .x = 1, .y = 0 } },
+            );
+            try protocol.wl_subsurface.encodeRequest(
+                self.queue,
+                self.subsurfaces[1].?.id,
+                .{ .place_above = .{ .sibling = self.surfaces[0].?.id } },
             );
         }
         self.shell_created = true;
