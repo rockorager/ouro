@@ -26,6 +26,7 @@ pub fn build(b: *std.Build) void {
     generate_core_protocol.addFileArg(wayland_protocols.path("unstable/pointer-gestures/pointer-gestures-unstable-v1.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("unstable/idle-inhibit/idle-inhibit-unstable-v1.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("unstable/keyboard-shortcuts-inhibit/keyboard-shortcuts-inhibit-unstable-v1.xml"));
+    generate_core_protocol.addFileArg(wayland_protocols.path("unstable/xdg-foreign/xdg-foreign-unstable-v2.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("unstable/pointer-constraints/pointer-constraints-unstable-v1.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("unstable/primary-selection/primary-selection-unstable-v1.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("staging/cursor-shape/cursor-shape-v1.xml"));
@@ -52,6 +53,7 @@ pub fn build(b: *std.Build) void {
     generate_xdg_protocol.addFileArg(wayland_protocols.path("unstable/pointer-gestures/pointer-gestures-unstable-v1.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("unstable/idle-inhibit/idle-inhibit-unstable-v1.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("unstable/keyboard-shortcuts-inhibit/keyboard-shortcuts-inhibit-unstable-v1.xml"));
+    generate_xdg_protocol.addFileArg(wayland_protocols.path("unstable/xdg-foreign/xdg-foreign-unstable-v2.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("unstable/pointer-constraints/pointer-constraints-unstable-v1.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("unstable/primary-selection/primary-selection-unstable-v1.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("staging/cursor-shape/cursor-shape-v1.xml"));

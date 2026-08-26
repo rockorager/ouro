@@ -39,6 +39,7 @@ const protocol_relative_pointer = @import("../protocol/relative_pointer.zig");
 const protocol_pointer_gestures = @import("../protocol/pointer_gestures.zig");
 const protocol_idle_inhibit = @import("../protocol/idle_inhibit.zig");
 const protocol_shortcuts_inhibit = @import("../protocol/keyboard_shortcuts_inhibit.zig");
+const protocol_xdg_foreign = @import("../protocol/xdg_foreign.zig");
 const protocol_pointer_constraints = @import("../protocol/pointer_constraints.zig");
 const protocol_fractional_scale = @import("../protocol/fractional_scale.zig");
 const protocol_color_management = @import("../protocol/color_management.zig");
@@ -79,6 +80,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const PointerGesturesAdapter = protocol_pointer_gestures.Adapter(protocol);
         const IdleInhibitAdapter = protocol_idle_inhibit.Adapter(protocol, Adapter);
         const ShortcutsInhibitAdapter = protocol_shortcuts_inhibit.Adapter(protocol, Adapter);
+        const ForeignAdapter = protocol_xdg_foreign.Adapter(protocol, Adapter, ShellAdapter);
         const PointerConstraintsAdapter = protocol_pointer_constraints.Adapter(protocol, Adapter, SeatAdapter);
         const FractionalScaleAdapter = protocol_fractional_scale.Adapter(protocol, Adapter);
         const ColorManagementAdapter = protocol_color_management.Adapter(protocol, Adapter);
@@ -151,11 +153,12 @@ pub fn Coordinator(comptime protocol: type) type {
             const text_input: u16 = 1 << 14;
             const pointer_gestures: u16 = 1 << 15;
             const shortcuts_inhibit: u16 = 1 << 16;
+            const xdg_foreign: u16 = 1 << 17;
             const all: u16 = decoration | shell | seat | data_device | dmabuf |
                 activation | relative_pointer | fractional_scale | output | core |
                 pointer_constraints | color_management | color_representation |
                 primary_selection | text_input | pointer_gestures |
-                shortcuts_inhibit;
+                shortcuts_inhibit | xdg_foreign;
         };
         const Client = struct {
             active: bool = false,
@@ -253,6 +256,7 @@ pub fn Coordinator(comptime protocol: type) type {
             pointer_gestures: protocol_pointer_gestures.Config = .{},
             idle_inhibit: protocol_idle_inhibit.Config = .{},
             shortcuts_inhibit: protocol_shortcuts_inhibit.Config = .{},
+            xdg_foreign: protocol_xdg_foreign.Config = .{},
             pointer_constraints: protocol_pointer_constraints.WireConfig = .{},
             fractional_scale: protocol_fractional_scale.Config = .{},
             color_management: protocol_color_management.Config = .{},
@@ -328,6 +332,7 @@ pub fn Coordinator(comptime protocol: type) type {
         pointer_gestures_adapter: PointerGesturesAdapter,
         idle_inhibit_adapter: IdleInhibitAdapter,
         shortcuts_inhibit_adapter: ShortcutsInhibitAdapter,
+        foreign_adapter: ForeignAdapter,
         pointer_constraints_adapter: PointerConstraintsAdapter,
         fractional_scale_adapter: FractionalScaleAdapter,
         color_management_adapter: ColorManagementAdapter,
@@ -585,6 +590,13 @@ pub fn Coordinator(comptime protocol: type) type {
                 config.shortcuts_inhibit,
             );
             errdefer self.shortcuts_inhibit_adapter.deinit();
+            self.foreign_adapter = try ForeignAdapter.init(
+                allocator,
+                &self.adapter,
+                &self.shell_adapter,
+                config.xdg_foreign,
+            );
+            errdefer self.foreign_adapter.deinit();
             self.pointer_constraints_adapter = try PointerConstraintsAdapter.init(
                 allocator,
                 &self.adapter,
@@ -748,6 +760,9 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = try self.shortcuts_inhibit_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
+            try self.foreign_adapter.install(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
             _ = try self.pointer_constraints_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
@@ -842,6 +857,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.pointer_constraints_adapter.deinit();
             self.idle_inhibit_adapter.deinit();
             self.shortcuts_inhibit_adapter.deinit();
+            self.foreign_adapter.deinit();
             self.pointer_gestures_adapter.deinit();
             self.relative_pointer_adapter.deinit();
             self.seat_adapter.deinit();
@@ -884,6 +900,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.pointer_gestures_adapter.disconnected(peer);
             self.idle_inhibit_adapter.disconnected(peer);
             self.shortcuts_inhibit_adapter.disconnected(peer);
+            self.foreign_adapter.disconnected(peer);
             self.text_input_adapter.disconnected(peer);
             self.primary_selection_adapter.disconnected(peer);
             for (self.clients.items) |*client| if (client.active and samePeer(client.peer, peer)) {
@@ -1070,6 +1087,14 @@ pub fn Coordinator(comptime protocol: type) type {
             if (try self.shortcuts_inhibit_adapter.request(peer, target, message, fds)) |control| {
                 if (self.shortcuts_inhibit_adapter.pendingOutbound(peer))
                     self.markProtocol(peer, ProtocolReady.shortcuts_inhibit);
+                try self.flushProtocol();
+                return control;
+            }
+            if (try self.foreign_adapter.request(peer, target, message, fds)) |control| {
+                _ = try self.foreign_adapter.advanceRelations();
+                try self.advanceShell();
+                if (self.foreign_adapter.pendingOutbound(peer))
+                    self.markProtocol(peer, ProtocolReady.xdg_foreign);
                 try self.flushProtocol();
                 return control;
             }
@@ -1619,6 +1644,7 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn advanceShell(self: *Self) !void {
             while (true) {
+                _ = try self.foreign_adapter.advanceRelations();
                 if (self.desktop.takeDestroyed()) |id| {
                     self.interaction.toplevelDestroyed(id);
                     continue;
@@ -2023,6 +2049,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 flushed += try self.pointer_gestures_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.shortcuts_inhibit != 0)
                 flushed += try self.shortcuts_inhibit_adapter.flushOn(peer, objects, &actor.transmit);
+            if (client.protocol_ready & ProtocolReady.xdg_foreign != 0)
+                flushed += try self.foreign_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.pointer_constraints != 0)
                 flushed += try self.pointer_constraints_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.fractional_scale != 0)
@@ -2116,6 +2144,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (ready & ProtocolReady.shortcuts_inhibit != 0 and
                 !self.shortcuts_inhibit_adapter.pendingOutbound(client.peer))
                 ready &= ~ProtocolReady.shortcuts_inhibit;
+            if (ready & ProtocolReady.xdg_foreign != 0 and
+                !self.foreign_adapter.pendingOutbound(client.peer))
+                ready &= ~ProtocolReady.xdg_foreign;
             if (ready & ProtocolReady.pointer_constraints != 0 and
                 !self.pointer_constraints_adapter.pendingOutbound(client.peer))
                 ready &= ~ProtocolReady.pointer_constraints;
@@ -3374,6 +3405,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     removed_surface = id;
                 } else |_| {}
             }
+            if (removed_surface_candidate) |id| self.foreign_adapter.surfaceRemoved(id);
             const removed_subsurface = self.subcompositor_adapter.surfaceForResource(handle, &object);
             if (removed_subsurface) |id| {
                 self.queueLayerRemoval(id);
@@ -3392,6 +3424,7 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.pointer_gestures_adapter.resourceRemoved(handle, object);
             _ = self.idle_inhibit_adapter.resourceRemoved(handle, object);
             _ = self.shortcuts_inhibit_adapter.resourceRemoved(handle, object);
+            _ = self.foreign_adapter.resourceRemoved(handle, object);
             _ = self.pointer_constraints_adapter.resourceRemoved(handle, object);
             _ = self.fractional_scale_adapter.resourceRemoved(handle, object);
             _ = self.color_management_adapter.resourceRemoved(handle, object);
