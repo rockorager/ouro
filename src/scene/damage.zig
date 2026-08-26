@@ -219,6 +219,13 @@ pub const Planner = struct {
         self.* = undefined;
     }
 
+    /// Marks every scanout image stale across the complete output. Security
+    /// boundaries and other compositor-wide scene replacements use this when
+    /// retained surfaces stay alive but must disappear in the next frame.
+    pub fn invalidateAll(self: *Planner) void {
+        for (self.images) |*image| image.stale.setFull(self.physical_output);
+    }
+
     pub fn allocatedBytes(self: Planner) usize {
         return self.images.len * @sizeOf(Image) +
             self.stale_storage.len * @sizeOf(render.Rect) +
@@ -629,6 +636,20 @@ fn prime(planner: *Planner, image_count: usize) !void {
         try std.testing.expect(plan.repair_full);
         try planner.publish();
     }
+}
+
+test "damage: compositor-wide invalidation fully repairs every retained image" {
+    var planner = try Planner.init(std.testing.allocator, .{ .width = 100, .height = 100 }, .normal, testConfig(2));
+    defer planner.deinit();
+    try prime(&planner, 2);
+
+    planner.invalidateAll();
+    var plan = try planner.prepare(.{ .slot = 0, .generation = 2 }, testList(&.{}), &.{});
+    try std.testing.expect(plan.repair_full);
+    try planner.publish();
+    plan = try planner.prepare(.{ .slot = 1, .generation = 2 }, testList(&.{}), &.{});
+    try std.testing.expect(plan.repair_full);
+    try planner.cancel();
 }
 
 test "damage: movement removal and explicit occlusion invalidate old and new bounds" {

@@ -86,6 +86,11 @@ responsibilities:
   exclusive zones, layer, and keyboard-interactivity state; publish exact
   acknowledged configure transactions; reserve desktop work area; and compose
   background, bottom, top, and overlay surfaces in protocol order.
+- [Session lock](src/protocol/session_lock.zig): bounded
+  `ext_session_lock_v1` roles replace ordinary scene and input ownership,
+  publish `locked` only after an opaque lock frame is physically presented,
+  and remain fail-closed with a black output if the accepted lock client
+  disconnects.
 - [XDG popups](src/protocol/xdg_shell.zig): bounded popup roles retain copied
   positioner state, receive exact initial and reposition configure transactions,
   validate explicit grabs against exact seat/user-action serials, and compose

@@ -135,6 +135,11 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
             const s = self.resolveLock(id) catch return null;
             return if (s.phase == .pending) id else null;
         }
+        pub fn activeLock(self: *const Self) ?LockId {
+            const id = self.accepted orelse return null;
+            _ = self.resolveLock(id) catch return null;
+            return id;
+        }
         pub fn isFailClosed(self: *const Self) bool {
             return self.fail_closed;
         }
@@ -156,6 +161,12 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
         pub fn surfaceState(self: *const Self, id: LockSurfaceId) !SurfaceState {
             const s = try self.resolveSurface(id);
             return .{ .lock = s.lock, .surface = s.surface, .output = s.output, .mapped = s.mapped };
+        }
+        pub fn ownsSurface(self: *const Self, surface: SurfaceId) bool {
+            return self.findSurface(surface) != null;
+        }
+        pub fn lockPeer(self: *const Self, id: LockId) !wayring.io_uring.Peer {
+            return (try self.resolveLock(id)).peer;
         }
         pub fn publishLocked(self: *Self, id: LockId) !void {
             const s = try self.resolveLock(id);
@@ -299,8 +310,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
             for (self.locks) |*l| if (l.header.active and l.event != null and samePeer(l.peer, peer) and os.namespace.resolve(l.header.resource) != null) {
                 const event = l.event.?;
                 (switch (event) {
-                    .locked => Lock.encodeEvent(queue, l.header.resource.id, .{ .locked = {} }),
-                    .finished => Lock.encodeEvent(queue, l.header.resource.id, .{ .finished = {} }),
+                    .locked => Lock.encodeEvent(queue, l.header.resource.id, .{ .locked = .{} }),
+                    .finished => Lock.encodeEvent(queue, l.header.resource.id, .{ .finished = .{} }),
                 }) catch |e| switch (e) {
                     error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return count,
                     else => return e,
@@ -322,6 +333,11 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
                 count += 1;
             };
             return count;
+        }
+        pub fn pendingOutbound(self: *const Self, peer: wayring.io_uring.Peer) bool {
+            for (self.locks) |l| if (l.header.active and l.event != null and samePeer(l.peer, peer)) return true;
+            for (self.surfaces) |s| if (s.header.active and s.configure_pending and samePeer(s.peer, peer)) return true;
+            return false;
         }
         pub fn disconnected(self: *Self, peer: wayring.io_uring.Peer) void {
             for (self.surfaces, 0..) |s, i| if (s.header.active and samePeer(s.peer, peer)) self.releaseSurface(@intCast(i));
@@ -353,6 +369,12 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
                 if (self.findSurface(sid)) |s| self.releaseSurface(self.surfaceIndex(s));
             }
             return false;
+        }
+        pub fn surfaceForResource(self: *Self, h: objects.Handle, o: objects.Object) ?SurfaceId {
+            if (o.interface != &LockSurface.info) return null;
+            const s = fromContext(SurfaceSlot, self.surfaces, o.context) orelse return null;
+            if (!std.meta.eql(s.header.resource, h)) return null;
+            return s.surface;
         }
 
         fn ack(self: *Self, s: *SurfaceSlot, serial: u32) !void {

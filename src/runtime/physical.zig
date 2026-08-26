@@ -47,6 +47,7 @@ const protocol_color_representation = @import("../protocol/color_representation.
 const protocol_output = @import("../protocol/output.zig");
 const protocol_xdg_output = @import("../protocol/xdg_output.zig");
 const protocol_layer_shell = @import("../protocol/layer_shell.zig");
+const protocol_session_lock = @import("../protocol/session_lock.zig");
 const protocol_cursor_shape = @import("../protocol/cursor_shape.zig");
 const protocol_text_input = @import("../protocol/text_input.zig");
 const cursor_theme = @import("../cursor_theme.zig");
@@ -90,6 +91,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const OutputAdapter = protocol_output.Adapter(protocol);
         const XdgOutputAdapter = protocol_xdg_output.Adapter(protocol, OutputAdapter);
         const LayerShellAdapter = protocol_layer_shell.Adapter(protocol, Adapter, OutputAdapter);
+        const SessionLockAdapter = protocol_session_lock.Adapter(protocol, Adapter, OutputAdapter);
         const CursorShapeAdapter = protocol_cursor_shape.Adapter(protocol);
         const TextInputAdapter = protocol_text_input.Adapter(protocol);
 
@@ -121,6 +123,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 point: geometry.Point,
             ) ?hit_test.Hit(Window) {
                 if (Window == Desktop.SceneWindow) {
+                    if (scene.coordinator.sessionLockActive())
+                        return scene.coordinator.sessionLockHit(point, scene);
                     if (scene.coordinator.layerShellHit(point, true, scene)) |hit| return hit;
                     if (hit_test.topmostTree(Window, windows, point, scene)) |hit| return hit;
                     return scene.coordinator.layerShellHit(point, false, scene);
@@ -166,11 +170,12 @@ pub fn Coordinator(comptime protocol: type) type {
             const xdg_foreign: u32 = 1 << 17;
             const xdg_output: u32 = 1 << 18;
             const layer_shell: u32 = 1 << 19;
+            const session_lock: u32 = 1 << 20;
             const all: u32 = decoration | shell | seat | data_device | dmabuf |
                 activation | relative_pointer | fractional_scale | output | core |
                 pointer_constraints | color_management | color_representation |
                 primary_selection | text_input | pointer_gestures |
-                shortcuts_inhibit | xdg_foreign | xdg_output | layer_shell;
+                shortcuts_inhibit | xdg_foreign | xdg_output | layer_shell | session_lock;
         };
         const Client = struct {
             active: bool = false,
@@ -277,6 +282,7 @@ pub fn Coordinator(comptime protocol: type) type {
             protocol_output: protocol_output.Config = .{},
             xdg_output: protocol_xdg_output.Config = .{},
             layer_shell: protocol_layer_shell.Config = .{},
+            session_lock: protocol_session_lock.Config = .{},
             cursor_shape: protocol_cursor_shape.Config = .{},
             cursor_cache: cursor_theme.Cache.Config = .{
                 // Every protocol shape (including the default fallback) has a slot.
@@ -357,6 +363,7 @@ pub fn Coordinator(comptime protocol: type) type {
         output_adapter: OutputAdapter,
         xdg_output_adapter: XdgOutputAdapter,
         layer_shell_adapter: LayerShellAdapter,
+        session_lock_adapter: SessionLockAdapter,
         cursor_shape_adapter: CursorShapeAdapter,
         cursor_cache: cursor_theme.Cache,
         themed_cursor: theme_cursor.Cursor = .{},
@@ -393,6 +400,9 @@ pub fn Coordinator(comptime protocol: type) type {
         removed_layer_len: usize = 0,
         association_surfaces: []wayring.objects.Handle,
         layer_surface_ids: []LayerShellAdapter.LayerSurfaceId,
+        lock_surface_ids: []SessionLockAdapter.LockSurfaceId,
+        session_lock_frame: ?@import("../output/headless.zig").FrameId = null,
+        session_lock_input_ready: bool = false,
         desktop_timer: ?timer.Handle = null,
         desktop_timer_canceling: bool = false,
         cursor_layer: Layer,
@@ -506,6 +516,11 @@ pub fn Coordinator(comptime protocol: type) type {
                 config.layer_shell.resource_capacity,
             );
             errdefer allocator.free(self.layer_surface_ids);
+            self.lock_surface_ids = try allocator.alloc(
+                SessionLockAdapter.LockSurfaceId,
+                config.session_lock.surface_capacity,
+            );
+            errdefer allocator.free(self.lock_surface_ids);
             self.desktop_timer = null;
             self.desktop_timer_canceling = false;
             self.color_protocols_enabled = config.enable_color_protocols and config.output.renderer == .vulkan;
@@ -711,6 +726,13 @@ pub fn Coordinator(comptime protocol: type) type {
                 config.layer_shell,
             );
             errdefer self.layer_shell_adapter.deinit();
+            self.session_lock_adapter = try SessionLockAdapter.init(
+                allocator,
+                &self.adapter,
+                &self.output_adapter,
+                config.session_lock,
+            );
+            errdefer self.session_lock_adapter.deinit();
             self.cursor_cache = try cursor_theme.Cache.init(allocator, config.cursor_cache);
             errdefer self.cursor_cache.deinit();
             self.cursor_shape_adapter = try CursorShapeAdapter.init(allocator, .{
@@ -766,6 +788,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
             _ = try self.layer_shell_adapter.install(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
+            _ = try self.session_lock_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
             _ = try self.seat_adapter.install(&root.runtime);
@@ -875,6 +900,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.allocator.free(self.ready_update_surfaces);
             self.allocator.free(self.pending_surfaces);
             self.clients.deinit(self.allocator);
+            self.allocator.free(self.lock_surface_ids);
             self.allocator.free(self.layer_surface_ids);
             self.allocator.free(self.association_surfaces);
             self.allocator.free(self.frame_changes);
@@ -886,6 +912,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.cursor_shape_adapter.deinit();
             self.cursor_cache.deinit();
             self.allocator.free(self.cursor_path);
+            self.session_lock_adapter.deinit();
             self.layer_shell_adapter.deinit();
             self.xdg_output_adapter.deinit();
             self.output_adapter.deinit();
@@ -940,6 +967,8 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         pub fn disconnected(self: *Self, peer: wayring.io_uring.Peer) void {
+            self.session_lock_adapter.disconnected(peer);
+            self.sessionLockChanged() catch {};
             self.cursor_shape_adapter.disconnected(peer);
             self.pointer_gestures_adapter.disconnected(peer);
             self.idle_inhibit_adapter.disconnected(peer);
@@ -959,8 +988,9 @@ pub fn Coordinator(comptime protocol: type) type {
                     break;
                 };
             };
-            if (self.client_count == 0) self.requestStop() catch |err|
-                std.log.err("physical compositor shutdown failed: {s}", .{@errorName(err)});
+            if (self.client_count == 0 and !self.session_lock_adapter.isFailClosed())
+                self.requestStop() catch |err|
+                    std.log.err("physical compositor shutdown failed: {s}", .{@errorName(err)});
         }
 
         pub fn protocolError(
@@ -1160,6 +1190,13 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.flushProtocol();
                 return control;
             }
+            if (try self.session_lock_adapter.request(peer, target, message, fds)) |control| {
+                if (self.session_lock_adapter.pendingOutbound(peer))
+                    self.markProtocol(peer, ProtocolReady.session_lock);
+                try self.sessionLockChanged();
+                try self.flushProtocol();
+                return control;
+            }
             if (try self.output_adapter.request(peer, target, message, fds)) |control| {
                 if (self.output_adapter.pendingOutboundOn(peer))
                     self.markProtocol(peer, ProtocolReady.output);
@@ -1267,6 +1304,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 error.StaleSurface => {},
                 else => return err,
             };
+            try self.session_lock_adapter.validateSurfaceCommit(id);
             if (self.layer_shell_adapter.ownsSurface(id))
                 try self.desktop.validateWorkArea(try self.layerWorkArea(id));
             const pointer = self.seat_adapter.pointerState();
@@ -1308,6 +1346,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 const peer = self.adapter.surfacePeer(id) catch unreachable;
                 if (self.layer_shell_adapter.pendingOutbound(peer))
                     self.markProtocol(peer, ProtocolReady.layer_shell);
+            }
+            if (self.session_lock_adapter.ownsSurface(id)) {
+                try self.session_lock_adapter.publishSurfaceCommitted(id);
+                try self.sessionLockChanged();
             }
             self.surface = self.adapter.surfaceHandle(id) catch unreachable;
             self.surface_id = id;
@@ -1505,6 +1547,10 @@ pub fn Coordinator(comptime protocol: type) type {
         /// physical tests. A false result retains the event between owners;
         /// the caller must retry that exact value before offering another.
         pub fn acceptNormalizedInput(self: *Self, event: input_api.Event) !bool {
+            if (self.sessionLockActive() and !self.session_lock_input_ready) {
+                try self.sessionLockChanged();
+                if (!self.session_lock_input_ready) return false;
+            }
             if (!self.input_delivery_prepared) {
                 self.input_delivery_event = self.pointerDeliveryEvent(event) catch |err| switch (err) {
                     error.Exhausted => return false,
@@ -1515,16 +1561,19 @@ pub fn Coordinator(comptime protocol: type) type {
             if (!self.input_interaction_accepted) {
                 self.input_keyboard_consumed = false;
                 if (self.input_delivery_event) |delivery_event| {
-                    var input_scene: InputScene = .{ .coordinator = self };
-                    self.interaction.consumeWithShortcutPolicy(
-                        &self.desktop,
-                        &input_scene,
-                        delivery_event,
-                        self.shortcuts_inhibit_adapter.shortcutsInhibited(),
-                    ) catch |err| switch (err) {
-                        error.Backpressure, error.Exhausted => return false,
-                        else => return err,
-                    };
+                    const lock_keyboard = self.sessionLockActive() and delivery_event == .keyboard_key;
+                    if (!lock_keyboard) {
+                        var input_scene: InputScene = .{ .coordinator = self };
+                        self.interaction.consumeWithShortcutPolicy(
+                            &self.desktop,
+                            &input_scene,
+                            delivery_event,
+                            self.shortcuts_inhibit_adapter.shortcutsInhibited(),
+                        ) catch |err| switch (err) {
+                            error.Backpressure, error.Exhausted => return false,
+                            else => return err,
+                        };
+                    }
                 }
                 self.input_interaction_accepted = true;
             }
@@ -1533,14 +1582,16 @@ pub fn Coordinator(comptime protocol: type) type {
                 else => return err,
             };
             if (!self.input_relative_accepted) {
-                self.relative_pointer_adapter.consume(event) catch return false;
+                if (!self.sessionLockActive())
+                    self.relative_pointer_adapter.consume(event) catch return false;
                 self.input_relative_accepted = true;
             }
             if (!self.input_gesture_accepted) {
-                self.consumePointerGesture(event) catch |err| switch (err) {
-                    error.Exhausted => return false,
-                    else => return err,
-                };
+                if (!self.sessionLockActive())
+                    self.consumePointerGesture(event) catch |err| switch (err) {
+                        error.Exhausted => return false,
+                        else => return err,
+                    };
                 self.input_gesture_accepted = true;
             }
             if (!self.input_seat_accepted) {
@@ -1832,7 +1883,10 @@ pub fn Coordinator(comptime protocol: type) type {
                     },
                     .keyboard_focus => |target| {
                         try self.setKeyboardSurface(
-                            self.exclusiveLayerSurface() orelse target.surface,
+                            if (self.sessionLockActive())
+                                self.firstSessionLockSurface()
+                            else
+                                self.exclusiveLayerSurface() orelse target.surface,
                         );
                     },
                     .cancel => |cancel| {
@@ -1844,7 +1898,10 @@ pub fn Coordinator(comptime protocol: type) type {
                                 .{ .x = 0, .y = 0 },
                             );
                         if (cancel.keyboard_focus) {
-                            try self.setKeyboardSurface(self.exclusiveLayerSurface());
+                            try self.setKeyboardSurface(if (self.sessionLockActive())
+                                self.firstSessionLockSurface()
+                            else
+                                self.exclusiveLayerSurface());
                         }
                         if (cancel.pointer_grab) try self.seat_adapter.cancelPointerGrab();
                     },
@@ -1898,6 +1955,54 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.setKeyboardSurface((try self.desktop.scene(focused)).surface);
             } else {
                 try self.setKeyboardSurface(null);
+            }
+        }
+
+        fn firstSessionLockSurface(self: *Self) ?Adapter.SurfaceId {
+            const active = self.session_lock_adapter.activeLock() orelse return null;
+            const ids = self.session_lock_adapter.surfaceIds(self.lock_surface_ids) catch return null;
+            for (ids) |id| {
+                const state = self.session_lock_adapter.surfaceState(id) catch continue;
+                if (state.mapped and std.meta.eql(state.lock, active)) return state.surface;
+            }
+            return null;
+        }
+
+        fn sessionLockChanged(self: *Self) !void {
+            const unlocked = self.session_lock_adapter.takeUnlocked();
+            self.markProtocolAll(ProtocolReady.seat | ProtocolReady.data_device |
+                ProtocolReady.primary_selection | ProtocolReady.text_input);
+            if (self.sessionLockActive()) {
+                self.session_lock_input_ready = false;
+                self.interaction.suspendClientFocus();
+                var input_ready = true;
+                self.data_device_adapter.cancelDrag() catch {
+                    input_ready = false;
+                };
+                const pointer = self.seat_adapter.pointerState();
+                self.seat_adapter.setPointerFocus(null, pointer.point) catch {
+                    input_ready = false;
+                };
+                self.seat_adapter.cancelPointerGrab() catch {
+                    input_ready = false;
+                };
+                self.setKeyboardSurface(self.firstSessionLockSurface()) catch |err| switch (err) {
+                    error.Exhausted => input_ready = false,
+                    else => return err,
+                };
+                self.session_lock_input_ready = input_ready;
+            } else if (unlocked) {
+                self.session_lock_frame = null;
+                self.session_lock_input_ready = false;
+                try self.syncLayerKeyboardFocus();
+            }
+            if (self.output) |output| {
+                output.planner.invalidateAll();
+                output.request(.damage, try monotonicNs()) catch |err| switch (err) {
+                    error.OutputPaused => return,
+                    else => return err,
+                };
+                try self.armTimer();
             }
         }
 
@@ -2176,6 +2281,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 flushed += try self.xdg_output_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.layer_shell != 0)
                 flushed += try self.layer_shell_adapter.flushOn(peer, objects, &actor.transmit);
+            if (client.protocol_ready & ProtocolReady.session_lock != 0)
+                flushed += try self.session_lock_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.core != 0) {
                 flushed += try self.adapter.flushPresentationClockOn(peer, objects, &actor.transmit);
                 flushed += try self.adapter.flushDiscardedFeedbackOn(peer, objects, &actor.transmit);
@@ -2283,6 +2390,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (ready & ProtocolReady.layer_shell != 0 and
                 !self.layer_shell_adapter.pendingOutbound(client.peer))
                 ready &= ~ProtocolReady.layer_shell;
+            if (ready & ProtocolReady.session_lock != 0 and
+                !self.session_lock_adapter.pendingOutbound(client.peer))
+                ready &= ~ProtocolReady.session_lock;
             if (ready & ProtocolReady.core != 0 and
                 !self.adapter.pendingPresentationClock(client.peer) and
                 !self.adapter.pendingDiscardedFeedback(client.peer))
@@ -2351,15 +2461,17 @@ pub fn Coordinator(comptime protocol: type) type {
             );
             self.xdg_output_adapter.publishMode();
             try self.recomputeLayerConfigures();
+            try self.recomputeSessionLockConfigures();
             self.markProtocolAll(ProtocolReady.output | ProtocolReady.xdg_output |
-                ProtocolReady.layer_shell);
+                ProtocolReady.layer_shell | ProtocolReady.session_lock);
             self.next_output_generation = if (generation == std.math.maxInt(u32))
                 null
             else
                 generation + 1;
             self.stats.selected_outputs += 1;
             output_committed = true;
-            if (self.anyAppLayerActive() or self.cursor_layer.active or retained_visibility_changed)
+            if (self.anyAppLayerActive() or self.cursor_layer.active or
+                retained_visibility_changed or self.sessionLockActive())
                 try self.output.?.request(.damage, try monotonicNs());
             try self.armTimer();
         }
@@ -2882,25 +2994,32 @@ pub fn Coordinator(comptime protocol: type) type {
         fn renderFrame(self: *Self, frame: @import("../output/headless.zig").FrameId) !void {
             const output = self.output orelse return;
             var sample_count: usize = 0;
-            try self.appendLayerShell(.background, &sample_count, output.planner.output);
-            try self.appendLayerShell(.bottom, &sample_count, output.planner.output);
-            const windows = try self.desktop.sceneSnapshotGrowing(
-                self.allocator,
-                &self.scene_windows,
-            );
-            for (windows) |window| {
-                if (!window.visible) continue;
-                try self.appendSceneRoot(window.surface, &sample_count, output.planner.output);
+            if (self.sessionLockActive()) {
+                try self.appendSessionLock(&sample_count, output.planner.output);
+                self.session_lock_frame = frame;
+            } else {
+                try self.appendLayerShell(.background, &sample_count, output.planner.output);
+                try self.appendLayerShell(.bottom, &sample_count, output.planner.output);
+                const windows = try self.desktop.sceneSnapshotGrowing(
+                    self.allocator,
+                    &self.scene_windows,
+                );
+                for (windows) |window| {
+                    if (!window.visible) continue;
+                    try self.appendSceneRoot(window.surface, &sample_count, output.planner.output);
+                }
+                try self.appendLayerShell(.top, &sample_count, output.planner.output);
+                try self.appendLayerShell(.overlay, &sample_count, output.planner.output);
             }
-            try self.appendLayerShell(.top, &sample_count, output.planner.output);
-            try self.appendLayerShell(.overlay, &sample_count, output.planner.output);
             var change_count = sample_count;
             for (self.removed_layers[0..self.removed_layer_len]) |removed| {
                 try self.ensureFrameStorage(@max(sample_count, change_count) + 1);
                 self.frame_changes[change_count] = .{ .previous = removed.state };
                 change_count += 1;
             }
-            if (self.cursor_layer.active and self.themed_cursor.image == null) {
+            if (!self.sessionLockActive() and self.cursor_layer.active and
+                self.themed_cursor.image == null)
+            {
                 if (try self.interaction.cursor.composite(.{
                     .surface = self.cursor_layer.id.?,
                     .sample = self.cursor_layer.sample.?,
@@ -2987,6 +3106,20 @@ pub fn Coordinator(comptime protocol: type) type {
             for (ids) |id| {
                 const state = try self.layer_shell_adapter.state(id);
                 if (!state.mapped or state.layer != selected) continue;
+                try self.appendSceneRoot(state.surface, count, output_size);
+            }
+        }
+
+        fn appendSessionLock(
+            self: *Self,
+            count: *usize,
+            output_size: render.Size,
+        ) !void {
+            const active = self.session_lock_adapter.activeLock() orelse return;
+            const ids = try self.session_lock_adapter.surfaceIds(self.lock_surface_ids);
+            for (ids) |id| {
+                const state = try self.session_lock_adapter.surfaceState(id);
+                if (!state.mapped or !std.meta.eql(state.lock, active)) continue;
                 try self.appendSceneRoot(state.surface, count, output_size);
             }
         }
@@ -3137,6 +3270,29 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (layer.active and !self.layerSurfaceLive(layer)) self.abandonLayer(layer);
             if (self.cursor_layer.active and !self.layerSurfaceLive(&self.cursor_layer))
                 self.abandonLayer(&self.cursor_layer);
+            if (self.session_lock_frame) |secure_frame| if (std.meta.eql(secure_frame, outcome.frame)) {
+                self.session_lock_frame = null;
+                if (was_presented) {
+                    if (self.session_lock_adapter.pendingLock()) |lock| {
+                        self.session_lock_adapter.publishLocked(lock) catch |err| switch (err) {
+                            error.Exhausted => {
+                                if (self.output) |output| {
+                                    output.request(.damage, try monotonicNs()) catch {};
+                                    self.armTimer() catch {};
+                                }
+                            },
+                            error.StaleLock, error.InvalidPhase => {},
+                        };
+                        const peer = self.session_lock_adapter.lockPeer(lock) catch null;
+                        if (peer) |value| self.markProtocol(value, ProtocolReady.session_lock);
+                    }
+                } else if (self.sessionLockActive()) {
+                    if (self.output) |output| {
+                        output.request(.damage, try monotonicNs()) catch {};
+                        self.armTimer() catch {};
+                    }
+                }
+            };
             if (was_presented) self.stats.presented += 1 else self.stats.retired += 1;
             _ = try self.retryRetainedOutcomes();
             try self.applyReady();
@@ -3334,10 +3490,12 @@ pub fn Coordinator(comptime protocol: type) type {
             if (self.desktop.sceneForSurface(id) catch null) |root|
                 return .{ .root = root };
             if (self.layerShellScene(id)) |root| return .{ .root = root };
+            if (self.sessionLockScene(id)) |root| return .{ .root = root };
             if (!(self.subcompositor_adapter.visible(id) catch return null)) return null;
             const placement = self.subcompositor_adapter.placement(id) catch return null;
             const root = self.desktop.sceneForSurface(placement.root) catch
-                (self.layerShellScene(placement.root) orelse return null);
+                (self.layerShellScene(placement.root) orelse
+                    self.sessionLockScene(placement.root) orelse return null);
             return .{
                 .root = root,
                 .offset_x = placement.offset.x,
@@ -3368,6 +3526,60 @@ pub fn Coordinator(comptime protocol: type) type {
                 .mode = .floating,
                 .content_ready = true,
             };
+        }
+
+        fn sessionLockActive(self: *const Self) bool {
+            return self.session_lock_adapter.activeLock() != null or
+                self.session_lock_adapter.isFailClosed();
+        }
+
+        fn sessionLockScene(self: *Self, id: Adapter.SurfaceId) ?Desktop.SceneWindow {
+            const active = self.session_lock_adapter.activeLock() orelse return null;
+            const ids = self.session_lock_adapter.surfaceIds(self.lock_surface_ids) catch return null;
+            for (ids) |lock_surface| {
+                const state = self.session_lock_adapter.surfaceState(lock_surface) catch continue;
+                if (!state.mapped or !std.meta.eql(state.lock, active) or
+                    !std.meta.eql(state.surface, id)) continue;
+                const rect = self.outputBounds() catch return null;
+                return .{
+                    .id = .{
+                        .index = id.index | (@as(u32, 1) << 30),
+                        .generation = id.generation,
+                    },
+                    .surface = id,
+                    .managed = false,
+                    .keyboard_focusable = true,
+                    .geometry = rect,
+                    .visible = true,
+                    .stacking = std.math.maxInt(u32),
+                    .mode = .floating,
+                    .content_ready = true,
+                };
+            }
+            return null;
+        }
+
+        fn sessionLockHit(
+            self: *Self,
+            point: geometry.Point,
+            input_scene: *InputScene,
+        ) ?hit_test.Hit(Desktop.SceneWindow) {
+            const active = self.session_lock_adapter.activeLock() orelse return null;
+            const ids = self.session_lock_adapter.surfaceIds(self.lock_surface_ids) catch return null;
+            var index = ids.len;
+            while (index != 0) {
+                index -= 1;
+                const state = self.session_lock_adapter.surfaceState(ids[index]) catch continue;
+                if (!state.mapped or !std.meta.eql(state.lock, active)) continue;
+                const window = self.sessionLockScene(state.surface) orelse continue;
+                if (hit_test.topmostTree(
+                    Desktop.SceneWindow,
+                    @as(*const [1]Desktop.SceneWindow, &window),
+                    point,
+                    input_scene,
+                )) |hit| return hit;
+            }
+            return null;
         }
 
         fn layerShellHit(
@@ -3546,6 +3758,16 @@ pub fn Coordinator(comptime protocol: type) type {
                     else => return err,
                 };
             }
+        }
+
+        fn recomputeSessionLockConfigures(self: *Self) !void {
+            const bounds = try self.outputBounds();
+            const ids = try self.session_lock_adapter.surfaceIds(self.lock_surface_ids);
+            for (ids) |id| try self.session_lock_adapter.queueConfigure(
+                id,
+                @intCast(bounds.width),
+                @intCast(bounds.height),
+            );
         }
 
         fn findAppLayer(self: *Self, id: Adapter.SurfaceId) ?*Layer {
@@ -3768,6 +3990,8 @@ pub fn Coordinator(comptime protocol: type) type {
             if (removed_surface) |id| self.queueLayerRemoval(id);
             const removed_layer_surface = self.layer_shell_adapter.surfaceForResource(handle, object);
             if (removed_layer_surface) |id| self.queueLayerRemoval(id);
+            const removed_lock_surface = self.session_lock_adapter.surfaceForResource(handle, object);
+            if (removed_lock_surface) |id| self.queueLayerRemoval(id);
             self.decoration_adapter.toplevelRemoved(handle, object);
             _ = self.shell_adapter.resourceRemoved(handle, object);
             _ = self.seat_adapter.resourceRemoved(handle, object);
@@ -3786,6 +4010,7 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.color_management_adapter.resourceRemoved(handle, object);
             _ = self.color_representation_adapter.resourceRemoved(handle, object);
             const layer_shell_removed = self.layer_shell_adapter.resourceRemoved(handle, object);
+            const session_lock_removed = self.session_lock_adapter.resourceRemoved(handle, object);
             _ = self.xdg_output_adapter.resourceRemoved(handle, object);
             _ = self.output_adapter.resourceRemoved(handle, object);
             _ = self.cursor_shape_adapter.resourceRemoved(handle, object);
@@ -3796,6 +4021,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.syncLayerKeyboardFocus() catch {};
                 self.output.?.request(.damage, monotonicNs() catch 0) catch {};
             }
+            if (session_lock_removed) self.sessionLockChanged() catch {};
             if (removed_surface_peer) |peer| self.data_device_adapter.surfaceRemoved(peer, handle.id);
             if (removed_surface_peer) |peer| self.output_adapter.surfaceRemoved(peer, handle);
             if (removed_surface) |id| {

@@ -315,6 +315,22 @@ pub fn Interaction(comptime Desktop: type) type {
             self.cancelMatching(toplevel, null);
         }
 
+        /// Clears retained client focus when a compositor-owned security
+        /// boundary takes over input. The reserved terminal command slot makes
+        /// this operation infallible even under ordinary command backpressure.
+        pub fn suspendClientFocus(self: *Self) void {
+            const cancellation: Cancellation = .{
+                .pointer_focus = self.hover != null,
+                .keyboard_focus = self.keyboard_focus != null,
+                .pointer_grab = self.mode != .default,
+            };
+            self.hover = null;
+            self.keyboard_focus = null;
+            self.mode = .default;
+            self.removeFocusCommands();
+            self.enqueueCancellation(cancellation);
+        }
+
         fn pointerMotion(
             self: *Self,
             desktop: *Desktop,
@@ -603,6 +619,21 @@ pub fn Interaction(comptime Desktop: type) type {
                 if (commandMatches(self.commands[source], toplevel, surface)) continue;
                 const destination = (self.command_head + retained) % self.commands.len;
                 self.commands[destination] = self.commands[source];
+                retained += 1;
+            }
+            self.command_len = retained;
+        }
+
+        fn removeFocusCommands(self: *Self) void {
+            var retained: usize = 0;
+            var offset: usize = 0;
+            while (offset < self.command_len) : (offset += 1) {
+                const command = self.commands[(self.command_head + offset) % self.commands.len];
+                switch (command) {
+                    .pointer_focus, .keyboard_focus => continue,
+                    else => {},
+                }
+                self.commands[(self.command_head + retained) % self.commands.len] = command;
                 retained += 1;
             }
             self.command_len = retained;
@@ -1436,6 +1467,28 @@ test "interaction: toplevel destruction cancels exact focus and grab generations
     try std.testing.expect(cancellation.keyboard_focus);
     try std.testing.expect(cancellation.pointer_grab);
     try std.testing.expect(interaction.interactionMode() == .default);
+}
+
+test "interaction: security suspension removes queued focus and cancels retained grabs" {
+    var interaction = try initTestInteraction(3);
+    defer interaction.deinit();
+    const target = targetFor(testDesktop().windows[0]);
+    interaction.hover = target;
+    interaction.keyboard_focus = target;
+    interaction.mode = .{ .button_grab = target };
+    interaction.enqueue(.{ .pointer_focus = target });
+    interaction.enqueue(.{ .keyboard_focus = target });
+
+    interaction.suspendClientFocus();
+
+    try std.testing.expect(interaction.hover == null);
+    try std.testing.expect(interaction.keyboard_focus == null);
+    try std.testing.expect(interaction.interactionMode() == .default);
+    try std.testing.expectEqual(@as(usize, 1), interaction.pendingCommands());
+    const cancellation = interaction.peekCommand().?.cancel;
+    try std.testing.expect(cancellation.pointer_focus);
+    try std.testing.expect(cancellation.keyboard_focus);
+    try std.testing.expect(cancellation.pointer_grab);
 }
 
 test "interaction: output replacement clamps retained pointer and cursor" {
