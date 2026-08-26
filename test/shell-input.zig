@@ -668,6 +668,37 @@ test "shell-input: synchronized subsurface publishes with parent and receives po
     try std.testing.expectEqual(@as(i32, 64), pointer.point.x);
     try std.testing.expectEqual(@as(i32, 64), pointer.point.y);
 
+    try wayring.client.sendRequest(
+        protocol.wl_subsurface,
+        &client.objects,
+        &actor.transmit,
+        handler.subsurfaces[1].?,
+        .{ .destroy = .{} },
+    );
+    handler.subsurfaces[1] = null;
+    try submitMultiClient(&client_reactor, &driver, &handler);
+    for (0..256) |_| {
+        client_progress = try drainMultiClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (coordinator.stats.presented == 2) break;
+        if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, client_reactor.ring);
+    }
+    try std.testing.expectEqual(@as(usize, 2), coordinator.stats.submitted);
+    try std.testing.expectEqual(@as(usize, 2), coordinator.stats.presented);
+    try std.testing.expectEqual(@as(usize, 0), coordinator.removed_layer_len);
+    const root_id = try coordinator.adapter.surfaceId(handler.surfaces[0].?);
+    const child_id = try coordinator.adapter.surfaceId(handler.surfaces[1].?);
+    var scene_order: [2]ouro.core_surface.Adapter(protocol).SurfaceId = undefined;
+    try std.testing.expectError(
+        error.NotSubsurface,
+        coordinator.subcompositor_adapter.sceneOrder(root_id, &scene_order),
+    );
+    try std.testing.expectError(
+        error.NotSubsurface,
+        coordinator.subcompositor_adapter.placement(child_id),
+    );
+
     coordinator.disconnected(coordinator.peer.?);
     _ = try client.prepareClose();
     try submitMultiClient(&client_reactor, &driver, &handler);

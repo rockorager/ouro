@@ -82,6 +82,10 @@ pub fn Coordinator(comptime protocol: type) type {
             offset_y: i32 = 0,
             subsurface: bool = false,
         };
+        const RemovedLayer = struct {
+            id: Adapter.SurfaceId,
+            state: damage.SurfaceState,
+        };
         const InputScene = struct {
             coordinator: *Self,
 
@@ -308,6 +312,8 @@ pub fn Coordinator(comptime protocol: type) type {
         frame_samples: []render_list.AppliedSurface,
         frame_bindings: []output_api.SampleBinding,
         frame_changes: []damage.Change,
+        removed_layers: []RemovedLayer,
+        removed_layer_len: usize = 0,
         association_surfaces: []wayring.objects.Handle,
         desktop_timer: ?timer.Handle = null,
         desktop_timer_canceling: bool = false,
@@ -405,8 +411,14 @@ pub fn Coordinator(comptime protocol: type) type {
             errdefer allocator.free(self.frame_samples);
             self.frame_bindings = try allocator.alloc(output_api.SampleBinding, config.output.max_samples);
             errdefer allocator.free(self.frame_bindings);
-            self.frame_changes = try allocator.alloc(damage.Change, config.output.max_samples);
+            self.frame_changes = try allocator.alloc(
+                damage.Change,
+                try std.math.add(usize, config.output.max_samples, config.surface.surface_capacity),
+            );
             errdefer allocator.free(self.frame_changes);
+            self.removed_layers = try allocator.alloc(RemovedLayer, config.surface.surface_capacity);
+            errdefer allocator.free(self.removed_layers);
+            self.removed_layer_len = 0;
             self.association_surfaces = try allocator.alloc(
                 wayring.objects.Handle,
                 config.output.max_samples,
@@ -647,6 +659,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.clients.deinit(self.allocator);
             self.allocator.free(self.association_surfaces);
             self.allocator.free(self.frame_changes);
+            self.allocator.free(self.removed_layers);
             self.allocator.free(self.frame_bindings);
             self.allocator.free(self.frame_samples);
             self.allocator.free(self.scene_windows);
@@ -2278,20 +2291,21 @@ pub fn Coordinator(comptime protocol: type) type {
                     count += 1;
                 }
             }
-            if (count == 0) {
-                const result = try output.renderFrame(frame, &.{}, &.{}, &.{}, try monotonicNs());
-                if (result == .retired) try self.finishOutcome(result.retired.frame, false);
-                return;
+            var change_count = count;
+            for (self.removed_layers[0..self.removed_layer_len]) |removed| {
+                self.frame_changes[change_count] = .{ .previous = removed.state };
+                change_count += 1;
             }
             switch (try output.renderFrame(
                 frame,
                 self.frame_samples[0..count],
-                self.frame_changes[0..count],
+                self.frame_changes[0..change_count],
                 self.frame_bindings[0..count],
                 try monotonicNs(),
             )) {
                 .submitted => {
                     self.stats.submitted += 1;
+                    self.removed_layer_len = 0;
                     _ = try self.retryRetainedOutcomes();
                 },
                 .retired => |failure| try self.finishOutcome(failure.frame, false),
@@ -2684,6 +2698,21 @@ pub fn Coordinator(comptime protocol: type) type {
             layer.* = .{};
         }
 
+        fn queueLayerRemoval(self: *Self, id: Adapter.SurfaceId) void {
+            for (self.removed_layers[0..self.removed_layer_len]) |removed|
+                if (std.meta.eql(removed.id, id)) return;
+            const layer = self.findAppLayer(id) orelse return;
+            if (!layer.active) return;
+            const state = (layer.change orelse return).current orelse return;
+            std.debug.assert(self.removed_layer_len < self.removed_layers.len);
+            self.removed_layers[self.removed_layer_len] = .{ .id = id, .state = state };
+            self.removed_layer_len += 1;
+            if (self.output) |output| {
+                output.request(.damage, monotonicNs() catch return) catch return;
+                self.armTimer() catch {};
+            }
+        }
+
         fn cleanupUnstartedOutput(self: *Self) void {
             const output = self.output orelse return;
             self.output_adapter.setAvailable(false);
@@ -2728,6 +2757,9 @@ pub fn Coordinator(comptime protocol: type) type {
                     removed_surface = id;
                 } else |_| {}
             }
+            const removed_subsurface = self.subcompositor_adapter.surfaceForResource(handle, &object);
+            if (removed_subsurface) |id| self.queueLayerRemoval(id);
+            if (removed_surface) |id| self.queueLayerRemoval(id);
             self.decoration_adapter.toplevelRemoved(handle, object);
             _ = self.shell_adapter.resourceRemoved(handle, object);
             _ = self.seat_adapter.resourceRemoved(handle, object);

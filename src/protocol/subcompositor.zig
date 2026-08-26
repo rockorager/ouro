@@ -274,6 +274,16 @@ pub fn Adapter(comptime protocol: type, comptime Core: type) type {
                 object.context == @as(?*anyopaque, @ptrCast(self));
         }
 
+        pub fn surfaceForResource(
+            self: *Self,
+            handle: objects.Handle,
+            object: *const objects.Object,
+        ) ?Core.SurfaceId {
+            if (object.interface != &Subsurface.info) return null;
+            const slot = self.fromObject(object) orelse return null;
+            return if (std.meta.eql(slot.resource, handle)) slot.child else null;
+        }
+
         pub fn directChildren(self: *Self, parent: Core.SurfaceId) ![]const Core.SurfaceId {
             return self.graph.directChildren(parent, self.surface_scratch);
         }
