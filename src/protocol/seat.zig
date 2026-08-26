@@ -526,6 +526,23 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             return sameClient(pointer.client, focus.client);
         }
 
+        /// Cursor-shape requests use the same exact enter serial and focused
+        /// pointer ownership as wl_pointer.set_cursor, but invalid requests are
+        /// ignored by that extension rather than becoming protocol errors.
+        pub fn validateCursorShapeOn(
+            adapter: *Self,
+            server_objects: anytype,
+            peer: wayring.io_uring.Peer,
+            pointer_object: u32,
+            serial: u32,
+        ) bool {
+            if (serial == 0) return false;
+            const id = adapter.pointerIdOn(server_objects, pointer_object) catch return false;
+            const pointer = adapter.resolvePointer(id) catch return false;
+            return sameClient(pointer.client, clientId(peer)) and
+                pointer.last_serial == serial and adapter.pointerFocused(id);
+        }
+
         pub fn pointerState(adapter: *const Self) PointerState {
             return .{ .focus = adapter.pointer_focus, .point = adapter.pointer_point };
         }
@@ -1972,8 +1989,18 @@ test "seat: relative pointer lookup retains exact resource generation and focus"
         .surface = .{ .index = 0, .generation = 1 },
     };
     try std.testing.expect(adapter.pointerFocused(id));
+    pointer.last_serial = 44;
+    try std.testing.expect(adapter.validateCursorShapeOn(&server_objects, peer, 2, 44));
+    try std.testing.expect(!adapter.validateCursorShapeOn(&server_objects, peer, 2, 43));
+    try std.testing.expect(!adapter.validateCursorShapeOn(
+        &server_objects,
+        .{ .slot = 2, .generation = 7 },
+        2,
+        44,
+    ));
     release(TestAdapter.PointerSlot, adapter.pointers, &adapter.pointer_free, id.index);
     try std.testing.expect(!adapter.pointerFocused(id));
+    try std.testing.expect(!adapter.validateCursorShapeOn(&server_objects, peer, 2, 44));
 }
 
 test "seat: popup grabs require the exact seat and delivered press serial" {
