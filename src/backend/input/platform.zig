@@ -24,6 +24,18 @@ pub const AxisValue = struct {
     value120: ?f64 = null,
 };
 
+pub const GestureBegin = struct { device: DeviceRef, time_usec: u64, fingers: u32 };
+pub const GestureUpdate = struct { device: DeviceRef, time_usec: u64, dx: f64, dy: f64 };
+pub const PinchUpdate = struct {
+    device: DeviceRef,
+    time_usec: u64,
+    dx: f64,
+    dy: f64,
+    scale: f64,
+    angle_delta: f64,
+};
+pub const GestureEnd = struct { device: DeviceRef, time_usec: u64, cancelled: bool };
+
 pub const RawEvent = union(enum) {
     device_added: struct { device: DeviceRef, capabilities: Capabilities },
     device_removed: DeviceRef,
@@ -36,6 +48,14 @@ pub const RawEvent = union(enum) {
         vertical: ?AxisValue,
         horizontal: ?AxisValue,
     },
+    swipe_begin: GestureBegin,
+    swipe_update: GestureUpdate,
+    swipe_end: GestureEnd,
+    pinch_begin: GestureBegin,
+    pinch_update: PinchUpdate,
+    pinch_end: GestureEnd,
+    hold_begin: GestureBegin,
+    hold_end: GestureEnd,
     keyboard_key: struct { device: DeviceRef, time_usec: u64, key: u32, pressed: bool },
     ignored,
 };
@@ -218,6 +238,66 @@ fn realNextEvent(_: *anyopaque, value: *anyopaque) !?RawEvent {
                 .vertical = axisValue(pointer, source, c.LIBINPUT_POINTER_AXIS_SCROLL_VERTICAL),
                 .horizontal = axisValue(pointer, source, c.LIBINPUT_POINTER_AXIS_SCROLL_HORIZONTAL),
             } };
+        },
+        c.LIBINPUT_EVENT_GESTURE_SWIPE_BEGIN,
+        c.LIBINPUT_EVENT_GESTURE_SWIPE_UPDATE,
+        c.LIBINPUT_EVENT_GESTURE_SWIPE_END,
+        c.LIBINPUT_EVENT_GESTURE_PINCH_BEGIN,
+        c.LIBINPUT_EVENT_GESTURE_PINCH_UPDATE,
+        c.LIBINPUT_EVENT_GESTURE_PINCH_END,
+        c.LIBINPUT_EVENT_GESTURE_HOLD_BEGIN,
+        c.LIBINPUT_EVENT_GESTURE_HOLD_END,
+        => blk: {
+            const gesture = c.libinput_event_get_gesture_event(event) orelse
+                return error.InvalidEvent;
+            const time_usec = c.libinput_event_gesture_get_time_usec(gesture);
+            break :blk switch (c.libinput_event_get_type(event)) {
+                c.LIBINPUT_EVENT_GESTURE_SWIPE_BEGIN => .{ .swipe_begin = .{
+                    .device = device,
+                    .time_usec = time_usec,
+                    .fingers = @intCast(c.libinput_event_gesture_get_finger_count(gesture)),
+                } },
+                c.LIBINPUT_EVENT_GESTURE_SWIPE_UPDATE => .{ .swipe_update = .{
+                    .device = device,
+                    .time_usec = time_usec,
+                    .dx = c.libinput_event_gesture_get_dx(gesture),
+                    .dy = c.libinput_event_gesture_get_dy(gesture),
+                } },
+                c.LIBINPUT_EVENT_GESTURE_SWIPE_END => .{ .swipe_end = .{
+                    .device = device,
+                    .time_usec = time_usec,
+                    .cancelled = c.libinput_event_gesture_get_cancelled(gesture) != 0,
+                } },
+                c.LIBINPUT_EVENT_GESTURE_PINCH_BEGIN => .{ .pinch_begin = .{
+                    .device = device,
+                    .time_usec = time_usec,
+                    .fingers = @intCast(c.libinput_event_gesture_get_finger_count(gesture)),
+                } },
+                c.LIBINPUT_EVENT_GESTURE_PINCH_UPDATE => .{ .pinch_update = .{
+                    .device = device,
+                    .time_usec = time_usec,
+                    .dx = c.libinput_event_gesture_get_dx(gesture),
+                    .dy = c.libinput_event_gesture_get_dy(gesture),
+                    .scale = c.libinput_event_gesture_get_scale(gesture),
+                    .angle_delta = c.libinput_event_gesture_get_angle_delta(gesture),
+                } },
+                c.LIBINPUT_EVENT_GESTURE_PINCH_END => .{ .pinch_end = .{
+                    .device = device,
+                    .time_usec = time_usec,
+                    .cancelled = c.libinput_event_gesture_get_cancelled(gesture) != 0,
+                } },
+                c.LIBINPUT_EVENT_GESTURE_HOLD_BEGIN => .{ .hold_begin = .{
+                    .device = device,
+                    .time_usec = time_usec,
+                    .fingers = @intCast(c.libinput_event_gesture_get_finger_count(gesture)),
+                } },
+                c.LIBINPUT_EVENT_GESTURE_HOLD_END => .{ .hold_end = .{
+                    .device = device,
+                    .time_usec = time_usec,
+                    .cancelled = c.libinput_event_gesture_get_cancelled(gesture) != 0,
+                } },
+                else => unreachable,
+            };
         },
         c.LIBINPUT_EVENT_KEYBOARD_KEY => blk: {
             const keyboard = c.libinput_event_get_keyboard_event(event) orelse

@@ -161,6 +161,14 @@ pub fn Interaction(comptime Desktop: type) type {
                     value.pressed,
                 ),
                 .pointer_axis => |value| _ = try self.resolveDevice(value.device),
+                .swipe_begin => |value| try self.acceptGesture(value.device),
+                .swipe_update => |value| try self.acceptGesture(value.device),
+                .swipe_end => |value| try self.acceptGesture(value.device),
+                .pinch_begin => |value| try self.acceptGesture(value.device),
+                .pinch_update => |value| try self.acceptGesture(value.device),
+                .pinch_end => |value| try self.acceptGesture(value.device),
+                .hold_begin => |value| try self.acceptGesture(value.device),
+                .hold_end => |value| try self.acceptGesture(value.device),
                 .keyboard_key => |value| try self.keyboardKey(
                     desktop,
                     value.device,
@@ -168,6 +176,11 @@ pub fn Interaction(comptime Desktop: type) type {
                     value.pressed,
                 ),
             }
+        }
+
+        fn acceptGesture(self: *Self, device_id: input.DeviceId) !void {
+            const device = try self.resolveDevice(device_id);
+            if (!device.capabilities.pointer) return error.MissingCapability;
         }
 
         pub fn peekCommand(self: *const Self) ?Command {
@@ -942,6 +955,43 @@ test "interaction: pointer motion selects exact topmost input surface" {
     try std.testing.expectEqual(TestInteraction.FixedPoint{ .x = 3 * 256, .y = 3 * 256 }, target.point);
     try std.testing.expectEqual(geometry.Point{ .x = 13, .y = 8 }, interaction.pointerPosition());
     try std.testing.expectEqual(interaction.pointerPosition(), interaction.cursor.position);
+}
+
+test "interaction: gestures require exact pointer device without mutating focus or cursor" {
+    var interaction = try initTestInteraction(4);
+    defer interaction.deinit();
+    var desktop = testDesktop();
+    var surfaces = TestSurfaces{};
+    try addPointer(&interaction, &desktop, &surfaces);
+    const position = interaction.pointerPosition();
+    const cursor = interaction.cursor;
+
+    const events = [_]input.Event{
+        .{ .swipe_begin = .{ .device = device_a, .time_usec = 1, .fingers = 3 } },
+        .{ .swipe_update = .{ .device = device_a, .time_usec = 2, .dx = 1, .dy = -1 } },
+        .{ .swipe_end = .{ .device = device_a, .time_usec = 3, .cancelled = false } },
+        .{ .pinch_begin = .{ .device = device_a, .time_usec = 4, .fingers = 3 } },
+        .{ .pinch_update = .{ .device = device_a, .time_usec = 5, .dx = 1, .dy = 2, .scale = 1.2, .angle_delta = 5 } },
+        .{ .pinch_end = .{ .device = device_a, .time_usec = 6, .cancelled = true } },
+        .{ .hold_begin = .{ .device = device_a, .time_usec = 7, .fingers = 2 } },
+        .{ .hold_end = .{ .device = device_a, .time_usec = 8, .cancelled = false } },
+    };
+    for (events) |event| try interaction.consume(&desktop, &surfaces, event);
+    try std.testing.expectEqual(position, interaction.pointerPosition());
+    try std.testing.expectEqual(cursor, interaction.cursor);
+    try std.testing.expectEqual(@as(?TestInteraction.Target, null), interaction.hover);
+    try std.testing.expectEqual(@as(usize, 0), interaction.pendingCommands());
+
+    try std.testing.expectError(error.StaleDevice, interaction.consume(&desktop, &surfaces, .{
+        .hold_begin = .{ .device = device_b, .time_usec = 9, .fingers = 2 },
+    }));
+    try interaction.consume(&desktop, &surfaces, .{ .device_added = .{
+        .device = device_b,
+        .capabilities = .{ .keyboard = true },
+    } });
+    try std.testing.expectError(error.MissingCapability, interaction.consume(&desktop, &surfaces, .{
+        .swipe_end = .{ .device = device_b, .time_usec = 10, .cancelled = true },
+    }));
 }
 
 test "interaction: command storage grows while preserving motion order" {

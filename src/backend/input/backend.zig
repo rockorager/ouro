@@ -21,6 +21,18 @@ pub const DeviceId = struct {
     seat_generation: u32,
 };
 
+pub const GestureBegin = struct { device: DeviceId, time_usec: u64, fingers: u32 };
+pub const GestureUpdate = struct { device: DeviceId, time_usec: u64, dx: f64, dy: f64 };
+pub const PinchUpdate = struct {
+    device: DeviceId,
+    time_usec: u64,
+    dx: f64,
+    dy: f64,
+    scale: f64,
+    angle_delta: f64,
+};
+pub const GestureEnd = struct { device: DeviceId, time_usec: u64, cancelled: bool };
+
 pub const Event = union(enum) {
     device_added: struct { device: DeviceId, capabilities: platform_api.Capabilities },
     device_removed: DeviceId,
@@ -33,6 +45,14 @@ pub const Event = union(enum) {
         vertical: ?platform_api.AxisValue,
         horizontal: ?platform_api.AxisValue,
     },
+    swipe_begin: GestureBegin,
+    swipe_update: GestureUpdate,
+    swipe_end: GestureEnd,
+    pinch_begin: GestureBegin,
+    pinch_update: PinchUpdate,
+    pinch_end: GestureEnd,
+    hold_begin: GestureBegin,
+    hold_end: GestureEnd,
     keyboard_key: struct { device: DeviceId, time_usec: u64, key: u32, pressed: bool },
 };
 
@@ -379,6 +399,27 @@ pub const Backend = struct {
                     .horizontal = value.horizontal,
                 } });
             },
+            .swipe_begin => |value| self.push(.{ .swipe_begin = try self.gestureBegin(value) }),
+            .swipe_update => |value| self.push(.{ .swipe_update = try self.gestureUpdate(value) }),
+            .swipe_end => |value| self.push(.{ .swipe_end = try self.gestureEnd(value) }),
+            .pinch_begin => |value| self.push(.{ .pinch_begin = try self.gestureBegin(value) }),
+            .pinch_update => |value| {
+                try self.validateGestureDevice(value.device);
+                if (!std.math.isFinite(value.dx) or !std.math.isFinite(value.dy) or
+                    !std.math.isFinite(value.scale) or !std.math.isFinite(value.angle_delta))
+                    return error.InvalidGesture;
+                self.push(.{ .pinch_update = .{
+                    .device = try self.idForReference(value.device),
+                    .time_usec = value.time_usec,
+                    .dx = value.dx,
+                    .dy = value.dy,
+                    .scale = value.scale,
+                    .angle_delta = value.angle_delta,
+                } });
+            },
+            .pinch_end => |value| self.push(.{ .pinch_end = try self.gestureEnd(value) }),
+            .hold_begin => |value| self.push(.{ .hold_begin = try self.gestureBegin(value) }),
+            .hold_end => |value| self.push(.{ .hold_end = try self.gestureEnd(value) }),
             .keyboard_key => |value| {
                 const index = self.findReference(value.device) orelse return error.UnknownDevice;
                 if (value.key >= code_count) return error.InvalidCode;
@@ -392,6 +433,27 @@ pub const Backend = struct {
             },
             .ignored => {},
         }
+    }
+
+    fn validateGestureDevice(self: *const Backend, reference: platform_api.DeviceRef) !void {
+        const index = self.findReference(reference) orelse return error.UnknownDevice;
+        if (!self.devices[index].capabilities.pointer) return error.MissingCapability;
+    }
+
+    fn gestureBegin(self: *const Backend, value: platform_api.GestureBegin) !GestureBegin {
+        try self.validateGestureDevice(value.device);
+        return .{ .device = try self.idForReference(value.device), .time_usec = value.time_usec, .fingers = value.fingers };
+    }
+
+    fn gestureUpdate(self: *const Backend, value: platform_api.GestureUpdate) !GestureUpdate {
+        try self.validateGestureDevice(value.device);
+        if (!std.math.isFinite(value.dx) or !std.math.isFinite(value.dy)) return error.InvalidGesture;
+        return .{ .device = try self.idForReference(value.device), .time_usec = value.time_usec, .dx = value.dx, .dy = value.dy };
+    }
+
+    fn gestureEnd(self: *const Backend, value: platform_api.GestureEnd) !GestureEnd {
+        try self.validateGestureDevice(value.device);
+        return .{ .device = try self.idForReference(value.device), .time_usec = value.time_usec, .cancelled = value.cancelled };
     }
 
     fn removeAllDevices(self: *Backend) void {
@@ -753,6 +815,78 @@ test "input: pointer button motion and keyboard events retain generation identit
     try std.testing.expectEqual(id, backend.events()[4].keyboard_key.device);
     try std.testing.expect(try backend.isPressed(id, 0x110));
     try std.testing.expect(try backend.isPressed(id, 42));
+}
+
+test "input: gesture lifecycles preserve normalized values and device identity" {
+    var seat_fake: FakeSeat = .{};
+    var input_fake: FakeInput = .{};
+    const backend = try testBackend(&seat_fake, &input_fake, 16);
+    defer destroyTestBackend(backend) catch unreachable;
+
+    try backend.consume(.{ .device_added = .{ .device = 7, .capabilities = .{ .pointer = true } } });
+    const id = backend.events()[0].device_added.device;
+    backend.clearEvents();
+    try backend.consume(.{ .swipe_begin = .{ .device = 7, .time_usec = 10, .fingers = 3 } });
+    try backend.consume(.{ .swipe_update = .{ .device = 7, .time_usec = 11, .dx = 1.25, .dy = -2.5 } });
+    try backend.consume(.{ .swipe_end = .{ .device = 7, .time_usec = 12, .cancelled = true } });
+    try backend.consume(.{ .pinch_begin = .{ .device = 7, .time_usec = 20, .fingers = 4 } });
+    try backend.consume(.{ .pinch_update = .{
+        .device = 7,
+        .time_usec = 21,
+        .dx = -3,
+        .dy = 4,
+        .scale = 0.75,
+        .angle_delta = 12.5,
+    } });
+    try backend.consume(.{ .pinch_end = .{ .device = 7, .time_usec = 22, .cancelled = false } });
+    try backend.consume(.{ .hold_begin = .{ .device = 7, .time_usec = 30, .fingers = 2 } });
+    try backend.consume(.{ .hold_end = .{ .device = 7, .time_usec = 31, .cancelled = true } });
+
+    try std.testing.expectEqual(id, backend.events()[0].swipe_begin.device);
+    try std.testing.expectEqual(@as(u32, 3), backend.events()[0].swipe_begin.fingers);
+    try std.testing.expectEqual(@as(u64, 11), backend.events()[1].swipe_update.time_usec);
+    try std.testing.expectEqual(@as(f64, -2.5), backend.events()[1].swipe_update.dy);
+    try std.testing.expect(backend.events()[2].swipe_end.cancelled);
+    try std.testing.expectEqual(@as(u32, 4), backend.events()[3].pinch_begin.fingers);
+    try std.testing.expectEqual(@as(f64, 0.75), backend.events()[4].pinch_update.scale);
+    try std.testing.expectEqual(@as(f64, 12.5), backend.events()[4].pinch_update.angle_delta);
+    try std.testing.expect(!backend.events()[5].pinch_end.cancelled);
+    try std.testing.expectEqual(@as(u64, 30), backend.events()[6].hold_begin.time_usec);
+    try std.testing.expect(backend.events()[7].hold_end.cancelled);
+}
+
+test "input: gestures reject unknown non-pointer and non-finite values" {
+    var seat_fake: FakeSeat = .{};
+    var input_fake: FakeInput = .{};
+    const backend = try testBackend(&seat_fake, &input_fake, 8);
+    defer destroyTestBackend(backend) catch unreachable;
+
+    try std.testing.expectError(error.UnknownDevice, backend.consume(.{ .hold_begin = .{
+        .device = 99,
+        .time_usec = 1,
+        .fingers = 2,
+    } }));
+    try backend.consume(.{ .device_added = .{ .device = 1, .capabilities = .{} } });
+    try std.testing.expectError(error.MissingCapability, backend.consume(.{ .swipe_begin = .{
+        .device = 1,
+        .time_usec = 2,
+        .fingers = 3,
+    } }));
+    try backend.consume(.{ .device_added = .{ .device = 2, .capabilities = .{ .pointer = true } } });
+    try std.testing.expectError(error.InvalidGesture, backend.consume(.{ .swipe_update = .{
+        .device = 2,
+        .time_usec = 3,
+        .dx = std.math.nan(f64),
+        .dy = 0,
+    } }));
+    try std.testing.expectError(error.InvalidGesture, backend.consume(.{ .pinch_update = .{
+        .device = 2,
+        .time_usec = 4,
+        .dx = 0,
+        .dy = 0,
+        .scale = std.math.inf(f64),
+        .angle_delta = 0,
+    } }));
 }
 
 test "input: quiesce closes Session devices and teardown occurs outside callbacks" {

@@ -752,6 +752,15 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .pointer_button => |value| try adapter.pointerButton(value),
                 .pointer_axis => |value| try adapter.pointerAxis(value),
                 .keyboard_key => |value| try adapter.keyboardKey(value),
+                .swipe_begin,
+                .swipe_update,
+                .swipe_end,
+                .pinch_begin,
+                .pinch_update,
+                .pinch_end,
+                .hold_begin,
+                .hold_end,
+                => {},
             }
         }
 
