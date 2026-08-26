@@ -682,7 +682,10 @@ pub fn Desktop(comptime Shell: type) type {
                     };
                 },
                 .commit_ready => |commit| {
-                    const index = try desktop.resolveIndex(try desktop.idForShell(commit.id));
+                    const id = try desktop.idForShell(commit.id);
+                    const index = try desktop.resolveIndex(id);
+                    if (commit.constraints_changed)
+                        try desktop.copyMetadata(id, try shell.metadata(commit.id));
                     if (commit.unmapped) desktop.unmapParenting(index);
                     const content_ready = !commit.unmapped;
                     desktop.slots[index].content_ready = content_ready;
@@ -1499,6 +1502,7 @@ const TestShell = struct {
             surface_offset_x: i32 = 0,
             surface_offset_y: i32 = 0,
             unmapped: bool = false,
+            constraints_changed: bool = false,
         },
         popup_commit_ready: struct {
             id: PopupId,
@@ -1692,6 +1696,27 @@ test "desktop: toplevel parents preserve ancestor stacking and reparent on unmap
     shell.push(.{ .toplevel_destroyed = .{ .index = 1, .generation = 1 } });
     _ = try desktop.consume(&shell, 1);
     try std.testing.expect(desktop.slots[child.index].parent == null);
+}
+
+test "desktop: committed toplevel constraints update interaction bounds" {
+    var desktop = try initTestDesktop(8);
+    defer desktop.deinit();
+    var shell = TestShell{};
+    shell.push(created(0));
+    _ = try desktop.consume(&shell, 1);
+    try settleDesktop(&desktop, &shell);
+    const id = try desktop.idForShell(.{ .index = 0, .generation = 1 });
+    try std.testing.expectEqual(@as(i32, 0), (try desktop.metadata(id)).min_width);
+
+    shell.push(.{ .commit_ready = .{
+        .id = .{ .index = 0, .generation = 1 },
+        .serial = 0,
+        .constraints_changed = true,
+    } });
+    _ = try desktop.consume(&shell, 1);
+    const metadata = try desktop.metadata(id);
+    try std.testing.expectEqual(@as(i32, 10), metadata.min_width);
+    try std.testing.expectEqual(@as(i32, 20), metadata.min_height);
 }
 
 test "desktop: popup configure maps above its owning toplevel" {

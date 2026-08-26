@@ -145,6 +145,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 surface_offset_x: i32 = 0,
                 surface_offset_y: i32 = 0,
                 unmapped: bool = false,
+                constraints_changed: bool = false,
             },
             popup_commit_ready: struct {
                 id: PopupId,
@@ -258,6 +259,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             min_height: i32 = 0,
             max_width: i32 = 0,
             max_height: i32 = 0,
+            pending_min_width: i32 = 0,
+            pending_min_height: i32 = 0,
+            pending_max_width: i32 = 0,
+            pending_max_height: i32 = 0,
             parent: ?ToplevelId = null,
             mapped: bool = false,
             version: u32 = 1,
@@ -612,6 +617,14 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 switch (slot.role) {
                     .toplevel => |toplevel| {
                         const role = try adapter.resolveToplevel(toplevel);
+                        const constraints_changed = role.min_width != role.pending_min_width or
+                            role.min_height != role.pending_min_height or
+                            role.max_width != role.pending_max_width or
+                            role.max_height != role.pending_max_height;
+                        role.min_width = role.pending_min_width;
+                        role.min_height = role.pending_min_height;
+                        role.max_width = role.pending_max_width;
+                        role.max_height = role.pending_max_height;
                         const size = (try adapter.core.getSurfaceById(slot.surface_id)).committedSize();
                         const mapped = size.width != 0 and size.height != 0;
                         const unmapped = role.mapped and !mapped;
@@ -624,6 +637,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                             .surface_offset_x = if (slot.window_geometry) |geometry| geometry.x else 0,
                             .surface_offset_y = if (slot.window_geometry) |geometry| geometry.y else 0,
                             .unmapped = unmapped,
+                            .constraints_changed = constraints_changed,
                         } });
                     },
                     .popup => |popup| adapter.publishReserved(.{ .popup_commit_ready = .{
@@ -1210,20 +1224,20 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .set_app_id => |v| adapter.setMetadata(slot, false, v.app_id) catch |cause|
                     return try adapter.metadataFailure(actor, decoded.handle.id, cause),
                 .set_max_size => |v| {
-                    if (v.width < 0 or v.height < 0) return try adapter.invalidToplevelSize(actor, decoded.handle.id);
-                    if (!adapter.canPublishWithLive(adapter.live_toplevels, adapter.live_popups))
-                        return try adapter.noMemory(actor);
-                    slot.max_width = v.width;
-                    slot.max_height = v.height;
-                    adapter.publish(.{ .metadata_changed = id }) catch unreachable;
+                    if (v.width < 0 or v.height < 0 or
+                        (v.width != 0 and slot.pending_min_width != 0 and v.width < slot.pending_min_width) or
+                        (v.height != 0 and slot.pending_min_height != 0 and v.height < slot.pending_min_height))
+                        return try adapter.invalidToplevelSize(actor, decoded.handle.id);
+                    slot.pending_max_width = v.width;
+                    slot.pending_max_height = v.height;
                 },
                 .set_min_size => |v| {
-                    if (v.width < 0 or v.height < 0) return try adapter.invalidToplevelSize(actor, decoded.handle.id);
-                    if (!adapter.canPublishWithLive(adapter.live_toplevels, adapter.live_popups))
-                        return try adapter.noMemory(actor);
-                    slot.min_width = v.width;
-                    slot.min_height = v.height;
-                    adapter.publish(.{ .metadata_changed = id }) catch unreachable;
+                    if (v.width < 0 or v.height < 0 or
+                        (v.width != 0 and slot.pending_max_width != 0 and v.width > slot.pending_max_width) or
+                        (v.height != 0 and slot.pending_max_height != 0 and v.height > slot.pending_max_height))
+                        return try adapter.invalidToplevelSize(actor, decoded.handle.id);
+                    slot.pending_min_width = v.width;
+                    slot.pending_min_height = v.height;
                 },
                 .set_maximized => adapter.publishState(id, .maximized, true) catch
                     return try adapter.noMemory(actor),
@@ -2275,6 +2289,74 @@ test "xdg-shell: toplevel parent cycles are protocol errors" {
     try std.testing.expect(context.adapter.toplevels[first.index].parent == null);
     try std.testing.expectEqual(first, context.adapter.toplevels[second.index].parent.?);
     try std.testing.expectError(error.InvalidParent, context.adapter.setParent(first, first));
+}
+
+test "xdg-shell: toplevel size constraints publish only on surface commit" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const id = try context.createToplevel();
+
+    try test_protocol.xdg_toplevel.encodeRequest(&context.requests, 12, .{
+        .set_max_size = .{ .width = 800, .height = 600 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try test_protocol.xdg_toplevel.encodeRequest(&context.requests, 12, .{
+        .set_min_size = .{ .width = 400, .height = 300 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try std.testing.expect(context.adapter.popEvent() == null);
+    const before = try context.adapter.metadata(id);
+    try std.testing.expectEqual(@as(i32, 0), before.min_width);
+    try std.testing.expectEqual(@as(i32, 0), before.max_width);
+
+    try context.adapter.surfaceCommitted(context.adapter.surfaces[0].surface_id);
+    const committed = switch (context.adapter.popEvent() orelse return error.MissingEvent) {
+        .commit_ready => |value| value,
+        else => return error.UnexpectedEvent,
+    };
+    try std.testing.expect(committed.constraints_changed);
+    const after = try context.adapter.metadata(id);
+    try std.testing.expectEqual(@as(i32, 400), after.min_width);
+    try std.testing.expectEqual(@as(i32, 300), after.min_height);
+    try std.testing.expectEqual(@as(i32, 800), after.max_width);
+    try std.testing.expectEqual(@as(i32, 600), after.max_height);
+
+    try context.adapter.surfaceCommitted(context.adapter.surfaces[0].surface_id);
+    try std.testing.expect(!(switch (context.adapter.popEvent() orelse return error.MissingEvent) {
+        .commit_ready => |value| value.constraints_changed,
+        else => return error.UnexpectedEvent,
+    }));
+}
+
+test "xdg-shell: contradictory pending size constraints are protocol errors" {
+    {
+        const context = try TestContext.init();
+        defer context.deinit();
+        _ = try context.createToplevel();
+        try test_protocol.xdg_toplevel.encodeRequest(&context.requests, 12, .{
+            .set_max_size = .{ .width = 100, .height = 100 },
+        });
+        try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+        try test_protocol.xdg_toplevel.encodeRequest(&context.requests, 12, .{
+            .set_min_size = .{ .width = 101, .height = 100 },
+        });
+        try std.testing.expectEqual(wayring.dispatch.Control.stop, try context.dispatch());
+        try std.testing.expectEqual(@as(i32, 0), context.adapter.toplevels[0].pending_min_width);
+    }
+    {
+        const context = try TestContext.init();
+        defer context.deinit();
+        _ = try context.createToplevel();
+        try test_protocol.xdg_toplevel.encodeRequest(&context.requests, 12, .{
+            .set_min_size = .{ .width = 100, .height = 100 },
+        });
+        try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+        try test_protocol.xdg_toplevel.encodeRequest(&context.requests, 12, .{
+            .set_max_size = .{ .width = 100, .height = 99 },
+        });
+        try std.testing.expectEqual(wayring.dispatch.Control.stop, try context.dispatch());
+        try std.testing.expectEqual(@as(i32, 0), context.adapter.toplevels[0].pending_max_height);
+    }
 }
 
 test "xdg-shell: configure emission resumes between role and surface events" {
