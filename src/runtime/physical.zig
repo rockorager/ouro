@@ -74,6 +74,12 @@ pub fn Coordinator(comptime protocol: type) type {
             id: Adapter.SurfaceId,
             commits: usize,
         };
+        const SurfaceScene = struct {
+            root: Desktop.SceneWindow,
+            offset_x: i32 = 0,
+            offset_y: i32 = 0,
+            subsurface: bool = false,
+        };
         const ProtocolReady = struct {
             const decoration: u16 = 1 << 0;
             const shell: u16 = 1 << 1;
@@ -254,6 +260,7 @@ pub fn Coordinator(comptime protocol: type) type {
         ready_update_surfaces: []wayring.objects.Handle,
         applied_updates: []Adapter.Applied,
         applied_layers: []*Layer,
+        subsurface_scene_order: []Adapter.SurfaceId,
         pending_surface_head: usize = 0,
         pending_surface_len: usize = 0,
         app_layers: []Layer,
@@ -326,10 +333,16 @@ pub fn Coordinator(comptime protocol: type) type {
                 config.surface.content_update_capacity,
             );
             errdefer allocator.free(self.applied_layers);
+            self.subsurface_scene_order = try allocator.alloc(
+                Adapter.SurfaceId,
+                config.surface.surface_capacity,
+            );
+            errdefer allocator.free(self.subsurface_scene_order);
             self.pending_surface_head = 0;
             self.pending_surface_len = 0;
             if (config.timer_capacity < 4 or config.desktop_transaction_timeout_ns == 0 or
                 config.output.max_samples < 2 or config.output.max_source_bytes == 0 or
+                config.output.max_samples < config.surface.surface_capacity or
                 config.protocol_output.association_capacity < config.output.max_samples)
                 return error.InvalidConfig;
             const app_layer_capacity = try std.math.add(
@@ -583,6 +596,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 first_error = err;
             };
             self.presentations.deinit(self.allocator);
+            self.allocator.free(self.subsurface_scene_order);
             self.allocator.free(self.applied_layers);
             self.allocator.free(self.applied_updates);
             self.allocator.free(self.ready_update_surfaces);
@@ -1689,25 +1703,56 @@ pub fn Coordinator(comptime protocol: type) type {
             var visibility_changed = false;
             for (self.app_layers) |*layer| if (layer.active) {
                 const id = layer.id orelse unreachable;
-                const scene = self.desktop.sceneForSurface(id) catch null;
+                const scene = self.surfaceScene(id) orelse {
+                    self.abandonLayer(layer);
+                    visibility_changed = true;
+                    continue;
+                };
                 var sample = layer.sample.?;
                 const natural_size = layer.change.?.current.?.surface_size;
-                if (scene) |window| {
-                    if (window.has_window_geometry) {
-                        sample.destination.x = alignedOrigin(window.geometry.x, window.surface_offset.x);
-                        sample.destination.y = alignedOrigin(window.geometry.y, window.surface_offset.y);
+                if (scene.subsurface) {
+                    sample.destination.x = std.math.add(
+                        i32,
+                        if (scene.root.has_window_geometry)
+                            alignedOrigin(scene.root.geometry.x, scene.root.surface_offset.x)
+                        else
+                            scene.root.geometry.x,
+                        scene.offset_x,
+                    ) catch {
+                        self.abandonLayer(layer);
+                        visibility_changed = true;
+                        continue;
+                    };
+                    sample.destination.y = std.math.add(
+                        i32,
+                        if (scene.root.has_window_geometry)
+                            alignedOrigin(scene.root.geometry.y, scene.root.surface_offset.y)
+                        else
+                            scene.root.geometry.y,
+                        scene.offset_y,
+                    ) catch {
+                        self.abandonLayer(layer);
+                        visibility_changed = true;
+                        continue;
+                    };
+                    sample.destination.width = natural_size.width;
+                    sample.destination.height = natural_size.height;
+                } else {
+                    if (scene.root.has_window_geometry) {
+                        sample.destination.x = alignedOrigin(scene.root.geometry.x, scene.root.surface_offset.x);
+                        sample.destination.y = alignedOrigin(scene.root.geometry.y, scene.root.surface_offset.y);
                         sample.destination.width = natural_size.width;
                         sample.destination.height = natural_size.height;
                     } else {
                         sample.destination = .{
-                            .x = window.geometry.x,
-                            .y = window.geometry.y,
+                            .x = scene.root.geometry.x,
+                            .y = scene.root.geometry.y,
                             .width = @intCast(@min(
-                                window.geometry.width,
+                                scene.root.geometry.width,
                                 @as(i32, @intCast(output_size.width)),
                             )),
                             .height = @intCast(@min(
-                                window.geometry.height,
+                                scene.root.geometry.height,
                                 @as(i32, @intCast(output_size.height)),
                             )),
                         };
@@ -1764,12 +1809,12 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.dropPendingSurface(pending.id);
                 return false;
             }
-            const in_desktop = self.desktop.sceneForSurface(exact_surface_id) catch null != null;
+            const surface_scene = self.surfaceScene(exact_surface_id);
             const requested_cursor = if (self.interaction.cursor.surface) |id|
                 std.meta.eql(id, exact_surface_id)
             else
                 false;
-            var layer = if (in_desktop)
+            var layer = if (surface_scene != null)
                 self.appLayerForSurface(exact_surface_id) orelse return false
             else if (requested_cursor)
                 &self.cursor_layer
@@ -1781,7 +1826,7 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             if (layer.candidate == null) {
                 if (!try self.admitReadyBatch(surface)) return false;
-                layer = if (in_desktop)
+                layer = if (surface_scene != null)
                     self.appLayerForSurface(exact_surface_id) orelse return false
                 else
                     &self.cursor_layer;
@@ -1865,26 +1910,42 @@ pub fn Coordinator(comptime protocol: type) type {
                 output.planner.output
             else
                 .{ .width = destination_size.width, .height = destination_size.height };
-            const scene = self.desktop.sceneForSurface(exact_surface_id) catch null;
-            const has_window_geometry = if (scene) |window| window.has_window_geometry else false;
-            const destination_x = if (scene) |window| if (has_window_geometry)
-                alignedOrigin(window.geometry.x, window.surface_offset.x)
+            const has_window_geometry = if (surface_scene) |scene|
+                !scene.subsurface and scene.root.has_window_geometry
             else
-                window.geometry.x else 0;
-            const destination_y = if (scene) |window| if (has_window_geometry)
-                alignedOrigin(window.geometry.y, window.surface_offset.y)
-            else
-                window.geometry.y else 0;
+                false;
+            const destination_x = if (surface_scene) |scene| try std.math.add(
+                i32,
+                if (scene.root.has_window_geometry)
+                    alignedOrigin(scene.root.geometry.x, scene.root.surface_offset.x)
+                else
+                    scene.root.geometry.x,
+                scene.offset_x,
+            ) else 0;
+            const destination_y = if (surface_scene) |scene| try std.math.add(
+                i32,
+                if (scene.root.has_window_geometry)
+                    alignedOrigin(scene.root.geometry.y, scene.root.surface_offset.y)
+                else
+                    scene.root.geometry.y,
+                scene.offset_y,
+            ) else 0;
             const rendered_width: u32 = if (has_window_geometry)
                 destination_size.width
-            else if (scene) |window|
-                @intCast(@min(window.geometry.width, @as(i32, @intCast(output_size.width))))
+            else if (surface_scene) |scene|
+                if (scene.subsurface)
+                    destination_size.width
+                else
+                    @intCast(@min(scene.root.geometry.width, @as(i32, @intCast(output_size.width))))
             else
                 @min(destination_size.width, output_size.width);
             const rendered_height: u32 = if (has_window_geometry)
                 destination_size.height
-            else if (scene) |window|
-                @intCast(@min(window.geometry.height, @as(i32, @intCast(output_size.height))))
+            else if (surface_scene) |scene|
+                if (scene.subsurface)
+                    destination_size.height
+                else
+                    @intCast(@min(scene.root.geometry.height, @as(i32, @intCast(output_size.height))))
             else
                 @min(destination_size.height, output_size.height);
             const destination: render.Rect = .{
@@ -1898,8 +1959,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 borrowed_source.size.width,
                 borrowed_source.size.height,
             );
-            const clip = if (scene) |window|
-                if (window.visible) try clipToOutput(destination, output_size) else null
+            const clip = if (surface_scene) |scene|
+                if (scene.root.visible) try clipToOutput(destination, output_size) else null
             else
                 try clipToOutput(destination, output_size);
             const visible_clip = clip orelse {
@@ -2050,7 +2111,7 @@ pub fn Coordinator(comptime protocol: type) type {
                         &self.cursor_layer
                     else
                         return false
-                else if (self.desktop.sceneForSurface(id) catch null != null)
+                else if (self.surfaceScene(id) != null)
                     self.availableAppLayer(id, index) orelse return false
                 else
                     return false;
@@ -2132,18 +2193,33 @@ pub fn Coordinator(comptime protocol: type) type {
             const windows = try self.desktop.sceneSnapshot(self.scene_windows);
             for (windows) |window| {
                 if (!window.visible) continue;
-                const layer = self.findAppLayer(window.surface) orelse continue;
-                if (!layer.active) continue;
-                self.frame_samples[count] = layer.sample.?;
-                self.frame_bindings[count] = layer.binding.?;
-                self.frame_changes[count] = layer.change.?;
-                count += 1;
+                const surfaces = self.subcompositor_adapter.sceneOrder(
+                    window.surface,
+                    self.subsurface_scene_order,
+                ) catch |err| switch (err) {
+                    error.NotSubsurface => single_surface: {
+                        self.subsurface_scene_order[0] = window.surface;
+                        break :single_surface self.subsurface_scene_order[0..1];
+                    },
+                    else => return err,
+                };
+                for (surfaces) |surface| {
+                    const layer = self.findAppLayer(surface) orelse continue;
+                    if (!layer.active) continue;
+                    if (!try self.refreshSubsurfaceLayer(layer, output.planner.output)) continue;
+                    if (count == self.frame_samples.len) return error.OutputTooSmall;
+                    self.frame_samples[count] = layer.sample.?;
+                    self.frame_bindings[count] = layer.binding.?;
+                    self.frame_changes[count] = layer.change.?;
+                    count += 1;
+                }
             }
             if (self.cursor_layer.active) {
                 if (try self.interaction.cursor.composite(.{
                     .surface = self.cursor_layer.id.?,
                     .sample = self.cursor_layer.sample.?,
                 }, output.planner.output)) |cursor_sample| {
+                    if (count == self.frame_samples.len) return error.OutputTooSmall;
                     self.frame_samples[count] = cursor_sample;
                     self.frame_bindings[count] = self.cursor_layer.binding.?;
                     self.frame_changes[count] = self.cursor_layer.change.?;
@@ -2175,6 +2251,43 @@ pub fn Coordinator(comptime protocol: type) type {
                 },
                 .retired => |failure| try self.finishOutcome(failure.frame, false),
             }
+        }
+
+        fn refreshSubsurfaceLayer(
+            self: *Self,
+            layer: *Layer,
+            output_size: render.Size,
+        ) !bool {
+            const id = layer.id orelse return false;
+            const scene = self.surfaceScene(id) orelse return false;
+            if (!scene.subsurface) return true;
+            var sample = layer.sample orelse return false;
+            sample.destination.x = try std.math.add(
+                i32,
+                if (scene.root.has_window_geometry)
+                    alignedOrigin(scene.root.geometry.x, scene.root.surface_offset.x)
+                else
+                    scene.root.geometry.x,
+                scene.offset_x,
+            );
+            sample.destination.y = try std.math.add(
+                i32,
+                if (scene.root.has_window_geometry)
+                    alignedOrigin(scene.root.geometry.y, scene.root.surface_offset.y)
+                else
+                    scene.root.geometry.y,
+                scene.offset_y,
+            );
+            sample.clip = try clipToOutput(sample.destination, output_size) orelse return false;
+            if (std.meta.eql(sample.destination, layer.sample.?.destination) and
+                std.meta.eql(sample.clip, layer.sample.?.clip)) return true;
+            const natural_size = layer.change.?.current.?.surface_size;
+            layer.sample = sample;
+            layer.change = .{
+                .current = damage.SurfaceState.fromSample(sample, natural_size),
+                .invalidate_bounds = true,
+            };
+            return true;
         }
 
         fn processOutput(self: *Self) !void {
@@ -2382,6 +2495,20 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             for (self.app_layers) |*layer| if (layerVacant(layer)) return layer;
             return null;
+        }
+
+        fn surfaceScene(self: *Self, id: Adapter.SurfaceId) ?SurfaceScene {
+            if (self.desktop.sceneForSurface(id) catch null) |root|
+                return .{ .root = root };
+            if (!(self.subcompositor_adapter.visible(id) catch return null)) return null;
+            const placement = self.subcompositor_adapter.placement(id) catch return null;
+            const root = self.desktop.sceneForSurface(placement.root) catch return null;
+            return .{
+                .root = root,
+                .offset_x = placement.offset.x,
+                .offset_y = placement.offset.y,
+                .subsurface = true,
+            };
         }
 
         fn findAppLayer(self: *Self, id: Adapter.SurfaceId) ?*Layer {
