@@ -260,6 +260,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             max_height: i32 = 0,
             parent: ?ToplevelId = null,
             mapped: bool = false,
+            version: u32 = 1,
+            capabilities_sent: bool = false,
         };
 
         const PopupSlot = struct {
@@ -277,7 +279,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 id: ToplevelId,
                 value: ToplevelConfigure,
                 serial: u32,
-                phase: u1 = 0,
+                phase: u2 = 0,
             },
             popup_configure: struct {
                 id: PopupId,
@@ -831,6 +833,18 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                         role.xdg_surface_generation,
                     ) catch return true;
                     if (command.phase == 0) {
+                        if (role.version >= 5 and !role.capabilities_sent) {
+                            var capability_bytes: [3 * 4]u8 = undefined;
+                            const capabilities = encodeCapabilities(Toplevel, &capability_bytes);
+                            try Toplevel.encodeEvent(queue, role.header.resource.id, .{
+                                .wm_capabilities = .{ .capabilities = capabilities },
+                            });
+                            role.capabilities_sent = true;
+                            return false;
+                        }
+                        command.phase = 1;
+                    }
+                    if (command.phase == 1) {
                         var state_bytes: [9 * 4]u8 = undefined;
                         const states = encodeStates(command.value.states, &state_bytes);
                         try Toplevel.encodeEvent(queue, role.header.resource.id, .{ .configure = .{
@@ -838,7 +852,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                             .height = command.value.height,
                             .states = states,
                         } });
-                        command.phase = 1;
+                        command.phase = 2;
                         return false;
                     }
                     try XdgSurface.encodeEvent(queue, surface.header.resource.id, .{
@@ -1055,6 +1069,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                         return try adapter.failure(actor, decoded.handle.id, cause);
                     };
                     role.header.resource = admitted.id;
+                    role.version = server_objects.namespace.resolve(admitted.id).?.version;
                     role.xdg_surface_index = indexOf(SurfaceSlot, adapter.surfaces, slot);
                     role.xdg_surface_generation = slot.header.generation;
                     const id = adapter.toplevelId(role);
@@ -1831,6 +1846,17 @@ fn encodeStates(states: anytype, storage: *[9 * 4]u8) []const u8 {
     return storage[0..offset];
 }
 
+fn encodeCapabilities(comptime Toplevel: type, storage: *[3 * 4]u8) []const u8 {
+    inline for (.{
+        Toplevel.wm_capabilities.maximize,
+        Toplevel.wm_capabilities.fullscreen,
+        Toplevel.wm_capabilities.minimize,
+    }, 0..) |capability, index| {
+        std.mem.writeInt(u32, storage[index * 4 ..][0..4], capability.toWire(), native_endian);
+    }
+    return storage;
+}
+
 const StateValue = enum(u32) {
     maximized = 1,
     fullscreen = 2,
@@ -2098,6 +2124,15 @@ fn expectClientOutbound(
     try std.testing.expectEqual(@as(usize, 0), snapshot.second.len);
     var bytes = snapshot.first;
 
+    const capabilities_message = (try wayring.wire.Message.decode(bytes)).?;
+    const capabilities_event = try test_protocol.xdg_toplevel.decodeEvent(capabilities_message, fds);
+    try std.testing.expectEqualSlices(u8, &.{
+        2, 0, 0, 0,
+        3, 0, 0, 0,
+        4, 0, 0, 0,
+    }, capabilities_event.wm_capabilities.capabilities);
+    bytes = bytes[capabilities_message.header.size..];
+
     const role_message = (try wayring.wire.Message.decode(bytes)).?;
     const role_event = try test_protocol.xdg_toplevel.decodeEvent(role_message, fds);
     try std.testing.expectEqual(width, role_event.configure.width);
@@ -2284,24 +2319,43 @@ test "xdg-shell: configure emission resumes between role and surface events" {
         first_message,
         &context.received_fds,
     );
-    try std.testing.expectEqual(@as(i32, 800), first_event.configure.width);
+    try std.testing.expectEqualSlices(u8, &.{
+        2, 0, 0, 0,
+        3, 0, 0, 0,
+        4, 0, 0, 0,
+    }, first_event.wm_capabilities.capabilities);
     try output.begin(first);
     try output.complete(first.byteCount());
 
-    try std.testing.expectEqual(@as(usize, 1), try context.adapter.flushOn(
+    try std.testing.expectEqual(@as(usize, 0), try context.adapter.flushOn(
         &context.server_objects,
         &output,
     ));
     const second = try output.snapshot(&descriptor_scratch, &control);
     const second_message = (try wayring.wire.Message.decode(second.first)).?;
-    try std.testing.expectEqual(@as(u32, 11), second_message.header.object_id);
-    const second_event = try test_protocol.xdg_surface.decodeEvent(
+    try std.testing.expectEqual(@as(u32, 12), second_message.header.object_id);
+    const second_event = try test_protocol.xdg_toplevel.decodeEvent(
         second_message,
         &context.received_fds,
     );
-    try std.testing.expectEqual(serial, second_event.configure.serial);
+    try std.testing.expectEqual(@as(i32, 800), second_event.configure.width);
     try output.begin(second);
     try output.complete(second.byteCount());
+
+    try std.testing.expectEqual(@as(usize, 1), try context.adapter.flushOn(
+        &context.server_objects,
+        &output,
+    ));
+    const third = try output.snapshot(&descriptor_scratch, &control);
+    const third_message = (try wayring.wire.Message.decode(third.first)).?;
+    try std.testing.expectEqual(@as(u32, 11), third_message.header.object_id);
+    const third_event = try test_protocol.xdg_surface.decodeEvent(
+        third_message,
+        &context.received_fds,
+    );
+    try std.testing.expectEqual(serial, third_event.configure.serial);
+    try output.begin(third);
+    try output.complete(third.byteCount());
 
     try test_protocol.xdg_surface.encodeRequest(&context.requests, 11, .{
         .ack_configure = .{ .serial = serial },
@@ -2327,6 +2381,28 @@ test "xdg-shell: configure emission resumes between role and surface events" {
         TestAdapter.WindowGeometry{ .x = -12, .y = 7, .width = 780, .height = 560 },
         context.adapter.surfaces[0].window_geometry.?,
     );
+}
+
+test "xdg-shell: pre-v5 toplevel configure omits wm capabilities" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    context.server_objects.namespace.resolve(context.manager).?.version = 4;
+    const id = try context.createToplevel();
+    try std.testing.expectEqual(@as(u32, 4), context.adapter.toplevels[id.index].version);
+    _ = try context.adapter.queueToplevelConfigure(id, .{ .width = 80, .height = 60 });
+
+    var output = wayring.tx.Queue.init(&context.blocks, 64, &context.descriptors, 0);
+    defer output.deinit();
+    try std.testing.expectEqual(@as(usize, 1), try context.adapter.flushOn(
+        &context.server_objects,
+        &output,
+    ));
+    var descriptor_scratch: [1]std.os.linux.fd_t = undefined;
+    var control: [64]u8 align(@alignOf(std.os.linux.cmsghdr)) = undefined;
+    const snapshot = try output.snapshot(&descriptor_scratch, &control);
+    const message = (try wayring.wire.Message.decode(snapshot.first)).?;
+    const event = try test_protocol.xdg_toplevel.decodeEvent(message, &context.received_fds);
+    try std.testing.expectEqual(@as(i32, 80), event.configure.width);
 }
 
 test "xdg-shell: full commit event capacity rejects before core mutation" {
@@ -2484,6 +2560,7 @@ test "xdg-shell: flushing is client scoped with overlapping object IDs" {
     const toplevel_a = try adapter.acquireToplevel();
     toplevel_a.xdg_surface_index = indexOf(TestAdapter.SurfaceSlot, adapter.surfaces, surface_a);
     toplevel_a.xdg_surface_generation = surface_a.header.generation;
+    toplevel_a.version = 7;
     toplevel_a.header.resource = try server_a.insertClient(
         12,
         &test_protocol.xdg_toplevel.info,
@@ -2495,6 +2572,7 @@ test "xdg-shell: flushing is client scoped with overlapping object IDs" {
     const toplevel_b = try adapter.acquireToplevel();
     toplevel_b.xdg_surface_index = indexOf(TestAdapter.SurfaceSlot, adapter.surfaces, surface_b);
     toplevel_b.xdg_surface_generation = surface_b.header.generation;
+    toplevel_b.version = 7;
     toplevel_b.header.resource = try server_b.insertClient(
         12,
         &test_protocol.xdg_toplevel.info,
