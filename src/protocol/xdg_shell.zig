@@ -130,6 +130,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 placement: PopupPlacement,
             },
             metadata_changed: ToplevelId,
+            parent_changed: struct { id: ToplevelId, parent: ?ToplevelId },
             state_requested: struct {
                 id: ToplevelId,
                 state: RequestedState,
@@ -143,6 +144,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 has_window_geometry: bool = false,
                 surface_offset_x: i32 = 0,
                 surface_offset_y: i32 = 0,
+                unmapped: bool = false,
             },
             popup_commit_ready: struct {
                 id: PopupId,
@@ -256,6 +258,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             min_height: i32 = 0,
             max_width: i32 = 0,
             max_height: i32 = 0,
+            parent: ?ToplevelId = null,
+            mapped: bool = false,
         };
 
         const PopupSlot = struct {
@@ -604,13 +608,22 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     slot.pending_window_geometry = null;
                 }
                 switch (slot.role) {
-                    .toplevel => |toplevel| adapter.publishReserved(.{ .commit_ready = .{
-                        .id = toplevel,
-                        .serial = slot.last_acked_serial,
-                        .has_window_geometry = slot.window_geometry != null,
-                        .surface_offset_x = if (slot.window_geometry) |geometry| geometry.x else 0,
-                        .surface_offset_y = if (slot.window_geometry) |geometry| geometry.y else 0,
-                    } }),
+                    .toplevel => |toplevel| {
+                        const role = try adapter.resolveToplevel(toplevel);
+                        const size = (try adapter.core.getSurfaceById(slot.surface_id)).committedSize();
+                        const mapped = size.width != 0 and size.height != 0;
+                        const unmapped = role.mapped and !mapped;
+                        if (unmapped) adapter.unmapToplevel(toplevel);
+                        role.mapped = mapped;
+                        adapter.publishReserved(.{ .commit_ready = .{
+                            .id = toplevel,
+                            .serial = slot.last_acked_serial,
+                            .has_window_geometry = slot.window_geometry != null,
+                            .surface_offset_x = if (slot.window_geometry) |geometry| geometry.x else 0,
+                            .surface_offset_y = if (slot.window_geometry) |geometry| geometry.y else 0,
+                            .unmapped = unmapped,
+                        } });
+                    },
                     .popup => |popup| adapter.publishReserved(.{ .popup_commit_ready = .{
                         .id = popup,
                         .serial = slot.last_acked_serial,
@@ -1144,7 +1157,18 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             const id = adapter.toplevelId(slot);
             switch (decoded.value) {
                 .destroy => {},
-                .set_parent, .show_window_menu => {},
+                .set_parent => |value| {
+                    const parent = if (value.parent) |object_id|
+                        adapter.toplevelIdOn(server_objects, object_id) catch
+                            return try adapter.invalidParent(actor, decoded.handle.id)
+                    else
+                        null;
+                    adapter.setParent(id, parent) catch |cause| switch (cause) {
+                        error.Exhausted => return try adapter.noMemory(actor),
+                        else => return try adapter.invalidParent(actor, decoded.handle.id),
+                    };
+                },
+                .show_window_menu => {},
                 .move => |v| {
                     if (adapter.validateToplevelGrab(slot, v.seat, v.serial))
                         adapter.publish(.{ .move_requested = id }) catch return try adapter.noMemory(actor);
@@ -1451,6 +1475,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             const slot = &adapter.toplevels[index];
             if (!slot.header.active) return;
             const id = adapter.toplevelId(slot);
+            adapter.unmapToplevel(id);
             if (adapter.resolveRoleSurface(slot.xdg_surface_index, slot.xdg_surface_generation)) |surface| {
                 if (adapter.core.getSurfaceById(surface.surface_id)) |core_surface| {
                     core_surface.role.deactivateObject(toplevel_role_id) catch {};
@@ -1464,6 +1489,41 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             adapter.publishTerminal(.{ .toplevel_destroyed = id });
             adapter.abandonToplevel(index);
         }
+
+        fn setParent(adapter: *Self, child: ToplevelId, requested: ?ToplevelId) !void {
+            const slot = try adapter.resolveToplevel(child);
+            var parent = requested;
+            if (parent) |id| {
+                if (std.meta.eql(id, child)) return error.InvalidParent;
+                const parent_slot = try adapter.resolveToplevel(id);
+                if (!parent_slot.mapped) {
+                    parent = null;
+                } else {
+                    var ancestor: ?ToplevelId = id;
+                    while (ancestor) |value| {
+                        if (std.meta.eql(value, child)) return error.InvalidParent;
+                        ancestor = (try adapter.resolveToplevel(value)).parent;
+                    }
+                }
+            }
+            if (optionalToplevelEqual(slot.parent, parent)) return;
+            if (!adapter.canPublishWithLive(adapter.live_toplevels, adapter.live_popups))
+                return error.Exhausted;
+            slot.parent = parent;
+            adapter.publish(.{ .parent_changed = .{ .id = child, .parent = parent } }) catch unreachable;
+        }
+
+        fn unmapToplevel(adapter: *Self, id: ToplevelId) void {
+            const slot = adapter.resolveToplevel(id) catch return;
+            const replacement = slot.parent;
+            slot.parent = null;
+            for (adapter.toplevels) |*child| {
+                if (!child.header.active or child.parent == null or
+                    !std.meta.eql(child.parent.?, id)) continue;
+                child.parent = replacement;
+            }
+        }
+
         fn abandonToplevel(adapter: *Self, index: u32) void {
             const slot = &adapter.toplevels[index];
             const title = slot.title;
@@ -1671,6 +1731,9 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         fn invalidToplevelSize(adapter: *Self, actor: *wayring.connection.Actor, id: u32) !wayring.dispatch.Control {
             return adapter.protocolError(actor, id, Toplevel.@"error".invalid_size.value, "invalid toplevel size");
         }
+        fn invalidParent(adapter: *Self, actor: *wayring.connection.Actor, id: u32) !wayring.dispatch.Control {
+            return adapter.protocolError(actor, id, Toplevel.@"error".invalid_parent.value, "invalid toplevel parent");
+        }
         fn protocolError(
             adapter: *Self,
             actor: *wayring.connection.Actor,
@@ -1693,6 +1756,11 @@ fn initHeaders(comptime T: type, slots: []T) void {
         slot.* = .{};
         slot.header.next_free = if (index + 1 < slots.len) @intCast(index + 1) else none;
     }
+}
+
+fn optionalToplevelEqual(a: anytype, b: @TypeOf(a)) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.meta.eql(a.?, b.?);
 }
 
 fn acquire(comptime T: type, slots: []T, free: *u32) !*T {
@@ -2105,6 +2173,75 @@ test "xdg-shell: generated requests publish owned generational toplevel state" {
     try std.testing.expectError(error.StaleToplevel, context.adapter.metadata(id));
 }
 
+test "xdg-shell: toplevel parents are mapped, nullable, and cleared on retirement" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const parent = try context.createToplevel();
+    const child = try context.createSecondToplevel();
+    context.adapter.toplevels[parent.index].mapped = true;
+
+    try test_protocol.xdg_toplevel.encodeRequest(&context.requests, 15, .{
+        .set_parent = .{ .parent = 12 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    const assigned = switch (context.adapter.popEvent() orelse return error.MissingEvent) {
+        .parent_changed => |value| value,
+        else => return error.UnexpectedEvent,
+    };
+    try std.testing.expectEqual(child, assigned.id);
+    try std.testing.expectEqual(parent, assigned.parent.?);
+
+    try test_protocol.xdg_toplevel.encodeRequest(&context.requests, 15, .{
+        .set_parent = .{ .parent = null },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try std.testing.expect((switch (context.adapter.popEvent() orelse return error.MissingEvent) {
+        .parent_changed => |value| value.parent,
+        else => return error.UnexpectedEvent,
+    }) == null);
+
+    context.adapter.toplevels[parent.index].mapped = false;
+    try test_protocol.xdg_toplevel.encodeRequest(&context.requests, 15, .{
+        .set_parent = .{ .parent = 12 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try std.testing.expect(context.adapter.popEvent() == null);
+
+    context.adapter.toplevels[parent.index].mapped = true;
+    try context.adapter.setParent(child, parent);
+    _ = context.adapter.popEvent();
+    try test_protocol.xdg_toplevel.encodeRequest(&context.requests, 12, .{ .destroy = .{} });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try std.testing.expect(context.adapter.toplevels[child.index].parent == null);
+    try std.testing.expectEqual(parent, switch (context.adapter.popEvent() orelse return error.MissingEvent) {
+        .toplevel_destroyed => |value| value,
+        else => return error.UnexpectedEvent,
+    });
+    try std.testing.expect(context.adapter.popEvent() == null);
+}
+
+test "xdg-shell: toplevel parent cycles are protocol errors" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const first = try context.createToplevel();
+    const second = try context.createSecondToplevel();
+    context.adapter.toplevels[first.index].mapped = true;
+    context.adapter.toplevels[second.index].mapped = true;
+
+    try test_protocol.xdg_toplevel.encodeRequest(&context.requests, 15, .{
+        .set_parent = .{ .parent = 12 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    _ = context.adapter.popEvent();
+    try test_protocol.xdg_toplevel.encodeRequest(&context.requests, 12, .{
+        .set_parent = .{ .parent = 15 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.stop, try context.dispatch());
+    try std.testing.expect(context.adapter.toplevels[first.index].parent == null);
+    try std.testing.expectEqual(first, context.adapter.toplevels[second.index].parent.?);
+    try std.testing.expectError(error.InvalidParent, context.adapter.setParent(first, first));
+}
+
 test "xdg-shell: configure emission resumes between role and surface events" {
     const context = try TestContext.init();
     defer context.deinit();
@@ -2230,6 +2367,19 @@ test "xdg-shell: full commit event capacity rejects before core mutation" {
     };
     try std.testing.expectEqual(id, ready.id);
     try std.testing.expectEqual(@as(u32, 1), ready.serial);
+    try std.testing.expect(!ready.unmapped);
+    try std.testing.expect(context.adapter.toplevels[id.index].mapped);
+
+    try context.core.state.attach(6, null, 0, 0);
+    try context.adapter.validateSurfaceCommit(surface_id);
+    _ = try context.core.state.commit();
+    try context.adapter.publishSurfaceCommitted(surface_id);
+    const unmapped = switch (context.adapter.popEvent().?) {
+        .commit_ready => |value| value,
+        else => return error.UnexpectedEvent,
+    };
+    try std.testing.expect(unmapped.unmapped);
+    try std.testing.expect(!context.adapter.toplevels[id.index].mapped);
 }
 
 test "xdg-shell: flushing is client scoped with overlapping object IDs" {

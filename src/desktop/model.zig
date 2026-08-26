@@ -116,6 +116,7 @@ pub fn Desktop(comptime Shell: type) type {
             min_height: i32 = 0,
             max_width: i32 = 0,
             max_height: i32 = 0,
+            parent: ?ToplevelId = null,
             fullscreen: bool = false,
             maximized: bool = false,
             minimized: bool = false,
@@ -657,6 +658,10 @@ pub fn Desktop(comptime Shell: type) type {
                     const source = try shell.metadata(shell_id);
                     try desktop.copyMetadata(id, source);
                 },
+                .parent_changed => |value| try desktop.setParent(
+                    try desktop.idForShell(value.id),
+                    if (value.parent) |parent| try desktop.idForShell(parent) else null,
+                ),
                 .state_requested => |request| try desktop.requestState(
                     try desktop.idForShell(request.id),
                     request.state,
@@ -678,9 +683,11 @@ pub fn Desktop(comptime Shell: type) type {
                 },
                 .commit_ready => |commit| {
                     const index = try desktop.resolveIndex(try desktop.idForShell(commit.id));
-                    desktop.slots[index].content_ready = true;
-                    desktop.slots[index].scene.content_ready = true;
-                    desktop.slots[index].target_scene.content_ready = true;
+                    if (commit.unmapped) desktop.unmapParenting(index);
+                    const content_ready = !commit.unmapped;
+                    desktop.slots[index].content_ready = content_ready;
+                    desktop.slots[index].scene.content_ready = content_ready;
+                    desktop.slots[index].target_scene.content_ready = content_ready;
                     desktop.slots[index].target_scene.has_window_geometry = commit.has_window_geometry;
                     desktop.slots[index].target_scene.surface_offset = .{
                         .x = commit.surface_offset_x,
@@ -688,7 +695,10 @@ pub fn Desktop(comptime Shell: type) type {
                     };
                     if (desktop.slots[index].expected_serial == commit.serial)
                         desktop.slots[index].configure_ready = true;
-                    desktop.publishReadyScene();
+                    if (commit.unmapped)
+                        try desktop.reflow()
+                    else
+                        desktop.publishReadyScene();
                 },
                 .toplevel_destroyed => |shell_id| try desktop.destroyShell(shell_id),
             }
@@ -861,10 +871,29 @@ pub fn Desktop(comptime Shell: type) type {
             desktop.removeCommandsFor(id);
             desktop.removeFocus(index);
             desktop.removeTile(index);
+            desktop.unmapParenting(index);
             desktop.release(index);
             desktop.live -= 1;
             try desktop.reflow();
             desktop.destroyed = id;
+        }
+
+        fn setParent(desktop: *Self, id: ToplevelId, parent: ?ToplevelId) !void {
+            const index = try desktop.resolveIndex(id);
+            if (parent) |value| _ = try desktop.resolveIndex(value);
+            desktop.slots[index].parent = parent;
+            try desktop.reflow();
+        }
+
+        fn unmapParenting(desktop: *Self, index: u32) void {
+            const id = desktop.idFor(index);
+            const replacement = desktop.slots[index].parent;
+            desktop.slots[index].parent = null;
+            for (desktop.slots) |*child| {
+                if (!child.header.active or child.parent == null or
+                    !std.meta.eql(child.parent.?, id)) continue;
+                child.parent = replacement;
+            }
         }
 
         fn copyMetadata(desktop: *Self, id: ToplevelId, source: anytype) !void {
@@ -972,6 +1001,28 @@ pub fn Desktop(comptime Shell: type) type {
                 {
                     desktop.desired[focused_index].stacking = stacking;
                 }
+            }
+
+            // Preserve the policy order above while moving every child after
+            // its parent. Repeating the stable move handles complete ancestor
+            // chains without allocating another scene-order buffer.
+            for (0..desktop.live) |_| {
+                var moved = false;
+                for (desktop.slots, 0..) |slot, child_index| {
+                    if (!slot.header.active or slot.parent == null) continue;
+                    const parent_index = desktop.resolveIndex(slot.parent.?) catch continue;
+                    const child_stacking = desktop.desired[child_index].stacking;
+                    const parent_stacking = desktop.desired[parent_index].stacking;
+                    if (child_stacking > parent_stacking) continue;
+                    for (desktop.desired, desktop.slots) |*desired, candidate| {
+                        if (!candidate.header.active or desired.stacking <= child_stacking or
+                            desired.stacking > parent_stacking) continue;
+                        desired.stacking -= 1;
+                    }
+                    desktop.desired[child_index].stacking = parent_stacking;
+                    moved = true;
+                }
+                if (!moved) break;
             }
 
             for (desktop.slots, 0..) |*slot, index| {
@@ -1437,6 +1488,7 @@ const TestShell = struct {
         toplevel_created: struct { id: ToplevelId, surface: SurfaceId },
         popup_created: struct { id: PopupId, surface: SurfaceId, parent: SurfaceId, placement: PopupPlacement },
         metadata_changed: ToplevelId,
+        parent_changed: struct { id: ToplevelId, parent: ?ToplevelId },
         state_requested: struct { id: ToplevelId, state: RequestedState, enabled: bool },
         move_requested: ToplevelId,
         resize_requested: struct { id: ToplevelId, edge: ResizeEdge },
@@ -1446,6 +1498,7 @@ const TestShell = struct {
             has_window_geometry: bool = false,
             surface_offset_x: i32 = 0,
             surface_offset_y: i32 = 0,
+            unmapped: bool = false,
         },
         popup_commit_ready: struct {
             id: PopupId,
@@ -1595,6 +1648,50 @@ test "desktop: shell events produce exact tiling, focus, metadata, and configure
     try std.testing.expectEqual(@as(usize, 2), try desktop.consume(&shell, 8));
     try std.testing.expectEqualStrings("terminal", (try desktop.metadata(first)).title);
     try std.testing.expect((try desktop.scene(first)).content_ready);
+}
+
+test "desktop: toplevel parents preserve ancestor stacking and reparent on unmap" {
+    var desktop = try initTestDesktop(12);
+    defer desktop.deinit();
+    var shell = TestShell{};
+    shell.push(created(0));
+    shell.push(created(1));
+    shell.push(created(2));
+    _ = try desktop.consume(&shell, 3);
+
+    const child = try desktop.idForShell(.{ .index = 0, .generation = 1 });
+    const ancestor = try desktop.idForShell(.{ .index = 1, .generation = 1 });
+    const parent = try desktop.idForShell(.{ .index = 2, .generation = 1 });
+    shell.push(.{ .parent_changed = .{
+        .id = .{ .index = 0, .generation = 1 },
+        .parent = .{ .index = 2, .generation = 1 },
+    } });
+    shell.push(.{ .parent_changed = .{
+        .id = .{ .index = 2, .generation = 1 },
+        .parent = .{ .index = 1, .generation = 1 },
+    } });
+    _ = try desktop.consume(&shell, 2);
+    try settleDesktop(&desktop, &shell);
+
+    try std.testing.expect((try desktop.scene(child)).stacking > (try desktop.scene(parent)).stacking);
+    try std.testing.expect((try desktop.scene(parent)).stacking > (try desktop.scene(ancestor)).stacking);
+    try std.testing.expectEqual(parent, desktop.slots[child.index].parent.?);
+    try std.testing.expectEqual(ancestor, desktop.slots[parent.index].parent.?);
+
+    shell.push(.{ .commit_ready = .{
+        .id = .{ .index = 2, .generation = 1 },
+        .serial = 0,
+        .unmapped = true,
+    } });
+    _ = try desktop.consume(&shell, 1);
+    try std.testing.expectEqual(ancestor, desktop.slots[child.index].parent.?);
+    try std.testing.expect(desktop.slots[parent.index].parent == null);
+    try std.testing.expect(!(try desktop.scene(parent)).content_ready);
+    try std.testing.expect((try desktop.scene(child)).stacking > (try desktop.scene(ancestor)).stacking);
+
+    shell.push(.{ .toplevel_destroyed = .{ .index = 1, .generation = 1 } });
+    _ = try desktop.consume(&shell, 1);
+    try std.testing.expect(desktop.slots[child.index].parent == null);
 }
 
 test "desktop: popup configure maps above its owning toplevel" {
