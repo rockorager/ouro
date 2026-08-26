@@ -277,6 +277,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             parent_surface_generation: u32 = 0,
             placement: PopupPlacement = undefined,
             grabbed: bool = false,
+            mapped: bool = false,
         };
 
         const Outbound = union(enum) {
@@ -640,13 +641,18 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                             .constraints_changed = constraints_changed,
                         } });
                     },
-                    .popup => |popup| adapter.publishReserved(.{ .popup_commit_ready = .{
-                        .id = popup,
-                        .serial = slot.last_acked_serial,
-                        .has_window_geometry = slot.window_geometry != null,
-                        .surface_offset_x = if (slot.window_geometry) |geometry| geometry.x else 0,
-                        .surface_offset_y = if (slot.window_geometry) |geometry| geometry.y else 0,
-                    } }),
+                    .popup => |popup| {
+                        const role = try adapter.resolvePopup(popup);
+                        const size = (try adapter.core.getSurfaceById(slot.surface_id)).committedSize();
+                        role.mapped = size.width != 0 and size.height != 0;
+                        adapter.publishReserved(.{ .popup_commit_ready = .{
+                            .id = popup,
+                            .serial = slot.last_acked_serial,
+                            .has_window_geometry = slot.window_geometry != null,
+                            .surface_offset_x = if (slot.window_geometry) |geometry| geometry.x else 0,
+                            .surface_offset_y = if (slot.window_geometry) |geometry| geometry.y else 0,
+                        } });
+                    },
                     .none => {},
                 }
                 return;
@@ -1267,8 +1273,22 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .destroy => if (adapter.popupHasChild(slot))
                     return try adapter.protocolError(actor, decoded.handle.id, WmBase.@"error".not_the_topmost_popup.value, "popup has a live child"),
                 .grab => |v| {
-                    if (slot.grabbed or adapter.popupHasChild(slot))
+                    if (slot.grabbed or slot.mapped or adapter.popupHasChild(slot))
                         return try adapter.protocolError(actor, decoded.handle.id, Popup.@"error".invalid_grab.value, "popup is not the topmost ungrabbed popup");
+                    const parent_surface = adapter.resolveRoleSurface(
+                        slot.parent_surface_index,
+                        slot.parent_surface_generation,
+                    ) catch return try adapter.protocolError(actor, decoded.handle.id, Popup.@"error".invalid_grab.value, "popup parent is stale");
+                    switch (parent_surface.role) {
+                        .toplevel => {},
+                        .popup => |parent| {
+                            const parent_popup = adapter.resolvePopup(parent) catch
+                                return try adapter.protocolError(actor, decoded.handle.id, Popup.@"error".invalid_grab.value, "popup parent is stale");
+                            if (!parent_popup.grabbed)
+                                return try adapter.protocolError(actor, decoded.handle.id, Popup.@"error".invalid_grab.value, "popup parent has no explicit grab");
+                        },
+                        .none => return try adapter.protocolError(actor, decoded.handle.id, Popup.@"error".invalid_grab.value, "popup parent has no role"),
+                    }
                     const surface = adapter.resolveRoleSurface(
                         slot.xdg_surface_index,
                         slot.xdg_surface_generation,
@@ -2791,7 +2811,15 @@ test "xdg-shell: generated popup requests validate positioner and parent role" {
         .set_window_geometry = .{ .x = 2, .y = 3, .width = 100, .height = 70 },
     });
     try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
-    try context.adapter.surfaceCommitted(try context.core.surfaceId(context.core.second_handle));
+    try context.core.second_state.attach(6, .{
+        .handle = .{ .id = 31, .generation = 1 },
+        .width = 120,
+        .height = 80,
+    }, 0, 0);
+    const popup_surface = try context.core.surfaceId(context.core.second_handle);
+    try context.adapter.validateSurfaceCommit(popup_surface);
+    _ = try context.core.second_state.commit();
+    try context.adapter.publishSurfaceCommitted(popup_surface);
     const committed = switch (context.adapter.popEvent() orelse return error.MissingEvent) {
         .popup_commit_ready => |value| value,
         else => return error.UnexpectedEvent,
@@ -2801,6 +2829,7 @@ test "xdg-shell: generated popup requests validate positioner and parent role" {
     try std.testing.expect(committed.has_window_geometry);
     try std.testing.expectEqual(@as(i32, 2), committed.surface_offset_x);
     try std.testing.expectEqual(@as(i32, 3), committed.surface_offset_y);
+    try std.testing.expect(context.adapter.popups[id.index].mapped);
 
     try test_protocol.xdg_wm_base.encodeRequest(&context.requests, context.manager.id, .{
         .create_positioner = .{ .id = 17 },
