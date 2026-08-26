@@ -324,6 +324,146 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     try root.deinit();
 }
 
+test "shell-input: idle notifications track activity and visible inhibitors" {
+    const allocator = std.testing.allocator;
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-idle-notify-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+
+    var fixture = try physical_fixture.Fixture.init();
+    defer fixture.deinit();
+    var input = try FakeInput.init();
+    defer input.deinit();
+    var root_config = physical_fixture.compositorConfig();
+    root_config.runtime.object_capacity = 64;
+    root_config.runtime.object_quota = 64;
+    root_config.runtime.buckets_per_client = 64;
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), root_config);
+    var platforms = fixture.platforms();
+    platforms.input = input.platform();
+    var config = physical_fixture.coordinatorConfig();
+    config.input.device_capacity = 1;
+    config.input.event_capacity = 1;
+    config.timer_capacity = 6;
+    config.surface.guarded_shm_access = false;
+    const coordinator = try Coordinator.create(allocator, root, platforms, config);
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{
+        .completion_batch = 16,
+    });
+    try coordinator.start(&loop);
+
+    var client_reactor: wayring.io_uring.Reactor = undefined;
+    try client_reactor.initOwned(allocator, .{ .entries = 16, .flags = 0 }, physical_fixture.clientReactorConfig());
+    var client = try ClientConnection.attach(
+        allocator,
+        &client_reactor,
+        try wayring.unix_socket.connect(path),
+        .{ .received_fd_budget = 2, .transmit_byte_budget = 4096, .transmit_fd_budget = 2 },
+        .{ .max_objects = 64, .max_client_ids = 63 },
+    );
+    const actor = try client.actor();
+    var driver = ClientDriver.init(&client);
+    const registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null);
+    var handler: Handler = .{ .objects = &client.objects, .queue = &actor.transmit, .registry = registry };
+    try submitClient(&client_reactor, &driver, &handler);
+
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    var device_added = false;
+    for (0..256) |_| {
+        _ = try drainClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (!device_added and coordinator.input != null) {
+            try input.publish(&.{.{ .device_added = .{
+                .device = 42,
+                .capabilities = .{ .pointer = true, .keyboard = true },
+            } }});
+            device_added = true;
+        }
+        if (handler.mapped and handler.input_ready and coordinator.stats.presented >= 1 and
+            handler.idle_notifier != null and handler.idle_inhibit_manager != null) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(handler.mapped and handler.input_ready);
+
+    try handler.createIdleNotifications();
+    try submitClient(&client_reactor, &driver, &handler);
+    for (0..10_000) |_| {
+        _ = try drainClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.standard_idled == 1 and handler.input_idled == 1) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(usize, 1), handler.standard_idled);
+    try std.testing.expectEqual(@as(usize, 1), handler.input_idled);
+
+    try handler.createIdleInhibitor();
+    try submitClient(&client_reactor, &driver, &handler);
+    for (0..10_000) |_| {
+        _ = try drainClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.standard_resumed == 1) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(usize, 1), handler.standard_resumed);
+    try std.testing.expectEqual(@as(usize, 0), handler.input_resumed);
+
+    try input.publish(&.{.{ .pointer_motion = .{
+        .device = 42,
+        .time_usec = 10_000,
+        .dx = 0,
+        .dy = 0,
+    } }});
+    for (0..10_000) |_| {
+        _ = try drainClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.input_resumed == 1) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(usize, 1), handler.standard_resumed);
+    try std.testing.expectEqual(@as(usize, 1), handler.input_resumed);
+
+    for (0..10_000) |_| {
+        _ = try drainClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.input_idled == 2) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(usize, 2), handler.input_idled);
+    try std.testing.expectEqual(@as(usize, 1), handler.standard_idled);
+
+    try handler.destroyIdleInhibitor();
+    try submitClient(&client_reactor, &driver, &handler);
+    for (0..10_000) |_| {
+        _ = try drainClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.standard_idled == 2) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(usize, 2), handler.standard_idled);
+    try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+
+    coordinator.disconnected(coordinator.peer.?);
+    _ = try client.prepareClose();
+    try submitClient(&client_reactor, &driver, &handler);
+    var drained = false;
+    for (0..256) |_| {
+        const client_progress = try drainClient(&client_reactor, &driver, &handler);
+        const progress = try loop.turn(coordinator);
+        drained = progress.wayring.shutdown_complete and client_progress.quiescent and
+            coordinator.backendDrainComplete();
+        if (drained) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(drained);
+    try client.deinit(allocator);
+    client_reactor.deinit(allocator);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
 const two_toplevel_cycle_count = 42;
 
 test "shell-input: two mapped toplevels sustain independent commit cycles" {
@@ -1218,6 +1358,11 @@ const Handler = struct {
     data_device: ?wayring.objects.Handle = null,
     data_source: ?wayring.objects.Handle = null,
     output: ?wayring.objects.Handle = null,
+    idle_notifier: ?wayring.objects.Handle = null,
+    idle_inhibit_manager: ?wayring.objects.Handle = null,
+    idle_standard: ?wayring.objects.Handle = null,
+    idle_input: ?wayring.objects.Handle = null,
+    idle_inhibitor: ?wayring.objects.Handle = null,
     surface: ?wayring.objects.Handle = null,
     xdg_surface: ?wayring.objects.Handle = null,
     toplevel: ?wayring.objects.Handle = null,
@@ -1267,6 +1412,10 @@ const Handler = struct {
     output_released: bool = false,
     output_deleted: bool = false,
     event_failures: usize = 0,
+    standard_idled: usize = 0,
+    standard_resumed: usize = 0,
+    input_idled: usize = 0,
+    input_resumed: usize = 0,
 
     pub fn eventError(
         self: *Handler,
@@ -1490,6 +1639,21 @@ const Handler = struct {
                 .cancelled => self.drag_cancelled += 1,
                 else => {},
             }
+        } else if (target.object.interface == &protocol.ext_idle_notification_v1.info) {
+            const notification_event = try protocol.ext_idle_notification_v1.decodeEvent(message, fds);
+            const standard = self.idle_standard != null and message.header.object_id == self.idle_standard.?.id;
+            switch (notification_event) {
+                .idled => if (standard) {
+                    self.standard_idled += 1;
+                } else {
+                    self.input_idled += 1;
+                },
+                .resumed => if (standard) {
+                    self.standard_resumed += 1;
+                } else {
+                    self.input_resumed += 1;
+                },
+            }
         } else if (target.object.interface == &protocol.wl_buffer.info) {
             switch (try protocol.wl_buffer.decodeEvent(message, fds)) {
                 .release => {
@@ -1544,6 +1708,10 @@ const Handler = struct {
             self.data_device_manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_data_device_manager.info, @min(value.version, 3), null);
         if (std.mem.eql(u8, value.interface, protocol.wl_output.info.name))
             self.output = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_output.info, @min(value.version, 4), null);
+        if (std.mem.eql(u8, value.interface, protocol.ext_idle_notifier_v1.info.name))
+            self.idle_notifier = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.ext_idle_notifier_v1.info, @min(value.version, 2), null);
+        if (std.mem.eql(u8, value.interface, protocol.zwp_idle_inhibit_manager_v1.info.name))
+            self.idle_inhibit_manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.zwp_idle_inhibit_manager_v1.info, @min(value.version, 1), null);
     }
 
     fn maybeCreateDataDevice(self: *Handler) !void {
@@ -1690,6 +1858,41 @@ const Handler = struct {
             .{ .destroy = .{} },
         );
         self.cursor_surface = null;
+    }
+
+    fn createIdleNotifications(self: *Handler) !void {
+        self.idle_standard = (try protocol.ext_idle_notifier_v1.construct_get_idle_notification(
+            self.objects,
+            self.queue,
+            self.idle_notifier.?,
+            .{ .timeout = 1, .seat = self.seat.?.id },
+        )).id;
+        self.idle_input = (try protocol.ext_idle_notifier_v1.construct_get_input_idle_notification(
+            self.objects,
+            self.queue,
+            self.idle_notifier.?,
+            .{ .timeout = 1, .seat = self.seat.?.id },
+        )).id;
+    }
+
+    fn createIdleInhibitor(self: *Handler) !void {
+        self.idle_inhibitor = (try protocol.zwp_idle_inhibit_manager_v1.construct_create_inhibitor(
+            self.objects,
+            self.queue,
+            self.idle_inhibit_manager.?,
+            .{ .surface = self.surface.?.id },
+        )).id;
+    }
+
+    fn destroyIdleInhibitor(self: *Handler) !void {
+        try wayring.client.sendRequest(
+            protocol.zwp_idle_inhibitor_v1,
+            self.objects,
+            self.queue,
+            self.idle_inhibitor.?,
+            .{ .destroy = .{} },
+        );
+        self.idle_inhibitor = null;
     }
 };
 
