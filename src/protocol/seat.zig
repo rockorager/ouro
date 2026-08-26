@@ -508,6 +508,15 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             return .{ .client = clientId(peer), .surface = surface };
         }
 
+        pub fn validateSeatOn(
+            adapter: *Self,
+            server_objects: anytype,
+            peer: wayring.io_uring.Peer,
+            seat_object: u32,
+        ) bool {
+            return adapter.seatByObject(server_objects, peer, seat_object) != null;
+        }
+
         pub fn pointerIdOn(adapter: *Self, server_objects: anytype, object_id: u32) !PointerId {
             const handle = server_objects.namespace.lookupHandle(object_id) orelse
                 return error.StalePointer;

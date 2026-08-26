@@ -42,6 +42,7 @@ const protocol_color_management = @import("../protocol/color_management.zig");
 const protocol_color_representation = @import("../protocol/color_representation.zig");
 const protocol_output = @import("../protocol/output.zig");
 const protocol_cursor_shape = @import("../protocol/cursor_shape.zig");
+const protocol_text_input = @import("../protocol/text_input.zig");
 const cursor_theme = @import("../cursor_theme.zig");
 const theme_cursor = @import("../scene/theme_cursor.zig");
 const desktop_model = @import("../desktop/model.zig");
@@ -78,6 +79,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const ColorRepresentationAdapter = protocol_color_representation.Adapter(protocol, Adapter);
         const OutputAdapter = protocol_output.Adapter(protocol);
         const CursorShapeAdapter = protocol_cursor_shape.Adapter(protocol);
+        const TextInputAdapter = protocol_text_input.Adapter(protocol);
 
         const Imported = struct {};
         const Presentations = presentation.Queue(Imported);
@@ -140,10 +142,11 @@ pub fn Coordinator(comptime protocol: type) type {
             const color_management: u16 = 1 << 11;
             const color_representation: u16 = 1 << 12;
             const primary_selection: u16 = 1 << 13;
+            const text_input: u16 = 1 << 14;
             const all: u16 = decoration | shell | seat | data_device | dmabuf |
                 activation | relative_pointer | fractional_scale | output | core |
                 pointer_constraints | color_management | color_representation |
-                primary_selection;
+                primary_selection | text_input;
         };
         const Client = struct {
             active: bool = false,
@@ -233,6 +236,7 @@ pub fn Coordinator(comptime protocol: type) type {
             },
             data_device: protocol_data_device.Config = .{},
             primary_selection: protocol_primary_selection.Config = .{},
+            text_input: protocol_text_input.Config = .{},
             linux_dmabuf: protocol_linux_dmabuf.Config = .{},
             xdg_activation: protocol_xdg_activation.Config = .{},
             xdg_decoration: protocol_xdg_decoration.Config = .{},
@@ -303,6 +307,7 @@ pub fn Coordinator(comptime protocol: type) type {
         seat_adapter: SeatAdapter,
         data_device_adapter: DataDeviceAdapter,
         primary_selection_adapter: PrimarySelectionAdapter,
+        text_input_adapter: TextInputAdapter,
         dmabuf_adapter: DmabufAdapter,
         activation_adapter: ActivationAdapter,
         decoration_adapter: DecorationAdapter,
@@ -556,6 +561,11 @@ pub fn Coordinator(comptime protocol: type) type {
             errdefer self.data_device_adapter.deinit();
             self.primary_selection_adapter = try PrimarySelectionAdapter.init(allocator, config.primary_selection);
             errdefer self.primary_selection_adapter.deinit();
+            self.text_input_adapter = try TextInputAdapter.init(allocator, .{
+                .context = self,
+                .validateFn = validateTextInputSeat,
+            }, config.text_input);
+            errdefer self.text_input_adapter.deinit();
             self.dmabuf_adapter = try DmabufAdapter.init(allocator, config.linux_dmabuf);
             errdefer self.dmabuf_adapter.deinit();
             try self.adapter.setExternalImporter(self.dmabuf_adapter.externalImporter(Adapter));
@@ -679,6 +689,9 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = try self.primary_selection_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
+            _ = try self.text_input_adapter.install(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
             _ = try self.dmabuf_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
@@ -779,6 +792,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.decoration_adapter.deinit();
             self.activation_adapter.deinit();
             self.dmabuf_adapter.deinit();
+            self.text_input_adapter.deinit();
             self.primary_selection_adapter.deinit();
             self.data_device_adapter.deinit();
             self.pointer_constraints_adapter.deinit();
@@ -820,6 +834,7 @@ pub fn Coordinator(comptime protocol: type) type {
 
         pub fn disconnected(self: *Self, peer: wayring.io_uring.Peer) void {
             self.cursor_shape_adapter.disconnected(peer);
+            self.text_input_adapter.disconnected(peer);
             self.primary_selection_adapter.disconnected(peer);
             for (self.clients.items) |*client| if (client.active and samePeer(client.peer, peer)) {
                 client.* = .{};
@@ -947,6 +962,14 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             if (try self.cursor_shape_adapter.request(peer, target, message, fds)) |control| {
                 try self.processCursorShapeEvents();
+                return control;
+            }
+            if (try self.text_input_adapter.request(peer, target, message, fds)) |control| {
+                while (self.text_input_adapter.peekEvent() != null)
+                    self.text_input_adapter.dropEvent();
+                if (self.text_input_adapter.pendingOutboundOn(peer))
+                    self.markProtocol(peer, ProtocolReady.text_input);
+                try self.flushProtocol();
                 return control;
             }
             if (try self.data_device_adapter.request(peer, target, message, fds)) |control| {
@@ -1566,9 +1589,15 @@ pub fn Coordinator(comptime protocol: type) type {
                     .keyboard_focus => |target| {
                         const peer = try self.adapter.surfacePeer(target.surface);
                         const seat_target = try self.seatTarget(target.surface);
+                        const text_input_focus: protocol_text_input.Focus = .{
+                            .peer = peer,
+                            .surface = (try self.adapter.surfaceResource(target.surface)).id,
+                        };
+                        try self.text_input_adapter.validateFocus(text_input_focus);
                         try self.seat_adapter.setKeyboardFocus(seat_target);
                         try self.data_device_adapter.setFocus(peer);
                         try self.primary_selection_adapter.setFocus(peer);
+                        try self.text_input_adapter.setFocus(text_input_focus);
                     },
                     .cancel => |cancel| {
                         if (cancel.pointer_focus)
@@ -1579,9 +1608,11 @@ pub fn Coordinator(comptime protocol: type) type {
                                 .{ .x = 0, .y = 0 },
                             );
                         if (cancel.keyboard_focus) {
+                            try self.text_input_adapter.validateFocus(null);
                             try self.seat_adapter.setKeyboardFocus(null);
                             try self.data_device_adapter.setFocus(null);
                             try self.primary_selection_adapter.setFocus(null);
+                            try self.text_input_adapter.setFocus(null);
                         }
                         if (cancel.pointer_grab) try self.seat_adapter.cancelPointerGrab();
                     },
@@ -1600,6 +1631,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.markProtocolAll(ProtocolReady.data_device);
             if (self.primary_selection_adapter.pendingOutbound() != 0)
                 self.markProtocolAll(ProtocolReady.primary_selection);
+            self.markTextInputProtocol();
             if (applied) self.markPointerConstraintsProtocol();
         }
 
@@ -1640,6 +1672,16 @@ pub fn Coordinator(comptime protocol: type) type {
             const self: *Self = @ptrCast(@alignCast(context orelse return false));
             const server_objects = self.root.runtime.clients.get(peer) catch return false;
             return self.seat_adapter.validateCursorShapeOn(server_objects, peer, pointer_object, serial);
+        }
+
+        fn validateTextInputSeat(
+            context: ?*anyopaque,
+            peer: wayring.io_uring.Peer,
+            seat_object: u32,
+        ) bool {
+            const self: *Self = @ptrCast(@alignCast(context orelse return false));
+            const server_objects = self.root.runtime.clients.get(peer) catch return false;
+            return self.seat_adapter.validateSeatOn(server_objects, peer, seat_object);
         }
 
         fn cursorImage(self: *Self, name: []const u8) ?cursor_theme.Image {
@@ -1811,6 +1853,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 flushed += try self.data_device_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.primary_selection != 0)
                 flushed += try self.primary_selection_adapter.flushOn(peer, objects, &actor.transmit);
+            if (client.protocol_ready & ProtocolReady.text_input != 0)
+                flushed += try self.text_input_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.dmabuf != 0)
                 flushed += try self.dmabuf_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.activation != 0)
@@ -1861,6 +1905,13 @@ pub fn Coordinator(comptime protocol: type) type {
             }
         }
 
+        fn markTextInputProtocol(self: *Self) void {
+            for (self.clients.items) |*client| {
+                if (client.active and self.text_input_adapter.pendingOutboundOn(client.peer))
+                    client.protocol_ready |= ProtocolReady.text_input;
+            }
+        }
+
         fn retainProtocolReady(self: *Self, client: *Client, objects: anytype) void {
             var ready = client.protocol_ready;
             if (ready & ProtocolReady.decoration != 0 and
@@ -1878,6 +1929,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (ready & ProtocolReady.primary_selection != 0 and
                 !self.primary_selection_adapter.pendingOutboundOn(client.peer))
                 ready &= ~ProtocolReady.primary_selection;
+            if (ready & ProtocolReady.text_input != 0 and
+                !self.text_input_adapter.pendingOutboundOn(client.peer))
+                ready &= ~ProtocolReady.text_input;
             if (ready & ProtocolReady.dmabuf != 0 and
                 !self.dmabuf_adapter.pendingOutbound(client.peer))
                 ready &= ~ProtocolReady.dmabuf;
@@ -3166,6 +3220,7 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.color_representation_adapter.resourceRemoved(handle, object);
             _ = self.output_adapter.resourceRemoved(handle, object);
             _ = self.cursor_shape_adapter.resourceRemoved(handle, object);
+            _ = self.text_input_adapter.resourceRemoved(handle, object);
             _ = self.subcompositor_adapter.resourceRemoved(handle, object);
             if (removed_surface_peer) |peer| self.data_device_adapter.surfaceRemoved(peer, handle.id);
             if (removed_surface_peer) |peer| self.output_adapter.surfaceRemoved(peer, handle);

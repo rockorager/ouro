@@ -161,15 +161,15 @@ pub fn Adapter(comptime protocol: type) type {
                 switch (d.value) {
                     .destroy => {},
                     .get_text_input => |q| {
-                        if (!s.validator.validate(p, q.seat)) return s.protocolError(a, d.handle.id, 0, "invalid wl_seat");
+                        if (!s.validator.validate(p, q.seat)) return try s.protocolError(a, d.handle.id, 0, "invalid wl_seat");
                         if (s.focus != null and same(s.focus.?.peer, p) and !s.canEnqueue(1))
-                            return s.noMemory(a);
-                        const z = s.acquire() catch return s.noMemory(a);
+                            return try s.noMemory(a);
+                        const z = s.acquire() catch return try s.noMemory(a);
                         z.peer = p;
                         z.seat = q.seat;
                         const admitted = Manager.admit_get_text_input(so, d.handle, q, .{ .id = z }) catch |e| {
                             s.release(s.index(z));
-                            return s.failure(a, d.handle.id, e);
+                            return try s.failure(a, d.handle.id, e);
                         };
                         z.resource = admitted.id;
                         if (s.focus != null and same(s.focus.?.peer, p)) {
@@ -203,7 +203,7 @@ pub fn Adapter(comptime protocol: type) type {
                             try d.finish(protocol, so, &a.transmit);
                             return .continue_dispatch;
                         }
-                        s.setSurrounding(z, q.text, q.cursor, q.anchor) catch return s.protocolError(a, d.handle.id, 0, "invalid surrounding text");
+                        s.setSurrounding(z, q.text, q.cursor, q.anchor) catch return try s.protocolError(a, d.handle.id, 0, "invalid surrounding text");
                     },
                     .set_text_change_cause => |q| if (z.focused) {
                         z.pending.cause = q.cause.value;
@@ -221,7 +221,7 @@ pub fn Adapter(comptime protocol: type) type {
                             z.pending.rectangle = .{ .x = q.x, .y = q.y, .width = q.width, .height = q.height };
                         }
                     },
-                    .commit => s.commit(z) catch return s.noMemory(a),
+                    .commit => s.commit(z) catch return try s.noMemory(a),
                     else => {},
                 }
                 try d.finish(protocol, so, &a.transmit);
@@ -272,7 +272,7 @@ pub fn Adapter(comptime protocol: type) type {
                 s.event_len -= 1;
             }
         }
-        pub fn setFocus(s: *Self, f: ?Focus) !void {
+        pub fn validateFocus(s: *const Self, f: ?Focus) !void {
             if (focusEq(s.focus, f)) return;
             var need: usize = 0;
             for (s.devices) |z| if (z.active) {
@@ -280,6 +280,10 @@ pub fn Adapter(comptime protocol: type) type {
                 if (f != null and same(z.peer, f.?.peer)) need += 1;
             };
             if (!s.canEnqueue(need)) return error.Exhausted;
+        }
+        pub fn setFocus(s: *Self, f: ?Focus) !void {
+            if (focusEq(s.focus, f)) return;
+            try s.validateFocus(f);
             if (s.focus) |old| {
                 for (s.devices) |*z| {
                     if (z.active and same(z.peer, old.peer)) {

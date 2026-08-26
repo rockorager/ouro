@@ -663,6 +663,14 @@ pub fn Adapter(comptime protocol: type) type {
             return &slot.state;
         }
 
+        pub fn surfaceResource(adapter: *Self, id: SurfaceId) !objects.Handle {
+            if (id.index >= adapter.surfaces.len) return error.StaleSurface;
+            const slot = &adapter.surfaces[id.index];
+            if (!slot.active or slot.resource.generation != id.generation)
+                return error.StaleSurface;
+            return slot.resource;
+        }
+
         pub fn surfacePeer(adapter: *Self, id: SurfaceId) !wayring.io_uring.Peer {
             if (id.index >= adapter.surfaces.len) return error.StaleSurface;
             const slot = adapter.surfaces[id.index];
