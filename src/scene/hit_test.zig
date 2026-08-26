@@ -47,11 +47,78 @@ pub fn topmost(
     return null;
 }
 
+/// Returns the topmost committed surface across rooted subsurface trees.
+/// `scene.order` supplies each tree in renderer back-to-front order and
+/// `scene.placement` supplies child offsets relative to the root surface.
+pub fn topmostTree(
+    comptime Window: type,
+    windows: []const Window,
+    point: geometry.Point,
+    scene: anytype,
+) ?Hit(Window) {
+    var window_index = windows.len;
+    while (window_index != 0) {
+        window_index -= 1;
+        const window = windows[window_index];
+        if (!window.visible or !window.content_ready) continue;
+        const surfaces = scene.order(window.surface) catch continue;
+        var surface_index = surfaces.len;
+        while (surface_index != 0) {
+            surface_index -= 1;
+            const surface = surfaces[surface_index];
+            const root = std.meta.eql(surface, window.surface);
+            const local: geometry.Point = if (root) root_local: {
+                if (!window.geometry.contains(point)) continue;
+                break :root_local .{
+                    .x = std.math.add(
+                        i32,
+                        std.math.sub(i32, point.x, window.geometry.x) catch continue,
+                        window.surface_offset.x,
+                    ) catch continue,
+                    .y = std.math.add(
+                        i32,
+                        std.math.sub(i32, point.y, window.geometry.y) catch continue,
+                        window.surface_offset.y,
+                    ) catch continue,
+                };
+            } else child_local: {
+                const placement = scene.placement(surface) catch continue;
+                const root_x = if (window.has_window_geometry)
+                    alignedOrigin(window.geometry.x, window.surface_offset.x)
+                else
+                    window.geometry.x;
+                const root_y = if (window.has_window_geometry)
+                    alignedOrigin(window.geometry.y, window.surface_offset.y)
+                else
+                    window.geometry.y;
+                const surface_x = std.math.add(i32, root_x, placement.x) catch continue;
+                const surface_y = std.math.add(i32, root_y, placement.y) catch continue;
+                break :child_local .{
+                    .x = std.math.sub(i32, point.x, surface_x) catch continue,
+                    .y = std.math.sub(i32, point.y, surface_y) catch continue,
+                };
+            };
+            if (!(scene.inputContains(surface, local) catch continue)) continue;
+            return .{ .toplevel = window.id, .surface = surface, .local = local };
+        }
+    }
+    return null;
+}
+
+fn alignedOrigin(target: i32, geometry_offset: i32) i32 {
+    return @intCast(std.math.clamp(
+        @as(i64, target) - geometry_offset,
+        std.math.minInt(i32),
+        std.math.maxInt(i32),
+    ));
+}
+
 const TestId = packed struct { index: u32, generation: u32 };
 const TestWindow = struct {
     id: TestId,
     surface: TestId,
     geometry: geometry.Rect,
+    has_window_geometry: bool = false,
     surface_offset: geometry.Point = .{ .x = 0, .y = 0 },
     visible: bool,
     content_ready: bool,
@@ -124,4 +191,68 @@ test "interaction: hit test ignores hidden unready and stale topmost windows" {
     );
     windows[0].content_ready = false;
     try std.testing.expect(topmost(TestWindow, &windows, .{ .x = 1, .y = 1 }, &surfaces) == null);
+}
+
+test "interaction: subsurface hit test follows stacking placement and input regions" {
+    const root = TestId{ .index = 1, .generation = 1 };
+    const below = TestId{ .index = 2, .generation = 1 };
+    const above = TestId{ .index = 3, .generation = 1 };
+    const Scene = struct {
+        order_storage: [3]TestId = .{ below, root, above },
+        hole: ?TestId = null,
+
+        pub fn order(self: *@This(), _: TestId) ![]const TestId {
+            return &self.order_storage;
+        }
+
+        pub fn placement(_: *@This(), surface: TestId) !geometry.Point {
+            if (std.meta.eql(surface, below)) return .{ .x = -4, .y = 2 };
+            if (std.meta.eql(surface, above)) return .{ .x = 6, .y = 3 };
+            return error.NotSubsurface;
+        }
+
+        pub fn inputContains(self: *@This(), surface: TestId, point: geometry.Point) !bool {
+            if (self.hole != null and std.meta.eql(self.hole.?, surface)) return false;
+            return point.x >= 0 and point.y >= 0 and point.x < 8 and point.y < 8;
+        }
+    };
+    const window = TestWindow{
+        .id = .{ .index = 10, .generation = 1 },
+        .surface = root,
+        .geometry = .{ .x = 10, .y = 10, .width = 8, .height = 8 },
+        .visible = true,
+        .content_ready = true,
+    };
+    var scene = Scene{};
+
+    const child = topmostTree(TestWindow, &.{window}, .{ .x = 17, .y = 14 }, &scene).?;
+    try std.testing.expectEqual(above, child.surface);
+    try std.testing.expectEqual(geometry.Point{ .x = 1, .y = 1 }, child.local);
+
+    scene.hole = above;
+    const root_hit = topmostTree(TestWindow, &.{window}, .{ .x = 17, .y = 14 }, &scene).?;
+    try std.testing.expectEqual(root, root_hit.surface);
+
+    const outside_root = topmostTree(TestWindow, &.{window}, .{ .x = 7, .y = 13 }, &scene).?;
+    try std.testing.expectEqual(below, outside_root.surface);
+    try std.testing.expectEqual(geometry.Point{ .x = 1, .y = 1 }, outside_root.local);
+
+    const offset_window = TestWindow{
+        .id = window.id,
+        .surface = root,
+        .geometry = .{ .x = 20, .y = 20, .width = 8, .height = 8 },
+        .has_window_geometry = true,
+        .surface_offset = .{ .x = 3, .y = 4 },
+        .visible = true,
+        .content_ready = true,
+    };
+    scene.hole = null;
+    const offset_child = topmostTree(
+        TestWindow,
+        &.{offset_window},
+        .{ .x = 24, .y = 20 },
+        &scene,
+    ).?;
+    try std.testing.expectEqual(above, offset_child.surface);
+    try std.testing.expectEqual(geometry.Point{ .x = 1, .y = 1 }, offset_child.local);
 }

@@ -312,7 +312,7 @@ pub fn Interaction(comptime Desktop: type) type {
             } else null;
             const point: geometry.Point = .{ .x = fixedFloor(next_x), .y = fixedFloor(next_y) };
             const windows = try desktop.sceneSnapshot(self.windows);
-            const hit = hit_test.topmost(SceneWindow, windows, point, surfaces);
+            const hit = surfaces.topmost(SceneWindow, windows, point);
             var target: ?Target = if (hit) |value| target: {
                 const local_x = next_x - @as(i64, point.x - value.local.x) * 256;
                 const local_y = next_y - @as(i64, point.y - value.local.y) * 256;
@@ -829,6 +829,15 @@ const TestDesktop = struct {
 
 const TestSurfaces = struct {
     hole_surface: ?TestId = null,
+
+    pub fn topmost(
+        self: *@This(),
+        comptime Window: type,
+        windows: []const Window,
+        point: geometry.Point,
+    ) ?hit_test.Hit(Window) {
+        return hit_test.topmost(Window, windows, point, self);
+    }
 
     pub fn inputContains(self: *@This(), surface: TestId, point: geometry.Point) !bool {
         _ = point;

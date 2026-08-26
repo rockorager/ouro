@@ -23,6 +23,8 @@ const render = @import("../render/types.zig");
 const render_content = @import("../render/content.zig");
 const render_list = @import("../scene/render_list.zig");
 const damage = @import("../scene/damage.zig");
+const geometry = @import("../scene/geometry.zig");
+const hit_test = @import("../scene/hit_test.zig");
 const presentation = @import("../presentation.zig");
 const core_surface = @import("../protocol/core_surface.zig");
 const protocol_subcompositor = @import("../protocol/subcompositor.zig");
@@ -79,6 +81,44 @@ pub fn Coordinator(comptime protocol: type) type {
             offset_x: i32 = 0,
             offset_y: i32 = 0,
             subsurface: bool = false,
+        };
+        const InputScene = struct {
+            coordinator: *Self,
+
+            pub fn topmost(
+                scene: *InputScene,
+                comptime Window: type,
+                windows: []const Window,
+                point: geometry.Point,
+            ) ?hit_test.Hit(Window) {
+                return hit_test.topmostTree(Window, windows, point, scene);
+            }
+
+            pub fn order(scene: *InputScene, root: Adapter.SurfaceId) ![]const Adapter.SurfaceId {
+                return scene.coordinator.subcompositor_adapter.sceneOrder(
+                    root,
+                    scene.coordinator.subsurface_scene_order,
+                ) catch |err| switch (err) {
+                    error.NotSubsurface => single_surface: {
+                        scene.coordinator.subsurface_scene_order[0] = root;
+                        break :single_surface scene.coordinator.subsurface_scene_order[0..1];
+                    },
+                    else => return err,
+                };
+            }
+
+            pub fn placement(scene: *InputScene, surface: Adapter.SurfaceId) !geometry.Point {
+                const value = (try scene.coordinator.subcompositor_adapter.placement(surface)).offset;
+                return .{ .x = value.x, .y = value.y };
+            }
+
+            pub fn inputContains(
+                scene: *InputScene,
+                surface: Adapter.SurfaceId,
+                point: geometry.Point,
+            ) !bool {
+                return scene.coordinator.adapter.inputContains(surface, point);
+            }
         };
         const ProtocolReady = struct {
             const decoration: u16 = 1 << 0;
@@ -1098,11 +1138,13 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             if (!self.input_interaction_accepted) {
                 self.input_keyboard_consumed = false;
-                if (self.input_delivery_event) |delivery_event|
-                    self.interaction.consume(&self.desktop, &self.adapter, delivery_event) catch |err| switch (err) {
+                if (self.input_delivery_event) |delivery_event| {
+                    var input_scene: InputScene = .{ .coordinator = self };
+                    self.interaction.consume(&self.desktop, &input_scene, delivery_event) catch |err| switch (err) {
                         error.Backpressure, error.Exhausted => return false,
                         else => return err,
                     };
+                }
                 self.input_interaction_accepted = true;
             }
             self.applyInteractionCommands() catch |err| switch (err) {
