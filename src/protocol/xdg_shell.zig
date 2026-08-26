@@ -664,6 +664,34 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             try adapter.publishSurfaceCommitted(id);
         }
 
+        pub fn toplevelForSurface(adapter: *Self, surface: SurfaceId) !ToplevelId {
+            for (adapter.surfaces) |slot| {
+                if (!slot.header.active or !std.meta.eql(slot.surface_id, surface)) continue;
+                const id = switch (slot.role) {
+                    .toplevel => |value| value,
+                    else => return error.InvalidRole,
+                };
+                _ = try adapter.resolveToplevel(id);
+                return id;
+            }
+            return error.StaleSurface;
+        }
+
+        pub fn setForeignParent(adapter: *Self, child: SurfaceId, parent: SurfaceId) !void {
+            try adapter.setParent(
+                try adapter.toplevelForSurface(child),
+                try adapter.toplevelForSurface(parent),
+            );
+        }
+
+        pub fn clearForeignParent(adapter: *Self, child: SurfaceId, parent: SurfaceId) !void {
+            const child_id = try adapter.toplevelForSurface(child);
+            const parent_id = try adapter.toplevelForSurface(parent);
+            const slot = try adapter.resolveToplevel(child_id);
+            if (slot.parent == null or !std.meta.eql(slot.parent.?, parent_id)) return;
+            try adapter.setParent(child_id, null);
+        }
+
         pub fn queueToplevelConfigure(
             adapter: *Self,
             id: ToplevelId,
@@ -2392,6 +2420,23 @@ test "xdg-shell: toplevel parents are mapped, nullable, and cleared on retiremen
         else => return error.UnexpectedEvent,
     });
     try std.testing.expect(context.adapter.popEvent() == null);
+}
+
+test "xdg-shell: foreign parenting resolves exact toplevel surfaces" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const parent = try context.createToplevel();
+    const child = try context.createSecondToplevel();
+    context.adapter.toplevels[parent.index].mapped = true;
+    const parent_surface = try context.core.surfaceId(context.core.handle);
+    const child_surface = try context.core.surfaceId(context.core.second_handle);
+
+    try std.testing.expectEqual(parent, try context.adapter.toplevelForSurface(parent_surface));
+    try context.adapter.setForeignParent(child_surface, parent_surface);
+    try std.testing.expectEqual(parent, context.adapter.toplevels[child.index].parent.?);
+    _ = context.adapter.popEvent() orelse return error.MissingEvent;
+    try context.adapter.clearForeignParent(child_surface, parent_surface);
+    try std.testing.expect(context.adapter.toplevels[child.index].parent == null);
 }
 
 test "xdg-shell: toplevel parent cycles are protocol errors" {
