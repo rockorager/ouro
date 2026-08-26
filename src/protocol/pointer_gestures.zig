@@ -144,9 +144,36 @@ pub fn Adapter(comptime protocol: type) type {
                 const decoded = try wayring.server.decodeRequest(Manager, server_objects, message, fds);
                 switch (decoded.value) {
                     .release => {},
-                    .get_swipe_gesture => |payload| try self.admit(actor, server_objects, peer, decoded.handle, payload, .swipe),
-                    .get_pinch_gesture => |payload| try self.admit(actor, server_objects, peer, decoded.handle, payload, .pinch),
-                    .get_hold_gesture => |payload| try self.admit(actor, server_objects, peer, decoded.handle, payload, .hold),
+                    .get_swipe_gesture => |payload| {
+                        if (try self.reserve(actor, peer, decoded.handle, payload.pointer, .swipe)) |slot| {
+                            const admitted = Manager.admit_get_swipe_gesture(server_objects, decoded.handle, payload, .{ .id = slot }) catch |err| admitted: {
+                                self.release(self.slotIndex(slot));
+                                try self.postProtocolError(actor, decoded.handle.id, @errorName(err));
+                                break :admitted null;
+                            };
+                            if (admitted) |value| slot.resource = value.id;
+                        }
+                    },
+                    .get_pinch_gesture => |payload| {
+                        if (try self.reserve(actor, peer, decoded.handle, payload.pointer, .pinch)) |slot| {
+                            const admitted = Manager.admit_get_pinch_gesture(server_objects, decoded.handle, payload, .{ .id = slot }) catch |err| admitted: {
+                                self.release(self.slotIndex(slot));
+                                try self.postProtocolError(actor, decoded.handle.id, @errorName(err));
+                                break :admitted null;
+                            };
+                            if (admitted) |value| slot.resource = value.id;
+                        }
+                    },
+                    .get_hold_gesture => |payload| {
+                        if (try self.reserve(actor, peer, decoded.handle, payload.pointer, .hold)) |slot| {
+                            const admitted = Manager.admit_get_hold_gesture(server_objects, decoded.handle, payload, .{ .id = slot }) catch |err| admitted: {
+                                self.release(self.slotIndex(slot));
+                                try self.postProtocolError(actor, decoded.handle.id, @errorName(err));
+                                break :admitted null;
+                            };
+                            if (admitted) |value| slot.resource = value.id;
+                        }
+                    },
                 }
                 try decoded.finish(protocol, server_objects, &actor.transmit);
                 return .continue_dispatch;
@@ -171,35 +198,25 @@ pub fn Adapter(comptime protocol: type) type {
             return null;
         }
 
-        fn admit(self: *Self, actor: *wayring.connection.Actor, server_objects: anytype, peer: wayring.io_uring.Peer, manager: objects.Handle, payload: anytype, kind: Kind) !void {
-            const pointer = self.validator.validate(peer, payload.pointer) orelse
-                return self.postProtocolError(actor, manager.id, "invalid wl_pointer");
+        fn reserve(self: *Self, actor: *wayring.connection.Actor, peer: wayring.io_uring.Peer, manager: objects.Handle, pointer_object: u32, kind: Kind) !?*Slot {
+            const pointer = self.validator.validate(peer, pointer_object) orelse {
+                try self.postProtocolError(actor, manager.id, "invalid wl_pointer");
+                return null;
+            };
             for (self.slots) |slot| if (slot.active and slot.kind == kind and
                 samePeer(slot.peer, peer) and std.meta.eql(slot.pointer, pointer))
-                return self.postProtocolError(actor, manager.id, "gesture already exists for wl_pointer");
-            const slot = self.acquire() catch return self.postNoMemory(actor);
+            {
+                try self.postProtocolError(actor, manager.id, "gesture already exists for wl_pointer");
+                return null;
+            };
+            const slot = self.acquire() catch {
+                try self.postNoMemory(actor);
+                return null;
+            };
             slot.peer = peer;
             slot.pointer = pointer;
             slot.kind = kind;
-            if (kind == .swipe) {
-                const admitted = Manager.admit_get_swipe_gesture(server_objects, manager, payload, .{ .id = slot }) catch |err| {
-                    self.release(self.slotIndex(slot));
-                    return self.postProtocolError(actor, manager.id, @errorName(err));
-                };
-                slot.resource = admitted.id;
-            } else if (kind == .pinch) {
-                const admitted = Manager.admit_get_pinch_gesture(server_objects, manager, payload, .{ .id = slot }) catch |err| {
-                    self.release(self.slotIndex(slot));
-                    return self.postProtocolError(actor, manager.id, @errorName(err));
-                };
-                slot.resource = admitted.id;
-            } else {
-                const admitted = Manager.admit_get_hold_gesture(server_objects, manager, payload, .{ .id = slot }) catch |err| {
-                    self.release(self.slotIndex(slot));
-                    return self.postProtocolError(actor, manager.id, @errorName(err));
-                };
-                slot.resource = admitted.id;
-            }
+            return slot;
         }
 
         pub fn beginSwipe(self: *Self, pointer: PointerId, serial: u32, time: u32, surface: u32, fingers: u32) !void {
@@ -210,6 +227,28 @@ pub fn Adapter(comptime protocol: type) type {
         }
         pub fn beginHold(self: *Self, pointer: PointerId, serial: u32, time: u32, surface: u32, fingers: u32) !void {
             return self.begin(.hold, pointer, serial, time, surface, fingers);
+        }
+        pub fn beginFocusedSwipe(self: *Self, seat: anytype, serial: u32, time: u32, surface: u32, fingers: u32) !void {
+            return self.beginFocused(.swipe, seat, serial, time, surface, fingers);
+        }
+        pub fn beginFocusedPinch(self: *Self, seat: anytype, serial: u32, time: u32, surface: u32, fingers: u32) !void {
+            return self.beginFocused(.pinch, seat, serial, time, surface, fingers);
+        }
+        pub fn beginFocusedHold(self: *Self, seat: anytype, serial: u32, time: u32, surface: u32, fingers: u32) !void {
+            return self.beginFocused(.hold, seat, serial, time, surface, fingers);
+        }
+        fn beginFocused(self: *Self, kind: Kind, seat: anytype, serial: u32, time: u32, surface: u32, fingers: u32) !void {
+            if (surface == 0 or fingers == 0) return error.InvalidState;
+            var count: usize = 0;
+            for (self.slots) |slot| if (slot.active and pointerFocused(seat, slot.pointer)) {
+                if (slot.sequence_active) return error.InvalidState;
+                count += @intFromBool(slot.kind == kind);
+            };
+            try self.prepare(count);
+            for (self.slots) |*slot| if (slot.active and slot.kind == kind and pointerFocused(seat, slot.pointer)) {
+                self.enqueue(slot, .{ .begin = .{ .serial = serial, .time = time, .surface = surface, .fingers = fingers } }) catch unreachable;
+                slot.sequence_active = true;
+            };
         }
         fn begin(self: *Self, kind: Kind, pointer: PointerId, serial: u32, time: u32, surface: u32, fingers: u32) !void {
             if (surface == 0 or fingers == 0) return error.InvalidState;
@@ -231,6 +270,20 @@ pub fn Adapter(comptime protocol: type) type {
         pub fn updatePinch(self: *Self, pointer: PointerId, time: u32, delta: Fixed, scale: i32, rotation: i32) !void {
             return self.update(.pinch, pointer, time, delta, scale, rotation);
         }
+        pub fn updateFocusedSwipe(self: *Self, time: u32, delta: Fixed) !void {
+            return self.updateActive(.swipe, time, delta, 0, 0);
+        }
+        pub fn updateFocusedPinch(self: *Self, time: u32, delta: Fixed, scale: i32, rotation: i32) !void {
+            return self.updateActive(.pinch, time, delta, scale, rotation);
+        }
+        fn updateActive(self: *Self, kind: Kind, time: u32, delta: Fixed, scale: i32, rotation: i32) !void {
+            var count: usize = 0;
+            for (self.slots) |slot| count += @intFromBool(slot.active and slot.sequence_active and slot.kind == kind);
+            if (count == 0) return;
+            try self.prepare(count);
+            for (self.slots) |*slot| if (slot.active and slot.sequence_active and slot.kind == kind)
+                self.enqueue(slot, .{ .update = .{ .time = time, .dx = delta.dx, .dy = delta.dy, .scale = scale, .rotation = rotation } }) catch unreachable;
+        }
         fn update(self: *Self, kind: Kind, pointer: PointerId, time: u32, delta: Fixed, scale: i32, rotation: i32) !void {
             var count: usize = 0;
             for (self.slots) |slot| count += @intFromBool(slot.active and slot.sequence_active and slot.kind == kind and std.meta.eql(slot.pointer, pointer));
@@ -248,6 +301,25 @@ pub fn Adapter(comptime protocol: type) type {
         }
         pub fn endHold(self: *Self, pointer: PointerId, serial: u32, time: u32, cancelled: bool) !void {
             return self.end(.hold, pointer, serial, time, cancelled);
+        }
+        pub fn endFocusedSwipe(self: *Self, serial: u32, time: u32, cancelled: bool) !void {
+            return self.endActive(.swipe, serial, time, cancelled);
+        }
+        pub fn endFocusedPinch(self: *Self, serial: u32, time: u32, cancelled: bool) !void {
+            return self.endActive(.pinch, serial, time, cancelled);
+        }
+        pub fn endFocusedHold(self: *Self, serial: u32, time: u32, cancelled: bool) !void {
+            return self.endActive(.hold, serial, time, cancelled);
+        }
+        fn endActive(self: *Self, kind: Kind, serial: u32, time: u32, cancelled: bool) !void {
+            var count: usize = 0;
+            for (self.slots) |slot| count += @intFromBool(slot.active and slot.sequence_active and slot.kind == kind);
+            if (count == 0) return;
+            try self.prepare(count);
+            for (self.slots) |*slot| if (slot.active and slot.sequence_active and slot.kind == kind) {
+                self.enqueue(slot, .{ .end = .{ .serial = serial, .time = time, .cancelled = @intFromBool(cancelled) } }) catch unreachable;
+                slot.sequence_active = false;
+            };
         }
         fn end(self: *Self, kind: Kind, pointer: PointerId, serial: u32, time: u32, cancelled: bool) !void {
             var count: usize = 0;
@@ -281,18 +353,18 @@ pub fn Adapter(comptime protocol: type) type {
         fn send(_: *Self, server_objects: anytype, queue: *wayring.tx.Queue, slot: *Slot, event: Event) !void {
             switch (slot.kind) {
                 .swipe => switch (event) {
-                    .begin => |e| try wayring.server.sendEvent(protocol, Swipe, server_objects, queue, slot.resource, .{ .begin = e }),
+                    .begin => |e| try wayring.server.sendEvent(protocol, Swipe, server_objects, queue, slot.resource, .{ .begin = .{ .serial = e.serial, .time = e.time, .surface = e.surface, .fingers = e.fingers } }),
                     .update => |e| try wayring.server.sendEvent(protocol, Swipe, server_objects, queue, slot.resource, .{ .update = .{ .time = e.time, .dx = e.dx, .dy = e.dy } }),
-                    .end => |e| try wayring.server.sendEvent(protocol, Swipe, server_objects, queue, slot.resource, .{ .end = e }),
+                    .end => |e| try wayring.server.sendEvent(protocol, Swipe, server_objects, queue, slot.resource, .{ .end = .{ .serial = e.serial, .time = e.time, .cancelled = e.cancelled } }),
                 },
                 .pinch => switch (event) {
-                    .begin => |e| try wayring.server.sendEvent(protocol, Pinch, server_objects, queue, slot.resource, .{ .begin = e }),
-                    .update => |e| try wayring.server.sendEvent(protocol, Pinch, server_objects, queue, slot.resource, .{ .update = e }),
-                    .end => |e| try wayring.server.sendEvent(protocol, Pinch, server_objects, queue, slot.resource, .{ .end = e }),
+                    .begin => |e| try wayring.server.sendEvent(protocol, Pinch, server_objects, queue, slot.resource, .{ .begin = .{ .serial = e.serial, .time = e.time, .surface = e.surface, .fingers = e.fingers } }),
+                    .update => |e| try wayring.server.sendEvent(protocol, Pinch, server_objects, queue, slot.resource, .{ .update = .{ .time = e.time, .dx = e.dx, .dy = e.dy, .scale = e.scale, .rotation = e.rotation } }),
+                    .end => |e| try wayring.server.sendEvent(protocol, Pinch, server_objects, queue, slot.resource, .{ .end = .{ .serial = e.serial, .time = e.time, .cancelled = e.cancelled } }),
                 },
                 .hold => switch (event) {
-                    .begin => |e| try wayring.server.sendEvent(protocol, Hold, server_objects, queue, slot.resource, .{ .begin = e }),
-                    .end => |e| try wayring.server.sendEvent(protocol, Hold, server_objects, queue, slot.resource, .{ .end = e }),
+                    .begin => |e| try wayring.server.sendEvent(protocol, Hold, server_objects, queue, slot.resource, .{ .begin = .{ .serial = e.serial, .time = e.time, .surface = e.surface, .fingers = e.fingers } }),
+                    .end => |e| try wayring.server.sendEvent(protocol, Hold, server_objects, queue, slot.resource, .{ .end = .{ .serial = e.serial, .time = e.time, .cancelled = e.cancelled } }),
                     .update => unreachable,
                 },
             }
@@ -422,9 +494,27 @@ fn samePeer(a: wayring.io_uring.Peer, b: wayring.io_uring.Peer) bool {
     return a.slot == b.slot and a.generation == b.generation;
 }
 
+fn pointerFocused(seat: anytype, pointer: PointerId) bool {
+    const Seat = @typeInfo(@TypeOf(seat)).pointer.child;
+    const SeatPointerId = Seat.PointerId;
+    return seat.pointerFocused(SeatPointerId{
+        .index = pointer.index,
+        .generation = pointer.generation,
+    });
+}
+
 fn acceptPointer(_: ?*anyopaque, _: wayring.io_uring.Peer, wire: u32) ?PointerId {
     return .{ .index = wire, .generation = 7 };
 }
+
+const FocusedPointerSet = struct {
+    pub const PointerId = packed struct { index: u32, generation: u32 };
+    focused: bool = true,
+
+    pub fn pointerFocused(self: *const FocusedPointerSet, _: FocusedPointerSet.PointerId) bool {
+        return self.focused;
+    }
+};
 
 test "pointer gestures: bounded sequencing, fanout, cleanup, and retirement" {
     const protocol = @import("core_protocol");
@@ -472,4 +562,53 @@ test "pointer gestures: bounded sequencing, fanout, cleanup, and retirement" {
     try std.testing.expect(reused.retired);
     adapter.disconnected(peer);
     try std.testing.expectEqual(@as(usize, 0), adapter.outbound_len);
+}
+
+test "pointer gestures: focused fanout is atomic and survives focus changes" {
+    const protocol = @import("core_protocol");
+    const A = Adapter(protocol);
+    var adapter = try A.init(std.testing.allocator, .{ .validateFn = acceptPointer }, .{
+        .gesture_capacity = 3,
+        .outbound_capacity = 4,
+    });
+    defer adapter.deinit();
+    const peer: wayring.io_uring.Peer = .{ .slot = 1, .generation = 2 };
+    const first = try adapter.acquire();
+    first.peer = peer;
+    first.pointer = .{ .index = 9, .generation = 7 };
+    first.kind = .swipe;
+    const second = try adapter.acquire();
+    second.peer = peer;
+    second.pointer = .{ .index = 10, .generation = 7 };
+    second.kind = .swipe;
+    const pinch = try adapter.acquire();
+    pinch.peer = peer;
+    pinch.pointer = first.pointer;
+    pinch.kind = .pinch;
+    var focus: FocusedPointerSet = .{};
+
+    try adapter.beginFocusedSwipe(&focus, 1, 2, 3, 4);
+    try std.testing.expect(first.sequence_active);
+    try std.testing.expect(second.sequence_active);
+    try std.testing.expect(!pinch.sequence_active);
+    focus.focused = false;
+    try adapter.updateFocusedSwipe(5, .{ .dx = 6, .dy = 7 });
+    try std.testing.expectError(error.Exhausted, adapter.endFocusedSwipe(8, 9, false));
+    try std.testing.expect(first.sequence_active);
+    try std.testing.expect(second.sequence_active);
+
+    adapter.purge(adapter.slotId(first));
+    adapter.purge(adapter.slotId(second));
+    try adapter.endFocusedSwipe(8, 9, false);
+    try std.testing.expect(!first.sequence_active);
+    try std.testing.expect(!second.sequence_active);
+    adapter.purge(adapter.slotId(first));
+    adapter.purge(adapter.slotId(second));
+
+    focus.focused = true;
+    try adapter.beginFocusedPinch(&focus, 10, 11, 12, 2);
+    try std.testing.expect(pinch.sequence_active);
+    try std.testing.expectError(error.InvalidState, adapter.beginFocusedSwipe(&focus, 13, 14, 15, 3));
+    try std.testing.expect(!first.sequence_active);
+    try std.testing.expect(!second.sequence_active);
 }

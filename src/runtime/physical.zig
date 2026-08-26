@@ -36,6 +36,7 @@ const protocol_linux_dmabuf = @import("../protocol/linux_dmabuf.zig");
 const protocol_xdg_activation = @import("../protocol/xdg_activation.zig");
 const protocol_xdg_decoration = @import("../protocol/xdg_decoration.zig");
 const protocol_relative_pointer = @import("../protocol/relative_pointer.zig");
+const protocol_pointer_gestures = @import("../protocol/pointer_gestures.zig");
 const protocol_pointer_constraints = @import("../protocol/pointer_constraints.zig");
 const protocol_fractional_scale = @import("../protocol/fractional_scale.zig");
 const protocol_color_management = @import("../protocol/color_management.zig");
@@ -73,6 +74,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const ActivationAdapter = protocol_xdg_activation.Adapter(protocol, Adapter);
         const DecorationAdapter = protocol_xdg_decoration.Adapter(protocol, ShellAdapter);
         const RelativePointerAdapter = protocol_relative_pointer.Adapter(protocol, SeatAdapter);
+        const PointerGesturesAdapter = protocol_pointer_gestures.Adapter(protocol);
         const PointerConstraintsAdapter = protocol_pointer_constraints.Adapter(protocol, Adapter, SeatAdapter);
         const FractionalScaleAdapter = protocol_fractional_scale.Adapter(protocol, Adapter);
         const ColorManagementAdapter = protocol_color_management.Adapter(protocol, Adapter);
@@ -143,10 +145,11 @@ pub fn Coordinator(comptime protocol: type) type {
             const color_representation: u16 = 1 << 12;
             const primary_selection: u16 = 1 << 13;
             const text_input: u16 = 1 << 14;
+            const pointer_gestures: u16 = 1 << 15;
             const all: u16 = decoration | shell | seat | data_device | dmabuf |
                 activation | relative_pointer | fractional_scale | output | core |
                 pointer_constraints | color_management | color_representation |
-                primary_selection | text_input;
+                primary_selection | text_input | pointer_gestures;
         };
         const Client = struct {
             active: bool = false,
@@ -241,6 +244,7 @@ pub fn Coordinator(comptime protocol: type) type {
             xdg_activation: protocol_xdg_activation.Config = .{},
             xdg_decoration: protocol_xdg_decoration.Config = .{},
             relative_pointer: protocol_relative_pointer.Config = .{},
+            pointer_gestures: protocol_pointer_gestures.Config = .{},
             pointer_constraints: protocol_pointer_constraints.WireConfig = .{},
             fractional_scale: protocol_fractional_scale.Config = .{},
             color_management: protocol_color_management.Config = .{},
@@ -292,6 +296,7 @@ pub fn Coordinator(comptime protocol: type) type {
         input_event_cursor: usize = 0,
         input_interaction_accepted: bool = false,
         input_relative_accepted: bool = false,
+        input_gesture_accepted: bool = false,
         input_keyboard_consumed: bool = false,
         input_seat_accepted: bool = false,
         input_drag_accepted: bool = false,
@@ -312,6 +317,7 @@ pub fn Coordinator(comptime protocol: type) type {
         activation_adapter: ActivationAdapter,
         decoration_adapter: DecorationAdapter,
         relative_pointer_adapter: RelativePointerAdapter,
+        pointer_gestures_adapter: PointerGesturesAdapter,
         pointer_constraints_adapter: PointerConstraintsAdapter,
         fractional_scale_adapter: FractionalScaleAdapter,
         color_management_adapter: ColorManagementAdapter,
@@ -388,6 +394,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.input_event_cursor = 0;
             self.input_interaction_accepted = false;
             self.input_relative_accepted = false;
+            self.input_gesture_accepted = false;
             self.input_keyboard_consumed = false;
             self.input_seat_accepted = false;
             self.input_drag_accepted = false;
@@ -550,6 +557,11 @@ pub fn Coordinator(comptime protocol: type) type {
                 config.relative_pointer,
             );
             errdefer self.relative_pointer_adapter.deinit();
+            self.pointer_gestures_adapter = try PointerGesturesAdapter.init(allocator, .{
+                .context = self,
+                .validateFn = validateGesturePointer,
+            }, config.pointer_gestures);
+            errdefer self.pointer_gestures_adapter.deinit();
             self.pointer_constraints_adapter = try PointerConstraintsAdapter.init(
                 allocator,
                 &self.adapter,
@@ -704,6 +716,9 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = try self.relative_pointer_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
+            _ = try self.pointer_gestures_adapter.install(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
             _ = try self.pointer_constraints_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
@@ -796,6 +811,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.primary_selection_adapter.deinit();
             self.data_device_adapter.deinit();
             self.pointer_constraints_adapter.deinit();
+            self.pointer_gestures_adapter.deinit();
             self.relative_pointer_adapter.deinit();
             self.seat_adapter.deinit();
             self.subcompositor_adapter.deinit();
@@ -834,6 +850,7 @@ pub fn Coordinator(comptime protocol: type) type {
 
         pub fn disconnected(self: *Self, peer: wayring.io_uring.Peer) void {
             self.cursor_shape_adapter.disconnected(peer);
+            self.pointer_gestures_adapter.disconnected(peer);
             self.text_input_adapter.disconnected(peer);
             self.primary_selection_adapter.disconnected(peer);
             for (self.clients.items) |*client| if (client.active and samePeer(client.peer, peer)) {
@@ -1013,6 +1030,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.flushProtocol();
                 return control;
             }
+            if (try self.pointer_gestures_adapter.request(peer, target, message, fds)) |control|
+                return control;
             if (try self.pointer_constraints_adapter.request(peer, target, message, fds)) |control| {
                 if (self.pointer_constraints_adapter.pendingOutbound(peer))
                     self.markProtocol(peer, ProtocolReady.pointer_constraints);
@@ -1366,6 +1385,13 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.relative_pointer_adapter.consume(event) catch return false;
                 self.input_relative_accepted = true;
             }
+            if (!self.input_gesture_accepted) {
+                self.consumePointerGesture(event) catch |err| switch (err) {
+                    error.Exhausted => return false,
+                    else => return err,
+                };
+                self.input_gesture_accepted = true;
+            }
             if (!self.input_seat_accepted) {
                 if (!self.input_keyboard_consumed) if (self.input_delivery_event) |delivery_event|
                     switch (delivery_event) {
@@ -1401,13 +1427,15 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             self.input_interaction_accepted = false;
             self.input_relative_accepted = false;
+            self.input_gesture_accepted = false;
             self.input_keyboard_consumed = false;
             self.input_seat_accepted = false;
             self.input_drag_accepted = false;
             self.input_delivery_prepared = false;
             self.input_delivery_event = null;
             self.stats.input_events += 1;
-            self.markProtocolAll(ProtocolReady.seat | ProtocolReady.relative_pointer);
+            self.markProtocolAll(ProtocolReady.seat | ProtocolReady.relative_pointer |
+                ProtocolReady.pointer_gestures);
             try self.advanceShell();
             switch (event) {
                 .pointer_motion, .device_added, .device_removed => try self.requestCursorRedraw(),
@@ -1416,6 +1444,70 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.processSeatEvents();
             try self.flushProtocol();
             return true;
+        }
+
+        fn consumePointerGesture(self: *Self, event: input_api.Event) !void {
+            const time: u32 = switch (event) {
+                .swipe_begin => |value| @truncate(value.time_usec / 1000),
+                .swipe_update => |value| @truncate(value.time_usec / 1000),
+                .swipe_end => |value| @truncate(value.time_usec / 1000),
+                .pinch_begin => |value| @truncate(value.time_usec / 1000),
+                .pinch_update => |value| @truncate(value.time_usec / 1000),
+                .pinch_end => |value| @truncate(value.time_usec / 1000),
+                .hold_begin => |value| @truncate(value.time_usec / 1000),
+                .hold_end => |value| @truncate(value.time_usec / 1000),
+                else => return,
+            };
+            const focus = self.seat_adapter.pointerState().focus;
+            switch (event) {
+                .swipe_begin => |value| if (focus) |target| try self.pointer_gestures_adapter.beginFocusedSwipe(
+                    &self.seat_adapter,
+                    self.seat_adapter.nextSerial(),
+                    time,
+                    (try self.adapter.surfaceResource(target.surface)).id,
+                    value.fingers,
+                ),
+                .swipe_update => |value| try self.pointer_gestures_adapter.updateFocusedSwipe(
+                    time,
+                    .{ .dx = gestureFixed(value.dx), .dy = gestureFixed(value.dy) },
+                ),
+                .swipe_end => |value| try self.pointer_gestures_adapter.endFocusedSwipe(
+                    self.seat_adapter.nextSerial(),
+                    time,
+                    value.cancelled,
+                ),
+                .pinch_begin => |value| if (focus) |target| try self.pointer_gestures_adapter.beginFocusedPinch(
+                    &self.seat_adapter,
+                    self.seat_adapter.nextSerial(),
+                    time,
+                    (try self.adapter.surfaceResource(target.surface)).id,
+                    value.fingers,
+                ),
+                .pinch_update => |value| try self.pointer_gestures_adapter.updateFocusedPinch(
+                    time,
+                    .{ .dx = gestureFixed(value.dx), .dy = gestureFixed(value.dy) },
+                    gestureFixed(value.scale),
+                    gestureFixed(value.angle_delta),
+                ),
+                .pinch_end => |value| try self.pointer_gestures_adapter.endFocusedPinch(
+                    self.seat_adapter.nextSerial(),
+                    time,
+                    value.cancelled,
+                ),
+                .hold_begin => |value| if (focus) |target| try self.pointer_gestures_adapter.beginFocusedHold(
+                    &self.seat_adapter,
+                    self.seat_adapter.nextSerial(),
+                    time,
+                    (try self.adapter.surfaceResource(target.surface)).id,
+                    value.fingers,
+                ),
+                .hold_end => |value| try self.pointer_gestures_adapter.endFocusedHold(
+                    self.seat_adapter.nextSerial(),
+                    time,
+                    value.cancelled,
+                ),
+                else => unreachable,
+            }
         }
 
         fn syncDragTarget(self: *Self, time_usec: u64, emit_motion: bool) !void {
@@ -1684,6 +1776,17 @@ pub fn Coordinator(comptime protocol: type) type {
             return self.seat_adapter.validateSeatOn(server_objects, peer, seat_object);
         }
 
+        fn validateGesturePointer(
+            context: ?*anyopaque,
+            peer: wayring.io_uring.Peer,
+            pointer_object: u32,
+        ) ?protocol_pointer_gestures.PointerId {
+            const self: *Self = @ptrCast(@alignCast(context orelse return null));
+            const server_objects = self.root.runtime.clients.get(peer) catch return null;
+            const id = self.seat_adapter.pointerIdOn(server_objects, pointer_object) catch return null;
+            return .{ .index = id.index, .generation = id.generation };
+        }
+
         fn cursorImage(self: *Self, name: []const u8) ?cursor_theme.Image {
             const suffix = std.fmt.bufPrint(self.cursor_path[self.cursor_directory_len..], "/{s}", .{name}) catch return null;
             const path = self.cursor_path[0 .. self.cursor_directory_len + suffix.len];
@@ -1861,6 +1964,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 flushed += try self.activation_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.relative_pointer != 0)
                 flushed += try self.relative_pointer_adapter.flushOn(peer, objects, &actor.transmit);
+            if (client.protocol_ready & ProtocolReady.pointer_gestures != 0)
+                flushed += try self.pointer_gestures_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.pointer_constraints != 0)
                 flushed += try self.pointer_constraints_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.fractional_scale != 0)
@@ -1941,6 +2046,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (ready & ProtocolReady.relative_pointer != 0 and
                 !self.relative_pointer_adapter.pendingOutbound(client.peer))
                 ready &= ~ProtocolReady.relative_pointer;
+            if (ready & ProtocolReady.pointer_gestures != 0 and
+                !self.pointer_gestures_adapter.pendingOutboundOn(client.peer))
+                ready &= ~ProtocolReady.pointer_gestures;
             if (ready & ProtocolReady.pointer_constraints != 0 and
                 !self.pointer_constraints_adapter.pendingOutbound(client.peer))
                 ready &= ~ProtocolReady.pointer_constraints;
@@ -3214,6 +3322,7 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.activation_adapter.resourceRemoved(handle, object);
             _ = self.decoration_adapter.resourceRemoved(handle, object);
             _ = self.relative_pointer_adapter.resourceRemoved(handle, object);
+            _ = self.pointer_gestures_adapter.resourceRemoved(handle, object);
             _ = self.pointer_constraints_adapter.resourceRemoved(handle, object);
             _ = self.fractional_scale_adapter.resourceRemoved(handle, object);
             _ = self.color_management_adapter.resourceRemoved(handle, object);
@@ -3294,6 +3403,13 @@ fn normalizedFixedDelta(value: f64) i64 {
     const scaled = value * 256.0;
     if (scaled >= @as(f64, @floatFromInt(std.math.maxInt(i64)))) return std.math.maxInt(i64);
     if (scaled <= @as(f64, @floatFromInt(std.math.minInt(i64)))) return std.math.minInt(i64);
+    return @intFromFloat(scaled);
+}
+
+fn gestureFixed(value: f64) i32 {
+    const scaled = value * 256.0;
+    if (scaled >= @as(f64, @floatFromInt(std.math.maxInt(i32)))) return std.math.maxInt(i32);
+    if (scaled <= @as(f64, @floatFromInt(std.math.minInt(i32)))) return std.math.minInt(i32);
     return @intFromFloat(scaled);
 }
 
