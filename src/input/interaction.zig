@@ -463,7 +463,11 @@ pub fn Interaction(comptime Desktop: type) type {
                 (pressed and (key == key_left_meta or key == key_right_meta));
             const shift = self.anyDeviceKey(key_left_shift) or self.anyDeviceKey(key_right_shift) or
                 (pressed and (key == key_left_shift or key == key_right_shift));
-            const binding = !shortcuts_inhibited and pressed and meta and isBindingKey(key);
+            const inhibit_bindings = if (self.keyboard_focus) |focus| inhibited: {
+                const scene = desktop.scene(focus.toplevel) catch break :inhibited false;
+                break :inhibited shortcuts_inhibited and scene.visible and scene.content_ready;
+            } else false;
+            const binding = !inhibit_bindings and pressed and meta and isBindingKey(key);
             const close_target = if (binding and key == key_q) desktop.focusedToplevel() else null;
             if (binding or release_binding)
                 try self.ensureCommandCapacity(1 + @as(usize, @intFromBool(close_target != null)));
@@ -833,6 +837,12 @@ const TestDesktop = struct {
 
     pub fn focusedToplevel(self: *const @This()) ?TestId {
         return self.focused;
+    }
+
+    pub fn scene(self: *const @This(), id: TestId) !SceneWindow {
+        for (self.windows[0..self.len]) |window|
+            if (std.meta.eql(window.id, id)) return window;
+        return error.StaleToplevel;
     }
 
     pub fn toggleFocusedFullscreen(self: *@This()) !void {
@@ -1507,6 +1517,7 @@ test "interaction: shortcut inhibition forwards compositor binding pairs" {
     defer interaction.deinit();
     var desktop = testDesktop();
     var surfaces = TestSurfaces{};
+    interaction.keyboard_focus = targetFor(desktop.windows[0]);
     try interaction.consume(&desktop, &surfaces, .{ .device_added = .{
         .device = device_a,
         .capabilities = .{ .keyboard = true },
@@ -1531,6 +1542,16 @@ test "interaction: shortcut inhibition forwards compositor binding pairs" {
     } }, true);
     try std.testing.expectEqual(@as(usize, 0), interaction.pendingCommands());
     try std.testing.expectEqual(@as(usize, 0), desktop.focus_next_count);
+
+    desktop.windows[0].content_ready = false;
+    try interaction.consumeWithShortcutPolicy(&desktop, &surfaces, .{ .keyboard_key = .{
+        .device = device_a,
+        .time_usec = 4,
+        .key = key_f,
+        .pressed = true,
+    } }, true);
+    try std.testing.expect(interaction.peekCommand().? == .key_consumed);
+    try std.testing.expectEqual(@as(usize, 1), desktop.fullscreen_count);
 }
 
 test "interaction: close binding retains the exact focused toplevel" {
