@@ -55,6 +55,7 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type) type {
         free_head: u32 = 0,
         event_head: usize = 0,
         event_len: usize = 0,
+        configure_pending_len: usize = 0,
 
         pub fn init(allocator: std.mem.Allocator, shell: *Shell, config: Config) !Self {
             try config.validate();
@@ -219,6 +220,7 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type) type {
             queue: *wayring.tx.Queue,
         ) !usize {
             var completed: usize = 0;
+            if (self.configure_pending_len == 0) return completed;
             for (self.slots) |*slot| {
                 if (!slot.active or !samePeer(slot.peer, peer) or !slot.configure_pending)
                     continue;
@@ -235,12 +237,14 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type) type {
                     else => return err,
                 };
                 slot.configure_pending = false;
+                self.configure_pending_len -= 1;
                 completed += 1;
             }
             return completed;
         }
 
         pub fn pendingOutbound(self: *const Self, peer: wayring.io_uring.Peer) bool {
+            if (self.configure_pending_len == 0) return false;
             for (self.slots) |slot|
                 if (slot.active and samePeer(slot.peer, peer) and slot.configure_pending)
                     return true;
@@ -248,6 +252,7 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type) type {
         }
 
         pub fn readyOutbound(self: *const Self, peer: wayring.io_uring.Peer) bool {
+            if (self.configure_pending_len == 0) return false;
             for (self.slots) |*slot| {
                 if (slot.active and samePeer(slot.peer, peer) and slot.configure_pending and
                     !self.eventQueued(self.slotId(slot))) return true;
@@ -284,6 +289,7 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type) type {
         fn queueConfigure(self: *Self, slot: *Slot) void {
             std.debug.assert(!slot.configure_pending and self.event_len < self.events.len);
             slot.configure_pending = true;
+            self.configure_pending_len += 1;
             const tail = (self.event_head + self.event_len) % self.events.len;
             self.events[tail] = self.slotId(slot);
             self.event_len += 1;
@@ -309,6 +315,7 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type) type {
         fn release(self: *Self, index_value: u32) void {
             const slot = &self.slots[index_value];
             if (!slot.active) return;
+            if (slot.configure_pending) self.configure_pending_len -= 1;
             const generation = slot.generation +% 1;
             slot.* = .{
                 .generation = if (generation == 0) 1 else generation,

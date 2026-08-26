@@ -61,6 +61,7 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
         global_version: u32,
         slots: []Slot,
         outbound: []Outbound,
+        outbound_len: usize = 0,
         free_head: u32 = 0,
         next_sequence: u64 = 1,
 
@@ -204,9 +205,11 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
             queue: *wayring.tx.Queue,
         ) !usize {
             var completed: usize = 0;
+            if (self.outbound_len == 0) return completed;
             while (self.oldest(peer)) |outbound| {
                 const slot = self.resolve(outbound.motion.relative) catch {
                     outbound.active = false;
+                    self.outbound_len -= 1;
                     completed += 1;
                     continue;
                 };
@@ -230,12 +233,14 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                     else => return err,
                 };
                 outbound.active = false;
+                self.outbound_len -= 1;
                 completed += 1;
             }
             return completed;
         }
 
         pub fn pendingOutbound(self: *const Self, peer: wayring.io_uring.Peer) bool {
+            if (self.outbound_len == 0) return false;
             for (self.outbound) |slot|
                 if (slot.active and samePeer(slot.peer, peer)) return true;
             return false;
@@ -249,6 +254,7 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                 for (self.outbound) |*outbound| {
                     if (outbound.active and std.meta.eql(outbound.motion.relative, id)) {
                         outbound.active = false;
+                        self.outbound_len -= 1;
                     }
                 }
                 self.release(id.index);
@@ -315,6 +321,7 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                     .motion = motion,
                 };
                 self.next_sequence +%= 1;
+                self.outbound_len += 1;
                 return;
             };
             return error.Exhausted;
@@ -329,9 +336,7 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
         }
 
         fn outboundFree(self: *const Self) usize {
-            var count: usize = 0;
-            for (self.outbound) |slot| count += @intFromBool(!slot.active);
-            return count;
+            return self.outbound.len - self.outbound_len;
         }
 
         fn noMemory(_: *Self, actor: *wayring.connection.Actor) !wayring.dispatch.Control {

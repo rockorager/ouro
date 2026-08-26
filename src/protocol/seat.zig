@@ -837,6 +837,11 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             return adapter.outbound_len;
         }
 
+        pub fn pendingOutboundOn(adapter: *Self, server_objects: anytype) bool {
+            if (adapter.outbound_len == 0) return false;
+            return adapter.oldestOutboundFor(server_objects) != null;
+        }
+
         pub fn flushOn(adapter: *Self, server_objects: anytype, queue: *wayring.tx.Queue) !usize {
             var completed: usize = 0;
             if (adapter.outbound_len == 0) return completed;

@@ -40,6 +40,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         slots: []Slot,
         free_head: u32 = 0,
         preferred_scale: u32,
+        event_pending_len: usize = 0,
 
         pub fn init(
             allocator: std.mem.Allocator,
@@ -152,6 +153,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             queue: *wayring.tx.Queue,
         ) !usize {
             var completed: usize = 0;
+            if (adapter.event_pending_len == 0) return completed;
             for (adapter.slots) |*slot| {
                 if (!slot.active or !samePeer(slot.peer, peer) or !slot.event_pending) continue;
                 if (server_objects.namespace.resolve(slot.resource) == null) continue;
@@ -162,12 +164,14 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     else => return err,
                 };
                 slot.event_pending = false;
+                adapter.event_pending_len -= 1;
                 completed += 1;
             }
             return completed;
         }
 
         pub fn pendingOutbound(adapter: *const Self, peer: wayring.io_uring.Peer) bool {
+            if (adapter.event_pending_len == 0) return false;
             for (adapter.slots) |slot|
                 if (slot.active and samePeer(slot.peer, peer) and slot.event_pending) return true;
             return false;
@@ -190,12 +194,14 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             const slot = &adapter.slots[index_value];
             adapter.free_head = slot.next_free;
             slot.* = .{ .active = true };
+            adapter.event_pending_len += 1;
             return slot;
         }
 
         fn release(adapter: *Self, index_value: u32) void {
             const slot = &adapter.slots[index_value];
             if (!slot.active) return;
+            if (slot.event_pending) adapter.event_pending_len -= 1;
             slot.* = .{ .next_free = adapter.free_head };
             adapter.free_head = index_value;
         }

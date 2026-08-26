@@ -94,6 +94,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         token_free: u32 = 0,
         event_head: usize = 0,
         event_len: usize = 0,
+        done_pending_len: usize = 0,
         next_sequence: u64 = 1,
         validator: ?SerialValidator = null,
 
@@ -252,6 +253,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             try fillToken(&slot.token);
             slot.committed = true;
             slot.done_pending = true;
+            self.done_pending_len += 1;
             const serial = slot.serial orelse return;
             const surface = slot.surface orelse return;
             const validator = self.validator orelse return;
@@ -311,6 +313,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             queue: *wayring.tx.Queue,
         ) !usize {
             var completed: usize = 0;
+            if (self.done_pending_len == 0) return completed;
             for (self.tokens) |*slot| {
                 if (!slot.header.active or !samePeer(slot.peer, peer) or !slot.done_pending)
                     continue;
@@ -326,12 +329,14 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     else => return err,
                 };
                 slot.done_pending = false;
+                self.done_pending_len -= 1;
                 completed += 1;
             }
             return completed;
         }
 
         pub fn pendingOutbound(self: *const Self, peer: wayring.io_uring.Peer) bool {
+            if (self.done_pending_len == 0) return false;
             for (self.tokens) |slot|
                 if (slot.header.active and samePeer(slot.peer, peer) and slot.done_pending)
                     return true;
@@ -348,6 +353,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             if (object.interface == &Token.info) {
                 const slot = fromContext(TokenSlot, self.tokens, object.context) orelse return false;
                 if (!std.meta.eql(slot.header.resource, handle)) return false;
+                if (slot.done_pending) self.done_pending_len -= 1;
                 release(TokenSlot, self.tokens, &self.token_free, indexOf(TokenSlot, self.tokens, slot));
                 return true;
             }

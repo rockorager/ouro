@@ -778,6 +778,11 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             return adapter.outbound_len;
         }
 
+        pub fn pendingOutboundOn(adapter: *Self, server_objects: anytype) bool {
+            if (adapter.outbound_len == 0) return false;
+            return adapter.oldestOutboundFor(server_objects) != null;
+        }
+
         /// Emits only commands owned by this client's object namespace, in
         /// per-client admission order. Multi-event configure commands retain
         /// their cursor and serial if TX storage fills between events.
@@ -2361,10 +2366,15 @@ test "xdg-shell: flushing is client scoped with overlapping object IDs" {
     try adapter.queueClose(id_b);
     try adapter.queueClose(id_a);
 
+    try std.testing.expect(adapter.pendingOutboundOn(&server_a));
+    try std.testing.expect(adapter.pendingOutboundOn(&server_b));
     try std.testing.expectEqual(@as(usize, 4), try adapter.flushOn(&server_a, &actor_a.transmit));
+    try std.testing.expect(!adapter.pendingOutboundOn(&server_a));
+    try std.testing.expect(adapter.pendingOutboundOn(&server_b));
     try std.testing.expectEqual(@as(usize, 3), adapter.pendingOutbound());
     try expectClientOutbound(&actor_a.transmit, &fds, 111, configure_a, ping_a);
     try std.testing.expectEqual(@as(usize, 3), try adapter.flushOn(&server_b, &actor_b.transmit));
+    try std.testing.expect(!adapter.pendingOutboundOn(&server_b));
     try std.testing.expectEqual(@as(usize, 0), adapter.pendingOutbound());
     try expectClientOutbound(&actor_b.transmit, &fds, 222, configure_b, ping_b);
 }

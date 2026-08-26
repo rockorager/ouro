@@ -83,6 +83,8 @@ pub fn Adapter(comptime protocol: type) type {
         associations: []Association,
         association_free: u32,
         outbound: []Outbound,
+        outbound_len: usize = 0,
+        associations_dirty: bool = false,
         next_sequence: u64 = 1,
 
         pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
@@ -193,6 +195,7 @@ pub fn Adapter(comptime protocol: type) type {
                 .refresh_millihz = @intCast(refresh_millihz),
             };
             adapter.available = true;
+            adapter.associations_dirty = true;
             for (adapter.resources, 0..) |resource, index| if (resource.active) {
                 const id = adapter.idFor(@intCast(index));
                 adapter.enqueue(id, .geometry) catch unreachable;
@@ -202,6 +205,7 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         pub fn setAvailable(adapter: *Self, available: bool) void {
+            if (adapter.available != available) adapter.associations_dirty = true;
             adapter.available = available;
         }
 
@@ -227,17 +231,26 @@ pub fn Adapter(comptime protocol: type) type {
             for (adapter.associations) |association| free += @intFromBool(!association.active);
             if (required > free) return error.Exhausted;
 
+            var changed = false;
             for (adapter.associations) |*association| {
-                if (association.active and samePeer(association.peer, peer)) association.desired = false;
+                if (!association.active or !samePeer(association.peer, peer)) continue;
+                var desired = false;
+                for (surfaces) |surface| if (std.meta.eql(association.surface, surface)) {
+                    desired = true;
+                    break;
+                };
+                if (association.desired != desired) {
+                    association.desired = desired;
+                    changed = true;
+                }
             }
             for (surfaces) |surface| {
-                if (adapter.findAssociation(peer, surface)) |association| {
-                    association.desired = true;
-                } else {
+                if (adapter.findAssociation(peer, surface) == null) {
                     const association = adapter.acquireAssociation() catch unreachable;
                     association.peer = peer;
                     association.surface = surface;
                     association.desired = true;
+                    changed = true;
                 }
             }
             var index: usize = 0;
@@ -245,8 +258,12 @@ pub fn Adapter(comptime protocol: type) type {
                 const association = &adapter.associations[index];
                 if (association.active and samePeer(association.peer, peer) and
                     !association.desired and association.entered == 0)
+                {
                     adapter.releaseAssociation(@intCast(index));
+                    changed = true;
+                }
             }
+            if (changed) adapter.associations_dirty = true;
         }
 
         pub fn request(
@@ -287,6 +304,7 @@ pub fn Adapter(comptime protocol: type) type {
                     adapter.releaseAssociation(@intCast(association_index));
             }
             adapter.releaseResource(id.index);
+            adapter.associations_dirty = true;
             return true;
         }
 
@@ -295,23 +313,33 @@ pub fn Adapter(comptime protocol: type) type {
             peer: wayring.io_uring.Peer,
             handle: objects.Handle,
         ) void {
-            if (adapter.findAssociation(peer, handle)) |association|
+            if (adapter.findAssociation(peer, handle)) |association| {
                 adapter.releaseAssociation(adapter.associationIndex(association));
+                adapter.associations_dirty = true;
+            }
         }
 
         pub fn pendingOutbound(adapter: *const Self) usize {
-            var count: usize = 0;
-            for (adapter.outbound) |slot| count += @intFromBool(slot.active);
+            return adapter.outbound_len + @intFromBool(adapter.associations_dirty);
+        }
+
+        pub fn pendingOutboundOn(adapter: *Self, peer: wayring.io_uring.Peer) bool {
+            if (adapter.outbound_len != 0) for (adapter.outbound) |slot| {
+                if (!slot.active) continue;
+                const resource = adapter.resolve(slot.resource) catch continue;
+                if (samePeer(resource.peer, peer)) return true;
+            };
+            if (!adapter.associations_dirty) return false;
             for (adapter.associations) |association| {
-                if (!association.active) continue;
+                if (!association.active or !samePeer(association.peer, peer)) continue;
                 for (adapter.resources, 0..) |resource, index| {
-                    if (!resource.active) continue;
+                    if (!resource.active or !samePeer(resource.peer, peer)) continue;
                     const bit = @as(u64, 1) << @intCast(index);
                     const entered = association.entered & bit != 0;
-                    count += @intFromBool(entered != (adapter.available and association.desired));
+                    if (entered != (adapter.available and association.desired)) return true;
                 }
             }
-            return count;
+            return false;
         }
 
         pub fn flushOn(
@@ -321,15 +349,20 @@ pub fn Adapter(comptime protocol: type) type {
             queue: *wayring.tx.Queue,
         ) !usize {
             var completed: usize = 0;
+            if (adapter.outbound_len == 0 and !adapter.associations_dirty) return completed;
             while (adapter.oldestOutbound(peer)) |slot| {
                 adapter.emit(queue, slot.*) catch |err| switch (err) {
                     error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return completed,
                     else => return err,
                 };
                 slot.active = false;
+                adapter.outbound_len -= 1;
                 completed += 1;
             }
-            completed += try adapter.flushAssociations(peer, server_objects, queue);
+            if (adapter.associations_dirty) {
+                completed += try adapter.flushAssociations(peer, server_objects, queue);
+                adapter.associations_dirty = adapter.hasPendingAssociations();
+            }
             return completed;
         }
 
@@ -446,6 +479,7 @@ pub fn Adapter(comptime protocol: type) type {
             adapter.resource_free = resource.next_free;
             resource.active = true;
             resource.next_free = none;
+            adapter.associations_dirty = true;
             return index;
         }
 
@@ -456,6 +490,7 @@ pub fn Adapter(comptime protocol: type) type {
                 .next_free = adapter.resource_free,
             };
             adapter.resource_free = index;
+            adapter.associations_dirty = true;
         }
 
         fn acquireAssociation(adapter: *Self) !*Association {
@@ -490,9 +525,7 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         fn ensureOutbound(adapter: *const Self, needed: usize) !void {
-            var pending: usize = 0;
-            for (adapter.outbound) |slot| pending += @intFromBool(slot.active);
-            if (pending + needed > adapter.outbound.len) return error.Exhausted;
+            if (adapter.outbound_len + needed > adapter.outbound.len) return error.Exhausted;
         }
 
         fn enqueue(adapter: *Self, resource: Id, event: Event) !void {
@@ -504,6 +537,7 @@ pub fn Adapter(comptime protocol: type) type {
                     .event = event,
                 };
                 adapter.next_sequence +%= 1;
+                adapter.outbound_len += 1;
                 return;
             };
             return error.Exhausted;
@@ -523,8 +557,24 @@ pub fn Adapter(comptime protocol: type) type {
 
         fn dropOutbound(adapter: *Self, id: Id) void {
             for (adapter.outbound) |*slot| {
-                if (slot.active and std.meta.eql(slot.resource, id)) slot.active = false;
+                if (slot.active and std.meta.eql(slot.resource, id)) {
+                    slot.active = false;
+                    adapter.outbound_len -= 1;
+                }
             }
+        }
+
+        fn hasPendingAssociations(adapter: *const Self) bool {
+            for (adapter.associations) |association| {
+                if (!association.active) continue;
+                for (adapter.resources, 0..) |resource, index| {
+                    if (!resource.active) continue;
+                    const bit = @as(u64, 1) << @intCast(index);
+                    const entered = association.entered & bit != 0;
+                    if (entered != (adapter.available and association.desired)) return true;
+                }
+            }
+            return false;
         }
 
         fn idFor(adapter: *const Self, index: u32) Id {

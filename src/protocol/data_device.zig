@@ -167,6 +167,7 @@ pub fn Adapter(comptime protocol: type) type {
         devices: []DeviceSlot,
         offers: []OfferSlot,
         outbound: []OutboundSlot,
+        outbound_len: usize = 0,
         mime_lengths: []u16,
         mime_storage: []u8,
         manager_free: u32 = 0,
@@ -692,20 +693,28 @@ pub fn Adapter(comptime protocol: type) type {
 
         pub fn flushOn(self: *Self, peer: wayring.io_uring.Peer, server_objects: anytype, queue: *wayring.tx.Queue) !usize {
             var completed: usize = 0;
+            if (self.outbound_len == 0) return completed;
             while (self.oldestOutbound(peer)) |slot| {
                 const done = self.emit(server_objects, queue, &slot.value) catch |err| switch (err) {
                     error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return completed,
                     else => return err,
                 };
                 if (!done) continue;
-                slot.active = false;
+                self.dropOutboundSlot(slot);
                 completed += 1;
             }
             return completed;
         }
 
         pub fn pendingOutbound(self: *const Self) usize {
-            return self.outbound.len - self.outboundFree();
+            return self.outbound_len;
+        }
+
+        pub fn pendingOutboundOn(self: *const Self, peer: wayring.io_uring.Peer) bool {
+            if (self.outbound_len == 0) return false;
+            for (self.outbound) |slot|
+                if (slot.active and std.meta.eql(slot.peer, peer)) return true;
+            return false;
         }
 
         fn emit(self: *Self, server_objects: anytype, queue: *wayring.tx.Queue, outbound: *Outbound) !bool {
@@ -947,6 +956,7 @@ pub fn Adapter(comptime protocol: type) type {
             for (self.outbound) |*slot| if (!slot.active) {
                 slot.* = .{ .active = true, .sequence = self.next_sequence, .peer = peer, .value = value };
                 self.next_sequence +%= 1;
+                self.outbound_len += 1;
                 return;
             };
             return error.Exhausted;
@@ -961,9 +971,13 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         fn outboundFree(self: *const Self) usize {
-            var count: usize = 0;
-            for (self.outbound) |slot| count += @intFromBool(!slot.active);
-            return count;
+            return self.outbound.len - self.outbound_len;
+        }
+
+        fn dropOutboundSlot(self: *Self, slot: *OutboundSlot) void {
+            std.debug.assert(slot.active);
+            slot.active = false;
+            self.outbound_len -= 1;
         }
 
         fn deviceCount(self: *const Self, peer: wayring.io_uring.Peer) usize {
@@ -1006,14 +1020,16 @@ pub fn Adapter(comptime protocol: type) type {
             }
             for (self.outbound) |*slot| if (slot.active) switch (slot.value) {
                 .source_cancelled => |source| {
-                    if (std.meta.eql(source, id)) slot.active = false;
+                    if (std.meta.eql(source, id)) {
+                        self.dropOutboundSlot(slot);
+                    }
                 },
                 .source_drop_performed, .source_finished => |source| {
-                    if (std.meta.eql(source, id)) slot.active = false;
+                    if (std.meta.eql(source, id)) self.dropOutboundSlot(slot);
                 },
                 .source_send => |value| if (std.meta.eql(value.source, id)) {
                     if (value.fd >= 0) _ = linux.close(value.fd);
-                    slot.active = false;
+                    self.dropOutboundSlot(slot);
                 },
                 .selection => |*value| {
                     if (value.source != null and std.meta.eql(value.source.?, id)) {
@@ -1022,21 +1038,21 @@ pub fn Adapter(comptime protocol: type) type {
                     }
                 },
                 .source_target => |value| {
-                    if (std.meta.eql(value.source, id)) slot.active = false;
+                    if (std.meta.eql(value.source, id)) self.dropOutboundSlot(slot);
                 },
                 .drag_enter => |*value| if (value.source != null and std.meta.eql(value.source.?, id)) {
                     self.abandonDragPublicationOffer(value);
                     value.source = null;
                 },
                 .source_action => |value| {
-                    if (std.meta.eql(value.source, id)) slot.active = false;
+                    if (std.meta.eql(value.source, id)) self.dropOutboundSlot(slot);
                 },
                 .offer_action => |value| {
                     const offer = self.resolveOffer(value.offer) catch {
-                        slot.active = false;
+                        self.dropOutboundSlot(slot);
                         continue;
                     };
-                    if (std.meta.eql(offer.source, id)) slot.active = false;
+                    if (std.meta.eql(offer.source, id)) self.dropOutboundSlot(slot);
                 },
                 .drag_motion, .drag_leave, .drag_drop => {},
             };
@@ -1045,7 +1061,7 @@ pub fn Adapter(comptime protocol: type) type {
         fn dropOfferOutbound(self: *Self, id: Id) void {
             for (self.outbound) |*slot| if (slot.active) switch (slot.value) {
                 .offer_action => |value| if (std.meta.eql(value.offer, id)) {
-                    slot.active = false;
+                    self.dropOutboundSlot(slot);
                 },
                 else => {},
             };
@@ -1055,27 +1071,27 @@ pub fn Adapter(comptime protocol: type) type {
             for (self.outbound) |*slot| if (slot.active) switch (slot.value) {
                 .selection => |*value| if (std.meta.eql(value.device, id)) {
                     self.abandonPublicationOffer(value);
-                    slot.active = false;
+                    self.dropOutboundSlot(slot);
                 },
                 .drag_enter => |*value| if (std.meta.eql(value.device, id)) {
                     self.abandonDragPublicationOffer(value);
-                    slot.active = false;
+                    self.dropOutboundSlot(slot);
                 },
                 .drag_motion => |value| {
-                    if (std.meta.eql(value.device, id)) slot.active = false;
+                    if (std.meta.eql(value.device, id)) self.dropOutboundSlot(slot);
                 },
                 .drag_leave => |device| {
-                    if (std.meta.eql(device, id)) slot.active = false;
+                    if (std.meta.eql(device, id)) self.dropOutboundSlot(slot);
                 },
                 .drag_drop => |device| {
-                    if (std.meta.eql(device, id)) slot.active = false;
+                    if (std.meta.eql(device, id)) self.dropOutboundSlot(slot);
                 },
                 .offer_action => |value| {
                     const offer = self.resolveOffer(value.offer) catch {
-                        slot.active = false;
+                        self.dropOutboundSlot(slot);
                         continue;
                     };
-                    if (std.meta.eql(offer.device, id)) slot.active = false;
+                    if (std.meta.eql(offer.device, id)) self.dropOutboundSlot(slot);
                 },
                 else => {},
             };
@@ -1314,6 +1330,7 @@ test "data device: copied MIME types and offer capacity make replacement transac
     device.peer = peer;
     try adapter.setFocus(peer);
     for (adapter.outbound) |*slot| slot.active = false;
+    adapter.outbound_len = 0;
 
     const first_id = adapter.sourceId(first);
     try adapter.replaceSelection(first_id, true);
@@ -1347,6 +1364,7 @@ test "data device: dropping a source closes retained receive FDs and reserved of
     device.peer = peer;
     try adapter.setFocus(peer);
     for (adapter.outbound) |*slot| slot.active = false;
+    adapter.outbound_len = 0;
     try adapter.replaceSelection(source_id, false);
     try std.testing.expectEqual(@as(usize, 0), adapter.offerFree());
 
@@ -1400,6 +1418,7 @@ test "data device: publication emits offer, copied MIME list, then selection" {
     device.header.resource = try server_objects.insertClient(5, &test_protocol.wl_data_device.info, 3, device);
     try adapter.setFocus(peer);
     for (adapter.outbound) |*slot| slot.active = false;
+    adapter.outbound_len = 0;
     try adapter.replaceSelection(adapter.sourceId(source), false);
 
     try std.testing.expectEqual(@as(usize, 1), try adapter.flushOn(peer, &server_objects, &output));

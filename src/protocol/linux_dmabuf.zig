@@ -334,6 +334,7 @@ pub fn Adapter(comptime protocol: type) type {
         manager_free: u32 = 0,
         params_free: u32 = 0,
         buffer_free: u32 = 0,
+        pending_len: usize = 0,
 
         pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
             try config.validate();
@@ -388,6 +389,7 @@ pub fn Adapter(comptime protocol: type) type {
             slot.header.resource = binding.resource;
             slot.peer = binding.peer;
             slot.version = binding.version;
+            adapter.pending_len += 1;
             return slot;
         }
 
@@ -498,6 +500,7 @@ pub fn Adapter(comptime protocol: type) type {
                     ) catch |cause| switch (cause) {
                         error.Exhausted => {
                             slot.pending = .failed;
+                            adapter.pending_len += 1;
                             try decoded.finish(protocol, server_objects, &actor.transmit);
                             return .continue_dispatch;
                         },
@@ -507,6 +510,7 @@ pub fn Adapter(comptime protocol: type) type {
                         unreachable;
                     buffer.state = created;
                     slot.pending = .{ .created = indexOf(BufferResource, adapter.buffers, buffer) };
+                    adapter.pending_len += 1;
                 },
                 .create_immed => |payload| {
                     const created = adapter.store.createBuffer(
@@ -547,8 +551,10 @@ pub fn Adapter(comptime protocol: type) type {
             queue: *wayring.tx.Queue,
         ) !usize {
             var completed: usize = 0;
+            if (adapter.pending_len == 0) return completed;
             for (adapter.managers) |*manager| {
                 if (!manager.header.active or !samePeer(manager.peer, peer)) continue;
+                if (manager.advertisement >= 4) continue;
                 while (manager.advertisement < 4) {
                     const format = if (manager.advertisement / 2 == 0)
                         drm_format_argb8888
@@ -581,6 +587,7 @@ pub fn Adapter(comptime protocol: type) type {
                     manager.advertisement += 1;
                     completed += @intFromBool(emitted);
                 }
+                adapter.pending_len -= 1;
             }
             for (adapter.params) |*slot| {
                 if (!slot.header.active or !samePeer(slot.peer, peer)) continue;
@@ -599,6 +606,7 @@ pub fn Adapter(comptime protocol: type) type {
                             else => return err,
                         };
                         slot.pending = .none;
+                        adapter.pending_len -= 1;
                         completed += 1;
                     },
                     .created => |buffer_index| {
@@ -615,6 +623,7 @@ pub fn Adapter(comptime protocol: type) type {
                         };
                         buffer.header.resource = admitted.buffer;
                         slot.pending = .none;
+                        adapter.pending_len -= 1;
                         completed += 1;
                     },
                 }
@@ -623,6 +632,7 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         pub fn pendingOutbound(adapter: *const Self, peer: wayring.io_uring.Peer) bool {
+            if (adapter.pending_len == 0) return false;
             for (adapter.managers) |slot|
                 if (slot.header.active and samePeer(slot.peer, peer) and slot.advertisement < 4)
                     return true;
@@ -692,12 +702,14 @@ pub fn Adapter(comptime protocol: type) type {
             if (object.interface == &Dmabuf.info) {
                 const slot = fromContext(ManagerSlot, adapter.managers, object.context) orelse return false;
                 if (!std.meta.eql(slot.header.resource, handle)) return false;
+                if (slot.advertisement < 4) adapter.pending_len -= 1;
                 release(ManagerSlot, adapter.managers, &adapter.manager_free, indexOf(ManagerSlot, adapter.managers, slot));
                 return true;
             }
             if (object.interface == &Params.info) {
                 const slot = fromContext(ParamsResource, adapter.params, object.context) orelse return false;
                 if (!std.meta.eql(slot.header.resource, handle)) return false;
+                if (slot.pending != .none) adapter.pending_len -= 1;
                 if (slot.pending == .created) {
                     const buffer_index = slot.pending.created;
                     const buffer = &adapter.buffers[buffer_index];
@@ -868,6 +880,7 @@ test "linux-dmabuf: legacy advertisements survive transmit backpressure" {
     defer descriptors.deinit(std.testing.allocator);
     const peer: wayring.io_uring.Peer = .{ .slot = 2, .generation = 7 };
     const manager = try acquire(TestAdapter.ManagerSlot, adapter.managers, &adapter.manager_free);
+    adapter.pending_len += 1;
     manager.peer = peer;
     manager.version = 3;
     manager.header.resource = try server_objects.insertClient(
@@ -961,6 +974,7 @@ test "linux-dmabuf: async created event retains buffer across params teardown" {
     const buffer = try acquire(TestAdapter.BufferResource, adapter.buffers, &adapter.buffer_free);
     buffer.state = state;
     params.pending = .{ .created = indexOf(TestAdapter.BufferResource, adapter.buffers, buffer) };
+    adapter.pending_len += 1;
 
     var blocked = wayring.tx.Queue.init(&blocks, 8, &descriptors, 0);
     defer blocked.deinit();
