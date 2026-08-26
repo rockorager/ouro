@@ -38,6 +38,7 @@ const protocol_xdg_decoration = @import("../protocol/xdg_decoration.zig");
 const protocol_relative_pointer = @import("../protocol/relative_pointer.zig");
 const protocol_pointer_gestures = @import("../protocol/pointer_gestures.zig");
 const protocol_idle_inhibit = @import("../protocol/idle_inhibit.zig");
+const protocol_shortcuts_inhibit = @import("../protocol/keyboard_shortcuts_inhibit.zig");
 const protocol_pointer_constraints = @import("../protocol/pointer_constraints.zig");
 const protocol_fractional_scale = @import("../protocol/fractional_scale.zig");
 const protocol_color_management = @import("../protocol/color_management.zig");
@@ -77,6 +78,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const RelativePointerAdapter = protocol_relative_pointer.Adapter(protocol, SeatAdapter);
         const PointerGesturesAdapter = protocol_pointer_gestures.Adapter(protocol);
         const IdleInhibitAdapter = protocol_idle_inhibit.Adapter(protocol, Adapter);
+        const ShortcutsInhibitAdapter = protocol_shortcuts_inhibit.Adapter(protocol, Adapter);
         const PointerConstraintsAdapter = protocol_pointer_constraints.Adapter(protocol, Adapter, SeatAdapter);
         const FractionalScaleAdapter = protocol_fractional_scale.Adapter(protocol, Adapter);
         const ColorManagementAdapter = protocol_color_management.Adapter(protocol, Adapter);
@@ -148,10 +150,12 @@ pub fn Coordinator(comptime protocol: type) type {
             const primary_selection: u16 = 1 << 13;
             const text_input: u16 = 1 << 14;
             const pointer_gestures: u16 = 1 << 15;
+            const shortcuts_inhibit: u16 = 1 << 16;
             const all: u16 = decoration | shell | seat | data_device | dmabuf |
                 activation | relative_pointer | fractional_scale | output | core |
                 pointer_constraints | color_management | color_representation |
-                primary_selection | text_input | pointer_gestures;
+                primary_selection | text_input | pointer_gestures |
+                shortcuts_inhibit;
         };
         const Client = struct {
             active: bool = false,
@@ -248,6 +252,7 @@ pub fn Coordinator(comptime protocol: type) type {
             relative_pointer: protocol_relative_pointer.Config = .{},
             pointer_gestures: protocol_pointer_gestures.Config = .{},
             idle_inhibit: protocol_idle_inhibit.Config = .{},
+            shortcuts_inhibit: protocol_shortcuts_inhibit.Config = .{},
             pointer_constraints: protocol_pointer_constraints.WireConfig = .{},
             fractional_scale: protocol_fractional_scale.Config = .{},
             color_management: protocol_color_management.Config = .{},
@@ -322,6 +327,7 @@ pub fn Coordinator(comptime protocol: type) type {
         relative_pointer_adapter: RelativePointerAdapter,
         pointer_gestures_adapter: PointerGesturesAdapter,
         idle_inhibit_adapter: IdleInhibitAdapter,
+        shortcuts_inhibit_adapter: ShortcutsInhibitAdapter,
         pointer_constraints_adapter: PointerConstraintsAdapter,
         fractional_scale_adapter: FractionalScaleAdapter,
         color_management_adapter: ColorManagementAdapter,
@@ -572,6 +578,13 @@ pub fn Coordinator(comptime protocol: type) type {
                 config.idle_inhibit,
             );
             errdefer self.idle_inhibit_adapter.deinit();
+            self.shortcuts_inhibit_adapter = try ShortcutsInhibitAdapter.init(
+                allocator,
+                &self.adapter,
+                .{ .context = self, .validateFn = validateShortcutSeat },
+                config.shortcuts_inhibit,
+            );
+            errdefer self.shortcuts_inhibit_adapter.deinit();
             self.pointer_constraints_adapter = try PointerConstraintsAdapter.init(
                 allocator,
                 &self.adapter,
@@ -732,6 +745,9 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = try self.idle_inhibit_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
+            _ = try self.shortcuts_inhibit_adapter.install(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
             _ = try self.pointer_constraints_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
@@ -825,6 +841,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.data_device_adapter.deinit();
             self.pointer_constraints_adapter.deinit();
             self.idle_inhibit_adapter.deinit();
+            self.shortcuts_inhibit_adapter.deinit();
             self.pointer_gestures_adapter.deinit();
             self.relative_pointer_adapter.deinit();
             self.seat_adapter.deinit();
@@ -866,6 +883,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.cursor_shape_adapter.disconnected(peer);
             self.pointer_gestures_adapter.disconnected(peer);
             self.idle_inhibit_adapter.disconnected(peer);
+            self.shortcuts_inhibit_adapter.disconnected(peer);
             self.text_input_adapter.disconnected(peer);
             self.primary_selection_adapter.disconnected(peer);
             for (self.clients.items) |*client| if (client.active and samePeer(client.peer, peer)) {
@@ -1049,6 +1067,12 @@ pub fn Coordinator(comptime protocol: type) type {
                 return control;
             if (try self.idle_inhibit_adapter.request(peer, target, message, fds)) |control|
                 return control;
+            if (try self.shortcuts_inhibit_adapter.request(peer, target, message, fds)) |control| {
+                if (self.shortcuts_inhibit_adapter.pendingOutbound(peer))
+                    self.markProtocol(peer, ProtocolReady.shortcuts_inhibit);
+                try self.flushProtocol();
+                return control;
+            }
             if (try self.pointer_constraints_adapter.request(peer, target, message, fds)) |control| {
                 if (self.pointer_constraints_adapter.pendingOutbound(peer))
                     self.markProtocol(peer, ProtocolReady.pointer_constraints);
@@ -1387,7 +1411,12 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.input_keyboard_consumed = false;
                 if (self.input_delivery_event) |delivery_event| {
                     var input_scene: InputScene = .{ .coordinator = self };
-                    self.interaction.consume(&self.desktop, &input_scene, delivery_event) catch |err| switch (err) {
+                    self.interaction.consumeWithShortcutPolicy(
+                        &self.desktop,
+                        &input_scene,
+                        delivery_event,
+                        self.shortcuts_inhibit_adapter.shortcutsInhibited(),
+                    ) catch |err| switch (err) {
                         error.Backpressure, error.Exhausted => return false,
                         else => return err,
                     };
@@ -1707,6 +1736,7 @@ pub fn Coordinator(comptime protocol: type) type {
                         try self.data_device_adapter.setFocus(peer);
                         try self.primary_selection_adapter.setFocus(peer);
                         try self.text_input_adapter.setFocus(text_input_focus);
+                        self.shortcuts_inhibit_adapter.setFocus(.{ .peer = peer, .surface = target.surface });
                     },
                     .cancel => |cancel| {
                         if (cancel.pointer_focus)
@@ -1722,6 +1752,7 @@ pub fn Coordinator(comptime protocol: type) type {
                             try self.data_device_adapter.setFocus(null);
                             try self.primary_selection_adapter.setFocus(null);
                             try self.text_input_adapter.setFocus(null);
+                            self.shortcuts_inhibit_adapter.setFocus(null);
                         }
                         if (cancel.pointer_grab) try self.seat_adapter.cancelPointerGrab();
                     },
@@ -1741,6 +1772,7 @@ pub fn Coordinator(comptime protocol: type) type {
             if (self.primary_selection_adapter.pendingOutbound() != 0)
                 self.markProtocolAll(ProtocolReady.primary_selection);
             self.markTextInputProtocol();
+            self.markShortcutsInhibitProtocol();
             if (applied) self.markPointerConstraintsProtocol();
         }
 
@@ -1749,6 +1781,12 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.adapter.surfacePeer(surface),
                 surface,
             );
+        }
+
+        fn validateShortcutSeat(context: ?*anyopaque, peer: wayring.io_uring.Peer, seat: u32) bool {
+            const self: *Self = @ptrCast(@alignCast(context orelse return false));
+            const objects = self.root.runtime.clients.get(peer) catch return false;
+            return self.seat_adapter.validateSeatOn(objects, peer, seat);
         }
 
         fn validatePopupGrab(
@@ -1983,6 +2021,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 flushed += try self.relative_pointer_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.pointer_gestures != 0)
                 flushed += try self.pointer_gestures_adapter.flushOn(peer, objects, &actor.transmit);
+            if (client.protocol_ready & ProtocolReady.shortcuts_inhibit != 0)
+                flushed += try self.shortcuts_inhibit_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.pointer_constraints != 0)
                 flushed += try self.pointer_constraints_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.fractional_scale != 0)
@@ -2034,6 +2074,13 @@ pub fn Coordinator(comptime protocol: type) type {
             }
         }
 
+        fn markShortcutsInhibitProtocol(self: *Self) void {
+            for (self.clients.items) |*client| {
+                if (client.active and self.shortcuts_inhibit_adapter.pendingOutbound(client.peer))
+                    client.protocol_ready |= ProtocolReady.shortcuts_inhibit;
+            }
+        }
+
         fn retainProtocolReady(self: *Self, client: *Client, objects: anytype) void {
             var ready = client.protocol_ready;
             if (ready & ProtocolReady.decoration != 0 and
@@ -2066,6 +2113,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (ready & ProtocolReady.pointer_gestures != 0 and
                 !self.pointer_gestures_adapter.pendingOutboundOn(client.peer))
                 ready &= ~ProtocolReady.pointer_gestures;
+            if (ready & ProtocolReady.shortcuts_inhibit != 0 and
+                !self.shortcuts_inhibit_adapter.pendingOutbound(client.peer))
+                ready &= ~ProtocolReady.shortcuts_inhibit;
             if (ready & ProtocolReady.pointer_constraints != 0 and
                 !self.pointer_constraints_adapter.pendingOutbound(client.peer))
                 ready &= ~ProtocolReady.pointer_constraints;
@@ -3341,6 +3391,7 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.relative_pointer_adapter.resourceRemoved(handle, object);
             _ = self.pointer_gestures_adapter.resourceRemoved(handle, object);
             _ = self.idle_inhibit_adapter.resourceRemoved(handle, object);
+            _ = self.shortcuts_inhibit_adapter.resourceRemoved(handle, object);
             _ = self.pointer_constraints_adapter.resourceRemoved(handle, object);
             _ = self.fractional_scale_adapter.resourceRemoved(handle, object);
             _ = self.color_management_adapter.resourceRemoved(handle, object);

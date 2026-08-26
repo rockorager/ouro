@@ -50,6 +50,7 @@ pub const xdg_decoration = @import("protocol/xdg_decoration.zig");
 pub const relative_pointer = @import("protocol/relative_pointer.zig");
 pub const pointer_gestures = @import("protocol/pointer_gestures.zig");
 pub const idle_inhibit = @import("protocol/idle_inhibit.zig");
+pub const keyboard_shortcuts_inhibit = @import("protocol/keyboard_shortcuts_inhibit.zig");
 pub const cursor_shape = @import("protocol/cursor_shape.zig");
 pub const text_input = @import("protocol/text_input.zig");
 pub const pointer_constraints = @import("protocol/pointer_constraints.zig");
@@ -115,6 +116,7 @@ test {
     _ = relative_pointer;
     _ = pointer_gestures;
     _ = idle_inhibit;
+    _ = keyboard_shortcuts_inhibit;
     _ = cursor_shape;
     _ = text_input;
     _ = pointer_constraints;

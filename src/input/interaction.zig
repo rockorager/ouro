@@ -144,6 +144,16 @@ pub fn Interaction(comptime Desktop: type) type {
             surfaces: anytype,
             event: input.Event,
         ) !void {
+            return self.consumeWithShortcutPolicy(desktop, surfaces, event, false);
+        }
+
+        pub fn consumeWithShortcutPolicy(
+            self: *Self,
+            desktop: *Desktop,
+            surfaces: anytype,
+            event: input.Event,
+            shortcuts_inhibited: bool,
+        ) !void {
             switch (event) {
                 .device_added => |value| try self.addDevice(value.device, value.capabilities),
                 .device_removed => |id| try self.removeDevice(desktop, id),
@@ -174,6 +184,7 @@ pub fn Interaction(comptime Desktop: type) type {
                     value.device,
                     value.key,
                     value.pressed,
+                    shortcuts_inhibited,
                 ),
             }
         }
@@ -440,6 +451,7 @@ pub fn Interaction(comptime Desktop: type) type {
             device_id: input.DeviceId,
             key: u32,
             pressed: bool,
+            shortcuts_inhibited: bool,
         ) !void {
             if (key >= code_count) return error.InvalidCode;
             const device = try self.resolveDevice(device_id);
@@ -451,7 +463,7 @@ pub fn Interaction(comptime Desktop: type) type {
                 (pressed and (key == key_left_meta or key == key_right_meta));
             const shift = self.anyDeviceKey(key_left_shift) or self.anyDeviceKey(key_right_shift) or
                 (pressed and (key == key_left_shift or key == key_right_shift));
-            const binding = pressed and meta and isBindingKey(key);
+            const binding = !shortcuts_inhibited and pressed and meta and isBindingKey(key);
             const close_target = if (binding and key == key_q) desktop.focusedToplevel() else null;
             if (binding or release_binding)
                 try self.ensureCommandCapacity(1 + @as(usize, @intFromBool(close_target != null)));
@@ -1488,6 +1500,37 @@ test "interaction: compositor bindings consume exact press and release pairs" {
     }
     try std.testing.expectEqual(@as(usize, 1), desktop.move_next_count);
     try std.testing.expectEqual(@as(usize, 1), desktop.move_previous_count);
+}
+
+test "interaction: shortcut inhibition forwards compositor binding pairs" {
+    var interaction = try initTestInteraction(2);
+    defer interaction.deinit();
+    var desktop = testDesktop();
+    var surfaces = TestSurfaces{};
+    try interaction.consume(&desktop, &surfaces, .{ .device_added = .{
+        .device = device_a,
+        .capabilities = .{ .keyboard = true },
+    } });
+    try interaction.consume(&desktop, &surfaces, .{ .keyboard_key = .{
+        .device = device_a,
+        .time_usec = 1,
+        .key = key_left_meta,
+        .pressed = true,
+    } });
+    try interaction.consumeWithShortcutPolicy(&desktop, &surfaces, .{ .keyboard_key = .{
+        .device = device_a,
+        .time_usec = 2,
+        .key = key_tab,
+        .pressed = true,
+    } }, true);
+    try interaction.consumeWithShortcutPolicy(&desktop, &surfaces, .{ .keyboard_key = .{
+        .device = device_a,
+        .time_usec = 3,
+        .key = key_tab,
+        .pressed = false,
+    } }, true);
+    try std.testing.expectEqual(@as(usize, 0), interaction.pendingCommands());
+    try std.testing.expectEqual(@as(usize, 0), desktop.focus_next_count);
 }
 
 test "interaction: close binding retains the exact focused toplevel" {
