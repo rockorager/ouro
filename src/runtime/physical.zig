@@ -160,6 +160,8 @@ pub fn Coordinator(comptime protocol: type) type {
             callback_data: ?u32 = null,
             feedback_outcome: ?Adapter.PresentationOutcome = null,
             retire_after_outcome: bool = false,
+            retire_after_source_release: bool = false,
+            retains_source: bool = false,
         };
 
         pub const Platforms = struct {
@@ -1754,7 +1756,7 @@ pub fn Coordinator(comptime protocol: type) type {
             for (self.app_layers) |*layer| if (layer.active) {
                 const id = layer.id orelse unreachable;
                 const scene = self.surfaceScene(id) orelse {
-                    self.abandonLayer(layer);
+                    self.retireLayer(layer);
                     visibility_changed = true;
                     continue;
                 };
@@ -1769,7 +1771,7 @@ pub fn Coordinator(comptime protocol: type) type {
                             scene.root.geometry.x,
                         scene.offset_x,
                     ) catch {
-                        self.abandonLayer(layer);
+                        self.retireLayer(layer);
                         visibility_changed = true;
                         continue;
                     };
@@ -1781,7 +1783,7 @@ pub fn Coordinator(comptime protocol: type) type {
                             scene.root.geometry.y,
                         scene.offset_y,
                     ) catch {
-                        self.abandonLayer(layer);
+                        self.retireLayer(layer);
                         visibility_changed = true;
                         continue;
                     };
@@ -1809,12 +1811,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     }
                 }
                 sample.clip = clipToOutput(sample.destination, output_size) catch unreachable orelse {
-                    if (layer.outcome_pending) {
-                        layer.active = false;
-                        layer.retire_after_outcome = true;
-                    } else {
-                        self.abandonLayer(layer);
-                    }
+                    self.retireLayer(layer);
                     visibility_changed = true;
                     continue;
                 };
@@ -1890,6 +1887,11 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             var content = &candidate.content;
             const attachment = content.surface.attachment orelse {
+                if (layer.retains_source) {
+                    if (!try self.retryLayerSourceReleaseForced(layer)) return false;
+                    (layer.content orelse return error.MissingContent).deinit();
+                    layer.content = null;
+                }
                 content.deinit();
                 layer.candidate = null;
                 self.abandonLayer(layer);
@@ -1897,6 +1899,11 @@ pub fn Coordinator(comptime protocol: type) type {
                 return true;
             };
             if (attachment.buffer == null) {
+                if (layer.retains_source) {
+                    if (!try self.retryLayerSourceReleaseForced(layer)) return false;
+                    (layer.content orelse return error.MissingContent).deinit();
+                    layer.content = null;
+                }
                 return self.discardPendingCandidate(layer, pending.id);
             }
             const lease = content.attachment_lease orelse return error.MissingLease;
@@ -2020,14 +2027,25 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             const render_device = self.render_device orelse return false;
             const upload_damage = renderUploadDamage(content.surface.upload_damage);
+            var retained_external = false;
             const prepared = native: {
                 if (borrowed_source.external != null) {
+                    if (render_device.content.prepareReplacingRetainedExternal(
+                        layer.rendered,
+                        sample_identity,
+                        borrowed_source,
+                    )) |direct_prepared| {
+                        retained_external = true;
+                        break :native direct_prepared;
+                    } else |_| {}
                     if (render_device.content.prepareReplacingExternal(
                         layer.rendered,
                         sample_identity,
                         borrowed_source,
                         upload_damage,
-                    )) |prepared| break :native prepared else |_| {
+                    )) |external_prepared| {
+                        break :native external_prepared;
+                    } else |_| {
                         const external = switch (source) {
                             .external => |external| external,
                             .shm => unreachable,
@@ -2096,6 +2114,11 @@ pub fn Coordinator(comptime protocol: type) type {
             // admission has succeeded. Only this non-fallible edge publishes
             // the renderer-owned version, consuming a compatible previous
             // handle in place when it is uniquely owned by this layer.
+            if (layer.retains_source) {
+                if (!try self.retryLayerSourceReleaseForced(layer)) return false;
+                (layer.content orelse return error.MissingContent).deinit();
+                layer.content = null;
+            }
             const rendered = render_device.content.publish(prepared);
             prepared_owned = false;
             const sample: render_list.AppliedSurface = .{
@@ -2133,11 +2156,12 @@ pub fn Coordinator(comptime protocol: type) type {
             layer.id = published.id;
             layer.presentation = token;
             layer.source_release_pending = true;
+            layer.retains_source = retained_external;
             layer.sample = sample;
             layer.binding = binding;
             self.finishPendingCandidate(pending.id);
             self.stats.applied += 1;
-            if (render_device.content.ready(rendered))
+            if (!retained_external and render_device.content.ready(rendered))
                 _ = try self.retryLayerSourceRelease(layer);
             return true;
         }
@@ -2292,13 +2316,14 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (result == .retired) try self.finishOutcome(result.retired.frame, false);
                 return;
             }
-            switch (try output.renderFrame(
+            const render_result = try output.renderFrame(
                 frame,
                 self.frame_samples[0..sample_count],
                 self.frame_changes[0..change_count],
                 self.frame_bindings[0..sample_count],
                 try monotonicNs(),
-            )) {
+            );
+            switch (render_result) {
                 .submitted => {
                     self.stats.submitted += 1;
                     self.removed_layer_len = 0;
@@ -2443,15 +2468,33 @@ pub fn Coordinator(comptime protocol: type) type {
         fn retryRetainedOutcomes(self: *Self) !bool {
             var changed = false;
             for (self.app_layers) |*layer| {
-                if (layer.source_release_pending)
+                if (layer.retire_after_source_release) {
+                    if (layer.source_release_pending and
+                        !try self.retryLayerSourceReleaseForced(layer)) continue;
+                    self.abandonLayer(layer);
+                    changed = true;
+                    continue;
+                }
+                if (layer.source_release_pending and !layer.retains_source)
                     _ = try self.retryLayerSourceRelease(layer);
-                if (layer.outcome_pending and !layer.source_release_pending) {
+                if (layer.outcome_pending and
+                    (!layer.source_release_pending or layer.retains_source))
+                {
                     changed = (try self.retryLayerOutcome(layer)) or changed;
                 }
             }
-            if (self.cursor_layer.source_release_pending)
+            if (self.cursor_layer.retire_after_source_release) {
+                if (!self.cursor_layer.source_release_pending or
+                    try self.retryLayerSourceReleaseForced(&self.cursor_layer))
+                {
+                    self.abandonLayer(&self.cursor_layer);
+                    changed = true;
+                }
+            }
+            if (self.cursor_layer.source_release_pending and !self.cursor_layer.retains_source)
                 _ = try self.retryLayerSourceRelease(&self.cursor_layer);
-            if (self.cursor_layer.outcome_pending and !self.cursor_layer.source_release_pending)
+            if (self.cursor_layer.outcome_pending and
+                (!self.cursor_layer.source_release_pending or self.cursor_layer.retains_source))
                 changed = (try self.retryLayerOutcome(&self.cursor_layer)) or changed;
             if (changed) if (self.output) |output| {
                 try output.request(.damage, try monotonicNs());
@@ -2463,12 +2506,14 @@ pub fn Coordinator(comptime protocol: type) type {
         fn retryLayerOutcome(self: *Self, layer: *Layer) !bool {
             const token = layer.presentation orelse return error.MissingPresentation;
             var content = &(layer.content orelse return error.MissingContent);
-            if (layer.source_release_pending and
+            if (layer.source_release_pending and !layer.retains_source and
                 !try self.retryLayerSourceRelease(layer)) return false;
-            std.debug.assert(content.attachment_lease == null);
-            std.debug.assert(content.release_callbacks == null);
-            std.debug.assert(content.surface.attachment == null or
-                content.surface.attachment.?.buffer == null);
+            if (!layer.retains_source) {
+                std.debug.assert(content.attachment_lease == null);
+                std.debug.assert(content.release_callbacks == null);
+                std.debug.assert(content.surface.attachment == null or
+                    content.surface.attachment.?.buffer == null);
+            }
             if (content.presentation_feedback != null) {
                 const peer = layer.peer orelse return error.ClientDisconnected;
                 const objects = try self.root.runtime.clients.get(peer);
@@ -2503,21 +2548,30 @@ pub fn Coordinator(comptime protocol: type) type {
                 layer.callback_data = null;
             }
             try self.presentations.finish(token);
-            content.deinit();
-            layer.content = null;
+            if (!layer.retains_source) {
+                content.deinit();
+                layer.content = null;
+            }
             layer.presentation = null;
             layer.outcome_pending = false;
             layer.feedback_outcome = null;
             if (layer.retire_after_outcome) {
+                layer.retire_after_outcome = false;
+                if (layer.source_release_pending and
+                    !try self.retryLayerSourceReleaseForced(layer))
+                {
+                    layer.retire_after_source_release = true;
+                    return false;
+                }
                 self.abandonLayer(layer);
                 return true;
             }
             return false;
         }
 
-        /// Renderer-owned content has already copied every borrowed source byte.
-        /// Drop backing ownership immediately, then queue protocol releases with
-        /// retryable transport backpressure independently of presentation.
+        /// Once renderer use no longer requires a borrowed source, drop its
+        /// backing ownership and queue protocol releases with retryable
+        /// transport backpressure independently of presentation.
         fn retryLayerSourceRelease(self: *Self, layer: *Layer) !bool {
             if (layer.rendered) |rendered| {
                 const render_device = self.render_device orelse return false;
@@ -2564,7 +2618,13 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             if (notification_queued) _ = try self.loop.?.driver.schedule(peer);
             layer.source_release_pending = false;
+            layer.retains_source = false;
             return true;
+        }
+
+        fn retryLayerSourceReleaseForced(self: *Self, layer: *Layer) !bool {
+            layer.retains_source = false;
+            return self.retryLayerSourceRelease(layer);
         }
 
         fn layerForPresentation(
@@ -2742,6 +2802,17 @@ pub fn Coordinator(comptime protocol: type) type {
             layer.* = .{};
         }
 
+        fn retireLayer(self: *Self, layer: *Layer) void {
+            layer.active = false;
+            if (layer.presentation != null) {
+                layer.retire_after_outcome = true;
+            } else if (layer.source_release_pending) {
+                layer.retire_after_source_release = true;
+            } else {
+                self.abandonLayer(layer);
+            }
+        }
+
         fn queueLayerRemoval(self: *Self, id: Adapter.SurfaceId) void {
             for (self.removed_layers[0..self.removed_layer_len]) |removed|
                 if (std.meta.eql(removed.id, id)) return;
@@ -2901,7 +2972,8 @@ fn layerVacant(layer: anytype) bool {
         layer.id == null and layer.content == null and layer.rendered == null and
         layer.presentation == null and layer.sample == null and layer.binding == null and
         layer.change == null and layer.candidate == null and !layer.source_release_pending and
-        !layer.outcome_pending and layer.callback_data == null and !layer.retire_after_outcome;
+        !layer.outcome_pending and layer.callback_data == null and !layer.retire_after_outcome and
+        !layer.retire_after_source_release;
 }
 
 fn tokenOwnedBySession(session: *const session_api.Session, token: completion.Token) bool {

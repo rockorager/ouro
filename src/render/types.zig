@@ -231,7 +231,7 @@ pub fn validateSample(sample: SurfaceSample) ValidationError!usize {
         return error.InvalidSource;
     const length = std.math.mul(usize, sample.source.stride, sample.source.size.height) catch
         return error.InvalidSource;
-    if (sample.source.native != null) {
+    if (sample.source.external != null) {
         const external = sample.source.external orelse return error.InvalidSource;
         if (sample.source.bytes.len != 0 or external.token == 0 or
             external.drm_format == 0 or external.plane_count == 0 or
@@ -239,7 +239,7 @@ pub fn validateSample(sample: SurfaceSample) ValidationError!usize {
             return error.InvalidSource;
         for (0..external.plane_count) |plane| if (external.fds[plane] < 0 or
             external.strides[plane] == 0) return error.InvalidSource;
-    } else if (sample.source.external != null or sample.source.bytes.len < length) {
+    } else if (sample.source.native != null or sample.source.bytes.len < length) {
         return error.InvalidSource;
     }
     if (sample.upload_damage.count > upload_damage_rect_capacity) return error.InvalidSource;

@@ -42,6 +42,7 @@ pub const Provider = struct {
     release_native_fn: ?*const fn (*anyopaque, u64) void = null,
     pinned_native_fn: ?*const fn (*anyopaque, u64) bool = null,
     ready_native_fn: ?*const fn (*anyopaque, u64, render.SampleIdentity) bool = null,
+    validate_retained_external_fn: ?*const fn (*anyopaque, render.ExternalSource, render.Size, render.PixelFormat) anyerror!void = null,
 
     pub fn allocate(self: Provider, size: usize) !Allocation {
         return self.allocate_fn(self.context, size);
@@ -261,6 +262,62 @@ pub const Store = struct {
         return .{ .index = @intCast(index), .generation = slot.generation };
     }
 
+    /// Retains external DMA-BUF metadata as the authoritative content instead
+    /// of allocating a compositor-owned snapshot. The caller must retain the
+    /// corresponding protocol buffer lease until this version is replaced or
+    /// detached and all submitted renderer use has completed.
+    pub fn prepareReplacingRetainedExternal(
+        self: *Store,
+        previous: ?Handle,
+        identity: render.SampleIdentity,
+        source: render.Source,
+    ) !Prepared {
+        try validateExternal(identity, source);
+        const provider = self.provider orelse return error.NativeProviderUnavailable;
+        const validate_fn = provider.validate_retained_external_fn orelse
+            return error.NativeProviderUnavailable;
+        try validate_fn(provider.context, source.external.?, source.size, source.format);
+        const logical_bytes = std.math.mul(usize, source.stride, source.size.height) catch
+            return error.InvalidSource;
+
+        if (previous) |handle| reuse: {
+            if (handle.index >= self.slots.len) return error.StaleContent;
+            const slot = &self.slots[handle.index];
+            if (slot.state != .published or slot.generation != handle.generation or !slot.current)
+                return error.StaleContent;
+            if (slot.identity.surface != identity.surface or slot.source.external == null or
+                slot.accounted_bytes != logical_bytes)
+                break :reuse;
+            if (identity.commit_sequence <= slot.identity.commit_sequence) return error.StaleCommit;
+            const next = std.math.add(u64, slot.identity.commit_sequence, 1) catch
+                return error.NonAdjacentCommit;
+            if (identity.commit_sequence != next) return error.NonAdjacentCommit;
+            slot.state = .replacing;
+            slot.replacement = .{ .identity = identity, .source = source, .damage = .{} };
+            return .{ .index = handle.index, .generation = handle.generation, .replaces = true };
+        }
+
+        const predecessor = self.currentSlot(identity.surface);
+        if (predecessor) |slot| {
+            if (identity.commit_sequence <= slot.identity.commit_sequence) return error.StaleCommit;
+            const next = std.math.add(u64, slot.identity.commit_sequence, 1) catch
+                return error.NonAdjacentCommit;
+            if (identity.commit_sequence != next) return error.NonAdjacentCommit;
+        }
+        if (logical_bytes > self.byte_capacity - self.used_bytes) return error.ByteCapacityExceeded;
+        const index = try self.claimSlot();
+        var slot = &self.slots[index];
+        slot.generation +%= 1;
+        if (slot.generation == 0) slot.generation = 1;
+        slot.state = .prepared;
+        slot.identity = identity;
+        slot.source = source;
+        slot.accounted_bytes = logical_bytes;
+        slot.current = false;
+        self.used_bytes += logical_bytes;
+        return .{ .index = @intCast(index), .generation = slot.generation };
+    }
+
     /// Prepares a normal immutable version, except when `previous` names the
     /// uniquely-owned compatible current version. That case reserves an
     /// allocation-free replacement whose borrowed source is consumed only by
@@ -345,6 +402,15 @@ pub const Store = struct {
                 if (slot.generation == 0) slot.generation = 1;
                 slot.identity = replacement.identity;
                 slot.source.external = replacement.source.external;
+                slot.replacement = null;
+                slot.state = .published;
+                return .{ .index = prepared.index, .generation = slot.generation };
+            }
+            if (slot.source.external != null) {
+                slot.generation +%= 1;
+                if (slot.generation == 0) slot.generation = 1;
+                slot.identity = replacement.identity;
+                slot.source = replacement.source;
                 slot.replacement = null;
                 slot.state = .published;
                 return .{ .index = prepared.index, .generation = slot.generation };
@@ -475,6 +541,7 @@ pub const Store = struct {
             if (provider.release_native_fn) |release_fn| release_fn(provider.context, native.token);
             return;
         };
+        if (source.external != null) return;
         if (source.upload) |upload| if (self.provider) |provider| {
             provider.release(upload.token);
             return;
@@ -623,6 +690,7 @@ const NativeTestProvider = struct {
     pinned_token: u64 = 0,
     ready_token: u64 = 0,
     ready_identity: render.SampleIdentity = .{ .surface = 0, .commit_sequence = 0 },
+    retained_supported: bool = true,
 
     fn provider(self: *NativeTestProvider) Provider {
         return .{
@@ -636,6 +704,7 @@ const NativeTestProvider = struct {
             .release_native_fn = releaseNative,
             .pinned_native_fn = pinnedNative,
             .ready_native_fn = readyNative,
+            .validate_retained_external_fn = validateRetainedExternal,
         };
     }
     fn cpuAllocate(context: *anyopaque, size: usize) !Allocation {
@@ -670,6 +739,15 @@ const NativeTestProvider = struct {
     fn readyNative(context: *anyopaque, token: u64, identity: render.SampleIdentity) bool {
         const self: *NativeTestProvider = @ptrCast(@alignCast(context));
         return self.ready_token == token and std.meta.eql(self.ready_identity, identity);
+    }
+    fn validateRetainedExternal(
+        context: *anyopaque,
+        _: render.ExternalSource,
+        _: render.Size,
+        _: render.PixelFormat,
+    ) !void {
+        const self: *NativeTestProvider = @ptrCast(@alignCast(context));
+        if (!self.retained_supported) return error.ExternalSamplingUnsupported;
     }
 };
 
@@ -971,6 +1049,55 @@ test "render-content: external allocation publication readiness and exact accoun
     try std.testing.expectEqual(baseline, store.allocatedBytes());
     try std.testing.expectEqual(@as(usize, 1), backing.releases);
     try std.testing.expect(!store.ready(handle));
+}
+
+test "render-content: retained external replacement is metadata-only and capability-gated" {
+    var backing: NativeTestProvider = .{};
+    var store = try Store.initWithProvider(
+        std.testing.allocator,
+        .{ .version_capacity = 2, .byte_capacity = 16 },
+        backing.provider(),
+    );
+    defer store.deinit();
+    const baseline = store.allocatedBytes();
+    const first = store.publish(try store.prepareReplacingRetainedExternal(
+        null,
+        .{ .surface = 9, .commit_sequence = 1 },
+        externalSource(&backing, 301),
+    ));
+    try std.testing.expectEqual(@as(usize, 0), backing.allocations);
+    try std.testing.expectEqual(baseline + 16, store.allocatedBytes());
+    try std.testing.expect((try store.resolve(first)).native == null);
+    try std.testing.expectEqual(@as(u64, 301), (try store.resolve(first)).external.?.token);
+    try std.testing.expect(store.ready(first));
+
+    const cancelled = try store.prepareReplacingRetainedExternal(
+        first,
+        .{ .surface = 9, .commit_sequence = 2 },
+        externalSource(&backing, 302),
+    );
+    try std.testing.expect(cancelled.replaces);
+    store.cancel(cancelled);
+    try std.testing.expectEqual(@as(u64, 301), (try store.resolve(first)).external.?.token);
+    const current = store.publish(try store.prepareReplacingRetainedExternal(
+        first,
+        .{ .surface = 9, .commit_sequence = 2 },
+        externalSource(&backing, 302),
+    ));
+    try std.testing.expectError(error.StaleContent, store.resolve(first));
+    try std.testing.expectEqual(@as(u64, 302), (try store.resolve(current)).external.?.token);
+    store.release(current);
+    try std.testing.expectEqual(baseline, store.allocatedBytes());
+
+    backing.retained_supported = false;
+    try std.testing.expectError(
+        error.ExternalSamplingUnsupported,
+        store.prepareReplacingRetainedExternal(
+            null,
+            .{ .surface = 10, .commit_sequence = 1 },
+            externalSource(&backing, 303),
+        ),
+    );
 }
 
 test "render-content: external adjacent replacement cancel reuse and pinned fallback" {

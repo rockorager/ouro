@@ -11,6 +11,7 @@ const render_content = @import("content.zig");
 const c = @cImport({
     @cInclude("drm_fourcc.h");
     @cInclude("linux/dma-buf.h");
+    @cInclude("linux/sync_file.h");
     @cInclude("sys/ioctl.h");
     @cInclude("sys/sysmacros.h");
     @cInclude("sys/stat.h");
@@ -150,6 +151,7 @@ const ImportedImage = struct {
     source: render.ExternalSource = undefined,
     image: c.VkImage = undefined,
     memory: c.VkDeviceMemory = undefined,
+    view: c.VkImageView = undefined,
 };
 
 const PendingAcquire = struct {
@@ -194,6 +196,7 @@ const PreparedTexture = struct {
     content_token: ?u64 = null,
     native_token: ?u64 = null,
     imported_token: ?u64 = null,
+    direct_external: bool = false,
 };
 
 const RealRenderer = struct {
@@ -638,6 +641,7 @@ fn realContentProvider(_: *anyopaque, renderer: Renderer) ?render_content.Provid
         .release_native_fn = releaseNativeOwner,
         .pinned_native_fn = nativePinned,
         .ready_native_fn = nativeReady,
+        .validate_retained_external_fn = validateRetainedExternal,
     };
 }
 
@@ -811,7 +815,21 @@ fn nativeReady(context: *anyopaque, token: u64, identity: render.SampleIdentity)
     return if (allocation.ready) |ready| std.meta.eql(ready, identity) else false;
 }
 
-fn importedImage(self: *RealRenderer, source: render.ExternalSource, size: render.Size, format: render.PixelFormat) !u64 {
+fn validateRetainedExternal(
+    context: *anyopaque,
+    source: render.ExternalSource,
+    size: render.Size,
+    format: render.PixelFormat,
+) !void {
+    try requireExternalSampling(@ptrCast(@alignCast(context)), source, size, format);
+}
+
+fn requireExternalSampling(
+    self: *RealRenderer,
+    source: render.ExternalSource,
+    size: render.Size,
+    format: render.PixelFormat,
+) !void {
     if (source.plane_count != 1 or source.fds[0] < 0 or source.strides[0] == 0)
         return error.UnsupportedExternalSource;
     const vk_format: c.VkFormat = switch (format) {
@@ -822,6 +840,57 @@ fn importedImage(self: *RealRenderer, source: render.ExternalSource, size: rende
         .argb8888_premultiplied => c.DRM_FORMAT_ARGB8888,
     };
     if (source.drm_format != expected_drm) return error.UnsupportedExternalFormat;
+    var modifier_query: c.VkPhysicalDeviceImageDrmFormatModifierInfoEXT = .{
+        .sType = c.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT,
+        .pNext = null,
+        .drmFormatModifier = source.modifier,
+        .sharingMode = c.VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = 0,
+        .pQueueFamilyIndices = null,
+    };
+    var external_query: c.VkPhysicalDeviceExternalImageFormatInfo = .{
+        .sType = c.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
+        .pNext = &modifier_query,
+        .handleType = c.VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+    };
+    var format_query: c.VkPhysicalDeviceImageFormatInfo2 = .{
+        .sType = c.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
+        .pNext = &external_query,
+        .format = vk_format,
+        .type = c.VK_IMAGE_TYPE_2D,
+        .tiling = c.VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+        .usage = c.VK_IMAGE_USAGE_TRANSFER_SRC_BIT | c.VK_IMAGE_USAGE_SAMPLED_BIT,
+        .flags = 0,
+    };
+    var external_properties: c.VkExternalImageFormatProperties = .{
+        .sType = c.VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
+        .pNext = null,
+        .externalMemoryProperties = undefined,
+    };
+    var format_properties: c.VkImageFormatProperties2 = .{
+        .sType = c.VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
+        .pNext = &external_properties,
+        .imageFormatProperties = undefined,
+    };
+    try vk(c.vkGetPhysicalDeviceImageFormatProperties2(
+        self.physical_device,
+        &format_query,
+        &format_properties,
+    ), error.ExternalSamplingUnsupported);
+    if (size.width > format_properties.imageFormatProperties.maxExtent.width or
+        size.height > format_properties.imageFormatProperties.maxExtent.height)
+        return error.ExternalSamplingUnsupported;
+    const external_memory = external_properties.externalMemoryProperties;
+    if (external_memory.externalMemoryFeatures & c.VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT == 0 or
+        external_memory.compatibleHandleTypes & c.VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT == 0)
+        return error.ExternalSamplingUnsupported;
+}
+
+fn importedImage(self: *RealRenderer, source: render.ExternalSource, size: render.Size, format: render.PixelFormat) !u64 {
+    try requireExternalSampling(self, source, size, format);
+    const vk_format: c.VkFormat = switch (format) {
+        .xrgb8888, .argb8888_premultiplied => c.VK_FORMAT_B8G8R8A8_UNORM,
+    };
     for (self.imported_images, 0..) |*entry, index| if (entry.occupied and
         entry.source.context == source.context and entry.source.token == source.token)
     {
@@ -872,7 +941,7 @@ fn importedImage(self: *RealRenderer, source: render.ExternalSource, size: rende
         .arrayLayers = 1,
         .samples = c.VK_SAMPLE_COUNT_1_BIT,
         .tiling = c.VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
-        .usage = c.VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        .usage = c.VK_IMAGE_USAGE_TRANSFER_SRC_BIT | c.VK_IMAGE_USAGE_SAMPLED_BIT,
         .sharingMode = c.VK_SHARING_MODE_EXCLUSIVE,
         .queueFamilyIndexCount = 0,
         .pQueueFamilyIndices = null,
@@ -924,6 +993,24 @@ fn importedImage(self: *RealRenderer, source: render.ExternalSource, size: rende
     duplicate_owned = false;
     errdefer c.vkFreeMemory(self.device, memory, null);
     try vk(c.vkBindImageMemory(self.device, image, memory, 0), error.BindExternalMemoryFailed);
+    var view_info: c.VkImageViewCreateInfo = .{
+        .sType = c.VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .pNext = null,
+        .flags = 0,
+        .image = image,
+        .viewType = c.VK_IMAGE_VIEW_TYPE_2D,
+        .format = vk_format,
+        .components = .{
+            .r = c.VK_COMPONENT_SWIZZLE_IDENTITY,
+            .g = c.VK_COMPONENT_SWIZZLE_IDENTITY,
+            .b = c.VK_COMPONENT_SWIZZLE_IDENTITY,
+            .a = c.VK_COMPONENT_SWIZZLE_IDENTITY,
+        },
+        .subresourceRange = colorRange(),
+    };
+    var view: c.VkImageView = undefined;
+    try vk(c.vkCreateImageView(self.device, &view_info, null, &view), error.CreateExternalImageViewFailed);
+    errdefer c.vkDestroyImageView(self.device, view, null);
     entry.generation +%= 1;
     if (entry.generation == 0) entry.generation = 1;
     entry.* = .{
@@ -933,6 +1020,7 @@ fn importedImage(self: *RealRenderer, source: render.ExternalSource, size: rende
         .source = source,
         .image = image,
         .memory = memory,
+        .view = view,
     };
     return importedToken(entry, index);
 }
@@ -1008,6 +1096,7 @@ fn releaseImported(self: *RealRenderer, token: u64) void {
 fn destroyImportedImage(self: *RealRenderer, entry: *ImportedImage) void {
     if (!entry.occupied) return;
     std.debug.assert(entry.references == 1);
+    c.vkDestroyImageView(self.device, entry.view, null);
     c.vkDestroyImage(self.device, entry.image, null);
     c.vkFreeMemory(self.device, entry.memory, null);
     const generation = entry.generation;
@@ -1035,6 +1124,32 @@ fn exportDmaBufFence(fd: std.posix.fd_t) !std.posix.fd_t {
     return export_file.fd;
 }
 
+fn mergeSyncFiles(first: std.posix.fd_t, second: std.posix.fd_t) !std.posix.fd_t {
+    var merge = std.mem.zeroes(c.struct_sync_merge_data);
+    merge.fd2 = second;
+    merge.fence = -1;
+    if (c.ioctl(first, c.SYNC_IOC_MERGE, &merge) != 0 or merge.fence < 0)
+        return error.MergeAcquireFencesFailed;
+    return merge.fence;
+}
+
+/// Returns a new sync_file that signals after every input, while retaining
+/// caller ownership of all inputs. A merge failure closes only intermediates
+/// and lets the caller fall back to importing each original fence.
+fn mergeAcquireFences(fds: []const std.posix.fd_t) ?std.posix.fd_t {
+    std.debug.assert(fds.len > 1);
+    var merged: ?std.posix.fd_t = null;
+    for (fds[1..]) |fd| {
+        const next = mergeSyncFiles(merged orelse fds[0], fd) catch {
+            if (merged) |owned| _ = linux.close(owned);
+            return null;
+        };
+        if (merged) |owned| _ = linux.close(owned);
+        merged = next;
+    }
+    return merged.?;
+}
+
 fn importDmaBufFence(fd: std.posix.fd_t, sync_fd: std.posix.fd_t) !void {
     var import_file: c.struct_dma_buf_import_sync_file = .{
         .flags = c.DMA_BUF_SYNC_READ,
@@ -1042,6 +1157,22 @@ fn importDmaBufFence(fd: std.posix.fd_t, sync_fd: std.posix.fd_t) !void {
     };
     if (c.ioctl(fd, c.DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &import_file) != 0)
         return error.ImportCompletionFenceFailed;
+}
+
+fn importAcquireFence(
+    self: *RealRenderer,
+    semaphore: c.VkSemaphore,
+    fd: std.posix.fd_t,
+) !void {
+    var import_info: c.VkImportSemaphoreFdInfoKHR = .{
+        .sType = c.VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR,
+        .pNext = null,
+        .semaphore = semaphore,
+        .flags = c.VK_SEMAPHORE_IMPORT_TEMPORARY_BIT,
+        .handleType = c.VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+        .fd = fd,
+    };
+    try vk(self.import_semaphore_fd.?(self.device, &import_info), error.ImportAcquireFenceFailed);
 }
 
 fn createExportSemaphore(self: *RealRenderer) !c.VkSemaphore {
@@ -1366,9 +1497,23 @@ fn prepareTextures(self: *RealRenderer, frame: Frame, staging_capacity: usize) !
             return error.StaleNativeBacking else null;
         if (surface.source.native) |backing| if (backing.owner != @as(*anyopaque, @ptrCast(self)))
             return error.ForeignNativeBacking;
-        const existing_index = if (native == null) cacheIndex(self.cache, surface.sample.surface) else null;
+        const direct_external = native == null and surface.source.external != null;
+        const direct_imported_token = if (direct_external) try importedImage(
+            self,
+            surface.source.external.?,
+            surface.source.size,
+            surface.source.format,
+        ) else null;
+        const direct_imported = if (direct_imported_token) |token|
+            importedFromToken(self, token) orelse return error.StaleExternalImage
+        else
+            null;
+        const existing_index = if (native == null and !direct_external)
+            cacheIndex(self.cache, surface.sample.surface)
+        else
+            null;
         const cache_index = existing_index orelse
-            (if (native != null) std.math.maxInt(usize) else freeCacheIndex(self.cache, self.prepared[0..count]) orelse
+            (if (native != null or direct_external) std.math.maxInt(usize) else freeCacheIndex(self.cache, self.prepared[0..count]) orelse
                 evictableCacheIndex(self.cache, frame, self.prepared[0..count]) orelse
                 return error.TextureCapacityExceeded);
         const existing = if (existing_index) |index| self.cache[index] else null;
@@ -1377,9 +1522,18 @@ fn prepareTextures(self: *RealRenderer, frame: Frame, staging_capacity: usize) !
                 entry.format == surface.source.format
         else
             false;
-        const created = native == null and (existing == null or !compatible or cache_index != existing_index.?);
+        const created = native == null and !direct_external and
+            (existing == null or !compatible or cache_index != existing_index.?);
         const texture = if (native) |allocation|
             allocation.texture
+        else if (direct_imported) |imported|
+            Texture{
+                .image = imported.image,
+                .memory = imported.memory,
+                .view = imported.view,
+                .size = surface.source.size,
+                .initialized = true,
+            }
         else if (created)
             try createTexture(self, surface.source.size)
         else
@@ -1389,11 +1543,13 @@ fn prepareTextures(self: *RealRenderer, frame: Frame, staging_capacity: usize) !
             if (upload.owner == @as(*anyopaque, @ptrCast(self))) upload else null
         else
             null;
-        const upload_damage = if (native) |allocation|
+        const upload_damage = if (direct_external)
+            render.UploadDamage{}
+        else if (native) |allocation|
             nativeTextureUpload(allocation, surface)
         else
             textureUpload(created, existing, surface);
-        const imported_token = if (native != null and upload_damage.count != 0)
+        const imported_token = direct_imported_token orelse if (native != null and upload_damage.count != 0)
             (pendingAcquire(self, surface.source.native.?.token, surface.sample) orelse
                 return error.MissingAcquireFence).imported_token
         else
@@ -1403,13 +1559,15 @@ fn prepareTextures(self: *RealRenderer, frame: Frame, staging_capacity: usize) !
             .source_index = source_index,
             .texture = texture,
             .created = created,
-            .retire_previous = native == null and created and self.cache[cache_index].occupied,
+            .retire_previous = native == null and !direct_external and created and
+                self.cache[cache_index].occupied,
             .surface = surface.sample.surface,
             .commit_sequence = surface.sample.commit_sequence,
             .format = surface.source.format,
             .content_token = if (direct_upload) |upload| upload.token else null,
             .native_token = if (surface.source.native) |backing| backing.token else null,
             .imported_token = imported_token,
+            .direct_external = direct_external,
         };
         count += 1;
 
@@ -1622,7 +1780,8 @@ fn realDraw(_: *anyopaque, renderer: Renderer, target_value: Target, frame: Fram
             return error.CapacityExceeded;
         const source_offset = std.math.cast(u32, validated_bytes) orelse
             return error.CapacityExceeded;
-        if (source.stride < packed_stride or (source.native == null and source_length > source.bytes.len) or
+        if (source.stride < packed_stride or
+            (source.native == null and source.external == null and source_length > source.bytes.len) or
             end > frame.source_byte_count or
             !std.meta.eql(sample.source, [4]u32{
                 source_offset,
@@ -1761,6 +1920,7 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
     const imported_tokens = try allocator.alloc(u64, frame.samples.len);
     defer allocator.free(imported_tokens);
     var imported_token_count: usize = 0;
+    var source_bridge_count: usize = 0;
     var imported_tokens_owned = true;
     defer if (imported_tokens_owned) for (imported_tokens[0..imported_token_count]) |token|
         releaseImported(self, token);
@@ -1769,6 +1929,12 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
     const wait_stages = try allocator.alloc(c.VkPipelineStageFlags, frame.samples.len);
     defer allocator.free(wait_stages);
     var wait_count: usize = 0;
+    const acquire_fds = try allocator.alloc(std.posix.fd_t, frame.samples.len);
+    defer allocator.free(acquire_fds);
+    var acquire_fd_count: usize = 0;
+    defer for (acquire_fds[0..acquire_fd_count]) |fd| if (fd >= 0) {
+        _ = linux.close(fd);
+    };
 
     for (self.prepared[0..batch.count]) |prepared| {
         if (prepared.upload_count == 0) continue;
@@ -1782,14 +1948,15 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
         content_token_count += 1;
     }
     for (self.prepared[0..batch.count]) |prepared| {
-        const native_token = prepared.native_token orelse continue;
-        var native_present = false;
-        for (native_tokens[0..native_token_count]) |existing|
-            native_present = native_present or existing == native_token;
-        if (!native_present) {
-            try retainNative(self, native_token);
-            native_tokens[native_token_count] = native_token;
-            native_token_count += 1;
+        if (prepared.native_token) |native_token| {
+            var native_present = false;
+            for (native_tokens[0..native_token_count]) |existing|
+                native_present = native_present or existing == native_token;
+            if (!native_present) {
+                try retainNative(self, native_token);
+                native_tokens[native_token_count] = native_token;
+                native_token_count += 1;
+            }
         }
         const imported_token = prepared.imported_token orelse continue;
         var imported_present = false;
@@ -1800,29 +1967,74 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
             imported_tokens[imported_token_count] = imported_token;
             imported_token_count += 1;
         }
-        const pending = takePendingAcquire(self, native_token, .{
-            .surface = prepared.surface,
-            .commit_sequence = prepared.commit_sequence,
-        }) orelse return error.MissingAcquireFence;
-        const acquire_fd = pending.fd;
-        var acquire_owned = true;
-        defer if (acquire_owned) {
-            _ = linux.close(acquire_fd);
+        if (prepared.native_token != null) source_bridge_count += 1;
+        const acquire_fd = if (prepared.native_token) |native_token| pending: {
+            const pending = takePendingAcquire(self, native_token, .{
+                .surface = prepared.surface,
+                .commit_sequence = prepared.commit_sequence,
+            }) orelse return error.MissingAcquireFence;
+            if (pending.imported_token != imported_token) return error.ExternalIdentityMismatch;
+            break :pending pending.fd;
+        } else external: {
+            const source = frame.sources[prepared.source_index].source.external orelse
+                return error.MissingExternalSource;
+            break :external try exportDmaBufFence(source.fds[0]);
         };
-        if (pending.imported_token != imported_token) return error.ExternalIdentityMismatch;
-        var import_info: c.VkImportSemaphoreFdInfoKHR = .{
-            .sType = c.VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR,
-            .pNext = null,
-            .semaphore = target.acquire_semaphores[wait_count],
-            .flags = c.VK_SEMAPHORE_IMPORT_TEMPORARY_BIT,
-            .handleType = c.VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
-            .fd = acquire_fd,
-        };
-        try vk(self.import_semaphore_fd.?(self.device, &import_info), error.ImportAcquireFenceFailed);
-        acquire_owned = false;
-        wait_semaphores[wait_count] = target.acquire_semaphores[wait_count];
-        wait_stages[wait_count] = c.VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-        wait_count += 1;
+        acquire_fds[acquire_fd_count] = acquire_fd;
+        acquire_fd_count += 1;
+    }
+
+    // A signaled sync_file remains signaled permanently, so importing it into
+    // Vulkan cannot add an ordering dependency. Poll the batch once and keep
+    // only genuinely pending acquire fences for the explicit wait bridge.
+    if (acquire_fd_count != 0) {
+        const descriptors = try allocator.alloc(std.posix.pollfd, acquire_fd_count);
+        defer allocator.free(descriptors);
+        for (acquire_fds[0..acquire_fd_count], descriptors) |fd, *descriptor| {
+            descriptor.* = .{ .fd = fd, .events = linux.POLL.IN, .revents = 0 };
+        }
+        if (std.posix.poll(descriptors, 0)) |_| {
+            var pending_count: usize = 0;
+            for (acquire_fds[0..acquire_fd_count], descriptors) |fd, descriptor| {
+                if (descriptor.revents & linux.POLL.IN != 0) {
+                    _ = linux.close(fd);
+                } else {
+                    acquire_fds[pending_count] = fd;
+                    pending_count += 1;
+                }
+            }
+            acquire_fd_count = pending_count;
+        } else |_| {}
+    }
+
+    if (acquire_fd_count != 0) {
+        const merged = if (acquire_fd_count > 1)
+            mergeAcquireFences(acquire_fds[0..acquire_fd_count])
+        else
+            null;
+        if (merged) |fd| {
+            var owned = true;
+            defer if (owned) {
+                _ = linux.close(fd);
+            };
+            try importAcquireFence(self, target.acquire_semaphores[0], fd);
+            owned = false;
+            for (acquire_fds[0..acquire_fd_count]) |*original| {
+                _ = linux.close(original.*);
+                original.* = -1;
+            }
+            wait_semaphores[0] = target.acquire_semaphores[0];
+            wait_stages[0] = c.VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+            wait_count = 1;
+        } else {
+            for (acquire_fds[0..acquire_fd_count], 0..) |fd, index| {
+                try importAcquireFence(self, target.acquire_semaphores[index], fd);
+                acquire_fds[index] = -1;
+                wait_semaphores[index] = target.acquire_semaphores[index];
+                wait_stages[index] = c.VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+                wait_count += 1;
+            }
+        }
     }
 
     const sample_stride = std.mem.alignForward(usize, self.sample_buffer_size, self.sample_region_alignment);
@@ -1882,6 +2094,38 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
         .pInheritanceInfo = null,
     };
     try vk(c.vkBeginCommandBuffer(target.command_buffer, &begin), error.BeginCommandBufferFailed);
+    for (self.prepared[0..batch.count], 0..) |prepared, index| {
+        const token = prepared.imported_token orelse continue;
+        if (prepared.native_token != null) continue;
+        var duplicate = false;
+        for (self.prepared[0..index]) |earlier|
+            duplicate = duplicate or (earlier.native_token == null and earlier.imported_token == token);
+        if (duplicate) continue;
+        var before: c.VkImageMemoryBarrier = .{
+            .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .pNext = null,
+            .srcAccessMask = 0,
+            .dstAccessMask = c.VK_ACCESS_SHADER_READ_BIT,
+            .oldLayout = c.VK_IMAGE_LAYOUT_GENERAL,
+            .newLayout = c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .srcQueueFamilyIndex = c.VK_QUEUE_FAMILY_FOREIGN_EXT,
+            .dstQueueFamilyIndex = self.queue_family,
+            .image = prepared.texture.image,
+            .subresourceRange = colorRange(),
+        };
+        c.vkCmdPipelineBarrier(
+            target.command_buffer,
+            c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0,
+            0,
+            null,
+            0,
+            null,
+            1,
+            &before,
+        );
+    }
     for (self.prepared[0..batch.count]) |prepared| {
         if (prepared.upload_count == 0) continue;
         if (prepared.imported_token) |token| {
@@ -2026,6 +2270,38 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
             c.vkCmdPipelineBarrier(target.command_buffer, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, null, 0, null, 1, &between);
         }
     }
+    for (self.prepared[0..batch.count], 0..) |prepared, index| {
+        const token = prepared.imported_token orelse continue;
+        if (prepared.native_token != null) continue;
+        var duplicate = false;
+        for (self.prepared[0..index]) |earlier|
+            duplicate = duplicate or (earlier.native_token == null and earlier.imported_token == token);
+        if (duplicate) continue;
+        var after: c.VkImageMemoryBarrier = .{
+            .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .pNext = null,
+            .srcAccessMask = c.VK_ACCESS_SHADER_READ_BIT,
+            .dstAccessMask = 0,
+            .oldLayout = c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .newLayout = c.VK_IMAGE_LAYOUT_GENERAL,
+            .srcQueueFamilyIndex = self.queue_family,
+            .dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_FOREIGN_EXT,
+            .image = prepared.texture.image,
+            .subresourceRange = colorRange(),
+        };
+        c.vkCmdPipelineBarrier(
+            target.command_buffer,
+            c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            c.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+            0,
+            0,
+            null,
+            0,
+            null,
+            1,
+            &after,
+        );
+    }
     var release_barrier: c.VkImageMemoryBarrier = .{
         .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
         .pNext = null,
@@ -2063,7 +2339,7 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
         .pWaitDstStageMask = if (wait_count == 0) null else wait_stages.ptr,
         .commandBufferCount = 1,
         .pCommandBuffers = &target.command_buffer,
-        .signalSemaphoreCount = if (imported_token_count == 0) 1 else 2,
+        .signalSemaphoreCount = if (source_bridge_count == 0) 1 else 2,
         .pSignalSemaphores = &[_]c.VkSemaphore{ target.semaphore, target.source_semaphore },
     };
     if (c.vkQueueSubmit(self.queue, 1, &submit, target.fence) != c.VK_SUCCESS) {
@@ -2088,7 +2364,7 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
     // Queue submission transfers ownership of every prepared object. Publish
     // those leases before any post-submit synchronization operation can fail.
     for (self.prepared[0..batch.count]) |prepared| {
-        if (prepared.native_token != null) continue;
+        if (prepared.native_token != null or prepared.direct_external) continue;
         const cache = &self.cache[prepared.cache_index];
         if (prepared.retire_previous) {
             std.debug.assert(target.retired_texture_count < target.retired_textures.len);
@@ -2107,9 +2383,13 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
     }
     prepared_owned = false;
 
-    var source_safe = imported_token_count == 0;
-    var source_exported = imported_token_count == 0;
-    if (imported_token_count != 0) source_sync: {
+    // Snapshot imports release their protocol source before presentation, so
+    // bridge GPU completion back into each DMA-BUF reservation. Direct sampled
+    // sources remain leased until replacement or detach with no frame in
+    // flight; their protocol lifetime already proves GPU completion.
+    var source_safe = source_bridge_count == 0;
+    var source_exported = source_bridge_count == 0;
+    if (source_bridge_count != 0) source_sync: {
         var source_fd_info: c.VkSemaphoreGetFdInfoKHR = .{
             .sType = c.VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
             .pNext = null,
@@ -2122,7 +2402,7 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
         source_exported = true;
         defer _ = linux.close(source_completion_fd);
         for (self.prepared[0..batch.count]) |prepared| {
-            if (prepared.imported_token == null) continue;
+            if (prepared.imported_token == null or prepared.native_token == null) continue;
             const source = frame.sources[prepared.source_index].source.external orelse
                 break :source_sync;
             importDmaBufFence(source.fds[0], source_completion_fd) catch break :source_sync;
