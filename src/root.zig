@@ -43,6 +43,7 @@ pub const subcompositor = @import("protocol/subcompositor.zig");
 pub const xdg_shell = @import("protocol/xdg_shell.zig");
 pub const seat = @import("protocol/seat.zig");
 pub const data_device = @import("protocol/data_device.zig");
+pub const primary_selection = @import("protocol/primary_selection.zig");
 pub const linux_dmabuf = @import("protocol/linux_dmabuf.zig");
 pub const xdg_activation = @import("protocol/xdg_activation.zig");
 pub const xdg_decoration = @import("protocol/xdg_decoration.zig");
@@ -101,6 +102,7 @@ test {
     _ = xdg_shell;
     _ = seat;
     _ = data_device;
+    _ = primary_selection;
     _ = linux_dmabuf;
     _ = xdg_activation;
     _ = xdg_decoration;
