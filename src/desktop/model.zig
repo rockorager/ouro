@@ -147,6 +147,8 @@ pub fn Desktop(comptime Shell: type) type {
             surface: Shell.SurfaceId = undefined,
             parent: Shell.SurfaceId = undefined,
             owner: ToplevelId = undefined,
+            external_root: bool = false,
+            root_surface: Shell.SurfaceId = undefined,
             placement: Shell.PopupPlacement = undefined,
             configure: Shell.PopupConfigure = undefined,
             pending_configure: ?Shell.PopupConfigure = null,
@@ -165,6 +167,8 @@ pub fn Desktop(comptime Shell: type) type {
         popups: []PopupSlot,
         popup_free: u32,
         popup_live: usize = 0,
+        external_roots: []SceneWindow,
+        external_root_len: usize = 0,
         work_area: geometry.Rect,
         metadata_storage: []u8,
         metadata_bytes: usize,
@@ -200,6 +204,8 @@ pub fn Desktop(comptime Shell: type) type {
             errdefer allocator.free(slots);
             const popups = try allocator.alloc(PopupSlot, config.popup_capacity);
             errdefer allocator.free(popups);
+            const external_roots = try allocator.alloc(SceneWindow, config.popup_capacity);
+            errdefer allocator.free(external_roots);
             const metadata_per_slot = try std.math.mul(usize, config.metadata_bytes, 2);
             const storage_len = try std.math.mul(
                 usize,
@@ -247,6 +253,7 @@ pub fn Desktop(comptime Shell: type) type {
                 .free = 0,
                 .popups = popups,
                 .popup_free = 0,
+                .external_roots = external_roots,
                 .work_area = work_area,
                 .metadata_storage = metadata_storage,
                 .metadata_bytes = config.metadata_bytes,
@@ -270,6 +277,7 @@ pub fn Desktop(comptime Shell: type) type {
             desktop.allocator.free(desktop.focus);
             desktop.allocator.free(desktop.metadata_storage);
             desktop.allocator.free(desktop.popups);
+            desktop.allocator.free(desktop.external_roots);
             desktop.allocator.free(desktop.slots);
             desktop.* = undefined;
         }
@@ -565,7 +573,59 @@ pub fn Desktop(comptime Shell: type) type {
             for (desktop.slots) |slot| {
                 if (slot.header.active and std.meta.eql(slot.surface, surface)) return slot.scene;
             }
+            for (desktop.external_roots[0..desktop.external_root_len]) |root|
+                if (std.meta.eql(root.surface, surface)) return root;
             return error.StaleSurface;
+        }
+
+        pub fn setExternalRoot(desktop: *Self, root: SceneWindow) !void {
+            if (desktop.updateExternalRoot(root)) return;
+            if (desktop.external_root_len == desktop.external_roots.len) return error.Exhausted;
+            desktop.external_roots[desktop.external_root_len] = root;
+            desktop.external_root_len += 1;
+            desktop.updatePopupScenes();
+        }
+
+        pub fn updateExternalRoot(desktop: *Self, root: SceneWindow) bool {
+            for (desktop.external_roots[0..desktop.external_root_len]) |*current| {
+                if (!std.meta.eql(current.surface, root.surface)) continue;
+                const changed = !std.meta.eql(current.*, root);
+                current.* = root;
+                if (changed) desktop.updatePopupScenes();
+                return true;
+            }
+            return false;
+        }
+
+        pub fn removeExternalRoot(desktop: *Self, surface: Shell.SurfaceId) void {
+            for (desktop.external_roots[0..desktop.external_root_len], 0..) |root, index| {
+                if (!std.meta.eql(root.surface, surface)) continue;
+                desktop.external_root_len -= 1;
+                desktop.external_roots[index] = desktop.external_roots[desktop.external_root_len];
+                desktop.updatePopupScenes();
+                return;
+            }
+        }
+
+        pub fn externalPopupSnapshot(
+            desktop: *const Self,
+            root: Shell.SurfaceId,
+            output: []SceneWindow,
+        ) ![]const SceneWindow {
+            var len: usize = 0;
+            for (desktop.popups) |slot| {
+                if (!slot.active or !slot.external_root or
+                    !std.meta.eql(slot.root_surface, root)) continue;
+                if (len == output.len) return error.Exhausted;
+                var position = len;
+                while (position > 0 and output[position - 1].stacking > slot.scene.stacking) {
+                    output[position] = output[position - 1];
+                    position -= 1;
+                }
+                output[position] = slot.scene;
+                len += 1;
+            }
+            return output[0..len];
         }
 
         pub fn toplevelSceneForSurface(desktop: *const Self, surface: Shell.SurfaceId) !SceneWindow {
@@ -611,7 +671,7 @@ pub fn Desktop(comptime Shell: type) type {
                 output[position] = slot.scene;
                 len += 1;
             }
-            for (desktop.popups) |slot| if (slot.active) {
+            for (desktop.popups) |slot| if (slot.active and !slot.external_root) {
                 var position = len;
                 while (position > 0 and output[position - 1].stacking > slot.scene.stacking) {
                     output[position] = output[position - 1];
@@ -757,6 +817,15 @@ pub fn Desktop(comptime Shell: type) type {
             if (desktop.popup_free == none) try desktop.growPopups();
             try desktop.requirePopupCommandCapacity(1);
             const parent = try desktop.sceneForSurface(value.parent);
+            const parent_popup = desktop.popupBySurface(value.parent);
+            const external_root = if (parent_popup) |popup|
+                popup.external_root
+            else
+                desktop.externalRootForSurface(value.parent) != null;
+            const root_surface = if (parent_popup) |popup|
+                popup.root_surface
+            else
+                value.parent;
             const positioned = try placePopup(value.placement, parent.geometry, desktop.work_area);
             const configure: Shell.PopupConfigure = .{
                 .x = positioned.x,
@@ -775,6 +844,8 @@ pub fn Desktop(comptime Shell: type) type {
                 .surface = value.surface,
                 .parent = value.parent,
                 .owner = parent.id,
+                .external_root = external_root,
+                .root_surface = root_surface,
                 .placement = value.placement,
                 .configure = configure,
                 .scene = .{
@@ -847,6 +918,8 @@ pub fn Desktop(comptime Shell: type) type {
             if (desktop.destroyed_surface != null) return;
             const surface = slot.surface;
             const parent = slot.parent;
+            const external_root = slot.external_root;
+            const root_surface = slot.root_surface;
             const was_grab = if (desktop.popup_grab) |grab| std.meta.eql(grab, id) else false;
             const was_dismiss = if (desktop.popup_dismiss) |dismiss| std.meta.eql(dismiss, id) else false;
             const index: u32 = @intCast((@intFromPtr(slot) - @intFromPtr(desktop.popups.ptr)) /
@@ -865,6 +938,18 @@ pub fn Desktop(comptime Shell: type) type {
             desktop.popup_live -= 1;
             desktop.scene_changed = true;
             desktop.destroyed_surface = surface;
+            if (external_root) {
+                var root_in_use = false;
+                for (desktop.popups) |popup| {
+                    if (popup.active and popup.external_root and
+                        std.meta.eql(popup.root_surface, root_surface))
+                    {
+                        root_in_use = true;
+                        break;
+                    }
+                }
+                if (!root_in_use) desktop.removeExternalRoot(root_surface);
+            }
             const parent_popup = desktop.popupBySurface(parent);
             if (was_dismiss) {
                 if (parent_popup) |popup| {
@@ -1182,6 +1267,12 @@ pub fn Desktop(comptime Shell: type) type {
                 }
                 changed = true;
             };
+            desktop.updatePopupScenes();
+            desktop.scene_changed = changed or desktop.scene_changed;
+        }
+
+        fn updatePopupScenes(desktop: *Self) void {
+            var changed = false;
             for (0..desktop.popup_live) |_| for (desktop.popups) |*popup| {
                 if (!popup.active or !popup.content_ready) continue;
                 const parent = desktop.sceneForSurface(popup.parent) catch {
@@ -1196,6 +1287,12 @@ pub fn Desktop(comptime Shell: type) type {
                 popup.scene.visible = parent.visible;
             };
             desktop.scene_changed = changed or desktop.scene_changed;
+        }
+
+        fn externalRootForSurface(desktop: *const Self, surface: Shell.SurfaceId) ?SceneWindow {
+            for (desktop.external_roots[0..desktop.external_root_len]) |root|
+                if (std.meta.eql(root.surface, surface)) return root;
+            return null;
         }
 
         fn defaultFloating(desktop: *const Self) geometry.Rect {
@@ -2036,6 +2133,70 @@ test "desktop: popup configure maps above its owning toplevel" {
     _ = try desktop.consume(&shell, 1);
     try std.testing.expectError(error.StaleSurface, desktop.sceneForSurface(popup_surface));
     try std.testing.expect(desktop.takeSceneChanged());
+}
+
+test "desktop: external-root popup stays out of the ordinary desktop scene" {
+    var desktop = try initTestDesktop(8);
+    defer desktop.deinit();
+    var shell = TestShell{};
+    const root_surface: TestShell.SurfaceId = .{ .index = 10, .generation = 2 };
+    const popup_surface: TestShell.SurfaceId = .{ .index = 20, .generation = 3 };
+    const root = TestDesktop.SceneWindow{
+        .id = .{ .index = 0x8000_000a, .generation = 2 },
+        .surface = root_surface,
+        .managed = false,
+        .geometry = .{ .x = 40, .y = 5, .width = 50, .height = 30 },
+        .visible = true,
+        .stacking = 2,
+        .mode = .floating,
+        .content_ready = true,
+    };
+    try desktop.setExternalRoot(root);
+    shell.push(.{ .popup_created = .{
+        .id = .{ .index = 0, .generation = 1 },
+        .surface = popup_surface,
+        .parent = root_surface,
+        .placement = .{
+            .width = 10,
+            .height = 8,
+            .anchor_x = 2,
+            .anchor_y = 3,
+            .anchor_width = 4,
+            .anchor_height = 5,
+            .anchor = 8,
+            .gravity = 8,
+            .constraint_adjustment = 0,
+            .offset_x = 0,
+            .offset_y = 0,
+        },
+    } });
+    _ = try desktop.consume(&shell, 1);
+    const serial = (try desktop.flushConfigure(&shell)).?;
+    shell.push(.{ .popup_commit_ready = .{
+        .id = .{ .index = 0, .generation = 1 },
+        .serial = serial,
+    } });
+    _ = try desktop.consume(&shell, 1);
+
+    var storage: [4]TestDesktop.SceneWindow = undefined;
+    try std.testing.expectEqual(@as(usize, 0), (try desktop.sceneSnapshot(&storage)).len);
+    const external = try desktop.externalPopupSnapshot(root_surface, &storage);
+    try std.testing.expectEqual(@as(usize, 1), external.len);
+    try std.testing.expectEqual(popup_surface, external[0].surface);
+    try std.testing.expectEqual(
+        geometry.Rect{ .x = 46, .y = 13, .width = 10, .height = 8 },
+        external[0].geometry,
+    );
+
+    var moved = root;
+    moved.geometry.x = 50;
+    try desktop.setExternalRoot(moved);
+    try std.testing.expectEqual(
+        @as(i32, 56),
+        (try desktop.sceneForSurface(popup_surface)).geometry.x,
+    );
+    desktop.removeExternalRoot(root_surface);
+    try std.testing.expect(!(try desktop.sceneForSurface(popup_surface)).visible);
 }
 
 test "desktop: popup placement flips before sliding or resizing" {

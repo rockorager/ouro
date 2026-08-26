@@ -400,6 +400,7 @@ pub fn Coordinator(comptime protocol: type) type {
         pending_surface_len: usize = 0,
         app_layers: []Layer,
         scene_windows: []Desktop.SceneWindow,
+        popup_scene_windows: []Desktop.SceneWindow,
         frame_samples: []render_list.AppliedSurface,
         frame_bindings: []output_api.SampleBinding,
         frame_changes: []damage.Change,
@@ -506,6 +507,11 @@ pub fn Coordinator(comptime protocol: type) type {
             );
             self.scene_windows = try allocator.alloc(Desktop.SceneWindow, scene_capacity);
             errdefer allocator.free(self.scene_windows);
+            self.popup_scene_windows = try allocator.alloc(
+                Desktop.SceneWindow,
+                config.desktop.popup_capacity,
+            );
+            errdefer allocator.free(self.popup_scene_windows);
             self.frame_samples = try allocator.alloc(render_list.AppliedSurface, config.output.max_samples);
             errdefer allocator.free(self.frame_samples);
             self.frame_bindings = try allocator.alloc(output_api.SampleBinding, config.output.max_samples);
@@ -753,6 +759,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 config.layer_shell,
             );
             errdefer self.layer_shell_adapter.deinit();
+            self.layer_shell_adapter.setPopupAdopter(.{
+                .context = self,
+                .adopt = adoptLayerPopup,
+            });
             self.session_lock_adapter = try SessionLockAdapter.init(
                 allocator,
                 &self.adapter,
@@ -939,6 +949,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.allocator.free(self.removed_layers);
             self.allocator.free(self.frame_bindings);
             self.allocator.free(self.frame_samples);
+            self.allocator.free(self.popup_scene_windows);
             self.allocator.free(self.scene_windows);
             self.allocator.free(self.app_layers);
             self.cursor_shape_adapter.deinit();
@@ -1229,6 +1240,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 return control;
             }
             if (try self.layer_shell_adapter.request(peer, target, message, fds)) |control| {
+                try self.advanceShell();
                 if (self.layer_shell_adapter.pendingOutbound(peer))
                     self.markProtocol(peer, ProtocolReady.layer_shell);
                 try self.flushProtocol();
@@ -1391,6 +1403,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     else => unreachable,
                 };
                 self.syncLayerKeyboardFocus() catch unreachable;
+                try self.syncLayerPopupRoots();
                 const peer = self.adapter.surfacePeer(id) catch unreachable;
                 if (self.layer_shell_adapter.pendingOutbound(peer))
                     self.markProtocol(peer, ProtocolReady.layer_shell);
@@ -2166,6 +2179,19 @@ pub fn Coordinator(comptime protocol: type) type {
         ) bool {
             const self: *Self = @ptrCast(@alignCast(context));
             return self.seat_adapter.validateInteractiveGrab(peer, seat_object, serial, surface);
+        }
+
+        fn adoptLayerPopup(
+            context: *anyopaque,
+            peer: wayring.io_uring.Peer,
+            handle: wayring.objects.Handle,
+            object: *const wayring.objects.Object,
+            parent: Adapter.SurfaceId,
+        ) !void {
+            const self: *Self = @ptrCast(@alignCast(context));
+            const root = self.layerShellSceneAny(parent) orelse return error.InvalidPopup;
+            try self.shell_adapter.adoptLayerPopup(peer, handle, object, parent);
+            try self.desktop.setExternalRoot(root);
         }
 
         fn validateCursorShape(
@@ -3232,6 +3258,12 @@ pub fn Coordinator(comptime protocol: type) type {
                 const state = try self.layer_shell_adapter.state(id);
                 if (!state.mapped or state.layer != selected) continue;
                 try self.appendSceneRoot(state.surface, count, output_size);
+                const popups = try self.desktop.externalPopupSnapshot(
+                    state.surface,
+                    self.popup_scene_windows,
+                );
+                for (popups) |popup| if (popup.visible)
+                    try self.appendSceneRoot(popup.surface, count, output_size);
             }
         }
 
@@ -3632,6 +3664,16 @@ pub fn Coordinator(comptime protocol: type) type {
         fn layerShellScene(self: *Self, id: Adapter.SurfaceId) ?Desktop.SceneWindow {
             const state = self.layer_shell_adapter.stateForSurface(id) orelse return null;
             if (!state.mapped) return null;
+            return self.layerShellSceneState(state);
+        }
+
+        fn layerShellSceneAny(self: *Self, id: Adapter.SurfaceId) ?Desktop.SceneWindow {
+            return self.layerShellSceneState(
+                self.layer_shell_adapter.stateForSurface(id) orelse return null,
+            );
+        }
+
+        fn layerShellSceneState(self: *Self, state: LayerShellAdapter.State) ?Desktop.SceneWindow {
             const rect = self.layerGeometry(state) catch return null;
             return .{
                 // Interaction targets require a desktop-shaped identity even
@@ -3642,15 +3684,23 @@ pub fn Coordinator(comptime protocol: type) type {
                     .index = state.surface.index | (@as(u32, 1) << 31),
                     .generation = state.surface.generation,
                 },
-                .surface = id,
+                .surface = state.surface,
                 .managed = false,
                 .keyboard_focusable = state.keyboard_interactivity != .none,
                 .geometry = rect,
-                .visible = true,
+                .visible = state.mapped,
                 .stacking = @intFromEnum(state.layer),
                 .mode = .floating,
                 .content_ready = true,
             };
+        }
+
+        fn syncLayerPopupRoots(self: *Self) !void {
+            const ids = try self.layer_shell_adapter.ids(self.layer_surface_ids);
+            for (ids) |id| {
+                const state = try self.layer_shell_adapter.state(id);
+                _ = self.desktop.updateExternalRoot(self.layerShellSceneState(state) orelse continue);
+            }
         }
 
         fn sessionLockActive(self: *const Self) bool {
@@ -3723,6 +3773,16 @@ pub fn Coordinator(comptime protocol: type) type {
                     const state = self.layer_shell_adapter.state(ids[index]) catch continue;
                     if (!state.mapped or @intFromEnum(state.layer) != layer_value) continue;
                     const window = self.layerShellScene(state.surface) orelse continue;
+                    const popups = self.desktop.externalPopupSnapshot(
+                        state.surface,
+                        self.popup_scene_windows,
+                    ) catch return null;
+                    if (hit_test.topmostTree(
+                        Desktop.SceneWindow,
+                        popups,
+                        point,
+                        input_scene,
+                    )) |hit| return hit;
                     if (hit_test.topmostTree(
                         Desktop.SceneWindow,
                         @as(*const [1]Desktop.SceneWindow, &window),
@@ -4114,7 +4174,10 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             if (removed_surface) |id| self.queueLayerRemoval(id);
             const removed_layer_surface = self.layer_shell_adapter.surfaceForResource(handle, object);
-            if (removed_layer_surface) |id| self.queueLayerRemoval(id);
+            if (removed_layer_surface) |id| {
+                self.queueLayerRemoval(id);
+                self.desktop.removeExternalRoot(id);
+            }
             const removed_lock_surface = self.session_lock_adapter.surfaceForResource(handle, object);
             if (removed_lock_surface) |id| self.queueLayerRemoval(id);
             self.decoration_adapter.toplevelRemoved(handle, object);
@@ -4144,6 +4207,7 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.subcompositor_adapter.resourceRemoved(handle, object);
             if (layer_shell_removed and self.output != null) {
                 self.desktop.applyWorkArea(self.layerWorkArea(null) catch self.outputBounds() catch unreachable);
+                self.syncLayerPopupRoots() catch {};
                 self.syncLayerKeyboardFocus() catch {};
                 self.output.?.request(.damage, monotonicNs() catch 0) catch {};
             }
