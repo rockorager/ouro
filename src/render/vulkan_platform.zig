@@ -796,9 +796,14 @@ fn releaseNativeOwner(context: *anyopaque, token: u64) void {
     releaseNative(@ptrCast(@alignCast(context)), token);
 }
 
-fn nativePinned(context: *anyopaque, token: u64) bool {
-    const allocation = nativeAllocation(@ptrCast(@alignCast(context)), token) orelse return false;
-    return allocation.references > 1;
+fn nativePinned(_: *anyopaque, _: u64) bool {
+    // Extra native references are lifetime leases held by work already
+    // submitted to this renderer's single queue. They prevent destruction,
+    // but the next submission may replace the same mutable snapshot: its
+    // transfer-write barrier is ordered after every prior compute read. Frame
+    // capture and queue submission are synchronous and non-reentrant, so no
+    // unsubmitted reader can exist at this boundary.
+    return false;
 }
 
 fn nativeReady(context: *anyopaque, token: u64, identity: render.SampleIdentity) bool {
