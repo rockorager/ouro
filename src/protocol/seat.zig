@@ -9,6 +9,7 @@ const std = @import("std");
 const wayring = @import("wayring");
 const input = @import("../backend/input/backend.zig");
 const input_platform = @import("../backend/input/platform.zig");
+const surface_state = @import("../surface.zig");
 
 const linux = std.os.linux;
 const objects = wayring.objects;
@@ -32,6 +33,7 @@ const mod_alt: u32 = 1 << 3;
 const mod_num: u32 = 1 << 4;
 const mod_meta: u32 = 1 << 6;
 const mod_alt_gr: u32 = 1 << 7;
+const cursor_role_id: surface_state.RoleId = 0x6375_7273_6f72_5f5f;
 
 pub const SeatClientId = packed struct {
     slot: u32,
@@ -447,6 +449,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                             return try adapter.protocolError(actor, decoded.handle.id, 0, "stale cursor surface");
                         const object = server_objects.namespace.resolve(handle) orelse
                             return try adapter.protocolError(actor, decoded.handle.id, 0, "stale cursor surface");
+                        const cursor = adapter.core.getSurfaceObject(handle, object) catch
+                            return try adapter.protocolError(actor, decoded.handle.id, 0, "invalid cursor surface");
+                        cursor.role.assign(cursor_role_id, false) catch
+                            return try adapter.protocolError(actor, decoded.handle.id, Pointer.@"error".role.value, "cursor surface already has another role");
                         surface_id = adapter.core.surfaceIdObject(handle, object) catch
                             return try adapter.protocolError(actor, decoded.handle.id, 0, "invalid cursor surface");
                     }
