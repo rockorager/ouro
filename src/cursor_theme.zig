@@ -2,6 +2,104 @@
 
 const std = @import("std");
 
+/// A bounded, allocator-owned cache of parsed Xcursor files. Cache hits are
+/// identified by the exact path bytes; returned images borrow retained files.
+pub const Cache = struct {
+    pub const Config = struct {
+        file_capacity: usize,
+        path_capacity: usize,
+        max_file_bytes: usize,
+        max_total_bytes: usize,
+    };
+
+    const Slot = struct {
+        path_len: usize = 0,
+        bytes: ?[]u8 = null,
+    };
+
+    allocator: std.mem.Allocator,
+    config: Config,
+    slots: []Slot,
+    paths: []u8,
+    file_count: usize = 0,
+    byte_count: usize = 0,
+
+    pub fn init(allocator: std.mem.Allocator, config: Config) !Cache {
+        if (config.file_capacity == 0 or config.path_capacity == 0 or
+            config.max_file_bytes == 0 or config.max_total_bytes == 0)
+            return error.InvalidConfig;
+        const path_bytes = std.math.mul(usize, config.file_capacity, config.path_capacity) catch
+            return error.InvalidConfig;
+        const slots = try allocator.alloc(Slot, config.file_capacity);
+        errdefer allocator.free(slots);
+        @memset(slots, .{});
+        const paths = try allocator.alloc(u8, path_bytes);
+        return .{ .allocator = allocator, .config = config, .slots = slots, .paths = paths };
+    }
+
+    pub fn deinit(self: *Cache) void {
+        for (self.slots) |slot| if (slot.bytes) |bytes| self.allocator.free(bytes);
+        self.allocator.free(self.paths);
+        self.allocator.free(self.slots);
+        self.* = undefined;
+    }
+
+    pub fn retainedFiles(self: *const Cache) usize {
+        return self.file_count;
+    }
+
+    pub fn retainedBytes(self: *const Cache) usize {
+        return self.byte_count;
+    }
+
+    pub fn load(self: *Cache, path: []const u8, requested_size: u32) !Image {
+        if (path.len == 0) return error.EmptyPath;
+        if (path.len > self.config.path_capacity) return error.PathTooLong;
+        for (self.slots, 0..) |slot, i| {
+            if (slot.bytes != null and std.mem.eql(u8, path, self.slotPath(i)))
+                return select(slot.bytes.?, requested_size);
+        }
+        const slot_index = for (self.slots, 0..) |slot, i| {
+            if (slot.bytes == null) break i;
+        } else return error.CacheFull;
+
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only, .allow_directory = true });
+        defer file.close(io);
+        const stat = try file.stat(io);
+        if (stat.kind != .file) return error.NotRegularFile;
+        if (stat.size == 0) return error.EmptyFile;
+        const len = std.math.cast(usize, stat.size) orelse return error.FileTooLarge;
+        if (len > self.config.max_file_bytes) return error.FileTooLarge;
+        const new_total = std.math.add(usize, self.byte_count, len) catch return error.TotalBytesExceeded;
+        if (new_total > self.config.max_total_bytes) return error.TotalBytesExceeded;
+
+        const bytes = try self.allocator.alloc(u8, len);
+        errdefer self.allocator.free(bytes);
+        var offset: usize = 0;
+        while (offset < len) {
+            const n = try file.readPositional(io, &.{bytes[offset..]}, offset);
+            if (n == 0) return error.UnexpectedEndOfFile;
+            offset += n;
+        }
+        const image = try select(bytes, requested_size);
+
+        const path_start = slot_index * self.config.path_capacity;
+        @memcpy(self.paths[path_start..][0..path.len], path);
+        self.slots[slot_index] = .{ .path_len = path.len, .bytes = bytes };
+        self.file_count += 1;
+        self.byte_count = new_total;
+        return image;
+    }
+
+    fn slotPath(self: *const Cache, index: usize) []const u8 {
+        const start = index * self.config.path_capacity;
+        return self.paths[start..][0..self.slots[index].path_len];
+    }
+};
+
+pub const Store = Cache;
+
 pub const Image = struct {
     width: u32,
     height: u32,
@@ -231,4 +329,79 @@ test "cursor theme: rejects pixels, hotspot, dimensions, and arithmetic overflow
     std.mem.writeInt(u32, fixture.bytes[44..48], std.math.maxInt(u32), .little);
     std.mem.writeInt(u32, fixture.bytes[48..52], std.math.maxInt(u32), .little);
     try std.testing.expectError(error.InvalidFormat, select(fixture.slice(), 24));
+}
+
+fn fixtureFile(dir: std.Io.Dir, name: []const u8, fixture: *Fixture) !void {
+    const io = std.testing.io;
+    const file = try dir.createFile(io, name, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, fixture.slice());
+}
+
+fn temporaryPath(tmp: *const std.testing.TmpDir, name: []const u8, buffer: []u8) ![]const u8 {
+    return std.fmt.bufPrint(buffer, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
+}
+
+test "cursor theme cache: hits retain bytes and sizes share a file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fixture = Fixture.init(2);
+    fixture.toc(24, 40);
+    fixture.toc(48, 80);
+    fixture.image(24, 1, 1, 0, 0, 24, 0xff000018);
+    fixture.image(48, 1, 1, 0, 0, 48, 0xff000030);
+    try fixtureFile(tmp.dir, "cursor", &fixture);
+    var path_buffer: [128]u8 = undefined;
+    const path = try temporaryPath(&tmp, "cursor", &path_buffer);
+
+    var cache = try Cache.init(std.testing.allocator, .{
+        .file_capacity = 2,
+        .path_capacity = 128,
+        .max_file_bytes = 512,
+        .max_total_bytes = 512,
+    });
+    defer cache.deinit();
+    const first = try cache.load(path, 24);
+    try tmp.dir.deleteFile(std.testing.io, "cursor");
+    const second = try cache.load(path, 48);
+    try std.testing.expectEqual(@as(u32, 24), first.delay);
+    try std.testing.expectEqual(@as(u32, 48), second.delay);
+    try std.testing.expectEqual(@as(usize, 1), cache.retainedFiles());
+    try std.testing.expectEqual(fixture.len, cache.retainedBytes());
+}
+
+test "cursor theme cache: bounds and failed files are transactional" {
+    try std.testing.expectError(error.InvalidConfig, Cache.init(std.testing.allocator, .{
+        .file_capacity = std.math.maxInt(usize),
+        .path_capacity = 2,
+        .max_file_bytes = 1,
+        .max_total_bytes = 1,
+    }));
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var valid = Fixture.init(1);
+    valid.toc(24, 28);
+    valid.image(24, 1, 1, 0, 0, 24, 0xff000018);
+    try fixtureFile(tmp.dir, "one", &valid);
+    try fixtureFile(tmp.dir, "two", &valid);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "empty", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bad", .data = "bad" });
+    var buffer: [128]u8 = undefined;
+
+    var cache = try Cache.init(std.testing.allocator, .{
+        .file_capacity = 2,
+        .path_capacity = 128,
+        .max_file_bytes = 512,
+        .max_total_bytes = valid.len,
+    });
+    defer cache.deinit();
+    try std.testing.expectError(error.EmptyPath, cache.load("", 24));
+    try std.testing.expectError(error.EmptyFile, cache.load(try temporaryPath(&tmp, "empty", &buffer), 24));
+    try std.testing.expectError(error.InvalidFormat, cache.load(try temporaryPath(&tmp, "bad", &buffer), 24));
+    try std.testing.expectError(error.NotRegularFile, cache.load(try temporaryPath(&tmp, ".", &buffer), 24));
+    try std.testing.expectEqual(@as(usize, 0), cache.retainedFiles());
+    _ = try cache.load(try temporaryPath(&tmp, "one", &buffer), 24);
+    try std.testing.expectError(error.TotalBytesExceeded, cache.load(try temporaryPath(&tmp, "two", &buffer), 24));
+    try std.testing.expectEqual(@as(usize, 1), cache.retainedFiles());
+    try std.testing.expectEqual(valid.len, cache.retainedBytes());
 }
