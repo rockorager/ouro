@@ -57,6 +57,7 @@ pub const desktop_layout = @import("desktop/layout.zig");
 pub const desktop = @import("desktop/model.zig");
 pub const interaction = @import("input/interaction.zig");
 pub const confinement = @import("input/confinement.zig");
+pub const cursor_theme = @import("cursor_theme.zig");
 
 test {
     _ = surface;
@@ -116,4 +117,5 @@ test {
     _ = desktop;
     _ = interaction;
     _ = confinement;
+    _ = cursor_theme;
 }
