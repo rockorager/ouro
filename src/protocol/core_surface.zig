@@ -769,6 +769,20 @@ pub fn Adapter(comptime protocol: type) type {
             return adapter.scheduler.tryApply(&slot.updates, output);
         }
 
+        pub fn readyUpdateCount(adapter: *Self, handle: objects.Handle) !usize {
+            const slot = try adapter.resolveSurface(handle);
+            return adapter.scheduler.readyCount(&slot.updates);
+        }
+
+        pub fn readyUpdateSurfaces(
+            adapter: *Self,
+            handle: objects.Handle,
+            output: []objects.Handle,
+        ) ![]objects.Handle {
+            const slot = try adapter.resolveSurface(handle);
+            return adapter.scheduler.readySurfaces(&slot.updates, output);
+        }
+
         pub fn satisfy(adapter: *Self, token: UpdateToken, count: u32) !void {
             try adapter.scheduler.satisfy(token, count);
         }

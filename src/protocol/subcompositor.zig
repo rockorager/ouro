@@ -29,6 +29,9 @@ pub fn Adapter(comptime protocol: type, comptime Core: type) type {
         const Subsurface = protocol.wl_subsurface;
         const Graph = subsurface_state.Graph(Core.SurfaceId, void);
 
+        pub const StackEntry = Graph.StackEntry;
+        pub const Placement = Graph.Placement;
+
         const Slot = struct {
             active: bool = false,
             next_free: u32 = none,
@@ -275,8 +278,20 @@ pub fn Adapter(comptime protocol: type, comptime Core: type) type {
             return self.graph.directChildren(parent, self.surface_scratch);
         }
 
+        pub fn stack(
+            self: *Self,
+            parent: Core.SurfaceId,
+            output: []StackEntry,
+        ) ![]StackEntry {
+            return self.graph.stack(parent, output);
+        }
+
         pub fn position(self: *Self, child: Core.SurfaceId) !Graph.Position {
             return self.graph.position(child);
+        }
+
+        pub fn placement(self: *Self, child: Core.SurfaceId) !Placement {
+            return self.graph.placement(child);
         }
 
         pub fn visible(self: *Self, child: Core.SurfaceId) !bool {

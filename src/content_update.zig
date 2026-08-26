@@ -341,6 +341,45 @@ pub fn Scheduler(comptime Key: type, comptime Payload: type) type {
         /// Applies one candidate DCU and its complete reachable dependency
         /// graph. Blocked graphs return an empty slice. Capacity checking and
         /// constraint inspection happen before any queue or pool mutation.
+        pub fn readyCount(scheduler: *Self, queue: *Queue) Error!usize {
+            if (queue.scheduler != scheduler) return error.InvalidDependency;
+            if (queue.head == none or scheduler.nodes[queue.head].kind != .desync)
+                return 0;
+            const inspect_epoch = scheduler.nextEpoch();
+            var required: usize = 0;
+            var blocked = false;
+            scheduler.inspect(
+                scheduler.nodeToken(queue.head),
+                inspect_epoch,
+                &required,
+                &blocked,
+            );
+            return if (blocked) 0 else required;
+        }
+
+        /// Writes the exact application-order surface keys without consuming
+        /// nodes or payload ownership. This permits bounded scene owners to
+        /// preflight destination capacity before calling tryApply.
+        pub fn readySurfaces(
+            scheduler: *Self,
+            queue: *Queue,
+            output: []Key,
+        ) Error![]Key {
+            const required = try scheduler.readyCount(queue);
+            if (required == 0) return output[0..0];
+            if (output.len < required) return error.OutputTooSmall;
+            const collect_epoch = scheduler.nextEpoch();
+            var used: usize = 0;
+            scheduler.collectSurfaces(
+                scheduler.nodeToken(queue.head),
+                collect_epoch,
+                output,
+                &used,
+            );
+            std.debug.assert(used == required);
+            return output[0..used];
+        }
+
         pub fn tryApply(
             scheduler: *Self,
             queue: *Queue,
@@ -381,6 +420,29 @@ pub fn Scheduler(comptime Key: type, comptime Payload: type) type {
             };
             scheduler.active_nodes += 1;
             return index;
+        }
+
+        fn collectSurfaces(
+            scheduler: *Self,
+            token: Token,
+            epoch: u32,
+            output: []Key,
+            used: *usize,
+        ) void {
+            const index = scheduler.validateToken(token) catch unreachable;
+            if (scheduler.nodes[index].visit_epoch == epoch) return;
+            scheduler.nodes[index].visit_epoch = epoch;
+            var edge = scheduler.nodes[index].dependency_head;
+            while (edge != none) : (edge = scheduler.edges[edge].next) {
+                scheduler.collectSurfaces(
+                    scheduler.edges[edge].dependency,
+                    epoch,
+                    output,
+                    used,
+                );
+            }
+            output[used.*] = scheduler.nodes[index].owner.key;
+            used.* += 1;
         }
 
         fn releaseNode(scheduler: *Self, index: u32) void {
@@ -519,7 +581,15 @@ test "content updates apply complete dependency graphs atomically" {
     _ = try scheduler.commit(&parent, 10, .desync, &.{newest_child}, 0);
 
     var applied: [3]TestScheduler.Applied = undefined;
+    try std.testing.expectEqual(@as(usize, 3), try scheduler.readyCount(&parent));
+    var ready_surfaces: [3]u32 = undefined;
+    try std.testing.expectEqualSlices(
+        u32,
+        &.{ 2, 2, 1 },
+        try scheduler.readySurfaces(&parent, &ready_surfaces),
+    );
     try std.testing.expectError(error.OutputTooSmall, scheduler.tryApply(&parent, applied[0..2]));
+    try std.testing.expectEqual(@as(usize, 3), try scheduler.readyCount(&parent));
     const result = try scheduler.tryApply(&parent, &applied);
     try std.testing.expectEqual(@as(usize, 3), result.len);
     try std.testing.expectEqual(@as(u32, 20), result[0].payload);
@@ -539,6 +609,7 @@ test "constraints block a graph without mutation" {
     const child_update = try scheduler.commit(&child, 20, .sync, &.{}, 2);
     _ = try scheduler.commit(&parent, 10, .desync, &.{child_update}, 0);
     var applied: [2]TestScheduler.Applied = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try scheduler.readyCount(&parent));
     try std.testing.expectEqual(@as(usize, 0), (try scheduler.tryApply(&parent, &applied)).len);
     try std.testing.expectEqual(@as(usize, 1), parent.count);
     try scheduler.satisfy(child_update, 1);

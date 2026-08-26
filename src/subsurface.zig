@@ -19,6 +19,7 @@ pub const Error = std.mem.Allocator.Error || error{
     InvalidToken,
     InvalidSibling,
     DefunctSurface,
+    PositionOverflow,
 };
 
 pub fn Graph(comptime Key: type, comptime Payload: type) type {
@@ -46,6 +47,11 @@ pub fn Graph(comptime Key: type, comptime Payload: type) type {
         pub const StackEntry = struct {
             surface: Key,
             above_parent: bool,
+        };
+
+        pub const Placement = struct {
+            root: Key,
+            offset: Position,
         };
 
         const SurfaceNode = struct {
@@ -196,6 +202,25 @@ pub fn Graph(comptime Key: type, comptime Payload: type) type {
 
         pub fn position(graph: Self, child: Key) Error!Position {
             return graph.surfaces[try graph.relationship(child)].current_position;
+        }
+
+        pub fn placement(graph: Self, child: Key) Error!Placement {
+            var index = try graph.relationship(child);
+            var x: i64 = 0;
+            var y: i64 = 0;
+            while (graph.surfaces[index].parent != none) {
+                const child_position = graph.surfaces[index].current_position;
+                x += child_position.x;
+                y += child_position.y;
+                index = graph.surfaces[index].parent;
+            }
+            if (x < std.math.minInt(i32) or x > std.math.maxInt(i32) or
+                y < std.math.minInt(i32) or y > std.math.maxInt(i32))
+                return error.PositionOverflow;
+            return .{
+                .root = graph.surfaces[index].surface,
+                .offset = .{ .x = @intCast(x), .y = @intCast(y) },
+            };
         }
 
         pub fn isVisible(graph: Self, child: Key) Error!bool {
@@ -631,6 +656,7 @@ test "synchronized commits latch atomically with their parent" {
     try graph.add(child, parent);
     try graph.add(grandchild, child);
     try graph.setPosition(child, -7, 11);
+    try graph.setPosition(grandchild, 3, 5);
 
     var applied: [4]TestGraph.Applied = undefined;
     try std.testing.expectEqual(@as(usize, 0), (try graph.commit(child, 20, &applied)).len);
@@ -643,6 +669,10 @@ test "synchronized commits latch atomically with their parent" {
     try std.testing.expectEqual(@as(u32, 30), result[2].payload);
     try std.testing.expect(try graph.isVisible(child));
     try std.testing.expectEqual(TestGraph.Position{ .x = -7, .y = 11 }, try graph.position(child));
+    try std.testing.expectEqual(
+        TestGraph.Placement{ .root = parent, .offset = .{ .x = -4, .y = 16 } },
+        try graph.placement(grandchild),
+    );
 }
 
 test "desynchronized descendants inherit synchronized ancestors" {
