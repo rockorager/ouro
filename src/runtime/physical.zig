@@ -666,73 +666,83 @@ pub fn Coordinator(comptime protocol: type) type {
             if (try self.shm.request(actor, objects, target, message, fds)) |control|
                 return control;
             if (try self.adapter.request(peer, target, message, fds)) |control| {
-                self.markProtocol(peer, ProtocolReady.core);
                 if (self.surface == null) if (self.adapter.firstSurface()) |first| {
                     self.surface = first;
                     self.surface_id = try self.adapter.surfaceId(first);
                 };
                 try self.advanceShell();
+                if (self.adapter.pendingPresentationClock(peer) or
+                    self.adapter.pendingDiscardedFeedback(peer))
+                    self.markProtocol(peer, ProtocolReady.core);
                 try self.flushProtocol();
                 try self.applyReady();
                 return control;
             }
             if (try self.fractional_scale_adapter.request(peer, target, message, fds)) |control| {
-                self.markProtocol(peer, ProtocolReady.fractional_scale);
+                if (self.fractional_scale_adapter.pendingOutbound(peer))
+                    self.markProtocol(peer, ProtocolReady.fractional_scale);
                 try self.flushProtocol();
                 return control;
             }
             if (try self.shell_adapter.request(peer, target, message, fds)) |control| {
-                self.markProtocol(peer, ProtocolReady.shell);
                 try self.advanceShell();
                 try self.flushProtocol();
                 return control;
             }
             if (try self.seat_adapter.request(peer, target, message, fds)) |control| {
-                self.markProtocol(peer, ProtocolReady.seat);
                 try self.processSeatEvents();
+                if (self.seat_adapter.pendingOutboundOn(objects))
+                    self.markProtocol(peer, ProtocolReady.seat);
                 try self.flushProtocol();
                 return control;
             }
             if (try self.data_device_adapter.request(peer, target, message, fds)) |control| {
-                self.markProtocol(peer, ProtocolReady.data_device);
+                if (self.data_device_adapter.pendingOutboundOn(peer))
+                    self.markProtocol(peer, ProtocolReady.data_device);
                 try self.flushProtocol();
                 return control;
             }
             if (try self.dmabuf_adapter.request(peer, target, message, fds)) |control| {
-                self.markProtocol(peer, ProtocolReady.dmabuf);
+                if (self.dmabuf_adapter.pendingOutbound(peer))
+                    self.markProtocol(peer, ProtocolReady.dmabuf);
                 try self.flushProtocol();
                 return control;
             }
             if (try self.activation_adapter.request(peer, target, message, fds)) |control| {
-                self.markProtocol(peer, ProtocolReady.activation);
                 try self.processActivationEvents();
                 try self.advanceShell();
                 try self.applyInteractionCommands();
+                if (self.activation_adapter.pendingOutbound(peer))
+                    self.markProtocol(peer, ProtocolReady.activation);
                 try self.flushProtocol();
                 return control;
             }
             if (try self.decoration_adapter.request(peer, target, message, fds)) |control| {
-                self.markProtocol(peer, ProtocolReady.decoration | ProtocolReady.shell);
                 self.processDecorationEvents() catch |err| switch (err) {
                     error.Backpressure => {},
                     else => return err,
                 };
                 try self.advanceShell();
+                if (self.decoration_adapter.pendingOutbound(peer))
+                    self.markProtocol(peer, ProtocolReady.decoration);
                 try self.flushProtocol();
                 return control;
             }
             if (try self.relative_pointer_adapter.request(peer, target, message, fds)) |control| {
-                self.markProtocol(peer, ProtocolReady.relative_pointer);
+                if (self.relative_pointer_adapter.pendingOutbound(peer))
+                    self.markProtocol(peer, ProtocolReady.relative_pointer);
                 try self.flushProtocol();
                 return control;
             }
             if (try self.pointer_constraints_adapter.request(peer, target, message, fds)) |control| {
-                self.markProtocol(peer, ProtocolReady.pointer_constraints);
+                if (self.pointer_constraints_adapter.pendingOutbound(peer))
+                    self.markProtocol(peer, ProtocolReady.pointer_constraints);
                 try self.flushProtocol();
                 return control;
             }
             if (try self.output_adapter.request(peer, target, message, fds)) |control| {
-                self.markProtocol(peer, ProtocolReady.output);
+                if (self.output_adapter.pendingOutboundOn(peer))
+                    self.markProtocol(peer, ProtocolReady.output);
                 try self.flushProtocol();
                 return control;
             }
@@ -827,7 +837,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (pointer.focus) |focus| focus.surface else null,
                 .{ .x = pointer.point.x, .y = pointer.point.y },
             );
-            self.markProtocolAll(ProtocolReady.pointer_constraints);
+            self.markPointerConstraintsProtocol();
             if (self.shell_adapter.ownsSurface(id))
                 self.shell_adapter.publishSurfaceCommitted(id) catch unreachable;
             self.surface = self.adapter.surfaceHandle(id) catch unreachable;
@@ -1281,7 +1291,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.markProtocolAll(ProtocolReady.seat);
             if (self.data_device_adapter.pendingOutbound() != 0)
                 self.markProtocolAll(ProtocolReady.data_device);
-            if (applied) self.markProtocolAll(ProtocolReady.pointer_constraints);
+            if (applied) self.markPointerConstraintsProtocol();
         }
 
         fn seatTarget(self: *Self, surface: Adapter.SurfaceId) !SeatAdapter.FocusTarget {
@@ -1476,6 +1486,14 @@ pub fn Coordinator(comptime protocol: type) type {
         fn markProtocolAll(self: *Self, ready: u16) void {
             for (self.clients) |*client| {
                 if (client.active) client.protocol_ready |= ready;
+            }
+        }
+
+        fn markPointerConstraintsProtocol(self: *Self) void {
+            for (self.clients) |*client| {
+                if (client.active and
+                    self.pointer_constraints_adapter.pendingOutbound(client.peer))
+                    client.protocol_ready |= ProtocolReady.pointer_constraints;
             }
         }
 
