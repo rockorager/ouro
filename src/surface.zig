@@ -314,6 +314,17 @@ pub const Surface = struct {
         return surface.viewport.current.surfaceSize(content_size);
     }
 
+    /// Returns the logical extent and buffer presence that a commit would
+    /// publish, without mutating pending state. Role adapters use this to
+    /// enforce configure dimensions before core publication.
+    pub fn prospectiveContent(surface: Surface) Error!struct { has_buffer: bool, size: SurfaceSize } {
+        const buffer = if (surface.attach_changed) surface.pending_buffer else surface.current_buffer;
+        try surface.validateCommit();
+        if (buffer == null) return .{ .has_buffer = false, .size = .{ .width = 0, .height = 0 } };
+        const content_size = surface.contentSize(buffer).?;
+        return .{ .has_buffer = true, .size = surface.viewport.pending.surfaceSize(content_size) };
+    }
+
     /// Validates the effective buffer geometry without mutating pending state.
     pub fn validateCommit(surface: Surface) Error!void {
         const buffer = if (surface.attach_changed)

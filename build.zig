@@ -22,6 +22,7 @@ pub fn build(b: *std.Build) void {
     generate_core_protocol.addFileArg(wayland_protocols.path("staging/color-management/color-management-v1.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("staging/color-representation/color-representation-v1.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("staging/xdg-activation/xdg-activation-v1.xml"));
+    generate_core_protocol.addFileArg(wayland_protocols.path("staging/ext-session-lock/ext-session-lock-v1.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("unstable/xdg-decoration/xdg-decoration-unstable-v1.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("unstable/relative-pointer/relative-pointer-unstable-v1.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("unstable/pointer-gestures/pointer-gestures-unstable-v1.xml"));
@@ -51,6 +52,7 @@ pub fn build(b: *std.Build) void {
     generate_xdg_protocol.addFileArg(wayland_protocols.path("staging/color-management/color-management-v1.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("staging/color-representation/color-representation-v1.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("staging/xdg-activation/xdg-activation-v1.xml"));
+    generate_xdg_protocol.addFileArg(wayland_protocols.path("staging/ext-session-lock/ext-session-lock-v1.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("unstable/xdg-decoration/xdg-decoration-unstable-v1.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("unstable/relative-pointer/relative-pointer-unstable-v1.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("unstable/pointer-gestures/pointer-gestures-unstable-v1.xml"));
