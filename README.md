@@ -77,6 +77,10 @@ responsibilities:
   scale, stable name, and description through version-correct `wl_output`
   snapshots and updates. Mapped surfaces receive resumable `enter`/`leave`
   associations across output suspension and recreation.
+- [XDG output](src/protocol/xdg_output.zig): bounded logical-output resources
+  publish the selected output's actual compositor-space extent, stable name,
+  and description, with `zxdg_output_v1.done` for versions 1–2 and the
+  associated `wl_output.done` atomicity marker for version 3.
 - [XDG popups](src/protocol/xdg_shell.zig): bounded popup roles retain copied
   positioner state, receive exact initial and reposition configure transactions,
   validate explicit grabs against exact seat/user-action serials, and compose

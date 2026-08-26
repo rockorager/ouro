@@ -56,6 +56,7 @@ pub const cursor_shape = @import("protocol/cursor_shape.zig");
 pub const text_input = @import("protocol/text_input.zig");
 pub const pointer_constraints = @import("protocol/pointer_constraints.zig");
 pub const protocol_output = @import("protocol/output.zig");
+pub const xdg_output = @import("protocol/xdg_output.zig");
 pub const scene_geometry = @import("scene/geometry.zig");
 pub const scene_hit_test = @import("scene/hit_test.zig");
 pub const scene_cursor = @import("scene/cursor.zig");
@@ -123,6 +124,7 @@ test {
     _ = text_input;
     _ = pointer_constraints;
     _ = protocol_output;
+    _ = xdg_output;
     _ = scene_geometry;
     _ = scene_hit_test;
     _ = scene_cursor;

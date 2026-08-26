@@ -40,6 +40,15 @@ pub fn Adapter(comptime protocol: type) type {
         const Output = protocol.wl_output;
 
         const Id = struct { index: u32, generation: u32 };
+        pub const Reference = struct {
+            handle: objects.Handle,
+        };
+        pub const LogicalSnapshot = struct {
+            width: ?i32,
+            height: ?i32,
+            name: []const u8,
+            description: []const u8,
+        };
         const Resource = struct {
             active: bool = false,
             generation: u32 = 1,
@@ -384,6 +393,31 @@ pub fn Adapter(comptime protocol: type) type {
             return output[0..count];
         }
 
+        pub fn reference(
+            adapter: *Self,
+            peer: wayring.io_uring.Peer,
+            handle: objects.Handle,
+            object: objects.Object,
+        ) !Reference {
+            if (object.interface != &Output.info) return error.WrongInterface;
+            const resource = adapter.fromContext(object.context) orelse return error.ForeignResource;
+            if (!resource.active or !samePeer(resource.peer, peer) or
+                !std.meta.eql(resource.handle, handle)) return error.ForeignResource;
+            return .{ .handle = resource.handle };
+        }
+
+        pub fn logicalSnapshot(adapter: *const Self) LogicalSnapshot {
+            return .{
+                // Ouro's compositor space currently maps directly to the
+                // untransformed physical mode; wl_output.scale only describes
+                // the preferred client buffer scale.
+                .width = if (adapter.mode) |mode| mode.width else null,
+                .height = if (adapter.mode) |mode| mode.height else null,
+                .name = adapter.name,
+                .description = adapter.description,
+            };
+        }
+
         fn flushAssociations(
             adapter: *Self,
             peer: wayring.io_uring.Peer,
@@ -669,6 +703,23 @@ test "output: resources and surface associations are peer scoped" {
     const resource_b = try adapter.acquireResource();
     adapter.resources[resource_b].peer = peer_b;
     adapter.resources[resource_b].handle = .{ .id = 9, .generation = 3 };
+    const object_a: objects.Object = .{
+        .interface = &@import("core_protocol").wl_output.info,
+        .version = 4,
+        .context = &adapter.resources[resource_a],
+    };
+    try std.testing.expectEqual(
+        adapter.resources[resource_a].handle,
+        (try adapter.reference(peer_a, adapter.resources[resource_a].handle, object_a)).handle,
+    );
+    try std.testing.expectError(
+        error.ForeignResource,
+        adapter.reference(peer_b, adapter.resources[resource_a].handle, object_a),
+    );
+    try std.testing.expectError(
+        error.ForeignResource,
+        adapter.reference(peer_a, .{ .id = 9, .generation = 99 }, object_a),
+    );
     try adapter.enqueue(adapter.idFor(resource_b), .geometry);
     try adapter.enqueue(adapter.idFor(resource_a), .geometry);
     try std.testing.expectEqual(adapter.idFor(resource_a), adapter.oldestOutbound(peer_a).?.resource);

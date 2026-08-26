@@ -45,6 +45,7 @@ const protocol_fractional_scale = @import("../protocol/fractional_scale.zig");
 const protocol_color_management = @import("../protocol/color_management.zig");
 const protocol_color_representation = @import("../protocol/color_representation.zig");
 const protocol_output = @import("../protocol/output.zig");
+const protocol_xdg_output = @import("../protocol/xdg_output.zig");
 const protocol_cursor_shape = @import("../protocol/cursor_shape.zig");
 const protocol_text_input = @import("../protocol/text_input.zig");
 const cursor_theme = @import("../cursor_theme.zig");
@@ -86,6 +87,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const ColorManagementAdapter = protocol_color_management.Adapter(protocol, Adapter);
         const ColorRepresentationAdapter = protocol_color_representation.Adapter(protocol, Adapter);
         const OutputAdapter = protocol_output.Adapter(protocol);
+        const XdgOutputAdapter = protocol_xdg_output.Adapter(protocol, OutputAdapter);
         const CursorShapeAdapter = protocol_cursor_shape.Adapter(protocol);
         const TextInputAdapter = protocol_text_input.Adapter(protocol);
 
@@ -136,34 +138,35 @@ pub fn Coordinator(comptime protocol: type) type {
             }
         };
         const ProtocolReady = struct {
-            const decoration: u16 = 1 << 0;
-            const shell: u16 = 1 << 1;
-            const seat: u16 = 1 << 2;
-            const data_device: u16 = 1 << 3;
-            const dmabuf: u16 = 1 << 4;
-            const activation: u16 = 1 << 5;
-            const relative_pointer: u16 = 1 << 6;
-            const fractional_scale: u16 = 1 << 7;
-            const output: u16 = 1 << 8;
-            const core: u16 = 1 << 9;
-            const pointer_constraints: u16 = 1 << 10;
-            const color_management: u16 = 1 << 11;
-            const color_representation: u16 = 1 << 12;
-            const primary_selection: u16 = 1 << 13;
-            const text_input: u16 = 1 << 14;
-            const pointer_gestures: u16 = 1 << 15;
-            const shortcuts_inhibit: u16 = 1 << 16;
-            const xdg_foreign: u16 = 1 << 17;
-            const all: u16 = decoration | shell | seat | data_device | dmabuf |
+            const decoration: u32 = 1 << 0;
+            const shell: u32 = 1 << 1;
+            const seat: u32 = 1 << 2;
+            const data_device: u32 = 1 << 3;
+            const dmabuf: u32 = 1 << 4;
+            const activation: u32 = 1 << 5;
+            const relative_pointer: u32 = 1 << 6;
+            const fractional_scale: u32 = 1 << 7;
+            const output: u32 = 1 << 8;
+            const core: u32 = 1 << 9;
+            const pointer_constraints: u32 = 1 << 10;
+            const color_management: u32 = 1 << 11;
+            const color_representation: u32 = 1 << 12;
+            const primary_selection: u32 = 1 << 13;
+            const text_input: u32 = 1 << 14;
+            const pointer_gestures: u32 = 1 << 15;
+            const shortcuts_inhibit: u32 = 1 << 16;
+            const xdg_foreign: u32 = 1 << 17;
+            const xdg_output: u32 = 1 << 18;
+            const all: u32 = decoration | shell | seat | data_device | dmabuf |
                 activation | relative_pointer | fractional_scale | output | core |
                 pointer_constraints | color_management | color_representation |
                 primary_selection | text_input | pointer_gestures |
-                shortcuts_inhibit | xdg_foreign;
+                shortcuts_inhibit | xdg_foreign | xdg_output;
         };
         const Client = struct {
             active: bool = false,
             peer: wayring.io_uring.Peer = undefined,
-            protocol_ready: u16 = 0,
+            protocol_ready: u32 = 0,
         };
         const Candidate = struct {
             peer: ?wayring.io_uring.Peer,
@@ -263,6 +266,7 @@ pub fn Coordinator(comptime protocol: type) type {
             color_representation: protocol_color_representation.Config = .{},
             enable_color_protocols: bool = false,
             protocol_output: protocol_output.Config = .{},
+            xdg_output: protocol_xdg_output.Config = .{},
             cursor_shape: protocol_cursor_shape.Config = .{},
             cursor_cache: cursor_theme.Cache.Config = .{
                 // Every protocol shape (including the default fallback) has a slot.
@@ -341,6 +345,7 @@ pub fn Coordinator(comptime protocol: type) type {
         color_protocols_enabled: bool = false,
         color_representation_adapter: ColorRepresentationAdapter,
         output_adapter: OutputAdapter,
+        xdg_output_adapter: XdgOutputAdapter,
         cursor_shape_adapter: CursorShapeAdapter,
         cursor_cache: cursor_theme.Cache,
         themed_cursor: theme_cursor.Cursor = .{},
@@ -676,6 +681,12 @@ pub fn Coordinator(comptime protocol: type) type {
             });
             self.output_adapter = try OutputAdapter.init(allocator, config.protocol_output);
             errdefer self.output_adapter.deinit();
+            self.xdg_output_adapter = try XdgOutputAdapter.init(
+                allocator,
+                &self.output_adapter,
+                config.xdg_output,
+            );
+            errdefer self.xdg_output_adapter.deinit();
             self.cursor_cache = try cursor_theme.Cache.init(allocator, config.cursor_cache);
             errdefer self.cursor_cache.deinit();
             self.cursor_shape_adapter = try CursorShapeAdapter.init(allocator, .{
@@ -725,6 +736,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
             _ = try self.output_adapter.install(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
+            _ = try self.xdg_output_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
             _ = try self.seat_adapter.install(&root.runtime);
@@ -844,6 +858,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.cursor_shape_adapter.deinit();
             self.cursor_cache.deinit();
             self.allocator.free(self.cursor_path);
+            self.xdg_output_adapter.deinit();
             self.output_adapter.deinit();
             self.fractional_scale_adapter.deinit();
             self.color_representation_adapter.deinit();
@@ -1101,6 +1116,12 @@ pub fn Coordinator(comptime protocol: type) type {
             if (try self.pointer_constraints_adapter.request(peer, target, message, fds)) |control| {
                 if (self.pointer_constraints_adapter.pendingOutbound(peer))
                     self.markProtocol(peer, ProtocolReady.pointer_constraints);
+                try self.flushProtocol();
+                return control;
+            }
+            if (try self.xdg_output_adapter.request(peer, target, message, fds)) |control| {
+                if (self.xdg_output_adapter.pendingOutbound(peer))
+                    self.markProtocol(peer, ProtocolReady.xdg_output);
                 try self.flushProtocol();
                 return control;
             }
@@ -2061,6 +2082,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 flushed += try self.color_representation_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.output != 0)
                 flushed += try self.output_adapter.flushOn(peer, objects, &actor.transmit);
+            if (client.protocol_ready & ProtocolReady.xdg_output != 0)
+                flushed += try self.xdg_output_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.core != 0) {
                 flushed += try self.adapter.flushPresentationClockOn(peer, objects, &actor.transmit);
                 flushed += try self.adapter.flushDiscardedFeedbackOn(peer, objects, &actor.transmit);
@@ -2076,12 +2099,12 @@ pub fn Coordinator(comptime protocol: type) type {
             return null;
         }
 
-        fn markProtocol(self: *Self, peer: wayring.io_uring.Peer, ready: u16) void {
+        fn markProtocol(self: *Self, peer: wayring.io_uring.Peer, ready: u32) void {
             const client = self.clientFor(peer) orelse return;
             client.protocol_ready |= ready;
         }
 
-        fn markProtocolAll(self: *Self, ready: u16) void {
+        fn markProtocolAll(self: *Self, ready: u32) void {
             for (self.clients.items) |*client| {
                 if (client.active) client.protocol_ready |= ready;
             }
@@ -2162,6 +2185,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (ready & ProtocolReady.output != 0 and
                 !self.output_adapter.pendingOutboundOn(client.peer))
                 ready &= ~ProtocolReady.output;
+            if (ready & ProtocolReady.xdg_output != 0 and
+                !self.xdg_output_adapter.pendingOutbound(client.peer))
+                ready &= ~ProtocolReady.xdg_output;
             if (ready & ProtocolReady.core != 0 and
                 !self.adapter.pendingPresentationClock(client.peer) and
                 !self.adapter.pendingDiscardedFeedback(client.peer))
@@ -2228,7 +2254,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 connector.width_mm,
                 connector.height_mm,
             );
-            self.markProtocolAll(ProtocolReady.output);
+            self.xdg_output_adapter.publishMode();
+            self.markProtocolAll(ProtocolReady.output | ProtocolReady.xdg_output);
             self.next_output_generation = if (generation == std.math.maxInt(u32))
                 null
             else
@@ -3429,6 +3456,7 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.fractional_scale_adapter.resourceRemoved(handle, object);
             _ = self.color_management_adapter.resourceRemoved(handle, object);
             _ = self.color_representation_adapter.resourceRemoved(handle, object);
+            _ = self.xdg_output_adapter.resourceRemoved(handle, object);
             _ = self.output_adapter.resourceRemoved(handle, object);
             _ = self.cursor_shape_adapter.resourceRemoved(handle, object);
             _ = self.text_input_adapter.resourceRemoved(handle, object);
