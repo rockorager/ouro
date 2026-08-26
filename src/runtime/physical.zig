@@ -2758,7 +2758,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 } else |_| {}
             }
             const removed_subsurface = self.subcompositor_adapter.surfaceForResource(handle, &object);
-            if (removed_subsurface) |id| self.queueLayerRemoval(id);
+            if (removed_subsurface) |id| {
+                self.queueLayerRemoval(id);
+                self.interaction.surfaceDestroyed(id);
+            }
             if (removed_surface) |id| self.queueLayerRemoval(id);
             self.decoration_adapter.toplevelRemoved(handle, object);
             _ = self.shell_adapter.resourceRemoved(handle, object);

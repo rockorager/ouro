@@ -687,6 +687,7 @@ test "shell-input: synchronized subsurface publishes with parent and receives po
     try std.testing.expectEqual(@as(usize, 2), coordinator.stats.submitted);
     try std.testing.expectEqual(@as(usize, 2), coordinator.stats.presented);
     try std.testing.expectEqual(@as(usize, 0), coordinator.removed_layer_len);
+    try std.testing.expect(coordinator.seat_adapter.pointerState().focus == null);
     const root_id = try coordinator.adapter.surfaceId(handler.surfaces[0].?);
     const child_id = try coordinator.adapter.surfaceId(handler.surfaces[1].?);
     var scene_order: [2]ouro.core_surface.Adapter(protocol).SurfaceId = undefined;
