@@ -34,6 +34,16 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
 
         pub const SurfaceId = CoreSurface.SurfaceId;
         pub const LayerSurfaceId = packed struct { index: u32, generation: u32 };
+        pub const PopupAdopter = struct {
+            context: *anyopaque,
+            adopt: *const fn (
+                *anyopaque,
+                wayring.io_uring.Peer,
+                objects.Handle,
+                *const objects.Object,
+                SurfaceId,
+            ) anyerror!void,
+        };
         pub const Layer = enum(u2) { background, bottom, top, overlay };
         pub const KeyboardInteractivity = enum(u2) { none, exclusive, on_demand };
         pub const Anchor = packed struct(u8) {
@@ -124,6 +134,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
         outbound_capacity: usize,
         outbound_len: usize = 0,
         next_serial: u32,
+        popup_adopter: ?PopupAdopter = null,
 
         pub fn init(allocator: std.mem.Allocator, core: *CoreSurface, output: *OutputAdapter, config: Config) !Self {
             try config.validate();
@@ -155,6 +166,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
             errdefer self.runtime = null;
             self.global = try runtime.addGlobalWithBinder(&Manager.info, 5, self, bind);
             return self.global.?;
+        }
+
+        pub fn setPopupAdopter(self: *Self, adopter: PopupAdopter) void {
+            self.popup_adopter = adopter;
         }
 
         fn bind(context: ?*anyopaque, binding: wayring.server.Binding) !?*anyopaque {
@@ -233,7 +248,18 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
                 .set_exclusive_zone => |v| slot.pending.exclusive_zone = v.zone,
                 .set_margin => |v| slot.pending.margins = .{ .top = v.top, .right = v.right, .bottom = v.bottom, .left = v.left },
                 .set_keyboard_interactivity => |v| slot.pending.keyboard = parseKeyboard(v.keyboard_interactivity.value) catch return try self.surfaceError(actor, decoded.handle.id, LayerSurface.@"error".invalid_keyboard_interactivity.value, "invalid keyboard interactivity"),
-                .get_popup => return try self.surfaceError(actor, decoded.handle.id, LayerSurface.@"error".invalid_surface_state.value, "layer popup parenting is unsupported"),
+                .get_popup => |v| {
+                    const adopter = self.popup_adopter orelse
+                        return try self.surfaceError(actor, decoded.handle.id, LayerSurface.@"error".invalid_surface_state.value, "popup adoption unavailable");
+                    const popup_handle = server_objects.namespace.lookupHandle(v.popup) orelse
+                        return try self.surfaceError(actor, decoded.handle.id, LayerSurface.@"error".invalid_surface_state.value, "invalid popup");
+                    const popup_object = server_objects.namespace.resolve(popup_handle) orelse
+                        return try self.surfaceError(actor, decoded.handle.id, LayerSurface.@"error".invalid_surface_state.value, "invalid popup");
+                    adopter.adopt(adopter.context, peer, popup_handle, popup_object, slot.surface) catch |err| switch (err) {
+                        error.Exhausted, error.OutOfMemory => return try self.noMemory(actor),
+                        else => return try self.surfaceError(actor, decoded.handle.id, LayerSurface.@"error".invalid_surface_state.value, "invalid popup state"),
+                    };
+                },
                 .ack_configure => |v| self.ackConfigure(slot, v.serial) catch
                     return try self.surfaceError(actor, decoded.handle.id, LayerSurface.@"error".invalid_surface_state.value, "invalid configure serial"),
                 .destroy => {},

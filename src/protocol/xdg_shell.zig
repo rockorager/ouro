@@ -275,11 +275,12 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             header: Header = .{},
             xdg_surface_index: u32 = none,
             xdg_surface_generation: u32 = 0,
-            parent_surface_index: u32 = none,
-            parent_surface_generation: u32 = 0,
+            parent: ?SurfaceId = null,
+            external_parent: bool = false,
             placement: PopupPlacement = undefined,
             grabbed: bool = false,
             mapped: bool = false,
+            initial_committed: bool = false,
         };
 
         const Outbound = union(enum) {
@@ -443,6 +444,43 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             adapter.interactive_grab_validator = validator;
         }
 
+        /// Completes the protocol-defined two-request construction of a popup
+        /// whose xdg_surface.get_popup parent was null. The external parent
+        /// must belong to the requesting client and be attached before the
+        /// popup's initial wl_surface.commit.
+        pub fn adoptLayerPopup(
+            adapter: *Self,
+            peer: wayring.io_uring.Peer,
+            handle: objects.Handle,
+            object: *const objects.Object,
+            parent: SurfaceId,
+        ) !void {
+            if (object.interface != &Popup.info) return error.InvalidPopup;
+            const role = fromContext(PopupSlot, adapter.popups, object.context) orelse
+                return error.InvalidPopup;
+            if (!std.meta.eql(role.header.resource, handle) or role.parent != null or
+                role.initial_committed) return error.InvalidPopup;
+            const surface = try adapter.resolveRoleSurface(
+                role.xdg_surface_index,
+                role.xdg_surface_generation,
+            );
+            const manager = try adapter.resolveManager(
+                surface.manager_index,
+                surface.manager_generation,
+            );
+            if (!std.meta.eql(manager.peer, peer)) return error.InvalidPopup;
+            if (!adapter.canPublishWithLive(adapter.live_toplevels, adapter.live_popups))
+                return error.Exhausted;
+            try adapter.publish(.{ .popup_created = .{
+                .id = adapter.popupId(role),
+                .surface = surface.surface_id,
+                .parent = parent,
+                .placement = role.placement,
+            } });
+            role.parent = parent;
+            role.external_parent = true;
+        }
+
         fn bind(context: ?*anyopaque, binding: wayring.server.Binding) !?*anyopaque {
             const adapter: *Self = @ptrCast(@alignCast(context orelse return error.InvalidContext));
             const slot = adapter.acquireManager() catch return error.OutOfMemory;
@@ -588,6 +626,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 const surface = try adapter.core.getSurfaceById(slot.surface_id);
                 if (surface.hasPendingBufferAttachment() and slot.last_acked_serial == 0)
                     return error.UnconfiguredBuffer;
+                if (slot.role == .popup) {
+                    const popup = try adapter.resolvePopup(slot.role.popup);
+                    if (popup.parent == null) return error.PopupParentRequired;
+                }
                 if ((slot.role == .toplevel or slot.role == .popup) and
                     !adapter.canPublishWithLive(adapter.live_toplevels, adapter.live_popups))
                     return error.Exhausted;
@@ -643,6 +685,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                         const role = try adapter.resolvePopup(popup);
                         const size = (try adapter.core.getSurfaceById(slot.surface_id)).committedSize();
                         role.mapped = size.width != 0 and size.height != 0;
+                        role.initial_committed = true;
                         adapter.publishReserved(.{ .popup_commit_ready = .{
                             .id = popup,
                             .serial = slot.last_acked_serial,
@@ -1132,21 +1175,24 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                         return try adapter.invalidPositioner(actor, decoded.handle.id);
                     if (!positioner.state.configured_size or !positioner.state.configured_anchor_rect)
                         return try adapter.invalidPositioner(actor, decoded.handle.id);
-                    const parent = if (payload.parent) |parent_id|
+                    const parent: ?*SurfaceSlot = if (payload.parent) |parent_id|
                         adapter.xdgSurfaceByObject(server_objects, parent_id) catch
                             return try adapter.protocolError(actor, decoded.handle.id, WmBase.@"error".invalid_popup_parent.value, "invalid popup parent")
                     else
-                        return try adapter.protocolError(actor, decoded.handle.id, WmBase.@"error".invalid_popup_parent.value, "popup parent required");
-                    if (parent.manager_index != slot.manager_index or
+                        null;
+                    if ((parent != null and parent.?.manager_index != slot.manager_index) or
                         positioner.manager_index != slot.manager_index)
                         return try adapter.protocolError(actor, decoded.handle.id, WmBase.@"error".invalid_popup_parent.value, "cross-client popup objects");
-                    if (parent.role == .none)
+                    if (parent != null and parent.?.role == .none)
                         return try adapter.protocolError(actor, decoded.handle.id, WmBase.@"error".invalid_popup_parent.value, "popup parent has no role");
                     if (adapter.topmostPopup(slot.manager_index, slot.manager_generation)) |topmost| {
-                        const parent_is_topmost = switch (parent.role) {
-                            .popup => |id| std.meta.eql(id, adapter.popupId(topmost)),
-                            else => false,
-                        };
+                        const parent_is_topmost = if (parent) |parent_slot|
+                            switch (parent_slot.role) {
+                                .popup => |id| std.meta.eql(id, adapter.popupId(topmost)),
+                                else => false,
+                            }
+                        else
+                            false;
                         if (!parent_is_topmost)
                             return try adapter.protocolError(actor, decoded.handle.id, WmBase.@"error".not_the_topmost_popup.value, "popup parent is not topmost");
                     }
@@ -1170,16 +1216,15 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     role.header.resource = admitted.id;
                     role.xdg_surface_index = indexOf(SurfaceSlot, adapter.surfaces, slot);
                     role.xdg_surface_generation = slot.header.generation;
-                    role.parent_surface_index = indexOf(SurfaceSlot, adapter.surfaces, parent);
-                    role.parent_surface_generation = parent.header.generation;
+                    role.parent = if (parent) |parent_slot| parent_slot.surface_id else null;
                     role.placement = popupPlacement(positioner.state);
                     slot.role = .{ .popup = adapter.popupId(role) };
                     slot.had_role = true;
                     adapter.live_popups += 1;
-                    adapter.publish(.{ .popup_created = .{
+                    if (parent) |parent_slot| adapter.publish(.{ .popup_created = .{
                         .id = adapter.popupId(role),
                         .surface = slot.surface_id,
-                        .parent = parent.surface_id,
+                        .parent = parent_slot.surface_id,
                         .placement = role.placement,
                     } }) catch unreachable;
                 },
@@ -1301,19 +1346,21 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .grab => |v| {
                     if (slot.grabbed or slot.mapped or adapter.popupHasChild(slot))
                         return try adapter.protocolError(actor, decoded.handle.id, Popup.@"error".invalid_grab.value, "popup is not the topmost ungrabbed popup");
-                    const parent_surface = adapter.resolveRoleSurface(
-                        slot.parent_surface_index,
-                        slot.parent_surface_generation,
-                    ) catch return try adapter.protocolError(actor, decoded.handle.id, Popup.@"error".invalid_grab.value, "popup parent is stale");
-                    switch (parent_surface.role) {
-                        .toplevel => {},
-                        .popup => |parent| {
-                            const parent_popup = adapter.resolvePopup(parent) catch
-                                return try adapter.protocolError(actor, decoded.handle.id, Popup.@"error".invalid_grab.value, "popup parent is stale");
-                            if (!parent_popup.grabbed)
-                                return try adapter.protocolError(actor, decoded.handle.id, Popup.@"error".invalid_grab.value, "popup parent has no explicit grab");
-                        },
-                        .none => return try adapter.protocolError(actor, decoded.handle.id, Popup.@"error".invalid_grab.value, "popup parent has no role"),
+                    const parent_id = slot.parent orelse
+                        return try adapter.protocolError(actor, decoded.handle.id, Popup.@"error".invalid_grab.value, "popup parent is unset");
+                    if (!slot.external_parent) {
+                        const parent_surface = adapter.xdgSurfaceById(parent_id) orelse
+                            return try adapter.protocolError(actor, decoded.handle.id, Popup.@"error".invalid_grab.value, "popup parent is stale");
+                        switch (parent_surface.role) {
+                            .toplevel => {},
+                            .popup => |parent| {
+                                const parent_popup = adapter.resolvePopup(parent) catch
+                                    return try adapter.protocolError(actor, decoded.handle.id, Popup.@"error".invalid_grab.value, "popup parent is stale");
+                                if (!parent_popup.grabbed)
+                                    return try adapter.protocolError(actor, decoded.handle.id, Popup.@"error".invalid_grab.value, "popup parent has no explicit grab");
+                            },
+                            .none => return try adapter.protocolError(actor, decoded.handle.id, Popup.@"error".invalid_grab.value, "popup parent has no role"),
+                        }
                     }
                     const surface = adapter.resolveRoleSurface(
                         slot.xdg_surface_index,
@@ -1784,12 +1831,21 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         }
 
         fn popupHasChild(adapter: *Self, parent: *PopupSlot) bool {
+            const parent_surface = adapter.resolveRoleSurface(
+                parent.xdg_surface_index,
+                parent.xdg_surface_generation,
+            ) catch return false;
             for (adapter.popups) |popup| {
-                if (popup.header.active and
-                    popup.parent_surface_index == parent.xdg_surface_index and
-                    popup.parent_surface_generation == parent.xdg_surface_generation) return true;
+                if (popup.header.active and popup.parent != null and
+                    std.meta.eql(popup.parent.?, parent_surface.surface_id)) return true;
             }
             return false;
+        }
+
+        fn xdgSurfaceById(adapter: *Self, id: SurfaceId) ?*SurfaceSlot {
+            for (adapter.surfaces) |*surface|
+                if (surface.header.active and std.meta.eql(surface.surface_id, id)) return surface;
+            return null;
         }
 
         fn topmostPopup(adapter: *Self, manager_index: u32, manager_generation: u32) ?*PopupSlot {
@@ -3113,6 +3169,69 @@ test "xdg-shell: generated popup requests validate positioner and parent role" {
         .popup_destroyed => |value| value,
         else => return error.UnexpectedEvent,
     });
+}
+
+test "xdg-shell: null-parent popup requires layer adoption before initial commit" {
+    const context = try TestContext.init();
+    defer context.deinit();
+
+    try test_protocol.xdg_wm_base.encodeRequest(&context.requests, context.manager.id, .{
+        .get_xdg_surface = .{ .id = 14, .surface = context.core.second_handle.id },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try test_protocol.xdg_wm_base.encodeRequest(&context.requests, context.manager.id, .{
+        .create_positioner = .{ .id = 15 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try test_protocol.xdg_positioner.encodeRequest(&context.requests, 15, .{
+        .set_size = .{ .width = 120, .height = 80 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try test_protocol.xdg_positioner.encodeRequest(&context.requests, 15, .{
+        .set_anchor_rect = .{ .x = 4, .y = 5, .width = 20, .height = 30 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try test_protocol.xdg_surface.encodeRequest(&context.requests, 14, .{
+        .get_popup = .{ .id = 16, .parent = null, .positioner = 15 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try std.testing.expect(context.adapter.popEvent() == null);
+
+    const popup_surface = try context.core.surfaceId(context.core.second_handle);
+    try std.testing.expectError(
+        error.PopupParentRequired,
+        context.adapter.validateSurfaceCommit(popup_surface),
+    );
+    const popup_handle = context.server_objects.namespace.lookupHandle(16) orelse
+        return error.MissingPopup;
+    const popup_object = context.server_objects.namespace.resolve(popup_handle) orelse
+        return error.MissingPopup;
+    const layer_parent: TestAdapter.SurfaceId = .{ .index = 99, .generation = 7 };
+    try std.testing.expectError(error.InvalidPopup, context.adapter.adoptLayerPopup(
+        .{ .slot = 1, .generation = 1 },
+        popup_handle,
+        popup_object,
+        layer_parent,
+    ));
+    try context.adapter.adoptLayerPopup(
+        .{ .slot = 0, .generation = 1 },
+        popup_handle,
+        popup_object,
+        layer_parent,
+    );
+    const created = switch (context.adapter.popEvent() orelse return error.MissingEvent) {
+        .popup_created => |value| value,
+        else => return error.UnexpectedEvent,
+    };
+    try std.testing.expectEqual(popup_surface, created.surface);
+    try std.testing.expectEqual(layer_parent, created.parent);
+    try std.testing.expectError(error.InvalidPopup, context.adapter.adoptLayerPopup(
+        .{ .slot = 0, .generation = 1 },
+        popup_handle,
+        popup_object,
+        layer_parent,
+    ));
+    try context.adapter.validateSurfaceCommit(popup_surface);
 }
 
 test "xdg-shell: stale generations cannot address reused toplevel slots" {
