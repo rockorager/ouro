@@ -116,6 +116,7 @@ pub fn Desktop(comptime Shell: type) type {
             max_width: i32 = 0,
             max_height: i32 = 0,
             parent: ?ToplevelId = null,
+            initial_committed: bool = false,
             fullscreen: bool = false,
             maximized: bool = false,
             minimized: bool = false,
@@ -701,24 +702,27 @@ pub fn Desktop(comptime Shell: type) type {
                 .commit_ready => |commit| {
                     const id = try desktop.idForShell(commit.id);
                     const index = try desktop.resolveIndex(id);
-                    if (commit.constraints_changed)
+                    if (commit.constraints_changed or commit.unmapped)
                         try desktop.copyMetadata(id, try shell.metadata(commit.id));
-                    if (commit.unmapped) desktop.unmapParenting(index);
-                    const content_ready = !commit.unmapped;
-                    desktop.slots[index].content_ready = content_ready;
-                    desktop.slots[index].scene.content_ready = content_ready;
-                    desktop.slots[index].target_scene.content_ready = content_ready;
+                    if (commit.unmapped) {
+                        try desktop.resetUnmapped(index);
+                        return;
+                    }
+                    desktop.slots[index].content_ready = commit.mapped;
+                    desktop.slots[index].scene.content_ready = commit.mapped;
+                    desktop.slots[index].target_scene.content_ready = commit.mapped;
                     desktop.slots[index].target_scene.has_window_geometry = commit.has_window_geometry;
                     desktop.slots[index].target_scene.surface_offset = .{
                         .x = commit.surface_offset_x,
                         .y = commit.surface_offset_y,
                     };
+                    if (commit.initial_commit) {
+                        try desktop.beginInitialCommit(index);
+                        return;
+                    }
                     if (desktop.slots[index].expected_serial == commit.serial)
                         desktop.slots[index].configure_ready = true;
-                    if (commit.unmapped)
-                        try desktop.reflow()
-                    else
-                        desktop.publishReadyScene();
+                    desktop.publishReadyScene();
                 },
                 .toplevel_destroyed => |shell_id| try desktop.destroyShell(shell_id),
             }
@@ -738,16 +742,13 @@ pub fn Desktop(comptime Shell: type) type {
                 .id = desktop.idFor(index),
                 .surface = surface,
                 .geometry = desktop.work_area,
-                .visible = true,
+                .visible = false,
                 .stacking = 0,
                 .mode = .tiled,
                 .content_ready = false,
             };
             slot.target_scene = slot.scene;
             desktop.live += 1;
-            desktop.appendTile(index);
-            desktop.promoteFocus(index);
-            try desktop.reflow();
         }
 
         fn createPopup(desktop: *Self, value: anytype) !void {
@@ -904,6 +905,56 @@ pub fn Desktop(comptime Shell: type) type {
             try desktop.reflow();
         }
 
+        fn beginInitialCommit(desktop: *Self, index: u32) !void {
+            const slot = &desktop.slots[index];
+            if (slot.initial_committed) return;
+            const adds_layout = slot.mode == .tiled and !slot.minimized and
+                !slot.fullscreen and !slot.maximized;
+            try desktop.validateLayout(desktop.layoutCount() + @intFromBool(adds_layout), desktop.work_area);
+            try desktop.requireCommandCapacity(desktop.live);
+            slot.initial_committed = true;
+            if (slot.mode == .tiled) desktop.appendTile(index);
+            desktop.promoteFocus(index);
+            try desktop.reflow();
+            // An unmapped role has no pixels to expose, so its initial layout
+            // is a safe scene baseline. A later reflow can then retain content
+            // committed for this configure until every participant is ready.
+            slot.scene = slot.target_scene;
+        }
+
+        fn resetUnmapped(desktop: *Self, index: u32) !void {
+            const id = desktop.idFor(index);
+            const reclaimable = desktop.commandCountFor(id);
+            if (desktop.commandAvailable() + reclaimable < desktop.live - 1)
+                return error.Backpressure;
+            if (desktop.interactive_request) |request| {
+                if (std.meta.eql(request.id, id)) desktop.interactive_request = null;
+            }
+            desktop.removeCommandsFor(id);
+            desktop.removeFocus(index);
+            if (desktop.slots[index].mode == .tiled and desktop.slots[index].initial_committed)
+                desktop.removeTile(index);
+            desktop.unmapParenting(index);
+            const slot = &desktop.slots[index];
+            slot.mode = .tiled;
+            slot.floating = desktop.defaultFloating();
+            slot.fullscreen = false;
+            slot.maximized = false;
+            slot.minimized = false;
+            slot.resizing = false;
+            slot.initial_committed = false;
+            slot.configured = false;
+            slot.applied_configure = null;
+            slot.expected_serial = null;
+            slot.configure_ready = false;
+            slot.content_ready = false;
+            slot.scene.content_ready = false;
+            slot.target_scene.content_ready = false;
+            slot.scene.visible = false;
+            slot.target_scene.visible = false;
+            try desktop.reflow();
+        }
+
         fn unmapParenting(desktop: *Self, index: u32) void {
             const id = desktop.idFor(index);
             const replacement = desktop.slots[index].parent;
@@ -944,7 +995,7 @@ pub fn Desktop(comptime Shell: type) type {
             const next_fullscreen = if (state == .fullscreen) enabled else slot.fullscreen;
             const next_maximized = if (state == .maximized) enabled else slot.maximized;
             const next_minimized = if (state == .minimized) enabled else slot.minimized;
-            const will_be_eligible = slot.mode == .tiled and !next_fullscreen and
+            const will_be_eligible = slot.initial_committed and slot.mode == .tiled and !next_fullscreen and
                 !next_maximized and !next_minimized;
             if (was_eligible and !will_be_eligible) next_layout_count -= 1;
             if (!was_eligible and will_be_eligible) next_layout_count += 1;
@@ -1045,7 +1096,7 @@ pub fn Desktop(comptime Shell: type) type {
             }
 
             for (desktop.slots, 0..) |*slot, index| {
-                if (!slot.header.active) continue;
+                if (!slot.header.active or !slot.initial_committed) continue;
                 const desired = &desktop.desired[index];
                 std.debug.assert(desired.active);
                 desired.configure = .{
@@ -1162,7 +1213,7 @@ pub fn Desktop(comptime Shell: type) type {
 
         fn isLayoutEligible(desktop: *const Self, index: u32) bool {
             const slot = &desktop.slots[index];
-            return slot.mode == .tiled and !slot.minimized and
+            return slot.initial_committed and slot.mode == .tiled and !slot.minimized and
                 !slot.fullscreen and !slot.maximized;
         }
 
@@ -1614,6 +1665,8 @@ const TestShell = struct {
             surface_offset_y: i32 = 0,
             unmapped: bool = false,
             constraints_changed: bool = false,
+            initial_commit: bool = false,
+            mapped: bool = true,
         },
         popup_commit_ready: struct {
             id: PopupId,
@@ -1719,13 +1772,28 @@ fn created(index: u32) TestShell.Event {
     } };
 }
 
+fn beginInitialDesktop(desktop: *TestDesktop, shell: *TestShell) !void {
+    for (desktop.slots) |slot| {
+        if (!slot.header.active or slot.initial_committed) continue;
+        shell.push(.{ .commit_ready = .{
+            .id = slot.shell_id,
+            .serial = 0,
+            .initial_commit = true,
+            .mapped = false,
+        } });
+    }
+    _ = try desktop.consume(shell, shell.len);
+}
+
 fn settleDesktop(desktop: *TestDesktop, shell: *TestShell) !void {
+    try beginInitialDesktop(desktop, shell);
     while (desktop.pendingCommands() != 0) _ = try desktop.flushConfigure(shell);
     for (desktop.slots) |slot| {
         if (!slot.header.active) continue;
         if (slot.expected_serial) |serial| shell.push(.{ .commit_ready = .{
             .id = slot.shell_id,
             .serial = serial,
+            .mapped = true,
         } });
     }
     _ = try desktop.consume(shell, shell.len);
@@ -1742,7 +1810,7 @@ test "desktop: shell events produce exact tiling, focus, metadata, and configure
     const first = try desktop.idForShell(.{ .index = 0, .generation = 1 });
     const second = try desktop.idForShell(.{ .index = 1, .generation = 1 });
     try std.testing.expectEqual(geometry.Rect{ .x = 0, .y = 0, .width = 100, .height = 60 }, (try desktop.scene(first)).geometry);
-    try std.testing.expectEqual(@as(usize, 3), desktop.pendingCommands());
+    try std.testing.expectEqual(@as(usize, 0), desktop.pendingCommands());
     try settleDesktop(&desktop, &shell);
     try std.testing.expectEqual(geometry.Rect{ .x = 0, .y = 0, .width = 50, .height = 60 }, (try desktop.scene(first)).geometry);
     try std.testing.expectEqual(geometry.Rect{ .x = 50, .y = 0, .width = 50, .height = 60 }, (try desktop.scene(second)).geometry);
@@ -1763,6 +1831,47 @@ test "desktop: shell events produce exact tiling, focus, metadata, and configure
     try std.testing.expectEqual(@as(usize, 2), try desktop.consume(&shell, 8));
     try std.testing.expectEqualStrings("terminal", (try desktop.metadata(first)).title);
     try std.testing.expect((try desktop.scene(first)).content_ready);
+}
+
+test "desktop: initial commit gates configure and unmap requires it again" {
+    var desktop = try initTestDesktop(8);
+    defer desktop.deinit();
+    var shell = TestShell{};
+    shell.push(created(0));
+    _ = try desktop.consume(&shell, 1);
+    const id = try desktop.idForShell(.{ .index = 0, .generation = 1 });
+    try std.testing.expectEqual(@as(usize, 0), desktop.pendingCommands());
+    try std.testing.expect(desktop.focused() == null);
+    try std.testing.expect(!(try desktop.scene(id)).visible);
+
+    try beginInitialDesktop(&desktop, &shell);
+    try std.testing.expectEqual(@as(usize, 1), desktop.pendingCommands());
+    try std.testing.expectEqual(id, desktop.focused().?);
+    const serial = (try desktop.flushConfigure(&shell)).?;
+    shell.push(.{ .commit_ready = .{
+        .id = .{ .index = 0, .generation = 1 },
+        .serial = serial,
+        .mapped = true,
+    } });
+    _ = try desktop.consume(&shell, 1);
+    try std.testing.expect((try desktop.scene(id)).content_ready);
+
+    shell.push(.{ .commit_ready = .{
+        .id = .{ .index = 0, .generation = 1 },
+        .serial = 0,
+        .unmapped = true,
+        .mapped = false,
+    } });
+    _ = try desktop.consume(&shell, 1);
+    try std.testing.expect(!desktop.slots[id.index].initial_committed);
+    try std.testing.expect(!desktop.slots[id.index].configured);
+    try std.testing.expect(desktop.focused() == null);
+    try std.testing.expect(!(try desktop.scene(id)).visible);
+    try std.testing.expectEqual(@as(usize, 0), desktop.pendingCommands());
+
+    try beginInitialDesktop(&desktop, &shell);
+    try std.testing.expect(desktop.slots[id.index].initial_committed);
+    try std.testing.expectEqual(@as(usize, 1), desktop.pendingCommands());
 }
 
 test "desktop: toplevel parents preserve ancestor stacking and reparent on unmap" {
@@ -1960,6 +2069,7 @@ test "desktop: scene transaction waits for every exact configure serial" {
     shell.push(created(0));
     shell.push(created(1));
     _ = try desktop.consume(&shell, 2);
+    try beginInitialDesktop(&desktop, &shell);
 
     const first = try desktop.idForShell(.{ .index = 0, .generation = 1 });
     const second = try desktop.idForShell(.{ .index = 1, .generation = 1 });
@@ -2005,6 +2115,7 @@ test "desktop: expired transaction publishes latest target and ignores late read
     shell.push(created(0));
     shell.push(created(1));
     _ = try desktop.consume(&shell, 2);
+    try beginInitialDesktop(&desktop, &shell);
     while (desktop.pendingCommands() != 0) _ = try desktop.flushConfigure(&shell);
 
     const first = try desktop.idForShell(.{ .index = 0, .generation = 1 });
@@ -2147,9 +2258,11 @@ test "desktop: toplevel and command storage grow transactionally" {
     var shell = TestShell{};
     shell.push(created(0));
     _ = try desktop.consume(&shell, 1);
+    try beginInitialDesktop(&desktop, &shell);
     const first = desktop.focused().?;
     shell.push(created(1));
     _ = try desktop.consume(&shell, 1);
+    try beginInitialDesktop(&desktop, &shell);
     const second = desktop.focused().?;
     shell.push(created(2));
     shell.push(created(3));
@@ -2166,6 +2279,7 @@ test "desktop: shell outbound backpressure retains configure ownership" {
     var shell = TestShell{};
     shell.push(created(0));
     _ = try desktop.consume(&shell, 1);
+    try beginInitialDesktop(&desktop, &shell);
     shell.reject_configure = true;
     try std.testing.expectError(error.Exhausted, desktop.flushConfigure(&shell));
     try std.testing.expectEqual(@as(usize, 1), desktop.pendingCommands());
@@ -2182,6 +2296,7 @@ test "desktop: stale identity is rejected and exhausted generations retire" {
     desktop.slots[0].header.generation = std.math.maxInt(u32);
     shell.push(created(0));
     _ = try desktop.consume(&shell, 1);
+    try beginInitialDesktop(&desktop, &shell);
     const exhausted = desktop.focused().?;
     shell.push(.{ .toplevel_destroyed = .{ .index = 0, .generation = 1 } });
     _ = try desktop.consume(&shell, 1);
@@ -2213,6 +2328,7 @@ test "desktop: minimized and fullscreen requests update visibility and states" {
     shell.push(created(0));
     shell.push(created(1));
     _ = try desktop.consume(&shell, 2);
+    try beginInitialDesktop(&desktop, &shell);
     while (desktop.peekCommand() != null) desktop.dropCommand();
     const first = try desktop.idForShell(.{ .index = 0, .generation = 1 });
     const second = try desktop.idForShell(.{ .index = 1, .generation = 1 });

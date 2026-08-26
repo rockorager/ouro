@@ -145,6 +145,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 surface_offset_y: i32 = 0,
                 unmapped: bool = false,
                 constraints_changed: bool = false,
+                initial_commit: bool = false,
+                mapped: bool = false,
             },
             popup_commit_ready: struct {
                 id: PopupId,
@@ -264,6 +266,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             pending_max_height: i32 = 0,
             parent: ?ToplevelId = null,
             mapped: bool = false,
+            initial_committed: bool = false,
             version: u32 = 1,
             capabilities_sent: bool = false,
         };
@@ -605,18 +608,24 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 switch (slot.role) {
                     .toplevel => |toplevel| {
                         const role = try adapter.resolveToplevel(toplevel);
-                        const constraints_changed = role.min_width != role.pending_min_width or
-                            role.min_height != role.pending_min_height or
-                            role.max_width != role.pending_max_width or
-                            role.max_height != role.pending_max_height;
-                        role.min_width = role.pending_min_width;
-                        role.min_height = role.pending_min_height;
-                        role.max_width = role.pending_max_width;
-                        role.max_height = role.pending_max_height;
                         const size = (try adapter.core.getSurfaceById(slot.surface_id)).committedSize();
                         const mapped = size.width != 0 and size.height != 0;
                         const unmapped = role.mapped and !mapped;
-                        if (unmapped) adapter.unmapToplevel(toplevel);
+                        const initial_commit = !role.mapped and !role.initial_committed and !mapped;
+                        var constraints_changed = false;
+                        if (unmapped) {
+                            adapter.unmapToplevel(toplevel);
+                        } else {
+                            constraints_changed = role.min_width != role.pending_min_width or
+                                role.min_height != role.pending_min_height or
+                                role.max_width != role.pending_max_width or
+                                role.max_height != role.pending_max_height;
+                            role.min_width = role.pending_min_width;
+                            role.min_height = role.pending_min_height;
+                            role.max_width = role.pending_max_width;
+                            role.max_height = role.pending_max_height;
+                            if (initial_commit) role.initial_committed = true;
+                        }
                         role.mapped = mapped;
                         adapter.publishReserved(.{ .commit_ready = .{
                             .id = toplevel,
@@ -626,6 +635,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                             .surface_offset_y = if (slot.window_geometry) |geometry| geometry.y else 0,
                             .unmapped = unmapped,
                             .constraints_changed = constraints_changed,
+                            .initial_commit = initial_commit,
+                            .mapped = mapped,
                         } });
                     },
                     .popup => |popup| {
@@ -1580,11 +1591,29 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             const slot = adapter.resolveToplevel(id) catch return;
             const replacement = slot.parent;
             slot.parent = null;
+            slot.title_len = 0;
+            slot.app_id_len = 0;
+            slot.min_width = 0;
+            slot.min_height = 0;
+            slot.max_width = 0;
+            slot.max_height = 0;
+            slot.pending_min_width = 0;
+            slot.pending_min_height = 0;
+            slot.pending_max_width = 0;
+            slot.pending_max_height = 0;
+            slot.mapped = false;
+            slot.initial_committed = false;
+            slot.capabilities_sent = false;
             for (adapter.toplevels) |child| {
                 if (!child.header.active or child.parent == null or
                     !std.meta.eql(child.parent.?, id)) continue;
                 child.parent = replacement;
             }
+            if (adapter.resolveRoleSurface(slot.xdg_surface_index, slot.xdg_surface_generation)) |surface| {
+                surface.last_acked_serial = 0;
+            } else |_| {}
+            adapter.dropOutstanding(slot.xdg_surface_index, slot.xdg_surface_generation);
+            adapter.dropOutboundToplevel(id);
         }
 
         fn abandonToplevel(adapter: *Self, index: u32) void {
@@ -2581,6 +2610,85 @@ test "xdg-shell: pre-v5 toplevel configure omits wm capabilities" {
     const message = (try wayring.wire.Message.decode(snapshot.first)).?;
     const event = try test_protocol.xdg_toplevel.decodeEvent(message, &context.received_fds);
     try std.testing.expectEqual(@as(i32, 80), event.configure.width);
+}
+
+test "xdg-shell: unmap resets role state and requires a fresh initial commit" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const id = try context.createToplevel();
+    const surface_id = context.adapter.surfaces[0].surface_id;
+    const role = context.adapter.toplevels[id.index];
+    try std.testing.expect(!role.initial_committed);
+    try std.testing.expectEqual(@as(usize, 0), context.adapter.pendingOutbound());
+
+    try context.adapter.validateSurfaceCommit(surface_id);
+    _ = try context.core.state.commit();
+    try context.adapter.publishSurfaceCommitted(surface_id);
+    const initial = switch (context.adapter.popEvent().?) {
+        .commit_ready => |value| value,
+        else => return error.UnexpectedEvent,
+    };
+    try std.testing.expect(initial.initial_commit);
+    try std.testing.expect(!initial.mapped);
+    try std.testing.expect(role.initial_committed);
+
+    context.adapter.surfaces[0].last_acked_serial = 1;
+    try context.core.state.attach(6, .{
+        .handle = .{ .id = 30, .generation = 1 },
+        .width = 80,
+        .height = 60,
+    }, 0, 0);
+    try context.adapter.validateSurfaceCommit(surface_id);
+    _ = try context.core.state.commit();
+    try context.adapter.publishSurfaceCommitted(surface_id);
+    const mapped = switch (context.adapter.popEvent().?) {
+        .commit_ready => |value| value,
+        else => return error.UnexpectedEvent,
+    };
+    try std.testing.expect(mapped.mapped);
+
+    @memcpy(role.title[0..5], "title");
+    role.title_len = 5;
+    @memcpy(role.app_id[0..3], "app");
+    role.app_id_len = 3;
+    role.min_width = 10;
+    role.pending_min_width = 10;
+    _ = try context.adapter.queueToplevelConfigure(id, .{ .width = 70, .height = 50 });
+    try std.testing.expectEqual(@as(usize, 1), context.adapter.pendingOutbound());
+
+    try context.core.state.attach(6, null, 0, 0);
+    try context.adapter.validateSurfaceCommit(surface_id);
+    _ = try context.core.state.commit();
+    try context.adapter.publishSurfaceCommitted(surface_id);
+    const unmapped = switch (context.adapter.popEvent().?) {
+        .commit_ready => |value| value,
+        else => return error.UnexpectedEvent,
+    };
+    try std.testing.expect(unmapped.unmapped);
+    try std.testing.expect(!role.mapped);
+    try std.testing.expect(!role.initial_committed);
+    try std.testing.expectEqual(@as(usize, 0), role.title_len);
+    try std.testing.expectEqual(@as(usize, 0), role.app_id_len);
+    try std.testing.expectEqual(@as(i32, 0), role.min_width);
+    try std.testing.expectEqual(@as(u32, 0), context.adapter.surfaces[0].last_acked_serial);
+    try std.testing.expectEqual(@as(usize, 0), context.adapter.pendingOutbound());
+
+    try context.core.state.attach(6, .{
+        .handle = .{ .id = 30, .generation = 1 },
+        .width = 80,
+        .height = 60,
+    }, 0, 0);
+    try std.testing.expectError(error.UnconfiguredBuffer, context.adapter.validateSurfaceCommit(surface_id));
+    try context.core.state.attach(6, null, 0, 0);
+    try context.adapter.validateSurfaceCommit(surface_id);
+    _ = try context.core.state.commit();
+    try context.adapter.publishSurfaceCommitted(surface_id);
+    const remap_initial = switch (context.adapter.popEvent().?) {
+        .commit_ready => |value| value,
+        else => return error.UnexpectedEvent,
+    };
+    try std.testing.expect(remap_initial.initial_commit);
+    try std.testing.expect(!remap_initial.mapped);
 }
 
 test "xdg-shell: commit event storage grows before core mutation" {
