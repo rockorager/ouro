@@ -51,6 +51,7 @@ pub const xdg_activation = @import("protocol/xdg_activation.zig");
 pub const xdg_decoration = @import("protocol/xdg_decoration.zig");
 pub const relative_pointer = @import("protocol/relative_pointer.zig");
 pub const pointer_gestures = @import("protocol/pointer_gestures.zig");
+pub const tablet_v2 = @import("protocol/tablet_v2.zig");
 pub const idle_inhibit = @import("protocol/idle_inhibit.zig");
 pub const idle_notify = @import("protocol/idle_notify.zig");
 pub const keyboard_shortcuts_inhibit = @import("protocol/keyboard_shortcuts_inhibit.zig");
@@ -124,6 +125,7 @@ test {
     _ = xdg_decoration;
     _ = relative_pointer;
     _ = pointer_gestures;
+    _ = tablet_v2;
     _ = idle_inhibit;
     _ = idle_notify;
     _ = keyboard_shortcuts_inhibit;
