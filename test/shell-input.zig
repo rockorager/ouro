@@ -399,7 +399,10 @@ test "shell-input: security context filters nested manager before registry disco
         _ = try loop.turn(coordinator);
         if (parent_handler.security_manager != null and
             parent_handler.ext_data_control_global_seen and
-            parent_handler.wlr_data_control_global_seen) break;
+            parent_handler.wlr_data_control_global_seen and
+            parent_handler.input_method_global_seen and
+            parent_handler.virtual_keyboard_global_seen and
+            parent_handler.virtual_pointer_global_seen) break;
         _ = linux.sched_yield();
     }
     try std.testing.expect(parent_handler.security_manager != null);
@@ -1486,6 +1489,106 @@ test "shell-input: layer surface adopts and presents an xdg popup" {
     var drained = false;
     for (0..256) |_| {
         client_progress = try drainLayerPopupClient(&client_reactor, &driver, &handler);
+        const progress = try loop.turn(coordinator);
+        drained = progress.wayring.shutdown_complete and client_progress.quiescent and
+            coordinator.backendDrainComplete();
+        if (drained) break;
+        if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, client_reactor.ring);
+    }
+    try std.testing.expect(drained);
+    try client.deinit(allocator);
+    client_reactor.deinit(allocator);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
+test "shell-input: screencopy captures clipped output into writable SHM" {
+    const allocator = std.testing.allocator;
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-screencopy-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+
+    var fixture = try physical_fixture.Fixture.init();
+    defer fixture.deinit();
+    var root_config = physical_fixture.compositorConfig();
+    root_config.runtime.object_capacity = 24;
+    root_config.runtime.object_quota = 24;
+    const root = try Compositor.create(
+        allocator,
+        try wayring.unix_socket.listen(path, 1),
+        root_config,
+    );
+    var config = physical_fixture.coordinatorConfig();
+    config.router_capacity = 24;
+    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), config);
+    var loop = try Loop.init(
+        allocator,
+        root,
+        &coordinator.router,
+        &coordinator.timers,
+        coordinator,
+        .{ .completion_batch = 16 },
+    );
+    try coordinator.start(&loop);
+
+    var client_reactor: wayring.io_uring.Reactor = undefined;
+    try client_reactor.initOwned(
+        allocator,
+        .{ .entries = 16, .flags = 0 },
+        physical_fixture.clientReactorConfig(),
+    );
+    var client = try ClientConnection.attach(
+        allocator,
+        &client_reactor,
+        try wayring.unix_socket.connect(path),
+        .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 },
+        .{ .max_objects = 16, .max_client_ids = 15 },
+    );
+    const actor = try client.actor();
+    var driver = ClientDriver.init(&client);
+    const registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null);
+    var handler: ScreencopyHandler = .{
+        .objects = &client.objects,
+        .queue = &actor.transmit,
+        .registry = registry,
+    };
+    defer {
+        if (handler.read_fd >= 0) _ = linux.close(handler.read_fd);
+    }
+    try submitClient(&client_reactor, &driver, &handler);
+
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    var client_progress: ClientDriver.Progress = .{};
+    for (0..512) |_| {
+        client_progress = try drainClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.ready) break;
+        if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, client_reactor.ring);
+    }
+    try std.testing.expect(handler.ready);
+    try std.testing.expect(!handler.failed);
+    try std.testing.expectEqual(@as(usize, 1), handler.buffer_events);
+    try std.testing.expectEqual(@as(usize, 1), handler.buffer_done_events);
+    try std.testing.expectEqual(@as(usize, 1), handler.flags_events);
+    try std.testing.expectEqual(@as(usize, 1), handler.damage_events);
+    try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+    var captured: [4]u8 = undefined;
+    const read = linux.pread(handler.read_fd, &captured, captured.len, 0);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(read));
+    try std.testing.expectEqual(@as(usize, captured.len), read);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0xff }, &captured);
+
+    coordinator.disconnected(coordinator.peer.?);
+    _ = try client.prepareClose();
+    try submitClient(&client_reactor, &driver, &handler);
+    var drained = false;
+    for (0..256) |_| {
+        client_progress = try drainClient(&client_reactor, &driver, &handler);
         const progress = try loop.turn(coordinator);
         drained = progress.wayring.shutdown_complete and client_progress.quiescent and
             coordinator.backendDrainComplete();
@@ -2684,6 +2787,166 @@ const MultiHandler = struct {
         for (handles, 0..) |handle, index|
             if (handle != null and handle.?.id == object_id) return index;
         return null;
+    }
+};
+
+const ScreencopyHandler = struct {
+    objects: *wayring.objects.ClientObjects,
+    queue: *wayring.tx.Queue,
+    registry: wayring.objects.Handle,
+    shm: ?wayring.objects.Handle = null,
+    output: ?wayring.objects.Handle = null,
+    manager: ?wayring.objects.Handle = null,
+    frame: ?wayring.objects.Handle = null,
+    buffer: ?wayring.objects.Handle = null,
+    read_fd: linux.fd_t = -1,
+    output_ready: bool = false,
+    capture_requested: bool = false,
+    copy_requested: bool = false,
+    ready: bool = false,
+    failed: bool = false,
+    buffer_events: usize = 0,
+    buffer_done_events: usize = 0,
+    flags_events: usize = 0,
+    damage_events: usize = 0,
+    event_failures: usize = 0,
+
+    pub fn eventError(
+        self: *ScreencopyHandler,
+        _: wayring.io_uring.Peer,
+        _: ClientCore.EventFailure,
+    ) void {
+        self.event_failures += 1;
+    }
+
+    pub fn event(
+        self: *ScreencopyHandler,
+        target: wayring.objects.Dispatch,
+        message: wayring.wire.Message,
+        fds: *wayring.ancillary.FdQueue,
+    ) !wayring.dispatch.Control {
+        if (target.object.interface == &ClientCore.Registry.info) {
+            switch (try ClientCore.decodeRegistryEvent(self.objects, self.registry, message, fds)) {
+                .global => |value| try self.bindGlobal(value),
+                .global_remove => {},
+            }
+            try self.maybeCapture();
+        } else if (target.object.interface == &protocol.wl_shm.info) {
+            _ = try protocol.wl_shm.decodeEvent(message, fds);
+        } else if (target.object.interface == &protocol.wl_output.info) {
+            switch (try protocol.wl_output.decodeEvent(message, fds)) {
+                .done => {
+                    self.output_ready = true;
+                    try self.maybeCapture();
+                },
+                else => {},
+            }
+        } else if (target.object.interface == &protocol.zwlr_screencopy_frame_v1.info) {
+            switch (try protocol.zwlr_screencopy_frame_v1.decodeEvent(message, fds)) {
+                .buffer => |value| {
+                    try std.testing.expectEqual(protocol.wl_shm.format.xrgb8888.value, value.format.value);
+                    try std.testing.expectEqual(@as(u32, 1), value.width);
+                    try std.testing.expectEqual(@as(u32, 1), value.height);
+                    try std.testing.expectEqual(@as(u32, 4), value.stride);
+                    self.buffer_events += 1;
+                },
+                .buffer_done => {
+                    self.buffer_done_events += 1;
+                    try self.requestCopy();
+                },
+                .flags => |value| {
+                    try std.testing.expectEqual(@as(u32, 0), value.flags.value);
+                    self.flags_events += 1;
+                },
+                .damage => |value| {
+                    try std.testing.expectEqual(@as(u32, 0), value.x);
+                    try std.testing.expectEqual(@as(u32, 0), value.y);
+                    try std.testing.expectEqual(@as(u32, 1), value.width);
+                    try std.testing.expectEqual(@as(u32, 1), value.height);
+                    self.damage_events += 1;
+                },
+                .ready => self.ready = true,
+                .failed => self.failed = true,
+                .linux_dmabuf => return error.UnexpectedDmabufCapture,
+            }
+        } else if (target.object.interface == &ClientCore.Display.info) {
+            switch (try ClientCore.decodeDisplayEvent(self.objects, message, fds)) {
+                .delete_id => {},
+                .@"error" => return error.ServerProtocolError,
+            }
+        } else return error.UnexpectedEvent;
+        return .continue_dispatch;
+    }
+
+    fn bindGlobal(self: *ScreencopyHandler, value: anytype) !void {
+        if (std.mem.eql(u8, value.interface, protocol.wl_shm.info.name))
+            self.shm = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_shm.info, @min(value.version, 2), null);
+        if (std.mem.eql(u8, value.interface, protocol.wl_output.info.name))
+            self.output = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_output.info, @min(value.version, 4), null);
+        if (std.mem.eql(u8, value.interface, protocol.zwlr_screencopy_manager_v1.info.name))
+            self.manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.zwlr_screencopy_manager_v1.info, @min(value.version, 3), null);
+    }
+
+    fn maybeCapture(self: *ScreencopyHandler) !void {
+        if (self.capture_requested or !self.output_ready or self.manager == null or
+            self.output == null or self.shm == null) return;
+        self.frame = (try protocol.zwlr_screencopy_manager_v1.construct_capture_output_region(
+            self.objects,
+            self.queue,
+            self.manager.?,
+            .{
+                .overlay_cursor = 0,
+                .output = self.output.?.id,
+                .x = 1,
+                .y = 0,
+                .width = 1,
+                .height = 1,
+            },
+        )).frame;
+        self.capture_requested = true;
+    }
+
+    fn requestCopy(self: *ScreencopyHandler) !void {
+        if (self.copy_requested) return;
+        const descriptor = try ordinaryMemfd(4, 0, &.{ 0x55, 0x55, 0x55, 0x55 });
+        const retained = linux.fcntl(descriptor, linux.F.DUPFD_CLOEXEC, 0);
+        if (linux.errno(retained) != .SUCCESS) return error.DuplicateFailed;
+        self.read_fd = @intCast(retained);
+        errdefer {
+            _ = linux.close(self.read_fd);
+            self.read_fd = -1;
+        }
+        const pool = try protocol.wl_shm.construct_create_pool(
+            self.objects,
+            self.queue,
+            self.shm.?,
+            .{ .fd = descriptor, .size = 4 },
+        );
+        self.buffer = (try protocol.wl_shm_pool.construct_create_buffer(
+            self.objects,
+            self.queue,
+            pool.id,
+            .{
+                .offset = 0,
+                .width = 1,
+                .height = 1,
+                .stride = 4,
+                .format = .xrgb8888,
+            },
+        )).id;
+        try wayring.client.sendRequest(
+            protocol.wl_shm_pool,
+            self.objects,
+            self.queue,
+            pool.id,
+            .{ .destroy = .{} },
+        );
+        try protocol.zwlr_screencopy_frame_v1.encodeRequest(
+            self.queue,
+            self.frame.?.id,
+            .{ .copy_with_damage = .{ .buffer = self.buffer.?.id } },
+        );
+        self.copy_requested = true;
     }
 };
 

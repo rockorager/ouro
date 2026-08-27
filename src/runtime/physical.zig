@@ -66,6 +66,7 @@ const protocol_text_input = @import("../protocol/text_input.zig");
 const protocol_tablet_v2 = @import("../protocol/tablet_v2.zig");
 const protocol_virtual_keyboard = @import("../protocol/virtual_keyboard.zig");
 const protocol_virtual_pointer = @import("../protocol/virtual_pointer.zig");
+const protocol_wlr_screencopy = @import("../protocol/wlr_screencopy.zig");
 const cursor_theme = @import("../cursor_theme.zig");
 const theme_cursor = @import("../scene/theme_cursor.zig");
 const desktop_model = @import("../desktop/model.zig");
@@ -124,6 +125,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const InputMethodAdapter = protocol_input_method.Adapter(protocol, TextInputAdapter);
         const VirtualKeyboardAdapter = protocol_virtual_keyboard.Adapter(protocol, SeatAdapter);
         const VirtualPointerAdapter = protocol_virtual_pointer.Adapter(protocol);
+        const ScreencopyAdapter = protocol_wlr_screencopy.Adapter(protocol);
         const TabletState = tablet_input.State(SeatAdapter.FocusTarget);
         const TabletAdapter = protocol_tablet_v2.Adapter(protocol, SeatAdapter);
 
@@ -133,6 +135,17 @@ pub fn Coordinator(comptime protocol: type) type {
             handle: wayring.objects.Handle,
             id: Adapter.SurfaceId,
             commits: usize,
+        };
+        const PendingScreencopy = struct {
+            frame: ScreencopyAdapter.FrameId,
+            peer: wayring.io_uring.Peer,
+            pin: wayring.shm.Store.Pin,
+            region: ScreencopyAdapter.Region,
+            full_stride: u32,
+            overlay_cursor: bool,
+            awaiting_output: bool = false,
+            copied: bool = false,
+            success: bool = false,
         };
         const SurfaceScene = struct {
             root: Desktop.SceneWindow,
@@ -208,12 +221,14 @@ pub fn Coordinator(comptime protocol: type) type {
             const ext_data_control: u32 = 1 << 23;
             const wlr_data_control: u32 = 1 << 24;
             const input_method: u32 = 1 << 25;
+            const screencopy: u32 = 1 << 26;
             const all: u32 = decoration | shell | seat | data_device | dmabuf |
                 activation | relative_pointer | fractional_scale | output | core |
                 pointer_constraints | color_management | color_representation |
                 primary_selection | text_input | pointer_gestures |
                 shortcuts_inhibit | xdg_foreign | xdg_output | layer_shell | session_lock |
-                idle_notify | tablet | ext_data_control | wlr_data_control | input_method;
+                idle_notify | tablet | ext_data_control | wlr_data_control | input_method |
+                screencopy;
         };
         const Client = struct {
             active: bool = false,
@@ -315,6 +330,7 @@ pub fn Coordinator(comptime protocol: type) type {
             input_method: protocol_input_method.Config = .{},
             virtual_keyboard: protocol_virtual_keyboard.Config = .{},
             virtual_pointer: protocol_virtual_pointer.Config = .{},
+            wlr_screencopy: protocol_wlr_screencopy.Config = .{},
             linux_dmabuf: protocol_linux_dmabuf.Config = .{},
             linux_drm_syncobj: protocol_linux_drm_syncobj.Config = .{},
             xdg_activation: protocol_xdg_activation.Config = .{},
@@ -414,6 +430,7 @@ pub fn Coordinator(comptime protocol: type) type {
         input_method_adapter: InputMethodAdapter,
         virtual_keyboard_adapter: VirtualKeyboardAdapter,
         virtual_pointer_adapter: VirtualPointerAdapter,
+        screencopy_adapter: ScreencopyAdapter,
         dmabuf_adapter: DmabufAdapter,
         syncobj_device: ?drm_syncobj.Device = null,
         syncobj_adapter: ?SyncobjAdapter = null,
@@ -447,6 +464,8 @@ pub fn Coordinator(comptime protocol: type) type {
         themed_cursor: theme_cursor.Cursor = .{},
         themed_cursor_previous: ?damage.SurfaceState = null,
         client_cursor_hidden_previous: ?damage.SurfaceState = null,
+        screencopy_bytes: []u8,
+        pending_screencopy: ?PendingScreencopy = null,
         cursor_path: []u8,
         cursor_directory_len: usize,
         cursor_size: u32,
@@ -656,6 +675,9 @@ pub fn Coordinator(comptime protocol: type) type {
             self.themed_cursor = .{};
             self.themed_cursor_previous = null;
             self.client_cursor_hidden_previous = null;
+            self.screencopy_bytes = try allocator.alloc(u8, 0);
+            errdefer allocator.free(self.screencopy_bytes);
+            self.pending_screencopy = null;
             self.output_drain_started = false;
             self.stopping = false;
             self.session_disable_pending = false;
@@ -909,6 +931,16 @@ pub fn Coordinator(comptime protocol: type) type {
             });
             self.output_adapter = try OutputAdapter.init(allocator, config.protocol_output);
             errdefer self.output_adapter.deinit();
+            self.screencopy_adapter = try ScreencopyAdapter.init(allocator, config.wlr_screencopy);
+            errdefer self.screencopy_adapter.deinit();
+            self.screencopy_adapter.setOutputValidator(.{
+                .context = self,
+                .validateFn = validateScreencopyOutput,
+            });
+            self.screencopy_adapter.setBufferValidator(.{
+                .context = self,
+                .validateFn = validateScreencopyBuffer,
+            });
             self.xdg_output_adapter = try XdgOutputAdapter.init(
                 allocator,
                 &self.output_adapter,
@@ -1006,6 +1038,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
             _ = try self.output_adapter.install(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
+            _ = try self.screencopy_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
             _ = try self.xdg_output_adapter.install(&root.runtime);
@@ -1130,6 +1165,7 @@ pub fn Coordinator(comptime protocol: type) type {
 
         pub fn backendDrainComplete(self: *const Self) bool {
             return self.stopping and self.output == null and
+                self.pending_screencopy == null and
                 (self.input == null or self.input.?.drainComplete()) and
                 self.session.drainComplete() and self.timers.idle() and
                 self.icc_poll == null and !self.icc_poll_canceling and
@@ -1174,9 +1210,11 @@ pub fn Coordinator(comptime protocol: type) type {
             self.cursor_shape_adapter.deinit();
             self.cursor_cache.deinit();
             self.allocator.free(self.cursor_path);
+            self.allocator.free(self.screencopy_bytes);
             self.session_lock_adapter.deinit();
             self.layer_shell_adapter.deinit();
             self.xdg_output_adapter.deinit();
+            self.screencopy_adapter.deinit();
             self.output_adapter.deinit();
             self.fractional_scale_adapter.deinit();
             self.alpha_modifier_adapter.deinit();
@@ -1259,6 +1297,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.input_method_adapter.disconnected(peer);
             self.virtual_keyboard_adapter.disconnected(peer);
             self.virtual_pointer_adapter.disconnected(peer);
+            self.screencopy_adapter.disconnected(peer);
             self.processVirtualPointerEvents() catch {};
             self.text_input_adapter.disconnected(peer);
             self.primary_selection_adapter.disconnected(peer);
@@ -1563,6 +1602,13 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (self.session_lock_adapter.pendingOutbound(peer))
                     self.markProtocol(peer, ProtocolReady.session_lock);
                 try self.sessionLockChanged();
+                try self.flushProtocol();
+                return control;
+            }
+            if (try self.screencopy_adapter.request(peer, target, message, fds)) |control| {
+                if (self.screencopy_adapter.pendingOutbound(peer))
+                    self.markProtocol(peer, ProtocolReady.screencopy);
+                try self.processScreencopyCaptures();
                 try self.flushProtocol();
                 return control;
             }
@@ -3013,6 +3059,34 @@ pub fn Coordinator(comptime protocol: type) type {
             return true;
         }
 
+        fn validateScreencopyOutput(
+            context: ?*anyopaque,
+            peer: wayring.io_uring.Peer,
+            handle: wayring.objects.Handle,
+            object: wayring.objects.Object,
+        ) bool {
+            const self: *Self = @ptrCast(@alignCast(context orelse return false));
+            _ = self.output_adapter.reference(peer, handle, object) catch return false;
+            return self.output != null;
+        }
+
+        fn validateScreencopyBuffer(
+            context: ?*anyopaque,
+            _: wayring.io_uring.Peer,
+            _: wayring.objects.Handle,
+            object: wayring.objects.Object,
+            width: u32,
+            height: u32,
+            stride: u32,
+        ) bool {
+            const self: *Self = @ptrCast(@alignCast(context orelse return false));
+            const token = self.shm.bufferToken(&object) orelse return false;
+            const info = self.shm.store.bufferInfo(token) catch return false;
+            return info.width == width and info.height == height and
+                info.stride == stride and
+                info.format.value == protocol.wl_shm.format.xrgb8888.value;
+        }
+
         fn validateGesturePointer(
             context: ?*anyopaque,
             peer: wayring.io_uring.Peer,
@@ -3326,6 +3400,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 flushed += try self.color_management_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.color_representation != 0)
                 flushed += try self.color_representation_adapter.flushOn(peer, objects, &actor.transmit);
+            if (client.protocol_ready & ProtocolReady.screencopy != 0)
+                flushed += try self.screencopy_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.output != 0)
                 flushed += try self.output_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.xdg_output != 0)
@@ -3468,6 +3544,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (ready & ProtocolReady.color_representation != 0 and
                 !self.color_representation_adapter.pendingOutbound(client.peer))
                 ready &= ~ProtocolReady.color_representation;
+            if (ready & ProtocolReady.screencopy != 0 and
+                !self.screencopy_adapter.pendingOutbound(client.peer))
+                ready &= ~ProtocolReady.screencopy;
             if (ready & ProtocolReady.output != 0 and
                 !self.output_adapter.pendingOutboundOn(client.peer))
                 ready &= ~ProtocolReady.output;
@@ -3549,6 +3628,24 @@ pub fn Coordinator(comptime protocol: type) type {
                 try std.math.mul(u32, mode.vrefresh, 1000),
                 connector.width_mm,
                 connector.height_mm,
+            );
+            const screencopy_stride = try std.math.mul(
+                u32,
+                self.output.?.planner.output.width,
+                4,
+            );
+            const screencopy_bytes = try std.math.mul(
+                usize,
+                screencopy_stride,
+                self.output.?.planner.output.height,
+            );
+            self.screencopy_bytes = try self.allocator.realloc(
+                self.screencopy_bytes,
+                screencopy_bytes,
+            );
+            try self.screencopy_adapter.publishMode(
+                self.output.?.planner.output.width,
+                self.output.?.planner.output.height,
             );
             self.xdg_output_adapter.publishMode();
             try self.recomputeLayerConfigures();
@@ -4198,6 +4295,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.frame_changes[change_count] = .{ .previous = removed.state };
                 change_count += 1;
             }
+            const cursor_start = sample_count;
             if (!self.sessionLockActive() and self.cursor_layer.active and
                 self.themed_cursor.image == null)
             {
@@ -4253,18 +4351,52 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.frame_changes[change_count] = .{ .previous = previous };
                 change_count += 1;
             }
+            const capture_request: ?output_api.CaptureRequest = if (self.pending_screencopy) |pending|
+                if (pending.awaiting_output) .{
+                    .token = frameToken(pending.frame),
+                    .cursor_start = cursor_start,
+                    .overlay_cursor = pending.overlay_cursor,
+                    .bytes = self.screencopy_bytes,
+                    .stride = pending.full_stride,
+                } else null
+            else
+                null;
             if (sample_count == 0 and change_count == 0) {
-                const result = try output.renderFrame(frame, &.{}, &.{}, &.{}, try monotonicNs());
-                if (result == .retired) try self.finishOutcome(result.retired.frame, false);
+                const result = if (capture_request) |capture|
+                    output.renderFrameCapture(frame, &.{}, &.{}, &.{}, try monotonicNs(), capture)
+                else
+                    output.renderFrame(frame, &.{}, &.{}, &.{}, try monotonicNs());
+                const rendered = result catch |cause| {
+                    if (capture_request != null) try self.finishScreencopy(false, 0);
+                    return cause;
+                };
+                if (rendered == .retired) {
+                    if (capture_request != null) try self.finishScreencopy(false, 0);
+                    try self.finishOutcome(rendered.retired.frame, false);
+                }
                 return;
             }
-            const render_result = try output.renderFrame(
-                frame,
-                self.frame_samples[0..sample_count],
-                self.frame_changes[0..change_count],
-                self.frame_bindings[0..sample_count],
-                try monotonicNs(),
-            );
+            const result = if (capture_request) |capture|
+                output.renderFrameCapture(
+                    frame,
+                    self.frame_samples[0..sample_count],
+                    self.frame_changes[0..change_count],
+                    self.frame_bindings[0..sample_count],
+                    try monotonicNs(),
+                    capture,
+                )
+            else
+                output.renderFrame(
+                    frame,
+                    self.frame_samples[0..sample_count],
+                    self.frame_changes[0..change_count],
+                    self.frame_bindings[0..sample_count],
+                    try monotonicNs(),
+                );
+            const render_result = result catch |cause| {
+                if (capture_request != null) try self.finishScreencopy(false, 0);
+                return cause;
+            };
             switch (render_result) {
                 .submitted => {
                     self.adapter.clearFifoBarriers();
@@ -4276,6 +4408,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     _ = try self.retryRetainedOutcomes();
                 },
                 .retired => |failure| {
+                    if (capture_request != null) try self.finishScreencopy(false, 0);
                     self.adapter.clearFifoBarriers();
                     try self.finishOutcome(failure.frame, false);
                 },
@@ -4428,7 +4561,9 @@ pub fn Coordinator(comptime protocol: type) type {
                 .context = self,
                 .presented_fn = presented,
                 .retired_fn = retired,
+                .captured_fn = captured,
             });
+            try self.processScreencopyCaptures();
         }
 
         fn presented(context: *anyopaque, outcome: output_api.FrameOutcome, callback_data: u32) !void {
@@ -4442,6 +4577,126 @@ pub fn Coordinator(comptime protocol: type) type {
             const self: *Self = @ptrCast(@alignCast(context));
             try self.finishOutcome(outcome, false);
             try self.scheduleClients();
+        }
+
+        fn captured(context: *anyopaque, token: u64, success: bool, timestamp_ns: u64) !void {
+            const self: *Self = @ptrCast(@alignCast(context));
+            const pending = self.pending_screencopy orelse return error.InvalidCaptureToken;
+            if (token != frameToken(pending.frame)) return error.InvalidCaptureToken;
+            try self.finishScreencopy(success, timestamp_ns);
+            try self.scheduleClients();
+        }
+
+        fn processScreencopyCaptures(self: *Self) !void {
+            if (self.pending_screencopy) |pending| {
+                if (!pending.awaiting_output) try self.finishScreencopy(false, 0);
+                return;
+            }
+            const output = self.output orelse return;
+            const pending_capture = self.screencopy_adapter.peekCapture() orelse return;
+            const capture = pending_capture.*;
+            const server_objects = self.root.runtime.clients.get(capture.peer) catch {
+                try self.failQueuedScreencopy(capture);
+                return;
+            };
+            const object = server_objects.namespace.resolve(capture.buffer) orelse {
+                try self.failQueuedScreencopy(capture);
+                return;
+            };
+            const token = self.shm.bufferToken(object) orelse {
+                try self.failQueuedScreencopy(capture);
+                return;
+            };
+            const pin = self.shm.store.pin(token) catch {
+                try self.failQueuedScreencopy(capture);
+                return;
+            };
+            const full_stride = std.math.mul(u32, output.planner.output.width, 4) catch {
+                self.shm.store.unpin(pin) catch unreachable;
+                try self.failQueuedScreencopy(capture);
+                return;
+            };
+            self.pending_screencopy = .{
+                .frame = capture.frame,
+                .peer = capture.peer,
+                .pin = pin,
+                .region = capture.region,
+                .full_stride = full_stride,
+                .overlay_cursor = capture.overlay_cursor,
+            };
+            self.screencopy_adapter.dropCapture();
+            output.request(.damage, try monotonicNs()) catch {
+                try self.finishScreencopy(false, 0);
+                return;
+            };
+            self.pending_screencopy.?.awaiting_output = true;
+            try self.armTimer();
+        }
+
+        fn failQueuedScreencopy(self: *Self, capture: ScreencopyAdapter.Capture) !void {
+            self.screencopy_adapter.failCapture(capture.frame) catch |cause| switch (cause) {
+                error.StaleFrame, error.InvalidCompletion => return,
+                else => return cause,
+            };
+            self.markProtocol(capture.peer, ProtocolReady.screencopy);
+        }
+
+        fn finishScreencopy(self: *Self, output_success: bool, timestamp_ns: u64) !void {
+            const pending = &(self.pending_screencopy orelse return error.MissingCapture);
+            if (!pending.copied) {
+                pending.success = false;
+                if (output_success) {
+                    if (self.copyScreencopy(pending)) |_| {
+                        pending.success = true;
+                    } else |_| {}
+                }
+                self.shm.store.unpin(pending.pin) catch |cause| switch (cause) {
+                    error.StalePin => {},
+                    else => return cause,
+                };
+                pending.copied = true;
+            }
+            self.markProtocol(pending.peer, ProtocolReady.screencopy);
+            self.screencopy_adapter.complete(
+                pending.frame,
+                if (pending.success) timestamp_ns else null,
+            ) catch |cause| switch (cause) {
+                error.StaleFrame, error.InvalidCompletion => {
+                    self.pending_screencopy = null;
+                    return;
+                },
+                else => return cause,
+            };
+            self.pending_screencopy = null;
+        }
+
+        fn copyScreencopy(self: *Self, pending: *const PendingScreencopy) !void {
+            var access = try self.shm.store.writeAccess(pending.pin);
+            var ended = false;
+            defer if (!ended) access.end() catch {};
+            const row_bytes = try std.math.mul(usize, pending.region.width, 4);
+            for (0..pending.region.height) |row| {
+                const source_row = try std.math.add(usize, pending.region.y, row);
+                const source_start = try std.math.add(
+                    usize,
+                    try std.math.mul(usize, source_row, pending.full_stride),
+                    try std.math.mul(usize, pending.region.x, 4),
+                );
+                const destination_start = try std.math.mul(usize, row, row_bytes);
+                if (source_start + row_bytes > self.screencopy_bytes.len or
+                    destination_start + row_bytes > access.bytes.len)
+                    return error.CaptureCapacityExceeded;
+                @memcpy(
+                    access.bytes[destination_start..][0..row_bytes],
+                    self.screencopy_bytes[source_start..][0..row_bytes],
+                );
+            }
+            try access.end();
+            ended = true;
+        }
+
+        fn frameToken(frame: ScreencopyAdapter.FrameId) u64 {
+            return (@as(u64, frame.generation) << 32) | frame.index;
         }
 
         fn finishOutcome(self: *Self, outcome: output_api.FrameOutcome, was_presented: bool) !void {
@@ -5088,6 +5343,7 @@ pub fn Coordinator(comptime protocol: type) type {
             const output = self.output orelse return;
             if (!output.accepting_frames) return;
             self.output_adapter.setAvailable(false);
+            self.screencopy_adapter.setAvailable(false);
             self.markProtocolAll(ProtocolReady.output);
             if (try output.requestPause()) |action| try self.consumeRetireAction(action);
             try self.processOutput();
@@ -5233,6 +5489,7 @@ pub fn Coordinator(comptime protocol: type) type {
         fn cleanupUnstartedOutput(self: *Self) void {
             const output = self.output orelse return;
             self.output_adapter.setAvailable(false);
+            self.screencopy_adapter.setAvailable(false);
             if (output.accepting_frames) {
                 if (output.requestPause() catch unreachable) |action|
                     self.consumeRetireAction(action) catch unreachable;
@@ -5241,6 +5498,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .context = self,
                 .presented_fn = presented,
                 .retired_fn = retired,
+                .captured_fn = captured,
             }) catch unreachable;
             std.debug.assert(output.paused);
             output.beginDrain(&self.router, &self.root.ring) catch unreachable;
@@ -5335,6 +5593,7 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.input_method_adapter.resourceRemoved(handle, object);
             _ = self.virtual_keyboard_adapter.resourceRemoved(handle, object);
             _ = self.virtual_pointer_adapter.resourceRemoved(handle, object);
+            _ = self.screencopy_adapter.resourceRemoved(handle, object);
             _ = self.text_input_adapter.resourceRemoved(handle, object);
             _ = self.subcompositor_adapter.resourceRemoved(handle, object);
             if (layer_shell_removed and self.output != null) {
