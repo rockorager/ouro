@@ -32,6 +32,7 @@ pub fn build(b: *std.Build) void {
     generate_core_protocol.addFileArg(wayland_protocols.path("staging/linux-drm-syncobj/linux-drm-syncobj-v1.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("staging/xdg-activation/xdg-activation-v1.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("staging/xdg-dialog/xdg-dialog-v1.xml"));
+    generate_core_protocol.addFileArg(wayland_protocols.path("staging/xdg-system-bell/xdg-system-bell-v1.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("staging/ext-session-lock/ext-session-lock-v1.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("staging/ext-idle-notify/ext-idle-notify-v1.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("staging/ext-data-control/ext-data-control-v1.xml"));
@@ -77,6 +78,7 @@ pub fn build(b: *std.Build) void {
     generate_xdg_protocol.addFileArg(wayland_protocols.path("staging/linux-drm-syncobj/linux-drm-syncobj-v1.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("staging/xdg-activation/xdg-activation-v1.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("staging/xdg-dialog/xdg-dialog-v1.xml"));
+    generate_xdg_protocol.addFileArg(wayland_protocols.path("staging/xdg-system-bell/xdg-system-bell-v1.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("staging/ext-session-lock/ext-session-lock-v1.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("staging/ext-idle-notify/ext-idle-notify-v1.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("staging/ext-data-control/ext-data-control-v1.xml"));

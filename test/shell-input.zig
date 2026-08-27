@@ -18,7 +18,7 @@ const pixels = [_]u8{
     0xa0, 0xb0, 0xc0, 0xff, 0xd0, 0xe0, 0xf0, 0xff, 0x11, 0x22, 0x33, 0xff, 0, 0, 0, 0,
 };
 
-test "shell-input: wl_fixes v1 destroys one registry without disturbing another" {
+test "shell-input: core compatibility extensions cross generated runtime" {
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-wayland-fixes-{d}.sock", .{linux.getpid()});
@@ -59,11 +59,26 @@ test "shell-input: wl_fixes v1 destroys one registry without disturbing another"
     for (0..512) |_| {
         _ = try drainClient(&reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
-        if (handler.fixes != null) break;
+        if (handler.fixes != null and handler.system_bell != null) break;
         _ = linux.sched_yield();
     }
     try std.testing.expect(handler.fixes != null);
     try std.testing.expectEqual(@as(u32, 1), handler.fixes_version);
+    try std.testing.expect(handler.system_bell != null);
+    try std.testing.expectEqual(@as(u32, 1), handler.system_bell_version);
+
+    try protocol.xdg_system_bell_v1.encodeRequest(
+        &actor.transmit,
+        handler.system_bell.?.id,
+        .{ .ring = .{ .surface = 0 } },
+    );
+    try wayring.client.sendRequest(
+        protocol.xdg_system_bell_v1,
+        &client.objects,
+        &actor.transmit,
+        handler.system_bell.?,
+        .{ .destroy = .{} },
+    );
 
     const second_registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null);
     try wayring.client.sendRequest(
@@ -128,6 +143,8 @@ const WaylandFixesHandler = struct {
     registry: wayring.objects.Handle,
     fixes: ?wayring.objects.Handle = null,
     fixes_version: u32 = 0,
+    system_bell: ?wayring.objects.Handle = null,
+    system_bell_version: u32 = 0,
     event_failures: usize = 0,
 
     pub fn eventError(self: *WaylandFixesHandler, _: wayring.io_uring.Peer, _: ClientCore.EventFailure) void {
@@ -154,6 +171,17 @@ const WaylandFixesHandler = struct {
                     self.registry,
                     value.name,
                     &protocol.wl_fixes.info,
+                    @min(value.version, 1),
+                    null,
+                );
+            } else if (std.mem.eql(u8, value.interface, protocol.xdg_system_bell_v1.info.name)) {
+                self.system_bell_version = value.version;
+                self.system_bell = try ClientCore.bind(
+                    self.objects,
+                    self.queue,
+                    self.registry,
+                    value.name,
+                    &protocol.xdg_system_bell_v1.info,
                     @min(value.version, 1),
                     null,
                 );

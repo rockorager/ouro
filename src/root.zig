@@ -55,6 +55,7 @@ pub const xdg_activation = @import("protocol/xdg_activation.zig");
 pub const xdg_decoration = @import("protocol/xdg_decoration.zig");
 pub const xdg_dialog = @import("protocol/xdg_dialog.zig");
 pub const wayland_fixes = @import("protocol/wayland_fixes.zig");
+pub const xdg_system_bell = @import("protocol/xdg_system_bell.zig");
 pub const relative_pointer = @import("protocol/relative_pointer.zig");
 pub const pointer_gestures = @import("protocol/pointer_gestures.zig");
 pub const tablet_v2 = @import("protocol/tablet_v2.zig");
