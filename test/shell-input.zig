@@ -18,6 +18,219 @@ const pixels = [_]u8{
     0xa0, 0xb0, 0xc0, 0xff, 0xd0, 0xe0, 0xf0, 0xff, 0x11, 0x22, 0x33, 0xff, 0, 0, 0, 0,
 };
 
+test "shell-input: security context filters nested manager before registry discovery" {
+    const allocator = std.testing.allocator;
+    var path_storage: [128]u8 = undefined;
+    var child_path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-security-parent-{d}.sock", .{linux.getpid()});
+    const child_path = try std.fmt.bufPrint(&child_path_storage, "/tmp/ouro-security-child-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    wayring.unix_socket.unlink(child_path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(child_path) catch {};
+
+    var fixture = try physical_fixture.Fixture.init();
+    defer fixture.deinit();
+    var root_config = physical_fixture.compositorConfig();
+    root_config.runtime.object_capacity = 64;
+    root_config.runtime.object_quota = 32;
+    root_config.runtime.registry_capacity = 2;
+    root_config.runtime.actor.received_fd_budget = 2;
+    const root = try Compositor.create(
+        allocator,
+        try wayring.unix_socket.listen(path, 2),
+        root_config,
+    );
+    var config = physical_fixture.coordinatorConfig();
+    config.router_capacity = 24;
+    config.security_context = .{
+        .resource_capacity = 2,
+        .listener_capacity = 1,
+        .client_capacity = 1,
+        .metadata_bytes = 64,
+    };
+    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), config);
+    var loop = try Loop.init(
+        allocator,
+        root,
+        &coordinator.router,
+        &coordinator.timers,
+        coordinator,
+        .{ .completion_batch = 32 },
+    );
+    try coordinator.start(&loop);
+
+    var parent_reactor: wayring.io_uring.Reactor = undefined;
+    try parent_reactor.initOwned(
+        allocator,
+        .{ .entries = 16, .flags = 0 },
+        physical_fixture.clientReactorConfig(),
+    );
+    var parent = try ClientConnection.attach(
+        allocator,
+        &parent_reactor,
+        try wayring.unix_socket.connect(path),
+        .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 2 },
+        .{ .max_objects = 8, .max_client_ids = 7 },
+    );
+    const parent_actor = try parent.actor();
+    var parent_driver = ClientDriver.init(&parent);
+    const parent_registry = try ClientCore.getRegistry(&parent.objects, &parent_actor.transmit, null);
+    var parent_handler: Handler = .{
+        .objects = &parent.objects,
+        .queue = &parent_actor.transmit,
+        .registry = parent_registry,
+        .registry_only = true,
+        .test_security_context = true,
+    };
+    try submitClient(&parent_reactor, &parent_driver, &parent_handler);
+    for (0..256) |_| {
+        _ = try drainClient(&parent_reactor, &parent_driver, &parent_handler);
+        _ = try loop.turn(coordinator);
+        if (parent_handler.security_manager != null) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(parent_handler.security_manager != null);
+
+    var close_pair: [2]linux.fd_t = undefined;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(
+        linux.AF.UNIX,
+        linux.SOCK.STREAM | linux.SOCK.CLOEXEC,
+        0,
+        &close_pair,
+    )));
+    var close_signal = close_pair[0];
+    defer if (close_signal >= 0) {
+        _ = linux.close(close_signal);
+    };
+    var sent_close = close_pair[1];
+    defer if (sent_close >= 0) {
+        _ = linux.close(sent_close);
+    };
+    var child_listener = try wayring.unix_socket.listen(child_path, 1);
+    defer if (child_listener >= 0) {
+        _ = linux.close(child_listener);
+    };
+    const context = (try protocol.wp_security_context_manager_v1.construct_create_listener(
+        &parent.objects,
+        &parent_actor.transmit,
+        parent_handler.security_manager.?,
+        .{ .listen_fd = child_listener, .close_fd = sent_close },
+    )).id;
+    // Wayring's transmit queue takes descriptor ownership at enqueue time.
+    child_listener = -1;
+    sent_close = -1;
+    try protocol.wp_security_context_v1.encodeRequest(
+        &parent_actor.transmit,
+        context.id,
+        .{ .set_sandbox_engine = .{ .name = "org.example.Sandbox" } },
+    );
+    try protocol.wp_security_context_v1.encodeRequest(
+        &parent_actor.transmit,
+        context.id,
+        .{ .set_app_id = .{ .app_id = "org.example.Client" } },
+    );
+    try protocol.wp_security_context_v1.encodeRequest(
+        &parent_actor.transmit,
+        context.id,
+        .{ .commit = .{} },
+    );
+    try submitClient(&parent_reactor, &parent_driver, &parent_handler);
+    for (0..256) |_| {
+        _ = try drainClient(&parent_reactor, &parent_driver, &parent_handler);
+        _ = try loop.turn(coordinator);
+        const listeners = coordinator.security_context_adapter.committedListeners();
+        if (listeners.len != 0 and listeners[0].accept_token != null) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(usize, 1), coordinator.security_context_adapter.committedListeners().len);
+    const listener = coordinator.security_context_adapter.committedListeners()[0];
+    try std.testing.expect(listener.accept_token != null);
+
+    var child_reactor: wayring.io_uring.Reactor = undefined;
+    try child_reactor.initOwned(
+        allocator,
+        .{ .entries = 16, .flags = 0 },
+        physical_fixture.clientReactorConfig(),
+    );
+    var child = try ClientConnection.attach(
+        allocator,
+        &child_reactor,
+        try wayring.unix_socket.connect(child_path),
+        .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 },
+        .{ .max_objects = 8, .max_client_ids = 7 },
+    );
+    const child_actor = try child.actor();
+    var child_driver = ClientDriver.init(&child);
+    const child_registry = try ClientCore.getRegistry(&child.objects, &child_actor.transmit, null);
+    var child_handler: Handler = .{
+        .objects = &child.objects,
+        .queue = &child_actor.transmit,
+        .registry = child_registry,
+        .registry_only = true,
+        .test_security_context = true,
+    };
+    try submitClient(&child_reactor, &child_driver, &child_handler);
+    for (0..512) |_| {
+        _ = try drainClient(&parent_reactor, &parent_driver, &parent_handler);
+        _ = try drainClient(&child_reactor, &child_driver, &child_handler);
+        _ = try loop.turn(coordinator);
+        if (child_handler.compositor != null and root.runtime.registries.initial_count == 0)
+            break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(child_handler.compositor != null);
+    try std.testing.expect(!child_handler.security_global_seen);
+    try std.testing.expect(child_handler.security_manager == null);
+    var sandbox_peer: ?wayring.io_uring.Peer = null;
+    for (coordinator.clients.items) |client_state| if (client_state.active and
+        coordinator.security_context_adapter.sandboxed(client_state.peer))
+    {
+        sandbox_peer = client_state.peer;
+        break;
+    };
+    try std.testing.expect(sandbox_peer != null);
+    const metadata = coordinator.security_context_adapter.metadata(sandbox_peer.?).?;
+    try std.testing.expectEqualStrings("org.example.Sandbox", metadata.sandbox_engine.?);
+    try std.testing.expectEqualStrings("org.example.Client", metadata.app_id.?);
+
+    _ = linux.close(close_signal);
+    close_signal = -1;
+    for (0..256) |_| {
+        _ = try drainClient(&parent_reactor, &parent_driver, &parent_handler);
+        _ = try drainClient(&child_reactor, &child_driver, &child_handler);
+        _ = try loop.turn(coordinator);
+        if (listener.listen_fd < 0 and listener.close_fd < 0) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(linux.fd_t, -1), listener.listen_fd);
+    try std.testing.expectEqual(@as(linux.fd_t, -1), listener.close_fd);
+
+    _ = try parent.prepareClose();
+    _ = try child.prepareClose();
+    try submitClient(&parent_reactor, &parent_driver, &parent_handler);
+    try submitClient(&child_reactor, &child_driver, &child_handler);
+    try coordinator.requestStop();
+    var drained = false;
+    for (0..512) |_| {
+        const parent_progress = try drainClient(&parent_reactor, &parent_driver, &parent_handler);
+        const child_progress = try drainClient(&child_reactor, &child_driver, &child_handler);
+        const progress = try loop.turn(coordinator);
+        drained = progress.wayring.shutdown_complete and parent_progress.quiescent and
+            child_progress.quiescent and coordinator.backendDrainComplete();
+        if (drained) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(drained);
+    try child.deinit(allocator);
+    child_reactor.deinit(allocator);
+    try parent.deinit(allocator);
+    parent_reactor.deinit(allocator);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
 test "shell-input: pollable backend retains a backpressured suffix without replay" {
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;
@@ -1979,6 +2192,10 @@ const Handler = struct {
     idle_notifier: ?wayring.objects.Handle = null,
     idle_inhibit_manager: ?wayring.objects.Handle = null,
     pointer_warp_manager: ?wayring.objects.Handle = null,
+    security_manager: ?wayring.objects.Handle = null,
+    security_global_seen: bool = false,
+    test_security_context: bool = false,
+    registry_only: bool = false,
     idle_standard: ?wayring.objects.Handle = null,
     idle_input: ?wayring.objects.Handle = null,
     idle_inhibitor: ?wayring.objects.Handle = null,
@@ -2059,8 +2276,10 @@ const Handler = struct {
                 .global => |value| try self.bindGlobal(value),
                 .global_remove => {},
             }
-            try self.maybeCreateShell();
-            try self.maybeCreateDataDevice();
+            if (!self.registry_only) {
+                try self.maybeCreateShell();
+                try self.maybeCreateDataDevice();
+            }
         } else if (target.object.interface == &protocol.wl_shm.info) {
             _ = try protocol.wl_shm.decodeEvent(message, fds);
         } else if (target.object.interface == &protocol.wl_output.info) {
@@ -2318,6 +2537,16 @@ const Handler = struct {
     }
 
     fn bindGlobal(self: *Handler, value: anytype) !void {
+        if (self.registry_only) {
+            if (std.mem.eql(u8, value.interface, protocol.wl_compositor.info.name))
+                self.compositor = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_compositor.info, @min(value.version, 7), null);
+            if (std.mem.eql(u8, value.interface, protocol.wp_security_context_manager_v1.info.name)) {
+                self.security_global_seen = true;
+                if (self.test_security_context)
+                    self.security_manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wp_security_context_manager_v1.info, @min(value.version, 1), null);
+            }
+            return;
+        }
         if (std.mem.eql(u8, value.interface, protocol.wl_compositor.info.name))
             self.compositor = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_compositor.info, @min(value.version, 7), null);
         if (std.mem.eql(u8, value.interface, protocol.wl_shm.info.name))
@@ -2336,6 +2565,11 @@ const Handler = struct {
             self.idle_inhibit_manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.zwp_idle_inhibit_manager_v1.info, @min(value.version, 1), null);
         if (self.test_pointer_warp and std.mem.eql(u8, value.interface, protocol.wp_pointer_warp_v1.info.name))
             self.pointer_warp_manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wp_pointer_warp_v1.info, @min(value.version, 1), null);
+        if (std.mem.eql(u8, value.interface, protocol.wp_security_context_manager_v1.info.name)) {
+            self.security_global_seen = true;
+            if (self.test_security_context)
+                self.security_manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wp_security_context_manager_v1.info, @min(value.version, 1), null);
+        }
     }
 
     fn maybeCreateDataDevice(self: *Handler) !void {

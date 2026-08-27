@@ -1508,7 +1508,7 @@ pub fn Coordinator(comptime protocol: type) type {
                         )) |peer| {
                             self.security_context_adapter.admit(peer, listener) catch unreachable;
                             self.connected(peer);
-                        } else |_| {}
+                        } else |err| return err;
                         if (!more and !listener.closing) try self.armSecurityAccept(listener);
                     }
                 },
