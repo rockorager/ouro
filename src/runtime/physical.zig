@@ -4613,7 +4613,10 @@ test "seat: physical input batch retries only the failed suffix" {
     };
     const id: input_api.DeviceId = .{ .slot = 0, .generation = 1, .seat_generation = 1 };
     const events = [_]input_api.Event{
-        .{ .device_added = .{ .device = id, .capabilities = .{ .pointer = true } } },
+        .{ .device_added = .{
+            .device = id,
+            .info = .{ .capabilities = .{ .pointer = true } },
+        } },
         .{ .device_removed = id },
     };
     var context: Context = .{};

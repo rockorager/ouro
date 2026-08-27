@@ -746,7 +746,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         /// mutation occurs here; delivery is queued for `flushOn`.
         pub fn consume(adapter: *Self, event: input.Event) !void {
             switch (event) {
-                .device_added => |value| try adapter.addDevice(value.device, value.capabilities),
+                .device_added => |value| try adapter.addDevice(value.device, value.info.capabilities),
                 .device_removed => |id| try adapter.removeDevice(id),
                 .pointer_motion => |value| try adapter.pointerMotion(value, null),
                 .pointer_button => |value| try adapter.pointerButton(value),
@@ -760,6 +760,13 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .pinch_end,
                 .hold_begin,
                 .hold_end,
+                .tablet_tool_axis,
+                .tablet_tool_proximity,
+                .tablet_tool_tip,
+                .tablet_tool_button,
+                .tablet_pad_button,
+                .tablet_pad_ring,
+                .tablet_pad_strip,
                 => {},
             }
         }
@@ -1944,11 +1951,11 @@ test "seat: capabilities aggregate exact physical generations" {
 
     try adapter.consume(.{ .device_added = .{
         .device = first,
-        .capabilities = .{ .pointer = true },
+        .info = .{ .capabilities = .{ .pointer = true } },
     } });
     try adapter.consume(.{ .device_added = .{
         .device = second,
-        .capabilities = .{ .pointer = true, .keyboard = true },
+        .info = .{ .capabilities = .{ .pointer = true, .keyboard = true } },
     } });
     try std.testing.expectEqual(
         test_protocol.wl_seat.capability.pointer.value |
@@ -2186,7 +2193,7 @@ test "seat: pointer grab retains focus and device removal cancels it" {
     const device: input.DeviceId = .{ .slot = 0, .generation = 2, .seat_generation = 8 };
     try adapter.consume(.{ .device_added = .{
         .device = device,
-        .capabilities = .{ .pointer = true },
+        .info = .{ .capabilities = .{ .pointer = true } },
     } });
     try adapter.consume(.{ .pointer_button = .{
         .device = device,
@@ -2217,7 +2224,7 @@ test "seat: physical modifier and lock state follows the published keymap" {
     const device: input.DeviceId = .{ .slot = 0, .generation = 2, .seat_generation = 8 };
     try adapter.consume(.{ .device_added = .{
         .device = device,
-        .capabilities = .{ .keyboard = true },
+        .info = .{ .capabilities = .{ .keyboard = true } },
     } });
     try adapter.setKeyboardFocus(target);
     clearTestOutbound(&adapter);
@@ -2286,7 +2293,7 @@ test "seat: pointer axis delivers wheel precision and finger stops" {
     const device: input.DeviceId = .{ .slot = 0, .generation = 2, .seat_generation = 8 };
     try adapter.consume(.{ .device_added = .{
         .device = device,
-        .capabilities = .{ .pointer = true },
+        .info = .{ .capabilities = .{ .pointer = true } },
     } });
     clearTestOutbound(&adapter);
 
@@ -2423,7 +2430,7 @@ test "seat: button and key backpressure preserves exact retry" {
     const device: input.DeviceId = .{ .slot = 0, .generation = 2, .seat_generation = 4 };
     try adapter.consume(.{ .device_added = .{
         .device = device,
-        .capabilities = .{ .pointer = true, .keyboard = true },
+        .info = .{ .capabilities = .{ .pointer = true, .keyboard = true } },
     } });
     const pointer = try acquire(TestAdapter.PointerSlot, adapter.pointers, &adapter.pointer_free);
     pointer.client = client;
@@ -2483,7 +2490,7 @@ test "seat: device add backpressure preserves identity for exact retry" {
     const device: input.DeviceId = .{ .slot = 0, .generation = 5, .seat_generation = 7 };
     const added = input.Event{ .device_added = .{
         .device = device,
-        .capabilities = .{ .pointer = true },
+        .info = .{ .capabilities = .{ .pointer = true } },
     } };
 
     try std.testing.expectError(error.Exhausted, adapter.consume(added));
@@ -2507,7 +2514,7 @@ test "seat: device removal reserves cancellation releases and capabilities atomi
     const device: input.DeviceId = .{ .slot = 0, .generation = 5, .seat_generation = 7 };
     try adapter.consume(.{ .device_added = .{
         .device = device,
-        .capabilities = .{ .pointer = true, .keyboard = true },
+        .info = .{ .capabilities = .{ .pointer = true, .keyboard = true } },
     } });
     const seat = try acquire(TestAdapter.SeatSlot, adapter.seats, &adapter.seat_free);
     seat.peer = peer;
@@ -2571,7 +2578,7 @@ test "seat: removed grab surface completes cancellation once" {
     const device: input.DeviceId = .{ .slot = 0, .generation = 5, .seat_generation = 7 };
     try adapter.consume(.{ .device_added = .{
         .device = device,
-        .capabilities = .{ .pointer = true },
+        .info = .{ .capabilities = .{ .pointer = true } },
     } });
     const pointer = try acquire(TestAdapter.PointerSlot, adapter.pointers, &adapter.pointer_free);
     pointer.client = client;
@@ -2619,7 +2626,7 @@ test "seat: pointer fixed coordinates saturate" {
     const device: input.DeviceId = .{ .slot = 0, .generation = 5, .seat_generation = 7 };
     try adapter.consume(.{ .device_added = .{
         .device = device,
-        .capabilities = .{ .pointer = true },
+        .info = .{ .capabilities = .{ .pointer = true } },
     } });
     try adapter.setPointerFocus(target, .{
         .x = std.math.maxInt(i32) - 1,
@@ -2662,7 +2669,7 @@ test "seat: surface removal retires ordinary commands but not terminal releases"
     const device: input.DeviceId = .{ .slot = 0, .generation = 5, .seat_generation = 7 };
     try adapter.consume(.{ .device_added = .{
         .device = device,
-        .capabilities = .{ .pointer = true, .keyboard = true },
+        .info = .{ .capabilities = .{ .pointer = true, .keyboard = true } },
     } });
     try adapter.setPointerFocus(target, .{ .x = 10, .y = 20 });
     try adapter.setKeyboardFocus(target);
@@ -2739,7 +2746,7 @@ test "seat: keyboard enter retains admission-time pressed keys through backpress
     const device: input.DeviceId = .{ .slot = 0, .generation = 5, .seat_generation = 7 };
     try adapter.consume(.{ .device_added = .{
         .device = device,
-        .capabilities = .{ .keyboard = true },
+        .info = .{ .capabilities = .{ .keyboard = true } },
     } });
     try adapter.consume(.{ .keyboard_key = .{
         .device = device,

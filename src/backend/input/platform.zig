@@ -11,12 +11,58 @@ const c = @cImport({
 });
 
 pub const DeviceRef = usize;
+pub const ToolRef = usize;
+pub const DeviceGroupRef = usize;
 
 pub const Capabilities = packed struct {
     pointer: bool = false,
     keyboard: bool = false,
-    _padding: u6 = 0,
+    tablet_tool: bool = false,
+    tablet_pad: bool = false,
+    _padding: u4 = 0,
 };
+
+pub const DeviceInfo = struct {
+    capabilities: Capabilities,
+    vendor: u32 = 0,
+    product: u32 = 0,
+    group: DeviceGroupRef = 0,
+    pad_buttons: u32 = 0,
+    pad_rings: u32 = 0,
+    pad_strips: u32 = 0,
+    pad_mode_groups: u32 = 0,
+};
+
+pub const TabletToolType = enum { pen, eraser, brush, pencil, airbrush, mouse, lens, totem };
+pub const TabletToolCapabilities = packed struct {
+    pressure: bool = false,
+    distance: bool = false,
+    tilt: bool = false,
+    rotation: bool = false,
+    slider: bool = false,
+    wheel: bool = false,
+    _padding: u2 = 0,
+};
+pub const TabletToolInfo = struct {
+    reference: ToolRef,
+    kind: TabletToolType,
+    serial: u64,
+    hardware_id: u64,
+    capabilities: TabletToolCapabilities,
+};
+pub const TabletToolAxes = struct {
+    x: ?f64 = null,
+    y: ?f64 = null,
+    pressure: ?f64 = null,
+    distance: ?f64 = null,
+    tilt_x: ?f64 = null,
+    tilt_y: ?f64 = null,
+    rotation: ?f64 = null,
+    slider: ?f64 = null,
+    wheel_degrees: ?f64 = null,
+    wheel_clicks: i32 = 0,
+};
+pub const TabletPadSource = enum { finger, unknown };
 
 pub const AxisSource = enum { wheel, finger, continuous };
 pub const AxisValue = struct {
@@ -37,7 +83,7 @@ pub const PinchUpdate = struct {
 pub const GestureEnd = struct { device: DeviceRef, time_usec: u64, cancelled: bool };
 
 pub const RawEvent = union(enum) {
-    device_added: struct { device: DeviceRef, capabilities: Capabilities },
+    device_added: struct { device: DeviceRef, info: DeviceInfo },
     device_removed: DeviceRef,
     pointer_motion: struct { device: DeviceRef, time_usec: u64, dx: f64, dy: f64 },
     pointer_button: struct { device: DeviceRef, time_usec: u64, button: u32, pressed: bool },
@@ -57,6 +103,52 @@ pub const RawEvent = union(enum) {
     hold_begin: GestureBegin,
     hold_end: GestureEnd,
     keyboard_key: struct { device: DeviceRef, time_usec: u64, key: u32, pressed: bool },
+    tablet_tool_axis: struct {
+        device: DeviceRef,
+        tool: ToolRef,
+        time_usec: u64,
+        axes: TabletToolAxes,
+    },
+    tablet_tool_proximity: struct {
+        device: DeviceRef,
+        tool: TabletToolInfo,
+        time_usec: u64,
+        entered: bool,
+        x: f64,
+        y: f64,
+    },
+    tablet_tool_tip: struct { device: DeviceRef, tool: ToolRef, time_usec: u64, down: bool },
+    tablet_tool_button: struct {
+        device: DeviceRef,
+        tool: ToolRef,
+        time_usec: u64,
+        button: u32,
+        pressed: bool,
+    },
+    tablet_pad_button: struct {
+        device: DeviceRef,
+        time_usec: u64,
+        button: u32,
+        pressed: bool,
+        mode: u32,
+        group: u32,
+    },
+    tablet_pad_ring: struct {
+        device: DeviceRef,
+        time_usec: u64,
+        ring: u32,
+        position: f64,
+        source: TabletPadSource,
+        mode: u32,
+    },
+    tablet_pad_strip: struct {
+        device: DeviceRef,
+        time_usec: u64,
+        strip: u32,
+        position: f64,
+        source: TabletPadSource,
+        mode: u32,
+    },
     ignored,
 };
 
@@ -185,16 +277,7 @@ fn realNextEvent(_: *anyopaque, value: *anyopaque) !?RawEvent {
     return switch (c.libinput_event_get_type(event)) {
         c.LIBINPUT_EVENT_DEVICE_ADDED => .{ .device_added = .{
             .device = device,
-            .capabilities = .{
-                .pointer = c.libinput_device_has_capability(
-                    c.libinput_event_get_device(event),
-                    c.LIBINPUT_DEVICE_CAP_POINTER,
-                ) != 0,
-                .keyboard = c.libinput_device_has_capability(
-                    c.libinput_event_get_device(event),
-                    c.LIBINPUT_DEVICE_CAP_KEYBOARD,
-                ) != 0,
-            },
+            .info = deviceInfo(c.libinput_event_get_device(event)),
         } },
         c.LIBINPUT_EVENT_DEVICE_REMOVED => .{ .device_removed = device },
         c.LIBINPUT_EVENT_POINTER_MOTION => blk: {
@@ -310,8 +393,172 @@ fn realNextEvent(_: *anyopaque, value: *anyopaque) !?RawEvent {
                     c.LIBINPUT_KEY_STATE_PRESSED,
             } };
         },
+        c.LIBINPUT_EVENT_TABLET_TOOL_AXIS,
+        c.LIBINPUT_EVENT_TABLET_TOOL_PROXIMITY,
+        c.LIBINPUT_EVENT_TABLET_TOOL_TIP,
+        c.LIBINPUT_EVENT_TABLET_TOOL_BUTTON,
+        => blk: {
+            const tablet = c.libinput_event_get_tablet_tool_event(event) orelse
+                return error.InvalidEvent;
+            const tool = c.libinput_event_tablet_tool_get_tool(tablet) orelse
+                return error.InvalidEvent;
+            const time_usec = c.libinput_event_tablet_tool_get_time_usec(tablet);
+            break :blk switch (c.libinput_event_get_type(event)) {
+                c.LIBINPUT_EVENT_TABLET_TOOL_AXIS => .{ .tablet_tool_axis = .{
+                    .device = device,
+                    .tool = @intFromPtr(tool),
+                    .time_usec = time_usec,
+                    .axes = tabletAxes(tablet),
+                } },
+                c.LIBINPUT_EVENT_TABLET_TOOL_PROXIMITY => .{ .tablet_tool_proximity = .{
+                    .device = device,
+                    .tool = tabletToolInfo(tool),
+                    .time_usec = time_usec,
+                    .entered = c.libinput_event_tablet_tool_get_proximity_state(tablet) ==
+                        c.LIBINPUT_TABLET_TOOL_PROXIMITY_STATE_IN,
+                    .x = c.libinput_event_tablet_tool_get_x_transformed(tablet, 1),
+                    .y = c.libinput_event_tablet_tool_get_y_transformed(tablet, 1),
+                } },
+                c.LIBINPUT_EVENT_TABLET_TOOL_TIP => .{ .tablet_tool_tip = .{
+                    .device = device,
+                    .tool = @intFromPtr(tool),
+                    .time_usec = time_usec,
+                    .down = c.libinput_event_tablet_tool_get_tip_state(tablet) ==
+                        c.LIBINPUT_TABLET_TOOL_TIP_DOWN,
+                } },
+                c.LIBINPUT_EVENT_TABLET_TOOL_BUTTON => .{ .tablet_tool_button = .{
+                    .device = device,
+                    .tool = @intFromPtr(tool),
+                    .time_usec = time_usec,
+                    .button = c.libinput_event_tablet_tool_get_button(tablet),
+                    .pressed = c.libinput_event_tablet_tool_get_button_state(tablet) ==
+                        c.LIBINPUT_BUTTON_STATE_PRESSED,
+                } },
+                else => unreachable,
+            };
+        },
+        c.LIBINPUT_EVENT_TABLET_PAD_BUTTON,
+        c.LIBINPUT_EVENT_TABLET_PAD_RING,
+        c.LIBINPUT_EVENT_TABLET_PAD_STRIP,
+        => blk: {
+            const pad = c.libinput_event_get_tablet_pad_event(event) orelse
+                return error.InvalidEvent;
+            const time_usec = c.libinput_event_tablet_pad_get_time_usec(pad);
+            const mode = c.libinput_event_tablet_pad_get_mode(pad);
+            break :blk switch (c.libinput_event_get_type(event)) {
+                c.LIBINPUT_EVENT_TABLET_PAD_BUTTON => .{ .tablet_pad_button = .{
+                    .device = device,
+                    .time_usec = time_usec,
+                    .button = c.libinput_event_tablet_pad_get_button_number(pad),
+                    .pressed = c.libinput_event_tablet_pad_get_button_state(pad) ==
+                        c.LIBINPUT_BUTTON_STATE_PRESSED,
+                    .mode = mode,
+                    .group = if (c.libinput_event_tablet_pad_get_mode_group(pad)) |group|
+                        c.libinput_tablet_pad_mode_group_get_index(group)
+                    else
+                        0,
+                } },
+                c.LIBINPUT_EVENT_TABLET_PAD_RING => .{ .tablet_pad_ring = .{
+                    .device = device,
+                    .time_usec = time_usec,
+                    .ring = c.libinput_event_tablet_pad_get_ring_number(pad),
+                    .position = c.libinput_event_tablet_pad_get_ring_position(pad),
+                    .source = padRingSource(c.libinput_event_tablet_pad_get_ring_source(pad)),
+                    .mode = mode,
+                } },
+                c.LIBINPUT_EVENT_TABLET_PAD_STRIP => .{ .tablet_pad_strip = .{
+                    .device = device,
+                    .time_usec = time_usec,
+                    .strip = c.libinput_event_tablet_pad_get_strip_number(pad),
+                    .position = c.libinput_event_tablet_pad_get_strip_position(pad),
+                    .source = padStripSource(c.libinput_event_tablet_pad_get_strip_source(pad)),
+                    .mode = mode,
+                } },
+                else => unreachable,
+            };
+        },
         else => .ignored,
     };
+}
+
+fn deviceInfo(device: *c.struct_libinput_device) DeviceInfo {
+    const capabilities: Capabilities = .{
+        .pointer = c.libinput_device_has_capability(device, c.LIBINPUT_DEVICE_CAP_POINTER) != 0,
+        .keyboard = c.libinput_device_has_capability(device, c.LIBINPUT_DEVICE_CAP_KEYBOARD) != 0,
+        .tablet_tool = c.libinput_device_has_capability(device, c.LIBINPUT_DEVICE_CAP_TABLET_TOOL) != 0,
+        .tablet_pad = c.libinput_device_has_capability(device, c.LIBINPUT_DEVICE_CAP_TABLET_PAD) != 0,
+    };
+    return .{
+        .capabilities = capabilities,
+        .vendor = c.libinput_device_get_id_vendor(device),
+        .product = c.libinput_device_get_id_product(device),
+        .group = @intFromPtr(c.libinput_device_get_device_group(device)),
+        .pad_buttons = if (capabilities.tablet_pad) c.libinput_device_tablet_pad_get_num_buttons(device) else 0,
+        .pad_rings = if (capabilities.tablet_pad) c.libinput_device_tablet_pad_get_num_rings(device) else 0,
+        .pad_strips = if (capabilities.tablet_pad) c.libinput_device_tablet_pad_get_num_strips(device) else 0,
+        .pad_mode_groups = if (capabilities.tablet_pad) @intCast(c.libinput_device_tablet_pad_get_num_mode_groups(device)) else 0,
+    };
+}
+
+fn tabletToolInfo(tool: *c.struct_libinput_tablet_tool) TabletToolInfo {
+    return .{
+        .reference = @intFromPtr(tool),
+        .kind = switch (c.libinput_tablet_tool_get_type(tool)) {
+            c.LIBINPUT_TABLET_TOOL_TYPE_PEN => .pen,
+            c.LIBINPUT_TABLET_TOOL_TYPE_ERASER => .eraser,
+            c.LIBINPUT_TABLET_TOOL_TYPE_BRUSH => .brush,
+            c.LIBINPUT_TABLET_TOOL_TYPE_PENCIL => .pencil,
+            c.LIBINPUT_TABLET_TOOL_TYPE_AIRBRUSH => .airbrush,
+            c.LIBINPUT_TABLET_TOOL_TYPE_MOUSE => .mouse,
+            c.LIBINPUT_TABLET_TOOL_TYPE_LENS => .lens,
+            c.LIBINPUT_TABLET_TOOL_TYPE_TOTEM => .totem,
+            else => .pen,
+        },
+        .serial = c.libinput_tablet_tool_get_serial(tool),
+        .hardware_id = c.libinput_tablet_tool_get_tool_id(tool),
+        .capabilities = .{
+            .pressure = c.libinput_tablet_tool_has_pressure(tool) != 0,
+            .distance = c.libinput_tablet_tool_has_distance(tool) != 0,
+            .tilt = c.libinput_tablet_tool_has_tilt(tool) != 0,
+            .rotation = c.libinput_tablet_tool_has_rotation(tool) != 0,
+            .slider = c.libinput_tablet_tool_has_slider(tool) != 0,
+            .wheel = c.libinput_tablet_tool_has_wheel(tool) != 0,
+        },
+    };
+}
+
+fn tabletAxes(event: *c.struct_libinput_event_tablet_tool) TabletToolAxes {
+    const wheel_changed = c.libinput_event_tablet_tool_wheel_has_changed(event) != 0;
+    return .{
+        .x = if (c.libinput_event_tablet_tool_x_has_changed(event) != 0)
+            c.libinput_event_tablet_tool_get_x_transformed(event, 1)
+        else
+            null,
+        .y = if (c.libinput_event_tablet_tool_y_has_changed(event) != 0)
+            c.libinput_event_tablet_tool_get_y_transformed(event, 1)
+        else
+            null,
+        .pressure = changedAxis(event, c.libinput_event_tablet_tool_pressure_has_changed, c.libinput_event_tablet_tool_get_pressure),
+        .distance = changedAxis(event, c.libinput_event_tablet_tool_distance_has_changed, c.libinput_event_tablet_tool_get_distance),
+        .tilt_x = changedAxis(event, c.libinput_event_tablet_tool_tilt_x_has_changed, c.libinput_event_tablet_tool_get_tilt_x),
+        .tilt_y = changedAxis(event, c.libinput_event_tablet_tool_tilt_y_has_changed, c.libinput_event_tablet_tool_get_tilt_y),
+        .rotation = changedAxis(event, c.libinput_event_tablet_tool_rotation_has_changed, c.libinput_event_tablet_tool_get_rotation),
+        .slider = changedAxis(event, c.libinput_event_tablet_tool_slider_has_changed, c.libinput_event_tablet_tool_get_slider_position),
+        .wheel_degrees = if (wheel_changed) c.libinput_event_tablet_tool_get_wheel_delta(event) else null,
+        .wheel_clicks = if (wheel_changed) c.libinput_event_tablet_tool_get_wheel_delta_discrete(event) else 0,
+    };
+}
+
+fn changedAxis(event: anytype, changed: anytype, get: anytype) ?f64 {
+    return if (changed(event) != 0) get(event) else null;
+}
+
+fn padRingSource(source: c.enum_libinput_tablet_pad_ring_axis_source) TabletPadSource {
+    return if (source == c.LIBINPUT_TABLET_PAD_RING_SOURCE_FINGER) .finger else .unknown;
+}
+
+fn padStripSource(source: c.enum_libinput_tablet_pad_strip_axis_source) TabletPadSource {
+    return if (source == c.LIBINPUT_TABLET_PAD_STRIP_SOURCE_FINGER) .finger else .unknown;
 }
 
 fn axisValue(

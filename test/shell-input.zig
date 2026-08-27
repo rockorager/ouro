@@ -110,7 +110,7 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
             try input.publish(&.{
                 .{ .device_added = .{
                     .device = 42,
-                    .capabilities = .{ .pointer = true, .keyboard = true },
+                    .info = .{ .capabilities = .{ .pointer = true, .keyboard = true } },
                 } },
             });
             input_sent = true;
@@ -377,7 +377,7 @@ test "shell-input: idle notifications track activity and visible inhibitors" {
         if (!device_added and coordinator.input != null) {
             try input.publish(&.{.{ .device_added = .{
                 .device = 42,
-                .capabilities = .{ .pointer = true, .keyboard = true },
+                .info = .{ .capabilities = .{ .pointer = true, .keyboard = true } },
             } }});
             device_added = true;
         }
@@ -589,7 +589,7 @@ test "shell-input: two mapped toplevels sustain independent commit cycles" {
     };
     try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .device_added = .{
         .device = pointer_device,
-        .capabilities = .{ .pointer = true },
+        .info = .{ .capabilities = .{ .pointer = true } },
     } }));
     try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_motion = .{
         .device = pointer_device,
@@ -919,7 +919,7 @@ test "shell-input: synchronized subsurface publishes with parent and receives po
     };
     try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .device_added = .{
         .device = pointer_device,
-        .capabilities = .{ .pointer = true },
+        .info = .{ .capabilities = .{ .pointer = true } },
     } }));
     try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_motion = .{
         .device = pointer_device,

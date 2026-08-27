@@ -34,7 +34,7 @@ pub const PinchUpdate = struct {
 pub const GestureEnd = struct { device: DeviceId, time_usec: u64, cancelled: bool };
 
 pub const Event = union(enum) {
-    device_added: struct { device: DeviceId, capabilities: platform_api.Capabilities },
+    device_added: struct { device: DeviceId, info: platform_api.DeviceInfo },
     device_removed: DeviceId,
     pointer_motion: struct { device: DeviceId, time_usec: u64, dx: f64, dy: f64 },
     pointer_button: struct { device: DeviceId, time_usec: u64, button: u32, pressed: bool },
@@ -54,6 +54,57 @@ pub const Event = union(enum) {
     hold_begin: GestureBegin,
     hold_end: GestureEnd,
     keyboard_key: struct { device: DeviceId, time_usec: u64, key: u32, pressed: bool },
+    tablet_tool_axis: struct {
+        device: DeviceId,
+        tool: platform_api.ToolRef,
+        time_usec: u64,
+        axes: platform_api.TabletToolAxes,
+    },
+    tablet_tool_proximity: struct {
+        device: DeviceId,
+        tool: platform_api.TabletToolInfo,
+        time_usec: u64,
+        entered: bool,
+        x: f64,
+        y: f64,
+    },
+    tablet_tool_tip: struct {
+        device: DeviceId,
+        tool: platform_api.ToolRef,
+        time_usec: u64,
+        down: bool,
+    },
+    tablet_tool_button: struct {
+        device: DeviceId,
+        tool: platform_api.ToolRef,
+        time_usec: u64,
+        button: u32,
+        pressed: bool,
+    },
+    tablet_pad_button: struct {
+        device: DeviceId,
+        time_usec: u64,
+        button: u32,
+        pressed: bool,
+        mode: u32,
+        group: u32,
+    },
+    tablet_pad_ring: struct {
+        device: DeviceId,
+        time_usec: u64,
+        ring: u32,
+        position: f64,
+        source: platform_api.TabletPadSource,
+        mode: u32,
+    },
+    tablet_pad_strip: struct {
+        device: DeviceId,
+        time_usec: u64,
+        strip: u32,
+        position: f64,
+        source: platform_api.TabletPadSource,
+        mode: u32,
+    },
 };
 
 pub const Config = struct {
@@ -68,7 +119,7 @@ const DeviceSlot = struct {
     next_free: u32 = none,
     seat_generation: u32 = 0,
     reference: platform_api.DeviceRef = 0,
-    capabilities: platform_api.Capabilities = .{},
+    info: platform_api.DeviceInfo = .{ .capabilities = .{} },
     pressed: [state_words]u64 = [_]u64{0} ** state_words,
 };
 
@@ -353,12 +404,12 @@ pub const Backend = struct {
                 slot.active = true;
                 slot.seat_generation = self.seat_generation;
                 slot.reference = value.device;
-                slot.capabilities = value.capabilities;
+                slot.info = value.info;
                 @memset(&slot.pressed, 0);
                 self.active_devices += 1;
                 self.push(.{ .device_added = .{
                     .device = self.idFor(index),
-                    .capabilities = value.capabilities,
+                    .info = value.info,
                 } });
             },
             .device_removed => |reference| {
@@ -431,13 +482,106 @@ pub const Backend = struct {
                     .pressed = value.pressed,
                 } });
             },
+            .tablet_tool_axis => |value| {
+                _ = try self.validateTabletDevice(value.device, true);
+                try validateTabletAxes(value.axes);
+                self.push(.{ .tablet_tool_axis = .{
+                    .device = try self.idForReference(value.device),
+                    .tool = value.tool,
+                    .time_usec = value.time_usec,
+                    .axes = value.axes,
+                } });
+            },
+            .tablet_tool_proximity => |value| {
+                _ = try self.validateTabletDevice(value.device, true);
+                if (!std.math.isFinite(value.x) or !std.math.isFinite(value.y))
+                    return error.InvalidTabletAxis;
+                self.push(.{ .tablet_tool_proximity = .{
+                    .device = try self.idForReference(value.device),
+                    .tool = value.tool,
+                    .time_usec = value.time_usec,
+                    .entered = value.entered,
+                    .x = value.x,
+                    .y = value.y,
+                } });
+            },
+            .tablet_tool_tip => |value| {
+                _ = try self.validateTabletDevice(value.device, true);
+                self.push(.{ .tablet_tool_tip = .{
+                    .device = try self.idForReference(value.device),
+                    .tool = value.tool,
+                    .time_usec = value.time_usec,
+                    .down = value.down,
+                } });
+            },
+            .tablet_tool_button => |value| {
+                _ = try self.validateTabletDevice(value.device, true);
+                self.push(.{ .tablet_tool_button = .{
+                    .device = try self.idForReference(value.device),
+                    .tool = value.tool,
+                    .time_usec = value.time_usec,
+                    .button = value.button,
+                    .pressed = value.pressed,
+                } });
+            },
+            .tablet_pad_button => |value| {
+                const slot = try self.validateTabletDevice(value.device, false);
+                if (value.button >= slot.info.pad_buttons or value.group >= slot.info.pad_mode_groups)
+                    return error.InvalidTabletControl;
+                self.push(.{ .tablet_pad_button = .{
+                    .device = try self.idForReference(value.device),
+                    .time_usec = value.time_usec,
+                    .button = value.button,
+                    .pressed = value.pressed,
+                    .mode = value.mode,
+                    .group = value.group,
+                } });
+            },
+            .tablet_pad_ring => |value| {
+                const slot = try self.validateTabletDevice(value.device, false);
+                if (value.ring >= slot.info.pad_rings or !std.math.isFinite(value.position))
+                    return error.InvalidTabletControl;
+                self.push(.{ .tablet_pad_ring = .{
+                    .device = try self.idForReference(value.device),
+                    .time_usec = value.time_usec,
+                    .ring = value.ring,
+                    .position = value.position,
+                    .source = value.source,
+                    .mode = value.mode,
+                } });
+            },
+            .tablet_pad_strip => |value| {
+                const slot = try self.validateTabletDevice(value.device, false);
+                if (value.strip >= slot.info.pad_strips or !std.math.isFinite(value.position))
+                    return error.InvalidTabletControl;
+                self.push(.{ .tablet_pad_strip = .{
+                    .device = try self.idForReference(value.device),
+                    .time_usec = value.time_usec,
+                    .strip = value.strip,
+                    .position = value.position,
+                    .source = value.source,
+                    .mode = value.mode,
+                } });
+            },
             .ignored => {},
         }
     }
 
+    fn validateTabletDevice(
+        self: *const Backend,
+        reference: platform_api.DeviceRef,
+        tool: bool,
+    ) !*const DeviceSlot {
+        const index = self.findReference(reference) orelse return error.UnknownDevice;
+        const slot = &self.devices[index];
+        if (if (tool) !slot.info.capabilities.tablet_tool else !slot.info.capabilities.tablet_pad)
+            return error.MissingCapability;
+        return slot;
+    }
+
     fn validateGestureDevice(self: *const Backend, reference: platform_api.DeviceRef) !void {
         const index = self.findReference(reference) orelse return error.UnknownDevice;
-        if (!self.devices[index].capabilities.pointer) return error.MissingCapability;
+        if (!self.devices[index].info.capabilities.pointer) return error.MissingCapability;
     }
 
     fn gestureBegin(self: *const Backend, value: platform_api.GestureBegin) !GestureBegin {
@@ -558,6 +702,21 @@ fn bitIsSet(words: *const [state_words]u64, code: u32) bool {
 fn setBit(words: *[state_words]u64, code: u32, value: bool) void {
     const mask = @as(u64, 1) << @intCast(code % 64);
     if (value) words[code / 64] |= mask else words[code / 64] &= ~mask;
+}
+
+fn validateTabletAxes(axes: platform_api.TabletToolAxes) !void {
+    inline for (.{
+        axes.x,
+        axes.y,
+        axes.pressure,
+        axes.distance,
+        axes.tilt_x,
+        axes.tilt_y,
+        axes.rotation,
+        axes.slider,
+        axes.wheel_degrees,
+    }) |axis| if (axis) |value| if (!std.math.isFinite(value))
+        return error.InvalidTabletAxis;
 }
 
 fn sameToken(a: completion.Token, b: completion.Token) bool {
@@ -736,11 +895,11 @@ test "input: physical state remains distinct and device reuse advances generatio
 
     input_fake.append(.{ .device_added = .{
         .device = 1,
-        .capabilities = .{ .keyboard = true },
+        .info = .{ .capabilities = .{ .keyboard = true } },
     } });
     input_fake.append(.{ .device_added = .{
         .device = 2,
-        .capabilities = .{ .keyboard = true },
+        .info = .{ .capabilities = .{ .keyboard = true } },
     } });
     input_fake.append(.{ .keyboard_key = .{
         .device = 1,
@@ -758,7 +917,7 @@ test "input: physical state remains distinct and device reuse advances generatio
     input_fake.append(.{ .device_removed = 1 });
     input_fake.append(.{ .device_added = .{
         .device = 3,
-        .capabilities = .{ .pointer = true },
+        .info = .{ .capabilities = .{ .pointer = true } },
     } });
     try backend.drainEvents();
     const replacement = backend.events()[1].device_added.device;
@@ -775,7 +934,7 @@ test "input: pointer button motion and keyboard events retain generation identit
 
     input_fake.append(.{ .device_added = .{
         .device = 7,
-        .capabilities = .{ .pointer = true, .keyboard = true },
+        .info = .{ .capabilities = .{ .pointer = true, .keyboard = true } },
     } });
     input_fake.append(.{ .pointer_motion = .{
         .device = 7,
@@ -823,7 +982,10 @@ test "input: gesture lifecycles preserve normalized values and device identity" 
     const backend = try testBackend(&seat_fake, &input_fake, 16);
     defer destroyTestBackend(backend) catch unreachable;
 
-    try backend.consume(.{ .device_added = .{ .device = 7, .capabilities = .{ .pointer = true } } });
+    try backend.consume(.{ .device_added = .{
+        .device = 7,
+        .info = .{ .capabilities = .{ .pointer = true } },
+    } });
     const id = backend.events()[0].device_added.device;
     backend.clearEvents();
     try backend.consume(.{ .swipe_begin = .{ .device = 7, .time_usec = 10, .fingers = 3 } });
@@ -866,13 +1028,19 @@ test "input: gestures reject unknown non-pointer and non-finite values" {
         .time_usec = 1,
         .fingers = 2,
     } }));
-    try backend.consume(.{ .device_added = .{ .device = 1, .capabilities = .{} } });
+    try backend.consume(.{ .device_added = .{
+        .device = 1,
+        .info = .{ .capabilities = .{} },
+    } });
     try std.testing.expectError(error.MissingCapability, backend.consume(.{ .swipe_begin = .{
         .device = 1,
         .time_usec = 2,
         .fingers = 3,
     } }));
-    try backend.consume(.{ .device_added = .{ .device = 2, .capabilities = .{ .pointer = true } } });
+    try backend.consume(.{ .device_added = .{
+        .device = 2,
+        .info = .{ .capabilities = .{ .pointer = true } },
+    } });
     try std.testing.expectError(error.InvalidGesture, backend.consume(.{ .swipe_update = .{
         .device = 2,
         .time_usec = 3,
@@ -895,7 +1063,7 @@ test "input: quiesce closes Session devices and teardown occurs outside callback
     const backend = try testBackend(&seat_fake, &input_fake, 4);
     input_fake.append(.{ .device_added = .{
         .device = 9,
-        .capabilities = .{ .pointer = true },
+        .info = .{ .capabilities = .{ .pointer = true } },
     } });
     try backend.drainEvents();
     var router = try completion.Router.init(std.testing.allocator, 2);
@@ -974,7 +1142,7 @@ test "input: Session re-enable advances seat generation before new devices" {
     defer destroyTestBackend(backend) catch unreachable;
     input_fake.append(.{ .device_added = .{
         .device = 1,
-        .capabilities = .{ .keyboard = true },
+        .info = .{ .capabilities = .{ .keyboard = true } },
     } });
     try backend.drainEvents();
     const old = backend.events()[0].device_added.device;
@@ -997,16 +1165,87 @@ test "input: Session re-enable advances seat generation before new devices" {
 
     input_fake.append(.{ .device_added = .{
         .device = 2,
-        .capabilities = .{ .pointer = true },
+        .info = .{ .capabilities = .{ .pointer = true } },
     } });
     input_fake.append(.{ .device_added = .{
         .device = 3,
-        .capabilities = .{ .keyboard = true },
+        .info = .{ .capabilities = .{ .keyboard = true } },
     } });
     try backend.resumeAfterEnable(&router, &ring);
     const current = backend.events()[0].device_added.device;
     try std.testing.expectEqual(@as(u32, 2), current.seat_generation);
     try std.testing.expect(old.seat_generation != current.seat_generation);
+}
+
+test "input: tablet metadata and events retain generational device ownership" {
+    var seat_fake: FakeSeat = .{};
+    var input_fake: FakeInput = .{};
+    const backend = try testBackend(&seat_fake, &input_fake, 16);
+    defer destroyTestBackend(backend) catch unreachable;
+
+    try backend.consume(.{ .device_added = .{
+        .device = 12,
+        .info = .{
+            .capabilities = .{ .tablet_tool = true, .tablet_pad = true },
+            .vendor = 0x56a,
+            .product = 0x37,
+            .group = 44,
+            .pad_buttons = 2,
+            .pad_rings = 1,
+            .pad_strips = 1,
+            .pad_mode_groups = 1,
+        },
+    } });
+    const id = backend.events()[0].device_added.device;
+    try std.testing.expectEqual(@as(u32, 0x56a), backend.events()[0].device_added.info.vendor);
+    backend.clearEvents();
+
+    try backend.consume(.{ .tablet_tool_proximity = .{
+        .device = 12,
+        .tool = .{
+            .reference = 91,
+            .kind = .pen,
+            .serial = 1234,
+            .hardware_id = 5678,
+            .capabilities = .{ .pressure = true, .tilt = true },
+        },
+        .time_usec = 100,
+        .entered = true,
+        .x = 0.25,
+        .y = 0.75,
+    } });
+    try backend.consume(.{ .tablet_tool_axis = .{
+        .device = 12,
+        .tool = 91,
+        .time_usec = 101,
+        .axes = .{ .x = 0.5, .pressure = 0.8, .wheel_clicks = -1 },
+    } });
+    try backend.consume(.{ .tablet_pad_ring = .{
+        .device = 12,
+        .time_usec = 102,
+        .ring = 0,
+        .position = 90,
+        .source = .finger,
+        .mode = 0,
+    } });
+    try std.testing.expectEqual(id, backend.events()[0].tablet_tool_proximity.device);
+    try std.testing.expectEqual(@as(platform_api.ToolRef, 91), backend.events()[1].tablet_tool_axis.tool);
+    try std.testing.expectEqual(platform_api.TabletPadSource.finger, backend.events()[2].tablet_pad_ring.source);
+
+    try std.testing.expectError(error.InvalidTabletAxis, backend.consume(.{ .tablet_tool_axis = .{
+        .device = 12,
+        .tool = 91,
+        .time_usec = 103,
+        .axes = .{ .pressure = std.math.nan(f64) },
+    } }));
+    try std.testing.expectError(error.InvalidTabletControl, backend.consume(.{ .tablet_pad_button = .{
+        .device = 12,
+        .time_usec = 104,
+        .button = 2,
+        .pressed = true,
+        .mode = 0,
+        .group = 0,
+    } }));
 }
 
 test "input: readiness and removal join the shared ring without internal submit" {

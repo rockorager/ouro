@@ -257,7 +257,7 @@ fn runVertical(trigger: TerminalTrigger, source: ClientSource) !void {
         if (coordinator.surface_id) |id| if (coordinator.interaction.cursor.surface == null) {
             try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .device_added = .{
                 .device = .{ .slot = 0, .generation = 1, .seat_generation = 1 },
-                .capabilities = .{ .pointer = true },
+                .info = .{ .capabilities = .{ .pointer = true } },
             } }));
             coordinator.interaction.cursorRequest(id, .{ .x = 0, .y = 0 });
             cursor_assigned = true;

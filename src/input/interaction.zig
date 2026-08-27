@@ -157,7 +157,7 @@ pub fn Interaction(comptime Desktop: type) type {
             shortcuts_inhibited: bool,
         ) !void {
             switch (event) {
-                .device_added => |value| try self.addDevice(value.device, value.capabilities),
+                .device_added => |value| try self.addDevice(value.device, value.info.capabilities),
                 .device_removed => |id| try self.removeDevice(desktop, id),
                 .pointer_motion => |value| try self.pointerMotion(
                     desktop,
@@ -188,6 +188,14 @@ pub fn Interaction(comptime Desktop: type) type {
                     value.pressed,
                     shortcuts_inhibited,
                 ),
+                .tablet_tool_axis,
+                .tablet_tool_proximity,
+                .tablet_tool_tip,
+                .tablet_tool_button,
+                .tablet_pad_button,
+                .tablet_pad_ring,
+                .tablet_pad_strip,
+                => {},
             }
         }
 
@@ -973,7 +981,7 @@ fn initTestInteraction(command_capacity: usize) !TestInteraction {
 fn addPointer(interaction: *TestInteraction, desktop: *TestDesktop, surfaces: *TestSurfaces) !void {
     try interaction.consume(desktop, surfaces, .{ .device_added = .{
         .device = device_a,
-        .capabilities = .{ .pointer = true },
+        .info = .{ .capabilities = .{ .pointer = true } },
     } });
 }
 
@@ -1048,7 +1056,7 @@ test "interaction: gestures require exact pointer device without mutating focus 
     }));
     try interaction.consume(&desktop, &surfaces, .{ .device_added = .{
         .device = device_b,
-        .capabilities = .{ .keyboard = true },
+        .info = .{ .capabilities = .{ .keyboard = true } },
     } });
     try std.testing.expectError(error.MissingCapability, interaction.consume(&desktop, &surfaces, .{
         .swipe_end = .{ .device = device_b, .time_usec = 10, .cancelled = true },
@@ -1400,7 +1408,7 @@ test "interaction: removed device buttons cannot retain a later grab" {
     try addPointer(&interaction, &desktop, &surfaces);
     try interaction.consume(&desktop, &surfaces, .{ .device_added = .{
         .device = device_b,
-        .capabilities = .{ .pointer = true },
+        .info = .{ .capabilities = .{ .pointer = true } },
     } });
     try interaction.consume(&desktop, &surfaces, .{ .pointer_motion = .{
         .device = device_a,
@@ -1552,7 +1560,7 @@ test "interaction: compositor bindings consume exact press and release pairs" {
     var surfaces = TestSurfaces{};
     try interaction.consume(&desktop, &surfaces, .{ .device_added = .{
         .device = device_a,
-        .capabilities = .{ .keyboard = true },
+        .info = .{ .capabilities = .{ .keyboard = true } },
     } });
     try interaction.consume(&desktop, &surfaces, .{ .keyboard_key = .{
         .device = device_a,
@@ -1639,7 +1647,7 @@ test "interaction: shortcut inhibition forwards compositor binding pairs" {
     interaction.keyboard_focus = targetFor(desktop.windows[0]);
     try interaction.consume(&desktop, &surfaces, .{ .device_added = .{
         .device = device_a,
-        .capabilities = .{ .keyboard = true },
+        .info = .{ .capabilities = .{ .keyboard = true } },
     } });
     try interaction.consume(&desktop, &surfaces, .{ .keyboard_key = .{
         .device = device_a,
@@ -1681,7 +1689,7 @@ test "interaction: close binding retains the exact focused toplevel" {
     desktop.focused = desktop.windows[1].id;
     try interaction.consume(&desktop, &surfaces, .{ .device_added = .{
         .device = device_a,
-        .capabilities = .{ .keyboard = true },
+        .info = .{ .capabilities = .{ .keyboard = true } },
     } });
     try interaction.consume(&desktop, &surfaces, .{ .keyboard_key = .{
         .device = device_a,
