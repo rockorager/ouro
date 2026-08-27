@@ -443,25 +443,19 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                         adapter.pointer_delivery == null or
                         !sameClient(client, adapter.pointer_delivery.?.client))
                         return try adapter.protocolError(actor, decoded.handle.id, 0, "invalid pointer serial");
-                    var surface_id: ?SurfaceId = null;
-                    if (payload.surface) |object_id| {
-                        const handle = server_objects.namespace.lookupHandle(object_id) orelse
-                            return try adapter.protocolError(actor, decoded.handle.id, 0, "stale cursor surface");
-                        const object = server_objects.namespace.resolve(handle) orelse
-                            return try adapter.protocolError(actor, decoded.handle.id, 0, "stale cursor surface");
-                        const cursor = adapter.core.getSurfaceObject(handle, object) catch
-                            return try adapter.protocolError(actor, decoded.handle.id, 0, "invalid cursor surface");
-                        cursor.role.assign(cursor_role_id, false) catch
-                            return try adapter.protocolError(actor, decoded.handle.id, Pointer.@"error".role.value, "cursor surface already has another role");
-                        surface_id = adapter.core.surfaceIdObject(handle, object) catch
-                            return try adapter.protocolError(actor, decoded.handle.id, 0, "invalid cursor surface");
-                    }
-                    adapter.publish(.{ .cursor_requested = .{
-                        .client = client,
-                        .serial = payload.serial,
-                        .surface = surface_id,
-                        .hotspot = .{ .x = payload.hotspot_x, .y = payload.hotspot_y },
-                    } }) catch return try adapter.noMemory(actor);
+                    adapter.requestCursorOn(
+                        server_objects,
+                        pointer.client,
+                        payload.serial,
+                        payload.surface,
+                        .{ .x = payload.hotspot_x, .y = payload.hotspot_y },
+                        0,
+                    ) catch |err| return switch (err) {
+                        error.StaleSurface => try adapter.protocolError(actor, decoded.handle.id, 0, "stale cursor surface"),
+                        error.InvalidSurface => try adapter.protocolError(actor, decoded.handle.id, 0, "invalid cursor surface"),
+                        error.SurfaceRole => try adapter.protocolError(actor, decoded.handle.id, Pointer.@"error".role.value, "cursor surface already has another role"),
+                        error.Exhausted => try adapter.noMemory(actor),
+                    };
                 },
                 .release => {},
             }
@@ -569,6 +563,43 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             const pointer = adapter.resolvePointer(id) catch return false;
             return sameClient(pointer.client, clientId(peer)) and
                 pointer.last_serial == serial and adapter.pointerFocused(id);
+        }
+
+        pub fn requestTabletCursorOn(
+            adapter: *Self,
+            server_objects: anytype,
+            peer: wayring.io_uring.Peer,
+            serial: u32,
+            surface: ?u32,
+            hotspot: Point,
+            owner: u128,
+        ) !void {
+            try adapter.requestCursorOn(server_objects, clientId(peer), serial, surface, hotspot, owner);
+        }
+
+        fn requestCursorOn(
+            adapter: *Self,
+            server_objects: anytype,
+            client: ClientId,
+            serial: u32,
+            surface: ?u32,
+            hotspot: Point,
+            owner: u128,
+        ) !void {
+            var surface_id: ?SurfaceId = null;
+            if (surface) |object_id| {
+                const handle = server_objects.namespace.lookupHandle(object_id) orelse return error.StaleSurface;
+                const object = server_objects.namespace.resolve(handle) orelse return error.StaleSurface;
+                const cursor = adapter.core.getSurfaceObject(handle, object) catch return error.InvalidSurface;
+                cursor.role.assignOwned(cursor_role_id, owner, false) catch return error.SurfaceRole;
+                surface_id = adapter.core.surfaceIdObject(handle, object) catch return error.InvalidSurface;
+            }
+            adapter.publish(.{ .cursor_requested = .{
+                .client = client,
+                .serial = serial,
+                .surface = surface_id,
+                .hotspot = hotspot,
+            } }) catch return error.Exhausted;
         }
 
         pub fn pointerState(adapter: *const Self) PointerState {

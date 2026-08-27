@@ -94,6 +94,7 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
             key: tablet_input.ToolKey = undefined,
             focus: ?Seat.FocusTarget = null,
             leaving: bool = false,
+            last_proximity_serial: u32 = 0,
         };
         const ToolEvent = union(enum) {
             create,
@@ -433,12 +434,58 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
             const binding = self.resolveBinding(tool.binding) catch return null;
             if (!samePeer(binding.peer, peer)) return null;
             const decoded = try wayring.server.decodeRequest(Tool, server_objects, message, fds);
-            // set_cursor is admitted only after the exact tool resource and
-            // peer are validated. It remains an intentional no-op until tool
-            // proximity serial/focus delivery is wired, and the global is not
-            // advertised before that boundary is complete.
+            switch (decoded.value) {
+                .set_cursor => |value| {
+                    self.requestToolCursorOn(
+                        tool,
+                        binding,
+                        server_objects,
+                        value.serial,
+                        value.surface,
+                        .{ .x = value.hotspot_x, .y = value.hotspot_y },
+                    ) catch |err| switch (err) {
+                        // Stable tablet-v2 defines no invalid-serial error;
+                        // stale requests simply have no effect.
+                        error.InvalidSerial => {},
+                        error.StaleSurface => return try self.protocolError(actor, decoded.handle.id, 0, "stale cursor surface"),
+                        error.InvalidSurface => return try self.protocolError(actor, decoded.handle.id, 0, "invalid cursor surface"),
+                        error.SurfaceRole => return try self.protocolError(actor, decoded.handle.id, Tool.@"error".role.value, "cursor surface already has another role"),
+                        error.Exhausted => return try self.noMemory(actor),
+                    };
+                },
+                .destroy => {},
+            }
             try decoded.finish(protocol, server_objects, &actor.transmit);
             return .continue_dispatch;
+        }
+
+        fn requestToolCursorOn(
+            self: *Self,
+            tool: *ToolSlot,
+            binding: *Binding,
+            server_objects: anytype,
+            serial: u32,
+            surface: ?u32,
+            hotspot: Seat.Point,
+        ) !void {
+            if (serial == 0 or serial != tool.last_proximity_serial or
+                tool.focus == null or !self.seat.targetBelongsTo(tool.focus.?, binding.peer))
+                return error.InvalidSerial;
+            try self.seat.requestTabletCursorOn(
+                server_objects,
+                binding.peer,
+                serial,
+                surface,
+                hotspot,
+                self.toolCursorOwner(tool, binding),
+            );
+        }
+
+        fn toolCursorOwner(self: *const Self, tool: *const ToolSlot, binding: *const Binding) u128 {
+            const id = self.toolId(tool);
+            return (@as(u128, binding.peer.slot) << 96) |
+                (@as(u128, binding.peer.generation) << 64) |
+                (@as(u128, id.index) << 32) | id.generation;
         }
 
         /// Fans one physical tablet out to every live tablet-seat resource.
@@ -659,12 +706,14 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                     !self.seat.targetBelongsTo(focus, binding.peer)) continue;
                 const tool = self.findTool(binding_id, snapshot.key) orelse continue;
                 const id = self.toolId(tool);
+                const proximity_serial = self.seat.nextSerial();
                 self.enqueue(binding.peer, .{ .tool = .{ .id = id, .event = .{ .proximity_in = .{
-                    .serial = self.seat.nextSerial(),
+                    .serial = proximity_serial,
                     .tablet = snapshot.key.device,
                     .target = focus,
                 } } } }) catch unreachable;
                 tool.focus = focus;
+                tool.last_proximity_serial = proximity_serial;
                 if (snapshot.tip_down)
                     self.enqueue(binding.peer, .{ .tool = .{
                         .id = id,
@@ -799,6 +848,7 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                 } }) catch unreachable;
                 slot.focus = target;
                 slot.leaving = false;
+                slot.last_proximity_serial = serial;
             }
             const pad_serial = if (pad_count == 0) 0 else self.seat.nextSerial();
             for (self.pads) |*pad| {
@@ -836,6 +886,7 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                 const binding = self.resolveBinding(slot.binding) catch continue;
                 self.enqueue(binding.peer, .{ .tool = .{ .id = self.toolId(slot), .event = .proximity_out } }) catch unreachable;
                 slot.leaving = true;
+                slot.last_proximity_serial = 0;
             }
             const serial = if (pad_count == 0) 0 else self.seat.nextSerial();
             for (self.pads) |*pad| {
@@ -1962,7 +2013,9 @@ fn signedNormalized(value: f64) i32 {
 
 const TestSeat = struct {
     pub const FocusTarget = struct { peer: wayring.io_uring.Peer, surface: u32 };
+    pub const Point = struct { x: i32, y: i32 };
     serial: u32 = 1,
+    cursor_requests: usize = 0,
 
     pub fn validateSeatOn(_: *@This(), _: anytype, _: wayring.io_uring.Peer, _: u32) bool {
         return true;
@@ -1978,6 +2031,17 @@ const TestSeat = struct {
     pub fn surfaceHandleOn(_: *@This(), server_objects: anytype, peer: wayring.io_uring.Peer, target: FocusTarget) !objects.Handle {
         if (!samePeer(peer, target.peer)) return error.ForeignSurface;
         return server_objects.namespace.lookupHandle(target.surface) orelse error.StaleSurface;
+    }
+    pub fn requestTabletCursorOn(
+        self: *@This(),
+        _: anytype,
+        _: wayring.io_uring.Peer,
+        _: u32,
+        _: ?u32,
+        _: Point,
+        _: u128,
+    ) !void {
+        self.cursor_requests += 1;
     }
 };
 
@@ -2302,6 +2366,24 @@ test "tablet-v2: focused tool frame preserves protocol event order" {
 
     const target: TestSeat.FocusTarget = .{ .peer = peer, .surface = 5 };
     try adapter.toolProximityIn(key, target);
+    const proximity_serial = adapter.tools[0].last_proximity_serial;
+    try adapter.requestToolCursorOn(
+        &adapter.tools[0],
+        binding,
+        &server_objects,
+        proximity_serial,
+        null,
+        .{ .x = 3, .y = 4 },
+    );
+    try std.testing.expectEqual(@as(usize, 1), seat.cursor_requests);
+    try std.testing.expectError(error.InvalidSerial, adapter.requestToolCursorOn(
+        &adapter.tools[0],
+        binding,
+        &server_objects,
+        proximity_serial +% 1,
+        null,
+        .{ .x = 3, .y = 4 },
+    ));
     try adapter.toolAxes(key, .{
         .pressure = 0.5,
         .distance = 0.25,
@@ -2318,6 +2400,7 @@ test "tablet-v2: focused tool frame preserves protocol event order" {
     try adapter.toolButton(key, 0x14b, false);
     try adapter.toolTip(key, false);
     try adapter.toolProximityOut(key);
+    try std.testing.expectEqual(@as(u32, 0), adapter.tools[0].last_proximity_serial);
     try std.testing.expect(adapter.tools[0].leaving);
     try adapter.toolFrame(key, 1_235_000);
     try std.testing.expect(adapter.tools[0].focus == null);

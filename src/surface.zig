@@ -70,15 +70,25 @@ pub const RoleId = u64;
 
 pub const Role = struct {
     id: RoleId = 0,
+    owner: u128 = 0,
     object_active: bool = false,
 
     /// Assigns a permanent role. Repeating the same objectless role is valid;
     /// creating a second live role object is not.
     pub fn assign(role: *Role, id: RoleId, has_object: bool) Error!void {
+        try role.assignOwned(id, 0, has_object);
+    }
+
+    /// Objectless roles may additionally retain an exact protocol owner.
+    /// An unowned role can be claimed once; ownership then remains permanent
+    /// with the surface role, including after the owning resource disappears.
+    pub fn assignOwned(role: *Role, id: RoleId, owner: u128, has_object: bool) Error!void {
         if (id == 0) return error.InvalidRole;
         if (role.id != 0 and role.id != id) return error.WrongRole;
+        if (role.id != 0 and role.owner != 0 and role.owner != owner) return error.WrongRole;
         if (has_object and role.object_active) return error.RoleObjectActive;
         role.id = id;
+        if (owner != 0) role.owner = owner;
         if (has_object) role.object_active = true;
     }
 
@@ -1463,6 +1473,13 @@ test "surface validates offsets scale transform and permanent roles" {
     try surface.role.deactivateObject(11);
     try surface.validateDestroy();
     try surface.role.assign(11, true);
+
+    var cursor_role: Role = .{};
+    try cursor_role.assign(13, false);
+    try cursor_role.assignOwned(13, 21, false);
+    try cursor_role.assignOwned(13, 21, false);
+    try std.testing.expectError(error.WrongRole, cursor_role.assignOwned(13, 22, false));
+    try std.testing.expectError(error.WrongRole, cursor_role.assign(13, false));
 }
 
 test "surface rejects buffer dimensions not divisible by scale transactionally" {
