@@ -78,6 +78,8 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
             binding: Id = undefined,
             resource: ?objects.Handle = null,
             key: tablet_input.ToolKey = undefined,
+            focus: ?Seat.FocusTarget = null,
+            leaving: bool = false,
         };
         const ToolEvent = union(enum) {
             create,
@@ -87,6 +89,23 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
             capability: u32,
             done,
             removed,
+            proximity_in: struct {
+                serial: u32,
+                tablet: input.DeviceId,
+                target: Seat.FocusTarget,
+            },
+            proximity_out,
+            motion: struct { x: i32, y: i32 },
+            pressure: u32,
+            distance: u32,
+            tilt: struct { x: i32, y: i32 },
+            rotation: i32,
+            slider: i32,
+            wheel: struct { degrees: i32, clicks: i32 },
+            down: u32,
+            up,
+            button: struct { serial: u32, button: u32, pressed: bool },
+            frame: u32,
         };
         const OutboundValue = union(enum) {
             tablet: struct { id: Id, event: TabletEvent },
@@ -376,6 +395,119 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
             }
         }
 
+        pub fn toolProximityIn(self: *Self, key: tablet_input.ToolKey, target: Seat.FocusTarget) !void {
+            var count: usize = 0;
+            for (self.tools) |slot| {
+                if (!slot.active or slot.resource == null or !std.meta.eql(slot.key, key)) continue;
+                const binding = self.resolveBinding(slot.binding) catch continue;
+                if (self.seat.targetBelongsTo(target, binding.peer) and
+                    self.findTablet(slot.binding, key.device) != null) count += 1;
+            }
+            try self.ensureOutbound(count);
+            const serial = if (count == 0) 0 else self.seat.nextSerial();
+            for (self.tools) |*slot| {
+                if (!slot.active or slot.resource == null or !std.meta.eql(slot.key, key)) continue;
+                const binding = self.resolveBinding(slot.binding) catch continue;
+                if (!self.seat.targetBelongsTo(target, binding.peer) or
+                    self.findTablet(slot.binding, key.device) == null) continue;
+                self.enqueue(binding.peer, .{ .tool = .{
+                    .id = self.toolId(slot),
+                    .event = .{ .proximity_in = .{ .serial = serial, .tablet = key.device, .target = target } },
+                } }) catch unreachable;
+                slot.focus = target;
+                slot.leaving = false;
+            }
+        }
+
+        pub fn toolProximityOut(self: *Self, key: tablet_input.ToolKey) !void {
+            const count = self.focusedToolCount(key);
+            try self.ensureOutbound(count);
+            for (self.tools) |*slot| {
+                if (!slot.active or slot.focus == null or !std.meta.eql(slot.key, key)) continue;
+                const binding = self.resolveBinding(slot.binding) catch continue;
+                self.enqueue(binding.peer, .{ .tool = .{ .id = self.toolId(slot), .event = .proximity_out } }) catch unreachable;
+                slot.leaving = true;
+            }
+        }
+
+        pub fn toolAxes(
+            self: *Self,
+            key: tablet_input.ToolKey,
+            axes: platform.TabletToolAxes,
+            point: ?tablet_input.Point,
+        ) !void {
+            const per_tool = toolAxisCount(axes, point);
+            const needed = std.math.mul(usize, self.focusedToolCount(key), per_tool) catch
+                return error.Exhausted;
+            try self.ensureOutbound(needed);
+            for (self.tools) |*slot| {
+                if (!slot.active or slot.focus == null or !std.meta.eql(slot.key, key)) continue;
+                const binding = self.resolveBinding(slot.binding) catch continue;
+                const id = self.toolId(slot);
+                if (point) |value| self.enqueue(binding.peer, .{ .tool = .{ .id = id, .event = .{ .motion = .{
+                    .x = fixed(value.x),
+                    .y = fixed(value.y),
+                } } } }) catch unreachable;
+                if (axes.pressure) |value| self.enqueue(binding.peer, .{ .tool = .{ .id = id, .event = .{ .pressure = normalized(value) } } }) catch unreachable;
+                if (axes.distance) |value| self.enqueue(binding.peer, .{ .tool = .{ .id = id, .event = .{ .distance = normalized(value) } } }) catch unreachable;
+                if (axes.tilt_x) |x| self.enqueue(binding.peer, .{ .tool = .{ .id = id, .event = .{ .tilt = .{
+                    .x = fixed(x),
+                    .y = fixed(axes.tilt_y.?),
+                } } } }) catch unreachable;
+                if (axes.rotation) |value| self.enqueue(binding.peer, .{ .tool = .{ .id = id, .event = .{ .rotation = fixed(value) } } }) catch unreachable;
+                if (axes.slider) |value| self.enqueue(binding.peer, .{ .tool = .{ .id = id, .event = .{ .slider = signedNormalized(value) } } }) catch unreachable;
+                if (axes.wheel_degrees) |value| self.enqueue(binding.peer, .{ .tool = .{ .id = id, .event = .{ .wheel = .{
+                    .degrees = fixed(value),
+                    .clicks = axes.wheel_clicks,
+                } } } }) catch unreachable;
+            }
+        }
+
+        pub fn toolTip(self: *Self, key: tablet_input.ToolKey, down: bool) !void {
+            const count = self.focusedToolCount(key);
+            try self.ensureOutbound(count);
+            const serial = if (down and count != 0) self.seat.nextSerial() else 0;
+            for (self.tools) |*slot| {
+                if (!slot.active or slot.focus == null or !std.meta.eql(slot.key, key)) continue;
+                const binding = self.resolveBinding(slot.binding) catch continue;
+                self.enqueue(binding.peer, .{ .tool = .{
+                    .id = self.toolId(slot),
+                    .event = if (down) .{ .down = serial } else .up,
+                } }) catch unreachable;
+            }
+        }
+
+        pub fn toolButton(self: *Self, key: tablet_input.ToolKey, button: u32, pressed: bool) !void {
+            const count = self.focusedToolCount(key);
+            try self.ensureOutbound(count);
+            const serial = if (count == 0) 0 else self.seat.nextSerial();
+            for (self.tools) |*slot| {
+                if (!slot.active or slot.focus == null or !std.meta.eql(slot.key, key)) continue;
+                const binding = self.resolveBinding(slot.binding) catch continue;
+                self.enqueue(binding.peer, .{ .tool = .{
+                    .id = self.toolId(slot),
+                    .event = .{ .button = .{ .serial = serial, .button = button, .pressed = pressed } },
+                } }) catch unreachable;
+            }
+        }
+
+        pub fn toolFrame(self: *Self, key: tablet_input.ToolKey, time_usec: u64) !void {
+            const count = self.focusedToolCount(key);
+            try self.ensureOutbound(count);
+            for (self.tools) |*slot| {
+                if (!slot.active or slot.focus == null or !std.meta.eql(slot.key, key)) continue;
+                const binding = self.resolveBinding(slot.binding) catch continue;
+                self.enqueue(binding.peer, .{ .tool = .{
+                    .id = self.toolId(slot),
+                    .event = .{ .frame = @truncate(time_usec / 1000) },
+                } }) catch unreachable;
+                if (slot.leaving) {
+                    slot.focus = null;
+                    slot.leaving = false;
+                }
+            }
+        }
+
         pub fn pendingOutbound(self: *const Self, peer: wayring.io_uring.Peer) bool {
             if (self.outbound_len == 0) return false;
             for (self.outbound) |slot|
@@ -478,6 +610,36 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                 .capability => |capability| .{ .capability = .{ .capability = Tool.capability.fromInt(capability) } },
                 .done => .{ .done = .{} },
                 .removed => .{ .removed = .{} },
+                .proximity_in => |proximity| proximity: {
+                    const tablet = self.findTablet(tool.binding, proximity.tablet) orelse
+                        return true;
+                    const surface = self.seat.surfaceHandleOn(
+                        server_objects,
+                        binding.peer,
+                        proximity.target,
+                    ) catch return true;
+                    break :proximity .{ .proximity_in = .{
+                        .serial = proximity.serial,
+                        .tablet = (tablet.resource orelse return true).id,
+                        .surface = surface.id,
+                    } };
+                },
+                .proximity_out => .{ .proximity_out = .{} },
+                .motion => |motion| .{ .motion = .{ .x = motion.x, .y = motion.y } },
+                .pressure => |pressure| .{ .pressure = .{ .pressure = pressure } },
+                .distance => |distance| .{ .distance = .{ .distance = distance } },
+                .tilt => |tilt| .{ .tilt = .{ .tilt_x = tilt.x, .tilt_y = tilt.y } },
+                .rotation => |rotation| .{ .rotation = .{ .degrees = rotation } },
+                .slider => |slider| .{ .slider = .{ .position = slider } },
+                .wheel => |wheel| .{ .wheel = .{ .degrees = wheel.degrees, .clicks = wheel.clicks } },
+                .down => |serial| .{ .down = .{ .serial = serial } },
+                .up => .{ .up = .{} },
+                .button => |button| .{ .button = .{
+                    .serial = button.serial,
+                    .button = button.button,
+                    .state = if (button.pressed) Tool.button_state.pressed else Tool.button_state.released,
+                } },
+                .frame => |time| .{ .frame = .{ .time = time } },
             };
             if (event) |wire_event| wayring.server.sendEvent(
                 protocol,
@@ -687,6 +849,24 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
             return count;
         }
 
+        fn focusedToolCount(self: *const Self, key: tablet_input.ToolKey) usize {
+            var count: usize = 0;
+            for (self.tools) |slot|
+                count += @intFromBool(slot.active and slot.focus != null and std.meta.eql(slot.key, key));
+            return count;
+        }
+
+        fn findTablet(self: *Self, binding: Id, device: input.DeviceId) ?*TabletSlot {
+            for (self.tablets) |*slot|
+                if (slot.active and std.meta.eql(slot.binding, binding) and
+                    std.meta.eql(slot.device, device)) return slot;
+            return null;
+        }
+
+        fn ensureOutbound(self: *const Self, needed: usize) !void {
+            if (self.outbound.len - self.outbound_len < needed) return error.Exhausted;
+        }
+
         fn enqueue(self: *Self, peer: wayring.io_uring.Peer, value: OutboundValue) !void {
             for (self.outbound) |*slot| if (!slot.active) {
                 slot.* = .{ .active = true, .sequence = self.next_sequence, .peer = peer, .value = value };
@@ -827,15 +1007,57 @@ fn toolMetadataCount(info: platform.TabletToolInfo) usize {
     return count;
 }
 
+fn toolAxisCount(axes: platform.TabletToolAxes, point: ?tablet_input.Point) usize {
+    var count: usize = @intFromBool(point != null);
+    count += @intFromBool(axes.pressure != null);
+    count += @intFromBool(axes.distance != null);
+    count += @intFromBool(axes.tilt_x != null);
+    count += @intFromBool(axes.rotation != null);
+    count += @intFromBool(axes.slider != null);
+    count += @intFromBool(axes.wheel_degrees != null);
+    return count;
+}
+
+fn fixed(value: f64) i32 {
+    const scaled = value * 256.0;
+    if (scaled >= @as(f64, @floatFromInt(std.math.maxInt(i32)))) return std.math.maxInt(i32);
+    if (scaled <= @as(f64, @floatFromInt(std.math.minInt(i32)))) return std.math.minInt(i32);
+    return @intFromFloat(@round(scaled));
+}
+
+fn normalized(value: f64) u32 {
+    return @intFromFloat(@round(std.math.clamp(value, 0, 1) * 65535.0));
+}
+
+fn signedNormalized(value: f64) i32 {
+    return @intFromFloat(@round(std.math.clamp(value, -1, 1) * 65535.0));
+}
+
+const TestSeat = struct {
+    pub const FocusTarget = struct { peer: wayring.io_uring.Peer, surface: u32 };
+    serial: u32 = 1,
+
+    pub fn validateSeatOn(_: *@This(), _: anytype, _: wayring.io_uring.Peer, _: u32) bool {
+        return true;
+    }
+    pub fn targetBelongsTo(_: *const @This(), target: FocusTarget, peer: wayring.io_uring.Peer) bool {
+        return samePeer(target.peer, peer);
+    }
+    pub fn nextSerial(self: *@This()) u32 {
+        const serial = self.serial;
+        self.serial +%= 1;
+        return serial;
+    }
+    pub fn surfaceHandleOn(_: *@This(), server_objects: anytype, peer: wayring.io_uring.Peer, target: FocusTarget) !objects.Handle {
+        if (!samePeer(peer, target.peer)) return error.ForeignSurface;
+        return server_objects.namespace.lookupHandle(target.surface) orelse error.StaleSurface;
+    }
+};
+
 test "tablet-v2: tablet-seat parent retires only after its children" {
     const protocol = @import("core_protocol");
-    const FakeSeat = struct {
-        pub fn validateSeatOn(_: *@This(), _: anytype, _: wayring.io_uring.Peer, _: u32) bool {
-            return true;
-        }
-    };
-    const TestAdapter = Adapter(protocol, FakeSeat);
-    var seat: FakeSeat = .{};
+    const TestAdapter = Adapter(protocol, TestSeat);
+    var seat: TestSeat = .{};
     var adapter = try TestAdapter.init(std.testing.allocator, &seat, .{
         .manager_capacity = 1,
         .tablet_seat_capacity = 1,
@@ -860,13 +1082,8 @@ test "tablet-v2: tablet-seat parent retires only after its children" {
 
 test "tablet-v2: disconnect matches the complete peer generation" {
     const protocol = @import("core_protocol");
-    const FakeSeat = struct {
-        pub fn validateSeatOn(_: *@This(), _: anytype, _: wayring.io_uring.Peer, _: u32) bool {
-            return true;
-        }
-    };
-    const TestAdapter = Adapter(protocol, FakeSeat);
-    var seat: FakeSeat = .{};
+    const TestAdapter = Adapter(protocol, TestSeat);
+    var seat: TestSeat = .{};
     var adapter = try TestAdapter.init(std.testing.allocator, &seat, .{
         .manager_capacity = 2,
         .tablet_seat_capacity = 2,
@@ -884,13 +1101,8 @@ test "tablet-v2: disconnect matches the complete peer generation" {
 
 test "tablet-v2: tablet publication is atomic and metadata stays ordered" {
     const protocol = @import("core_protocol");
-    const FakeSeat = struct {
-        pub fn validateSeatOn(_: *@This(), _: anytype, _: wayring.io_uring.Peer, _: u32) bool {
-            return true;
-        }
-    };
-    const TestAdapter = Adapter(protocol, FakeSeat);
-    var seat: FakeSeat = .{};
+    const TestAdapter = Adapter(protocol, TestSeat);
+    var seat: TestSeat = .{};
     var adapter = try TestAdapter.init(std.testing.allocator, &seat, .{
         .manager_capacity = 1,
         .tablet_seat_capacity = 2,
@@ -925,13 +1137,8 @@ test "tablet-v2: tablet publication is atomic and metadata stays ordered" {
 
 test "tablet-v2: TX pressure cannot duplicate a server-created tablet" {
     const protocol = @import("core_protocol");
-    const FakeSeat = struct {
-        pub fn validateSeatOn(_: *@This(), _: anytype, _: wayring.io_uring.Peer, _: u32) bool {
-            return true;
-        }
-    };
-    const TestAdapter = Adapter(protocol, FakeSeat);
-    var seat: FakeSeat = .{};
+    const TestAdapter = Adapter(protocol, TestSeat);
+    var seat: TestSeat = .{};
     var adapter = try TestAdapter.init(std.testing.allocator, &seat, .{
         .manager_capacity = 1,
         .tablet_seat_capacity = 1,
@@ -981,13 +1188,8 @@ test "tablet-v2: TX pressure cannot duplicate a server-created tablet" {
 
 test "tablet-v2: tool metadata resumes after its constructor" {
     const protocol = @import("core_protocol");
-    const FakeSeat = struct {
-        pub fn validateSeatOn(_: *@This(), _: anytype, _: wayring.io_uring.Peer, _: u32) bool {
-            return true;
-        }
-    };
-    const TestAdapter = Adapter(protocol, FakeSeat);
-    var seat: FakeSeat = .{};
+    const TestAdapter = Adapter(protocol, TestSeat);
+    var seat: TestSeat = .{};
     var adapter = try TestAdapter.init(std.testing.allocator, &seat, .{
         .manager_capacity = 1,
         .tablet_seat_capacity = 1,
@@ -1050,4 +1252,86 @@ test "tablet-v2: tool metadata resumes after its constructor" {
         .capabilities = .{},
     })));
     try std.testing.expectEqual(@as(usize, 1), adapter.freeTools());
+}
+
+test "tablet-v2: focused tool frame preserves protocol event order" {
+    const protocol = @import("core_protocol");
+    const TestAdapter = Adapter(protocol, TestSeat);
+    var seat: TestSeat = .{};
+    var adapter = try TestAdapter.init(std.testing.allocator, &seat, .{
+        .manager_capacity = 1,
+        .tablet_seat_capacity = 1,
+        .tablet_capacity = 1,
+        .tool_capacity = 1,
+        .outbound_capacity = 32,
+    });
+    defer adapter.deinit();
+    var server_objects = try wayring.objects.ServerObjects.init(
+        std.testing.allocator,
+        32,
+        16,
+        &protocol.wl_display.info,
+        null,
+    );
+    defer server_objects.deinit(std.testing.allocator);
+    const peer: wayring.io_uring.Peer = .{ .slot = 9, .generation = 10 };
+    const binding = try adapter.acquireBinding();
+    binding.peer = peer;
+    binding.resource = try server_objects.insertClient(
+        4,
+        &protocol.zwp_tablet_seat_v2.info,
+        2,
+        binding,
+    );
+    binding.resource_present = true;
+    _ = try server_objects.insertClient(5, &protocol.wl_surface.info, 6, null);
+    const device: input.DeviceId = .{ .slot = 1, .generation = 2, .seat_generation = 3 };
+    const key: tablet_input.ToolKey = .{ .device = device, .reference = 4 };
+
+    var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 256, 4);
+    defer blocks.deinit(std.testing.allocator);
+    var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 1);
+    defer descriptors.deinit(std.testing.allocator);
+    try adapter.publishTablet(device, .{ .capabilities = .{ .tablet_tool = true } });
+    var tablet_metadata = wayring.tx.Queue.init(&blocks, 64, &descriptors, 1);
+    try std.testing.expectEqual(@as(usize, 2), try adapter.flushOn(peer, &server_objects, &tablet_metadata));
+    tablet_metadata.deinit();
+    try std.testing.expect(try adapter.publishTool(key, .{
+        .reference = key.reference,
+        .kind = .pen,
+        .serial = 0,
+        .hardware_id = 0,
+        .capabilities = .{},
+    }));
+    var tool_metadata = wayring.tx.Queue.init(&blocks, 64, &descriptors, 1);
+    try std.testing.expectEqual(@as(usize, 3), try adapter.flushOn(peer, &server_objects, &tool_metadata));
+    tool_metadata.deinit();
+
+    const target: TestSeat.FocusTarget = .{ .peer = peer, .surface = 5 };
+    try adapter.toolProximityIn(key, target);
+    try adapter.toolAxes(key, .{
+        .pressure = 0.5,
+        .distance = 0.25,
+        .tilt_x = 10,
+        .tilt_y = -10,
+        .rotation = 45,
+        .slider = -0.5,
+        .wheel_degrees = 15,
+        .wheel_clicks = 1,
+    }, .{ .x = 20, .y = 30 });
+    try adapter.toolTip(key, true);
+    try adapter.toolButton(key, 0x14b, true);
+    try adapter.toolFrame(key, 1_234_567);
+    try adapter.toolButton(key, 0x14b, false);
+    try adapter.toolTip(key, false);
+    try adapter.toolProximityOut(key);
+    try std.testing.expect(adapter.tools[0].leaving);
+    try adapter.toolFrame(key, 1_235_000);
+    try std.testing.expect(adapter.tools[0].focus == null);
+    try std.testing.expectEqual(@as(usize, 15), adapter.outbound_len);
+
+    var events = wayring.tx.Queue.init(&blocks, 256, &descriptors, 1);
+    defer events.deinit();
+    try std.testing.expectEqual(@as(usize, 15), try adapter.flushOn(peer, &server_objects, &events));
+    try std.testing.expectEqual(@as(usize, 0), adapter.outbound_len);
 }
