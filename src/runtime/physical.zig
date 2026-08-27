@@ -2256,11 +2256,18 @@ pub fn Coordinator(comptime protocol: type) type {
         fn sessionLockChanged(self: *Self) !void {
             const unlocked = self.session_lock_adapter.takeUnlocked();
             self.markProtocolAll(ProtocolReady.seat | ProtocolReady.data_device |
-                ProtocolReady.primary_selection | ProtocolReady.text_input);
+                ProtocolReady.primary_selection | ProtocolReady.text_input |
+                ProtocolReady.tablet);
             if (self.sessionLockActive()) {
                 self.session_lock_input_ready = false;
                 self.interaction.suspendClientFocus();
                 var input_ready = true;
+                self.tablet_state.suspendFocus(0) catch {
+                    input_ready = false;
+                };
+                _ = self.tablet_adapter.drainState(&self.tablet_state) catch {
+                    input_ready = false;
+                };
                 self.data_device_adapter.cancelDrag() catch {
                     input_ready = false;
                 };

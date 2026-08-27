@@ -175,6 +175,21 @@ pub fn State(comptime Focus: type) type {
             state.event_len = 0;
         }
 
+        /// Releases every client-focused tool while retaining physical device
+        /// and proximity identity. The complete cancellation is preflighted
+        /// so callers can retry without publishing a partial leave.
+        pub fn suspendFocus(state: *Self, time_usec: u64) !void {
+            var required: usize = 0;
+            for (state.tools) |tool| {
+                if (tool.active and tool.focus != null)
+                    required += tool.button_len + 2 + boolCount(tool.tip_down);
+            }
+            try state.prepare(required);
+            for (state.tools) |*tool|
+                if (tool.active and tool.focus != null)
+                    state.leaveAssumeCapacity(tool, time_usec, true);
+        }
+
         pub fn consume(
             state: *Self,
             event: input.Event,
@@ -556,6 +571,51 @@ test "tablet state retains implicit focus until tip release" {
     };
     try std.testing.expect(left and entered);
     try std.testing.expect(state.toolAt(0).?.focus_sequence > initial_focus_sequence);
+}
+
+test "tablet state focus suspension is atomic and releases held state" {
+    var state = try TestState.init(std.testing.allocator, .{
+        .device_capacity = 1,
+        .tool_capacity = 1,
+        .buttons_per_tool = 1,
+        .event_capacity = 5,
+    });
+    defer state.deinit();
+    try addTestTool(&state);
+    state.clear();
+    try state.consume(.{ .tablet_tool_tip = .{
+        .device = test_device,
+        .tool = 44,
+        .time_usec = 2,
+        .down = true,
+        .axes = .{},
+    } }, focus_a, null);
+    state.clear();
+    try state.consume(.{ .tablet_tool_button = .{
+        .device = test_device,
+        .tool = 44,
+        .time_usec = 3,
+        .button = 9,
+        .pressed = true,
+        .axes = .{},
+    } }, focus_a, null);
+    state.clear();
+
+    state.event_len = state.events.len - 3;
+    try std.testing.expectError(error.Exhausted, state.suspendFocus(4));
+    try std.testing.expect(state.toolAt(0).?.focus != null);
+    try std.testing.expect(state.toolAt(0).?.tip_down);
+    try std.testing.expectEqual(@as(usize, 1), state.toolAt(0).?.button_count);
+    state.clear();
+
+    try state.suspendFocus(4);
+    try std.testing.expect(state.toolAt(0).?.focus == null);
+    try std.testing.expect(!state.toolAt(0).?.tip_down);
+    try std.testing.expectEqual(@as(usize, 0), state.toolAt(0).?.button_count);
+    const expected = [_]std.meta.Tag(TestState.Event){ .button, .tip, .proximity_out, .frame };
+    try std.testing.expectEqual(expected.len, state.pendingCount());
+    for (expected, 0..) |tag, index|
+        try std.testing.expectEqual(tag, std.meta.activeTag(state.eventAt(index).?.*));
 }
 
 test "tablet state removal synthesizes releases before retirement" {
