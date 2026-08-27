@@ -37,6 +37,7 @@ pub fn State(comptime Focus: type) type {
             info: platform.TabletToolInfo,
             in_proximity: bool,
             focus: ?Focus,
+            focus_sequence: u64,
             tip_down: bool,
             button_count: usize,
         };
@@ -68,6 +69,7 @@ pub fn State(comptime Focus: type) type {
             info: platform.TabletToolInfo = undefined,
             in_proximity: bool = false,
             focus: ?Focus = null,
+            focus_sequence: u64 = 0,
             tip_down: bool = false,
             buttons_offset: usize = 0,
             button_len: usize = 0,
@@ -81,6 +83,7 @@ pub fn State(comptime Focus: type) type {
         event_head: usize = 0,
         event_len: usize = 0,
         buttons_per_tool: usize,
+        next_focus_sequence: u64 = 1,
 
         pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
             try config.validate();
@@ -146,6 +149,7 @@ pub fn State(comptime Focus: type) type {
                     .info = tool.info,
                     .in_proximity = tool.in_proximity,
                     .focus = tool.focus,
+                    .focus_sequence = tool.focus_sequence,
                     .tip_down = tool.tip_down,
                     .button_count = tool.button_len,
                 };
@@ -240,7 +244,7 @@ pub fn State(comptime Focus: type) type {
                 }
                 if (tool.?.in_proximity) return error.InvalidState;
                 tool.?.in_proximity = true;
-                tool.?.focus = candidate;
+                state.setFocus(tool.?, candidate);
                 if (candidate) |focus|
                     state.pushAssumeCapacity(.{ .proximity_in = .{ .key = tool.?.key, .focus = focus } });
                 state.axesAssumeCapacity(tool.?, value.axes, point);
@@ -310,7 +314,7 @@ pub fn State(comptime Focus: type) type {
             try state.prepare(leave_count + enter_count + axisEventCount(axes, point) + edge_count + frame_count);
             if (leave_count != 0) state.leaveAssumeCapacity(tool, time_usec, false);
             if (enter_count != 0) {
-                tool.focus = candidate;
+                state.setFocus(tool, candidate);
                 state.pushAssumeCapacity(.{ .proximity_in = .{ .key = tool.key, .focus = candidate.? } });
             }
             state.axesAssumeCapacity(tool, axes, point);
@@ -348,7 +352,18 @@ pub fn State(comptime Focus: type) type {
             }
             state.pushAssumeCapacity(.{ .proximity_out = tool.key });
             state.frameAssumeCapacity(tool, time_usec);
-            tool.focus = null;
+            state.setFocus(tool, null);
+        }
+
+        fn setFocus(state: *Self, tool: *Tool, focus: ?Focus) void {
+            tool.focus = focus;
+            if (focus == null) {
+                tool.focus_sequence = 0;
+                return;
+            }
+            tool.focus_sequence = state.next_focus_sequence;
+            state.next_focus_sequence +%= 1;
+            if (state.next_focus_sequence == 0) state.next_focus_sequence = 1;
         }
 
         fn axesAssumeCapacity(
@@ -495,6 +510,8 @@ test "tablet state retains implicit focus until tip release" {
     try addTestTool(&state);
     try std.testing.expectEqual(test_device, state.deviceAt(0).?.device);
     try std.testing.expectEqual(@as(platform.ToolRef, 44), state.toolAt(0).?.key.reference);
+    const initial_focus_sequence = state.toolAt(0).?.focus_sequence;
+    try std.testing.expect(initial_focus_sequence != 0);
     state.clear();
 
     try state.consume(.{ .tablet_tool_tip = .{
@@ -538,6 +555,7 @@ test "tablet state retains implicit focus until tip release" {
         else => {},
     };
     try std.testing.expect(left and entered);
+    try std.testing.expect(state.toolAt(0).?.focus_sequence > initial_focus_sequence);
 }
 
 test "tablet state removal synthesizes releases before retirement" {
