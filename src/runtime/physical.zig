@@ -810,6 +810,9 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = try self.adapter.installTearingControl();
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
+            _ = try self.adapter.installFifo();
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
             _ = try self.fractional_scale_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
@@ -2722,7 +2725,9 @@ pub fn Coordinator(comptime protocol: type) type {
             while (remaining != 0 and self.pending_surface_len != 0) : (remaining -= 1) {
                 const before_len = self.pending_surface_len;
                 const pending = self.pending_surfaces[self.pending_surface_head];
-                changed = (try self.applyPendingSurface(pending)) or changed;
+                const applied = try self.applyPendingSurface(pending);
+                if (applied and self.output == null) self.adapter.clearFifoBarriers();
+                changed = applied or changed;
                 if (self.pending_surface_len == before_len)
                     _ = self.rotatePendingSurface();
             }
@@ -3252,13 +3257,17 @@ pub fn Coordinator(comptime protocol: type) type {
             );
             switch (render_result) {
                 .submitted => {
+                    self.adapter.clearFifoBarriers();
                     self.stats.submitted += 1;
                     self.themed_cursor_previous = next_themed_cursor_previous;
                     self.client_cursor_hidden_previous = null;
                     self.removed_layer_len = 0;
                     _ = try self.retryRetainedOutcomes();
                 },
-                .retired => |failure| try self.finishOutcome(failure.frame, false),
+                .retired => |failure| {
+                    self.adapter.clearFifoBarriers();
+                    try self.finishOutcome(failure.frame, false);
+                },
             }
         }
 

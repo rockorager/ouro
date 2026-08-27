@@ -225,6 +225,8 @@ pub const Update = struct {
     color_representation: color.Representation,
     content_type: u32 = 0,
     presentation_hint: PresentationHint = .vsync,
+    fifo_set: bool = false,
+    fifo_wait: bool = false,
 };
 
 pub const Surface = struct {
@@ -253,6 +255,8 @@ pub const Surface = struct {
     pending_color_representation: color.Representation = .{},
     pending_content_type: u32 = 0,
     pending_presentation_hint: PresentationHint = .vsync,
+    pending_fifo_set: bool = false,
+    pending_fifo_wait: bool = false,
 
     /// Applies wl_surface.attach validation and replaces the pending buffer.
     pub fn attach(
@@ -312,6 +316,14 @@ pub const Surface = struct {
 
     pub fn setPresentationHint(surface: *Surface, hint: PresentationHint) void {
         surface.pending_presentation_hint = hint;
+    }
+
+    pub fn setFifoBarrier(surface: *Surface) void {
+        surface.pending_fifo_set = true;
+    }
+
+    pub fn waitFifoBarrier(surface: *Surface) void {
+        surface.pending_fifo_wait = true;
     }
 
     pub fn hasPendingBufferAttachment(surface: Surface) bool {
@@ -402,6 +414,8 @@ pub const Surface = struct {
             .color_representation = surface.current_color_representation,
             .content_type = surface.current_content_type,
             .presentation_hint = surface.current_presentation_hint,
+            .fifo_set = surface.pending_fifo_set,
+            .fifo_wait = surface.pending_fifo_wait,
         };
         surface.pending_buffer = null;
         surface.pending_attach_offset = .{};
@@ -411,6 +425,8 @@ pub const Surface = struct {
         surface.pending_surface_upload_damage = .{};
         surface.pending_buffer_upload_damage = .{};
         surface.pending_offset = .{};
+        surface.pending_fifo_set = false;
+        surface.pending_fifo_wait = false;
         return update;
     }
 
@@ -871,6 +887,23 @@ test "surface presentation hint is double buffered" {
     try std.testing.expectEqual(PresentationHint.async, surface.current_presentation_hint);
     const synchronized = try surface.commit();
     try std.testing.expectEqual(PresentationHint.vsync, synchronized.presentation_hint);
+}
+
+test "surface FIFO requests are one-shot commit state" {
+    var surface: Surface = .{};
+
+    surface.setFifoBarrier();
+    surface.setFifoBarrier();
+    surface.waitFifoBarrier();
+    const constrained = try surface.commit();
+    try std.testing.expect(constrained.fifo_set);
+    try std.testing.expect(constrained.fifo_wait);
+
+    const next = try surface.commit();
+    try std.testing.expect(!next.fifo_set);
+    try std.testing.expect(!next.fifo_wait);
+    try std.testing.expect(constrained.fifo_set);
+    try std.testing.expect(constrained.fifo_wait);
 }
 
 test "surface viewport validates transformed and scaled content atomically" {

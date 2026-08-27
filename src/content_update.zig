@@ -31,6 +31,11 @@ pub fn Scheduler(comptime Key: type, comptime Payload: type) type {
             payload: Payload,
         };
 
+        pub const Pending = struct {
+            kind: Kind,
+            payload: *const Payload,
+        };
+
         pub const CommitPlan = struct {
             queue: *Queue,
             previous: ?Token,
@@ -315,6 +320,16 @@ pub fn Scheduler(comptime Key: type, comptime Payload: type) type {
             if (count > scheduler.nodes[index].constraint_count)
                 return error.ConstraintUnderflow;
             scheduler.nodes[index].constraint_count -= count;
+        }
+
+        /// Borrows the exact queue head for policy constraints which depend on
+        /// state outside this protocol-neutral scheduler. The pointer remains
+        /// valid only until the next operation mutates the scheduler.
+        pub fn peek(scheduler: *Self, queue: *Queue) Error!?Pending {
+            if (queue.scheduler != scheduler) return error.InvalidDependency;
+            if (queue.head == none) return null;
+            const node = &scheduler.nodes[queue.head];
+            return .{ .kind = node.kind, .payload = &node.payload };
         }
 
         /// Implements the wl_surface synchronized-to-desynchronized rewrite.
@@ -673,6 +688,25 @@ test "content updates detach an applied head from its queued successor" {
     try std.testing.expectEqual(@as(usize, 1), second_applied.len);
     try std.testing.expectEqual(second, second_applied[0].update);
     try std.testing.expectEqual(@as(u32, 22), second_applied[0].payload);
+}
+
+test "content updates expose the exact queue head without mutation" {
+    var scheduler = try TestScheduler.init(std.testing.allocator, 2, 1);
+    defer scheduler.deinit(std.testing.allocator);
+    var queue = TestScheduler.Queue.init(&scheduler, 7);
+    defer queue.deinit();
+
+    try std.testing.expect((try scheduler.peek(&queue)) == null);
+    _ = try scheduler.commit(&queue, 11, .sync, &.{}, 0);
+    _ = try scheduler.commit(&queue, 22, .sync, &.{}, 0);
+    const first = (try scheduler.peek(&queue)).?;
+    try std.testing.expectEqual(Kind.sync, first.kind);
+    try std.testing.expectEqual(@as(u32, 11), first.payload.*);
+
+    try std.testing.expectEqual(@as(usize, 2), try scheduler.transitionDesync(&queue));
+    const promoted = (try scheduler.peek(&queue)).?;
+    try std.testing.expectEqual(Kind.desync, promoted.kind);
+    try std.testing.expectEqual(@as(u32, 11), promoted.payload.*);
 }
 
 test "constraints block a graph without mutation" {

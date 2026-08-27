@@ -55,6 +55,10 @@ responsibilities:
   `wp_tearing_control_v1` objects retain synchronized or asynchronous
   presentation suitability on exact commits; Ouro currently presents both
   through its synchronized KMS path.
+- [FIFO constraints](src/protocol/core_surface.zig): bounded `wp_fifo_v1`
+  objects retain one-shot barrier and wait state on exact commits, block only
+  desynchronized content updates, and release barriers after the next physical
+  latching attempt.
 - [Fractional scale](src/protocol/fractional_scale.zig): bounded per-surface
   `wp_fractional_scale_v1` objects publish Ouro's preferred render scale and
   pair with viewporter destination sizing.

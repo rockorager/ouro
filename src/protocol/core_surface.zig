@@ -27,6 +27,7 @@ pub const Config = struct {
     single_pixel_buffer_capacity: usize = 8,
     content_type_capacity: usize = 8,
     tearing_control_capacity: usize = 8,
+    fifo_capacity: usize = 8,
     presentation_resource_capacity: usize = 4,
     presentation_feedback_capacity: usize = 64,
     region_operation_capacity: usize,
@@ -48,6 +49,7 @@ pub const Config = struct {
             config.single_pixel_buffer_capacity >= none or
             config.content_type_capacity == 0 or config.content_type_capacity >= none or
             config.tearing_control_capacity == 0 or config.tearing_control_capacity >= none or
+            config.fifo_capacity == 0 or config.fifo_capacity >= none or
             config.presentation_resource_capacity == 0 or
             config.presentation_resource_capacity >= none or
             config.presentation_feedback_capacity == 0 or
@@ -77,6 +79,8 @@ pub fn Adapter(comptime protocol: type) type {
         const ContentType = protocol.wp_content_type_v1;
         const TearingControlManager = protocol.wp_tearing_control_manager_v1;
         const TearingControl = protocol.wp_tearing_control_v1;
+        const FifoManager = protocol.wp_fifo_manager_v1;
+        const Fifo = protocol.wp_fifo_v1;
         const WlBuffer = protocol.wl_buffer;
         const Presentation = protocol.wp_presentation;
         const PresentationFeedback = protocol.wp_presentation_feedback;
@@ -196,6 +200,7 @@ pub fn Adapter(comptime protocol: type) type {
             releases: surface_state.ReleaseQueue = undefined,
             attachment: surface_state.AttachmentLeaseState = .{},
             updates: Commit.Scheduler.Queue = undefined,
+            fifo_barrier: bool = false,
             viewport_resource: ?objects.Handle = null,
             presentation_feedback: surface_state.PresentationFeedbackPending = undefined,
         };
@@ -235,6 +240,13 @@ pub fn Adapter(comptime protocol: type) type {
             surface: ?SurfaceId = null,
         };
 
+        const FifoSlot = struct {
+            active: bool = false,
+            next_free: u32 = none,
+            resource: objects.Handle = .{ .id = 0, .generation = 0 },
+            surface: ?SurfaceId = null,
+        };
+
         const PresentationResource = struct {
             active: bool = false,
             next_free: u32 = none,
@@ -253,6 +265,7 @@ pub fn Adapter(comptime protocol: type) type {
         single_pixel_global: ?objects.Handle = null,
         content_type_global: ?objects.Handle = null,
         tearing_control_global: ?objects.Handle = null,
+        fifo_global: ?objects.Handle = null,
         presentation_global: ?objects.Handle = null,
         compositor_version: u32,
         surfaces: []*SurfaceSlot,
@@ -261,6 +274,7 @@ pub fn Adapter(comptime protocol: type) type {
         single_pixels: []*SinglePixelSlot,
         content_types: []*ContentTypeSlot,
         tearing_controls: []*TearingControlSlot,
+        fifos: []*FifoSlot,
         presentation_resources: []*PresentationResource,
         surface_free: u32,
         region_free: u32,
@@ -268,6 +282,7 @@ pub fn Adapter(comptime protocol: type) type {
         single_pixel_free: u32,
         content_type_free: u32,
         tearing_control_free: u32,
+        fifo_free: u32,
         presentation_resource_free: u32,
         region_pool: surface_state.RegionPool,
         frame_pool: surface_state.FramePool,
@@ -324,6 +339,8 @@ pub fn Adapter(comptime protocol: type) type {
                 config.tearing_control_capacity,
             );
             errdefer freeSlots(TearingControlSlot, allocator, tearing_controls);
+            const fifos = try allocSlots(FifoSlot, allocator, config.fifo_capacity);
+            errdefer freeSlots(FifoSlot, allocator, fifos);
             const presentation_resources = try allocSlots(
                 PresentationResource,
                 allocator,
@@ -391,6 +408,9 @@ pub fn Adapter(comptime protocol: type) type {
             for (tearing_controls, 0..) |slot, index| slot.* = .{
                 .next_free = if (index + 1 < tearing_controls.len) @intCast(index + 1) else none,
             };
+            for (fifos, 0..) |slot, index| slot.* = .{
+                .next_free = if (index + 1 < fifos.len) @intCast(index + 1) else none,
+            };
             for (presentation_resources, 0..) |slot, index| slot.* = .{
                 .next_free = if (index + 1 < presentation_resources.len) @intCast(index + 1) else none,
             };
@@ -409,6 +429,7 @@ pub fn Adapter(comptime protocol: type) type {
                 .single_pixels = single_pixels,
                 .content_types = content_types,
                 .tearing_controls = tearing_controls,
+                .fifos = fifos,
                 .presentation_resources = presentation_resources,
                 .surface_free = 0,
                 .region_free = 0,
@@ -416,6 +437,7 @@ pub fn Adapter(comptime protocol: type) type {
                 .single_pixel_free = 0,
                 .content_type_free = 0,
                 .tearing_control_free = 0,
+                .fifo_free = 0,
                 .presentation_resource_free = 0,
                 .region_pool = region_pool,
                 .frame_pool = frame_pool,
@@ -450,6 +472,9 @@ pub fn Adapter(comptime protocol: type) type {
             for (adapter.tearing_controls, 0..) |slot, index| {
                 if (slot.active) adapter.releaseTearingControl(@intCast(index));
             }
+            for (adapter.fifos, 0..) |slot, index| {
+                if (slot.active) adapter.releaseFifo(@intCast(index));
+            }
             for (adapter.presentation_resources, 0..) |slot, index| {
                 if (slot.active) adapter.releasePresentationResource(@intCast(index));
             }
@@ -469,6 +494,7 @@ pub fn Adapter(comptime protocol: type) type {
             freeSlots(SinglePixelSlot, adapter.allocator, adapter.single_pixels);
             freeSlots(ContentTypeSlot, adapter.allocator, adapter.content_types);
             freeSlots(TearingControlSlot, adapter.allocator, adapter.tearing_controls);
+            freeSlots(FifoSlot, adapter.allocator, adapter.fifos);
             freeSlots(PresentationResource, adapter.allocator, adapter.presentation_resources);
             adapter.allocator.free(adapter.copy_storage);
             adapter.allocator.free(adapter.copies);
@@ -559,6 +585,19 @@ pub fn Adapter(comptime protocol: type) type {
             return global;
         }
 
+        pub fn installFifo(adapter: *Self) !objects.Handle {
+            const runtime = adapter.runtime orelse return error.NotInstalled;
+            if (adapter.fifo_global != null) return error.AlreadyInstalled;
+            const global = try runtime.addGlobalWithBinder(
+                &FifoManager.info,
+                1,
+                adapter,
+                bind,
+            );
+            adapter.fifo_global = global;
+            return global;
+        }
+
         /// Driver-facing dispatch entry point. Null means another protocol
         /// owner should inspect the request.
         pub fn request(
@@ -629,6 +668,14 @@ pub fn Adapter(comptime protocol: type) type {
                 const slot = adapter.tearingControlFromObject(target.object) orelse return null;
                 return try adapter.tearingControlRequest(actor, server_objects, slot, message, fds);
             }
+            if (interface == &FifoManager.info) {
+                if (target.object.context != @as(?*anyopaque, @ptrCast(adapter))) return null;
+                return try adapter.fifoManagerRequest(actor, server_objects, message, fds);
+            }
+            if (interface == &Fifo.info) {
+                const slot = adapter.fifoFromObject(target.object) orelse return null;
+                return try adapter.fifoRequest(actor, server_objects, slot, message, fds);
+            }
             if (interface == &Presentation.info) {
                 const resource = adapter.presentationResourceFromObject(target.object) orelse return null;
                 return try adapter.presentationRequest(actor, server_objects, resource, message, fds);
@@ -653,6 +700,7 @@ pub fn Adapter(comptime protocol: type) type {
                 };
                 adapter.detachContentTypes(surface_id);
                 adapter.detachTearingControls(surface_id);
+                adapter.detachFifos(surface_id);
                 adapter.releaseSurface(adapter.surfaceIndex(slot));
                 return true;
             }
@@ -686,6 +734,12 @@ pub fn Adapter(comptime protocol: type) type {
                 adapter.releaseTearingControl(adapter.tearingControlIndex(slot));
                 return true;
             }
+            if (object.interface == &Fifo.info) {
+                const slot = adapter.fifoFromObject(&object) orelse return false;
+                if (!std.meta.eql(slot.resource, handle)) return false;
+                adapter.releaseFifo(adapter.fifoIndex(slot));
+                return true;
+            }
             if (object.interface == &Presentation.info) {
                 const resource = adapter.presentationResourceFromObject(&object) orelse return false;
                 if (!std.meta.eql(resource.resource, handle)) return false;
@@ -696,7 +750,8 @@ pub fn Adapter(comptime protocol: type) type {
             return (object.interface == &Compositor.info or object.interface == &Viewporter.info or
                 object.interface == &SinglePixelManager.info or
                 object.interface == &ContentTypeManager.info or
-                object.interface == &TearingControlManager.info) and
+                object.interface == &TearingControlManager.info or
+                object.interface == &FifoManager.info) and
                 object.context == @as(?*anyopaque, @ptrCast(adapter));
         }
 
@@ -955,11 +1010,18 @@ pub fn Adapter(comptime protocol: type) type {
             output: []Applied,
         ) ![]Applied {
             const slot = try adapter.resolveSurface(handle);
-            return adapter.scheduler.tryApply(&slot.updates, output);
+            if (try adapter.fifoBlocked(slot)) return output[0..0];
+            const applied = try adapter.scheduler.tryApply(&slot.updates, output);
+            for (applied) |update| if (update.payload.surface.fifo_set) {
+                const applied_surface = try adapter.resolveSurface(update.surface);
+                applied_surface.fifo_barrier = true;
+            };
+            return applied;
         }
 
         pub fn readyUpdateCount(adapter: *Self, handle: objects.Handle) !usize {
             const slot = try adapter.resolveSurface(handle);
+            if (try adapter.fifoBlocked(slot)) return 0;
             return adapter.scheduler.readyCount(&slot.updates);
         }
 
@@ -969,7 +1031,17 @@ pub fn Adapter(comptime protocol: type) type {
             output: []objects.Handle,
         ) ![]objects.Handle {
             const slot = try adapter.resolveSurface(handle);
+            if (try adapter.fifoBlocked(slot)) return output[0..0];
             return adapter.scheduler.readySurfaces(&slot.updates, output);
+        }
+
+        /// Clears every active single-output FIFO condition after one physical
+        /// latching attempt. This is intentionally infallible so the output
+        /// submission boundary cannot fail after KMS accepts a frame.
+        pub fn clearFifoBarriers(adapter: *Self) void {
+            for (adapter.surfaces) |*slot| {
+                if (slot.active) slot.fifo_barrier = false;
+            }
         }
 
         pub fn satisfy(adapter: *Self, token: UpdateToken, count: u32) !void {
@@ -1768,6 +1840,88 @@ pub fn Adapter(comptime protocol: type) type {
             return .continue_dispatch;
         }
 
+        fn fifoManagerRequest(
+            adapter: *Self,
+            actor: *wayring.connection.Actor,
+            server_objects: anytype,
+            message: wayring.wire.Message,
+            fds: *wayring.ancillary.FdQueue,
+        ) !wayring.dispatch.Control {
+            const decoded = try wayring.server.decodeRequest(
+                FifoManager,
+                server_objects,
+                message,
+                fds,
+            );
+            switch (decoded.value) {
+                .destroy => {},
+                .get_fifo => |value| {
+                    const surface_handle = server_objects.namespace.lookupHandle(value.surface) orelse
+                        return try adapter.fifoManagerError(actor, decoded.handle.id, "invalid FIFO surface");
+                    const surface_object = server_objects.namespace.resolve(surface_handle) orelse
+                        return try adapter.fifoManagerError(actor, decoded.handle.id, "invalid FIFO surface");
+                    const surface = adapter.surfaceIdObject(surface_handle, surface_object) catch
+                        return try adapter.fifoManagerError(actor, decoded.handle.id, "invalid FIFO surface");
+                    for (adapter.fifos) |slot| if (slot.active and slot.surface != null and
+                        std.meta.eql(slot.surface.?, surface))
+                        return try adapter.fifoManagerError(actor, decoded.handle.id, "FIFO already exists");
+                    const slot = adapter.acquireFifo() catch return try adapter.noMemory(actor);
+                    const admitted = FifoManager.admit_get_fifo(
+                        server_objects,
+                        decoded.handle,
+                        value,
+                        .{ .id = slot },
+                    ) catch |cause| {
+                        adapter.releaseFifo(adapter.fifoIndex(slot));
+                        return try adapter.failure(actor, decoded.handle.id, cause);
+                    };
+                    slot.resource = admitted.id;
+                    slot.surface = surface;
+                },
+            }
+            try decoded.finish(protocol, server_objects, &actor.transmit);
+            return .continue_dispatch;
+        }
+
+        fn fifoRequest(
+            adapter: *Self,
+            actor: *wayring.connection.Actor,
+            server_objects: anytype,
+            slot: *FifoSlot,
+            message: wayring.wire.Message,
+            fds: *wayring.ancillary.FdQueue,
+        ) !wayring.dispatch.Control {
+            const decoded = try wayring.server.decodeRequest(
+                Fifo,
+                server_objects,
+                message,
+                fds,
+            );
+            switch (decoded.value) {
+                .destroy => {},
+                .set_barrier => {
+                    const surface = slot.surface orelse
+                        return try adapter.fifoSurfaceError(actor, decoded.handle.id);
+                    const target = adapter.surfaceForId(surface) catch {
+                        slot.surface = null;
+                        return try adapter.fifoSurfaceError(actor, decoded.handle.id);
+                    };
+                    target.state.setFifoBarrier();
+                },
+                .wait_barrier => {
+                    const surface = slot.surface orelse
+                        return try adapter.fifoSurfaceError(actor, decoded.handle.id);
+                    const target = adapter.surfaceForId(surface) catch {
+                        slot.surface = null;
+                        return try adapter.fifoSurfaceError(actor, decoded.handle.id);
+                    };
+                    target.state.waitFifoBarrier();
+                },
+            }
+            try decoded.finish(protocol, server_objects, &actor.transmit);
+            return .continue_dispatch;
+        }
+
         fn viewportRequest(
             adapter: *Self,
             actor: *wayring.connection.Actor,
@@ -2132,6 +2286,35 @@ pub fn Adapter(comptime protocol: type) type {
             }
         }
 
+        fn acquireFifo(adapter: *Self) !*FifoSlot {
+            if (adapter.fifo_free == none) return error.Exhausted;
+            const index = adapter.fifo_free;
+            const slot = adapter.fifos[index];
+            adapter.fifo_free = slot.next_free;
+            slot.* = .{ .active = true };
+            return slot;
+        }
+
+        fn releaseFifo(adapter: *Self, index: u32) void {
+            const slot = adapter.fifos[index];
+            if (!slot.active) return;
+            slot.* = .{ .next_free = adapter.fifo_free };
+            adapter.fifo_free = index;
+        }
+
+        fn detachFifos(adapter: *Self, surface: SurfaceId) void {
+            for (adapter.fifos) |slot| {
+                if (slot.active and slot.surface != null and
+                    std.meta.eql(slot.surface.?, surface)) slot.surface = null;
+            }
+        }
+
+        fn fifoBlocked(adapter: *Self, slot: *SurfaceSlot) !bool {
+            if (!slot.fifo_barrier) return false;
+            const pending = (try adapter.scheduler.peek(&slot.updates)) orelse return false;
+            return pending.kind == .desync and pending.payload.surface.fifo_wait;
+        }
+
         fn acquirePresentationResource(adapter: *Self) !*PresentationResource {
             if (adapter.presentation_resource_free == none) try adapter.growSlots(PresentationResource, &adapter.presentation_resources, &adapter.presentation_resource_free);
             const index = adapter.presentation_resource_free;
@@ -2294,6 +2477,10 @@ pub fn Adapter(comptime protocol: type) type {
             return bindingFromContext(TearingControlSlot, adapter.tearing_controls, object.context);
         }
 
+        fn fifoFromObject(adapter: *Self, object: *const objects.Object) ?*FifoSlot {
+            return bindingFromContext(FifoSlot, adapter.fifos, object.context);
+        }
+
         fn presentationResourceFromObject(
             adapter: *Self,
             object: *const objects.Object,
@@ -2323,6 +2510,10 @@ pub fn Adapter(comptime protocol: type) type {
 
         fn tearingControlIndex(adapter: *Self, slot: *TearingControlSlot) u32 {
             return slotIndex(TearingControlSlot, adapter.tearing_controls, slot);
+        }
+
+        fn fifoIndex(adapter: *Self, slot: *FifoSlot) u32 {
+            return slotIndex(FifoSlot, adapter.fifos, slot);
         }
 
         fn presentationResourceIndex(adapter: *Self, resource: *PresentationResource) u32 {
@@ -2575,6 +2766,33 @@ pub fn Adapter(comptime protocol: type) type {
             );
         }
 
+        fn fifoManagerError(
+            adapter: *Self,
+            actor: *wayring.connection.Actor,
+            object_id: u32,
+            message: []const u8,
+        ) !wayring.dispatch.Control {
+            return adapter.protocolError(
+                actor,
+                object_id,
+                FifoManager.@"error".already_exists.value,
+                message,
+            );
+        }
+
+        fn fifoSurfaceError(
+            adapter: *Self,
+            actor: *wayring.connection.Actor,
+            object_id: u32,
+        ) !wayring.dispatch.Control {
+            return adapter.protocolError(
+                actor,
+                object_id,
+                Fifo.@"error".surface_destroyed.value,
+                "FIFO surface was destroyed",
+            );
+        }
+
         fn protocolError(
             adapter: *Self,
             actor: *wayring.connection.Actor,
@@ -2692,6 +2910,7 @@ const TestContext = struct {
             .single_pixel_buffer_capacity = 1,
             .content_type_capacity = 1,
             .tearing_control_capacity = 1,
+            .fifo_capacity = 1,
             .presentation_resource_capacity = 2,
             .presentation_feedback_capacity = 4,
             .region_operation_capacity = 16,
@@ -3772,6 +3991,258 @@ test "tearing control rejects duplicate objects for one surface" {
     );
     try std.testing.expectEqual(wayring.dispatch.Control.stop, try context.dispatchCore());
     try std.testing.expect(context.server_objects.namespace.get(12) == null);
+}
+
+test "FIFO waits for the refresh after its exact barrier commit" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const manager = try context.server_objects.insertClient(
+        30,
+        &test_protocol.wp_fifo_manager_v1.info,
+        1,
+        &context.adapter,
+    );
+    const surface = try context.createSurface(10);
+    try test_protocol.wp_fifo_manager_v1.encodeRequest(
+        &context.requests,
+        manager.id,
+        .{ .get_fifo = .{ .id = 11, .surface = surface.id } },
+    );
+    _ = try context.dispatchCore();
+    const fifo = context.server_objects.namespace.lookupHandle(11) orelse
+        return error.MissingFifo;
+
+    try test_protocol.wp_fifo_v1.encodeRequest(
+        &context.requests,
+        fifo.id,
+        .{ .set_barrier = .{} },
+    );
+    _ = try context.dispatchCore();
+    try test_protocol.wp_fifo_v1.encodeRequest(
+        &context.requests,
+        fifo.id,
+        .{ .destroy = .{} },
+    );
+    _ = try context.dispatchCore();
+    try test_protocol.wl_surface.encodeRequest(
+        &context.requests,
+        surface.id,
+        .{ .commit = .{} },
+    );
+    _ = try context.dispatchCore();
+
+    var output: [1]TestAdapter.Applied = undefined;
+    var barrier = (try context.adapter.tryApply(surface, &output))[0].payload;
+    try std.testing.expect(barrier.surface.fifo_set);
+    barrier.deinit();
+
+    try test_protocol.wp_fifo_manager_v1.encodeRequest(
+        &context.requests,
+        manager.id,
+        .{ .get_fifo = .{ .id = 12, .surface = surface.id } },
+    );
+    _ = try context.dispatchCore();
+    const replacement = context.server_objects.namespace.lookupHandle(12) orelse
+        return error.MissingFifo;
+    try test_protocol.wp_fifo_v1.encodeRequest(
+        &context.requests,
+        replacement.id,
+        .{ .wait_barrier = .{} },
+    );
+    _ = try context.dispatchCore();
+    try test_protocol.wp_fifo_v1.encodeRequest(
+        &context.requests,
+        replacement.id,
+        .{ .set_barrier = .{} },
+    );
+    _ = try context.dispatchCore();
+    try test_protocol.wl_surface.encodeRequest(
+        &context.requests,
+        surface.id,
+        .{ .commit = .{} },
+    );
+    _ = try context.dispatchCore();
+    try test_protocol.wp_fifo_v1.encodeRequest(
+        &context.requests,
+        replacement.id,
+        .{ .wait_barrier = .{} },
+    );
+    _ = try context.dispatchCore();
+    try test_protocol.wl_surface.encodeRequest(
+        &context.requests,
+        surface.id,
+        .{ .commit = .{} },
+    );
+    _ = try context.dispatchCore();
+    try std.testing.expectEqual(@as(usize, 0), try context.adapter.readyUpdateCount(surface));
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        (try context.adapter.tryApply(surface, &output)).len,
+    );
+
+    context.adapter.clearFifoBarriers();
+    var waiting = (try context.adapter.tryApply(surface, &output))[0].payload;
+    try std.testing.expect(waiting.surface.fifo_wait);
+    try std.testing.expect(waiting.surface.fifo_set);
+    waiting.deinit();
+    try std.testing.expectEqual(@as(usize, 0), try context.adapter.readyUpdateCount(surface));
+    context.adapter.clearFifoBarriers();
+    var second_wait = (try context.adapter.tryApply(surface, &output))[0].payload;
+    try std.testing.expect(second_wait.surface.fifo_wait);
+    try std.testing.expect(!second_wait.surface.fifo_set);
+    second_wait.deinit();
+}
+
+test "FIFO wait does not block a synchronized child update" {
+    const Hook = struct {
+        adapter: *TestAdapter,
+        child: TestAdapter.SurfaceId,
+        parent: TestAdapter.SurfaceId,
+
+        fn plan(
+            pointer: *anyopaque,
+            surface: TestAdapter.SurfaceId,
+            dependencies: []TestAdapter.UpdateToken,
+        ) !TestAdapter.ContentCommitPlan {
+            const hook: *@This() = @ptrCast(@alignCast(pointer));
+            if (std.meta.eql(surface, hook.child)) return .{ .kind = .sync };
+            if (!std.meta.eql(surface, hook.parent)) return .{};
+            if (try hook.adapter.newestSynchronizedUpdate(hook.child)) |update| {
+                if (dependencies.len == 0) return error.OutputTooSmall;
+                dependencies[0] = update;
+                return .{ .dependency_count = 1 };
+            }
+            return .{};
+        }
+
+        fn committed(_: *anyopaque, _: TestAdapter.SurfaceId) void {}
+    };
+    const context = try TestContext.init();
+    defer context.deinit();
+    const manager = try context.server_objects.insertClient(
+        30,
+        &test_protocol.wp_fifo_manager_v1.info,
+        1,
+        &context.adapter,
+    );
+    const child = try context.createSurface(10);
+    const parent = try context.createSurface(11);
+    try test_protocol.wp_fifo_manager_v1.encodeRequest(
+        &context.requests,
+        manager.id,
+        .{ .get_fifo = .{ .id = 12, .surface = child.id } },
+    );
+    _ = try context.dispatchCore();
+    const fifo = context.server_objects.namespace.lookupHandle(12) orelse
+        return error.MissingFifo;
+    try test_protocol.wp_fifo_v1.encodeRequest(
+        &context.requests,
+        fifo.id,
+        .{ .set_barrier = .{} },
+    );
+    _ = try context.dispatchCore();
+    try test_protocol.wl_surface.encodeRequest(
+        &context.requests,
+        child.id,
+        .{ .commit = .{} },
+    );
+    _ = try context.dispatchCore();
+    var output: [2]TestAdapter.Applied = undefined;
+    var barrier = (try context.adapter.tryApply(child, &output))[0].payload;
+    barrier.deinit();
+
+    var hook: Hook = .{
+        .adapter = &context.adapter,
+        .child = try context.adapter.surfaceId(child),
+        .parent = try context.adapter.surfaceId(parent),
+    };
+    try context.adapter.setContentCommitHook(.{
+        .context = &hook,
+        .plan_fn = Hook.plan,
+        .committed_fn = Hook.committed,
+    });
+    try test_protocol.wp_fifo_v1.encodeRequest(
+        &context.requests,
+        fifo.id,
+        .{ .wait_barrier = .{} },
+    );
+    _ = try context.dispatchCore();
+    try test_protocol.wl_surface.encodeRequest(
+        &context.requests,
+        child.id,
+        .{ .commit = .{} },
+    );
+    _ = try context.dispatchCore();
+    try std.testing.expectEqual(@as(usize, 0), try context.adapter.readyUpdateCount(child));
+    try test_protocol.wl_surface.encodeRequest(
+        &context.requests,
+        parent.id,
+        .{ .commit = .{} },
+    );
+    _ = try context.dispatchCore();
+    const updates = try context.adapter.tryApply(parent, &output);
+    defer for (updates) |*update| update.payload.deinit();
+    try std.testing.expectEqual(@as(usize, 2), updates.len);
+    try std.testing.expectEqual(child, updates[0].surface);
+    try std.testing.expect(updates[0].payload.surface.fifo_wait);
+    try std.testing.expectEqual(parent, updates[1].surface);
+}
+
+test "FIFO rejects duplicate objects for one surface" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const manager = try context.server_objects.insertClient(
+        30,
+        &test_protocol.wp_fifo_manager_v1.info,
+        1,
+        &context.adapter,
+    );
+    const surface = try context.createSurface(10);
+    try test_protocol.wp_fifo_manager_v1.encodeRequest(
+        &context.requests,
+        manager.id,
+        .{ .get_fifo = .{ .id = 11, .surface = surface.id } },
+    );
+    _ = try context.dispatchCore();
+    try test_protocol.wp_fifo_manager_v1.encodeRequest(
+        &context.requests,
+        manager.id,
+        .{ .get_fifo = .{ .id = 12, .surface = surface.id } },
+    );
+    try std.testing.expectEqual(wayring.dispatch.Control.stop, try context.dispatchCore());
+    try std.testing.expect(context.server_objects.namespace.get(12) == null);
+}
+
+test "FIFO requests fail after the associated surface is destroyed" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const manager = try context.server_objects.insertClient(
+        30,
+        &test_protocol.wp_fifo_manager_v1.info,
+        1,
+        &context.adapter,
+    );
+    const surface = try context.createSurface(10);
+    try test_protocol.wp_fifo_manager_v1.encodeRequest(
+        &context.requests,
+        manager.id,
+        .{ .get_fifo = .{ .id = 11, .surface = surface.id } },
+    );
+    _ = try context.dispatchCore();
+    const fifo = context.server_objects.namespace.lookupHandle(11) orelse
+        return error.MissingFifo;
+    try test_protocol.wl_surface.encodeRequest(
+        &context.requests,
+        surface.id,
+        .{ .destroy = .{} },
+    );
+    _ = try context.dispatchCore();
+    try test_protocol.wp_fifo_v1.encodeRequest(
+        &context.requests,
+        fifo.id,
+        .{ .wait_barrier = .{} },
+    );
+    try std.testing.expectEqual(wayring.dispatch.Control.stop, try context.dispatchCore());
 }
 
 test "surface removal drops copy ownership but preserves storage through CQE" {
