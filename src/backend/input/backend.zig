@@ -96,6 +96,7 @@ pub const Event = union(enum) {
         position: f64,
         source: platform_api.TabletPadSource,
         mode: u32,
+        group: u32,
     },
     tablet_pad_strip: struct {
         device: DeviceId,
@@ -104,6 +105,7 @@ pub const Event = union(enum) {
         position: f64,
         source: platform_api.TabletPadSource,
         mode: u32,
+        group: u32,
     },
 };
 
@@ -526,7 +528,9 @@ pub const Backend = struct {
             },
             .tablet_pad_button => |value| {
                 const slot = try self.validateTabletDevice(value.device, false);
-                if (value.button >= slot.info.pad_buttons or value.group >= slot.info.pad_mode_groups)
+                if (value.button >= slot.info.pad_buttons or
+                    !validPadMode(slot.info, value.group, value.mode) or
+                    slot.info.pad_groups[value.group].buttons & (@as(u64, 1) << @intCast(value.button)) == 0)
                     return error.InvalidTabletControl;
                 self.push(.{ .tablet_pad_button = .{
                     .device = try self.idForReference(value.device),
@@ -539,7 +543,10 @@ pub const Backend = struct {
             },
             .tablet_pad_ring => |value| {
                 const slot = try self.validateTabletDevice(value.device, false);
-                if (value.ring >= slot.info.pad_rings or !std.math.isFinite(value.position))
+                if (value.ring >= slot.info.pad_rings or
+                    !validPadMode(slot.info, value.group, value.mode) or
+                    slot.info.pad_groups[value.group].rings & (@as(u64, 1) << @intCast(value.ring)) == 0 or
+                    !std.math.isFinite(value.position))
                     return error.InvalidTabletControl;
                 self.push(.{ .tablet_pad_ring = .{
                     .device = try self.idForReference(value.device),
@@ -548,11 +555,15 @@ pub const Backend = struct {
                     .position = value.position,
                     .source = value.source,
                     .mode = value.mode,
+                    .group = value.group,
                 } });
             },
             .tablet_pad_strip => |value| {
                 const slot = try self.validateTabletDevice(value.device, false);
-                if (value.strip >= slot.info.pad_strips or !std.math.isFinite(value.position))
+                if (value.strip >= slot.info.pad_strips or
+                    !validPadMode(slot.info, value.group, value.mode) or
+                    slot.info.pad_groups[value.group].strips & (@as(u64, 1) << @intCast(value.strip)) == 0 or
+                    !std.math.isFinite(value.position))
                     return error.InvalidTabletControl;
                 self.push(.{ .tablet_pad_strip = .{
                     .device = try self.idForReference(value.device),
@@ -561,6 +572,7 @@ pub const Backend = struct {
                     .position = value.position,
                     .source = value.source,
                     .mode = value.mode,
+                    .group = value.group,
                 } });
             },
             .ignored => {},
@@ -717,6 +729,10 @@ fn validateTabletAxes(axes: platform_api.TabletToolAxes) !void {
         axes.wheel_degrees,
     }) |axis| if (axis) |value| if (!std.math.isFinite(value))
         return error.InvalidTabletAxis;
+}
+
+fn validPadMode(info: platform_api.DeviceInfo, group: u32, mode: u32) bool {
+    return group < info.pad_mode_groups and mode < info.pad_groups[group].modes;
 }
 
 fn sameToken(a: completion.Token, b: completion.Token) bool {
@@ -1194,6 +1210,12 @@ test "input: tablet metadata and events retain generational device ownership" {
             .pad_rings = 1,
             .pad_strips = 1,
             .pad_mode_groups = 1,
+            .pad_groups = groups: {
+                var groups = [_]platform_api.TabletPadGroupInfo{.{}} **
+                    platform_api.max_tablet_pad_groups;
+                groups[0] = .{ .buttons = 0b11, .rings = 0b1, .strips = 0b1, .modes = 2 };
+                break :groups groups;
+            },
         },
     } });
     const id = backend.events()[0].device_added.device;
@@ -1227,6 +1249,7 @@ test "input: tablet metadata and events retain generational device ownership" {
         .position = 90,
         .source = .finger,
         .mode = 0,
+        .group = 0,
     } });
     try std.testing.expectEqual(id, backend.events()[0].tablet_tool_proximity.device);
     try std.testing.expectEqual(@as(platform_api.ToolRef, 91), backend.events()[1].tablet_tool_axis.tool);

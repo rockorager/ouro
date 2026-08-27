@@ -13,6 +13,8 @@ const c = @cImport({
 pub const DeviceRef = usize;
 pub const ToolRef = usize;
 pub const DeviceGroupRef = usize;
+pub const max_tablet_pad_groups = 8;
+pub const max_tablet_pad_controls = 64;
 
 pub const Capabilities = packed struct {
     pointer: bool = false,
@@ -31,6 +33,15 @@ pub const DeviceInfo = struct {
     pad_rings: u32 = 0,
     pad_strips: u32 = 0,
     pad_mode_groups: u32 = 0,
+    pad_groups: [max_tablet_pad_groups]TabletPadGroupInfo =
+        [_]TabletPadGroupInfo{.{}} ** max_tablet_pad_groups,
+};
+
+pub const TabletPadGroupInfo = struct {
+    buttons: u64 = 0,
+    rings: u64 = 0,
+    strips: u64 = 0,
+    modes: u32 = 0,
 };
 
 pub const TabletToolType = enum { pen, eraser, brush, pencil, airbrush, mouse, lens, totem };
@@ -140,6 +151,7 @@ pub const RawEvent = union(enum) {
         position: f64,
         source: TabletPadSource,
         mode: u32,
+        group: u32,
     },
     tablet_pad_strip: struct {
         device: DeviceRef,
@@ -148,6 +160,7 @@ pub const RawEvent = union(enum) {
         position: f64,
         source: TabletPadSource,
         mode: u32,
+        group: u32,
     },
     ignored,
 };
@@ -465,6 +478,7 @@ fn realNextEvent(_: *anyopaque, value: *anyopaque) !?RawEvent {
                     .position = c.libinput_event_tablet_pad_get_ring_position(pad),
                     .source = padRingSource(c.libinput_event_tablet_pad_get_ring_source(pad)),
                     .mode = mode,
+                    .group = padModeGroup(pad),
                 } },
                 c.LIBINPUT_EVENT_TABLET_PAD_STRIP => .{ .tablet_pad_strip = .{
                     .device = device,
@@ -473,6 +487,7 @@ fn realNextEvent(_: *anyopaque, value: *anyopaque) !?RawEvent {
                     .position = c.libinput_event_tablet_pad_get_strip_position(pad),
                     .source = padStripSource(c.libinput_event_tablet_pad_get_strip_source(pad)),
                     .mode = mode,
+                    .group = padModeGroup(pad),
                 } },
                 else => unreachable,
             };
@@ -482,13 +497,13 @@ fn realNextEvent(_: *anyopaque, value: *anyopaque) !?RawEvent {
 }
 
 fn deviceInfo(device: *c.struct_libinput_device) DeviceInfo {
-    const capabilities: Capabilities = .{
+    var capabilities: Capabilities = .{
         .pointer = c.libinput_device_has_capability(device, c.LIBINPUT_DEVICE_CAP_POINTER) != 0,
         .keyboard = c.libinput_device_has_capability(device, c.LIBINPUT_DEVICE_CAP_KEYBOARD) != 0,
         .tablet_tool = c.libinput_device_has_capability(device, c.LIBINPUT_DEVICE_CAP_TABLET_TOOL) != 0,
         .tablet_pad = c.libinput_device_has_capability(device, c.LIBINPUT_DEVICE_CAP_TABLET_PAD) != 0,
     };
-    return .{
+    var info: DeviceInfo = .{
         .capabilities = capabilities,
         .vendor = c.libinput_device_get_id_vendor(device),
         .product = c.libinput_device_get_id_product(device),
@@ -498,6 +513,45 @@ fn deviceInfo(device: *c.struct_libinput_device) DeviceInfo {
         .pad_strips = if (capabilities.tablet_pad) c.libinput_device_tablet_pad_get_num_strips(device) else 0,
         .pad_mode_groups = if (capabilities.tablet_pad) @intCast(c.libinput_device_tablet_pad_get_num_mode_groups(device)) else 0,
     };
+    if (capabilities.tablet_pad and !tabletPadTopology(device, &info)) {
+        capabilities.tablet_pad = false;
+        info.capabilities.tablet_pad = false;
+        info.pad_buttons = 0;
+        info.pad_rings = 0;
+        info.pad_strips = 0;
+        info.pad_mode_groups = 0;
+    }
+    return info;
+}
+
+fn tabletPadTopology(device: *c.struct_libinput_device, info: *DeviceInfo) bool {
+    if (info.pad_buttons > max_tablet_pad_controls or
+        info.pad_rings > max_tablet_pad_controls or
+        info.pad_strips > max_tablet_pad_controls or
+        info.pad_mode_groups > max_tablet_pad_groups)
+        return false;
+    for (0..info.pad_mode_groups) |group_index| {
+        const group = c.libinput_device_tablet_pad_get_mode_group(device, @intCast(group_index)) orelse
+            return false;
+        var result: TabletPadGroupInfo = .{
+            .modes = c.libinput_tablet_pad_mode_group_get_num_modes(group),
+        };
+        if (result.modes == 0) return false;
+        for (0..info.pad_buttons) |index| {
+            if (c.libinput_tablet_pad_mode_group_has_button(group, @intCast(index)) != 0)
+                result.buttons |= @as(u64, 1) << @intCast(index);
+        }
+        for (0..info.pad_rings) |index| {
+            if (c.libinput_tablet_pad_mode_group_has_ring(group, @intCast(index)) != 0)
+                result.rings |= @as(u64, 1) << @intCast(index);
+        }
+        for (0..info.pad_strips) |index| {
+            if (c.libinput_tablet_pad_mode_group_has_strip(group, @intCast(index)) != 0)
+                result.strips |= @as(u64, 1) << @intCast(index);
+        }
+        info.pad_groups[group_index] = result;
+    }
+    return true;
 }
 
 fn tabletToolInfo(tool: *c.struct_libinput_tablet_tool) TabletToolInfo {
@@ -559,6 +613,11 @@ fn padRingSource(source: c.enum_libinput_tablet_pad_ring_axis_source) TabletPadS
 
 fn padStripSource(source: c.enum_libinput_tablet_pad_strip_axis_source) TabletPadSource {
     return if (source == c.LIBINPUT_TABLET_PAD_STRIP_SOURCE_FINGER) .finger else .unknown;
+}
+
+fn padModeGroup(event: *c.struct_libinput_event_tablet_pad) u32 {
+    const group = c.libinput_event_tablet_pad_get_mode_group(event) orelse return 0;
+    return c.libinput_tablet_pad_mode_group_get_index(group);
 }
 
 fn axisValue(
