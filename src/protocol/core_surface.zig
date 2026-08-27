@@ -2303,6 +2303,7 @@ pub fn Adapter(comptime protocol: type) type {
                 .handle = handle,
                 .width = external.width,
                 .height = external.height,
+                .explicit_sync_supported = true,
             }, x, y);
             slot.attachment.attach(lease);
         }
@@ -2359,6 +2360,7 @@ pub fn Adapter(comptime protocol: type) type {
             slot.presentation_feedback.deinit();
             slot.frames.deinit();
             slot.regions.deinit();
+            slot.state.deinit();
             slot.* = .{ .next_free = adapter.surface_free };
             adapter.surface_free = index;
         }

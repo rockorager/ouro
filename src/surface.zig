@@ -5,6 +5,7 @@ const objects = @import("wayring").objects;
 const viewport = @import("viewport.zig");
 const buffer_import = @import("buffer_import.zig");
 const color = @import("render/color.zig");
+const drm_syncobj = @import("drm_syncobj.zig");
 
 pub const RegionPool = @import("region.zig").Pool;
 pub const Region = @import("region.zig").Region;
@@ -51,6 +52,13 @@ pub const Error = viewport.Error || error{
     InvalidScale,
     InvalidTransform,
     InvalidOffset,
+    ExplicitSyncExists,
+    ExplicitSyncInactive,
+    ExplicitSyncUnsupportedBuffer,
+    ExplicitSyncNoBuffer,
+    ExplicitSyncNoAcquirePoint,
+    ExplicitSyncNoReleasePoint,
+    ExplicitSyncConflictingPoints,
 };
 
 /// Application-defined permanent surface role identity. Zero is reserved for
@@ -193,6 +201,7 @@ pub const Buffer = struct {
     handle: objects.Handle,
     width: u32,
     height: u32,
+    explicit_sync_supported: bool = false,
 };
 
 pub const PresentationHint = enum {
@@ -240,6 +249,7 @@ pub const Update = struct {
     fifo_set: bool = false,
     fifo_wait: bool = false,
     commit_timestamp: ?CommitTimestamp = null,
+    explicit_sync: ?drm_syncobj.Commit = null,
 };
 
 pub const Surface = struct {
@@ -271,6 +281,40 @@ pub const Surface = struct {
     pending_fifo_set: bool = false,
     pending_fifo_wait: bool = false,
     pending_commit_timestamp: ?CommitTimestamp = null,
+    explicit_sync_active: bool = false,
+    pending_acquire_point: ?drm_syncobj.Point = null,
+    pending_release_point: ?drm_syncobj.Point = null,
+
+    pub fn deinit(surface: *Surface) void {
+        surface.clearPendingExplicitSync();
+        surface.* = undefined;
+    }
+
+    pub fn enableExplicitSync(surface: *Surface) Error!void {
+        if (surface.explicit_sync_active) return error.ExplicitSyncExists;
+        surface.explicit_sync_active = true;
+    }
+
+    pub fn disableExplicitSync(surface: *Surface) void {
+        surface.clearPendingExplicitSync();
+        surface.explicit_sync_active = false;
+    }
+
+    /// Takes ownership of `point` on success. A later request in the same
+    /// commit cycle replaces and releases the previous pending point.
+    pub fn setAcquirePoint(surface: *Surface, point: drm_syncobj.Point) Error!void {
+        if (!surface.explicit_sync_active) return error.ExplicitSyncInactive;
+        if (surface.pending_acquire_point) |*previous| previous.deinit();
+        surface.pending_acquire_point = point;
+    }
+
+    /// Takes ownership of `point` on success. A later request in the same
+    /// commit cycle replaces and releases the previous pending point.
+    pub fn setReleasePoint(surface: *Surface, point: drm_syncobj.Point) Error!void {
+        if (!surface.explicit_sync_active) return error.ExplicitSyncInactive;
+        if (surface.pending_release_point) |*previous| previous.deinit();
+        surface.pending_release_point = point;
+    }
 
     /// Applies wl_surface.attach validation and replaces the pending buffer.
     pub fn attach(
@@ -388,6 +432,7 @@ pub const Surface = struct {
                 return error.InvalidSize;
         }
         try surface.viewport.validateCommit(surface.contentSize(buffer));
+        try surface.validateExplicitSync();
     }
 
     /// Atomically applies persistent scalar state and extracts one-shot state.
@@ -419,6 +464,10 @@ pub const Surface = struct {
             surface.current_scale,
             viewport_state,
         );
+        const explicit_sync: ?drm_syncobj.Commit = if (surface.pending_acquire_point) |acquire| .{
+            .acquire = acquire,
+            .release = surface.pending_release_point.?,
+        } else null;
         const update: Update = .{
             .sequence = surface.sequence,
             .attachment = attachment,
@@ -437,6 +486,7 @@ pub const Surface = struct {
             .fifo_set = surface.pending_fifo_set,
             .fifo_wait = surface.pending_fifo_wait,
             .commit_timestamp = surface.pending_commit_timestamp,
+            .explicit_sync = explicit_sync,
         };
         surface.pending_buffer = null;
         surface.pending_attach_offset = .{};
@@ -449,7 +499,37 @@ pub const Surface = struct {
         surface.pending_fifo_set = false;
         surface.pending_fifo_wait = false;
         surface.pending_commit_timestamp = null;
+        surface.pending_acquire_point = null;
+        surface.pending_release_point = null;
         return update;
+    }
+
+    fn validateExplicitSync(surface: Surface) Error!void {
+        const has_acquire = surface.pending_acquire_point != null;
+        const has_release = surface.pending_release_point != null;
+        if (!surface.explicit_sync_active) {
+            if (has_acquire or has_release) return error.ExplicitSyncInactive;
+            return;
+        }
+        if (!surface.attach_changed or surface.pending_buffer == null) {
+            if (has_acquire or has_release) return error.ExplicitSyncNoBuffer;
+            return;
+        }
+        if (!surface.pending_buffer.?.explicit_sync_supported)
+            return error.ExplicitSyncUnsupportedBuffer;
+        if (!has_acquire) return error.ExplicitSyncNoAcquirePoint;
+        if (!has_release) return error.ExplicitSyncNoReleasePoint;
+        const acquire = surface.pending_acquire_point.?;
+        const release = surface.pending_release_point.?;
+        if (acquire.sameTimeline(release) and acquire.value >= release.value)
+            return error.ExplicitSyncConflictingPoints;
+    }
+
+    fn clearPendingExplicitSync(surface: *Surface) void {
+        if (surface.pending_acquire_point) |*point| point.deinit();
+        if (surface.pending_release_point) |*point| point.deinit();
+        surface.pending_acquire_point = null;
+        surface.pending_release_point = null;
     }
 
     fn contentSize(surface: Surface, buffer: ?Buffer) ?SurfaceSize {
@@ -873,6 +953,59 @@ test "surface commits persistent and one-shot state atomically" {
     try std.testing.expectEqual(display_p3, second.color_description);
     try std.testing.expectEqual(color.AlphaMode.straight, second.color_representation.alpha_mode);
     try std.testing.expectEqual(buffer, surface.current_buffer.?);
+}
+
+test "explicit sync points validate and publish with their exact attachment" {
+    var surface: Surface = .{};
+    defer surface.deinit();
+    var timeline: drm_syncobj.Timeline = .{
+        .device = undefined,
+        .handle = 1,
+        // Five owned point references are constructed below. Keep one sentinel
+        // reference so this pure state test never invokes a DRM destructor.
+        .references = 6,
+    };
+    const buffer: Buffer = .{
+        .handle = .{ .id = 8, .generation = 2 },
+        .width = 64,
+        .height = 32,
+        .explicit_sync_supported = true,
+    };
+
+    try surface.enableExplicitSync();
+    try std.testing.expectError(error.ExplicitSyncExists, surface.enableExplicitSync());
+    try surface.attach(7, buffer, 0, 0);
+    try std.testing.expectError(error.ExplicitSyncNoAcquirePoint, surface.validateCommit());
+    try surface.setAcquirePoint(.{ .timeline = &timeline, .value = 4 });
+    try std.testing.expectError(error.ExplicitSyncNoReleasePoint, surface.validateCommit());
+    try surface.setReleasePoint(.{ .timeline = &timeline, .value = 4 });
+    try std.testing.expectError(error.ExplicitSyncConflictingPoints, surface.validateCommit());
+    try surface.setReleasePoint(.{ .timeline = &timeline, .value = 5 });
+
+    var update = try surface.commit();
+    try std.testing.expectEqual(@as(u64, 4), update.explicit_sync.?.acquire.value);
+    try std.testing.expectEqual(@as(u64, 5), update.explicit_sync.?.release.value);
+    update.explicit_sync.?.deinit();
+    update.explicit_sync = null;
+    try std.testing.expect((try surface.commit()).explicit_sync == null);
+
+    try surface.setAcquirePoint(.{ .timeline = &timeline, .value = 6 });
+    try surface.setReleasePoint(.{ .timeline = &timeline, .value = 7 });
+    try std.testing.expectError(error.ExplicitSyncNoBuffer, surface.validateCommit());
+    surface.disableExplicitSync();
+    try std.testing.expectEqual(@as(usize, 1), timeline.references);
+}
+
+test "explicit sync rejects non-dmabuf attachments" {
+    var surface: Surface = .{};
+    defer surface.deinit();
+    try surface.enableExplicitSync();
+    try surface.attach(7, .{
+        .handle = .{ .id = 3, .generation = 1 },
+        .width = 10,
+        .height = 10,
+    }, 0, 0);
+    try std.testing.expectError(error.ExplicitSyncUnsupportedBuffer, surface.validateCommit());
 }
 
 test "surface content type is double buffered and preserves unknown values" {
