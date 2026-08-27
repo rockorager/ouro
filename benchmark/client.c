@@ -20,6 +20,7 @@
 #include <unistd.h>
 #include <wayland-client.h>
 
+#include "alpha-modifier-v1-client-protocol.h"
 #include "linux-dmabuf-v1-client-protocol.h"
 #include "presentation-time-client-protocol.h"
 #include "single-pixel-buffer-v1-client-protocol.h"
@@ -28,6 +29,7 @@
 #include "color-management-v1-client-protocol.h"
 
 #define BUFFER_COUNT 3
+#define HALF_ALPHA_FACTOR UINT32_C(0x80808080)
 
 enum workload {
     WORKLOAD_STATIC,
@@ -100,6 +102,7 @@ struct scene_layer {
     struct wl_surface *surface;
     struct wl_subsurface *subsurface;
     struct wp_viewport *viewport;
+    struct wp_alpha_modifier_surface_v1 *alpha_modifier;
     struct frame_buffer buffers[BUFFER_COUNT];
     uint32_t *canonical_pixels;
     bool mapped;
@@ -125,9 +128,11 @@ struct client {
     struct wp_presentation *presentation;
     struct zwp_linux_dmabuf_v1 *dmabuf;
     struct wp_color_manager_v1 *color_manager;
+    struct wp_alpha_modifier_v1 *alpha_modifier_manager;
     struct wp_color_management_surface_v1 *color_surface;
     struct wp_image_description_v1 *color_description;
     struct wp_viewport *viewport;
+    struct wp_alpha_modifier_surface_v1 *alpha_modifier;
     uint32_t dmabuf_version;
     struct gbm_device *gbm;
     int drm_fd;
@@ -151,6 +156,8 @@ struct client {
     int32_t scene_layer_width;
     int32_t scene_layer_height;
     bool alpha;
+    bool global_alpha;
+    bool alpha_toggle;
     bool churn;
     bool solid;
     bool configured;
@@ -508,6 +515,13 @@ static void registry_global(
             &color_manager_listener,
             client
         ) != 0) protocol_fail("bind color manager");
+    } else if (strcmp(interface, wp_alpha_modifier_v1_interface.name) == 0) {
+        client->alpha_modifier_manager = wl_registry_bind(
+            registry,
+            name,
+            &wp_alpha_modifier_v1_interface,
+            1
+        );
     }
 }
 
@@ -796,19 +810,47 @@ static void setup_color(struct client *client) {
     client->color_setup_ns = monotonic_ns() - started_ns;
 }
 
-static uint32_t *allocate_pixels(int32_t width, int32_t height, bool alpha, uint32_t seed) {
+static struct wp_alpha_modifier_surface_v1 *create_alpha_modifier(
+    struct client *client,
+    struct wl_surface *surface
+) {
+    if (client->alpha_modifier_manager == NULL) unsupported("wp_alpha_modifier_v1");
+    struct wp_alpha_modifier_surface_v1 *modifier = wp_alpha_modifier_v1_get_surface(
+        client->alpha_modifier_manager,
+        surface
+    );
+    if (modifier == NULL) protocol_fail("create alpha modifier surface");
+    wp_alpha_modifier_surface_v1_set_multiplier(modifier, HALF_ALPHA_FACTOR);
+    return modifier;
+}
+
+static uint32_t *allocate_pixels(
+    int32_t width,
+    int32_t height,
+    bool alpha,
+    bool global_alpha,
+    uint32_t seed
+) {
     const size_t pixel_count = (size_t)width * (size_t)height;
     if (pixel_count > SIZE_MAX / sizeof(uint32_t)) protocol_fail("pixel allocation overflow");
     uint32_t *pixels = malloc(pixel_count * sizeof(uint32_t));
     if (pixels == NULL) fail("allocate canonical pixels");
     for (size_t index = 0; index < pixel_count; index++) {
-        if (alpha) {
+        if (alpha || global_alpha) {
             const uint32_t red = UINT32_C(0x10) + ((uint32_t)(index + seed) & UINT32_C(0x1f));
             const uint32_t green = UINT32_C(0x20) +
                 (((uint32_t)(index + seed) >> 5) & UINT32_C(0x1f));
             const uint32_t blue = UINT32_C(0x30) +
                 (((uint32_t)(index + seed) >> 10) & UINT32_C(0x1f));
-            pixels[index] = UINT32_C(0x80000000) | red << 16 | green << 8 | blue;
+            if (alpha) {
+                pixels[index] = UINT32_C(0x80000000) | red << 16 | green << 8 | blue;
+            } else {
+                const uint32_t straight_red = (red * 255 + 64) / 128;
+                const uint32_t straight_green = (green * 255 + 64) / 128;
+                const uint32_t straight_blue = (blue * 255 + 64) / 128;
+                pixels[index] = UINT32_C(0xff000000) |
+                    straight_red << 16 | straight_green << 8 | straight_blue;
+            }
         } else {
             pixels[index] = UINT32_C(0xff204060) ^ (uint32_t)(index + seed);
         }
@@ -848,7 +890,7 @@ static void setup_scene(struct client *client) {
     if (client->scene_layer_width == 0) client->scene_layer_width = 1;
     if (client->scene_layer_height == 0) client->scene_layer_height = 1;
 
-    client->canonical_pixels = allocate_pixels(client->width, client->height, false, 0);
+    client->canonical_pixels = allocate_pixels(client->width, client->height, false, false, 0);
     initialize_buffer(
         client,
         &client->root_buffer,
@@ -879,11 +921,14 @@ static void setup_scene(struct client *client) {
             layer->viewport = wp_viewporter_get_viewport(client->viewporter, layer->surface);
             if (layer->viewport == NULL) protocol_fail("create scene viewport");
         }
-        const bool alpha = client->scene_mode == SCENE_OVERLAP;
+        if (client->global_alpha)
+            layer->alpha_modifier = create_alpha_modifier(client, layer->surface);
+        const bool alpha = client->scene_mode == SCENE_OVERLAP && !client->global_alpha;
         layer->canonical_pixels = allocate_pixels(
             client->scene_layer_width,
             client->scene_layer_height,
             alpha,
+            client->global_alpha,
             (uint32_t)(index * 4099)
         );
         for (size_t buffer_index = 0; buffer_index < BUFFER_COUNT; buffer_index++) {
@@ -940,6 +985,8 @@ static void setup(struct client *client, const char *socket_path, const char *dr
     client->toplevel = xdg_surface_get_toplevel(client->xdg_surface);
     if (client->toplevel == NULL) protocol_fail("create xdg_toplevel");
     xdg_toplevel_set_title(client->toplevel, "Ouro compositor benchmark");
+    if (client->global_alpha && client->scene_mode == SCENE_NONE)
+        client->alpha_modifier = create_alpha_modifier(client, client->surface);
     if (client->viewport_mode != VIEWPORT_NONE) {
         if (client->viewporter == NULL) unsupported("wp_viewporter");
         client->viewport = wp_viewporter_get_viewport(client->viewporter, client->surface);
@@ -973,7 +1020,13 @@ static void setup(struct client *client, const char *socket_path, const char *dr
         1 : client->width;
     const int32_t buffer_height = client->solid || client->backing == BACKING_SINGLE_PIXEL ?
         1 : client->height;
-    client->canonical_pixels = allocate_pixels(buffer_width, buffer_height, client->alpha, 0);
+    client->canonical_pixels = allocate_pixels(
+        buffer_width,
+        buffer_height,
+        client->alpha,
+        client->global_alpha,
+        0
+    );
     for (uint32_t index = 0; index < BUFFER_COUNT; index++) {
         initialize_buffer(
             client,
@@ -1288,6 +1341,11 @@ static void submit_frame(
         }
     }
     if (client->workload != WORKLOAD_STATIC) write_buffer(buffer);
+    if (client->alpha_toggle)
+        wp_alpha_modifier_surface_v1_set_multiplier(
+            client->alpha_modifier,
+            (sequence & 1) != 0 ? HALF_ALPHA_FACTOR : UINT32_MAX
+        );
 
     begin_frame_wait(client, wait, client->surface);
     wl_surface_attach(client->surface, buffer->proxy, 0, 0);
@@ -1351,6 +1409,8 @@ static void cleanup(struct client *client) {
             struct scene_layer *layer = &client->scene_layers[index];
             for (size_t buffer_index = 0; buffer_index < BUFFER_COUNT; buffer_index++)
                 destroy_buffer(&layer->buffers[buffer_index]);
+            if (layer->alpha_modifier != NULL)
+                wp_alpha_modifier_surface_v1_destroy(layer->alpha_modifier);
             if (layer->viewport != NULL) wp_viewport_destroy(layer->viewport);
             if (layer->subsurface != NULL) wl_subsurface_destroy(layer->subsurface);
             if (layer->surface != NULL) wl_surface_destroy(layer->surface);
@@ -1361,11 +1421,15 @@ static void cleanup(struct client *client) {
     }
     if (client->color_surface != NULL) wp_color_management_surface_v1_destroy(client->color_surface);
     if (client->color_description != NULL) wp_image_description_v1_destroy(client->color_description);
+    if (client->alpha_modifier != NULL)
+        wp_alpha_modifier_surface_v1_destroy(client->alpha_modifier);
     if (client->viewport != NULL) wp_viewport_destroy(client->viewport);
     if (client->toplevel != NULL) xdg_toplevel_destroy(client->toplevel);
     if (client->xdg_surface != NULL) xdg_surface_destroy(client->xdg_surface);
     if (client->surface != NULL) wl_surface_destroy(client->surface);
     if (client->presentation != NULL) wp_presentation_destroy(client->presentation);
+    if (client->alpha_modifier_manager != NULL)
+        wp_alpha_modifier_v1_destroy(client->alpha_modifier_manager);
     if (client->color_manager != NULL) wp_color_manager_v1_destroy(client->color_manager);
     if (client->dmabuf != NULL) zwp_linux_dmabuf_v1_destroy(client->dmabuf);
     if (client->wm_base != NULL) xdg_wm_base_destroy(client->wm_base);
@@ -1498,6 +1562,22 @@ static void parse_workload(struct client *client, const char *name) {
         client->color_mode = COLOR_ICC;
         return;
     }
+    if (strcmp(workload, "alpha-modifier-full") == 0) {
+        client->workload = WORKLOAD_FULL;
+        client->global_alpha = true;
+        return;
+    }
+    if (strcmp(workload, "alpha-modifier-sparse") == 0) {
+        client->workload = WORKLOAD_SPARSE;
+        client->global_alpha = true;
+        return;
+    }
+    if (strcmp(workload, "alpha-modifier-toggle") == 0) {
+        client->workload = WORKLOAD_STATIC;
+        client->global_alpha = true;
+        client->alpha_toggle = true;
+        return;
+    }
     if (strcmp(workload, "alpha-full") == 0) {
         client->workload = WORKLOAD_FULL;
         client->alpha = true;
@@ -1509,7 +1589,11 @@ static void parse_workload(struct client *client, const char *name) {
         return;
     }
     const char *layers = NULL;
-    if (strncmp(workload, "scene-motion-", 13) == 0) {
+    if (strncmp(workload, "alpha-modifier-overlap-", 23) == 0) {
+        client->scene_mode = SCENE_OVERLAP;
+        client->global_alpha = true;
+        layers = workload + 23;
+    } else if (strncmp(workload, "scene-motion-", 13) == 0) {
         client->scene_mode = SCENE_OVERLAP;
         client->scene_action = SCENE_ACTION_MOTION;
         layers = workload + 13;

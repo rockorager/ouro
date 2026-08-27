@@ -23,7 +23,7 @@ usage() {
 usage: benchmark/run.sh [options]
 
   --suite NAME            quick, standard, all, shm, dmabuf, damage, viewport,
-                          solid, scale, churn, mixed, color, composition, layers,
+                          solid, scale, churn, mixed, color, alpha, composition, layers,
                           dynamic, or capacity (default: quick)
   --runs N                repetitions per compositor/workload (default: 3)
   --workload NAME         run one workload instead of a suite
@@ -73,7 +73,7 @@ done
     exit 2
 }
 case "$selected_suite" in
-    quick|standard|all|shm|dmabuf|damage|viewport|solid|scale|churn|mixed|color|composition|layers|dynamic|capacity) ;;
+    quick|standard|all|shm|dmabuf|damage|viewport|solid|scale|churn|mixed|color|alpha|composition|layers|dynamic|capacity) ;;
     *) echo "unknown suite: $selected_suite" >&2; exit 2 ;;
 esac
 [[ -e $drm_device ]] || { echo "DRM device does not exist: $drm_device" >&2; exit 1; }

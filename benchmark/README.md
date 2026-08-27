@@ -90,6 +90,16 @@ Workloads are declared in `workloads.sh`:
 - `alpha-{shm,dmabuf}-full`: full-damage ARGB8888 with valid electrically
   premultiplied color and constant 50% alpha;
 - `alpha-mixed-scale-8`: eight translucent SHM/DMA-BUF sparse clients.
+- `alpha-modifier-{shm,dmabuf}-full`: XRGB8888 with a constant 50% surface
+  multiplier. Its straight RGB values are derived from the matched ARGB control's
+  premultiplied values so the two paths exercise equivalent electrical source
+  colors within integer rounding;
+- `alpha-modifier-{shm,dmabuf}-toggle`: unchanged XRGB buffers whose
+  double-buffered multiplier alternates between opaque and 50% every commit;
+- `alpha-modifier-mixed-scale-8`: eight sparse SHM/DMA-BUF clients using the
+  constant surface multiplier;
+- `alpha-modifier-layers-8`: eight synchronized XRGB subsurfaces using the
+  constant multiplier, matched to `layers-overlap-8`'s per-pixel-alpha scene;
 - `layers-overlap-{2,8,32}`: one XDG root with two, eight, or 32 synchronized,
   partially overlapping, translucent SHM subsurfaces. Child commits are
   atomically applied by the parent commit; callback and presentation feedback
@@ -161,6 +171,7 @@ benchmark/run.sh --suite damage --runs 3
 benchmark/run.sh --suite viewport --runs 3
 benchmark/run.sh --suite solid --runs 3
 benchmark/run.sh --suite color --runs 3
+benchmark/run.sh --suite alpha --runs 3
 benchmark/run.sh --suite composition --runs 3
 benchmark/run.sh --suite layers --runs 3
 benchmark/run.sh --suite dynamic --runs 3

@@ -228,12 +228,26 @@ pub fn build(b: *std.Build) void {
     const benchmark_single_pixel_code_output = benchmark_single_pixel_code.addOutputFileArg(
         "single-pixel-buffer-v1-protocol.c",
     );
+    const benchmark_alpha_modifier_xml = wayland_protocols.path(
+        "staging/alpha-modifier/alpha-modifier-v1.xml",
+    );
+    const benchmark_alpha_modifier_header = b.addSystemCommand(&.{ benchmark_scanner, "client-header" });
+    benchmark_alpha_modifier_header.addFileArg(benchmark_alpha_modifier_xml);
+    const benchmark_alpha_modifier_header_output = benchmark_alpha_modifier_header.addOutputFileArg(
+        "alpha-modifier-v1-client-protocol.h",
+    );
+    const benchmark_alpha_modifier_code = b.addSystemCommand(&.{ benchmark_scanner, "private-code" });
+    benchmark_alpha_modifier_code.addFileArg(benchmark_alpha_modifier_xml);
+    const benchmark_alpha_modifier_code_output = benchmark_alpha_modifier_code.addOutputFileArg(
+        "alpha-modifier-v1-protocol.c",
+    );
     benchmark_client.root_module.addIncludePath(benchmark_xdg_header_output.dirname());
     benchmark_client.root_module.addIncludePath(benchmark_presentation_header_output.dirname());
     benchmark_client.root_module.addIncludePath(benchmark_dmabuf_header_output.dirname());
     benchmark_client.root_module.addIncludePath(benchmark_color_header_output.dirname());
     benchmark_client.root_module.addIncludePath(benchmark_viewporter_header_output.dirname());
     benchmark_client.root_module.addIncludePath(benchmark_single_pixel_header_output.dirname());
+    benchmark_client.root_module.addIncludePath(benchmark_alpha_modifier_header_output.dirname());
     benchmark_client.root_module.addCSourceFile(.{
         .file = benchmark_xdg_code_output,
         .flags = &.{"-std=c11"},
@@ -256,6 +270,10 @@ pub fn build(b: *std.Build) void {
     });
     benchmark_client.root_module.addCSourceFile(.{
         .file = benchmark_single_pixel_code_output,
+        .flags = &.{"-std=c11"},
+    });
+    benchmark_client.root_module.addCSourceFile(.{
+        .file = benchmark_alpha_modifier_code_output,
         .flags = &.{"-std=c11"},
     });
     benchmark_client.root_module.addCSourceFile(.{

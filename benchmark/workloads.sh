@@ -60,6 +60,12 @@ benchmark_workloads=(
     "alpha-shm-full       shm-alpha-full                       1       1280  720    1000   3"
     "alpha-dmabuf-full    dmabuf-alpha-full                    1       1280  720    1000   3"
     "alpha-mixed-scale-8  shm-alpha-sparse,shm-alpha-sparse,shm-alpha-sparse,shm-alpha-sparse,dmabuf-alpha-sparse,dmabuf-alpha-sparse,dmabuf-alpha-sparse,dmabuf-alpha-sparse 8 640 360 1000 3"
+    "alpha-modifier-shm-full shm-alpha-modifier-full            1       1280  720    1000   3"
+    "alpha-modifier-dmabuf-full dmabuf-alpha-modifier-full      1       1280  720    1000   3"
+    "alpha-modifier-shm-toggle shm-alpha-modifier-toggle        1       1280  720    1000   3"
+    "alpha-modifier-dmabuf-toggle dmabuf-alpha-modifier-toggle  1       1280  720    1000   3"
+    "alpha-modifier-mixed-scale-8 shm-alpha-modifier-sparse,shm-alpha-modifier-sparse,shm-alpha-modifier-sparse,shm-alpha-modifier-sparse,dmabuf-alpha-modifier-sparse,dmabuf-alpha-modifier-sparse,dmabuf-alpha-modifier-sparse,dmabuf-alpha-modifier-sparse 8 640 360 1000 3"
+    "alpha-modifier-layers-8 shm-alpha-modifier-overlap-8       1       960   540    600    3"
     "layers-overlap-2     shm-overlap-2                        1       960   540    600    3"
     "layers-overlap-8     shm-overlap-8                        1       960   540    600    3"
     "layers-overlap-32    shm-overlap-32                       1       960   540    600    3"
@@ -101,6 +107,7 @@ benchmark_suite_contains() {
         churn) [[ $workload == *churn* ]] ;;
         mixed) [[ $workload == mixed-* ]] ;;
         color) [[ $workload == color-* ]] ;;
+        alpha) [[ $workload == alpha-* ]] ;;
         composition) [[ $workload == alpha-* || $workload == layers-* ]] ;;
         layers) [[ $workload == layers-* ]] ;;
         dynamic) [[ $workload == layers-motion-* || $workload == layers-resize-* ||
