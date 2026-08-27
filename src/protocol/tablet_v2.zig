@@ -17,6 +17,10 @@ pub const Config = struct {
     tablet_seat_capacity: usize = 16,
     tablet_capacity: usize = 64,
     tool_capacity: usize = 128,
+    pad_capacity: usize = 64,
+    pad_group_capacity: usize = 128,
+    pad_ring_capacity: usize = 128,
+    pad_strip_capacity: usize = 128,
     outbound_capacity: usize = 256,
     global_version: u32 = 2,
 
@@ -25,6 +29,10 @@ pub const Config = struct {
             config.tablet_seat_capacity == 0 or config.tablet_seat_capacity >= none or
             config.tablet_capacity == 0 or config.tablet_capacity >= none or
             config.tool_capacity == 0 or config.tool_capacity >= none or
+            config.pad_capacity == 0 or config.pad_capacity >= none or
+            config.pad_group_capacity == 0 or config.pad_group_capacity >= none or
+            config.pad_ring_capacity == 0 or config.pad_ring_capacity >= none or
+            config.pad_strip_capacity == 0 or config.pad_strip_capacity >= none or
             config.outbound_capacity == 0 or config.outbound_capacity >= none or
             config.global_version == 0 or config.global_version > 2)
             return error.InvalidConfig;
@@ -40,6 +48,10 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
         const TabletSeat = protocol.zwp_tablet_seat_v2;
         const Tablet = protocol.zwp_tablet_v2;
         const Tool = protocol.zwp_tablet_tool_v2;
+        const Pad = protocol.zwp_tablet_pad_v2;
+        const Group = protocol.zwp_tablet_pad_group_v2;
+        const Ring = protocol.zwp_tablet_pad_ring_v2;
+        const Strip = protocol.zwp_tablet_pad_strip_v2;
         const Id = packed struct { index: u32, generation: u32 };
 
         const ManagerSlot = struct {
@@ -107,9 +119,44 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
             button: struct { serial: u32, button: u32, pressed: bool },
             frame: u32,
         };
+        const PadSlot = struct {
+            active: bool = false,
+            generation: u32 = 1,
+            next_free: u32 = none,
+            binding: Id = undefined,
+            resource: ?objects.Handle = null,
+            device: input.DeviceId = undefined,
+        };
+        const ChildSlot = struct {
+            active: bool = false,
+            generation: u32 = 1,
+            next_free: u32 = none,
+            binding: Id = undefined,
+            resource: ?objects.Handle = null,
+            pad: Id = undefined,
+            parent: Id = undefined,
+            control_index: u32 = 0,
+        };
+        const PadEvent = union(enum) {
+            create,
+            buttons: u32,
+            done,
+            removed,
+        };
+        const GroupEvent = union(enum) {
+            create,
+            buttons: u64,
+            modes: u32,
+            done,
+        };
+        const ControlEvent = enum { create };
         const OutboundValue = union(enum) {
             tablet: struct { id: Id, event: TabletEvent },
             tool: struct { id: Id, event: ToolEvent },
+            pad: struct { id: Id, event: PadEvent },
+            group: struct { id: Id, event: GroupEvent },
+            ring: struct { id: Id, event: ControlEvent },
+            strip: struct { id: Id, event: ControlEvent },
         };
         const Outbound = struct {
             active: bool = false,
@@ -124,11 +171,19 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
         bindings: []Binding,
         tablets: []TabletSlot,
         tools: []ToolSlot,
+        pads: []PadSlot,
+        groups: []ChildSlot,
+        rings: []ChildSlot,
+        strips: []ChildSlot,
         outbound: []Outbound,
         manager_free: u32 = 0,
         binding_free: u32 = 0,
         tablet_free: u32 = 0,
         tool_free: u32 = 0,
+        pad_free: u32 = 0,
+        group_free: u32 = 0,
+        ring_free: u32 = 0,
+        strip_free: u32 = 0,
         outbound_len: usize = 0,
         next_sequence: u64 = 1,
         global_version: u32,
@@ -150,6 +205,14 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
             errdefer allocator.free(tablets);
             const tools = try allocator.alloc(ToolSlot, config.tool_capacity);
             errdefer allocator.free(tools);
+            const pads = try allocator.alloc(PadSlot, config.pad_capacity);
+            errdefer allocator.free(pads);
+            const groups = try allocator.alloc(ChildSlot, config.pad_group_capacity);
+            errdefer allocator.free(groups);
+            const rings = try allocator.alloc(ChildSlot, config.pad_ring_capacity);
+            errdefer allocator.free(rings);
+            const strips = try allocator.alloc(ChildSlot, config.pad_strip_capacity);
+            errdefer allocator.free(strips);
             const outbound = try allocator.alloc(Outbound, config.outbound_capacity);
             for (managers, 0..) |*slot, i| slot.* = .{
                 .next_free = if (i + 1 < managers.len) @intCast(i + 1) else none,
@@ -163,6 +226,10 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
             for (tools, 0..) |*slot, i| slot.* = .{
                 .next_free = if (i + 1 < tools.len) @intCast(i + 1) else none,
             };
+            for (pads, 0..) |*slot, i| slot.* = .{ .next_free = if (i + 1 < pads.len) @intCast(i + 1) else none };
+            for (groups, 0..) |*slot, i| slot.* = .{ .next_free = if (i + 1 < groups.len) @intCast(i + 1) else none };
+            for (rings, 0..) |*slot, i| slot.* = .{ .next_free = if (i + 1 < rings.len) @intCast(i + 1) else none };
+            for (strips, 0..) |*slot, i| slot.* = .{ .next_free = if (i + 1 < strips.len) @intCast(i + 1) else none };
             @memset(outbound, .{});
             return .{
                 .allocator = allocator,
@@ -171,6 +238,10 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                 .bindings = bindings,
                 .tablets = tablets,
                 .tools = tools,
+                .pads = pads,
+                .groups = groups,
+                .rings = rings,
+                .strips = strips,
                 .outbound = outbound,
                 .global_version = config.global_version,
             };
@@ -179,6 +250,10 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
         pub fn deinit(self: *Self) void {
             self.allocator.free(self.outbound);
             self.allocator.free(self.tools);
+            self.allocator.free(self.strips);
+            self.allocator.free(self.rings);
+            self.allocator.free(self.groups);
+            self.allocator.free(self.pads);
             self.allocator.free(self.tablets);
             self.allocator.free(self.bindings);
             self.allocator.free(self.managers);
@@ -289,6 +364,18 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                 try decoded.finish(protocol, server_objects, &actor.transmit);
                 return .continue_dispatch;
             }
+            inline for (.{ Pad, Group, Ring, Strip }) |Interface| if (target.object.interface == &Interface.info) {
+                const child = if (Interface == Pad) self.padFromObject(target.object) else self.childFromObject(Interface, target.object);
+                const slot = child orelse return null;
+                if (slot.resource == null or !std.meta.eql(slot.resource.?, handle)) return null;
+                const binding = self.resolveBinding(slot.binding) catch return null;
+                if (!samePeer(binding.peer, peer)) return null;
+                const decoded = try wayring.server.decodeRequest(Interface, server_objects, message, fds);
+                // destroy and set_feedback are intentionally handled by the
+                // generated decoder; feedback is advisory and is a no-op.
+                try decoded.finish(protocol, server_objects, &actor.transmit);
+                return .continue_dispatch;
+            };
             if (target.object.interface != &Tool.info) return null;
             const tool = self.toolFromObject(target.object) orelse return null;
             if (tool.resource == null or !std.meta.eql(tool.resource.?, handle)) return null;
@@ -308,6 +395,8 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
         /// child and ordered outbound records are available.
         pub fn publishTablet(self: *Self, device: input.DeviceId, info: platform.DeviceInfo) !bool {
             if (!info.capabilities.tablet_tool) return false;
+            for (self.tablets) |slot|
+                if (slot.active and std.meta.eql(slot.device, device)) return true;
             var bindings: usize = 0;
             for (self.bindings) |binding|
                 bindings += @intFromBool(binding.active and binding.resource_present);
@@ -346,6 +435,99 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                 const binding = self.resolveBinding(slot.binding) catch continue;
                 self.enqueue(binding.peer, .{ .tablet = .{ .id = self.tabletId(slot), .event = .removed } }) catch unreachable;
             }
+        }
+
+        pub fn publishPad(self: *Self, device: input.DeviceId, info: platform.DeviceInfo) !bool {
+            if (!info.capabilities.tablet_pad) return false;
+            for (self.pads) |slot| if (slot.active and std.meta.eql(slot.device, device)) return true;
+            var binding_count: usize = 0;
+            for (self.bindings) |binding| binding_count += @intFromBool(binding.active and binding.resource_present);
+            const groups: usize = info.pad_mode_groups;
+            var rings: usize = 0;
+            var strips: usize = 0;
+            var records: usize = 3; // pad constructor, buttons, done
+            for (info.pad_groups[0..info.pad_mode_groups]) |group| {
+                rings += @popCount(group.rings);
+                strips += @popCount(group.strips);
+                records += 4 + @popCount(group.rings) + @popCount(group.strips);
+            }
+            const group_needed = std.math.mul(usize, groups, binding_count) catch return error.Exhausted;
+            const ring_needed = std.math.mul(usize, rings, binding_count) catch return error.Exhausted;
+            const strip_needed = std.math.mul(usize, strips, binding_count) catch return error.Exhausted;
+            const outbound_needed = std.math.mul(usize, records, binding_count) catch return error.Exhausted;
+            if (self.freeSlots(PadSlot, self.pads) < binding_count or
+                self.freeSlots(ChildSlot, self.groups) < group_needed or
+                self.freeSlots(ChildSlot, self.rings) < ring_needed or
+                self.freeSlots(ChildSlot, self.strips) < strip_needed or
+                self.outbound.len - self.outbound_len < outbound_needed) return error.Exhausted;
+            for (self.bindings, 0..) |binding, binding_index| {
+                if (!binding.active or !binding.resource_present) continue;
+                const binding_id: Id = .{ .index = @intCast(binding_index), .generation = binding.generation };
+                const pad = self.acquirePad(binding_id) catch unreachable;
+                pad.device = device;
+                const pad_id = self.padId(pad);
+                self.enqueue(binding.peer, .{ .pad = .{ .id = pad_id, .event = .create } }) catch unreachable;
+                for (info.pad_groups[0..info.pad_mode_groups], 0..) |group_info, group_index| {
+                    const group = self.acquireChild(
+                        &self.group_free,
+                        self.groups,
+                        binding_id,
+                        pad_id,
+                        pad_id,
+                        @intCast(group_index),
+                    ) catch unreachable;
+                    const group_id = self.childId(self.groups, group);
+                    self.enqueue(binding.peer, .{ .group = .{ .id = group_id, .event = .create } }) catch unreachable;
+                    self.enqueue(binding.peer, .{ .group = .{ .id = group_id, .event = .{ .buttons = group_info.buttons } } }) catch unreachable;
+                    var mask = group_info.rings;
+                    while (mask != 0) : (mask &= mask - 1) {
+                        const control_index: u32 = @intCast(@ctz(mask));
+                        const ring = self.acquireChild(
+                            &self.ring_free,
+                            self.rings,
+                            binding_id,
+                            pad_id,
+                            group_id,
+                            control_index,
+                        ) catch unreachable;
+                        self.enqueue(binding.peer, .{ .ring = .{
+                            .id = self.childId(self.rings, ring),
+                            .event = .create,
+                        } }) catch unreachable;
+                    }
+                    mask = group_info.strips;
+                    while (mask != 0) : (mask &= mask - 1) {
+                        const control_index: u32 = @intCast(@ctz(mask));
+                        const strip = self.acquireChild(
+                            &self.strip_free,
+                            self.strips,
+                            binding_id,
+                            pad_id,
+                            group_id,
+                            control_index,
+                        ) catch unreachable;
+                        self.enqueue(binding.peer, .{ .strip = .{
+                            .id = self.childId(self.strips, strip),
+                            .event = .create,
+                        } }) catch unreachable;
+                    }
+                    self.enqueue(binding.peer, .{ .group = .{ .id = group_id, .event = .{ .modes = group_info.modes } } }) catch unreachable;
+                    self.enqueue(binding.peer, .{ .group = .{ .id = group_id, .event = .done } }) catch unreachable;
+                }
+                self.enqueue(binding.peer, .{ .pad = .{ .id = pad_id, .event = .{ .buttons = info.pad_buttons } } }) catch unreachable;
+                self.enqueue(binding.peer, .{ .pad = .{ .id = pad_id, .event = .done } }) catch unreachable;
+            }
+            return true;
+        }
+
+        pub fn removePad(self: *Self, device: input.DeviceId) !void {
+            var count: usize = 0;
+            for (self.pads) |slot| count += @intFromBool(slot.active and std.meta.eql(slot.device, device));
+            try self.ensureOutbound(count);
+            for (self.pads) |*slot| if (slot.active and std.meta.eql(slot.device, device)) {
+                const binding = self.resolveBinding(slot.binding) catch continue;
+                self.enqueue(binding.peer, .{ .pad = .{ .id = self.padId(slot), .event = .removed } }) catch unreachable;
+            };
         }
 
         pub fn publishTool(self: *Self, key: tablet_input.ToolKey, info: platform.TabletToolInfo) !bool {
@@ -515,8 +697,14 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
         /// not yet installed and must remain pending.
         pub fn consumeStateEvent(self: *Self, event: anytype) !bool {
             switch (event) {
-                .device_added => |value| _ = try self.publishTablet(value.device, value.info),
-                .device_removed => |device| try self.removeTablet(device),
+                .device_added => |value| {
+                    _ = try self.publishTablet(value.device, value.info);
+                    _ = try self.publishPad(value.device, value.info);
+                },
+                .device_removed => |device| {
+                    try self.removeTablet(device);
+                    try self.removePad(device);
+                },
                 .tool_added => |value| _ = try self.publishTool(value.key, value.info),
                 .tool_removed => |key| try self.removeTool(key),
                 .proximity_in => |value| try self.toolProximityIn(value.key, value.focus),
@@ -555,6 +743,10 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                         return completed,
                     .tool => |value| if (!try self.flushTool(server_objects, queue, value))
                         return completed,
+                    .pad => |value| if (!try self.flushPad(server_objects, queue, value)) return completed,
+                    .group => |value| if (!try self.flushGroup(server_objects, queue, value)) return completed,
+                    .ring => |value| if (!try self.flushControl(Ring, server_objects, queue, value)) return completed,
+                    .strip => |value| if (!try self.flushControl(Strip, server_objects, queue, value)) return completed,
                 }
                 self.dropOutbound(outbound);
                 completed += 1;
@@ -687,6 +879,90 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
             return true;
         }
 
+        fn flushPad(self: *Self, server_objects: anytype, queue: *wayring.tx.Queue, value: anytype) !bool {
+            const pad = self.resolvePad(value.id) catch return true;
+            const binding = self.resolveBinding(pad.binding) catch return true;
+            const result = switch (value.event) {
+                .create => create: {
+                    if (!binding.resource_present) {
+                        self.releaseUnpublishedPad(value.id);
+                        return true;
+                    }
+                    const created = TabletSeat.construct_event_pad_added(protocol, server_objects, queue, binding.resource, .{ .id = .{ .context = pad } }) catch |err| break :create err;
+                    pad.resource = created.id;
+                    return true;
+                },
+                .buttons => |buttons| wayring.server.sendEvent(protocol, Pad, server_objects, queue, pad.resource orelse return error.InvalidState, .{ .buttons = .{ .buttons = buttons } }),
+                .done => wayring.server.sendEvent(protocol, Pad, server_objects, queue, pad.resource orelse return error.InvalidState, .{ .done = .{} }),
+                .removed => wayring.server.sendEvent(protocol, Pad, server_objects, queue, pad.resource orelse return error.InvalidState, .{ .removed = .{} }),
+            };
+            result catch |err| switch (err) {
+                error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return false,
+                else => return err,
+            };
+            return true;
+        }
+
+        fn flushGroup(self: *Self, server_objects: anytype, queue: *wayring.tx.Queue, value: anytype) !bool {
+            const group = self.resolveChild(self.groups, value.id) catch return true;
+            const result = switch (value.event) {
+                .create => create: {
+                    const pad = self.resolvePad(group.parent) catch {
+                        self.releaseChild(&self.group_free, self.groups, value.id.index);
+                        return true;
+                    };
+                    const created = Pad.construct_event_group(
+                        protocol,
+                        server_objects,
+                        queue,
+                        pad.resource orelse return true,
+                        .{ .pad_group = .{ .context = group } },
+                    ) catch |err| break :create err;
+                    group.resource = created.pad_group;
+                    return true;
+                },
+                .buttons => |mask| send: {
+                    var values: [64]u32 = undefined;
+                    var len: usize = 0;
+                    for (0..64) |i| if (mask & (@as(u64, 1) << @intCast(i)) != 0) {
+                        values[len] = @intCast(i);
+                        len += 1;
+                    };
+                    wayring.server.sendEvent(protocol, Group, server_objects, queue, group.resource orelse return true, .{ .buttons = .{
+                        .buttons = std.mem.sliceAsBytes(values[0..len]),
+                    } }) catch |err| break :send err;
+                    return true;
+                },
+                .modes => |modes| wayring.server.sendEvent(protocol, Group, server_objects, queue, group.resource orelse return true, .{ .modes = .{ .modes = modes } }),
+                .done => wayring.server.sendEvent(protocol, Group, server_objects, queue, group.resource orelse return true, .{ .done = .{} }),
+            };
+            result catch |err| switch (err) {
+                error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return false,
+                else => return err,
+            };
+            return true;
+        }
+
+        fn flushControl(self: *Self, comptime Interface: type, server_objects: anytype, queue: *wayring.tx.Queue, value: anytype) !bool {
+            const slots = self.childSlots(Interface);
+            const child = self.resolveChild(slots, value.id) catch return true;
+            const group = self.resolveChild(self.groups, child.parent) catch {
+                self.releaseChild(self.childFree(Interface), slots, value.id.index);
+                return true;
+            };
+            _ = value.event;
+            const created = if (Interface == Ring)
+                Group.construct_event_ring(protocol, server_objects, queue, group.resource orelse return true, .{ .ring = .{ .context = child } })
+            else
+                Group.construct_event_strip(protocol, server_objects, queue, group.resource orelse return true, .{ .strip = .{ .context = child } });
+            const resource = created catch |err| switch (err) {
+                error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return false,
+                else => return err,
+            };
+            child.resource = if (Interface == Ring) resource.ring else resource.strip;
+            return true;
+        }
+
         pub fn resourceRemoved(
             self: *Self,
             handle: objects.Handle,
@@ -711,6 +987,19 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                 self.releaseTablet(self.tabletIndex(tablet));
                 return true;
             }
+            if (object.interface == &Pad.info) {
+                const slot = self.padFromObject(&object) orelse return false;
+                if (slot.resource == null or !std.meta.eql(slot.resource.?, handle)) return false;
+                self.releasePad(self.padIndex(slot));
+                return true;
+            }
+            inline for (.{ Group, Ring, Strip }) |Interface| if (object.interface == &Interface.info) {
+                const slots = self.childSlots(Interface);
+                const slot = fromContext(ChildSlot, slots, object.context) orelse return false;
+                if (slot.resource == null or !std.meta.eql(slot.resource.?, handle)) return false;
+                self.releaseChild(self.childFree(Interface), slots, self.childIndex(slots, slot));
+                return true;
+            };
             if (object.interface != &Tool.info) return false;
             const tool = self.toolFromObject(&object) orelse return false;
             if (tool.resource == null or !std.meta.eql(tool.resource.?, handle)) return false;
@@ -719,6 +1008,19 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
         }
 
         pub fn disconnected(self: *Self, peer: wayring.io_uring.Peer) void {
+            for (self.outbound) |*outbound|
+                if (outbound.active and samePeer(outbound.peer, peer)) self.dropOutbound(outbound);
+            inline for (.{ Group, Ring, Strip }) |Interface| {
+                const slots = self.childSlots(Interface);
+                for (slots, 0..) |slot, i| if (slot.active) {
+                    const binding = self.resolveBinding(slot.binding) catch continue;
+                    if (samePeer(binding.peer, peer)) self.releaseChild(self.childFree(Interface), slots, @intCast(i));
+                };
+            }
+            for (self.pads, 0..) |slot, i| if (slot.active) {
+                const binding = self.resolveBinding(slot.binding) catch continue;
+                if (samePeer(binding.peer, peer)) self.releasePad(@intCast(i));
+            };
             for (self.tools, 0..) |slot, i| if (slot.active) {
                 const binding = self.resolveBinding(slot.binding) catch continue;
                 if (samePeer(binding.peer, peer)) self.releaseTool(@intCast(i));
@@ -881,6 +1183,100 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
             return count;
         }
 
+        fn acquirePad(self: *Self, binding: Id) !*PadSlot {
+            if (self.pad_free == none) return error.Exhausted;
+            const index = self.pad_free;
+            const slot = &self.pads[index];
+            self.pad_free = slot.next_free;
+            const generation = slot.generation;
+            slot.* = .{ .active = true, .generation = generation, .binding = binding };
+            self.retainBinding(binding.index, binding.generation) catch |err| {
+                slot.* = .{ .generation = generation, .next_free = self.pad_free };
+                self.pad_free = index;
+                return err;
+            };
+            return slot;
+        }
+
+        fn acquireChild(
+            self: *Self,
+            free: *u32,
+            slots: []ChildSlot,
+            binding: Id,
+            pad: Id,
+            parent: Id,
+            control_index: u32,
+        ) !*ChildSlot {
+            if (free.* == none) return error.Exhausted;
+            const index = free.*;
+            const slot = &slots[index];
+            free.* = slot.next_free;
+            const generation = slot.generation;
+            slot.* = .{
+                .active = true,
+                .generation = generation,
+                .binding = binding,
+                .pad = pad,
+                .parent = parent,
+                .control_index = control_index,
+            };
+            self.retainBinding(binding.index, binding.generation) catch |err| {
+                slot.* = .{ .generation = generation, .next_free = free.* };
+                free.* = index;
+                return err;
+            };
+            return slot;
+        }
+
+        fn releaseUnpublishedPad(self: *Self, id: Id) void {
+            for (self.rings, 0..) |slot, index|
+                if (slot.active and slot.resource == null and std.meta.eql(slot.pad, id))
+                    self.releaseChild(&self.ring_free, self.rings, @intCast(index));
+            for (self.strips, 0..) |slot, index|
+                if (slot.active and slot.resource == null and std.meta.eql(slot.pad, id))
+                    self.releaseChild(&self.strip_free, self.strips, @intCast(index));
+            for (self.groups, 0..) |slot, index|
+                if (slot.active and slot.resource == null and std.meta.eql(slot.pad, id))
+                    self.releaseChild(&self.group_free, self.groups, @intCast(index));
+            if (id.index < self.pads.len and self.pads[id.index].active and
+                self.pads[id.index].generation == id.generation)
+                self.releasePad(id.index);
+        }
+
+        fn releasePad(self: *Self, index: u32) void {
+            const slot = &self.pads[index];
+            if (!slot.active) return;
+            const binding = slot.binding;
+            const generation = bump(slot.generation);
+            slot.* = .{ .generation = generation, .next_free = if (generation == 0) none else self.pad_free };
+            if (generation != 0) self.pad_free = index;
+            self.releaseBindingReference(binding.index, binding.generation);
+        }
+
+        fn releaseChild(self: *Self, free: *u32, slots: []ChildSlot, index: u32) void {
+            const slot = &slots[index];
+            if (!slot.active) return;
+            const binding = slot.binding;
+            const generation = bump(slot.generation);
+            slot.* = .{ .generation = generation, .next_free = if (generation == 0) none else free.* };
+            if (generation != 0) free.* = index;
+            self.releaseBindingReference(binding.index, binding.generation);
+        }
+
+        fn resolvePad(self: *Self, id: Id) !*PadSlot {
+            if (id.index >= self.pads.len or !self.pads[id.index].active or self.pads[id.index].generation != id.generation) return error.StalePad;
+            return &self.pads[id.index];
+        }
+        fn resolveChild(_: *Self, slots: []ChildSlot, id: Id) !*ChildSlot {
+            if (id.index >= slots.len or !slots[id.index].active or slots[id.index].generation != id.generation) return error.StaleChild;
+            return &slots[id.index];
+        }
+        fn freeSlots(_: *const Self, comptime T: type, slots: []const T) usize {
+            var count: usize = 0;
+            for (slots) |slot| count += @intFromBool(!slot.active and slot.generation != 0);
+            return count;
+        }
+
         fn focusedToolCount(self: *const Self, key: tablet_input.ToolKey) usize {
             var count: usize = 0;
             for (self.tools) |slot|
@@ -938,6 +1334,18 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
         fn toolFromObject(self: *Self, object: *const objects.Object) ?*ToolSlot {
             return fromContext(ToolSlot, self.tools, object.context);
         }
+        fn padFromObject(self: *Self, object: *const objects.Object) ?*PadSlot {
+            return fromContext(PadSlot, self.pads, object.context);
+        }
+        fn childFromObject(self: *Self, comptime Interface: type, object: *const objects.Object) ?*ChildSlot {
+            return fromContext(ChildSlot, self.childSlots(Interface), object.context);
+        }
+        fn childSlots(self: *Self, comptime Interface: type) []ChildSlot {
+            return if (Interface == Group) self.groups else if (Interface == Ring) self.rings else self.strips;
+        }
+        fn childFree(self: *Self, comptime Interface: type) *u32 {
+            return if (Interface == Group) &self.group_free else if (Interface == Ring) &self.ring_free else &self.strip_free;
+        }
 
         fn managerIndex(self: *const Self, slot: *const ManagerSlot) u32 {
             return @intCast((@intFromPtr(slot) - @intFromPtr(self.managers.ptr)) /
@@ -965,6 +1373,18 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
         fn toolIndex(self: *const Self, slot: *const ToolSlot) u32 {
             return @intCast((@intFromPtr(slot) - @intFromPtr(self.tools.ptr)) /
                 @sizeOf(ToolSlot));
+        }
+        fn padId(self: *const Self, slot: *const PadSlot) Id {
+            return .{ .index = self.padIndex(slot), .generation = slot.generation };
+        }
+        fn padIndex(self: *const Self, slot: *const PadSlot) u32 {
+            return @intCast((@intFromPtr(slot) - @intFromPtr(self.pads.ptr)) / @sizeOf(PadSlot));
+        }
+        fn childId(_: *const Self, slots: []const ChildSlot, slot: *const ChildSlot) Id {
+            return .{ .index = @intCast((@intFromPtr(slot) - @intFromPtr(slots.ptr)) / @sizeOf(ChildSlot)), .generation = slot.generation };
+        }
+        fn childIndex(_: *const Self, slots: []const ChildSlot, slot: *const ChildSlot) u32 {
+            return @intCast((@intFromPtr(slot) - @intFromPtr(slots.ptr)) / @sizeOf(ChildSlot));
         }
 
         fn toolType(kind: platform.TabletToolType) Tool.type {
@@ -1163,7 +1583,11 @@ test "tablet-v2: tablet publication is atomic and metadata stays ordered" {
     adapter.outbound_len -= 1;
     try std.testing.expect(adapter.oldest(first.peer).?.value.tablet.event == .done);
 
-    try std.testing.expectError(error.Exhausted, adapter.publishTablet(device, .{ .capabilities = .{ .tablet_tool = true } }));
+    try std.testing.expectError(error.Exhausted, adapter.publishTablet(.{
+        .slot = 4,
+        .generation = 5,
+        .seat_generation = 6,
+    }, .{ .capabilities = .{ .tablet_tool = true } }));
     try std.testing.expectEqual(@as(usize, 0), adapter.freeTablets());
 }
 
@@ -1216,6 +1640,68 @@ test "tablet-v2: TX pressure cannot duplicate a server-created tablet" {
     try std.testing.expectEqual(@as(usize, 2), try adapter.flushOn(peer, &server_objects, &second_queue));
     try std.testing.expectEqual(resource, adapter.tablets[0].resource.?);
     try std.testing.expectEqual(@as(usize, 0), adapter.outbound_len);
+}
+
+test "tablet-v2: pad topology is exact and constructors survive backpressure" {
+    const protocol = @import("core_protocol");
+    const TestAdapter = Adapter(protocol, TestSeat);
+    var seat: TestSeat = .{};
+    var adapter = try TestAdapter.init(std.testing.allocator, &seat, .{
+        .manager_capacity = 1,
+        .tablet_seat_capacity = 1,
+        .pad_capacity = 1,
+        .pad_group_capacity = 1,
+        .pad_ring_capacity = 2,
+        .pad_strip_capacity = 1,
+        .outbound_capacity = 10,
+    });
+    defer adapter.deinit();
+    var server_objects = try wayring.objects.ServerObjects.init(std.testing.allocator, 24, 16, &protocol.wl_display.info, null);
+    defer server_objects.deinit(std.testing.allocator);
+    const peer: wayring.io_uring.Peer = .{ .slot = 12, .generation = 13 };
+    const binding = try adapter.acquireBinding();
+    binding.peer = peer;
+    binding.resource = try server_objects.insertClient(4, &protocol.zwp_tablet_seat_v2.info, 2, binding);
+    binding.resource_present = true;
+    var info: platform.DeviceInfo = .{
+        .capabilities = .{ .tablet_pad = true },
+        .pad_buttons = 7,
+        .pad_rings = 2,
+        .pad_strips = 1,
+        .pad_mode_groups = 1,
+    };
+    info.pad_groups[0] = .{ .buttons = 0b1010010, .rings = 0b11, .strips = 0b1, .modes = 3 };
+    try std.testing.expect(try adapter.publishPad(.{ .slot = 1, .generation = 2, .seat_generation = 3 }, info));
+    try std.testing.expectEqual(@as(usize, 10), adapter.outbound_len);
+    const expected = [_]std.meta.Tag(TestAdapter.OutboundValue){
+        .pad, .group, .group, .ring, .ring, .strip, .group, .group, .pad, .pad,
+    };
+    for (expected, 0..) |tag, i|
+        try std.testing.expectEqual(tag, std.meta.activeTag(adapter.outbound[i].value));
+    try std.testing.expectEqual(@as(u32, 0), adapter.rings[0].control_index);
+    try std.testing.expectEqual(@as(u32, 1), adapter.rings[1].control_index);
+    try std.testing.expectEqual(@as(u32, 0), adapter.strips[0].control_index);
+
+    var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 256, 2);
+    defer blocks.deinit(std.testing.allocator);
+    var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 1);
+    defer descriptors.deinit(std.testing.allocator);
+    var constructor = wayring.tx.Queue.init(&blocks, 12, &descriptors, 1);
+    try std.testing.expectEqual(@as(usize, 1), try adapter.flushOn(peer, &server_objects, &constructor));
+    const pad_resource = adapter.pads[0].resource.?;
+    constructor.deinit();
+    var group_constructor = wayring.tx.Queue.init(&blocks, 12, &descriptors, 1);
+    try std.testing.expectEqual(@as(usize, 1), try adapter.flushOn(peer, &server_objects, &group_constructor));
+    const group_resource = adapter.groups[0].resource.?;
+    group_constructor.deinit();
+    try std.testing.expect(adapter.resourceRemoved(pad_resource, server_objects.namespace.resolve(pad_resource).?.*));
+    var remainder = wayring.tx.Queue.init(&blocks, 256, &descriptors, 1);
+    defer remainder.deinit();
+    try std.testing.expectEqual(@as(usize, 8), try adapter.flushOn(peer, &server_objects, &remainder));
+    try std.testing.expect(!adapter.pads[0].active);
+    try std.testing.expectEqual(group_resource, adapter.groups[0].resource.?);
+    try std.testing.expectEqual(@as(usize, 2), 2 - adapter.freeSlots(TestAdapter.ChildSlot, adapter.rings));
+    try std.testing.expect(adapter.strips[0].resource != null);
 }
 
 test "tablet-v2: tool metadata resumes after its constructor" {
