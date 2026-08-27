@@ -218,6 +218,7 @@ pub const Update = struct {
     size: SurfaceSize,
     color_description: color.Description,
     color_representation: color.Representation,
+    content_type: u32 = 0,
 };
 
 pub const Surface = struct {
@@ -226,6 +227,7 @@ pub const Surface = struct {
     current_buffer: ?Buffer = null,
     current_transform: Transform = .normal,
     current_scale: i32 = 1,
+    current_content_type: u32 = 0,
     viewport: Viewport = .{},
     current_color_description: color.Description = .srgb,
     current_color_representation: color.Representation = .{},
@@ -242,6 +244,7 @@ pub const Surface = struct {
     pending_offset: Point = .{},
     pending_color_description: color.Description = .srgb,
     pending_color_representation: color.Representation = .{},
+    pending_content_type: u32 = 0,
 
     /// Applies wl_surface.attach validation and replaces the pending buffer.
     pub fn attach(
@@ -293,6 +296,10 @@ pub const Surface = struct {
 
     pub fn setColorRepresentation(surface: *Surface, representation: color.Representation) void {
         surface.pending_color_representation = representation;
+    }
+
+    pub fn setContentType(surface: *Surface, content_type: u32) void {
+        surface.pending_content_type = content_type;
     }
 
     pub fn hasPendingBufferAttachment(surface: Surface) bool {
@@ -356,6 +363,7 @@ pub const Surface = struct {
         surface.current_scale = surface.pending_scale;
         surface.current_color_description = surface.pending_color_description;
         surface.current_color_representation = surface.pending_color_representation;
+        surface.current_content_type = surface.pending_content_type;
         const content_size = surface.contentSize(surface.current_buffer);
         const viewport_state = surface.viewport.publishCommit();
         const upload_damage = canonicalBufferDamage(
@@ -379,6 +387,7 @@ pub const Surface = struct {
             .size = viewport_state.surfaceSize(content_size),
             .color_description = surface.current_color_description,
             .color_representation = surface.current_color_representation,
+            .content_type = surface.current_content_type,
         };
         surface.pending_buffer = null;
         surface.pending_attach_offset = .{};
@@ -812,6 +821,26 @@ test "surface commits persistent and one-shot state atomically" {
     try std.testing.expectEqual(display_p3, second.color_description);
     try std.testing.expectEqual(color.AlphaMode.straight, second.color_representation.alpha_mode);
     try std.testing.expectEqual(buffer, surface.current_buffer.?);
+}
+
+test "surface content type is double buffered and preserves unknown values" {
+    var surface: Surface = .{};
+
+    surface.setContentType(77);
+    const unknown = try surface.commit();
+    try std.testing.expectEqual(@as(u32, 77), unknown.content_type);
+    try std.testing.expectEqual(@as(u32, 77), surface.current_content_type);
+
+    surface.setContentType(3);
+    try std.testing.expectEqual(@as(u32, 77), unknown.content_type);
+    try std.testing.expectEqual(@as(u32, 77), surface.current_content_type);
+    const game = try surface.commit();
+    try std.testing.expectEqual(@as(u32, 3), game.content_type);
+
+    surface.setContentType(0);
+    const cleared = try surface.commit();
+    try std.testing.expectEqual(@as(u32, 0), cleared.content_type);
+    try std.testing.expectEqual(@as(u32, 0), surface.current_content_type);
 }
 
 test "surface viewport validates transformed and scaled content atomically" {

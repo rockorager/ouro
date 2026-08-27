@@ -25,6 +25,7 @@ pub const Config = struct {
     region_capacity: usize,
     viewport_capacity: usize = 8,
     single_pixel_buffer_capacity: usize = 8,
+    content_type_capacity: usize = 8,
     presentation_resource_capacity: usize = 4,
     presentation_feedback_capacity: usize = 64,
     region_operation_capacity: usize,
@@ -44,6 +45,7 @@ pub const Config = struct {
             config.viewport_capacity == 0 or config.viewport_capacity >= none or
             config.single_pixel_buffer_capacity == 0 or
             config.single_pixel_buffer_capacity >= none or
+            config.content_type_capacity == 0 or config.content_type_capacity >= none or
             config.presentation_resource_capacity == 0 or
             config.presentation_resource_capacity >= none or
             config.presentation_feedback_capacity == 0 or
@@ -69,6 +71,8 @@ pub fn Adapter(comptime protocol: type) type {
         const Viewporter = protocol.wp_viewporter;
         const ViewportInterface = protocol.wp_viewport;
         const SinglePixelManager = protocol.wp_single_pixel_buffer_manager_v1;
+        const ContentTypeManager = protocol.wp_content_type_manager_v1;
+        const ContentType = protocol.wp_content_type_v1;
         const WlBuffer = protocol.wl_buffer;
         const Presentation = protocol.wp_presentation;
         const PresentationFeedback = protocol.wp_presentation_feedback;
@@ -213,6 +217,13 @@ pub fn Adapter(comptime protocol: type) type {
             bytes: SinglePixelBacking = .{ 0, 0, 0, 0 },
         };
 
+        const ContentTypeSlot = struct {
+            active: bool = false,
+            next_free: u32 = none,
+            resource: objects.Handle = .{ .id = 0, .generation = 0 },
+            surface: ?SurfaceId = null,
+        };
+
         const PresentationResource = struct {
             active: bool = false,
             next_free: u32 = none,
@@ -229,17 +240,20 @@ pub fn Adapter(comptime protocol: type) type {
         global: ?objects.Handle = null,
         viewporter_global: ?objects.Handle = null,
         single_pixel_global: ?objects.Handle = null,
+        content_type_global: ?objects.Handle = null,
         presentation_global: ?objects.Handle = null,
         compositor_version: u32,
         surfaces: []*SurfaceSlot,
         regions: []*RegionSlot,
         viewports: []*ViewportSlot,
         single_pixels: []*SinglePixelSlot,
+        content_types: []*ContentTypeSlot,
         presentation_resources: []*PresentationResource,
         surface_free: u32,
         region_free: u32,
         viewport_free: u32,
         single_pixel_free: u32,
+        content_type_free: u32,
         presentation_resource_free: u32,
         region_pool: surface_state.RegionPool,
         frame_pool: surface_state.FramePool,
@@ -284,6 +298,12 @@ pub fn Adapter(comptime protocol: type) type {
                 config.single_pixel_buffer_capacity,
             );
             errdefer freeSlots(SinglePixelSlot, allocator, single_pixels);
+            const content_types = try allocSlots(
+                ContentTypeSlot,
+                allocator,
+                config.content_type_capacity,
+            );
+            errdefer freeSlots(ContentTypeSlot, allocator, content_types);
             const presentation_resources = try allocSlots(
                 PresentationResource,
                 allocator,
@@ -345,6 +365,9 @@ pub fn Adapter(comptime protocol: type) type {
             for (single_pixels, 0..) |slot, index| slot.* = .{
                 .next_free = if (index + 1 < single_pixels.len) @intCast(index + 1) else none,
             };
+            for (content_types, 0..) |slot, index| slot.* = .{
+                .next_free = if (index + 1 < content_types.len) @intCast(index + 1) else none,
+            };
             for (presentation_resources, 0..) |slot, index| slot.* = .{
                 .next_free = if (index + 1 < presentation_resources.len) @intCast(index + 1) else none,
             };
@@ -361,11 +384,13 @@ pub fn Adapter(comptime protocol: type) type {
                 .regions = regions,
                 .viewports = viewports,
                 .single_pixels = single_pixels,
+                .content_types = content_types,
                 .presentation_resources = presentation_resources,
                 .surface_free = 0,
                 .region_free = 0,
                 .viewport_free = 0,
                 .single_pixel_free = 0,
+                .content_type_free = 0,
                 .presentation_resource_free = 0,
                 .region_pool = region_pool,
                 .frame_pool = frame_pool,
@@ -394,6 +419,9 @@ pub fn Adapter(comptime protocol: type) type {
             for (adapter.single_pixels, 0..) |slot, index| {
                 if (slot.active) adapter.releaseSinglePixel(@intCast(index));
             }
+            for (adapter.content_types, 0..) |slot, index| {
+                if (slot.active) adapter.releaseContentType(@intCast(index));
+            }
             for (adapter.presentation_resources, 0..) |slot, index| {
                 if (slot.active) adapter.releasePresentationResource(@intCast(index));
             }
@@ -411,6 +439,7 @@ pub fn Adapter(comptime protocol: type) type {
             adapter.allocator.free(adapter.commit_dependencies);
             freeSlots(ViewportSlot, adapter.allocator, adapter.viewports);
             freeSlots(SinglePixelSlot, adapter.allocator, adapter.single_pixels);
+            freeSlots(ContentTypeSlot, adapter.allocator, adapter.content_types);
             freeSlots(PresentationResource, adapter.allocator, adapter.presentation_resources);
             adapter.allocator.free(adapter.copy_storage);
             adapter.allocator.free(adapter.copies);
@@ -475,6 +504,19 @@ pub fn Adapter(comptime protocol: type) type {
             return global;
         }
 
+        pub fn installContentType(adapter: *Self) !objects.Handle {
+            const runtime = adapter.runtime orelse return error.NotInstalled;
+            if (adapter.content_type_global != null) return error.AlreadyInstalled;
+            const global = try runtime.addGlobalWithBinder(
+                &ContentTypeManager.info,
+                1,
+                adapter,
+                bind,
+            );
+            adapter.content_type_global = global;
+            return global;
+        }
+
         /// Driver-facing dispatch entry point. Null means another protocol
         /// owner should inspect the request.
         pub fn request(
@@ -529,6 +571,14 @@ pub fn Adapter(comptime protocol: type) type {
                 const slot = adapter.singlePixelFromObject(target.object) orelse return null;
                 return try adapter.singlePixelBufferRequest(actor, server_objects, slot, message, fds);
             }
+            if (interface == &ContentTypeManager.info) {
+                if (target.object.context != @as(?*anyopaque, @ptrCast(adapter))) return null;
+                return try adapter.contentTypeManagerRequest(actor, server_objects, message, fds);
+            }
+            if (interface == &ContentType.info) {
+                const slot = adapter.contentTypeFromObject(target.object) orelse return null;
+                return try adapter.contentTypeRequest(actor, server_objects, slot, message, fds);
+            }
             if (interface == &Presentation.info) {
                 const resource = adapter.presentationResourceFromObject(target.object) orelse return null;
                 return try adapter.presentationRequest(actor, server_objects, resource, message, fds);
@@ -547,6 +597,11 @@ pub fn Adapter(comptime protocol: type) type {
             if (object.interface == &SurfaceInterface.info) {
                 const slot = adapter.surfaceFromObject(&object) orelse return false;
                 if (!std.meta.eql(slot.resource, handle)) return false;
+                const surface_id: SurfaceId = .{
+                    .index = adapter.surfaceIndex(slot),
+                    .generation = slot.resource.generation,
+                };
+                adapter.detachContentTypes(surface_id);
                 adapter.releaseSurface(adapter.surfaceIndex(slot));
                 return true;
             }
@@ -568,6 +623,12 @@ pub fn Adapter(comptime protocol: type) type {
                 adapter.releaseSinglePixel(adapter.singlePixelIndex(slot));
                 return true;
             }
+            if (object.interface == &ContentType.info) {
+                const slot = adapter.contentTypeFromObject(&object) orelse return false;
+                if (!std.meta.eql(slot.resource, handle)) return false;
+                adapter.releaseContentType(adapter.contentTypeIndex(slot));
+                return true;
+            }
             if (object.interface == &Presentation.info) {
                 const resource = adapter.presentationResourceFromObject(&object) orelse return false;
                 if (!std.meta.eql(resource.resource, handle)) return false;
@@ -576,7 +637,8 @@ pub fn Adapter(comptime protocol: type) type {
             }
             if (object.interface == &PresentationFeedback.info) return true;
             return (object.interface == &Compositor.info or object.interface == &Viewporter.info or
-                object.interface == &SinglePixelManager.info) and
+                object.interface == &SinglePixelManager.info or
+                object.interface == &ContentTypeManager.info) and
                 object.context == @as(?*anyopaque, @ptrCast(adapter));
         }
 
@@ -1504,6 +1566,78 @@ pub fn Adapter(comptime protocol: type) type {
             return .continue_dispatch;
         }
 
+        fn contentTypeManagerRequest(
+            adapter: *Self,
+            actor: *wayring.connection.Actor,
+            server_objects: anytype,
+            message: wayring.wire.Message,
+            fds: *wayring.ancillary.FdQueue,
+        ) !wayring.dispatch.Control {
+            const decoded = try wayring.server.decodeRequest(
+                ContentTypeManager,
+                server_objects,
+                message,
+                fds,
+            );
+            switch (decoded.value) {
+                .destroy => {},
+                .get_surface_content_type => |value| {
+                    const surface_handle = server_objects.namespace.lookupHandle(value.surface) orelse
+                        return try adapter.contentTypeError(actor, decoded.handle.id, "invalid content-type surface");
+                    const surface_object = server_objects.namespace.resolve(surface_handle) orelse
+                        return try adapter.contentTypeError(actor, decoded.handle.id, "invalid content-type surface");
+                    const surface = adapter.surfaceIdObject(surface_handle, surface_object) catch
+                        return try adapter.contentTypeError(actor, decoded.handle.id, "invalid content-type surface");
+                    for (adapter.content_types) |slot| if (slot.active and slot.surface != null and
+                        std.meta.eql(slot.surface.?, surface))
+                        return try adapter.contentTypeError(actor, decoded.handle.id, "content type already exists");
+                    const slot = adapter.acquireContentType() catch
+                        return try adapter.noMemory(actor);
+                    const admitted = ContentTypeManager.admit_get_surface_content_type(
+                        server_objects,
+                        decoded.handle,
+                        value,
+                        .{ .id = slot },
+                    ) catch |cause| {
+                        adapter.releaseContentType(adapter.contentTypeIndex(slot));
+                        return try adapter.failure(actor, decoded.handle.id, cause);
+                    };
+                    slot.resource = admitted.id;
+                    slot.surface = surface;
+                },
+            }
+            try decoded.finish(protocol, server_objects, &actor.transmit);
+            return .continue_dispatch;
+        }
+
+        fn contentTypeRequest(
+            adapter: *Self,
+            actor: *wayring.connection.Actor,
+            server_objects: anytype,
+            slot: *ContentTypeSlot,
+            message: wayring.wire.Message,
+            fds: *wayring.ancillary.FdQueue,
+        ) !wayring.dispatch.Control {
+            const decoded = try wayring.server.decodeRequest(
+                ContentType,
+                server_objects,
+                message,
+                fds,
+            );
+            switch (decoded.value) {
+                .destroy => adapter.clearContentType(slot),
+                .set_content_type => |value| {
+                    if (slot.surface) |surface| if (adapter.surfaceForId(surface)) |target| {
+                        target.state.setContentType(value.content_type.value);
+                    } else |_| {
+                        slot.surface = null;
+                    };
+                },
+            }
+            try decoded.finish(protocol, server_objects, &actor.transmit);
+            return .continue_dispatch;
+        }
+
         fn viewportRequest(
             adapter: *Self,
             actor: *wayring.connection.Actor,
@@ -1804,6 +1938,38 @@ pub fn Adapter(comptime protocol: type) type {
             adapter.single_pixel_free = index;
         }
 
+        fn acquireContentType(adapter: *Self) !*ContentTypeSlot {
+            if (adapter.content_type_free == none) return error.Exhausted;
+            const index = adapter.content_type_free;
+            const slot = adapter.content_types[index];
+            adapter.content_type_free = slot.next_free;
+            slot.* = .{ .active = true };
+            return slot;
+        }
+
+        fn releaseContentType(adapter: *Self, index: u32) void {
+            const slot = adapter.content_types[index];
+            if (!slot.active) return;
+            adapter.clearContentType(slot);
+            slot.* = .{ .next_free = adapter.content_type_free };
+            adapter.content_type_free = index;
+        }
+
+        fn clearContentType(adapter: *Self, slot: *ContentTypeSlot) void {
+            const surface = slot.surface orelse return;
+            if (adapter.surfaceForId(surface)) |target|
+                target.state.setContentType(0)
+            else |_| {}
+            slot.surface = null;
+        }
+
+        fn detachContentTypes(adapter: *Self, surface: SurfaceId) void {
+            for (adapter.content_types) |slot| {
+                if (slot.active and slot.surface != null and
+                    std.meta.eql(slot.surface.?, surface)) slot.surface = null;
+            }
+        }
+
         fn acquirePresentationResource(adapter: *Self) !*PresentationResource {
             if (adapter.presentation_resource_free == none) try adapter.growSlots(PresentationResource, &adapter.presentation_resources, &adapter.presentation_resource_free);
             const index = adapter.presentation_resource_free;
@@ -1842,6 +2008,14 @@ pub fn Adapter(comptime protocol: type) type {
                 if (slot.active and std.meta.eql(slot.resource, handle)) return slot;
             }
             return error.StaleSurface;
+        }
+
+        fn surfaceForId(adapter: *Self, id: SurfaceId) !*SurfaceSlot {
+            if (id.index >= adapter.surfaces.len) return error.StaleSurface;
+            const slot = &adapter.surfaces[id.index];
+            if (!slot.active or slot.resource.generation != id.generation)
+                return error.StaleSurface;
+            return slot;
         }
 
         fn pendingAttachmentCopy(adapter: *Self, surface: *SurfaceSlot) !?*CopySlot {
@@ -1947,6 +2121,10 @@ pub fn Adapter(comptime protocol: type) type {
             return bindingFromContext(SinglePixelSlot, adapter.single_pixels, object.context);
         }
 
+        fn contentTypeFromObject(adapter: *Self, object: *const objects.Object) ?*ContentTypeSlot {
+            return bindingFromContext(ContentTypeSlot, adapter.content_types, object.context);
+        }
+
         fn presentationResourceFromObject(
             adapter: *Self,
             object: *const objects.Object,
@@ -1968,6 +2146,10 @@ pub fn Adapter(comptime protocol: type) type {
 
         fn singlePixelIndex(adapter: *Self, slot: *SinglePixelSlot) u32 {
             return slotIndex(SinglePixelSlot, adapter.single_pixels, slot);
+        }
+
+        fn contentTypeIndex(adapter: *Self, slot: *ContentTypeSlot) u32 {
+            return slotIndex(ContentTypeSlot, adapter.content_types, slot);
         }
 
         fn presentationResourceIndex(adapter: *Self, resource: *PresentationResource) u32 {
@@ -2192,6 +2374,20 @@ pub fn Adapter(comptime protocol: type) type {
             };
         }
 
+        fn contentTypeError(
+            adapter: *Self,
+            actor: *wayring.connection.Actor,
+            object_id: u32,
+            message: []const u8,
+        ) !wayring.dispatch.Control {
+            return adapter.protocolError(
+                actor,
+                object_id,
+                ContentTypeManager.@"error".already_constructed.value,
+                message,
+            );
+        }
+
         fn protocolError(
             adapter: *Self,
             actor: *wayring.connection.Actor,
@@ -2307,6 +2503,7 @@ const TestContext = struct {
             .region_capacity = 2,
             .viewport_capacity = 2,
             .single_pixel_buffer_capacity = 1,
+            .content_type_capacity = 1,
             .presentation_resource_capacity = 2,
             .presentation_feedback_capacity = 4,
             .region_operation_capacity = 16,
@@ -3107,6 +3304,137 @@ test "single pixel buffers retain normalized color after resource destruction" {
         .{ .destroy = .{} },
     );
     _ = try context.dispatchCore();
+}
+
+test "content type follows exact commits and survives resource lifecycles" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const manager = try context.server_objects.insertClient(
+        30,
+        &test_protocol.wp_content_type_manager_v1.info,
+        1,
+        &context.adapter,
+    );
+    const surface = try context.createSurface(10);
+    try test_protocol.wp_content_type_manager_v1.encodeRequest(
+        &context.requests,
+        manager.id,
+        .{ .get_surface_content_type = .{ .id = 11, .surface = surface.id } },
+    );
+    _ = try context.dispatchCore();
+    const content_type = context.server_objects.namespace.lookupHandle(11) orelse
+        return error.MissingContentType;
+
+    try test_protocol.wp_content_type_v1.encodeRequest(
+        &context.requests,
+        content_type.id,
+        .{ .set_content_type = .{
+            .content_type = test_protocol.wp_content_type_v1.type.fromInt(77),
+        } },
+    );
+    _ = try context.dispatchCore();
+    try test_protocol.wl_surface.encodeRequest(
+        &context.requests,
+        surface.id,
+        .{ .commit = .{} },
+    );
+    _ = try context.dispatchCore();
+    var output: [1]TestAdapter.Applied = undefined;
+    var unknown = (try context.adapter.tryApply(surface, &output))[0].payload;
+    try std.testing.expectEqual(@as(u32, 77), unknown.surface.content_type);
+    unknown.deinit();
+
+    try test_protocol.wp_content_type_v1.encodeRequest(
+        &context.requests,
+        content_type.id,
+        .{ .destroy = .{} },
+    );
+    _ = try context.dispatchCore();
+    try std.testing.expectEqual(
+        @as(u32, 77),
+        (try context.adapter.getSurface(surface)).current_content_type,
+    );
+    try test_protocol.wl_surface.encodeRequest(
+        &context.requests,
+        surface.id,
+        .{ .commit = .{} },
+    );
+    _ = try context.dispatchCore();
+    var cleared = (try context.adapter.tryApply(surface, &output))[0].payload;
+    try std.testing.expectEqual(@as(u32, 0), cleared.surface.content_type);
+    cleared.deinit();
+
+    try test_protocol.wp_content_type_manager_v1.encodeRequest(
+        &context.requests,
+        manager.id,
+        .{ .get_surface_content_type = .{ .id = 12, .surface = surface.id } },
+    );
+    _ = try context.dispatchCore();
+    const stale_content_type = context.server_objects.namespace.lookupHandle(12) orelse
+        return error.MissingContentType;
+    try test_protocol.wl_surface.encodeRequest(
+        &context.requests,
+        surface.id,
+        .{ .destroy = .{} },
+    );
+    _ = try context.dispatchCore();
+    const replacement = try context.createSurface(10);
+    try test_protocol.wp_content_type_v1.encodeRequest(
+        &context.requests,
+        stale_content_type.id,
+        .{ .set_content_type = .{
+            .content_type = test_protocol.wp_content_type_v1.type.fromInt(55),
+        } },
+    );
+    _ = try context.dispatchCore();
+    try test_protocol.wl_surface.encodeRequest(
+        &context.requests,
+        replacement.id,
+        .{ .commit = .{} },
+    );
+    _ = try context.dispatchCore();
+    var replacement_update = (try context.adapter.tryApply(replacement, &output))[0].payload;
+    try std.testing.expectEqual(@as(u32, 0), replacement_update.surface.content_type);
+    replacement_update.deinit();
+
+    try test_protocol.wp_content_type_v1.encodeRequest(
+        &context.requests,
+        stale_content_type.id,
+        .{ .destroy = .{} },
+    );
+    _ = try context.dispatchCore();
+    try test_protocol.wp_content_type_manager_v1.encodeRequest(
+        &context.requests,
+        manager.id,
+        .{ .get_surface_content_type = .{ .id = 13, .surface = replacement.id } },
+    );
+    _ = try context.dispatchCore();
+    try std.testing.expect(context.server_objects.namespace.get(13) != null);
+}
+
+test "content type rejects duplicate objects for one surface" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const manager = try context.server_objects.insertClient(
+        30,
+        &test_protocol.wp_content_type_manager_v1.info,
+        1,
+        &context.adapter,
+    );
+    const surface = try context.createSurface(10);
+    try test_protocol.wp_content_type_manager_v1.encodeRequest(
+        &context.requests,
+        manager.id,
+        .{ .get_surface_content_type = .{ .id = 11, .surface = surface.id } },
+    );
+    _ = try context.dispatchCore();
+    try test_protocol.wp_content_type_manager_v1.encodeRequest(
+        &context.requests,
+        manager.id,
+        .{ .get_surface_content_type = .{ .id = 12, .surface = surface.id } },
+    );
+    try std.testing.expectEqual(wayring.dispatch.Control.stop, try context.dispatchCore());
+    try std.testing.expect(context.server_objects.namespace.get(12) == null);
 }
 
 test "surface removal drops copy ownership but preserves storage through CQE" {

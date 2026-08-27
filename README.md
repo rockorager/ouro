@@ -48,6 +48,9 @@ responsibilities:
   `wp_single_pixel_buffer_v1` resources normalize protocol RGBA components into
   immutable premultiplied 1×1 content and retain that content independently of
   the client buffer resource through attachment, rendering, and release.
+- [Surface content types](src/protocol/core_surface.zig): bounded
+  `wp_content_type_v1` objects retain double-buffered photo, video, game, and
+  unknown future hints on their exact surface commits.
 - [Fractional scale](src/protocol/fractional_scale.zig): bounded per-surface
   `wp_fractional_scale_v1` objects publish Ouro's preferred render scale and
   pair with viewporter destination sizing.
