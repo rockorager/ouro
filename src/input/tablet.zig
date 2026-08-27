@@ -28,6 +28,19 @@ pub fn State(comptime Focus: type) type {
     return struct {
         const Self = @This();
 
+        pub const DeviceSnapshot = struct {
+            device: input.DeviceId,
+            info: platform.DeviceInfo,
+        };
+        pub const ToolSnapshot = struct {
+            key: ToolKey,
+            info: platform.TabletToolInfo,
+            in_proximity: bool,
+            focus: ?Focus,
+            tip_down: bool,
+            button_count: usize,
+        };
+
         pub const Event = union(enum) {
             device_added: struct { device: input.DeviceId, info: platform.DeviceInfo },
             device_removed: input.DeviceId,
@@ -112,6 +125,39 @@ pub fn State(comptime Focus: type) type {
         pub fn eventAt(state: *const Self, offset: usize) ?*const Event {
             if (offset >= state.event_len) return null;
             return &state.events[(state.event_head + offset) % state.events.len];
+        }
+
+        pub fn deviceAt(state: *const Self, offset: usize) ?DeviceSnapshot {
+            var present: usize = 0;
+            for (state.devices) |device| {
+                if (!device.active) continue;
+                if (present == offset) return .{ .device = device.id, .info = device.info };
+                present += 1;
+            }
+            return null;
+        }
+
+        pub fn toolAt(state: *const Self, offset: usize) ?ToolSnapshot {
+            var present: usize = 0;
+            for (state.tools) |tool| {
+                if (!tool.active) continue;
+                if (present == offset) return .{
+                    .key = tool.key,
+                    .info = tool.info,
+                    .in_proximity = tool.in_proximity,
+                    .focus = tool.focus,
+                    .tip_down = tool.tip_down,
+                    .button_count = tool.button_len,
+                };
+                present += 1;
+            }
+            return null;
+        }
+
+        pub fn toolButtonAt(state: *const Self, key: ToolKey, offset: usize) ?u32 {
+            const tool = state.findToolConst(key) orelse return null;
+            if (offset >= tool.button_len) return null;
+            return state.toolButtonsConst(tool)[offset];
         }
 
         pub fn drop(state: *Self) void {
@@ -345,7 +391,17 @@ pub fn State(comptime Focus: type) type {
             return null;
         }
 
+        fn findToolConst(state: *const Self, key: ToolKey) ?*const Tool {
+            for (state.tools) |*tool|
+                if (tool.active and sameKey(tool.key, key)) return tool;
+            return null;
+        }
+
         fn toolButtons(state: *Self, tool: *Tool) []u32 {
+            return state.buttons[tool.buttons_offset..][0..state.buttons_per_tool];
+        }
+
+        fn toolButtonsConst(state: *const Self, tool: *const Tool) []const u32 {
             return state.buttons[tool.buttons_offset..][0..state.buttons_per_tool];
         }
 
@@ -437,6 +493,8 @@ test "tablet state retains implicit focus until tip release" {
     var state = try TestState.init(std.testing.allocator, .{});
     defer state.deinit();
     try addTestTool(&state);
+    try std.testing.expectEqual(test_device, state.deviceAt(0).?.device);
+    try std.testing.expectEqual(@as(platform.ToolRef, 44), state.toolAt(0).?.key.reference);
     state.clear();
 
     try state.consume(.{ .tablet_tool_tip = .{
