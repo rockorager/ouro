@@ -292,11 +292,12 @@ fn realNextEvent(_: *anyopaque, value: *anyopaque) !?RawEvent {
     const owner: *RealContext = @ptrCast(@alignCast(value));
     const event = c.libinput_get_event(owner.input) orelse return null;
     defer c.libinput_event_destroy(event);
-    const device: DeviceRef = @intFromPtr(c.libinput_event_get_device(event));
+    const device_ptr = c.libinput_event_get_device(event) orelse return error.InvalidEvent;
+    const device: DeviceRef = @intFromPtr(device_ptr);
     return switch (c.libinput_event_get_type(event)) {
         c.LIBINPUT_EVENT_DEVICE_ADDED => .{ .device_added = .{
             .device = device,
-            .info = deviceInfo(c.libinput_event_get_device(event)),
+            .info = deviceInfo(device_ptr),
         } },
         c.LIBINPUT_EVENT_DEVICE_REMOVED => .{ .device_removed = device },
         c.LIBINPUT_EVENT_POINTER_MOTION => blk: {
@@ -515,9 +516,9 @@ fn deviceInfo(device: *c.struct_libinput_device) DeviceInfo {
         .vendor = c.libinput_device_get_id_vendor(device),
         .product = c.libinput_device_get_id_product(device),
         .group = @intFromPtr(c.libinput_device_get_device_group(device)),
-        .pad_buttons = if (capabilities.tablet_pad) c.libinput_device_tablet_pad_get_num_buttons(device) else 0,
-        .pad_rings = if (capabilities.tablet_pad) c.libinput_device_tablet_pad_get_num_rings(device) else 0,
-        .pad_strips = if (capabilities.tablet_pad) c.libinput_device_tablet_pad_get_num_strips(device) else 0,
+        .pad_buttons = if (capabilities.tablet_pad) @intCast(c.libinput_device_tablet_pad_get_num_buttons(device)) else 0,
+        .pad_rings = if (capabilities.tablet_pad) @intCast(c.libinput_device_tablet_pad_get_num_rings(device)) else 0,
+        .pad_strips = if (capabilities.tablet_pad) @intCast(c.libinput_device_tablet_pad_get_num_strips(device)) else 0,
         .pad_mode_groups = if (capabilities.tablet_pad) @intCast(c.libinput_device_tablet_pad_get_num_mode_groups(device)) else 0,
     };
     if (capabilities.tablet_pad and !tabletPadTopology(device, &info)) {
