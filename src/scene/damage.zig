@@ -261,6 +261,29 @@ pub const Planner = struct {
         list: render.List,
         changes: []const Change,
     ) Error!render.DamagePlan {
+        return self.prepareInternal(handle, list, changes, false);
+    }
+
+    /// Capture frames must refresh every output pixel even when ordinary scene
+    /// damage is empty. This forces only the selected target's current plan;
+    /// unlike `invalidateAll`, it does not make unrelated swapchain images
+    /// stale for later frames.
+    pub fn prepareFull(
+        self: *Planner,
+        handle: framebuffer.Handle,
+        list: render.List,
+        changes: []const Change,
+    ) Error!render.DamagePlan {
+        return self.prepareInternal(handle, list, changes, true);
+    }
+
+    fn prepareInternal(
+        self: *Planner,
+        handle: framebuffer.Handle,
+        list: render.List,
+        changes: []const Change,
+        force_full: bool,
+    ) Error!render.DamagePlan {
         if (self.pending) return error.PlanPending;
         try self.validateHandle(handle);
         try render.validateList(list);
@@ -297,6 +320,7 @@ pub const Planner = struct {
         self.combined.addRegion(self.physical_output, self.client);
         self.combined.addRegion(self.physical_output, self.scene);
         self.combined.addRegion(self.physical_output, self.repair);
+        if (force_full) self.combined.setFull(self.physical_output);
         self.pending = true;
         self.pending_handle = handle;
         return .{
@@ -797,6 +821,26 @@ test "damage: compositor-wide invalidation fully repairs every retained image" {
     try planner.publish();
     plan = try planner.prepare(.{ .slot = 1, .generation = 2 }, testList(&.{}), &.{});
     try std.testing.expect(plan.repair_full);
+    try planner.cancel();
+}
+
+test "damage: capture forces only its selected image to render fully" {
+    var planner = try Planner.init(std.testing.allocator, .{ .width = 100, .height = 100 }, .normal, testConfig(2));
+    defer planner.deinit();
+    try prime(&planner, 2);
+
+    var plan = try planner.prepareFull(
+        .{ .slot = 0, .generation = 2 },
+        testList(&.{}),
+        &.{},
+    );
+    try std.testing.expect(plan.render_full);
+    try std.testing.expect(!plan.repair_full);
+    try planner.publish();
+
+    plan = try planner.prepare(.{ .slot = 1, .generation = 2 }, testList(&.{}), &.{});
+    try std.testing.expect(!plan.render_full);
+    try std.testing.expectEqual(@as(usize, 0), plan.render_damage.len);
     try planner.cancel();
 }
 
