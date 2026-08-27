@@ -2604,6 +2604,8 @@ pub fn Adapter(comptime protocol: type) type {
 
         fn commitReady(context: ?*const anyopaque, content: *const Content) bool {
             const now_ns: *const u64 = @ptrCast(@alignCast(context.?));
+            if (content.surface.explicit_sync) |sync|
+                if (!(sync.acquire.signaled() catch false)) return false;
             if (now_ns.* == std.math.maxInt(u64)) return true;
             const timestamp = content.surface.commit_timestamp orelse return true;
             return timestamp.ready(now_ns.*);
@@ -2611,6 +2613,18 @@ pub fn Adapter(comptime protocol: type) type {
 
         fn collectCommitDeadline(context: ?*anyopaque, content: *const Content) void {
             const search: *DeadlineSearch = @ptrCast(@alignCast(context.?));
+            if (content.surface.explicit_sync) |sync| {
+                if (!(sync.acquire.signaled() catch false)) {
+                    const retry_ns = std.math.add(u64, search.now_ns, std.time.ns_per_ms) catch
+                        std.math.maxInt(u64);
+                    const retry = surface_state.CommitTimestamp{
+                        .sec = retry_ns / std.time.ns_per_s,
+                        .nsec = @intCast(retry_ns % std.time.ns_per_s),
+                    };
+                    if (search.result.* == null or timestampLess(retry, search.result.*.?))
+                        search.result.* = retry;
+                }
+            }
             const timestamp = content.surface.commit_timestamp orelse return;
             if (timestamp.ready(search.now_ns)) return;
             if (search.result.* == null or timestampLess(timestamp, search.result.*.?))

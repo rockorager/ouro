@@ -252,6 +252,26 @@ pub const Update = struct {
     fifo_wait: bool = false,
     commit_timestamp: ?CommitTimestamp = null,
     explicit_sync: ?drm_syncobj.Commit = null,
+
+    /// Signals and releases the explicit release point after compositor use.
+    /// Ownership is retained on failure so the caller may retry.
+    pub fn releaseExplicitSync(update: *Update) !void {
+        if (update.explicit_sync) |*sync| {
+            try sync.release.signal();
+            sync.deinit();
+            update.explicit_sync = null;
+        }
+    }
+
+    /// Discarded commits must still make their buffers reusable, even when the
+    /// compositor never waited on or sampled from the acquire point.
+    pub fn discardExplicitSync(update: *Update) void {
+        if (update.explicit_sync) |*sync| {
+            sync.release.signal() catch {};
+            sync.deinit();
+            update.explicit_sync = null;
+        }
+    }
 };
 
 pub const Surface = struct {
@@ -751,6 +771,7 @@ pub fn CommitState(comptime Key: type) type {
 
             /// Releases callback and import ownership when an unapplied CU is discarded.
             pub fn deinit(content: *Content) void {
+                content.surface.discardExplicitSync();
                 if (content.frame_callbacks) |*batch| batch.deinit();
                 if (content.release_callbacks) |*batch| batch.deinit();
                 if (content.presentation_feedback) |*batch| batch.deinit();

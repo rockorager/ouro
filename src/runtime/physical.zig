@@ -3647,6 +3647,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (!render_device.content.ready(rendered)) return false;
             }
             var content = &(layer.content orelse return error.MissingContent);
+            try content.surface.releaseExplicitSync();
             if (content.attachment_lease) |*lease| {
                 lease.deinit();
                 content.attachment_lease = null;
