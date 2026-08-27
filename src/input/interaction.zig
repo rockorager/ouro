@@ -536,8 +536,11 @@ pub fn Interaction(comptime Desktop: type) type {
         fn removeDevice(self: *Self, desktop: *Desktop, id: input.DeviceId) !void {
             const device = self.findDevice(id) orelse return error.StaleDevice;
             const pointer = device.capabilities.pointer;
-            const cancel_grab = pointer and (self.mode == .button_grab or self.mode == .interactive);
-            if (pointer and self.mode == .interactive)
+            var held_button = false;
+            for (device.buttons) |word| held_button = held_button or word != 0;
+            const cancel_grab = pointer and held_button and
+                (self.mode == .button_grab or self.mode == .interactive);
+            if (cancel_grab and self.mode == .interactive)
                 try desktop.endInteractive(self.mode.interactive.target.toplevel);
             device.* = .{};
             if (pointer) self.pointer_devices -= 1;
@@ -1475,6 +1478,36 @@ test "interaction: removed device buttons cannot retain a later grab" {
         .pressed = false,
     } });
     try std.testing.expect(interaction.interactionMode() == .default);
+}
+
+test "interaction: removing idle pointer preserves another device grab" {
+    var interaction = try initTestInteraction(4);
+    defer interaction.deinit();
+    var desktop = testDesktop();
+    var surfaces = TestSurfaces{};
+    try addPointer(&interaction, &desktop, &surfaces);
+    try interaction.consume(&desktop, &surfaces, .{ .device_added = .{
+        .device = device_b,
+        .info = .{ .capabilities = .{ .pointer = true } },
+    } });
+    try interaction.consume(&desktop, &surfaces, .{ .pointer_motion = .{
+        .device = device_a,
+        .time_usec = 1,
+        .dx = 12,
+        .dy = 7,
+    } });
+    interaction.dropCommand();
+    try interaction.consume(&desktop, &surfaces, .{ .pointer_button = .{
+        .device = device_a,
+        .time_usec = 2,
+        .button = 272,
+        .pressed = true,
+    } });
+    interaction.dropCommand();
+
+    try interaction.consume(&desktop, &surfaces, .{ .device_removed = device_b });
+    try std.testing.expect(interaction.interactionMode() == .button_grab);
+    try std.testing.expectEqual(@as(usize, 0), interaction.pendingCommands());
 }
 
 test "interaction: toplevel destruction cancels exact focus and grab generations" {

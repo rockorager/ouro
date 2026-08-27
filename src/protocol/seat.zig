@@ -1423,8 +1423,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             const time = millis(value.time_usec);
             var axis_commands: usize = 0;
             inline for (.{ value.vertical, value.horizontal }) |axis| if (axis) |present| {
-                if (present.value == 0) {
-                    if (value.source != .wheel) axis_commands += 1;
+                if (present.stop or present.value == 0) {
+                    if (present.stop or value.source != .wheel) axis_commands += 1;
                 } else {
                     axis_commands += 1 + @as(usize, @intFromBool(axisValue120(present.value120) != null));
                 }
@@ -1444,8 +1444,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     .{ Axis.vertical, value.vertical },
                     .{ Axis.horizontal, value.horizontal },
                 }) |entry| if (entry[1]) |present| {
-                    if (present.value == 0) {
-                        if (value.source != .wheel) adapter.enqueue(target.client, .{
+                    if (present.stop or present.value == 0) {
+                        if (present.stop or value.source != .wheel) adapter.enqueue(target.client, .{
                             .pointer_axis_stop = .{
                                 .pointer = pointer,
                                 .target = target,
@@ -2655,7 +2655,7 @@ test "seat: physical modifier and lock state follows the published keymap" {
     try std.testing.expectEqual(@as(usize, 1), countTestOutbound(&adapter, .keyboard_modifiers));
 }
 
-test "seat: pointer axis delivers wheel precision and finger stops" {
+test "seat: pointer axis delivers wheel precision and explicit stops" {
     var core: FakeCore = .{};
     var adapter = try testAdapter(&core);
     defer adapter.deinit();
@@ -2690,6 +2690,18 @@ test "seat: pointer axis delivers wheel precision and finger stops" {
         .time_usec = 11_000,
         .source = .finger,
         .vertical = .{ .value = 0, .value120 = null },
+        .horizontal = null,
+    } });
+    try std.testing.expectEqual(@as(usize, 1), countTestOutbound(&adapter, .pointer_axis_source));
+    try std.testing.expectEqual(@as(usize, 1), countTestOutbound(&adapter, .pointer_axis_stop));
+    try std.testing.expectEqual(@as(usize, 1), countTestOutbound(&adapter, .pointer_frame));
+
+    clearTestOutbound(&adapter);
+    try adapter.consume(.{ .pointer_axis = .{
+        .device = device,
+        .time_usec = 12_000,
+        .source = .wheel,
+        .vertical = .{ .value = 0, .stop = true },
         .horizontal = null,
     } });
     try std.testing.expectEqual(@as(usize, 1), countTestOutbound(&adapter, .pointer_axis_source));

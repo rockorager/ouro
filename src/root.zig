@@ -67,6 +67,7 @@ pub const cursor_shape = @import("protocol/cursor_shape.zig");
 pub const text_input = @import("protocol/text_input.zig");
 pub const input_method = @import("protocol/input_method.zig");
 pub const virtual_keyboard = @import("protocol/virtual_keyboard.zig");
+pub const virtual_pointer = @import("protocol/virtual_pointer.zig");
 pub const pointer_constraints = @import("protocol/pointer_constraints.zig");
 pub const protocol_output = @import("protocol/output.zig");
 pub const xdg_output = @import("protocol/xdg_output.zig");
@@ -148,6 +149,7 @@ test {
     _ = text_input;
     _ = input_method;
     _ = virtual_keyboard;
+    _ = virtual_pointer;
     _ = pointer_constraints;
     _ = protocol_output;
     _ = xdg_output;

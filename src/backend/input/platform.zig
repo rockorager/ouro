@@ -79,6 +79,7 @@ pub const AxisSource = enum { wheel, finger, continuous };
 pub const AxisValue = struct {
     value: f64,
     value120: ?f64 = null,
+    stop: bool = false,
 };
 
 pub const GestureBegin = struct { device: DeviceRef, time_usec: u64, fingers: u32 };

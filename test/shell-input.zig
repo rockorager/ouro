@@ -407,6 +407,7 @@ test "shell-input: security context filters nested manager before registry disco
     try std.testing.expect(parent_handler.wlr_data_control_global_seen);
     try std.testing.expect(parent_handler.input_method_global_seen);
     try std.testing.expect(parent_handler.virtual_keyboard_global_seen);
+    try std.testing.expect(parent_handler.virtual_pointer_global_seen);
 
     var close_pair: [2]linux.fd_t = undefined;
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(
@@ -501,6 +502,7 @@ test "shell-input: security context filters nested manager before registry disco
     try std.testing.expect(!child_handler.wlr_data_control_global_seen);
     try std.testing.expect(!child_handler.input_method_global_seen);
     try std.testing.expect(!child_handler.virtual_keyboard_global_seen);
+    try std.testing.expect(!child_handler.virtual_pointer_global_seen);
     try std.testing.expect(child_handler.security_manager == null);
     var sandbox_peer: ?wayring.io_uring.Peer = null;
     for (coordinator.clients.items) |client_state| if (client_state.active and
@@ -1714,7 +1716,13 @@ test "shell-input: generated input-method client bridges focused text input" {
     const app_actor = try app.actor();
     var app_driver = ClientDriver.init(&app);
     const app_registry = try ClientCore.getRegistry(&app.objects, &app_actor.transmit, null);
-    var app_handler: Handler = .{ .objects = &app.objects, .queue = &app_actor.transmit, .registry = app_registry, .test_text_input = true };
+    var app_handler: Handler = .{
+        .objects = &app.objects,
+        .queue = &app_actor.transmit,
+        .registry = app_registry,
+        .test_text_input = true,
+        .pointer_axis_expected_time = 17,
+    };
     try submitClient(&app_reactor, &app_driver, &app_handler);
 
     var method_reactor: wayring.io_uring.Reactor = undefined;
@@ -1816,6 +1824,39 @@ test "shell-input: generated input-method client bridges focused text input" {
     try std.testing.expectEqual(@as(usize, 4), app_handler.keyboard_key);
     try std.testing.expectEqual(@as(usize, 2), method_handler.grab_keymap);
     try std.testing.expectEqual(@as(usize, 4), method_handler.grab_keys);
+
+    const virtual_pointer = method_handler.virtual_pointer.?;
+    const pointer_buttons_before = app_handler.pointer_button;
+    const pointer_axes_before = app_handler.pointer_axis;
+    try protocol.zwlr_virtual_pointer_v1.encodeRequest(&method_actor.transmit, virtual_pointer.id, .{ .motion = .{ .time = 12, .dx = 0, .dy = 0 } });
+    try protocol.zwlr_virtual_pointer_v1.encodeRequest(&method_actor.transmit, virtual_pointer.id, .{ .button = .{ .time = 13, .button = 0x111, .state = .pressed } });
+    try protocol.zwlr_virtual_pointer_v1.encodeRequest(&method_actor.transmit, virtual_pointer.id, .{ .button = .{ .time = 14, .button = 0x111, .state = .pressed } });
+    try protocol.zwlr_virtual_pointer_v1.encodeRequest(&method_actor.transmit, virtual_pointer.id, .{ .button = .{ .time = 15, .button = 0x111, .state = .released } });
+    try protocol.zwlr_virtual_pointer_v1.encodeRequest(&method_actor.transmit, virtual_pointer.id, .{ .button = .{ .time = 16, .button = 0x111, .state = .released } });
+    try protocol.zwlr_virtual_pointer_v1.encodeRequest(&method_actor.transmit, virtual_pointer.id, .{ .axis_source = .{ .axis_source = .wheel } });
+    try protocol.zwlr_virtual_pointer_v1.encodeRequest(&method_actor.transmit, virtual_pointer.id, .{ .axis_discrete = .{ .time = 17, .axis = .vertical_scroll, .value = 256, .discrete = 1 } });
+    try protocol.zwlr_virtual_pointer_v1.encodeRequest(&method_actor.transmit, virtual_pointer.id, .{ .frame = .{} });
+    try wayring.client.sendRequest(
+        protocol.zwlr_virtual_pointer_v1,
+        &method_client.objects,
+        &method_actor.transmit,
+        virtual_pointer,
+        .{ .destroy = .{} },
+    );
+    method_handler.virtual_pointer = null;
+    try submitClient(&method_reactor, &method_driver, &method_handler);
+    for (0..512) |_| {
+        _ = try drainClient(&app_reactor, &app_driver, &app_handler);
+        _ = try drainClient(&method_reactor, &method_driver, &method_handler);
+        _ = try loop.turn(coordinator);
+        if (app_handler.pointer_button == pointer_buttons_before + 2 and
+            app_handler.pointer_axis == pointer_axes_before + 1) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(u4, 0b0101), app_handler.virtual_pointer_button_times);
+    try std.testing.expectEqual(@as(usize, 0), app_handler.zero_time_pointer_buttons);
+    try std.testing.expectEqual(pointer_buttons_before + 2, app_handler.pointer_button);
+    try std.testing.expectEqual(pointer_axes_before + 1, app_handler.pointer_axis);
 
     const method_done_before_enable = method_handler.done;
     try protocol.zwp_text_input_v3.encodeRequest(&app_actor.transmit, app_handler.text_input.?.id, .{ .enable = .{} });
@@ -2278,6 +2319,8 @@ const InputMethodHandler = struct {
     manager: ?wayring.objects.Handle = null,
     virtual_manager: ?wayring.objects.Handle = null,
     virtual_keyboard: ?wayring.objects.Handle = null,
+    virtual_pointer_manager: ?wayring.objects.Handle = null,
+    virtual_pointer: ?wayring.objects.Handle = null,
     method: ?wayring.objects.Handle = null,
     rejected: ?wayring.objects.Handle = null,
     keyboard_grab: ?wayring.objects.Handle = null,
@@ -2307,12 +2350,20 @@ const InputMethodHandler = struct {
                     if (std.mem.eql(u8, v.interface, protocol.wl_seat.info.name)) self.seat = try ClientCore.bind(self.objects, self.queue, self.registry, v.name, &protocol.wl_seat.info, @min(v.version, 9), null);
                     if (std.mem.eql(u8, v.interface, protocol.zwp_input_method_manager_v2.info.name)) self.manager = try ClientCore.bind(self.objects, self.queue, self.registry, v.name, &protocol.zwp_input_method_manager_v2.info, 1, null);
                     if (std.mem.eql(u8, v.interface, protocol.zwp_virtual_keyboard_manager_v1.info.name)) self.virtual_manager = try ClientCore.bind(self.objects, self.queue, self.registry, v.name, &protocol.zwp_virtual_keyboard_manager_v1.info, 1, null);
+                    if (std.mem.eql(u8, v.interface, protocol.zwlr_virtual_pointer_manager_v1.info.name)) self.virtual_pointer_manager = try ClientCore.bind(self.objects, self.queue, self.registry, v.name, &protocol.zwlr_virtual_pointer_manager_v1.info, 2, null);
                     if (self.virtual_keyboard == null and self.seat != null and self.virtual_manager != null)
                         self.virtual_keyboard = (try protocol.zwp_virtual_keyboard_manager_v1.construct_create_virtual_keyboard(
                             self.objects,
                             self.queue,
                             self.virtual_manager.?,
                             .{ .seat = self.seat.?.id },
+                        )).id;
+                    if (self.virtual_pointer == null and self.virtual_pointer_manager != null)
+                        self.virtual_pointer = (try protocol.zwlr_virtual_pointer_manager_v1.construct_create_virtual_pointer(
+                            self.objects,
+                            self.queue,
+                            self.virtual_pointer_manager.?,
+                            .{ .seat = null },
                         )).id;
                     if (self.method == null and self.seat != null and self.manager != null) {
                         self.method = (try protocol.zwp_input_method_manager_v2.construct_get_input_method(self.objects, self.queue, self.manager.?, .{ .seat = self.seat.?.id })).input_method;
@@ -2984,6 +3035,7 @@ const Handler = struct {
     wlr_data_control_global_seen: bool = false,
     input_method_global_seen: bool = false,
     virtual_keyboard_global_seen: bool = false,
+    virtual_pointer_global_seen: bool = false,
     text_input_manager: ?wayring.objects.Handle = null,
     text_input: ?wayring.objects.Handle = null,
     test_text_input: bool = false,
@@ -3021,12 +3073,15 @@ const Handler = struct {
     test_pointer_warp: bool = false,
     pointer_motion: usize = 0,
     pointer_button: usize = 0,
+    virtual_pointer_button_times: u4 = 0,
+    zero_time_pointer_buttons: usize = 0,
     pointer_axis_source: usize = 0,
     pointer_axis: usize = 0,
     pointer_axis_value120: usize = 0,
     pointer_frame: usize = 0,
     pointer_axis_fixed: i32 = 0,
     pointer_axis_value120_value: i32 = 0,
+    pointer_axis_expected_time: u32 = 3,
     drag_cancelled: usize = 0,
     drag_data_offer: usize = 0,
     drag_mime_offer: usize = 0,
@@ -3193,6 +3248,11 @@ const Handler = struct {
                 .motion => self.pointer_motion += 1,
                 .button => |value| {
                     self.pointer_button += 1;
+                    if (value.time >= 13 and value.time <= 16)
+                        self.virtual_pointer_button_times |= @as(u4, 1) << @intCast(value.time - 13);
+                    if (value.time == 0) {
+                        self.zero_time_pointer_buttons += 1;
+                    }
                     if (self.cursor_surface == null and !self.test_text_input)
                         try self.queueCursor(value.serial);
                     if (value.state.value == protocol.wl_pointer.button_state.pressed.value and
@@ -3222,7 +3282,7 @@ const Handler = struct {
                 },
                 .axis => |value| {
                     try std.testing.expectEqual(protocol.wl_pointer.axis.vertical_scroll.value, value.axis.value);
-                    try std.testing.expectEqual(@as(u32, 3), value.time);
+                    try std.testing.expectEqual(self.pointer_axis_expected_time, value.time);
                     self.pointer_axis += 1;
                     self.pointer_axis_fixed = value.value;
                 },
@@ -3379,6 +3439,8 @@ const Handler = struct {
                 self.input_method_global_seen = true;
             if (std.mem.eql(u8, value.interface, protocol.zwp_virtual_keyboard_manager_v1.info.name))
                 self.virtual_keyboard_global_seen = true;
+            if (std.mem.eql(u8, value.interface, protocol.zwlr_virtual_pointer_manager_v1.info.name))
+                self.virtual_pointer_global_seen = true;
             return;
         }
         if (std.mem.eql(u8, value.interface, protocol.wl_compositor.info.name))

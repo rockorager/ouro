@@ -65,6 +65,7 @@ const protocol_cursor_shape = @import("../protocol/cursor_shape.zig");
 const protocol_text_input = @import("../protocol/text_input.zig");
 const protocol_tablet_v2 = @import("../protocol/tablet_v2.zig");
 const protocol_virtual_keyboard = @import("../protocol/virtual_keyboard.zig");
+const protocol_virtual_pointer = @import("../protocol/virtual_pointer.zig");
 const cursor_theme = @import("../cursor_theme.zig");
 const theme_cursor = @import("../scene/theme_cursor.zig");
 const desktop_model = @import("../desktop/model.zig");
@@ -122,6 +123,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const TextInputAdapter = protocol_text_input.Adapter(protocol);
         const InputMethodAdapter = protocol_input_method.Adapter(protocol, TextInputAdapter);
         const VirtualKeyboardAdapter = protocol_virtual_keyboard.Adapter(protocol, SeatAdapter);
+        const VirtualPointerAdapter = protocol_virtual_pointer.Adapter(protocol);
         const TabletState = tablet_input.State(SeatAdapter.FocusTarget);
         const TabletAdapter = protocol_tablet_v2.Adapter(protocol, SeatAdapter);
 
@@ -306,6 +308,7 @@ pub fn Coordinator(comptime protocol: type) type {
             text_input: protocol_text_input.Config = .{},
             input_method: protocol_input_method.Config = .{},
             virtual_keyboard: protocol_virtual_keyboard.Config = .{},
+            virtual_pointer: protocol_virtual_pointer.Config = .{},
             linux_dmabuf: protocol_linux_dmabuf.Config = .{},
             linux_drm_syncobj: protocol_linux_drm_syncobj.Config = .{},
             xdg_activation: protocol_xdg_activation.Config = .{},
@@ -386,6 +389,7 @@ pub fn Coordinator(comptime protocol: type) type {
         input_delivery_prepared: bool = false,
         input_delivery_event: ?input_api.Event = null,
         input_method_key_owners: [0x300]?protocol_input_method.GrabId = [_]?protocol_input_method.GrabId{null} ** 0x300,
+        processing_virtual_pointer: bool = false,
         manager: drm.Manager,
         shm: Shm,
         adapter: Adapter,
@@ -403,6 +407,7 @@ pub fn Coordinator(comptime protocol: type) type {
         text_input_adapter: TextInputAdapter,
         input_method_adapter: InputMethodAdapter,
         virtual_keyboard_adapter: VirtualKeyboardAdapter,
+        virtual_pointer_adapter: VirtualPointerAdapter,
         dmabuf_adapter: DmabufAdapter,
         syncobj_device: ?drm_syncobj.Device = null,
         syncobj_adapter: ?SyncobjAdapter = null,
@@ -798,6 +803,19 @@ pub fn Coordinator(comptime protocol: type) type {
                 .canUpdateFn = canUpdateInputMethodKeymap,
                 .updatedFn = inputMethodKeymapUpdated,
             });
+            self.virtual_pointer_adapter = try VirtualPointerAdapter.init(
+                allocator,
+                config.virtual_pointer,
+            );
+            errdefer self.virtual_pointer_adapter.deinit();
+            self.virtual_pointer_adapter.setSeatValidator(.{
+                .context = self,
+                .validateFn = validateVirtualPointerSeat,
+            });
+            self.virtual_pointer_adapter.setOutputValidator(.{
+                .context = self,
+                .validateFn = validateVirtualPointerOutput,
+            });
             self.dmabuf_adapter = try DmabufAdapter.init(allocator, config.linux_dmabuf);
             errdefer self.dmabuf_adapter.deinit();
             try self.adapter.setExternalImporter(self.dmabuf_adapter.externalImporter(Adapter));
@@ -1020,6 +1038,9 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = try self.virtual_keyboard_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
+            _ = try self.virtual_pointer_adapter.install(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
             _ = try self.dmabuf_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
@@ -1161,6 +1182,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.decoration_adapter.deinit();
             self.activation_adapter.deinit();
             self.dmabuf_adapter.deinit();
+            self.virtual_pointer_adapter.deinit();
             self.virtual_keyboard_adapter.deinit();
             self.input_method_adapter.deinit();
             self.text_input_adapter.deinit();
@@ -1230,6 +1252,8 @@ pub fn Coordinator(comptime protocol: type) type {
             self.foreign_adapter.disconnected(peer);
             self.input_method_adapter.disconnected(peer);
             self.virtual_keyboard_adapter.disconnected(peer);
+            self.virtual_pointer_adapter.disconnected(peer);
+            self.processVirtualPointerEvents() catch {};
             self.text_input_adapter.disconnected(peer);
             self.primary_selection_adapter.disconnected(peer);
             self.wlr_data_control_adapter.disconnected(peer);
@@ -1397,6 +1421,11 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             if (try self.virtual_keyboard_adapter.request(peer, target, message, fds)) |control| {
                 self.markProtocolAll(ProtocolReady.seat);
+                try self.flushProtocol();
+                return control;
+            }
+            if (try self.virtual_pointer_adapter.request(peer, target, message, fds)) |control| {
+                try self.processVirtualPointerEvents();
                 try self.flushProtocol();
                 return control;
             }
@@ -2869,7 +2898,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 !std.mem.eql(u8, name, "ext_data_control_manager_v1") and
                 !std.mem.eql(u8, name, "zwlr_data_control_manager_v1") and
                 !std.mem.eql(u8, name, "zwp_input_method_manager_v2") and
-                !std.mem.eql(u8, name, "zwp_virtual_keyboard_manager_v1");
+                !std.mem.eql(u8, name, "zwp_virtual_keyboard_manager_v1") and
+                !std.mem.eql(u8, name, "zwlr_virtual_pointer_manager_v1");
         }
 
         fn commitSecurityContext(
@@ -2953,6 +2983,28 @@ pub fn Coordinator(comptime protocol: type) type {
             const self: *Self = @ptrCast(@alignCast(context orelse return));
             self.input_method_adapter.keymapUpdated() catch unreachable;
             self.markInputMethodProtocol();
+        }
+
+        fn validateVirtualPointerSeat(
+            context: ?*anyopaque,
+            peer: wayring.io_uring.Peer,
+            seat_object: u32,
+        ) bool {
+            const self: *Self = @ptrCast(@alignCast(context orelse return false));
+            return self.seat_adapter.ownsSeat(peer, seat_object);
+        }
+
+        fn validateVirtualPointerOutput(
+            context: ?*anyopaque,
+            peer: wayring.io_uring.Peer,
+            output_object: u32,
+        ) bool {
+            const self: *Self = @ptrCast(@alignCast(context orelse return false));
+            const server_objects = self.root.runtime.clients.get(peer) catch return false;
+            const handle = server_objects.namespace.lookupHandle(output_object) orelse return false;
+            const object = server_objects.namespace.resolve(handle) orelse return false;
+            _ = self.output_adapter.reference(peer, handle, object.*) catch return false;
+            return true;
         }
 
         fn validateGesturePointer(
@@ -3113,12 +3165,113 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn flushProtocol(self: *Self) !void {
+            if (!self.processing_virtual_pointer) try self.processVirtualPointerEvents();
             try self.processDecorationEvents();
             try self.advanceShell();
             self.input_method_adapter.advance();
             self.markInputMethodProtocol();
             for (self.clients.items) |client| if (client.active and client.protocol_ready != 0)
                 try self.flushProtocolOn(client.peer);
+        }
+
+        fn processVirtualPointerEvents(self: *Self) anyerror!void {
+            if (self.processing_virtual_pointer) return;
+            self.processing_virtual_pointer = true;
+            defer self.processing_virtual_pointer = false;
+            while (self.virtual_pointer_adapter.peekEvent()) |pending| {
+                const accepted = switch (pending.*) {
+                    .device_added => |value| try self.acceptNormalizedInput(.{ .device_added = .{
+                        .device = value.device,
+                        .info = value.info,
+                    } }),
+                    .device_removed => |value| try self.acceptNormalizedInput(.{ .device_removed = value }),
+                    .motion => |value| try self.acceptNormalizedInput(.{ .pointer_motion = .{
+                        .device = value.device,
+                        .time_usec = @as(u64, value.time) * 1000,
+                        .dx = @as(f64, @floatFromInt(value.dx)) / 256.0,
+                        .dy = @as(f64, @floatFromInt(value.dy)) / 256.0,
+                    } }),
+                    .motion_absolute => |value| absolute: {
+                        if (value.x_extent == 0 or value.y_extent == 0) break :absolute true;
+                        const bounds = self.outputBounds() catch break :absolute true;
+                        if (bounds.width <= 0 or bounds.height <= 0) break :absolute true;
+                        const x = @min(value.x, value.x_extent);
+                        const y = @min(value.y, value.y_extent);
+                        const target_x = @as(i64, bounds.x) + @as(i64, @intCast(
+                            (@as(u64, x) * @as(u64, @intCast(bounds.width - 1))) / value.x_extent,
+                        ));
+                        const target_y = @as(i64, bounds.y) + @as(i64, @intCast(
+                            (@as(u64, y) * @as(u64, @intCast(bounds.height - 1))) / value.y_extent,
+                        ));
+                        const current = self.interaction.pointerPosition();
+                        break :absolute try self.acceptNormalizedInput(.{ .pointer_motion = .{
+                            .device = value.device,
+                            .time_usec = @as(u64, value.time) * 1000,
+                            .dx = @floatFromInt(target_x - current.x),
+                            .dy = @floatFromInt(target_y - current.y),
+                        } });
+                    },
+                    .button => |value| try self.acceptNormalizedInput(.{ .pointer_button = .{
+                        .device = value.device,
+                        .time_usec = @as(u64, value.time) * 1000,
+                        .button = value.button,
+                        .pressed = value.pressed,
+                    } }),
+                    .axis => |value| try self.acceptVirtualPointerAxis(
+                        value.device,
+                        value.time,
+                        value.axis,
+                        @as(f64, @floatFromInt(value.value)) / 256.0,
+                        null,
+                        value.source,
+                        false,
+                    ),
+                    .axis_stop => |value| try self.acceptVirtualPointerAxis(
+                        value.device,
+                        value.time,
+                        value.axis,
+                        0,
+                        null,
+                        value.source,
+                        true,
+                    ),
+                    .axis_discrete => |value| try self.acceptVirtualPointerAxis(
+                        value.device,
+                        value.time,
+                        value.axis,
+                        @as(f64, @floatFromInt(value.value)) / 256.0,
+                        @floatFromInt(std.math.clamp(
+                            @as(i64, value.discrete) * 120,
+                            std.math.minInt(i32),
+                            std.math.maxInt(i32),
+                        )),
+                        value.source,
+                        false,
+                    ),
+                };
+                if (!accepted) break;
+                self.virtual_pointer_adapter.dropEvent();
+            }
+        }
+
+        fn acceptVirtualPointerAxis(
+            self: *Self,
+            device: input_api.DeviceId,
+            time: u32,
+            axis: u32,
+            value: f64,
+            value120: ?f64,
+            source: input_platform.AxisSource,
+            stop: bool,
+        ) !bool {
+            const present: input_platform.AxisValue = .{ .value = value, .value120 = value120, .stop = stop };
+            return self.acceptNormalizedInput(.{ .pointer_axis = .{
+                .device = device,
+                .time_usec = @as(u64, time) * 1000,
+                .source = source,
+                .vertical = if (axis == 0) present else null,
+                .horizontal = if (axis == 1) present else null,
+            } });
         }
 
         fn flushProtocolOn(self: *Self, peer: wayring.io_uring.Peer) !void {
@@ -5124,6 +5277,7 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.cursor_shape_adapter.resourceRemoved(handle, object);
             _ = self.input_method_adapter.resourceRemoved(handle, object);
             _ = self.virtual_keyboard_adapter.resourceRemoved(handle, object);
+            _ = self.virtual_pointer_adapter.resourceRemoved(handle, object);
             _ = self.text_input_adapter.resourceRemoved(handle, object);
             _ = self.subcompositor_adapter.resourceRemoved(handle, object);
             if (layer_shell_removed and self.output != null) {
