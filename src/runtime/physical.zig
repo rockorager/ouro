@@ -2363,7 +2363,8 @@ pub fn Coordinator(comptime protocol: type) type {
         ) bool {
             const self: *Self = @ptrCast(@alignCast(context orelse return false));
             const server_objects = self.root.runtime.clients.get(peer) catch return false;
-            return self.seat_adapter.validateCursorShapeOn(server_objects, peer, pointer_object, serial);
+            return self.seat_adapter.validateCursorShapeOn(server_objects, peer, pointer_object, serial) or
+                self.tablet_adapter.validateCursorShapeOn(server_objects, peer, pointer_object, serial);
         }
 
         fn validateTextInputSeat(

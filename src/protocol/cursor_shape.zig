@@ -112,7 +112,6 @@ pub fn Adapter(comptime protocol: type) type {
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
             peer: wayring.io_uring.Peer = undefined,
             pointer: u32 = 0,
-            inert: bool = false,
         };
 
         allocator: std.mem.Allocator,
@@ -191,7 +190,7 @@ pub fn Adapter(comptime protocol: type) type {
                     .get_tablet_tool_v2 => |payload| {
                         const slot = self.acquireDevice() catch return try self.noMemory(actor);
                         slot.peer = peer;
-                        slot.inert = true;
+                        slot.pointer = payload.tablet_tool;
                         const admitted = Manager.admit_get_tablet_tool_v2(server_objects, decoded.handle, payload, .{ .cursor_shape_device = slot }) catch |err| {
                             self.releaseDevice(self.deviceIndex(slot));
                             return try self.failure(actor, decoded.handle.id, err);
@@ -288,7 +287,7 @@ pub fn Adapter(comptime protocol: type) type {
             }
         }
         fn publishShape(self: *Self, slot: *DeviceSlot, serial: u32, shape: Shape) !void {
-            if (slot.inert or !self.validator.validate(slot.peer, slot.pointer, serial)) return;
+            if (!self.validator.validate(slot.peer, slot.pointer, serial)) return;
             if (self.event_len == self.events.len) return error.Exhausted;
             self.events[(self.event_head + self.event_len) % self.events.len] = .{
                 .device = self.deviceId(slot),
@@ -403,12 +402,8 @@ test "cursor shape validation precedes bounded event admission" {
     accepted = true;
     try adapter.publishShape(first, 7, .default);
     try std.testing.expectEqual(Shape.default, adapter.peekEvent().?.shape);
-    const inert = try adapter.acquireDevice();
-    inert.peer = peer;
-    inert.pointer = 9;
-    inert.inert = true;
-    try adapter.publishShape(inert, 8, .pointer);
-    try std.testing.expectEqual(@as(usize, 1), adapter.event_len);
-    inert.inert = false;
-    try std.testing.expectError(error.Exhausted, adapter.publishShape(inert, 8, .pointer));
+    const second = try adapter.acquireDevice();
+    second.peer = peer;
+    second.pointer = 9;
+    try std.testing.expectError(error.Exhausted, adapter.publishShape(second, 8, .pointer));
 }

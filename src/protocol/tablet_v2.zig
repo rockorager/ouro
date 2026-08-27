@@ -481,6 +481,24 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
             );
         }
 
+        pub fn validateCursorShapeOn(
+            self: *Self,
+            server_objects: anytype,
+            peer: wayring.io_uring.Peer,
+            tool_object: u32,
+            serial: u32,
+        ) bool {
+            if (serial == 0) return false;
+            const handle = server_objects.namespace.lookupHandle(tool_object) orelse return false;
+            const object = server_objects.namespace.resolve(handle) orelse return false;
+            if (object.interface != &Tool.info) return false;
+            const tool = self.toolFromObject(object) orelse return false;
+            if (tool.resource == null or !std.meta.eql(tool.resource.?, handle)) return false;
+            const binding = self.resolveBinding(tool.binding) catch return false;
+            return samePeer(binding.peer, peer) and serial == tool.last_proximity_serial and
+                tool.focus != null and self.seat.targetBelongsTo(tool.focus.?, peer);
+        }
+
         fn toolCursorOwner(self: *const Self, tool: *const ToolSlot, binding: *const Binding) u128 {
             const id = self.toolId(tool);
             return (@as(u128, binding.peer.slot) << 96) |
@@ -2367,6 +2385,19 @@ test "tablet-v2: focused tool frame preserves protocol event order" {
     const target: TestSeat.FocusTarget = .{ .peer = peer, .surface = 5 };
     try adapter.toolProximityIn(key, target);
     const proximity_serial = adapter.tools[0].last_proximity_serial;
+    const tool_resource = adapter.tools[0].resource.?;
+    try std.testing.expect(adapter.validateCursorShapeOn(
+        &server_objects,
+        peer,
+        tool_resource.id,
+        proximity_serial,
+    ));
+    try std.testing.expect(!adapter.validateCursorShapeOn(
+        &server_objects,
+        peer,
+        tool_resource.id,
+        proximity_serial +% 1,
+    ));
     try adapter.requestToolCursorOn(
         &adapter.tools[0],
         binding,
@@ -2401,6 +2432,12 @@ test "tablet-v2: focused tool frame preserves protocol event order" {
     try adapter.toolTip(key, false);
     try adapter.toolProximityOut(key);
     try std.testing.expectEqual(@as(u32, 0), adapter.tools[0].last_proximity_serial);
+    try std.testing.expect(!adapter.validateCursorShapeOn(
+        &server_objects,
+        peer,
+        tool_resource.id,
+        proximity_serial,
+    ));
     try std.testing.expect(adapter.tools[0].leaving);
     try adapter.toolFrame(key, 1_235_000);
     try std.testing.expect(adapter.tools[0].focus == null);
