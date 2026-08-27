@@ -47,6 +47,7 @@ const protocol_pointer_constraints = @import("../protocol/pointer_constraints.zi
 const protocol_fractional_scale = @import("../protocol/fractional_scale.zig");
 const protocol_color_management = @import("../protocol/color_management.zig");
 const protocol_color_representation = @import("../protocol/color_representation.zig");
+const protocol_alpha_modifier = @import("../protocol/alpha_modifier.zig");
 const protocol_output = @import("../protocol/output.zig");
 const protocol_xdg_output = @import("../protocol/xdg_output.zig");
 const protocol_layer_shell = @import("../protocol/layer_shell.zig");
@@ -95,6 +96,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const FractionalScaleAdapter = protocol_fractional_scale.Adapter(protocol, Adapter);
         const ColorManagementAdapter = protocol_color_management.Adapter(protocol, Adapter);
         const ColorRepresentationAdapter = protocol_color_representation.Adapter(protocol, Adapter);
+        const AlphaModifierAdapter = protocol_alpha_modifier.Adapter(protocol, Adapter);
         const OutputAdapter = protocol_output.Adapter(protocol);
         const XdgOutputAdapter = protocol_xdg_output.Adapter(protocol, OutputAdapter);
         const LayerShellAdapter = protocol_layer_shell.Adapter(protocol, Adapter, OutputAdapter);
@@ -292,6 +294,7 @@ pub fn Coordinator(comptime protocol: type) type {
             fractional_scale: protocol_fractional_scale.Config = .{},
             color_management: protocol_color_management.Config = .{},
             color_representation: protocol_color_representation.Config = .{},
+            alpha_modifier: protocol_alpha_modifier.Config = .{},
             enable_color_protocols: bool = false,
             protocol_output: protocol_output.Config = .{},
             xdg_output: protocol_xdg_output.Config = .{},
@@ -384,6 +387,7 @@ pub fn Coordinator(comptime protocol: type) type {
         icc_poll_canceling: bool = false,
         color_protocols_enabled: bool = false,
         color_representation_adapter: ColorRepresentationAdapter,
+        alpha_modifier_adapter: AlphaModifierAdapter,
         output_adapter: OutputAdapter,
         xdg_output_adapter: XdgOutputAdapter,
         layer_shell_adapter: LayerShellAdapter,
@@ -752,6 +756,12 @@ pub fn Coordinator(comptime protocol: type) type {
                 config.color_representation,
             );
             errdefer self.color_representation_adapter.deinit();
+            self.alpha_modifier_adapter = try AlphaModifierAdapter.init(
+                allocator,
+                &self.adapter,
+                config.alpha_modifier,
+            );
+            errdefer self.alpha_modifier_adapter.deinit();
             self.data_device_adapter.setSerialValidator(.{
                 .context = self,
                 .validate = validateSelection,
@@ -863,6 +873,9 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                     return error.GlobalPublicationIncomplete;
             }
+            _ = try self.alpha_modifier_adapter.install(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
             _ = try self.adapter.installPresentation();
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
@@ -1015,6 +1028,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.xdg_output_adapter.deinit();
             self.output_adapter.deinit();
             self.fractional_scale_adapter.deinit();
+            self.alpha_modifier_adapter.deinit();
             self.color_representation_adapter.deinit();
             self.color_management_adapter.deinit();
             self.decoration_adapter.deinit();
@@ -1085,6 +1099,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.foreign_adapter.disconnected(peer);
             self.text_input_adapter.disconnected(peer);
             self.primary_selection_adapter.disconnected(peer);
+            self.alpha_modifier_adapter.disconnected(peer);
             for (self.clients.items) |*client| if (client.active and samePeer(client.peer, peer)) {
                 client.* = .{};
                 self.client_count -= 1;
@@ -1198,6 +1213,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.flushProtocol();
                 return control;
             }
+            if (try self.alpha_modifier_adapter.request(peer, target, message, fds)) |control|
+                return control;
             if (try self.shell_adapter.request(peer, target, message, fds)) |control| {
                 try self.advanceShell();
                 try self.flushProtocol();
@@ -3232,6 +3249,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .transform = @enumFromInt(@intFromEnum(content.surface.transform)),
                 .color_description = content.surface.color_description,
                 .color_representation = content.surface.color_representation,
+                .global_alpha = alphaMultiplier(content.surface.alpha_multiplier),
             };
             const published = .{
                 .peer = candidate.peer,
@@ -4473,6 +4491,7 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.fractional_scale_adapter.resourceRemoved(handle, object);
             _ = self.color_management_adapter.resourceRemoved(handle, object);
             _ = self.color_representation_adapter.resourceRemoved(handle, object);
+            _ = self.alpha_modifier_adapter.resourceRemoved(handle, object);
             const layer_shell_removed = self.layer_shell_adapter.resourceRemoved(handle, object);
             const session_lock_removed = self.session_lock_adapter.resourceRemoved(handle, object);
             _ = self.xdg_output_adapter.resourceRemoved(handle, object);
@@ -4494,6 +4513,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.pointer_constraints_adapter.surfaceRemoved(id);
                 self.color_management_adapter.surfaceRemoved(id);
                 self.color_representation_adapter.surfaceRemoved(id);
+                self.alpha_modifier_adapter.surfaceRemoved(id);
                 self.dropPendingSurface(id);
                 if (self.render_device) |render_device| render_device.content.destroySurface(
                     (@as(u64, id.generation) << 32) | id.index,
@@ -4555,6 +4575,17 @@ fn longestCursorShapeName() usize {
     var longest: usize = 0;
     for (protocol_cursor_shape.shape_names) |name| longest = @max(longest, name.len);
     return longest;
+}
+
+fn alphaMultiplier(multiplier: u32) u8 {
+    const maximum = std.math.maxInt(u32);
+    return @intCast((@as(u64, multiplier) * 255 + maximum / 2) / maximum);
+}
+
+test "alpha modifier UNORM converts to renderer alpha with rounded endpoints" {
+    try std.testing.expectEqual(@as(u8, 0), alphaMultiplier(0));
+    try std.testing.expectEqual(@as(u8, 128), alphaMultiplier(0x8080_8080));
+    try std.testing.expectEqual(@as(u8, 255), alphaMultiplier(std.math.maxInt(u32)));
 }
 
 fn normalizedFixedDelta(value: f64) i64 {

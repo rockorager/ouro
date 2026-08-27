@@ -256,6 +256,7 @@ pub const Update = struct {
     size: SurfaceSize,
     color_description: color.Description,
     color_representation: color.Representation,
+    alpha_multiplier: u32 = std.math.maxInt(u32),
     content_type: u32 = 0,
     presentation_hint: PresentationHint = .vsync,
     fifo_set: bool = false,
@@ -295,6 +296,7 @@ pub const Surface = struct {
     viewport: Viewport = .{},
     current_color_description: color.Description = .srgb,
     current_color_representation: color.Representation = .{},
+    current_alpha_multiplier: u32 = std.math.maxInt(u32),
 
     pending_buffer: ?Buffer = null,
     pending_attach_offset: Point = .{},
@@ -308,6 +310,7 @@ pub const Surface = struct {
     pending_offset: Point = .{},
     pending_color_description: color.Description = .srgb,
     pending_color_representation: color.Representation = .{},
+    pending_alpha_multiplier: u32 = std.math.maxInt(u32),
     pending_content_type: u32 = 0,
     pending_presentation_hint: PresentationHint = .vsync,
     pending_fifo_set: bool = false,
@@ -404,6 +407,10 @@ pub const Surface = struct {
         surface.pending_content_type = content_type;
     }
 
+    pub fn setAlphaMultiplier(surface: *Surface, multiplier: u32) void {
+        surface.pending_alpha_multiplier = multiplier;
+    }
+
     pub fn setPresentationHint(surface: *Surface, hint: PresentationHint) void {
         surface.pending_presentation_hint = hint;
     }
@@ -484,6 +491,7 @@ pub const Surface = struct {
         surface.current_scale = surface.pending_scale;
         surface.current_color_description = surface.pending_color_description;
         surface.current_color_representation = surface.pending_color_representation;
+        surface.current_alpha_multiplier = surface.pending_alpha_multiplier;
         surface.current_content_type = surface.pending_content_type;
         surface.current_presentation_hint = surface.pending_presentation_hint;
         const content_size = surface.contentSize(surface.current_buffer);
@@ -513,6 +521,7 @@ pub const Surface = struct {
             .size = viewport_state.surfaceSize(content_size),
             .color_description = surface.current_color_description,
             .color_representation = surface.current_color_representation,
+            .alpha_multiplier = surface.current_alpha_multiplier,
             .content_type = surface.current_content_type,
             .presentation_hint = surface.current_presentation_hint,
             .fifo_set = surface.pending_fifo_set,
@@ -962,6 +971,7 @@ test "surface commits persistent and one-shot state atomically" {
     display_p3.primaries.green = .{ .x = 0.265, .y = 0.69 };
     try surface.setColorDescription(display_p3);
     surface.setColorRepresentation(.{ .alpha_mode = .straight });
+    surface.setAlphaMultiplier(0x8080_8080);
 
     const first = try surface.commit();
     try std.testing.expectEqual(@as(u64, 1), first.sequence);
@@ -974,6 +984,7 @@ test "surface commits persistent and one-shot state atomically" {
     try std.testing.expectEqual(Point{ .x = 7, .y = -8 }, first.offset);
     try std.testing.expectEqual(display_p3, first.color_description);
     try std.testing.expectEqual(color.AlphaMode.straight, first.color_representation.alpha_mode);
+    try std.testing.expectEqual(@as(u32, 0x8080_8080), first.alpha_multiplier);
 
     const second = try surface.commit();
     try std.testing.expectEqual(@as(u64, 2), second.sequence);
@@ -985,6 +996,7 @@ test "surface commits persistent and one-shot state atomically" {
     try std.testing.expectEqual(Point{}, second.offset);
     try std.testing.expectEqual(display_p3, second.color_description);
     try std.testing.expectEqual(color.AlphaMode.straight, second.color_representation.alpha_mode);
+    try std.testing.expectEqual(@as(u32, 0x8080_8080), second.alpha_multiplier);
     try std.testing.expectEqual(buffer, surface.current_buffer.?);
 }
 

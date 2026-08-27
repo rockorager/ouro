@@ -37,6 +37,10 @@ test "generated single pixel buffer scales through the physical coordinator" {
     try runVertical(.client_disconnect, .single_pixel);
 }
 
+test "generated alpha modifier reaches the physical render sample" {
+    try runVertical(.client_disconnect, .alpha_shm);
+}
+
 test "physical coordinator keeps serving until its final client disconnects" {
     const allocator = std.testing.allocator;
     var fixture = try Fixture.init();
@@ -208,7 +212,7 @@ test "output readiness exhaustion destroys output and releases device" {
 }
 
 const TerminalTrigger = enum { session_disable, client_disconnect };
-const ClientSource = enum { shm, dmabuf, single_pixel };
+const ClientSource = enum { shm, alpha_shm, dmabuf, single_pixel };
 
 fn runVertical(trigger: TerminalTrigger, source: ClientSource) !void {
     const allocator = std.testing.allocator;
@@ -231,7 +235,7 @@ fn runVertical(trigger: TerminalTrigger, source: ClientSource) !void {
         &client_reactor,
         try wayring.unix_socket.connect(path),
         .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 },
-        .{ .max_objects = 16, .max_client_ids = 15 },
+        .{ .max_objects = 32, .max_client_ids = 31 },
     );
     var client_driver = ClientDriver.init(&client);
     const actor = try client.actor();
@@ -282,6 +286,8 @@ fn runVertical(trigger: TerminalTrigger, source: ClientSource) !void {
                 try std.testing.expectEqual(@as(u32, 3), sample.destination.width);
                 try std.testing.expectEqual(@as(u32, 2), sample.destination.height);
             }
+            if (source == .alpha_shm)
+                try std.testing.expectEqual(@as(u8, 128), sample.global_alpha);
             observed_identity = true;
         }
         if (client_handler.complete()) break;
@@ -460,6 +466,7 @@ const ClientHandler = struct {
     dmabuf: ?wayring.objects.Handle = null,
     single_pixel_manager: ?wayring.objects.Handle = null,
     viewporter: ?wayring.objects.Handle = null,
+    alpha_modifier_manager: ?wayring.objects.Handle = null,
     surface: ?wayring.objects.Handle = null,
     frame: ?wayring.objects.Handle = null,
     release: ?wayring.objects.Handle = null,
@@ -484,7 +491,8 @@ const ClientHandler = struct {
                         self.tablet_v2_announced = true;
                     if (std.mem.eql(u8, global.interface, protocol.wl_compositor.info.name))
                         self.compositor = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wl_compositor.info, @min(global.version, 7), null);
-                    if (self.source == .shm and std.mem.eql(u8, global.interface, protocol.wl_shm.info.name))
+                    if ((self.source == .shm or self.source == .alpha_shm) and
+                        std.mem.eql(u8, global.interface, protocol.wl_shm.info.name))
                         self.shm = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wl_shm.info, @min(global.version, 2), null);
                     if (self.source == .dmabuf and std.mem.eql(u8, global.interface, protocol.zwp_linux_dmabuf_v1.info.name))
                         self.dmabuf = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.zwp_linux_dmabuf_v1.info, @min(global.version, 3), null);
@@ -492,8 +500,11 @@ const ClientHandler = struct {
                         self.single_pixel_manager = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wp_single_pixel_buffer_manager_v1.info, @min(global.version, 1), null);
                     if (self.source == .single_pixel and std.mem.eql(u8, global.interface, protocol.wp_viewporter.info.name))
                         self.viewporter = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wp_viewporter.info, @min(global.version, 1), null);
+                    if (self.source == .alpha_shm and std.mem.eql(u8, global.interface, protocol.wp_alpha_modifier_v1.info.name))
+                        self.alpha_modifier_manager = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wp_alpha_modifier_v1.info, @min(global.version, 1), null);
                     const source_ready = switch (self.source) {
                         .shm => self.shm != null,
+                        .alpha_shm => self.shm != null and self.alpha_modifier_manager != null,
                         .dmabuf => self.dmabuf != null,
                         .single_pixel => self.single_pixel_manager != null and self.viewporter != null,
                     };
@@ -557,10 +568,26 @@ const ClientHandler = struct {
         const surface = (try protocol.wl_compositor.construct_create_surface(self.objects, self.queue, self.compositor.?, .{})).id;
         self.surface = surface;
         const buffer = switch (self.source) {
-            .shm => try self.createShmBuffer(),
+            .shm, .alpha_shm => try self.createShmBuffer(),
             .dmabuf => try self.createDmabufBuffer(),
             .single_pixel => try self.createSinglePixelBuffer(),
         };
+        const alpha_modifier = if (self.source == .alpha_shm)
+            (try protocol.wp_alpha_modifier_v1.construct_get_surface(
+                self.objects,
+                self.queue,
+                self.alpha_modifier_manager.?,
+                .{ .surface = surface.id },
+            )).id
+        else
+            null;
+        if (alpha_modifier) |handle| try wayring.client.sendRequest(
+            protocol.wp_alpha_modifier_surface_v1,
+            self.objects,
+            self.queue,
+            handle,
+            .{ .set_multiplier = .{ .factor = 0x8080_8080 } },
+        );
         const viewport = if (self.source == .single_pixel)
             (try protocol.wp_viewporter.construct_get_viewport(
                 self.objects,
@@ -585,6 +612,13 @@ const ClientHandler = struct {
         self.frame = (try protocol.wl_surface.construct_frame(self.objects, self.queue, surface, .{})).callback;
         self.release = (try protocol.wl_surface.construct_get_release(self.objects, self.queue, surface, .{})).callback;
         try wayring.client.sendRequest(protocol.wl_surface, self.objects, self.queue, surface, .{ .commit = .{} });
+        if (alpha_modifier) |handle| try wayring.client.sendRequest(
+            protocol.wp_alpha_modifier_surface_v1,
+            self.objects,
+            self.queue,
+            handle,
+            .{ .destroy = .{} },
+        );
         if (viewport) |handle| try wayring.client.sendRequest(
             protocol.wp_viewport,
             self.objects,
@@ -939,7 +973,7 @@ pub fn coordinatorConfig() Coordinator.Config {
     return .{ .router_capacity = 12, .timer_capacity = 5, .device_capacity = 1, .shm = .{ .limits = .{ .max_pool_bytes = 4096 }, .pool_capacity = 1, .buffer_capacity = 1, .formats = &shm_formats }, .surface = .{ .surface_capacity = 1, .region_capacity = 1, .viewport_capacity = 1, .presentation_resource_capacity = 1, .presentation_feedback_capacity = 2, .region_operation_capacity = 1, .frame_callback_capacity = 1, .release_callback_capacity = 1, .content_update_capacity = 1, .dependency_capacity = 1, .attachment_capacity = 1, .copy_capacity = 1, .max_copy_bytes = pixels.len }, .drm = .{ .card_capacity = 1, .connector_capacity = 1, .mode_capacity = 1, .connector_encoder_capacity = 1, .encoder_capacity = 1, .crtc_capacity = 1, .plane_capacity = 1, .format_capacity = 1, .event_capacity = 4 }, .output = .{ .output_id = .{ .index = 0, .generation = 1 }, .scheduler = .{ .refresh_ns = 4 * std.time.ns_per_ms, .render_budget_ns = std.time.ns_per_ms }, .renderer = .pixman, .image_count = 2, .max_samples = 2, .max_source_bytes = pixels.len, .max_source_width = 3, .max_source_height = 2, .kms = .{ .event_capacity = 2 } } };
 }
 pub fn compositorConfig() Compositor.Config {
-    return .{ .ring = .{ .entries = 32, .flags = 0 }, .reactor = clientReactorConfig(), .runtime = .{ .actor = .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 }, .object_capacity = 16, .object_quota = 16, .buckets_per_client = 16, .max_globals = 33, .registry_capacity = 1 } };
+    return .{ .ring = .{ .entries = 32, .flags = 0 }, .reactor = clientReactorConfig(), .runtime = .{ .actor = .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 }, .object_capacity = 32, .object_quota = 32, .buckets_per_client = 32, .max_globals = 34, .registry_capacity = 1 } };
 }
 pub fn clientReactorConfig() wayring.io_uring.Config {
     return .{ .receive_buffer_size = 4096, .receive_buffer_count = 4, .receive_control_capacity = 256, .fragment_block_size = 256, .fragment_block_count = 4, .transmit_block_size = 512, .transmit_block_count = 8, .descriptor_count = 4, .send_descriptor_capacity = 2 };
