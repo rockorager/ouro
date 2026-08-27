@@ -8,6 +8,7 @@ const std = @import("std");
 const wayring = @import("wayring");
 const input = @import("../backend/input/backend.zig");
 const platform = @import("../backend/input/platform.zig");
+const tablet_input = @import("../input/tablet.zig");
 const objects = wayring.objects;
 const none = std.math.maxInt(u32);
 
@@ -15,6 +16,7 @@ pub const Config = struct {
     manager_capacity: usize = 8,
     tablet_seat_capacity: usize = 16,
     tablet_capacity: usize = 64,
+    tool_capacity: usize = 128,
     outbound_capacity: usize = 256,
     global_version: u32 = 2,
 
@@ -22,6 +24,7 @@ pub const Config = struct {
         if (config.manager_capacity == 0 or config.manager_capacity >= none or
             config.tablet_seat_capacity == 0 or config.tablet_seat_capacity >= none or
             config.tablet_capacity == 0 or config.tablet_capacity >= none or
+            config.tool_capacity == 0 or config.tool_capacity >= none or
             config.outbound_capacity == 0 or config.outbound_capacity >= none or
             config.global_version == 0 or config.global_version > 2)
             return error.InvalidConfig;
@@ -36,6 +39,7 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
         const Manager = protocol.zwp_tablet_manager_v2;
         const TabletSeat = protocol.zwp_tablet_seat_v2;
         const Tablet = protocol.zwp_tablet_v2;
+        const Tool = protocol.zwp_tablet_tool_v2;
         const Id = packed struct { index: u32, generation: u32 };
 
         const ManagerSlot = struct {
@@ -67,12 +71,32 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
             done,
             removed,
         };
+        const ToolSlot = struct {
+            active: bool = false,
+            generation: u32 = 1,
+            next_free: u32 = none,
+            binding: Id = undefined,
+            resource: ?objects.Handle = null,
+            key: tablet_input.ToolKey = undefined,
+        };
+        const ToolEvent = union(enum) {
+            create,
+            tool_type: platform.TabletToolType,
+            hardware_serial: u64,
+            hardware_id: u64,
+            capability: u32,
+            done,
+            removed,
+        };
+        const OutboundValue = union(enum) {
+            tablet: struct { id: Id, event: TabletEvent },
+            tool: struct { id: Id, event: ToolEvent },
+        };
         const Outbound = struct {
             active: bool = false,
             sequence: u64 = 0,
             peer: wayring.io_uring.Peer = undefined,
-            tablet: Id = undefined,
-            value: TabletEvent = undefined,
+            value: OutboundValue = undefined,
         };
 
         allocator: std.mem.Allocator,
@@ -80,10 +104,12 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
         managers: []ManagerSlot,
         bindings: []Binding,
         tablets: []TabletSlot,
+        tools: []ToolSlot,
         outbound: []Outbound,
         manager_free: u32 = 0,
         binding_free: u32 = 0,
         tablet_free: u32 = 0,
+        tool_free: u32 = 0,
         outbound_len: usize = 0,
         next_sequence: u64 = 1,
         global_version: u32,
@@ -103,6 +129,8 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
             errdefer allocator.free(bindings);
             const tablets = try allocator.alloc(TabletSlot, config.tablet_capacity);
             errdefer allocator.free(tablets);
+            const tools = try allocator.alloc(ToolSlot, config.tool_capacity);
+            errdefer allocator.free(tools);
             const outbound = try allocator.alloc(Outbound, config.outbound_capacity);
             for (managers, 0..) |*slot, i| slot.* = .{
                 .next_free = if (i + 1 < managers.len) @intCast(i + 1) else none,
@@ -113,6 +141,9 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
             for (tablets, 0..) |*slot, i| slot.* = .{
                 .next_free = if (i + 1 < tablets.len) @intCast(i + 1) else none,
             };
+            for (tools, 0..) |*slot, i| slot.* = .{
+                .next_free = if (i + 1 < tools.len) @intCast(i + 1) else none,
+            };
             @memset(outbound, .{});
             return .{
                 .allocator = allocator,
@@ -120,6 +151,7 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                 .managers = managers,
                 .bindings = bindings,
                 .tablets = tablets,
+                .tools = tools,
                 .outbound = outbound,
                 .global_version = config.global_version,
             };
@@ -127,6 +159,7 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
 
         pub fn deinit(self: *Self) void {
             self.allocator.free(self.outbound);
+            self.allocator.free(self.tools);
             self.allocator.free(self.tablets);
             self.allocator.free(self.bindings);
             self.allocator.free(self.managers);
@@ -228,12 +261,25 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                 try decoded.finish(protocol, server_objects, &actor.transmit);
                 return .continue_dispatch;
             }
-            if (target.object.interface != &Tablet.info) return null;
-            const tablet = self.tabletFromObject(target.object) orelse return null;
-            if (tablet.resource == null or !std.meta.eql(tablet.resource.?, handle)) return null;
-            const binding = self.resolveBinding(tablet.binding) catch return null;
+            if (target.object.interface == &Tablet.info) {
+                const tablet = self.tabletFromObject(target.object) orelse return null;
+                if (tablet.resource == null or !std.meta.eql(tablet.resource.?, handle)) return null;
+                const binding = self.resolveBinding(tablet.binding) catch return null;
+                if (!samePeer(binding.peer, peer)) return null;
+                const decoded = try wayring.server.decodeRequest(Tablet, server_objects, message, fds);
+                try decoded.finish(protocol, server_objects, &actor.transmit);
+                return .continue_dispatch;
+            }
+            if (target.object.interface != &Tool.info) return null;
+            const tool = self.toolFromObject(target.object) orelse return null;
+            if (tool.resource == null or !std.meta.eql(tool.resource.?, handle)) return null;
+            const binding = self.resolveBinding(tool.binding) catch return null;
             if (!samePeer(binding.peer, peer)) return null;
-            const decoded = try wayring.server.decodeRequest(Tablet, server_objects, message, fds);
+            const decoded = try wayring.server.decodeRequest(Tool, server_objects, message, fds);
+            // set_cursor is admitted only after the exact tool resource and
+            // peer are validated. It remains an intentional no-op until tool
+            // proximity serial/focus delivery is wired, and the global is not
+            // advertised before that boundary is complete.
             try decoded.finish(protocol, server_objects, &actor.transmit);
             return .continue_dispatch;
         }
@@ -259,13 +305,13 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                 }) catch unreachable;
                 tablet.device = device;
                 const id = self.tabletId(tablet);
-                self.enqueue(binding.peer, id, .create) catch unreachable;
+                self.enqueue(binding.peer, .{ .tablet = .{ .id = id, .event = .create } }) catch unreachable;
                 if (info.vendor != 0 or info.product != 0)
-                    self.enqueue(binding.peer, id, .{ .id = .{
+                    self.enqueue(binding.peer, .{ .tablet = .{ .id = id, .event = .{ .id = .{
                         .vendor = info.vendor,
                         .product = info.product,
-                    } }) catch unreachable;
-                self.enqueue(binding.peer, id, .done) catch unreachable;
+                    } } } }) catch unreachable;
+                self.enqueue(binding.peer, .{ .tablet = .{ .id = id, .event = .done } }) catch unreachable;
             }
         }
 
@@ -277,7 +323,56 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
             for (self.tablets) |*slot| {
                 if (!slot.active or !std.meta.eql(slot.device, device)) continue;
                 const binding = self.resolveBinding(slot.binding) catch continue;
-                self.enqueue(binding.peer, self.tabletId(slot), .removed) catch unreachable;
+                self.enqueue(binding.peer, .{ .tablet = .{ .id = self.tabletId(slot), .event = .removed } }) catch unreachable;
+            }
+        }
+
+        pub fn publishTool(self: *Self, key: tablet_input.ToolKey, info: platform.TabletToolInfo) !bool {
+            if (info.kind == .totem) return false;
+            var bindings: usize = 0;
+            for (self.bindings) |binding|
+                bindings += @intFromBool(binding.active and binding.resource_present);
+            const records = toolMetadataCount(info);
+            const needed = std.math.mul(usize, bindings, records) catch return error.Exhausted;
+            if (self.freeTools() < bindings or self.outbound.len - self.outbound_len < needed)
+                return error.Exhausted;
+            for (self.bindings, 0..) |binding, binding_index| {
+                if (!binding.active or !binding.resource_present) continue;
+                const tool = self.acquireTool(.{
+                    .index = @intCast(binding_index),
+                    .generation = binding.generation,
+                }) catch unreachable;
+                tool.key = key;
+                const id = self.toolId(tool);
+                self.enqueue(binding.peer, .{ .tool = .{ .id = id, .event = .create } }) catch unreachable;
+                self.enqueue(binding.peer, .{ .tool = .{ .id = id, .event = .{ .tool_type = info.kind } } }) catch unreachable;
+                if (info.serial != 0)
+                    self.enqueue(binding.peer, .{ .tool = .{ .id = id, .event = .{ .hardware_serial = info.serial } } }) catch unreachable;
+                if (info.hardware_id != 0)
+                    self.enqueue(binding.peer, .{ .tool = .{ .id = id, .event = .{ .hardware_id = info.hardware_id } } }) catch unreachable;
+                inline for (.{
+                    .{ info.capabilities.tilt, 1 },
+                    .{ info.capabilities.pressure, 2 },
+                    .{ info.capabilities.distance, 3 },
+                    .{ info.capabilities.rotation, 4 },
+                    .{ info.capabilities.slider, 5 },
+                    .{ info.capabilities.wheel, 6 },
+                }) |capability| if (capability[0])
+                    self.enqueue(binding.peer, .{ .tool = .{ .id = id, .event = .{ .capability = capability[1] } } }) catch unreachable;
+                self.enqueue(binding.peer, .{ .tool = .{ .id = id, .event = .done } }) catch unreachable;
+            }
+            return true;
+        }
+
+        pub fn removeTool(self: *Self, key: tablet_input.ToolKey) !void {
+            var count: usize = 0;
+            for (self.tools) |slot|
+                count += @intFromBool(slot.active and std.meta.eql(slot.key, key));
+            if (self.outbound.len - self.outbound_len < count) return error.Exhausted;
+            for (self.tools) |*slot| {
+                if (!slot.active or !std.meta.eql(slot.key, key)) continue;
+                const binding = self.resolveBinding(slot.binding) catch continue;
+                self.enqueue(binding.peer, .{ .tool = .{ .id = self.toolId(slot), .event = .removed } }) catch unreachable;
             }
         }
 
@@ -291,52 +386,111 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
         pub fn flushOn(self: *Self, peer: wayring.io_uring.Peer, server_objects: anytype, queue: *wayring.tx.Queue) !usize {
             var completed: usize = 0;
             while (self.oldest(peer)) |outbound| {
-                const tablet = self.resolveTablet(outbound.tablet) catch {
-                    self.dropOutbound(outbound);
-                    completed += 1;
-                    continue;
-                };
-                const binding = self.resolveBinding(tablet.binding) catch {
-                    self.releaseTablet(outbound.tablet.index);
-                    completed += 1;
-                    continue;
-                };
                 switch (outbound.value) {
-                    .create => {
-                        if (!binding.resource_present) {
-                            self.releaseTablet(outbound.tablet.index);
-                            completed += 1;
-                            continue;
-                        }
-                        const created = TabletSeat.construct_event_tablet_added(
-                            protocol,
-                            server_objects,
-                            queue,
-                            binding.resource,
-                            .{ .id = .{ .context = tablet } },
-                        ) catch |err| switch (err) {
-                            error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return completed,
-                            else => return err,
-                        };
-                        tablet.resource = created.id;
-                    },
-                    .id => |value| wayring.server.sendEvent(protocol, Tablet, server_objects, queue, tablet.resource orelse return error.InvalidState, .{ .id = .{ .vid = value.vendor, .pid = value.product } }) catch |err| switch (err) {
-                        error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return completed,
-                        else => return err,
-                    },
-                    .done => wayring.server.sendEvent(protocol, Tablet, server_objects, queue, tablet.resource orelse return error.InvalidState, .{ .done = .{} }) catch |err| switch (err) {
-                        error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return completed,
-                        else => return err,
-                    },
-                    .removed => wayring.server.sendEvent(protocol, Tablet, server_objects, queue, tablet.resource orelse return error.InvalidState, .{ .removed = .{} }) catch |err| switch (err) {
-                        error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return completed,
-                        else => return err,
-                    },
+                    .tablet => |value| if (!try self.flushTablet(server_objects, queue, value))
+                        return completed,
+                    .tool => |value| if (!try self.flushTool(server_objects, queue, value))
+                        return completed,
                 }
                 self.dropOutbound(outbound);
                 completed += 1;
             }
             return completed;
+        }
+
+        fn flushTablet(self: *Self, server_objects: anytype, queue: *wayring.tx.Queue, value: anytype) !bool {
+            const tablet = self.resolveTablet(value.id) catch {
+                return true;
+            };
+            const binding = self.resolveBinding(tablet.binding) catch {
+                self.releaseTablet(value.id.index);
+                return true;
+            };
+            switch (value.event) {
+                .create => {
+                    if (!binding.resource_present) {
+                        self.releaseTablet(value.id.index);
+                        return true;
+                    }
+                    const created = TabletSeat.construct_event_tablet_added(
+                        protocol,
+                        server_objects,
+                        queue,
+                        binding.resource,
+                        .{ .id = .{ .context = tablet } },
+                    ) catch |err| switch (err) {
+                        error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return false,
+                        else => return err,
+                    };
+                    tablet.resource = created.id;
+                },
+                .id => |id| wayring.server.sendEvent(protocol, Tablet, server_objects, queue, tablet.resource orelse return error.InvalidState, .{ .id = .{ .vid = id.vendor, .pid = id.product } }) catch |err| switch (err) {
+                    error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return false,
+                    else => return err,
+                },
+                .done => wayring.server.sendEvent(protocol, Tablet, server_objects, queue, tablet.resource orelse return error.InvalidState, .{ .done = .{} }) catch |err| switch (err) {
+                    error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return false,
+                    else => return err,
+                },
+                .removed => wayring.server.sendEvent(protocol, Tablet, server_objects, queue, tablet.resource orelse return error.InvalidState, .{ .removed = .{} }) catch |err| switch (err) {
+                    error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return false,
+                    else => return err,
+                },
+            }
+            return true;
+        }
+
+        fn flushTool(self: *Self, server_objects: anytype, queue: *wayring.tx.Queue, value: anytype) !bool {
+            const tool = self.resolveTool(value.id) catch return true;
+            const binding = self.resolveBinding(tool.binding) catch {
+                self.releaseTool(value.id.index);
+                return true;
+            };
+            const resource = tool.resource;
+            const event: ?Tool.Event = switch (value.event) {
+                .create => create: {
+                    if (!binding.resource_present) {
+                        self.releaseTool(value.id.index);
+                        return true;
+                    }
+                    const created = TabletSeat.construct_event_tool_added(
+                        protocol,
+                        server_objects,
+                        queue,
+                        binding.resource,
+                        .{ .id = .{ .context = tool } },
+                    ) catch |err| switch (err) {
+                        error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return false,
+                        else => return err,
+                    };
+                    tool.resource = created.id;
+                    break :create null;
+                },
+                .tool_type => |kind| .{ .type = .{ .tool_type = toolType(kind) } },
+                .hardware_serial => |serial| .{ .hardware_serial = .{
+                    .hardware_serial_hi = @truncate(serial >> 32),
+                    .hardware_serial_lo = @truncate(serial),
+                } },
+                .hardware_id => |hardware_id| .{ .hardware_id_wacom = .{
+                    .hardware_id_hi = @truncate(hardware_id >> 32),
+                    .hardware_id_lo = @truncate(hardware_id),
+                } },
+                .capability => |capability| .{ .capability = .{ .capability = Tool.capability.fromInt(capability) } },
+                .done => .{ .done = .{} },
+                .removed => .{ .removed = .{} },
+            };
+            if (event) |wire_event| wayring.server.sendEvent(
+                protocol,
+                Tool,
+                server_objects,
+                queue,
+                resource orelse return error.InvalidState,
+                wire_event,
+            ) catch |err| switch (err) {
+                error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return false,
+                else => return err,
+            };
+            return true;
         }
 
         pub fn resourceRemoved(
@@ -357,14 +511,24 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                 if (binding.child_references == 0) self.releaseBinding(self.bindingIndex(binding));
                 return true;
             }
-            if (object.interface != &Tablet.info) return false;
-            const tablet = self.tabletFromObject(&object) orelse return false;
-            if (tablet.resource == null or !std.meta.eql(tablet.resource.?, handle)) return false;
-            self.releaseTablet(self.tabletIndex(tablet));
+            if (object.interface == &Tablet.info) {
+                const tablet = self.tabletFromObject(&object) orelse return false;
+                if (tablet.resource == null or !std.meta.eql(tablet.resource.?, handle)) return false;
+                self.releaseTablet(self.tabletIndex(tablet));
+                return true;
+            }
+            if (object.interface != &Tool.info) return false;
+            const tool = self.toolFromObject(&object) orelse return false;
+            if (tool.resource == null or !std.meta.eql(tool.resource.?, handle)) return false;
+            self.releaseTool(self.toolIndex(tool));
             return true;
         }
 
         pub fn disconnected(self: *Self, peer: wayring.io_uring.Peer) void {
+            for (self.tools, 0..) |slot, i| if (slot.active) {
+                const binding = self.resolveBinding(slot.binding) catch continue;
+                if (samePeer(binding.peer, peer)) self.releaseTool(@intCast(i));
+            };
             for (self.tablets, 0..) |slot, i| if (slot.active) {
                 const binding = self.resolveBinding(slot.binding) catch continue;
                 if (samePeer(binding.peer, peer)) self.releaseTablet(@intCast(i));
@@ -449,8 +613,10 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
             const slot = &self.tablets[index];
             if (!slot.active) return;
             const id = self.tabletId(slot);
-            for (self.outbound) |*outbound| if (outbound.active and std.meta.eql(outbound.tablet, id))
-                self.dropOutbound(outbound);
+            for (self.outbound) |*outbound| if (outbound.active) switch (outbound.value) {
+                .tablet => |value| if (std.meta.eql(value.id, id)) self.dropOutbound(outbound),
+                else => {},
+            };
             const binding = slot.binding;
             const generation = bump(slot.generation);
             slot.* = .{ .generation = generation, .next_free = if (generation == 0) none else self.tablet_free };
@@ -478,9 +644,52 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
             return count;
         }
 
-        fn enqueue(self: *Self, peer: wayring.io_uring.Peer, tablet: Id, value: TabletEvent) !void {
+        fn acquireTool(self: *Self, binding: Id) !*ToolSlot {
+            if (self.tool_free == none) return error.Exhausted;
+            const index = self.tool_free;
+            const slot = &self.tools[index];
+            self.tool_free = slot.next_free;
+            const generation = slot.generation;
+            slot.* = .{ .active = true, .generation = generation, .binding = binding };
+            self.retainBinding(binding.index, binding.generation) catch |err| {
+                slot.* = .{ .generation = generation, .next_free = self.tool_free };
+                self.tool_free = index;
+                return err;
+            };
+            return slot;
+        }
+
+        fn releaseTool(self: *Self, index: u32) void {
+            const slot = &self.tools[index];
+            if (!slot.active) return;
+            const id = self.toolId(slot);
+            for (self.outbound) |*outbound| if (outbound.active) switch (outbound.value) {
+                .tool => |value| if (std.meta.eql(value.id, id)) self.dropOutbound(outbound),
+                else => {},
+            };
+            const binding = slot.binding;
+            const generation = bump(slot.generation);
+            slot.* = .{ .generation = generation, .next_free = if (generation == 0) none else self.tool_free };
+            if (generation != 0) self.tool_free = index;
+            self.releaseBindingReference(binding.index, binding.generation);
+        }
+
+        fn resolveTool(self: *Self, id: Id) !*ToolSlot {
+            if (id.index >= self.tools.len) return error.StaleTool;
+            const slot = &self.tools[id.index];
+            if (!slot.active or slot.generation != id.generation) return error.StaleTool;
+            return slot;
+        }
+
+        fn freeTools(self: *const Self) usize {
+            var count: usize = 0;
+            for (self.tools) |slot| count += @intFromBool(!slot.active and slot.generation != 0);
+            return count;
+        }
+
+        fn enqueue(self: *Self, peer: wayring.io_uring.Peer, value: OutboundValue) !void {
             for (self.outbound) |*slot| if (!slot.active) {
-                slot.* = .{ .active = true, .sequence = self.next_sequence, .peer = peer, .tablet = tablet, .value = value };
+                slot.* = .{ .active = true, .sequence = self.next_sequence, .peer = peer, .value = value };
                 self.next_sequence +%= 1;
                 self.outbound_len += 1;
                 return;
@@ -514,6 +723,10 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
             return fromContext(TabletSlot, self.tablets, object.context);
         }
 
+        fn toolFromObject(self: *Self, object: *const objects.Object) ?*ToolSlot {
+            return fromContext(ToolSlot, self.tools, object.context);
+        }
+
         fn managerIndex(self: *const Self, slot: *const ManagerSlot) u32 {
             return @intCast((@intFromPtr(slot) - @intFromPtr(self.managers.ptr)) /
                 @sizeOf(ManagerSlot));
@@ -531,6 +744,28 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
         fn tabletIndex(self: *const Self, slot: *const TabletSlot) u32 {
             return @intCast((@intFromPtr(slot) - @intFromPtr(self.tablets.ptr)) /
                 @sizeOf(TabletSlot));
+        }
+
+        fn toolId(self: *const Self, slot: *const ToolSlot) Id {
+            return .{ .index = self.toolIndex(slot), .generation = slot.generation };
+        }
+
+        fn toolIndex(self: *const Self, slot: *const ToolSlot) u32 {
+            return @intCast((@intFromPtr(slot) - @intFromPtr(self.tools.ptr)) /
+                @sizeOf(ToolSlot));
+        }
+
+        fn toolType(kind: platform.TabletToolType) Tool.type {
+            return switch (kind) {
+                .pen => Tool.type.pen,
+                .eraser => Tool.type.eraser,
+                .brush => Tool.type.brush,
+                .pencil => Tool.type.pencil,
+                .airbrush => Tool.type.airbrush,
+                .mouse => Tool.type.mouse,
+                .lens => Tool.type.lens,
+                .totem => unreachable,
+            };
         }
 
         fn noMemory(_: *Self, actor: *wayring.connection.Actor) !wayring.dispatch.Control {
@@ -577,6 +812,19 @@ fn bump(generation: u32) u32 {
 
 fn samePeer(a: wayring.io_uring.Peer, b: wayring.io_uring.Peer) bool {
     return a.slot == b.slot and a.generation == b.generation;
+}
+
+fn toolMetadataCount(info: platform.TabletToolInfo) usize {
+    var count: usize = 3;
+    count += @intFromBool(info.serial != 0);
+    count += @intFromBool(info.hardware_id != 0);
+    count += @intFromBool(info.capabilities.tilt);
+    count += @intFromBool(info.capabilities.pressure);
+    count += @intFromBool(info.capabilities.distance);
+    count += @intFromBool(info.capabilities.rotation);
+    count += @intFromBool(info.capabilities.slider);
+    count += @intFromBool(info.capabilities.wheel);
+    return count;
 }
 
 test "tablet-v2: tablet-seat parent retires only after its children" {
@@ -662,14 +910,14 @@ test "tablet-v2: tablet publication is atomic and metadata stays ordered" {
     try std.testing.expectEqual(@as(usize, 6), adapter.outbound_len);
     try std.testing.expect(adapter.pendingOutbound(first.peer));
     const create = adapter.oldest(first.peer).?;
-    try std.testing.expect(create.value == .create);
+    try std.testing.expect(create.value.tablet.event == .create);
     create.active = false;
     adapter.outbound_len -= 1;
     const id = adapter.oldest(first.peer).?;
-    try std.testing.expectEqual(@as(u32, 10), id.value.id.vendor);
+    try std.testing.expectEqual(@as(u32, 10), id.value.tablet.event.id.vendor);
     id.active = false;
     adapter.outbound_len -= 1;
-    try std.testing.expect(adapter.oldest(first.peer).?.value == .done);
+    try std.testing.expect(adapter.oldest(first.peer).?.value.tablet.event == .done);
 
     try std.testing.expectError(error.Exhausted, adapter.publishTablet(device, .{ .capabilities = .{ .tablet_tool = true } }));
     try std.testing.expectEqual(@as(usize, 0), adapter.freeTablets());
@@ -729,4 +977,77 @@ test "tablet-v2: TX pressure cannot duplicate a server-created tablet" {
     try std.testing.expectEqual(@as(usize, 2), try adapter.flushOn(peer, &server_objects, &second_queue));
     try std.testing.expectEqual(resource, adapter.tablets[0].resource.?);
     try std.testing.expectEqual(@as(usize, 0), adapter.outbound_len);
+}
+
+test "tablet-v2: tool metadata resumes after its constructor" {
+    const protocol = @import("core_protocol");
+    const FakeSeat = struct {
+        pub fn validateSeatOn(_: *@This(), _: anytype, _: wayring.io_uring.Peer, _: u32) bool {
+            return true;
+        }
+    };
+    const TestAdapter = Adapter(protocol, FakeSeat);
+    var seat: FakeSeat = .{};
+    var adapter = try TestAdapter.init(std.testing.allocator, &seat, .{
+        .manager_capacity = 1,
+        .tablet_seat_capacity = 1,
+        .tablet_capacity = 1,
+        .tool_capacity = 1,
+        .outbound_capacity = 7,
+    });
+    defer adapter.deinit();
+    var server_objects = try wayring.objects.ServerObjects.init(
+        std.testing.allocator,
+        16,
+        8,
+        &protocol.wl_display.info,
+        null,
+    );
+    defer server_objects.deinit(std.testing.allocator);
+    const peer: wayring.io_uring.Peer = .{ .slot = 7, .generation = 8 };
+    const binding = try adapter.acquireBinding();
+    binding.peer = peer;
+    binding.resource = try server_objects.insertClient(
+        4,
+        &protocol.zwp_tablet_seat_v2.info,
+        2,
+        binding,
+    );
+    binding.resource_present = true;
+    const key: tablet_input.ToolKey = .{
+        .device = .{ .slot = 1, .generation = 2, .seat_generation = 3 },
+        .reference = 44,
+    };
+    try std.testing.expect(try adapter.publishTool(key, .{
+        .reference = key.reference,
+        .kind = .pen,
+        .serial = 0x1122334455667788,
+        .hardware_id = 0x8877665544332211,
+        .capabilities = .{ .pressure = true, .tilt = true },
+    }));
+    try std.testing.expectEqual(@as(usize, 7), adapter.outbound_len);
+
+    var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 128, 2);
+    defer blocks.deinit(std.testing.allocator);
+    var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 1);
+    defer descriptors.deinit(std.testing.allocator);
+    var constructor = wayring.tx.Queue.init(&blocks, 12, &descriptors, 1);
+    try std.testing.expectEqual(@as(usize, 1), try adapter.flushOn(peer, &server_objects, &constructor));
+    const resource = adapter.tools[0].resource.?;
+    constructor.deinit();
+    var metadata = wayring.tx.Queue.init(&blocks, 128, &descriptors, 1);
+    defer metadata.deinit();
+    try std.testing.expectEqual(@as(usize, 6), try adapter.flushOn(peer, &server_objects, &metadata));
+    try std.testing.expectEqual(resource, adapter.tools[0].resource.?);
+    try std.testing.expectEqual(@as(usize, 0), adapter.outbound_len);
+
+    adapter.releaseTool(0);
+    try std.testing.expect(!(try adapter.publishTool(key, .{
+        .reference = key.reference,
+        .kind = .totem,
+        .serial = 0,
+        .hardware_id = 0,
+        .capabilities = .{},
+    })));
+    try std.testing.expectEqual(@as(usize, 1), adapter.freeTools());
 }
