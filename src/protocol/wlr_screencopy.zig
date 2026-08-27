@@ -240,7 +240,7 @@ pub fn Adapter(comptime protocol: type) type {
                 switch (decoded.value) {
                     .destroy => {},
                     .capture_output => |value| {
-                        if (try self.createFrame(actor, server_objects, peer, decoded.handle, value, null)) |control|
+                        if (try self.createFrame(actor, server_objects, peer, decoded.handle, value, null, false)) |control|
                             return control;
                     },
                     .capture_output_region => |value| {
@@ -250,7 +250,7 @@ pub fn Adapter(comptime protocol: type) type {
                             .width = value.width,
                             .height = value.height,
                         };
-                        if (try self.createFrame(actor, server_objects, peer, decoded.handle, value, requested)) |control|
+                        if (try self.createFrame(actor, server_objects, peer, decoded.handle, value, requested, true)) |control|
                             return control;
                     },
                 }
@@ -282,6 +282,7 @@ pub fn Adapter(comptime protocol: type) type {
             parent: objects.Handle,
             value: anytype,
             requested: ?RequestedRegion,
+            comptime with_region: bool,
         ) !?wayring.dispatch.Control {
             const output_handle = server_objects.namespace.lookupHandle(value.output) orelse
                 return try self.invalidObject(actor, parent.id, "invalid output");
@@ -313,10 +314,10 @@ pub fn Adapter(comptime protocol: type) type {
             const event_count: usize = if (frame.failed_creation) 1 else 2;
             if (self.outbound.len - self.outbound_count < event_count)
                 return try self.noMemory(actor);
-            const admitted = if (requested == null)
-                Manager.admit_capture_output(server_objects, parent, value, .{ .frame = frame })
+            const admitted = if (with_region)
+                Manager.admit_capture_output_region(server_objects, parent, value, .{ .frame = frame })
             else
-                Manager.admit_capture_output_region(server_objects, parent, value, .{ .frame = frame });
+                Manager.admit_capture_output(server_objects, parent, value, .{ .frame = frame });
             const result = admitted catch |cause| return try self.failure(actor, parent.id, cause);
             frame.resource = result.frame;
             const id = self.frameId(frame);
@@ -406,6 +407,24 @@ pub fn Adapter(comptime protocol: type) type {
             if (self.resolve(slot.capture.frame)) |frame| {
                 if (frame.phase == .queued) frame.phase = .capturing;
             } else |_| {}
+            slot.active = false;
+            self.capture_count -= 1;
+        }
+
+        pub fn failCapture(self: *Self, id: FrameId) !void {
+            const frame = try self.resolve(id);
+            if (frame.phase != .queued) return error.InvalidCompletion;
+            if (self.outbound_count == self.outbound.len) return error.Exhausted;
+            var capture: ?*CaptureSlot = null;
+            for (self.captures) |*slot| {
+                if (slot.active and std.meta.eql(slot.capture.frame, id)) {
+                    capture = slot;
+                    break;
+                }
+            }
+            const slot = capture orelse return error.InvalidCompletion;
+            self.enqueue(id, .failed) catch unreachable;
+            frame.phase = .finished;
             slot.active = false;
             self.capture_count -= 1;
         }
