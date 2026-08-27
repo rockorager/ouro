@@ -227,6 +227,11 @@ pub fn Coordinator(comptime protocol: type) type {
             content: Adapter.Content,
             superseded: bool = false,
         };
+        const RetiredSource = struct {
+            peer: wayring.io_uring.Peer,
+            content: Adapter.Content,
+            releasable: bool = false,
+        };
         const Layer = struct {
             active: bool = false,
             peer: ?wayring.io_uring.Peer = null,
@@ -246,6 +251,7 @@ pub fn Coordinator(comptime protocol: type) type {
             retire_after_outcome: bool = false,
             retire_after_source_release: bool = false,
             retains_source: bool = false,
+            retired_source: ?RetiredSource = null,
         };
 
         pub const Platforms = struct {
@@ -3743,23 +3749,18 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             var content = &candidate.content;
             const attachment = content.surface.attachment orelse {
-                if (layer.retains_source) {
-                    if (!try self.retryLayerSourceReleaseForced(layer)) return false;
-                    (layer.content orelse return error.MissingContent).deinit();
-                    layer.content = null;
-                }
+                if (layer.retains_source) try self.retireLayerSource(layer);
                 content.deinit();
                 layer.candidate = null;
-                self.abandonLayer(layer);
+                if (layer.retired_source != null)
+                    self.abandonLayerKeepingRetired(layer)
+                else
+                    self.abandonLayer(layer);
                 self.finishPendingCandidate(pending.id);
                 return true;
             };
             if (attachment.buffer == null) {
-                if (layer.retains_source) {
-                    if (!try self.retryLayerSourceReleaseForced(layer)) return false;
-                    (layer.content orelse return error.MissingContent).deinit();
-                    layer.content = null;
-                }
+                if (layer.retains_source) try self.retireLayerSource(layer);
                 return self.discardPendingCandidate(layer, pending.id);
             }
             const lease = content.attachment_lease orelse return error.MissingLease;
@@ -3796,6 +3797,7 @@ pub fn Coordinator(comptime protocol: type) type {
                         .external = .{
                             .context = external.context,
                             .token = external.token,
+                            .alive_fn = external.alive_fn,
                             .drm_format = external.format,
                             .modifier = external.modifier,
                             .plane_count = external.plane_count,
@@ -3976,11 +3978,7 @@ pub fn Coordinator(comptime protocol: type) type {
             // admission has succeeded. Only this non-fallible edge publishes
             // the renderer-owned version, consuming a compatible previous
             // handle in place when it is uniquely owned by this layer.
-            if (layer.retains_source) {
-                if (!try self.retryLayerSourceReleaseForced(layer)) return false;
-                (layer.content orelse return error.MissingContent).deinit();
-                layer.content = null;
-            }
+            if (layer.retains_source) try self.retireLayerSource(layer);
             const rendered = render_device.content.publish(prepared);
             prepared_owned = false;
             const sample: render_list.AppliedSurface = .{
@@ -4447,6 +4445,12 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn finishOutcome(self: *Self, outcome: output_api.FrameOutcome, was_presented: bool) !void {
+            if (was_presented) {
+                for (self.app_layers) |*layer| {
+                    if (layer.retired_source) |*source| source.releasable = true;
+                }
+                if (self.cursor_layer.retired_source) |*source| source.releasable = true;
+            }
             for (outcome.sampled) |sampled| {
                 const layer = self.layerForPresentation(sampled.presentation) orelse continue;
                 const binding = layer.binding orelse return error.SampleBindingMismatch;
@@ -4508,10 +4512,14 @@ pub fn Coordinator(comptime protocol: type) type {
         fn retryRetainedOutcomes(self: *Self) !bool {
             var changed = false;
             for (self.app_layers) |*layer| {
+                _ = try self.retryRetiredSource(layer);
                 if (layer.retire_after_source_release) {
                     if (layer.source_release_pending and
                         !try self.retryLayerSourceReleaseForced(layer)) continue;
-                    self.abandonLayer(layer);
+                    if (layer.retired_source != null)
+                        self.abandonLayerKeepingRetired(layer)
+                    else
+                        self.abandonLayer(layer);
                     changed = true;
                     continue;
                 }
@@ -4523,11 +4531,15 @@ pub fn Coordinator(comptime protocol: type) type {
                     changed = (try self.retryLayerOutcome(layer)) or changed;
                 }
             }
+            _ = try self.retryRetiredSource(&self.cursor_layer);
             if (self.cursor_layer.retire_after_source_release) {
                 if (!self.cursor_layer.source_release_pending or
                     try self.retryLayerSourceReleaseForced(&self.cursor_layer))
                 {
-                    self.abandonLayer(&self.cursor_layer);
+                    if (self.cursor_layer.retired_source != null)
+                        self.abandonLayerKeepingRetired(&self.cursor_layer)
+                    else
+                        self.abandonLayer(&self.cursor_layer);
                     changed = true;
                 }
             }
@@ -4545,7 +4557,7 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn retryLayerOutcome(self: *Self, layer: *Layer) !bool {
             const token = layer.presentation orelse return error.MissingPresentation;
-            var content = &(layer.content orelse return error.MissingContent);
+            const content = &(layer.content orelse return error.MissingContent);
             if (layer.source_release_pending and !layer.retains_source and
                 !try self.retryLayerSourceRelease(layer)) return false;
             if (!layer.retains_source) {
@@ -4603,7 +4615,10 @@ pub fn Coordinator(comptime protocol: type) type {
                     layer.retire_after_source_release = true;
                     return false;
                 }
-                self.abandonLayer(layer);
+                if (layer.retired_source != null)
+                    self.abandonLayerKeepingRetired(layer)
+                else
+                    self.abandonLayer(layer);
                 return true;
             }
             return false;
@@ -4617,13 +4632,24 @@ pub fn Coordinator(comptime protocol: type) type {
                 const render_device = self.render_device orelse return false;
                 if (!render_device.content.ready(rendered)) return false;
             }
-            var content = &(layer.content orelse return error.MissingContent);
+            const content = &(layer.content orelse return error.MissingContent);
+            const peer = layer.peer orelse return error.ClientDisconnected;
+            if (!try self.releaseSource(peer, content)) return false;
+            layer.source_release_pending = false;
+            layer.retains_source = false;
+            return true;
+        }
+
+        fn releaseSource(
+            self: *Self,
+            peer: wayring.io_uring.Peer,
+            content: *Adapter.Content,
+        ) !bool {
             try content.surface.releaseExplicitSync();
             if (content.attachment_lease) |*lease| {
                 lease.deinit();
                 content.attachment_lease = null;
             }
-            const peer = layer.peer orelse return error.ClientDisconnected;
             if (!self.peerLive(peer)) return error.ClientDisconnected;
             const objects = try self.root.runtime.clients.get(peer);
             const actor = try self.root.runtime.clients.reactor.getActor(peer);
@@ -4658,8 +4684,31 @@ pub fn Coordinator(comptime protocol: type) type {
                 content.release_callbacks = null;
             }
             if (notification_queued) _ = try self.loop.?.driver.schedule(peer);
+            return true;
+        }
+
+        fn retireLayerSource(_: *Self, layer: *Layer) !void {
+            if (layer.retired_source != null) return error.RetiredSourceOccupied;
+            layer.retired_source = .{
+                .peer = layer.peer orelse return error.ClientDisconnected,
+                .content = layer.content orelse return error.MissingContent,
+            };
+            layer.content = null;
             layer.source_release_pending = false;
             layer.retains_source = false;
+        }
+
+        fn retryRetiredSource(self: *Self, layer: *Layer) !bool {
+            const source = &(layer.retired_source orelse return false);
+            if (!source.releasable) return false;
+            if (!self.peerLive(source.peer)) {
+                source.content.deinit();
+                layer.retired_source = null;
+                return true;
+            }
+            if (!try self.releaseSource(source.peer, &source.content)) return false;
+            source.content.deinit();
+            layer.retired_source = null;
             return true;
         }
 
@@ -5136,9 +5185,17 @@ pub fn Coordinator(comptime protocol: type) type {
             if (layer.presentation) |token| self.presentations.discard(token) catch unreachable;
             if (layer.content) |*content| content.deinit();
             if (layer.candidate) |*candidate| candidate.content.deinit();
+            if (layer.retired_source) |*source| source.content.deinit();
             if (layer.rendered) |rendered| if (self.render_device) |render_device|
                 render_device.content.release(rendered);
             layer.* = .{};
+        }
+
+        fn abandonLayerKeepingRetired(self: *Self, layer: *Layer) void {
+            const source = layer.retired_source orelse return self.abandonLayer(layer);
+            layer.retired_source = null;
+            self.abandonLayer(layer);
+            layer.retired_source = source;
         }
 
         fn retireLayer(self: *Self, layer: *Layer) void {
@@ -5403,7 +5460,8 @@ fn layerVacant(layer: anytype) bool {
         layer.presentation == null and layer.sample == null and layer.binding == null and
         layer.change == null and layer.candidate == null and !layer.source_release_pending and
         !layer.outcome_pending and layer.callback_data == null and !layer.retire_after_outcome and
-        !layer.retire_after_source_release;
+        !layer.retire_after_source_release and !layer.retains_source and
+        layer.retired_source == null;
 }
 
 fn tokenOwnedBySession(session: *const session_api.Session, token: completion.Token) bool {

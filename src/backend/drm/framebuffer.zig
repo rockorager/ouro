@@ -651,7 +651,7 @@ const FakePlatform = struct {
         return @ptrFromInt(32 + self.bo_create_count * 16);
     }
 
-    fn importBo(context: *anyopaque, device: gbm.Device, import: gbm.Import) !gbm.Bo {
+    fn importBo(context: *anyopaque, device: gbm.Device, import: gbm.Import, _: gbm.ImportUsage) !gbm.Bo {
         return createBo(context, device, .{
             .width = import.width,
             .height = import.height,

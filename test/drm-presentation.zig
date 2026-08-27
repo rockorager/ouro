@@ -890,7 +890,7 @@ pub const Fixture = struct {
         return @ptrCast(bo);
     }
 
-    fn importBo(context: *anyopaque, device: ouro.gbm.Device, import: ouro.gbm.Import) !ouro.gbm.Bo {
+    fn importBo(context: *anyopaque, device: ouro.gbm.Device, import: ouro.gbm.Import, _: ouro.gbm.ImportUsage) !ouro.gbm.Bo {
         const self: *Fixture = @ptrCast(@alignCast(context));
         self.import_attempts += 1;
         if (self.fail_imports) return error.ImportBoFailed;

@@ -765,6 +765,7 @@ fn externalSource(context: *anyopaque, token: u64) render.Source {
         .external = .{
             .context = context,
             .token = token,
+            .alive_fn = externalAlive,
             .drm_format = 0x34325258,
             .modifier = 0,
             .plane_count = 1,
@@ -773,6 +774,10 @@ fn externalSource(context: *anyopaque, token: u64) render.Source {
             .offsets = .{ 0, 0, 0, 0 },
         },
     };
+}
+
+fn externalAlive(_: *anyopaque, _: u64) bool {
+    return true;
 }
 
 test "render-content: large packed full copy preserves every byte" {

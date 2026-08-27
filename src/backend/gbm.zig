@@ -44,6 +44,7 @@ pub const Import = struct {
 };
 
 pub const MapAccess = enum { read, write };
+pub const ImportUsage = enum { rendering, scanout };
 
 pub const Metadata = struct {
     width: u32,
@@ -70,7 +71,7 @@ pub const Platform = struct {
         create_device: *const fn (*anyopaque, std.posix.fd_t) anyerror!Device,
         destroy_device: *const fn (*anyopaque, Device) void,
         create_bo: *const fn (*anyopaque, Device, Allocation) anyerror!Bo,
-        import_bo: *const fn (*anyopaque, Device, Import) anyerror!Bo,
+        import_bo: *const fn (*anyopaque, Device, Import, ImportUsage) anyerror!Bo,
         destroy_bo: *const fn (*anyopaque, Bo) void,
         metadata: *const fn (*anyopaque, Bo) anyerror!Metadata,
         export_plane_fd: *const fn (*anyopaque, Bo, u8) anyerror!std.posix.fd_t,
@@ -90,8 +91,8 @@ pub const Platform = struct {
         return self.vtable.create_bo(self.context, device, allocation);
     }
 
-    pub fn importBo(self: Platform, device: Device, import: Import) !Bo {
-        return self.vtable.import_bo(self.context, device, import);
+    pub fn importBo(self: Platform, device: Device, import: Import, usage: ImportUsage) !Bo {
+        return self.vtable.import_bo(self.context, device, import, usage);
     }
 
     pub fn destroyBo(self: Platform, bo: Bo) void {
@@ -165,7 +166,7 @@ fn realCreateBo(_: *anyopaque, device: Device, allocation: Allocation) !Bo {
     return @ptrCast(bo orelse return error.CreateBoFailed);
 }
 
-fn realImportBo(_: *anyopaque, device: Device, import: Import) !Bo {
+fn realImportBo(_: *anyopaque, device: Device, import: Import, usage: ImportUsage) !Bo {
     if (import.width == 0 or import.height == 0 or import.plane_count == 0 or
         import.plane_count > max_planes)
         return error.InvalidImport;
@@ -191,7 +192,10 @@ fn realImportBo(_: *anyopaque, device: Device, import: Import) !Bo {
         @ptrCast(@alignCast(device)),
         c.GBM_BO_IMPORT_FD_MODIFIER,
         &data,
-        c.GBM_BO_USE_RENDERING,
+        switch (usage) {
+            .rendering => c.GBM_BO_USE_RENDERING,
+            .scanout => c.GBM_BO_USE_SCANOUT,
+        },
     );
     return @ptrCast(bo orelse return error.ImportBoFailed);
 }

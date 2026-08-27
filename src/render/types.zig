@@ -96,6 +96,7 @@ pub const UploadBacking = struct {
 pub const ExternalSource = struct {
     context: *anyopaque,
     token: u64,
+    alive_fn: *const fn (*anyopaque, u64) bool,
     drm_format: u32,
     modifier: u64,
     plane_count: u8,

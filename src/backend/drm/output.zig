@@ -130,6 +130,7 @@ const Queued = struct {
     image: framebuffer.Handle,
     in_fence_fd: ?std.posix.fd_t,
     previous_state: State,
+    test_before_commit: bool,
 };
 
 pub const Output = struct {
@@ -257,6 +258,23 @@ pub const Output = struct {
     /// fence only after all validation succeeds. The fence is closed after the
     /// real atomic ioctl attempt or on any earlier rollback.
     pub fn queue(self: *Output, image_handle: framebuffer.Handle, in_fence_fd: ?std.posix.fd_t) !void {
+        return self.queueImage(image_handle, in_fence_fd, false);
+    }
+
+    /// Direct client images are not part of the compositor's negotiated target
+    /// pool. Test each candidate atomically before the real nonblocking commit
+    /// so unsupported format/modifier combinations can fall back to rendering
+    /// without disturbing the current scanout.
+    pub fn queueTested(self: *Output, image_handle: framebuffer.Handle, in_fence_fd: ?std.posix.fd_t) !void {
+        return self.queueImage(image_handle, in_fence_fd, true);
+    }
+
+    fn queueImage(
+        self: *Output,
+        image_handle: framebuffer.Handle,
+        in_fence_fd: ?std.posix.fd_t,
+        test_before_commit: bool,
+    ) !void {
         if (self.state != .initial and self.state != .active and self.state != .paused)
             return error.InvalidState;
         if (in_fence_fd) |fence| if (fence < 0) return error.InvalidInFence;
@@ -271,6 +289,7 @@ pub const Output = struct {
             .image = image_handle,
             .in_fence_fd = in_fence_fd,
             .previous_state = self.state,
+            .test_before_commit = test_before_commit,
         };
         self.state = .queued;
     }
@@ -296,16 +315,19 @@ pub const Output = struct {
         };
         const modeset = queued.previous_state == .initial or queued.previous_state == .paused;
 
-        if (modeset and !self.modeset_tested) {
-            self.buildScanout(record, image.framebuffer_id, queued.in_fence_fd, true, false) catch |err| {
+        if ((modeset and !self.modeset_tested) or queued.test_before_commit) {
+            self.buildScanout(record, image.framebuffer_id, queued.in_fence_fd, modeset, false) catch |err| {
                 try self.rollbackRecordAndQueued(record);
                 return err;
             };
-            self.platform.commit(fd, record.request, .{ .test_only = true, .allow_modeset = true }, null) catch |err| {
+            self.platform.commit(fd, record.request, .{
+                .test_only = true,
+                .allow_modeset = modeset,
+            }, null) catch |err| {
                 try self.rollbackRecordAndQueued(record);
                 return err;
             };
-            self.modeset_tested = true;
+            if (modeset) self.modeset_tested = true;
             self.platform.resetRequest(record.request);
         }
         self.buildScanout(record, image.framebuffer_id, queued.in_fence_fd, modeset, true) catch |err| {
@@ -560,9 +582,12 @@ pub const Output = struct {
     fn rollbackQueued(self: *Output) !void {
         const queued = self.queued orelse return;
         self.closeQueuedInFence();
-        try self.images.discard_image(self.images.context, queued.image);
         self.queued = null;
         self.state = queued.previous_state;
+        // Restore KMS admission state even when terminal image cleanup reports
+        // an error. Direct-scanout fallback must never inherit `.queued` from
+        // a rejected TEST_ONLY or real commit.
+        try self.images.discard_image(self.images.context, queued.image);
     }
 
     fn closeQueuedInFence(self: *Output) void {
@@ -719,6 +744,27 @@ test "kms: scanout properties flags and optional fences match capabilities" {
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(rejected_fence, linux.F.GETFD, 0)));
     try FakeImages.discard(&fixture.images_state, image);
     try fixture.destroy(output);
+}
+
+test "kms: direct candidates receive an active-state TEST_ONLY commit" {
+    var fixture = Fixture{};
+    const output = try fixture.create(.{});
+    try output.queue(fixture.acquire(0), null);
+    try output.commitQueued();
+    fixture.flip(output, fixture.crtc[0].id, false);
+    try output.processCallbacks();
+
+    try output.queueTested(fixture.acquire(1), null);
+    try output.commitQueued();
+    try std.testing.expectEqual(@as(usize, 4), fixture.atomic_state.commit_count);
+    try std.testing.expect(fixture.atomic_state.commits[2].flags.test_only);
+    try std.testing.expect(!fixture.atomic_state.commits[2].flags.allow_modeset);
+    try std.testing.expect(!fixture.atomic_state.commits[3].flags.test_only);
+    try std.testing.expect(!fixture.atomic_state.commits[3].flags.allow_modeset);
+    fixture.flip(output, fixture.crtc[0].id, false);
+    try output.processCallbacks();
+    try output.requestPause();
+    try fixture.drainAndDestroy(output);
 }
 
 test "kms: flips present new and release only previous scanout" {

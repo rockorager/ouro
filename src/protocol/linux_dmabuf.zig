@@ -218,6 +218,11 @@ pub const Store = struct {
         return &slot.value;
     }
 
+    pub fn bufferAlive(store: *Store, lease: Lease) bool {
+        const slot = store.resolveBuffer(lease.index, lease.generation) catch return false;
+        return slot.resource_alive;
+    }
+
     pub fn releaseLease(store: *Store, lease: Lease) Error!void {
         const slot = try store.resolveBuffer(lease.index, lease.generation);
         if (slot.leases == 0) return error.StaleHandle;
@@ -650,6 +655,7 @@ pub fn Adapter(comptime protocol: type) type {
                     var result: CoreSurface.ExternalBuffer = .{
                         .context = owner,
                         .token = encodeLease(lease),
+                        .alive_fn = @This().alive,
                         .width = value.width,
                         .height = value.height,
                         .format = value.format,
@@ -669,6 +675,11 @@ pub fn Adapter(comptime protocol: type) type {
                 fn release(context: *anyopaque, token: u64) void {
                     const owner: *Self = @ptrCast(@alignCast(context));
                     owner.store.releaseLease(decodeLease(token)) catch unreachable;
+                }
+
+                fn alive(context: *anyopaque, token: u64) bool {
+                    const owner: *Self = @ptrCast(@alignCast(context));
+                    return owner.store.bufferAlive(decodeLease(token));
                 }
             };
             return .{ .context = adapter, .acquire_fn = Bridge.acquire };
@@ -1088,7 +1099,9 @@ test "linux-dmabuf: retained attachment outlives destroyed buffer resource" {
     try store.addPlane(params, fd, 0, 0, 4, modifier_linear);
     const created = try store.createBuffer(params, 1, 1, drm_format_argb8888, 0);
     const lease = try store.retainBuffer(created);
+    try std.testing.expect(store.bufferAlive(lease));
     try store.destroyBuffer(created);
+    try std.testing.expect(!store.bufferAlive(lease));
     try std.testing.expectError(error.StaleHandle, store.buffer(created));
     try std.testing.expectEqual(fd, (try store.leasedBuffer(lease)).planes[0].?.fd);
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(fd, linux.F.GETFD, 0)));

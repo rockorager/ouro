@@ -213,6 +213,16 @@ const ImportIdentity = struct {
     token: u64,
 };
 
+const DirectIdentity = struct {
+    context: *anyopaque,
+    token: u64,
+    alive_fn: *const fn (*anyopaque, u64) bool,
+
+    fn alive(identity: DirectIdentity) bool {
+        return identity.alive_fn(identity.context, identity.token);
+    }
+};
+
 const CachedImport = struct {
     occupied: bool = false,
     identity: ImportIdentity = undefined,
@@ -222,6 +232,212 @@ const CachedImport = struct {
         gbm: gbm.Bo,
     } = undefined,
 };
+
+// The high slot bit is outside every valid compositor-pool index. KMS can
+// therefore keep its existing allocation-free framebuffer handle while this
+// adapter routes pool images and cached client images through distinct owners.
+// The cache has one entry per live client buffer rather than an arbitrary
+// global limit; KMS itself still owns at most current plus next.
+const direct_slot_bit: u32 = 1 << 31;
+
+const DirectImage = struct {
+    occupied: bool = false,
+    state: framebuffer.State = .free,
+    generation: u32 = 1,
+    identity: DirectIdentity = undefined,
+    tested: bool = false,
+    bo: gbm.Bo = undefined,
+    metadata: gbm.Metadata = undefined,
+    framebuffer_id: u32 = 0,
+};
+
+const ScanoutImages = struct {
+    allocator: std.mem.Allocator,
+    pool: *framebuffer.Pool,
+    gbm_platform: gbm.Platform,
+    framebuffer_platform: framebuffer.Platform,
+    direct: std.ArrayListUnmanaged(DirectImage) = .empty,
+
+    fn adapter(images: *ScanoutImages) kms.Images {
+        return .{
+            .context = images,
+            .get_image = getImage,
+            .validate_submit = validateSubmit,
+            .submit_image = submit,
+            .discard_image = discard,
+            .release_image = release,
+        };
+    }
+
+    fn acquireDirect(images: *ScanoutImages, source: render.Source) !framebuffer.Handle {
+        const external = source.external orelse return error.InvalidDirectScanoutSource;
+        const identity: DirectIdentity = .{
+            .context = external.context,
+            .token = external.token,
+            .alive_fn = external.alive_fn,
+        };
+        for (images.direct.items) |*slot|
+            if (slot.occupied and slot.state == .free and !slot.identity.alive())
+                try images.destroyDirect(slot);
+        for (images.direct.items, 0..) |*slot, index| {
+            if (!slot.occupied or slot.state != .free or
+                !std.meta.eql(slot.identity, identity)) continue;
+            try validateDirectMetadata(externalImport(source.size, external), slot.metadata);
+            slot.state = .acquired;
+            return directHandle(index, slot.generation);
+        }
+        const index: usize = for (images.direct.items, 0..) |slot, candidate| {
+            if (!slot.occupied and slot.state == .free) break candidate;
+        } else append: {
+            if (images.direct.items.len >= direct_slot_bit) return error.DirectScanoutImagesExhausted;
+            try images.direct.append(images.allocator, .{});
+            break :append images.direct.items.len - 1;
+        };
+        const import = externalImport(source.size, external);
+        const bo = try images.gbm_platform.importBo(images.pool.device, import, .scanout);
+        errdefer images.gbm_platform.destroyBo(bo);
+        var metadata = try images.gbm_platform.getMetadata(bo);
+        if (import.modifier == gbm.modifier_linear and metadata.modifier == gbm.modifier_invalid)
+            metadata.modifier = gbm.modifier_linear;
+        try validateDirectMetadata(import, metadata);
+        const framebuffer_id = try images.framebuffer_platform.add(images.pool.fd, metadata);
+        errdefer images.framebuffer_platform.remove(images.pool.fd, framebuffer_id) catch {};
+        const slot = &images.direct.items[index];
+        slot.occupied = true;
+        slot.state = .acquired;
+        slot.identity = identity;
+        slot.tested = false;
+        slot.bo = bo;
+        slot.metadata = metadata;
+        slot.framebuffer_id = framebuffer_id;
+        return directHandle(index, slot.generation);
+    }
+
+    fn discardAcquired(images: *ScanoutImages, handle: framebuffer.Handle) void {
+        discard(images, handle) catch {};
+    }
+
+    fn deinit(images: *ScanoutImages) !void {
+        for (images.direct.items) |*slot| {
+            if (slot.state == .submitted) return error.ImagesInFlight;
+            if (slot.occupied) try images.destroyDirect(slot);
+        }
+        images.direct.deinit(images.allocator);
+        images.direct = .empty;
+    }
+
+    fn needsTest(images: *ScanoutImages, handle: framebuffer.Handle) !bool {
+        return !(try images.directSlot(handle)).tested;
+    }
+
+    fn markTested(images: *ScanoutImages, handle: framebuffer.Handle) void {
+        (images.directSlot(handle) catch unreachable).tested = true;
+    }
+
+    fn directSlot(images: *ScanoutImages, handle: framebuffer.Handle) !*DirectImage {
+        if (handle.slot & direct_slot_bit == 0) return error.NotDirectImage;
+        const index = handle.slot & ~direct_slot_bit;
+        if (index >= images.direct.items.len) return error.StaleImage;
+        const slot = &images.direct.items[index];
+        if (!slot.occupied or slot.state == .free or slot.state == .retired or
+            slot.generation != handle.generation) return error.StaleImage;
+        return slot;
+    }
+
+    fn getImage(context: *anyopaque, handle: framebuffer.Handle) !framebuffer.Image {
+        const images: *ScanoutImages = @ptrCast(@alignCast(context));
+        if (handle.slot & direct_slot_bit == 0) return images.pool.image(handle);
+        const slot = try images.directSlot(handle);
+        return .{
+            .metadata = slot.metadata,
+            .framebuffer_id = slot.framebuffer_id,
+            .state = slot.state,
+        };
+    }
+
+    fn validateSubmit(context: *anyopaque, handle: framebuffer.Handle) !void {
+        const images: *ScanoutImages = @ptrCast(@alignCast(context));
+        if (handle.slot & direct_slot_bit == 0) return images.pool.validateSubmit(handle);
+        const slot = try images.directSlot(handle);
+        if (slot.state != .acquired) return error.InvalidTransition;
+    }
+
+    fn submit(context: *anyopaque, handle: framebuffer.Handle) !void {
+        const images: *ScanoutImages = @ptrCast(@alignCast(context));
+        if (handle.slot & direct_slot_bit == 0) return images.pool.submit(handle);
+        const slot = try images.directSlot(handle);
+        if (slot.state != .acquired) return error.InvalidTransition;
+        slot.state = .submitted;
+    }
+
+    fn discard(context: *anyopaque, handle: framebuffer.Handle) !void {
+        const images: *ScanoutImages = @ptrCast(@alignCast(context));
+        if (handle.slot & direct_slot_bit == 0) return images.pool.discard(handle);
+        const slot = try images.directSlot(handle);
+        if (slot.state != .acquired) return error.InvalidTransition;
+        try images.destroyDirect(slot);
+    }
+
+    fn release(context: *anyopaque, handle: framebuffer.Handle) !void {
+        const images: *ScanoutImages = @ptrCast(@alignCast(context));
+        if (handle.slot & direct_slot_bit == 0) return images.pool.release(handle);
+        const slot = try images.directSlot(handle);
+        if (slot.state != .submitted) return error.InvalidTransition;
+        if (slot.generation == std.math.maxInt(u32)) {
+            try images.destroyDirect(slot);
+        } else {
+            slot.state = .free;
+            slot.generation += 1;
+        }
+    }
+
+    fn destroyDirect(images: *ScanoutImages, slot: *DirectImage) !void {
+        std.debug.assert(slot.occupied and slot.state != .submitted);
+        var first_error: ?anyerror = null;
+        images.framebuffer_platform.remove(images.pool.fd, slot.framebuffer_id) catch |err| {
+            first_error = err;
+        };
+        images.gbm_platform.destroyBo(slot.bo);
+        const generation = slot.generation;
+        if (generation == std.math.maxInt(u32)) {
+            slot.* = .{ .state = .retired, .generation = generation };
+        } else {
+            slot.* = .{ .generation = generation + 1 };
+        }
+        if (first_error) |err| return err;
+    }
+};
+
+fn directHandle(index: usize, generation: u32) framebuffer.Handle {
+    return .{
+        .slot = direct_slot_bit | @as(u32, @intCast(index)),
+        .generation = generation,
+    };
+}
+
+fn externalImport(size: render.Size, external: render.ExternalSource) gbm.Import {
+    return .{
+        .width = size.width,
+        .height = size.height,
+        .format = external.drm_format,
+        .modifier = external.modifier,
+        .plane_count = external.plane_count,
+        .fds = external.fds,
+        .strides = external.strides,
+        .offsets = external.offsets,
+    };
+}
+
+fn validateDirectMetadata(import: gbm.Import, metadata: gbm.Metadata) !void {
+    if (metadata.width != import.width or metadata.height != import.height or
+        metadata.format != import.format or metadata.modifier != import.modifier or
+        metadata.plane_count != import.plane_count)
+        return error.ImportMetadataMismatch;
+    for (0..import.plane_count) |plane| if (metadata.handles[plane] == 0 or
+        metadata.strides[plane] != import.strides[plane] or
+        metadata.offsets[plane] != import.offsets[plane])
+        return error.ImportMetadataMismatch;
+}
 
 /// Imports and read-maps one client DMA-BUF long enough for the renderer
 /// content store to take its immutable bounded copy. GBM owns any required
@@ -239,7 +455,7 @@ pub fn mapImportedSource(
 fn importClientBo(platform: gbm.Platform, device: gbm.Device, import: gbm.Import) !gbm.Bo {
     if (import.plane_count != 1) return error.UnsupportedPlaneCount;
     _ = formatFromDrm(import.format) orelse return error.UnsupportedFormat;
-    const bo = try platform.importBo(device, import);
+    const bo = try platform.importBo(device, import, .rendering);
     errdefer platform.destroyBo(bo);
     const metadata = try platform.getMetadata(bo);
     if (metadata.width != import.width or metadata.height != import.height or
@@ -385,6 +601,7 @@ pub fn sessionAction(event: @import("../backend/session.zig").Event) SessionActi
 pub const Output = struct {
     allocator: std.mem.Allocator,
     pool: framebuffer.Pool,
+    scanout_images: ScanoutImages,
     render_device: *RenderDevice,
     owns_render_device: bool,
     vulkan_targets: ?vulkan.Targets,
@@ -515,6 +732,12 @@ pub const Output = struct {
         const self = try allocator.create(Output);
         errdefer allocator.destroy(self);
         self.pool = path.pool;
+        self.scanout_images = .{
+            .allocator = allocator,
+            .pool = &self.pool,
+            .gbm_platform = platforms.gbm,
+            .framebuffer_platform = platforms.framebuffer,
+        };
         self.render_device = render_device;
         self.owns_render_device = owns_render_device;
         self.vulkan_targets = path.vulkan_targets;
@@ -551,7 +774,7 @@ pub const Output = struct {
             allocator,
             platforms.atomic,
             device,
-            kms.Images.fromPool(&self.pool),
+            self.scanout_images.adapter(),
             snapshot,
             config.kms,
         );
@@ -573,6 +796,7 @@ pub const Output = struct {
         if (!self.drainComplete() or self.pending_callback != null)
             return error.DrainIncomplete;
         try self.kms_output.destroy();
+        try self.scanout_images.deinit();
         if (self.render_device.renderer) |*value| {
             if (self.vulkan_targets) |*targets| switch (value.*) {
                 .vulkan => |*renderer| renderer.destroyTargets(targets),
@@ -721,6 +945,8 @@ pub const Output = struct {
         bindSamples(color_list, bindings, self.sample_storage) catch |cause|
             return self.retireUnstartedRender(frame_id, cause);
         try self.scheduler.captureSamples(frame_id, self.sample_storage[0..bindings.len]);
+        if (try self.submitDirectScanout(frame_id, color_list, now_ns))
+            return .submitted;
         const handle = self.pool.acquire() catch |cause|
             return self.retireRender(frame_id, cause);
         const plan = self.planner.prepare(handle, color_list, changes) catch |cause| {
@@ -780,6 +1006,40 @@ pub const Output = struct {
         self.planner.publish() catch unreachable;
         self.scheduler.submitPhysical(frame_id, now_ns) catch unreachable;
         return .submitted;
+    }
+
+    /// Attempts the strict one-sample bypass while the scheduler still owns a
+    /// reversible rendering-stage frame. Candidate import, FB registration,
+    /// and TEST_ONLY failure all leave the current KMS image untouched and
+    /// return to ordinary composition. After the real commit succeeds, the
+    /// remaining scheduler transitions are prevalidated and infallible.
+    fn submitDirectScanout(
+        self: *Output,
+        frame_id: scheduler_api.FrameId,
+        list: render.List,
+        now_ns: u64,
+    ) !bool {
+        if (self.planner.output_transform != .normal) return false;
+        const source = directScanoutSource(list, self.output_color_description) orelse
+            return false;
+        const handle = self.scanout_images.acquireDirect(source) catch return false;
+        var acquired = true;
+        defer if (acquired) self.scanout_images.discardAcquired(handle);
+        const needs_test = self.scanout_images.needsTest(handle) catch unreachable;
+        if (needs_test)
+            self.kms_output.queueTested(handle, null) catch return false
+        else
+            self.kms_output.queue(handle, null) catch return false;
+        acquired = false;
+        self.kms_output.commitQueued() catch return false;
+        if (needs_test) self.scanout_images.markTested(handle);
+        _ = self.scheduler.renderComplete(frame_id, now_ns) catch unreachable;
+        self.in_flight_frame = frame_id;
+        // Pool targets did not receive this scene. A later composed frame must
+        // repair its complete destination before any pool image is displayed.
+        self.planner.invalidateAll();
+        self.scheduler.submitPhysical(frame_id, now_ns) catch unreachable;
+        return true;
     }
 
     /// Dispatches callbacks already recorded by R11. Callback backpressure is
@@ -1080,6 +1340,37 @@ pub fn formatFromDrm(value: u32) ?render.PixelFormat {
     return null;
 }
 
+fn directScanoutSource(
+    list: render.List,
+    output_color: render.color.Description,
+) ?render.Source {
+    if (list.samples.len != 1) return null;
+    const sample = list.samples[0];
+    const external = sample.source.external orelse return null;
+    if (sample.source.native != null or sample.source.upload != null or
+        sample.source.format != .xrgb8888 or list.output_format != .xrgb8888 or
+        formatFromDrm(external.drm_format) != .xrgb8888 or
+        !std.meta.eql(sample.source.size, list.output) or sample.transform != .normal or
+        sample.global_alpha != 255 or
+        !std.meta.eql(sample.color_description, output_color) or
+        !std.meta.eql(sample.color_representation, render.color.Representation{}))
+        return null;
+    const fixed_width = @as(i64, sample.source.size.width) * render.fixed_one;
+    const fixed_height = @as(i64, sample.source.size.height) * render.fixed_one;
+    if (sample.crop.x != 0 or sample.crop.y != 0 or
+        sample.crop.width != fixed_width or sample.crop.height != fixed_height)
+        return null;
+    const full = render.Rect{
+        .x = 0,
+        .y = 0,
+        .width = list.output.width,
+        .height = list.output.height,
+    };
+    if (!std.meta.eql(sample.destination, full) or !std.meta.eql(sample.clip, full))
+        return null;
+    return sample.source;
+}
+
 fn flipTimestampNs(seconds: u32, microseconds: u32) u64 {
     return @as(u64, seconds) * std.time.ns_per_s + @as(u64, microseconds) * std.time.ns_per_us;
 }
@@ -1114,6 +1405,56 @@ test "drm-sim: exact sampled identities bind in presentation order" {
         .sample = stale.sample,
         .presentation = stale.presentation,
     }}, &output));
+}
+
+test "drm-output: direct scanout eligibility is exact and conservative" {
+    const external: render.ExternalSource = .{
+        .context = @ptrFromInt(1),
+        .token = 1,
+        .alive_fn = testExternalAlive,
+        .drm_format = gbm.format_xrgb8888,
+        .modifier = gbm.modifier_linear,
+        .plane_count = 1,
+        .fds = .{ 3, -1, -1, -1 },
+        .strides = .{ 8, 0, 0, 0 },
+        .offsets = .{ 0, 0, 0, 0 },
+    };
+    var sample: render.SurfaceSample = .{
+        .sample = .{ .surface = 1, .commit_sequence = 1 },
+        .presentation = .{ .slot = 0, .generation = 1 },
+        .source = .{
+            .size = .{ .width = 2, .height = 1 },
+            .stride = 8,
+            .format = .xrgb8888,
+            .bytes = &.{},
+            .external = external,
+        },
+        .crop = render.SourceRect.pixels(0, 0, 2, 1),
+        .destination = .{ .x = 0, .y = 0, .width = 2, .height = 1 },
+        .clip = .{ .x = 0, .y = 0, .width = 2, .height = 1 },
+    };
+    var list: render.List = .{
+        .output = .{ .width = 2, .height = 1 },
+        .output_format = .xrgb8888,
+        .clear = .{ .r = 0, .g = 0, .b = 0 },
+        .samples = &.{sample},
+    };
+    try std.testing.expect(directScanoutSource(list, .srgb) != null);
+    sample.destination.width = 1;
+    list.samples = &.{sample};
+    try std.testing.expect(directScanoutSource(list, .srgb) == null);
+    sample.destination.width = 2;
+    sample.global_alpha = 254;
+    list.samples = &.{sample};
+    try std.testing.expect(directScanoutSource(list, .srgb) == null);
+    sample.global_alpha = 255;
+    sample.source.native = .{ .owner = @ptrFromInt(1), .token = 1 };
+    list.samples = &.{sample};
+    try std.testing.expect(directScanoutSource(list, .srgb) == null);
+}
+
+fn testExternalAlive(_: *anyopaque, _: u64) bool {
+    return true;
 }
 
 test "drm-sim: physical scheduler is page-flip paced and retires on failure" {
@@ -1447,7 +1788,7 @@ const SimFixture = struct {
         return @ptrCast(&self.bytes[index]);
     }
 
-    fn importBo(context: *anyopaque, gbm_device: gbm.Device, import: gbm.Import) !gbm.Bo {
+    fn importBo(context: *anyopaque, gbm_device: gbm.Device, import: gbm.Import, _: gbm.ImportUsage) !gbm.Bo {
         return createBo(context, gbm_device, .{
             .width = import.width,
             .height = import.height,

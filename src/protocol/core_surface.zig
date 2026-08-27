@@ -174,6 +174,7 @@ pub fn Adapter(comptime protocol: type) type {
         pub const ExternalBuffer = struct {
             context: *anyopaque,
             token: u64,
+            alive_fn: *const fn (*anyopaque, u64) bool,
             width: u32,
             height: u32,
             format: u32,
@@ -4007,6 +4008,7 @@ test "external buffer attachment uses shared commit ownership" {
             return .{
                 .context = self,
                 .token = 42,
+                .alive_fn = alive,
                 .width = 2,
                 .height = 1,
                 .format = 0x34325258,
@@ -4022,6 +4024,10 @@ test "external buffer attachment uses shared commit ownership" {
             const self: *@This() = @ptrCast(@alignCast(context));
             std.debug.assert(token == 42);
             self.released += 1;
+        }
+
+        fn alive(_: *anyopaque, token: u64) bool {
+            return token == 42;
         }
     };
 
