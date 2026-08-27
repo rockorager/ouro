@@ -62,6 +62,15 @@ enum scene_mode {
     SCENE_OCCLUSION,
 };
 
+enum scene_action {
+    SCENE_ACTION_STATIC,
+    SCENE_ACTION_MOTION,
+    SCENE_ACTION_RESIZE,
+    SCENE_ACTION_RESTACK,
+    SCENE_ACTION_MAP,
+    SCENE_ACTION_OCCLUSION_TOGGLE,
+};
+
 enum viewport_mode {
     VIEWPORT_NONE,
     VIEWPORT_CROP,
@@ -90,8 +99,10 @@ struct frame_buffer {
 struct scene_layer {
     struct wl_surface *surface;
     struct wl_subsurface *subsurface;
+    struct wp_viewport *viewport;
     struct frame_buffer buffers[BUFFER_COUNT];
     uint32_t *canonical_pixels;
+    bool mapped;
 };
 
 struct frame_wait {
@@ -133,8 +144,10 @@ struct client {
     enum backing backing;
     enum color_mode color_mode;
     enum scene_mode scene_mode;
+    enum scene_action scene_action;
     enum viewport_mode viewport_mode;
     size_t scene_layer_count;
+    size_t scene_top_index;
     int32_t scene_layer_width;
     int32_t scene_layer_height;
     bool alpha;
@@ -154,6 +167,7 @@ struct client {
     uint64_t advisory_releases;
     uint64_t presented;
     uint64_t discarded;
+    uint64_t submitted_buffers;
     uint64_t color_setup_ns;
 };
 
@@ -802,11 +816,34 @@ static uint32_t *allocate_pixels(int32_t width, int32_t height, bool alpha, uint
     return pixels;
 }
 
+static void scene_position(
+    const struct client *client,
+    size_t index,
+    int32_t *x,
+    int32_t *y
+) {
+    if (client->scene_mode == SCENE_OCCLUSION) {
+        *x = 0;
+        *y = 0;
+        return;
+    }
+    const int32_t max_x = client->width - client->scene_layer_width;
+    const int32_t max_y = client->height - client->scene_layer_height;
+    const int64_t divisor = (int64_t)(client->scene_layer_count > 1 ?
+        client->scene_layer_count - 1 : 2);
+    *x = (int32_t)((int64_t)max_x * (int64_t)index / divisor);
+    *y = max_y - (int32_t)((int64_t)max_y * (int64_t)index / divisor);
+}
+
 static void setup_scene(struct client *client) {
     if (client->subcompositor == NULL) unsupported("wl_subcompositor");
-    client->scene_layer_width = client->scene_mode == SCENE_OCCLUSION ?
+    if (client->scene_action == SCENE_ACTION_RESIZE && client->viewporter == NULL)
+        unsupported("wp_viewporter");
+    const bool full_occlusion = client->scene_mode == SCENE_OCCLUSION &&
+        client->scene_action == SCENE_ACTION_STATIC;
+    client->scene_layer_width = full_occlusion ?
         client->width : client->width * 2 / 3;
-    client->scene_layer_height = client->scene_mode == SCENE_OCCLUSION ?
+    client->scene_layer_height = full_occlusion ?
         client->height : client->height * 2 / 3;
     if (client->scene_layer_width == 0) client->scene_layer_width = 1;
     if (client->scene_layer_height == 0) client->scene_layer_height = 1;
@@ -825,8 +862,6 @@ static void setup_scene(struct client *client) {
 
     client->scene_layers = calloc(client->scene_layer_count, sizeof(struct scene_layer));
     if (client->scene_layers == NULL) fail("allocate scene layers");
-    const int32_t max_x = client->width - client->scene_layer_width;
-    const int32_t max_y = client->height - client->scene_layer_height;
     for (size_t index = 0; index < client->scene_layer_count; index++) {
         struct scene_layer *layer = &client->scene_layers[index];
         layer->surface = wl_compositor_create_surface(client->compositor);
@@ -837,13 +872,13 @@ static void setup_scene(struct client *client) {
         );
         if (layer->surface == NULL || layer->subsurface == NULL)
             protocol_fail("create synchronized subsurface layer");
-        const int32_t x = client->scene_mode == SCENE_OCCLUSION ? 0 :
-            (int32_t)((int64_t)max_x * (int64_t)index /
-                (int64_t)(client->scene_layer_count > 1 ? client->scene_layer_count - 1 : 2));
-        const int32_t y = client->scene_mode == SCENE_OCCLUSION ? 0 :
-            max_y - (int32_t)((int64_t)max_y * (int64_t)index /
-                (int64_t)(client->scene_layer_count > 1 ? client->scene_layer_count - 1 : 2));
+        int32_t x, y;
+        scene_position(client, index, &x, &y);
         wl_subsurface_set_position(layer->subsurface, x, y);
+        if (client->scene_action == SCENE_ACTION_RESIZE) {
+            layer->viewport = wp_viewporter_get_viewport(client->viewporter, layer->surface);
+            if (layer->viewport == NULL) protocol_fail("create scene viewport");
+        }
         const bool alpha = client->scene_mode == SCENE_OVERLAP;
         layer->canonical_pixels = allocate_pixels(
             client->scene_layer_width,
@@ -866,6 +901,7 @@ static void setup_scene(struct client *client) {
                 fail("publish scene buffer");
         }
     }
+    client->scene_top_index = client->scene_layer_count - 1;
     client->root_buffer.available = false;
     wl_surface_attach(client->surface, client->root_buffer.proxy, 0, 0);
     wl_surface_damage_buffer(client->surface, 0, 0, client->width, client->height);
@@ -1073,14 +1109,91 @@ static void wait_for_frame(
         protocol_fail("frame was discarded");
 }
 
+static void update_scene_geometry(struct client *client, uint64_t sequence) {
+    if (sequence == 0) return;
+    switch (client->scene_action) {
+        case SCENE_ACTION_STATIC:
+        case SCENE_ACTION_MAP:
+            return;
+        case SCENE_ACTION_MOTION: {
+            const uint64_t span_x = (uint64_t)(client->width - client->scene_layer_width + 1);
+            const uint64_t span_y = (uint64_t)(client->height - client->scene_layer_height + 1);
+            for (size_t index = 0; index < client->scene_layer_count; index++) {
+                const int32_t x = (int32_t)((sequence * 17 + index * 53) % span_x);
+                const int32_t y = (int32_t)((sequence * 29 + index * 31) % span_y);
+                wl_subsurface_set_position(client->scene_layers[index].subsurface, x, y);
+            }
+            return;
+        }
+        case SCENE_ACTION_RESIZE: {
+            const bool smaller = (sequence & 1) != 0;
+            const int32_t width = smaller ? client->scene_layer_width * 3 / 4 :
+                client->scene_layer_width;
+            const int32_t height = smaller ? client->scene_layer_height * 3 / 4 :
+                client->scene_layer_height;
+            for (size_t index = 0; index < client->scene_layer_count; index++)
+                wp_viewport_set_destination(
+                    client->scene_layers[index].viewport,
+                    width > 0 ? width : 1,
+                    height > 0 ? height : 1
+                );
+            return;
+        }
+        case SCENE_ACTION_RESTACK: {
+            const size_t selected = (size_t)(sequence % client->scene_layer_count);
+            if (selected != client->scene_top_index) {
+                wl_subsurface_place_above(
+                    client->scene_layers[selected].subsurface,
+                    client->scene_layers[client->scene_top_index].surface
+                );
+                client->scene_top_index = selected;
+            }
+            return;
+        }
+        case SCENE_ACTION_OCCLUSION_TOGGLE: {
+            for (size_t index = 0; index < client->scene_layer_count; index++) {
+                int32_t x = 0;
+                int32_t y = 0;
+                if ((sequence & 1) != 0) {
+                    const int32_t max_x = client->width - client->scene_layer_width;
+                    const int32_t max_y = client->height - client->scene_layer_height;
+                    const int64_t divisor = (int64_t)(client->scene_layer_count > 1 ?
+                        client->scene_layer_count - 1 : 2);
+                    x = (int32_t)((int64_t)max_x * (int64_t)index / divisor);
+                    y = max_y - (int32_t)((int64_t)max_y * (int64_t)index / divisor);
+                }
+                wl_subsurface_set_position(client->scene_layers[index].subsurface, x, y);
+            }
+            return;
+        }
+    }
+}
+
 static void submit_scene_frame(
     struct client *client,
     uint64_t sequence,
     struct frame_wait *wait,
     enum pacing pacing
 ) {
+    update_scene_geometry(client, sequence);
+    if (client->scene_action == SCENE_ACTION_MAP && sequence != 0) {
+        const size_t selected = client->scene_layer_count > 1 ?
+            client->scene_layer_count - 2 : 0;
+        client->scene_layers[selected].mapped = !client->scene_layers[selected].mapped;
+    }
+    if (sequence == 0)
+        for (size_t index = 0; index < client->scene_layer_count; index++)
+            client->scene_layers[index].mapped = true;
+    size_t callback_index = client->scene_top_index;
+    while (callback_index != 0 && !client->scene_layers[callback_index].mapped)
+        callback_index--;
     for (size_t index = 0; index < client->scene_layer_count; index++) {
         struct scene_layer *layer = &client->scene_layers[index];
+        if (!layer->mapped) {
+            wl_surface_attach(layer->surface, NULL, 0, 0);
+            wl_surface_commit(layer->surface);
+            continue;
+        }
         struct frame_buffer *buffer = &layer->buffers[sequence % BUFFER_COUNT];
         while (!buffer->available)
             if (wl_display_dispatch(client->display) < 0)
@@ -1096,6 +1209,7 @@ static void submit_scene_frame(
         );
         write_buffer(buffer);
         wl_surface_attach(layer->surface, buffer->proxy, 0, 0);
+        client->submitted_buffers++;
         wl_surface_damage_buffer(
             layer->surface,
             0,
@@ -1103,7 +1217,7 @@ static void submit_scene_frame(
             client->scene_layer_width,
             client->scene_layer_height
         );
-        if (index + 1 == client->scene_layer_count)
+        if (index == callback_index)
             begin_frame_wait(client, wait, layer->surface);
         wl_surface_commit(layer->surface);
     }
@@ -1177,6 +1291,7 @@ static void submit_frame(
 
     begin_frame_wait(client, wait, client->surface);
     wl_surface_attach(client->surface, buffer->proxy, 0, 0);
+    if (buffer->count_release) client->submitted_buffers++;
     switch (client->workload) {
         case WORKLOAD_STATIC:
             wl_surface_damage_buffer(client->surface, 0, 0, 1, 1);
@@ -1236,6 +1351,7 @@ static void cleanup(struct client *client) {
             struct scene_layer *layer = &client->scene_layers[index];
             for (size_t buffer_index = 0; buffer_index < BUFFER_COUNT; buffer_index++)
                 destroy_buffer(&layer->buffers[buffer_index]);
+            if (layer->viewport != NULL) wp_viewport_destroy(layer->viewport);
             if (layer->subsurface != NULL) wl_subsurface_destroy(layer->subsurface);
             if (layer->surface != NULL) wl_surface_destroy(layer->surface);
             free(layer->canonical_pixels);
@@ -1271,7 +1387,8 @@ static size_t buffers_per_frame(const struct client *client) {
 }
 
 static size_t release_events_per_frame(const struct client *client) {
-    return client->backing == BACKING_SINGLE_PIXEL ? 0 : buffers_per_frame(client);
+    if (client->backing == BACKING_SINGLE_PIXEL) return 0;
+    return buffers_per_frame(client);
 }
 
 static bool buffers_available(const struct client *client) {
@@ -1392,7 +1509,27 @@ static void parse_workload(struct client *client, const char *name) {
         return;
     }
     const char *layers = NULL;
-    if (strncmp(workload, "overlap-", 8) == 0) {
+    if (strncmp(workload, "scene-motion-", 13) == 0) {
+        client->scene_mode = SCENE_OVERLAP;
+        client->scene_action = SCENE_ACTION_MOTION;
+        layers = workload + 13;
+    } else if (strncmp(workload, "scene-resize-", 13) == 0) {
+        client->scene_mode = SCENE_OVERLAP;
+        client->scene_action = SCENE_ACTION_RESIZE;
+        layers = workload + 13;
+    } else if (strncmp(workload, "scene-restack-", 14) == 0) {
+        client->scene_mode = SCENE_OVERLAP;
+        client->scene_action = SCENE_ACTION_RESTACK;
+        layers = workload + 14;
+    } else if (strncmp(workload, "scene-map-", 10) == 0) {
+        client->scene_mode = SCENE_OVERLAP;
+        client->scene_action = SCENE_ACTION_MAP;
+        layers = workload + 10;
+    } else if (strncmp(workload, "scene-occlusion-toggle-", 23) == 0) {
+        client->scene_mode = SCENE_OCCLUSION;
+        client->scene_action = SCENE_ACTION_OCCLUSION_TOGGLE;
+        layers = workload + 23;
+    } else if (strncmp(workload, "overlap-", 8) == 0) {
         client->scene_mode = SCENE_OVERLAP;
         layers = workload + 8;
     } else if (strncmp(workload, "occlusion-", 10) == 0) {
@@ -1457,6 +1594,7 @@ int main(int argc, char **argv) {
     const uint64_t advisory_releases_before = client.advisory_releases;
     const uint64_t presented_before = client.presented;
     const uint64_t discarded_before = client.discarded;
+    const uint64_t submitted_buffers_before = client.submitted_buffers;
     const uint64_t started_ns = monotonic_ns();
     uint64_t first_actual_ns = 0;
     uint64_t last_actual_ns = 0;
@@ -1471,6 +1609,8 @@ int main(int argc, char **argv) {
         while (!wait->presented && !wait->discarded)
             if (wl_display_dispatch(client.display) < 0) fail("drain presentation feedback");
         if (wait->discarded) protocol_fail("frame was discarded");
+        if (sequence != 0 && wait->actual_ns <= waits[warmup + sequence - 1].actual_ns)
+            protocol_fail("presentation timestamps are not strictly increasing");
     }
     first_actual_ns = waits[warmup].actual_ns;
     first_observed_ns = waits[warmup].observed_ns;
@@ -1485,13 +1625,15 @@ int main(int argc, char **argv) {
         "\"callbacks\":%" PRIu64 ",\"releases\":%" PRIu64 ","
         "\"advisory_releases\":%" PRIu64 ","
         "\"presented\":%" PRIu64 ",\"discarded\":%" PRIu64 ","
+        "\"submitted_buffers\":%" PRIu64 ","
         "\"color_setup_ns\":%" PRIu64 ","
         "\"raw_callbacks\":%" PRIu64 ",\"raw_releases\":%" PRIu64 ","
         "\"raw_advisory_releases\":%" PRIu64 ","
         "\"raw_presented\":%" PRIu64 ",\"raw_discarded\":%" PRIu64 ","
+        "\"raw_submitted_buffers\":%" PRIu64 ","
         "\"start_to_gate_ns\":%" PRIu64 ",\"observed_window_ns\":%" PRIu64 ","
         "\"actual_window_ns\":%" PRIu64 ",\"first_actual_ns\":%" PRIu64 ","
-        "\"last_actual_ns\":%" PRIu64 "}\n",
+        "\"last_actual_ns\":%" PRIu64 ",\"actual_intervals_ns\":[",
         argv[2],
         argv[8],
         client.width,
@@ -1505,29 +1647,35 @@ int main(int argc, char **argv) {
         client.advisory_releases - advisory_releases_before,
         client.presented - presented_before,
         client.discarded - discarded_before,
+        client.submitted_buffers - submitted_buffers_before,
         client.color_setup_ns,
         client.callbacks,
         client.releases,
         client.advisory_releases,
         client.presented,
         client.discarded,
+        client.submitted_buffers,
         gated_ns - started_ns,
         last_observed_ns - first_observed_ns,
         last_actual_ns - first_actual_ns,
         first_actual_ns,
         last_actual_ns
     );
+    for (uint64_t sequence = 1; sequence < frames; sequence++) {
+        if (sequence != 1) putchar(',');
+        printf(
+            "%" PRIu64,
+            waits[warmup + sequence].actual_ns - waits[warmup + sequence - 1].actual_ns
+        );
+    }
+    puts("]}");
     fflush(stdout);
     if (read(STDIN_FILENO, &gate, 1) != 1) fail("read cleanup gate");
     client.draining = true;
     detach_content(&client);
     while (!buffers_available(&client))
         if (wl_display_dispatch(client.display) < 0) fail("drain buffer releases");
-    const size_t releases_per_frame = release_events_per_frame(&client);
-    if (releases_per_frame != 0 && warmup + frames > UINT64_MAX / releases_per_frame)
-        protocol_fail("release count overflow");
-    const uint64_t expected_releases = (warmup + frames) * releases_per_frame;
-    if (client.releases != expected_releases)
+    if (client.releases != client.submitted_buffers)
         protocol_fail("not every submitted buffer was released");
     printf("DRAINED releases=%" PRIu64 "\n", client.releases);
     fflush(stdout);

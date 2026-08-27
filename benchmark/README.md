@@ -34,6 +34,9 @@ the number of published buffers per atomic frame, and exact
 callback/release/presentation totals. Multiple clients finish at one shared
 runner gate; the slowest client defines that run's wall boundary. These are
 surface-presentation measurements, not direct output page-flip counts.
+Every measured presentation interval is retained in the raw client result. The
+report shows p50/p95/p99/max cadence and counts intervals longer than 1.5 output
+refresh periods as missed refreshes.
 
 `run.sh` performs orchestration outside the timed client: isolated runtime and
 seat ownership, fixed post-socket readiness, exact compositor PID snapshots,
@@ -101,6 +104,14 @@ Workloads are declared in `workloads.sh`:
   instructions, not refresh-capped FPS: an occlusion-aware renderer should
   submit only the frontmost sample while preserving every covered commit's
   release and presentation lifecycle;
+- `layers-{motion,resize,restack,map}-8`: eight synchronized translucent SHM
+  subsurfaces whose positions, viewporter destinations, stacking order, or
+  mapped state change once per atomic parent commit. The map workload repeatedly
+  unmaps and remaps one child while retaining seven mapped peers, so its reported
+  buffers/frame is the measured average rather than a declared constant;
+- `layers-occlusion-toggle-8`: eight synchronized opaque children alternate
+  between exact full occlusion and spread geometry, exercising dynamic culling
+  and repair damage without relying on shell placement policy;
 - `viewport-{crop,scale,crop-scale}-{shm,dmabuf}`: central-half source crop,
   half-size destination scaling, and central-half crop scaled back to the full
   1280×720 destination. Matched no-viewport controls make source versus output
@@ -152,6 +163,7 @@ benchmark/run.sh --suite solid --runs 3
 benchmark/run.sh --suite color --runs 3
 benchmark/run.sh --suite composition --runs 3
 benchmark/run.sh --suite layers --runs 3
+benchmark/run.sh --suite dynamic --runs 3
 benchmark/run.sh --suite capacity --runs 1  # High concurrent-client probes.
 benchmark/run.sh --workload shm-sparse --runs 3
 benchmark/run.sh --workload shm-tiny --frames 600 \
@@ -177,10 +189,10 @@ python3 benchmark/report.py benchmark-results/20260825T180000Z
 
 The report shows per-surface FPS, aggregate surface presentations per second,
 published buffers per atomic frame, exact compositor task-clock CPU utilization,
-cost per presentation and per published buffer, and the compositor process's
-gate RSS/HWM. Per-buffer cost is descriptive rather than a claim that each
-buffer has equal work. FPS at the output refresh limit is an acceptance and
-cadence result, not evidence that two compositors perform equal work. CPU
-excludes clients; RSS excludes helpers, kernel memory, and GPU allocations. Do
-not infer output page-flip rate, GPU execution time, power, or pixel correctness
-from these counters.
+cost per presentation and per published buffer, presentation-interval tails and
+missed-refresh count, and the compositor process's gate RSS/HWM. Per-buffer cost
+is descriptive rather than a claim that each buffer has equal work. FPS at the
+output refresh limit is an acceptance and cadence result, not evidence that two
+compositors perform equal work. CPU excludes clients; RSS excludes helpers,
+kernel memory, and GPU allocations. Do not infer output page-flip rate, GPU
+execution time, power, or pixel correctness from these counters.

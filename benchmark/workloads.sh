@@ -65,6 +65,11 @@ benchmark_workloads=(
     "layers-overlap-32    shm-overlap-32                       1       960   540    600    3"
     "layers-occlusion-8   shm-occlusion-8                      1       640   360    600    3"
     "layers-occlusion-32  shm-occlusion-32                     1       640   360    600    3"
+    "layers-motion-8      shm-scene-motion-8                   1       960   540    600    3"
+    "layers-resize-8      shm-scene-resize-8                   1       960   540    600    3"
+    "layers-restack-8     shm-scene-restack-8                  1       960   540    600    3"
+    "layers-map-8         shm-scene-map-8                      1       960   540    600    3"
+    "layers-occlusion-toggle-8 shm-scene-occlusion-toggle-8    1       640   360    600    3"
 )
 
 benchmark_suite_contains() {
@@ -98,6 +103,9 @@ benchmark_suite_contains() {
         color) [[ $workload == color-* ]] ;;
         composition) [[ $workload == alpha-* || $workload == layers-* ]] ;;
         layers) [[ $workload == layers-* ]] ;;
+        dynamic) [[ $workload == layers-motion-* || $workload == layers-resize-* ||
+            $workload == layers-restack-* || $workload == layers-map-* ||
+            $workload == layers-occlusion-toggle-* ]] ;;
         capacity) [[ $workload == *-scale-16 || $workload == *-scale-32 ||
             $workload == *-scale-64 ]] ;;
         *) return 1 ;;

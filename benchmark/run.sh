@@ -24,7 +24,7 @@ usage: benchmark/run.sh [options]
 
   --suite NAME            quick, standard, all, shm, dmabuf, damage, viewport,
                           solid, scale, churn, mixed, color, composition, layers,
-                          or capacity (default: quick)
+                          dynamic, or capacity (default: quick)
   --runs N                repetitions per compositor/workload (default: 3)
   --workload NAME         run one workload instead of a suite
   --frames N              frames per client (default: 300)
@@ -73,7 +73,7 @@ done
     exit 2
 }
 case "$selected_suite" in
-    quick|standard|all|shm|dmabuf|damage|viewport|solid|scale|churn|mixed|color|composition|layers|capacity) ;;
+    quick|standard|all|shm|dmabuf|damage|viewport|solid|scale|churn|mixed|color|composition|layers|dynamic|capacity) ;;
     *) echo "unknown suite: $selected_suite" >&2; exit 2 ;;
 esac
 [[ -e $drm_device ]] || { echo "DRM device does not exist: $drm_device" >&2; exit 1; }
@@ -241,8 +241,8 @@ run_case() {
     expected_socket="$runtime/wayland-0"
     chmod 700 "$runtime"
     render_configs "$directory"
-    printf 'workload=%s\nclient_modes=%s\nclients=%s\nwidth=%s\nheight=%s\nframes=%s\nwarmup=%s\npacing=%s\n' \
-        "$workload_name" "$client_modes" "$clients" "$width" "$height" "$frames" "$warmup" "$pacing" \
+    printf 'workload=%s\nclient_modes=%s\nclients=%s\nwidth=%s\nheight=%s\nframes=%s\nwarmup=%s\nrefresh=%s\npacing=%s\n' \
+        "$workload_name" "$client_modes" "$clients" "$width" "$height" "$frames" "$warmup" "$refresh" "$pacing" \
         >"$directory/case.env"
 
     case "$compositor" in

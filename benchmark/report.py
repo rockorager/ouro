@@ -59,6 +59,14 @@ def parse_perf(path: Path) -> dict[str, float]:
     return values
 
 
+def percentile(values: list[int], percent: int) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = (len(ordered) * percent + 99) // 100 - 1
+    return float(ordered[index])
+
+
 def run_record(directory: Path, workload: str, compositor: str, run: int) -> dict[str, Any]:
     case = parse_env(directory / "case.env")
     client_count = int(case["clients"])
@@ -99,7 +107,10 @@ def run_record(directory: Path, workload: str, compositor: str, run: int) -> dic
             raise ValueError(
                 f"{directory}: invalid release_events_per_frame={release_events_per_frame}"
             )
-        expected_total = (expected_frames + int(case["warmup"])) * release_events_per_frame
+        expected_total = client.get(
+            "raw_submitted_buffers",
+            (expected_frames + int(case["warmup"])) * release_events_per_frame,
+        )
         if "pacing" in case and cleanup_releases[index] != expected_total:
             raise ValueError(
                 f"{directory}: cleanup releases={cleanup_releases[index]}, expected {expected_total}"
@@ -110,6 +121,23 @@ def run_record(directory: Path, workload: str, compositor: str, run: int) -> dic
     pre_status = parse_status(directory / "pre.status")
     gate_status = parse_status(directory / "gate.status")
     perf = parse_perf(directory / "perf.csv")
+    intervals: list[int] = []
+    intervals_complete = True
+    for client in clients:
+        client_intervals = client.get("actual_intervals_ns")
+        if client_intervals is None:
+            intervals_complete = False
+            continue
+        if len(client_intervals) != max(expected_frames - 1, 0) or any(
+            not isinstance(value, int) or value <= 0 for value in client_intervals
+        ):
+            raise ValueError(f"{directory}: invalid presentation interval series")
+        intervals.extend(client_intervals)
+    submitted_buffers = sum(
+        client.get("submitted_buffers", expected_frames * client.get("buffers_per_frame", 1))
+        for client in clients
+    )
+    expected_interval_ns = 1_000_000_000 / int(case.get("refresh", "60"))
     return {
         "workload": workload,
         "compositor": compositor,
@@ -120,20 +148,26 @@ def run_record(directory: Path, workload: str, compositor: str, run: int) -> dic
         "observed_window_ns": max(client["observed_window_ns"] for client in clients),
         "actual_window_ns": max(client["actual_window_ns"] for client in clients),
         "callbacks": sum(client["callbacks"] for client in clients),
-        "buffers_per_frame": sum(client.get("buffers_per_frame", 1) for client in clients),
+        "buffers_per_frame": submitted_buffers / expected_frames,
+        "submitted_buffers": submitted_buffers,
         "release_events_per_frame": sum(
             client.get("release_events_per_frame", client.get("buffers_per_frame", 1))
             for client in clients
         ),
-        "releases": expected_frames
-        * sum(
-            client.get("release_events_per_frame", client.get("buffers_per_frame", 1))
-            for client in clients
-        ),
+        "releases": submitted_buffers,
         "gate_release_events": sum(client["releases"] for client in clients),
         "presented": sum(client["presented"] for client in clients),
         "discarded": sum(client["discarded"] for client in clients),
         "color_setup_ns": max(client.get("color_setup_ns", 0) for client in clients),
+        "interval_p50_ns": percentile(intervals, 50) if intervals_complete else None,
+        "interval_p95_ns": percentile(intervals, 95) if intervals_complete else None,
+        "interval_p99_ns": percentile(intervals, 99) if intervals_complete else None,
+        "interval_max_ns": float(max(intervals)) if intervals_complete and intervals else None,
+        "missed_refreshes": (
+            sum(value > expected_interval_ns * 1.5 for value in intervals)
+            if intervals_complete
+            else None
+        ),
         "user_ticks": gate_cpu[0] - pre_cpu[0],
         "system_ticks": gate_cpu[1] - pre_cpu[1],
         "total_ticks": sum(gate_cpu) - sum(pre_cpu),
@@ -149,6 +183,11 @@ def run_record(directory: Path, workload: str, compositor: str, run: int) -> dic
 
 def median(records: list[dict[str, Any]], field: str) -> float:
     return float(statistics.median(record[field] for record in records))
+
+
+def optional_median(records: list[dict[str, Any]], field: str) -> float | None:
+    values = [record[field] for record in records if record[field] is not None]
+    return float(statistics.median(values)) if values else None
 
 
 def perf_median(records: list[dict[str, Any]], field: str) -> float | None:
@@ -247,6 +286,11 @@ def aggregate(
                         if frames > 1
                         else None
                     ),
+                    "interval_p50_ns_median": optional_median(values, "interval_p50_ns"),
+                    "interval_p95_ns_median": optional_median(values, "interval_p95_ns"),
+                    "interval_p99_ns_median": optional_median(values, "interval_p99_ns"),
+                    "interval_max_ns_median": optional_median(values, "interval_max_ns"),
+                    "missed_refreshes_median": optional_median(values, "missed_refreshes"),
                     "surface_fps_median": (
                         (frames - 1) * 1_000_000_000 / actual_window_ns
                         if frames > 1 and actual_window_ns > 0
@@ -293,9 +337,10 @@ def print_markdown(summaries: list[dict[str, Any]]) -> None:
         print(
             "| Compositor | Runs | Clients | Buffers/frame | Surface FPS "
             "| Aggregate presentations/s | CPU % | µs/presented | µs/buffer "
-            "| Color setup ms | RSS MiB | HWM MiB |"
+            "| Interval p50/p95/p99/max ms | Missed refreshes | Color setup ms "
+            "| RSS MiB | HWM MiB |"
         )
-        print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+        print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
         for compositor in COMPOSITORS:
             summary = next(
                 item
@@ -305,7 +350,7 @@ def print_markdown(summaries: list[dict[str, Any]]) -> None:
             if summary["status"] == "unsupported":
                 print(
                     f"| {compositor} | {summary['runs']} | — | — | unsupported: "
-                    f"{summary['reason']} | — | — | — | — | — | — | — |"
+                    f"{summary['reason']} | — | — | — | — | — | — | — | — | — |"
                 )
                 continue
             print(
@@ -316,6 +361,11 @@ def print_markdown(summaries: list[dict[str, Any]]) -> None:
                 f"{fmt(summary['cpu_percent_median'])} | "
                 f"{fmt(summary['task_clock_us_per_presented'])} | "
                 f"{fmt(summary['task_clock_us_per_buffer'])} | "
+                f"{fmt(summary['interval_p50_ns_median'], 1_000_000, 3)}/"
+                f"{fmt(summary['interval_p95_ns_median'], 1_000_000, 3)}/"
+                f"{fmt(summary['interval_p99_ns_median'], 1_000_000, 3)}/"
+                f"{fmt(summary['interval_max_ns_median'], 1_000_000, 3)} | "
+                f"{fmt(summary['missed_refreshes_median'], digits=0)} | "
                 f"{fmt(summary['color_setup_ns_median'], 1_000_000, 3)} | "
                 f"{fmt(summary['rss_kib_median'], 1024, 1)} |"
                 f" {fmt(summary['hwm_kib_median'], 1024, 1)} |"
