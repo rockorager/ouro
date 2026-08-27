@@ -52,6 +52,7 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
         const Group = protocol.zwp_tablet_pad_group_v2;
         const Ring = protocol.zwp_tablet_pad_ring_v2;
         const Strip = protocol.zwp_tablet_pad_strip_v2;
+        const TabletState = tablet_input.State(Seat.FocusTarget);
         const Id = packed struct { index: u32, generation: u32 };
 
         const ManagerSlot = struct {
@@ -177,6 +178,15 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
             frame: u32,
         };
         const PadAxisKind = enum { ring, strip };
+        const SnapshotNeeds = struct {
+            tablets: usize = 0,
+            tools: usize = 0,
+            pads: usize = 0,
+            groups: usize = 0,
+            rings: usize = 0,
+            strips: usize = 0,
+            outbound: usize = 0,
+        };
         const OutboundValue = union(enum) {
             tablet: struct { id: Id, event: TabletEvent },
             tool: struct { id: Id, event: ToolEvent },
@@ -214,6 +224,7 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
         outbound_len: usize = 0,
         next_sequence: u64 = 1,
         global_version: u32,
+        state_source: ?*const TabletState = null,
         runtime: ?*Runtime = null,
         global: ?objects.Handle = null,
 
@@ -300,6 +311,11 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
             return self.global.?;
         }
 
+        pub fn attachState(self: *Self, state: *const TabletState) !void {
+            for (self.bindings) |binding| if (binding.active) return error.InvalidState;
+            self.state_source = state;
+        }
+
         fn bind(context: ?*anyopaque, binding: wayring.server.Binding) !?*anyopaque {
             const self: *Self = @ptrCast(@alignCast(context orelse return error.InvalidContext));
             const slot = self.acquireManager() catch return error.OutOfMemory;
@@ -356,6 +372,12 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                                 decoded.handle.id,
                                 "invalid tablet seat wl_seat",
                             );
+                        if (self.state_source) |state| {
+                            const needs = self.snapshotNeeds(peer, state) catch
+                                return try self.noMemory(actor);
+                            self.ensureSnapshotCapacity(needs) catch
+                                return try self.noMemory(actor);
+                        }
                         const binding = self.acquireBinding() catch return try self.noMemory(actor);
                         binding.peer = peer;
                         const admitted = Manager.admit_get_tablet_seat(
@@ -369,6 +391,8 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                         };
                         binding.resource = admitted.tablet_seat;
                         binding.resource_present = true;
+                        if (self.state_source) |state|
+                            self.synchronizeBinding(self.bindingId(binding), state) catch unreachable;
                     },
                 }
                 try decoded.finish(protocol, server_objects, &actor.transmit);
@@ -435,22 +459,27 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                 return error.Exhausted;
             for (self.bindings, 0..) |binding, binding_index| {
                 if (!binding.active or !binding.resource_present) continue;
-                const tablet = self.acquireTablet(.{
+                self.publishTabletOn(.{
                     .index = @intCast(binding_index),
                     .generation = binding.generation,
-                }) catch unreachable;
-                tablet.device = device;
-                tablet.physical_group = info.group;
-                const id = self.tabletId(tablet);
-                self.enqueue(binding.peer, .{ .tablet = .{ .id = id, .event = .create } }) catch unreachable;
-                if (info.vendor != 0 or info.product != 0)
-                    self.enqueue(binding.peer, .{ .tablet = .{ .id = id, .event = .{ .id = .{
-                        .vendor = info.vendor,
-                        .product = info.product,
-                    } } } }) catch unreachable;
-                self.enqueue(binding.peer, .{ .tablet = .{ .id = id, .event = .done } }) catch unreachable;
+                }, device, info);
             }
             return true;
+        }
+
+        fn publishTabletOn(self: *Self, binding_id: Id, device: input.DeviceId, info: platform.DeviceInfo) void {
+            const binding = self.resolveBinding(binding_id) catch unreachable;
+            const tablet = self.acquireTablet(binding_id) catch unreachable;
+            tablet.device = device;
+            tablet.physical_group = info.group;
+            const id = self.tabletId(tablet);
+            self.enqueue(binding.peer, .{ .tablet = .{ .id = id, .event = .create } }) catch unreachable;
+            if (info.vendor != 0 or info.product != 0)
+                self.enqueue(binding.peer, .{ .tablet = .{ .id = id, .event = .{ .id = .{
+                    .vendor = info.vendor,
+                    .product = info.product,
+                } } } }) catch unreachable;
+            self.enqueue(binding.peer, .{ .tablet = .{ .id = id, .event = .done } }) catch unreachable;
         }
 
         pub fn removeTablet(self: *Self, device: input.DeviceId) !void {
@@ -491,62 +520,65 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
             for (self.bindings, 0..) |binding, binding_index| {
                 if (!binding.active or !binding.resource_present) continue;
                 const binding_id: Id = .{ .index = @intCast(binding_index), .generation = binding.generation };
-                const pad = self.acquirePad(binding_id) catch unreachable;
-                pad.device = device;
-                pad.physical_group = info.group;
-                const pad_id = self.padId(pad);
-                self.enqueue(binding.peer, .{ .pad = .{ .id = pad_id, .event = .create } }) catch unreachable;
-                for (info.pad_groups[0..info.pad_mode_groups], 0..) |group_info, group_index| {
-                    const group = self.acquireChild(
-                        &self.group_free,
-                        self.groups,
-                        binding_id,
-                        pad_id,
-                        pad_id,
-                        @intCast(group_index),
-                    ) catch unreachable;
-                    const group_id = self.childId(self.groups, group);
-                    self.enqueue(binding.peer, .{ .group = .{ .id = group_id, .event = .create } }) catch unreachable;
-                    self.enqueue(binding.peer, .{ .group = .{ .id = group_id, .event = .{ .buttons = group_info.buttons } } }) catch unreachable;
-                    var mask = group_info.rings;
-                    while (mask != 0) : (mask &= mask - 1) {
-                        const control_index: u32 = @intCast(@ctz(mask));
-                        const ring = self.acquireChild(
-                            &self.ring_free,
-                            self.rings,
-                            binding_id,
-                            pad_id,
-                            group_id,
-                            control_index,
-                        ) catch unreachable;
-                        self.enqueue(binding.peer, .{ .ring = .{
-                            .id = self.childId(self.rings, ring),
-                            .event = .create,
-                        } }) catch unreachable;
-                    }
-                    mask = group_info.strips;
-                    while (mask != 0) : (mask &= mask - 1) {
-                        const control_index: u32 = @intCast(@ctz(mask));
-                        const strip = self.acquireChild(
-                            &self.strip_free,
-                            self.strips,
-                            binding_id,
-                            pad_id,
-                            group_id,
-                            control_index,
-                        ) catch unreachable;
-                        self.enqueue(binding.peer, .{ .strip = .{
-                            .id = self.childId(self.strips, strip),
-                            .event = .create,
-                        } }) catch unreachable;
-                    }
-                    self.enqueue(binding.peer, .{ .group = .{ .id = group_id, .event = .{ .modes = group_info.modes } } }) catch unreachable;
-                    self.enqueue(binding.peer, .{ .group = .{ .id = group_id, .event = .done } }) catch unreachable;
-                }
-                self.enqueue(binding.peer, .{ .pad = .{ .id = pad_id, .event = .{ .buttons = info.pad_buttons } } }) catch unreachable;
-                self.enqueue(binding.peer, .{ .pad = .{ .id = pad_id, .event = .done } }) catch unreachable;
+                self.publishPadOn(binding_id, device, info);
             }
             return true;
+        }
+
+        fn publishPadOn(self: *Self, binding_id: Id, device: input.DeviceId, info: platform.DeviceInfo) void {
+            const binding = self.resolveBinding(binding_id) catch unreachable;
+            const pad = self.acquirePad(binding_id) catch unreachable;
+            pad.device = device;
+            pad.physical_group = info.group;
+            const pad_id = self.padId(pad);
+            self.enqueue(binding.peer, .{ .pad = .{ .id = pad_id, .event = .create } }) catch unreachable;
+            for (info.pad_groups[0..info.pad_mode_groups], 0..) |group_info, group_index| {
+                const group = self.acquireChild(
+                    &self.group_free,
+                    self.groups,
+                    binding_id,
+                    pad_id,
+                    pad_id,
+                    @intCast(group_index),
+                ) catch unreachable;
+                const group_id = self.childId(self.groups, group);
+                self.enqueue(binding.peer, .{ .group = .{ .id = group_id, .event = .create } }) catch unreachable;
+                self.enqueue(binding.peer, .{ .group = .{ .id = group_id, .event = .{ .buttons = group_info.buttons } } }) catch unreachable;
+                var mask = group_info.rings;
+                while (mask != 0) : (mask &= mask - 1) {
+                    const ring = self.acquireChild(
+                        &self.ring_free,
+                        self.rings,
+                        binding_id,
+                        pad_id,
+                        group_id,
+                        @intCast(@ctz(mask)),
+                    ) catch unreachable;
+                    self.enqueue(binding.peer, .{ .ring = .{
+                        .id = self.childId(self.rings, ring),
+                        .event = .create,
+                    } }) catch unreachable;
+                }
+                mask = group_info.strips;
+                while (mask != 0) : (mask &= mask - 1) {
+                    const strip = self.acquireChild(
+                        &self.strip_free,
+                        self.strips,
+                        binding_id,
+                        pad_id,
+                        group_id,
+                        @intCast(@ctz(mask)),
+                    ) catch unreachable;
+                    self.enqueue(binding.peer, .{ .strip = .{
+                        .id = self.childId(self.strips, strip),
+                        .event = .create,
+                    } }) catch unreachable;
+                }
+                self.enqueue(binding.peer, .{ .group = .{ .id = group_id, .event = .{ .modes = group_info.modes } } }) catch unreachable;
+                self.enqueue(binding.peer, .{ .group = .{ .id = group_id, .event = .done } }) catch unreachable;
+            }
+            self.enqueue(binding.peer, .{ .pad = .{ .id = pad_id, .event = .{ .buttons = info.pad_buttons } } }) catch unreachable;
+            self.enqueue(binding.peer, .{ .pad = .{ .id = pad_id, .event = .done } }) catch unreachable;
         }
 
         pub fn removePad(self: *Self, device: input.DeviceId) !void {
@@ -570,30 +602,167 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                 return error.Exhausted;
             for (self.bindings, 0..) |binding, binding_index| {
                 if (!binding.active or !binding.resource_present) continue;
-                const tool = self.acquireTool(.{
+                self.publishToolOn(.{
                     .index = @intCast(binding_index),
                     .generation = binding.generation,
-                }) catch unreachable;
-                tool.key = key;
-                const id = self.toolId(tool);
-                self.enqueue(binding.peer, .{ .tool = .{ .id = id, .event = .create } }) catch unreachable;
-                self.enqueue(binding.peer, .{ .tool = .{ .id = id, .event = .{ .tool_type = info.kind } } }) catch unreachable;
-                if (info.serial != 0)
-                    self.enqueue(binding.peer, .{ .tool = .{ .id = id, .event = .{ .hardware_serial = info.serial } } }) catch unreachable;
-                if (info.hardware_id != 0)
-                    self.enqueue(binding.peer, .{ .tool = .{ .id = id, .event = .{ .hardware_id = info.hardware_id } } }) catch unreachable;
-                inline for (.{
-                    .{ info.capabilities.tilt, 1 },
-                    .{ info.capabilities.pressure, 2 },
-                    .{ info.capabilities.distance, 3 },
-                    .{ info.capabilities.rotation, 4 },
-                    .{ info.capabilities.slider, 5 },
-                    .{ info.capabilities.wheel, 6 },
-                }) |capability| if (capability[0])
-                    self.enqueue(binding.peer, .{ .tool = .{ .id = id, .event = .{ .capability = capability[1] } } }) catch unreachable;
-                self.enqueue(binding.peer, .{ .tool = .{ .id = id, .event = .done } }) catch unreachable;
+                }, key, info);
             }
             return true;
+        }
+
+        fn publishToolOn(self: *Self, binding_id: Id, key: tablet_input.ToolKey, info: platform.TabletToolInfo) void {
+            const binding = self.resolveBinding(binding_id) catch unreachable;
+            const tool = self.acquireTool(binding_id) catch unreachable;
+            tool.key = key;
+            const id = self.toolId(tool);
+            self.enqueue(binding.peer, .{ .tool = .{ .id = id, .event = .create } }) catch unreachable;
+            self.enqueue(binding.peer, .{ .tool = .{ .id = id, .event = .{ .tool_type = info.kind } } }) catch unreachable;
+            if (info.serial != 0)
+                self.enqueue(binding.peer, .{ .tool = .{ .id = id, .event = .{ .hardware_serial = info.serial } } }) catch unreachable;
+            if (info.hardware_id != 0)
+                self.enqueue(binding.peer, .{ .tool = .{ .id = id, .event = .{ .hardware_id = info.hardware_id } } }) catch unreachable;
+            inline for (.{
+                .{ info.capabilities.tilt, 1 },
+                .{ info.capabilities.pressure, 2 },
+                .{ info.capabilities.distance, 3 },
+                .{ info.capabilities.rotation, 4 },
+                .{ info.capabilities.slider, 5 },
+                .{ info.capabilities.wheel, 6 },
+            }) |capability| if (capability[0])
+                self.enqueue(binding.peer, .{ .tool = .{ .id = id, .event = .{ .capability = capability[1] } } }) catch unreachable;
+            self.enqueue(binding.peer, .{ .tool = .{ .id = id, .event = .done } }) catch unreachable;
+        }
+
+        /// Publishes one coherent current-state snapshot to a newly admitted
+        /// tablet-seat binding. Capacity is reserved for the whole snapshot
+        /// before any child resource or outbound record becomes visible.
+        pub fn synchronizeBinding(self: *Self, binding_id: Id, state: *const TabletState) !void {
+            const binding = try self.resolveBinding(binding_id);
+            const needs = try self.snapshotNeeds(binding.peer, state);
+            try self.ensureSnapshotCapacity(needs);
+
+            var device_index: usize = 0;
+            while (state.deviceAt(device_index)) |device| : (device_index += 1) {
+                if (device.info.capabilities.tablet_tool)
+                    self.publishTabletOn(binding_id, device.device, device.info);
+                if (device.info.capabilities.tablet_pad)
+                    self.publishPadOn(binding_id, device.device, device.info);
+            }
+            var tool_index: usize = 0;
+            while (state.toolAt(tool_index)) |tool| : (tool_index += 1)
+                if (tool.info.kind != .totem) self.publishToolOn(binding_id, tool.key, tool.info);
+
+            tool_index = 0;
+            while (state.toolAt(tool_index)) |snapshot| : (tool_index += 1) {
+                const focus = snapshot.focus orelse continue;
+                if (snapshot.info.kind == .totem or
+                    !self.seat.targetBelongsTo(focus, binding.peer)) continue;
+                const tool = self.findTool(binding_id, snapshot.key) orelse continue;
+                const id = self.toolId(tool);
+                self.enqueue(binding.peer, .{ .tool = .{ .id = id, .event = .{ .proximity_in = .{
+                    .serial = self.seat.nextSerial(),
+                    .tablet = snapshot.key.device,
+                    .target = focus,
+                } } } }) catch unreachable;
+                tool.focus = focus;
+                if (snapshot.tip_down)
+                    self.enqueue(binding.peer, .{ .tool = .{
+                        .id = id,
+                        .event = .{ .down = self.seat.nextSerial() },
+                    } }) catch unreachable;
+                for (0..snapshot.button_count) |button_index| self.enqueue(binding.peer, .{ .tool = .{
+                    .id = id,
+                    .event = .{ .button = .{
+                        .serial = self.seat.nextSerial(),
+                        .button = state.toolButtonAt(snapshot.key, button_index).?,
+                        .pressed = true,
+                    } },
+                } }) catch unreachable;
+                self.enqueue(binding.peer, .{ .tool = .{ .id = id, .event = .{ .frame = 0 } } }) catch unreachable;
+            }
+
+            device_index = 0;
+            while (state.deviceAt(device_index)) |device| : (device_index += 1) {
+                if (!device.info.capabilities.tablet_pad) continue;
+                const pad = self.findPad(binding_id, device.device) orelse continue;
+                const owner = self.snapshotPadOwner(state, device, binding.peer) orelse continue;
+                self.enqueue(binding.peer, .{ .pad = .{
+                    .id = self.padId(pad),
+                    .event = .{ .enter = .{
+                        .serial = self.seat.nextSerial(),
+                        .tablet = owner.key.device,
+                        .target = owner.focus.?,
+                    } },
+                } }) catch unreachable;
+                pad.focus = owner.focus;
+                pad.tool = owner.key;
+            }
+        }
+
+        fn ensureSnapshotCapacity(self: *const Self, needs: SnapshotNeeds) !void {
+            if (self.freeTablets() < needs.tablets or
+                self.freeTools() < needs.tools or
+                self.freeSlots(PadSlot, self.pads) < needs.pads or
+                self.freeSlots(ChildSlot, self.groups) < needs.groups or
+                self.freeSlots(ChildSlot, self.rings) < needs.rings or
+                self.freeSlots(ChildSlot, self.strips) < needs.strips or
+                self.outbound.len - self.outbound_len < needs.outbound)
+                return error.Exhausted;
+        }
+
+        fn snapshotNeeds(self: *Self, peer: wayring.io_uring.Peer, state: *const TabletState) !SnapshotNeeds {
+            var needs: SnapshotNeeds = .{};
+            var device_index: usize = 0;
+            while (state.deviceAt(device_index)) |device| : (device_index += 1) {
+                if (device.info.capabilities.tablet_tool) {
+                    try addNeed(&needs.tablets, 1);
+                    try addNeed(&needs.outbound, if (device.info.vendor != 0 or device.info.product != 0) 3 else 2);
+                }
+                if (device.info.capabilities.tablet_pad) {
+                    try addNeed(&needs.pads, 1);
+                    try addNeed(&needs.outbound, 3);
+                    for (device.info.pad_groups[0..device.info.pad_mode_groups]) |group| {
+                        const rings: usize = @popCount(group.rings);
+                        const strips: usize = @popCount(group.strips);
+                        try addNeed(&needs.groups, 1);
+                        try addNeed(&needs.rings, rings);
+                        try addNeed(&needs.strips, strips);
+                        try addNeed(&needs.outbound, 4 + rings + strips);
+                    }
+                    if (self.snapshotPadOwner(state, device, peer) != null)
+                        try addNeed(&needs.outbound, 1);
+                }
+            }
+            var tool_index: usize = 0;
+            while (state.toolAt(tool_index)) |tool| : (tool_index += 1) {
+                if (tool.info.kind == .totem) continue;
+                try addNeed(&needs.tools, 1);
+                try addNeed(&needs.outbound, toolMetadataCount(tool.info));
+                if (tool.focus) |focus| if (self.seat.targetBelongsTo(focus, peer))
+                    try addNeed(&needs.outbound, 2 + tool.button_count + @intFromBool(tool.tip_down));
+            }
+            return needs;
+        }
+
+        fn snapshotPadOwner(
+            self: *Self,
+            state: *const TabletState,
+            pad: TabletState.DeviceSnapshot,
+            peer: wayring.io_uring.Peer,
+        ) ?TabletState.ToolSnapshot {
+            var owner: ?TabletState.ToolSnapshot = null;
+            var index: usize = 0;
+            while (state.toolAt(index)) |tool| : (index += 1) {
+                const focus = tool.focus orelse continue;
+                if (tool.info.kind == .totem or !self.seat.targetBelongsTo(focus, peer)) continue;
+                const tablet = snapshotDevice(state, tool.key.device) orelse continue;
+                if (!tablet.info.capabilities.tablet_tool) continue;
+                const linked = std.meta.eql(pad.device, tool.key.device) or
+                    (pad.info.group != 0 and pad.info.group == tablet.info.group);
+                if (linked and (owner == null or tool.focus_sequence > owner.?.focus_sequence))
+                    owner = tool;
+            }
+            return owner;
         }
 
         pub fn removeTool(self: *Self, key: tablet_input.ToolKey) !void {
@@ -1495,9 +1664,16 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
             return null;
         }
 
+        fn findPad(self: *Self, binding: Id, device: input.DeviceId) ?*PadSlot {
+            for (self.pads) |*slot|
+                if (slot.active and std.meta.eql(slot.binding, binding) and
+                    std.meta.eql(slot.device, device)) return slot;
+            return null;
+        }
+
         fn findTool(self: *Self, binding: Id, key: tablet_input.ToolKey) ?*ToolSlot {
             for (self.tools) |*slot|
-                if (slot.active and slot.resource != null and std.meta.eql(slot.binding, binding) and
+                if (slot.active and std.meta.eql(slot.binding, binding) and
                     std.meta.eql(slot.key, key)) return slot;
             return null;
         }
@@ -1511,7 +1687,8 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
             if (!pad.active or pad.resource == null) return false;
             const binding = self.resolveBinding(pad.binding) catch return false;
             if (!self.seat.targetBelongsTo(target, binding.peer)) return false;
-            if (self.findTool(pad.binding, key) == null) return false;
+            const tool = self.findTool(pad.binding, key) orelse return false;
+            if (tool.resource == null) return false;
             const tablet = self.findTablet(pad.binding, key.device) orelse return false;
             return std.meta.eql(pad.device, key.device) or
                 (pad.physical_group != 0 and pad.physical_group == tablet.physical_group);
@@ -1640,6 +1817,10 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                 @sizeOf(Binding));
         }
 
+        fn bindingId(self: *const Self, slot: *const Binding) Id {
+            return .{ .index = self.bindingIndex(slot), .generation = slot.generation };
+        }
+
         fn tabletId(self: *const Self, slot: *const TabletSlot) Id {
             return .{ .index = self.tabletIndex(slot), .generation = slot.generation };
         }
@@ -1740,6 +1921,17 @@ fn toolMetadataCount(info: platform.TabletToolInfo) usize {
     count += @intFromBool(info.capabilities.slider);
     count += @intFromBool(info.capabilities.wheel);
     return count;
+}
+
+fn addNeed(value: *usize, increment: usize) !void {
+    value.* = std.math.add(usize, value.*, increment) catch return error.Exhausted;
+}
+
+fn snapshotDevice(state: anytype, id: input.DeviceId) ?@TypeOf(state.deviceAt(0).?) {
+    var index: usize = 0;
+    while (state.deviceAt(index)) |device| : (index += 1)
+        if (std.meta.eql(device.device, id)) return device;
+    return null;
 }
 
 fn toolAxisCount(axes: platform.TabletToolAxes, point: ?tablet_input.Point) usize {
@@ -2260,6 +2452,127 @@ test "tablet-v2: linked pad focus and controls preserve protocol order" {
     var events = wayring.tx.Queue.init(&blocks, 1024, &descriptors, 1);
     defer events.deinit();
     try std.testing.expectEqual(expected.len, try adapter.flushOn(peer, &server_objects, &events));
+    try std.testing.expectEqual(@as(usize, 0), adapter.outbound_len);
+}
+
+test "tablet-v2: late binding atomically replays current tablet state" {
+    const protocol = @import("core_protocol");
+    const TestAdapter = Adapter(protocol, TestSeat);
+    const TabletState = tablet_input.State(TestSeat.FocusTarget);
+    const peer: wayring.io_uring.Peer = .{ .slot = 16, .generation = 17 };
+    const target: TestSeat.FocusTarget = .{ .peer = peer, .surface = 5 };
+    const tablet_device: input.DeviceId = .{ .slot = 1, .generation = 2, .seat_generation = 3 };
+    const pad_device: input.DeviceId = .{ .slot = 2, .generation = 2, .seat_generation = 3 };
+    const key: tablet_input.ToolKey = .{ .device = tablet_device, .reference = 8 };
+    const newer_key: tablet_input.ToolKey = .{ .device = tablet_device, .reference = 9 };
+    var state = try TabletState.init(std.testing.allocator, .{});
+    defer state.deinit();
+    try state.consume(.{ .device_added = .{
+        .device = tablet_device,
+        .info = .{ .capabilities = .{ .tablet_tool = true }, .group = 44 },
+    } }, null, null);
+    var pad_info: platform.DeviceInfo = .{
+        .capabilities = .{ .tablet_pad = true },
+        .group = 44,
+        .pad_buttons = 2,
+        .pad_rings = 1,
+        .pad_strips = 1,
+        .pad_mode_groups = 1,
+    };
+    pad_info.pad_groups[0] = .{ .buttons = 0b11, .rings = 1, .strips = 1, .modes = 2 };
+    try state.consume(.{ .device_added = .{ .device = pad_device, .info = pad_info } }, null, null);
+    try state.consume(.{ .tablet_tool_proximity = .{
+        .device = tablet_device,
+        .tool = .{ .reference = key.reference, .kind = .pen, .serial = 0, .hardware_id = 0, .capabilities = .{} },
+        .time_usec = 1_000,
+        .entered = true,
+        .axes = .{},
+    } }, target, null);
+    try state.consume(.{ .tablet_tool_tip = .{
+        .device = tablet_device,
+        .tool = key.reference,
+        .time_usec = 2_000,
+        .down = true,
+        .axes = .{},
+    } }, target, null);
+    try state.consume(.{ .tablet_tool_button = .{
+        .device = tablet_device,
+        .tool = key.reference,
+        .time_usec = 3_000,
+        .button = 0x14b,
+        .pressed = true,
+        .axes = .{},
+    } }, target, null);
+    try state.consume(.{ .tablet_tool_proximity = .{
+        .device = tablet_device,
+        .tool = .{ .reference = newer_key.reference, .kind = .eraser, .serial = 0, .hardware_id = 0, .capabilities = .{} },
+        .time_usec = 4_000,
+        .entered = true,
+        .axes = .{},
+    } }, target, null);
+
+    var constrained_seat: TestSeat = .{};
+    var constrained = try TestAdapter.init(std.testing.allocator, &constrained_seat, .{
+        .manager_capacity = 1,
+        .tablet_seat_capacity = 1,
+        .tablet_capacity = 1,
+        .tool_capacity = 2,
+        .pad_capacity = 1,
+        .pad_group_capacity = 1,
+        .pad_ring_capacity = 1,
+        .pad_strip_capacity = 1,
+        .outbound_capacity = 23,
+    });
+    defer constrained.deinit();
+    const constrained_binding = try constrained.acquireBinding();
+    constrained_binding.peer = peer;
+    constrained_binding.resource_present = true;
+    try std.testing.expectError(error.Exhausted, constrained.synchronizeBinding(
+        .{ .index = 0, .generation = constrained_binding.generation },
+        &state,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), constrained.outbound_len);
+    try std.testing.expectEqual(@as(usize, 1), constrained.freeTablets());
+    try std.testing.expectEqual(@as(usize, 2), constrained.freeTools());
+
+    var seat: TestSeat = .{};
+    var adapter = try TestAdapter.init(std.testing.allocator, &seat, .{
+        .manager_capacity = 1,
+        .tablet_seat_capacity = 1,
+        .tablet_capacity = 1,
+        .tool_capacity = 2,
+        .pad_capacity = 1,
+        .pad_group_capacity = 1,
+        .pad_ring_capacity = 1,
+        .pad_strip_capacity = 1,
+        .outbound_capacity = 24,
+    });
+    defer adapter.deinit();
+    try adapter.attachState(&state);
+    var server_objects = try wayring.objects.ServerObjects.init(std.testing.allocator, 32, 16, &protocol.wl_display.info, null);
+    defer server_objects.deinit(std.testing.allocator);
+    const binding = try adapter.acquireBinding();
+    binding.peer = peer;
+    binding.resource = try server_objects.insertClient(4, &protocol.zwp_tablet_seat_v2.info, 2, binding);
+    binding.resource_present = true;
+    try std.testing.expectError(error.InvalidState, adapter.attachState(&state));
+    _ = try server_objects.insertClient(5, &protocol.wl_surface.info, 6, null);
+    const binding_id: TestAdapter.Id = .{ .index = 0, .generation = binding.generation };
+    try adapter.synchronizeBinding(binding_id, &state);
+    try std.testing.expectEqual(@as(usize, 24), adapter.outbound_len);
+    try std.testing.expectEqual(newer_key, adapter.pads[0].tool.?);
+    try std.testing.expectEqual(TestAdapter.ToolEvent.proximity_in, std.meta.activeTag(adapter.outbound[17].value.tool.event));
+    try std.testing.expectEqual(TestAdapter.ToolEvent.down, std.meta.activeTag(adapter.outbound[18].value.tool.event));
+    try std.testing.expectEqual(TestAdapter.ToolEvent.button, std.meta.activeTag(adapter.outbound[19].value.tool.event));
+    try std.testing.expectEqual(TestAdapter.PadEvent.enter, std.meta.activeTag(adapter.outbound[23].value.pad.event));
+
+    var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 256, 8);
+    defer blocks.deinit(std.testing.allocator);
+    var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 1);
+    defer descriptors.deinit(std.testing.allocator);
+    var events = wayring.tx.Queue.init(&blocks, 2048, &descriptors, 1);
+    defer events.deinit();
+    try std.testing.expectEqual(@as(usize, 24), try adapter.flushOn(peer, &server_objects, &events));
     try std.testing.expectEqual(@as(usize, 0), adapter.outbound_len);
 }
 
