@@ -1,8 +1,8 @@
 //! Bounded tablet-v2 wire-resource ownership.
 //!
 //! Physical tablet state belongs to `input/tablet.zig`. This adapter owns only
-//! per-client protocol resources. It remains unadvertised until tablet, tool,
-//! and pad synchronization and event delivery are complete.
+//! per-client protocol resources and synchronizes bindings from that retained
+//! physical state before delivering subsequent device events.
 
 const std = @import("std");
 const wayring = @import("wayring");
@@ -447,9 +447,9 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                         // Stable tablet-v2 defines no invalid-serial error;
                         // stale requests simply have no effect.
                         error.InvalidSerial => {},
-                        error.StaleSurface => return try self.protocolError(actor, decoded.handle.id, 0, "stale cursor surface"),
-                        error.InvalidSurface => return try self.protocolError(actor, decoded.handle.id, 0, "invalid cursor surface"),
-                        error.SurfaceRole => return try self.protocolError(actor, decoded.handle.id, Tool.@"error".role.value, "cursor surface already has another role"),
+                        error.StaleSurface => return try self.protocolError(actor, decoded.handle.id, "stale cursor surface"),
+                        error.InvalidSurface => return try self.protocolError(actor, decoded.handle.id, "invalid cursor surface"),
+                        error.SurfaceRole => return try self.protocolError(actor, decoded.handle.id, "cursor surface already has another role"),
                         error.Exhausted => return try self.noMemory(actor),
                     };
                 },

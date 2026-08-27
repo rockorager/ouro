@@ -53,10 +53,12 @@ const protocol_layer_shell = @import("../protocol/layer_shell.zig");
 const protocol_session_lock = @import("../protocol/session_lock.zig");
 const protocol_cursor_shape = @import("../protocol/cursor_shape.zig");
 const protocol_text_input = @import("../protocol/text_input.zig");
+const protocol_tablet_v2 = @import("../protocol/tablet_v2.zig");
 const cursor_theme = @import("../cursor_theme.zig");
 const theme_cursor = @import("../scene/theme_cursor.zig");
 const desktop_model = @import("../desktop/model.zig");
 const interaction_model = @import("../input/interaction.zig");
+const tablet_input = @import("../input/tablet.zig");
 const confinement = @import("../input/confinement.zig");
 const surface_state = @import("../surface.zig");
 
@@ -99,6 +101,8 @@ pub fn Coordinator(comptime protocol: type) type {
         const SessionLockAdapter = protocol_session_lock.Adapter(protocol, Adapter, OutputAdapter);
         const CursorShapeAdapter = protocol_cursor_shape.Adapter(protocol);
         const TextInputAdapter = protocol_text_input.Adapter(protocol);
+        const TabletState = tablet_input.State(SeatAdapter.FocusTarget);
+        const TabletAdapter = protocol_tablet_v2.Adapter(protocol, SeatAdapter);
 
         const Imported = struct {};
         const Presentations = presentation.Queue(Imported);
@@ -177,12 +181,13 @@ pub fn Coordinator(comptime protocol: type) type {
             const layer_shell: u32 = 1 << 19;
             const session_lock: u32 = 1 << 20;
             const idle_notify: u32 = 1 << 21;
+            const tablet: u32 = 1 << 22;
             const all: u32 = decoration | shell | seat | data_device | dmabuf |
                 activation | relative_pointer | fractional_scale | output | core |
                 pointer_constraints | color_management | color_representation |
                 primary_selection | text_input | pointer_gestures |
                 shortcuts_inhibit | xdg_foreign | xdg_output | layer_shell | session_lock |
-                idle_notify;
+                idle_notify | tablet;
         };
         const Client = struct {
             active: bool = false,
@@ -293,6 +298,8 @@ pub fn Coordinator(comptime protocol: type) type {
             layer_shell: protocol_layer_shell.Config = .{},
             session_lock: protocol_session_lock.Config = .{},
             cursor_shape: protocol_cursor_shape.Config = .{},
+            tablet_input: tablet_input.Config = .{},
+            tablet_v2: protocol_tablet_v2.Config = .{},
             cursor_cache: cursor_theme.Cache.Config = .{
                 // Every protocol shape (including the default fallback) has a slot.
                 .file_capacity = protocol_cursor_shape.shape_names.len,
@@ -342,6 +349,7 @@ pub fn Coordinator(comptime protocol: type) type {
         input_idle_accepted: bool = false,
         input_keyboard_consumed: bool = false,
         input_seat_accepted: bool = false,
+        input_tablet_accepted: bool = false,
         input_drag_accepted: bool = false,
         input_delivery_prepared: bool = false,
         input_delivery_event: ?input_api.Event = null,
@@ -353,6 +361,8 @@ pub fn Coordinator(comptime protocol: type) type {
         desktop: Desktop,
         interaction: Interaction,
         seat_adapter: SeatAdapter,
+        tablet_state: TabletState,
+        tablet_adapter: TabletAdapter,
         data_device_adapter: DataDeviceAdapter,
         primary_selection_adapter: PrimarySelectionAdapter,
         text_input_adapter: TextInputAdapter,
@@ -463,6 +473,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.input_gesture_accepted = false;
             self.input_keyboard_consumed = false;
             self.input_seat_accepted = false;
+            self.input_tablet_accepted = false;
             self.input_drag_accepted = false;
             self.input_delivery_prepared = false;
             self.input_delivery_event = null;
@@ -645,6 +656,15 @@ pub fn Coordinator(comptime protocol: type) type {
                 config.protocol_seat,
             );
             errdefer self.seat_adapter.deinit();
+            self.tablet_state = try TabletState.init(allocator, config.tablet_input);
+            errdefer self.tablet_state.deinit();
+            self.tablet_adapter = try TabletAdapter.init(
+                allocator,
+                &self.seat_adapter,
+                config.tablet_v2,
+            );
+            errdefer self.tablet_adapter.deinit();
+            try self.tablet_adapter.attachState(&self.tablet_state);
             self.relative_pointer_adapter = try RelativePointerAdapter.init(
                 allocator,
                 &self.seat_adapter,
@@ -864,6 +884,9 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = try self.seat_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
+            _ = try self.tablet_adapter.install(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
             _ = try self.data_device_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
@@ -1007,6 +1030,8 @@ pub fn Coordinator(comptime protocol: type) type {
             self.foreign_adapter.deinit();
             self.pointer_gestures_adapter.deinit();
             self.relative_pointer_adapter.deinit();
+            self.tablet_adapter.deinit();
+            self.tablet_state.deinit();
             self.seat_adapter.deinit();
             self.subcompositor_adapter.deinit();
             self.interaction.deinit();
@@ -1051,6 +1076,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.session_lock_adapter.disconnected(peer);
             self.sessionLockChanged() catch {};
             self.cursor_shape_adapter.disconnected(peer);
+            self.tablet_adapter.disconnected(peer);
             self.pointer_gestures_adapter.disconnected(peer);
             self.idle_inhibit_adapter.disconnected(peer);
             self.idle_notify_adapter.disconnected(peer);
@@ -1179,6 +1205,15 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             if (try self.seat_adapter.request(peer, target, message, fds)) |control| {
                 try self.processSeatEvents();
+                if (self.seat_adapter.pendingOutboundOn(objects))
+                    self.markProtocol(peer, ProtocolReady.seat);
+                try self.flushProtocol();
+                return control;
+            }
+            if (try self.tablet_adapter.request(peer, target, message, fds)) |control| {
+                try self.processSeatEvents();
+                if (self.tablet_adapter.pendingOutbound(peer))
+                    self.markProtocol(peer, ProtocolReady.tablet);
                 if (self.seat_adapter.pendingOutboundOn(objects))
                     self.markProtocol(peer, ProtocolReady.seat);
                 try self.flushProtocol();
@@ -1727,6 +1762,15 @@ pub fn Coordinator(comptime protocol: type) type {
                     };
                 self.input_seat_accepted = true;
             }
+            if (!self.input_tablet_accepted) {
+                const delivery = self.tabletDelivery(event);
+                self.tablet_state.consume(event, delivery.target, delivery.point) catch |err| switch (err) {
+                    error.Exhausted => return false,
+                    else => return err,
+                };
+                self.input_tablet_accepted = true;
+            }
+            _ = self.tablet_adapter.drainState(&self.tablet_state) catch return false;
             if (!self.input_drag_accepted) {
                 switch (event) {
                     .pointer_motion => |motion| self.syncDragTarget(motion.time_usec, true) catch |err| switch (err) {
@@ -1752,12 +1796,13 @@ pub fn Coordinator(comptime protocol: type) type {
             self.input_idle_accepted = false;
             self.input_keyboard_consumed = false;
             self.input_seat_accepted = false;
+            self.input_tablet_accepted = false;
             self.input_drag_accepted = false;
             self.input_delivery_prepared = false;
             self.input_delivery_event = null;
             self.stats.input_events += 1;
             self.markProtocolAll(ProtocolReady.seat | ProtocolReady.relative_pointer |
-                ProtocolReady.pointer_gestures);
+                ProtocolReady.pointer_gestures | ProtocolReady.tablet);
             try self.advanceShell();
             switch (event) {
                 .pointer_motion, .device_added, .device_removed => try self.requestCursorRedraw(),
@@ -1889,6 +1934,40 @@ pub fn Coordinator(comptime protocol: type) type {
                         .dx = fixedNormalizedDelta(clipped.x - motion_start.x),
                         .dy = fixedNormalizedDelta(clipped.y - motion_start.y),
                     } };
+                },
+            };
+        }
+
+        const TabletDelivery = struct {
+            target: ?SeatAdapter.FocusTarget = null,
+            point: ?tablet_input.Point = null,
+        };
+
+        fn tabletDelivery(self: *Self, event: input_api.Event) TabletDelivery {
+            const axes = switch (event) {
+                .tablet_tool_axis => |value| value.axes,
+                .tablet_tool_proximity => |value| if (value.entered) value.axes else return .{},
+                .tablet_tool_tip => |value| value.axes,
+                .tablet_tool_button => |value| value.axes,
+                else => return .{},
+            };
+            const normalized_x = axes.x orelse return .{};
+            const normalized_y = axes.y orelse return .{};
+            const bounds = self.outputBounds() catch return .{};
+            const global_x = tabletCoordinate(normalized_x, bounds.x, bounds.width);
+            const global_y = tabletCoordinate(normalized_y, bounds.y, bounds.height);
+            const whole: geometry.Point = .{
+                .x = @intFromFloat(@floor(global_x)),
+                .y = @intFromFloat(@floor(global_y)),
+            };
+            const windows = self.desktop.sceneSnapshot(self.scene_windows) catch return .{};
+            var input_scene: InputScene = .{ .coordinator = self };
+            const hit = input_scene.topmost(Desktop.SceneWindow, windows, whole) orelse return .{};
+            return .{
+                .target = self.seatTarget(hit.surface) catch return .{},
+                .point = .{
+                    .x = global_x - @as(f64, @floatFromInt(whole.x - hit.local.x)),
+                    .y = global_y - @as(f64, @floatFromInt(whole.y - hit.local.y)),
                 },
             };
         }
@@ -2473,6 +2552,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 flushed += try self.shell_adapter.flushOn(objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.seat != 0)
                 flushed += try self.seat_adapter.flushOn(objects, &actor.transmit);
+            if (client.protocol_ready & ProtocolReady.tablet != 0)
+                flushed += try self.tablet_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.data_device != 0)
                 flushed += try self.data_device_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.primary_selection != 0)
@@ -2572,6 +2653,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (ready & ProtocolReady.seat != 0 and
                 !self.seat_adapter.pendingOutboundOn(objects))
                 ready &= ~ProtocolReady.seat;
+            if (ready & ProtocolReady.tablet != 0 and
+                !self.tablet_adapter.pendingOutbound(client.peer))
+                ready &= ~ProtocolReady.tablet;
             if (ready & ProtocolReady.data_device != 0 and
                 !self.data_device_adapter.pendingOutboundOn(client.peer))
                 ready &= ~ProtocolReady.data_device;
@@ -4364,6 +4448,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.decoration_adapter.toplevelRemoved(handle, object);
             _ = self.shell_adapter.resourceRemoved(handle, object);
             _ = self.seat_adapter.resourceRemoved(handle, object);
+            _ = self.tablet_adapter.resourceRemoved(handle, object);
             _ = self.data_device_adapter.resourceRemoved(handle, object);
             _ = self.primary_selection_adapter.resourceRemoved(handle, object);
             _ = self.dmabuf_adapter.resourceRemoved(handle, object);
@@ -4480,6 +4565,16 @@ fn gestureFixed(value: f64) i32 {
 
 fn fixedNormalizedDelta(value: i64) f64 {
     return @as(f64, @floatFromInt(value)) / 256.0;
+}
+
+fn tabletCoordinate(value: f64, origin: i32, extent: i32) f64 {
+    const start = @as(f64, @floatFromInt(origin));
+    const maximum = start + @as(f64, @floatFromInt(extent)) - (1.0 / 256.0);
+    return std.math.clamp(
+        start + std.math.clamp(value, 0.0, 1.0) * @as(f64, @floatFromInt(extent)),
+        start,
+        maximum,
+    );
 }
 
 fn layerVacant(layer: anytype) bool {
