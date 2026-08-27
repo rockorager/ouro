@@ -33,6 +33,16 @@ benchmark_workloads=(
     "dmabuf-churn-8       dmabuf-churn                         8       640   360    300    3"
     "mixed-sparse         shm-sparse,dmabuf-sparse             2       640   720    1000   3"
     "mixed-scale-8        shm-sparse,shm-sparse,shm-sparse,shm-sparse,dmabuf-sparse,dmabuf-sparse,dmabuf-sparse,dmabuf-sparse 8 640 360 1000 3"
+    "color-control-shm    shm-full                             1       1280  720    1000   3"
+    "color-control-dmabuf dmabuf-full                          1       1280  720    1000   3"
+    "color-control-scale-8 shm-full                            8       640   360    1000   3"
+    "color-parametric-shm shm-color-parametric                 1       1280  720    1000   3"
+    "color-icc-shm        shm-color-icc                        1       1280  720    1000   3"
+    "color-icc-dmabuf     dmabuf-color-icc                     1       1280  720    1000   3"
+    "color-icc-scale-8    shm-color-icc                        8       640   360    1000   3"
+    "alpha-shm-full       shm-alpha-full                       1       1280  720    1000   3"
+    "alpha-dmabuf-full    dmabuf-alpha-full                    1       1280  720    1000   3"
+    "alpha-mixed-scale-8  shm-alpha-sparse,shm-alpha-sparse,shm-alpha-sparse,shm-alpha-sparse,dmabuf-alpha-sparse,dmabuf-alpha-sparse,dmabuf-alpha-sparse,dmabuf-alpha-sparse 8 640 360 1000 3"
 )
 
 benchmark_suite_contains() {
@@ -49,7 +59,9 @@ benchmark_suite_contains() {
                 $workload == shm-buffer-churn || $workload == dmabuf-full ||
                 $workload == dmabuf-tiny || $workload == dmabuf-sparse ||
                 $workload == dmabuf-scale-8 || $workload == dmabuf-churn ||
-                $workload == mixed-scale-8 ]]
+                $workload == mixed-scale-8 || $workload == color-parametric-shm ||
+                $workload == color-icc-shm || $workload == alpha-shm-full ||
+                $workload == alpha-dmabuf-full ]]
             ;;
         all) [[ $workload != *-scale-16 && $workload != *-scale-32 && $workload != *-scale-64 ]] ;;
         shm) [[ $workload == shm-* && $workload != *-scale-16 && $workload != *-scale-32 && $workload != *-scale-64 ]] ;;
@@ -57,6 +69,8 @@ benchmark_suite_contains() {
         scale) [[ $workload == *-scale-[128] ]] ;;
         churn) [[ $workload == *churn* ]] ;;
         mixed) [[ $workload == mixed-* ]] ;;
+        color) [[ $workload == color-* ]] ;;
+        composition) [[ $workload == alpha-* ]] ;;
         capacity) [[ $workload == *-scale-16 || $workload == *-scale-32 || $workload == *-scale-64 ]] ;;
         *) return 1 ;;
     esac

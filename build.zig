@@ -175,9 +175,23 @@ pub fn build(b: *std.Build) void {
     const benchmark_dmabuf_code_output = benchmark_dmabuf_code.addOutputFileArg(
         "linux-dmabuf-v1-protocol.c",
     );
+    const benchmark_color_xml = wayland_protocols.path(
+        "staging/color-management/color-management-v1.xml",
+    );
+    const benchmark_color_header = b.addSystemCommand(&.{ benchmark_scanner, "client-header" });
+    benchmark_color_header.addFileArg(benchmark_color_xml);
+    const benchmark_color_header_output = benchmark_color_header.addOutputFileArg(
+        "color-management-v1-client-protocol.h",
+    );
+    const benchmark_color_code = b.addSystemCommand(&.{ benchmark_scanner, "private-code" });
+    benchmark_color_code.addFileArg(benchmark_color_xml);
+    const benchmark_color_code_output = benchmark_color_code.addOutputFileArg(
+        "color-management-v1-protocol.c",
+    );
     benchmark_client.root_module.addIncludePath(benchmark_xdg_header_output.dirname());
     benchmark_client.root_module.addIncludePath(benchmark_presentation_header_output.dirname());
     benchmark_client.root_module.addIncludePath(benchmark_dmabuf_header_output.dirname());
+    benchmark_client.root_module.addIncludePath(benchmark_color_header_output.dirname());
     benchmark_client.root_module.addCSourceFile(.{
         .file = benchmark_xdg_code_output,
         .flags = &.{"-std=c11"},
@@ -191,6 +205,10 @@ pub fn build(b: *std.Build) void {
         .flags = &.{"-std=c11"},
     });
     benchmark_client.root_module.addCSourceFile(.{
+        .file = benchmark_color_code_output,
+        .flags = &.{"-std=c11"},
+    });
+    benchmark_client.root_module.addCSourceFile(.{
         .file = b.path("benchmark/client.c"),
         .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
     });
@@ -199,6 +217,7 @@ pub fn build(b: *std.Build) void {
     });
     benchmark_client.root_module.linkSystemLibrary("gbm", .{ .use_pkg_config = .force });
     benchmark_client.root_module.linkSystemLibrary("libdrm", .{ .use_pkg_config = .force });
+    benchmark_client.root_module.linkSystemLibrary("lcms2", .{ .use_pkg_config = .force });
     const install_benchmark_client = b.addInstallArtifact(benchmark_client, .{
         .dest_dir = .{ .override = .{ .custom = "benchmark" } },
     });

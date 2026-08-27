@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <gbm.h>
 #include <inttypes.h>
+#include <lcms2.h>
 #include <libdrm/drm_fourcc.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -21,6 +22,7 @@
 #include "linux-dmabuf-v1-client-protocol.h"
 #include "presentation-time-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
+#include "color-management-v1-client-protocol.h"
 
 #define BUFFER_COUNT 3
 
@@ -39,6 +41,12 @@ enum backing {
 enum pacing {
     PACING_CALLBACK,
     PACING_PRESENTATION,
+};
+
+enum color_mode {
+    COLOR_IMPLICIT,
+    COLOR_PARAMETRIC,
+    COLOR_ICC,
 };
 
 struct client;
@@ -69,6 +77,9 @@ struct client {
     struct xdg_wm_base *wm_base;
     struct wp_presentation *presentation;
     struct zwp_linux_dmabuf_v1 *dmabuf;
+    struct wp_color_manager_v1 *color_manager;
+    struct wp_color_management_surface_v1 *color_surface;
+    struct wp_image_description_v1 *color_description;
     uint32_t dmabuf_version;
     struct gbm_device *gbm;
     int drm_fd;
@@ -81,13 +92,23 @@ struct client {
     int32_t height;
     enum workload workload;
     enum backing backing;
+    enum color_mode color_mode;
+    bool alpha;
     bool churn;
     bool configured;
+    bool color_capabilities_done;
+    bool color_parametric;
+    bool color_icc;
+    bool color_perceptual;
+    bool color_srgb_tf;
+    bool color_srgb_primaries;
+    bool color_ready;
     bool draining;
     uint64_t callbacks;
     uint64_t releases;
     uint64_t presented;
     uint64_t discarded;
+    uint64_t color_setup_ns;
 };
 
 static uint64_t monotonic_ns(void) {
@@ -104,6 +125,12 @@ static void fail(const char *message) {
 static void protocol_fail(const char *message) {
     fprintf(stderr, "ouro-benchmark-client: %s\n", message);
     exit(1);
+}
+
+static void unsupported(const char *feature) {
+    printf("UNSUPPORTED %s\n", feature);
+    fflush(stdout);
+    exit(77);
 }
 
 static uint64_t parse_positive(const char *text, const char *name) {
@@ -237,6 +264,100 @@ static const struct wp_presentation_listener presentation_listener = {
     .clock_id = presentation_clock_id,
 };
 
+static void color_supported_intent(
+    void *data,
+    struct wp_color_manager_v1 *manager,
+    uint32_t intent
+) {
+    (void)manager;
+    if (intent == WP_COLOR_MANAGER_V1_RENDER_INTENT_PERCEPTUAL)
+        ((struct client *)data)->color_perceptual = true;
+}
+
+static void color_supported_feature(
+    void *data,
+    struct wp_color_manager_v1 *manager,
+    uint32_t feature
+) {
+    (void)manager;
+    struct client *client = data;
+    if (feature == WP_COLOR_MANAGER_V1_FEATURE_PARAMETRIC) client->color_parametric = true;
+    if (feature == WP_COLOR_MANAGER_V1_FEATURE_ICC_V2_V4) client->color_icc = true;
+}
+
+static void color_supported_tf(
+    void *data,
+    struct wp_color_manager_v1 *manager,
+    uint32_t tf
+) {
+    (void)manager;
+    if (tf == WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_SRGB)
+        ((struct client *)data)->color_srgb_tf = true;
+}
+
+static void color_supported_primaries(
+    void *data,
+    struct wp_color_manager_v1 *manager,
+    uint32_t primaries
+) {
+    (void)manager;
+    if (primaries == WP_COLOR_MANAGER_V1_PRIMARIES_SRGB)
+        ((struct client *)data)->color_srgb_primaries = true;
+}
+
+static void color_capabilities_done(void *data, struct wp_color_manager_v1 *manager) {
+    (void)manager;
+    ((struct client *)data)->color_capabilities_done = true;
+}
+
+static const struct wp_color_manager_v1_listener color_manager_listener = {
+    .supported_intent = color_supported_intent,
+    .supported_feature = color_supported_feature,
+    .supported_tf_named = color_supported_tf,
+    .supported_primaries_named = color_supported_primaries,
+    .done = color_capabilities_done,
+};
+
+static void color_description_failed(
+    void *data,
+    struct wp_image_description_v1 *description,
+    uint32_t cause,
+    const char *message
+) {
+    (void)data;
+    (void)description;
+    fprintf(stderr, "ouro-benchmark-client: color description failed (%u): %s\n", cause, message);
+    exit(1);
+}
+
+static void color_description_ready(
+    void *data,
+    struct wp_image_description_v1 *description,
+    uint32_t identity
+) {
+    (void)description;
+    if (identity == 0) protocol_fail("invalid color description identity");
+    ((struct client *)data)->color_ready = true;
+}
+
+static void color_description_ready2(
+    void *data,
+    struct wp_image_description_v1 *description,
+    uint32_t identity_hi,
+    uint32_t identity_lo
+) {
+    (void)description;
+    if (identity_hi == 0 && identity_lo == 0)
+        protocol_fail("invalid color description identity");
+    ((struct client *)data)->color_ready = true;
+}
+
+static const struct wp_image_description_v1_listener color_description_listener = {
+    .failed = color_description_failed,
+    .ready = color_description_ready,
+    .ready2 = color_description_ready2,
+};
+
 static void registry_global(
     void *data,
     struct wl_registry *registry,
@@ -266,6 +387,18 @@ static void registry_global(
             &zwp_linux_dmabuf_v1_interface,
             client->dmabuf_version
         );
+    } else if (strcmp(interface, wp_color_manager_v1_interface.name) == 0) {
+        client->color_manager = wl_registry_bind(
+            registry,
+            name,
+            &wp_color_manager_v1_interface,
+            1
+        );
+        if (client->color_manager == NULL || wp_color_manager_v1_add_listener(
+            client->color_manager,
+            &color_manager_listener,
+            client
+        ) != 0) protocol_fail("bind color manager");
     }
 }
 
@@ -337,7 +470,7 @@ static void create_shm_buffer(struct client *client, struct frame_buffer *buffer
         client->width,
         client->height,
         client->width * 4,
-        WL_SHM_FORMAT_XRGB8888
+        client->alpha ? WL_SHM_FORMAT_ARGB8888 : WL_SHM_FORMAT_XRGB8888
     );
     wl_shm_pool_destroy(pool);
     buffer->available = true;
@@ -355,7 +488,7 @@ static void create_dmabuf_buffer(struct client *client, struct frame_buffer *buf
         client->gbm,
         (uint32_t)client->width,
         (uint32_t)client->height,
-        GBM_FORMAT_XRGB8888,
+        client->alpha ? GBM_FORMAT_ARGB8888 : GBM_FORMAT_XRGB8888,
         modifiers,
         1,
         GBM_BO_USE_RENDERING
@@ -382,7 +515,7 @@ static void create_dmabuf_buffer(struct client *client, struct frame_buffer *buf
         params,
         client->width,
         client->height,
-        DRM_FORMAT_XRGB8888,
+        client->alpha ? DRM_FORMAT_ARGB8888 : DRM_FORMAT_XRGB8888,
         0
     );
     zwp_linux_buffer_params_v1_destroy(params);
@@ -398,6 +531,116 @@ static void create_buffer(struct client *client, struct frame_buffer *buffer) {
         create_dmabuf_buffer(client, buffer);
     else
         create_shm_buffer(client, buffer);
+}
+
+static int create_srgb_profile_fd(void) {
+    cmsHPROFILE profile = cmsCreate_sRGBProfile();
+    if (profile == NULL) protocol_fail("create benchmark sRGB ICC profile");
+    cmsUInt32Number size = 0;
+    if (!cmsSaveProfileToMem(profile, NULL, &size) || size == 0) {
+        cmsCloseProfile(profile);
+        protocol_fail("size benchmark sRGB ICC profile");
+    }
+    void *bytes = malloc(size);
+    if (bytes == NULL) {
+        cmsCloseProfile(profile);
+        fail("allocate benchmark ICC profile");
+    }
+    if (!cmsSaveProfileToMem(profile, bytes, &size)) {
+        free(bytes);
+        cmsCloseProfile(profile);
+        protocol_fail("serialize benchmark sRGB ICC profile");
+    }
+    cmsCloseProfile(profile);
+    int fd = memfd_create("ouro-benchmark-icc", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    if (fd < 0) {
+        free(bytes);
+        fail("create benchmark ICC profile fd");
+    }
+    size_t written = 0;
+    while (written < size) {
+        ssize_t count = write(fd, (uint8_t *)bytes + written, size - written);
+        if (count <= 0) {
+            free(bytes);
+            close(fd);
+            fail("write benchmark ICC profile");
+        }
+        written += (size_t)count;
+    }
+    free(bytes);
+    if (fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE) != 0) {
+        close(fd);
+        fail("seal benchmark ICC profile");
+    }
+    return fd;
+}
+
+static void setup_color(struct client *client) {
+    if (client->color_mode == COLOR_IMPLICIT) return;
+    const uint64_t started_ns = monotonic_ns();
+    if (client->color_manager == NULL) unsupported("wp_color_manager_v1");
+    while (!client->color_capabilities_done)
+        if (wl_display_dispatch(client->display) < 0)
+            fail("wait for color-management capabilities");
+    if (!client->color_perceptual) unsupported("color-management perceptual intent");
+
+    if (client->color_mode == COLOR_PARAMETRIC) {
+        if (!client->color_parametric || !client->color_srgb_tf || !client->color_srgb_primaries)
+            unsupported("parametric sRGB color description");
+        struct wp_image_description_creator_params_v1 *creator =
+            wp_color_manager_v1_create_parametric_creator(client->color_manager);
+        if (creator == NULL) protocol_fail("create parametric color description creator");
+        wp_image_description_creator_params_v1_set_tf_named(
+            creator,
+            WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_SRGB
+        );
+        wp_image_description_creator_params_v1_set_primaries_named(
+            creator,
+            WP_COLOR_MANAGER_V1_PRIMARIES_SRGB
+        );
+        client->color_description = wp_image_description_creator_params_v1_create(creator);
+    } else {
+        if (!client->color_icc) unsupported("ICC v2/v4 color description");
+        const int fd = create_srgb_profile_fd();
+        struct stat status;
+        if (fstat(fd, &status) != 0 || status.st_size <= 0 || status.st_size > UINT32_MAX) {
+            close(fd);
+            fail("stat benchmark ICC profile");
+        }
+        struct wp_image_description_creator_icc_v1 *creator =
+            wp_color_manager_v1_create_icc_creator(client->color_manager);
+        if (creator == NULL) {
+            close(fd);
+            protocol_fail("create ICC color description creator");
+        }
+        wp_image_description_creator_icc_v1_set_icc_file(
+            creator,
+            fd,
+            0,
+            (uint32_t)status.st_size
+        );
+        client->color_description = wp_image_description_creator_icc_v1_create(creator);
+        close(fd);
+    }
+    if (client->color_description == NULL || wp_image_description_v1_add_listener(
+        client->color_description,
+        &color_description_listener,
+        client
+    ) != 0) protocol_fail("create color description");
+    while (!client->color_ready)
+        if (wl_display_dispatch(client->display) < 0)
+            fail("wait for color description");
+    client->color_surface = wp_color_manager_v1_get_surface(
+        client->color_manager,
+        client->surface
+    );
+    if (client->color_surface == NULL) protocol_fail("create color-managed surface");
+    wp_color_management_surface_v1_set_image_description(
+        client->color_surface,
+        client->color_description,
+        WP_COLOR_MANAGER_V1_RENDER_INTENT_PERCEPTUAL
+    );
+    client->color_setup_ns = monotonic_ns() - started_ns;
 }
 
 static void setup(struct client *client, const char *socket_path, const char *drm_path) {
@@ -431,6 +674,7 @@ static void setup(struct client *client, const char *socket_path, const char *dr
     client->toplevel = xdg_surface_get_toplevel(client->xdg_surface);
     if (client->toplevel == NULL) protocol_fail("create xdg_toplevel");
     xdg_toplevel_set_title(client->toplevel, "Ouro compositor benchmark");
+    setup_color(client);
     wl_surface_commit(client->surface);
     while (!client->configured)
         if (wl_display_dispatch(client->display) < 0) fail("wait for initial configure");
@@ -438,8 +682,16 @@ static void setup(struct client *client, const char *socket_path, const char *dr
     const size_t buffer_size = (size_t)client->width * (size_t)client->height * 4;
     client->canonical_pixels = malloc(buffer_size);
     if (client->canonical_pixels == NULL) fail("allocate canonical pixels");
-    for (size_t index = 0; index < buffer_size / 4; index++)
-        client->canonical_pixels[index] = UINT32_C(0xff204060) ^ (uint32_t)index;
+    for (size_t index = 0; index < buffer_size / 4; index++) {
+        if (client->alpha) {
+            const uint32_t red = UINT32_C(0x10) + ((uint32_t)index & UINT32_C(0x1f));
+            const uint32_t green = UINT32_C(0x20) + (((uint32_t)index >> 5) & UINT32_C(0x1f));
+            const uint32_t blue = UINT32_C(0x30) + (((uint32_t)index >> 10) & UINT32_C(0x1f));
+            client->canonical_pixels[index] = UINT32_C(0x80000000) | red << 16 | green << 8 | blue;
+        } else {
+            client->canonical_pixels[index] = UINT32_C(0xff204060) ^ (uint32_t)index;
+        }
+    }
     for (uint32_t index = 0; index < BUFFER_COUNT; index++) {
         client->buffers[index].client = client;
         client->buffers[index].fd = -1;
@@ -554,10 +806,13 @@ static void submit_frame(
 
 static void cleanup(struct client *client) {
     for (size_t index = 0; index < BUFFER_COUNT; index++) destroy_buffer(&client->buffers[index]);
+    if (client->color_surface != NULL) wp_color_management_surface_v1_destroy(client->color_surface);
+    if (client->color_description != NULL) wp_image_description_v1_destroy(client->color_description);
     if (client->toplevel != NULL) xdg_toplevel_destroy(client->toplevel);
     if (client->xdg_surface != NULL) xdg_surface_destroy(client->xdg_surface);
     if (client->surface != NULL) wl_surface_destroy(client->surface);
     if (client->presentation != NULL) wp_presentation_destroy(client->presentation);
+    if (client->color_manager != NULL) wp_color_manager_v1_destroy(client->color_manager);
     if (client->dmabuf != NULL) zwp_linux_dmabuf_v1_destroy(client->dmabuf);
     if (client->wm_base != NULL) xdg_wm_base_destroy(client->wm_base);
     if (client->shm != NULL) wl_shm_destroy(client->shm);
@@ -600,6 +855,26 @@ static void parse_workload(struct client *client, const char *name) {
     if (strcmp(workload, "churn") == 0) {
         client->workload = WORKLOAD_SPARSE;
         client->churn = true;
+        return;
+    }
+    if (strcmp(workload, "color-parametric") == 0) {
+        client->workload = WORKLOAD_FULL;
+        client->color_mode = COLOR_PARAMETRIC;
+        return;
+    }
+    if (strcmp(workload, "color-icc") == 0) {
+        client->workload = WORKLOAD_FULL;
+        client->color_mode = COLOR_ICC;
+        return;
+    }
+    if (strcmp(workload, "alpha-full") == 0) {
+        client->workload = WORKLOAD_FULL;
+        client->alpha = true;
+        return;
+    }
+    if (strcmp(workload, "alpha-sparse") == 0) {
+        client->workload = WORKLOAD_SPARSE;
+        client->alpha = true;
         return;
     }
     fprintf(stderr, "ouro-benchmark-client: unknown workload: %s\n", name);
@@ -677,6 +952,7 @@ int main(int argc, char **argv) {
         "\"frames\":%" PRIu64 ",\"warmup\":%" PRIu64 ","
         "\"callbacks\":%" PRIu64 ",\"releases\":%" PRIu64 ","
         "\"presented\":%" PRIu64 ",\"discarded\":%" PRIu64 ","
+        "\"color_setup_ns\":%" PRIu64 ","
         "\"raw_callbacks\":%" PRIu64 ",\"raw_releases\":%" PRIu64 ","
         "\"raw_presented\":%" PRIu64 ",\"raw_discarded\":%" PRIu64 ","
         "\"start_to_gate_ns\":%" PRIu64 ",\"observed_window_ns\":%" PRIu64 ","
@@ -692,6 +968,7 @@ int main(int argc, char **argv) {
         client.releases - releases_before,
         client.presented - presented_before,
         client.discarded - discarded_before,
+        client.color_setup_ns,
         client.callbacks,
         client.releases,
         client.presented,

@@ -116,6 +116,7 @@ def run_record(directory: Path, workload: str, compositor: str, run: int) -> dic
         "gate_release_events": sum(client["releases"] for client in clients),
         "presented": sum(client["presented"] for client in clients),
         "discarded": sum(client["discarded"] for client in clients),
+        "color_setup_ns": max(client.get("color_setup_ns", 0) for client in clients),
         "user_ticks": gate_cpu[0] - pre_cpu[0],
         "system_ticks": gate_cpu[1] - pre_cpu[1],
         "total_ticks": sum(gate_cpu) - sum(pre_cpu),
@@ -149,9 +150,14 @@ def fmt(value: float | None, divisor: float = 1.0, digits: int = 2) -> str:
     return f"{value / divisor:.{digits}f}"
 
 
-def aggregate(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def aggregate(
+    records: list[dict[str, Any]], unsupported: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
     summaries: list[dict[str, Any]] = []
-    workloads = sorted({record["workload"] for record in records})
+    workloads = sorted(
+        {record["workload"] for record in records}
+        | {record["workload"] for record in unsupported}
+    )
     for workload in workloads:
         grouped = {
             compositor: [
@@ -161,10 +167,35 @@ def aggregate(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
             ]
             for compositor in COMPOSITORS
         }
-        counts = {compositor: len(values) for compositor, values in grouped.items()}
-        if 0 in counts.values() or len(set(counts.values())) != 1:
-            raise ValueError(f"{workload}: comparison is incomplete: {counts}")
+        unsupported_grouped = {
+            compositor: [
+                record
+                for record in unsupported
+                if record["workload"] == workload and record["compositor"] == compositor
+            ]
+            for compositor in COMPOSITORS
+        }
+        for compositor in COMPOSITORS:
+            if grouped[compositor] and unsupported_grouped[compositor]:
+                raise ValueError(f"{workload}/{compositor}: mixes supported and unsupported runs")
+            if not grouped[compositor] and not unsupported_grouped[compositor]:
+                raise ValueError(f"{workload}/{compositor}: comparison is incomplete")
+        supported_counts = {len(values) for values in grouped.values() if values}
+        if len(supported_counts) > 1:
+            raise ValueError(f"{workload}: supported run counts differ: {supported_counts}")
         for compositor, values in grouped.items():
+            if not values:
+                reasons = sorted({item["reason"] for item in unsupported_grouped[compositor]})
+                summaries.append(
+                    {
+                        "workload": workload,
+                        "compositor": compositor,
+                        "runs": len(unsupported_grouped[compositor]),
+                        "status": "unsupported",
+                        "reason": "; ".join(reasons),
+                    }
+                )
+                continue
             case_shapes = {
                 (
                     value["case"]["clients"],
@@ -183,11 +214,13 @@ def aggregate(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 {
                     "workload": workload,
                     "compositor": compositor,
+                    "status": "supported",
                     "runs": len(values),
                     "clients": clients,
                     "pacing": values[0]["case"].get("pacing", "presentation"),
                     "frames_per_client": frames,
                     "gate_ns_median": median(values, "gate_ns"),
+                    "color_setup_ns_median": median(values, "color_setup_ns"),
                     "actual_window_ns_median": actual_window_ns,
                     "interval_ns_median": (
                         actual_window_ns / (frames - 1)
@@ -234,21 +267,28 @@ def print_markdown(summaries: list[dict[str, Any]]) -> None:
         print(f"\n## {workload}\n")
         print(
             "| Compositor | Runs | Clients | Surface FPS | Aggregate presentations/s "
-            "| CPU % | µs/presented | RSS MiB | HWM MiB |"
+            "| CPU % | µs/presented | Color setup ms | RSS MiB | HWM MiB |"
         )
-        print("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+        print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
         for compositor in COMPOSITORS:
             summary = next(
                 item
                 for item in summaries
                 if item["workload"] == workload and item["compositor"] == compositor
             )
+            if summary["status"] == "unsupported":
+                print(
+                    f"| {compositor} | {summary['runs']} | — | unsupported: "
+                    f"{summary['reason']} | — | — | — | — | — | — |"
+                )
+                continue
             print(
                 f"| {compositor} | {summary['runs']} | {summary['clients']} | "
                 f"{fmt(summary['surface_fps_median'])} | "
                 f"{fmt(summary['aggregate_presentations_per_second_median'])} | "
                 f"{fmt(summary['cpu_percent_median'])} | "
                 f"{fmt(summary['task_clock_us_per_presented'])} | "
+                f"{fmt(summary['color_setup_ns_median'], 1_000_000, 3)} | "
                 f"{fmt(summary['rss_kib_median'], 1024, 1)} |"
                 f" {fmt(summary['hwm_kib_median'], 1024, 1)} |"
             )
@@ -262,6 +302,7 @@ def main() -> int:
     if not (root / "metadata.env").is_file():
         raise ValueError(f"not a benchmark result directory: {root}")
     records: list[dict[str, Any]] = []
+    unsupported: list[dict[str, Any]] = []
     for workload_dir in sorted(path for path in root.iterdir() if path.is_dir()):
         for compositor in COMPOSITORS:
             compositor_dir = workload_dir / compositor
@@ -273,12 +314,33 @@ def main() -> int:
             )
             for run_dir in run_dirs:
                 run = int(run_dir.name.removeprefix("run-"))
+                unsupported_path = run_dir / "unsupported.txt"
+                if unsupported_path.is_file():
+                    reasons = sorted(
+                        {
+                            line.removeprefix("UNSUPPORTED ").strip()
+                            for line in unsupported_path.read_text().splitlines()
+                            if line.startswith("UNSUPPORTED ")
+                        }
+                    )
+                    if not reasons:
+                        raise ValueError(f"{unsupported_path}: missing unsupported reason")
+                    unsupported.append(
+                        {
+                            "workload": workload_dir.name,
+                            "compositor": compositor,
+                            "run": run,
+                            "reason": "; ".join(reasons),
+                        }
+                    )
+                    continue
                 records.append(run_record(run_dir, workload_dir.name, compositor, run))
-    summaries = aggregate(records)
+    summaries = aggregate(records, unsupported)
     payload = {
         "schema": 1,
         "metadata": parse_env(root / "metadata.env"),
         "runs": records,
+        "unsupported": unsupported,
         "summary": summaries,
     }
     (root / "results.json").write_text(json.dumps(payload, indent=2) + "\n")

@@ -23,7 +23,7 @@ usage() {
 usage: benchmark/run.sh [options]
 
   --suite NAME            quick, standard, all, shm, dmabuf, scale, churn, mixed,
-                          or capacity (default: quick)
+                          color, composition, or capacity (default: quick)
   --runs N                repetitions per compositor/workload (default: 3)
   --workload NAME         run one workload instead of a suite
   --frames N              frames per client (default: 300)
@@ -72,7 +72,7 @@ done
     exit 2
 }
 case "$selected_suite" in
-    quick|standard|all|shm|dmabuf|scale|churn|mixed|capacity) ;;
+    quick|standard|all|shm|dmabuf|scale|churn|mixed|color|composition|capacity) ;;
     *) echo "unknown suite: $selected_suite" >&2; exit 2 ;;
 esac
 [[ -e $drm_device ]] || { echo "DRM device does not exist: $drm_device" >&2; exit 1; }
@@ -300,8 +300,22 @@ run_case() {
             grep -q '^READY$' "$directory/client-$index.log" 2>/dev/null && ((ready += 1))
         done
         ((ready == clients)) && break
+        if grep -h '^UNSUPPORTED ' "$directory"/client-*.log \
+            >"$directory/unsupported.txt" 2>/dev/null &&
+            [[ -s $directory/unsupported.txt ]]
+        then
+            return 77
+        fi
+        rm -f "$directory/unsupported.txt"
         for pid in "${client_pids[@]}"; do
             kill -0 "$pid" 2>/dev/null || {
+                if grep -h '^UNSUPPORTED ' "$directory"/client-*.log \
+                    >"$directory/unsupported.txt" 2>/dev/null &&
+                    [[ -s $directory/unsupported.txt ]]
+                then
+                    return 77
+                fi
+                rm -f "$directory/unsupported.txt"
                 cat "$directory"/client-*.log >&2
                 return 1
             }
@@ -407,9 +421,15 @@ for definition in "${benchmark_workloads[@]}"; do
     for ((repetition = 1; repetition <= runs; repetition++)); do
         for compositor in ouro sway hyprland; do
             printf '==> %s run %d: %s\n' "$workload_name" "$repetition" "$compositor"
-            run_case "$workload_name" "$client_modes" "$clients" "$width" "$height" \
+            if run_case "$workload_name" "$client_modes" "$clients" "$width" "$height" \
                 "$frames" "$warmup" "$compositor" "$repetition"
+            then
+                result=0
+            else
+                result=$?
+            fi
             cleanup_case
+            if ((result != 0 && result != 77)); then exit "$result"; fi
         done
     done
 done
