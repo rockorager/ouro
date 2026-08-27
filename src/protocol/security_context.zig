@@ -4,15 +4,17 @@ const std = @import("std");
 const wayring = @import("wayring");
 const objects = wayring.objects;
 const linux = std.os.linux;
+const completion = @import("../runtime/completion.zig");
 
 pub const Config = struct {
     resource_capacity: usize = 16,
     listener_capacity: usize = 8,
+    client_capacity: usize = 16,
     metadata_bytes: usize = 4096,
 
     fn validate(config: Config) !void {
         if (config.resource_capacity == 0 or config.listener_capacity == 0 or
-            config.metadata_bytes == 0)
+            config.client_capacity == 0 or config.metadata_bytes == 0)
             return error.InvalidConfig;
     }
 };
@@ -31,6 +33,11 @@ pub const Listener = struct {
     close_fd: linux.fd_t,
     metadata: Metadata = .{},
     committed: bool = false,
+    closing: bool = false,
+    accept_token: ?completion.Token = null,
+    close_token: ?completion.Token = null,
+    accept_cancel_token: ?completion.Token = null,
+    close_cancel_token: ?completion.Token = null,
 };
 
 pub fn Adapter(comptime protocol: type) type {
@@ -53,13 +60,19 @@ pub fn Adapter(comptime protocol: type) type {
             peer: wayring.io_uring.Peer,
             listener: ?*Listener = null,
         };
+        const Client = struct {
+            peer: wayring.io_uring.Peer,
+            listener: *Listener,
+        };
 
         allocator: std.mem.Allocator,
         committer: Committer,
         resources: std.ArrayListUnmanaged(*Resource) = .empty,
         listeners: std.ArrayListUnmanaged(*Listener) = .empty,
+        clients: std.ArrayListUnmanaged(Client) = .empty,
         resource_capacity: usize,
         listener_capacity: usize,
+        client_capacity: usize,
         metadata_capacity: usize,
         metadata_used: usize = 0,
         runtime: ?*Runtime = null,
@@ -76,17 +89,21 @@ pub fn Adapter(comptime protocol: type) type {
                 .committer = committer,
                 .resource_capacity = config.resource_capacity,
                 .listener_capacity = config.listener_capacity,
+                .client_capacity = config.client_capacity,
                 .metadata_capacity = config.metadata_bytes,
             };
             errdefer self.resources.deinit(allocator);
+            errdefer self.listeners.deinit(allocator);
             try self.resources.ensureTotalCapacity(allocator, config.resource_capacity);
             try self.listeners.ensureTotalCapacity(allocator, config.listener_capacity);
+            try self.clients.ensureTotalCapacity(allocator, config.client_capacity);
             return self;
         }
 
         pub fn deinit(self: *Self) void {
             for (self.resources.items) |resource| self.allocator.destroy(resource);
             for (self.listeners.items) |listener| self.destroyListener(listener);
+            self.clients.deinit(self.allocator);
             self.listeners.deinit(self.allocator);
             self.resources.deinit(self.allocator);
             self.* = undefined;
@@ -222,6 +239,55 @@ pub fn Adapter(comptime protocol: type) type {
                 const resource = self.resources.items[index];
                 if (samePeer(resource.peer, peer)) self.removeResource(resource);
             }
+            for (self.clients.items, 0..) |client, client_index| if (samePeer(client.peer, peer)) {
+                _ = self.clients.swapRemove(client_index);
+                return;
+            };
+        }
+
+        /// Attaches a committed context before the accepted client's first
+        /// receive can be submitted. Classification never depends on metadata.
+        pub fn admit(self: *Self, peer: wayring.io_uring.Peer, listener: *Listener) !void {
+            if (!listener.committed or listener.closing) return error.InactiveListener;
+            if (self.clients.items.len == self.client_capacity) return error.Exhausted;
+            self.clients.appendAssumeCapacity(.{ .peer = peer, .listener = listener });
+        }
+
+        pub fn canAdmit(self: *const Self) bool {
+            return self.clients.items.len < self.client_capacity;
+        }
+
+        pub fn sandboxed(self: *const Self, peer: wayring.io_uring.Peer) bool {
+            for (self.clients.items) |client| if (samePeer(client.peer, peer)) return true;
+            return false;
+        }
+
+        pub fn metadata(self: *const Self, peer: wayring.io_uring.Peer) ?Metadata {
+            for (self.clients.items) |client| if (samePeer(client.peer, peer))
+                return client.listener.metadata;
+            return null;
+        }
+
+        pub fn listenerForToken(self: *Self, token: completion.Token) ?*Listener {
+            for (self.listeners.items) |listener| {
+                inline for (.{ "accept_token", "close_token", "accept_cancel_token", "close_cancel_token" }) |field|
+                    if (@field(listener, field)) |candidate| if (std.meta.eql(candidate, token))
+                        return listener;
+            }
+            return null;
+        }
+
+        pub fn committedListeners(self: *Self) []*Listener {
+            return self.listeners.items;
+        }
+
+        pub fn drainComplete(self: *const Self) bool {
+            for (self.listeners.items) |listener| if (listener.committed and
+                (listener.listen_fd >= 0 or listener.close_fd >= 0 or
+                    listener.accept_token != null or listener.close_token != null or
+                    listener.accept_cancel_token != null or listener.close_cancel_token != null))
+                return false;
+            return true;
         }
 
         fn setMetadata(
@@ -271,12 +337,16 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         fn destroyListener(self: *Self, listener: *Listener) void {
+            std.debug.assert(listener.accept_token == null);
+            std.debug.assert(listener.close_token == null);
+            std.debug.assert(listener.accept_cancel_token == null);
+            std.debug.assert(listener.close_cancel_token == null);
             inline for (.{ "sandbox_engine", "app_id", "instance_id" }) |field| if (@field(listener.metadata, field)) |value| {
                 self.metadata_used -= value.len;
                 self.allocator.free(value);
             };
-            _ = linux.close(listener.listen_fd);
-            _ = linux.close(listener.close_fd);
+            if (listener.listen_fd >= 0) _ = linux.close(listener.listen_fd);
+            if (listener.close_fd >= 0) _ = linux.close(listener.close_fd);
             self.allocator.destroy(listener);
         }
 
@@ -328,7 +398,8 @@ pub fn validateListenFd(fd: linux.fd_t) !void {
 fn setNonblocking(fd: linux.fd_t) !void {
     const current = linux.fcntl(fd, linux.F.GETFL, 0);
     if (linux.errno(current) != .SUCCESS) return error.FcntlFailed;
-    const result = linux.fcntl(fd, linux.F.SETFL, current | linux.O.NONBLOCK);
+    const nonblocking: u32 = @bitCast(linux.O{ .NONBLOCK = true });
+    const result = linux.fcntl(fd, linux.F.SETFL, current | nonblocking);
     if (linux.errno(result) != .SUCCESS) return error.FcntlFailed;
 }
 
@@ -354,4 +425,34 @@ test "security-context validates listening sockets" {
     defer _ = linux.close(pair[0]);
     defer _ = linux.close(pair[1]);
     try std.testing.expectError(error.InvalidListenFd, validateListenFd(pair[0]));
+}
+
+test "security-context classifies admitted peers independently of metadata" {
+    const TestAdapter = Adapter(@import("core_protocol"));
+    const Hooks = struct {
+        fn commit(_: ?*anyopaque, _: *Listener) !void {}
+    };
+    var adapter = try TestAdapter.init(
+        std.testing.allocator,
+        .{ .commitFn = Hooks.commit },
+        .{ .resource_capacity = 1, .listener_capacity = 1, .client_capacity = 1 },
+    );
+    defer adapter.deinit();
+
+    var listener: Listener = .{
+        .listen_fd = -1,
+        .close_fd = -1,
+        .metadata = .{ .sandbox_engine = "org.example.Sandbox" },
+        .committed = true,
+    };
+    const peer: wayring.io_uring.Peer = .{ .slot = 2, .generation = 7 };
+    try adapter.admit(peer, &listener);
+    try std.testing.expect(adapter.sandboxed(peer));
+    try std.testing.expectEqualStrings(
+        "org.example.Sandbox",
+        adapter.metadata(peer).?.sandbox_engine.?,
+    );
+    try std.testing.expect(!adapter.sandboxed(.{ .slot = 2, .generation = 8 }));
+    adapter.disconnected(peer);
+    try std.testing.expect(!adapter.sandboxed(peer));
 }

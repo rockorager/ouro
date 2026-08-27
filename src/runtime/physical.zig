@@ -50,6 +50,7 @@ const protocol_color_management = @import("../protocol/color_management.zig");
 const protocol_color_representation = @import("../protocol/color_representation.zig");
 const protocol_alpha_modifier = @import("../protocol/alpha_modifier.zig");
 const protocol_pointer_warp = @import("../protocol/pointer_warp.zig");
+const protocol_security_context = @import("../protocol/security_context.zig");
 const protocol_output = @import("../protocol/output.zig");
 const protocol_xdg_output = @import("../protocol/xdg_output.zig");
 const protocol_layer_shell = @import("../protocol/layer_shell.zig");
@@ -100,6 +101,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const ColorRepresentationAdapter = protocol_color_representation.Adapter(protocol, Adapter);
         const AlphaModifierAdapter = protocol_alpha_modifier.Adapter(protocol, Adapter);
         const PointerWarpAdapter = protocol_pointer_warp.Adapter(protocol, Adapter);
+        const SecurityContextAdapter = protocol_security_context.Adapter(protocol);
         const OutputAdapter = protocol_output.Adapter(protocol);
         const XdgOutputAdapter = protocol_xdg_output.Adapter(protocol, OutputAdapter);
         const LayerShellAdapter = protocol_layer_shell.Adapter(protocol, Adapter, OutputAdapter);
@@ -299,6 +301,7 @@ pub fn Coordinator(comptime protocol: type) type {
             color_representation: protocol_color_representation.Config = .{},
             alpha_modifier: protocol_alpha_modifier.Config = .{},
             pointer_warp: protocol_pointer_warp.Config = .{},
+            security_context: protocol_security_context.Config = .{},
             enable_color_protocols: bool = false,
             protocol_output: protocol_output.Config = .{},
             xdg_output: protocol_xdg_output.Config = .{},
@@ -393,6 +396,7 @@ pub fn Coordinator(comptime protocol: type) type {
         color_representation_adapter: ColorRepresentationAdapter,
         alpha_modifier_adapter: AlphaModifierAdapter,
         pointer_warp_adapter: PointerWarpAdapter,
+        security_context_adapter: SecurityContextAdapter,
         output_adapter: OutputAdapter,
         xdg_output_adapter: XdgOutputAdapter,
         layer_shell_adapter: LayerShellAdapter,
@@ -774,6 +778,13 @@ pub fn Coordinator(comptime protocol: type) type {
                 config.pointer_warp,
             );
             errdefer self.pointer_warp_adapter.deinit();
+            self.security_context_adapter = try SecurityContextAdapter.init(
+                allocator,
+                .{ .context = self, .commitFn = commitSecurityContext },
+                config.security_context,
+            );
+            errdefer self.security_context_adapter.deinit();
+            root.runtime.global_filter = .{ .context = self, .visible = globalVisible };
             self.data_device_adapter.setSerialValidator(.{
                 .context = self,
                 .validate = validateSelection,
@@ -891,6 +902,9 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = try self.pointer_warp_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
+            _ = try self.security_context_adapter.install(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
             _ = try self.adapter.installPresentation();
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
@@ -979,6 +993,8 @@ pub fn Coordinator(comptime protocol: type) type {
             if (!self.stopping) {
                 self.stopping = true;
                 if (self.loop) |value| try value.requestShutdown();
+                for (self.security_context_adapter.committedListeners()) |listener|
+                    listener.closing = true;
             }
             if (self.icc_poll) |token| if (!self.icc_poll_canceling) {
                 const cancel = try self.router.acquire(.icc_worker);
@@ -989,6 +1005,7 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.syncDesktopTimer();
             try self.syncIdleTimer();
             try self.syncCommitTimer();
+            try self.prepareSecurityClosures();
             try self.pauseOutput();
             try self.advanceDrain();
         }
@@ -997,7 +1014,8 @@ pub fn Coordinator(comptime protocol: type) type {
             return self.stopping and self.output == null and
                 (self.input == null or self.input.?.drainComplete()) and
                 self.session.drainComplete() and self.timers.idle() and
-                self.icc_poll == null and !self.icc_poll_canceling;
+                self.icc_poll == null and !self.icc_poll_canceling and
+                self.security_context_adapter.drainComplete();
         }
 
         /// Requires completed Wayring and backend drains. Teardown order is
@@ -1045,6 +1063,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.fractional_scale_adapter.deinit();
             self.alpha_modifier_adapter.deinit();
             self.pointer_warp_adapter.deinit();
+            self.security_context_adapter.deinit();
             self.color_representation_adapter.deinit();
             self.color_management_adapter.deinit();
             self.decoration_adapter.deinit();
@@ -1117,6 +1136,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.primary_selection_adapter.disconnected(peer);
             self.alpha_modifier_adapter.disconnected(peer);
             self.pointer_warp_adapter.disconnected(peer);
+            self.security_context_adapter.disconnected(peer);
             for (self.clients.items) |*client| if (client.active and samePeer(client.peer, peer)) {
                 client.* = .{};
                 self.client_count -= 1;
@@ -1233,6 +1253,8 @@ pub fn Coordinator(comptime protocol: type) type {
             if (try self.alpha_modifier_adapter.request(peer, target, message, fds)) |control|
                 return control;
             if (try self.pointer_warp_adapter.request(peer, target, message, fds)) |control|
+                return control;
+            if (try self.security_context_adapter.request(peer, target, message, fds)) |control|
                 return control;
             if (try self.shell_adapter.request(peer, target, message, fds)) |control| {
                 try self.advanceShell();
@@ -1383,6 +1405,8 @@ pub fn Coordinator(comptime protocol: type) type {
         ) !void {
             for (ouro_outcomes) |outcome| switch (outcome.token.kind) {
                 .icc_worker => try self.completeIcc(outcome),
+                .security_accept, .security_close, .security_cancel =>
+                    try self.completeSecurity(outcome),
                 .copy => {
                     try self.adapter.completeShmCopy(outcome);
                     try self.applyReady();
@@ -1423,6 +1447,7 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             try self.processSession();
             try self.processOutput();
+            try self.prepareSecurityClosures();
             try self.armTimer();
             try self.advanceDrain();
         }
@@ -1454,9 +1479,134 @@ pub fn Coordinator(comptime protocol: type) type {
             self.icc_poll_canceling = false;
         }
 
+        fn completeSecurity(self: *Self, outcome: loop_api.OuroCompletion) !void {
+            const listener = self.security_context_adapter.listenerForToken(outcome.token) orelse
+                return error.UnknownToken;
+            switch (outcome.token.kind) {
+                .security_accept => {
+                    if (listener.accept_token == null or
+                        !std.meta.eql(listener.accept_token.?, outcome.token))
+                        return error.UnknownToken;
+                    if (outcome.cqe.res < 0) {
+                        try self.router.retire(outcome.token);
+                        listener.accept_token = null;
+                        if (!listener.closing or outcome.cqe.err() != .CANCELED)
+                            return error.SecurityAcceptFailed;
+                    } else {
+                        const more = outcome.cqe.flags & linux.IORING_CQE_F_MORE != 0;
+                        if (!more) {
+                            try self.router.retire(outcome.token);
+                            listener.accept_token = null;
+                        }
+                        const fd: linux.fd_t = @intCast(outcome.cqe.res);
+                        if (listener.closing or !self.security_context_adapter.canAdmit()) {
+                            _ = linux.close(fd);
+                        } else if (self.root.runtime.clients.admit(
+                            .{ .fd = fd, .more = more },
+                            self.root.runtime.actor_config,
+                            self,
+                        )) |peer| {
+                            self.security_context_adapter.admit(peer, listener) catch unreachable;
+                            self.connected(peer);
+                        } else |_| {}
+                        if (!more and !listener.closing) try self.armSecurityAccept(listener);
+                    }
+                },
+                .security_close => {
+                    if (listener.close_token == null or
+                        !std.meta.eql(listener.close_token.?, outcome.token))
+                        return error.UnknownToken;
+                    try self.router.retire(outcome.token);
+                    listener.close_token = null;
+                    if (outcome.cqe.res < 0 and
+                        (!listener.closing or outcome.cqe.err() != .CANCELED))
+                        return error.SecurityClosePollFailed;
+                    listener.closing = true;
+                },
+                .security_cancel => {
+                    if (listener.accept_cancel_token != null and
+                        std.meta.eql(listener.accept_cancel_token.?, outcome.token))
+                    {
+                        listener.accept_cancel_token = null;
+                    } else if (listener.close_cancel_token != null and
+                        std.meta.eql(listener.close_cancel_token.?, outcome.token))
+                    {
+                        listener.close_cancel_token = null;
+                    } else return error.UnknownToken;
+                    try self.router.retire(outcome.token);
+                    if (outcome.cqe.res < 0 and outcome.cqe.err() != .NOENT and
+                        outcome.cqe.err() != .ALREADY)
+                        return error.SecurityCancelFailed;
+                },
+                else => unreachable,
+            }
+            self.finishSecurityClose(listener);
+        }
+
+        fn armSecurityAccept(self: *Self, listener: *protocol_security_context.Listener) !void {
+            std.debug.assert(listener.accept_token == null);
+            const token = try self.router.acquire(.security_accept);
+            errdefer self.router.retire(token) catch unreachable;
+            _ = try self.root.ring.accept_multishot(
+                token.encode(),
+                listener.listen_fd,
+                null,
+                null,
+                linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK,
+            );
+            listener.accept_token = token;
+        }
+
+        fn prepareSecurityClosures(self: *Self) !void {
+            for (self.security_context_adapter.committedListeners()) |listener| {
+                if (!listener.closing) continue;
+                if (listener.accept_token != null and listener.accept_cancel_token == null) {
+                    const cancel = try self.router.acquire(.security_cancel);
+                    _ = self.root.ring.cancel(
+                        cancel.encode(),
+                        listener.accept_token.?.encode(),
+                        0,
+                    ) catch |err| {
+                        self.router.retire(cancel) catch unreachable;
+                        if (err == error.SubmissionQueueFull) return;
+                        return err;
+                    };
+                    listener.accept_cancel_token = cancel;
+                }
+                if (listener.close_token != null and listener.close_cancel_token == null) {
+                    const cancel = try self.router.acquire(.security_cancel);
+                    _ = self.root.ring.poll_remove(
+                        listener.close_token.?.encode(),
+                        cancel.encode(),
+                    ) catch |err| {
+                        self.router.retire(cancel) catch unreachable;
+                        if (err == error.SubmissionQueueFull) return;
+                        return err;
+                    };
+                    listener.close_cancel_token = cancel;
+                }
+                self.finishSecurityClose(listener);
+            }
+        }
+
+        fn finishSecurityClose(_: *Self, listener: *protocol_security_context.Listener) void {
+            if (!listener.closing or listener.accept_token != null or
+                listener.close_token != null or listener.accept_cancel_token != null or
+                listener.close_cancel_token != null) return;
+            if (listener.listen_fd >= 0) {
+                _ = linux.close(listener.listen_fd);
+                listener.listen_fd = -1;
+            }
+            if (listener.close_fd >= 0) {
+                _ = linux.close(listener.close_fd);
+                listener.close_fd = -1;
+            }
+        }
+
         /// End-of-turn backend phase. This consumes at most one fixed input
         /// batch and may prepare (but never submit) its next readiness poll.
         pub fn prepare(self: *Self) !void {
+            try self.prepareSecurityClosures();
             try self.processSession();
             try self.processInput();
             try self.advanceShell();
@@ -2462,6 +2612,48 @@ pub fn Coordinator(comptime protocol: type) type {
             if (!self.interaction.warpPointer(target, global_x, global_y)) return;
             if (!self.seat_adapter.applyPointerWarp(surface, .{ .x = x, .y = y })) unreachable;
             self.requestCursorRedraw() catch {};
+        }
+
+        fn globalVisible(
+            context: ?*anyopaque,
+            visibility: wayring.server.GlobalVisibility,
+        ) bool {
+            const self: *Self = @ptrCast(@alignCast(context orelse return false));
+            if (!self.security_context_adapter.sandboxed(visibility.peer)) return true;
+            const name = visibility.interface.name;
+            return !std.mem.eql(u8, name, protocol.wp_security_context_manager_v1.info.name) and
+                !std.mem.eql(u8, name, "ext_data_control_manager_v1") and
+                !std.mem.eql(u8, name, "zwlr_data_control_manager_v1");
+        }
+
+        fn commitSecurityContext(
+            context: ?*anyopaque,
+            listener: *protocol_security_context.Listener,
+        ) !void {
+            const self: *Self = @ptrCast(@alignCast(context orelse return error.InvalidContext));
+            if (self.stopping or listener.closing or listener.accept_token != null or
+                listener.close_token != null)
+                return error.InvalidListener;
+            if (self.root.ring.sq.sqes.len - self.root.ring.sq_ready() < 2)
+                return error.SubmissionQueueFull;
+            const accept_token = try self.router.acquire(.security_accept);
+            errdefer self.router.retire(accept_token) catch unreachable;
+            const close_token = try self.router.acquire(.security_close);
+            errdefer self.router.retire(close_token) catch unreachable;
+            _ = try self.root.ring.accept_multishot(
+                accept_token.encode(),
+                listener.listen_fd,
+                null,
+                null,
+                linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK,
+            );
+            _ = try self.root.ring.poll_add(
+                close_token.encode(),
+                listener.close_fd,
+                linux.POLL.IN | linux.POLL.ERR | linux.POLL.HUP | linux.POLL.NVAL,
+            );
+            listener.accept_token = accept_token;
+            listener.close_token = close_token;
         }
 
         fn validateTextInputSeat(
@@ -4566,6 +4758,7 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.color_representation_adapter.resourceRemoved(handle, object);
             _ = self.alpha_modifier_adapter.resourceRemoved(handle, object);
             _ = self.pointer_warp_adapter.resourceRemoved(handle, object);
+            _ = self.security_context_adapter.resourceRemoved(handle, object);
             const layer_shell_removed = self.layer_shell_adapter.resourceRemoved(handle, object);
             const session_lock_removed = self.session_lock_adapter.resourceRemoved(handle, object);
             _ = self.xdg_output_adapter.resourceRemoved(handle, object);

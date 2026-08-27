@@ -16,6 +16,9 @@ pub const Kind = enum(u8) {
     copy = 0x84,
     shutdown = 0x85,
     icc_worker = 0x86,
+    security_accept = 0x87,
+    security_close = 0x88,
+    security_cancel = 0x89,
 };
 
 pub const DecodeError = error{
