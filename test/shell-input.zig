@@ -466,6 +466,137 @@ test "shell-input: idle notifications track activity and visible inhibitors" {
 
 const two_toplevel_cycle_count = 42;
 
+test "shell-input: tablet global delivers normalized device and tool metadata" {
+    const allocator = std.testing.allocator;
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-tablet-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+
+    var fixture = try physical_fixture.Fixture.init();
+    defer fixture.deinit();
+    var input = try FakeInput.init();
+    defer input.deinit();
+    var root_config = physical_fixture.compositorConfig();
+    root_config.runtime.object_capacity = 32;
+    root_config.runtime.object_quota = 32;
+    root_config.runtime.buckets_per_client = 32;
+    const root = try Compositor.create(
+        allocator,
+        try wayring.unix_socket.listen(path, 1),
+        root_config,
+    );
+    var platforms = fixture.platforms();
+    platforms.input = input.platform();
+    var config = physical_fixture.coordinatorConfig();
+    config.input.device_capacity = 1;
+    config.input.event_capacity = 2;
+    config.tablet_input.device_capacity = 1;
+    config.tablet_input.tool_capacity = 1;
+    config.tablet_input.event_capacity = 8;
+    config.tablet_v2.manager_capacity = 1;
+    config.tablet_v2.tablet_seat_capacity = 1;
+    config.tablet_v2.tablet_capacity = 1;
+    config.tablet_v2.tool_capacity = 1;
+    config.tablet_v2.outbound_capacity = 8;
+    const coordinator = try Coordinator.create(allocator, root, platforms, config);
+    var loop = try Loop.init(
+        allocator,
+        root,
+        &coordinator.router,
+        &coordinator.timers,
+        coordinator,
+        .{ .completion_batch = 16 },
+    );
+    try coordinator.start(&loop);
+
+    var client_reactor: wayring.io_uring.Reactor = undefined;
+    try client_reactor.initOwned(
+        allocator,
+        .{ .entries = 16, .flags = 0 },
+        physical_fixture.clientReactorConfig(),
+    );
+    var client = try ClientConnection.attach(
+        allocator,
+        &client_reactor,
+        try wayring.unix_socket.connect(path),
+        .{ .received_fd_budget = 2, .transmit_byte_budget = 4096, .transmit_fd_budget = 2 },
+        .{ .max_objects = 32, .max_client_ids = 31 },
+    );
+    const actor = try client.actor();
+    var driver = ClientDriver.init(&client);
+    const registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null);
+    var handler: TabletHandler = .{
+        .objects = &client.objects,
+        .queue = &actor.transmit,
+        .registry = registry,
+    };
+    try submitTabletClient(&client_reactor, &driver, &handler);
+
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    var published = false;
+    var client_progress: ClientDriver.Progress = .{};
+    for (0..512) |_| {
+        client_progress = try drainTabletClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (!published and handler.tablet_seat != null and coordinator.input != null) {
+            try input.publish(&.{
+                .{ .device_added = .{
+                    .device = 42,
+                    .info = .{
+                        .capabilities = .{ .tablet_tool = true },
+                        .vendor = 0x1234,
+                        .product = 0x5678,
+                    },
+                } },
+                .{ .tablet_tool_proximity = .{
+                    .device = 42,
+                    .tool = .{
+                        .reference = 99,
+                        .kind = .pen,
+                        .serial = 7,
+                        .hardware_id = 8,
+                        .capabilities = .{ .pressure = true },
+                    },
+                    .time_usec = 1_000,
+                    .entered = true,
+                    .axes = .{ .x = 0.5, .y = 0.5, .pressure = 0.25 },
+                } },
+            });
+            published = true;
+        }
+        if (handler.tablet_done == 1 and handler.tool_done == 1) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(published);
+    try std.testing.expectEqual(@as(usize, 1), handler.tablet_added);
+    try std.testing.expectEqual(@as(usize, 1), handler.tool_added);
+    try std.testing.expectEqual(@as(usize, 1), handler.tablet_done);
+    try std.testing.expectEqual(@as(usize, 1), handler.tool_done);
+    try std.testing.expectEqual(@as(usize, 2), coordinator.stats.input_events);
+    try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+
+    coordinator.disconnected(coordinator.peer.?);
+    _ = try client.prepareClose();
+    try submitTabletClient(&client_reactor, &driver, &handler);
+    var drained = false;
+    for (0..256) |_| {
+        client_progress = try drainTabletClient(&client_reactor, &driver, &handler);
+        const progress = try loop.turn(coordinator);
+        drained = progress.wayring.shutdown_complete and client_progress.quiescent and
+            coordinator.backendDrainComplete();
+        if (drained) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(drained);
+    try client.deinit(allocator);
+    client_reactor.deinit(allocator);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
 test "shell-input: two mapped toplevels sustain independent commit cycles" {
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;
@@ -1231,6 +1362,123 @@ const FakeInput = struct {
     }
     fn suspendContext(_: *anyopaque, _: *anyopaque) !void {}
     fn resumeContext(_: *anyopaque, _: *anyopaque) !void {}
+};
+
+const TabletHandler = struct {
+    objects: *wayring.objects.ClientObjects,
+    queue: *wayring.tx.Queue,
+    registry: wayring.objects.Handle,
+    seat: ?wayring.objects.Handle = null,
+    manager: ?wayring.objects.Handle = null,
+    tablet_seat: ?wayring.objects.Handle = null,
+    tablet: ?wayring.objects.Handle = null,
+    tool: ?wayring.objects.Handle = null,
+    tablet_added: usize = 0,
+    tool_added: usize = 0,
+    tablet_done: usize = 0,
+    tool_done: usize = 0,
+    event_failures: usize = 0,
+
+    pub fn eventError(
+        self: *TabletHandler,
+        _: wayring.io_uring.Peer,
+        _: ClientCore.EventFailure,
+    ) void {
+        self.event_failures += 1;
+    }
+
+    pub fn event(
+        self: *TabletHandler,
+        target: wayring.objects.Dispatch,
+        message: wayring.wire.Message,
+        fds: *wayring.ancillary.FdQueue,
+    ) !wayring.dispatch.Control {
+        if (target.object.interface == &ClientCore.Registry.info) {
+            switch (try ClientCore.decodeRegistryEvent(self.objects, self.registry, message, fds)) {
+                .global => |value| {
+                    if (std.mem.eql(u8, value.interface, protocol.wl_seat.info.name))
+                        self.seat = try ClientCore.bind(
+                            self.objects,
+                            self.queue,
+                            self.registry,
+                            value.name,
+                            &protocol.wl_seat.info,
+                            @min(value.version, 9),
+                            null,
+                        );
+                    if (std.mem.eql(u8, value.interface, protocol.zwp_tablet_manager_v2.info.name))
+                        self.manager = try ClientCore.bind(
+                            self.objects,
+                            self.queue,
+                            self.registry,
+                            value.name,
+                            &protocol.zwp_tablet_manager_v2.info,
+                            @min(value.version, 2),
+                            null,
+                        );
+                    try self.maybeCreateSeat();
+                },
+                .global_remove => {},
+            }
+        } else if (target.object.interface == &protocol.wl_seat.info) {
+            _ = try protocol.wl_seat.decodeEvent(message, fds);
+        } else if (target.object.interface == &protocol.zwp_tablet_seat_v2.info) {
+            switch (try protocol.zwp_tablet_seat_v2.decodeEvent(message, fds)) {
+                .tablet_added => |value| {
+                    self.tablet = (try protocol.zwp_tablet_seat_v2.admit_event_tablet_added(
+                        self.objects,
+                        self.tablet_seat.?,
+                        value,
+                        .{},
+                    )).id;
+                    self.tablet_added += 1;
+                },
+                .tool_added => |value| {
+                    self.tool = (try protocol.zwp_tablet_seat_v2.admit_event_tool_added(
+                        self.objects,
+                        self.tablet_seat.?,
+                        value,
+                        .{},
+                    )).id;
+                    self.tool_added += 1;
+                },
+                .pad_added => |value| {
+                    _ = try protocol.zwp_tablet_seat_v2.admit_event_pad_added(
+                        self.objects,
+                        self.tablet_seat.?,
+                        value,
+                        .{},
+                    );
+                },
+            }
+        } else if (target.object.interface == &protocol.zwp_tablet_v2.info) {
+            switch (try protocol.zwp_tablet_v2.decodeEvent(message, fds)) {
+                .done => self.tablet_done += 1,
+                else => {},
+            }
+        } else if (target.object.interface == &protocol.zwp_tablet_tool_v2.info) {
+            switch (try protocol.zwp_tablet_tool_v2.decodeEvent(message, fds)) {
+                .done => self.tool_done += 1,
+                else => {},
+            }
+        } else if (target.object.interface == &ClientCore.Display.info) {
+            switch (try ClientCore.decodeDisplayEvent(self.objects, message, fds)) {
+                .delete_id => {},
+                .@"error" => return error.ServerProtocolError,
+            }
+        } else return error.UnexpectedEvent;
+        return .continue_dispatch;
+    }
+
+    fn maybeCreateSeat(self: *TabletHandler) !void {
+        if (self.tablet_seat != null or self.seat == null or self.manager == null) return;
+        self.tablet_seat = (try protocol.zwp_tablet_manager_v2.construct_get_tablet_seat(
+            self.objects,
+            self.queue,
+            self.manager.?,
+            .{ .seat = self.seat.?.id },
+        )).tablet_seat;
+    }
 };
 
 const MultiHandler = struct {
@@ -2304,6 +2552,38 @@ fn submitLayerPopupClient(
     reactor: *wayring.io_uring.Reactor,
     driver: *ClientDriver,
     handler: *LayerPopupHandler,
+) !void {
+    _ = try driver.schedule();
+    _ = try driver.prepare(handler);
+    _ = try reactor.ring.submit();
+}
+
+fn drainTabletClient(
+    reactor: *wayring.io_uring.Reactor,
+    driver: *ClientDriver,
+    handler: *TabletHandler,
+) !ClientDriver.Progress {
+    var completions: [16]linux.io_uring_cqe = undefined;
+    const count = if (reactor.ring.cq_ready() == 0)
+        0
+    else
+        try reactor.ring.copy_cqes(&completions, 0);
+    var progress = try driver.dispatch(completions[0..count], handler);
+    if (handler.queue.queuedBytes() != 0) {
+        _ = try driver.schedule();
+        const prepared = try driver.prepare(handler);
+        progress.prepared += prepared.prepared;
+        progress.pending = prepared.pending;
+        progress.quiescent = prepared.quiescent;
+    }
+    if (progress.prepared != 0 or progress.pending) _ = try reactor.ring.submit();
+    return progress;
+}
+
+fn submitTabletClient(
+    reactor: *wayring.io_uring.Reactor,
+    driver: *ClientDriver,
+    handler: *TabletHandler,
 ) !void {
     _ = try driver.schedule();
     _ = try driver.prepare(handler);
