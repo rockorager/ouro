@@ -59,6 +59,10 @@ responsibilities:
   objects retain one-shot barrier and wait state on exact commits, block only
   desynchronized content updates, and release barriers after the next physical
   latching attempt.
+- [Commit timing](src/protocol/core_surface.zig): `wp_commit_timing_v1`
+  timestamps are retained on the exact following commit and gate the complete
+  reachable surface-update graph. One shared monotonic timer wakes the earliest
+  blocked commit without allowing later untimed commits to bypass it.
 - [Fractional scale](src/protocol/fractional_scale.zig): bounded per-surface
   `wp_fractional_scale_v1` objects publish Ouro's preferred render scale and
   pair with viewporter destination sizing.

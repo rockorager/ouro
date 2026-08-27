@@ -417,6 +417,9 @@ pub fn Coordinator(comptime protocol: type) type {
         idle_timer: ?timer.Handle = null,
         idle_timer_canceling: bool = false,
         idle_timer_deadline_ns: ?u64 = null,
+        commit_timer: ?timer.Handle = null,
+        commit_timer_canceling: bool = false,
+        commit_timer_deadline: ?surface_state.CommitTimestamp = null,
         cursor_layer: Layer,
         output_drain_started: bool = false,
         stopping: bool = false,
@@ -488,7 +491,7 @@ pub fn Coordinator(comptime protocol: type) type {
             errdefer allocator.free(self.subsurface_scene_order);
             self.pending_surface_head = 0;
             self.pending_surface_len = 0;
-            if (config.timer_capacity < 4 or config.desktop_transaction_timeout_ns == 0 or
+            if (config.timer_capacity < 5 or config.desktop_transaction_timeout_ns == 0 or
                 config.output.max_samples < 2 or config.output.max_source_bytes == 0 or
                 config.protocol_output.association_capacity == 0)
                 return error.InvalidConfig;
@@ -552,6 +555,9 @@ pub fn Coordinator(comptime protocol: type) type {
             self.idle_timer = null;
             self.idle_timer_canceling = false;
             self.idle_timer_deadline_ns = null;
+            self.commit_timer = null;
+            self.commit_timer_canceling = false;
+            self.commit_timer_deadline = null;
             self.cursor_layer = .{};
             const cursor_path_requirement = std.math.add(
                 usize,
@@ -813,6 +819,9 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = try self.adapter.installFifo();
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
+            _ = try self.adapter.installCommitTiming();
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
             _ = try self.fractional_scale_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
@@ -918,6 +927,7 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             try self.syncDesktopTimer();
             try self.syncIdleTimer();
+            try self.syncCommitTimer();
             try self.pauseOutput();
             try self.advanceDrain();
         }
@@ -1300,6 +1310,10 @@ pub fn Coordinator(comptime protocol: type) type {
             for (timer_outcomes) |outcome| {
                 if (self.idle_timer) |handle| if (std.meta.eql(handle, outcome.handle)) {
                     try self.idleTimerEvent(outcome.event);
+                    continue;
+                };
+                if (self.commit_timer) |handle| if (std.meta.eql(handle, outcome.handle)) {
+                    try self.commitTimerEvent(outcome.event);
                     continue;
                 };
                 if (self.desktop_timer) |handle| if (std.meta.eql(handle, outcome.handle)) {
@@ -1973,6 +1987,41 @@ pub fn Coordinator(comptime protocol: type) type {
                 error.Exhausted => self.markProtocolAll(ProtocolReady.idle_notify),
                 else => return err,
             };
+        }
+
+        fn syncCommitTimer(self: *Self) !void {
+            const deadline = if (self.stopping)
+                null
+            else
+                try self.adapter.nextCommitDeadline(try monotonicNs());
+            if (self.commit_timer) |handle| {
+                if (!self.commit_timer_canceling and
+                    !std.meta.eql(self.commit_timer_deadline, deadline))
+                {
+                    try self.timers.cancel(&self.router, &self.root.ring, handle);
+                    self.commit_timer_canceling = true;
+                }
+                return;
+            }
+            const value = deadline orelse return;
+            if (value.sec > std.math.maxInt(i64)) return;
+            self.commit_timer = try self.timers.arm(
+                &self.router,
+                &self.root.ring,
+                .{ .sec = @intCast(value.sec), .nsec = value.nsec },
+            );
+            self.commit_timer_deadline = value;
+            self.commit_timer_canceling = false;
+        }
+
+        fn commitTimerEvent(self: *Self, event: timer.Event) !void {
+            if (event == .pending_cleanup or event == .cleanup_complete) return;
+            const was_canceling = self.commit_timer_canceling;
+            self.commit_timer = null;
+            self.commit_timer_deadline = null;
+            self.commit_timer_canceling = false;
+            if (event == .fired and !was_canceling) try self.applyReady();
+            try self.syncCommitTimer();
         }
 
         fn desktopTimerEvent(self: *Self, event: timer.Event) !void {
@@ -2715,7 +2764,10 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn applyReady(self: *Self) !void {
-            if (self.output) |output| if (output.in_flight_frame != null) return;
+            if (self.output) |output| if (output.in_flight_frame != null) {
+                try self.syncCommitTimer();
+                return;
+            };
             var remaining: usize = 0;
             for (0..self.pending_surface_len) |offset| {
                 const index = (self.pending_surface_head + offset) % self.pending_surfaces.len;
@@ -2735,6 +2787,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 try output.request(.damage, try monotonicNs());
                 try self.armTimer();
             };
+            try self.syncCommitTimer();
         }
 
         fn applyPendingSurface(self: *Self, pending: PendingSurface) !bool {
@@ -3066,9 +3119,11 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn admitReadyBatch(self: *Self, trigger: wayring.objects.Handle) !bool {
-            const ready = self.adapter.readyUpdateSurfaces(
+            const now = try monotonicNs();
+            const ready = self.adapter.readyUpdateSurfacesAt(
                 trigger,
                 self.ready_update_surfaces,
+                now,
             ) catch |err| switch (err) {
                 error.StaleSurface => return false,
                 else => return err,
@@ -3094,7 +3149,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 superseded_count += @intFromBool(!is_last);
             }
             if (self.presentations.available() < superseded_count) return false;
-            const applied = try self.adapter.tryApply(trigger, self.applied_updates);
+            const applied = try self.adapter.tryApplyAt(trigger, self.applied_updates, now);
             std.debug.assert(applied.len == ready.len);
             for (applied, 0..) |*update, index| {
                 const id = try self.adapter.surfaceId(update.surface);
@@ -4281,6 +4336,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     self.abandonLayer(&self.cursor_layer);
             }
             _ = self.adapter.resourceRemoved(handle, object);
+            self.syncCommitTimer() catch {};
             if (self.surface) |surface| {
                 if (std.meta.eql(surface, handle)) {
                     self.surface = self.adapter.firstSurface();

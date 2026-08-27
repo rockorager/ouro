@@ -73,6 +73,13 @@ The other compositors provide narrower lessons:
 9. **Correctness works without effects.** Disabling every animation and effect
    leaves the same protocol, layout, focus, and lifetime behavior.
 
+Commit-timing constraints use the same `CLOCK_MONOTONIC` domain advertised by
+presentation-time. They are one-shot fields of exact surface updates, so DAG
+inspection gates synchronized child updates together with their parent and
+queue predecessor edges preserve commit order. The physical coordinator scans
+only reachable queue heads and owns one earliest-deadline timer for all clients
+and surfaces.
+
 ## System boundaries
 
 ```text

@@ -71,7 +71,7 @@ pub fn main(init: std.process.Init) !void {
         .input = ouro.input_platform.real,
     }, .{
         .router_capacity = 16,
-        .timer_capacity = 4,
+        .timer_capacity = 5,
         .device_capacity = 36,
         .input = .{
             .device_capacity = 16,
@@ -315,7 +315,7 @@ fn compositorConfig() Compositor.Config {
             .object_capacity = 128,
             .object_quota = 128,
             .buckets_per_client = 128,
-            .max_globals = 33,
+            .max_globals = 34,
             .registry_capacity = 4,
         },
     };

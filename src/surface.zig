@@ -200,6 +200,18 @@ pub const PresentationHint = enum {
     async,
 };
 
+pub const CommitTimestamp = struct {
+    sec: u64,
+    nsec: u32,
+
+    pub fn ready(timestamp: CommitTimestamp, now_ns: u64) bool {
+        const now_sec = now_ns / std.time.ns_per_s;
+        const now_nsec: u32 = @intCast(now_ns % std.time.ns_per_s);
+        return timestamp.sec < now_sec or
+            (timestamp.sec == now_sec and timestamp.nsec <= now_nsec);
+    }
+};
+
 pub const Attachment = struct {
     buffer: ?Buffer,
     offset: Point,
@@ -227,6 +239,7 @@ pub const Update = struct {
     presentation_hint: PresentationHint = .vsync,
     fifo_set: bool = false,
     fifo_wait: bool = false,
+    commit_timestamp: ?CommitTimestamp = null,
 };
 
 pub const Surface = struct {
@@ -257,6 +270,7 @@ pub const Surface = struct {
     pending_presentation_hint: PresentationHint = .vsync,
     pending_fifo_set: bool = false,
     pending_fifo_wait: bool = false,
+    pending_commit_timestamp: ?CommitTimestamp = null,
 
     /// Applies wl_surface.attach validation and replaces the pending buffer.
     pub fn attach(
@@ -324,6 +338,12 @@ pub const Surface = struct {
 
     pub fn waitFifoBarrier(surface: *Surface) void {
         surface.pending_fifo_wait = true;
+    }
+
+    pub fn setCommitTimestamp(surface: *Surface, timestamp: CommitTimestamp) !void {
+        if (timestamp.nsec >= std.time.ns_per_s) return error.InvalidTimestamp;
+        if (surface.pending_commit_timestamp != null) return error.TimestampExists;
+        surface.pending_commit_timestamp = timestamp;
     }
 
     pub fn hasPendingBufferAttachment(surface: Surface) bool {
@@ -416,6 +436,7 @@ pub const Surface = struct {
             .presentation_hint = surface.current_presentation_hint,
             .fifo_set = surface.pending_fifo_set,
             .fifo_wait = surface.pending_fifo_wait,
+            .commit_timestamp = surface.pending_commit_timestamp,
         };
         surface.pending_buffer = null;
         surface.pending_attach_offset = .{};
@@ -427,6 +448,7 @@ pub const Surface = struct {
         surface.pending_offset = .{};
         surface.pending_fifo_set = false;
         surface.pending_fifo_wait = false;
+        surface.pending_commit_timestamp = null;
         return update;
     }
 
@@ -1313,4 +1335,24 @@ test "surface rejects buffer dimensions not divisible by scale transactionally" 
     const update = try surface.commit();
     try std.testing.expectEqual(second, update.attachment.?.buffer.?);
     try std.testing.expectEqual(@as(i32, 4), surface.current_scale);
+}
+
+test "commit timestamps are validated, one-shot, and committed exactly" {
+    var surface: Surface = .{};
+    try std.testing.expectError(error.InvalidTimestamp, surface.setCommitTimestamp(.{
+        .sec = 1,
+        .nsec = std.time.ns_per_s,
+    }));
+    try surface.setCommitTimestamp(.{ .sec = 7, .nsec = 42 });
+    try std.testing.expectError(
+        error.TimestampExists,
+        surface.setCommitTimestamp(.{ .sec = 8, .nsec = 0 }),
+    );
+    const timed = try surface.commit();
+    try std.testing.expectEqual(
+        CommitTimestamp{ .sec = 7, .nsec = 42 },
+        timed.commit_timestamp.?,
+    );
+    try std.testing.expect(surface.pending_commit_timestamp == null);
+    try std.testing.expect((try surface.commit()).commit_timestamp == null);
 }

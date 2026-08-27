@@ -384,6 +384,17 @@ pub fn Scheduler(comptime Key: type, comptime Payload: type) type {
         /// graph. Blocked graphs return an empty slice. Capacity checking and
         /// constraint inspection happen before any queue or pool mutation.
         pub fn readyCount(scheduler: *Self, queue: *Queue) Error!usize {
+            return scheduler.readyCountWith(queue, null, alwaysReady);
+        }
+
+        /// Like `readyCount`, but also requires every reachable payload to
+        /// satisfy an owner-provided readiness condition.
+        pub fn readyCountWith(
+            scheduler: *Self,
+            queue: *Queue,
+            context: ?*const anyopaque,
+            ready_fn: *const fn (?*const anyopaque, *const Payload) bool,
+        ) Error!usize {
             if (queue.scheduler != scheduler) return error.InvalidDependency;
             if (queue.head == none or scheduler.nodes[queue.head].kind != .desync)
                 return 0;
@@ -395,6 +406,8 @@ pub fn Scheduler(comptime Key: type, comptime Payload: type) type {
                 inspect_epoch,
                 &required,
                 &blocked,
+                context,
+                ready_fn,
             );
             return if (blocked) 0 else required;
         }
@@ -407,7 +420,17 @@ pub fn Scheduler(comptime Key: type, comptime Payload: type) type {
             queue: *Queue,
             output: []Key,
         ) Error![]Key {
-            const required = try scheduler.readyCount(queue);
+            return scheduler.readySurfacesWith(queue, output, null, alwaysReady);
+        }
+
+        pub fn readySurfacesWith(
+            scheduler: *Self,
+            queue: *Queue,
+            output: []Key,
+            context: ?*const anyopaque,
+            ready_fn: *const fn (?*const anyopaque, *const Payload) bool,
+        ) Error![]Key {
+            const required = try scheduler.readyCountWith(queue, context, ready_fn);
             if (required == 0) return output[0..0];
             if (output.len < required) return error.OutputTooSmall;
             const collect_epoch = scheduler.nextEpoch();
@@ -427,6 +450,16 @@ pub fn Scheduler(comptime Key: type, comptime Payload: type) type {
             queue: *Queue,
             output: []Applied,
         ) Error![]Applied {
+            return scheduler.tryApplyWith(queue, output, null, alwaysReady);
+        }
+
+        pub fn tryApplyWith(
+            scheduler: *Self,
+            queue: *Queue,
+            output: []Applied,
+            context: ?*const anyopaque,
+            ready_fn: *const fn (?*const anyopaque, *const Payload) bool,
+        ) Error![]Applied {
             if (queue.scheduler != scheduler) return error.InvalidDependency;
             if (queue.head == none or scheduler.nodes[queue.head].kind != .desync)
                 return output[0..0];
@@ -434,12 +467,38 @@ pub fn Scheduler(comptime Key: type, comptime Payload: type) type {
             const inspect_epoch = scheduler.nextEpoch();
             var required: usize = 0;
             var blocked = false;
-            scheduler.inspect(candidate, inspect_epoch, &required, &blocked);
+            scheduler.inspect(
+                candidate,
+                inspect_epoch,
+                &required,
+                &blocked,
+                context,
+                ready_fn,
+            );
             if (blocked) return output[0..0];
             if (output.len < required) return error.OutputTooSmall;
             var used: usize = 0;
             scheduler.apply(candidate, output, &used);
             return output[0..used];
+        }
+
+        /// Visits the queue head and its complete dependency graph without
+        /// mutating scheduler ownership. Both synchronized and desynchronized
+        /// heads are accepted so owners can derive wake-up requirements.
+        pub fn visitReachable(
+            scheduler: *Self,
+            queue: *Queue,
+            context: ?*anyopaque,
+            visit_fn: *const fn (?*anyopaque, *const Payload) void,
+        ) Error!void {
+            if (queue.scheduler != scheduler) return error.InvalidDependency;
+            if (queue.head == none) return;
+            scheduler.visit(
+                scheduler.nodeToken(queue.head),
+                scheduler.nextEpoch(),
+                context,
+                visit_fn,
+            );
         }
 
         fn acquireNode(
@@ -553,16 +612,51 @@ pub fn Scheduler(comptime Key: type, comptime Payload: type) type {
             epoch: u32,
             count: *usize,
             blocked: *bool,
+            context: ?*const anyopaque,
+            ready_fn: *const fn (?*const anyopaque, *const Payload) bool,
         ) void {
             const index = scheduler.validateToken(token) catch return;
             const node = &scheduler.nodes[index];
             if (node.visit_epoch == epoch) return;
             node.visit_epoch = epoch;
             count.* += 1;
-            if (node.constraint_count != 0) blocked.* = true;
+            if (node.constraint_count != 0 or !ready_fn(context, &node.payload)) blocked.* = true;
             var edge_index = node.dependency_head;
             while (edge_index != none) : (edge_index = scheduler.edges[edge_index].next)
-                scheduler.inspect(scheduler.edges[edge_index].dependency, epoch, count, blocked);
+                scheduler.inspect(
+                    scheduler.edges[edge_index].dependency,
+                    epoch,
+                    count,
+                    blocked,
+                    context,
+                    ready_fn,
+                );
+        }
+
+        fn alwaysReady(_: ?*const anyopaque, _: *const Payload) bool {
+            return true;
+        }
+
+        fn visit(
+            scheduler: *Self,
+            token: Token,
+            epoch: u32,
+            context: ?*anyopaque,
+            visit_fn: *const fn (?*anyopaque, *const Payload) void,
+        ) void {
+            const index = scheduler.validateToken(token) catch return;
+            const node = &scheduler.nodes[index];
+            if (node.visit_epoch == epoch) return;
+            node.visit_epoch = epoch;
+            visit_fn(context, &node.payload);
+            var edge_index = node.dependency_head;
+            while (edge_index != none) : (edge_index = scheduler.edges[edge_index].next)
+                scheduler.visit(
+                    scheduler.edges[edge_index].dependency,
+                    epoch,
+                    context,
+                    visit_fn,
+                );
         }
 
         fn markReachable(scheduler: *Self, token: Token, epoch: u32) void {
@@ -655,6 +749,34 @@ test "content updates apply complete dependency graphs atomically" {
     try std.testing.expectEqual(@as(u32, 10), result[2].payload);
     try std.testing.expectEqual(@as(usize, 0), parent.count);
     try std.testing.expectEqual(@as(usize, 0), child.count);
+}
+
+test "owner readiness blocks every payload in a dependency graph" {
+    const Ready = struct {
+        fn check(context: ?*const anyopaque, payload: *const u32) bool {
+            const limit: *const u32 = @ptrCast(@alignCast(context.?));
+            return payload.* <= limit.*;
+        }
+    };
+    var scheduler = try TestScheduler.init(std.testing.allocator, 2, 2);
+    defer scheduler.deinit(std.testing.allocator);
+    var parent = TestScheduler.Queue.init(&scheduler, 1);
+    defer parent.deinit();
+    var child = TestScheduler.Queue.init(&scheduler, 2);
+    defer child.deinit();
+    const child_update = try scheduler.commit(&child, 20, .sync, &.{}, 0);
+    _ = try scheduler.commit(&parent, 10, .desync, &.{child_update}, 0);
+    var applied: [2]TestScheduler.Applied = undefined;
+    const blocked_limit: u32 = 15;
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        (try scheduler.tryApplyWith(&parent, &applied, &blocked_limit, Ready.check)).len,
+    );
+    const ready_limit: u32 = 20;
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        (try scheduler.tryApplyWith(&parent, &applied, &ready_limit, Ready.check)).len,
+    );
 }
 
 test "content updates detach an applied head from its queued successor" {

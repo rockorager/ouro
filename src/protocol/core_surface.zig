@@ -28,6 +28,7 @@ pub const Config = struct {
     content_type_capacity: usize = 8,
     tearing_control_capacity: usize = 8,
     fifo_capacity: usize = 8,
+    commit_timer_capacity: usize = 8,
     presentation_resource_capacity: usize = 4,
     presentation_feedback_capacity: usize = 64,
     region_operation_capacity: usize,
@@ -50,6 +51,7 @@ pub const Config = struct {
             config.content_type_capacity == 0 or config.content_type_capacity >= none or
             config.tearing_control_capacity == 0 or config.tearing_control_capacity >= none or
             config.fifo_capacity == 0 or config.fifo_capacity >= none or
+            config.commit_timer_capacity == 0 or config.commit_timer_capacity >= none or
             config.presentation_resource_capacity == 0 or
             config.presentation_resource_capacity >= none or
             config.presentation_feedback_capacity == 0 or
@@ -81,6 +83,8 @@ pub fn Adapter(comptime protocol: type) type {
         const TearingControl = protocol.wp_tearing_control_v1;
         const FifoManager = protocol.wp_fifo_manager_v1;
         const Fifo = protocol.wp_fifo_v1;
+        const CommitTimingManager = protocol.wp_commit_timing_manager_v1;
+        const CommitTimer = protocol.wp_commit_timer_v1;
         const WlBuffer = protocol.wl_buffer;
         const Presentation = protocol.wp_presentation;
         const PresentationFeedback = protocol.wp_presentation_feedback;
@@ -247,6 +251,13 @@ pub fn Adapter(comptime protocol: type) type {
             surface: ?SurfaceId = null,
         };
 
+        const CommitTimerSlot = struct {
+            active: bool = false,
+            next_free: u32 = none,
+            resource: objects.Handle = .{ .id = 0, .generation = 0 },
+            surface: ?SurfaceId = null,
+        };
+
         const PresentationResource = struct {
             active: bool = false,
             next_free: u32 = none,
@@ -266,6 +277,7 @@ pub fn Adapter(comptime protocol: type) type {
         content_type_global: ?objects.Handle = null,
         tearing_control_global: ?objects.Handle = null,
         fifo_global: ?objects.Handle = null,
+        commit_timing_global: ?objects.Handle = null,
         presentation_global: ?objects.Handle = null,
         compositor_version: u32,
         surfaces: []*SurfaceSlot,
@@ -275,6 +287,7 @@ pub fn Adapter(comptime protocol: type) type {
         content_types: []*ContentTypeSlot,
         tearing_controls: []*TearingControlSlot,
         fifos: []*FifoSlot,
+        commit_timers: []*CommitTimerSlot,
         presentation_resources: []*PresentationResource,
         surface_free: u32,
         region_free: u32,
@@ -283,6 +296,7 @@ pub fn Adapter(comptime protocol: type) type {
         content_type_free: u32,
         tearing_control_free: u32,
         fifo_free: u32,
+        commit_timer_free: u32,
         presentation_resource_free: u32,
         region_pool: surface_state.RegionPool,
         frame_pool: surface_state.FramePool,
@@ -341,6 +355,12 @@ pub fn Adapter(comptime protocol: type) type {
             errdefer freeSlots(TearingControlSlot, allocator, tearing_controls);
             const fifos = try allocSlots(FifoSlot, allocator, config.fifo_capacity);
             errdefer freeSlots(FifoSlot, allocator, fifos);
+            const commit_timers = try allocSlots(
+                CommitTimerSlot,
+                allocator,
+                config.commit_timer_capacity,
+            );
+            errdefer freeSlots(CommitTimerSlot, allocator, commit_timers);
             const presentation_resources = try allocSlots(
                 PresentationResource,
                 allocator,
@@ -411,6 +431,9 @@ pub fn Adapter(comptime protocol: type) type {
             for (fifos, 0..) |slot, index| slot.* = .{
                 .next_free = if (index + 1 < fifos.len) @intCast(index + 1) else none,
             };
+            for (commit_timers, 0..) |slot, index| slot.* = .{
+                .next_free = if (index + 1 < commit_timers.len) @intCast(index + 1) else none,
+            };
             for (presentation_resources, 0..) |slot, index| slot.* = .{
                 .next_free = if (index + 1 < presentation_resources.len) @intCast(index + 1) else none,
             };
@@ -430,6 +453,7 @@ pub fn Adapter(comptime protocol: type) type {
                 .content_types = content_types,
                 .tearing_controls = tearing_controls,
                 .fifos = fifos,
+                .commit_timers = commit_timers,
                 .presentation_resources = presentation_resources,
                 .surface_free = 0,
                 .region_free = 0,
@@ -438,6 +462,7 @@ pub fn Adapter(comptime protocol: type) type {
                 .content_type_free = 0,
                 .tearing_control_free = 0,
                 .fifo_free = 0,
+                .commit_timer_free = 0,
                 .presentation_resource_free = 0,
                 .region_pool = region_pool,
                 .frame_pool = frame_pool,
@@ -475,6 +500,9 @@ pub fn Adapter(comptime protocol: type) type {
             for (adapter.fifos, 0..) |slot, index| {
                 if (slot.active) adapter.releaseFifo(@intCast(index));
             }
+            for (adapter.commit_timers, 0..) |slot, index| {
+                if (slot.active) adapter.releaseCommitTimer(@intCast(index));
+            }
             for (adapter.presentation_resources, 0..) |slot, index| {
                 if (slot.active) adapter.releasePresentationResource(@intCast(index));
             }
@@ -495,6 +523,7 @@ pub fn Adapter(comptime protocol: type) type {
             freeSlots(ContentTypeSlot, adapter.allocator, adapter.content_types);
             freeSlots(TearingControlSlot, adapter.allocator, adapter.tearing_controls);
             freeSlots(FifoSlot, adapter.allocator, adapter.fifos);
+            freeSlots(CommitTimerSlot, adapter.allocator, adapter.commit_timers);
             freeSlots(PresentationResource, adapter.allocator, adapter.presentation_resources);
             adapter.allocator.free(adapter.copy_storage);
             adapter.allocator.free(adapter.copies);
@@ -598,6 +627,19 @@ pub fn Adapter(comptime protocol: type) type {
             return global;
         }
 
+        pub fn installCommitTiming(adapter: *Self) !objects.Handle {
+            const runtime = adapter.runtime orelse return error.NotInstalled;
+            if (adapter.commit_timing_global != null) return error.AlreadyInstalled;
+            const global = try runtime.addGlobalWithBinder(
+                &CommitTimingManager.info,
+                1,
+                adapter,
+                bind,
+            );
+            adapter.commit_timing_global = global;
+            return global;
+        }
+
         /// Driver-facing dispatch entry point. Null means another protocol
         /// owner should inspect the request.
         pub fn request(
@@ -676,6 +718,14 @@ pub fn Adapter(comptime protocol: type) type {
                 const slot = adapter.fifoFromObject(target.object) orelse return null;
                 return try adapter.fifoRequest(actor, server_objects, slot, message, fds);
             }
+            if (interface == &CommitTimingManager.info) {
+                if (target.object.context != @as(?*anyopaque, @ptrCast(adapter))) return null;
+                return try adapter.commitTimingManagerRequest(actor, server_objects, message, fds);
+            }
+            if (interface == &CommitTimer.info) {
+                const slot = adapter.commitTimerFromObject(target.object) orelse return null;
+                return try adapter.commitTimerRequest(actor, server_objects, slot, message, fds);
+            }
             if (interface == &Presentation.info) {
                 const resource = adapter.presentationResourceFromObject(target.object) orelse return null;
                 return try adapter.presentationRequest(actor, server_objects, resource, message, fds);
@@ -701,6 +751,7 @@ pub fn Adapter(comptime protocol: type) type {
                 adapter.detachContentTypes(surface_id);
                 adapter.detachTearingControls(surface_id);
                 adapter.detachFifos(surface_id);
+                adapter.detachCommitTimers(surface_id);
                 adapter.releaseSurface(adapter.surfaceIndex(slot));
                 return true;
             }
@@ -740,6 +791,12 @@ pub fn Adapter(comptime protocol: type) type {
                 adapter.releaseFifo(adapter.fifoIndex(slot));
                 return true;
             }
+            if (object.interface == &CommitTimer.info) {
+                const slot = adapter.commitTimerFromObject(&object) orelse return false;
+                if (!std.meta.eql(slot.resource, handle)) return false;
+                adapter.releaseCommitTimer(adapter.commitTimerIndex(slot));
+                return true;
+            }
             if (object.interface == &Presentation.info) {
                 const resource = adapter.presentationResourceFromObject(&object) orelse return false;
                 if (!std.meta.eql(resource.resource, handle)) return false;
@@ -751,7 +808,8 @@ pub fn Adapter(comptime protocol: type) type {
                 object.interface == &SinglePixelManager.info or
                 object.interface == &ContentTypeManager.info or
                 object.interface == &TearingControlManager.info or
-                object.interface == &FifoManager.info) and
+                object.interface == &FifoManager.info or
+                object.interface == &CommitTimingManager.info) and
                 object.context == @as(?*anyopaque, @ptrCast(adapter));
         }
 
@@ -1009,9 +1067,23 @@ pub fn Adapter(comptime protocol: type) type {
             handle: objects.Handle,
             output: []Applied,
         ) ![]Applied {
+            return adapter.tryApplyAt(handle, output, std.math.maxInt(u64));
+        }
+
+        pub fn tryApplyAt(
+            adapter: *Self,
+            handle: objects.Handle,
+            output: []Applied,
+            now_ns: u64,
+        ) ![]Applied {
             const slot = try adapter.resolveSurface(handle);
             if (try adapter.fifoBlocked(slot)) return output[0..0];
-            const applied = try adapter.scheduler.tryApply(&slot.updates, output);
+            const applied = try adapter.scheduler.tryApplyWith(
+                &slot.updates,
+                output,
+                &now_ns,
+                commitReady,
+            );
             for (applied) |update| if (update.payload.surface.fifo_set) {
                 const applied_surface = try adapter.resolveSurface(update.surface);
                 applied_surface.fifo_barrier = true;
@@ -1020,9 +1092,17 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         pub fn readyUpdateCount(adapter: *Self, handle: objects.Handle) !usize {
+            return adapter.readyUpdateCountAt(handle, std.math.maxInt(u64));
+        }
+
+        pub fn readyUpdateCountAt(
+            adapter: *Self,
+            handle: objects.Handle,
+            now_ns: u64,
+        ) !usize {
             const slot = try adapter.resolveSurface(handle);
             if (try adapter.fifoBlocked(slot)) return 0;
-            return adapter.scheduler.readyCount(&slot.updates);
+            return adapter.scheduler.readyCountWith(&slot.updates, &now_ns, commitReady);
         }
 
         pub fn readyUpdateSurfaces(
@@ -1030,9 +1110,38 @@ pub fn Adapter(comptime protocol: type) type {
             handle: objects.Handle,
             output: []objects.Handle,
         ) ![]objects.Handle {
+            return adapter.readyUpdateSurfacesAt(handle, output, std.math.maxInt(u64));
+        }
+
+        pub fn readyUpdateSurfacesAt(
+            adapter: *Self,
+            handle: objects.Handle,
+            output: []objects.Handle,
+            now_ns: u64,
+        ) ![]objects.Handle {
             const slot = try adapter.resolveSurface(handle);
             if (try adapter.fifoBlocked(slot)) return output[0..0];
-            return adapter.scheduler.readySurfaces(&slot.updates, output);
+            return adapter.scheduler.readySurfacesWith(
+                &slot.updates,
+                output,
+                &now_ns,
+                commitReady,
+            );
+        }
+
+        pub fn nextCommitDeadline(adapter: *Self, now_ns: u64) !?surface_state.CommitTimestamp {
+            var result: ?surface_state.CommitTimestamp = null;
+            const context = DeadlineSearch{ .now_ns = now_ns, .result = &result };
+            var mutable = context;
+            for (adapter.surfaces) |slot| {
+                if (!slot.active) continue;
+                try adapter.scheduler.visitReachable(
+                    &slot.updates,
+                    &mutable,
+                    collectCommitDeadline,
+                );
+            }
+            return result;
         }
 
         /// Clears every active single-output FIFO condition after one physical
@@ -1922,6 +2031,104 @@ pub fn Adapter(comptime protocol: type) type {
             return .continue_dispatch;
         }
 
+        fn commitTimingManagerRequest(
+            adapter: *Self,
+            actor: *wayring.connection.Actor,
+            server_objects: anytype,
+            message: wayring.wire.Message,
+            fds: *wayring.ancillary.FdQueue,
+        ) !wayring.dispatch.Control {
+            const decoded = try wayring.server.decodeRequest(
+                CommitTimingManager,
+                server_objects,
+                message,
+                fds,
+            );
+            switch (decoded.value) {
+                .destroy => {},
+                .get_timer => |value| {
+                    const surface_handle = server_objects.namespace.lookupHandle(value.surface) orelse
+                        return try adapter.commitTimingManagerError(actor, decoded.handle.id);
+                    const surface_object = server_objects.namespace.resolve(surface_handle) orelse
+                        return try adapter.commitTimingManagerError(actor, decoded.handle.id);
+                    const surface = adapter.surfaceIdObject(surface_handle, surface_object) catch
+                        return try adapter.commitTimingManagerError(actor, decoded.handle.id);
+                    for (adapter.commit_timers) |slot| if (slot.active and slot.surface != null and
+                        std.meta.eql(slot.surface.?, surface))
+                        return try adapter.commitTimingManagerError(actor, decoded.handle.id);
+                    const slot = adapter.acquireCommitTimer() catch return try adapter.noMemory(actor);
+                    const admitted = CommitTimingManager.admit_get_timer(
+                        server_objects,
+                        decoded.handle,
+                        value,
+                        .{ .id = slot },
+                    ) catch |cause| {
+                        adapter.releaseCommitTimer(adapter.commitTimerIndex(slot));
+                        return try adapter.failure(actor, decoded.handle.id, cause);
+                    };
+                    slot.resource = admitted.id;
+                    slot.surface = surface;
+                },
+            }
+            try decoded.finish(protocol, server_objects, &actor.transmit);
+            return .continue_dispatch;
+        }
+
+        fn commitTimerRequest(
+            adapter: *Self,
+            actor: *wayring.connection.Actor,
+            server_objects: anytype,
+            slot: *CommitTimerSlot,
+            message: wayring.wire.Message,
+            fds: *wayring.ancillary.FdQueue,
+        ) !wayring.dispatch.Control {
+            const decoded = try wayring.server.decodeRequest(
+                CommitTimer,
+                server_objects,
+                message,
+                fds,
+            );
+            switch (decoded.value) {
+                .destroy => {},
+                .set_timestamp => |value| {
+                    const surface = slot.surface orelse
+                        return try adapter.commitTimerError(
+                            actor,
+                            decoded.handle.id,
+                            CommitTimer.@"error".surface_destroyed.value,
+                            "commit timing surface was destroyed",
+                        );
+                    const target = adapter.surfaceForId(surface) catch {
+                        slot.surface = null;
+                        return try adapter.commitTimerError(
+                            actor,
+                            decoded.handle.id,
+                            CommitTimer.@"error".surface_destroyed.value,
+                            "commit timing surface was destroyed",
+                        );
+                    };
+                    if (value.tv_nsec >= std.time.ns_per_s)
+                        return try adapter.commitTimerError(
+                            actor,
+                            decoded.handle.id,
+                            CommitTimer.@"error".invalid_timestamp.value,
+                            "invalid commit timestamp",
+                        );
+                    target.state.setCommitTimestamp(.{
+                        .sec = (@as(u64, value.tv_sec_hi) << 32) | value.tv_sec_lo,
+                        .nsec = value.tv_nsec,
+                    }) catch return try adapter.commitTimerError(
+                        actor,
+                        decoded.handle.id,
+                        CommitTimer.@"error".timestamp_exists.value,
+                        "commit timestamp already exists",
+                    );
+                },
+            }
+            try decoded.finish(protocol, server_objects, &actor.transmit);
+            return .continue_dispatch;
+        }
+
         fn viewportRequest(
             adapter: *Self,
             actor: *wayring.connection.Actor,
@@ -2309,10 +2516,65 @@ pub fn Adapter(comptime protocol: type) type {
             }
         }
 
+        fn acquireCommitTimer(adapter: *Self) !*CommitTimerSlot {
+            if (adapter.commit_timer_free == none)
+                try adapter.growSlots(
+                    CommitTimerSlot,
+                    &adapter.commit_timers,
+                    &adapter.commit_timer_free,
+                );
+            const index = adapter.commit_timer_free;
+            const slot = adapter.commit_timers[index];
+            adapter.commit_timer_free = slot.next_free;
+            slot.* = .{ .active = true };
+            return slot;
+        }
+
+        fn releaseCommitTimer(adapter: *Self, index: u32) void {
+            const slot = adapter.commit_timers[index];
+            if (!slot.active) return;
+            slot.* = .{ .next_free = adapter.commit_timer_free };
+            adapter.commit_timer_free = index;
+        }
+
+        fn detachCommitTimers(adapter: *Self, surface: SurfaceId) void {
+            for (adapter.commit_timers) |slot| {
+                if (slot.active and slot.surface != null and
+                    std.meta.eql(slot.surface.?, surface)) slot.surface = null;
+            }
+        }
+
         fn fifoBlocked(adapter: *Self, slot: *SurfaceSlot) !bool {
             if (!slot.fifo_barrier) return false;
             const pending = (try adapter.scheduler.peek(&slot.updates)) orelse return false;
             return pending.kind == .desync and pending.payload.surface.fifo_wait;
+        }
+
+        const DeadlineSearch = struct {
+            now_ns: u64,
+            result: *?surface_state.CommitTimestamp,
+        };
+
+        fn commitReady(context: ?*const anyopaque, content: *const Content) bool {
+            const now_ns: *const u64 = @ptrCast(@alignCast(context.?));
+            if (now_ns.* == std.math.maxInt(u64)) return true;
+            const timestamp = content.surface.commit_timestamp orelse return true;
+            return timestamp.ready(now_ns.*);
+        }
+
+        fn collectCommitDeadline(context: ?*anyopaque, content: *const Content) void {
+            const search: *DeadlineSearch = @ptrCast(@alignCast(context.?));
+            const timestamp = content.surface.commit_timestamp orelse return;
+            if (timestamp.ready(search.now_ns)) return;
+            if (search.result.* == null or timestampLess(timestamp, search.result.*.?))
+                search.result.* = timestamp;
+        }
+
+        fn timestampLess(
+            lhs: surface_state.CommitTimestamp,
+            rhs: surface_state.CommitTimestamp,
+        ) bool {
+            return lhs.sec < rhs.sec or (lhs.sec == rhs.sec and lhs.nsec < rhs.nsec);
         }
 
         fn acquirePresentationResource(adapter: *Self) !*PresentationResource {
@@ -2481,6 +2743,13 @@ pub fn Adapter(comptime protocol: type) type {
             return bindingFromContext(FifoSlot, adapter.fifos, object.context);
         }
 
+        fn commitTimerFromObject(
+            adapter: *Self,
+            object: *const objects.Object,
+        ) ?*CommitTimerSlot {
+            return bindingFromContext(CommitTimerSlot, adapter.commit_timers, object.context);
+        }
+
         fn presentationResourceFromObject(
             adapter: *Self,
             object: *const objects.Object,
@@ -2514,6 +2783,10 @@ pub fn Adapter(comptime protocol: type) type {
 
         fn fifoIndex(adapter: *Self, slot: *FifoSlot) u32 {
             return slotIndex(FifoSlot, adapter.fifos, slot);
+        }
+
+        fn commitTimerIndex(adapter: *Self, slot: *CommitTimerSlot) u32 {
+            return slotIndex(CommitTimerSlot, adapter.commit_timers, slot);
         }
 
         fn presentationResourceIndex(adapter: *Self, resource: *PresentationResource) u32 {
@@ -2791,6 +3064,29 @@ pub fn Adapter(comptime protocol: type) type {
                 Fifo.@"error".surface_destroyed.value,
                 "FIFO surface was destroyed",
             );
+        }
+
+        fn commitTimingManagerError(
+            adapter: *Self,
+            actor: *wayring.connection.Actor,
+            object_id: u32,
+        ) !wayring.dispatch.Control {
+            return adapter.protocolError(
+                actor,
+                object_id,
+                CommitTimingManager.@"error".commit_timer_exists.value,
+                "commit timer already exists",
+            );
+        }
+
+        fn commitTimerError(
+            adapter: *Self,
+            actor: *wayring.connection.Actor,
+            object_id: u32,
+            code: u32,
+            message: []const u8,
+        ) !wayring.dispatch.Control {
+            return adapter.protocolError(actor, object_id, code, message);
         }
 
         fn protocolError(
@@ -3817,6 +4113,192 @@ test "content type follows exact commits and survives resource lifecycles" {
     );
     _ = try context.dispatchCore();
     try std.testing.expect(context.server_objects.namespace.get(13) != null);
+}
+
+test "commit timing preserves exact ordered commits after timer destruction" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const manager = try context.server_objects.insertClient(
+        30,
+        &test_protocol.wp_commit_timing_manager_v1.info,
+        1,
+        &context.adapter,
+    );
+    const surface = try context.createSurface(10);
+    try test_protocol.wp_commit_timing_manager_v1.encodeRequest(
+        &context.requests,
+        manager.id,
+        .{ .get_timer = .{ .id = 11, .surface = surface.id } },
+    );
+    _ = try context.dispatchCore();
+    const commit_timer = context.server_objects.namespace.lookupHandle(11) orelse
+        return error.MissingCommitTimer;
+    try test_protocol.wp_commit_timer_v1.encodeRequest(
+        &context.requests,
+        commit_timer.id,
+        .{ .set_timestamp = .{ .tv_sec_hi = 0, .tv_sec_lo = 2, .tv_nsec = 7 } },
+    );
+    _ = try context.dispatchCore();
+    try test_protocol.wl_surface.encodeRequest(
+        &context.requests,
+        surface.id,
+        .{ .commit = .{} },
+    );
+    _ = try context.dispatchCore();
+    try test_protocol.wp_commit_timer_v1.encodeRequest(
+        &context.requests,
+        commit_timer.id,
+        .{ .destroy = .{} },
+    );
+    _ = try context.dispatchCore();
+    try test_protocol.wl_surface.encodeRequest(
+        &context.requests,
+        surface.id,
+        .{ .commit = .{} },
+    );
+    _ = try context.dispatchCore();
+
+    try std.testing.expectEqual(
+        surface_state.CommitTimestamp{ .sec = 2, .nsec = 7 },
+        (try context.adapter.nextCommitDeadline(std.time.ns_per_s)).?,
+    );
+    var output: [1]TestAdapter.Applied = undefined;
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        (try context.adapter.tryApplyAt(surface, &output, std.time.ns_per_s)).len,
+    );
+    var timed = (try context.adapter.tryApplyAt(
+        surface,
+        &output,
+        2 * std.time.ns_per_s + 7,
+    ))[0].payload;
+    try std.testing.expectEqual(
+        surface_state.CommitTimestamp{ .sec = 2, .nsec = 7 },
+        timed.surface.commit_timestamp.?,
+    );
+    timed.deinit();
+    var untimed = (try context.adapter.tryApplyAt(
+        surface,
+        &output,
+        2 * std.time.ns_per_s + 7,
+    ))[0].payload;
+    try std.testing.expect(untimed.surface.commit_timestamp == null);
+    untimed.deinit();
+}
+
+test "commit timing rejects invalid timestamps" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const manager = try context.server_objects.insertClient(
+        30,
+        &test_protocol.wp_commit_timing_manager_v1.info,
+        1,
+        &context.adapter,
+    );
+    const surface = try context.createSurface(10);
+    try test_protocol.wp_commit_timing_manager_v1.encodeRequest(
+        &context.requests,
+        manager.id,
+        .{ .get_timer = .{ .id = 11, .surface = surface.id } },
+    );
+    _ = try context.dispatchCore();
+    const commit_timer = context.server_objects.namespace.lookupHandle(11) orelse
+        return error.MissingCommitTimer;
+    try test_protocol.wp_commit_timer_v1.encodeRequest(
+        &context.requests,
+        commit_timer.id,
+        .{ .set_timestamp = .{ .tv_sec_hi = 0, .tv_sec_lo = 1, .tv_nsec = std.time.ns_per_s } },
+    );
+    try std.testing.expectEqual(wayring.dispatch.Control.stop, try context.dispatchCore());
+}
+
+test "commit timing rejects duplicate timers and pending timestamps" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const manager = try context.server_objects.insertClient(
+        30,
+        &test_protocol.wp_commit_timing_manager_v1.info,
+        1,
+        &context.adapter,
+    );
+    const surface = try context.createSurface(10);
+    try test_protocol.wp_commit_timing_manager_v1.encodeRequest(
+        &context.requests,
+        manager.id,
+        .{ .get_timer = .{ .id = 11, .surface = surface.id } },
+    );
+    _ = try context.dispatchCore();
+    try test_protocol.wp_commit_timing_manager_v1.encodeRequest(
+        &context.requests,
+        manager.id,
+        .{ .get_timer = .{ .id = 12, .surface = surface.id } },
+    );
+    try std.testing.expectEqual(wayring.dispatch.Control.stop, try context.dispatchCore());
+
+    const second_context = try TestContext.init();
+    defer second_context.deinit();
+    const second_manager = try second_context.server_objects.insertClient(
+        30,
+        &test_protocol.wp_commit_timing_manager_v1.info,
+        1,
+        &second_context.adapter,
+    );
+    const second_surface = try second_context.createSurface(10);
+    try test_protocol.wp_commit_timing_manager_v1.encodeRequest(
+        &second_context.requests,
+        second_manager.id,
+        .{ .get_timer = .{ .id = 11, .surface = second_surface.id } },
+    );
+    _ = try second_context.dispatchCore();
+    const commit_timer = second_context.server_objects.namespace.lookupHandle(11) orelse
+        return error.MissingCommitTimer;
+    try test_protocol.wp_commit_timer_v1.encodeRequest(
+        &second_context.requests,
+        commit_timer.id,
+        .{ .set_timestamp = .{ .tv_sec_hi = 0, .tv_sec_lo = 1, .tv_nsec = 0 } },
+    );
+    _ = try second_context.dispatchCore();
+    try test_protocol.wp_commit_timer_v1.encodeRequest(
+        &second_context.requests,
+        commit_timer.id,
+        .{ .set_timestamp = .{ .tv_sec_hi = 0, .tv_sec_lo = 2, .tv_nsec = 0 } },
+    );
+    try std.testing.expectEqual(
+        wayring.dispatch.Control.stop,
+        try second_context.dispatchCore(),
+    );
+}
+
+test "commit timing reports a destroyed surface" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const manager = try context.server_objects.insertClient(
+        30,
+        &test_protocol.wp_commit_timing_manager_v1.info,
+        1,
+        &context.adapter,
+    );
+    const surface = try context.createSurface(10);
+    try test_protocol.wp_commit_timing_manager_v1.encodeRequest(
+        &context.requests,
+        manager.id,
+        .{ .get_timer = .{ .id = 11, .surface = surface.id } },
+    );
+    _ = try context.dispatchCore();
+    const commit_timer = context.server_objects.namespace.lookupHandle(11) orelse
+        return error.MissingCommitTimer;
+    try test_protocol.wl_surface.encodeRequest(
+        &context.requests,
+        surface.id,
+        .{ .destroy = .{} },
+    );
+    _ = try context.dispatchCore();
+    try test_protocol.wp_commit_timer_v1.encodeRequest(
+        &context.requests,
+        commit_timer.id,
+        .{ .set_timestamp = .{ .tv_sec_hi = 0, .tv_sec_lo = 1, .tv_nsec = 0 } },
+    );
+    try std.testing.expectEqual(wayring.dispatch.Control.stop, try context.dispatchCore());
 }
 
 test "content type rejects duplicate objects for one surface" {
