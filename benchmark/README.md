@@ -99,7 +99,8 @@ Workloads are declared in `workloads.sh`:
 - `alpha-modifier-mixed-scale-8`: eight sparse SHM/DMA-BUF clients using the
   constant surface multiplier;
 - `alpha-modifier-layers-8`: eight synchronized XRGB subsurfaces using the
-  constant multiplier, matched to `layers-overlap-8`'s per-pixel-alpha scene;
+  constant multiplier, matched to `alpha-control-layers-8`'s eight synchronized
+  per-pixel-alpha subsurfaces;
 - `layers-overlap-{2,8,32}`: one XDG root with two, eight, or 32 synchronized,
   partially overlapping, translucent SHM subsurfaces. Child commits are
   atomically applied by the parent commit; callback and presentation feedback

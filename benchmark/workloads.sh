@@ -65,6 +65,7 @@ benchmark_workloads=(
     "alpha-modifier-shm-toggle shm-alpha-modifier-toggle        1       1280  720    1000   3"
     "alpha-modifier-dmabuf-toggle dmabuf-alpha-modifier-toggle  1       1280  720    1000   3"
     "alpha-modifier-mixed-scale-8 shm-alpha-modifier-sparse,shm-alpha-modifier-sparse,shm-alpha-modifier-sparse,shm-alpha-modifier-sparse,dmabuf-alpha-modifier-sparse,dmabuf-alpha-modifier-sparse,dmabuf-alpha-modifier-sparse,dmabuf-alpha-modifier-sparse 8 640 360 1000 3"
+    "alpha-control-layers-8 shm-overlap-8                         1       960   540    600    3"
     "alpha-modifier-layers-8 shm-alpha-modifier-overlap-8       1       960   540    600    3"
     "layers-overlap-2     shm-overlap-2                        1       960   540    600    3"
     "layers-overlap-8     shm-overlap-8                        1       960   540    600    3"
