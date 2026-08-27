@@ -144,6 +144,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             seat_generation: u32 = 0,
             client: ClientId = undefined,
             last_serial: u32 = 0,
+            enter_serial: u32 = 0,
         };
         const KeyboardSlot = struct {
             header: Header = .{},
@@ -388,6 +389,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                             .point = adapter.pointer_point,
                         } });
                         slot.last_serial = serial;
+                        slot.enter_serial = serial;
                     };
                 },
                 .get_keyboard => |payload| {
@@ -563,6 +565,32 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             const pointer = adapter.resolvePointer(id) catch return false;
             return sameClient(pointer.client, clientId(peer)) and
                 pointer.last_serial == serial and adapter.pointerFocused(id);
+        }
+
+        pub fn validatePointerWarpOn(
+            adapter: *Self,
+            server_objects: anytype,
+            peer: wayring.io_uring.Peer,
+            pointer_object: u32,
+            surface: SurfaceId,
+            serial: u32,
+        ) bool {
+            if (serial == 0) return false;
+            const id = adapter.pointerIdOn(server_objects, pointer_object) catch return false;
+            const pointer = adapter.resolvePointer(id) catch return false;
+            const delivery = adapter.deliveryTarget() orelse return false;
+            return sameClient(pointer.client, clientId(peer)) and
+                pointer.enter_serial == serial and
+                sameClient(pointer.client, delivery.client) and
+                std.meta.eql(delivery.surface, surface);
+        }
+
+        pub fn applyPointerWarp(adapter: *Self, surface: SurfaceId, point: Point) bool {
+            const delivery = adapter.deliveryTarget() orelse return false;
+            if (!std.meta.eql(delivery.surface, surface)) return false;
+            adapter.pointer_point = point;
+            adapter.pointer_focus = delivery;
+            return true;
         }
 
         pub fn requestTabletCursorOn(
@@ -1406,6 +1434,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                         .serial = serial,
                         .target = value,
                     } }) catch unreachable;
+                adapter.setPointerEnterSerial(value.client, 0);
             }
             adapter.pointer_delivery = target;
             if (target) |value| {
@@ -1418,6 +1447,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                         .point = adapter.pointer_point,
                     } }) catch unreachable;
                 adapter.setLastPointerSerial(value.client, serial);
+                adapter.setPointerEnterSerial(value.client, serial);
             }
         }
 
@@ -1543,7 +1573,9 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 adapter.next_serial +%= 1;
                 if (adapter.next_serial == 0) adapter.next_serial = 1;
                 var used = false;
-                for (adapter.pointers) |pointer| if (pointer.header.active and pointer.last_serial == serial) {
+                for (adapter.pointers) |pointer| if (pointer.header.active and
+                    (pointer.last_serial == serial or pointer.enter_serial == serial))
+                {
                     used = true;
                     break;
                 };
@@ -1555,6 +1587,13 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             for (adapter.pointers) |*pointer| {
                 if (pointer.header.active and sameClient(pointer.client, client))
                     pointer.last_serial = serial;
+            }
+        }
+
+        fn setPointerEnterSerial(adapter: *Self, client: ClientId, serial: u32) void {
+            for (adapter.pointers) |*pointer| {
+                if (pointer.header.active and sameClient(pointer.client, client))
+                    pointer.enter_serial = serial;
             }
         }
 
@@ -2064,18 +2103,38 @@ test "seat: relative pointer lookup retains exact resource generation and focus"
         .surface = .{ .index = 0, .generation = 1 },
     };
     try std.testing.expect(adapter.pointerFocused(id));
-    pointer.last_serial = 44;
-    try std.testing.expect(adapter.validateCursorShapeOn(&server_objects, peer, 2, 44));
+    pointer.last_serial = 45;
+    pointer.enter_serial = 44;
+    try std.testing.expect(adapter.validateCursorShapeOn(&server_objects, peer, 2, 45));
     try std.testing.expect(!adapter.validateCursorShapeOn(&server_objects, peer, 2, 43));
+    try std.testing.expect(adapter.validatePointerWarpOn(
+        &server_objects,
+        peer,
+        2,
+        adapter.pointer_delivery.?.surface,
+        44,
+    ));
+    try std.testing.expect(!adapter.validatePointerWarpOn(
+        &server_objects,
+        peer,
+        2,
+        .{ .index = 1, .generation = 1 },
+        44,
+    ));
+    try std.testing.expect(adapter.applyPointerWarp(
+        adapter.pointer_delivery.?.surface,
+        .{ .x = 7 * 256, .y = 9 * 256 },
+    ));
+    try std.testing.expectEqual(TestAdapter.Point{ .x = 7 * 256, .y = 9 * 256 }, adapter.pointerState().point);
     try std.testing.expect(!adapter.validateCursorShapeOn(
         &server_objects,
         .{ .slot = 2, .generation = 7 },
         2,
-        44,
+        45,
     ));
     release(TestAdapter.PointerSlot, adapter.pointers, &adapter.pointer_free, id.index);
     try std.testing.expect(!adapter.pointerFocused(id));
-    try std.testing.expect(!adapter.validateCursorShapeOn(&server_objects, peer, 2, 44));
+    try std.testing.expect(!adapter.validateCursorShapeOn(&server_objects, peer, 2, 45));
 }
 
 test "seat: popup grabs require the exact seat and delivered press serial" {

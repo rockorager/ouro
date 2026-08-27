@@ -223,6 +223,22 @@ pub fn Interaction(comptime Desktop: type) type {
             return .{ .x = fixedFloor(self.x_fixed), .y = fixedFloor(self.y_fixed) };
         }
 
+        /// Applies a validated surface-local warp without synthesizing input.
+        pub fn warpPointer(self: *Self, target: Target, x_fixed: i64, y_fixed: i64) bool {
+            const minimum_x = @as(i64, self.bounds.x) * 256;
+            const minimum_y = @as(i64, self.bounds.y) * 256;
+            const maximum_x = (@as(i64, self.bounds.x) + self.bounds.width) * 256;
+            const maximum_y = (@as(i64, self.bounds.y) + self.bounds.height) * 256;
+            if (x_fixed < minimum_x or x_fixed >= maximum_x or
+                y_fixed < minimum_y or y_fixed >= maximum_y) return false;
+            self.x_fixed = x_fixed;
+            self.y_fixed = y_fixed;
+            self.hover = target;
+            self.pointer_inside = true;
+            self.cursor.move(self.pointerPosition());
+            return true;
+        }
+
         pub fn validatePointerMotion(
             self: *Self,
             device_id: input.DeviceId,
@@ -1024,6 +1040,22 @@ test "interaction: pointer motion selects exact topmost input surface" {
     try std.testing.expectEqual(TestInteraction.FixedPoint{ .x = 3 * 256, .y = 3 * 256 }, target.point);
     try std.testing.expectEqual(geometry.Point{ .x = 13, .y = 8 }, interaction.pointerPosition());
     try std.testing.expectEqual(interaction.pointerPosition(), interaction.cursor.position);
+}
+
+test "interaction: pointer warp updates retained global and local state without commands" {
+    var interaction = try initTestInteraction(2);
+    defer interaction.deinit();
+    const target = targetFor(testDesktop().windows[0]);
+    var warped = target;
+    warped.point = .{ .x = 5 * 256 + 128, .y = 4 * 256 + 64 };
+
+    try std.testing.expect(interaction.warpPointer(warped, 12 * 256 + 128, 9 * 256 + 64));
+    try std.testing.expectEqual(geometry.Point{ .x = 12, .y = 9 }, interaction.pointerPosition());
+    try std.testing.expectEqual(interaction.pointerPosition(), interaction.cursor.position);
+    try std.testing.expectEqual(warped, interaction.hover.?);
+    try std.testing.expectEqual(@as(usize, 0), interaction.pendingCommands());
+    try std.testing.expect(!interaction.warpPointer(warped, -1, 0));
+    try std.testing.expectEqual(geometry.Point{ .x = 12, .y = 9 }, interaction.pointerPosition());
 }
 
 test "interaction: gestures require exact pointer device without mutating focus or cursor" {
