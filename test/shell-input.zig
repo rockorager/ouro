@@ -1247,6 +1247,10 @@ test "shell-input: two mapped toplevels sustain independent commit cycles" {
                 return error.MissingSecondLayer;
             try std.testing.expectEqual(first.binding.?.surface, submitted[0].surface);
             try std.testing.expectEqual(second.binding.?.surface, submitted[1].surface);
+            try std.testing.expectEqual(first.change.?.current, first.change.?.previous);
+            try std.testing.expectEqual(second.change.?.current, second.change.?.previous);
+            try std.testing.expect(first.change.?.surface_damage == null);
+            try std.testing.expect(second.change.?.surface_damage == null);
             try std.testing.expectEqual(@as(i32, 0), first.sample.?.destination.x);
             try std.testing.expectEqual(@as(u32, 2), first.sample.?.destination.width);
             try std.testing.expectEqual(@as(i32, 2), second.sample.?.destination.x);

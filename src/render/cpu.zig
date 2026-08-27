@@ -1,9 +1,9 @@
 //! Pixman CPU renderer for R10 linear scanout targets.
 //!
-//! `render` accepts an acquired image, maps it, renders the complete list in
-//! protocol z-order, and unmaps it. Success leaves the image acquired for the
-//! output path to submit. Failure never submits and makes a best effort to
-//! unmap, leaving the handle valid for R10 `discard`.
+//! `render` accepts an acquired image, maps it, applies the R13 render-damage
+//! plan in protocol z-order, and unmaps it. Success leaves the image acquired
+//! for the output path to submit. Failure never submits and makes a best effort
+//! to unmap, leaving the handle valid for R10 `discard`.
 
 const std = @import("std");
 const gbm = @import("../backend/gbm.zig");
@@ -35,12 +35,14 @@ pub const Renderer = struct {
         target: anytype,
         handle: anytype,
         render_list: render_types.List,
+        damage_plan: render_types.DamagePlan,
     ) !void {
         try render_types.validateList(render_list);
+        try render_types.validateOutput(damage_plan.output);
         const image = try target.image(handle);
         if (image.metadata.modifier != gbm.modifier_linear or
-            image.metadata.width != render_list.output.width or
-            image.metadata.height != render_list.output.height or
+            image.metadata.width != damage_plan.output.width or
+            image.metadata.height != damage_plan.output.height or
             (formatFromDrm(image.metadata.format) orelse return error.TargetMismatch) !=
                 render_list.output_format)
             return error.TargetMismatch;
@@ -48,7 +50,7 @@ pub const Renderer = struct {
         const mapping = try target.map(handle);
         var mapped = true;
         errdefer if (mapped) target.unmap(handle) catch {};
-        try self.implementation.draw(render_list, mapping.data, mapping.stride);
+        try self.implementation.draw(render_list, damage_plan, mapping.data, mapping.stride);
         try target.unmap(handle);
         mapped = false;
     }
@@ -58,8 +60,9 @@ pub const Renderer = struct {
         target: *framebuffer.Pool,
         handle: framebuffer.Handle,
         render_list: render_types.List,
+        damage_plan: render_types.DamagePlan,
     ) !void {
-        try self.render(target, handle, render_list);
+        try self.render(target, handle, render_list, damage_plan);
     }
 };
 
@@ -170,6 +173,63 @@ fn sample(
     };
 }
 
+fn renderWithDamage(
+    renderer: *Renderer,
+    target: *FakeTarget,
+    render_list: render_types.List,
+    render_damage: []const render_types.Rect,
+    render_full: bool,
+) !void {
+    var planned: [2]render_types.PlannedSample = undefined;
+    if (render_list.samples.len > planned.len) return error.SampleCapacityExceeded;
+    for (render_list.samples, 0..) |value, index| planned[index] = .{
+        .source_index = @intCast(index),
+        .sample = value.sample,
+        .presentation = value.presentation,
+        .crop = value.crop,
+        .destination = .{
+            .x = value.destination.x,
+            .y = value.destination.y,
+            .width = value.destination.width,
+            .height = value.destination.height,
+        },
+        .clip = .{
+            .x = value.clip.x,
+            .y = value.clip.y,
+            .width = value.clip.width,
+            .height = value.clip.height,
+        },
+        .transform = value.transform,
+        .global_alpha = value.global_alpha,
+    };
+    try renderer.render(target, 0, render_list, .{
+        .output = render_list.output,
+        .samples = planned[0..render_list.samples.len],
+        .client_damage = render_damage,
+        .scene_damage = &.{},
+        .repair_damage = &.{},
+        .render_damage = render_damage,
+        .client_full = render_full,
+        .scene_full = false,
+        .repair_full = false,
+        .render_full = render_full,
+    });
+}
+
+fn renderFull(
+    renderer: *Renderer,
+    target: *FakeTarget,
+    render_list: render_types.List,
+) !void {
+    const damage = [_]render_types.Rect{.{
+        .x = 0,
+        .y = 0,
+        .width = render_list.output.width,
+        .height = render_list.output.height,
+    }};
+    try renderWithDamage(renderer, target, render_list, &damage, true);
+}
+
 fn putPixel(bytes: []u8, offset: usize, value: u32) void {
     std.mem.writeInt(u32, bytes[offset..][0..4], value, .little);
 }
@@ -195,7 +255,7 @@ test "render: clear is exact and target stride padding is untouched" {
     var target = FakeTarget{ .width = 2, .height = 2, .stride = 12 };
     var clear_list = list(2, 2, &.{});
     clear_list.clear = .{ .r = 0x11, .g = 0x22, .b = 0x33 };
-    try renderer.render(&target, 0, clear_list);
+    try renderFull(&renderer, &target, clear_list);
     try std.testing.expectEqual(@as(u32, 0xff112233), std.mem.readInt(u32, target.bytes[0..4], .little));
     try std.testing.expectEqual(@as(u32, 0xff112233), std.mem.readInt(u32, target.bytes[4..8], .little));
     try std.testing.expectEqualSlices(u8, &.{ 0xcc, 0xcc, 0xcc, 0xcc }, target.bytes[8..12]);
@@ -211,11 +271,36 @@ test "render: clear is exact and target stride padding is untouched" {
     var alpha_clear = list(1, 1, &.{});
     alpha_clear.output_format = .argb8888_premultiplied;
     alpha_clear.clear = .{ .a = 128, .r = 255, .g = 0, .b = 0 };
-    try renderer.render(&alpha_target, 0, alpha_clear);
+    try renderFull(&renderer, &alpha_target, alpha_clear);
     try std.testing.expectEqual(
         @as(u32, 0x80800000),
         std.mem.readInt(u32, alpha_target.bytes[0..4], .little),
     );
+}
+
+test "render: allocation is bounded by sample metadata instead of maximum source pixels" {
+    var renderer = try Renderer.init(std.testing.allocator, .{
+        .max_samples = 17,
+        .max_source_width = 8192,
+        .max_source_height = 8192,
+    });
+    defer renderer.deinit();
+    try std.testing.expect(renderer.implementation.allocatedBytes() < 1024);
+}
+
+test "render: damage preserves pixels outside the repaired region" {
+    var renderer = try Renderer.init(std.testing.allocator, .{
+        .max_samples = 1,
+        .max_source_width = 3,
+        .max_source_height = 1,
+    });
+    defer renderer.deinit();
+    const red = [_]u8{ 0, 0, 255, 255 } ** 3;
+    const value = sample(&red, 3, 1, 12, .{ .x = 0, .y = 0, .width = 3, .height = 1 });
+    var target = FakeTarget{ .width = 3, .height = 1, .stride = 12 };
+    const damage = [_]render_types.Rect{.{ .x = 1, .y = 0, .width = 1, .height = 1 }};
+    try renderWithDamage(&renderer, &target, list(3, 1, &.{value}), &damage, false);
+    try expectPixels(&target, &.{ 0xcccccccc, 0xffff0000, 0xcccccccc });
 }
 
 test "render: protocol z-order and clipping are exact" {
@@ -232,7 +317,7 @@ test "render: protocol z-order and clipping are exact" {
     upper.sample.surface = 2;
     upper.clip = .{ .x = 1, .y = 0, .width = 1, .height = 1 };
     var target = FakeTarget{ .width = 2, .height = 1, .stride = 8 };
-    try renderer.render(&target, 0, list(2, 1, &.{ lower, upper }));
+    try renderFull(&renderer, &target, list(2, 1, &.{ lower, upper }));
     try expectPixels(&target, &.{ 0xffff0000, 0xff00ff00 });
 }
 
@@ -251,7 +336,7 @@ test "render: crop nearest scale and source stride padding are exact" {
     var value = sample(&source_bytes, 4, 1, 20, .{ .x = 0, .y = 0, .width = 4, .height = 1 });
     value.crop = render_types.SourceRect.pixels(1, 0, 2, 1);
     var target = FakeTarget{ .width = 4, .height = 1, .stride = 16 };
-    try renderer.render(&target, 0, list(4, 1, &.{value}));
+    try renderFull(&renderer, &target, list(4, 1, &.{value}));
     try expectPixels(&target, &.{ 0xff00ff00, 0xff00ff00, 0xff0000ff, 0xff0000ff });
 }
 
@@ -284,7 +369,7 @@ test "render: all wl_output transforms are exact" {
         var value = sample(&bytes, 2, 3, 8, .{ .x = 0, .y = 0, .width = case.width, .height = case.height });
         value.transform = case.transform;
         var target = FakeTarget{ .width = case.width, .height = case.height, .stride = case.width * 4 };
-        try renderer.render(&target, 0, list(case.width, case.height, &.{value}));
+        try renderFull(&renderer, &target, list(case.width, case.height, &.{value}));
         try expectPixels(&target, case.expected);
     }
 }
@@ -307,10 +392,10 @@ test "render: premultiplied per-pixel and global alpha blend exactly" {
     global.sample.surface = 3;
     global.global_alpha = 128;
     var target = FakeTarget{ .width = 2, .height = 1, .stride = 8 };
-    try renderer.render(&target, 0, list(2, 1, &.{ background, foreground }));
+    try renderFull(&renderer, &target, list(2, 1, &.{ background, foreground }));
     // Render the global-alpha case separately because capacity is two.
     const first = std.mem.readInt(u32, target.bytes[0..4], .little);
-    try renderer.render(&target, 0, list(2, 1, &.{ background, global }));
+    try renderFull(&renderer, &target, list(2, 1, &.{ background, global }));
     try std.testing.expectEqual(@as(u32, 0xff80007f), first);
     try std.testing.expectEqual(@as(u32, 0xff80007f), std.mem.readInt(u32, target.bytes[4..8], .little));
 }
@@ -326,10 +411,10 @@ test "render: R10 map unmap discard recovery and no submit" {
     const malformed = sample(&.{}, 1, 1, 4, .{ .x = 0, .y = 0, .width = 1, .height = 1 });
     try std.testing.expectError(
         error.InvalidSource,
-        renderer.render(&target, 0, list(2, 1, &.{malformed})),
+        renderFull(&renderer, &target, list(2, 1, &.{malformed})),
     );
     try std.testing.expectEqual(@as(usize, 0), target.map_count);
-    try std.testing.expectError(error.InvalidTarget, renderer.render(&target, 0, list(2, 1, &.{})));
+    try std.testing.expectError(error.InvalidTarget, renderFull(&renderer, &target, list(2, 1, &.{})));
     try std.testing.expect(!target.mapped);
     try std.testing.expectEqual(@as(usize, 1), target.map_count);
     try std.testing.expectEqual(@as(usize, 1), target.unmap_count);

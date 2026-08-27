@@ -109,9 +109,7 @@ pub const Point = struct {
     y: i32 = 0,
 };
 
-/// Conservative damage accumulator. It stores one bounding rectangle rather
-/// than allocating an exact region; overdraw is safe and keeps each surface's
-/// hot pending state fixed-size.
+/// One damage rectangle stored in signed, overflow-safe edge coordinates.
 pub const Damage = struct {
     min_x: i64 = 0,
     min_y: i64 = 0,
@@ -142,22 +140,23 @@ pub const Damage = struct {
     }
 };
 
-pub const upload_damage_rect_capacity = 8;
+pub const damage_rect_capacity = 8;
+pub const upload_damage_rect_capacity = damage_rect_capacity;
 
-/// Allocation-free upload region. Rectangles remain disjoint; overlapping
-/// requests merge conservatively, and capacity overflow collapses to one bound.
-pub const UploadDamage = struct {
-    rects: [upload_damage_rect_capacity]Damage =
-        [_]Damage{.{}} ** upload_damage_rect_capacity,
+/// Allocation-free protocol and upload damage region. Rectangles remain
+/// disjoint; overlapping requests merge conservatively, and capacity overflow
+/// collapses to one bound.
+pub const DamageRegion = struct {
+    rects: [damage_rect_capacity]Damage = [_]Damage{.{}} ** damage_rect_capacity,
     count: u8 = 0,
 
-    pub fn items(damage: *const UploadDamage) []const Damage {
+    pub fn items(damage: *const DamageRegion) []const Damage {
         return damage.rects[0..damage.count];
     }
 
-    fn add(upload: *UploadDamage, x: i32, y: i32, width: i32, height: i32) void {
+    fn add(region: *DamageRegion, x: i32, y: i32, width: i32, height: i32) void {
         if (width <= 0 or height <= 0) return;
-        upload.addDamage(.{
+        region.addDamage(.{
             .min_x = x,
             .min_y = y,
             .max_x = @as(i64, x) + width,
@@ -166,32 +165,34 @@ pub const UploadDamage = struct {
         });
     }
 
-    fn addDamage(upload: *UploadDamage, value: Damage) void {
+    fn addDamage(region: *DamageRegion, value: Damage) void {
         if (value.empty) return;
         var merged = value;
         var index: usize = 0;
-        while (index < upload.count) {
-            if (!overlaps(upload.rects[index], merged)) {
+        while (index < region.count) {
+            if (!overlaps(region.rects[index], merged)) {
                 index += 1;
                 continue;
             }
-            unionDamage(&merged, upload.rects[index]);
-            upload.count -= 1;
-            upload.rects[index] = upload.rects[upload.count];
+            unionDamage(&merged, region.rects[index]);
+            region.count -= 1;
+            region.rects[index] = region.rects[region.count];
             // The larger merged bound can overlap an earlier rectangle that
             // did not overlap the original input, so recheck the whole region.
             index = 0;
         }
-        if (upload.count < upload.rects.len) {
-            upload.rects[upload.count] = merged;
-            upload.count += 1;
+        if (region.count < region.rects.len) {
+            region.rects[region.count] = merged;
+            region.count += 1;
             return;
         }
-        for (upload.items()) |rect| unionDamage(&merged, rect);
-        upload.rects[0] = merged;
-        upload.count = 1;
+        for (region.items()) |rect| unionDamage(&merged, rect);
+        region.rects[0] = merged;
+        region.count = 1;
     }
 };
+
+pub const UploadDamage = DamageRegion;
 
 pub const Transform = enum(u3) {
     normal,
@@ -244,8 +245,8 @@ pub const Attachment = struct {
 pub const Update = struct {
     sequence: u64,
     attachment: ?Attachment,
-    surface_damage: Damage,
-    buffer_damage: Damage,
+    surface_damage: DamageRegion,
+    buffer_damage: DamageRegion,
     /// Both protocol damage domains mapped to native buffer pixels. This is the
     /// renderer import/update domain; scene/output damage remains separate.
     upload_damage: UploadDamage,
@@ -301,10 +302,8 @@ pub const Surface = struct {
     pending_buffer: ?Buffer = null,
     pending_attach_offset: Point = .{},
     attach_changed: bool = false,
-    pending_surface_damage: Damage = .{},
-    pending_buffer_damage: Damage = .{},
-    pending_surface_upload_damage: UploadDamage = .{},
-    pending_buffer_upload_damage: UploadDamage = .{},
+    pending_surface_damage: DamageRegion = .{},
+    pending_buffer_damage: DamageRegion = .{},
     pending_transform: Transform = .normal,
     pending_scale: i32 = 1,
     pending_offset: Point = .{},
@@ -369,12 +368,10 @@ pub const Surface = struct {
 
     pub fn damage(surface: *Surface, x: i32, y: i32, width: i32, height: i32) void {
         surface.pending_surface_damage.add(x, y, width, height);
-        surface.pending_surface_upload_damage.add(x, y, width, height);
     }
 
     pub fn damageBuffer(surface: *Surface, x: i32, y: i32, width: i32, height: i32) void {
         surface.pending_buffer_damage.add(x, y, width, height);
-        surface.pending_buffer_upload_damage.add(x, y, width, height);
     }
 
     pub fn setTransform(surface: *Surface, value: i32) Error!void {
@@ -497,8 +494,8 @@ pub const Surface = struct {
         const content_size = surface.contentSize(surface.current_buffer);
         const viewport_state = surface.viewport.publishCommit();
         const upload_damage = canonicalBufferDamage(
-            surface.pending_surface_upload_damage,
-            surface.pending_buffer_upload_damage,
+            surface.pending_surface_damage,
+            surface.pending_buffer_damage,
             surface.current_buffer,
             surface.current_transform,
             surface.current_scale,
@@ -534,8 +531,6 @@ pub const Surface = struct {
         surface.attach_changed = false;
         surface.pending_surface_damage = .{};
         surface.pending_buffer_damage = .{};
-        surface.pending_surface_upload_damage = .{};
-        surface.pending_buffer_upload_damage = .{};
         surface.pending_offset = .{};
         surface.pending_fifo_set = false;
         surface.pending_fifo_wait = false;
@@ -977,8 +972,10 @@ test "surface commits persistent and one-shot state atomically" {
     try std.testing.expectEqual(@as(u64, 1), first.sequence);
     try std.testing.expectEqual(buffer, first.attachment.?.buffer.?);
     try std.testing.expectEqual(Point{ .x = 2, .y = -3 }, first.attachment.?.offset);
-    try std.testing.expectEqual(@as(i64, 8), first.surface_damage.min_x);
-    try std.testing.expectEqual(@as(i64, 32), first.surface_damage.max_y);
+    try expectUploadDamage(&.{
+        damageRect(10, 20, 3, 4),
+        damageRect(8, 30, 4, 2),
+    }, first.surface_damage);
     try std.testing.expectEqual(Transform.@"270", first.transform);
     try std.testing.expectEqual(@as(i32, 2), first.scale);
     try std.testing.expectEqual(Point{ .x = 7, .y = -8 }, first.offset);
@@ -989,8 +986,8 @@ test "surface commits persistent and one-shot state atomically" {
     const second = try surface.commit();
     try std.testing.expectEqual(@as(u64, 2), second.sequence);
     try std.testing.expectEqual(@as(?Attachment, null), second.attachment);
-    try std.testing.expect(second.surface_damage.empty);
-    try std.testing.expect(second.buffer_damage.empty);
+    try std.testing.expectEqual(@as(u8, 0), second.surface_damage.count);
+    try std.testing.expectEqual(@as(u8, 0), second.buffer_damage.count);
     try std.testing.expectEqual(Transform.@"270", second.transform);
     try std.testing.expectEqual(@as(i32, 2), second.scale);
     try std.testing.expectEqual(Point{}, second.offset);
@@ -1183,8 +1180,8 @@ test "surface commit maps viewport damage outward and unions clipped buffer dama
         damageRect(13, 0, 7, 1),
         damageRect(6, 6, 2, 2),
     }, update.upload_damage);
-    try std.testing.expectEqual(damageRect(2, 2, 2, 2), update.surface_damage);
-    try std.testing.expectEqual(damageRect(13, -2, 10, 3), update.buffer_damage);
+    try expectUploadDamage(&.{damageRect(2, 2, 2, 2)}, update.surface_damage);
+    try expectUploadDamage(&.{damageRect(13, -2, 10, 3)}, update.buffer_damage);
 }
 
 test "surface commit conservatively rounds fractional viewport upload damage" {
@@ -1229,11 +1226,16 @@ test "surface commit preserves sparse upload rectangles and bounds overflow" {
         damageRect(32, 32, 32, 32),
         damageRect(1856, 1136, 32, 32),
     }, sparse.upload_damage);
+    try expectUploadDamage(&.{
+        damageRect(32, 32, 32, 32),
+        damageRect(1856, 1136, 32, 32),
+    }, sparse.buffer_damage);
 
     for (0..upload_damage_rect_capacity + 1) |index|
         surface.damageBuffer(@intCast(index * 2), 0, 1, 1);
     const bounded = try surface.commit();
     try expectUploadDamage(&.{damageRect(0, 0, 17, 1)}, bounded.upload_damage);
+    try expectUploadDamage(&.{damageRect(0, 0, 17, 1)}, bounded.buffer_damage);
 }
 
 test "surface upload damage merges transitive overlap" {

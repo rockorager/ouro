@@ -59,8 +59,8 @@ pub const SurfaceState = struct {
 pub const Change = struct {
     previous: ?SurfaceState = null,
     current: ?SurfaceState = null,
-    surface_damage: ?Damage = null,
-    buffer_damage: ?Damage = null,
+    surface_damage: ?surface_state.DamageRegion = null,
+    buffer_damage: ?surface_state.DamageRegion = null,
     /// Stacking, opacity, or occlusion changes can invalidate unchanged bounds.
     invalidate_bounds: bool = false,
 };
@@ -398,18 +398,22 @@ pub const Planner = struct {
         }
         const current = change.current orelse return;
         if (change.surface_damage) |damage| {
-            if (!validDamage(damage)) {
-                self.client.setFull(self.physical_output);
-                return;
+            for (damage.items()) |rect| {
+                if (!validDamage(rect)) {
+                    self.client.setFull(self.physical_output);
+                    return;
+                }
+                self.addMapped(&self.client, mapSurfaceDamage(current, Damage.fromSurface(rect)));
             }
-            self.addMapped(&self.client, mapSurfaceDamage(current, damage));
         }
         if (change.buffer_damage) |damage| {
-            if (!validDamage(damage)) {
-                self.client.setFull(self.physical_output);
-                return;
+            for (damage.items()) |rect| {
+                if (!validDamage(rect)) {
+                    self.client.setFull(self.physical_output);
+                    return;
+                }
+                self.addMapped(&self.client, mapBufferDamage(current, Damage.fromSurface(rect)));
             }
-            self.addMapped(&self.client, mapBufferDamage(current, damage));
         }
     }
 
@@ -465,7 +469,7 @@ fn sameVisual(a: SurfaceState, b: SurfaceState) bool {
         std.meta.eql(a.surface_size, b.surface_size);
 }
 
-fn validDamage(damage: Damage) bool {
+fn validDamage(damage: surface_state.Damage) bool {
     return damage.empty or (damage.max_x > damage.min_x and damage.max_y > damage.min_y);
 }
 
@@ -714,6 +718,32 @@ fn testConfig(images: usize) Config {
     };
 }
 
+fn damageRegion(value: Damage) surface_state.DamageRegion {
+    var result: surface_state.DamageRegion = .{};
+    result.rects[0] = .{
+        .min_x = value.min_x,
+        .min_y = value.min_y,
+        .max_x = value.max_x,
+        .max_y = value.max_y,
+        .empty = value.empty,
+    };
+    result.count = 1;
+    return result;
+}
+
+fn sparseDamage(first: Damage, second: Damage) surface_state.DamageRegion {
+    var result = damageRegion(first);
+    result.rects[1] = .{
+        .min_x = second.min_x,
+        .min_y = second.min_y,
+        .max_x = second.max_x,
+        .max_y = second.max_y,
+        .empty = second.empty,
+    };
+    result.count = 2;
+    return result;
+}
+
 fn testSample(
     surface: u64,
     sequence: u64,
@@ -866,9 +896,36 @@ test "damage: committed surface damage scales through destination and clip" {
     const plan = try planner.prepare(.{ .slot = 0, .generation = 2 }, testList(&.{sample}), &.{.{
         .previous = state,
         .current = state,
-        .surface_damage = Damage.rect(0, 0, 10, 5),
+        .surface_damage = damageRegion(Damage.rect(0, 0, 10, 5)),
     }});
     try std.testing.expectEqualSlices(render.Rect, &.{.{ .x = 20, .y = 10, .width = 10, .height = 10 }}, plan.client_damage);
+    try planner.cancel();
+}
+
+test "damage: distant buffer rectangles remain disjoint through scene planning" {
+    var planner = try Planner.init(std.testing.allocator, .{ .width = 100, .height = 100 }, .normal, testConfig(1));
+    defer planner.deinit();
+    try prime(&planner, 1);
+    const pixels = [_]u8{0} ** (100 * 100 * 4);
+    var sample = testSample(1, 1, &pixels, .{ .x = 0, .y = 0, .width = 100, .height = 100 });
+    sample.source.size = .{ .width = 100, .height = 100 };
+    sample.source.stride = 100 * 4;
+    sample.crop = render.SourceRect.pixels(0, 0, 100, 100);
+    sample.clip = sample.destination;
+    const state = SurfaceState.fromSample(sample, .{ .width = 100, .height = 100 });
+    const plan = try planner.prepare(.{ .slot = 0, .generation = 2 }, testList(&.{sample}), &.{.{
+        .previous = state,
+        .current = state,
+        .buffer_damage = sparseDamage(
+            Damage.rect(2, 2, 4, 4),
+            Damage.rect(90, 90, 4, 4),
+        ),
+    }});
+    try std.testing.expectEqualSlices(render.Rect, &.{
+        .{ .x = 2, .y = 2, .width = 4, .height = 4 },
+        .{ .x = 90, .y = 90, .width = 4, .height = 4 },
+    }, plan.client_damage);
+    try std.testing.expectEqualSlices(render.Rect, plan.client_damage, plan.render_damage);
     try planner.cancel();
 }
 
@@ -891,7 +948,7 @@ test "damage: buffer crop transform clip and output transform are conservative a
     }, &.{.{
         .previous = state,
         .current = state,
-        .buffer_damage = Damage.rect(10, 0, 10, 10),
+        .buffer_damage = damageRegion(Damage.rect(10, 0, 10, 10)),
         .invalidate_bounds = true,
     }});
     try std.testing.expectEqual(render.Size{ .width = 50, .height = 100 }, plan.output);
@@ -958,7 +1015,7 @@ test "damage: each scanout image repairs only scene changes it missed" {
     var plan = try planner.prepare(.{ .slot = 0, .generation = 2 }, testList(&.{first}), &.{.{
         .previous = first_state,
         .current = first_state,
-        .surface_damage = Damage.rect(1, 1, 4, 4),
+        .surface_damage = damageRegion(Damage.rect(1, 1, 4, 4)),
     }});
     try std.testing.expectEqual(@as(usize, 0), plan.repair_damage.len);
     try planner.publish();
@@ -968,7 +1025,7 @@ test "damage: each scanout image repairs only scene changes it missed" {
     plan = try planner.prepare(.{ .slot = 1, .generation = 2 }, testList(&.{second}), &.{.{
         .previous = second_state,
         .current = second_state,
-        .surface_damage = Damage.rect(20, 20, 4, 4),
+        .surface_damage = damageRegion(Damage.rect(20, 20, 4, 4)),
     }});
     try std.testing.expectEqualSlices(render.Rect, &.{.{ .x = 1, .y = 1, .width = 4, .height = 4 }}, plan.repair_damage);
     try planner.publish();
@@ -997,8 +1054,8 @@ test "damage: capacity exhaustion and unsupported damage fall back to full outpu
         defer planner.deinit();
         try prime(&planner, 1);
         var plan = try planner.prepare(.{ .slot = 0, .generation = 2 }, testList(&.{ a, b }), &.{
-            .{ .previous = a_state, .current = a_state, .surface_damage = Damage.rect(0, 0, 2, 2) },
-            .{ .previous = b_state, .current = b_state, .surface_damage = Damage.rect(0, 0, 2, 2) },
+            .{ .previous = a_state, .current = a_state, .surface_damage = damageRegion(Damage.rect(0, 0, 2, 2)) },
+            .{ .previous = b_state, .current = b_state, .surface_damage = damageRegion(Damage.rect(0, 0, 2, 2)) },
         });
         try std.testing.expect(plan.client_full);
         try std.testing.expectEqualSlices(render.Rect, &.{outputRect(planner.physical_output)}, plan.client_damage);
@@ -1007,7 +1064,7 @@ test "damage: capacity exhaustion and unsupported damage fall back to full outpu
         plan = try planner.prepare(.{ .slot = 0, .generation = 2 }, testList(&.{a}), &.{.{
             .previous = a_state,
             .current = a_state,
-            .surface_damage = .{ .min_x = std.math.minInt(i64), .min_y = 0, .max_x = std.math.minInt(i64), .max_y = 1 },
+            .surface_damage = damageRegion(.{ .min_x = std.math.minInt(i64), .min_y = 0, .max_x = std.math.minInt(i64), .max_y = 1 }),
         }});
         try std.testing.expect(plan.client_full);
         try planner.cancel();
@@ -1020,8 +1077,8 @@ test "damage: capacity exhaustion and unsupported damage fall back to full outpu
         defer planner.deinit();
         try prime(&planner, 1);
         const plan = try planner.prepare(.{ .slot = 0, .generation = 2 }, testList(&.{ a, b }), &.{
-            .{ .previous = a_state, .current = a_state, .surface_damage = Damage.rect(0, 0, 2, 2) },
-            .{ .previous = b_state, .current = b_state, .surface_damage = Damage.rect(0, 0, 2, 2) },
+            .{ .previous = a_state, .current = a_state, .surface_damage = damageRegion(Damage.rect(0, 0, 2, 2)) },
+            .{ .previous = b_state, .current = b_state, .surface_damage = damageRegion(Damage.rect(0, 0, 2, 2)) },
         });
         try std.testing.expect(!plan.client_full);
         try std.testing.expect(plan.render_full);
@@ -1038,13 +1095,13 @@ test "damage: capacity exhaustion and unsupported damage fall back to full outpu
     var plan = try repair_planner.prepare(.{ .slot = 0, .generation = 2 }, testList(&.{a}), &.{.{
         .previous = a_state,
         .current = a_state,
-        .surface_damage = Damage.rect(0, 0, 2, 2),
+        .surface_damage = damageRegion(Damage.rect(0, 0, 2, 2)),
     }});
     try repair_planner.publish();
     plan = try repair_planner.prepare(.{ .slot = 0, .generation = 3 }, testList(&.{b}), &.{.{
         .previous = b_state,
         .current = b_state,
-        .surface_damage = Damage.rect(0, 0, 2, 2),
+        .surface_damage = damageRegion(Damage.rect(0, 0, 2, 2)),
     }});
     try repair_planner.publish();
     plan = try repair_planner.prepare(.{ .slot = 1, .generation = 2 }, testList(&.{b}), &.{});

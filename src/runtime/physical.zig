@@ -3451,8 +3451,10 @@ pub fn Coordinator(comptime protocol: type) type {
                     visibility_changed = true;
                     continue;
                 };
+                const previous = layer.change.?.current;
                 layer.sample = sample;
                 layer.change = .{
+                    .previous = previous,
                     .current = damage.SurfaceState.fromSample(sample, natural_size),
                     .invalidate_bounds = true,
                 };
@@ -3789,16 +3791,18 @@ pub fn Coordinator(comptime protocol: type) type {
                 .id = candidate.id,
                 .content = content.*,
             };
+            const previous = if (layer.change) |change| change.current else null;
             layer.candidate = null;
-            if (!prepared.replaces) if (layer.rendered) |previous|
-                render_device.content.release(previous);
+            if (!prepared.replaces) if (layer.rendered) |previous_handle|
+                render_device.content.release(previous_handle);
             layer.change = .{
+                .previous = previous,
                 .current = damage.SurfaceState.fromSample(sample, .{
                     .width = destination_size.width,
                     .height = destination_size.height,
                 }),
-                .surface_damage = damage.Damage.fromSurface(published.content.surface.surface_damage),
-                .buffer_damage = damage.Damage.fromSurface(published.content.surface.buffer_damage),
+                .surface_damage = published.content.surface.surface_damage,
+                .buffer_damage = published.content.surface.buffer_damage,
             };
             layer.active = true;
             layer.content = published.content;
@@ -4056,6 +4060,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .submitted => {
                     self.adapter.clearFifoBarriers();
                     self.stats.submitted += 1;
+                    self.markFrameChangesApplied();
                     self.themed_cursor_previous = next_themed_cursor_previous;
                     self.client_cursor_hidden_previous = null;
                     self.removed_layer_len = 0;
@@ -4066,6 +4071,17 @@ pub fn Coordinator(comptime protocol: type) type {
                     try self.finishOutcome(failure.frame, false);
                 },
             }
+        }
+
+        fn markFrameChangesApplied(self: *Self) void {
+            for (self.app_layers) |*layer| if (layer.active)
+                markLayerChangeApplied(layer);
+            if (self.cursor_layer.active) markLayerChangeApplied(&self.cursor_layer);
+        }
+
+        fn markLayerChangeApplied(layer: *Layer) void {
+            const current = (layer.change orelse return).current orelse return;
+            layer.change = .{ .previous = current, .current = current };
         }
 
         fn appendLayerShell(
@@ -4150,8 +4166,10 @@ pub fn Coordinator(comptime protocol: type) type {
             if (std.meta.eql(sample.destination, layer.sample.?.destination) and
                 std.meta.eql(sample.clip, layer.sample.?.clip)) return true;
             const natural_size = layer.change.?.current.?.surface_size;
+            const previous = layer.change.?.current;
             layer.sample = sample;
             layer.change = .{
+                .previous = previous,
                 .current = damage.SurfaceState.fromSample(sample, natural_size),
                 .invalidate_bounds = true,
             };

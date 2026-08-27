@@ -733,7 +733,7 @@ pub const Output = struct {
             return self.retireAndDiscard(frame_id, error.RendererUnavailable, handle);
         });
         switch (renderer.*) {
-            .pixman => |*value| value.renderPool(&self.pool, handle, list) catch |cause| {
+            .pixman => |*value| value.renderPool(&self.pool, handle, list, plan) catch |cause| {
                 return self.retireAndDiscard(frame_id, cause, handle);
             },
             .vulkan => |*value| {
