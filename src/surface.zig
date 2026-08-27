@@ -7,6 +7,8 @@ const buffer_import = @import("buffer_import.zig");
 const color = @import("render/color.zig");
 const drm_syncobj = @import("drm_syncobj.zig");
 
+pub const ExplicitSyncPoint = drm_syncobj.Point;
+
 pub const RegionPool = @import("region.zig").Pool;
 pub const Region = @import("region.zig").Region;
 pub const RegionRectangle = @import("region.zig").Rectangle;

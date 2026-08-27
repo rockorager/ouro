@@ -85,6 +85,7 @@ pub fn Adapter(comptime protocol: type) type {
         const Fifo = protocol.wp_fifo_v1;
         const CommitTimingManager = protocol.wp_commit_timing_manager_v1;
         const CommitTimer = protocol.wp_commit_timer_v1;
+        const ExplicitSyncSurface = protocol.wp_linux_drm_syncobj_surface_v1;
         const WlBuffer = protocol.wl_buffer;
         const Presentation = protocol.wp_presentation;
         const PresentationFeedback = protocol.wp_presentation_feedback;
@@ -206,6 +207,7 @@ pub fn Adapter(comptime protocol: type) type {
             updates: Commit.Scheduler.Queue = undefined,
             fifo_barrier: bool = false,
             viewport_resource: ?objects.Handle = null,
+            explicit_sync_resource: ?objects.Handle = null,
             presentation_feedback: surface_state.PresentationFeedbackPending = undefined,
         };
 
@@ -956,6 +958,49 @@ pub fn Adapter(comptime protocol: type) type {
             return &slot.state;
         }
 
+        pub fn enableExplicitSync(
+            adapter: *Self,
+            id: SurfaceId,
+            resource: objects.Handle,
+        ) !void {
+            const slot = try adapter.surfaceForId(id);
+            try slot.state.enableExplicitSync();
+            slot.explicit_sync_resource = resource;
+        }
+
+        pub fn disableExplicitSync(
+            adapter: *Self,
+            id: SurfaceId,
+            resource: objects.Handle,
+        ) void {
+            const slot = adapter.surfaceForId(id) catch return;
+            if (slot.explicit_sync_resource) |active| {
+                if (!std.meta.eql(active, resource)) return;
+                slot.state.disableExplicitSync();
+                slot.explicit_sync_resource = null;
+            }
+        }
+
+        pub fn setExplicitSyncAcquire(
+            adapter: *Self,
+            id: SurfaceId,
+            resource: objects.Handle,
+            point: surface_state.ExplicitSyncPoint,
+        ) !void {
+            const slot = try adapter.explicitSyncSurface(id, resource);
+            try slot.state.setAcquirePoint(point);
+        }
+
+        pub fn setExplicitSyncRelease(
+            adapter: *Self,
+            id: SurfaceId,
+            resource: objects.Handle,
+            point: surface_state.ExplicitSyncPoint,
+        ) !void {
+            const slot = try adapter.explicitSyncSurface(id, resource);
+            try slot.state.setReleasePoint(point);
+        }
+
         pub fn surfaceResource(adapter: *Self, id: SurfaceId) !objects.Handle {
             if (id.index >= adapter.surfaces.len) return error.StaleSurface;
             const slot = adapter.surfaces[id.index];
@@ -1559,7 +1604,7 @@ pub fn Adapter(comptime protocol: type) type {
                     };
                     if (adapter.commit_hook) |hook|
                         hook.validate_fn(hook.context, surface_id) catch |cause|
-                            return try adapter.surfaceFailure(actor, resource.id, cause);
+                            return try adapter.surfaceCommitFailure(actor, slot, cause);
                     const content_plan = if (adapter.content_commit_hook) |hook| plan: {
                         adapter.ensureCommitDependencies(adapter.surfaces.len) catch |cause|
                             return try adapter.surfaceFailure(actor, resource.id, cause);
@@ -2627,6 +2672,17 @@ pub fn Adapter(comptime protocol: type) type {
             return slot;
         }
 
+        fn explicitSyncSurface(
+            adapter: *Self,
+            id: SurfaceId,
+            resource: objects.Handle,
+        ) !*SurfaceSlot {
+            const slot = try adapter.surfaceForId(id);
+            const active = slot.explicit_sync_resource orelse return error.StaleSurface;
+            if (!std.meta.eql(active, resource)) return error.StaleSurface;
+            return slot;
+        }
+
         fn pendingAttachmentCopy(adapter: *Self, surface: *SurfaceSlot) !?*CopySlot {
             const lease = surface.attachment.pending orelse return null;
             const backing = try adapter.imports.get(lease);
@@ -2963,6 +3019,22 @@ pub fn Adapter(comptime protocol: type) type {
                 error.InvalidValue, error.InvalidSize, error.OutOfBuffer => return adapter.viewportFailure(actor, resource.id, cause),
                 else => {},
             };
+            if (surface.explicit_sync_resource) |resource| {
+                const code = switch (cause) {
+                    error.ExplicitSyncUnsupportedBuffer => ExplicitSyncSurface.@"error".unsupported_buffer.value,
+                    error.ExplicitSyncNoBuffer => ExplicitSyncSurface.@"error".no_buffer.value,
+                    error.ExplicitSyncNoAcquirePoint => ExplicitSyncSurface.@"error".no_acquire_point.value,
+                    error.ExplicitSyncNoReleasePoint => ExplicitSyncSurface.@"error".no_release_point.value,
+                    error.ExplicitSyncConflictingPoints => ExplicitSyncSurface.@"error".conflicting_points.value,
+                    else => null,
+                };
+                if (code) |value| return adapter.protocolError(
+                    actor,
+                    resource.id,
+                    value,
+                    @errorName(cause),
+                );
+            }
             return adapter.surfaceFailure(actor, surface.resource.id, cause);
         }
 
