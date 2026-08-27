@@ -65,14 +65,14 @@ pub const Event = union(enum) {
         tool: platform_api.TabletToolInfo,
         time_usec: u64,
         entered: bool,
-        x: f64,
-        y: f64,
+        axes: platform_api.TabletToolAxes,
     },
     tablet_tool_tip: struct {
         device: DeviceId,
         tool: platform_api.ToolRef,
         time_usec: u64,
         down: bool,
+        axes: platform_api.TabletToolAxes,
     },
     tablet_tool_button: struct {
         device: DeviceId,
@@ -80,6 +80,7 @@ pub const Event = union(enum) {
         time_usec: u64,
         button: u32,
         pressed: bool,
+        axes: platform_api.TabletToolAxes,
     },
     tablet_pad_button: struct {
         device: DeviceId,
@@ -496,34 +497,36 @@ pub const Backend = struct {
             },
             .tablet_tool_proximity => |value| {
                 _ = try self.validateTabletDevice(value.device, true);
-                if (!std.math.isFinite(value.x) or !std.math.isFinite(value.y))
-                    return error.InvalidTabletAxis;
+                try validateTabletAxes(value.axes);
                 self.push(.{ .tablet_tool_proximity = .{
                     .device = try self.idForReference(value.device),
                     .tool = value.tool,
                     .time_usec = value.time_usec,
                     .entered = value.entered,
-                    .x = value.x,
-                    .y = value.y,
+                    .axes = value.axes,
                 } });
             },
             .tablet_tool_tip => |value| {
                 _ = try self.validateTabletDevice(value.device, true);
+                try validateTabletAxes(value.axes);
                 self.push(.{ .tablet_tool_tip = .{
                     .device = try self.idForReference(value.device),
                     .tool = value.tool,
                     .time_usec = value.time_usec,
                     .down = value.down,
+                    .axes = value.axes,
                 } });
             },
             .tablet_tool_button => |value| {
                 _ = try self.validateTabletDevice(value.device, true);
+                try validateTabletAxes(value.axes);
                 self.push(.{ .tablet_tool_button = .{
                     .device = try self.idForReference(value.device),
                     .tool = value.tool,
                     .time_usec = value.time_usec,
                     .button = value.button,
                     .pressed = value.pressed,
+                    .axes = value.axes,
                 } });
             },
             .tablet_pad_button => |value| {
@@ -1233,8 +1236,7 @@ test "input: tablet metadata and events retain generational device ownership" {
         },
         .time_usec = 100,
         .entered = true,
-        .x = 0.25,
-        .y = 0.75,
+        .axes = .{ .x = 0.25, .y = 0.75, .pressure = 0.5 },
     } });
     try backend.consume(.{ .tablet_tool_axis = .{
         .device = 12,
@@ -1242,9 +1244,16 @@ test "input: tablet metadata and events retain generational device ownership" {
         .time_usec = 101,
         .axes = .{ .x = 0.5, .pressure = 0.8, .wheel_clicks = -1 },
     } });
+    try backend.consume(.{ .tablet_tool_tip = .{
+        .device = 12,
+        .tool = 91,
+        .time_usec = 102,
+        .down = true,
+        .axes = .{ .x = 0.6, .y = 0.7, .pressure = 1 },
+    } });
     try backend.consume(.{ .tablet_pad_ring = .{
         .device = 12,
-        .time_usec = 102,
+        .time_usec = 103,
         .ring = 0,
         .position = 90,
         .source = .finger,
@@ -1253,17 +1262,26 @@ test "input: tablet metadata and events retain generational device ownership" {
     } });
     try std.testing.expectEqual(id, backend.events()[0].tablet_tool_proximity.device);
     try std.testing.expectEqual(@as(platform_api.ToolRef, 91), backend.events()[1].tablet_tool_axis.tool);
-    try std.testing.expectEqual(platform_api.TabletPadSource.finger, backend.events()[2].tablet_pad_ring.source);
+    try std.testing.expectEqual(@as(?f64, 1), backend.events()[2].tablet_tool_tip.axes.pressure);
+    try std.testing.expectEqual(platform_api.TabletPadSource.finger, backend.events()[3].tablet_pad_ring.source);
 
     try std.testing.expectError(error.InvalidTabletAxis, backend.consume(.{ .tablet_tool_axis = .{
         .device = 12,
         .tool = 91,
-        .time_usec = 103,
+        .time_usec = 104,
         .axes = .{ .pressure = std.math.nan(f64) },
+    } }));
+    try std.testing.expectError(error.InvalidTabletAxis, backend.consume(.{ .tablet_tool_button = .{
+        .device = 12,
+        .tool = 91,
+        .time_usec = 105,
+        .button = 1,
+        .pressed = true,
+        .axes = .{ .rotation = std.math.inf(f64) },
     } }));
     try std.testing.expectError(error.InvalidTabletControl, backend.consume(.{ .tablet_pad_button = .{
         .device = 12,
-        .time_usec = 104,
+        .time_usec = 106,
         .button = 2,
         .pressed = true,
         .mode = 0,

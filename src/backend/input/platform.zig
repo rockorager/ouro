@@ -125,16 +125,22 @@ pub const RawEvent = union(enum) {
         tool: TabletToolInfo,
         time_usec: u64,
         entered: bool,
-        x: f64,
-        y: f64,
+        axes: TabletToolAxes,
     },
-    tablet_tool_tip: struct { device: DeviceRef, tool: ToolRef, time_usec: u64, down: bool },
+    tablet_tool_tip: struct {
+        device: DeviceRef,
+        tool: ToolRef,
+        time_usec: u64,
+        down: bool,
+        axes: TabletToolAxes,
+    },
     tablet_tool_button: struct {
         device: DeviceRef,
         tool: ToolRef,
         time_usec: u64,
         button: u32,
         pressed: bool,
+        axes: TabletToolAxes,
     },
     tablet_pad_button: struct {
         device: DeviceRef,
@@ -429,8 +435,7 @@ fn realNextEvent(_: *anyopaque, value: *anyopaque) !?RawEvent {
                     .time_usec = time_usec,
                     .entered = c.libinput_event_tablet_tool_get_proximity_state(tablet) ==
                         c.LIBINPUT_TABLET_TOOL_PROXIMITY_STATE_IN,
-                    .x = c.libinput_event_tablet_tool_get_x_transformed(tablet, 1),
-                    .y = c.libinput_event_tablet_tool_get_y_transformed(tablet, 1),
+                    .axes = tabletProximityAxes(tablet),
                 } },
                 c.LIBINPUT_EVENT_TABLET_TOOL_TIP => .{ .tablet_tool_tip = .{
                     .device = device,
@@ -438,6 +443,7 @@ fn realNextEvent(_: *anyopaque, value: *anyopaque) !?RawEvent {
                     .time_usec = time_usec,
                     .down = c.libinput_event_tablet_tool_get_tip_state(tablet) ==
                         c.LIBINPUT_TABLET_TOOL_TIP_DOWN,
+                    .axes = tabletAxes(tablet),
                 } },
                 c.LIBINPUT_EVENT_TABLET_TOOL_BUTTON => .{ .tablet_tool_button = .{
                     .device = device,
@@ -446,6 +452,7 @@ fn realNextEvent(_: *anyopaque, value: *anyopaque) !?RawEvent {
                     .button = c.libinput_event_tablet_tool_get_button(tablet),
                     .pressed = c.libinput_event_tablet_tool_get_button_state(tablet) ==
                         c.LIBINPUT_BUTTON_STATE_PRESSED,
+                    .axes = tabletAxes(tablet),
                 } },
                 else => unreachable,
             };
@@ -582,25 +589,35 @@ fn tabletToolInfo(tool: *c.struct_libinput_tablet_tool) TabletToolInfo {
 }
 
 fn tabletAxes(event: *c.struct_libinput_event_tablet_tool) TabletToolAxes {
+    const position_changed = c.libinput_event_tablet_tool_x_has_changed(event) != 0 or
+        c.libinput_event_tablet_tool_y_has_changed(event) != 0;
+    const tilt_changed = c.libinput_event_tablet_tool_tilt_x_has_changed(event) != 0 or
+        c.libinput_event_tablet_tool_tilt_y_has_changed(event) != 0;
     const wheel_changed = c.libinput_event_tablet_tool_wheel_has_changed(event) != 0;
     return .{
-        .x = if (c.libinput_event_tablet_tool_x_has_changed(event) != 0)
+        .x = if (position_changed)
             c.libinput_event_tablet_tool_get_x_transformed(event, 1)
         else
             null,
-        .y = if (c.libinput_event_tablet_tool_y_has_changed(event) != 0)
+        .y = if (position_changed)
             c.libinput_event_tablet_tool_get_y_transformed(event, 1)
         else
             null,
         .pressure = changedAxis(event, c.libinput_event_tablet_tool_pressure_has_changed, c.libinput_event_tablet_tool_get_pressure),
         .distance = changedAxis(event, c.libinput_event_tablet_tool_distance_has_changed, c.libinput_event_tablet_tool_get_distance),
-        .tilt_x = changedAxis(event, c.libinput_event_tablet_tool_tilt_x_has_changed, c.libinput_event_tablet_tool_get_tilt_x),
-        .tilt_y = changedAxis(event, c.libinput_event_tablet_tool_tilt_y_has_changed, c.libinput_event_tablet_tool_get_tilt_y),
+        .tilt_x = if (tilt_changed) c.libinput_event_tablet_tool_get_tilt_x(event) else null,
+        .tilt_y = if (tilt_changed) c.libinput_event_tablet_tool_get_tilt_y(event) else null,
         .rotation = changedAxis(event, c.libinput_event_tablet_tool_rotation_has_changed, c.libinput_event_tablet_tool_get_rotation),
         .slider = changedAxis(event, c.libinput_event_tablet_tool_slider_has_changed, c.libinput_event_tablet_tool_get_slider_position),
         .wheel_degrees = if (wheel_changed) c.libinput_event_tablet_tool_get_wheel_delta(event) else null,
         .wheel_clicks = if (wheel_changed) c.libinput_event_tablet_tool_get_wheel_delta_discrete(event) else 0,
     };
+}
+
+fn tabletProximityAxes(event: *c.struct_libinput_event_tablet_tool) TabletToolAxes {
+    if (c.libinput_event_tablet_tool_get_proximity_state(event) ==
+        c.LIBINPUT_TABLET_TOOL_PROXIMITY_STATE_OUT) return .{};
+    return tabletAxes(event);
 }
 
 fn changedAxis(event: anytype, changed: anytype, get: anytype) ?f64 {
