@@ -34,6 +34,7 @@ const protocol_seat = @import("../protocol/seat.zig");
 const protocol_data_device = @import("../protocol/data_device.zig");
 const protocol_primary_selection = @import("../protocol/primary_selection.zig");
 const protocol_ext_data_control = @import("../protocol/ext_data_control.zig");
+const protocol_input_method = @import("../protocol/input_method.zig");
 const SelectionSource = @import("../protocol/selection_source.zig").Source;
 const protocol_linux_dmabuf = @import("../protocol/linux_dmabuf.zig");
 const protocol_linux_drm_syncobj = @import("../protocol/linux_drm_syncobj.zig");
@@ -114,6 +115,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const SessionLockAdapter = protocol_session_lock.Adapter(protocol, Adapter, OutputAdapter);
         const CursorShapeAdapter = protocol_cursor_shape.Adapter(protocol);
         const TextInputAdapter = protocol_text_input.Adapter(protocol);
+        const InputMethodAdapter = protocol_input_method.Adapter(protocol, TextInputAdapter);
         const TabletState = tablet_input.State(SeatAdapter.FocusTarget);
         const TabletAdapter = protocol_tablet_v2.Adapter(protocol, SeatAdapter);
 
@@ -197,12 +199,13 @@ pub fn Coordinator(comptime protocol: type) type {
             const tablet: u32 = 1 << 22;
             const ext_data_control: u32 = 1 << 23;
             const wlr_data_control: u32 = 1 << 24;
+            const input_method: u32 = 1 << 25;
             const all: u32 = decoration | shell | seat | data_device | dmabuf |
                 activation | relative_pointer | fractional_scale | output | core |
                 pointer_constraints | color_management | color_representation |
                 primary_selection | text_input | pointer_gestures |
                 shortcuts_inhibit | xdg_foreign | xdg_output | layer_shell | session_lock |
-                idle_notify | tablet | ext_data_control | wlr_data_control;
+                idle_notify | tablet | ext_data_control | wlr_data_control | input_method;
         };
         const Client = struct {
             active: bool = false,
@@ -295,6 +298,7 @@ pub fn Coordinator(comptime protocol: type) type {
             ext_data_control: protocol_ext_data_control.Config = .{},
             wlr_data_control: protocol_ext_data_control.Config = .{ .global_version = 2 },
             text_input: protocol_text_input.Config = .{},
+            input_method: protocol_input_method.Config = .{},
             linux_dmabuf: protocol_linux_dmabuf.Config = .{},
             linux_drm_syncobj: protocol_linux_drm_syncobj.Config = .{},
             xdg_activation: protocol_xdg_activation.Config = .{},
@@ -389,6 +393,7 @@ pub fn Coordinator(comptime protocol: type) type {
         ext_data_control_adapter: ExtDataControlAdapter,
         wlr_data_control_adapter: WlrDataControlAdapter,
         text_input_adapter: TextInputAdapter,
+        input_method_adapter: InputMethodAdapter,
         dmabuf_adapter: DmabufAdapter,
         syncobj_device: ?drm_syncobj.Device = null,
         syncobj_adapter: ?SyncobjAdapter = null,
@@ -760,6 +765,11 @@ pub fn Coordinator(comptime protocol: type) type {
                 .validateFn = validateTextInputSeat,
             }, config.text_input);
             errdefer self.text_input_adapter.deinit();
+            self.input_method_adapter = try InputMethodAdapter.init(allocator, &self.text_input_adapter, .{
+                .context = self,
+                .resolveFn = resolveInputMethodSeat,
+            }, config.input_method);
+            errdefer self.input_method_adapter.deinit();
             self.dmabuf_adapter = try DmabufAdapter.init(allocator, config.linux_dmabuf);
             errdefer self.dmabuf_adapter.deinit();
             try self.adapter.setExternalImporter(self.dmabuf_adapter.externalImporter(Adapter));
@@ -974,6 +984,9 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = try self.text_input_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
+            _ = try self.input_method_adapter.install(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
             _ = try self.dmabuf_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
@@ -1109,6 +1122,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.decoration_adapter.deinit();
             self.activation_adapter.deinit();
             self.dmabuf_adapter.deinit();
+            self.input_method_adapter.deinit();
             self.text_input_adapter.deinit();
             self.primary_selection_adapter.deinit();
             self.wlr_data_control_adapter.deinit();
@@ -1174,6 +1188,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.syncIdleNotifications() catch {};
             self.shortcuts_inhibit_adapter.disconnected(peer);
             self.foreign_adapter.disconnected(peer);
+            self.input_method_adapter.disconnected(peer);
             self.text_input_adapter.disconnected(peer);
             self.primary_selection_adapter.disconnected(peer);
             self.wlr_data_control_adapter.disconnected(peer);
@@ -1326,10 +1341,16 @@ pub fn Coordinator(comptime protocol: type) type {
                 return control;
             }
             if (try self.text_input_adapter.request(peer, target, message, fds)) |control| {
-                while (self.text_input_adapter.peekEvent() != null)
-                    self.text_input_adapter.dropEvent();
+                try self.processTextInputEvents();
                 if (self.text_input_adapter.pendingOutboundOn(peer))
                     self.markProtocol(peer, ProtocolReady.text_input);
+                try self.flushProtocol();
+                return control;
+            }
+            if (try self.input_method_adapter.request(peer, target, message, fds)) |control| {
+                if (self.input_method_adapter.pendingOutboundOn(peer))
+                    self.markProtocol(peer, ProtocolReady.input_method);
+                self.markTextInputProtocol();
                 try self.flushProtocol();
                 return control;
             }
@@ -2727,7 +2748,8 @@ pub fn Coordinator(comptime protocol: type) type {
             const name = visibility.interface.name;
             return !std.mem.eql(u8, name, protocol.wp_security_context_manager_v1.info.name) and
                 !std.mem.eql(u8, name, "ext_data_control_manager_v1") and
-                !std.mem.eql(u8, name, "zwlr_data_control_manager_v1");
+                !std.mem.eql(u8, name, "zwlr_data_control_manager_v1") and
+                !std.mem.eql(u8, name, "zwp_input_method_manager_v2");
         }
 
         fn commitSecurityContext(
@@ -2768,6 +2790,14 @@ pub fn Coordinator(comptime protocol: type) type {
             const self: *Self = @ptrCast(@alignCast(context orelse return false));
             const server_objects = self.root.runtime.clients.get(peer) catch return false;
             return self.seat_adapter.validateSeatOn(server_objects, peer, seat_object);
+        }
+
+        fn resolveInputMethodSeat(
+            context: ?*anyopaque,
+            peer: wayring.io_uring.Peer,
+            seat_object: u32,
+        ) ?u32 {
+            return if (validateTextInputSeat(context, peer, seat_object)) 0 else null;
         }
 
         fn validateGesturePointer(
@@ -2958,6 +2988,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 flushed += try self.wlr_data_control_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.text_input != 0)
                 flushed += try self.text_input_adapter.flushOn(peer, objects, &actor.transmit);
+            if (client.protocol_ready & ProtocolReady.input_method != 0)
+                flushed += try self.input_method_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.dmabuf != 0)
                 flushed += try self.dmabuf_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.activation != 0)
@@ -3033,6 +3065,24 @@ pub fn Coordinator(comptime protocol: type) type {
             }
         }
 
+        fn markInputMethodProtocol(self: *Self) void {
+            for (self.clients.items) |*client| {
+                if (client.active and self.input_method_adapter.pendingOutboundOn(client.peer))
+                    client.protocol_ready |= ProtocolReady.input_method;
+            }
+        }
+
+        fn processTextInputEvents(self: *Self) !void {
+            while (self.text_input_adapter.peekEvent()) |event| {
+                self.input_method_adapter.synchronize(0, event.*) catch |err| switch (err) {
+                    error.Exhausted => break,
+                    else => return err,
+                };
+                self.text_input_adapter.dropEvent();
+            }
+            self.markInputMethodProtocol();
+        }
+
         fn markShortcutsInhibitProtocol(self: *Self) void {
             for (self.clients.items) |*client| {
                 if (client.active and self.shortcuts_inhibit_adapter.pendingOutbound(client.peer))
@@ -3069,6 +3119,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (ready & ProtocolReady.text_input != 0 and
                 !self.text_input_adapter.pendingOutboundOn(client.peer))
                 ready &= ~ProtocolReady.text_input;
+            if (ready & ProtocolReady.input_method != 0 and
+                !self.input_method_adapter.pendingOutboundOn(client.peer))
+                ready &= ~ProtocolReady.input_method;
             if (ready & ProtocolReady.dmabuf != 0 and
                 !self.dmabuf_adapter.pendingOutbound(client.peer))
                 ready &= ~ProtocolReady.dmabuf;
@@ -4892,6 +4945,7 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.xdg_output_adapter.resourceRemoved(handle, object);
             _ = self.output_adapter.resourceRemoved(handle, object);
             _ = self.cursor_shape_adapter.resourceRemoved(handle, object);
+            _ = self.input_method_adapter.resourceRemoved(handle, object);
             _ = self.text_input_adapter.resourceRemoved(handle, object);
             _ = self.subcompositor_adapter.resourceRemoved(handle, object);
             if (layer_shell_removed and self.output != null) {
