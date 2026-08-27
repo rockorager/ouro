@@ -37,6 +37,8 @@ const protocol_xdg_decoration = @import("../protocol/xdg_decoration.zig");
 const protocol_relative_pointer = @import("../protocol/relative_pointer.zig");
 const protocol_pointer_constraints = @import("../protocol/pointer_constraints.zig");
 const protocol_fractional_scale = @import("../protocol/fractional_scale.zig");
+const protocol_color_management = @import("../protocol/color_management.zig");
+const protocol_color_representation = @import("../protocol/color_representation.zig");
 const protocol_output = @import("../protocol/output.zig");
 const desktop_model = @import("../desktop/model.zig");
 const interaction_model = @import("../input/interaction.zig");
@@ -67,6 +69,8 @@ pub fn Coordinator(comptime protocol: type) type {
         const RelativePointerAdapter = protocol_relative_pointer.Adapter(protocol, SeatAdapter);
         const PointerConstraintsAdapter = protocol_pointer_constraints.Adapter(protocol, Adapter, SeatAdapter);
         const FractionalScaleAdapter = protocol_fractional_scale.Adapter(protocol, Adapter);
+        const ColorManagementAdapter = protocol_color_management.Adapter(protocol, Adapter);
+        const ColorRepresentationAdapter = protocol_color_representation.Adapter(protocol, Adapter);
         const OutputAdapter = protocol_output.Adapter(protocol);
 
         const Imported = struct {};
@@ -127,9 +131,11 @@ pub fn Coordinator(comptime protocol: type) type {
             const output: u16 = 1 << 8;
             const core: u16 = 1 << 9;
             const pointer_constraints: u16 = 1 << 10;
+            const color_management: u16 = 1 << 11;
+            const color_representation: u16 = 1 << 12;
             const all: u16 = decoration | shell | seat | data_device | dmabuf |
                 activation | relative_pointer | fractional_scale | output | core |
-                pointer_constraints;
+                pointer_constraints | color_management | color_representation;
         };
         const Client = struct {
             active: bool = false,
@@ -224,6 +230,9 @@ pub fn Coordinator(comptime protocol: type) type {
             relative_pointer: protocol_relative_pointer.Config = .{},
             pointer_constraints: protocol_pointer_constraints.WireConfig = .{},
             fractional_scale: protocol_fractional_scale.Config = .{},
+            color_management: protocol_color_management.Config = .{},
+            color_representation: protocol_color_representation.Config = .{},
+            enable_color_protocols: bool = false,
             protocol_output: protocol_output.Config = .{},
             drm: drm.Config,
             output: output_api.Config,
@@ -280,6 +289,11 @@ pub fn Coordinator(comptime protocol: type) type {
         relative_pointer_adapter: RelativePointerAdapter,
         pointer_constraints_adapter: PointerConstraintsAdapter,
         fractional_scale_adapter: FractionalScaleAdapter,
+        color_management_adapter: ColorManagementAdapter,
+        icc_poll: ?completion.Token = null,
+        icc_poll_canceling: bool = false,
+        color_protocols_enabled: bool = false,
+        color_representation_adapter: ColorRepresentationAdapter,
         output_adapter: OutputAdapter,
         presentations: Presentations,
         render_device: ?*output_api.RenderDevice = null,
@@ -417,6 +431,9 @@ pub fn Coordinator(comptime protocol: type) type {
             errdefer allocator.free(self.association_surfaces);
             self.desktop_timer = null;
             self.desktop_timer_canceling = false;
+            self.color_protocols_enabled = config.enable_color_protocols and config.output.renderer == .vulkan;
+            self.icc_poll = null;
+            self.icc_poll_canceling = false;
             self.cursor_layer = .{};
             self.output_drain_started = false;
             self.stopping = false;
@@ -509,6 +526,18 @@ pub fn Coordinator(comptime protocol: type) type {
                 config.fractional_scale,
             );
             errdefer self.fractional_scale_adapter.deinit();
+            self.color_management_adapter = try ColorManagementAdapter.init(
+                allocator,
+                &self.adapter,
+                config.color_management,
+            );
+            errdefer self.color_management_adapter.deinit();
+            self.color_representation_adapter = try ColorRepresentationAdapter.init(
+                allocator,
+                &self.adapter,
+                config.color_representation,
+            );
+            errdefer self.color_representation_adapter.deinit();
             self.data_device_adapter.setSerialValidator(.{
                 .context = self,
                 .validate = validateSelection,
@@ -562,6 +591,14 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = try self.fractional_scale_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
+            if (self.color_protocols_enabled) {
+                _ = try self.color_management_adapter.install(&root.runtime);
+                if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                    return error.GlobalPublicationIncomplete;
+                _ = try self.color_representation_adapter.install(&root.runtime);
+                if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                    return error.GlobalPublicationIncomplete;
+            }
             _ = try self.adapter.installPresentation();
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
@@ -613,6 +650,12 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.stopping = true;
                 if (self.loop) |value| try value.requestShutdown();
             }
+            if (self.icc_poll) |token| if (!self.icc_poll_canceling) {
+                const cancel = try self.router.acquire(.icc_worker);
+                errdefer self.router.retire(cancel) catch {};
+                _ = try self.root.ring.poll_remove(token.encode(), cancel.encode());
+                self.icc_poll_canceling = true;
+            };
             try self.syncDesktopTimer();
             try self.pauseOutput();
             try self.advanceDrain();
@@ -621,7 +664,8 @@ pub fn Coordinator(comptime protocol: type) type {
         pub fn backendDrainComplete(self: *const Self) bool {
             return self.stopping and self.output == null and
                 (self.input == null or self.input.?.drainComplete()) and
-                self.session.drainComplete() and self.timers.idle();
+                self.session.drainComplete() and self.timers.idle() and
+                self.icc_poll == null and !self.icc_poll_canceling;
         }
 
         /// Requires completed Wayring and backend drains. Teardown order is
@@ -657,6 +701,8 @@ pub fn Coordinator(comptime protocol: type) type {
             self.allocator.free(self.app_layers);
             self.output_adapter.deinit();
             self.fractional_scale_adapter.deinit();
+            self.color_representation_adapter.deinit();
+            self.color_management_adapter.deinit();
             self.decoration_adapter.deinit();
             self.activation_adapter.deinit();
             self.dmabuf_adapter.deinit();
@@ -798,6 +844,19 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.flushProtocol();
                 return control;
             }
+            if (try self.color_management_adapter.request(peer, target, message, fds)) |control| {
+                if (self.color_management_adapter.hasPendingJobs()) try self.armIccPoll();
+                if (self.color_management_adapter.pendingOutbound(peer))
+                    self.markProtocol(peer, ProtocolReady.color_management);
+                try self.flushProtocol();
+                return control;
+            }
+            if (try self.color_representation_adapter.request(peer, target, message, fds)) |control| {
+                if (self.color_representation_adapter.pendingOutbound(peer))
+                    self.markProtocol(peer, ProtocolReady.color_representation);
+                try self.flushProtocol();
+                return control;
+            }
             if (try self.shell_adapter.request(peer, target, message, fds)) |control| {
                 try self.advanceShell();
                 try self.flushProtocol();
@@ -866,6 +925,7 @@ pub fn Coordinator(comptime protocol: type) type {
             ouro_outcomes: []const loop_api.OuroCompletion,
         ) !void {
             for (ouro_outcomes) |outcome| switch (outcome.token.kind) {
+                .icc_worker => try self.completeIcc(outcome),
                 .copy => {
                     try self.adapter.completeShmCopy(outcome);
                     try self.applyReady();
@@ -900,6 +960,33 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.processOutput();
             try self.armTimer();
             try self.advanceDrain();
+        }
+
+        fn armIccPoll(self: *Self) !void {
+            if (self.stopping or self.icc_poll != null) return;
+            const token = try self.router.acquire(.icc_worker);
+            errdefer self.router.retire(token) catch {};
+            _ = try self.root.ring.poll_add(token.encode(), self.color_management_adapter.notificationFd(), linux.POLL.IN | linux.POLL.ERR | linux.POLL.HUP | linux.POLL.NVAL);
+            self.icc_poll = token;
+        }
+
+        fn completeIcc(self: *Self, outcome: loop_api.OuroCompletion) !void {
+            if (self.icc_poll) |poll| if (std.meta.eql(poll, outcome.token)) {
+                try self.router.retire(outcome.token);
+                self.icc_poll = null;
+                if (!self.icc_poll_canceling and outcome.cqe.res >= 0 and (@as(u32, @intCast(outcome.cqe.res)) & linux.POLL.IN) != 0) {
+                    try self.color_management_adapter.completeWorker();
+                    for (self.clients.items) |client| if (client.active and self.color_management_adapter.pendingOutbound(client.peer))
+                        self.markProtocol(client.peer, ProtocolReady.color_management);
+                    try self.flushProtocol();
+                }
+                if (!self.stopping and self.color_management_adapter.hasPendingJobs())
+                    try self.armIccPoll();
+                return;
+            };
+            // poll_remove's own completion token
+            try self.router.retire(outcome.token);
+            self.icc_poll_canceling = false;
         }
 
         /// End-of-turn backend phase. This consumes at most one fixed input
@@ -1604,6 +1691,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 flushed += try self.pointer_constraints_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.fractional_scale != 0)
                 flushed += try self.fractional_scale_adapter.flushOn(peer, objects, &actor.transmit);
+            if (client.protocol_ready & ProtocolReady.color_management != 0)
+                flushed += try self.color_management_adapter.flushOn(peer, objects, &actor.transmit);
+            if (client.protocol_ready & ProtocolReady.color_representation != 0)
+                flushed += try self.color_representation_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.output != 0)
                 flushed += try self.output_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.core != 0) {
@@ -1669,6 +1760,12 @@ pub fn Coordinator(comptime protocol: type) type {
             if (ready & ProtocolReady.fractional_scale != 0 and
                 !self.fractional_scale_adapter.pendingOutbound(client.peer))
                 ready &= ~ProtocolReady.fractional_scale;
+            if (ready & ProtocolReady.color_management != 0 and
+                !self.color_management_adapter.pendingOutbound(client.peer))
+                ready &= ~ProtocolReady.color_management;
+            if (ready & ProtocolReady.color_representation != 0 and
+                !self.color_representation_adapter.pendingOutbound(client.peer))
+                ready &= ~ProtocolReady.color_representation;
             if (ready & ProtocolReady.output != 0 and
                 !self.output_adapter.pendingOutboundOn(client.peer))
                 ready &= ~ProtocolReady.output;
@@ -2130,6 +2227,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 .destination = destination,
                 .clip = visible_clip,
                 .transform = @enumFromInt(@intFromEnum(content.surface.transform)),
+                .color_description = content.surface.color_description,
+                .color_representation = content.surface.color_representation,
             };
             const published = .{
                 .peer = candidate.peer,
@@ -2894,12 +2993,16 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.relative_pointer_adapter.resourceRemoved(handle, object);
             _ = self.pointer_constraints_adapter.resourceRemoved(handle, object);
             _ = self.fractional_scale_adapter.resourceRemoved(handle, object);
+            _ = self.color_management_adapter.resourceRemoved(handle, object);
+            _ = self.color_representation_adapter.resourceRemoved(handle, object);
             _ = self.output_adapter.resourceRemoved(handle, object);
             _ = self.subcompositor_adapter.resourceRemoved(handle, object);
             if (removed_surface_peer) |peer| self.data_device_adapter.surfaceRemoved(peer, handle.id);
             if (removed_surface_peer) |peer| self.output_adapter.surfaceRemoved(peer, handle);
             if (removed_surface) |id| {
                 self.pointer_constraints_adapter.surfaceRemoved(id);
+                self.color_management_adapter.surfaceRemoved(id);
+                self.color_representation_adapter.surfaceRemoved(id);
                 self.dropPendingSurface(id);
                 if (self.render_device) |render_device| render_device.content.destroySurface(
                     (@as(u64, id.generation) << 32) | id.index,

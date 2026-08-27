@@ -18,6 +18,8 @@ pub fn build(b: *std.Build) void {
     generate_core_protocol.addFileArg(wayland_protocols.path("stable/presentation-time/presentation-time.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("stable/linux-dmabuf/linux-dmabuf-v1.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("staging/fractional-scale/fractional-scale-v1.xml"));
+    generate_core_protocol.addFileArg(wayland_protocols.path("staging/color-management/color-management-v1.xml"));
+    generate_core_protocol.addFileArg(wayland_protocols.path("staging/color-representation/color-representation-v1.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("staging/xdg-activation/xdg-activation-v1.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("unstable/xdg-decoration/xdg-decoration-unstable-v1.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("unstable/relative-pointer/relative-pointer-unstable-v1.xml"));
@@ -36,6 +38,8 @@ pub fn build(b: *std.Build) void {
     generate_xdg_protocol.addFileArg(wayland_protocols.path("stable/presentation-time/presentation-time.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("stable/linux-dmabuf/linux-dmabuf-v1.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("staging/fractional-scale/fractional-scale-v1.xml"));
+    generate_xdg_protocol.addFileArg(wayland_protocols.path("staging/color-management/color-management-v1.xml"));
+    generate_xdg_protocol.addFileArg(wayland_protocols.path("staging/color-representation/color-representation-v1.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("staging/xdg-activation/xdg-activation-v1.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("unstable/xdg-decoration/xdg-decoration-unstable-v1.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("unstable/relative-pointer/relative-pointer-unstable-v1.xml"));
@@ -66,6 +70,7 @@ pub fn build(b: *std.Build) void {
     ouro.linkSystemLibrary("gbm", .{});
     ouro.linkSystemLibrary("pixman-1", .{});
     ouro.linkSystemLibrary("vulkan", .{});
+    ouro.linkSystemLibrary("lcms2", .{});
 
     const executable = b.addExecutable(.{
         .name = "ouro",

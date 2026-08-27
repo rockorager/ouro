@@ -29,6 +29,8 @@ pub const drm_atomic = @import("backend/drm/atomic.zig");
 pub const drm_output = @import("backend/drm/output.zig");
 pub const render = @import("render/types.zig");
 pub const render_content = @import("render/content.zig");
+pub const icc = @import("render/icc.zig");
+pub const icc_worker = @import("render/icc_worker.zig");
 pub const cpu_renderer = @import("render/cpu.zig");
 pub const vulkan_renderer = @import("render/vulkan.zig");
 pub const vulkan_platform = @import("render/vulkan_platform.zig");
@@ -85,6 +87,8 @@ test {
     _ = drm_output;
     _ = render;
     _ = render_content;
+    _ = icc;
+    _ = icc_worker;
     _ = cpu_renderer;
     _ = vulkan_renderer;
     _ = vulkan_platform;

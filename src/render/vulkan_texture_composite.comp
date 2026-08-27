@@ -6,6 +6,7 @@
 
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(set = 0, binding = 0, rgba8) uniform image2D target_image;
+layout(set = 0, binding = 5, rgba16f) uniform image2D linear_image;
 
 struct Sample {
     uvec4 source;       // reserved, width, height, reserved
@@ -14,32 +15,108 @@ struct Sample {
     ivec4 clip;         // x, y, width, height
     uvec4 attributes;   // format, transform, global alpha, reserved
     ivec4 affine;       // xx, xy, x0, yx in signed 16.16
-    ivec4 affine_tail;  // yy, y0, reserved, reserved
+    ivec4 affine_tail;  // yy, y0, alpha mode, LUT slot + 1
+    vec4 color_matrix_0;
+    vec4 color_matrix_1;
+    vec4 color_matrix_2;
 };
 
 layout(std430, set = 0, binding = 1) readonly buffer Samples { Sample items[]; };
 layout(set = 0, binding = 3) uniform sampler2D source_images[32];
+layout(std430, set = 0, binding = 4) readonly buffer ColorLuts { vec4 lut_texels[]; };
 
 layout(push_constant) uniform Frame {
     uvec4 clear_color;  // straight alpha, red, green, blue
     uvec4 output_info;  // width, height, format, sample count
     uvec4 damage;       // x, y, width, height
+    uvec4 output_color; // transfer, reference luminance bits, reserved, reserved
 } frame;
 
 uint multiply_unorm(uint value, uint alpha) {
     return (value * alpha + 127u) / 255u;
 }
 
-uvec4 load_pixel(Sample item, uint index, ivec2 coordinate) {
-    uvec4 value = uvec4(round(texelFetch(source_images[index], coordinate, 0) * 255.0));
-    if (item.attributes.x == 1u) value.a = 255u;
-    uint global_alpha = item.attributes.z;
-    return uvec4(
-        multiply_unorm(value.r, global_alpha),
-        multiply_unorm(value.g, global_alpha),
-        multiply_unorm(value.b, global_alpha),
-        multiply_unorm(value.a, global_alpha)
-    );
+vec3 decode_transfer(vec3 value, uint transfer) {
+    if (transfer == 0u) {
+        bvec3 low = lessThanEqual(value, vec3(0.04045));
+        return mix(pow((value + 0.055) / 1.055, vec3(2.4)), value / 12.92, low);
+    }
+    if (transfer == 1u) return value;
+    if (transfer == 2u) return pow(max(value, vec3(0.0)), vec3(2.2));
+    if (transfer == 3u) return pow(max(value, vec3(0.0)), vec3(2.8));
+    if (transfer == 4u) {
+        const float m1 = 2610.0 / 16384.0;
+        const float m2 = 2523.0 / 32.0;
+        const float c1 = 3424.0 / 4096.0;
+        const float c2 = 2413.0 / 128.0;
+        const float c3 = 2392.0 / 128.0;
+        vec3 p = pow(max(value, vec3(0.0)), vec3(1.0 / m2));
+        return pow(max(p - c1, vec3(0.0)) / max(c2 - c3 * p, vec3(0.000001)), vec3(1.0 / m1));
+    }
+    bvec3 low = lessThanEqual(value, vec3(0.5));
+    return mix((exp((value - 0.55991073) / 0.17883277) + 0.28466892) / 12.0,
+               value * value / 3.0, low);
+}
+
+vec3 encode_transfer(vec3 value, uint transfer) {
+    value = max(value, vec3(0.0));
+    if (transfer == 0u) {
+        bvec3 low = lessThanEqual(value, vec3(0.0031308));
+        return mix(1.055 * pow(value, vec3(1.0 / 2.4)) - 0.055, 12.92 * value, low);
+    }
+    if (transfer == 1u) return value;
+    if (transfer == 2u) return pow(value, vec3(1.0 / 2.2));
+    if (transfer == 3u) return pow(value, vec3(1.0 / 2.8));
+    if (transfer == 4u) {
+        const float m1 = 2610.0 / 16384.0;
+        const float m2 = 2523.0 / 32.0;
+        const float c1 = 3424.0 / 4096.0;
+        const float c2 = 2413.0 / 128.0;
+        const float c3 = 2392.0 / 128.0;
+        vec3 p = pow(value / 125.0, vec3(m1));
+        return pow((c1 + c2 * p) / (1.0 + c3 * p), vec3(m2));
+    }
+    bvec3 low = lessThanEqual(value, vec3(1.0 / 12.0));
+    return mix(0.17883277 * log(12.0 * value - 0.28466892) + 0.55991073,
+               sqrt(3.0 * value), low);
+}
+
+vec3 sample_lut(vec3 value, int packed_slot) {
+    const int edge = 33;
+    const int slot_texels = edge * edge * edge;
+    vec3 position = clamp(value, vec3(0.0), vec3(1.0)) * float(edge - 1);
+    ivec3 lower = ivec3(floor(position));
+    ivec3 upper = min(lower + ivec3(1), ivec3(edge - 1));
+    vec3 fraction = position - vec3(lower);
+    int base = (packed_slot - 1) * slot_texels;
+    int i000 = base + lower.x + edge * (lower.y + edge * lower.z);
+    int i100 = base + upper.x + edge * (lower.y + edge * lower.z);
+    int i010 = base + lower.x + edge * (upper.y + edge * lower.z);
+    int i110 = base + upper.x + edge * (upper.y + edge * lower.z);
+    int i001 = base + lower.x + edge * (lower.y + edge * upper.z);
+    int i101 = base + upper.x + edge * (lower.y + edge * upper.z);
+    int i011 = base + lower.x + edge * (upper.y + edge * upper.z);
+    int i111 = base + upper.x + edge * (upper.y + edge * upper.z);
+    vec3 z0 = mix(mix(lut_texels[i000].rgb, lut_texels[i100].rgb, fraction.x),
+                  mix(lut_texels[i010].rgb, lut_texels[i110].rgb, fraction.x), fraction.y);
+    vec3 z1 = mix(mix(lut_texels[i001].rgb, lut_texels[i101].rgb, fraction.x),
+                  mix(lut_texels[i011].rgb, lut_texels[i111].rgb, fraction.x), fraction.y);
+    return mix(z0, z1, fraction.z);
+}
+
+vec4 load_pixel(Sample item, uint index, ivec2 coordinate) {
+    vec4 value = texelFetch(source_images[index], coordinate, 0);
+    if (item.attributes.x == 1u) value.a = 1.0;
+    vec3 electrical = item.affine_tail.z == 0u && value.a > 0.0 ? value.rgb / value.a : value.rgb;
+    vec3 linear = item.affine_tail.w != 0
+        ? sample_lut(electrical, item.affine_tail.w)
+        : decode_transfer(clamp(electrical, 0.0, 1.0), item.attributes.w);
+    mat3 transform = mat3(item.color_matrix_0.xyz, item.color_matrix_1.xyz, item.color_matrix_2.xyz);
+    linear = transpose(transform) * linear * item.color_matrix_0.w;
+    float global_alpha = float(item.attributes.z) / 255.0;
+    float alpha = value.a * global_alpha;
+    vec3 premultiplied = item.affine_tail.z == 1u ? linear * global_alpha : linear * alpha;
+    return vec4(premultiplied, alpha);
 }
 
 ivec2 source_coordinate(Sample item, ivec2 local) {
@@ -55,19 +132,16 @@ void main() {
     if (local_damage.x >= int(frame.damage.z) || local_damage.y >= int(frame.damage.w)) return;
     ivec2 pixel = ivec2(frame.damage.xy) + local_damage;
 
-    // output_info.w's high bit is the continuation flag. A continuation loads
-    // the prior batch's premultiplied result instead of clearing the pixel.
+    // The high bits select an FP16 linear-light continuation. Single-batch
+    // frames remain fused and write the scanout target directly.
     bool continuation = (frame.output_info.w & 0x80000000u) != 0u;
-    uint sample_count = frame.output_info.w & 0x7fffffffu;
-    uint alpha = frame.output_info.z == 1u ? 255u : frame.clear_color.x;
-    uvec4 color = continuation
-        ? uvec4(round(imageLoad(target_image, pixel) * 255.0)).bgra
-        : uvec4(
-            multiply_unorm(frame.clear_color.y, alpha),
-            multiply_unorm(frame.clear_color.z, alpha),
-            multiply_unorm(frame.clear_color.w, alpha),
-            alpha
-        );
+    bool intermediate = (frame.output_info.w & 0x40000000u) != 0u;
+    uint sample_count = frame.output_info.w & 0x3fffffffu;
+    float alpha = frame.output_info.z == 1u ? 1.0 : float(frame.clear_color.x) / 255.0;
+    vec3 clear_electrical = vec3(frame.clear_color.yzw) / 255.0;
+    vec4 color = continuation
+        ? imageLoad(linear_image, pixel)
+        : vec4(decode_transfer(clear_electrical, frame.output_color.x) * alpha, alpha);
     for (uint index = 0u; index < sample_count; ++index) {
         Sample item = items[index];
         ivec2 destination_end = item.destination.xy + item.destination.zw;
@@ -77,14 +151,17 @@ void main() {
         ivec2 coordinate = source_coordinate(item, pixel - item.destination.xy);
         if (any(lessThan(coordinate, ivec2(0))) ||
             coordinate.x >= int(item.source.y) || coordinate.y >= int(item.source.z)) continue;
-        uvec4 source_pixel = load_pixel(item, index, coordinate);
-        uint inverse_alpha = 255u - source_pixel.a;
-        color = min(uvec4(255u), source_pixel + uvec4(
-            multiply_unorm(color.r, inverse_alpha),
-            multiply_unorm(color.g, inverse_alpha),
-            multiply_unorm(color.b, inverse_alpha),
-            multiply_unorm(color.a, inverse_alpha)
-        ));
+        vec4 source_pixel = load_pixel(item, index, coordinate);
+        color = source_pixel + color * (1.0 - source_pixel.a);
     }
-    imageStore(target_image, pixel, vec4(color.b, color.g, color.r, color.a) / 255.0);
+    if (intermediate) {
+        imageStore(linear_image, pixel, color);
+    } else {
+        vec3 straight = color.rgb / max(color.a, 0.000001);
+        vec3 encoded = frame.output_color.z != 0u
+            ? sample_lut(straight, int(frame.output_color.z))
+            : encode_transfer(straight, frame.output_color.x);
+        encoded *= color.a;
+        imageStore(target_image, pixel, vec4(encoded.bgr, color.a));
+    }
 }

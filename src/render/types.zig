@@ -6,6 +6,7 @@
 //! without choosing a renderer API. Samples are ordered back-to-front.
 
 const std = @import("std");
+pub const color = @import("color.zig");
 
 pub const fixed_one: i32 = 1 << 16;
 
@@ -151,6 +152,8 @@ pub const SurfaceSample = struct {
     clip: Rect,
     transform: Transform = .normal,
     global_alpha: u8 = 255,
+    color_description: color.Description = .srgb,
+    color_representation: color.Representation = .{},
 };
 
 /// Output repaint damage is intentionally absent here; R13 plans it separately.
@@ -161,6 +164,7 @@ pub const List = struct {
     output_format: PixelFormat,
     clear: Color,
     samples: []const SurfaceSample,
+    output_color_description: color.Description = .srgb,
 };
 
 /// One immutable R12 sample selected by an R13 plan. Geometry is in physical
@@ -208,6 +212,7 @@ pub const ValidationError = error{
 
 pub fn validateList(list: List) ValidationError!void {
     try validateOutput(list.output);
+    list.output_color_description.validate() catch return error.InvalidSource;
     for (list.samples) |sample| _ = try validateSample(sample);
 }
 
@@ -218,6 +223,7 @@ pub fn validateOutput(output: Size) ValidationError!void {
 }
 
 pub fn validateSample(sample: SurfaceSample) ValidationError!usize {
+    sample.color_description.validate() catch return error.InvalidSource;
     if (sample.sample.surface == 0 or sample.sample.commit_sequence == 0 or
         sample.presentation.generation == 0)
         return error.InvalidIdentity;

@@ -14,6 +14,8 @@ const vk = @import("vulkan_platform.zig");
 
 pub const Config = struct {
     max_samples: usize,
+    max_color_luts: usize = 1,
+    require_color_management: bool = false,
     max_source_bytes: usize,
     max_targets: usize = framebuffer.default_capacity,
     max_damage_rects: usize = 32,
@@ -46,6 +48,12 @@ const TargetRecord = struct {
     metadata: gbm.Metadata = undefined,
 };
 
+const TransformEntry = struct {
+    source: render_types.color.Description,
+    output: render_types.color.Description,
+    compiled: render_types.color.Transform,
+};
+
 /// One output swapchain's imported Vulkan targets. Slot numbers are local to
 /// this set, so separate outputs can safely use the same framebuffer slots.
 /// The owning renderer must outlive the set and destroy it before its pool.
@@ -66,6 +74,7 @@ pub const Renderer = struct {
     max_source_bytes: usize,
     packs_sources: bool,
     damage: []render_types.Rect,
+    transform_cache: std.ArrayListUnmanaged(TransformEntry) = .empty,
 
     /// `drm_fd` is borrowed for device identity only. Vulkan selects the
     /// physical device whose primary DRM node has the same major/minor pair.
@@ -75,7 +84,9 @@ pub const Renderer = struct {
         drm_fd: std.posix.fd_t,
         config: Config,
     ) !Renderer {
-        if (config.max_samples == 0 or config.max_source_bytes == 0 or
+        if (config.max_samples == 0 or config.max_color_luts == 0 or
+            config.max_color_luts > std.math.maxInt(i32) or
+            config.max_source_bytes == 0 or
             config.max_targets == 0 or config.max_targets > std.math.maxInt(u32) or
             config.max_samples > std.math.maxInt(u32) or
             config.max_source_bytes > std.math.maxInt(u32) or config.max_damage_rects == 0 or
@@ -94,6 +105,8 @@ pub const Renderer = struct {
         errdefer allocator.free(damage);
         const implementation = try platform.create(drm_fd, .{
             .max_samples = config.max_samples,
+            .max_color_luts = config.max_color_luts,
+            .require_color_management = config.require_color_management,
             .max_source_bytes = config.max_source_bytes,
             .max_targets = config.max_targets,
             .content_bytes = config.content_bytes,
@@ -110,6 +123,7 @@ pub const Renderer = struct {
             .max_source_bytes = config.max_source_bytes,
             .packs_sources = platform.packsSources(implementation),
             .damage = damage,
+            .transform_cache = .empty,
         };
     }
 
@@ -150,6 +164,7 @@ pub const Renderer = struct {
     pub fn deinit(self: *Renderer) void {
         std.debug.assert(self.attached_target_capacity == 0);
         self.platform.destroy(self.implementation);
+        self.transform_cache.deinit(self.allocator);
         self.allocator.free(self.damage);
         self.allocator.free(self.sources);
         self.allocator.free(self.samples);
@@ -193,6 +208,10 @@ pub const Renderer = struct {
 
         var byte_count: usize = 0;
         var sample_count: usize = 0;
+        const output_lut_slot = if (list.output_color_description.lut) |lut|
+            try self.platform.cacheLut(self.implementation, lut)
+        else
+            null;
         for (plan.samples) |planned| {
             if (planned.source_index >= list.samples.len) return error.InvalidSourceIndex;
             const source = list.samples[planned.source_index];
@@ -223,7 +242,16 @@ pub const Renderer = struct {
             // Native samples retain their dimensions/stride in the packed ABI,
             // but consume no bytes in the CPU source buffer.
             validated.source.stride = packed_stride;
-            self.samples[sample_count] = try packSample(validated, @intCast(start), planned.destination);
+            self.samples[sample_count] = try packSample(
+                validated,
+                try self.colorTransform(validated.color_description, list.output_color_description),
+                if (validated.color_description.lut) |lut|
+                    try self.platform.cacheLut(self.implementation, lut)
+                else
+                    null,
+                @intCast(start),
+                planned.destination,
+            );
             self.sources[sample_count] = source;
             sample_count += 1;
         }
@@ -254,6 +282,8 @@ pub const Renderer = struct {
         const completion_fd = self.platform.draw(self.implementation, record.imported.?, .{
             .output = plan.output,
             .output_format = list.output_format,
+            .output_color_description = list.output_color_description,
+            .output_lut_slot = output_lut_slot,
             .clear = list.clear,
             .samples = self.samples[0..sample_count],
             .sources = self.sources[0..sample_count],
@@ -265,6 +295,25 @@ pub const Renderer = struct {
         };
         if (completion_fd < 0) return error.InvalidCompletionFd;
         return completion_fd;
+    }
+
+    fn colorTransform(
+        self: *Renderer,
+        source: render_types.color.Description,
+        output: render_types.color.Description,
+    ) !render_types.color.Transform {
+        for (self.transform_cache.items) |entry| {
+            if (std.meta.eql(entry.source, source) and std.meta.eql(entry.output, output))
+                return entry.compiled;
+        }
+        const compiled = render_types.color.compile(source, output) catch
+            return error.InvalidColorDescription;
+        try self.transform_cache.append(self.allocator, .{
+            .source = source,
+            .output = output,
+            .compiled = compiled,
+        });
+        return compiled;
     }
 
     pub fn renderPool(
@@ -300,7 +349,13 @@ pub fn initTargetPool(
     );
 }
 
-fn packSample(sample: render_types.SurfaceSample, source_offset: u32, original_destination: render_types.PlanRect) !vk.Sample {
+fn packSample(
+    sample: render_types.SurfaceSample,
+    color_transform: render_types.color.Transform,
+    lut_slot: ?u32,
+    source_offset: u32,
+    original_destination: render_types.PlanRect,
+) !vk.Sample {
     const mapping = try affine(sample, original_destination);
     return .{
         .source = .{ source_offset, sample.source.size.width, sample.source.size.height, sample.source.stride },
@@ -311,10 +366,33 @@ fn packSample(sample: render_types.SurfaceSample, source_offset: u32, original_d
             @intFromEnum(sample.source.format),
             @intFromEnum(sample.transform),
             sample.global_alpha,
-            0,
+            @intFromEnum(color_transform.source_transfer),
         },
         .affine = .{ mapping.xx, mapping.xy, mapping.x0, mapping.yx },
-        .affine_tail = .{ mapping.yy, mapping.y0, 0, 0 },
+        .affine_tail = .{
+            mapping.yy,
+            mapping.y0,
+            @intFromEnum(sample.color_representation.alpha_mode),
+            if (lut_slot) |slot| @intCast(slot + 1) else 0,
+        },
+        .color_matrix_0 = .{
+            color_transform.matrix[0][0],
+            color_transform.matrix[0][1],
+            color_transform.matrix[0][2],
+            color_transform.luminance_scale,
+        },
+        .color_matrix_1 = .{
+            color_transform.matrix[1][0],
+            color_transform.matrix[1][1],
+            color_transform.matrix[1][2],
+            0,
+        },
+        .color_matrix_2 = .{
+            color_transform.matrix[2][0],
+            color_transform.matrix[2][1],
+            color_transform.matrix[2][2],
+            0,
+        },
     };
 }
 
@@ -398,12 +476,38 @@ test "render-vulkan: packed ABI preserves order geometry transform alpha and ret
         .transform = .flipped_270,
         .global_alpha = 13,
     };
-    const gpu_sample = try packSample(value, 16, .{ .x = -5, .y = 6, .width = 7, .height = 8 });
+    const gpu_sample = try packSample(value, try render_types.color.compile(.srgb, .srgb), null, 16, .{ .x = -5, .y = 6, .width = 7, .height = 8 });
     try std.testing.expectEqual([4]u32{ 16, 1, 2, 4 }, gpu_sample.source);
     try std.testing.expectEqual([4]i32{ 1, 2, 3, 4 }, gpu_sample.crop);
     try std.testing.expectEqual([4]i32{ -5, 6, 7, 8 }, gpu_sample.destination);
     try std.testing.expectEqual([4]u32{ 0, 7, 13, 0 }, gpu_sample.attributes);
-    try std.testing.expectEqual(@as(usize, 112), @sizeOf(vk.Sample));
+    try std.testing.expectEqual(@as(usize, 160), @sizeOf(vk.Sample));
+}
+
+test "render-vulkan: LUT slot is packed without changing Sample ABI" {
+    var value: render_types.SurfaceSample = undefined;
+    _ = testList(&.{ 0, 0, 0, 255 }, &value);
+    const gpu_sample = try packSample(
+        value,
+        try render_types.color.compile(.srgb, .srgb),
+        6,
+        0,
+        .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+    );
+    try std.testing.expectEqual(@as(i32, 7), gpu_sample.affine_tail[3]);
+    try std.testing.expectEqual(@as(usize, 160), @sizeOf(vk.Sample));
+}
+
+test "render-vulkan: profile hash cache hit does not upload twice" {
+    var fake = FakePlatform{};
+    const lut: @import("icc.zig").Lut = .{
+        .profile_hash = .{7} ** 32,
+        .rgba = &.{},
+    };
+    const platform = fake.platform();
+    try std.testing.expectEqual(@as(u32, 0), try platform.cacheLut(@ptrCast(&fake), &lut));
+    try std.testing.expectEqual(@as(u32, 0), try platform.cacheLut(@ptrCast(&fake), &lut));
+    try std.testing.expectEqual(@as(usize, 1), fake.lut_upload_count);
 }
 
 test "render-vulkan: fixed target cache retains source bytes and cleans up exactly once" {
@@ -692,6 +796,16 @@ test "render-vulkan: overflowing fixed capacities reject before platform startup
         }),
     );
     try std.testing.expectEqual(@as(usize, 0), fake.create_count);
+    try std.testing.expectError(
+        error.InvalidConfig,
+        Renderer.init(std.testing.allocator, fake.platform(), 41, .{
+            .max_samples = 1,
+            .max_color_luts = 0,
+            .max_source_bytes = 4,
+            .max_targets = 1,
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, 0), fake.create_count);
 }
 
 test "render-vulkan: shader transform coordinates match Pixman reference cases" {
@@ -834,6 +948,9 @@ const FakePlatform = struct {
     last_samples: [2]vk.Sample = undefined,
     last_sample_count: usize = 0,
     last_damage: render_types.Rect = undefined,
+    lut_hashes: [2][32]u8 = undefined,
+    lut_count: usize = 0,
+    lut_upload_count: usize = 0,
 
     const vtable: vk.Platform.VTable = .{
         .create = create,
@@ -843,6 +960,7 @@ const FakePlatform = struct {
         .draw = draw,
         .content_provider = contentProvider,
         .packs_sources = packsSources,
+        .cache_lut = cacheLut,
     };
     fn platform(self: *FakePlatform) vk.Platform {
         return .{ .context = self, .vtable = &vtable };
@@ -859,6 +977,17 @@ const FakePlatform = struct {
     fn packsSources(context: *anyopaque, _: vk.Renderer) bool {
         const self: *FakePlatform = @ptrCast(@alignCast(context));
         return self.pack_sources;
+    }
+    fn cacheLut(context: *anyopaque, _: vk.Renderer, lut: *const @import("icc.zig").Lut) !u32 {
+        const self: *FakePlatform = @ptrCast(@alignCast(context));
+        for (self.lut_hashes[0..self.lut_count], 0..) |hash, slot|
+            if (std.mem.eql(u8, &hash, &lut.profile_hash)) return @intCast(slot);
+        if (self.lut_count == self.lut_hashes.len) return error.ColorLutCapacityExceeded;
+        const slot = self.lut_count;
+        self.lut_hashes[slot] = lut.profile_hash;
+        self.lut_count += 1;
+        self.lut_upload_count += 1;
+        return @intCast(slot);
     }
     fn destroy(context: *anyopaque, _: vk.Renderer) void {
         const self: *FakePlatform = @ptrCast(@alignCast(context));

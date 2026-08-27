@@ -47,6 +47,13 @@ responsibilities:
 - [Fractional scale](src/protocol/fractional_scale.zig): bounded per-surface
   `wp_fractional_scale_v1` objects publish Ouro's preferred render scale and
   pair with viewporter destination sizing.
+- [Color management](src/protocol/color_management.zig): immutable parametric
+  and asynchronously compiled ICC v2/v4 image descriptions are applied as
+  double-buffered surface state. Vulkan converts sources into a linear-light
+  compositing space and applies an optional calibrated output transform.
+- [Color representation](src/protocol/color_representation.zig): RGB alpha
+  association is committed atomically with each surface; unsupported YCbCr
+  representations are not advertised.
 - [Subsurface state](src/subsurface.zig): Ouro owns the parent/child graph,
   synchronized commit caching, position, stacking, visibility, and sync/desync
   transitions.
@@ -129,6 +136,14 @@ Renderer selection is explicit:
 - `--renderer=pixman` requires the CPU renderer;
 - `--renderer=vulkan` requires Vulkan and a primary KMS plane with
   `IN_FENCE_FD`. Vulkan exports a sync-file fence to KMS and never host-waits.
+
+Strict Vulkan mode also publishes `color-management-v1` and
+`color-representation-v1`. Client parametric descriptions and ICC v2/v4 RGB
+Display or ColorSpace profiles are transformed in linear light. ICC parsing and
+33³ LUT generation run on a bounded worker rather than the compositor or render
+turn. `--output-icc=PATH` applies an ICC v2/v4 output profile, including VCGT
+calibration when present; it requires `--renderer=vulkan`. Auto and Pixman modes
+do not advertise color-management behavior they cannot guarantee.
 
 The physical path remains single-output and requires a usable `/dev/dri` device
 and libseat backend. `Loop.turn` is the sole io_uring submitter; protocol,

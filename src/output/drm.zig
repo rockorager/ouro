@@ -37,6 +37,9 @@ pub const Config = struct {
     /// Total imported output images across every output sharing one renderer.
     max_render_targets: usize = framebuffer.default_capacity * 4,
     max_samples: usize,
+    max_color_luts: usize = 16,
+    enable_color_management: bool = false,
+    output_color_description: render.color.Description = .srgb,
     /// Aggregate packed source bytes available to one fallback render frame.
     max_source_bytes: usize,
     /// Maximum bytes retained for one surface version. Defaults to the frame
@@ -393,6 +396,7 @@ pub const Output = struct {
     import_cache_cursor: usize,
     kms_output: *kms.Output,
     output_format: render.PixelFormat,
+    output_color_description: render.color.Description,
     clear: render.Color,
     accepting_frames: bool = true,
     in_flight_frame: ?scheduler_api.FrameId = null,
@@ -518,6 +522,8 @@ pub const Output = struct {
         const logical_output: render.Size = .{ .width = mode.hdisplay, .height = mode.vdisplay };
         self.output_format = formatFromDrm(self.pool.allocation.format) orelse
             return error.UnsupportedOutputFormat;
+        try config.output_color_description.validate();
+        self.output_color_description = config.output_color_description;
         self.builder = try render_list.Builder.initBorrowed(allocator, config.max_samples);
         errdefer self.builder.deinit();
         self.planner = try damage.Planner.init(allocator, logical_output, config.output_transform, .{
@@ -707,15 +713,17 @@ pub const Output = struct {
             self.clear,
             applied,
         ) catch |cause| return self.retireUnstartedRender(frame_id, cause);
+        var color_list = list;
+        color_list.output_color_description = self.output_color_description;
         if (bindings.len > self.sample_storage.len)
             self.sample_storage = self.allocator.realloc(self.sample_storage, bindings.len) catch |cause|
                 return self.retireUnstartedRender(frame_id, cause);
-        bindSamples(list, bindings, self.sample_storage) catch |cause|
+        bindSamples(color_list, bindings, self.sample_storage) catch |cause|
             return self.retireUnstartedRender(frame_id, cause);
         try self.scheduler.captureSamples(frame_id, self.sample_storage[0..bindings.len]);
         const handle = self.pool.acquire() catch |cause|
             return self.retireRender(frame_id, cause);
-        const plan = self.planner.prepare(handle, list, changes) catch |cause| {
+        const plan = self.planner.prepare(handle, color_list, changes) catch |cause| {
             self.pool.discard(handle) catch {};
             return self.retireRender(frame_id, cause);
         };
@@ -1022,6 +1030,8 @@ fn initVulkan(allocator: std.mem.Allocator, platforms: Platforms, fd: std.posix.
         .max_samples = config.max_samples,
         .max_source_bytes = config.max_source_bytes,
         .max_targets = config.max_render_targets,
+        .max_color_luts = config.max_color_luts,
+        .require_color_management = config.enable_color_management,
         .max_damage_rects = config.max_render_damage,
         .content_bytes = std.math.add(
             usize,

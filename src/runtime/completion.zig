@@ -15,6 +15,7 @@ pub const Kind = enum(u8) {
     renderer_fence = 0x83,
     copy = 0x84,
     shutdown = 0x85,
+    icc_worker = 0x86,
 };
 
 pub const DecodeError = error{

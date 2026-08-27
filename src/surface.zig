@@ -4,6 +4,7 @@ const std = @import("std");
 const objects = @import("wayring").objects;
 const viewport = @import("viewport.zig");
 const buffer_import = @import("buffer_import.zig");
+const color = @import("render/color.zig");
 
 pub const RegionPool = @import("region.zig").Pool;
 pub const Region = @import("region.zig").Region;
@@ -215,6 +216,8 @@ pub const Update = struct {
     offset: Point,
     viewport: ViewportState,
     size: SurfaceSize,
+    color_description: color.Description,
+    color_representation: color.Representation,
 };
 
 pub const Surface = struct {
@@ -224,6 +227,8 @@ pub const Surface = struct {
     current_transform: Transform = .normal,
     current_scale: i32 = 1,
     viewport: Viewport = .{},
+    current_color_description: color.Description = .srgb,
+    current_color_representation: color.Representation = .{},
 
     pending_buffer: ?Buffer = null,
     pending_attach_offset: Point = .{},
@@ -235,6 +240,8 @@ pub const Surface = struct {
     pending_transform: Transform = .normal,
     pending_scale: i32 = 1,
     pending_offset: Point = .{},
+    pending_color_description: color.Description = .srgb,
+    pending_color_representation: color.Representation = .{},
 
     /// Applies wl_surface.attach validation and replaces the pending buffer.
     pub fn attach(
@@ -273,6 +280,19 @@ pub const Surface = struct {
 
     pub fn setOffset(surface: *Surface, x: i32, y: i32) void {
         surface.pending_offset = .{ .x = x, .y = y };
+    }
+
+    pub fn setColorDescription(surface: *Surface, description: color.Description) !void {
+        try description.validate();
+        surface.pending_color_description = description;
+    }
+
+    pub fn unsetColorDescription(surface: *Surface) void {
+        surface.pending_color_description = .srgb;
+    }
+
+    pub fn setColorRepresentation(surface: *Surface, representation: color.Representation) void {
+        surface.pending_color_representation = representation;
     }
 
     pub fn hasPendingBufferAttachment(surface: Surface) bool {
@@ -323,6 +343,8 @@ pub const Surface = struct {
         if (surface.attach_changed) surface.current_buffer = surface.pending_buffer;
         surface.current_transform = surface.pending_transform;
         surface.current_scale = surface.pending_scale;
+        surface.current_color_description = surface.pending_color_description;
+        surface.current_color_representation = surface.pending_color_representation;
         const content_size = surface.contentSize(surface.current_buffer);
         const viewport_state = surface.viewport.publishCommit();
         const upload_damage = canonicalBufferDamage(
@@ -344,6 +366,8 @@ pub const Surface = struct {
             .offset = surface.pending_offset,
             .viewport = viewport_state,
             .size = viewport_state.surfaceSize(content_size),
+            .color_description = surface.current_color_description,
+            .color_representation = surface.current_color_representation,
         };
         surface.pending_buffer = null;
         surface.pending_attach_offset = .{};
@@ -748,6 +772,11 @@ test "surface commits persistent and one-shot state atomically" {
     try surface.setTransform(3);
     try surface.setScale(2);
     surface.setOffset(7, -8);
+    var display_p3 = color.Description.srgb;
+    display_p3.primaries.red = .{ .x = 0.68, .y = 0.32 };
+    display_p3.primaries.green = .{ .x = 0.265, .y = 0.69 };
+    try surface.setColorDescription(display_p3);
+    surface.setColorRepresentation(.{ .alpha_mode = .straight });
 
     const first = try surface.commit();
     try std.testing.expectEqual(@as(u64, 1), first.sequence);
@@ -758,6 +787,8 @@ test "surface commits persistent and one-shot state atomically" {
     try std.testing.expectEqual(Transform.@"270", first.transform);
     try std.testing.expectEqual(@as(i32, 2), first.scale);
     try std.testing.expectEqual(Point{ .x = 7, .y = -8 }, first.offset);
+    try std.testing.expectEqual(display_p3, first.color_description);
+    try std.testing.expectEqual(color.AlphaMode.straight, first.color_representation.alpha_mode);
 
     const second = try surface.commit();
     try std.testing.expectEqual(@as(u64, 2), second.sequence);
@@ -767,6 +798,8 @@ test "surface commits persistent and one-shot state atomically" {
     try std.testing.expectEqual(Transform.@"270", second.transform);
     try std.testing.expectEqual(@as(i32, 2), second.scale);
     try std.testing.expectEqual(Point{}, second.offset);
+    try std.testing.expectEqual(display_p3, second.color_description);
+    try std.testing.expectEqual(color.AlphaMode.straight, second.color_representation.alpha_mode);
     try std.testing.expectEqual(buffer, surface.current_buffer.?);
 }
 

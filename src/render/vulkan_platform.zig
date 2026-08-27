@@ -7,6 +7,7 @@ const linux = std.os.linux;
 const gbm = @import("../backend/gbm.zig");
 const render = @import("types.zig");
 const render_content = @import("content.zig");
+const icc = @import("icc.zig");
 
 const c = @cImport({
     @cInclude("drm_fourcc.h");
@@ -23,10 +24,12 @@ pub const Target = *anyopaque;
 
 pub const Config = struct {
     max_samples: usize,
+    max_color_luts: usize,
     max_source_bytes: usize,
     max_targets: usize,
     content_bytes: usize = 1,
     content_allocations: usize = 1,
+    require_color_management: bool = false,
 };
 
 /// Exact std430 ABI consumed by `vulkan_composite.comp`.
@@ -38,11 +41,16 @@ pub const Sample = extern struct {
     attributes: [4]u32,
     affine: [4]i32,
     affine_tail: [4]i32,
+    color_matrix_0: [4]f32,
+    color_matrix_1: [4]f32,
+    color_matrix_2: [4]f32,
 };
 
 pub const Frame = struct {
     output: render.Size,
     output_format: render.PixelFormat,
+    output_color_description: render.color.Description = .srgb,
+    output_lut_slot: ?u32 = null,
     clear: render.Color,
     samples: []const Sample,
     sources: []const render.SurfaceSample,
@@ -62,6 +70,7 @@ pub const Platform = struct {
         draw: *const fn (*anyopaque, Renderer, Target, Frame) anyerror!std.posix.fd_t,
         content_provider: *const fn (*anyopaque, Renderer) ?render_content.Provider,
         packs_sources: *const fn (*anyopaque, Renderer) bool,
+        cache_lut: *const fn (*anyopaque, Renderer, *const icc.Lut) anyerror!u32,
     };
 
     pub fn create(self: Platform, fd: std.posix.fd_t, config: Config) !Renderer {
@@ -86,6 +95,9 @@ pub const Platform = struct {
     pub fn packsSources(self: Platform, renderer: Renderer) bool {
         return self.vtable.packs_sources(self.context, renderer);
     }
+    pub fn cacheLut(self: Platform, renderer: Renderer, lut: *const icc.Lut) !u32 {
+        return self.vtable.cache_lut(self.context, renderer, lut);
+    }
 };
 
 var real_context: u8 = 0;
@@ -99,6 +111,7 @@ const real_vtable: Platform.VTable = .{
     .draw = realDraw,
     .content_provider = realContentProvider,
     .packs_sources = realPacksSources,
+    .cache_lut = realCacheLut,
 };
 
 const device_extensions = [_][*:0]const u8{
@@ -233,6 +246,11 @@ const RealRenderer = struct {
     imported_images: []ImportedImage,
     imported_cursor: usize,
     pending_acquires: []PendingAcquire,
+    lut_buffer: c.VkBuffer,
+    lut_memory: c.VkDeviceMemory,
+    lut_map: *anyopaque,
+    lut_hashes: [][32]u8,
+    lut_count: usize,
 };
 
 const TargetState = enum { ready, in_flight, queue_failed, export_failed };
@@ -241,6 +259,9 @@ const RealTarget = struct {
     image: c.VkImage,
     image_memory: c.VkDeviceMemory,
     view: c.VkImageView,
+    linear_image: c.VkImage,
+    linear_memory: c.VkDeviceMemory,
+    linear_view: c.VkImageView,
     sample_buffer: c.VkBuffer,
     sample_memory: c.VkDeviceMemory,
     sample_map: *anyopaque,
@@ -277,9 +298,12 @@ const Push = extern struct {
     clear_color: [4]u32,
     output: [4]u32,
     damage: [4]u32,
+    output_color: [4]u32,
 };
 
 const continuation_bit: u32 = 0x80000000;
+const intermediate_bit: u32 = 0x40000000;
+const sample_count_mask: u32 = ~(continuation_bit | intermediate_bit);
 
 const Batch = struct { first: usize, count: usize, initialize: bool };
 
@@ -332,7 +356,13 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
     );
     const sample_size = std.math.mul(usize, config.max_samples, @sizeOf(Sample)) catch
         return error.InvalidConfig;
-    const descriptor_count = std.math.mul(usize, config.max_targets, 2) catch
+    const descriptor_count = std.math.mul(usize, config.max_targets, 3) catch
+        return error.InvalidConfig;
+    const storage_image_count = std.math.mul(usize, config.max_targets, 2) catch
+        return error.InvalidConfig;
+    const lut_texels = std.math.mul(usize, config.max_color_luts, icc.texel_count) catch
+        return error.InvalidConfig;
+    const lut_buffer_size = std.math.mul(usize, lut_texels, @sizeOf([4]f32)) catch
         return error.InvalidConfig;
     const sampled_descriptor_count = std.math.mul(
         usize,
@@ -341,16 +371,19 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
     ) catch return error.InvalidConfig;
     if (physical_properties.apiVersion < c.VK_API_VERSION_1_2 or
         sample_size == 0 or sample_size > physical_properties.limits.maxStorageBufferRange or
-        config.max_source_bytes == 0 or
+        config.max_source_bytes == 0 or config.max_color_luts == 0 or
+        config.max_color_luts > std.math.maxInt(i32) or
+        lut_buffer_size == 0 or lut_buffer_size > physical_properties.limits.maxStorageBufferRange or
         config.max_source_bytes > physical_properties.limits.maxStorageBufferRange or
         config.content_bytes == 0 or config.content_allocations == 0 or
         config.content_allocations > std.math.maxInt(u32) or
         config.max_targets == 0 or config.max_targets > std.math.maxInt(u32) or
         descriptor_count > std.math.maxInt(u32) or
-        physical_properties.limits.maxPerStageDescriptorStorageBuffers < 2 or
-        physical_properties.limits.maxDescriptorSetStorageBuffers < 2 or
-        physical_properties.limits.maxPerStageDescriptorStorageImages < 1 or
-        physical_properties.limits.maxDescriptorSetStorageImages < 1)
+        storage_image_count > std.math.maxInt(u32) or
+        physical_properties.limits.maxPerStageDescriptorStorageBuffers < 3 or
+        physical_properties.limits.maxDescriptorSetStorageBuffers < 3 or
+        physical_properties.limits.maxPerStageDescriptorStorageImages < 2 or
+        physical_properties.limits.maxDescriptorSetStorageImages < 2)
         return error.InvalidConfig;
     self.sampled_enabled = config.max_samples <= sampled_image_capacity and
         sampled_descriptor_count <= std.math.maxInt(u32) and
@@ -362,6 +395,8 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
         source_format.optimalTilingFeatures &
             (c.VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | c.VK_FORMAT_FEATURE_TRANSFER_DST_BIT) ==
             (c.VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | c.VK_FORMAT_FEATURE_TRANSFER_DST_BIT);
+    if (config.require_color_management and !self.sampled_enabled)
+        return error.ColorManagementUnavailable;
     try requireSyncFdSemaphore(self.physical_device);
     const priority: f32 = 1;
     var queue_info: c.VkDeviceQueueCreateInfo = .{
@@ -400,6 +435,8 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
         descriptorBinding(0, c.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE),
         descriptorBinding(1, c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER),
         descriptorBinding(2, c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER),
+        descriptorBinding(4, c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER),
+        descriptorBinding(5, c.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE),
         .{
             .binding = 3,
             .descriptorType = c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
@@ -482,7 +519,7 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
     errdefer if (self.sampled_pipeline) |pipeline|
         c.vkDestroyPipeline(self.device, pipeline, null);
     const pool_sizes = [_]c.VkDescriptorPoolSize{
-        .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = @intCast(config.max_targets) },
+        .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = @intCast(storage_image_count) },
         .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = @intCast(descriptor_count) },
         .{
             .type = c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
@@ -584,6 +621,11 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
     self.pending_acquires = try allocator.alloc(PendingAcquire, config.content_allocations);
     @memset(self.pending_acquires, .{});
     errdefer allocator.free(self.pending_acquires);
+    self.lut_hashes = try allocator.alloc([32]u8, config.max_color_luts);
+    errdefer allocator.free(self.lut_hashes);
+    self.lut_count = 0;
+    try createHostBuffer(self, lut_buffer_size, &self.lut_buffer, &self.lut_memory, &self.lut_map);
+    errdefer destroyBuffer(self, self.lut_buffer, self.lut_memory);
     try createHostBuffer(
         self,
         self.content_buffer_size,
@@ -611,6 +653,8 @@ fn realDestroy(_: *anyopaque, renderer: Renderer) void {
     std.heap.c_allocator.free(self.imported_images);
     for (self.pending_acquires) |pending| std.debug.assert(!pending.occupied);
     std.heap.c_allocator.free(self.pending_acquires);
+    destroyBuffer(self, self.lut_buffer, self.lut_memory);
+    std.heap.c_allocator.free(self.lut_hashes);
     destroyBuffer(self, self.content_buffer, self.content_memory);
     std.heap.c_allocator.free(self.content_allocations);
     for (self.cache) |entry| if (entry.occupied) destroyTexture(self, entry.texture);
@@ -643,6 +687,21 @@ fn realContentProvider(_: *anyopaque, renderer: Renderer) ?render_content.Provid
         .ready_native_fn = nativeReady,
         .validate_retained_external_fn = validateRetainedExternal,
     };
+}
+
+fn realCacheLut(_: *anyopaque, renderer: Renderer, lut: *const icc.Lut) !u32 {
+    const self: *RealRenderer = @ptrCast(@alignCast(renderer));
+    if (lut.rgba.len != icc.texel_count) return error.InvalidColorLut;
+    for (self.lut_hashes[0..self.lut_count], 0..) |hash, slot|
+        if (std.mem.eql(u8, &hash, &lut.profile_hash)) return @intCast(slot);
+    if (self.lut_count == self.lut_hashes.len) return error.ColorLutCapacityExceeded;
+    const slot = self.lut_count;
+    const output = @as([*][4]f32, @ptrCast(@alignCast(self.lut_map)))[slot * icc.texel_count .. (slot + 1) * icc.texel_count];
+    for (lut.rgba, output) |source, *destination|
+        destination.* = .{ source[0], source[1], source[2], source[3] };
+    self.lut_hashes[slot] = lut.profile_hash;
+    self.lut_count += 1;
+    return @intCast(slot);
 }
 
 fn realPacksSources(_: *anyopaque, renderer: Renderer) bool {
@@ -1304,6 +1363,15 @@ fn realImportTarget(_: *anyopaque, renderer: Renderer, metadata: gbm.Metadata, d
     };
     try vk(c.vkCreateImageView(self.device, &view_info, null, &target.view), error.CreateTargetViewFailed);
     errdefer c.vkDestroyImageView(self.device, target.view, null);
+    try createLinearImage(
+        self,
+        metadata.width,
+        metadata.height,
+        &target.linear_image,
+        &target.linear_memory,
+        &target.linear_view,
+    );
+    errdefer destroyLinearImage(self, target);
 
     target.sample_buffer = null;
     target.sample_memory = null;
@@ -1366,6 +1434,7 @@ fn realDestroyTarget(_: *anyopaque, renderer: Renderer, target_value: Target) vo
     c.vkDestroyImageView(self.device, target.view, null);
     c.vkDestroyImage(self.device, target.image, null);
     c.vkFreeMemory(self.device, target.image_memory, null);
+    destroyLinearImage(self, target);
     std.heap.c_allocator.free(target.retired_textures);
     std.heap.c_allocator.free(target.content_leases);
     std.heap.c_allocator.free(target.native_leases);
@@ -1406,8 +1475,8 @@ fn growTargetBatches(self: *RealRenderer, target: *RealTarget, count: usize) !vo
     @memset(layouts, self.descriptor_layout);
     const combined_count = std.math.mul(usize, count, sampled_image_capacity) catch return error.CapacityExceeded;
     const pool_sizes = [_]c.VkDescriptorPoolSize{
-        .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = @intCast(count) },
-        .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = @intCast(count * 2) },
+        .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = @intCast(count * 2) },
+        .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = @intCast(count * 3) },
         .{ .type = c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = if (self.sampled_enabled) @intCast(combined_count) else 0 },
     };
     var pool_info: c.VkDescriptorPoolCreateInfo = .{
@@ -1424,13 +1493,17 @@ fn growTargetBatches(self: *RealRenderer, target: *RealTarget, count: usize) !vo
     var set_info: c.VkDescriptorSetAllocateInfo = .{ .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .pNext = null, .descriptorPool = pool, .descriptorSetCount = @intCast(count), .pSetLayouts = layouts.ptr };
     try vk(c.vkAllocateDescriptorSets(self.device, &set_info, sets.ptr), error.AllocateDescriptorSetFailed);
     var image_descriptor: c.VkDescriptorImageInfo = .{ .sampler = null, .imageView = target.view, .imageLayout = c.VK_IMAGE_LAYOUT_GENERAL };
+    var linear_descriptor: c.VkDescriptorImageInfo = .{ .sampler = null, .imageView = target.linear_view, .imageLayout = c.VK_IMAGE_LAYOUT_GENERAL };
     var source_descriptor: c.VkDescriptorBufferInfo = .{ .buffer = target.source_buffer, .offset = 0, .range = self.max_source_bytes };
+    var lut_descriptor: c.VkDescriptorBufferInfo = .{ .buffer = self.lut_buffer, .offset = 0, .range = c.VK_WHOLE_SIZE };
     for (sets, 0..) |set, index| {
         var sample_descriptor: c.VkDescriptorBufferInfo = .{ .buffer = buffer, .offset = stride * index, .range = self.sample_buffer_size };
         const writes = [_]c.VkWriteDescriptorSet{
             descriptorWrite(set, 0, c.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &image_descriptor, null),
             descriptorWrite(set, 1, c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, null, &sample_descriptor),
             descriptorWrite(set, 2, c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, null, &source_descriptor),
+            descriptorWrite(set, 4, c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, null, &lut_descriptor),
+            descriptorWrite(set, 5, c.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &linear_descriptor, null),
         };
         c.vkUpdateDescriptorSets(self.device, writes.len, &writes, 0, null);
     }
@@ -1629,7 +1702,7 @@ fn prepareTextures(self: *RealRenderer, frame: Frame, staging_capacity: usize) !
 }
 
 fn ensureSampledFrameCapacity(self: *RealRenderer, target: *RealTarget, sample_count: usize) !usize {
-    if (sample_count > std.math.maxInt(u32) & ~continuation_bit) return error.CapacityExceeded;
+    if (sample_count > sample_count_mask) return error.CapacityExceeded;
     const allocator = std.heap.c_allocator;
     if (self.prepared.len < sample_count)
         self.prepared = try allocator.realloc(self.prepared, sample_count);
@@ -1851,6 +1924,12 @@ fn realDraw(_: *anyopaque, renderer: Renderer, target_value: Target, frame: Fram
             .clear_color = .{ frame.clear.a, frame.clear.r, frame.clear.g, frame.clear.b },
             .output = .{ frame.output.width, frame.output.height, @intFromEnum(frame.output_format), @intCast(frame.samples.len) },
             .damage = .{ @intCast(damage.x), @intCast(damage.y), damage.width, damage.height },
+            .output_color = .{
+                @intFromEnum(frame.output_color_description.transfer),
+                @bitCast(frame.output_color_description.reference_luminance),
+                if (frame.output_lut_slot) |slot| slot + 1 else 0,
+                0,
+            },
         };
         c.vkCmdPushConstants(target.command_buffer, self.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(Push), &push);
         c.vkCmdDispatch(target.command_buffer, (damage.width + 7) / 8, (damage.height + 7) / 8, 1);
@@ -2236,6 +2315,19 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
         1,
         &target_barrier,
     );
+    var linear_barrier: c.VkImageMemoryBarrier = .{
+        .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .pNext = null,
+        .srcAccessMask = 0,
+        .dstAccessMask = c.VK_ACCESS_SHADER_READ_BIT | c.VK_ACCESS_SHADER_WRITE_BIT,
+        .oldLayout = c.VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = c.VK_IMAGE_LAYOUT_GENERAL,
+        .srcQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
+        .image = target.linear_image,
+        .subresourceRange = colorRange(),
+    };
+    c.vkCmdPipelineBarrier(target.command_buffer, c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, null, 0, null, 1, &linear_barrier);
     c.vkCmdBindPipeline(
         target.command_buffer,
         c.VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -2246,10 +2338,18 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
         c.vkCmdBindDescriptorSets(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 0, 1, &target.descriptor_sets[batch_index], 0, null);
         for (frame.render_damage) |damage| {
             const encoded_count: u32 = @intCast(partition.count);
+            const flags: u32 = (if (!partition.initialize) continuation_bit else 0) |
+                (if (batch_index + 1 < batch_count) intermediate_bit else 0);
             const push: Push = .{
                 .clear_color = .{ frame.clear.a, frame.clear.r, frame.clear.g, frame.clear.b },
-                .output = .{ frame.output.width, frame.output.height, @intFromEnum(frame.output_format), encoded_count | if (partition.initialize) 0 else continuation_bit },
+                .output = .{ frame.output.width, frame.output.height, @intFromEnum(frame.output_format), encoded_count | flags },
                 .damage = .{ @intCast(damage.x), @intCast(damage.y), damage.width, damage.height },
+                .output_color = .{
+                    @intFromEnum(frame.output_color_description.transfer),
+                    @bitCast(frame.output_color_description.reference_luminance),
+                    if (frame.output_lut_slot) |slot| slot + 1 else 0,
+                    0,
+                },
             };
             c.vkCmdPushConstants(target.command_buffer, self.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(Push), &push);
             c.vkCmdDispatch(target.command_buffer, (damage.width + 7) / 8, (damage.height + 7) / 8, 1);
@@ -2264,7 +2364,7 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
                 .newLayout = c.VK_IMAGE_LAYOUT_GENERAL,
                 .srcQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
                 .dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
-                .image = target.image,
+                .image = if (batch_count > 1) target.linear_image else target.image,
                 .subresourceRange = colorRange(),
             };
             c.vkCmdPipelineBarrier(target.command_buffer, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, null, 0, null, 1, &between);
@@ -2788,6 +2888,68 @@ fn destroyBuffer(self: *RealRenderer, buffer: c.VkBuffer, memory: c.VkDeviceMemo
     c.vkFreeMemory(self.device, memory, null);
 }
 
+fn createLinearImage(
+    self: *RealRenderer,
+    width: u32,
+    height: u32,
+    image: *c.VkImage,
+    memory: *c.VkDeviceMemory,
+    view: *c.VkImageView,
+) !void {
+    var image_info: c.VkImageCreateInfo = .{
+        .sType = c.VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .pNext = null,
+        .flags = 0,
+        .imageType = c.VK_IMAGE_TYPE_2D,
+        .format = c.VK_FORMAT_R16G16B16A16_SFLOAT,
+        .extent = .{ .width = width, .height = height, .depth = 1 },
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = c.VK_SAMPLE_COUNT_1_BIT,
+        .tiling = c.VK_IMAGE_TILING_OPTIMAL,
+        .usage = c.VK_IMAGE_USAGE_STORAGE_BIT,
+        .sharingMode = c.VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = 0,
+        .pQueueFamilyIndices = null,
+        .initialLayout = c.VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    try vk(c.vkCreateImage(self.device, &image_info, null, image), error.CreateLinearImageFailed);
+    errdefer c.vkDestroyImage(self.device, image.*, null);
+    var requirements: c.VkMemoryRequirements = undefined;
+    c.vkGetImageMemoryRequirements(self.device, image.*, &requirements);
+    var allocation: c.VkMemoryAllocateInfo = .{
+        .sType = c.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .pNext = null,
+        .allocationSize = requirements.size,
+        .memoryTypeIndex = try memoryType(self, requirements.memoryTypeBits, c.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
+    };
+    try vk(c.vkAllocateMemory(self.device, &allocation, null, memory), error.AllocateLinearImageMemoryFailed);
+    errdefer c.vkFreeMemory(self.device, memory.*, null);
+    try vk(c.vkBindImageMemory(self.device, image.*, memory.*, 0), error.BindLinearImageMemoryFailed);
+    var view_info: c.VkImageViewCreateInfo = .{
+        .sType = c.VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .pNext = null,
+        .flags = 0,
+        .image = image.*,
+        .viewType = c.VK_IMAGE_VIEW_TYPE_2D,
+        .format = c.VK_FORMAT_R16G16B16A16_SFLOAT,
+        .components = .{
+            .r = c.VK_COMPONENT_SWIZZLE_IDENTITY,
+            .g = c.VK_COMPONENT_SWIZZLE_IDENTITY,
+            .b = c.VK_COMPONENT_SWIZZLE_IDENTITY,
+            .a = c.VK_COMPONENT_SWIZZLE_IDENTITY,
+        },
+        .subresourceRange = colorRange(),
+    };
+    try vk(c.vkCreateImageView(self.device, &view_info, null, view), error.CreateLinearImageViewFailed);
+}
+
+fn destroyLinearImage(self: *RealRenderer, target: *RealTarget) void {
+    c.vkDestroyImageView(self.device, target.linear_view, null);
+    c.vkDestroyImage(self.device, target.linear_image, null);
+    c.vkFreeMemory(self.device, target.linear_memory, null);
+}
+
 fn createTexture(self: *RealRenderer, size: render.Size) !Texture {
     var image_info: c.VkImageCreateInfo = .{
         .sType = c.VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -2882,7 +3044,7 @@ fn vk(result: c.VkResult, failure: anyerror) !void {
 
 test "render-vulkan: real Vulkan ABI and shader artifact are linked" {
     try std.testing.expect(real.context == @as(*anyopaque, @ptrCast(&real_context)));
-    try std.testing.expectEqual(@as(usize, 112), @sizeOf(Sample));
+    try std.testing.expectEqual(@as(usize, 160), @sizeOf(Sample));
     const shader = @embedFile("vulkan_composite.spv");
     try std.testing.expect(shader.len > 20);
     try std.testing.expectEqual(@as(u32, 0x07230203), std.mem.readInt(u32, shader[0..4], .little));
