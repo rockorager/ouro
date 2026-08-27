@@ -48,6 +48,7 @@ const protocol_fractional_scale = @import("../protocol/fractional_scale.zig");
 const protocol_color_management = @import("../protocol/color_management.zig");
 const protocol_color_representation = @import("../protocol/color_representation.zig");
 const protocol_alpha_modifier = @import("../protocol/alpha_modifier.zig");
+const protocol_pointer_warp = @import("../protocol/pointer_warp.zig");
 const protocol_output = @import("../protocol/output.zig");
 const protocol_xdg_output = @import("../protocol/xdg_output.zig");
 const protocol_layer_shell = @import("../protocol/layer_shell.zig");
@@ -97,6 +98,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const ColorManagementAdapter = protocol_color_management.Adapter(protocol, Adapter);
         const ColorRepresentationAdapter = protocol_color_representation.Adapter(protocol, Adapter);
         const AlphaModifierAdapter = protocol_alpha_modifier.Adapter(protocol, Adapter);
+        const PointerWarpAdapter = protocol_pointer_warp.Adapter(protocol, Adapter);
         const OutputAdapter = protocol_output.Adapter(protocol);
         const XdgOutputAdapter = protocol_xdg_output.Adapter(protocol, OutputAdapter);
         const LayerShellAdapter = protocol_layer_shell.Adapter(protocol, Adapter, OutputAdapter);
@@ -295,6 +297,7 @@ pub fn Coordinator(comptime protocol: type) type {
             color_management: protocol_color_management.Config = .{},
             color_representation: protocol_color_representation.Config = .{},
             alpha_modifier: protocol_alpha_modifier.Config = .{},
+            pointer_warp: protocol_pointer_warp.Config = .{},
             enable_color_protocols: bool = false,
             protocol_output: protocol_output.Config = .{},
             xdg_output: protocol_xdg_output.Config = .{},
@@ -388,6 +391,7 @@ pub fn Coordinator(comptime protocol: type) type {
         color_protocols_enabled: bool = false,
         color_representation_adapter: ColorRepresentationAdapter,
         alpha_modifier_adapter: AlphaModifierAdapter,
+        pointer_warp_adapter: PointerWarpAdapter,
         output_adapter: OutputAdapter,
         xdg_output_adapter: XdgOutputAdapter,
         layer_shell_adapter: LayerShellAdapter,
@@ -762,6 +766,13 @@ pub fn Coordinator(comptime protocol: type) type {
                 config.alpha_modifier,
             );
             errdefer self.alpha_modifier_adapter.deinit();
+            self.pointer_warp_adapter = try PointerWarpAdapter.init(
+                allocator,
+                &self.adapter,
+                .{ .context = self, .applyFn = applyPointerWarp },
+                config.pointer_warp,
+            );
+            errdefer self.pointer_warp_adapter.deinit();
             self.data_device_adapter.setSerialValidator(.{
                 .context = self,
                 .validate = validateSelection,
@@ -874,6 +885,9 @@ pub fn Coordinator(comptime protocol: type) type {
                     return error.GlobalPublicationIncomplete;
             }
             _ = try self.alpha_modifier_adapter.install(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
+            _ = try self.pointer_warp_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
             _ = try self.adapter.installPresentation();
@@ -1029,6 +1043,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.output_adapter.deinit();
             self.fractional_scale_adapter.deinit();
             self.alpha_modifier_adapter.deinit();
+            self.pointer_warp_adapter.deinit();
             self.color_representation_adapter.deinit();
             self.color_management_adapter.deinit();
             self.decoration_adapter.deinit();
@@ -1100,6 +1115,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.text_input_adapter.disconnected(peer);
             self.primary_selection_adapter.disconnected(peer);
             self.alpha_modifier_adapter.disconnected(peer);
+            self.pointer_warp_adapter.disconnected(peer);
             for (self.clients.items) |*client| if (client.active and samePeer(client.peer, peer)) {
                 client.* = .{};
                 self.client_count -= 1;
@@ -1214,6 +1230,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 return control;
             }
             if (try self.alpha_modifier_adapter.request(peer, target, message, fds)) |control|
+                return control;
+            if (try self.pointer_warp_adapter.request(peer, target, message, fds)) |control|
                 return control;
             if (try self.shell_adapter.request(peer, target, message, fds)) |control| {
                 try self.advanceShell();
@@ -2389,6 +2407,60 @@ pub fn Coordinator(comptime protocol: type) type {
             const server_objects = self.root.runtime.clients.get(peer) catch return false;
             return self.seat_adapter.validateCursorShapeOn(server_objects, peer, pointer_object, serial) or
                 self.tablet_adapter.validateCursorShapeOn(server_objects, peer, pointer_object, serial);
+        }
+
+        fn applyPointerWarp(
+            context: ?*anyopaque,
+            peer: wayring.io_uring.Peer,
+            surface: Adapter.SurfaceId,
+            pointer_object: u32,
+            x: i32,
+            y: i32,
+            serial: u32,
+        ) void {
+            const self: *Self = @ptrCast(@alignCast(context orelse return));
+            const server_objects = self.root.runtime.clients.get(peer) catch return;
+            if (!self.seat_adapter.validatePointerWarpOn(
+                server_objects,
+                peer,
+                pointer_object,
+                surface,
+                serial,
+            )) return;
+            const state = self.adapter.getSurfaceById(surface) catch return;
+            const size = state.committedSize();
+            if (x < 0 or y < 0 or
+                @as(u64, @intCast(x)) >= @as(u64, size.width) * 256 or
+                @as(u64, @intCast(y)) >= @as(u64, size.height) * 256) return;
+            const scene = self.surfaceScene(surface) orelse return;
+            const origin_x = std.math.add(
+                i32,
+                if (scene.root.has_window_geometry)
+                    alignedOrigin(scene.root.geometry.x, scene.root.surface_offset.x)
+                else
+                    scene.root.geometry.x,
+                scene.offset_x,
+            ) catch return;
+            const origin_y = std.math.add(
+                i32,
+                if (scene.root.has_window_geometry)
+                    alignedOrigin(scene.root.geometry.y, scene.root.surface_offset.y)
+                else
+                    scene.root.geometry.y,
+                scene.offset_y,
+            ) catch return;
+            const target: Interaction.Target = .{
+                .toplevel = scene.root.id,
+                .surface = surface,
+                .managed = scene.root.managed,
+                .keyboard_focusable = scene.root.keyboard_focusable,
+                .point = .{ .x = x, .y = y },
+            };
+            const global_x = @as(i64, origin_x) * 256 + x;
+            const global_y = @as(i64, origin_y) * 256 + y;
+            if (!self.interaction.warpPointer(target, global_x, global_y)) return;
+            if (!self.seat_adapter.applyPointerWarp(surface, .{ .x = x, .y = y })) unreachable;
+            self.requestCursorRedraw() catch {};
         }
 
         fn validateTextInputSeat(
@@ -4492,6 +4564,7 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.color_management_adapter.resourceRemoved(handle, object);
             _ = self.color_representation_adapter.resourceRemoved(handle, object);
             _ = self.alpha_modifier_adapter.resourceRemoved(handle, object);
+            _ = self.pointer_warp_adapter.resourceRemoved(handle, object);
             const layer_shell_removed = self.layer_shell_adapter.resourceRemoved(handle, object);
             const session_lock_removed = self.session_lock_adapter.resourceRemoved(handle, object);
             _ = self.xdg_output_adapter.resourceRemoved(handle, object);

@@ -22,6 +22,7 @@ pub fn build(b: *std.Build) void {
     generate_core_protocol.addFileArg(wayland_protocols.path("staging/color-management/color-management-v1.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("staging/color-representation/color-representation-v1.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("staging/alpha-modifier/alpha-modifier-v1.xml"));
+    generate_core_protocol.addFileArg(wayland_protocols.path("staging/pointer-warp/pointer-warp-v1.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("staging/single-pixel-buffer/single-pixel-buffer-v1.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("staging/content-type/content-type-v1.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("staging/tearing-control/tearing-control-v1.xml"));
@@ -61,6 +62,7 @@ pub fn build(b: *std.Build) void {
     generate_xdg_protocol.addFileArg(wayland_protocols.path("staging/color-management/color-management-v1.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("staging/color-representation/color-representation-v1.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("staging/alpha-modifier/alpha-modifier-v1.xml"));
+    generate_xdg_protocol.addFileArg(wayland_protocols.path("staging/pointer-warp/pointer-warp-v1.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("staging/single-pixel-buffer/single-pixel-buffer-v1.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("staging/content-type/content-type-v1.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("staging/tearing-control/tearing-control-v1.xml"));

@@ -91,6 +91,7 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
         .objects = &client.objects,
         .queue = &actor.transmit,
         .registry = registry,
+        .test_pointer_warp = true,
     };
     try submitClient(&client_reactor, &driver, &handler);
 
@@ -251,6 +252,31 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     try std.testing.expect(!handler.output_released);
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
 
+    const motion_before_warp = handler.pointer_motion;
+    try handler.queuePointerWarp();
+    try submitClient(&client_reactor, &driver, &handler);
+    for (0..64) |_| {
+        client_progress = try drainClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        const point = coordinator.seat_adapter.pointerState().point;
+        if (point.x == 256 and point.y == 256) break;
+        if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, client_reactor.ring);
+    }
+    try std.testing.expectEqual(
+        ouro.seat.Adapter(protocol, ouro.core_surface.Adapter(protocol)).Point{ .x = 256, .y = 256 },
+        coordinator.seat_adapter.pointerState().point,
+    );
+    try std.testing.expectEqual(motion_before_warp, handler.pointer_motion);
+    for (0..64) |_| {
+        if (coordinator.stats.presented >= 4) break;
+        if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, client_reactor.ring);
+        client_progress = try drainClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+    }
+    const presented_before_disable = coordinator.stats.presented;
+
     const retained_app = coordinator.app_layers[0].sample.?;
     const retained_cursor = coordinator.cursor_layer.sample.?;
     const first_output_generation = coordinator.output.?.outputId().generation;
@@ -273,13 +299,13 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     for (0..128) |_| {
         client_progress = try drainClient(&client_reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
-        if (coordinator.stats.presented == 4 and handler.output_enter == 4 and
+        if (coordinator.stats.presented == presented_before_disable + 1 and handler.output_enter == 4 and
             handler.output_deleted) break;
         if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
             try waitForEither(&root.ring, client_reactor.ring);
     }
-    try std.testing.expectEqual(@as(usize, 4), coordinator.stats.submitted);
-    try std.testing.expectEqual(@as(usize, 4), coordinator.stats.presented);
+    try std.testing.expectEqual(presented_before_disable + 1, coordinator.stats.submitted);
+    try std.testing.expectEqual(presented_before_disable + 1, coordinator.stats.presented);
     try std.testing.expect(coordinator.output.?.outputId().generation != first_output_generation);
     try std.testing.expectEqual(retained_app.sample, coordinator.app_layers[0].sample.?.sample);
     try std.testing.expectEqual(retained_cursor.sample, coordinator.cursor_layer.sample.?.sample);
@@ -1952,6 +1978,7 @@ const Handler = struct {
     output: ?wayring.objects.Handle = null,
     idle_notifier: ?wayring.objects.Handle = null,
     idle_inhibit_manager: ?wayring.objects.Handle = null,
+    pointer_warp_manager: ?wayring.objects.Handle = null,
     idle_standard: ?wayring.objects.Handle = null,
     idle_input: ?wayring.objects.Handle = null,
     idle_inhibitor: ?wayring.objects.Handle = null,
@@ -1971,6 +1998,9 @@ const Handler = struct {
     configure_serial: u32 = 0,
     acked_serial: u32 = 0,
     pointer_enter: usize = 0,
+    pointer_enter_serial: u32 = 0,
+    pointer_warp_queued: bool = false,
+    test_pointer_warp: bool = false,
     pointer_motion: usize = 0,
     pointer_button: usize = 0,
     pointer_axis_source: usize = 0,
@@ -2138,7 +2168,7 @@ const Handler = struct {
             switch (try protocol.wl_pointer.decodeEvent(message, fds)) {
                 .enter => |value| {
                     self.pointer_enter += 1;
-                    _ = value;
+                    self.pointer_enter_serial = value.serial;
                 },
                 .motion => self.pointer_motion += 1,
                 .button => |value| {
@@ -2304,6 +2334,8 @@ const Handler = struct {
             self.idle_notifier = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.ext_idle_notifier_v1.info, @min(value.version, 2), null);
         if (std.mem.eql(u8, value.interface, protocol.zwp_idle_inhibit_manager_v1.info.name))
             self.idle_inhibit_manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.zwp_idle_inhibit_manager_v1.info, @min(value.version, 1), null);
+        if (self.test_pointer_warp and std.mem.eql(u8, value.interface, protocol.wp_pointer_warp_v1.info.name))
+            self.pointer_warp_manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wp_pointer_warp_v1.info, @min(value.version, 1), null);
     }
 
     fn maybeCreateDataDevice(self: *Handler) !void {
@@ -2439,6 +2471,21 @@ const Handler = struct {
         try protocol.wl_surface.encodeRequest(self.queue, surface.id, .{ .commit = .{} });
         try wayring.client.sendRequest(protocol.wl_buffer, self.objects, self.queue, buffer, .{ .destroy = .{} });
         try wayring.client.sendRequest(protocol.wl_shm_pool, self.objects, self.queue, pool.id, .{ .destroy = .{} });
+    }
+
+    fn queuePointerWarp(self: *Handler) !void {
+        try protocol.wp_pointer_warp_v1.encodeRequest(
+            self.queue,
+            self.pointer_warp_manager.?.id,
+            .{ .warp_pointer = .{
+                .surface = self.surface.?.id,
+                .pointer = self.pointer.?.id,
+                .x = 256,
+                .y = 256,
+                .serial = self.pointer_enter_serial,
+            } },
+        );
+        self.pointer_warp_queued = true;
     }
 
     fn destroyCursor(self: *Handler) !void {
