@@ -76,6 +76,7 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
             binding: Id = undefined,
             resource: ?objects.Handle = null,
             device: input.DeviceId = undefined,
+            physical_group: platform.DeviceGroupRef = 0,
         };
         const TabletEvent = union(enum) {
             create,
@@ -126,6 +127,9 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
             binding: Id = undefined,
             resource: ?objects.Handle = null,
             device: input.DeviceId = undefined,
+            physical_group: platform.DeviceGroupRef = 0,
+            focus: ?Seat.FocusTarget = null,
+            tool: ?tablet_input.ToolKey = null,
         };
         const ChildSlot = struct {
             active: bool = false,
@@ -136,27 +140,50 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
             pad: Id = undefined,
             parent: Id = undefined,
             control_index: u32 = 0,
+            mode: ?u32 = null,
         };
         const PadEvent = union(enum) {
             create,
             buttons: u32,
             done,
             removed,
+            enter: struct {
+                serial: u32,
+                tablet: input.DeviceId,
+                target: Seat.FocusTarget,
+            },
+            leave: struct { serial: u32, target: Seat.FocusTarget },
+            button: struct { time: u32, button: u32, pressed: bool },
         };
         const GroupEvent = union(enum) {
             create,
             buttons: u64,
             modes: u32,
             done,
+            mode_switch: struct { time: u32, serial: u32, mode: u32 },
         };
-        const ControlEvent = enum { create };
+        const RingEvent = union(enum) {
+            create,
+            source,
+            angle: i32,
+            stop,
+            frame: u32,
+        };
+        const StripEvent = union(enum) {
+            create,
+            source,
+            position: u32,
+            stop,
+            frame: u32,
+        };
+        const PadAxisKind = enum { ring, strip };
         const OutboundValue = union(enum) {
             tablet: struct { id: Id, event: TabletEvent },
             tool: struct { id: Id, event: ToolEvent },
             pad: struct { id: Id, event: PadEvent },
             group: struct { id: Id, event: GroupEvent },
-            ring: struct { id: Id, event: ControlEvent },
-            strip: struct { id: Id, event: ControlEvent },
+            ring: struct { id: Id, event: RingEvent },
+            strip: struct { id: Id, event: StripEvent },
         };
         const Outbound = struct {
             active: bool = false,
@@ -413,6 +440,7 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                     .generation = binding.generation,
                 }) catch unreachable;
                 tablet.device = device;
+                tablet.physical_group = info.group;
                 const id = self.tabletId(tablet);
                 self.enqueue(binding.peer, .{ .tablet = .{ .id = id, .event = .create } }) catch unreachable;
                 if (info.vendor != 0 or info.product != 0)
@@ -465,6 +493,7 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                 const binding_id: Id = .{ .index = @intCast(binding_index), .generation = binding.generation };
                 const pad = self.acquirePad(binding_id) catch unreachable;
                 pad.device = device;
+                pad.physical_group = info.group;
                 const pad_id = self.padId(pad);
                 self.enqueue(binding.peer, .{ .pad = .{ .id = pad_id, .event = .create } }) catch unreachable;
                 for (info.pad_groups[0..info.pad_mode_groups], 0..) |group_info, group_index| {
@@ -580,15 +609,16 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
         }
 
         pub fn toolProximityIn(self: *Self, key: tablet_input.ToolKey, target: Seat.FocusTarget) !void {
-            var count: usize = 0;
+            var tool_count: usize = 0;
             for (self.tools) |slot| {
                 if (!slot.active or slot.resource == null or !std.meta.eql(slot.key, key)) continue;
                 const binding = self.resolveBinding(slot.binding) catch continue;
                 if (self.seat.targetBelongsTo(target, binding.peer) and
-                    self.findTablet(slot.binding, key.device) != null) count += 1;
+                    self.findTablet(slot.binding, key.device) != null) tool_count += 1;
             }
-            try self.ensureOutbound(count);
-            const serial = if (count == 0) 0 else self.seat.nextSerial();
+            const pad_count = self.padTransitionCount(key, target);
+            try self.ensureOutbound(tool_count + pad_count);
+            const serial = if (tool_count == 0) 0 else self.seat.nextSerial();
             for (self.tools) |*slot| {
                 if (!slot.active or slot.resource == null or !std.meta.eql(slot.key, key)) continue;
                 const binding = self.resolveBinding(slot.binding) catch continue;
@@ -601,16 +631,54 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                 slot.focus = target;
                 slot.leaving = false;
             }
+            const pad_serial = if (pad_count == 0) 0 else self.seat.nextSerial();
+            for (self.pads) |*pad| {
+                if (!self.padCanLink(pad, key, target)) continue;
+                if (pad.focus != null and pad.tool != null and
+                    std.meta.eql(pad.focus.?, target) and
+                    std.meta.eql(pad.tool.?.device, key.device))
+                {
+                    pad.tool = key;
+                    continue;
+                }
+                const binding = self.resolveBinding(pad.binding) catch continue;
+                if (pad.focus) |old_target| self.enqueue(binding.peer, .{ .pad = .{
+                    .id = self.padId(pad),
+                    .event = .{ .leave = .{ .serial = pad_serial, .target = old_target } },
+                } }) catch unreachable;
+                self.enqueue(binding.peer, .{ .pad = .{
+                    .id = self.padId(pad),
+                    .event = .{ .enter = .{ .serial = pad_serial, .tablet = key.device, .target = target } },
+                } }) catch unreachable;
+                pad.focus = target;
+                pad.tool = key;
+            }
         }
 
         pub fn toolProximityOut(self: *Self, key: tablet_input.ToolKey) !void {
-            const count = self.focusedToolCount(key);
-            try self.ensureOutbound(count);
+            const tool_count = self.focusedToolCount(key);
+            var pad_count: usize = 0;
+            for (self.pads) |pad|
+                pad_count += @intFromBool(pad.active and pad.resource != null and
+                    pad.focus != null and pad.tool != null and std.meta.eql(pad.tool.?, key));
+            try self.ensureOutbound(tool_count + pad_count);
             for (self.tools) |*slot| {
                 if (!slot.active or slot.focus == null or !std.meta.eql(slot.key, key)) continue;
                 const binding = self.resolveBinding(slot.binding) catch continue;
                 self.enqueue(binding.peer, .{ .tool = .{ .id = self.toolId(slot), .event = .proximity_out } }) catch unreachable;
                 slot.leaving = true;
+            }
+            const serial = if (pad_count == 0) 0 else self.seat.nextSerial();
+            for (self.pads) |*pad| {
+                if (!pad.active or pad.resource == null or pad.focus == null or
+                    pad.tool == null or !std.meta.eql(pad.tool.?, key)) continue;
+                const binding = self.resolveBinding(pad.binding) catch continue;
+                self.enqueue(binding.peer, .{ .pad = .{
+                    .id = self.padId(pad),
+                    .event = .{ .leave = .{ .serial = serial, .target = pad.focus.? } },
+                } }) catch unreachable;
+                pad.focus = null;
+                pad.tool = null;
             }
         }
 
@@ -692,6 +760,99 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
             }
         }
 
+        pub fn padButton(self: *Self, event: input.Event) !void {
+            const value = event.tablet_pad_button;
+            var needed: usize = 0;
+            var mode_switches: usize = 0;
+            for (self.pads) |*pad| {
+                if (!padFocusedFor(pad, value.device)) continue;
+                const group = self.findPadChild(self.groups, self.padId(pad), value.group) orelse continue;
+                const mode_switch = group.mode == null or group.mode.? != value.mode;
+                needed += @as(usize, 1) + @intFromBool(mode_switch);
+                mode_switches += @intFromBool(mode_switch);
+            }
+            try self.ensureOutbound(needed);
+            const serial = if (mode_switches == 0) 0 else self.seat.nextSerial();
+            for (self.pads) |*pad| {
+                if (!padFocusedFor(pad, value.device)) continue;
+                const group = self.findPadChild(self.groups, self.padId(pad), value.group) orelse continue;
+                const binding = self.resolveBinding(pad.binding) catch continue;
+                try self.switchPadMode(binding.peer, group, value.time_usec, serial, value.mode);
+                self.enqueue(binding.peer, .{ .pad = .{
+                    .id = self.padId(pad),
+                    .event = .{ .button = .{
+                        .time = @truncate(value.time_usec / 1000),
+                        .button = value.button,
+                        .pressed = value.pressed,
+                    } },
+                } }) catch unreachable;
+            }
+        }
+
+        pub fn padRing(self: *Self, event: input.Event) !void {
+            const value = event.tablet_pad_ring;
+            try self.padAxis(.ring, value);
+        }
+
+        pub fn padStrip(self: *Self, event: input.Event) !void {
+            const value = event.tablet_pad_strip;
+            try self.padAxis(.strip, value);
+        }
+
+        fn padAxis(self: *Self, comptime kind: PadAxisKind, value: anytype) !void {
+            var needed: usize = 0;
+            var mode_switches: usize = 0;
+            for (self.pads) |*pad| {
+                if (!padFocusedFor(pad, value.device)) continue;
+                const pad_id = self.padId(pad);
+                const group = self.findPadChild(self.groups, pad_id, value.group) orelse continue;
+                const controls = if (kind == .ring) self.rings else self.strips;
+                const index = if (kind == .ring) value.ring else value.strip;
+                if (self.findPadChild(controls, pad_id, index) == null) continue;
+                const mode_switch = group.mode == null or group.mode.? != value.mode;
+                needed += @as(usize, 2) + @intFromBool(value.source == .finger) +
+                    @intFromBool(mode_switch);
+                mode_switches += @intFromBool(mode_switch);
+            }
+            try self.ensureOutbound(needed);
+            const serial = if (mode_switches == 0) 0 else self.seat.nextSerial();
+            for (self.pads) |*pad| {
+                if (!padFocusedFor(pad, value.device)) continue;
+                const pad_id = self.padId(pad);
+                const group = self.findPadChild(self.groups, pad_id, value.group) orelse continue;
+                const controls = if (kind == .ring) self.rings else self.strips;
+                const index = if (kind == .ring) value.ring else value.strip;
+                const control = self.findPadChild(controls, pad_id, index) orelse continue;
+                const binding = self.resolveBinding(pad.binding) catch continue;
+                try self.switchPadMode(binding.peer, group, value.time_usec, serial, value.mode);
+                if (kind == .ring) {
+                    const id = self.childId(self.rings, control);
+                    if (value.source == .finger)
+                        self.enqueue(binding.peer, .{ .ring = .{ .id = id, .event = .source } }) catch unreachable;
+                    self.enqueue(binding.peer, .{ .ring = .{
+                        .id = id,
+                        .event = if (value.position < 0) .stop else .{ .angle = fixed(value.position) },
+                    } }) catch unreachable;
+                    self.enqueue(binding.peer, .{ .ring = .{
+                        .id = id,
+                        .event = .{ .frame = @truncate(value.time_usec / 1000) },
+                    } }) catch unreachable;
+                } else {
+                    const id = self.childId(self.strips, control);
+                    if (value.source == .finger)
+                        self.enqueue(binding.peer, .{ .strip = .{ .id = id, .event = .source } }) catch unreachable;
+                    self.enqueue(binding.peer, .{ .strip = .{
+                        .id = id,
+                        .event = if (value.position < 0) .stop else .{ .position = normalized(value.position) },
+                    } }) catch unreachable;
+                    self.enqueue(binding.peer, .{ .strip = .{
+                        .id = id,
+                        .event = .{ .frame = @truncate(value.time_usec / 1000) },
+                    } }) catch unreachable;
+                }
+            }
+        }
+
         /// Translates one logical tablet-state event without advancing the
         /// source queue. False means the event belongs to pad support that is
         /// not yet installed and must remain pending.
@@ -713,7 +874,9 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                 .tip => |value| try self.toolTip(value.key, value.down),
                 .button => |value| try self.toolButton(value.key, value.button, value.pressed),
                 .frame => |value| try self.toolFrame(value.key, value.time_usec),
-                .pad_button, .pad_ring, .pad_strip => return false,
+                .pad_button => |value| try self.padButton(value),
+                .pad_ring => |value| try self.padRing(value),
+                .pad_strip => |value| try self.padStrip(value),
             }
             return true;
         }
@@ -895,6 +1058,27 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                 .buttons => |buttons| wayring.server.sendEvent(protocol, Pad, server_objects, queue, pad.resource orelse return error.InvalidState, .{ .buttons = .{ .buttons = buttons } }),
                 .done => wayring.server.sendEvent(protocol, Pad, server_objects, queue, pad.resource orelse return error.InvalidState, .{ .done = .{} }),
                 .removed => wayring.server.sendEvent(protocol, Pad, server_objects, queue, pad.resource orelse return error.InvalidState, .{ .removed = .{} }),
+                .enter => |enter| enter: {
+                    const tablet = self.findTablet(pad.binding, enter.tablet) orelse return true;
+                    const surface = self.seat.surfaceHandleOn(server_objects, binding.peer, enter.target) catch return true;
+                    break :enter wayring.server.sendEvent(protocol, Pad, server_objects, queue, pad.resource orelse return error.InvalidState, .{ .enter = .{
+                        .serial = enter.serial,
+                        .tablet = (tablet.resource orelse return true).id,
+                        .surface = surface.id,
+                    } });
+                },
+                .leave => |leave| leave: {
+                    const surface = self.seat.surfaceHandleOn(server_objects, binding.peer, leave.target) catch return true;
+                    break :leave wayring.server.sendEvent(protocol, Pad, server_objects, queue, pad.resource orelse return error.InvalidState, .{ .leave = .{
+                        .serial = leave.serial,
+                        .surface = surface.id,
+                    } });
+                },
+                .button => |button| wayring.server.sendEvent(protocol, Pad, server_objects, queue, pad.resource orelse return error.InvalidState, .{ .button = .{
+                    .time = button.time,
+                    .button = button.button,
+                    .state = if (button.pressed) Pad.button_state.pressed else Pad.button_state.released,
+                } }),
             };
             result catch |err| switch (err) {
                 error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return false,
@@ -935,6 +1119,11 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                 },
                 .modes => |modes| wayring.server.sendEvent(protocol, Group, server_objects, queue, group.resource orelse return true, .{ .modes = .{ .modes = modes } }),
                 .done => wayring.server.sendEvent(protocol, Group, server_objects, queue, group.resource orelse return true, .{ .done = .{} }),
+                .mode_switch => |mode| wayring.server.sendEvent(protocol, Group, server_objects, queue, group.resource orelse return true, .{ .mode_switch = .{
+                    .time = mode.time,
+                    .serial = mode.serial,
+                    .mode = mode.mode,
+                } }),
             };
             result catch |err| switch (err) {
                 error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return false,
@@ -950,16 +1139,31 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                 self.releaseChild(self.childFree(Interface), slots, value.id.index);
                 return true;
             };
-            _ = value.event;
-            const created = if (Interface == Ring)
-                Group.construct_event_ring(protocol, server_objects, queue, group.resource orelse return true, .{ .ring = .{ .context = child } })
-            else
-                Group.construct_event_strip(protocol, server_objects, queue, group.resource orelse return true, .{ .strip = .{ .context = child } });
-            const resource = created catch |err| switch (err) {
+            const result = if (Interface == Ring) switch (value.event) {
+                .create => create: {
+                    const resource = Group.construct_event_ring(protocol, server_objects, queue, group.resource orelse return true, .{ .ring = .{ .context = child } }) catch |err| break :create err;
+                    child.resource = resource.ring;
+                    return true;
+                },
+                .source => wayring.server.sendEvent(protocol, Ring, server_objects, queue, child.resource orelse return true, .{ .source = .{ .source = Ring.source.finger } }),
+                .angle => |angle| wayring.server.sendEvent(protocol, Ring, server_objects, queue, child.resource orelse return true, .{ .angle = .{ .degrees = angle } }),
+                .stop => wayring.server.sendEvent(protocol, Ring, server_objects, queue, child.resource orelse return true, .{ .stop = .{} }),
+                .frame => |time| wayring.server.sendEvent(protocol, Ring, server_objects, queue, child.resource orelse return true, .{ .frame = .{ .time = time } }),
+            } else switch (value.event) {
+                .create => create: {
+                    const resource = Group.construct_event_strip(protocol, server_objects, queue, group.resource orelse return true, .{ .strip = .{ .context = child } }) catch |err| break :create err;
+                    child.resource = resource.strip;
+                    return true;
+                },
+                .source => wayring.server.sendEvent(protocol, Strip, server_objects, queue, child.resource orelse return true, .{ .source = .{ .source = Strip.source.finger } }),
+                .position => |position| wayring.server.sendEvent(protocol, Strip, server_objects, queue, child.resource orelse return true, .{ .position = .{ .position = position } }),
+                .stop => wayring.server.sendEvent(protocol, Strip, server_objects, queue, child.resource orelse return true, .{ .stop = .{} }),
+                .frame => |time| wayring.server.sendEvent(protocol, Strip, server_objects, queue, child.resource orelse return true, .{ .frame = .{ .time = time } }),
+            };
+            result catch |err| switch (err) {
                 error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return false,
                 else => return err,
             };
-            child.resource = if (Interface == Ring) resource.ring else resource.strip;
             return true;
         }
 
@@ -1289,6 +1493,85 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                 if (slot.active and std.meta.eql(slot.binding, binding) and
                     std.meta.eql(slot.device, device)) return slot;
             return null;
+        }
+
+        fn findTool(self: *Self, binding: Id, key: tablet_input.ToolKey) ?*ToolSlot {
+            for (self.tools) |*slot|
+                if (slot.active and slot.resource != null and std.meta.eql(slot.binding, binding) and
+                    std.meta.eql(slot.key, key)) return slot;
+            return null;
+        }
+
+        fn padCanLink(
+            self: *Self,
+            pad: *const PadSlot,
+            key: tablet_input.ToolKey,
+            target: Seat.FocusTarget,
+        ) bool {
+            if (!pad.active or pad.resource == null) return false;
+            const binding = self.resolveBinding(pad.binding) catch return false;
+            if (!self.seat.targetBelongsTo(target, binding.peer)) return false;
+            if (self.findTool(pad.binding, key) == null) return false;
+            const tablet = self.findTablet(pad.binding, key.device) orelse return false;
+            return std.meta.eql(pad.device, key.device) or
+                (pad.physical_group != 0 and pad.physical_group == tablet.physical_group);
+        }
+
+        fn padFocusedFor(pad: *const PadSlot, device: input.DeviceId) bool {
+            return pad.active and pad.resource != null and pad.focus != null and
+                std.meta.eql(pad.device, device);
+        }
+
+        fn findPadChild(
+            _: *Self,
+            slots: []ChildSlot,
+            pad: Id,
+            control_index: u32,
+        ) ?*ChildSlot {
+            for (slots) |*slot|
+                if (slot.active and std.meta.eql(slot.pad, pad) and
+                    slot.control_index == control_index) return slot;
+            return null;
+        }
+
+        fn switchPadMode(
+            self: *Self,
+            peer: wayring.io_uring.Peer,
+            group: *ChildSlot,
+            time_usec: u64,
+            serial: u32,
+            mode: u32,
+        ) !void {
+            if (group.mode != null and group.mode.? == mode) return;
+            group.mode = mode;
+            try self.enqueue(peer, .{ .group = .{
+                .id = self.childId(self.groups, group),
+                .event = .{ .mode_switch = .{
+                    .time = @truncate(time_usec / 1000),
+                    .serial = serial,
+                    .mode = mode,
+                } },
+            } });
+        }
+
+        fn padTransitionCount(
+            self: *Self,
+            key: tablet_input.ToolKey,
+            target: Seat.FocusTarget,
+        ) usize {
+            var count: usize = 0;
+            for (self.pads) |*pad| {
+                if (!self.padCanLink(pad, key, target)) continue;
+                if (pad.focus == null) {
+                    count += 1;
+                } else if (pad.tool == null or
+                    !std.meta.eql(pad.focus.?, target) or
+                    !std.meta.eql(pad.tool.?.device, key.device))
+                {
+                    count += 2;
+                }
+            }
+            return count;
         }
 
         fn ensureOutbound(self: *const Self, needed: usize) !void {
@@ -1854,7 +2137,133 @@ test "tablet-v2: focused tool frame preserves protocol event order" {
     try std.testing.expectEqual(@as(usize, 0), adapter.outbound_len);
 }
 
-test "tablet-v2: state drain retains unsupported pad events" {
+test "tablet-v2: linked pad focus and controls preserve protocol order" {
+    const protocol = @import("core_protocol");
+    const TestAdapter = Adapter(protocol, TestSeat);
+    var seat: TestSeat = .{};
+    var adapter = try TestAdapter.init(std.testing.allocator, &seat, .{
+        .manager_capacity = 1,
+        .tablet_seat_capacity = 1,
+        .tablet_capacity = 1,
+        .tool_capacity = 2,
+        .pad_capacity = 1,
+        .pad_group_capacity = 1,
+        .pad_ring_capacity = 1,
+        .pad_strip_capacity = 1,
+        .outbound_capacity = 32,
+    });
+    defer adapter.deinit();
+    var server_objects = try wayring.objects.ServerObjects.init(std.testing.allocator, 32, 16, &protocol.wl_display.info, null);
+    defer server_objects.deinit(std.testing.allocator);
+    const peer: wayring.io_uring.Peer = .{ .slot = 14, .generation = 15 };
+    const binding = try adapter.acquireBinding();
+    binding.peer = peer;
+    binding.resource = try server_objects.insertClient(4, &protocol.zwp_tablet_seat_v2.info, 2, binding);
+    binding.resource_present = true;
+    _ = try server_objects.insertClient(5, &protocol.wl_surface.info, 6, null);
+    const tablet_device: input.DeviceId = .{ .slot = 1, .generation = 2, .seat_generation = 3 };
+    const pad_device: input.DeviceId = .{ .slot = 2, .generation = 2, .seat_generation = 3 };
+    const key: tablet_input.ToolKey = .{ .device = tablet_device, .reference = 8 };
+    const newer_key: tablet_input.ToolKey = .{ .device = tablet_device, .reference = 9 };
+    _ = try adapter.publishTablet(tablet_device, .{ .capabilities = .{ .tablet_tool = true }, .group = 44 });
+    var pad_info: platform.DeviceInfo = .{
+        .capabilities = .{ .tablet_pad = true },
+        .group = 44,
+        .pad_buttons = 2,
+        .pad_rings = 1,
+        .pad_strips = 1,
+        .pad_mode_groups = 1,
+    };
+    pad_info.pad_groups[0] = .{ .buttons = 0b11, .rings = 1, .strips = 1, .modes = 3 };
+    try std.testing.expect(try adapter.publishPad(pad_device, pad_info));
+    try std.testing.expect(try adapter.publishTool(key, .{
+        .reference = key.reference,
+        .kind = .pen,
+        .serial = 0,
+        .hardware_id = 0,
+        .capabilities = .{},
+    }));
+    try std.testing.expect(try adapter.publishTool(newer_key, .{
+        .reference = newer_key.reference,
+        .kind = .eraser,
+        .serial = 0,
+        .hardware_id = 0,
+        .capabilities = .{},
+    }));
+
+    var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 256, 8);
+    defer blocks.deinit(std.testing.allocator);
+    var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 1);
+    defer descriptors.deinit(std.testing.allocator);
+    var metadata = wayring.tx.Queue.init(&blocks, 1024, &descriptors, 1);
+    try std.testing.expectEqual(@as(usize, 17), try adapter.flushOn(peer, &server_objects, &metadata));
+    metadata.deinit();
+
+    const target: TestSeat.FocusTarget = .{ .peer = peer, .surface = 5 };
+    try adapter.toolProximityIn(key, target);
+    try adapter.toolProximityIn(newer_key, target);
+    try adapter.toolProximityOut(key);
+    try std.testing.expectEqual(newer_key, adapter.pads[0].tool.?);
+    try adapter.padButton(.{ .tablet_pad_button = .{
+        .device = pad_device,
+        .time_usec = 1_000,
+        .button = 1,
+        .pressed = true,
+        .mode = 1,
+        .group = 0,
+    } });
+    try adapter.padRing(.{ .tablet_pad_ring = .{
+        .device = pad_device,
+        .time_usec = 2_000,
+        .ring = 0,
+        .position = 90,
+        .source = .finger,
+        .mode = 2,
+        .group = 0,
+    } });
+    try adapter.padStrip(.{ .tablet_pad_strip = .{
+        .device = pad_device,
+        .time_usec = 3_000,
+        .strip = 0,
+        .position = -1,
+        .source = .finger,
+        .mode = 2,
+        .group = 0,
+    } });
+    try adapter.toolProximityOut(newer_key);
+    try adapter.toolFrame(key, 4_000);
+    try adapter.toolFrame(newer_key, 4_000);
+
+    const expected = [_]std.meta.Tag(TestAdapter.OutboundValue){
+        .tool,  .pad,  .tool,  .tool,
+        .group, .pad,  .group, .ring,
+        .ring,  .ring, .strip, .strip,
+        .strip, .tool, .pad,   .tool,
+        .tool,
+    };
+    try std.testing.expectEqual(expected.len, adapter.outbound_len);
+    for (expected, 0..) |tag, i|
+        try std.testing.expectEqual(tag, std.meta.activeTag(adapter.outbound[i].value));
+    try std.testing.expectEqual(TestAdapter.PadEvent.enter, std.meta.activeTag(adapter.outbound[1].value.pad.event));
+    try std.testing.expectEqual(TestAdapter.GroupEvent.mode_switch, std.meta.activeTag(adapter.outbound[4].value.group.event));
+    try std.testing.expectEqual(TestAdapter.PadEvent.button, std.meta.activeTag(adapter.outbound[5].value.pad.event));
+    try std.testing.expectEqual(TestAdapter.RingEvent.angle, std.meta.activeTag(adapter.outbound[8].value.ring.event));
+    try std.testing.expectEqual(TestAdapter.StripEvent.stop, std.meta.activeTag(adapter.outbound[11].value.strip.event));
+    try std.testing.expectEqual(TestAdapter.PadEvent.leave, std.meta.activeTag(adapter.outbound[14].value.pad.event));
+    try std.testing.expect(adapter.pads[0].focus == null);
+    try std.testing.expectEqual(@as(u32, 7), seat.serial);
+
+    var pressure = wayring.tx.Queue.init(&blocks, 12, &descriptors, 1);
+    try std.testing.expectEqual(@as(usize, 0), try adapter.flushOn(peer, &server_objects, &pressure));
+    try std.testing.expectEqual(expected.len, adapter.outbound_len);
+    pressure.deinit();
+    var events = wayring.tx.Queue.init(&blocks, 1024, &descriptors, 1);
+    defer events.deinit();
+    try std.testing.expectEqual(expected.len, try adapter.flushOn(peer, &server_objects, &events));
+    try std.testing.expectEqual(@as(usize, 0), adapter.outbound_len);
+}
+
+test "tablet-v2: state drain consumes unmatched pad events" {
     const protocol = @import("core_protocol");
     const TabletState = tablet_input.State(TestSeat.FocusTarget);
     const Queue = struct {
@@ -1891,8 +2300,8 @@ test "tablet-v2: state drain retains unsupported pad events" {
         } } },
     } };
 
-    try std.testing.expectEqual(@as(usize, 1), try adapter.drainState(&queue));
-    try std.testing.expectEqual(@as(usize, 1), queue.index);
+    try std.testing.expectEqual(@as(usize, 2), try adapter.drainState(&queue));
+    try std.testing.expectEqual(@as(usize, 2), queue.index);
     try std.testing.expectEqual(@as(usize, 1), adapter.freeTablets());
     try std.testing.expectEqual(@as(usize, 0), adapter.outbound_len);
 }
