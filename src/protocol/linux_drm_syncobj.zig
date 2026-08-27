@@ -248,23 +248,23 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             acquire: bool,
         ) !?wayring.dispatch.Control {
             const handle = server_objects.namespace.lookupHandle(timeline_id) orelse
-                return adapter.surfaceError(actor, surface.resource.id, "invalid syncobj timeline");
+                return @as(?wayring.dispatch.Control, try adapter.surfaceError(actor, surface.resource.id, "invalid syncobj timeline"));
             const object = server_objects.namespace.resolve(handle) orelse
-                return adapter.surfaceError(actor, surface.resource.id, "invalid syncobj timeline");
+                return @as(?wayring.dispatch.Control, try adapter.surfaceError(actor, surface.resource.id, "invalid syncobj timeline"));
             const timeline = adapter.timelines.fromObject(object) orelse
-                return adapter.surfaceError(actor, surface.resource.id, "invalid syncobj timeline");
+                return @as(?wayring.dispatch.Control, try adapter.surfaceError(actor, surface.resource.id, "invalid syncobj timeline"));
             if (!std.meta.eql(timeline.resource, handle) or !samePeer(timeline.peer, surface.peer))
-                return adapter.surfaceError(actor, surface.resource.id, "invalid syncobj timeline");
+                return @as(?wayring.dispatch.Control, try adapter.surfaceError(actor, surface.resource.id, "invalid syncobj timeline"));
             var point = timeline.timeline.point(drm_syncobj.pointValue(high, low)) catch |cause|
-                return adapter.failure(actor, surface.resource.id, cause);
+                return @as(?wayring.dispatch.Control, try adapter.failure(actor, surface.resource.id, cause));
             var point_owned = true;
             errdefer if (point_owned) point.deinit();
             if (acquire)
                 adapter.core.setExplicitSyncAcquire(surface.surface, surface.resource, point) catch
-                    return adapter.surfaceError(actor, surface.resource.id, "syncobj surface no longer exists")
+                    return @as(?wayring.dispatch.Control, try adapter.surfaceError(actor, surface.resource.id, "syncobj surface no longer exists"))
             else
                 adapter.core.setExplicitSyncRelease(surface.surface, surface.resource, point) catch
-                    return adapter.surfaceError(actor, surface.resource.id, "syncobj surface no longer exists");
+                    return @as(?wayring.dispatch.Control, try adapter.surfaceError(actor, surface.resource.id, "syncobj surface no longer exists"));
             point_owned = false;
             return null;
         }

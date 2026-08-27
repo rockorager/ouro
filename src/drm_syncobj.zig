@@ -126,7 +126,7 @@ pub const Point = struct {
             null,
         );
         if (result == 0) return true;
-        if (result == -c.ETIME) return false;
+        if (std.c.errno(result) == .TIME) return false;
         return error.WaitFailed;
     }
 

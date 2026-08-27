@@ -33,6 +33,8 @@ const protocol_seat = @import("../protocol/seat.zig");
 const protocol_data_device = @import("../protocol/data_device.zig");
 const protocol_primary_selection = @import("../protocol/primary_selection.zig");
 const protocol_linux_dmabuf = @import("../protocol/linux_dmabuf.zig");
+const protocol_linux_drm_syncobj = @import("../protocol/linux_drm_syncobj.zig");
+const drm_syncobj = @import("../drm_syncobj.zig");
 const protocol_xdg_activation = @import("../protocol/xdg_activation.zig");
 const protocol_xdg_decoration = @import("../protocol/xdg_decoration.zig");
 const protocol_relative_pointer = @import("../protocol/relative_pointer.zig");
@@ -78,6 +80,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const DataDeviceAdapter = protocol_data_device.Adapter(protocol);
         const PrimarySelectionAdapter = protocol_primary_selection.Adapter(protocol);
         const DmabufAdapter = protocol_linux_dmabuf.Adapter(protocol);
+        const SyncobjAdapter = protocol_linux_drm_syncobj.Adapter(protocol, Adapter);
         const ActivationAdapter = protocol_xdg_activation.Adapter(protocol, Adapter);
         const DecorationAdapter = protocol_xdg_decoration.Adapter(protocol, ShellAdapter);
         const RelativePointerAdapter = protocol_relative_pointer.Adapter(protocol, SeatAdapter);
@@ -271,6 +274,7 @@ pub fn Coordinator(comptime protocol: type) type {
             primary_selection: protocol_primary_selection.Config = .{},
             text_input: protocol_text_input.Config = .{},
             linux_dmabuf: protocol_linux_dmabuf.Config = .{},
+            linux_drm_syncobj: protocol_linux_drm_syncobj.Config = .{},
             xdg_activation: protocol_xdg_activation.Config = .{},
             xdg_decoration: protocol_xdg_decoration.Config = .{},
             relative_pointer: protocol_relative_pointer.Config = .{},
@@ -322,6 +326,7 @@ pub fn Coordinator(comptime protocol: type) type {
         root: *Compositor,
         platforms: Platforms,
         output_config: output_api.Config,
+        syncobj_config: protocol_linux_drm_syncobj.Config,
         input_config: input_api.Config,
         desktop_transaction_timeout_ns: u64,
         seat: [64]u8 = undefined,
@@ -352,6 +357,8 @@ pub fn Coordinator(comptime protocol: type) type {
         primary_selection_adapter: PrimarySelectionAdapter,
         text_input_adapter: TextInputAdapter,
         dmabuf_adapter: DmabufAdapter,
+        syncobj_device: ?drm_syncobj.Device = null,
+        syncobj_adapter: ?SyncobjAdapter = null,
         activation_adapter: ActivationAdapter,
         decoration_adapter: DecorationAdapter,
         relative_pointer_adapter: RelativePointerAdapter,
@@ -440,6 +447,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.root = root;
             self.platforms = platforms;
             self.output_config = config.output;
+            self.syncobj_config = config.linux_drm_syncobj;
             self.desktop_transaction_timeout_ns = config.desktop_transaction_timeout_ns;
             if (config.seat.len == 0 or config.seat.len > self.seat.len)
                 return error.InvalidSeat;
@@ -459,6 +467,8 @@ pub fn Coordinator(comptime protocol: type) type {
             self.input_delivery_prepared = false;
             self.input_delivery_event = null;
             self.render_device = null;
+            self.syncobj_device = null;
+            self.syncobj_adapter = null;
             self.next_output_generation = config.output.output_id.generation;
             self.loop = null;
             self.clients = .empty;
@@ -1002,7 +1012,11 @@ pub fn Coordinator(comptime protocol: type) type {
             self.interaction.deinit();
             self.desktop.deinit();
             self.shell_adapter.deinit();
+            if (self.syncobj_adapter) |*adapter| adapter.deinit();
+            self.syncobj_adapter = null;
             self.adapter.deinit();
+            if (self.syncobj_device) |*device| device.deinit();
+            self.syncobj_device = null;
             self.shm.deinit(self.allocator);
             self.timers.deinit(self.allocator);
             self.router.deinit(self.allocator);
@@ -1033,6 +1047,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         pub fn disconnected(self: *Self, peer: wayring.io_uring.Peer) void {
+            if (self.syncobj_adapter) |*adapter| adapter.disconnected(peer);
             self.session_lock_adapter.disconnected(peer);
             self.sessionLockChanged() catch {};
             self.cursor_shape_adapter.disconnected(peer);
@@ -1198,6 +1213,12 @@ pub fn Coordinator(comptime protocol: type) type {
                     self.markProtocol(peer, ProtocolReady.dmabuf);
                 try self.flushProtocol();
                 return control;
+            }
+            if (self.syncobj_adapter) |*adapter| {
+                if (try adapter.request(peer, target, message, fds)) |control| {
+                    try self.flushProtocol();
+                    return control;
+                }
             }
             if (try self.activation_adapter.request(peer, target, message, fds)) |control| {
                 try self.processActivationEvents();
@@ -2649,6 +2670,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 );
             if (self.render_device == null)
                 self.render_device = self.output.?.takeRenderDevice();
+            try self.ensureExplicitSync(snapshot.handle);
             const work_area: @import("../scene/geometry.zig").Rect = .{
                 .x = 0,
                 .y = 0,
@@ -2686,6 +2708,42 @@ pub fn Coordinator(comptime protocol: type) type {
                 retained_visibility_changed or self.sessionLockActive())
                 try self.output.?.request(.damage, try monotonicNs());
             try self.armTimer();
+        }
+
+        /// The global is advertised only after the selected renderer/KMS DRM
+        /// device proves timeline-syncobj support. The duplicated descriptor
+        /// survives output disable/re-enable and keeps imported timelines valid.
+        fn ensureExplicitSync(self: *Self, handle: drm.Handle) !void {
+            if (self.syncobj_adapter != null) return;
+            const fd = try kms.Device.fromManager(&self.manager).fd(handle);
+            self.syncobj_device = drm_syncobj.Device.init(self.allocator, fd) catch |cause|
+                switch (cause) {
+                    error.Unsupported => return,
+                    else => return cause,
+                };
+            var device_owned = true;
+            errdefer if (device_owned) {
+                self.syncobj_device.?.deinit();
+                self.syncobj_device = null;
+            };
+            self.syncobj_adapter = try SyncobjAdapter.init(
+                self.allocator,
+                &self.adapter,
+                &self.syncobj_device.?,
+                self.syncobj_config,
+            );
+            var adapter_owned = true;
+            errdefer if (adapter_owned) {
+                self.syncobj_adapter.?.deinit();
+                self.syncobj_adapter = null;
+            };
+            _ = self.syncobj_adapter.?.install(&self.root.runtime) catch |cause| return cause;
+            // From this point the runtime retains the adapter's stable address.
+            // Any publication failure is fatal and teardown owns both values.
+            adapter_owned = false;
+            device_owned = false;
+            if (try self.root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
         }
 
         fn refreshRetainedLayersForOutput(self: *Self) bool {
@@ -4266,6 +4324,7 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.data_device_adapter.resourceRemoved(handle, object);
             _ = self.primary_selection_adapter.resourceRemoved(handle, object);
             _ = self.dmabuf_adapter.resourceRemoved(handle, object);
+            if (self.syncobj_adapter) |*adapter| _ = adapter.resourceRemoved(handle, object);
             _ = self.activation_adapter.resourceRemoved(handle, object);
             _ = self.decoration_adapter.resourceRemoved(handle, object);
             _ = self.relative_pointer_adapter.resourceRemoved(handle, object);

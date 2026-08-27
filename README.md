@@ -35,6 +35,10 @@ responsibilities:
 - [Linux DMA-BUF](src/protocol/linux_dmabuf.zig): bounded parameter and buffer
   resources retain imported plane descriptors and GBM leases through the
   existing immutable content-copy and release lifecycle.
+- [Linux DRM explicit sync](src/protocol/linux_drm_syncobj.zig):
+  `linux-drm-syncobj-v1` timelines and points are refcounted independently of
+  protocol resources, gate their exact DMA-BUF commit before compositor access,
+  and signal release only after renderer use or explicit discard.
 - [Presentation lifetime](src/presentation.zig): imported handles, source
   leases, and per-commit release callbacks remain together until successful
   presentation completion or explicit output teardown.

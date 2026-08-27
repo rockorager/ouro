@@ -216,8 +216,9 @@ protocol/
   layer_shell.zig
   seat.zig
   data_device.zig
+  linux_dmabuf.zig
+  linux_drm_syncobj.zig
   output.zig
-  presentation_time.zig
 ```
 
 An XDG toplevel adapter owns XDG resources, configure serials, acknowledgments,
@@ -535,7 +536,7 @@ unintegrated abstractions.
    - occlusion, direct scanout, presentation telemetry.
 6. **Advanced effects and protocols**
    - backdrop blur after dependency-aware damage is tested;
-   - gestures, screencopy, explicit sync, color management, Xwayland as demanded
+   - gestures, screencopy, color management, Xwayland as demanded
      by product priorities.
 
 ## Invariants to test
