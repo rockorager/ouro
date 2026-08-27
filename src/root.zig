@@ -69,6 +69,7 @@ pub const scene_theme_cursor = @import("scene/theme_cursor.zig");
 pub const desktop_layout = @import("desktop/layout.zig");
 pub const desktop = @import("desktop/model.zig");
 pub const interaction = @import("input/interaction.zig");
+pub const tablet_input = @import("input/tablet.zig");
 pub const confinement = @import("input/confinement.zig");
 pub const cursor_theme = @import("cursor_theme.zig");
 
@@ -141,6 +142,7 @@ test {
     _ = desktop_layout;
     _ = desktop;
     _ = interaction;
+    _ = tablet_input;
     _ = confinement;
     _ = cursor_theme;
 }
