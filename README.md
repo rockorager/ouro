@@ -51,6 +51,10 @@ responsibilities:
 - [Surface content types](src/protocol/core_surface.zig): bounded
   `wp_content_type_v1` objects retain double-buffered photo, video, game, and
   unknown future hints on their exact surface commits.
+- [Tearing control](src/protocol/core_surface.zig): bounded
+  `wp_tearing_control_v1` objects retain synchronized or asynchronous
+  presentation suitability on exact commits; Ouro currently presents both
+  through its synchronized KMS path.
 - [Fractional scale](src/protocol/fractional_scale.zig): bounded per-surface
   `wp_fractional_scale_v1` objects publish Ouro's preferred render scale and
   pair with viewporter destination sizing.

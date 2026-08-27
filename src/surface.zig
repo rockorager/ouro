@@ -195,6 +195,11 @@ pub const Buffer = struct {
     height: u32,
 };
 
+pub const PresentationHint = enum {
+    vsync,
+    async,
+};
+
 pub const Attachment = struct {
     buffer: ?Buffer,
     offset: Point,
@@ -219,6 +224,7 @@ pub const Update = struct {
     color_description: color.Description,
     color_representation: color.Representation,
     content_type: u32 = 0,
+    presentation_hint: PresentationHint = .vsync,
 };
 
 pub const Surface = struct {
@@ -228,6 +234,7 @@ pub const Surface = struct {
     current_transform: Transform = .normal,
     current_scale: i32 = 1,
     current_content_type: u32 = 0,
+    current_presentation_hint: PresentationHint = .vsync,
     viewport: Viewport = .{},
     current_color_description: color.Description = .srgb,
     current_color_representation: color.Representation = .{},
@@ -245,6 +252,7 @@ pub const Surface = struct {
     pending_color_description: color.Description = .srgb,
     pending_color_representation: color.Representation = .{},
     pending_content_type: u32 = 0,
+    pending_presentation_hint: PresentationHint = .vsync,
 
     /// Applies wl_surface.attach validation and replaces the pending buffer.
     pub fn attach(
@@ -300,6 +308,10 @@ pub const Surface = struct {
 
     pub fn setContentType(surface: *Surface, content_type: u32) void {
         surface.pending_content_type = content_type;
+    }
+
+    pub fn setPresentationHint(surface: *Surface, hint: PresentationHint) void {
+        surface.pending_presentation_hint = hint;
     }
 
     pub fn hasPendingBufferAttachment(surface: Surface) bool {
@@ -364,6 +376,7 @@ pub const Surface = struct {
         surface.current_color_description = surface.pending_color_description;
         surface.current_color_representation = surface.pending_color_representation;
         surface.current_content_type = surface.pending_content_type;
+        surface.current_presentation_hint = surface.pending_presentation_hint;
         const content_size = surface.contentSize(surface.current_buffer);
         const viewport_state = surface.viewport.publishCommit();
         const upload_damage = canonicalBufferDamage(
@@ -388,6 +401,7 @@ pub const Surface = struct {
             .color_description = surface.current_color_description,
             .color_representation = surface.current_color_representation,
             .content_type = surface.current_content_type,
+            .presentation_hint = surface.current_presentation_hint,
         };
         surface.pending_buffer = null;
         surface.pending_attach_offset = .{};
@@ -841,6 +855,22 @@ test "surface content type is double buffered and preserves unknown values" {
     const cleared = try surface.commit();
     try std.testing.expectEqual(@as(u32, 0), cleared.content_type);
     try std.testing.expectEqual(@as(u32, 0), surface.current_content_type);
+}
+
+test "surface presentation hint is double buffered" {
+    var surface: Surface = .{};
+
+    surface.setPresentationHint(.async);
+    try std.testing.expectEqual(PresentationHint.vsync, surface.current_presentation_hint);
+    const asynchronous = try surface.commit();
+    try std.testing.expectEqual(PresentationHint.async, asynchronous.presentation_hint);
+    try std.testing.expectEqual(PresentationHint.async, surface.current_presentation_hint);
+
+    surface.setPresentationHint(.vsync);
+    try std.testing.expectEqual(PresentationHint.async, asynchronous.presentation_hint);
+    try std.testing.expectEqual(PresentationHint.async, surface.current_presentation_hint);
+    const synchronized = try surface.commit();
+    try std.testing.expectEqual(PresentationHint.vsync, synchronized.presentation_hint);
 }
 
 test "surface viewport validates transformed and scaled content atomically" {

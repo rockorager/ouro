@@ -26,6 +26,7 @@ pub const Config = struct {
     viewport_capacity: usize = 8,
     single_pixel_buffer_capacity: usize = 8,
     content_type_capacity: usize = 8,
+    tearing_control_capacity: usize = 8,
     presentation_resource_capacity: usize = 4,
     presentation_feedback_capacity: usize = 64,
     region_operation_capacity: usize,
@@ -46,6 +47,7 @@ pub const Config = struct {
             config.single_pixel_buffer_capacity == 0 or
             config.single_pixel_buffer_capacity >= none or
             config.content_type_capacity == 0 or config.content_type_capacity >= none or
+            config.tearing_control_capacity == 0 or config.tearing_control_capacity >= none or
             config.presentation_resource_capacity == 0 or
             config.presentation_resource_capacity >= none or
             config.presentation_feedback_capacity == 0 or
@@ -73,6 +75,8 @@ pub fn Adapter(comptime protocol: type) type {
         const SinglePixelManager = protocol.wp_single_pixel_buffer_manager_v1;
         const ContentTypeManager = protocol.wp_content_type_manager_v1;
         const ContentType = protocol.wp_content_type_v1;
+        const TearingControlManager = protocol.wp_tearing_control_manager_v1;
+        const TearingControl = protocol.wp_tearing_control_v1;
         const WlBuffer = protocol.wl_buffer;
         const Presentation = protocol.wp_presentation;
         const PresentationFeedback = protocol.wp_presentation_feedback;
@@ -224,6 +228,13 @@ pub fn Adapter(comptime protocol: type) type {
             surface: ?SurfaceId = null,
         };
 
+        const TearingControlSlot = struct {
+            active: bool = false,
+            next_free: u32 = none,
+            resource: objects.Handle = .{ .id = 0, .generation = 0 },
+            surface: ?SurfaceId = null,
+        };
+
         const PresentationResource = struct {
             active: bool = false,
             next_free: u32 = none,
@@ -241,6 +252,7 @@ pub fn Adapter(comptime protocol: type) type {
         viewporter_global: ?objects.Handle = null,
         single_pixel_global: ?objects.Handle = null,
         content_type_global: ?objects.Handle = null,
+        tearing_control_global: ?objects.Handle = null,
         presentation_global: ?objects.Handle = null,
         compositor_version: u32,
         surfaces: []*SurfaceSlot,
@@ -248,12 +260,14 @@ pub fn Adapter(comptime protocol: type) type {
         viewports: []*ViewportSlot,
         single_pixels: []*SinglePixelSlot,
         content_types: []*ContentTypeSlot,
+        tearing_controls: []*TearingControlSlot,
         presentation_resources: []*PresentationResource,
         surface_free: u32,
         region_free: u32,
         viewport_free: u32,
         single_pixel_free: u32,
         content_type_free: u32,
+        tearing_control_free: u32,
         presentation_resource_free: u32,
         region_pool: surface_state.RegionPool,
         frame_pool: surface_state.FramePool,
@@ -304,6 +318,12 @@ pub fn Adapter(comptime protocol: type) type {
                 config.content_type_capacity,
             );
             errdefer freeSlots(ContentTypeSlot, allocator, content_types);
+            const tearing_controls = try allocSlots(
+                TearingControlSlot,
+                allocator,
+                config.tearing_control_capacity,
+            );
+            errdefer freeSlots(TearingControlSlot, allocator, tearing_controls);
             const presentation_resources = try allocSlots(
                 PresentationResource,
                 allocator,
@@ -368,6 +388,9 @@ pub fn Adapter(comptime protocol: type) type {
             for (content_types, 0..) |slot, index| slot.* = .{
                 .next_free = if (index + 1 < content_types.len) @intCast(index + 1) else none,
             };
+            for (tearing_controls, 0..) |slot, index| slot.* = .{
+                .next_free = if (index + 1 < tearing_controls.len) @intCast(index + 1) else none,
+            };
             for (presentation_resources, 0..) |slot, index| slot.* = .{
                 .next_free = if (index + 1 < presentation_resources.len) @intCast(index + 1) else none,
             };
@@ -385,12 +408,14 @@ pub fn Adapter(comptime protocol: type) type {
                 .viewports = viewports,
                 .single_pixels = single_pixels,
                 .content_types = content_types,
+                .tearing_controls = tearing_controls,
                 .presentation_resources = presentation_resources,
                 .surface_free = 0,
                 .region_free = 0,
                 .viewport_free = 0,
                 .single_pixel_free = 0,
                 .content_type_free = 0,
+                .tearing_control_free = 0,
                 .presentation_resource_free = 0,
                 .region_pool = region_pool,
                 .frame_pool = frame_pool,
@@ -422,6 +447,9 @@ pub fn Adapter(comptime protocol: type) type {
             for (adapter.content_types, 0..) |slot, index| {
                 if (slot.active) adapter.releaseContentType(@intCast(index));
             }
+            for (adapter.tearing_controls, 0..) |slot, index| {
+                if (slot.active) adapter.releaseTearingControl(@intCast(index));
+            }
             for (adapter.presentation_resources, 0..) |slot, index| {
                 if (slot.active) adapter.releasePresentationResource(@intCast(index));
             }
@@ -440,6 +468,7 @@ pub fn Adapter(comptime protocol: type) type {
             freeSlots(ViewportSlot, adapter.allocator, adapter.viewports);
             freeSlots(SinglePixelSlot, adapter.allocator, adapter.single_pixels);
             freeSlots(ContentTypeSlot, adapter.allocator, adapter.content_types);
+            freeSlots(TearingControlSlot, adapter.allocator, adapter.tearing_controls);
             freeSlots(PresentationResource, adapter.allocator, adapter.presentation_resources);
             adapter.allocator.free(adapter.copy_storage);
             adapter.allocator.free(adapter.copies);
@@ -517,6 +546,19 @@ pub fn Adapter(comptime protocol: type) type {
             return global;
         }
 
+        pub fn installTearingControl(adapter: *Self) !objects.Handle {
+            const runtime = adapter.runtime orelse return error.NotInstalled;
+            if (adapter.tearing_control_global != null) return error.AlreadyInstalled;
+            const global = try runtime.addGlobalWithBinder(
+                &TearingControlManager.info,
+                1,
+                adapter,
+                bind,
+            );
+            adapter.tearing_control_global = global;
+            return global;
+        }
+
         /// Driver-facing dispatch entry point. Null means another protocol
         /// owner should inspect the request.
         pub fn request(
@@ -579,6 +621,14 @@ pub fn Adapter(comptime protocol: type) type {
                 const slot = adapter.contentTypeFromObject(target.object) orelse return null;
                 return try adapter.contentTypeRequest(actor, server_objects, slot, message, fds);
             }
+            if (interface == &TearingControlManager.info) {
+                if (target.object.context != @as(?*anyopaque, @ptrCast(adapter))) return null;
+                return try adapter.tearingControlManagerRequest(actor, server_objects, message, fds);
+            }
+            if (interface == &TearingControl.info) {
+                const slot = adapter.tearingControlFromObject(target.object) orelse return null;
+                return try adapter.tearingControlRequest(actor, server_objects, slot, message, fds);
+            }
             if (interface == &Presentation.info) {
                 const resource = adapter.presentationResourceFromObject(target.object) orelse return null;
                 return try adapter.presentationRequest(actor, server_objects, resource, message, fds);
@@ -602,6 +652,7 @@ pub fn Adapter(comptime protocol: type) type {
                     .generation = slot.resource.generation,
                 };
                 adapter.detachContentTypes(surface_id);
+                adapter.detachTearingControls(surface_id);
                 adapter.releaseSurface(adapter.surfaceIndex(slot));
                 return true;
             }
@@ -629,6 +680,12 @@ pub fn Adapter(comptime protocol: type) type {
                 adapter.releaseContentType(adapter.contentTypeIndex(slot));
                 return true;
             }
+            if (object.interface == &TearingControl.info) {
+                const slot = adapter.tearingControlFromObject(&object) orelse return false;
+                if (!std.meta.eql(slot.resource, handle)) return false;
+                adapter.releaseTearingControl(adapter.tearingControlIndex(slot));
+                return true;
+            }
             if (object.interface == &Presentation.info) {
                 const resource = adapter.presentationResourceFromObject(&object) orelse return false;
                 if (!std.meta.eql(resource.resource, handle)) return false;
@@ -638,7 +695,8 @@ pub fn Adapter(comptime protocol: type) type {
             if (object.interface == &PresentationFeedback.info) return true;
             return (object.interface == &Compositor.info or object.interface == &Viewporter.info or
                 object.interface == &SinglePixelManager.info or
-                object.interface == &ContentTypeManager.info) and
+                object.interface == &ContentTypeManager.info or
+                object.interface == &TearingControlManager.info) and
                 object.context == @as(?*anyopaque, @ptrCast(adapter));
         }
 
@@ -1638,6 +1696,78 @@ pub fn Adapter(comptime protocol: type) type {
             return .continue_dispatch;
         }
 
+        fn tearingControlManagerRequest(
+            adapter: *Self,
+            actor: *wayring.connection.Actor,
+            server_objects: anytype,
+            message: wayring.wire.Message,
+            fds: *wayring.ancillary.FdQueue,
+        ) !wayring.dispatch.Control {
+            const decoded = try wayring.server.decodeRequest(
+                TearingControlManager,
+                server_objects,
+                message,
+                fds,
+            );
+            switch (decoded.value) {
+                .destroy => {},
+                .get_tearing_control => |value| {
+                    const surface_handle = server_objects.namespace.lookupHandle(value.surface) orelse
+                        return try adapter.tearingControlError(actor, decoded.handle.id, "invalid tearing-control surface");
+                    const surface_object = server_objects.namespace.resolve(surface_handle) orelse
+                        return try adapter.tearingControlError(actor, decoded.handle.id, "invalid tearing-control surface");
+                    const surface = adapter.surfaceIdObject(surface_handle, surface_object) catch
+                        return try adapter.tearingControlError(actor, decoded.handle.id, "invalid tearing-control surface");
+                    for (adapter.tearing_controls) |slot| if (slot.active and slot.surface != null and
+                        std.meta.eql(slot.surface.?, surface))
+                        return try adapter.tearingControlError(actor, decoded.handle.id, "tearing control already exists");
+                    const slot = adapter.acquireTearingControl() catch
+                        return try adapter.noMemory(actor);
+                    const admitted = TearingControlManager.admit_get_tearing_control(
+                        server_objects,
+                        decoded.handle,
+                        value,
+                        .{ .id = slot },
+                    ) catch |cause| {
+                        adapter.releaseTearingControl(adapter.tearingControlIndex(slot));
+                        return try adapter.failure(actor, decoded.handle.id, cause);
+                    };
+                    slot.resource = admitted.id;
+                    slot.surface = surface;
+                },
+            }
+            try decoded.finish(protocol, server_objects, &actor.transmit);
+            return .continue_dispatch;
+        }
+
+        fn tearingControlRequest(
+            adapter: *Self,
+            actor: *wayring.connection.Actor,
+            server_objects: anytype,
+            slot: *TearingControlSlot,
+            message: wayring.wire.Message,
+            fds: *wayring.ancillary.FdQueue,
+        ) !wayring.dispatch.Control {
+            const decoded = try wayring.server.decodeRequest(
+                TearingControl,
+                server_objects,
+                message,
+                fds,
+            );
+            switch (decoded.value) {
+                .destroy => adapter.clearTearingControl(slot),
+                .set_presentation_hint => |value| {
+                    if (slot.surface) |surface| if (adapter.surfaceForId(surface)) |target| {
+                        target.state.setPresentationHint(if (value.hint.value == TearingControl.presentation_hint.async.value) .async else .vsync);
+                    } else |_| {
+                        slot.surface = null;
+                    };
+                },
+            }
+            try decoded.finish(protocol, server_objects, &actor.transmit);
+            return .continue_dispatch;
+        }
+
         fn viewportRequest(
             adapter: *Self,
             actor: *wayring.connection.Actor,
@@ -1970,6 +2100,38 @@ pub fn Adapter(comptime protocol: type) type {
             }
         }
 
+        fn acquireTearingControl(adapter: *Self) !*TearingControlSlot {
+            if (adapter.tearing_control_free == none) return error.Exhausted;
+            const index = adapter.tearing_control_free;
+            const slot = adapter.tearing_controls[index];
+            adapter.tearing_control_free = slot.next_free;
+            slot.* = .{ .active = true };
+            return slot;
+        }
+
+        fn releaseTearingControl(adapter: *Self, index: u32) void {
+            const slot = adapter.tearing_controls[index];
+            if (!slot.active) return;
+            adapter.clearTearingControl(slot);
+            slot.* = .{ .next_free = adapter.tearing_control_free };
+            adapter.tearing_control_free = index;
+        }
+
+        fn clearTearingControl(adapter: *Self, slot: *TearingControlSlot) void {
+            const surface = slot.surface orelse return;
+            if (adapter.surfaceForId(surface)) |target|
+                target.state.setPresentationHint(.vsync)
+            else |_| {}
+            slot.surface = null;
+        }
+
+        fn detachTearingControls(adapter: *Self, surface: SurfaceId) void {
+            for (adapter.tearing_controls) |slot| {
+                if (slot.active and slot.surface != null and
+                    std.meta.eql(slot.surface.?, surface)) slot.surface = null;
+            }
+        }
+
         fn acquirePresentationResource(adapter: *Self) !*PresentationResource {
             if (adapter.presentation_resource_free == none) try adapter.growSlots(PresentationResource, &adapter.presentation_resources, &adapter.presentation_resource_free);
             const index = adapter.presentation_resource_free;
@@ -2125,6 +2287,13 @@ pub fn Adapter(comptime protocol: type) type {
             return bindingFromContext(ContentTypeSlot, adapter.content_types, object.context);
         }
 
+        fn tearingControlFromObject(
+            adapter: *Self,
+            object: *const objects.Object,
+        ) ?*TearingControlSlot {
+            return bindingFromContext(TearingControlSlot, adapter.tearing_controls, object.context);
+        }
+
         fn presentationResourceFromObject(
             adapter: *Self,
             object: *const objects.Object,
@@ -2150,6 +2319,10 @@ pub fn Adapter(comptime protocol: type) type {
 
         fn contentTypeIndex(adapter: *Self, slot: *ContentTypeSlot) u32 {
             return slotIndex(ContentTypeSlot, adapter.content_types, slot);
+        }
+
+        fn tearingControlIndex(adapter: *Self, slot: *TearingControlSlot) u32 {
+            return slotIndex(TearingControlSlot, adapter.tearing_controls, slot);
         }
 
         fn presentationResourceIndex(adapter: *Self, resource: *PresentationResource) u32 {
@@ -2388,6 +2561,20 @@ pub fn Adapter(comptime protocol: type) type {
             );
         }
 
+        fn tearingControlError(
+            adapter: *Self,
+            actor: *wayring.connection.Actor,
+            object_id: u32,
+            message: []const u8,
+        ) !wayring.dispatch.Control {
+            return adapter.protocolError(
+                actor,
+                object_id,
+                TearingControlManager.@"error".tearing_control_exists.value,
+                message,
+            );
+        }
+
         fn protocolError(
             adapter: *Self,
             actor: *wayring.connection.Actor,
@@ -2504,6 +2691,7 @@ const TestContext = struct {
             .viewport_capacity = 2,
             .single_pixel_buffer_capacity = 1,
             .content_type_capacity = 1,
+            .tearing_control_capacity = 1,
             .presentation_resource_capacity = 2,
             .presentation_feedback_capacity = 4,
             .region_operation_capacity = 16,
@@ -3432,6 +3620,155 @@ test "content type rejects duplicate objects for one surface" {
         &context.requests,
         manager.id,
         .{ .get_surface_content_type = .{ .id = 12, .surface = surface.id } },
+    );
+    try std.testing.expectEqual(wayring.dispatch.Control.stop, try context.dispatchCore());
+    try std.testing.expect(context.server_objects.namespace.get(12) == null);
+}
+
+test "tearing control follows exact commits and normalizes unknown hints" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const manager = try context.server_objects.insertClient(
+        30,
+        &test_protocol.wp_tearing_control_manager_v1.info,
+        1,
+        &context.adapter,
+    );
+    const surface = try context.createSurface(10);
+    try test_protocol.wp_tearing_control_manager_v1.encodeRequest(
+        &context.requests,
+        manager.id,
+        .{ .get_tearing_control = .{ .id = 11, .surface = surface.id } },
+    );
+    _ = try context.dispatchCore();
+    const tearing = context.server_objects.namespace.lookupHandle(11) orelse
+        return error.MissingTearingControl;
+
+    try test_protocol.wp_tearing_control_v1.encodeRequest(
+        &context.requests,
+        tearing.id,
+        .{ .set_presentation_hint = .{
+            .hint = test_protocol.wp_tearing_control_v1.presentation_hint.async,
+        } },
+    );
+    _ = try context.dispatchCore();
+    try test_protocol.wl_surface.encodeRequest(
+        &context.requests,
+        surface.id,
+        .{ .commit = .{} },
+    );
+    _ = try context.dispatchCore();
+    try test_protocol.wp_tearing_control_v1.encodeRequest(
+        &context.requests,
+        tearing.id,
+        .{ .destroy = .{} },
+    );
+    _ = try context.dispatchCore();
+    try std.testing.expectEqual(
+        surface_state.PresentationHint.async,
+        (try context.adapter.getSurface(surface)).current_presentation_hint,
+    );
+    try test_protocol.wl_surface.encodeRequest(
+        &context.requests,
+        surface.id,
+        .{ .commit = .{} },
+    );
+    _ = try context.dispatchCore();
+
+    var output: [1]TestAdapter.Applied = undefined;
+    const asynchronous = try context.adapter.tryApply(surface, &output);
+    try std.testing.expectEqual(@as(usize, 1), asynchronous.len);
+    try std.testing.expectEqual(
+        surface_state.PresentationHint.async,
+        asynchronous[0].payload.surface.presentation_hint,
+    );
+    asynchronous[0].payload.deinit();
+    const synchronized = try context.adapter.tryApply(surface, &output);
+    try std.testing.expectEqual(@as(usize, 1), synchronized.len);
+    try std.testing.expectEqual(
+        surface_state.PresentationHint.vsync,
+        synchronized[0].payload.surface.presentation_hint,
+    );
+    synchronized[0].payload.deinit();
+
+    try test_protocol.wp_tearing_control_manager_v1.encodeRequest(
+        &context.requests,
+        manager.id,
+        .{ .get_tearing_control = .{ .id = 12, .surface = surface.id } },
+    );
+    _ = try context.dispatchCore();
+    const replacement = context.server_objects.namespace.lookupHandle(12) orelse
+        return error.MissingTearingControl;
+    try test_protocol.wp_tearing_control_v1.encodeRequest(
+        &context.requests,
+        replacement.id,
+        .{ .set_presentation_hint = .{
+            .hint = test_protocol.wp_tearing_control_v1.presentation_hint.fromInt(99),
+        } },
+    );
+    _ = try context.dispatchCore();
+    try test_protocol.wl_surface.encodeRequest(
+        &context.requests,
+        surface.id,
+        .{ .commit = .{} },
+    );
+    _ = try context.dispatchCore();
+    var normalized = (try context.adapter.tryApply(surface, &output))[0].payload;
+    try std.testing.expectEqual(
+        surface_state.PresentationHint.vsync,
+        normalized.surface.presentation_hint,
+    );
+    normalized.deinit();
+
+    try test_protocol.wl_surface.encodeRequest(
+        &context.requests,
+        surface.id,
+        .{ .destroy = .{} },
+    );
+    _ = try context.dispatchCore();
+    const replacement_surface = try context.createSurface(10);
+    try test_protocol.wp_tearing_control_v1.encodeRequest(
+        &context.requests,
+        replacement.id,
+        .{ .set_presentation_hint = .{
+            .hint = test_protocol.wp_tearing_control_v1.presentation_hint.async,
+        } },
+    );
+    _ = try context.dispatchCore();
+    try test_protocol.wl_surface.encodeRequest(
+        &context.requests,
+        replacement_surface.id,
+        .{ .commit = .{} },
+    );
+    _ = try context.dispatchCore();
+    var stale = (try context.adapter.tryApply(replacement_surface, &output))[0].payload;
+    try std.testing.expectEqual(
+        surface_state.PresentationHint.vsync,
+        stale.surface.presentation_hint,
+    );
+    stale.deinit();
+}
+
+test "tearing control rejects duplicate objects for one surface" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const manager = try context.server_objects.insertClient(
+        30,
+        &test_protocol.wp_tearing_control_manager_v1.info,
+        1,
+        &context.adapter,
+    );
+    const surface = try context.createSurface(10);
+    try test_protocol.wp_tearing_control_manager_v1.encodeRequest(
+        &context.requests,
+        manager.id,
+        .{ .get_tearing_control = .{ .id = 11, .surface = surface.id } },
+    );
+    _ = try context.dispatchCore();
+    try test_protocol.wp_tearing_control_manager_v1.encodeRequest(
+        &context.requests,
+        manager.id,
+        .{ .get_tearing_control = .{ .id = 12, .surface = surface.id } },
     );
     try std.testing.expectEqual(wayring.dispatch.Control.stop, try context.dispatchCore());
     try std.testing.expect(context.server_objects.namespace.get(12) == null);
