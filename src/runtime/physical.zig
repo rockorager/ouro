@@ -67,6 +67,7 @@ const protocol_tablet_v2 = @import("../protocol/tablet_v2.zig");
 const protocol_virtual_keyboard = @import("../protocol/virtual_keyboard.zig");
 const protocol_virtual_pointer = @import("../protocol/virtual_pointer.zig");
 const protocol_wlr_screencopy = @import("../protocol/wlr_screencopy.zig");
+const protocol_foreign_toplevel_list = @import("../protocol/foreign_toplevel_list.zig");
 const cursor_theme = @import("../cursor_theme.zig");
 const theme_cursor = @import("../scene/theme_cursor.zig");
 const desktop_model = @import("../desktop/model.zig");
@@ -126,6 +127,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const VirtualKeyboardAdapter = protocol_virtual_keyboard.Adapter(protocol, SeatAdapter);
         const VirtualPointerAdapter = protocol_virtual_pointer.Adapter(protocol);
         const ScreencopyAdapter = protocol_wlr_screencopy.Adapter(protocol);
+        const ForeignToplevelListAdapter = protocol_foreign_toplevel_list.Adapter(protocol);
         const TabletState = tablet_input.State(SeatAdapter.FocusTarget);
         const TabletAdapter = protocol_tablet_v2.Adapter(protocol, SeatAdapter);
 
@@ -146,6 +148,12 @@ pub fn Coordinator(comptime protocol: type) type {
             awaiting_output: bool = false,
             copied: bool = false,
             success: bool = false,
+        };
+        const ForeignToplevel = struct {
+            active: bool = false,
+            desktop: Desktop.ToplevelId = undefined,
+            protocol_id: ForeignToplevelListAdapter.ToplevelId = undefined,
+            seen: bool = false,
         };
         const SurfaceScene = struct {
             root: Desktop.SceneWindow,
@@ -222,13 +230,14 @@ pub fn Coordinator(comptime protocol: type) type {
             const wlr_data_control: u32 = 1 << 24;
             const input_method: u32 = 1 << 25;
             const screencopy: u32 = 1 << 26;
+            const foreign_toplevel_list: u32 = 1 << 27;
             const all: u32 = decoration | shell | seat | data_device | dmabuf |
                 activation | relative_pointer | fractional_scale | output | core |
                 pointer_constraints | color_management | color_representation |
                 primary_selection | text_input | pointer_gestures |
                 shortcuts_inhibit | xdg_foreign | xdg_output | layer_shell | session_lock |
                 idle_notify | tablet | ext_data_control | wlr_data_control | input_method |
-                screencopy;
+                screencopy | foreign_toplevel_list;
         };
         const Client = struct {
             active: bool = false,
@@ -331,6 +340,7 @@ pub fn Coordinator(comptime protocol: type) type {
             virtual_keyboard: protocol_virtual_keyboard.Config = .{},
             virtual_pointer: protocol_virtual_pointer.Config = .{},
             wlr_screencopy: protocol_wlr_screencopy.Config = .{},
+            foreign_toplevel_list: protocol_foreign_toplevel_list.Config = .{},
             linux_dmabuf: protocol_linux_dmabuf.Config = .{},
             linux_drm_syncobj: protocol_linux_drm_syncobj.Config = .{},
             xdg_activation: protocol_xdg_activation.Config = .{},
@@ -431,6 +441,7 @@ pub fn Coordinator(comptime protocol: type) type {
         virtual_keyboard_adapter: VirtualKeyboardAdapter,
         virtual_pointer_adapter: VirtualPointerAdapter,
         screencopy_adapter: ScreencopyAdapter,
+        foreign_toplevel_list_adapter: ForeignToplevelListAdapter,
         dmabuf_adapter: DmabufAdapter,
         syncobj_device: ?drm_syncobj.Device = null,
         syncobj_adapter: ?SyncobjAdapter = null,
@@ -466,6 +477,7 @@ pub fn Coordinator(comptime protocol: type) type {
         client_cursor_hidden_previous: ?damage.SurfaceState = null,
         screencopy_bytes: []u8,
         pending_screencopy: ?PendingScreencopy = null,
+        foreign_toplevels: []ForeignToplevel,
         cursor_path: []u8,
         cursor_directory_len: usize,
         cursor_size: u32,
@@ -524,6 +536,8 @@ pub fn Coordinator(comptime protocol: type) type {
             platforms: Platforms,
             config: Config,
         ) !*Self {
+            if (config.foreign_toplevel_list.metadata_capacity < config.desktop.metadata_bytes)
+                return error.InvalidConfig;
             const self = try allocator.create(Self);
             errdefer allocator.destroy(self);
             self.allocator = allocator;
@@ -605,6 +619,12 @@ pub fn Coordinator(comptime protocol: type) type {
             );
             self.scene_windows = try allocator.alloc(Desktop.SceneWindow, scene_capacity);
             errdefer allocator.free(self.scene_windows);
+            self.foreign_toplevels = try allocator.alloc(
+                ForeignToplevel,
+                config.desktop.toplevel_capacity,
+            );
+            errdefer allocator.free(self.foreign_toplevels);
+            @memset(self.foreign_toplevels, .{});
             self.popup_scene_windows = try allocator.alloc(
                 Desktop.SceneWindow,
                 config.desktop.popup_capacity,
@@ -725,6 +745,11 @@ pub fn Coordinator(comptime protocol: type) type {
             errdefer self.shell_adapter.deinit();
             self.desktop = try Desktop.init(allocator, config.desktop, config.interaction.bounds);
             errdefer self.desktop.deinit();
+            self.foreign_toplevel_list_adapter = try ForeignToplevelListAdapter.init(
+                allocator,
+                config.foreign_toplevel_list,
+            );
+            errdefer self.foreign_toplevel_list_adapter.deinit();
             self.interaction = try Interaction.init(allocator, config.interaction);
             errdefer self.interaction.deinit();
             self.seat_adapter = try SeatAdapter.init(
@@ -1037,6 +1062,9 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = try self.shell_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
+            _ = try self.foreign_toplevel_list_adapter.install(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
             _ = try self.output_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
@@ -1206,6 +1234,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.allocator.free(self.frame_samples);
             self.allocator.free(self.popup_scene_windows);
             self.allocator.free(self.scene_windows);
+            self.allocator.free(self.foreign_toplevels);
             self.allocator.free(self.app_layers);
             self.cursor_shape_adapter.deinit();
             self.cursor_cache.deinit();
@@ -1247,6 +1276,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.subcompositor_adapter.deinit();
             self.interaction.deinit();
             self.desktop.deinit();
+            self.foreign_toplevel_list_adapter.deinit();
             self.shell_adapter.deinit();
             if (self.syncobj_adapter) |*adapter| adapter.deinit();
             self.syncobj_adapter = null;
@@ -1294,6 +1324,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.syncIdleNotifications() catch {};
             self.shortcuts_inhibit_adapter.disconnected(peer);
             self.foreign_adapter.disconnected(peer);
+            self.foreign_toplevel_list_adapter.disconnected(peer);
             self.input_method_adapter.disconnected(peer);
             self.virtual_keyboard_adapter.disconnected(peer);
             self.virtual_pointer_adapter.disconnected(peer);
@@ -1576,6 +1607,12 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.advanceShell();
                 if (self.foreign_adapter.pendingOutbound(peer))
                     self.markProtocol(peer, ProtocolReady.xdg_foreign);
+                try self.flushProtocol();
+                return control;
+            }
+            if (try self.foreign_toplevel_list_adapter.request(peer, target, message, fds)) |control| {
+                if (self.foreign_toplevel_list_adapter.pendingOutbound(peer))
+                    self.markProtocol(peer, ProtocolReady.foreign_toplevel_list);
                 try self.flushProtocol();
                 return control;
             }
@@ -2470,6 +2507,12 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (consumed == 0) break;
                 self.stats.shell_events += consumed;
             }
+            self.syncForeignToplevels() catch |cause| switch (cause) {
+                error.Exhausted => {},
+                else => return cause,
+            };
+            if (self.foreignToplevelOutbound())
+                self.markProtocolAll(ProtocolReady.foreign_toplevel_list);
             while (self.desktop.pendingCommands() != 0) {
                 if (try self.desktop.flushConfigure(&self.shell_adapter)) |_|
                     self.stats.configures += 1;
@@ -2479,6 +2522,70 @@ pub fn Coordinator(comptime protocol: type) type {
             if (self.desktop.takeSceneChanged()) try self.desktopSceneChanged();
             if (self.shell_adapter.pendingOutbound() != 0)
                 self.markProtocolAll(ProtocolReady.shell);
+        }
+
+        fn syncForeignToplevels(self: *Self) !void {
+            for (self.foreign_toplevels) |*entry| entry.seen = false;
+            const windows = try self.desktop.sceneSnapshot(self.scene_windows);
+            for (windows, 0..) |window, index| {
+                var duplicate = false;
+                for (windows[0..index]) |previous| if (std.meta.eql(previous.id, window.id)) {
+                    duplicate = true;
+                    break;
+                };
+                if (duplicate or !window.content_ready) continue;
+                const metadata = try self.desktop.metadata(window.id);
+                var entry = self.foreignToplevel(window.id);
+                if (entry == null) {
+                    for (self.foreign_toplevels) |*candidate| if (!candidate.active) {
+                        candidate.* = .{
+                            .active = true,
+                            .desktop = window.id,
+                            .protocol_id = try self.foreign_toplevel_list_adapter.publish(
+                                metadata.title,
+                                metadata.app_id,
+                            ),
+                            .seen = true,
+                        };
+                        entry = candidate;
+                        break;
+                    };
+                    if (entry == null) return error.Exhausted;
+                    continue;
+                }
+                entry.?.seen = true;
+                const published = try self.foreign_toplevel_list_adapter.metadata(
+                    entry.?.protocol_id,
+                );
+                if (!std.mem.eql(u8, published.title, metadata.title))
+                    try self.foreign_toplevel_list_adapter.updateTitle(
+                        entry.?.protocol_id,
+                        metadata.title,
+                    );
+                if (!std.mem.eql(u8, published.app_id, metadata.app_id))
+                    try self.foreign_toplevel_list_adapter.updateAppId(
+                        entry.?.protocol_id,
+                        metadata.app_id,
+                    );
+            }
+            for (self.foreign_toplevels) |*entry| {
+                if (!entry.active or entry.seen) continue;
+                try self.foreign_toplevel_list_adapter.close(entry.protocol_id);
+                entry.* = .{};
+            }
+        }
+
+        fn foreignToplevel(self: *Self, id: Desktop.ToplevelId) ?*ForeignToplevel {
+            for (self.foreign_toplevels) |*entry|
+                if (entry.active and std.meta.eql(entry.desktop, id)) return entry;
+            return null;
+        }
+
+        fn foreignToplevelOutbound(self: *const Self) bool {
+            for (self.clients.items) |client|
+                if (client.active and self.foreign_toplevel_list_adapter.pendingOutbound(client.peer))
+                    return true;
+            return false;
         }
 
         fn syncDesktopTimer(self: *Self) !void {
@@ -2951,7 +3058,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 !std.mem.eql(u8, name, "zwlr_data_control_manager_v1") and
                 !std.mem.eql(u8, name, "zwp_input_method_manager_v2") and
                 !std.mem.eql(u8, name, "zwp_virtual_keyboard_manager_v1") and
-                !std.mem.eql(u8, name, "zwlr_virtual_pointer_manager_v1");
+                !std.mem.eql(u8, name, "zwlr_virtual_pointer_manager_v1") and
+                !std.mem.eql(u8, name, "ext_foreign_toplevel_list_v1");
         }
 
         fn commitSecurityContext(
@@ -3402,6 +3510,12 @@ pub fn Coordinator(comptime protocol: type) type {
                 flushed += try self.color_representation_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.screencopy != 0)
                 flushed += try self.screencopy_adapter.flushOn(peer, objects, &actor.transmit);
+            if (client.protocol_ready & ProtocolReady.foreign_toplevel_list != 0)
+                flushed += try self.foreign_toplevel_list_adapter.flushOn(
+                    peer,
+                    objects,
+                    &actor.transmit,
+                );
             if (client.protocol_ready & ProtocolReady.output != 0)
                 flushed += try self.output_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.xdg_output != 0)
@@ -3547,6 +3661,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (ready & ProtocolReady.screencopy != 0 and
                 !self.screencopy_adapter.pendingOutbound(client.peer))
                 ready &= ~ProtocolReady.screencopy;
+            if (ready & ProtocolReady.foreign_toplevel_list != 0 and
+                !self.foreign_toplevel_list_adapter.pendingOutbound(client.peer))
+                ready &= ~ProtocolReady.foreign_toplevel_list;
             if (ready & ProtocolReady.output != 0 and
                 !self.output_adapter.pendingOutboundOn(client.peer))
                 ready &= ~ProtocolReady.output;
@@ -5594,6 +5711,7 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.virtual_keyboard_adapter.resourceRemoved(handle, object);
             _ = self.virtual_pointer_adapter.resourceRemoved(handle, object);
             _ = self.screencopy_adapter.resourceRemoved(handle, object);
+            _ = self.foreign_toplevel_list_adapter.resourceRemoved(handle, object);
             _ = self.text_input_adapter.resourceRemoved(handle, object);
             _ = self.subcompositor_adapter.resourceRemoved(handle, object);
             if (layer_shell_removed and self.output != null) {

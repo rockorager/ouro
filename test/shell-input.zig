@@ -402,7 +402,8 @@ test "shell-input: security context filters nested manager before registry disco
             parent_handler.wlr_data_control_global_seen and
             parent_handler.input_method_global_seen and
             parent_handler.virtual_keyboard_global_seen and
-            parent_handler.virtual_pointer_global_seen) break;
+            parent_handler.virtual_pointer_global_seen and
+            parent_handler.foreign_toplevel_global_seen) break;
         _ = linux.sched_yield();
     }
     try std.testing.expect(parent_handler.security_manager != null);
@@ -411,6 +412,7 @@ test "shell-input: security context filters nested manager before registry disco
     try std.testing.expect(parent_handler.input_method_global_seen);
     try std.testing.expect(parent_handler.virtual_keyboard_global_seen);
     try std.testing.expect(parent_handler.virtual_pointer_global_seen);
+    try std.testing.expect(parent_handler.foreign_toplevel_global_seen);
 
     var close_pair: [2]linux.fd_t = undefined;
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(
@@ -506,6 +508,7 @@ test "shell-input: security context filters nested manager before registry disco
     try std.testing.expect(!child_handler.input_method_global_seen);
     try std.testing.expect(!child_handler.virtual_keyboard_global_seen);
     try std.testing.expect(!child_handler.virtual_pointer_global_seen);
+    try std.testing.expect(!child_handler.foreign_toplevel_global_seen);
     try std.testing.expect(child_handler.security_manager == null);
     var sandbox_peer: ?wayring.io_uring.Peer = null;
     for (coordinator.clients.items) |client_state| if (client_state.active and
@@ -630,6 +633,7 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
         .queue = &actor.transmit,
         .registry = registry,
         .test_pointer_warp = true,
+        .test_foreign_toplevel = true,
     };
     try submitClient(&client_reactor, &driver, &handler);
 
@@ -788,6 +792,13 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     try std.testing.expectEqual(@as(usize, 2), handler.output_enter);
     try std.testing.expectEqual(@as(usize, 0), handler.output_leave);
     try std.testing.expect(!handler.output_released);
+    try std.testing.expect(handler.foreign_toplevel_list != null);
+    try std.testing.expect(handler.foreign_toplevel_handle != null);
+    try std.testing.expect(handler.foreign_toplevel_title);
+    try std.testing.expect(handler.foreign_toplevel_app_id);
+    try std.testing.expect(handler.foreign_toplevel_identifier);
+    try std.testing.expect(handler.foreign_toplevel_done >= 1);
+    try std.testing.expectEqual(@as(usize, 1), handler.foreign_toplevel_finished);
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
 
     const motion_before_warp = handler.pointer_motion;
@@ -863,6 +874,40 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     try std.testing.expect(!coordinator.cursor_layer.active);
     try std.testing.expect(coordinator.app_layers[0].active);
     try std.testing.expect(handler.output_deleted);
+
+    try wayring.client.sendRequest(
+        protocol.xdg_toplevel,
+        handler.objects,
+        handler.queue,
+        handler.toplevel.?,
+        .{ .destroy = .{} },
+    );
+    handler.toplevel = null;
+    try wayring.client.sendRequest(
+        protocol.xdg_surface,
+        handler.objects,
+        handler.queue,
+        handler.xdg_surface.?,
+        .{ .destroy = .{} },
+    );
+    handler.xdg_surface = null;
+    try wayring.client.sendRequest(
+        protocol.wl_surface,
+        handler.objects,
+        handler.queue,
+        handler.surface.?,
+        .{ .destroy = .{} },
+    );
+    handler.surface = null;
+    try submitClient(&client_reactor, &driver, &handler);
+    for (0..64) |_| {
+        client_progress = try drainClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.foreign_toplevel_closed == 1) break;
+        if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, client_reactor.ring);
+    }
+    try std.testing.expectEqual(@as(usize, 1), handler.foreign_toplevel_closed);
 
     coordinator.disconnected(coordinator.peer.?);
     _ = try client.prepareClose();
@@ -3293,6 +3338,16 @@ const Handler = struct {
     idle_inhibit_manager: ?wayring.objects.Handle = null,
     pointer_warp_manager: ?wayring.objects.Handle = null,
     security_manager: ?wayring.objects.Handle = null,
+    foreign_toplevel_list: ?wayring.objects.Handle = null,
+    foreign_toplevel_handle: ?wayring.objects.Handle = null,
+    test_foreign_toplevel: bool = false,
+    foreign_toplevel_title: bool = false,
+    foreign_toplevel_app_id: bool = false,
+    foreign_toplevel_identifier: bool = false,
+    foreign_toplevel_done: usize = 0,
+    foreign_toplevel_finished: usize = 0,
+    foreign_toplevel_closed: usize = 0,
+    foreign_toplevel_global_seen: bool = false,
     security_global_seen: bool = false,
     ext_data_control_global_seen: bool = false,
     wlr_data_control_global_seen: bool = false,
@@ -3439,6 +3494,34 @@ const Handler = struct {
                 .done => {
                     self.output_done += 1;
                 },
+            }
+        } else if (target.object.interface == &protocol.ext_foreign_toplevel_list_v1.info) {
+            switch (try protocol.ext_foreign_toplevel_list_v1.decodeEvent(message, fds)) {
+                .toplevel => |value| {
+                    self.foreign_toplevel_handle = (try protocol.ext_foreign_toplevel_list_v1.admit_event_toplevel(
+                        self.objects,
+                        self.foreign_toplevel_list.?,
+                        value,
+                        .{},
+                    )).toplevel;
+                },
+                .finished => self.foreign_toplevel_finished += 1,
+            }
+        } else if (target.object.interface == &protocol.ext_foreign_toplevel_handle_v1.info) {
+            switch (try protocol.ext_foreign_toplevel_handle_v1.decodeEvent(message, fds)) {
+                .title => |value| self.foreign_toplevel_title = std.mem.eql(u8, value.title, "Foreign title"),
+                .app_id => |value| self.foreign_toplevel_app_id = std.mem.eql(u8, value.app_id, "org.example.Foreign"),
+                .identifier => |value| self.foreign_toplevel_identifier = std.mem.startsWith(u8, value.identifier, "ouro-"),
+                .done => {
+                    self.foreign_toplevel_done += 1;
+                    if (self.foreign_toplevel_done == 1)
+                        try protocol.ext_foreign_toplevel_list_v1.encodeRequest(
+                            self.queue,
+                            self.foreign_toplevel_list.?.id,
+                            .{ .stop = .{} },
+                        );
+                },
+                .closed => self.foreign_toplevel_closed += 1,
             }
         } else if (target.object.interface == &protocol.wl_surface.info) {
             switch (try protocol.wl_surface.decodeEvent(message, fds)) {
@@ -3704,6 +3787,8 @@ const Handler = struct {
                 self.virtual_keyboard_global_seen = true;
             if (std.mem.eql(u8, value.interface, protocol.zwlr_virtual_pointer_manager_v1.info.name))
                 self.virtual_pointer_global_seen = true;
+            if (std.mem.eql(u8, value.interface, protocol.ext_foreign_toplevel_list_v1.info.name))
+                self.foreign_toplevel_global_seen = true;
             return;
         }
         if (std.mem.eql(u8, value.interface, protocol.wl_compositor.info.name))
@@ -3736,6 +3821,21 @@ const Handler = struct {
             if (self.test_security_context)
                 self.security_manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wp_security_context_manager_v1.info, @min(value.version, 1), null);
         }
+        if (self.test_foreign_toplevel and std.mem.eql(
+            u8,
+            value.interface,
+            protocol.ext_foreign_toplevel_list_v1.info.name,
+        )) self.foreign_toplevel_list = try ClientCore.bind(
+            self.objects,
+            self.queue,
+            self.registry,
+            value.name,
+            &protocol.ext_foreign_toplevel_list_v1.info,
+            1,
+            null,
+        );
+        if (std.mem.eql(u8, value.interface, protocol.ext_foreign_toplevel_list_v1.info.name))
+            self.foreign_toplevel_global_seen = true;
     }
 
     fn maybeCreateDataDevice(self: *Handler) !void {
@@ -3784,6 +3884,14 @@ const Handler = struct {
             self.xdg_surface.?,
             .{},
         )).id;
+        if (self.test_foreign_toplevel) {
+            try protocol.xdg_toplevel.encodeRequest(self.queue, self.toplevel.?.id, .{
+                .set_title = .{ .title = "Foreign title" },
+            });
+            try protocol.xdg_toplevel.encodeRequest(self.queue, self.toplevel.?.id, .{
+                .set_app_id = .{ .app_id = "org.example.Foreign" },
+            });
+        }
         try protocol.xdg_surface.encodeRequest(self.queue, self.xdg_surface.?.id, .{
             .set_window_geometry = .{ .x = 1, .y = 0, .width = 2, .height = 2 },
         });

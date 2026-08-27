@@ -154,6 +154,17 @@ pub fn Adapter(comptime protocol: type) type {
         pub fn updateAppId(self: *Self, id: ToplevelId, value: []const u8) !void {
             try self.update(id, value, .app_id);
         }
+        pub const Metadata = struct {
+            title: []const u8,
+            app_id: []const u8,
+        };
+        pub fn metadata(self: *Self, id: ToplevelId) !Metadata {
+            const top = try self.resolveTop(id);
+            return .{
+                .title = self.topText(self.top_title, id.index)[0..top.title_len],
+                .app_id = self.topText(self.top_app, id.index)[0..top.app_len],
+            };
+        }
         fn update(self: *Self, id: ToplevelId, value: []const u8, kind: Kind) !void {
             try self.validText(value);
             const t = try self.resolveTop(id);
