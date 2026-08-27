@@ -18,6 +18,142 @@ const pixels = [_]u8{
     0xa0, 0xb0, 0xc0, 0xff, 0xd0, 0xe0, 0xf0, 0xff, 0x11, 0x22, 0x33, 0xff, 0, 0, 0, 0,
 };
 
+test "shell-input: generated data-control client crosses ext and wlr runtime paths" {
+    const allocator = std.testing.allocator;
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-data-control-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+
+    var fixture = try physical_fixture.Fixture.init();
+    defer fixture.deinit();
+    var root_config = physical_fixture.compositorConfig();
+    root_config.runtime.object_capacity = 64;
+    root_config.runtime.object_quota = 48;
+    root_config.runtime.registry_capacity = 1;
+    root_config.runtime.actor.received_fd_budget = 4;
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), root_config);
+    var config = physical_fixture.coordinatorConfig();
+    config.router_capacity = 24;
+    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), config);
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 32 });
+    try coordinator.start(&loop);
+
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(allocator, .{ .entries = 16, .flags = 0 }, physical_fixture.clientReactorConfig());
+    var client = try ClientConnection.attach(
+        allocator,
+        &reactor,
+        try wayring.unix_socket.connect(path),
+        .{ .received_fd_budget = 4, .transmit_byte_budget = 8192, .transmit_fd_budget = 2 },
+        .{ .max_objects = 24, .max_client_ids = 23 },
+    );
+    const actor = try client.actor();
+    var driver = ClientDriver.init(&client);
+    const registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null);
+    var handler: DataControlHandler = .{ .objects = &client.objects, .queue = &actor.transmit, .registry = registry };
+    try submitClient(&reactor, &driver, &handler);
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.initial_ext_regular == 1 and handler.initial_ext_primary == 1 and handler.initial_wlr_regular == 1 and handler.initial_wlr_primary == 1) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(handler.seat != null);
+    try std.testing.expect(handler.ext_manager != null);
+    try std.testing.expect(handler.wlr_manager != null);
+    try std.testing.expectEqual(@as(usize, 1), handler.initial_ext_regular);
+    try std.testing.expectEqual(@as(usize, 1), handler.initial_ext_primary);
+    try std.testing.expectEqual(@as(usize, 1), handler.initial_wlr_regular);
+    try std.testing.expectEqual(@as(usize, 1), handler.initial_wlr_primary);
+
+    handler.source1 = (try protocol.ext_data_control_manager_v1.construct_create_data_source(&client.objects, &actor.transmit, handler.ext_manager.?, .{})).id;
+    try protocol.ext_data_control_source_v1.encodeRequest(&actor.transmit, handler.source1.?.id, .{ .offer = .{ .mime_type = "text/plain;charset=utf-8" } });
+    try protocol.ext_data_control_device_v1.encodeRequest(&actor.transmit, handler.ext_device.?.id, .{ .set_selection = .{ .source = handler.source1.?.id } });
+    try submitClient(&reactor, &driver, &handler);
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.ext_selection != null and handler.wlr_selection != null and handler.ext_mimes != 0 and handler.wlr_mimes != 0) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(handler.ext_selection != null);
+    try std.testing.expect(handler.wlr_selection != null);
+    try std.testing.expectEqual(@as(usize, 1), handler.ext_mimes);
+    try std.testing.expectEqual(@as(usize, 1), handler.wlr_mimes);
+
+    var pipe: [2]linux.fd_t = undefined;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&pipe, .{ .CLOEXEC = true })));
+    const read_fd = pipe[0];
+    defer _ = linux.close(read_fd);
+    var write_fd = pipe[1];
+    defer if (write_fd >= 0) {
+        _ = linux.close(write_fd);
+    };
+    try protocol.ext_data_control_offer_v1.encodeRequest(&actor.transmit, handler.ext_selection.?.id, .{ .receive = .{ .mime_type = "text/plain;charset=utf-8", .fd = write_fd } });
+    write_fd = -1; // The generated transmit queue owns it after encoding.
+    try submitClient(&reactor, &driver, &handler);
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.send_fd >= 0) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(handler.send_mime_valid);
+    try std.testing.expect(handler.send_fd >= 0);
+    try std.testing.expectEqual(@as(usize, 1), linux.write(handler.send_fd, "x", 1));
+    _ = linux.close(handler.send_fd);
+    handler.send_fd = -1;
+    var byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), linux.read(read_fd, &byte, 1));
+    try std.testing.expectEqual(@as(u8, 'x'), byte[0]);
+
+    handler.source2 = (try protocol.ext_data_control_manager_v1.construct_create_data_source(&client.objects, &actor.transmit, handler.ext_manager.?, .{})).id;
+    try protocol.ext_data_control_source_v1.encodeRequest(&actor.transmit, handler.source2.?.id, .{ .offer = .{ .mime_type = "text/plain" } });
+    try protocol.ext_data_control_device_v1.encodeRequest(&actor.transmit, handler.ext_device.?.id, .{ .set_selection = .{ .source = handler.source2.?.id } });
+    try submitClient(&reactor, &driver, &handler);
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.cancelled != 0) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(usize, 1), handler.cancelled);
+
+    const ext_mimes_before_wlr = handler.ext_mimes;
+    handler.wlr_source = (try protocol.zwlr_data_control_manager_v1.construct_create_data_source(&client.objects, &actor.transmit, handler.wlr_manager.?, .{})).id;
+    try protocol.zwlr_data_control_source_v1.encodeRequest(&actor.transmit, handler.wlr_source.?.id, .{ .offer = .{ .mime_type = "text/html" } });
+    try protocol.zwlr_data_control_device_v1.encodeRequest(&actor.transmit, handler.wlr_device.?.id, .{ .set_selection = .{ .source = handler.wlr_source.?.id } });
+    try submitClient(&reactor, &driver, &handler);
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.cancelled == 2 and handler.ext_mimes > ext_mimes_before_wlr) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(usize, 2), handler.cancelled);
+    try std.testing.expect(handler.ext_mimes > ext_mimes_before_wlr);
+    try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+
+    _ = try client.prepareClose();
+    try submitClient(&reactor, &driver, &handler);
+    try coordinator.requestStop();
+    var drained = false;
+    for (0..512) |_| {
+        const cp = try drainClient(&reactor, &driver, &handler);
+        const progress = try loop.turn(coordinator);
+        drained = progress.wayring.shutdown_complete and cp.quiescent and coordinator.backendDrainComplete();
+        if (drained) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(drained);
+    try client.deinit(allocator);
+    reactor.deinit(allocator);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
 test "shell-input: security context filters nested manager before registry discovery" {
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;
@@ -87,10 +223,14 @@ test "shell-input: security context filters nested manager before registry disco
     for (0..256) |_| {
         _ = try drainClient(&parent_reactor, &parent_driver, &parent_handler);
         _ = try loop.turn(coordinator);
-        if (parent_handler.security_manager != null) break;
+        if (parent_handler.security_manager != null and
+            parent_handler.ext_data_control_global_seen and
+            parent_handler.wlr_data_control_global_seen) break;
         _ = linux.sched_yield();
     }
     try std.testing.expect(parent_handler.security_manager != null);
+    try std.testing.expect(parent_handler.ext_data_control_global_seen);
+    try std.testing.expect(parent_handler.wlr_data_control_global_seen);
 
     var close_pair: [2]linux.fd_t = undefined;
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(
@@ -181,6 +321,8 @@ test "shell-input: security context filters nested manager before registry disco
     }
     try std.testing.expect(child_handler.compositor != null);
     try std.testing.expect(!child_handler.security_global_seen);
+    try std.testing.expect(!child_handler.ext_data_control_global_seen);
+    try std.testing.expect(!child_handler.wlr_data_control_global_seen);
     try std.testing.expect(child_handler.security_manager == null);
     var sandbox_peer: ?wayring.io_uring.Peer = null;
     for (coordinator.clients.items) |client_state| if (client_state.active and
@@ -2177,6 +2319,115 @@ const LayerPopupHandler = struct {
     }
 };
 
+const DataControlHandler = struct {
+    objects: *wayring.objects.ClientObjects,
+    queue: *wayring.tx.Queue,
+    registry: wayring.objects.Handle,
+    seat: ?wayring.objects.Handle = null,
+    ext_manager: ?wayring.objects.Handle = null,
+    wlr_manager: ?wayring.objects.Handle = null,
+    ext_device: ?wayring.objects.Handle = null,
+    wlr_device: ?wayring.objects.Handle = null,
+    source1: ?wayring.objects.Handle = null,
+    source2: ?wayring.objects.Handle = null,
+    wlr_source: ?wayring.objects.Handle = null,
+    ext_selection: ?wayring.objects.Handle = null,
+    wlr_selection: ?wayring.objects.Handle = null,
+    initial_ext_regular: usize = 0,
+    initial_ext_primary: usize = 0,
+    initial_wlr_regular: usize = 0,
+    initial_wlr_primary: usize = 0,
+    ext_mimes: usize = 0,
+    wlr_mimes: usize = 0,
+    cancelled: usize = 0,
+    send_fd: linux.fd_t = -1,
+    send_mime_valid: bool = false,
+    event_failures: usize = 0,
+
+    pub fn eventError(self: *DataControlHandler, _: wayring.io_uring.Peer, _: ClientCore.EventFailure) void {
+        self.event_failures += 1;
+    }
+
+    pub fn event(self: *DataControlHandler, target: wayring.objects.Dispatch, message: wayring.wire.Message, fds: *wayring.ancillary.FdQueue) !wayring.dispatch.Control {
+        if (target.object.interface == &ClientCore.Registry.info) {
+            switch (try ClientCore.decodeRegistryEvent(self.objects, self.registry, message, fds)) {
+                .global => |value| {
+                    if (std.mem.eql(u8, value.interface, protocol.wl_seat.info.name))
+                        self.seat = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_seat.info, @min(value.version, 9), null);
+                    if (std.mem.eql(u8, value.interface, protocol.ext_data_control_manager_v1.info.name))
+                        self.ext_manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.ext_data_control_manager_v1.info, 1, null);
+                    if (std.mem.eql(u8, value.interface, protocol.zwlr_data_control_manager_v1.info.name))
+                        self.wlr_manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.zwlr_data_control_manager_v1.info, @min(value.version, 2), null);
+                    try self.createDevices();
+                },
+                .global_remove => {},
+            }
+        } else if (target.object.interface == &protocol.wl_seat.info) {
+            _ = try protocol.wl_seat.decodeEvent(message, fds);
+        } else if (target.object.interface == &protocol.ext_data_control_device_v1.info) {
+            switch (try protocol.ext_data_control_device_v1.decodeEvent(message, fds)) {
+                .data_offer => |value| {
+                    _ = try protocol.ext_data_control_device_v1.admit_event_data_offer(self.objects, self.ext_device.?, value, .{});
+                },
+                .selection => |value| {
+                    if (value.id) |id| self.ext_selection = self.objects.namespace.lookupHandle(id).? else self.initial_ext_regular += 1;
+                },
+                .primary_selection => |value| {
+                    if (value.id == null) self.initial_ext_primary += 1;
+                },
+                .finished => {},
+            }
+        } else if (target.object.interface == &protocol.zwlr_data_control_device_v1.info) {
+            switch (try protocol.zwlr_data_control_device_v1.decodeEvent(message, fds)) {
+                .data_offer => |value| {
+                    _ = try protocol.zwlr_data_control_device_v1.admit_event_data_offer(self.objects, self.wlr_device.?, value, .{});
+                },
+                .selection => |value| {
+                    if (value.id) |id| self.wlr_selection = self.objects.namespace.lookupHandle(id).? else self.initial_wlr_regular += 1;
+                },
+                .primary_selection => |value| {
+                    if (value.id == null) self.initial_wlr_primary += 1;
+                },
+                .finished => {},
+            }
+        } else if (target.object.interface == &protocol.ext_data_control_offer_v1.info) {
+            const value = try protocol.ext_data_control_offer_v1.decodeEvent(message, fds);
+            try std.testing.expect(std.mem.eql(u8, "text/plain;charset=utf-8", value.offer.mime_type) or
+                std.mem.eql(u8, "text/plain", value.offer.mime_type) or
+                std.mem.eql(u8, "text/html", value.offer.mime_type));
+            self.ext_mimes += 1;
+        } else if (target.object.interface == &protocol.zwlr_data_control_offer_v1.info) {
+            const value = try protocol.zwlr_data_control_offer_v1.decodeEvent(message, fds);
+            try std.testing.expect(std.mem.eql(u8, "text/plain;charset=utf-8", value.offer.mime_type) or
+                std.mem.eql(u8, "text/plain", value.offer.mime_type) or
+                std.mem.eql(u8, "text/html", value.offer.mime_type));
+            self.wlr_mimes += 1;
+        } else if (target.object.interface == &protocol.ext_data_control_source_v1.info) {
+            switch (try protocol.ext_data_control_source_v1.decodeEvent(message, fds)) {
+                .send => |value| {
+                    self.send_mime_valid = std.mem.eql(u8, "text/plain;charset=utf-8", value.mime_type);
+                    self.send_fd = value.fd;
+                },
+                .cancelled => self.cancelled += 1,
+            }
+        } else if (target.object.interface == &ClientCore.Display.info) {
+            switch (try ClientCore.decodeDisplayEvent(self.objects, message, fds)) {
+                .delete_id => {},
+                .@"error" => return error.ServerProtocolError,
+            }
+        } else return error.UnexpectedEvent;
+        return .continue_dispatch;
+    }
+
+    fn createDevices(self: *DataControlHandler) !void {
+        if (self.seat == null) return;
+        if (self.ext_manager != null and self.ext_device == null)
+            self.ext_device = (try protocol.ext_data_control_manager_v1.construct_get_data_device(self.objects, self.queue, self.ext_manager.?, .{ .seat = self.seat.?.id })).id;
+        if (self.wlr_manager != null and self.wlr_device == null)
+            self.wlr_device = (try protocol.zwlr_data_control_manager_v1.construct_get_data_device(self.objects, self.queue, self.wlr_manager.?, .{ .seat = self.seat.?.id })).id;
+    }
+};
+
 const Handler = struct {
     objects: *wayring.objects.ClientObjects,
     queue: *wayring.tx.Queue,
@@ -2194,6 +2445,8 @@ const Handler = struct {
     pointer_warp_manager: ?wayring.objects.Handle = null,
     security_manager: ?wayring.objects.Handle = null,
     security_global_seen: bool = false,
+    ext_data_control_global_seen: bool = false,
+    wlr_data_control_global_seen: bool = false,
     test_security_context: bool = false,
     registry_only: bool = false,
     idle_standard: ?wayring.objects.Handle = null,
@@ -2545,6 +2798,10 @@ const Handler = struct {
                 if (self.test_security_context)
                     self.security_manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wp_security_context_manager_v1.info, @min(value.version, 1), null);
             }
+            if (std.mem.eql(u8, value.interface, protocol.ext_data_control_manager_v1.info.name))
+                self.ext_data_control_global_seen = true;
+            if (std.mem.eql(u8, value.interface, protocol.zwlr_data_control_manager_v1.info.name))
+                self.wlr_data_control_global_seen = true;
             return;
         }
         if (std.mem.eql(u8, value.interface, protocol.wl_compositor.info.name))
@@ -2874,7 +3131,7 @@ fn submitTabletClient(
 fn drainClient(
     reactor: *wayring.io_uring.Reactor,
     driver: *ClientDriver,
-    handler: *Handler,
+    handler: anytype,
 ) !ClientDriver.Progress {
     var completions: [16]linux.io_uring_cqe = undefined;
     const count = if (reactor.ring.cq_ready() == 0)
@@ -2898,7 +3155,7 @@ fn drainClient(
 fn submitClient(
     reactor: *wayring.io_uring.Reactor,
     driver: *ClientDriver,
-    handler: *Handler,
+    handler: anytype,
 ) !void {
     _ = try driver.schedule();
     _ = try driver.prepare(handler);
