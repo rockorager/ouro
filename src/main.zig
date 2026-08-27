@@ -313,7 +313,7 @@ fn compositorConfig() Compositor.Config {
                 .transmit_fd_budget = 2,
             },
             .object_capacity = 128,
-            .object_quota = 128,
+            .object_quota = std.math.maxInt(u32),
             .buckets_per_client = 128,
             .max_globals = 34,
             .registry_capacity = 4,

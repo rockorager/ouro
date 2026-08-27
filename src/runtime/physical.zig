@@ -3178,6 +3178,13 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn admitReadyBatch(self: *Self, trigger: wayring.objects.Handle) !bool {
             const now = try monotonicNs();
+            const ready_count = self.adapter.readyUpdateCountAt(trigger, now) catch |err| switch (err) {
+                error.StaleSurface => return false,
+                else => return err,
+            };
+            if (ready_count == 0) return false;
+            try self.ensureUpdateBatchStorage(ready_count);
+            try self.ensureAvailableAppLayers(ready_count);
             const ready = self.adapter.readyUpdateSurfacesAt(
                 trigger,
                 self.ready_update_surfaces,
@@ -3221,6 +3228,42 @@ pub fn Coordinator(comptime protocol: type) type {
                 };
             }
             return true;
+        }
+
+        fn ensureUpdateBatchStorage(self: *Self, needed: usize) !void {
+            if (self.ready_update_surfaces.len >= needed and
+                self.applied_updates.len >= needed and
+                self.applied_layers.len >= needed) return;
+            var capacity = @max(
+                self.ready_update_surfaces.len,
+                self.applied_updates.len,
+                self.applied_layers.len,
+            );
+            while (capacity < needed) capacity = std.math.mul(usize, capacity, 2) catch
+                return error.OutOfMemory;
+            if (self.ready_update_surfaces.len < needed)
+                self.ready_update_surfaces = try self.allocator.realloc(
+                    self.ready_update_surfaces,
+                    capacity,
+                );
+            if (self.applied_updates.len < needed)
+                self.applied_updates = try self.allocator.realloc(self.applied_updates, capacity);
+            if (self.applied_layers.len < needed)
+                self.applied_layers = try self.allocator.realloc(self.applied_layers, capacity);
+        }
+
+        fn ensureAvailableAppLayers(self: *Self, needed: usize) !void {
+            var available: usize = 0;
+            for (self.app_layers) |*layer|
+                available += @intFromBool(layer.presentation == null and layer.candidate == null);
+            if (available >= needed) return;
+            const old_len = self.app_layers.len;
+            const minimum = try std.math.add(usize, old_len, needed - available);
+            var capacity = old_len;
+            while (capacity < minimum) capacity = std.math.mul(usize, capacity, 2) catch
+                return error.OutOfMemory;
+            self.app_layers = try self.allocator.realloc(self.app_layers, capacity);
+            @memset(self.app_layers[old_len..], .{});
         }
 
         fn availableAppLayer(

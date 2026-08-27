@@ -1,4 +1,4 @@
-//! Bounded wl_subcompositor ownership and synchronized commit policy.
+//! Growable wl_subcompositor ownership and synchronized commit policy.
 
 const std = @import("std");
 const wayring = @import("wayring");
@@ -44,7 +44,7 @@ pub fn Adapter(comptime protocol: type, comptime Core: type) type {
         core: *Core,
         runtime: ?*Runtime = null,
         global: ?objects.Handle = null,
-        slots: []Slot,
+        slots: []*Slot,
         free_head: u32 = 0,
         graph: Graph,
         surface_scratch: []Core.SurfaceId,
@@ -55,13 +55,13 @@ pub fn Adapter(comptime protocol: type, comptime Core: type) type {
             config: Config,
         ) !Self {
             try config.validate();
-            const slots = try allocator.alloc(Slot, config.resource_capacity);
-            errdefer allocator.free(slots);
+            const slots = try allocSlots(allocator, config.resource_capacity);
+            errdefer freeSlots(allocator, slots);
             const scratch = try allocator.alloc(Core.SurfaceId, config.surface_capacity);
             errdefer allocator.free(scratch);
             var graph = try Graph.init(allocator, config.surface_capacity, 1);
             errdefer graph.deinit(allocator);
-            for (slots, 0..) |*slot, index| slot.* = .{
+            for (slots, 0..) |slot, index| slot.* = .{
                 .next_free = if (index + 1 < slots.len) @intCast(index + 1) else none,
             };
             return .{
@@ -76,7 +76,7 @@ pub fn Adapter(comptime protocol: type, comptime Core: type) type {
         pub fn deinit(self: *Self) void {
             self.graph.deinit(self.allocator);
             self.allocator.free(self.surface_scratch);
-            self.allocator.free(self.slots);
+            freeSlots(self.allocator, self.slots);
             self.* = undefined;
         }
 
@@ -160,6 +160,7 @@ pub fn Adapter(comptime protocol: type, comptime Core: type) type {
                         self.graph.add(child, parent) catch |cause| {
                             surface.role.deactivateObject(subsurface_role_id) catch unreachable;
                             self.release(slot_index);
+                            if (cause == error.OutOfMemory) return try self.noMemory(actor);
                             return try self.managerError(actor, decoded.handle.id, .bad_surface, @errorName(cause));
                         };
                         const admitted = Manager.admit_get_subsurface(
@@ -225,6 +226,7 @@ pub fn Adapter(comptime protocol: type, comptime Core: type) type {
         }
 
         fn setDesync(self: *Self, child: Core.SurfaceId) !void {
+            try self.ensureSurfaceScratch();
             const changed = try self.graph.transitionDesync(child, self.surface_scratch);
             for (changed) |surface| _ = self.core.transitionSurfaceDesync(surface) catch continue;
         }
@@ -235,6 +237,7 @@ pub fn Adapter(comptime protocol: type, comptime Core: type) type {
             dependencies: []Core.UpdateToken,
         ) !Core.ContentCommitPlan {
             const self: *Self = @ptrCast(@alignCast(context));
+            try self.ensureSurfaceScratch();
             const children = try self.graph.directChildren(surface, self.surface_scratch);
             var count: usize = 0;
             for (children) |child| if (try self.core.newestSynchronizedUpdate(child)) |update| {
@@ -285,6 +288,7 @@ pub fn Adapter(comptime protocol: type, comptime Core: type) type {
         }
 
         pub fn directChildren(self: *Self, parent: Core.SurfaceId) ![]const Core.SurfaceId {
+            try self.ensureSurfaceScratch();
             return self.graph.directChildren(parent, self.surface_scratch);
         }
 
@@ -317,33 +321,71 @@ pub fn Adapter(comptime protocol: type, comptime Core: type) type {
         }
 
         fn acquire(self: *Self) !*Slot {
-            if (self.free_head == none) return error.Exhausted;
+            if (self.free_head == none) try self.growSlots();
             const index = self.free_head;
-            const slot = &self.slots[index];
+            const slot = self.slots[index];
             self.free_head = slot.next_free;
             slot.* = .{ .active = true };
             return slot;
         }
 
         fn release(self: *Self, index: u32) void {
-            const slot = &self.slots[index];
+            const slot = self.slots[index];
             slot.* = .{ .next_free = self.free_head };
             self.free_head = index;
         }
 
         fn fromObject(self: *Self, object: *const objects.Object) ?*Slot {
             const pointer = object.context orelse return null;
-            const address = @intFromPtr(pointer);
-            const start = @intFromPtr(self.slots.ptr);
-            const size = std.math.mul(usize, self.slots.len, @sizeOf(Slot)) catch return null;
-            if (address < start or address >= start + size or (address - start) % @sizeOf(Slot) != 0)
-                return null;
-            const slot = &self.slots[(address - start) / @sizeOf(Slot)];
-            return if (slot.active and @intFromPtr(slot) == address) slot else null;
+            for (self.slots) |slot| if (@intFromPtr(slot) == @intFromPtr(pointer))
+                return if (slot.active) slot else null;
+            return null;
         }
 
         fn slotIndex(self: *Self, slot: *Slot) u32 {
-            return @intCast((@intFromPtr(slot) - @intFromPtr(self.slots.ptr)) / @sizeOf(Slot));
+            for (self.slots, 0..) |candidate, index| if (candidate == slot) return @intCast(index);
+            unreachable;
+        }
+
+        fn allocSlots(allocator: std.mem.Allocator, count: usize) ![]*Slot {
+            const slots = try allocator.alloc(*Slot, count);
+            errdefer allocator.free(slots);
+            var initialized: usize = 0;
+            errdefer for (slots[0..initialized]) |slot| allocator.destroy(slot);
+            while (initialized < count) : (initialized += 1)
+                slots[initialized] = try allocator.create(Slot);
+            return slots;
+        }
+
+        fn freeSlots(allocator: std.mem.Allocator, slots: []*Slot) void {
+            for (slots) |slot| allocator.destroy(slot);
+            allocator.free(slots);
+        }
+
+        fn growSlots(self: *Self) !void {
+            const old_len = self.slots.len;
+            if (old_len >= none - 1) return error.OutOfMemory;
+            const new_len = @min(@as(usize, none - 1), old_len + @max(old_len, 1));
+            self.slots = try self.allocator.realloc(self.slots, new_len);
+            var initialized = old_len;
+            errdefer {
+                for (self.slots[old_len..initialized]) |slot| self.allocator.destroy(slot);
+                self.slots = self.allocator.realloc(self.slots, old_len) catch self.slots[0..old_len];
+            }
+            while (initialized < new_len) : (initialized += 1) {
+                const slot = try self.allocator.create(Slot);
+                slot.* = .{
+                    .next_free = if (initialized + 1 < new_len) @intCast(initialized + 1) else none,
+                };
+                self.slots[initialized] = slot;
+            }
+            self.free_head = @intCast(old_len);
+        }
+
+        fn ensureSurfaceScratch(self: *Self) !void {
+            const minimum = self.graph.activeSurfaceCount();
+            if (self.surface_scratch.len >= minimum) return;
+            self.surface_scratch = try self.allocator.realloc(self.surface_scratch, minimum);
         }
 
         fn noMemory(_: *Self, actor: *wayring.connection.Actor) !wayring.dispatch.Control {
@@ -436,4 +478,36 @@ test "subcompositor: synchronized child is claimed by parent and desync transiti
     );
     try adapter.setDesync(child);
     try std.testing.expectEqual(@as(usize, 1), core.transitioned);
+}
+
+test "subcompositor: resource and graph storage grow without moving live resources" {
+    const protocol = @import("core_protocol");
+    const FakeCore = struct {
+        pub const SurfaceId = struct { index: u32, generation: u32 };
+        pub const UpdateToken = struct { index: u32, generation: u32 };
+        pub const ContentCommitPlan = struct {};
+
+        pub fn setContentCommitHook(_: *@This(), _: anytype) !void {}
+    };
+    const TestAdapter = Adapter(protocol, FakeCore);
+    var core: FakeCore = .{};
+    var adapter = try TestAdapter.init(std.testing.allocator, &core, .{
+        .resource_capacity = 1,
+        .surface_capacity = 1,
+    });
+    defer adapter.deinit();
+
+    const first = try adapter.acquire();
+    _ = try adapter.acquire();
+    _ = try adapter.acquire();
+    try std.testing.expectEqual(first, adapter.slots[0]);
+
+    const parent: FakeCore.SurfaceId = .{ .index = 0, .generation = 1 };
+    var index: u32 = 1;
+    while (index <= 32) : (index += 1) try adapter.graph.add(
+        .{ .index = index, .generation = 1 },
+        parent,
+    );
+    try std.testing.expectEqual(@as(usize, 32), (try adapter.directChildren(parent)).len);
+    try std.testing.expect(adapter.surface_scratch.len >= 33);
 }

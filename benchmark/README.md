@@ -30,9 +30,10 @@ without turning post-page-flip feedback into an artificial submission barrier.
 waits for callback and presentation before the next commit.
 
 The client reports presentation-clock FPS, aggregate surface presentations,
-and exact callback/release/presentation totals. Multiple clients finish at one
-shared runner gate; the slowest client defines that run's wall boundary. These
-are surface-presentation measurements, not direct output page-flip counts.
+the number of published buffers per atomic frame, and exact
+callback/release/presentation totals. Multiple clients finish at one shared
+runner gate; the slowest client defines that run's wall boundary. These are
+surface-presentation measurements, not direct output page-flip counts.
 
 `run.sh` performs orchestration outside the timed client: isolated runtime and
 seat ownership, fixed post-socket readiness, exact compositor PID snapshots,
@@ -55,6 +56,11 @@ Workloads are declared in `workloads.sh`:
 - `shm-full`: mutate and damage the complete 1280×720 source;
 - `shm-tiny`: mutate and damage one fixed 64×64 rectangle;
 - `shm-sparse`: mutate and damage two distant 32×32 rectangles;
+- `shm-moving`: mutate and damage the old and new positions of a moving 64×64
+  rectangle;
+- `shm-multirect-{8,9}`: mutate and issue eight or nine disjoint 16×16 damage
+  rectangles over a 3×3 grid. The pair exercises Ouro's exact eight-rectangle
+  region boundary and conservative ninth-rectangle collapse;
 - `shm-dual-sparse`: two independent 640×720 clients running sparse damage.
 - `shm-static`: alternate unchanged buffers with 1×1 damage, the smallest
   cross-compositor presentation-paced fixed-overhead proxy;
@@ -81,6 +87,29 @@ Workloads are declared in `workloads.sh`:
 - `alpha-{shm,dmabuf}-full`: full-damage ARGB8888 with valid electrically
   premultiplied color and constant 50% alpha;
 - `alpha-mixed-scale-8`: eight translucent SHM/DMA-BUF sparse clients.
+- `layers-overlap-{2,8,32}`: one XDG root with two, eight, or 32 synchronized,
+  partially overlapping, translucent SHM subsurfaces. Child commits are
+  atomically applied by the parent commit; callback and presentation feedback
+  are attached to the visible top child's synchronized commit. The 32-child
+  row exceeds the renderer's 17-sample batch and exercises multi-batch
+  composition;
+- `layers-occlusion-{8,32}`: synchronized opaque children at identical
+  geometry, exercising a true full-occlusion scene without depending on a
+  compositor's toplevel placement policy. The 32-child row also verifies that
+  protocol ownership, synchronized-update admission, and scene storage grow
+  beyond their initial reserves. Its primary comparison is compositor CPU and
+  instructions, not refresh-capped FPS: an occlusion-aware renderer should
+  submit only the frontmost sample while preserving every covered commit's
+  release and presentation lifecycle;
+- `viewport-{crop,scale,crop-scale}-{shm,dmabuf}`: central-half source crop,
+  half-size destination scaling, and central-half crop scaled back to the full
+  1280×720 destination. Matched no-viewport controls make source versus output
+  area explicit rather than conflating them with protocol overhead.
+- `solid-{shm,dmabuf,single-pixel}`: matched immutable 1×1 solid-color sources
+  expanded to 1280×720 with viewporter. Single-pixel protocol buffers are
+  immutable and have no client-owned storage to protect; the client does not
+  gate reuse on `wl_buffer.release`, but separately records any release events
+  a compositor chooses to send rather than fabricating a required count.
 
 Most declarations repeat one client mode for the requested population. Mixed
 workloads use a comma-separated mode list with exactly one entry per client.
@@ -117,9 +146,13 @@ benchmark/run.sh
 benchmark/run.sh --suite standard
 benchmark/run.sh --suite all --frames 1000
 benchmark/run.sh --suite dmabuf --runs 5
+benchmark/run.sh --suite damage --runs 3
+benchmark/run.sh --suite viewport --runs 3
+benchmark/run.sh --suite solid --runs 3
 benchmark/run.sh --suite color --runs 3
 benchmark/run.sh --suite composition --runs 3
-benchmark/run.sh --suite capacity --runs 1  # Expected to expose current limits.
+benchmark/run.sh --suite layers --runs 3
+benchmark/run.sh --suite capacity --runs 1  # High concurrent-client probes.
 benchmark/run.sh --workload shm-sparse --runs 3
 benchmark/run.sh --workload shm-tiny --frames 600 \
   --drm-device /dev/dri/card0 --output DP-1 --mode 2560x1440 --refresh 144
@@ -143,7 +176,11 @@ python3 benchmark/report.py benchmark-results/20260825T180000Z
 ```
 
 The report shows per-surface FPS, aggregate surface presentations per second,
-exact compositor task-clock CPU utilization and cost per presentation, and the
-compositor process's gate RSS/HWM. CPU excludes clients; RSS excludes helpers,
-kernel memory, and GPU allocations. Do not infer output page-flip rate, GPU
-execution time, power, or pixel correctness from these counters.
+published buffers per atomic frame, exact compositor task-clock CPU utilization,
+cost per presentation and per published buffer, and the compositor process's
+gate RSS/HWM. Per-buffer cost is descriptive rather than a claim that each
+buffer has equal work. FPS at the output refresh limit is an acceptance and
+cadence result, not evidence that two compositors perform equal work. CPU
+excludes clients; RSS excludes helpers, kernel memory, and GPU allocations. Do
+not infer output page-flip rate, GPU execution time, power, or pixel correctness
+from these counters.

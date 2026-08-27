@@ -194,10 +194,38 @@ pub fn build(b: *std.Build) void {
     const benchmark_color_code_output = benchmark_color_code.addOutputFileArg(
         "color-management-v1-protocol.c",
     );
+    const benchmark_viewporter_xml = wayland_protocols.path(
+        "stable/viewporter/viewporter.xml",
+    );
+    const benchmark_viewporter_header = b.addSystemCommand(&.{ benchmark_scanner, "client-header" });
+    benchmark_viewporter_header.addFileArg(benchmark_viewporter_xml);
+    const benchmark_viewporter_header_output = benchmark_viewporter_header.addOutputFileArg(
+        "viewporter-client-protocol.h",
+    );
+    const benchmark_viewporter_code = b.addSystemCommand(&.{ benchmark_scanner, "private-code" });
+    benchmark_viewporter_code.addFileArg(benchmark_viewporter_xml);
+    const benchmark_viewporter_code_output = benchmark_viewporter_code.addOutputFileArg(
+        "viewporter-protocol.c",
+    );
+    const benchmark_single_pixel_xml = wayland_protocols.path(
+        "staging/single-pixel-buffer/single-pixel-buffer-v1.xml",
+    );
+    const benchmark_single_pixel_header = b.addSystemCommand(&.{ benchmark_scanner, "client-header" });
+    benchmark_single_pixel_header.addFileArg(benchmark_single_pixel_xml);
+    const benchmark_single_pixel_header_output = benchmark_single_pixel_header.addOutputFileArg(
+        "single-pixel-buffer-v1-client-protocol.h",
+    );
+    const benchmark_single_pixel_code = b.addSystemCommand(&.{ benchmark_scanner, "private-code" });
+    benchmark_single_pixel_code.addFileArg(benchmark_single_pixel_xml);
+    const benchmark_single_pixel_code_output = benchmark_single_pixel_code.addOutputFileArg(
+        "single-pixel-buffer-v1-protocol.c",
+    );
     benchmark_client.root_module.addIncludePath(benchmark_xdg_header_output.dirname());
     benchmark_client.root_module.addIncludePath(benchmark_presentation_header_output.dirname());
     benchmark_client.root_module.addIncludePath(benchmark_dmabuf_header_output.dirname());
     benchmark_client.root_module.addIncludePath(benchmark_color_header_output.dirname());
+    benchmark_client.root_module.addIncludePath(benchmark_viewporter_header_output.dirname());
+    benchmark_client.root_module.addIncludePath(benchmark_single_pixel_header_output.dirname());
     benchmark_client.root_module.addCSourceFile(.{
         .file = benchmark_xdg_code_output,
         .flags = &.{"-std=c11"},
@@ -212,6 +240,14 @@ pub fn build(b: *std.Build) void {
     });
     benchmark_client.root_module.addCSourceFile(.{
         .file = benchmark_color_code_output,
+        .flags = &.{"-std=c11"},
+    });
+    benchmark_client.root_module.addCSourceFile(.{
+        .file = benchmark_viewporter_code_output,
+        .flags = &.{"-std=c11"},
+    });
+    benchmark_client.root_module.addCSourceFile(.{
+        .file = benchmark_single_pixel_code_output,
         .flags = &.{"-std=c11"},
     });
     benchmark_client.root_module.addCSourceFile(.{

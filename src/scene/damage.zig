@@ -146,6 +146,9 @@ pub const Planner = struct {
     images: []Image,
     stale_storage: []render.Rect,
     planned_samples: []render.PlannedSample,
+    sample_visible: []bool,
+    occlusion_fragments: std.ArrayListUnmanaged(render.Rect) = .empty,
+    occlusion_next: std.ArrayListUnmanaged(render.Rect) = .empty,
     client: Region,
     scene: Region,
     repair: Region,
@@ -177,6 +180,14 @@ pub const Planner = struct {
         errdefer allocator.free(stale);
         const samples = try allocator.alloc(render.PlannedSample, config.max_samples);
         errdefer allocator.free(samples);
+        const sample_visible = try allocator.alloc(bool, config.max_samples);
+        errdefer allocator.free(sample_visible);
+        var occlusion_fragments: std.ArrayListUnmanaged(render.Rect) = .empty;
+        errdefer occlusion_fragments.deinit(allocator);
+        try occlusion_fragments.ensureTotalCapacity(allocator, config.max_samples);
+        var occlusion_next: std.ArrayListUnmanaged(render.Rect) = .empty;
+        errdefer occlusion_next.deinit(allocator);
+        try occlusion_next.ensureTotalCapacity(allocator, config.max_samples);
         const client = try allocator.alloc(render.Rect, config.max_client_rects);
         errdefer allocator.free(client);
         const scene = try allocator.alloc(render.Rect, config.max_scene_rects);
@@ -201,6 +212,9 @@ pub const Planner = struct {
             .images = images,
             .stale_storage = stale,
             .planned_samples = samples,
+            .sample_visible = sample_visible,
+            .occlusion_fragments = occlusion_fragments,
+            .occlusion_next = occlusion_next,
             .client = .{ .rects = client },
             .scene = .{ .rects = scene },
             .repair = .{ .rects = repair },
@@ -213,6 +227,9 @@ pub const Planner = struct {
         self.allocator.free(self.repair.rects);
         self.allocator.free(self.scene.rects);
         self.allocator.free(self.client.rects);
+        self.occlusion_next.deinit(self.allocator);
+        self.occlusion_fragments.deinit(self.allocator);
+        self.allocator.free(self.sample_visible);
         self.allocator.free(self.planned_samples);
         self.allocator.free(self.stale_storage);
         self.allocator.free(self.images);
@@ -230,6 +247,8 @@ pub const Planner = struct {
         return self.images.len * @sizeOf(Image) +
             self.stale_storage.len * @sizeOf(render.Rect) +
             self.planned_samples.len * @sizeOf(render.PlannedSample) +
+            self.sample_visible.len * @sizeOf(bool) +
+            (self.occlusion_fragments.capacity + self.occlusion_next.capacity) * @sizeOf(render.Rect) +
             (self.client.rects.len + self.scene.rects.len + self.repair.rects.len +
                 self.combined.rects.len) * @sizeOf(render.Rect);
     }
@@ -250,6 +269,8 @@ pub const Planner = struct {
         if (list.samples.len > std.math.maxInt(u32)) return error.InvalidConfig;
         if (list.samples.len > self.planned_samples.len)
             self.planned_samples = try self.allocator.realloc(self.planned_samples, list.samples.len);
+        if (list.samples.len > self.sample_visible.len)
+            self.sample_visible = try self.allocator.realloc(self.sample_visible, list.samples.len);
 
         self.client.clear();
         self.scene.clear();
@@ -270,6 +291,7 @@ pub const Planner = struct {
                 .global_alpha = sample.global_alpha,
             };
         }
+        const planned_count = try self.cullOccluded(list);
 
         for (changes) |change| self.addChange(change);
         self.combined.addRegion(self.physical_output, self.client);
@@ -279,7 +301,7 @@ pub const Planner = struct {
         self.pending_handle = handle;
         return .{
             .output = self.physical_output,
-            .samples = self.planned_samples[0..list.samples.len],
+            .samples = self.planned_samples[0..planned_count],
             .client_damage = self.client.slice(),
             .scene_damage = self.scene.slice(),
             .repair_damage = self.repair.slice(),
@@ -289,6 +311,53 @@ pub const Planner = struct {
             .repair_full = self.repair.full,
             .render_full = self.combined.full,
         };
+    }
+
+    /// Removes only renderer-plan entries. `list` remains complete so output
+    /// presentation bindings retire every committed surface on the page flip.
+    /// XRGB plus full global alpha is the only implicit whole-buffer opacity;
+    /// ARGB requires explicit opaque-region integration before it can cover.
+    fn cullOccluded(self: *Planner, list: render.List) !usize {
+        var index = list.samples.len;
+        while (index != 0) {
+            index -= 1;
+            self.sample_visible[index] = !try self.coveredByLaterOpaque(list, index);
+        }
+        var used: usize = 0;
+        for (self.sample_visible[0..list.samples.len], 0..) |visible, source_index| {
+            if (!visible) continue;
+            self.planned_samples[used] = self.planned_samples[source_index];
+            used += 1;
+        }
+        return used;
+    }
+
+    fn coveredByLaterOpaque(self: *Planner, list: render.List, candidate_index: usize) !bool {
+        const candidate = clippedPlanRect(
+            self.planned_samples[candidate_index].destination,
+            self.planned_samples[candidate_index].clip,
+            self.physical_output,
+        ) orelse return true;
+        self.occlusion_fragments.clearRetainingCapacity();
+        try self.occlusion_fragments.append(self.allocator, candidate);
+        for (list.samples[candidate_index + 1 ..], candidate_index + 1..) |sample, cover_index| {
+            if (sample.source.format != .xrgb8888 or sample.global_alpha != 255) continue;
+            const cover = clippedPlanRect(
+                self.planned_samples[cover_index].destination,
+                self.planned_samples[cover_index].clip,
+                self.physical_output,
+            ) orelse continue;
+            self.occlusion_next.clearRetainingCapacity();
+            for (self.occlusion_fragments.items) |fragment|
+                try subtractRect(self.allocator, &self.occlusion_next, fragment, cover);
+            std.mem.swap(
+                std.ArrayListUnmanaged(render.Rect),
+                &self.occlusion_fragments,
+                &self.occlusion_next,
+            );
+            if (self.occlusion_fragments.items.len == 0) return true;
+        }
+        return false;
     }
 
     /// Commits a successfully rendered plan. Repair is deliberately omitted
@@ -553,6 +622,55 @@ fn outputRect(size: render.Size) render.Rect {
     return .{ .x = 0, .y = 0, .width = size.width, .height = size.height };
 }
 
+fn clippedPlanRect(
+    destination: render.PlanRect,
+    clip: render.PlanRect,
+    output: render.Size,
+) ?render.Rect {
+    return rectFromEdges(
+        @max(destination.x, clip.x, 0),
+        @max(destination.y, clip.y, 0),
+        @min(
+            destination.x + destination.width,
+            clip.x + clip.width,
+            output.width,
+        ),
+        @min(
+            destination.y + destination.height,
+            clip.y + clip.height,
+            output.height,
+        ),
+    );
+}
+
+fn subtractRect(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayListUnmanaged(render.Rect),
+    value: render.Rect,
+    cover: render.Rect,
+) !void {
+    const overlap = intersect(value, cover) orelse {
+        try output.append(allocator, value);
+        return;
+    };
+    const left: i64 = value.x;
+    const top: i64 = value.y;
+    const right = left + value.width;
+    const bottom = top + value.height;
+    const overlap_left: i64 = overlap.x;
+    const overlap_top: i64 = overlap.y;
+    const overlap_right = overlap_left + overlap.width;
+    const overlap_bottom = overlap_top + overlap.height;
+    if (rectFromEdges(left, top, right, overlap_top)) |remaining|
+        try output.append(allocator, remaining);
+    if (rectFromEdges(left, overlap_bottom, right, bottom)) |remaining|
+        try output.append(allocator, remaining);
+    if (rectFromEdges(left, overlap_top, overlap_left, overlap_bottom)) |remaining|
+        try output.append(allocator, remaining);
+    if (rectFromEdges(overlap_right, overlap_top, right, overlap_bottom)) |remaining|
+        try output.append(allocator, remaining);
+}
+
 fn rectFromEdges(left: i64, top: i64, right: i64, bottom: i64) ?render.Rect {
     if (right <= left or bottom <= top or left < std.math.minInt(i32) or
         top < std.math.minInt(i32) or left > std.math.maxInt(i32) or
@@ -680,6 +798,60 @@ test "damage: movement removal and explicit occlusion invalidate old and new bou
         .invalidate_bounds = true,
     }});
     try std.testing.expectEqualSlices(render.Rect, &.{visible.destination}, plan.scene_damage);
+    try planner.cancel();
+}
+
+test "damage: opaque coverage culls exact render samples and reveal restores them" {
+    var planner = try Planner.init(std.testing.allocator, .{ .width = 100, .height = 100 }, .normal, testConfig(1));
+    defer planner.deinit();
+    const pixel = [_]u8{0} ** 4;
+    const background = testSample(1, 1, &pixel, .{ .x = 0, .y = 0, .width = 100, .height = 100 });
+    const left = testSample(2, 1, &pixel, .{ .x = 0, .y = 0, .width = 50, .height = 100 });
+    const right = testSample(3, 1, &pixel, .{ .x = 50, .y = 0, .width = 50, .height = 100 });
+
+    var plan = try planner.prepare(
+        .{ .slot = 0, .generation = 1 },
+        testList(&.{ background, left, right }),
+        &.{},
+    );
+    try std.testing.expectEqual(@as(usize, 2), plan.samples.len);
+    try std.testing.expectEqual(@as(u32, 1), plan.samples[0].source_index);
+    try std.testing.expectEqual(@as(u32, 2), plan.samples[1].source_index);
+    try planner.cancel();
+
+    plan = try planner.prepare(
+        .{ .slot = 0, .generation = 1 },
+        testList(&.{background}),
+        &.{},
+    );
+    try std.testing.expectEqual(@as(usize, 1), plan.samples.len);
+    try std.testing.expectEqual(background.sample, plan.samples[0].sample);
+    try planner.cancel();
+}
+
+test "damage: translucent and partial coverage never cull hidden pixels" {
+    var planner = try Planner.init(std.testing.allocator, .{ .width = 100, .height = 100 }, .normal, testConfig(1));
+    defer planner.deinit();
+    const pixel = [_]u8{0} ** 4;
+    const background = testSample(1, 1, &pixel, .{ .x = 0, .y = 0, .width = 100, .height = 100 });
+    var translucent = testSample(2, 1, &pixel, background.destination);
+    translucent.source.format = .argb8888_premultiplied;
+
+    var plan = try planner.prepare(
+        .{ .slot = 0, .generation = 1 },
+        testList(&.{ background, translucent }),
+        &.{},
+    );
+    try std.testing.expectEqual(@as(usize, 2), plan.samples.len);
+    try planner.cancel();
+
+    const partial = testSample(2, 2, &pixel, .{ .x = 0, .y = 0, .width = 99, .height = 100 });
+    plan = try planner.prepare(
+        .{ .slot = 0, .generation = 1 },
+        testList(&.{ background, partial }),
+        &.{},
+    );
+    try std.testing.expectEqual(@as(usize, 2), plan.samples.len);
     try planner.cancel();
 }
 
@@ -916,16 +1088,16 @@ test "damage: stale identities handles and cancelled plans are transactional" {
 }
 
 test "damage: prepare publish and cancel make no allocator calls" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 7 });
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 10 });
     var planner = try Planner.init(failing.allocator(), .{ .width = 100, .height = 100 }, .normal, testConfig(1));
     defer planner.deinit();
-    try std.testing.expectEqual(@as(usize, 7), failing.allocations);
+    try std.testing.expectEqual(@as(usize, 10), failing.allocations);
     const plan = try planner.prepare(.{ .slot = 0, .generation = 1 }, testList(&.{}), &.{});
     try std.testing.expect(plan.repair_full);
     try planner.cancel();
     _ = try planner.prepare(.{ .slot = 0, .generation = 1 }, testList(&.{}), &.{});
     try planner.publish();
-    try std.testing.expectEqual(@as(usize, 7), failing.allocations);
+    try std.testing.expectEqual(@as(usize, 10), failing.allocations);
     try std.testing.expect(!failing.has_induced_failure);
 }
 

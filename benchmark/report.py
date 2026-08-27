@@ -91,7 +91,15 @@ def run_record(directory: Path, workload: str, compositor: str, run: int) -> dic
                 )
         if client["discarded"] != 0:
             raise ValueError(f"{directory}: client discarded a measured frame")
-        expected_total = expected_frames + int(case["warmup"])
+        buffers_per_frame = client.get("buffers_per_frame", 1)
+        if not isinstance(buffers_per_frame, int) or buffers_per_frame <= 0:
+            raise ValueError(f"{directory}: invalid buffers_per_frame={buffers_per_frame}")
+        release_events_per_frame = client.get("release_events_per_frame", buffers_per_frame)
+        if not isinstance(release_events_per_frame, int) or release_events_per_frame < 0:
+            raise ValueError(
+                f"{directory}: invalid release_events_per_frame={release_events_per_frame}"
+            )
+        expected_total = (expected_frames + int(case["warmup"])) * release_events_per_frame
         if "pacing" in case and cleanup_releases[index] != expected_total:
             raise ValueError(
                 f"{directory}: cleanup releases={cleanup_releases[index]}, expected {expected_total}"
@@ -112,7 +120,16 @@ def run_record(directory: Path, workload: str, compositor: str, run: int) -> dic
         "observed_window_ns": max(client["observed_window_ns"] for client in clients),
         "actual_window_ns": max(client["actual_window_ns"] for client in clients),
         "callbacks": sum(client["callbacks"] for client in clients),
-        "releases": expected_frames * client_count,
+        "buffers_per_frame": sum(client.get("buffers_per_frame", 1) for client in clients),
+        "release_events_per_frame": sum(
+            client.get("release_events_per_frame", client.get("buffers_per_frame", 1))
+            for client in clients
+        ),
+        "releases": expected_frames
+        * sum(
+            client.get("release_events_per_frame", client.get("buffers_per_frame", 1))
+            for client in clients
+        ),
         "gate_release_events": sum(client["releases"] for client in clients),
         "presented": sum(client["presented"] for client in clients),
         "discarded": sum(client["discarded"] for client in clients),
@@ -201,6 +218,7 @@ def aggregate(
                     value["case"]["clients"],
                     value["case"]["frames"],
                     value["case"].get("pacing", "presentation"),
+                    value["buffers_per_frame"],
                 )
                 for value in values
             }
@@ -210,6 +228,7 @@ def aggregate(
             clients = int(values[0]["case"]["clients"])
             task_clock_ms = perf_median(values, "task-clock")
             actual_window_ns = median(values, "actual_window_ns")
+            buffers_per_frame = values[0]["buffers_per_frame"]
             summaries.append(
                 {
                     "workload": workload,
@@ -219,6 +238,7 @@ def aggregate(
                     "clients": clients,
                     "pacing": values[0]["case"].get("pacing", "presentation"),
                     "frames_per_client": frames,
+                    "buffers_per_frame": buffers_per_frame,
                     "gate_ns_median": median(values, "gate_ns"),
                     "color_setup_ns_median": median(values, "color_setup_ns"),
                     "actual_window_ns_median": actual_window_ns,
@@ -248,6 +268,11 @@ def aggregate(
                     "task_clock_us_per_presented": (
                         task_clock_ms * 1000 / (frames * clients) if task_clock_ms is not None else None
                     ),
+                    "task_clock_us_per_buffer": (
+                        task_clock_ms * 1000 / (frames * buffers_per_frame)
+                        if task_clock_ms is not None
+                        else None
+                    ),
                     "cpu_percent_median": derived_perf_median(
                         values,
                         lambda record: record["perf"]["task-clock"]
@@ -266,10 +291,11 @@ def print_markdown(summaries: list[dict[str, Any]]) -> None:
     for workload in sorted({summary["workload"] for summary in summaries}):
         print(f"\n## {workload}\n")
         print(
-            "| Compositor | Runs | Clients | Surface FPS | Aggregate presentations/s "
-            "| CPU % | µs/presented | Color setup ms | RSS MiB | HWM MiB |"
+            "| Compositor | Runs | Clients | Buffers/frame | Surface FPS "
+            "| Aggregate presentations/s | CPU % | µs/presented | µs/buffer "
+            "| Color setup ms | RSS MiB | HWM MiB |"
         )
-        print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+        print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
         for compositor in COMPOSITORS:
             summary = next(
                 item
@@ -278,16 +304,18 @@ def print_markdown(summaries: list[dict[str, Any]]) -> None:
             )
             if summary["status"] == "unsupported":
                 print(
-                    f"| {compositor} | {summary['runs']} | — | unsupported: "
-                    f"{summary['reason']} | — | — | — | — | — | — |"
+                    f"| {compositor} | {summary['runs']} | — | — | unsupported: "
+                    f"{summary['reason']} | — | — | — | — | — | — | — |"
                 )
                 continue
             print(
                 f"| {compositor} | {summary['runs']} | {summary['clients']} | "
+                f"{summary['buffers_per_frame']} | "
                 f"{fmt(summary['surface_fps_median'])} | "
                 f"{fmt(summary['aggregate_presentations_per_second_median'])} | "
                 f"{fmt(summary['cpu_percent_median'])} | "
                 f"{fmt(summary['task_clock_us_per_presented'])} | "
+                f"{fmt(summary['task_clock_us_per_buffer'])} | "
                 f"{fmt(summary['color_setup_ns_median'], 1_000_000, 3)} | "
                 f"{fmt(summary['rss_kib_median'], 1024, 1)} |"
                 f" {fmt(summary['hwm_kib_median'], 1024, 1)} |"

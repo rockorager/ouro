@@ -6,6 +6,7 @@
 #include <inttypes.h>
 #include <lcms2.h>
 #include <libdrm/drm_fourcc.h>
+#include <poll.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -21,6 +22,8 @@
 
 #include "linux-dmabuf-v1-client-protocol.h"
 #include "presentation-time-client-protocol.h"
+#include "single-pixel-buffer-v1-client-protocol.h"
+#include "viewporter-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 #include "color-management-v1-client-protocol.h"
 
@@ -31,11 +34,15 @@ enum workload {
     WORKLOAD_FULL,
     WORKLOAD_TINY,
     WORKLOAD_SPARSE,
+    WORKLOAD_MOVING,
+    WORKLOAD_MULTIRECT_8,
+    WORKLOAD_MULTIRECT_9,
 };
 
 enum backing {
     BACKING_SHM,
     BACKING_DMABUF,
+    BACKING_SINGLE_PIXEL,
 };
 
 enum pacing {
@@ -49,6 +56,20 @@ enum color_mode {
     COLOR_ICC,
 };
 
+enum scene_mode {
+    SCENE_NONE,
+    SCENE_OVERLAP,
+    SCENE_OCCLUSION,
+};
+
+enum viewport_mode {
+    VIEWPORT_NONE,
+    VIEWPORT_CROP,
+    VIEWPORT_SCALE,
+    VIEWPORT_CROP_SCALE,
+    VIEWPORT_SINGLE_PIXEL,
+};
+
 struct client;
 
 struct frame_buffer {
@@ -56,9 +77,21 @@ struct frame_buffer {
     struct wl_buffer *proxy;
     uint32_t *pixels;
     struct gbm_bo *bo;
+    uint32_t *canonical_pixels;
     size_t size;
     int fd;
+    int32_t width;
+    int32_t height;
+    bool alpha;
+    bool count_release;
     bool available;
+};
+
+struct scene_layer {
+    struct wl_surface *surface;
+    struct wl_subsurface *subsurface;
+    struct frame_buffer buffers[BUFFER_COUNT];
+    uint32_t *canonical_pixels;
 };
 
 struct frame_wait {
@@ -73,13 +106,17 @@ struct frame_wait {
 struct client {
     struct wl_display *display;
     struct wl_compositor *compositor;
+    struct wl_subcompositor *subcompositor;
     struct wl_shm *shm;
+    struct wp_single_pixel_buffer_manager_v1 *single_pixel_manager;
+    struct wp_viewporter *viewporter;
     struct xdg_wm_base *wm_base;
     struct wp_presentation *presentation;
     struct zwp_linux_dmabuf_v1 *dmabuf;
     struct wp_color_manager_v1 *color_manager;
     struct wp_color_management_surface_v1 *color_surface;
     struct wp_image_description_v1 *color_description;
+    struct wp_viewport *viewport;
     uint32_t dmabuf_version;
     struct gbm_device *gbm;
     int drm_fd;
@@ -87,14 +124,22 @@ struct client {
     struct xdg_surface *xdg_surface;
     struct xdg_toplevel *toplevel;
     struct frame_buffer buffers[BUFFER_COUNT];
+    struct frame_buffer root_buffer;
+    struct scene_layer *scene_layers;
     uint32_t *canonical_pixels;
     int32_t width;
     int32_t height;
     enum workload workload;
     enum backing backing;
     enum color_mode color_mode;
+    enum scene_mode scene_mode;
+    enum viewport_mode viewport_mode;
+    size_t scene_layer_count;
+    int32_t scene_layer_width;
+    int32_t scene_layer_height;
     bool alpha;
     bool churn;
+    bool solid;
     bool configured;
     bool color_capabilities_done;
     bool color_parametric;
@@ -106,15 +151,45 @@ struct client {
     bool draining;
     uint64_t callbacks;
     uint64_t releases;
+    uint64_t advisory_releases;
     uint64_t presented;
     uint64_t discarded;
     uint64_t color_setup_ns;
 };
 
+static void fail(const char *message);
+static void unsupported(const char *feature);
+
 static uint64_t monotonic_ns(void) {
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) abort();
     return (uint64_t)now.tv_sec * UINT64_C(1000000000) + (uint64_t)now.tv_nsec;
+}
+
+static bool dispatch_with_timeout(struct wl_display *display, int timeout_ms) {
+    while (wl_display_prepare_read(display) != 0) {
+        if (wl_display_dispatch_pending(display) < 0) fail("dispatch pending Wayland events");
+    }
+    if (wl_display_flush(display) < 0 && errno != EAGAIN) {
+        wl_display_cancel_read(display);
+        fail("flush Wayland requests");
+    }
+    struct pollfd descriptor = {
+        .fd = wl_display_get_fd(display),
+        .events = POLLIN,
+    };
+    const int ready = poll(&descriptor, 1, timeout_ms);
+    if (ready < 0) {
+        wl_display_cancel_read(display);
+        fail("poll Wayland display");
+    }
+    if (ready == 0) {
+        wl_display_cancel_read(display);
+        return false;
+    }
+    if (wl_display_read_events(display) < 0 || wl_display_dispatch_pending(display) < 0)
+        fail("read Wayland events");
+    return true;
 }
 
 static void fail(const char *message) {
@@ -179,7 +254,11 @@ static void buffer_release(void *data, struct wl_buffer *buffer) {
     (void)buffer;
     struct frame_buffer *frame_buffer = data;
     frame_buffer->available = true;
-    frame_buffer->client->releases++;
+    if (frame_buffer->client->backing == BACKING_SINGLE_PIXEL) {
+        frame_buffer->client->advisory_releases++;
+        return;
+    }
+    if (frame_buffer->count_release) frame_buffer->client->releases++;
 }
 
 static const struct wl_buffer_listener buffer_listener = {
@@ -373,6 +452,22 @@ static void registry_global(
             &wl_compositor_interface,
             version < 4 ? version : 4
         );
+    } else if (strcmp(interface, wl_subcompositor_interface.name) == 0) {
+        client->subcompositor = wl_registry_bind(
+            registry,
+            name,
+            &wl_subcompositor_interface,
+            1
+        );
+    } else if (strcmp(interface, wp_viewporter_interface.name) == 0) {
+        client->viewporter = wl_registry_bind(registry, name, &wp_viewporter_interface, 1);
+    } else if (strcmp(interface, wp_single_pixel_buffer_manager_v1_interface.name) == 0) {
+        client->single_pixel_manager = wl_registry_bind(
+            registry,
+            name,
+            &wp_single_pixel_buffer_manager_v1_interface,
+            1
+        );
     } else if (strcmp(interface, wl_shm_interface.name) == 0) {
         client->shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
     } else if (strcmp(interface, xdg_wm_base_interface.name) == 0) {
@@ -415,8 +510,9 @@ static const struct wl_registry_listener registry_listener = {
 
 static void write_buffer(struct frame_buffer *buffer) {
     struct client *client = buffer->client;
+    if (client->backing == BACKING_SINGLE_PIXEL) return;
     if (client->backing == BACKING_SHM) {
-        memcpy(buffer->pixels, client->canonical_pixels, buffer->size);
+        memcpy(buffer->pixels, buffer->canonical_pixels, buffer->size);
         return;
     }
     uint32_t stride = 0;
@@ -425,37 +521,44 @@ static void write_buffer(struct frame_buffer *buffer) {
         buffer->bo,
         0,
         0,
-        (uint32_t)client->width,
-        (uint32_t)client->height,
+        (uint32_t)buffer->width,
+        (uint32_t)buffer->height,
         GBM_BO_TRANSFER_WRITE,
         &stride,
         &map_data
     );
     if (pixels == NULL) fail("map DMA-BUF");
-    const size_t row_bytes = (size_t)client->width * 4;
-    for (int32_t row = 0; row < client->height; row++)
+    const size_t row_bytes = (size_t)buffer->width * 4;
+    for (int32_t row = 0; row < buffer->height; row++)
         memcpy(
             pixels + (size_t)row * stride,
-            client->canonical_pixels + (size_t)row * (size_t)client->width,
+            buffer->canonical_pixels + (size_t)row * (size_t)buffer->width,
             row_bytes
         );
     gbm_bo_unmap(buffer->bo, map_data);
 }
 
 static void destroy_buffer(struct frame_buffer *buffer) {
-    struct client *client = buffer->client;
+    const struct frame_buffer retained = {
+        .client = buffer->client,
+        .canonical_pixels = buffer->canonical_pixels,
+        .fd = -1,
+        .width = buffer->width,
+        .height = buffer->height,
+        .alpha = buffer->alpha,
+        .count_release = buffer->count_release,
+    };
     if (buffer->proxy != NULL) wl_buffer_destroy(buffer->proxy);
     if (buffer->pixels != NULL && buffer->pixels != MAP_FAILED)
         munmap(buffer->pixels, buffer->size);
     if (buffer->fd >= 0) close(buffer->fd);
     if (buffer->bo != NULL) gbm_bo_destroy(buffer->bo);
-    *buffer = (struct frame_buffer){ .client = client, .fd = -1 };
+    *buffer = retained;
 }
 
 static void create_shm_buffer(struct client *client, struct frame_buffer *buffer) {
-    buffer->client = client;
     buffer->fd = -1;
-    buffer->size = (size_t)client->width * (size_t)client->height * 4;
+    buffer->size = (size_t)buffer->width * (size_t)buffer->height * 4;
     buffer->fd = memfd_create("ouro-benchmark-shm", MFD_CLOEXEC | MFD_ALLOW_SEALING);
     if (buffer->fd < 0 || ftruncate(buffer->fd, (off_t)buffer->size) != 0)
         fail("create SHM buffer");
@@ -467,10 +570,10 @@ static void create_shm_buffer(struct client *client, struct frame_buffer *buffer
     buffer->proxy = wl_shm_pool_create_buffer(
         pool,
         0,
-        client->width,
-        client->height,
-        client->width * 4,
-        client->alpha ? WL_SHM_FORMAT_ARGB8888 : WL_SHM_FORMAT_XRGB8888
+        buffer->width,
+        buffer->height,
+        buffer->width * 4,
+        buffer->alpha ? WL_SHM_FORMAT_ARGB8888 : WL_SHM_FORMAT_XRGB8888
     );
     wl_shm_pool_destroy(pool);
     buffer->available = true;
@@ -481,14 +584,13 @@ static void create_shm_buffer(struct client *client, struct frame_buffer *buffer
 
 static void create_dmabuf_buffer(struct client *client, struct frame_buffer *buffer) {
     static const uint64_t modifiers[] = { DRM_FORMAT_MOD_LINEAR };
-    buffer->client = client;
     buffer->fd = -1;
-    buffer->size = (size_t)client->width * (size_t)client->height * 4;
+    buffer->size = (size_t)buffer->width * (size_t)buffer->height * 4;
     buffer->bo = gbm_bo_create_with_modifiers2(
         client->gbm,
-        (uint32_t)client->width,
-        (uint32_t)client->height,
-        client->alpha ? GBM_FORMAT_ARGB8888 : GBM_FORMAT_XRGB8888,
+        (uint32_t)buffer->width,
+        (uint32_t)buffer->height,
+        buffer->alpha ? GBM_FORMAT_ARGB8888 : GBM_FORMAT_XRGB8888,
         modifiers,
         1,
         GBM_BO_USE_RENDERING
@@ -513,9 +615,9 @@ static void create_dmabuf_buffer(struct client *client, struct frame_buffer *buf
     );
     buffer->proxy = zwp_linux_buffer_params_v1_create_immed(
         params,
-        client->width,
-        client->height,
-        client->alpha ? DRM_FORMAT_ARGB8888 : DRM_FORMAT_XRGB8888,
+        buffer->width,
+        buffer->height,
+        buffer->alpha ? DRM_FORMAT_ARGB8888 : DRM_FORMAT_XRGB8888,
         0
     );
     zwp_linux_buffer_params_v1_destroy(params);
@@ -527,10 +629,47 @@ static void create_dmabuf_buffer(struct client *client, struct frame_buffer *buf
 }
 
 static void create_buffer(struct client *client, struct frame_buffer *buffer) {
-    if (client->backing == BACKING_DMABUF)
+    if (buffer->client != client || buffer->canonical_pixels == NULL ||
+        buffer->width <= 0 || buffer->height <= 0)
+        protocol_fail("invalid buffer geometry");
+    if (client->backing == BACKING_SINGLE_PIXEL) {
+        if (client->single_pixel_manager == NULL) unsupported("wp_single_pixel_buffer_manager_v1");
+        buffer->proxy = wp_single_pixel_buffer_manager_v1_create_u32_rgba_buffer(
+            client->single_pixel_manager,
+            UINT32_C(0x20000000),
+            UINT32_C(0x40000000),
+            UINT32_C(0x60000000),
+            UINT32_MAX
+        );
+        buffer->available = true;
+        if (buffer->proxy == NULL ||
+            wl_buffer_add_listener(buffer->proxy, &buffer_listener, buffer) != 0)
+            protocol_fail("create single-pixel buffer");
+    } else if (client->backing == BACKING_DMABUF) {
         create_dmabuf_buffer(client, buffer);
-    else
+    } else {
         create_shm_buffer(client, buffer);
+    }
+}
+
+static void initialize_buffer(
+    struct client *client,
+    struct frame_buffer *buffer,
+    uint32_t *canonical_pixels,
+    int32_t width,
+    int32_t height,
+    bool alpha,
+    bool count_release
+) {
+    *buffer = (struct frame_buffer){
+        .client = client,
+        .canonical_pixels = canonical_pixels,
+        .fd = -1,
+        .width = width,
+        .height = height,
+        .alpha = alpha,
+        .count_release = count_release,
+    };
 }
 
 static int create_srgb_profile_fd(void) {
@@ -643,6 +782,97 @@ static void setup_color(struct client *client) {
     client->color_setup_ns = monotonic_ns() - started_ns;
 }
 
+static uint32_t *allocate_pixels(int32_t width, int32_t height, bool alpha, uint32_t seed) {
+    const size_t pixel_count = (size_t)width * (size_t)height;
+    if (pixel_count > SIZE_MAX / sizeof(uint32_t)) protocol_fail("pixel allocation overflow");
+    uint32_t *pixels = malloc(pixel_count * sizeof(uint32_t));
+    if (pixels == NULL) fail("allocate canonical pixels");
+    for (size_t index = 0; index < pixel_count; index++) {
+        if (alpha) {
+            const uint32_t red = UINT32_C(0x10) + ((uint32_t)(index + seed) & UINT32_C(0x1f));
+            const uint32_t green = UINT32_C(0x20) +
+                (((uint32_t)(index + seed) >> 5) & UINT32_C(0x1f));
+            const uint32_t blue = UINT32_C(0x30) +
+                (((uint32_t)(index + seed) >> 10) & UINT32_C(0x1f));
+            pixels[index] = UINT32_C(0x80000000) | red << 16 | green << 8 | blue;
+        } else {
+            pixels[index] = UINT32_C(0xff204060) ^ (uint32_t)(index + seed);
+        }
+    }
+    return pixels;
+}
+
+static void setup_scene(struct client *client) {
+    if (client->subcompositor == NULL) unsupported("wl_subcompositor");
+    client->scene_layer_width = client->scene_mode == SCENE_OCCLUSION ?
+        client->width : client->width * 2 / 3;
+    client->scene_layer_height = client->scene_mode == SCENE_OCCLUSION ?
+        client->height : client->height * 2 / 3;
+    if (client->scene_layer_width == 0) client->scene_layer_width = 1;
+    if (client->scene_layer_height == 0) client->scene_layer_height = 1;
+
+    client->canonical_pixels = allocate_pixels(client->width, client->height, false, 0);
+    initialize_buffer(
+        client,
+        &client->root_buffer,
+        client->canonical_pixels,
+        client->width,
+        client->height,
+        false,
+        false
+    );
+    create_buffer(client, &client->root_buffer);
+
+    client->scene_layers = calloc(client->scene_layer_count, sizeof(struct scene_layer));
+    if (client->scene_layers == NULL) fail("allocate scene layers");
+    const int32_t max_x = client->width - client->scene_layer_width;
+    const int32_t max_y = client->height - client->scene_layer_height;
+    for (size_t index = 0; index < client->scene_layer_count; index++) {
+        struct scene_layer *layer = &client->scene_layers[index];
+        layer->surface = wl_compositor_create_surface(client->compositor);
+        layer->subsurface = wl_subcompositor_get_subsurface(
+            client->subcompositor,
+            layer->surface,
+            client->surface
+        );
+        if (layer->surface == NULL || layer->subsurface == NULL)
+            protocol_fail("create synchronized subsurface layer");
+        const int32_t x = client->scene_mode == SCENE_OCCLUSION ? 0 :
+            (int32_t)((int64_t)max_x * (int64_t)index /
+                (int64_t)(client->scene_layer_count > 1 ? client->scene_layer_count - 1 : 2));
+        const int32_t y = client->scene_mode == SCENE_OCCLUSION ? 0 :
+            max_y - (int32_t)((int64_t)max_y * (int64_t)index /
+                (int64_t)(client->scene_layer_count > 1 ? client->scene_layer_count - 1 : 2));
+        wl_subsurface_set_position(layer->subsurface, x, y);
+        const bool alpha = client->scene_mode == SCENE_OVERLAP;
+        layer->canonical_pixels = allocate_pixels(
+            client->scene_layer_width,
+            client->scene_layer_height,
+            alpha,
+            (uint32_t)(index * 4099)
+        );
+        for (size_t buffer_index = 0; buffer_index < BUFFER_COUNT; buffer_index++) {
+            initialize_buffer(
+                client,
+                &layer->buffers[buffer_index],
+                layer->canonical_pixels,
+                client->scene_layer_width,
+                client->scene_layer_height,
+                alpha,
+                true
+            );
+            create_buffer(client, &layer->buffers[buffer_index]);
+            if (wl_display_roundtrip(client->display) < 0)
+                fail("publish scene buffer");
+        }
+    }
+    client->root_buffer.available = false;
+    wl_surface_attach(client->surface, client->root_buffer.proxy, 0, 0);
+    wl_surface_damage_buffer(client->surface, 0, 0, client->width, client->height);
+    wl_surface_commit(client->surface);
+    if (wl_display_roundtrip(client->display) < 0) fail("map scene root");
+}
+
 static void setup(struct client *client, const char *socket_path, const char *drm_path) {
     client->display = connect_path(socket_path);
     struct wl_registry *registry = wl_display_get_registry(client->display);
@@ -674,33 +904,77 @@ static void setup(struct client *client, const char *socket_path, const char *dr
     client->toplevel = xdg_surface_get_toplevel(client->xdg_surface);
     if (client->toplevel == NULL) protocol_fail("create xdg_toplevel");
     xdg_toplevel_set_title(client->toplevel, "Ouro compositor benchmark");
+    if (client->viewport_mode != VIEWPORT_NONE) {
+        if (client->viewporter == NULL) unsupported("wp_viewporter");
+        client->viewport = wp_viewporter_get_viewport(client->viewporter, client->surface);
+        if (client->viewport == NULL) protocol_fail("create viewport");
+        if (client->viewport_mode == VIEWPORT_CROP ||
+            client->viewport_mode == VIEWPORT_CROP_SCALE)
+            wp_viewport_set_source(
+                client->viewport,
+                wl_fixed_from_int(client->width / 4),
+                wl_fixed_from_int(client->height / 4),
+                wl_fixed_from_int(client->width / 2),
+                wl_fixed_from_int(client->height / 2)
+            );
+        if (client->viewport_mode == VIEWPORT_SCALE)
+            wp_viewport_set_destination(client->viewport, client->width / 2, client->height / 2);
+        if (client->viewport_mode == VIEWPORT_CROP_SCALE)
+            wp_viewport_set_destination(client->viewport, client->width, client->height);
+        if (client->viewport_mode == VIEWPORT_SINGLE_PIXEL)
+            wp_viewport_set_destination(client->viewport, client->width, client->height);
+    }
     setup_color(client);
     wl_surface_commit(client->surface);
     while (!client->configured)
         if (wl_display_dispatch(client->display) < 0) fail("wait for initial configure");
 
-    const size_t buffer_size = (size_t)client->width * (size_t)client->height * 4;
-    client->canonical_pixels = malloc(buffer_size);
-    if (client->canonical_pixels == NULL) fail("allocate canonical pixels");
-    for (size_t index = 0; index < buffer_size / 4; index++) {
-        if (client->alpha) {
-            const uint32_t red = UINT32_C(0x10) + ((uint32_t)index & UINT32_C(0x1f));
-            const uint32_t green = UINT32_C(0x20) + (((uint32_t)index >> 5) & UINT32_C(0x1f));
-            const uint32_t blue = UINT32_C(0x30) + (((uint32_t)index >> 10) & UINT32_C(0x1f));
-            client->canonical_pixels[index] = UINT32_C(0x80000000) | red << 16 | green << 8 | blue;
-        } else {
-            client->canonical_pixels[index] = UINT32_C(0xff204060) ^ (uint32_t)index;
-        }
+    if (client->scene_mode != SCENE_NONE) {
+        setup_scene(client);
+        return;
     }
+    const int32_t buffer_width = client->solid || client->backing == BACKING_SINGLE_PIXEL ?
+        1 : client->width;
+    const int32_t buffer_height = client->solid || client->backing == BACKING_SINGLE_PIXEL ?
+        1 : client->height;
+    client->canonical_pixels = allocate_pixels(buffer_width, buffer_height, client->alpha, 0);
     for (uint32_t index = 0; index < BUFFER_COUNT; index++) {
-        client->buffers[index].client = client;
-        client->buffers[index].fd = -1;
+        initialize_buffer(
+            client,
+            &client->buffers[index],
+            client->canonical_pixels,
+            buffer_width,
+            buffer_height,
+            client->alpha,
+            true
+        );
         if (!client->churn) {
             create_buffer(client, &client->buffers[index]);
             if (wl_display_roundtrip(client->display) < 0)
                 fail("publish persistent buffer");
         }
     }
+    if (client->backing == BACKING_SINGLE_PIXEL) {
+        wl_surface_attach(client->surface, client->buffers[0].proxy, 0, 0);
+        wl_surface_damage_buffer(client->surface, 0, 0, 1, 1);
+        wl_surface_commit(client->surface);
+        if (wl_display_roundtrip(client->display) < 0)
+            fail("map single-pixel surface before warmup");
+    }
+}
+
+static void mutate_pixels(
+    uint32_t *pixels,
+    int32_t stride,
+    int32_t x,
+    int32_t y,
+    int32_t width,
+    int32_t height
+) {
+    for (int32_t row = y; row < y + height; row++)
+        for (int32_t column = x; column < x + width; column++)
+            pixels[(size_t)row * (size_t)stride + (size_t)column] ^=
+                UINT32_C(0x00010101);
 }
 
 static void mutate_rect(
@@ -710,10 +984,131 @@ static void mutate_rect(
     int32_t width,
     int32_t height
 ) {
-    for (int32_t row = y; row < y + height; row++)
-        for (int32_t column = x; column < x + width; column++)
-            client->canonical_pixels[(size_t)row * (size_t)client->width + (size_t)column] ^=
-                UINT32_C(0x00010101);
+    mutate_pixels(client->canonical_pixels, client->width, x, y, width, height);
+}
+
+static void grid_rect(
+    const struct client *client,
+    size_t index,
+    int32_t *x,
+    int32_t *y,
+    int32_t *width,
+    int32_t *height
+) {
+    *width = client->width < 16 ? client->width : 16;
+    *height = client->height < 16 ? client->height : 16;
+    const int32_t span_x = client->width - *width;
+    const int32_t span_y = client->height - *height;
+    *x = (int32_t)(index % 3) * span_x / 2;
+    *y = (int32_t)(index / 3) * span_y / 2;
+}
+
+static void moving_rect(
+    const struct client *client,
+    uint64_t sequence,
+    int32_t *x,
+    int32_t *y,
+    int32_t *width,
+    int32_t *height
+) {
+    *width = client->width < 64 ? client->width : 64;
+    *height = client->height < 64 ? client->height : 64;
+    const uint64_t span_x = (uint64_t)(client->width - *width + 1);
+    const uint64_t span_y = (uint64_t)(client->height - *height + 1);
+    *x = (int32_t)(sequence * 37 % span_x);
+    *y = (int32_t)(sequence * 23 % span_y);
+}
+
+static void begin_frame_wait(
+    struct client *client,
+    struct frame_wait *wait,
+    struct wl_surface *surface
+) {
+    *wait = (struct frame_wait){ .client = client };
+    struct wl_callback *callback = wl_surface_frame(surface);
+    struct wp_presentation_feedback *feedback = wp_presentation_feedback(
+        client->presentation,
+        surface
+    );
+    if (callback == NULL || feedback == NULL ||
+        wl_callback_add_listener(callback, &callback_listener, wait) != 0 ||
+        wp_presentation_feedback_add_listener(feedback, &feedback_listener, wait) != 0)
+        protocol_fail("create frame completion objects");
+}
+
+static void wait_for_frame(
+    struct client *client,
+    struct frame_wait *wait,
+    enum pacing pacing,
+    uint64_t sequence,
+    struct frame_buffer *buffer
+) {
+    while (!wait->callback_done ||
+        (pacing == PACING_PRESENTATION && !wait->presented && !wait->discarded)) {
+        if (client->backing == BACKING_SINGLE_PIXEL && pacing == PACING_PRESENTATION &&
+            wait->callback_done && !wait->presented && !wait->discarded)
+        {
+            if (!dispatch_with_timeout(client->display, 1000))
+                unsupported("single-pixel presentation feedback lifecycle");
+        } else if (wl_display_dispatch(client->display) < 0) {
+            fail("wait for presented frame");
+        }
+    }
+    if (pacing == PACING_PRESENTATION && client->backing == BACKING_SHM) {
+        if (client->scene_mode == SCENE_NONE) {
+            while (!buffer->available)
+                if (wl_display_dispatch(client->display) < 0)
+                    fail("wait for presented buffer release");
+        } else {
+            for (size_t index = 0; index < client->scene_layer_count; index++) {
+                struct frame_buffer *layer_buffer =
+                    &client->scene_layers[index].buffers[sequence % BUFFER_COUNT];
+                while (!layer_buffer->available)
+                    if (wl_display_dispatch(client->display) < 0)
+                        fail("wait for presented scene buffer release");
+            }
+        }
+    }
+    if (pacing == PACING_PRESENTATION && wait->discarded)
+        protocol_fail("frame was discarded");
+}
+
+static void submit_scene_frame(
+    struct client *client,
+    uint64_t sequence,
+    struct frame_wait *wait,
+    enum pacing pacing
+) {
+    for (size_t index = 0; index < client->scene_layer_count; index++) {
+        struct scene_layer *layer = &client->scene_layers[index];
+        struct frame_buffer *buffer = &layer->buffers[sequence % BUFFER_COUNT];
+        while (!buffer->available)
+            if (wl_display_dispatch(client->display) < 0)
+                fail("wait for scene buffer release");
+        buffer->available = false;
+        mutate_pixels(
+            layer->canonical_pixels,
+            client->scene_layer_width,
+            0,
+            0,
+            client->scene_layer_width,
+            client->scene_layer_height
+        );
+        write_buffer(buffer);
+        wl_surface_attach(layer->surface, buffer->proxy, 0, 0);
+        wl_surface_damage_buffer(
+            layer->surface,
+            0,
+            0,
+            client->scene_layer_width,
+            client->scene_layer_height
+        );
+        if (index + 1 == client->scene_layer_count)
+            begin_frame_wait(client, wait, layer->surface);
+        wl_surface_commit(layer->surface);
+    }
+    wl_surface_commit(client->surface);
+    wait_for_frame(client, wait, pacing, sequence, NULL);
 }
 
 static void submit_frame(
@@ -722,6 +1117,10 @@ static void submit_frame(
     struct frame_wait *wait,
     enum pacing pacing
 ) {
+    if (client->scene_mode != SCENE_NONE) {
+        submit_scene_frame(client, sequence, wait, pacing);
+        return;
+    }
     struct frame_buffer *buffer = &client->buffers[sequence % BUFFER_COUNT];
     if (client->churn) {
         while (buffer->proxy != NULL && !buffer->available)
@@ -729,9 +1128,11 @@ static void submit_frame(
         destroy_buffer(buffer);
         create_buffer(client, buffer);
     }
-    while (!buffer->available)
-        if (wl_display_dispatch(client->display) < 0) fail("wait for buffer release");
-    buffer->available = false;
+    if (client->backing != BACKING_SINGLE_PIXEL) {
+        while (!buffer->available)
+            if (wl_display_dispatch(client->display) < 0) fail("wait for buffer release");
+        buffer->available = false;
+    }
 
     switch (client->workload) {
         case WORKLOAD_STATIC:
@@ -753,19 +1154,28 @@ static void submit_frame(
             mutate_rect(client, client->width - size, client->height - size, size, size);
             break;
         }
+        case WORKLOAD_MOVING: {
+            int32_t x, y, width, height;
+            moving_rect(client, sequence, &x, &y, &width, &height);
+            mutate_rect(client, x, y, width, height);
+            moving_rect(client, sequence + 1, &x, &y, &width, &height);
+            mutate_rect(client, x, y, width, height);
+            break;
+        }
+        case WORKLOAD_MULTIRECT_8:
+        case WORKLOAD_MULTIRECT_9: {
+            const size_t count = client->workload == WORKLOAD_MULTIRECT_8 ? 8 : 9;
+            for (size_t index = 0; index < count; index++) {
+                int32_t x, y, width, height;
+                grid_rect(client, index, &x, &y, &width, &height);
+                mutate_rect(client, x, y, width, height);
+            }
+            break;
+        }
     }
     if (client->workload != WORKLOAD_STATIC) write_buffer(buffer);
 
-    *wait = (struct frame_wait){ .client = client };
-    struct wl_callback *callback = wl_surface_frame(client->surface);
-    struct wp_presentation_feedback *feedback = wp_presentation_feedback(
-        client->presentation,
-        client->surface
-    );
-    if (callback == NULL || feedback == NULL ||
-        wl_callback_add_listener(callback, &callback_listener, wait) != 0 ||
-        wp_presentation_feedback_add_listener(feedback, &feedback_listener, wait) != 0)
-        protocol_fail("create frame completion objects");
+    begin_frame_wait(client, wait, client->surface);
     wl_surface_attach(client->surface, buffer->proxy, 0, 0);
     switch (client->workload) {
         case WORKLOAD_STATIC:
@@ -794,20 +1204,48 @@ static void submit_frame(
             );
             break;
         }
+        case WORKLOAD_MOVING: {
+            int32_t x, y, width, height;
+            moving_rect(client, sequence, &x, &y, &width, &height);
+            wl_surface_damage_buffer(client->surface, x, y, width, height);
+            moving_rect(client, sequence + 1, &x, &y, &width, &height);
+            wl_surface_damage_buffer(client->surface, x, y, width, height);
+            break;
+        }
+        case WORKLOAD_MULTIRECT_8:
+        case WORKLOAD_MULTIRECT_9: {
+            const size_t count = client->workload == WORKLOAD_MULTIRECT_8 ? 8 : 9;
+            for (size_t index = 0; index < count; index++) {
+                int32_t x, y, width, height;
+                grid_rect(client, index, &x, &y, &width, &height);
+                wl_surface_damage_buffer(client->surface, x, y, width, height);
+            }
+            break;
+        }
     }
     wl_surface_commit(client->surface);
-    while (!wait->callback_done ||
-        (pacing == PACING_PRESENTATION && !wait->presented && !wait->discarded) ||
-        (pacing == PACING_PRESENTATION && client->backing == BACKING_SHM && !buffer->available))
-        if (wl_display_dispatch(client->display) < 0) fail("wait for presented frame");
-    if (pacing == PACING_PRESENTATION && wait->discarded)
-        protocol_fail("frame was discarded");
+    wait_for_frame(client, wait, pacing, sequence, buffer);
 }
 
 static void cleanup(struct client *client) {
-    for (size_t index = 0; index < BUFFER_COUNT; index++) destroy_buffer(&client->buffers[index]);
+    if (client->scene_mode == SCENE_NONE) {
+        for (size_t index = 0; index < BUFFER_COUNT; index++)
+            destroy_buffer(&client->buffers[index]);
+    } else {
+        for (size_t index = 0; index < client->scene_layer_count; index++) {
+            struct scene_layer *layer = &client->scene_layers[index];
+            for (size_t buffer_index = 0; buffer_index < BUFFER_COUNT; buffer_index++)
+                destroy_buffer(&layer->buffers[buffer_index]);
+            if (layer->subsurface != NULL) wl_subsurface_destroy(layer->subsurface);
+            if (layer->surface != NULL) wl_surface_destroy(layer->surface);
+            free(layer->canonical_pixels);
+        }
+        free(client->scene_layers);
+        destroy_buffer(&client->root_buffer);
+    }
     if (client->color_surface != NULL) wp_color_management_surface_v1_destroy(client->color_surface);
     if (client->color_description != NULL) wp_image_description_v1_destroy(client->color_description);
+    if (client->viewport != NULL) wp_viewport_destroy(client->viewport);
     if (client->toplevel != NULL) xdg_toplevel_destroy(client->toplevel);
     if (client->xdg_surface != NULL) xdg_surface_destroy(client->xdg_surface);
     if (client->surface != NULL) wl_surface_destroy(client->surface);
@@ -816,12 +1254,47 @@ static void cleanup(struct client *client) {
     if (client->dmabuf != NULL) zwp_linux_dmabuf_v1_destroy(client->dmabuf);
     if (client->wm_base != NULL) xdg_wm_base_destroy(client->wm_base);
     if (client->shm != NULL) wl_shm_destroy(client->shm);
+    if (client->single_pixel_manager != NULL)
+        wp_single_pixel_buffer_manager_v1_destroy(client->single_pixel_manager);
+    if (client->viewporter != NULL) wp_viewporter_destroy(client->viewporter);
+    if (client->subcompositor != NULL) wl_subcompositor_destroy(client->subcompositor);
     if (client->compositor != NULL) wl_compositor_destroy(client->compositor);
     if (client->gbm != NULL) gbm_device_destroy(client->gbm);
     if (client->drm_fd >= 0) close(client->drm_fd);
     free(client->canonical_pixels);
     wl_display_flush(client->display);
     wl_display_disconnect(client->display);
+}
+
+static size_t buffers_per_frame(const struct client *client) {
+    return client->scene_mode == SCENE_NONE ? 1 : client->scene_layer_count;
+}
+
+static size_t release_events_per_frame(const struct client *client) {
+    return client->backing == BACKING_SINGLE_PIXEL ? 0 : buffers_per_frame(client);
+}
+
+static bool buffers_available(const struct client *client) {
+    if (client->scene_mode == SCENE_NONE) {
+        for (size_t index = 0; index < BUFFER_COUNT; index++)
+            if (!client->buffers[index].available) return false;
+        return true;
+    }
+    for (size_t index = 0; index < client->scene_layer_count; index++)
+        for (size_t buffer_index = 0; buffer_index < BUFFER_COUNT; buffer_index++)
+            if (!client->scene_layers[index].buffers[buffer_index].available) return false;
+    return client->root_buffer.available;
+}
+
+static void detach_content(struct client *client) {
+    if (client->scene_mode != SCENE_NONE) {
+        for (size_t index = 0; index < client->scene_layer_count; index++) {
+            wl_surface_attach(client->scene_layers[index].surface, NULL, 0, 0);
+            wl_surface_commit(client->scene_layers[index].surface);
+        }
+    }
+    wl_surface_attach(client->surface, NULL, 0, 0);
+    wl_surface_commit(client->surface);
 }
 
 static void parse_workload(struct client *client, const char *name) {
@@ -832,12 +1305,26 @@ static void parse_workload(struct client *client, const char *name) {
     } else if (strncmp(name, "dmabuf-", 7) == 0) {
         client->backing = BACKING_DMABUF;
         workload = name + 7;
+    } else if (strncmp(name, "single-pixel-", 13) == 0) {
+        client->backing = BACKING_SINGLE_PIXEL;
+        workload = name + 13;
     } else {
         fprintf(stderr, "ouro-benchmark-client: unknown backing: %s\n", name);
         exit(2);
     }
     if (strcmp(workload, "static") == 0) {
         client->workload = WORKLOAD_STATIC;
+        return;
+    }
+    if (client->backing == BACKING_SINGLE_PIXEL && strcmp(workload, "full") == 0) {
+        client->workload = WORKLOAD_STATIC;
+        client->viewport_mode = VIEWPORT_SINGLE_PIXEL;
+        return;
+    }
+    if (strcmp(workload, "solid-full") == 0) {
+        client->workload = WORKLOAD_STATIC;
+        client->viewport_mode = VIEWPORT_SINGLE_PIXEL;
+        client->solid = true;
         return;
     }
     if (strcmp(workload, "full") == 0) {
@@ -850,6 +1337,33 @@ static void parse_workload(struct client *client, const char *name) {
     }
     if (strcmp(workload, "sparse") == 0) {
         client->workload = WORKLOAD_SPARSE;
+        return;
+    }
+    if (strcmp(workload, "moving") == 0) {
+        client->workload = WORKLOAD_MOVING;
+        return;
+    }
+    if (strcmp(workload, "multirect-8") == 0) {
+        client->workload = WORKLOAD_MULTIRECT_8;
+        return;
+    }
+    if (strcmp(workload, "multirect-9") == 0) {
+        client->workload = WORKLOAD_MULTIRECT_9;
+        return;
+    }
+    if (strcmp(workload, "viewport-crop") == 0) {
+        client->workload = WORKLOAD_FULL;
+        client->viewport_mode = VIEWPORT_CROP;
+        return;
+    }
+    if (strcmp(workload, "viewport-scale") == 0) {
+        client->workload = WORKLOAD_FULL;
+        client->viewport_mode = VIEWPORT_SCALE;
+        return;
+    }
+    if (strcmp(workload, "viewport-crop-scale") == 0) {
+        client->workload = WORKLOAD_FULL;
+        client->viewport_mode = VIEWPORT_CROP_SCALE;
         return;
     }
     if (strcmp(workload, "churn") == 0) {
@@ -875,6 +1389,21 @@ static void parse_workload(struct client *client, const char *name) {
     if (strcmp(workload, "alpha-sparse") == 0) {
         client->workload = WORKLOAD_SPARSE;
         client->alpha = true;
+        return;
+    }
+    const char *layers = NULL;
+    if (strncmp(workload, "overlap-", 8) == 0) {
+        client->scene_mode = SCENE_OVERLAP;
+        layers = workload + 8;
+    } else if (strncmp(workload, "occlusion-", 10) == 0) {
+        client->scene_mode = SCENE_OCCLUSION;
+        layers = workload + 10;
+    }
+    if (layers != NULL) {
+        const uint64_t count = parse_positive(layers, "scene layer count");
+        if (count > INT32_MAX) protocol_fail("scene layer count exceeds protocol range");
+        client->scene_layer_count = (size_t)count;
+        client->workload = WORKLOAD_FULL;
         return;
     }
     fprintf(stderr, "ouro-benchmark-client: unknown workload: %s\n", name);
@@ -925,6 +1454,7 @@ int main(int argc, char **argv) {
     if (read(STDIN_FILENO, &gate, 1) != 1) fail("read start gate");
     const uint64_t callbacks_before = client.callbacks;
     const uint64_t releases_before = client.releases;
+    const uint64_t advisory_releases_before = client.advisory_releases;
     const uint64_t presented_before = client.presented;
     const uint64_t discarded_before = client.discarded;
     const uint64_t started_ns = monotonic_ns();
@@ -950,10 +1480,14 @@ int main(int argc, char **argv) {
     printf(
         "{\"workload\":\"%s\",\"pacing\":\"%s\",\"width\":%d,\"height\":%d,"
         "\"frames\":%" PRIu64 ",\"warmup\":%" PRIu64 ","
+        "\"buffers_per_frame\":%zu,"
+        "\"release_events_per_frame\":%zu,"
         "\"callbacks\":%" PRIu64 ",\"releases\":%" PRIu64 ","
+        "\"advisory_releases\":%" PRIu64 ","
         "\"presented\":%" PRIu64 ",\"discarded\":%" PRIu64 ","
         "\"color_setup_ns\":%" PRIu64 ","
         "\"raw_callbacks\":%" PRIu64 ",\"raw_releases\":%" PRIu64 ","
+        "\"raw_advisory_releases\":%" PRIu64 ","
         "\"raw_presented\":%" PRIu64 ",\"raw_discarded\":%" PRIu64 ","
         "\"start_to_gate_ns\":%" PRIu64 ",\"observed_window_ns\":%" PRIu64 ","
         "\"actual_window_ns\":%" PRIu64 ",\"first_actual_ns\":%" PRIu64 ","
@@ -964,13 +1498,17 @@ int main(int argc, char **argv) {
         client.height,
         frames,
         warmup,
+        buffers_per_frame(&client),
+        release_events_per_frame(&client),
         client.callbacks - callbacks_before,
         client.releases - releases_before,
+        client.advisory_releases - advisory_releases_before,
         client.presented - presented_before,
         client.discarded - discarded_before,
         client.color_setup_ns,
         client.callbacks,
         client.releases,
+        client.advisory_releases,
         client.presented,
         client.discarded,
         gated_ns - started_ns,
@@ -982,12 +1520,13 @@ int main(int argc, char **argv) {
     fflush(stdout);
     if (read(STDIN_FILENO, &gate, 1) != 1) fail("read cleanup gate");
     client.draining = true;
-    wl_surface_attach(client.surface, NULL, 0, 0);
-    wl_surface_commit(client.surface);
-    for (size_t index = 0; index < BUFFER_COUNT; index++)
-        while (!client.buffers[index].available)
-            if (wl_display_dispatch(client.display) < 0) fail("drain buffer releases");
-    const uint64_t expected_releases = warmup + frames;
+    detach_content(&client);
+    while (!buffers_available(&client))
+        if (wl_display_dispatch(client.display) < 0) fail("drain buffer releases");
+    const size_t releases_per_frame = release_events_per_frame(&client);
+    if (releases_per_frame != 0 && warmup + frames > UINT64_MAX / releases_per_frame)
+        protocol_fail("release count overflow");
+    const uint64_t expected_releases = (warmup + frames) * releases_per_frame;
     if (client.releases != expected_releases)
         protocol_fail("not every submitted buffer was released");
     printf("DRAINED releases=%" PRIu64 "\n", client.releases);

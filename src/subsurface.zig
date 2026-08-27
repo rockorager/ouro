@@ -1,16 +1,15 @@
-//! Shared, bounded synchronized-subsurface state.
+//! Shared synchronized-subsurface state.
 //!
-//! Surface and cached-commit storage is compositor-wide: idle surfaces reserve
-//! nothing, and no client owns a private pool. The payload is compositor
-//! policy, so transport and protocol dispatch remain independent of rendering.
+//! Surface and cached-commit storage is compositor-wide and grows on demand:
+//! idle surfaces reserve nothing, and no client owns a private pool. The
+//! payload is compositor policy, so transport and protocol dispatch remain
+//! independent of rendering.
 
 const std = @import("std");
 const none = std.math.maxInt(u32);
 
 pub const Error = std.mem.Allocator.Error || error{
     InvalidConfig,
-    Exhausted,
-    CommitExhausted,
     OutputTooSmall,
     AlreadySubsurface,
     NotSubsurface,
@@ -83,6 +82,7 @@ pub fn Graph(comptime Key: type, comptime Payload: type) type {
             next: u32 = none,
         };
 
+        allocator: std.mem.Allocator,
         surfaces: []SurfaceNode,
         commits: []CommitNode,
         surface_free: u32,
@@ -109,6 +109,7 @@ pub fn Graph(comptime Key: type, comptime Payload: type) type {
             else
                 none;
             return .{
+                .allocator = allocator,
                 .surfaces = surfaces,
                 .commits = commits,
                 .surface_free = 0,
@@ -435,7 +436,7 @@ pub fn Graph(comptime Key: type, comptime Payload: type) type {
 
         fn ensureSurface(graph: *Self, surface: Key) Error!u32 {
             if (graph.find(surface)) |index| return index;
-            if (graph.surface_free == none) return error.Exhausted;
+            if (graph.surface_free == none) try graph.growSurfaces();
             const index = graph.surface_free;
             graph.surface_free = graph.surfaces[index].free_next;
             const generation = graph.surfaces[index].generation +% 1;
@@ -526,7 +527,7 @@ pub fn Graph(comptime Key: type, comptime Payload: type) type {
         }
 
         fn cache(graph: *Self, surface: u32, payload: Payload) Error!void {
-            if (graph.commit_free == none) return error.CommitExhausted;
+            if (graph.commit_free == none) try graph.growCommits();
             const index = graph.commit_free;
             graph.commit_free = graph.commits[index].next;
             graph.commits[index] = .{ .payload = payload };
@@ -534,6 +535,32 @@ pub fn Graph(comptime Key: type, comptime Payload: type) type {
             if (node.commit_tail == none) node.commit_head = index else graph.commits[node.commit_tail].next = index;
             node.commit_tail = index;
             graph.cached_commits += 1;
+        }
+
+        fn growSurfaces(graph: *Self) std.mem.Allocator.Error!void {
+            const old_len = graph.surfaces.len;
+            if (old_len >= none - 1) return error.OutOfMemory;
+            const new_len = @min(@as(usize, none - 1), old_len + @max(old_len, 1));
+            graph.surfaces = try graph.allocator.realloc(graph.surfaces, new_len);
+            for (graph.surfaces[old_len..], old_len..) |*node, index| node.* = .{
+                .free_next = if (index + 1 < new_len) @intCast(index + 1) else none,
+            };
+            graph.surface_free = @intCast(old_len);
+        }
+
+        fn growCommits(graph: *Self) std.mem.Allocator.Error!void {
+            const old_len = graph.commits.len;
+            if (old_len >= none - 1) return error.OutOfMemory;
+            const new_len = @min(@as(usize, none - 1), old_len + @max(old_len, 1));
+            graph.commits = try graph.allocator.realloc(graph.commits, new_len);
+            for (graph.commits[old_len..], old_len..) |*node, index| node.* = .{
+                .next = if (index + 1 < new_len) @intCast(index + 1) else none,
+            };
+            graph.commit_free = @intCast(old_len);
+        }
+
+        pub fn activeSurfaceCount(graph: Self) usize {
+            return graph.active_surfaces;
         }
 
         fn countSubtreeCommits(graph: Self, index: u32) usize {
@@ -928,7 +955,7 @@ test "subsurface stacking is validated and parent double buffered" {
     );
 }
 
-test "relationship and cache operations are transactional under pressure" {
+test "relationship and cache operations grow and remain transactional" {
     var graph = try TestGraph.init(std.testing.allocator, 3, 1);
     defer graph.deinit(std.testing.allocator);
     const root = handle(1);
@@ -942,10 +969,35 @@ test "relationship and cache operations are transactional under pressure" {
 
     var applied: [2]TestGraph.Applied = undefined;
     _ = try graph.commit(child, 1, &applied);
-    try std.testing.expectError(error.CommitExhausted, graph.commit(grandchild, 2, &applied));
+    _ = try graph.commit(grandchild, 2, &applied);
     try std.testing.expectError(error.OutputTooSmall, graph.commit(root, 0, applied[0..1]));
-    try std.testing.expectEqual(@as(usize, 2), (try graph.commit(root, 0, &applied)).len);
+    var complete: [3]TestGraph.Applied = undefined;
+    try std.testing.expectEqual(@as(usize, 3), (try graph.commit(root, 0, &complete)).len);
     try std.testing.expectEqual(@as(usize, 0), graph.cached_commits);
+}
+
+test "relationship storage grows while preserving live tokens and scene order" {
+    var graph = try TestGraph.init(std.testing.allocator, 1, 1);
+    defer graph.deinit(std.testing.allocator);
+    const root = handle(1);
+    const first = handle(2);
+    try graph.add(first, root);
+    const first_token = graph.token(first).?;
+
+    var id: u32 = 3;
+    while (id <= 34) : (id += 1) try graph.add(handle(id), root);
+    try std.testing.expectEqual(@as(usize, 34), graph.activeSurfaceCount());
+    try std.testing.expectEqual(first_token, graph.token(first).?);
+    try graph.setPosition(first, 7, -9);
+    graph.commitStructure(root);
+    try std.testing.expectEqual(TestGraph.Position{ .x = 7, .y = -9 }, try graph.position(first));
+
+    var scene: [34]objects.Handle = undefined;
+    const order = try graph.sceneOrder(root, &scene);
+    try std.testing.expectEqual(@as(usize, 34), order.len);
+    try std.testing.expectEqual(root, order[0]);
+    try std.testing.expectEqual(first, order[1]);
+    try std.testing.expectEqual(handle(34), order[33]);
 }
 
 test "destroying a role preserves children and releases cached state" {
