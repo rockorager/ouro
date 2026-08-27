@@ -675,15 +675,31 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         pub fn setKeymapOwned(adapter: *Self, fd: linux.fd_t, size: u32) !void {
             if (size == 0) return error.InvalidKeymap;
             var count: usize = 0;
-            for (adapter.keyboards) |slot| {
-                if (slot.header.active) count += 1;
+            for (adapter.keyboards, 0..) |slot, index| {
+                if (!slot.header.active) continue;
+                const id: Id = .{ .index = @intCast(index), .generation = slot.header.generation };
+                var has_keymap = false;
+                var has_repeat = false;
+                for (adapter.outbound) |out| if (out.active) switch (out.value) {
+                    .keyboard_keymap => |value| has_keymap = has_keymap or std.meta.eql(value, id),
+                    .keyboard_repeat => |value| has_repeat = has_repeat or std.meta.eql(value, id),
+                    else => {},
+                };
+                count += @as(usize, @intFromBool(!has_keymap)) +
+                    @as(usize, @intFromBool(!has_repeat));
             }
             try adapter.ensureOutbound(count);
             for (adapter.keyboards, 0..) |slot, index| if (slot.header.active) {
-                adapter.enqueue(slot.client, .{ .keyboard_keymap = .{
-                    .index = @intCast(index),
-                    .generation = slot.header.generation,
-                } }) catch unreachable;
+                const id: Id = .{ .index = @intCast(index), .generation = slot.header.generation };
+                var has_keymap = false;
+                var has_repeat = false;
+                for (adapter.outbound) |out| if (out.active) switch (out.value) {
+                    .keyboard_keymap => |value| has_keymap = has_keymap or std.meta.eql(value, id),
+                    .keyboard_repeat => |value| has_repeat = has_repeat or std.meta.eql(value, id),
+                    else => {},
+                };
+                if (!has_keymap) adapter.enqueue(slot.client, .{ .keyboard_keymap = id }) catch unreachable;
+                if (!has_repeat) adapter.enqueue(slot.client, .{ .keyboard_repeat = id }) catch unreachable;
             };
             const previous = adapter.keymap_fd;
             adapter.keymap_fd = fd;
@@ -720,6 +736,17 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .key = key,
                 .pressed = pressed,
             });
+        }
+
+        pub fn keyboardTransitionPending(
+            adapter: *Self,
+            device: input.DeviceId,
+            key: u32,
+            pressed: bool,
+        ) bool {
+            if (key >= code_count) return false;
+            const slot = adapter.findDevice(device) orelse return false;
+            return bitSet(&slot.keys, key) != pressed;
         }
 
         pub fn virtualModifiers(adapter: *Self, state: ModifierState) !void {

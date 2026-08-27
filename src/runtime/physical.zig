@@ -64,6 +64,7 @@ const protocol_session_lock = @import("../protocol/session_lock.zig");
 const protocol_cursor_shape = @import("../protocol/cursor_shape.zig");
 const protocol_text_input = @import("../protocol/text_input.zig");
 const protocol_tablet_v2 = @import("../protocol/tablet_v2.zig");
+const protocol_virtual_keyboard = @import("../protocol/virtual_keyboard.zig");
 const cursor_theme = @import("../cursor_theme.zig");
 const theme_cursor = @import("../scene/theme_cursor.zig");
 const desktop_model = @import("../desktop/model.zig");
@@ -120,6 +121,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const CursorShapeAdapter = protocol_cursor_shape.Adapter(protocol);
         const TextInputAdapter = protocol_text_input.Adapter(protocol);
         const InputMethodAdapter = protocol_input_method.Adapter(protocol, TextInputAdapter);
+        const VirtualKeyboardAdapter = protocol_virtual_keyboard.Adapter(protocol, SeatAdapter);
         const TabletState = tablet_input.State(SeatAdapter.FocusTarget);
         const TabletAdapter = protocol_tablet_v2.Adapter(protocol, SeatAdapter);
 
@@ -303,6 +305,7 @@ pub fn Coordinator(comptime protocol: type) type {
             wlr_data_control: protocol_ext_data_control.Config = .{ .global_version = 2 },
             text_input: protocol_text_input.Config = .{},
             input_method: protocol_input_method.Config = .{},
+            virtual_keyboard: protocol_virtual_keyboard.Config = .{},
             linux_dmabuf: protocol_linux_dmabuf.Config = .{},
             linux_drm_syncobj: protocol_linux_drm_syncobj.Config = .{},
             xdg_activation: protocol_xdg_activation.Config = .{},
@@ -399,6 +402,7 @@ pub fn Coordinator(comptime protocol: type) type {
         wlr_data_control_adapter: WlrDataControlAdapter,
         text_input_adapter: TextInputAdapter,
         input_method_adapter: InputMethodAdapter,
+        virtual_keyboard_adapter: VirtualKeyboardAdapter,
         dmabuf_adapter: DmabufAdapter,
         syncobj_device: ?drm_syncobj.Device = null,
         syncobj_adapter: ?SyncobjAdapter = null,
@@ -783,6 +787,17 @@ pub fn Coordinator(comptime protocol: type) type {
                 .snapshotFn = inputMethodKeyboardSnapshot,
                 .duplicateKeymapFn = inputMethodDuplicateKeymap,
             });
+            self.virtual_keyboard_adapter = try VirtualKeyboardAdapter.init(
+                allocator,
+                &self.seat_adapter,
+                config.virtual_keyboard,
+            );
+            errdefer self.virtual_keyboard_adapter.deinit();
+            self.virtual_keyboard_adapter.setKeymapObserver(.{
+                .context = self,
+                .canUpdateFn = canUpdateInputMethodKeymap,
+                .updatedFn = inputMethodKeymapUpdated,
+            });
             self.dmabuf_adapter = try DmabufAdapter.init(allocator, config.linux_dmabuf);
             errdefer self.dmabuf_adapter.deinit();
             try self.adapter.setExternalImporter(self.dmabuf_adapter.externalImporter(Adapter));
@@ -1002,6 +1017,9 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = try self.input_method_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
+            _ = try self.virtual_keyboard_adapter.install(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
             _ = try self.dmabuf_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
@@ -1143,6 +1161,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.decoration_adapter.deinit();
             self.activation_adapter.deinit();
             self.dmabuf_adapter.deinit();
+            self.virtual_keyboard_adapter.deinit();
             self.input_method_adapter.deinit();
             self.text_input_adapter.deinit();
             self.primary_selection_adapter.deinit();
@@ -1210,6 +1229,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.shortcuts_inhibit_adapter.disconnected(peer);
             self.foreign_adapter.disconnected(peer);
             self.input_method_adapter.disconnected(peer);
+            self.virtual_keyboard_adapter.disconnected(peer);
             self.text_input_adapter.disconnected(peer);
             self.primary_selection_adapter.disconnected(peer);
             self.wlr_data_control_adapter.disconnected(peer);
@@ -1372,6 +1392,11 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (self.input_method_adapter.pendingOutboundOn(peer))
                     self.markProtocol(peer, ProtocolReady.input_method);
                 self.markTextInputProtocol();
+                try self.flushProtocol();
+                return control;
+            }
+            if (try self.virtual_keyboard_adapter.request(peer, target, message, fds)) |control| {
+                self.markProtocolAll(ProtocolReady.seat);
                 try self.flushProtocol();
                 return control;
             }
@@ -2052,6 +2077,15 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             if (!self.input_seat_accepted) {
                 if (self.input_delivery_event) |delivery_event| {
+                    const keyboard_transition = if (delivery_event == .keyboard_key)
+                        self.seat_adapter.keyboardTransitionPending(
+                            delivery_event.keyboard_key.device,
+                            delivery_event.keyboard_key.key,
+                            delivery_event.keyboard_key.pressed,
+                        )
+                    else
+                        false;
+                    var keyboard_accepted = false;
                     if (delivery_event == .keyboard_key and
                         (!self.input_keyboard_consumed or !delivery_event.keyboard_key.pressed))
                     {
@@ -2059,18 +2093,26 @@ pub fn Coordinator(comptime protocol: type) type {
                             error.Exhausted => return false,
                             else => return err,
                         };
-                        if (handled) self.input_keyboard_consumed = true;
+                        if (handled) {
+                            self.input_keyboard_consumed = true;
+                            keyboard_accepted = true;
+                        }
                     }
-                    if (!self.input_keyboard_consumed) switch (delivery_event) {
-                        .pointer_motion => self.seat_adapter.consumePointerMotionAt(
-                            delivery_event,
-                            self.seat_adapter.pointerState().point,
-                        ),
-                        else => self.seat_adapter.consume(delivery_event),
-                    } catch |err| switch (err) {
-                        error.Exhausted => return false,
-                        else => return err,
-                    };
+                    if (!self.input_keyboard_consumed) {
+                        (switch (delivery_event) {
+                            .pointer_motion => self.seat_adapter.consumePointerMotionAt(
+                                delivery_event,
+                                self.seat_adapter.pointerState().point,
+                            ),
+                            else => self.seat_adapter.consume(delivery_event),
+                        }) catch |err| switch (err) {
+                            error.Exhausted => return false,
+                            else => return err,
+                        };
+                        if (delivery_event == .keyboard_key) keyboard_accepted = true;
+                    }
+                    if (keyboard_transition and keyboard_accepted)
+                        self.virtual_keyboard_adapter.clearModifierOwnerOnPhysicalInput();
                 }
                 self.input_seat_accepted = true;
             }
@@ -2617,6 +2659,9 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.input_method_adapter.setGrabInhibited(true) catch {
                     input_ready = false;
                 };
+                self.virtual_keyboard_adapter.setInhibited(true) catch {
+                    input_ready = false;
+                };
                 self.tablet_state.suspendFocus(0) catch {
                     input_ready = false;
                 };
@@ -2642,6 +2687,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.session_lock_frame = null;
                 self.session_lock_input_ready = false;
                 try self.input_method_adapter.setGrabInhibited(false);
+                try self.virtual_keyboard_adapter.setInhibited(false);
                 try self.syncLayerKeyboardFocus();
             }
             if (self.output) |output| {
@@ -2822,7 +2868,8 @@ pub fn Coordinator(comptime protocol: type) type {
             return !std.mem.eql(u8, name, protocol.wp_security_context_manager_v1.info.name) and
                 !std.mem.eql(u8, name, "ext_data_control_manager_v1") and
                 !std.mem.eql(u8, name, "zwlr_data_control_manager_v1") and
-                !std.mem.eql(u8, name, "zwp_input_method_manager_v2");
+                !std.mem.eql(u8, name, "zwp_input_method_manager_v2") and
+                !std.mem.eql(u8, name, "zwp_virtual_keyboard_manager_v1");
         }
 
         fn commitSecurityContext(
@@ -2895,6 +2942,17 @@ pub fn Coordinator(comptime protocol: type) type {
             const self: *Self = @ptrCast(@alignCast(context orelse return error.InvalidContext));
             if (seat != 0) return error.InvalidSeat;
             return self.seat_adapter.duplicateKeymap();
+        }
+
+        fn canUpdateInputMethodKeymap(context: ?*anyopaque) bool {
+            const self: *Self = @ptrCast(@alignCast(context orelse return false));
+            return self.input_method_adapter.canQueueKeymapUpdate();
+        }
+
+        fn inputMethodKeymapUpdated(context: ?*anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(context orelse return));
+            self.input_method_adapter.keymapUpdated() catch unreachable;
+            self.markInputMethodProtocol();
         }
 
         fn validateGesturePointer(
@@ -5065,6 +5123,7 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.output_adapter.resourceRemoved(handle, object);
             _ = self.cursor_shape_adapter.resourceRemoved(handle, object);
             _ = self.input_method_adapter.resourceRemoved(handle, object);
+            _ = self.virtual_keyboard_adapter.resourceRemoved(handle, object);
             _ = self.text_input_adapter.resourceRemoved(handle, object);
             _ = self.subcompositor_adapter.resourceRemoved(handle, object);
             if (layer_shell_removed and self.output != null) {

@@ -406,6 +406,7 @@ test "shell-input: security context filters nested manager before registry disco
     try std.testing.expect(parent_handler.ext_data_control_global_seen);
     try std.testing.expect(parent_handler.wlr_data_control_global_seen);
     try std.testing.expect(parent_handler.input_method_global_seen);
+    try std.testing.expect(parent_handler.virtual_keyboard_global_seen);
 
     var close_pair: [2]linux.fd_t = undefined;
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(
@@ -499,6 +500,7 @@ test "shell-input: security context filters nested manager before registry disco
     try std.testing.expect(!child_handler.ext_data_control_global_seen);
     try std.testing.expect(!child_handler.wlr_data_control_global_seen);
     try std.testing.expect(!child_handler.input_method_global_seen);
+    try std.testing.expect(!child_handler.virtual_keyboard_global_seen);
     try std.testing.expect(child_handler.security_manager == null);
     var sandbox_peer: ?wayring.io_uring.Peer = null;
     for (coordinator.clients.items) |client_state| if (client_state.active and
@@ -1776,6 +1778,46 @@ test "shell-input: generated input-method client bridges focused text input" {
     try std.testing.expectEqual(@as(usize, 3), method_handler.grab_modifiers);
     try std.testing.expect(method_handler.grab_keys_valid);
 
+    const virtual_keyboard = method_handler.virtual_keyboard.?;
+    const keymap = coordinator.seat_adapter.keyboardSnapshot();
+    const keymap_fd = try coordinator.seat_adapter.duplicateKeymap();
+    try protocol.zwp_virtual_keyboard_v1.encodeRequest(&method_actor.transmit, virtual_keyboard.id, .{ .keymap = .{
+        .format = .xkb_v1,
+        .fd = keymap_fd,
+        .size = keymap.keymap_size,
+    } });
+    try protocol.zwp_virtual_keyboard_v1.encodeRequest(&method_actor.transmit, virtual_keyboard.id, .{ .key = .{ .time = 7, .key = 30, .state = 1 } });
+    try protocol.zwp_virtual_keyboard_v1.encodeRequest(&method_actor.transmit, virtual_keyboard.id, .{ .key = .{ .time = 8, .key = 30, .state = 1 } });
+    try protocol.zwp_virtual_keyboard_v1.encodeRequest(&method_actor.transmit, virtual_keyboard.id, .{ .key = .{ .time = 9, .key = 30, .state = 0 } });
+    try protocol.zwp_virtual_keyboard_v1.encodeRequest(&method_actor.transmit, virtual_keyboard.id, .{ .key = .{ .time = 10, .key = 30, .state = 0 } });
+    try protocol.zwp_virtual_keyboard_v1.encodeRequest(&method_actor.transmit, virtual_keyboard.id, .{ .key = .{ .time = 11, .key = 31, .state = 1 } });
+    try protocol.zwp_virtual_keyboard_v1.encodeRequest(&method_actor.transmit, virtual_keyboard.id, .{ .modifiers = .{
+        .mods_depressed = 1,
+        .mods_latched = 2,
+        .mods_locked = 4,
+        .group = 1,
+    } });
+    try wayring.client.sendRequest(
+        protocol.zwp_virtual_keyboard_v1,
+        &method_client.objects,
+        &method_actor.transmit,
+        virtual_keyboard,
+        .{ .destroy = .{} },
+    );
+    method_handler.virtual_keyboard = null;
+    try submitClient(&method_reactor, &method_driver, &method_handler);
+    for (0..512) |_| {
+        _ = try drainClient(&app_reactor, &app_driver, &app_handler);
+        _ = try drainClient(&method_reactor, &method_driver, &method_handler);
+        _ = try loop.turn(coordinator);
+        if (app_handler.keyboard_key == 4 and method_handler.grab_keymap == 2) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(usize, 4), app_handler.keyboard_key);
+    try std.testing.expectEqual(@as(usize, 2), method_handler.grab_keymap);
+    try std.testing.expectEqual(@as(usize, 4), method_handler.grab_keys);
+
+    const method_done_before_enable = method_handler.done;
     try protocol.zwp_text_input_v3.encodeRequest(&app_actor.transmit, app_handler.text_input.?.id, .{ .enable = .{} });
     try protocol.zwp_text_input_v3.encodeRequest(&app_actor.transmit, app_handler.text_input.?.id, .{ .set_surrounding_text = .{ .text = "hello world", .cursor = 5, .anchor = 3 } });
     try protocol.zwp_text_input_v3.encodeRequest(&app_actor.transmit, app_handler.text_input.?.id, .{ .set_text_change_cause = .{ .cause = .other } });
@@ -1786,8 +1828,9 @@ test "shell-input: generated input-method client bridges focused text input" {
         _ = try drainClient(&app_reactor, &app_driver, &app_handler);
         _ = try drainClient(&method_reactor, &method_driver, &method_handler);
         _ = try loop.turn(coordinator);
-        if (method_handler.done == 1) break;
-        _ = linux.sched_yield();
+        if (method_handler.done > method_done_before_enable) break;
+        if (root.ring.cq_ready() == 0 and app_reactor.ring.cq_ready() == 0 and method_reactor.ring.cq_ready() == 0)
+            try waitForAny(&root.ring, app_reactor.ring, method_reactor.ring);
     }
     try std.testing.expect(method_handler.state_valid);
     try std.testing.expectEqual(@as(usize, 1), method_handler.activate);
@@ -2233,6 +2276,8 @@ const InputMethodHandler = struct {
     registry: wayring.objects.Handle,
     seat: ?wayring.objects.Handle = null,
     manager: ?wayring.objects.Handle = null,
+    virtual_manager: ?wayring.objects.Handle = null,
+    virtual_keyboard: ?wayring.objects.Handle = null,
     method: ?wayring.objects.Handle = null,
     rejected: ?wayring.objects.Handle = null,
     keyboard_grab: ?wayring.objects.Handle = null,
@@ -2261,6 +2306,14 @@ const InputMethodHandler = struct {
                 .global => |v| {
                     if (std.mem.eql(u8, v.interface, protocol.wl_seat.info.name)) self.seat = try ClientCore.bind(self.objects, self.queue, self.registry, v.name, &protocol.wl_seat.info, @min(v.version, 9), null);
                     if (std.mem.eql(u8, v.interface, protocol.zwp_input_method_manager_v2.info.name)) self.manager = try ClientCore.bind(self.objects, self.queue, self.registry, v.name, &protocol.zwp_input_method_manager_v2.info, 1, null);
+                    if (std.mem.eql(u8, v.interface, protocol.zwp_virtual_keyboard_manager_v1.info.name)) self.virtual_manager = try ClientCore.bind(self.objects, self.queue, self.registry, v.name, &protocol.zwp_virtual_keyboard_manager_v1.info, 1, null);
+                    if (self.virtual_keyboard == null and self.seat != null and self.virtual_manager != null)
+                        self.virtual_keyboard = (try protocol.zwp_virtual_keyboard_manager_v1.construct_create_virtual_keyboard(
+                            self.objects,
+                            self.queue,
+                            self.virtual_manager.?,
+                            .{ .seat = self.seat.?.id },
+                        )).id;
                     if (self.method == null and self.seat != null and self.manager != null) {
                         self.method = (try protocol.zwp_input_method_manager_v2.construct_get_input_method(self.objects, self.queue, self.manager.?, .{ .seat = self.seat.?.id })).input_method;
                         self.rejected = (try protocol.zwp_input_method_manager_v2.construct_get_input_method(self.objects, self.queue, self.manager.?, .{ .seat = self.seat.?.id })).input_method;
@@ -2930,6 +2983,7 @@ const Handler = struct {
     ext_data_control_global_seen: bool = false,
     wlr_data_control_global_seen: bool = false,
     input_method_global_seen: bool = false,
+    virtual_keyboard_global_seen: bool = false,
     text_input_manager: ?wayring.objects.Handle = null,
     text_input: ?wayring.objects.Handle = null,
     test_text_input: bool = false,
@@ -3323,6 +3377,8 @@ const Handler = struct {
                 self.wlr_data_control_global_seen = true;
             if (std.mem.eql(u8, value.interface, protocol.zwp_input_method_manager_v2.info.name))
                 self.input_method_global_seen = true;
+            if (std.mem.eql(u8, value.interface, protocol.zwp_virtual_keyboard_manager_v1.info.name))
+                self.virtual_keyboard_global_seen = true;
             return;
         }
         if (std.mem.eql(u8, value.interface, protocol.wl_compositor.info.name))

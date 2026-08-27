@@ -390,6 +390,26 @@ pub fn Adapter(comptime protocol: type, comptime TextInput: type) type {
             };
             self.grab_inhibited = inhibited;
         }
+        pub fn canQueueKeymapUpdate(self: *Self) bool {
+            const id = self.active_grab orelse return true;
+            for (self.outbound) |out| {
+                if (out.active and out.kind == .grab_keymap and std.meta.eql(out.grab, id)) return true;
+            }
+            return self.canEnqueue(1);
+        }
+        pub fn keymapUpdated(self: *Self) !void {
+            const id = self.active_grab orelse return;
+            const child = self.resolveGrab(id) orelse return;
+            const method = self.resolveMethod(child.parent) orelse return;
+            const size = self.provider.?.snapshot(method.seat_key).keymap_size;
+            for (self.outbound) |*out| {
+                if (out.active and out.kind == .grab_keymap and std.meta.eql(out.grab, id)) {
+                    out.size = size;
+                    return;
+                }
+            }
+            try self.enqueueGrab(child, id, .grab_keymap, .{ .size = size });
+        }
         const GrabPayload = struct { serial: u32 = 0, time: u32 = 0, key: u32 = 0, state: u32 = 0, modifiers: Modifiers = .{}, rate: i32 = 0, delay: i32 = 0, size: u32 = 0 };
         fn enqueueGrab(self: *Self, c: *Child, id: GrabId, kind: OutKind, p: GrabPayload) !void {
             if (!self.canEnqueue(1)) return error.Exhausted;
