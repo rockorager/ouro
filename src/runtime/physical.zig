@@ -40,6 +40,7 @@ const protocol_linux_drm_syncobj = @import("../protocol/linux_drm_syncobj.zig");
 const drm_syncobj = @import("../drm_syncobj.zig");
 const protocol_xdg_activation = @import("../protocol/xdg_activation.zig");
 const protocol_xdg_decoration = @import("../protocol/xdg_decoration.zig");
+const protocol_xdg_dialog = @import("../protocol/xdg_dialog.zig");
 const protocol_relative_pointer = @import("../protocol/relative_pointer.zig");
 const protocol_pointer_gestures = @import("../protocol/pointer_gestures.zig");
 const protocol_idle_inhibit = @import("../protocol/idle_inhibit.zig");
@@ -93,6 +94,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const SyncobjAdapter = protocol_linux_drm_syncobj.Adapter(protocol, Adapter);
         const ActivationAdapter = protocol_xdg_activation.Adapter(protocol, Adapter);
         const DecorationAdapter = protocol_xdg_decoration.Adapter(protocol, ShellAdapter);
+        const DialogAdapter = protocol_xdg_dialog.Adapter(protocol, ShellAdapter);
         const RelativePointerAdapter = protocol_relative_pointer.Adapter(protocol, SeatAdapter);
         const PointerGesturesAdapter = protocol_pointer_gestures.Adapter(protocol);
         const IdleInhibitAdapter = protocol_idle_inhibit.Adapter(protocol, Adapter);
@@ -297,6 +299,7 @@ pub fn Coordinator(comptime protocol: type) type {
             linux_drm_syncobj: protocol_linux_drm_syncobj.Config = .{},
             xdg_activation: protocol_xdg_activation.Config = .{},
             xdg_decoration: protocol_xdg_decoration.Config = .{},
+            xdg_dialog: protocol_xdg_dialog.Config = .{},
             relative_pointer: protocol_relative_pointer.Config = .{},
             pointer_gestures: protocol_pointer_gestures.Config = .{},
             idle_inhibit: protocol_idle_inhibit.Config = .{},
@@ -391,6 +394,7 @@ pub fn Coordinator(comptime protocol: type) type {
         syncobj_adapter: ?SyncobjAdapter = null,
         activation_adapter: ActivationAdapter,
         decoration_adapter: DecorationAdapter,
+        dialog_adapter: DialogAdapter,
         relative_pointer_adapter: RelativePointerAdapter,
         pointer_gestures_adapter: PointerGesturesAdapter,
         idle_inhibit_adapter: IdleInhibitAdapter,
@@ -771,6 +775,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 config.xdg_decoration,
             );
             errdefer self.decoration_adapter.deinit();
+            self.dialog_adapter = try DialogAdapter.init(allocator, &self.shell_adapter, config.xdg_dialog);
+            errdefer self.dialog_adapter.deinit();
             self.fractional_scale_adapter = try FractionalScaleAdapter.init(
                 allocator,
                 &self.adapter,
@@ -977,6 +983,9 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = try self.decoration_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
+            _ = try self.dialog_adapter.install(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
             _ = try self.relative_pointer_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
@@ -1096,6 +1105,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.security_context_adapter.deinit();
             self.color_representation_adapter.deinit();
             self.color_management_adapter.deinit();
+            self.dialog_adapter.deinit();
             self.decoration_adapter.deinit();
             self.activation_adapter.deinit();
             self.dmabuf_adapter.deinit();
@@ -1383,6 +1393,11 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.advanceShell();
                 if (self.decoration_adapter.pendingOutbound(peer))
                     self.markProtocol(peer, ProtocolReady.decoration);
+                try self.flushProtocol();
+                return control;
+            }
+            if (try self.dialog_adapter.request(peer, target, message, fds)) |control| {
+                try self.advanceShell();
                 try self.flushProtocol();
                 return control;
             }
@@ -4836,6 +4851,7 @@ pub fn Coordinator(comptime protocol: type) type {
             const removed_lock_surface = self.session_lock_adapter.surfaceForResource(handle, object);
             if (removed_lock_surface) |id| self.queueLayerRemoval(id);
             self.decoration_adapter.toplevelRemoved(handle, object);
+            self.dialog_adapter.toplevelRemoved(handle, object);
             _ = self.shell_adapter.resourceRemoved(handle, object);
             _ = self.seat_adapter.resourceRemoved(handle, object);
             _ = self.tablet_adapter.resourceRemoved(handle, object);
@@ -4857,6 +4873,7 @@ pub fn Coordinator(comptime protocol: type) type {
             if (self.syncobj_adapter) |*adapter| _ = adapter.resourceRemoved(handle, object);
             _ = self.activation_adapter.resourceRemoved(handle, object);
             _ = self.decoration_adapter.resourceRemoved(handle, object);
+            _ = self.dialog_adapter.resourceRemoved(handle, object);
             _ = self.relative_pointer_adapter.resourceRemoved(handle, object);
             _ = self.pointer_gestures_adapter.resourceRemoved(handle, object);
             const idle_inhibit_removed = self.idle_inhibit_adapter.resourceRemoved(handle, object);

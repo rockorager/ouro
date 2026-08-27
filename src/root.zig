@@ -53,6 +53,7 @@ pub const ext_data_control = @import("protocol/ext_data_control.zig");
 pub const linux_dmabuf = @import("protocol/linux_dmabuf.zig");
 pub const xdg_activation = @import("protocol/xdg_activation.zig");
 pub const xdg_decoration = @import("protocol/xdg_decoration.zig");
+pub const xdg_dialog = @import("protocol/xdg_dialog.zig");
 pub const relative_pointer = @import("protocol/relative_pointer.zig");
 pub const pointer_gestures = @import("protocol/pointer_gestures.zig");
 pub const tablet_v2 = @import("protocol/tablet_v2.zig");
@@ -131,6 +132,7 @@ test {
     _ = linux_dmabuf;
     _ = xdg_activation;
     _ = xdg_decoration;
+    _ = xdg_dialog;
     _ = relative_pointer;
     _ = pointer_gestures;
     _ = tablet_v2;

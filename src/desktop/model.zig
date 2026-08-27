@@ -65,6 +65,8 @@ pub fn Desktop(comptime Shell: type) type {
             min_height: i32,
             max_width: i32,
             max_height: i32,
+            dialog: bool,
+            modal: bool,
         };
 
         pub const SceneWindow = struct {
@@ -117,6 +119,8 @@ pub fn Desktop(comptime Shell: type) type {
             min_height: i32 = 0,
             max_width: i32 = 0,
             max_height: i32 = 0,
+            dialog: bool = false,
+            modal: bool = false,
             parent: ?ToplevelId = null,
             initial_committed: bool = false,
             fullscreen: bool = false,
@@ -710,6 +714,8 @@ pub fn Desktop(comptime Shell: type) type {
                 .min_height = slot.min_height,
                 .max_width = slot.max_width,
                 .max_height = slot.max_height,
+                .dialog = slot.dialog,
+                .modal = slot.modal,
             };
         }
 
@@ -1065,6 +1071,8 @@ pub fn Desktop(comptime Shell: type) type {
             slot.min_height = source.min_height;
             slot.max_width = source.max_width;
             slot.max_height = source.max_height;
+            slot.dialog = source.dialog;
+            slot.modal = source.modal;
         }
 
         fn requestState(desktop: *Self, id: ToplevelId, state: Shell.RequestedState, enabled: bool) !void {
@@ -1747,6 +1755,16 @@ const TestShell = struct {
         height: i32,
         states: StateSet = .{},
     };
+    pub const Metadata = struct {
+        title: []const u8 = "",
+        app_id: []const u8 = "",
+        min_width: i32 = 0,
+        min_height: i32 = 0,
+        max_width: i32 = 0,
+        max_height: i32 = 0,
+        dialog: bool = false,
+        modal: bool = false,
+    };
     pub const PopupConfigure = struct { x: i32, y: i32, width: i32, height: i32 };
     pub const Event = union(enum) {
         toplevel_created: struct { id: ToplevelId, surface: SurfaceId },
@@ -1804,14 +1822,7 @@ const TestShell = struct {
         return event;
     }
 
-    pub fn metadata(shell: *TestShell, id: ToplevelId) !struct {
-        title: []const u8,
-        app_id: []const u8,
-        min_width: i32,
-        min_height: i32,
-        max_width: i32,
-        max_height: i32,
-    } {
+    pub fn metadata(shell: *TestShell, id: ToplevelId) !Metadata {
         _ = id;
         return .{
             .title = shell.title,
@@ -1820,6 +1831,8 @@ const TestShell = struct {
             .min_height = 20,
             .max_width = 0,
             .max_height = 0,
+            .dialog = false,
+            .modal = false,
         };
     }
 

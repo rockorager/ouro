@@ -172,6 +172,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             min_height: i32,
             max_width: i32,
             max_height: i32,
+            dialog: bool,
+            modal: bool,
         };
 
         pub const ToplevelConfigure = struct {
@@ -269,6 +271,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             initial_committed: bool = false,
             version: u32 = 1,
             capabilities_sent: bool = false,
+            dialog: bool = false,
+            modal: bool = false,
         };
 
         const PopupSlot = struct {
@@ -597,7 +601,39 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .min_height = slot.min_height,
                 .max_width = slot.max_width,
                 .max_height = slot.max_height,
+                .dialog = slot.dialog,
+                .modal = slot.modal,
             };
+        }
+
+        /// Transactionally updates ancillary dialog hints for a live generation.
+        /// Modal state always implies dialog state.
+        pub fn setDialogState(adapter: *Self, id: ToplevelId, dialog: bool, modal: bool) !bool {
+            const changed = try adapter.prepareDialogState(id, dialog, modal);
+            if (!changed) return false;
+            adapter.setDialogStatePrepared(id, dialog, modal);
+            return true;
+        }
+
+        /// Reserves publication capacity without changing observable metadata.
+        pub fn prepareDialogState(adapter: *Self, id: ToplevelId, dialog: bool, modal: bool) !bool {
+            const slot = try adapter.resolveToplevel(id);
+            const next_dialog = dialog or modal;
+            if (slot.dialog == next_dialog and slot.modal == modal) return false;
+            if (!adapter.canPublishWithLive(adapter.live_toplevels, adapter.live_popups))
+                return error.Exhausted;
+            return true;
+        }
+
+        /// Commits a change previously accepted by `prepareDialogState`.
+        pub fn setDialogStatePrepared(adapter: *Self, id: ToplevelId, dialog: bool, modal: bool) void {
+            const slot = adapter.resolveToplevel(id) catch unreachable;
+            const next_dialog = dialog or modal;
+            std.debug.assert(slot.dialog != next_dialog or slot.modal != modal);
+            std.debug.assert(adapter.canPublishWithLive(adapter.live_toplevels, adapter.live_popups));
+            slot.dialog = next_dialog;
+            slot.modal = modal;
+            adapter.publishReserved(.{ .metadata_changed = id });
         }
 
         pub fn lastAckedConfigure(adapter: *Self, id: ToplevelId) !u32 {
@@ -3319,6 +3355,32 @@ test "xdg-shell: terminal reservation preserves an unrelated full event" {
         .toplevel_destroyed => |destroyed| destroyed,
         else => return error.UnexpectedEvent,
     });
+    try std.testing.expect(context.adapter.popEvent() == null);
+}
+
+test "xdg-shell: prepared dialog metadata publishes atomically" {
+    const context = try TestContext.initWithEventCapacity(1);
+    defer context.deinit();
+    const id = try context.createToplevel();
+
+    try std.testing.expect(try context.adapter.prepareDialogState(id, true, false));
+    var metadata = try context.adapter.metadata(id);
+    try std.testing.expect(!metadata.dialog and !metadata.modal);
+    try std.testing.expect(context.adapter.popEvent() == null);
+
+    context.adapter.setDialogStatePrepared(id, true, false);
+    try std.testing.expectEqual(id, switch (context.adapter.popEvent().?) {
+        .metadata_changed => |changed| changed,
+        else => return error.UnexpectedEvent,
+    });
+    metadata = try context.adapter.metadata(id);
+    try std.testing.expect(metadata.dialog and !metadata.modal);
+
+    try std.testing.expect(try context.adapter.setDialogState(id, false, true));
+    _ = context.adapter.popEvent().?;
+    metadata = try context.adapter.metadata(id);
+    try std.testing.expect(metadata.dialog and metadata.modal);
+    try std.testing.expect(!try context.adapter.setDialogState(id, true, true));
     try std.testing.expect(context.adapter.popEvent() == null);
 }
 
