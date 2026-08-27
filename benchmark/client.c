@@ -6,6 +6,7 @@
 #include <inttypes.h>
 #include <lcms2.h>
 #include <libdrm/drm_fourcc.h>
+#include <xf86drm.h>
 #include <poll.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -22,6 +23,7 @@
 
 #include "alpha-modifier-v1-client-protocol.h"
 #include "linux-dmabuf-v1-client-protocol.h"
+#include "linux-drm-syncobj-v1-client-protocol.h"
 #include "presentation-time-client-protocol.h"
 #include "single-pixel-buffer-v1-client-protocol.h"
 #include "viewporter-client-protocol.h"
@@ -49,6 +51,7 @@ enum backing {
 
 enum pacing {
     PACING_CALLBACK,
+    PACING_CALLBACK_ONLY,
     PACING_PRESENTATION,
 };
 
@@ -71,6 +74,8 @@ enum scene_action {
     SCENE_ACTION_RESTACK,
     SCENE_ACTION_MAP,
     SCENE_ACTION_OCCLUSION_TOGGLE,
+    SCENE_ACTION_CLIPPED,
+    SCENE_ACTION_HIDDEN_DAMAGE,
 };
 
 enum viewport_mode {
@@ -96,6 +101,15 @@ struct frame_buffer {
     bool alpha;
     bool count_release;
     bool available;
+    uint64_t modifier;
+    uint32_t plane_count;
+    uint64_t release_point;
+    bool sync_pending;
+};
+
+struct dmabuf_modifier {
+    uint32_t format;
+    uint64_t modifier;
 };
 
 struct scene_layer {
@@ -127,6 +141,9 @@ struct client {
     struct xdg_wm_base *wm_base;
     struct wp_presentation *presentation;
     struct zwp_linux_dmabuf_v1 *dmabuf;
+    struct wp_linux_drm_syncobj_manager_v1 *syncobj_manager;
+    struct wp_linux_drm_syncobj_timeline_v1 *syncobj_timeline;
+    struct wp_linux_drm_syncobj_surface_v1 *syncobj_surface;
     struct wp_color_manager_v1 *color_manager;
     struct wp_alpha_modifier_v1 *alpha_modifier_manager;
     struct wp_color_management_surface_v1 *color_surface;
@@ -134,8 +151,13 @@ struct client {
     struct wp_viewport *viewport;
     struct wp_alpha_modifier_surface_v1 *alpha_modifier;
     uint32_t dmabuf_version;
+    struct dmabuf_modifier *dmabuf_modifiers;
+    size_t dmabuf_modifier_count;
+    size_t dmabuf_modifier_capacity;
     struct gbm_device *gbm;
     int drm_fd;
+    uint32_t syncobj_handle;
+    uint64_t next_sync_point;
     struct wl_surface *surface;
     struct xdg_surface *xdg_surface;
     struct xdg_toplevel *toplevel;
@@ -160,6 +182,10 @@ struct client {
     bool alpha_toggle;
     bool churn;
     bool solid;
+    bool native_modifier;
+    bool explicit_sync;
+    bool opaque_region;
+    bool hold;
     bool configured;
     bool color_capabilities_done;
     bool color_parametric;
@@ -263,6 +289,10 @@ static void callback_done(void *data, struct wl_callback *callback, uint32_t cal
     (void)callback_data;
     struct frame_wait *wait = data;
     wait->callback_done = true;
+    if (wait->observed_ns == 0) {
+        wait->observed_ns = monotonic_ns();
+        wait->actual_ns = wait->observed_ns;
+    }
     wait->client->callbacks++;
     wl_callback_destroy(callback);
 }
@@ -458,6 +488,55 @@ static const struct wp_image_description_v1_listener color_description_listener 
     .ready2 = color_description_ready2,
 };
 
+static void remember_dmabuf_modifier(struct client *client, uint32_t format, uint64_t modifier) {
+    for (size_t index = 0; index < client->dmabuf_modifier_count; index++)
+        if (client->dmabuf_modifiers[index].format == format &&
+            client->dmabuf_modifiers[index].modifier == modifier)
+            return;
+    if (client->dmabuf_modifier_count == client->dmabuf_modifier_capacity) {
+        const size_t capacity = client->dmabuf_modifier_capacity == 0 ?
+            16 : client->dmabuf_modifier_capacity * 2;
+        struct dmabuf_modifier *modifiers = realloc(
+            client->dmabuf_modifiers,
+            capacity * sizeof(*modifiers)
+        );
+        if (modifiers == NULL) fail("grow DMA-BUF modifier advertisements");
+        client->dmabuf_modifiers = modifiers;
+        client->dmabuf_modifier_capacity = capacity;
+    }
+    client->dmabuf_modifiers[client->dmabuf_modifier_count++] =
+        (struct dmabuf_modifier){ .format = format, .modifier = modifier };
+}
+
+static void dmabuf_format(
+    void *data,
+    struct zwp_linux_dmabuf_v1 *dmabuf,
+    uint32_t format
+) {
+    (void)dmabuf;
+    remember_dmabuf_modifier(data, format, DRM_FORMAT_MOD_INVALID);
+}
+
+static void dmabuf_modifier(
+    void *data,
+    struct zwp_linux_dmabuf_v1 *dmabuf,
+    uint32_t format,
+    uint32_t modifier_hi,
+    uint32_t modifier_lo
+) {
+    (void)dmabuf;
+    remember_dmabuf_modifier(
+        data,
+        format,
+        ((uint64_t)modifier_hi << 32) | modifier_lo
+    );
+}
+
+static const struct zwp_linux_dmabuf_v1_listener dmabuf_listener = {
+    .format = dmabuf_format,
+    .modifier = dmabuf_modifier,
+};
+
 static void registry_global(
     void *data,
     struct wl_registry *registry,
@@ -503,6 +582,16 @@ static void registry_global(
             &zwp_linux_dmabuf_v1_interface,
             client->dmabuf_version
         );
+        if (client->dmabuf == NULL ||
+            zwp_linux_dmabuf_v1_add_listener(client->dmabuf, &dmabuf_listener, client) != 0)
+            protocol_fail("bind linux-dmabuf");
+    } else if (strcmp(interface, wp_linux_drm_syncobj_manager_v1_interface.name) == 0) {
+        client->syncobj_manager = wl_registry_bind(
+            registry,
+            name,
+            &wp_linux_drm_syncobj_manager_v1_interface,
+            1
+        );
     } else if (strcmp(interface, wp_color_manager_v1_interface.name) == 0) {
         client->color_manager = wl_registry_bind(
             registry,
@@ -536,6 +625,22 @@ static const struct wl_registry_listener registry_listener = {
     .global_remove = registry_remove,
 };
 
+static void wait_for_release_point(struct frame_buffer *buffer) {
+    if (!buffer->sync_pending) return;
+    const uint64_t timeout = monotonic_ns() + UINT64_C(5000000000);
+    uint32_t first = 0;
+    if (drmSyncobjTimelineWait(
+        buffer->client->drm_fd,
+        &buffer->client->syncobj_handle,
+        &buffer->release_point,
+        1,
+        timeout,
+        DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT,
+        &first
+    ) != 0) fail("wait for explicit DMA-BUF release point");
+    buffer->sync_pending = false;
+}
+
 static void write_buffer(struct frame_buffer *buffer) {
     struct client *client = buffer->client;
     if (client->backing == BACKING_SINGLE_PIXEL) return;
@@ -555,7 +660,10 @@ static void write_buffer(struct frame_buffer *buffer) {
         &stride,
         &map_data
     );
-    if (pixels == NULL) fail("map DMA-BUF");
+    if (pixels == NULL) {
+        if (client->native_modifier) unsupported("CPU-mappable advertised DMA-BUF modifier");
+        fail("map DMA-BUF");
+    }
     const size_t row_bytes = (size_t)buffer->width * 4;
     for (int32_t row = 0; row < buffer->height; row++)
         memcpy(
@@ -576,6 +684,7 @@ static void destroy_buffer(struct frame_buffer *buffer) {
         .alpha = buffer->alpha,
         .count_release = buffer->count_release,
     };
+    wait_for_release_point(buffer);
     if (buffer->proxy != NULL) wl_buffer_destroy(buffer->proxy);
     if (buffer->pixels != NULL && buffer->pixels != MAP_FAILED)
         munmap(buffer->pixels, buffer->size);
@@ -611,36 +720,69 @@ static void create_shm_buffer(struct client *client, struct frame_buffer *buffer
 }
 
 static void create_dmabuf_buffer(struct client *client, struct frame_buffer *buffer) {
-    static const uint64_t modifiers[] = { DRM_FORMAT_MOD_LINEAR };
+    static const uint64_t linear[] = { DRM_FORMAT_MOD_LINEAR };
     buffer->fd = -1;
     buffer->size = (size_t)buffer->width * (size_t)buffer->height * 4;
+    const uint32_t format = buffer->alpha ? GBM_FORMAT_ARGB8888 : GBM_FORMAT_XRGB8888;
+    uint64_t *native = NULL;
+    size_t modifier_count = 1;
+    const uint64_t *modifiers = linear;
+    if (client->native_modifier) {
+        if (client->dmabuf_version < 3)
+            unsupported("linux-dmabuf v3 modifier advertisements");
+        if (client->dmabuf_modifier_count == 0)
+            unsupported("advertised native DMA-BUF modifier");
+        native = calloc(client->dmabuf_modifier_count, sizeof(*native));
+        if (native == NULL) fail("allocate advertised DMA-BUF modifier list");
+        modifier_count = 0;
+        for (size_t index = 0; index < client->dmabuf_modifier_count; index++) {
+            const struct dmabuf_modifier advertised = client->dmabuf_modifiers[index];
+            if (advertised.format != format || advertised.modifier == DRM_FORMAT_MOD_INVALID)
+                continue;
+            native[modifier_count++] = advertised.modifier;
+        }
+        if (modifier_count == 0) {
+            free(native);
+            unsupported("advertised native DMA-BUF modifier");
+        }
+        modifiers = native;
+    }
     buffer->bo = gbm_bo_create_with_modifiers2(
         client->gbm,
         (uint32_t)buffer->width,
         (uint32_t)buffer->height,
-        buffer->alpha ? GBM_FORMAT_ARGB8888 : GBM_FORMAT_XRGB8888,
+        format,
         modifiers,
-        1,
+        (unsigned int)modifier_count,
         GBM_BO_USE_RENDERING
     );
-    if (buffer->bo == NULL || gbm_bo_get_plane_count(buffer->bo) != 1 ||
-        gbm_bo_get_modifier(buffer->bo) != DRM_FORMAT_MOD_LINEAR)
-        protocol_fail("allocate linear single-plane DMA-BUF");
+    free(native);
+    if (buffer->bo == NULL) {
+        if (client->native_modifier) unsupported("GBM allocation for advertised DMA-BUF modifier");
+        protocol_fail("allocate linear DMA-BUF");
+    }
+    buffer->modifier = gbm_bo_get_modifier(buffer->bo);
+    buffer->plane_count = gbm_bo_get_plane_count(buffer->bo);
+    if (buffer->plane_count == 0 || (!client->native_modifier &&
+        (buffer->plane_count != 1 || buffer->modifier != DRM_FORMAT_MOD_LINEAR)))
+        protocol_fail("allocate requested DMA-BUF layout");
     write_buffer(buffer);
-    const uint64_t modifier = gbm_bo_get_modifier(buffer->bo);
-    const int fd = gbm_bo_get_fd_for_plane(buffer->bo, 0);
-    if (fd < 0) fail("export DMA-BUF");
     struct zwp_linux_buffer_params_v1 *params = zwp_linux_dmabuf_v1_create_params(client->dmabuf);
     if (params == NULL) protocol_fail("create DMA-BUF parameters");
-    zwp_linux_buffer_params_v1_add(
-        params,
-        fd,
-        0,
-        gbm_bo_get_offset(buffer->bo, 0),
-        gbm_bo_get_stride_for_plane(buffer->bo, 0),
-        (uint32_t)(modifier >> 32),
-        (uint32_t)modifier
-    );
+    for (uint32_t plane = 0; plane < buffer->plane_count; plane++) {
+        const int fd = gbm_bo_get_fd_for_plane(buffer->bo, (int)plane);
+        if (fd < 0) fail("export DMA-BUF plane");
+        zwp_linux_buffer_params_v1_add(
+            params,
+            fd,
+            plane,
+            gbm_bo_get_offset(buffer->bo, (int)plane),
+            gbm_bo_get_stride_for_plane(buffer->bo, (int)plane),
+            (uint32_t)(buffer->modifier >> 32),
+            (uint32_t)buffer->modifier
+        );
+        close(fd);
+    }
     buffer->proxy = zwp_linux_buffer_params_v1_create_immed(
         params,
         buffer->width,
@@ -649,7 +791,6 @@ static void create_dmabuf_buffer(struct client *client, struct frame_buffer *buf
         0
     );
     zwp_linux_buffer_params_v1_destroy(params);
-    close(fd);
     buffer->available = true;
     if (buffer->proxy == NULL ||
         wl_buffer_add_listener(buffer->proxy, &buffer_listener, buffer) != 0)
@@ -864,6 +1005,13 @@ static void scene_position(
     int32_t *x,
     int32_t *y
 ) {
+    if (client->scene_action == SCENE_ACTION_CLIPPED) {
+        *x = index == 0 ? -client->scene_layer_width / 2 :
+            client->width - client->scene_layer_width / 2;
+        *y = index == 0 ? -client->scene_layer_height / 2 :
+            client->height - client->scene_layer_height / 2;
+        return;
+    }
     if (client->scene_mode == SCENE_OCCLUSION) {
         *x = 0;
         *y = 0;
@@ -882,7 +1030,8 @@ static void setup_scene(struct client *client) {
     if (client->scene_action == SCENE_ACTION_RESIZE && client->viewporter == NULL)
         unsupported("wp_viewporter");
     const bool full_occlusion = client->scene_mode == SCENE_OCCLUSION &&
-        client->scene_action == SCENE_ACTION_STATIC;
+        (client->scene_action == SCENE_ACTION_STATIC ||
+            client->scene_action == SCENE_ACTION_HIDDEN_DAMAGE);
     client->scene_layer_width = full_occlusion ?
         client->width : client->width * 2 / 3;
     client->scene_layer_height = full_occlusion ?
@@ -954,6 +1103,30 @@ static void setup_scene(struct client *client) {
     if (wl_display_roundtrip(client->display) < 0) fail("map scene root");
 }
 
+static void setup_explicit_sync(struct client *client) {
+    if (!client->explicit_sync) return;
+    if (client->backing != BACKING_DMABUF)
+        protocol_fail("explicit synchronization requires DMA-BUF backing");
+    if (client->syncobj_manager == NULL)
+        unsupported("linux-drm-syncobj-v1");
+    if (drmSyncobjCreate(client->drm_fd, 0, &client->syncobj_handle) != 0)
+        unsupported("DRM timeline syncobj");
+    int fd = -1;
+    if (drmSyncobjHandleToFD(client->drm_fd, client->syncobj_handle, &fd) != 0)
+        fail("export DRM timeline syncobj");
+    client->syncobj_timeline = wp_linux_drm_syncobj_manager_v1_import_timeline(
+        client->syncobj_manager,
+        fd
+    );
+    close(fd);
+    client->syncobj_surface = wp_linux_drm_syncobj_manager_v1_get_surface(
+        client->syncobj_manager,
+        client->surface
+    );
+    if (client->syncobj_timeline == NULL || client->syncobj_surface == NULL)
+        protocol_fail("create explicit synchronization surface");
+}
+
 static void setup(struct client *client, const char *socket_path, const char *drm_path) {
     client->display = connect_path(socket_path);
     struct wl_registry *registry = wl_display_get_registry(client->display);
@@ -973,6 +1146,8 @@ static void setup(struct client *client, const char *socket_path, const char *dr
         if (client->drm_fd < 0) fail("open DMA-BUF allocation device");
         client->gbm = gbm_create_device(client->drm_fd);
         if (client->gbm == NULL) fail("create GBM device");
+        if (wl_display_roundtrip(client->display) < 0)
+            fail("collect DMA-BUF modifier advertisements");
     }
     if (xdg_wm_base_add_listener(client->wm_base, &wm_base_listener, client) != 0 ||
         wp_presentation_add_listener(client->presentation, &presentation_listener, client) != 0)
@@ -985,6 +1160,14 @@ static void setup(struct client *client, const char *socket_path, const char *dr
     client->toplevel = xdg_surface_get_toplevel(client->xdg_surface);
     if (client->toplevel == NULL) protocol_fail("create xdg_toplevel");
     xdg_toplevel_set_title(client->toplevel, "Ouro compositor benchmark");
+    setup_explicit_sync(client);
+    if (client->opaque_region) {
+        struct wl_region *region = wl_compositor_create_region(client->compositor);
+        if (region == NULL) protocol_fail("create opaque region");
+        wl_region_add(region, 0, 0, client->width, client->height);
+        wl_surface_set_opaque_region(client->surface, region);
+        wl_region_destroy(region);
+    }
     if (client->global_alpha && client->scene_mode == SCENE_NONE)
         client->alpha_modifier = create_alpha_modifier(client, client->surface);
     if (client->viewport_mode != VIEWPORT_NONE) {
@@ -1111,18 +1294,44 @@ static void moving_rect(
 static void begin_frame_wait(
     struct client *client,
     struct frame_wait *wait,
-    struct wl_surface *surface
+    struct wl_surface *surface,
+    enum pacing pacing
 ) {
     *wait = (struct frame_wait){ .client = client };
     struct wl_callback *callback = wl_surface_frame(surface);
-    struct wp_presentation_feedback *feedback = wp_presentation_feedback(
-        client->presentation,
-        surface
-    );
-    if (callback == NULL || feedback == NULL ||
-        wl_callback_add_listener(callback, &callback_listener, wait) != 0 ||
-        wp_presentation_feedback_add_listener(feedback, &feedback_listener, wait) != 0)
+    if (callback == NULL || wl_callback_add_listener(callback, &callback_listener, wait) != 0)
         protocol_fail("create frame completion objects");
+    if (pacing != PACING_CALLBACK_ONLY) {
+        struct wp_presentation_feedback *feedback = wp_presentation_feedback(
+            client->presentation,
+            surface
+        );
+        if (feedback == NULL ||
+            wp_presentation_feedback_add_listener(feedback, &feedback_listener, wait) != 0)
+            protocol_fail("create presentation feedback");
+    }
+}
+
+static void set_explicit_sync_points(struct client *client, struct frame_buffer *buffer) {
+    if (!client->explicit_sync) return;
+    uint64_t acquire = ++client->next_sync_point;
+    const uint64_t release = ++client->next_sync_point;
+    if (drmSyncobjTimelineSignal(client->drm_fd, &client->syncobj_handle, &acquire, 1) != 0)
+        fail("signal explicit DMA-BUF acquire point");
+    wp_linux_drm_syncobj_surface_v1_set_acquire_point(
+        client->syncobj_surface,
+        client->syncobj_timeline,
+        (uint32_t)(acquire >> 32),
+        (uint32_t)acquire
+    );
+    wp_linux_drm_syncobj_surface_v1_set_release_point(
+        client->syncobj_surface,
+        client->syncobj_timeline,
+        (uint32_t)(release >> 32),
+        (uint32_t)release
+    );
+    buffer->release_point = release;
+    buffer->sync_pending = true;
 }
 
 static void wait_for_frame(
@@ -1167,6 +1376,8 @@ static void update_scene_geometry(struct client *client, uint64_t sequence) {
     switch (client->scene_action) {
         case SCENE_ACTION_STATIC:
         case SCENE_ACTION_MAP:
+        case SCENE_ACTION_CLIPPED:
+        case SCENE_ACTION_HIDDEN_DAMAGE:
             return;
         case SCENE_ACTION_MOTION: {
             const uint64_t span_x = (uint64_t)(client->width - client->scene_layer_width + 1);
@@ -1257,21 +1468,26 @@ static void submit_scene_frame(
             client->scene_layer_width,
             0,
             0,
-            client->scene_layer_width,
-            client->scene_layer_height
+            client->scene_action == SCENE_ACTION_HIDDEN_DAMAGE && index != 0 ? 1 :
+                client->scene_layer_width,
+            client->scene_action == SCENE_ACTION_HIDDEN_DAMAGE && index != 0 ? 1 :
+                client->scene_layer_height
         );
         write_buffer(buffer);
         wl_surface_attach(layer->surface, buffer->proxy, 0, 0);
         client->submitted_buffers++;
-        wl_surface_damage_buffer(
-            layer->surface,
-            0,
-            0,
-            client->scene_layer_width,
-            client->scene_layer_height
-        );
+        if (client->scene_action == SCENE_ACTION_HIDDEN_DAMAGE && index != 0)
+            wl_surface_damage_buffer(layer->surface, 0, 0, 1, 1);
+        else
+            wl_surface_damage_buffer(
+                layer->surface,
+                0,
+                0,
+                client->scene_layer_width,
+                client->scene_layer_height
+            );
         if (index == callback_index)
-            begin_frame_wait(client, wait, layer->surface);
+            begin_frame_wait(client, wait, layer->surface, pacing);
         wl_surface_commit(layer->surface);
     }
     wl_surface_commit(client->surface);
@@ -1298,6 +1514,7 @@ static void submit_frame(
     if (client->backing != BACKING_SINGLE_PIXEL) {
         while (!buffer->available)
             if (wl_display_dispatch(client->display) < 0) fail("wait for buffer release");
+        wait_for_release_point(buffer);
         buffer->available = false;
     }
 
@@ -1347,7 +1564,8 @@ static void submit_frame(
             (sequence & 1) != 0 ? HALF_ALPHA_FACTOR : UINT32_MAX
         );
 
-    begin_frame_wait(client, wait, client->surface);
+    begin_frame_wait(client, wait, client->surface, pacing);
+    set_explicit_sync_points(client, buffer);
     wl_surface_attach(client->surface, buffer->proxy, 0, 0);
     if (buffer->count_release) client->submitted_buffers++;
     switch (client->workload) {
@@ -1424,6 +1642,8 @@ static void cleanup(struct client *client) {
     if (client->alpha_modifier != NULL)
         wp_alpha_modifier_surface_v1_destroy(client->alpha_modifier);
     if (client->viewport != NULL) wp_viewport_destroy(client->viewport);
+    if (client->syncobj_surface != NULL)
+        wp_linux_drm_syncobj_surface_v1_destroy(client->syncobj_surface);
     if (client->toplevel != NULL) xdg_toplevel_destroy(client->toplevel);
     if (client->xdg_surface != NULL) xdg_surface_destroy(client->xdg_surface);
     if (client->surface != NULL) wl_surface_destroy(client->surface);
@@ -1432,6 +1652,10 @@ static void cleanup(struct client *client) {
         wp_alpha_modifier_v1_destroy(client->alpha_modifier_manager);
     if (client->color_manager != NULL) wp_color_manager_v1_destroy(client->color_manager);
     if (client->dmabuf != NULL) zwp_linux_dmabuf_v1_destroy(client->dmabuf);
+    if (client->syncobj_timeline != NULL)
+        wp_linux_drm_syncobj_timeline_v1_destroy(client->syncobj_timeline);
+    if (client->syncobj_manager != NULL)
+        wp_linux_drm_syncobj_manager_v1_destroy(client->syncobj_manager);
     if (client->wm_base != NULL) xdg_wm_base_destroy(client->wm_base);
     if (client->shm != NULL) wl_shm_destroy(client->shm);
     if (client->single_pixel_manager != NULL)
@@ -1440,7 +1664,10 @@ static void cleanup(struct client *client) {
     if (client->subcompositor != NULL) wl_subcompositor_destroy(client->subcompositor);
     if (client->compositor != NULL) wl_compositor_destroy(client->compositor);
     if (client->gbm != NULL) gbm_device_destroy(client->gbm);
+    if (client->syncobj_handle != 0)
+        drmSyncobjDestroy(client->drm_fd, client->syncobj_handle);
     if (client->drm_fd >= 0) close(client->drm_fd);
+    free(client->dmabuf_modifiers);
     free(client->canonical_pixels);
     wl_display_flush(client->display);
     wl_display_disconnect(client->display);
@@ -1492,6 +1719,26 @@ static void parse_workload(struct client *client, const char *name) {
     } else {
         fprintf(stderr, "ouro-benchmark-client: unknown backing: %s\n", name);
         exit(2);
+    }
+    if (client->backing == BACKING_DMABUF && strncmp(workload, "native-sync-", 12) == 0) {
+        client->native_modifier = true;
+        client->explicit_sync = true;
+        workload += 12;
+    } else if (client->backing == BACKING_DMABUF && strncmp(workload, "native-", 7) == 0) {
+        client->native_modifier = true;
+        workload += 7;
+    } else if (client->backing == BACKING_DMABUF && strncmp(workload, "sync-", 5) == 0) {
+        client->explicit_sync = true;
+        workload += 5;
+    }
+    if (strncmp(workload, "opaque-", 7) == 0) {
+        client->opaque_region = true;
+        workload += 7;
+    }
+    if (strcmp(workload, "hold") == 0) {
+        client->workload = WORKLOAD_STATIC;
+        client->hold = true;
+        return;
     }
     if (strcmp(workload, "static") == 0) {
         client->workload = WORKLOAD_STATIC;
@@ -1613,6 +1860,14 @@ static void parse_workload(struct client *client, const char *name) {
         client->scene_mode = SCENE_OCCLUSION;
         client->scene_action = SCENE_ACTION_OCCLUSION_TOGGLE;
         layers = workload + 23;
+    } else if (strncmp(workload, "scene-clipped-", 14) == 0) {
+        client->scene_mode = SCENE_OVERLAP;
+        client->scene_action = SCENE_ACTION_CLIPPED;
+        layers = workload + 14;
+    } else if (strncmp(workload, "scene-hidden-damage-", 20) == 0) {
+        client->scene_mode = SCENE_OCCLUSION;
+        client->scene_action = SCENE_ACTION_HIDDEN_DAMAGE;
+        layers = workload + 20;
     } else if (strncmp(workload, "overlap-", 8) == 0) {
         client->scene_mode = SCENE_OVERLAP;
         layers = workload + 8;
@@ -1633,6 +1888,7 @@ static void parse_workload(struct client *client, const char *name) {
 
 static enum pacing parse_pacing(const char *name) {
     if (strcmp(name, "callback") == 0) return PACING_CALLBACK;
+    if (strcmp(name, "callback-only") == 0) return PACING_CALLBACK_ONLY;
     if (strcmp(name, "presentation") == 0) return PACING_PRESENTATION;
     fprintf(stderr, "ouro-benchmark-client: unknown pacing: %s\n", name);
     exit(2);
@@ -1666,13 +1922,33 @@ int main(int argc, char **argv) {
     if (waits == NULL) fail("allocate presentation feedback state");
     if (client.width > 8192 || client.height > 8192) protocol_fail("dimensions exceed 8192");
     setup(&client, argv[1], argv[7]);
+    const enum pacing warmup_pacing = pacing == PACING_CALLBACK_ONLY ?
+        PACING_CALLBACK_ONLY : PACING_PRESENTATION;
     for (uint64_t sequence = 0; sequence < warmup; sequence++)
-        submit_frame(&client, sequence, &waits[sequence], PACING_PRESENTATION);
+        submit_frame(&client, sequence, &waits[sequence], warmup_pacing);
 
     puts("READY");
     fflush(stdout);
     char gate;
     if (read(STDIN_FILENO, &gate, 1) != 1) fail("read start gate");
+    if (client.hold) {
+        const uint64_t started_ns = monotonic_ns();
+        if (read(STDIN_FILENO, &gate, 1) != 1) fail("read hold completion gate");
+        printf(
+            "{\"workload\":\"%s\",\"kind\":\"hold\",\"width\":%d,\"height\":%d,"
+            "\"hold_ns\":%" PRIu64 ",\"raw_callbacks\":%" PRIu64 ","
+            "\"raw_releases\":%" PRIu64 ",\"raw_presented\":%" PRIu64 "}\n",
+            argv[2],
+            client.width,
+            client.height,
+            monotonic_ns() - started_ns,
+            client.callbacks,
+            client.releases,
+            client.presented
+        );
+        fflush(stdout);
+        goto drain;
+    }
     const uint64_t callbacks_before = client.callbacks;
     const uint64_t releases_before = client.releases;
     const uint64_t advisory_releases_before = client.advisory_releases;
@@ -1690,11 +1966,13 @@ int main(int argc, char **argv) {
     }
     for (uint64_t sequence = 0; sequence < frames; sequence++) {
         struct frame_wait *wait = &waits[warmup + sequence];
-        while (!wait->presented && !wait->discarded)
-            if (wl_display_dispatch(client.display) < 0) fail("drain presentation feedback");
-        if (wait->discarded) protocol_fail("frame was discarded");
+        if (pacing != PACING_CALLBACK_ONLY) {
+            while (!wait->presented && !wait->discarded)
+                if (wl_display_dispatch(client.display) < 0) fail("drain presentation feedback");
+            if (wait->discarded) protocol_fail("frame was discarded");
+        }
         if (sequence != 0 && wait->actual_ns <= waits[warmup + sequence - 1].actual_ns)
-            protocol_fail("presentation timestamps are not strictly increasing");
+            protocol_fail("cadence timestamps are not strictly increasing");
     }
     first_actual_ns = waits[warmup].actual_ns;
     first_observed_ns = waits[warmup].observed_ns;
@@ -1710,6 +1988,8 @@ int main(int argc, char **argv) {
         "\"advisory_releases\":%" PRIu64 ","
         "\"presented\":%" PRIu64 ",\"discarded\":%" PRIu64 ","
         "\"submitted_buffers\":%" PRIu64 ","
+        "\"native_modifier\":%s,\"explicit_sync\":%s,"
+        "\"modifier\":%" PRIu64 ",\"plane_count\":%u,"
         "\"color_setup_ns\":%" PRIu64 ","
         "\"raw_callbacks\":%" PRIu64 ",\"raw_releases\":%" PRIu64 ","
         "\"raw_advisory_releases\":%" PRIu64 ","
@@ -1732,6 +2012,10 @@ int main(int argc, char **argv) {
         client.presented - presented_before,
         client.discarded - discarded_before,
         client.submitted_buffers - submitted_buffers_before,
+        client.native_modifier ? "true" : "false",
+        client.explicit_sync ? "true" : "false",
+        client.backing == BACKING_DMABUF ? client.buffers[0].modifier : 0,
+        client.backing == BACKING_DMABUF ? client.buffers[0].plane_count : 0,
         client.color_setup_ns,
         client.callbacks,
         client.releases,
@@ -1755,6 +2039,7 @@ int main(int argc, char **argv) {
     puts("]}");
     fflush(stdout);
     if (read(STDIN_FILENO, &gate, 1) != 1) fail("read cleanup gate");
+drain:
     client.draining = true;
     detach_content(&client);
     while (!buffers_available(&client))

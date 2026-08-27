@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 
-COMPOSITORS = ("ouro", "sway", "hyprland")
+DEFAULT_COMPOSITORS = ("ouro", "sway", "hyprland")
 
 
 def parse_env(path: Path) -> dict[str, str]:
@@ -69,7 +69,78 @@ def percentile(values: list[int], percent: int) -> float | None:
 
 def run_record(directory: Path, workload: str, compositor: str, run: int) -> dict[str, Any]:
     case = parse_env(directory / "case.env")
+    kind = case.get("kind", "paced")
     client_count = int(case["clients"])
+    pre_cpu = [int(value) for value in (directory / "pre.cpu").read_text().split()]
+    gate_cpu = [int(value) for value in (directory / "gate.cpu").read_text().split()]
+    pre_status = parse_status(directory / "pre.status")
+    gate_status = parse_status(directory / "gate.status")
+    perf = parse_perf(directory / "perf.csv")
+    if kind in ("idle", "hold", "client-churn"):
+        clients = []
+        measured_ns = int(case["duration_seconds"]) * 1_000_000_000
+        if kind == "hold":
+            clients = [
+                parse_client(directory / f"client-{index}.log")
+                for index in range(1, client_count + 1)
+            ]
+            if any(client.get("kind") != "hold" for client in clients):
+                raise ValueError(f"{directory}: invalid mapped-hold client result")
+            measured_ns = max(client["hold_ns"] for client in clients)
+        elif kind == "client-churn":
+            measured_ns = int((directory / "elapsed.ns").read_text().strip())
+            if measured_ns <= 0:
+                raise ValueError(f"{directory}: invalid client churn elapsed time")
+            churn_logs = sorted(directory.glob("churn-*.log"))
+            expected = int(case["frames"])
+            if len(churn_logs) != expected:
+                raise ValueError(
+                    f"{directory}: client churn logs={len(churn_logs)}, expected {expected}"
+                )
+            clients = [parse_client(path) for path in churn_logs]
+            expected_presented = 0 if case.get("pacing") == "callback-only" else 1
+            if any(
+                client.get("callbacks") != 1 or
+                client.get("presented") != expected_presented or
+                client.get("discarded") != 0
+                for client in clients
+            ):
+                raise ValueError(f"{directory}: invalid serial client lifecycle result")
+        return {
+            "workload": workload,
+            "compositor": compositor,
+            "run": run,
+            "kind": kind,
+            "case": case,
+            "clients": clients,
+            "gate_ns": measured_ns,
+            "observed_window_ns": measured_ns,
+            "actual_window_ns": measured_ns,
+            "callbacks": sum(client.get("raw_callbacks", 0) for client in clients),
+            "buffers_per_frame": 0,
+            "submitted_buffers": 0,
+            "release_events_per_frame": 0,
+            "releases": sum(client.get("raw_releases", 0) for client in clients),
+            "gate_release_events": sum(client.get("raw_releases", 0) for client in clients),
+            "presented": sum(client.get("raw_presented", 0) for client in clients),
+            "discarded": 0,
+            "color_setup_ns": 0,
+            "interval_p50_ns": None,
+            "interval_p95_ns": None,
+            "interval_p99_ns": None,
+            "interval_max_ns": None,
+            "missed_refreshes": None,
+            "user_ticks": gate_cpu[0] - pre_cpu[0],
+            "system_ticks": gate_cpu[1] - pre_cpu[1],
+            "total_ticks": sum(gate_cpu) - sum(pre_cpu),
+            "rss_kib": gate_status["VmRSS"],
+            "hwm_kib": gate_status["VmHWM"],
+            "voluntary_context_switches": gate_status["voluntary_ctxt_switches"]
+            - pre_status["voluntary_ctxt_switches"],
+            "involuntary_context_switches": gate_status["nonvoluntary_ctxt_switches"]
+            - pre_status["nonvoluntary_ctxt_switches"],
+            "perf": perf,
+        }
     client_paths = [directory / f"client-{index}.log" for index in range(1, client_count + 1)]
     clients = [parse_client(path) for path in client_paths]
     cleanup_releases = [parse_cleanup_releases(path) for path in client_paths]
@@ -92,11 +163,15 @@ def run_record(directory: Path, workload: str, compositor: str, run: int) -> dic
                 raise ValueError(
                     f"{directory}: client {field}={client[field]}, expected {case[field]}"
                 )
-        for field in ("callbacks", "presented"):
-            if client[field] != expected_frames:
-                raise ValueError(
-                    f"{directory}: client {field}={client[field]}, expected {expected_frames}"
-                )
+        if client["callbacks"] != expected_frames:
+            raise ValueError(
+                f"{directory}: client callbacks={client['callbacks']}, expected {expected_frames}"
+            )
+        expected_presented = 0 if expected_pacing == "callback-only" else expected_frames
+        if client["presented"] != expected_presented:
+            raise ValueError(
+                f"{directory}: client presented={client['presented']}, expected {expected_presented}"
+            )
         if client["discarded"] != 0:
             raise ValueError(f"{directory}: client discarded a measured frame")
         buffers_per_frame = client.get("buffers_per_frame", 1)
@@ -116,11 +191,6 @@ def run_record(directory: Path, workload: str, compositor: str, run: int) -> dic
                 f"{directory}: cleanup releases={cleanup_releases[index]}, expected {expected_total}"
             )
 
-    pre_cpu = [int(value) for value in (directory / "pre.cpu").read_text().split()]
-    gate_cpu = [int(value) for value in (directory / "gate.cpu").read_text().split()]
-    pre_status = parse_status(directory / "pre.status")
-    gate_status = parse_status(directory / "gate.status")
-    perf = parse_perf(directory / "perf.csv")
     intervals: list[int] = []
     intervals_complete = True
     for client in clients:
@@ -142,6 +212,7 @@ def run_record(directory: Path, workload: str, compositor: str, run: int) -> dic
         "workload": workload,
         "compositor": compositor,
         "run": run,
+        "kind": kind,
         "case": case,
         "clients": clients,
         "gate_ns": max(client["start_to_gate_ns"] for client in clients),
@@ -207,7 +278,7 @@ def fmt(value: float | None, divisor: float = 1.0, digits: int = 2) -> str:
 
 
 def aggregate(
-    records: list[dict[str, Any]], unsupported: list[dict[str, Any]]
+    records: list[dict[str, Any]], unsupported: list[dict[str, Any]], compositors: tuple[str, ...]
 ) -> list[dict[str, Any]]:
     summaries: list[dict[str, Any]] = []
     workloads = sorted(
@@ -221,7 +292,7 @@ def aggregate(
                 for record in records
                 if record["workload"] == workload and record["compositor"] == compositor
             ]
-            for compositor in COMPOSITORS
+            for compositor in compositors
         }
         unsupported_grouped = {
             compositor: [
@@ -229,9 +300,9 @@ def aggregate(
                 for record in unsupported
                 if record["workload"] == workload and record["compositor"] == compositor
             ]
-            for compositor in COMPOSITORS
+            for compositor in compositors
         }
-        for compositor in COMPOSITORS:
+        for compositor in compositors:
             if grouped[compositor] and unsupported_grouped[compositor]:
                 raise ValueError(f"{workload}/{compositor}: mixes supported and unsupported runs")
             if not grouped[compositor] and not unsupported_grouped[compositor]:
@@ -257,6 +328,7 @@ def aggregate(
                     value["case"]["clients"],
                     value["case"]["frames"],
                     value["case"].get("pacing", "presentation"),
+                    value["kind"],
                     value["buffers_per_frame"],
                 )
                 for value in values
@@ -265,6 +337,7 @@ def aggregate(
                 raise ValueError(f"{workload}/{compositor}: incompatible runs: {case_shapes}")
             frames = int(values[0]["case"]["frames"])
             clients = int(values[0]["case"]["clients"])
+            kind = values[0]["kind"]
             task_clock_ms = perf_median(values, "task-clock")
             actual_window_ns = median(values, "actual_window_ns")
             buffers_per_frame = values[0]["buffers_per_frame"]
@@ -273,6 +346,7 @@ def aggregate(
                     "workload": workload,
                     "compositor": compositor,
                     "status": "supported",
+                    "kind": kind,
                     "runs": len(values),
                     "clients": clients,
                     "pacing": values[0]["case"].get("pacing", "presentation"),
@@ -293,12 +367,26 @@ def aggregate(
                     "missed_refreshes_median": optional_median(values, "missed_refreshes"),
                     "surface_fps_median": (
                         (frames - 1) * 1_000_000_000 / actual_window_ns
-                        if frames > 1 and actual_window_ns > 0
+                        if kind == "paced" and frames > 1 and actual_window_ns > 0
                         else None
                     ),
                     "aggregate_presentations_per_second_median": (
                         (frames - 1) * clients * 1_000_000_000 / actual_window_ns
-                        if frames > 1 and actual_window_ns > 0
+                        if kind == "paced" and
+                        values[0]["case"].get("pacing") != "callback-only" and
+                        frames > 1 and actual_window_ns > 0
+                        else None
+                    ),
+                    "aggregate_callbacks_per_second_median": (
+                        (frames - 1) * clients * 1_000_000_000 / actual_window_ns
+                        if kind == "paced" and
+                        values[0]["case"].get("pacing") == "callback-only" and
+                        frames > 1 and actual_window_ns > 0
+                        else None
+                    ),
+                    "operations_per_second_median": (
+                        frames * 1_000_000_000 / actual_window_ns
+                        if kind == "client-churn" and actual_window_ns > 0
                         else None
                     ),
                     "user_ticks_median": median(values, "user_ticks"),
@@ -306,15 +394,23 @@ def aggregate(
                     "total_ticks_median": median(values, "total_ticks"),
                     "rss_kib_median": median(values, "rss_kib"),
                     "hwm_kib_median": median(values, "hwm_kib"),
+                    "voluntary_context_switches_median": median(
+                        values, "voluntary_context_switches"
+                    ),
+                    "involuntary_context_switches_median": median(
+                        values, "involuntary_context_switches"
+                    ),
                     "cycles_median": perf_median(values, "cycles:u"),
                     "instructions_median": perf_median(values, "instructions:u"),
                     "task_clock_ms_median": task_clock_ms,
                     "task_clock_us_per_presented": (
-                        task_clock_ms * 1000 / (frames * clients) if task_clock_ms is not None else None
+                        task_clock_ms * 1000 / (frames * clients)
+                        if task_clock_ms is not None and frames * clients > 0
+                        else None
                     ),
                     "task_clock_us_per_buffer": (
                         task_clock_ms * 1000 / (frames * buffers_per_frame)
-                        if task_clock_ms is not None
+                        if task_clock_ms is not None and frames * buffers_per_frame > 0
                         else None
                     ),
                     "cpu_percent_median": derived_perf_median(
@@ -331,17 +427,58 @@ def aggregate(
     return summaries
 
 
-def print_markdown(summaries: list[dict[str, Any]]) -> None:
+def print_markdown(summaries: list[dict[str, Any]], compositors: tuple[str, ...]) -> None:
     for workload in sorted({summary["workload"] for summary in summaries}):
         print(f"\n## {workload}\n")
+        workload_summaries = [
+            summary for summary in summaries if summary["workload"] == workload
+        ]
+        lifecycle = next(
+            (summary for summary in workload_summaries if summary.get("kind") != "paced"),
+            None,
+        )
+        if lifecycle is not None:
+            print(
+                "| Compositor | Runs | Kind | CPU % | Task clock ms | Process ticks | "
+                "Operations/s | Δ voluntary/involuntary context | RSS MiB | HWM MiB |"
+            )
+            print("|---|---:|---|---:|---:|---:|---:|---:|---:|---:|")
+            for compositor in compositors:
+                summary = next(
+                    item for item in workload_summaries if item["compositor"] == compositor
+                )
+                if summary["status"] == "unsupported":
+                    print(
+                        f"| {compositor} | {summary['runs']} | unsupported: {summary['reason']} "
+                        "| — | — | — | — | — | — | — |"
+                    )
+                    continue
+                print(
+                    f"| {compositor} | {summary['runs']} | {summary['kind']} | "
+                    f"{fmt(summary['cpu_percent_median'])} | "
+                    f"{fmt(summary['task_clock_ms_median'])} | "
+                    f"{fmt(summary['total_ticks_median'], digits=0)} | "
+                    f"{fmt(summary['operations_per_second_median'])} | "
+                    f"{fmt(summary['voluntary_context_switches_median'], digits=0)}/"
+                    f"{fmt(summary['involuntary_context_switches_median'], digits=0)} | "
+                    f"{fmt(summary['rss_kib_median'], 1024, 1)} | "
+                    f"{fmt(summary['hwm_kib_median'], 1024, 1)} |"
+                )
+            continue
+        callback_only = workload_summaries[0].get("pacing") == "callback-only"
+        cadence_label = "Callback Hz" if callback_only else "Surface FPS"
+        aggregate_label = (
+            "Aggregate callbacks/s" if callback_only else "Aggregate presentations/s"
+        )
+        unit_label = "µs/callback" if callback_only else "µs/presented"
         print(
-            "| Compositor | Runs | Clients | Buffers/frame | Surface FPS "
-            "| Aggregate presentations/s | CPU % | µs/presented | µs/buffer "
+            f"| Compositor | Runs | Clients | Buffers/frame | {cadence_label} "
+            f"| {aggregate_label} | CPU % | {unit_label} | µs/buffer "
             "| Interval p50/p95/p99/max ms | Missed refreshes | Color setup ms "
             "| RSS MiB | HWM MiB |"
         )
         print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
-        for compositor in COMPOSITORS:
+        for compositor in compositors:
             summary = next(
                 item
                 for item in summaries
@@ -357,7 +494,7 @@ def print_markdown(summaries: list[dict[str, Any]]) -> None:
                 f"| {compositor} | {summary['runs']} | {summary['clients']} | "
                 f"{summary['buffers_per_frame']} | "
                 f"{fmt(summary['surface_fps_median'])} | "
-                f"{fmt(summary['aggregate_presentations_per_second_median'])} | "
+                f"{fmt(summary['aggregate_callbacks_per_second_median'] if callback_only else summary['aggregate_presentations_per_second_median'])} | "
                 f"{fmt(summary['cpu_percent_median'])} | "
                 f"{fmt(summary['task_clock_us_per_presented'])} | "
                 f"{fmt(summary['task_clock_us_per_buffer'])} | "
@@ -379,10 +516,16 @@ def main() -> int:
     root = Path(sys.argv[1]).resolve()
     if not (root / "metadata.env").is_file():
         raise ValueError(f"not a benchmark result directory: {root}")
+    metadata = parse_env(root / "metadata.env")
+    compositors = tuple(filter(None, metadata.get("compositors", "").split(",")))
+    if not compositors:
+        compositors = DEFAULT_COMPOSITORS
+    if len(set(compositors)) != len(compositors):
+        raise ValueError(f"duplicate compositor in metadata: {compositors}")
     records: list[dict[str, Any]] = []
     unsupported: list[dict[str, Any]] = []
     for workload_dir in sorted(path for path in root.iterdir() if path.is_dir()):
-        for compositor in COMPOSITORS:
+        for compositor in compositors:
             compositor_dir = workload_dir / compositor
             if not compositor_dir.is_dir():
                 continue
@@ -413,16 +556,16 @@ def main() -> int:
                     )
                     continue
                 records.append(run_record(run_dir, workload_dir.name, compositor, run))
-    summaries = aggregate(records, unsupported)
+    summaries = aggregate(records, unsupported, compositors)
     payload = {
         "schema": 1,
-        "metadata": parse_env(root / "metadata.env"),
+        "metadata": metadata,
         "runs": records,
         "unsupported": unsupported,
         "summary": summaries,
     }
     (root / "results.json").write_text(json.dumps(payload, indent=2) + "\n")
-    print_markdown(summaries)
+    print_markdown(summaries, compositors)
     return 0
 
 

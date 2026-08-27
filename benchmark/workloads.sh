@@ -3,6 +3,9 @@
 # A comma-separated mode list assigns one mode per client; one mode is repeated.
 # name                    client modes                         clients width height frames warmup
 benchmark_workloads=(
+    "idle-no-client       -                                    0       0     0      1      1 idle"
+    "idle-mapped-shm      shm-hold                             1       1280  720    1      1 hold"
+    "client-churn-shm     shm-static                           0       640   360    100    1 client-churn"
     "shm-full             shm-full                             1       1280  720    1000   3"
     "shm-tiny             shm-tiny                             1       1280  720    1000   3"
     "shm-sparse           shm-sparse                           1       1280  720    1000   3"
@@ -11,6 +14,7 @@ benchmark_workloads=(
     "shm-multirect-9      shm-multirect-9                      1       1280  720    1000   3"
     "shm-dual-sparse      shm-sparse                           2       640   720    1000   3"
     "shm-static           shm-static                           1       1280  720    1000   3"
+    "shm-opaque-full      shm-opaque-full                      1       1280  720    1000   3"
     "shm-scale-1          shm-sparse                           1       640   360    1000   3"
     "shm-scale-2          shm-sparse                           2       640   360    1000   3"
     "shm-scale-8          shm-sparse                           8       640   360    1000   3"
@@ -48,6 +52,13 @@ benchmark_workloads=(
     "dmabuf-churn         dmabuf-churn                         1       1280  720    300    3"
     "dmabuf-churn-2       dmabuf-churn                         2       640   360    300    3"
     "dmabuf-churn-8       dmabuf-churn                         8       640   360    300    3"
+    "dmabuf-native-full   dmabuf-native-full                   1       1280  720    1000   3"
+    "dmabuf-native-churn dmabuf-native-churn                  1       1280  720    300    3"
+    "dmabuf-sync-full     dmabuf-sync-full                     1       1280  720    1000   3"
+    "dmabuf-sync-churn    dmabuf-sync-churn                    1       1280  720    300    3"
+    "dmabuf-native-sync-full dmabuf-native-sync-full           1       1280  720    1000   3"
+    "dmabuf-native-sync-churn dmabuf-native-sync-churn         1       1280  720    300    3"
+    "direct-scanout-dmabuf dmabuf-static                       1       1920  1200   1000   3"
     "mixed-sparse         shm-sparse,dmabuf-sparse             2       640   720    1000   3"
     "mixed-scale-8        shm-sparse,shm-sparse,shm-sparse,shm-sparse,dmabuf-sparse,dmabuf-sparse,dmabuf-sparse,dmabuf-sparse 8 640 360 1000 3"
     "color-control-shm    shm-full                             1       1280  720    1000   3"
@@ -77,6 +88,8 @@ benchmark_workloads=(
     "layers-restack-8     shm-scene-restack-8                  1       960   540    600    3"
     "layers-map-8         shm-scene-map-8                      1       960   540    600    3"
     "layers-occlusion-toggle-8 shm-scene-occlusion-toggle-8    1       640   360    600    3"
+    "layers-clipped-2     shm-scene-clipped-2                  1       960   540    600    3"
+    "layers-hidden-damage-2 shm-scene-hidden-damage-2          1       960   540    600    3"
 )
 
 benchmark_suite_contains() {
@@ -98,7 +111,7 @@ benchmark_suite_contains() {
                 $workload == alpha-dmabuf-full ]]
             ;;
         all) [[ $workload != *-scale-16 && $workload != *-scale-32 &&
-            $workload != *-scale-64 ]] ;;
+            $workload != *-scale-64 && $workload != direct-scanout-* ]] ;;
         shm) [[ $workload == shm-* && $workload != *-scale-16 && $workload != *-scale-32 && $workload != *-scale-64 ]] ;;
         dmabuf) [[ $workload == dmabuf-* && $workload != *-scale-16 && $workload != *-scale-32 && $workload != *-scale-64 ]] ;;
         damage) [[ $workload == *-moving || $workload == *-multirect-* ]] ;;
@@ -116,6 +129,17 @@ benchmark_suite_contains() {
             $workload == layers-occlusion-toggle-* ]] ;;
         capacity) [[ $workload == *-scale-16 || $workload == *-scale-32 ||
             $workload == *-scale-64 ]] ;;
+        lifecycle) [[ $workload == idle-* || $workload == client-churn-* ||
+            $workload == shm-buffer-churn || $workload == dmabuf-churn ]] ;;
+        native) [[ $workload == dmabuf-native-* ]] ;;
+        sync) [[ $workload == dmabuf-sync-* || $workload == dmabuf-native-sync-* ]] ;;
+        scanout) [[ $workload == direct-scanout-* ]] ;;
+        visibility) [[ $workload == shm-opaque-* || $workload == layers-clipped-* ||
+            $workload == layers-hidden-damage-* || $workload == layers-occlusion-* ]] ;;
+        cpu) [[ $workload == shm-full || $workload == shm-tiny ||
+            $workload == shm-sparse || $workload == shm-scale-8 ||
+            $workload == layers-overlap-8 || $workload == layers-occlusion-8 ||
+            $workload == layers-hidden-damage-2 ]] ;;
         *) return 1 ;;
     esac
 }

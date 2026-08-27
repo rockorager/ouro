@@ -1,16 +1,28 @@
 # Compositor benchmarks
 
-This opt-in hardware suite runs the same generated Wayland workload against
-Ouro, packaged Sway, and packaged Hyprland. A comparison is valid only when all
-three compositors complete every requested run. It is not part of `zig build
-test` and never installs packages or changes persistent system configuration.
+This opt-in hardware suite runs generated Wayland workloads against Ouro,
+packaged Sway, and packaged Hyprland. Vulkan comparisons include all three.
+CPU-renderer comparisons include Ouro and Sway because Hyprland has no supported
+Pixman renderer. A comparison is valid only when every compositor declared in
+`metadata.env` completes or explicitly reports unsupported for every requested
+run. The suite is not part of `zig build test` and never installs packages or
+changes persistent system configuration.
+
+Sway's Pixman DRM path does not deliver usable `wp_presentation` feedback for
+this client. CPU runs therefore use `callback-only` pacing for both Ouro and
+Sway and label their cadence as callback Hz, not physical presentation FPS.
+They remain useful for matched compositor CPU/RSS and callback-cadence
+comparisons, but must not be mixed with Vulkan presentation-paced rows.
 
 ## Method
 
 `client.c` owns workload semantics. Persistent workloads use three reusable
 XRGB8888 buffers. SHM buffers are unsealed and each has its own pool. DMA-BUF
-buffers are single-plane linear GBM allocations exported from the benchmark's
-configured DRM device. Churn workloads replace the selected buffer only after
+controls are single-plane linear GBM allocations exported from the benchmark's
+configured DRM device. Native-modifier workloads allocate from the compositor's
+linux-dmabuf v3 modifier advertisements and export every GBM plane. Explicit-sync
+workloads use `linux-drm-syncobj-v1` acquire/release timeline points in addition
+to exact buffer-release accounting. Churn workloads replace the selected buffer only after
 its exact release. Every measured commit requires:
 
 - the frame callback;
@@ -41,8 +53,13 @@ refresh periods as missed refreshes.
 `run.sh` performs orchestration outside the timed client: isolated runtime and
 seat ownership, fixed post-socket readiness, exact compositor PID snapshots,
 optional `perf stat`, independent termination, and raw artifact retention.
-Direct scanout is disabled for Sway and Hyprland so the workload exercises
-composition. Ouro is required to start with `--renderer=vulkan`.
+Direct scanout is disabled for normal Sway and Hyprland runs so those workloads
+exercise composition. `--renderer pixman` selects Ouro and Sway's Pixman paths;
+the default is Vulkan. The separate `--suite scanout --scanout on` family only
+removes forced-composition policy for one fullscreen-sized DMA-BUF candidate.
+Eligibility, cadence, and low CPU are not proof that direct scanout occurred;
+results must remain labelled diagnostic until the compositor supplies positive
+plane/KMS evidence.
 
 Except for the `*-static` workloads, the client copies its canonical image into
 the selected SHM or DMA-BUF before every commit. Perf and `/proc` counters attach only to the
@@ -67,6 +84,8 @@ Workloads are declared in `workloads.sh`:
 - `shm-dual-sparse`: two independent 640×720 clients running sparse damage.
 - `shm-static`: alternate unchanged buffers with 1×1 damage, the smallest
   cross-compositor presentation-paced fixed-overhead proxy;
+- `shm-opaque-full`: full damage with a full-surface opaque region, matched to
+  `shm-full` for opaque-region scene/render-path cost;
 - `shm-scale-{1,2,8,16}`: equal 640×360 sparse clients for client-population
   scaling without treating an arbitrary population as a compositor limit;
 - `shm-buffer-churn` and `shm-churn-{2,8}`: replace one SHM pool and buffer per
@@ -77,6 +96,14 @@ Workloads are declared in `workloads.sh`:
   client-population scaling;
 - `dmabuf-churn` and `dmabuf-churn-{2,8}`: allocate, import, and retire one
   linear DMA-BUF per sparse frame for one or multiple clients;
+- `dmabuf-native-{full,churn}`: choose from linux-dmabuf v3 advertised modifiers,
+  preserving the selected modifier and plane count in every raw result;
+- `dmabuf-sync-{full,churn}` and `dmabuf-native-sync-{full,churn}`: linear and
+  advertised-modifier DMA-BUF with explicit timeline synchronization. Missing
+  protocol, DRM timeline, advertised modifier, or CPU-mappable allocation support
+  is reported as unsupported rather than replaced with another path;
+- `direct-scanout-dmabuf`: fullscreen-sized persistent DMA-BUF eligibility probe,
+  only selected by `--suite scanout --scanout on`;
 - `mixed-sparse` and `mixed-scale-8`: equal SHM and DMA-BUF client populations
   under one compositor process and shared presentation gate.
 - `color-control-{shm,dmabuf}` and `color-control-scale-8`: matched implicit
@@ -123,6 +150,11 @@ Workloads are declared in `workloads.sh`:
 - `layers-occlusion-toggle-8`: eight synchronized opaque children alternate
   between exact full occlusion and spread geometry, exercising dynamic culling
   and repair damage without relying on shell placement policy;
+- `layers-clipped-2`: two synchronized layers positioned half outside opposite
+  output corners, exercising offscreen clipping;
+- `layers-hidden-damage-2`: two exactly overlapping opaque layers; the covered
+  lower layer receives full damage while the visible top layer receives 1×1
+  damage, exercising hidden-damage culling without losing presentation pacing;
 - `viewport-{crop,scale,crop-scale}-{shm,dmabuf}`: central-half source crop,
   half-size destination scaling, and central-half crop scaled back to the full
   1280×720 destination. Matched no-viewport controls make source versus output
@@ -155,6 +187,19 @@ rendering. If a comparator lacks the exact required global, feature, intent,
 transfer function, or primaries, the report records that cell as unsupported
 instead of substituting implicit sRGB or rejecting unrelated supported cells.
 
+Lifecycle rows use time windows rather than fabricated FPS. `idle-no-client`
+measures a compositor with no connected client for `--duration` seconds;
+`idle-mapped-shm` maps one persistent SHM toplevel and sends no commits during
+that window; `client-churn-shm` serially connects, maps, presents once, drains,
+and disconnects `--frames` independent clients. The report shows CPU, process
+ticks, context switches, RSS/HWM, and lifecycle operations/s where applicable.
+
+Output scale and output transform are not currently cross-compositor benchmark
+axes: Ouro's physical executable does not expose output scale/transform
+configuration. Surface buffer transforms are not an honest substitute. Add the
+axis only after all comparators can be configured and the applied output state
+can be recorded. This limitation does not block client-side viewporter scaling.
+
 ## Running
 
 The defaults describe Timbot's card1/eDP-1 1920×1200@60 setup. Override every
@@ -177,6 +222,12 @@ benchmark/run.sh --suite composition --runs 3
 benchmark/run.sh --suite layers --runs 3
 benchmark/run.sh --suite dynamic --runs 3
 benchmark/run.sh --suite capacity --runs 1  # High concurrent-client probes.
+benchmark/run.sh --suite native --runs 3
+benchmark/run.sh --suite sync --runs 3
+benchmark/run.sh --suite visibility --runs 3
+benchmark/run.sh --suite lifecycle --frames 100 --duration 10
+benchmark/run.sh --suite cpu --renderer pixman --runs 3
+benchmark/run.sh --suite scanout --scanout on --runs 3 # Diagnostic, not proof.
 benchmark/run.sh --workload shm-sparse --runs 3
 benchmark/run.sh --workload shm-tiny --frames 600 \
   --drm-device /dev/dri/card0 --output DP-1 --mode 2560x1440 --refresh 144

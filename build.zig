@@ -203,6 +203,19 @@ pub fn build(b: *std.Build) void {
     const benchmark_dmabuf_code_output = benchmark_dmabuf_code.addOutputFileArg(
         "linux-dmabuf-v1-protocol.c",
     );
+    const benchmark_syncobj_xml = wayland_protocols.path(
+        "staging/linux-drm-syncobj/linux-drm-syncobj-v1.xml",
+    );
+    const benchmark_syncobj_header = b.addSystemCommand(&.{ benchmark_scanner, "client-header" });
+    benchmark_syncobj_header.addFileArg(benchmark_syncobj_xml);
+    const benchmark_syncobj_header_output = benchmark_syncobj_header.addOutputFileArg(
+        "linux-drm-syncobj-v1-client-protocol.h",
+    );
+    const benchmark_syncobj_code = b.addSystemCommand(&.{ benchmark_scanner, "private-code" });
+    benchmark_syncobj_code.addFileArg(benchmark_syncobj_xml);
+    const benchmark_syncobj_code_output = benchmark_syncobj_code.addOutputFileArg(
+        "linux-drm-syncobj-v1-protocol.c",
+    );
     const benchmark_color_xml = wayland_protocols.path(
         "staging/color-management/color-management-v1.xml",
     );
@@ -258,6 +271,7 @@ pub fn build(b: *std.Build) void {
     benchmark_client.root_module.addIncludePath(benchmark_xdg_header_output.dirname());
     benchmark_client.root_module.addIncludePath(benchmark_presentation_header_output.dirname());
     benchmark_client.root_module.addIncludePath(benchmark_dmabuf_header_output.dirname());
+    benchmark_client.root_module.addIncludePath(benchmark_syncobj_header_output.dirname());
     benchmark_client.root_module.addIncludePath(benchmark_color_header_output.dirname());
     benchmark_client.root_module.addIncludePath(benchmark_viewporter_header_output.dirname());
     benchmark_client.root_module.addIncludePath(benchmark_single_pixel_header_output.dirname());
@@ -272,6 +286,10 @@ pub fn build(b: *std.Build) void {
     });
     benchmark_client.root_module.addCSourceFile(.{
         .file = benchmark_dmabuf_code_output,
+        .flags = &.{"-std=c11"},
+    });
+    benchmark_client.root_module.addCSourceFile(.{
+        .file = benchmark_syncobj_code_output,
         .flags = &.{"-std=c11"},
     });
     benchmark_client.root_module.addCSourceFile(.{

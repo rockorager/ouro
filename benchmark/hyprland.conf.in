@@ -32,5 +32,5 @@ xwayland {
 }
 
 render {
-    direct_scanout = 0
+    direct_scanout = @DIRECT_SCANOUT@
 }

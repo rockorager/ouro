@@ -17,6 +17,10 @@ readiness_seconds=2
 frames_override=300
 perf_enabled=auto
 pacing=callback
+renderer=vulkan
+scanout=off
+duration_seconds=5
+selected_compositors=
 
 usage() {
     cat <<'EOF'
@@ -29,6 +33,10 @@ usage: benchmark/run.sh [options]
   --workload NAME         run one workload instead of a suite
   --frames N              frames per client (default: 300)
   --pacing MODE           callback or presentation (default: callback)
+  --renderer MODE         vulkan or pixman (default: vulkan)
+  --scanout MODE          off or on (default: off)
+  --duration SECONDS      lifecycle measurement window (default: 5)
+  --compositors LIST      comma-separated ouro,sway,hyprland selection
   --results DIR           output directory
   --drm-device PATH       DRM card used by all compositors (default: /dev/dri/card1)
   --output NAME           connector name (default: eDP-1)
@@ -46,6 +54,10 @@ while (($#)); do
         --workload) selected_workload=$2; shift 2 ;;
         --frames) frames_override=$2; shift 2 ;;
         --pacing) pacing=$2; shift 2 ;;
+        --renderer) renderer=$2; shift 2 ;;
+        --scanout) scanout=$2; shift 2 ;;
+        --duration) duration_seconds=$2; shift 2 ;;
+        --compositors) selected_compositors=$2; shift 2 ;;
         --results) results=$2; shift 2 ;;
         --drm-device) drm_device=$2; shift 2 ;;
         --output) output=$2; shift 2 ;;
@@ -64,21 +76,62 @@ done
     exit 2
 }
 [[ $refresh =~ ^[1-9][0-9]*$ ]] || { echo "--refresh must be positive" >&2; exit 2; }
+[[ $duration_seconds =~ ^[1-9][0-9]*$ ]] || {
+    echo "--duration must be positive" >&2
+    exit 2
+}
 [[ $perf_enabled == auto || $perf_enabled == on || $perf_enabled == off ]] || {
     echo "--perf must be auto, on, or off" >&2
     exit 2
 }
-[[ $pacing == callback || $pacing == presentation ]] || {
-    echo "--pacing must be callback or presentation" >&2
+[[ $pacing == callback || $pacing == callback-only || $pacing == presentation ]] || {
+    echo "--pacing must be callback, callback-only, or presentation" >&2
     exit 2
 }
+[[ $renderer == vulkan || $renderer == pixman ]] || {
+    echo "--renderer must be vulkan or pixman" >&2
+    exit 2
+}
+[[ $scanout == off || $scanout == on ]] || {
+    echo "--scanout must be off or on" >&2
+    exit 2
+}
+if [[ $renderer == pixman && $scanout == on ]]; then
+    echo "Pixman and direct scanout are separate benchmark families" >&2
+    exit 2
+fi
+if [[ $renderer == pixman ]]; then
+    [[ $pacing != presentation ]] || {
+        echo "Sway Pixman does not provide the required presentation feedback" >&2
+        exit 2
+    }
+    pacing=callback-only
+fi
 case "$selected_suite" in
-    quick|standard|all|shm|dmabuf|damage|viewport|solid|scale|churn|mixed|color|alpha|composition|layers|dynamic|capacity) ;;
+    quick|standard|all|shm|dmabuf|damage|viewport|solid|scale|churn|mixed|color|alpha|composition|layers|dynamic|capacity|native|sync|visibility|cpu|lifecycle|scanout) ;;
     *) echo "unknown suite: $selected_suite" >&2; exit 2 ;;
 esac
+if [[ $selected_suite == scanout && $scanout != on ]]; then
+    echo "the scanout suite requires --scanout on" >&2
+    exit 2
+fi
+if [[ $selected_workload == direct-scanout-* && $scanout != on ]]; then
+    echo "direct-scanout workloads require --scanout on" >&2
+    exit 2
+fi
+if [[ $selected_suite == cpu && $renderer != pixman ]]; then
+    echo "the CPU suite requires --renderer pixman" >&2
+    exit 2
+fi
 [[ -e $drm_device ]] || { echo "DRM device does not exist: $drm_device" >&2; exit 1; }
 
-for command in seatd-launch sway Hyprland python3 sed sha256sum realpath fuser pgrep pkg-config; do
+required_commands=(seatd-launch sway python3 sed sha256sum realpath fuser pgrep pkg-config)
+if [[ $renderer == vulkan &&
+    ( -z $selected_compositors || ,$selected_compositors, == *,hyprland,* ) ]]
+then
+    required_commands+=(Hyprland)
+fi
+for command in "${required_commands[@]}"; do
     command -v "$command" >/dev/null || {
         echo "required comparator tool is unavailable: $command" >&2
         exit 1
@@ -109,6 +162,23 @@ zig build -Doptimize=ReleaseFast install benchmark-client --summary all
 ouro_binary="$repo/zig-out/bin/ouro"
 client_binary="$repo/zig-out/benchmark/ouro-benchmark-client"
 [[ -x $ouro_binary && -x $client_binary ]]
+if [[ -n $selected_compositors ]]; then
+    IFS=, read -r -a compositors <<<"$selected_compositors"
+else
+    compositors=(ouro sway hyprland)
+    if [[ $renderer == pixman ]]; then compositors=(ouro sway); fi
+fi
+for compositor in "${compositors[@]}"; do
+    [[ $compositor == ouro || $compositor == sway || $compositor == hyprland ]] || {
+        echo "unknown compositor: $compositor" >&2
+        exit 2
+    }
+    if [[ $renderer == pixman && $compositor == hyprland ]]; then
+        echo "Hyprland has no supported Pixman comparator" >&2
+        exit 2
+    fi
+done
+compositor_csv=$(IFS=,; printf '%s' "${compositors[*]}")
 
 {
     printf 'schema=1\n'
@@ -122,11 +192,13 @@ client_binary="$repo/zig-out/benchmark/ouro-benchmark-client"
     printf 'sway_config_template_sha256=%s\n' "$(sha256sum "$repo/benchmark/sway.conf.in" | cut -d' ' -f1)"
     printf 'hyprland_config_template_sha256=%s\n' "$(sha256sum "$repo/benchmark/hyprland.conf.in" | cut -d' ' -f1)"
     printf 'sway_version=%s\n' "$(sway --version | tr '\n' ' ')"
-    printf 'hyprland_version=%s\n' "$(Hyprland --version | head -1)"
+    if command -v Hyprland >/dev/null; then
+        printf 'hyprland_version=%s\n' "$(Hyprland --version | head -1)"
+        printf 'hyprland_binary=%s\n' "$(command -v Hyprland)"
+        printf 'hyprland_binary_sha256=%s\n' "$(sha256sum "$(command -v Hyprland)" | cut -d' ' -f1)"
+    fi
     printf 'sway_binary=%s\n' "$(command -v sway)"
     printf 'sway_binary_sha256=%s\n' "$(sha256sum "$(command -v sway)" | cut -d' ' -f1)"
-    printf 'hyprland_binary=%s\n' "$(command -v Hyprland)"
-    printf 'hyprland_binary_sha256=%s\n' "$(sha256sum "$(command -v Hyprland)" | cut -d' ' -f1)"
     printf 'wayland_client_version=%s\n' "$(pkg-config --modversion wayland-client)"
     printf 'gbm_version=%s\n' "$(pkg-config --modversion gbm)"
     printf 'libdrm_version=%s\n' "$(pkg-config --modversion libdrm)"
@@ -135,6 +207,7 @@ client_binary="$repo/zig-out/benchmark/ouro-benchmark-client"
         "$drm_device" "$output" "$mode" "$refresh"
     printf 'readiness_seconds=%s\nperf_policy=%s\npacing=%s\nsuite=%s\n' \
         "$readiness_seconds" "$perf_enabled" "$pacing" "$selected_suite"
+    printf 'renderer=%s\nscanout=%s\ncompositors=%s\n' "$renderer" "$scanout" "$compositor_csv"
     printf 'initial_vt=%s\n' "$initial_vt"
 } >"$results/metadata.env"
 git -C "$repo" status --porcelain=v1 >"$results/ouro-status.txt"
@@ -219,19 +292,20 @@ render_configs() {
         "$repo/benchmark/sway.conf.in" >"$directory/sway.conf"
     sed -e "s|@OUTPUT@|$output|g" -e "s|@MODE@|$mode|g" \
         -e "s|@MODE_REFRESH@|${mode}@${refresh}|g" \
+        -e "s|@DIRECT_SCANOUT@|$([[ $scanout == on ]] && printf 1 || printf 0)|g" \
         "$repo/benchmark/hyprland.conf.in" >"$directory/hyprland.conf"
 }
 
 run_case() {
     local workload_name=$1 client_modes=$2 clients=$3 width=$4 height=$5 frames=$6 warmup=$7
-    local compositor=$8 repetition=$9
+    local compositor=$8 repetition=$9 kind=${10}
     local directory="$results/$workload_name/$compositor/run-$repetition"
     local runtime
     local expected_socket
     local socket
     local -a modes
     IFS=, read -r -a modes <<<"$client_modes"
-    if ((${#modes[@]} != 1 && ${#modes[@]} != clients)); then
+    if [[ $kind != idle ]] && ((${#modes[@]} != 1 && ${#modes[@]} != clients)); then
         echo "$workload_name: client mode count must be one or match client count" >&2
         return 1
     fi
@@ -241,21 +315,27 @@ run_case() {
     expected_socket="$runtime/wayland-0"
     chmod 700 "$runtime"
     render_configs "$directory"
-    printf 'workload=%s\nclient_modes=%s\nclients=%s\nwidth=%s\nheight=%s\nframes=%s\nwarmup=%s\nrefresh=%s\npacing=%s\n' \
-        "$workload_name" "$client_modes" "$clients" "$width" "$height" "$frames" "$warmup" "$refresh" "$pacing" \
+    printf 'workload=%s\nclient_modes=%s\nclients=%s\nwidth=%s\nheight=%s\nframes=%s\nwarmup=%s\nrefresh=%s\npacing=%s\nkind=%s\nduration_seconds=%s\n' \
+        "$workload_name" "$client_modes" "$clients" "$width" "$height" "$frames" "$warmup" "$refresh" "$pacing" "$kind" "$duration_seconds" \
         >"$directory/case.env"
 
     case "$compositor" in
         ouro)
             seatd-launch -l error -- env XDG_RUNTIME_DIR="$runtime" LIBSEAT_BACKEND=seatd \
-                "$ouro_binary" --socket="$expected_socket" --renderer=vulkan \
+                "$ouro_binary" --socket="$expected_socket" --renderer="$renderer" \
                 >"$directory/compositor.log" 2>&1 &
             launcher_pid=$!
             ;;
         sway)
-            seatd-launch -l error -- env XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=wayland-0 \
-                LIBSEAT_BACKEND=seatd WLR_BACKENDS=drm WLR_DRM_DEVICES="$drm_device" \
-                WLR_SCENE_DISABLE_DIRECT_SCANOUT=1 \
+            local -a sway_environment=(
+                XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=wayland-0
+                LIBSEAT_BACKEND=seatd WLR_BACKENDS=drm WLR_DRM_DEVICES="$drm_device"
+            )
+            [[ $scanout == off ]] && sway_environment+=(WLR_SCENE_DISABLE_DIRECT_SCANOUT=1)
+            [[ $renderer == pixman ]] && sway_environment+=(
+                WLR_RENDERER=pixman WLR_RENDERER_ALLOW_SOFTWARE=1
+            )
+            seatd-launch -l error -- env "${sway_environment[@]}" \
                 sway -c "$directory/sway.conf" >"$directory/compositor.log" 2>&1 &
             launcher_pid=$!
             ;;
@@ -278,6 +358,108 @@ run_case() {
         hyprland) compositor_pid=$(find_compositor_pid Hyprland) ;;
     esac
     printf '%s\n' "$compositor_pid" >"$directory/compositor.pid"
+
+    if [[ $kind == idle || $kind == client-churn ]]; then
+        local anchor_pid= anchor_fd= anchor_log=
+        if [[ $kind == client-churn ]]; then
+            local anchor_fifo="$directory/anchor.in"
+            anchor_log="$directory/anchor.log"
+            mkfifo "$anchor_fifo"
+            "$client_binary" "$socket" shm-hold 64 64 1 1 "$drm_device" "$pacing" \
+                <"$anchor_fifo" >"$anchor_log" 2>&1 &
+            anchor_pid=$!
+            client_pids=("$anchor_pid")
+            exec {anchor_fd}>"$anchor_fifo"
+            for _ in {1..600}; do
+                grep -q '^READY$' "$anchor_log" 2>/dev/null && break
+                kill -0 "$anchor_pid" 2>/dev/null || {
+                    cat "$anchor_log" >&2
+                    return 1
+                }
+                sleep .01
+            done
+            grep -q '^READY$' "$anchor_log" || return 1
+            printf x >&"$anchor_fd"
+        fi
+        snapshot "$directory/pre" "$compositor_pid"
+        if [[ $perf_enabled != off ]] && command -v perf >/dev/null; then
+            perf stat -x, -e cycles:u,instructions:u,task-clock,context-switches,page-faults \
+                -p "$compositor_pid" -o "$directory/perf.csv" &
+            perf_pid=$!
+            sleep .1
+            if ! kill -0 "$perf_pid" 2>/dev/null; then
+                wait "$perf_pid" || true
+                perf_pid=
+                [[ $perf_enabled == on ]] && return 1
+            fi
+        fi
+        if [[ $kind == idle ]]; then
+            sleep "$duration_seconds"
+        else
+            local started_ns
+            started_ns=$(date +%s%N)
+            for ((iteration = 1; iteration <= frames; iteration++)); do
+                local fifo="$directory/churn-$iteration.in"
+                local log="$directory/churn-$iteration.log"
+                mkfifo "$fifo"
+                "$client_binary" "$socket" "$client_modes" "$width" "$height" 1 "$warmup" \
+                    "$drm_device" "$pacing" <"$fifo" >"$log" 2>&1 &
+                local client_pid=$!
+                local fd
+                exec {fd}>"$fifo"
+                for _ in {1..600}; do
+                    grep -q '^READY$' "$log" 2>/dev/null && break
+                    kill -0 "$client_pid" 2>/dev/null || {
+                        cat "$log" >&2
+                        return 1
+                    }
+                    sleep .01
+                done
+                grep -q '^READY$' "$log" || return 1
+                printf x >&"$fd"
+                local churn_completion=presented
+                [[ $pacing == callback-only ]] && churn_completion=callbacks
+                for _ in {1..600}; do
+                    grep -q '"'"$churn_completion"'":1' "$log" 2>/dev/null && break
+                    sleep .01
+                done
+                grep -q '"'"$churn_completion"'":1' "$log" || return 1
+                printf x >&"$fd"
+                for _ in {1..600}; do
+                    grep -q '^DRAINED releases=' "$log" 2>/dev/null && break
+                    sleep .01
+                done
+                grep -q '^DRAINED releases=' "$log" || return 1
+                printf x >&"$fd"
+                eval "exec ${fd}>&-"
+                wait "$client_pid"
+                grep -q '^CLEANUP releases=' "$log" || return 1
+                rm -f "$fifo"
+            done
+            printf '%s\n' "$(($(date +%s%N) - started_ns))" >"$directory/elapsed.ns"
+        fi
+        snapshot "$directory/gate" "$compositor_pid"
+        if [[ -n $perf_pid ]]; then
+            kill -INT "$perf_pid" 2>/dev/null || true
+            wait "$perf_pid" || true
+            perf_pid=
+        fi
+        if [[ $kind == client-churn ]]; then
+            printf x >&"$anchor_fd"
+            for _ in {1..600}; do
+                grep -q '^DRAINED releases=' "$anchor_log" 2>/dev/null && break
+                sleep .01
+            done
+            grep -q '^DRAINED releases=' "$anchor_log" || return 1
+            printf x >&"$anchor_fd"
+            eval "exec ${anchor_fd}>&-"
+            wait "$anchor_pid"
+            client_pids=()
+            grep -q '^CLEANUP releases=' "$anchor_log" || return 1
+            rm -f "$directory/anchor.in"
+        fi
+        return 0
+    fi
 
     client_pids=()
     client_fds=()
@@ -344,38 +526,75 @@ run_case() {
     fi
     for fd in "${client_fds[@]}"; do printf x >&"$fd"; done
 
-    local wait_steps=$((frames * 40 / refresh + 1200))
-    for ((step = 0; step < wait_steps; step++)); do
-        local complete=0
-        for ((index = 1; index <= clients; index++)); do
-            grep -q '"presented":'"$frames" "$directory/client-$index.log" 2>/dev/null &&
-                ((complete += 1))
+    if [[ $kind == hold ]]; then
+        sleep "$duration_seconds"
+        snapshot "$directory/gate" "$compositor_pid"
+        if [[ -n $perf_pid ]]; then
+            kill -INT "$perf_pid" 2>/dev/null || true
+            wait "$perf_pid" || true
+            perf_pid=
+        fi
+        for fd in "${client_fds[@]}"; do printf x >&"$fd"; done
+        for _ in {1..600}; do
+            local held=0
+            for ((index = 1; index <= clients; index++)); do
+                grep -q '"kind":"hold"' "$directory/client-$index.log" 2>/dev/null &&
+                    ((held += 1))
+            done
+            ((held == clients)) && break
+            sleep .05
         done
-        ((complete == clients)) && break
-        for pid in "${client_pids[@]}"; do
-            kill -0 "$pid" 2>/dev/null || {
-                cat "$directory"/client-*.log >&2
-                return 1
-            }
-        done
-        sleep .05
-    done
-    for ((index = 1; index <= clients; index++)); do
-        if ! grep -q '"presented":'"$frames" "$directory/client-$index.log" ||
-            ! grep -q '"discarded":0' "$directory/client-$index.log"
-        then
+        ((held == clients)) || {
             cat "$directory"/client-*.log >&2
             return 1
+        }
+    else
+        local wait_steps=$((frames * 40 / refresh + 1200))
+        for ((step = 0; step < wait_steps; step++)); do
+            local complete=0
+            for ((index = 1; index <= clients; index++)); do
+                if [[ $pacing == callback-only ]]; then
+                    grep -q '"callbacks":'"$frames" "$directory/client-$index.log" 2>/dev/null &&
+                        grep -q '"presented":0' "$directory/client-$index.log" 2>/dev/null &&
+                        ((complete += 1))
+                else
+                    grep -q '"presented":'"$frames" "$directory/client-$index.log" 2>/dev/null &&
+                        ((complete += 1))
+                fi
+            done
+            ((complete == clients)) && break
+            for pid in "${client_pids[@]}"; do
+                kill -0 "$pid" 2>/dev/null || {
+                    cat "$directory"/client-*.log >&2
+                    return 1
+                }
+            done
+            sleep .05
+        done
+        for ((index = 1; index <= clients; index++)); do
+            local completion_field=presented completion_count=$frames
+            if [[ $pacing == callback-only ]]; then
+                completion_field=callbacks
+                completion_count=$frames
+            fi
+            if ! grep -q '"'"$completion_field"'":'"$completion_count" "$directory/client-$index.log" ||
+                ! grep -q '"discarded":0' "$directory/client-$index.log"
+            then
+                cat "$directory"/client-*.log >&2
+                return 1
+            fi
+        done
+        snapshot "$directory/gate" "$compositor_pid"
+        if [[ -n $perf_pid ]]; then
+            kill -INT "$perf_pid" 2>/dev/null || true
+            wait "$perf_pid" || true
+            perf_pid=
         fi
-    done
-    snapshot "$directory/gate" "$compositor_pid"
-    if [[ -n $perf_pid ]]; then
-        kill -INT "$perf_pid" 2>/dev/null || true
-        wait "$perf_pid" || true
-        perf_pid=
     fi
 
-    for fd in "${client_fds[@]}"; do printf x >&"$fd"; done
+    if [[ $kind != hold ]]; then
+        for fd in "${client_fds[@]}"; do printf x >&"$fd"; done
+    fi
     for _ in {1..600}; do
         local drained=0
         for ((index = 1; index <= clients; index++)); do
@@ -424,7 +643,8 @@ run_case() {
 
 matched=0
 for definition in "${benchmark_workloads[@]}"; do
-    read -r workload_name client_modes clients width height frames warmup <<<"$definition"
+    read -r workload_name client_modes clients width height frames warmup kind <<<"$definition"
+    kind=${kind:-paced}
     if [[ -n $selected_workload ]]; then
         [[ $selected_workload == "$workload_name" ]] || continue
     else
@@ -433,10 +653,10 @@ for definition in "${benchmark_workloads[@]}"; do
     matched=1
     frames=$frames_override
     for ((repetition = 1; repetition <= runs; repetition++)); do
-        for compositor in ouro sway hyprland; do
+        for compositor in "${compositors[@]}"; do
             printf '==> %s run %d: %s\n' "$workload_name" "$repetition" "$compositor"
             if run_case "$workload_name" "$client_modes" "$clients" "$width" "$height" \
-                "$frames" "$warmup" "$compositor" "$repetition"
+                "$frames" "$warmup" "$compositor" "$repetition" "$kind"
             then
                 result=0
             else
