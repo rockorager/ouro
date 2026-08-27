@@ -306,7 +306,8 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
         /// Fans one physical tablet out to every live tablet-seat resource.
         /// Admission is atomic: no binding observes the device unless all
         /// child and ordered outbound records are available.
-        pub fn publishTablet(self: *Self, device: input.DeviceId, info: platform.DeviceInfo) !void {
+        pub fn publishTablet(self: *Self, device: input.DeviceId, info: platform.DeviceInfo) !bool {
+            if (!info.capabilities.tablet_tool) return false;
             var bindings: usize = 0;
             for (self.bindings) |binding|
                 bindings += @intFromBool(binding.active and binding.resource_present);
@@ -332,6 +333,7 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                     } } } }) catch unreachable;
                 self.enqueue(binding.peer, .{ .tablet = .{ .id = id, .event = .done } }) catch unreachable;
             }
+            return true;
         }
 
         pub fn removeTablet(self: *Self, device: input.DeviceId) !void {
@@ -506,6 +508,36 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                     slot.leaving = false;
                 }
             }
+        }
+
+        /// Translates one logical tablet-state event without advancing the
+        /// source queue. False means the event belongs to pad support that is
+        /// not yet installed and must remain pending.
+        pub fn consumeStateEvent(self: *Self, event: anytype) !bool {
+            switch (event) {
+                .device_added => |value| _ = try self.publishTablet(value.device, value.info),
+                .device_removed => |device| try self.removeTablet(device),
+                .tool_added => |value| _ = try self.publishTool(value.key, value.info),
+                .tool_removed => |key| try self.removeTool(key),
+                .proximity_in => |value| try self.toolProximityIn(value.key, value.focus),
+                .proximity_out => |key| try self.toolProximityOut(key),
+                .axes => |value| try self.toolAxes(value.key, value.axes, value.point),
+                .tip => |value| try self.toolTip(value.key, value.down),
+                .button => |value| try self.toolButton(value.key, value.button, value.pressed),
+                .frame => |value| try self.toolFrame(value.key, value.time_usec),
+                .pad_button, .pad_ring, .pad_strip => return false,
+            }
+            return true;
+        }
+
+        pub fn drainState(self: *Self, state: anytype) !usize {
+            var count: usize = 0;
+            while (state.peek()) |event| {
+                if (!try self.consumeStateEvent(event.*)) break;
+                state.drop();
+                count += 1;
+            }
+            return count;
         }
 
         pub fn pendingOutbound(self: *const Self, peer: wayring.io_uring.Peer) bool {
@@ -1118,7 +1150,7 @@ test "tablet-v2: tablet publication is atomic and metadata stays ordered" {
     second.peer = .{ .slot = 2, .generation = 1 };
     const device: input.DeviceId = .{ .slot = 3, .generation = 4, .seat_generation = 5 };
 
-    try adapter.publishTablet(device, .{ .capabilities = .{ .tablet_tool = true }, .vendor = 10, .product = 20 });
+    _ = try adapter.publishTablet(device, .{ .capabilities = .{ .tablet_tool = true }, .vendor = 10, .product = 20 });
     try std.testing.expectEqual(@as(usize, 6), adapter.outbound_len);
     try std.testing.expect(adapter.pendingOutbound(first.peer));
     const create = adapter.oldest(first.peer).?;
@@ -1164,7 +1196,7 @@ test "tablet-v2: TX pressure cannot duplicate a server-created tablet" {
         binding,
     );
     binding.resource_present = true;
-    try adapter.publishTablet(
+    _ = try adapter.publishTablet(
         .{ .slot = 1, .generation = 2, .seat_generation = 3 },
         .{ .capabilities = .{ .tablet_tool = true }, .vendor = 4, .product = 5 },
     );
@@ -1292,7 +1324,7 @@ test "tablet-v2: focused tool frame preserves protocol event order" {
     defer blocks.deinit(std.testing.allocator);
     var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 1);
     defer descriptors.deinit(std.testing.allocator);
-    try adapter.publishTablet(device, .{ .capabilities = .{ .tablet_tool = true } });
+    _ = try adapter.publishTablet(device, .{ .capabilities = .{ .tablet_tool = true } });
     var tablet_metadata = wayring.tx.Queue.init(&blocks, 64, &descriptors, 1);
     try std.testing.expectEqual(@as(usize, 2), try adapter.flushOn(peer, &server_objects, &tablet_metadata));
     tablet_metadata.deinit();
@@ -1333,5 +1365,48 @@ test "tablet-v2: focused tool frame preserves protocol event order" {
     var events = wayring.tx.Queue.init(&blocks, 256, &descriptors, 1);
     defer events.deinit();
     try std.testing.expectEqual(@as(usize, 15), try adapter.flushOn(peer, &server_objects, &events));
+    try std.testing.expectEqual(@as(usize, 0), adapter.outbound_len);
+}
+
+test "tablet-v2: state drain retains unsupported pad events" {
+    const protocol = @import("core_protocol");
+    const TabletState = tablet_input.State(TestSeat.FocusTarget);
+    const Queue = struct {
+        events: [2]TabletState.Event,
+        index: usize = 0,
+
+        pub fn peek(self: *@This()) ?*const TabletState.Event {
+            return if (self.index == self.events.len) null else &self.events[self.index];
+        }
+        pub fn drop(self: *@This()) void {
+            self.index += 1;
+        }
+    };
+    const TestAdapter = Adapter(protocol, TestSeat);
+    var seat: TestSeat = .{};
+    var adapter = try TestAdapter.init(std.testing.allocator, &seat, .{
+        .manager_capacity = 1,
+        .tablet_seat_capacity = 1,
+        .tablet_capacity = 1,
+        .tool_capacity = 1,
+        .outbound_capacity = 4,
+    });
+    defer adapter.deinit();
+    const device: input.DeviceId = .{ .slot = 1, .generation = 2, .seat_generation = 3 };
+    var queue: Queue = .{ .events = .{
+        .{ .device_added = .{ .device = device, .info = .{ .capabilities = .{ .pointer = true } } } },
+        .{ .pad_button = .{ .tablet_pad_button = .{
+            .device = device,
+            .time_usec = 10,
+            .button = 1,
+            .pressed = true,
+            .mode = 0,
+            .group = 0,
+        } } },
+    } };
+
+    try std.testing.expectEqual(@as(usize, 1), try adapter.drainState(&queue));
+    try std.testing.expectEqual(@as(usize, 1), queue.index);
+    try std.testing.expectEqual(@as(usize, 1), adapter.freeTablets());
     try std.testing.expectEqual(@as(usize, 0), adapter.outbound_len);
 }
