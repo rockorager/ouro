@@ -300,6 +300,20 @@ pub fn Adapter(comptime protocol: type) type {
             if (focus) |peer| for (self.devices) |*device| if (device.header.active and std.meta.eql(device.peer, peer))
                 self.enqueueSelection(device) catch unreachable;
         }
+        pub fn currentSelection(self: *const Self) ?SelectionSource {
+            return self.selection;
+        }
+        /// Replaces the primary clipboard without focus or serial validation.
+        /// Restricted control protocols use this after performing their own
+        /// source ownership and one-use validation.
+        pub fn setControlledSelection(self: *Self, source: ?SelectionSource) !void {
+            try self.replaceSelection(source, true);
+        }
+        pub fn clearControlledSource(self: *Self, source: SelectionSource) !void {
+            if (self.selection) |current| {
+                if (current.eql(source)) try self.replaceSelection(null, false);
+            }
+        }
         fn replaceSelection(self: *Self, next: ?SelectionSource, cancel_old: bool) !void {
             const old = self.selection;
             const count = if (self.focus) |peer| self.deviceCount(peer) else 0;

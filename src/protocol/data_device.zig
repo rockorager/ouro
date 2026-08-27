@@ -7,6 +7,7 @@ const std = @import("std");
 const wayring = @import("wayring");
 const linux = std.os.linux;
 const objects = wayring.objects;
+const SelectionSource = @import("selection_source.zig").Source;
 const none = std.math.maxInt(u32);
 
 pub const Config = struct {
@@ -98,6 +99,7 @@ pub fn Adapter(comptime protocol: type) type {
             peer: wayring.io_uring.Peer = undefined,
             device: Id = undefined,
             source: Id = undefined,
+            selection_source: ?SelectionSource = null,
             kind: OfferKind = .selection,
             current: bool = false,
             destination_actions: u32 = 0,
@@ -110,7 +112,7 @@ pub fn Adapter(comptime protocol: type) type {
         };
         const Publication = struct {
             device: Id,
-            source: ?Id,
+            source: ?SelectionSource,
             offer: ?Id = null,
             phase: u2 = 0,
             mime_index: usize = 0,
@@ -180,7 +182,7 @@ pub fn Adapter(comptime protocol: type) type {
         device_free: u32 = 0,
         offer_free: u32 = 0,
         next_sequence: u64 = 1,
-        selection: ?Id = null,
+        selection: ?SelectionSource = null,
         focus: ?wayring.io_uring.Peer = null,
         validator: ?SerialValidator = null,
         drag_validator: ?DragValidator = null,
@@ -364,7 +366,7 @@ pub fn Adapter(comptime protocol: type) type {
                         else => return try self.protocolError(actor, decoded.handle.id, Source.@"error".invalid_source.value, @errorName(err)),
                     };
                 },
-                .destroy => if (self.selection) |id| if (std.meta.eql(id, self.sourceId(source)))
+                .destroy => if (self.selection) |selected| if (selected.eql(self.selectionSource(source)))
                     self.replaceSelection(null, false) catch return try self.noMemory(actor),
                 .set_actions => |payload| {
                     if (source.used or source.drag_actions_set)
@@ -421,17 +423,17 @@ pub fn Adapter(comptime protocol: type) type {
                     if (!optionalPeerEqual(self.focus, peer) or
                         !validator.validate(validator.context, peer, device.seat_object, payload.serial))
                         break :selection;
-                    const next: ?Id = if (payload.source) |object_id| source: {
+                    const next: ?SelectionSource = if (payload.source) |object_id| source: {
                         const source = self.sourceByObject(server_objects, object_id) orelse
                             return try self.protocolError(actor, decoded.handle.id, Device.@"error".used_source.value, "invalid selection source");
                         if (!std.meta.eql(source.peer, peer) or source.used)
                             return try self.protocolError(actor, decoded.handle.id, Device.@"error".used_source.value, "selection source was already used");
                         if (source.drag_actions_set)
                             return try self.protocolError(actor, source.header.resource.id, Source.@"error".invalid_source.value, "drag-and-drop source cannot become a selection");
-                        break :source self.sourceId(source);
+                        break :source self.selectionSource(source);
                     } else null;
                     self.replaceSelection(next, true) catch return try self.noMemory(actor);
-                    if (next) |id| (self.resolveSource(id) catch unreachable).used = true;
+                    if (payload.source) |object_id| self.sourceByObject(server_objects, object_id).?.used = true;
                 },
                 .release => {},
             }
@@ -445,6 +447,25 @@ pub fn Adapter(comptime protocol: type) type {
                 return try self.protocolError(actor, decoded.handle.id, Offer.@"error".invalid_offer.value, "finished drag offer only accepts destroy");
             switch (decoded.value) {
                 .receive => |payload| {
+                    if (offer.kind == .selection) {
+                        const source = offer.selection_source orelse {
+                            _ = linux.close(payload.fd);
+                            return try self.protocolError(actor, decoded.handle.id, Offer.@"error".invalid_offer.value, "selection source is gone");
+                        };
+                        const mime_index = source.findMime(payload.mime_type) catch {
+                            _ = linux.close(payload.fd);
+                            return try self.protocolError(actor, decoded.handle.id, Offer.@"error".invalid_offer.value, "selection source is gone");
+                        } orelse {
+                            _ = linux.close(payload.fd);
+                            return try self.protocolError(actor, decoded.handle.id, Offer.@"error".invalid_offer.value, "MIME type was not offered");
+                        };
+                        source.send(mime_index, payload.fd) catch {
+                            _ = linux.close(payload.fd);
+                            return try self.noMemory(actor);
+                        };
+                        try decoded.finish(protocol, server_objects, &actor.transmit);
+                        return .continue_dispatch;
+                    }
                     const source = self.resolveSource(offer.source) catch {
                         _ = linux.close(payload.fd);
                         return try self.protocolError(actor, decoded.handle.id, Offer.@"error".invalid_offer.value, "selection source is gone");
@@ -531,6 +552,23 @@ pub fn Adapter(comptime protocol: type) type {
             self.focus = focus;
             if (focus) |peer| for (self.devices) |*device| if (device.header.active and std.meta.eql(device.peer, peer))
                 self.enqueueSelection(device) catch unreachable;
+        }
+
+        pub fn currentSelection(self: *const Self) ?SelectionSource {
+            return self.selection;
+        }
+
+        /// Replaces the regular clipboard without focus or serial validation.
+        /// Restricted control protocols use this after performing their own
+        /// source ownership and one-use validation.
+        pub fn setControlledSelection(self: *Self, source: ?SelectionSource) !void {
+            try self.replaceSelection(source, true);
+        }
+
+        pub fn clearControlledSource(self: *Self, source: SelectionSource) !void {
+            if (self.selection) |current| {
+                if (current.eql(source)) try self.replaceSelection(null, false);
+            }
         }
 
         pub fn dragActive(self: *const Self) bool {
@@ -712,17 +750,14 @@ pub fn Adapter(comptime protocol: type) type {
             offer.finished = true;
         }
 
-        fn replaceSelection(self: *Self, next: ?Id, cancel_old: bool) !void {
+        fn replaceSelection(self: *Self, next: ?SelectionSource, cancel_old: bool) !void {
             const old = self.selection;
             const focus_count = if (self.focus) |peer| self.deviceCount(peer) else 0;
             const cancel_count: usize = @intFromBool(cancel_old and old != null and
-                (next == null or !std.meta.eql(old.?, next.?)));
+                (next == null or !old.?.eql(next.?)));
             if (self.outboundFree() < focus_count + cancel_count) return error.Exhausted;
             if (next != null and self.offerFree() < focus_count) return error.Exhausted;
-            if (cancel_count != 0) {
-                const source = self.resolveSource(old.?) catch null;
-                if (source) |slot| self.enqueue(slot.peer, .{ .source_cancelled = old.? }) catch unreachable;
-            }
+            if (cancel_count != 0) try old.?.cancel();
             self.selection = next;
             if (self.focus) |peer| for (self.devices) |*device| if (device.header.active and std.meta.eql(device.peer, peer))
                 self.enqueueSelection(device) catch unreachable;
@@ -734,7 +769,7 @@ pub fn Adapter(comptime protocol: type) type {
                 const offer = acquire(OfferSlot, self.offers, &self.offer_free) catch return error.Exhausted;
                 offer.peer = device.peer;
                 offer.device = publication.device;
-                offer.source = source;
+                offer.selection_source = source;
                 publication.offer = self.offerId(offer);
             }
             self.enqueue(device.peer, .{ .selection = publication }) catch |err| {
@@ -837,7 +872,7 @@ pub fn Adapter(comptime protocol: type) type {
                         try wayring.server.sendEvent(protocol, Device, server_objects, queue, device.header.resource, .{ .selection = .{ .id = null } });
                         return true;
                     }
-                    const source = self.resolveSource(value.source.?) catch {
+                    const mime_count = value.source.?.mimeCount() catch {
                         value.source = null;
                         return false;
                     };
@@ -850,9 +885,13 @@ pub fn Adapter(comptime protocol: type) type {
                         value.phase = 1;
                         return false;
                     }
-                    if (value.phase == 1 and value.mime_index < source.mime_count) {
+                    if (value.phase == 1 and value.mime_index < mime_count) {
+                        const mime_type = value.source.?.mime(value.mime_index) catch {
+                            value.source = null;
+                            return false;
+                        };
                         try wayring.server.sendEvent(protocol, Offer, server_objects, queue, offer.header.resource, .{ .offer = .{
-                            .mime_type = self.mime(source, value.mime_index),
+                            .mime_type = mime_type,
                         } });
                         value.mime_index += 1;
                         return false;
@@ -961,7 +1000,7 @@ pub fn Adapter(comptime protocol: type) type {
                 if (!std.meta.eql(source.header.resource, handle)) return false;
                 const id = self.sourceId(source);
                 if (self.selection) |selection| {
-                    if (std.meta.eql(selection, id)) self.selection = null;
+                    if (selection.eql(self.selectionSource(source))) self.selection = null;
                 }
                 if (self.drag) |drag| {
                     if (drag.source != null and std.meta.eql(drag.source.?, id)) {
@@ -1076,6 +1115,7 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         fn dropSourceOutbound(self: *Self, id: Id) void {
+            const selected_source = SelectionSource{ .owner = self, .token = @bitCast(id), .vtable = &selection_source_vtable };
             for (self.offers) |*offer| {
                 if (offer.header.active and offer.kind == .drag and
                     std.meta.eql(offer.source, id)) offer.current = false;
@@ -1094,7 +1134,7 @@ pub fn Adapter(comptime protocol: type) type {
                     self.dropOutboundSlot(slot);
                 },
                 .selection => |*value| {
-                    if (value.source != null and std.meta.eql(value.source.?, id)) {
+                    if (value.source != null and value.source.?.eql(selected_source)) {
                         self.abandonPublicationOffer(value);
                         value.source = null;
                     }
@@ -1170,6 +1210,38 @@ pub fn Adapter(comptime protocol: type) type {
         }
         fn sourceId(self: *Self, slot: *SourceSlot) Id {
             return .{ .index = indexOf(SourceSlot, self.sources, slot), .generation = slot.header.generation };
+        }
+        fn selectionSource(self: *Self, slot: *SourceSlot) SelectionSource {
+            return .{ .owner = self, .token = @bitCast(self.sourceId(slot)), .vtable = &selection_source_vtable };
+        }
+        const selection_source_vtable: SelectionSource.VTable = .{
+            .mimeCount = selectionMimeCount,
+            .mime = selectionMime,
+            .send = selectionSend,
+            .cancel = selectionCancel,
+        };
+        fn selectionMimeCount(context: *anyopaque, token: u64) !usize {
+            const self: *Self = @ptrCast(@alignCast(context));
+            return (try self.resolveSource(@bitCast(token))).mime_count;
+        }
+        fn selectionMime(context: *anyopaque, token: u64, index: usize) ![]const u8 {
+            const self: *Self = @ptrCast(@alignCast(context));
+            const source = try self.resolveSource(@bitCast(token));
+            if (index >= source.mime_count) return error.Stale;
+            return self.mime(source, index);
+        }
+        fn selectionSend(context: *anyopaque, token: u64, mime_index: usize, fd: linux.fd_t) !void {
+            const self: *Self = @ptrCast(@alignCast(context));
+            const id: Id = @bitCast(token);
+            const source = try self.resolveSource(id);
+            if (mime_index >= source.mime_count) return error.Stale;
+            try self.enqueue(source.peer, .{ .source_send = .{ .source = id, .mime_index = mime_index, .fd = fd } });
+        }
+        fn selectionCancel(context: *anyopaque, token: u64) !void {
+            const self: *Self = @ptrCast(@alignCast(context));
+            const id: Id = @bitCast(token);
+            const source = try self.resolveSource(id);
+            try self.enqueue(source.peer, .{ .source_cancelled = id });
         }
         fn deviceId(self: *Self, slot: *DeviceSlot) Id {
             return .{ .index = indexOf(DeviceSlot, self.devices, slot), .generation = slot.header.generation };
@@ -1481,15 +1553,14 @@ test "data device: copied MIME types and offer capacity make replacement transac
     for (adapter.outbound) |*slot| slot.active = false;
     adapter.outbound_len = 0;
 
-    const first_id = adapter.sourceId(first);
-    try adapter.replaceSelection(first_id, true);
-    try std.testing.expectEqual(first_id, adapter.selection.?);
+    const first_selection = adapter.selectionSource(first);
+    try adapter.replaceSelection(first_selection, true);
+    try std.testing.expect(first_selection.eql(adapter.selection.?));
     try std.testing.expectEqual(@as(usize, 1), adapter.pendingOutbound());
     try std.testing.expectEqual(@as(usize, 0), adapter.offerFree());
 
-    const second_id = adapter.sourceId(second);
-    try std.testing.expectError(error.Exhausted, adapter.replaceSelection(second_id, true));
-    try std.testing.expectEqual(first_id, adapter.selection.?);
+    try std.testing.expectError(error.Exhausted, adapter.replaceSelection(adapter.selectionSource(second), true));
+    try std.testing.expect(first_selection.eql(adapter.selection.?));
     try std.testing.expectEqual(@as(usize, 1), adapter.pendingOutbound());
 }
 
@@ -1514,7 +1585,7 @@ test "data device: dropping a source closes retained receive FDs and reserved of
     try adapter.setFocus(peer);
     for (adapter.outbound) |*slot| slot.active = false;
     adapter.outbound_len = 0;
-    try adapter.replaceSelection(source_id, false);
+    try adapter.replaceSelection(adapter.selectionSource(source), false);
     try std.testing.expectEqual(@as(usize, 0), adapter.offerFree());
 
     const raw_fd = linux.eventfd(0, linux.EFD.CLOEXEC);
@@ -1568,7 +1639,7 @@ test "data device: publication emits offer, copied MIME list, then selection" {
     try adapter.setFocus(peer);
     for (adapter.outbound) |*slot| slot.active = false;
     adapter.outbound_len = 0;
-    try adapter.replaceSelection(adapter.sourceId(source), false);
+    try adapter.replaceSelection(adapter.selectionSource(source), false);
 
     try std.testing.expectEqual(@as(usize, 1), try adapter.flushOn(peer, &server_objects, &output));
     try std.testing.expectEqual(@as(usize, 0), adapter.pendingOutbound());
