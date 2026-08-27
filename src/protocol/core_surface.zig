@@ -89,7 +89,16 @@ pub fn Adapter(comptime protocol: type) type {
         const WlBuffer = protocol.wl_buffer;
         const Presentation = protocol.wp_presentation;
         const PresentationFeedback = protocol.wp_presentation_feedback;
-        const Commit = surface_state.CommitState(objects.Handle);
+
+        /// Protocol-neutral identity for a live Ouro surface slot. The slot
+        /// index is local to this adapter and the generation is inherited from
+        /// Wayring's complete resource handle.
+        pub const SurfaceId = struct {
+            index: u32,
+            generation: u32,
+        };
+
+        const Commit = surface_state.CommitState(SurfaceId);
 
         pub const Applied = Commit.Scheduler.Applied;
         pub const Content = Commit.Content;
@@ -125,14 +134,6 @@ pub fn Adapter(comptime protocol: type) type {
                 []UpdateToken,
             ) anyerror!ContentCommitPlan,
             committed_fn: *const fn (*anyopaque, SurfaceId) void,
-        };
-
-        /// Protocol-neutral identity for a live Ouro surface slot. The slot
-        /// index is local to this adapter and the generation is inherited from
-        /// Wayring's complete resource handle.
-        pub const SurfaceId = struct {
-            index: u32,
-            generation: u32,
         };
 
         const CopyState = union(enum) {
@@ -197,6 +198,7 @@ pub fn Adapter(comptime protocol: type) type {
         const SurfaceSlot = struct {
             active: bool = false,
             next_free: u32 = none,
+            index: u32 = 0,
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
             peer: wayring.io_uring.Peer = undefined,
             state: surface_state.Surface = .{},
@@ -414,6 +416,7 @@ pub fn Adapter(comptime protocol: type) type {
 
             for (surfaces, 0..) |slot, index| slot.* = .{
                 .next_free = if (index + 1 < surfaces.len) @intCast(index + 1) else none,
+                .index = @intCast(index),
             };
             for (regions, 0..) |slot, index| slot.* = .{
                 .next_free = if (index + 1 < regions.len) @intCast(index + 1) else none,
@@ -1121,7 +1124,16 @@ pub fn Adapter(comptime protocol: type) type {
             output: []Applied,
             now_ns: u64,
         ) ![]Applied {
-            const slot = try adapter.resolveSurface(handle);
+            return adapter.tryApplyAtId(try adapter.surfaceId(handle), output, now_ns);
+        }
+
+        pub fn tryApplyAtId(
+            adapter: *Self,
+            id: SurfaceId,
+            output: []Applied,
+            now_ns: u64,
+        ) ![]Applied {
+            const slot = try adapter.surfaceForId(id);
             if (try adapter.fifoBlocked(slot)) return output[0..0];
             const applied = try adapter.scheduler.tryApplyWith(
                 &slot.updates,
@@ -1130,7 +1142,7 @@ pub fn Adapter(comptime protocol: type) type {
                 commitReady,
             );
             for (applied) |update| if (update.payload.surface.fifo_set) {
-                const applied_surface = try adapter.resolveSurface(update.surface);
+                const applied_surface = try adapter.surfaceForId(update.surface);
                 applied_surface.fifo_barrier = true;
             };
             return applied;
@@ -1145,7 +1157,15 @@ pub fn Adapter(comptime protocol: type) type {
             handle: objects.Handle,
             now_ns: u64,
         ) !usize {
-            const slot = try adapter.resolveSurface(handle);
+            return adapter.readyUpdateCountAtId(try adapter.surfaceId(handle), now_ns);
+        }
+
+        pub fn readyUpdateCountAtId(
+            adapter: *Self,
+            id: SurfaceId,
+            now_ns: u64,
+        ) !usize {
+            const slot = try adapter.surfaceForId(id);
             if (try adapter.fifoBlocked(slot)) return 0;
             return adapter.scheduler.readyCountWith(&slot.updates, &now_ns, commitReady);
         }
@@ -1153,18 +1173,31 @@ pub fn Adapter(comptime protocol: type) type {
         pub fn readyUpdateSurfaces(
             adapter: *Self,
             handle: objects.Handle,
-            output: []objects.Handle,
-        ) ![]objects.Handle {
+            output: []SurfaceId,
+        ) ![]SurfaceId {
             return adapter.readyUpdateSurfacesAt(handle, output, std.math.maxInt(u64));
         }
 
         pub fn readyUpdateSurfacesAt(
             adapter: *Self,
             handle: objects.Handle,
-            output: []objects.Handle,
+            output: []SurfaceId,
             now_ns: u64,
-        ) ![]objects.Handle {
-            const slot = try adapter.resolveSurface(handle);
+        ) ![]SurfaceId {
+            return adapter.readyUpdateSurfaceIdsAt(
+                try adapter.surfaceId(handle),
+                output,
+                now_ns,
+            );
+        }
+
+        pub fn readyUpdateSurfaceIdsAt(
+            adapter: *Self,
+            id: SurfaceId,
+            output: []SurfaceId,
+            now_ns: u64,
+        ) ![]SurfaceId {
+            const slot = try adapter.surfaceForId(id);
             if (try adapter.fifoBlocked(slot)) return output[0..0];
             return adapter.scheduler.readySurfacesWith(
                 &slot.updates,
@@ -1513,7 +1546,10 @@ pub fn Adapter(comptime protocol: type) type {
                     };
                     slot.resource = admitted.id;
                     slot.peer = .{ .slot = actor.slot, .generation = actor.generation };
-                    slot.updates = Commit.Scheduler.Queue.init(&adapter.scheduler, admitted.id);
+                    slot.updates = Commit.Scheduler.Queue.init(&adapter.scheduler, .{
+                        .index = adapter.surfaceIndex(slot),
+                        .generation = admitted.id.generation,
+                    });
                 },
                 .create_region => |value| {
                     const slot = adapter.acquireRegion() catch |cause|
@@ -2382,6 +2418,7 @@ pub fn Adapter(comptime protocol: type) type {
             adapter.surface_free = slot.next_free;
             slot.* = .{
                 .active = true,
+                .index = index,
                 .regions = surface_state.SurfaceRegions.init(&adapter.region_pool),
                 .frames = surface_state.FrameQueue.init(&adapter.frame_pool),
                 .releases = surface_state.ReleaseQueue.init(&adapter.release_pool),
@@ -2406,7 +2443,7 @@ pub fn Adapter(comptime protocol: type) type {
             slot.frames.deinit();
             slot.regions.deinit();
             slot.state.deinit();
-            slot.* = .{ .next_free = adapter.surface_free };
+            slot.* = .{ .next_free = adapter.surface_free, .index = index };
             adapter.surface_free = index;
         }
 
@@ -2830,7 +2867,9 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         fn surfaceIndex(adapter: *Self, slot: *SurfaceSlot) u32 {
-            return slotIndex(SurfaceSlot, adapter.surfaces, slot);
+            std.debug.assert(slot.index < adapter.surfaces.len);
+            std.debug.assert(adapter.surfaces[slot.index] == slot);
+            return slot.index;
         }
 
         fn regionIndex(adapter: *Self, slot: *RegionSlot) u32 {
@@ -4753,9 +4792,9 @@ test "FIFO wait does not block a synchronized child update" {
     const updates = try context.adapter.tryApply(parent, &output);
     defer for (updates) |*update| update.payload.deinit();
     try std.testing.expectEqual(@as(usize, 2), updates.len);
-    try std.testing.expectEqual(child, updates[0].surface);
+    try std.testing.expectEqual(try context.adapter.surfaceId(child), updates[0].surface);
     try std.testing.expect(updates[0].payload.surface.fifo_wait);
-    try std.testing.expectEqual(parent, updates[1].surface);
+    try std.testing.expectEqual(try context.adapter.surfaceId(parent), updates[1].surface);
 }
 
 test "FIFO rejects duplicate objects for one surface" {
@@ -5311,14 +5350,15 @@ test "content commit hook synchronizes a child update with its parent" {
     const updates = try context.adapter.tryApply(parent, &applied);
     defer for (updates) |*update| update.payload.deinit();
     try std.testing.expectEqual(@as(usize, 2), updates.len);
-    try std.testing.expectEqual(child, updates[0].surface);
-    try std.testing.expectEqual(parent, updates[1].surface);
+    try std.testing.expectEqual(try context.adapter.surfaceId(child), updates[0].surface);
+    try std.testing.expectEqual(try context.adapter.surfaceId(parent), updates[1].surface);
 }
 
 test "stale removal cannot release a reused surface slot" {
     const context = try TestContext.init();
     defer context.deinit();
     const stale = try context.createSurface(10);
+    const stale_id = try context.adapter.surfaceId(stale);
     const stale_object = context.server_objects.namespace.resolve(stale).?.*;
     _ = try context.server_objects.removeClient(stale);
     const current = try context.createSurface(11);
@@ -5326,4 +5366,13 @@ test "stale removal cannot release a reused surface slot" {
     try std.testing.expect(!context.adapter.resourceRemoved(stale, stale_object));
     try std.testing.expectEqual(@as(u64, 0), (try context.adapter.getSurface(current)).sequence);
     try std.testing.expectError(error.StaleSurface, context.adapter.getSurface(stale));
+    try std.testing.expectError(
+        error.StaleSurface,
+        context.adapter.readyUpdateCountAtId(stale_id, std.math.maxInt(u64)),
+    );
+    var applied: [1]TestAdapter.Applied = undefined;
+    try std.testing.expectError(
+        error.StaleSurface,
+        context.adapter.tryApplyAtId(stale_id, &applied, std.math.maxInt(u64)),
+    );
 }

@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const render = @import("types.zig");
+const libc = @cImport(@cInclude("string.h"));
 
 pub const Handle = packed struct {
     index: u32,
@@ -563,6 +564,10 @@ fn validateExternal(identity: render.SampleIdentity, source: render.Source) !voi
 }
 
 fn copyFull(destination: []u8, packed_stride: u32, source: render.Source) void {
+    if (source.stride == packed_stride) {
+        _ = libc.memcpy(destination.ptr, source.bytes.ptr, destination.len);
+        return;
+    }
     for (0..source.size.height) |row| {
         const source_start = @as(usize, source.stride) * row;
         const destination_start = @as(usize, packed_stride) * row;
@@ -768,6 +773,21 @@ fn externalSource(context: *anyopaque, token: u64) render.Source {
             .offsets = .{ 0, 0, 0, 0 },
         },
     };
+}
+
+test "render-content: large packed full copy preserves every byte" {
+    const width = 256;
+    const height = 64;
+    const size = width * height * 4;
+    const source = try std.testing.allocator.alloc(u8, size);
+    defer std.testing.allocator.free(source);
+    const destination = try std.testing.allocator.alloc(u8, size);
+    defer std.testing.allocator.free(destination);
+    for (source, 0..) |*byte, index| byte.* = @truncate(index *% 131 +% 17);
+    @memset(destination, 0);
+
+    copyFull(destination, width * 4, testSource(source, width, height, width * 4));
+    try std.testing.expectEqualSlices(u8, source, destination);
 }
 
 test "render-content: alternating buffers patch one logical surface history" {
