@@ -231,6 +231,7 @@ test "shell-input: security context filters nested manager before registry disco
     try std.testing.expect(parent_handler.security_manager != null);
     try std.testing.expect(parent_handler.ext_data_control_global_seen);
     try std.testing.expect(parent_handler.wlr_data_control_global_seen);
+    try std.testing.expect(parent_handler.input_method_global_seen);
 
     var close_pair: [2]linux.fd_t = undefined;
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(
@@ -323,6 +324,7 @@ test "shell-input: security context filters nested manager before registry disco
     try std.testing.expect(!child_handler.security_global_seen);
     try std.testing.expect(!child_handler.ext_data_control_global_seen);
     try std.testing.expect(!child_handler.wlr_data_control_global_seen);
+    try std.testing.expect(!child_handler.input_method_global_seen);
     try std.testing.expect(child_handler.security_manager == null);
     var sandbox_peer: ?wayring.io_uring.Peer = null;
     for (coordinator.clients.items) |client_state| if (client_state.active and
@@ -1502,6 +1504,166 @@ test "shell-input: synchronized subsurface publishes with parent and receives po
     try root.deinit();
 }
 
+test "shell-input: generated input-method client bridges focused text input" {
+    const allocator = std.testing.allocator;
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-input-method-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+
+    var fixture = try physical_fixture.Fixture.init();
+    defer fixture.deinit();
+    var input = try FakeInput.init();
+    defer input.deinit();
+    var root_config = physical_fixture.compositorConfig();
+    root_config.runtime.object_capacity = 96;
+    root_config.runtime.object_quota = 48;
+    root_config.runtime.registry_capacity = 2;
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 2), root_config);
+    var config = physical_fixture.coordinatorConfig();
+    config.router_capacity = 32;
+    var platforms = fixture.platforms();
+    platforms.input = input.platform();
+    const coordinator = try Coordinator.create(allocator, root, platforms, config);
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 32 });
+    try coordinator.start(&loop);
+
+    var app_reactor: wayring.io_uring.Reactor = undefined;
+    try app_reactor.initOwned(allocator, .{ .entries = 16, .flags = 0 }, physical_fixture.clientReactorConfig());
+    var app = try ClientConnection.attach(allocator, &app_reactor, try wayring.unix_socket.connect(path), .{ .received_fd_budget = 2, .transmit_byte_budget = 8192, .transmit_fd_budget = 2 }, .{ .max_objects = 48, .max_client_ids = 47 });
+    const app_actor = try app.actor();
+    var app_driver = ClientDriver.init(&app);
+    const app_registry = try ClientCore.getRegistry(&app.objects, &app_actor.transmit, null);
+    var app_handler: Handler = .{ .objects = &app.objects, .queue = &app_actor.transmit, .registry = app_registry, .test_text_input = true };
+    try submitClient(&app_reactor, &app_driver, &app_handler);
+
+    var method_reactor: wayring.io_uring.Reactor = undefined;
+    try method_reactor.initOwned(allocator, .{ .entries = 16, .flags = 0 }, physical_fixture.clientReactorConfig());
+    var method_client = try ClientConnection.attach(allocator, &method_reactor, try wayring.unix_socket.connect(path), .{ .received_fd_budget = 2, .transmit_byte_budget = 8192, .transmit_fd_budget = 2 }, .{ .max_objects = 16, .max_client_ids = 15 });
+    const method_actor = try method_client.actor();
+    var method_driver = ClientDriver.init(&method_client);
+    const method_registry = try ClientCore.getRegistry(&method_client.objects, &method_actor.transmit, null);
+    var method_handler: InputMethodHandler = .{ .objects = &method_client.objects, .queue = &method_actor.transmit, .registry = method_registry };
+    try submitClient(&method_reactor, &method_driver, &method_handler);
+
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    var device_added = false;
+    var focus_clicked = false;
+    for (0..512) |_| {
+        _ = try drainClient(&app_reactor, &app_driver, &app_handler);
+        _ = try drainClient(&method_reactor, &method_driver, &method_handler);
+        _ = try loop.turn(coordinator);
+        if (!device_added and coordinator.input != null) {
+            try input.publish(&.{.{ .device_added = .{ .device = 42, .info = .{ .capabilities = .{ .pointer = true, .keyboard = true } } } }});
+            device_added = true;
+        }
+        if (device_added and !focus_clicked and app_handler.mapped and app_handler.input_ready and input.cursor == input.event_count) {
+            try input.publish(&.{
+                .{ .pointer_motion = .{ .device = 42, .time_usec = 1_000, .dx = 1, .dy = 1 } },
+                .{ .pointer_button = .{ .device = 42, .time_usec = 2_000, .button = 0x110, .pressed = true } },
+            });
+            focus_clicked = true;
+        }
+        if (app_handler.text_input_enter == 1 and method_handler.unavailable == 1) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(app_handler.mapped);
+    try std.testing.expectEqual(@as(usize, 1), app_handler.text_input_enter);
+    try std.testing.expect(method_handler.method != null);
+    try std.testing.expectEqual(@as(usize, 1), method_handler.unavailable);
+
+    try protocol.zwp_text_input_v3.encodeRequest(&app_actor.transmit, app_handler.text_input.?.id, .{ .enable = .{} });
+    try protocol.zwp_text_input_v3.encodeRequest(&app_actor.transmit, app_handler.text_input.?.id, .{ .set_surrounding_text = .{ .text = "hello world", .cursor = 5, .anchor = 3 } });
+    try protocol.zwp_text_input_v3.encodeRequest(&app_actor.transmit, app_handler.text_input.?.id, .{ .set_text_change_cause = .{ .cause = .other } });
+    try protocol.zwp_text_input_v3.encodeRequest(&app_actor.transmit, app_handler.text_input.?.id, .{ .set_content_type = .{ .hint = .completion, .purpose = .email } });
+    try protocol.zwp_text_input_v3.encodeRequest(&app_actor.transmit, app_handler.text_input.?.id, .{ .commit = .{} });
+    try submitClient(&app_reactor, &app_driver, &app_handler);
+    for (0..512) |_| {
+        _ = try drainClient(&app_reactor, &app_driver, &app_handler);
+        _ = try drainClient(&method_reactor, &method_driver, &method_handler);
+        _ = try loop.turn(coordinator);
+        if (method_handler.done == 1) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(method_handler.state_valid);
+    try std.testing.expectEqual(@as(usize, 1), method_handler.activate);
+    try std.testing.expectEqual(@as(usize, 1), method_handler.surrounding);
+    try std.testing.expectEqual(@as(usize, 1), method_handler.cause);
+    try std.testing.expectEqual(@as(usize, 1), method_handler.content);
+    try std.testing.expectEqual(@as(usize, 1), method_handler.done);
+
+    const im = method_handler.method.?;
+    try protocol.zwp_input_method_v2.encodeRequest(&method_actor.transmit, im.id, .{ .commit_string = .{ .text = "stale" } });
+    try protocol.zwp_input_method_v2.encodeRequest(&method_actor.transmit, im.id, .{ .set_preedit_string = .{ .text = "bad", .cursor_begin = 0, .cursor_end = 1 } });
+    try protocol.zwp_input_method_v2.encodeRequest(&method_actor.transmit, im.id, .{ .delete_surrounding_text = .{ .before_length = 9, .after_length = 9 } });
+    try protocol.zwp_input_method_v2.encodeRequest(&method_actor.transmit, im.id, .{ .commit = .{ .serial = 0 } });
+    try submitClient(&method_reactor, &method_driver, &method_handler);
+    for (0..64) |_| {
+        _ = try drainClient(&app_reactor, &app_driver, &app_handler);
+        _ = try drainClient(&method_reactor, &method_driver, &method_handler);
+        _ = try loop.turn(coordinator);
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(usize, 0), app_handler.text_input_done);
+
+    try protocol.zwp_input_method_v2.encodeRequest(&method_actor.transmit, im.id, .{ .commit_string = .{ .text = "committed" } });
+    try protocol.zwp_input_method_v2.encodeRequest(&method_actor.transmit, im.id, .{ .set_preedit_string = .{ .text = "pré", .cursor_begin = 2, .cursor_end = 4 } });
+    try protocol.zwp_input_method_v2.encodeRequest(&method_actor.transmit, im.id, .{ .delete_surrounding_text = .{ .before_length = 4, .after_length = 2 } });
+    try protocol.zwp_input_method_v2.encodeRequest(&method_actor.transmit, im.id, .{ .commit = .{ .serial = 1 } });
+    try submitClient(&method_reactor, &method_driver, &method_handler);
+    for (0..512) |_| {
+        _ = try drainClient(&app_reactor, &app_driver, &app_handler);
+        _ = try drainClient(&method_reactor, &method_driver, &method_handler);
+        _ = try loop.turn(coordinator);
+        if (app_handler.text_input_done == 1) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(usize, 1), app_handler.text_input_preedit);
+    try std.testing.expectEqual(@as(usize, 1), app_handler.text_input_commit);
+    try std.testing.expectEqual(@as(usize, 1), app_handler.text_input_delete);
+    try std.testing.expect(app_handler.text_input_preedit_valid and app_handler.text_input_commit_valid and app_handler.text_input_delete_valid);
+    try std.testing.expectEqual(@as(usize, 1), app_handler.text_input_done);
+
+    try wayring.client.sendRequest(protocol.zwp_input_method_manager_v2, &method_client.objects, &method_actor.transmit, method_handler.manager.?, .{ .destroy = .{} });
+    method_handler.manager = null;
+    try protocol.zwp_input_method_v2.encodeRequest(&method_actor.transmit, im.id, .{ .commit_string = .{ .text = "committed" } });
+    try protocol.zwp_input_method_v2.encodeRequest(&method_actor.transmit, im.id, .{ .commit = .{ .serial = 1 } });
+    try submitClient(&method_reactor, &method_driver, &method_handler);
+    for (0..512) |_| {
+        _ = try drainClient(&app_reactor, &app_driver, &app_handler);
+        _ = try drainClient(&method_reactor, &method_driver, &method_handler);
+        _ = try loop.turn(coordinator);
+        if (app_handler.text_input_done == 2) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(usize, 2), app_handler.text_input_done);
+    try std.testing.expectEqual(@as(usize, 0), app_handler.event_failures);
+    try std.testing.expectEqual(@as(usize, 0), method_handler.event_failures);
+
+    try wayring.client.sendRequest(protocol.zwp_input_method_v2, &method_client.objects, &method_actor.transmit, im, .{ .destroy = .{} });
+    try wayring.client.sendRequest(protocol.zwp_text_input_v3, &app.objects, &app_actor.transmit, app_handler.text_input.?, .{ .destroy = .{} });
+    _ = try app.prepareClose();
+    _ = try method_client.prepareClose();
+    try submitClient(&app_reactor, &app_driver, &app_handler);
+    try submitClient(&method_reactor, &method_driver, &method_handler);
+    try coordinator.requestStop();
+    for (0..512) |_| {
+        const a = try drainClient(&app_reactor, &app_driver, &app_handler);
+        const m = try drainClient(&method_reactor, &method_driver, &method_handler);
+        const p = try loop.turn(coordinator);
+        if (a.quiescent and m.quiescent and p.wayring.shutdown_complete and coordinator.backendDrainComplete()) break;
+        _ = linux.sched_yield();
+    }
+    try app.deinit(allocator);
+    try method_client.deinit(allocator);
+    app_reactor.deinit(allocator);
+    method_reactor.deinit(allocator);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
 test "shell-input: one client disconnect does not interrupt another client" {
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;
@@ -1859,6 +2021,85 @@ const TabletHandler = struct {
             self.manager.?,
             .{ .seat = self.seat.?.id },
         )).tablet_seat;
+    }
+};
+
+const InputMethodHandler = struct {
+    objects: *wayring.objects.ClientObjects,
+    queue: *wayring.tx.Queue,
+    registry: wayring.objects.Handle,
+    seat: ?wayring.objects.Handle = null,
+    manager: ?wayring.objects.Handle = null,
+    method: ?wayring.objects.Handle = null,
+    rejected: ?wayring.objects.Handle = null,
+    unavailable: usize = 0,
+    activate: usize = 0,
+    surrounding: usize = 0,
+    cause: usize = 0,
+    content: usize = 0,
+    done: usize = 0,
+    order: usize = 0,
+    state_valid: bool = true,
+    event_failures: usize = 0,
+
+    pub fn eventError(self: *@This(), _: wayring.io_uring.Peer, _: ClientCore.EventFailure) void {
+        self.event_failures += 1;
+    }
+    pub fn event(self: *@This(), target: wayring.objects.Dispatch, message: wayring.wire.Message, fds: *wayring.ancillary.FdQueue) !wayring.dispatch.Control {
+        if (target.object.interface == &ClientCore.Registry.info) {
+            switch (try ClientCore.decodeRegistryEvent(self.objects, self.registry, message, fds)) {
+                .global => |v| {
+                    if (std.mem.eql(u8, v.interface, protocol.wl_seat.info.name)) self.seat = try ClientCore.bind(self.objects, self.queue, self.registry, v.name, &protocol.wl_seat.info, @min(v.version, 9), null);
+                    if (std.mem.eql(u8, v.interface, protocol.zwp_input_method_manager_v2.info.name)) self.manager = try ClientCore.bind(self.objects, self.queue, self.registry, v.name, &protocol.zwp_input_method_manager_v2.info, 1, null);
+                    if (self.method == null and self.seat != null and self.manager != null) {
+                        self.method = (try protocol.zwp_input_method_manager_v2.construct_get_input_method(self.objects, self.queue, self.manager.?, .{ .seat = self.seat.?.id })).input_method;
+                        self.rejected = (try protocol.zwp_input_method_manager_v2.construct_get_input_method(self.objects, self.queue, self.manager.?, .{ .seat = self.seat.?.id })).input_method;
+                    }
+                },
+                .global_remove => {},
+            }
+        } else if (target.object.interface == &protocol.wl_seat.info) {
+            _ = try protocol.wl_seat.decodeEvent(message, fds);
+        } else if (target.object.interface == &protocol.zwp_input_method_v2.info) {
+            const rejected = message.header.object_id == self.rejected.?.id;
+            switch (try protocol.zwp_input_method_v2.decodeEvent(message, fds)) {
+                .unavailable => {
+                    try std.testing.expect(rejected);
+                    self.unavailable += 1;
+                },
+                .activate => {
+                    try std.testing.expect(!rejected);
+                    self.activate += 1;
+                    self.order += 1;
+                    try std.testing.expectEqual(@as(usize, 1), self.order);
+                },
+                .surrounding_text => |v| {
+                    self.surrounding += 1;
+                    self.order += 1;
+                    self.state_valid = self.state_valid and self.order == 2 and std.mem.eql(u8, v.text, "hello world") and v.cursor == 5 and v.anchor == 3;
+                },
+                .text_change_cause => |v| {
+                    self.cause += 1;
+                    self.order += 1;
+                    self.state_valid = self.state_valid and self.order == 3 and v.cause.value == protocol.zwp_text_input_v3.change_cause.other.value;
+                },
+                .content_type => |v| {
+                    self.content += 1;
+                    self.order += 1;
+                    self.state_valid = self.state_valid and self.order == 4 and v.hint.value == protocol.zwp_text_input_v3.content_hint.completion.value and v.purpose.value == protocol.zwp_text_input_v3.content_purpose.email.value;
+                },
+                .done => {
+                    self.done += 1;
+                    self.order += 1;
+                    self.state_valid = self.state_valid and self.order == 5;
+                },
+                else => {},
+            }
+        } else if (target.object.interface == &ClientCore.Display.info) switch (try ClientCore.decodeDisplayEvent(self.objects, message, fds)) {
+            .delete_id => {},
+            .@"error" => return error.ServerProtocolError,
+        } else return error.UnexpectedEvent;
+        return .continue_dispatch;
     }
 };
 
@@ -2447,6 +2688,18 @@ const Handler = struct {
     security_global_seen: bool = false,
     ext_data_control_global_seen: bool = false,
     wlr_data_control_global_seen: bool = false,
+    input_method_global_seen: bool = false,
+    text_input_manager: ?wayring.objects.Handle = null,
+    text_input: ?wayring.objects.Handle = null,
+    test_text_input: bool = false,
+    text_input_enter: usize = 0,
+    text_input_done: usize = 0,
+    text_input_preedit: usize = 0,
+    text_input_commit: usize = 0,
+    text_input_delete: usize = 0,
+    text_input_commit_valid: bool = false,
+    text_input_preedit_valid: bool = false,
+    text_input_delete_valid: bool = false,
     test_security_context: bool = false,
     registry_only: bool = false,
     idle_standard: ?wayring.objects.Handle = null,
@@ -2645,9 +2898,10 @@ const Handler = struct {
                 .motion => self.pointer_motion += 1,
                 .button => |value| {
                     self.pointer_button += 1;
-                    if (self.cursor_surface == null) try self.queueCursor(value.serial);
+                    if (self.cursor_surface == null and !self.test_text_input)
+                        try self.queueCursor(value.serial);
                     if (value.state.value == protocol.wl_pointer.button_state.pressed.value and
-                        self.drag_cancelled == 0)
+                        self.drag_cancelled == 0 and !self.test_text_input)
                     {
                         try protocol.wl_data_device.encodeRequest(self.queue, self.data_device.?.id, .{
                             .start_drag = .{
@@ -2693,6 +2947,28 @@ const Handler = struct {
                 },
                 .enter => self.keyboard_enter += 1,
                 .key => self.keyboard_key += 1,
+                else => {},
+            }
+        } else if (target.object.interface == &protocol.zwp_text_input_v3.info) {
+            switch (try protocol.zwp_text_input_v3.decodeEvent(message, fds)) {
+                .enter => |value| {
+                    try std.testing.expectEqual(self.surface.?.id, value.surface);
+                    self.text_input_enter += 1;
+                },
+                .leave => {},
+                .preedit_string => |value| {
+                    self.text_input_preedit += 1;
+                    self.text_input_preedit_valid = std.mem.eql(u8, value.text orelse "", "pré") and value.cursor_begin == 2 and value.cursor_end == 4;
+                },
+                .commit_string => |value| {
+                    self.text_input_commit += 1;
+                    self.text_input_commit_valid = std.mem.eql(u8, value.text orelse "", "committed");
+                },
+                .delete_surrounding_text => |value| {
+                    self.text_input_delete += 1;
+                    self.text_input_delete_valid = value.before_length == 4 and value.after_length == 2;
+                },
+                .done => self.text_input_done += 1,
                 else => {},
             }
         } else if (target.object.interface == &protocol.wl_data_device.info) {
@@ -2754,14 +3030,16 @@ const Handler = struct {
                     self.buffer_release += 1;
                     self.completion_order += 1;
                     self.buffer_release_order = self.completion_order;
-                    try wayring.client.sendRequest(
-                        protocol.wl_buffer,
-                        self.objects,
-                        self.queue,
-                        self.mapped_buffer.?,
-                        .{ .destroy = .{} },
-                    );
-                    self.mapped_buffer = null;
+                    if (!self.test_text_input) {
+                        try wayring.client.sendRequest(
+                            protocol.wl_buffer,
+                            self.objects,
+                            self.queue,
+                            self.mapped_buffer.?,
+                            .{ .destroy = .{} },
+                        );
+                        self.mapped_buffer = null;
+                    }
                 },
             }
         } else if (target.object.interface == &ClientCore.Callback.info) {
@@ -2802,6 +3080,8 @@ const Handler = struct {
                 self.ext_data_control_global_seen = true;
             if (std.mem.eql(u8, value.interface, protocol.zwlr_data_control_manager_v1.info.name))
                 self.wlr_data_control_global_seen = true;
+            if (std.mem.eql(u8, value.interface, protocol.zwp_input_method_manager_v2.info.name))
+                self.input_method_global_seen = true;
             return;
         }
         if (std.mem.eql(u8, value.interface, protocol.wl_compositor.info.name))
@@ -2812,6 +3092,13 @@ const Handler = struct {
             self.wm_base = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.xdg_wm_base.info, @min(value.version, 7), null);
         if (std.mem.eql(u8, value.interface, protocol.wl_seat.info.name))
             self.seat = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_seat.info, @min(value.version, 9), null);
+        if (self.test_text_input and std.mem.eql(u8, value.interface, protocol.zwp_text_input_manager_v3.info.name))
+            self.text_input_manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.zwp_text_input_manager_v3.info, 1, null);
+        if (self.test_text_input) {
+            if (self.text_input == null and self.text_input_manager != null and self.seat != null)
+                self.text_input = (try protocol.zwp_text_input_manager_v3.construct_get_text_input(self.objects, self.queue, self.text_input_manager.?, .{ .seat = self.seat.?.id })).id;
+            return;
+        }
         if (std.mem.eql(u8, value.interface, protocol.wl_data_device_manager.info.name))
             self.data_device_manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_data_device_manager.info, @min(value.version, 3), null);
         if (std.mem.eql(u8, value.interface, protocol.wl_output.info.name))
@@ -2903,12 +3190,14 @@ const Handler = struct {
             },
         )).id;
         self.mapped_buffer = buffer;
-        self.frame_callback = (try protocol.wl_surface.construct_frame(
-            self.objects,
-            self.queue,
-            self.surface.?,
-            .{},
-        )).callback;
+        if (!self.test_text_input) {
+            self.frame_callback = (try protocol.wl_surface.construct_frame(
+                self.objects,
+                self.queue,
+                self.surface.?,
+                .{},
+            )).callback;
+        }
         try protocol.wl_surface.encodeRequest(self.queue, self.surface.?.id, .{
             .attach = .{ .buffer = buffer.id, .x = 0, .y = 0 },
         });
@@ -2916,13 +3205,15 @@ const Handler = struct {
             .damage_buffer = .{ .x = 0, .y = 0, .width = 3, .height = 2 },
         });
         try protocol.wl_surface.encodeRequest(self.queue, self.surface.?.id, .{ .commit = .{} });
-        try wayring.client.sendRequest(
-            protocol.wl_shm_pool,
-            self.objects,
-            self.queue,
-            pool.id,
-            .{ .destroy = .{} },
-        );
+        if (!self.test_text_input) {
+            try wayring.client.sendRequest(
+                protocol.wl_shm_pool,
+                self.objects,
+                self.queue,
+                pool.id,
+                .{ .destroy = .{} },
+            );
+        }
         self.mapped = true;
     }
 
