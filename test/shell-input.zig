@@ -18,6 +18,152 @@ const pixels = [_]u8{
     0xa0, 0xb0, 0xc0, 0xff, 0xd0, 0xe0, 0xf0, 0xff, 0x11, 0x22, 0x33, 0xff, 0, 0, 0, 0,
 };
 
+test "shell-input: wl_fixes v1 destroys one registry without disturbing another" {
+    const allocator = std.testing.allocator;
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-wayland-fixes-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+
+    var fixture = try physical_fixture.Fixture.init();
+    defer fixture.deinit();
+    var root_config = physical_fixture.compositorConfig();
+    root_config.runtime.object_capacity = 32;
+    root_config.runtime.object_quota = 24;
+    root_config.runtime.registry_capacity = 2;
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), root_config);
+    var config = physical_fixture.coordinatorConfig();
+    config.router_capacity = 24;
+    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), config);
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
+    try coordinator.start(&loop);
+
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(allocator, .{ .entries = 16, .flags = 0 }, physical_fixture.clientReactorConfig());
+    var client = try ClientConnection.attach(
+        allocator,
+        &reactor,
+        try wayring.unix_socket.connect(path),
+        .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 },
+        .{ .max_objects = 8, .max_client_ids = 7 },
+    );
+    const actor = try client.actor();
+    var driver = ClientDriver.init(&client);
+    const first_registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null);
+    var handler: WaylandFixesHandler = .{
+        .objects = &client.objects,
+        .queue = &actor.transmit,
+        .registry = first_registry,
+    };
+    try submitClient(&reactor, &driver, &handler);
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.fixes != null) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(handler.fixes != null);
+    try std.testing.expectEqual(@as(u32, 1), handler.fixes_version);
+
+    const second_registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null);
+    try wayring.client.sendRequest(
+        protocol.wl_fixes,
+        &client.objects,
+        &actor.transmit,
+        handler.fixes.?,
+        .{ .destroy_registry = .{ .registry = second_registry.id } },
+    );
+    _ = try client.objects.retireLocal(second_registry);
+    try submitClient(&reactor, &driver, &handler);
+    for (0..64) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(client.objects.namespace.resolve(second_registry) == null);
+    const replacement_registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null);
+    try std.testing.expectEqual(second_registry.id, replacement_registry.id);
+    try std.testing.expect(client.objects.namespace.resolve(first_registry) != null);
+    try std.testing.expect(client.objects.namespace.resolve(handler.fixes.?) != null);
+    try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+
+    try wayring.client.sendRequest(
+        protocol.wl_fixes,
+        &client.objects,
+        &actor.transmit,
+        handler.fixes.?,
+        .{ .destroy = .{} },
+    );
+    try submitClient(&reactor, &driver, &handler);
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (client.objects.namespace.resolve(handler.fixes.?) == null) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(client.objects.namespace.resolve(handler.fixes.?) == null);
+
+    _ = try client.prepareClose();
+    try submitClient(&reactor, &driver, &handler);
+    try coordinator.requestStop();
+    var drained = false;
+    for (0..512) |_| {
+        const cp = try drainClient(&reactor, &driver, &handler);
+        const progress = try loop.turn(coordinator);
+        drained = progress.wayring.shutdown_complete and cp.quiescent and coordinator.backendDrainComplete();
+        if (drained) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(drained);
+    try client.deinit(allocator);
+    reactor.deinit(allocator);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
+const WaylandFixesHandler = struct {
+    objects: *wayring.objects.ClientObjects,
+    queue: *wayring.tx.Queue,
+    registry: wayring.objects.Handle,
+    fixes: ?wayring.objects.Handle = null,
+    fixes_version: u32 = 0,
+    event_failures: usize = 0,
+
+    pub fn eventError(self: *WaylandFixesHandler, _: wayring.io_uring.Peer, _: ClientCore.EventFailure) void {
+        self.event_failures += 1;
+    }
+
+    pub fn event(
+        self: *WaylandFixesHandler,
+        target: wayring.objects.Dispatch,
+        message: wayring.wire.Message,
+        fds: *wayring.ancillary.FdQueue,
+    ) !wayring.dispatch.Control {
+        if (target.object.interface == &ClientCore.Display.info) {
+            _ = try ClientCore.decodeDisplayEvent(self.objects, message, fds);
+            return .continue_dispatch;
+        }
+        if (target.object.interface != &ClientCore.Registry.info) return .continue_dispatch;
+        switch (try ClientCore.decodeRegistryEvent(self.objects, self.registry, message, fds)) {
+            .global => |value| if (std.mem.eql(u8, value.interface, protocol.wl_fixes.info.name)) {
+                self.fixes_version = value.version;
+                self.fixes = try ClientCore.bind(
+                    self.objects,
+                    self.queue,
+                    self.registry,
+                    value.name,
+                    &protocol.wl_fixes.info,
+                    @min(value.version, 1),
+                    null,
+                );
+            },
+            .global_remove => {},
+        }
+        return .continue_dispatch;
+    }
+};
+
 test "shell-input: generated data-control client crosses ext and wlr runtime paths" {
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;

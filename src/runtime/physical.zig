@@ -42,6 +42,7 @@ const drm_syncobj = @import("../drm_syncobj.zig");
 const protocol_xdg_activation = @import("../protocol/xdg_activation.zig");
 const protocol_xdg_decoration = @import("../protocol/xdg_decoration.zig");
 const protocol_xdg_dialog = @import("../protocol/xdg_dialog.zig");
+const protocol_wayland_fixes = @import("../protocol/wayland_fixes.zig");
 const protocol_relative_pointer = @import("../protocol/relative_pointer.zig");
 const protocol_pointer_gestures = @import("../protocol/pointer_gestures.zig");
 const protocol_idle_inhibit = @import("../protocol/idle_inhibit.zig");
@@ -96,6 +97,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const ActivationAdapter = protocol_xdg_activation.Adapter(protocol, Adapter);
         const DecorationAdapter = protocol_xdg_decoration.Adapter(protocol, ShellAdapter);
         const DialogAdapter = protocol_xdg_dialog.Adapter(protocol, ShellAdapter);
+        const WaylandFixesAdapter = protocol_wayland_fixes.Adapter(protocol);
         const RelativePointerAdapter = protocol_relative_pointer.Adapter(protocol, SeatAdapter);
         const PointerGesturesAdapter = protocol_pointer_gestures.Adapter(protocol);
         const IdleInhibitAdapter = protocol_idle_inhibit.Adapter(protocol, Adapter);
@@ -401,6 +403,7 @@ pub fn Coordinator(comptime protocol: type) type {
         activation_adapter: ActivationAdapter,
         decoration_adapter: DecorationAdapter,
         dialog_adapter: DialogAdapter,
+        wayland_fixes_adapter: WaylandFixesAdapter,
         relative_pointer_adapter: RelativePointerAdapter,
         pointer_gestures_adapter: PointerGesturesAdapter,
         idle_inhibit_adapter: IdleInhibitAdapter,
@@ -794,6 +797,7 @@ pub fn Coordinator(comptime protocol: type) type {
             errdefer self.decoration_adapter.deinit();
             self.dialog_adapter = try DialogAdapter.init(allocator, &self.shell_adapter, config.xdg_dialog);
             errdefer self.dialog_adapter.deinit();
+            self.wayland_fixes_adapter = .{};
             self.fractional_scale_adapter = try FractionalScaleAdapter.init(
                 allocator,
                 &self.adapter,
@@ -1004,6 +1008,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
             _ = try self.dialog_adapter.install(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
+            _ = try self.wayland_fixes_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
             _ = try self.relative_pointer_adapter.install(&root.runtime);
@@ -1429,6 +1436,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.flushProtocol();
                 return control;
             }
+            if (try self.wayland_fixes_adapter.request(peer, target, message, fds)) |control|
+                return control;
             if (try self.relative_pointer_adapter.request(peer, target, message, fds)) |control| {
                 if (self.relative_pointer_adapter.pendingOutbound(peer))
                     self.markProtocol(peer, ProtocolReady.relative_pointer);
@@ -5008,6 +5017,7 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.activation_adapter.resourceRemoved(handle, object);
             _ = self.decoration_adapter.resourceRemoved(handle, object);
             _ = self.dialog_adapter.resourceRemoved(handle, object);
+            _ = self.wayland_fixes_adapter.resourceRemoved(handle, object);
             _ = self.relative_pointer_adapter.resourceRemoved(handle, object);
             _ = self.pointer_gestures_adapter.resourceRemoved(handle, object);
             const idle_inhibit_removed = self.idle_inhibit_adapter.resourceRemoved(handle, object);
