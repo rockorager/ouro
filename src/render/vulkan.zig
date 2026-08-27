@@ -183,8 +183,24 @@ pub const Renderer = struct {
         list: render_types.List,
         plan: render_types.DamagePlan,
     ) !std.posix.fd_t {
+        return self.renderCapture(targets, target, handle, list, plan, list.samples.len, .{});
+    }
+
+    pub fn renderCapture(
+        self: *Renderer,
+        targets: *Targets,
+        target: Target,
+        handle: framebuffer.Handle,
+        list: render_types.List,
+        plan: render_types.DamagePlan,
+        cursor_start: usize,
+        captures: vk.Captures,
+    ) !std.posix.fd_t {
         try render_types.validateList(list);
         try render_types.validateOutput(plan.output);
+        if (cursor_start > list.samples.len) return error.InvalidSourceIndex;
+        if ((captures.before_cursor or captures.after_cursor) and !plan.render_full)
+            return error.CaptureRequiresFullRender;
         if (targets.owner != self.implementation) return error.TargetOwnerMismatch;
         if (plan.samples.len > std.math.maxInt(u32)) return error.SampleCapacityExceeded;
         if (plan.samples.len > self.samples.len) {
@@ -208,12 +224,21 @@ pub const Renderer = struct {
 
         var byte_count: usize = 0;
         var sample_count: usize = 0;
+        var packed_cursor_start: ?usize = null;
+        var cursor_sample_seen = false;
         const output_lut_slot = if (list.output_color_description.lut) |lut|
             try self.platform.cacheLut(self.implementation, lut)
         else
             null;
         for (plan.samples) |planned| {
             if (planned.source_index >= list.samples.len) return error.InvalidSourceIndex;
+            if (planned.source_index >= cursor_start) {
+                cursor_sample_seen = true;
+            } else if (cursor_sample_seen) {
+                return error.InvalidCursorPartition;
+            }
+            if (packed_cursor_start == null and cursor_sample_seen)
+                packed_cursor_start = sample_count;
             const source = list.samples[planned.source_index];
             if (!std.meta.eql(planned.sample, source.sample) or
                 !std.meta.eql(planned.presentation, source.presentation))
@@ -255,6 +280,7 @@ pub const Renderer = struct {
             self.sources[sample_count] = source;
             sample_count += 1;
         }
+        const capture_cursor_start = packed_cursor_start orelse sample_count;
 
         var damage_count: usize = 0;
         if (plan.render_full) {
@@ -289,12 +315,29 @@ pub const Renderer = struct {
             .sources = self.sources[0..sample_count],
             .source_byte_count = byte_count,
             .render_damage = self.damage[0..damage_count],
+            .cursor_start = capture_cursor_start,
+            .captures = captures,
         }) catch |err| {
             if (err == error.CompletionExportFailedAfterSubmit) record.terminal = true;
             return err;
         };
         if (completion_fd < 0) return error.InvalidCompletionFd;
         return completion_fd;
+    }
+
+    /// Valid only after completion of the exact rendered target generation.
+    pub fn readback(
+        self: *Renderer,
+        targets: *Targets,
+        handle: framebuffer.Handle,
+        phase: vk.CapturePhase,
+    ) !vk.Readback {
+        if (targets.owner != self.implementation) return error.TargetOwnerMismatch;
+        if (handle.slot >= targets.records.len) return error.TargetCapacityExceeded;
+        const record = &targets.records[handle.slot];
+        if (record.imported == null or record.generation != handle.generation)
+            return error.StaleTarget;
+        return self.platform.readback(self.implementation, record.imported.?, phase);
     }
 
     fn colorTransform(
@@ -674,6 +717,70 @@ test "render-vulkan: damage plan selects exact source and clips planned i64 geom
     );
 }
 
+test "render-vulkan: capture preserves the packed cursor partition and target generation" {
+    var fake = FakePlatform{};
+    var renderer = try Renderer.init(std.testing.allocator, fake.platform(), 41, .{
+        .max_samples = 2,
+        .max_source_bytes = 8,
+        .max_targets = 1,
+        .max_damage_rects = 1,
+    });
+    defer renderer.deinit();
+    var targets = try renderer.createTargets(1);
+    defer renderer.destroyTargets(&targets);
+    const base_bytes = [_]u8{ 1, 2, 3, 4 };
+    const cursor_bytes = [_]u8{ 5, 6, 7, 8 };
+    var samples = [_]render_types.SurfaceSample{ undefined, undefined };
+    _ = testList(&base_bytes, &samples[0]);
+    _ = testList(&cursor_bytes, &samples[1]);
+    samples[1].sample.surface = 2;
+    samples[1].presentation.slot = 1;
+    const list: render_types.List = .{
+        .output = .{ .width = 1, .height = 1 },
+        .output_format = .xrgb8888,
+        .clear = .{ .r = 0, .g = 0, .b = 0 },
+        .samples = &samples,
+    };
+    const planned = [_]render_types.PlannedSample{
+        plannedFromSample(samples[0], 0),
+        plannedFromSample(samples[1], 1),
+    };
+    const damage = [_]render_types.Rect{.{ .x = 0, .y = 0, .width = 1, .height = 1 }};
+    const plan: render_types.DamagePlan = .{
+        .output = list.output,
+        .samples = &planned,
+        .client_damage = &damage,
+        .scene_damage = &.{},
+        .repair_damage = &.{},
+        .render_damage = &damage,
+        .client_full = true,
+        .scene_full = false,
+        .repair_full = false,
+        .render_full = true,
+    };
+    var target = FakeTarget{};
+    const handle: framebuffer.Handle = .{ .slot = 0, .generation = 1 };
+    _ = linux.close(try renderer.renderCapture(
+        &targets,
+        target.target(),
+        handle,
+        list,
+        plan,
+        1,
+        .{ .before_cursor = true, .after_cursor = true },
+    ));
+    try std.testing.expectEqual(@as(usize, 1), fake.last_cursor_start);
+    try std.testing.expect(fake.last_captures.before_cursor);
+    try std.testing.expect(fake.last_captures.after_cursor);
+    const readback = try renderer.readback(&targets, handle, .before_cursor);
+    try std.testing.expectEqual(@as(u32, 4), readback.stride);
+    try std.testing.expectEqualSlices(u8, &.{ 9, 10, 11, 12 }, readback.bytes);
+    try std.testing.expectError(
+        error.StaleTarget,
+        renderer.readback(&targets, .{ .slot = 0, .generation = 2 }, .after_cursor),
+    );
+}
+
 test "render-vulkan: odd source strides repack to aligned contiguous shader words" {
     var fake = FakePlatform{};
     var renderer = try Renderer.init(std.testing.allocator, fake.platform(), 41, .{
@@ -951,6 +1058,9 @@ const FakePlatform = struct {
     lut_hashes: [2][32]u8 = undefined,
     lut_count: usize = 0,
     lut_upload_count: usize = 0,
+    last_cursor_start: usize = 0,
+    last_captures: vk.Captures = .{},
+    readback_bytes: [4]u8 = .{ 9, 10, 11, 12 },
 
     const vtable: vk.Platform.VTable = .{
         .create = create,
@@ -958,6 +1068,7 @@ const FakePlatform = struct {
         .import_target = importTarget,
         .destroy_target = destroyTarget,
         .draw = draw,
+        .readback = readback,
         .content_provider = contentProvider,
         .packs_sources = packsSources,
         .cache_lut = cacheLut,
@@ -1028,8 +1139,19 @@ const FakePlatform = struct {
         @memcpy(self.last_samples[0..frame.samples.len], frame.samples);
         if (frame.samples.len != 0) self.last_sample = frame.samples[0];
         if (frame.render_damage.len != 0) self.last_damage = frame.render_damage[0];
+        self.last_cursor_start = frame.cursor_start;
+        self.last_captures = frame.captures;
         if (self.fail_after_submit) return error.CompletionExportFailedAfterSubmit;
         return eventFd();
+    }
+    fn readback(context: *anyopaque, _: vk.Renderer, _: vk.Target, phase: vk.CapturePhase) !vk.Readback {
+        const self: *FakePlatform = @ptrCast(@alignCast(context));
+        const captured = switch (phase) {
+            .before_cursor => self.last_captures.before_cursor,
+            .after_cursor => self.last_captures.after_cursor,
+        };
+        if (!captured) return error.CaptureUnavailable;
+        return .{ .bytes = &self.readback_bytes, .stride = 4 };
     }
 };
 

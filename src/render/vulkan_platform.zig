@@ -46,6 +46,18 @@ pub const Sample = extern struct {
     color_matrix_2: [4]f32,
 };
 
+pub const CapturePhase = enum { before_cursor, after_cursor };
+
+pub const Captures = packed struct(u2) {
+    before_cursor: bool = false,
+    after_cursor: bool = false,
+};
+
+pub const Readback = struct {
+    bytes: []const u8,
+    stride: u32,
+};
+
 pub const Frame = struct {
     output: render.Size,
     output_format: render.PixelFormat,
@@ -56,6 +68,8 @@ pub const Frame = struct {
     sources: []const render.SurfaceSample,
     source_byte_count: usize,
     render_damage: []const render.Rect,
+    cursor_start: usize = 0,
+    captures: Captures = .{},
 };
 
 pub const Platform = struct {
@@ -68,6 +82,7 @@ pub const Platform = struct {
         import_target: *const fn (*anyopaque, Renderer, gbm.Metadata, std.posix.fd_t) anyerror!Target,
         destroy_target: *const fn (*anyopaque, Renderer, Target) void,
         draw: *const fn (*anyopaque, Renderer, Target, Frame) anyerror!std.posix.fd_t,
+        readback: *const fn (*anyopaque, Renderer, Target, CapturePhase) anyerror!Readback,
         content_provider: *const fn (*anyopaque, Renderer) ?render_content.Provider,
         packs_sources: *const fn (*anyopaque, Renderer) bool,
         cache_lut: *const fn (*anyopaque, Renderer, *const icc.Lut) anyerror!u32,
@@ -89,6 +104,9 @@ pub const Platform = struct {
     pub fn draw(self: Platform, renderer: Renderer, target: Target, frame: Frame) !std.posix.fd_t {
         return self.vtable.draw(self.context, renderer, target, frame);
     }
+    pub fn readback(self: Platform, renderer: Renderer, target: Target, phase: CapturePhase) !Readback {
+        return self.vtable.readback(self.context, renderer, target, phase);
+    }
     pub fn contentProvider(self: Platform, renderer: Renderer) ?render_content.Provider {
         return self.vtable.content_provider(self.context, renderer);
     }
@@ -109,6 +127,7 @@ const real_vtable: Platform.VTable = .{
     .import_target = realImportTarget,
     .destroy_target = realDestroyTarget,
     .draw = realDraw,
+    .readback = realReadback,
     .content_provider = realContentProvider,
     .packs_sources = realPacksSources,
     .cache_lut = realCacheLut,
@@ -292,6 +311,11 @@ const RealTarget = struct {
     native_lease_count: usize = 0,
     imported_leases: []u64,
     imported_lease_count: usize = 0,
+    readback_buffers: [2]c.VkBuffer,
+    readback_memories: [2]c.VkDeviceMemory,
+    readback_maps: [2]*anyopaque,
+    readback_size: usize,
+    captured: Captures = .{},
 };
 
 const Push = extern struct {
@@ -1312,7 +1336,7 @@ fn realImportTarget(_: *anyopaque, renderer: Renderer, metadata: gbm.Metadata, d
         .arrayLayers = 1,
         .samples = c.VK_SAMPLE_COUNT_1_BIT,
         .tiling = c.VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
-        .usage = c.VK_IMAGE_USAGE_STORAGE_BIT,
+        .usage = c.VK_IMAGE_USAGE_STORAGE_BIT | c.VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
         .sharingMode = c.VK_SHARING_MODE_EXCLUSIVE,
         .queueFamilyIndexCount = 0,
         .pQueueFamilyIndices = null,
@@ -1377,6 +1401,11 @@ fn realImportTarget(_: *anyopaque, renderer: Renderer, metadata: gbm.Metadata, d
     target.sample_memory = null;
     target.sample_map = undefined;
     target.descriptor_pool = null;
+    target.readback_buffers = .{ null, null };
+    target.readback_memories = .{ null, null };
+    target.readback_maps = undefined;
+    target.readback_size = try captureByteCount(metadata.width, metadata.height);
+    target.captured = .{};
     target.descriptor_sets = &.{};
     target.batch_capacity = 0;
     target.sample_buffer_size = 0;
@@ -1429,6 +1458,8 @@ fn realDestroyTarget(_: *anyopaque, renderer: Renderer, target_value: Target) vo
     c.vkDestroySemaphore(self.device, target.semaphore, null);
     c.vkDestroyFence(self.device, target.fence, null);
     c.vkDestroyCommandPool(self.device, target.command_pool, null);
+    for (target.readback_buffers, target.readback_memories) |buffer, memory|
+        if (buffer != null) destroyBuffer(self, buffer, memory);
     destroyTargetBatchResources(self, target);
     destroyBuffer(self, target.source_buffer, target.source_memory);
     c.vkDestroyImageView(self.device, target.view, null);
@@ -1441,6 +1472,23 @@ fn realDestroyTarget(_: *anyopaque, renderer: Renderer, target_value: Target) vo
     std.heap.c_allocator.free(target.imported_leases);
     std.heap.c_allocator.free(target.acquire_semaphores);
     std.heap.c_allocator.destroy(target);
+}
+
+fn realReadback(_: *anyopaque, renderer: Renderer, target_value: Target, phase: CapturePhase) !Readback {
+    const self: *RealRenderer = @ptrCast(@alignCast(renderer));
+    const target: *RealTarget = @ptrCast(@alignCast(target_value));
+    if (target.state != .in_flight or c.vkGetFenceStatus(self.device, target.fence) != c.VK_SUCCESS)
+        return error.TargetBusy;
+    const captured = switch (phase) {
+        .before_cursor => target.captured.before_cursor,
+        .after_cursor => target.captured.after_cursor,
+    };
+    if (!captured) return error.CaptureUnavailable;
+    const index = @intFromEnum(phase);
+    return .{
+        .bytes = @as([*]const u8, @ptrCast(target.readback_maps[index]))[0..target.readback_size],
+        .stride = try captureStride(target.width),
+    };
 }
 
 fn destroyTargetBatchResources(self: *RealRenderer, target: *RealTarget) void {
@@ -1829,14 +1877,157 @@ fn clippedUpload(damage: render.UploadDamage, size: render.Size) render.UploadDa
     return clipped;
 }
 
+fn recordPackedPass(
+    self: *RealRenderer,
+    target: *RealTarget,
+    frame: Frame,
+    sample_count: usize,
+) !void {
+    if (sample_count > sample_count_mask) return error.CapacityExceeded;
+    c.vkCmdBindPipeline(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
+    c.vkCmdBindDescriptorSets(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 0, 1, &target.descriptor_sets[0], 0, null);
+    for (frame.render_damage) |damage| {
+        const push: Push = .{
+            .clear_color = .{ frame.clear.a, frame.clear.r, frame.clear.g, frame.clear.b },
+            .output = .{ frame.output.width, frame.output.height, @intFromEnum(frame.output_format), @intCast(sample_count) },
+            .damage = .{ @intCast(damage.x), @intCast(damage.y), damage.width, damage.height },
+            .output_color = .{
+                @intFromEnum(frame.output_color_description.transfer),
+                @bitCast(frame.output_color_description.reference_luminance),
+                if (frame.output_lut_slot) |slot| slot + 1 else 0,
+                0,
+            },
+        };
+        c.vkCmdPushConstants(target.command_buffer, self.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(Push), &push);
+        c.vkCmdDispatch(target.command_buffer, (damage.width + 7) / 8, (damage.height + 7) / 8, 1);
+    }
+}
+
+fn recordCapture(
+    target: *RealTarget,
+    phase: CapturePhase,
+    source_stage: c.VkPipelineStageFlags,
+    source_access: c.VkAccessFlags,
+) void {
+    var image_barrier: c.VkImageMemoryBarrier = .{
+        .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .pNext = null,
+        .srcAccessMask = source_access,
+        .dstAccessMask = c.VK_ACCESS_TRANSFER_READ_BIT,
+        .oldLayout = c.VK_IMAGE_LAYOUT_GENERAL,
+        .newLayout = c.VK_IMAGE_LAYOUT_GENERAL,
+        .srcQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
+        .image = target.image,
+        .subresourceRange = colorRange(),
+    };
+    c.vkCmdPipelineBarrier(
+        target.command_buffer,
+        source_stage,
+        c.VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0,
+        0,
+        null,
+        0,
+        null,
+        1,
+        &image_barrier,
+    );
+    recordCaptureCopy(target, phase);
+}
+
+fn recordCaptureCopy(target: *RealTarget, phase: CapturePhase) void {
+    const index = @intFromEnum(phase);
+    var copy: c.VkBufferImageCopy = .{
+        .bufferOffset = 0,
+        .bufferRowLength = target.width,
+        .bufferImageHeight = target.height,
+        .imageSubresource = .{
+            .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT,
+            .mipLevel = 0,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        },
+        .imageOffset = .{ .x = 0, .y = 0, .z = 0 },
+        .imageExtent = .{ .width = target.width, .height = target.height, .depth = 1 },
+    };
+    c.vkCmdCopyImageToBuffer(
+        target.command_buffer,
+        target.image,
+        c.VK_IMAGE_LAYOUT_GENERAL,
+        target.readback_buffers[index],
+        1,
+        &copy,
+    );
+    var host_barrier: c.VkBufferMemoryBarrier = .{
+        .sType = c.VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+        .pNext = null,
+        .srcAccessMask = c.VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = c.VK_ACCESS_HOST_READ_BIT,
+        .srcQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
+        .buffer = target.readback_buffers[index],
+        .offset = 0,
+        .size = target.readback_size,
+    };
+    c.vkCmdPipelineBarrier(
+        target.command_buffer,
+        c.VK_PIPELINE_STAGE_TRANSFER_BIT,
+        c.VK_PIPELINE_STAGE_HOST_BIT,
+        0,
+        0,
+        null,
+        1,
+        &host_barrier,
+        0,
+        null,
+    );
+}
+
+fn recordResumeAfterCapture(target: *RealTarget) void {
+    var barrier: c.VkImageMemoryBarrier = .{
+        .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .pNext = null,
+        .srcAccessMask = c.VK_ACCESS_TRANSFER_READ_BIT,
+        .dstAccessMask = c.VK_ACCESS_SHADER_WRITE_BIT,
+        .oldLayout = c.VK_IMAGE_LAYOUT_GENERAL,
+        .newLayout = c.VK_IMAGE_LAYOUT_GENERAL,
+        .srcQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
+        .image = target.image,
+        .subresourceRange = colorRange(),
+    };
+    c.vkCmdPipelineBarrier(
+        target.command_buffer,
+        c.VK_PIPELINE_STAGE_TRANSFER_BIT,
+        c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0,
+        0,
+        null,
+        0,
+        null,
+        1,
+        &barrier,
+    );
+}
+
 fn realDraw(_: *anyopaque, renderer: Renderer, target_value: Target, frame: Frame) !std.posix.fd_t {
     const self: *RealRenderer = @ptrCast(@alignCast(renderer));
     const target: *RealTarget = @ptrCast(@alignCast(target_value));
     if (frame.sources.len != frame.samples.len or
         frame.source_byte_count > self.max_source_bytes)
         return error.CapacityExceeded;
+    if (frame.cursor_start > frame.samples.len) return error.InvalidCursorPartition;
     if (frame.output.width != target.width or frame.output.height != target.height)
         return error.TargetMismatch;
+    if (frame.captures.before_cursor or frame.captures.after_cursor) {
+        if (frame.render_damage.len != 1 or !std.meta.eql(frame.render_damage[0], render.Rect{
+            .x = 0,
+            .y = 0,
+            .width = frame.output.width,
+            .height = frame.output.height,
+        })) return error.CaptureRequiresFullRender;
+    }
     var validated_bytes: usize = 0;
     for (frame.sources, frame.samples) |surface, sample| {
         const source = surface.source;
@@ -1878,6 +2069,8 @@ fn realDraw(_: *anyopaque, renderer: Renderer, target_value: Target, frame: Fram
         },
         .queue_failed, .export_failed => return error.TargetTerminal,
     }
+    try ensureReadbacks(self, target, frame.captures);
+    target.captured = .{};
     drainRetiredTextures(self, target);
     if (self.sampled_enabled and frame.sources.len != 0)
         return realDrawSampled(self, target, frame);
@@ -1917,27 +2110,40 @@ fn realDraw(_: *anyopaque, renderer: Renderer, target_value: Target, frame: Fram
         .subresourceRange = colorRange(),
     };
     c.vkCmdPipelineBarrier(target.command_buffer, c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, null, 0, null, 1, &barrier);
-    c.vkCmdBindPipeline(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
-    c.vkCmdBindDescriptorSets(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 0, 1, &target.descriptor_sets[0], 0, null);
-    for (frame.render_damage) |damage| {
-        const push: Push = .{
-            .clear_color = .{ frame.clear.a, frame.clear.r, frame.clear.g, frame.clear.b },
-            .output = .{ frame.output.width, frame.output.height, @intFromEnum(frame.output_format), @intCast(frame.samples.len) },
-            .damage = .{ @intCast(damage.x), @intCast(damage.y), damage.width, damage.height },
-            .output_color = .{
-                @intFromEnum(frame.output_color_description.transfer),
-                @bitCast(frame.output_color_description.reference_luminance),
-                if (frame.output_lut_slot) |slot| slot + 1 else 0,
-                0,
-            },
-        };
-        c.vkCmdPushConstants(target.command_buffer, self.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(Push), &push);
-        c.vkCmdDispatch(target.command_buffer, (damage.width + 7) / 8, (damage.height + 7) / 8, 1);
+    var transfer_final = false;
+    if (frame.captures.before_cursor) {
+        try recordPackedPass(self, target, frame, frame.cursor_start);
+        recordCapture(
+            target,
+            .before_cursor,
+            c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            c.VK_ACCESS_SHADER_WRITE_BIT,
+        );
+        transfer_final = true;
+        if (frame.cursor_start != frame.samples.len) {
+            recordResumeAfterCapture(target);
+            try recordPackedPass(self, target, frame, frame.samples.len);
+            transfer_final = false;
+        }
+    } else {
+        try recordPackedPass(self, target, frame, frame.samples.len);
+    }
+    if (frame.captures.after_cursor) {
+        if (transfer_final)
+            recordCaptureCopy(target, .after_cursor)
+        else
+            recordCapture(
+                target,
+                .after_cursor,
+                c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                c.VK_ACCESS_SHADER_WRITE_BIT,
+            );
+        transfer_final = true;
     }
     var release_barrier: c.VkImageMemoryBarrier = .{
         .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
         .pNext = null,
-        .srcAccessMask = c.VK_ACCESS_SHADER_WRITE_BIT,
+        .srcAccessMask = if (transfer_final) c.VK_ACCESS_TRANSFER_READ_BIT else c.VK_ACCESS_SHADER_WRITE_BIT,
         .dstAccessMask = 0,
         .oldLayout = c.VK_IMAGE_LAYOUT_GENERAL,
         .newLayout = c.VK_IMAGE_LAYOUT_GENERAL,
@@ -1946,7 +2152,18 @@ fn realDraw(_: *anyopaque, renderer: Renderer, target_value: Target, frame: Fram
         .image = target.image,
         .subresourceRange = colorRange(),
     };
-    c.vkCmdPipelineBarrier(target.command_buffer, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, null, 0, null, 1, &release_barrier);
+    c.vkCmdPipelineBarrier(
+        target.command_buffer,
+        if (transfer_final) c.VK_PIPELINE_STAGE_TRANSFER_BIT else c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        c.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+        0,
+        0,
+        null,
+        0,
+        null,
+        1,
+        &release_barrier,
+    );
     try vk(c.vkEndCommandBuffer(target.command_buffer), error.EndCommandBufferFailed);
     var submit: c.VkSubmitInfo = .{
         .sType = c.VK_STRUCTURE_TYPE_SUBMIT_INFO,
@@ -1969,6 +2186,7 @@ fn realDraw(_: *anyopaque, renderer: Renderer, target_value: Target, frame: Fram
     }
     target.state = .in_flight;
     target.initialized_layout = true;
+    target.captured = frame.captures;
     var fd_info: c.VkSemaphoreGetFdInfoKHR = .{ .sType = c.VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR, .pNext = null, .semaphore = target.semaphore, .handleType = c.VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT };
     var completion_fd: c_int = -1;
     if (self.get_semaphore_fd.?(self.device, &fd_info, &completion_fd) != c.VK_SUCCESS or completion_fd < 0) {
@@ -1976,6 +2194,80 @@ fn realDraw(_: *anyopaque, renderer: Renderer, target_value: Target, frame: Fram
         return error.CompletionExportFailedAfterSubmit;
     }
     return completion_fd;
+}
+
+fn recordSampledPass(
+    self: *RealRenderer,
+    target: *RealTarget,
+    frame: Frame,
+    sample_count: usize,
+) !void {
+    const pass_batch_count = if (sample_count == 0)
+        1
+    else
+        try std.math.divCeil(usize, sample_count, self.max_samples);
+    c.vkCmdBindPipeline(
+        target.command_buffer,
+        c.VK_PIPELINE_BIND_POINT_COMPUTE,
+        self.sampled_pipeline.?,
+    );
+    for (0..pass_batch_count) |batch_index| {
+        const partition = if (sample_count == 0)
+            Batch{ .first = 0, .count = 0, .initialize = true }
+        else
+            batchAt(sample_count, self.max_samples, batch_index);
+        c.vkCmdBindDescriptorSets(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 0, 1, &target.descriptor_sets[batch_index], 0, null);
+        for (frame.render_damage) |damage| {
+            const encoded_count: u32 = @intCast(partition.count);
+            const flags: u32 = (if (!partition.initialize) continuation_bit else 0) |
+                (if (batch_index + 1 < pass_batch_count) intermediate_bit else 0);
+            const push: Push = .{
+                .clear_color = .{ frame.clear.a, frame.clear.r, frame.clear.g, frame.clear.b },
+                .output = .{ frame.output.width, frame.output.height, @intFromEnum(frame.output_format), encoded_count | flags },
+                .damage = .{ @intCast(damage.x), @intCast(damage.y), damage.width, damage.height },
+                .output_color = .{
+                    @intFromEnum(frame.output_color_description.transfer),
+                    @bitCast(frame.output_color_description.reference_luminance),
+                    if (frame.output_lut_slot) |slot| slot + 1 else 0,
+                    0,
+                },
+            };
+            c.vkCmdPushConstants(target.command_buffer, self.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(Push), &push);
+            c.vkCmdDispatch(target.command_buffer, (damage.width + 7) / 8, (damage.height + 7) / 8, 1);
+        }
+        if (batch_index + 1 < pass_batch_count) {
+            var between: c.VkImageMemoryBarrier = .{
+                .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .pNext = null,
+                .srcAccessMask = c.VK_ACCESS_SHADER_WRITE_BIT,
+                .dstAccessMask = c.VK_ACCESS_SHADER_READ_BIT | c.VK_ACCESS_SHADER_WRITE_BIT,
+                .oldLayout = c.VK_IMAGE_LAYOUT_GENERAL,
+                .newLayout = c.VK_IMAGE_LAYOUT_GENERAL,
+                .srcQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
+                .image = target.linear_image,
+                .subresourceRange = colorRange(),
+            };
+            c.vkCmdPipelineBarrier(target.command_buffer, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, null, 0, null, 1, &between);
+        }
+    }
+}
+
+fn recordRestartSampledPass(target: *RealTarget) void {
+    recordResumeAfterCapture(target);
+    var barrier: c.VkImageMemoryBarrier = .{
+        .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .pNext = null,
+        .srcAccessMask = c.VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = c.VK_ACCESS_SHADER_READ_BIT | c.VK_ACCESS_SHADER_WRITE_BIT,
+        .oldLayout = c.VK_IMAGE_LAYOUT_GENERAL,
+        .newLayout = c.VK_IMAGE_LAYOUT_GENERAL,
+        .srcQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
+        .image = target.linear_image,
+        .subresourceRange = colorRange(),
+    };
+    c.vkCmdPipelineBarrier(target.command_buffer, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, null, 0, null, 1, &barrier);
 }
 
 fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.posix.fd_t {
@@ -2328,47 +2620,35 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
         .subresourceRange = colorRange(),
     };
     c.vkCmdPipelineBarrier(target.command_buffer, c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, null, 0, null, 1, &linear_barrier);
-    c.vkCmdBindPipeline(
-        target.command_buffer,
-        c.VK_PIPELINE_BIND_POINT_COMPUTE,
-        self.sampled_pipeline.?,
-    );
-    for (0..batch_count) |batch_index| {
-        const partition = batchAt(frame.samples.len, self.max_samples, batch_index);
-        c.vkCmdBindDescriptorSets(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 0, 1, &target.descriptor_sets[batch_index], 0, null);
-        for (frame.render_damage) |damage| {
-            const encoded_count: u32 = @intCast(partition.count);
-            const flags: u32 = (if (!partition.initialize) continuation_bit else 0) |
-                (if (batch_index + 1 < batch_count) intermediate_bit else 0);
-            const push: Push = .{
-                .clear_color = .{ frame.clear.a, frame.clear.r, frame.clear.g, frame.clear.b },
-                .output = .{ frame.output.width, frame.output.height, @intFromEnum(frame.output_format), encoded_count | flags },
-                .damage = .{ @intCast(damage.x), @intCast(damage.y), damage.width, damage.height },
-                .output_color = .{
-                    @intFromEnum(frame.output_color_description.transfer),
-                    @bitCast(frame.output_color_description.reference_luminance),
-                    if (frame.output_lut_slot) |slot| slot + 1 else 0,
-                    0,
-                },
-            };
-            c.vkCmdPushConstants(target.command_buffer, self.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(Push), &push);
-            c.vkCmdDispatch(target.command_buffer, (damage.width + 7) / 8, (damage.height + 7) / 8, 1);
+    var transfer_final = false;
+    if (frame.captures.before_cursor) {
+        try recordSampledPass(self, target, frame, frame.cursor_start);
+        recordCapture(
+            target,
+            .before_cursor,
+            c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            c.VK_ACCESS_SHADER_WRITE_BIT,
+        );
+        transfer_final = true;
+        if (frame.cursor_start != frame.samples.len) {
+            recordRestartSampledPass(target);
+            try recordSampledPass(self, target, frame, frame.samples.len);
+            transfer_final = false;
         }
-        if (batch_index + 1 < batch_count) {
-            var between: c.VkImageMemoryBarrier = .{
-                .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                .pNext = null,
-                .srcAccessMask = c.VK_ACCESS_SHADER_WRITE_BIT,
-                .dstAccessMask = c.VK_ACCESS_SHADER_READ_BIT | c.VK_ACCESS_SHADER_WRITE_BIT,
-                .oldLayout = c.VK_IMAGE_LAYOUT_GENERAL,
-                .newLayout = c.VK_IMAGE_LAYOUT_GENERAL,
-                .srcQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
-                .dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
-                .image = if (batch_count > 1) target.linear_image else target.image,
-                .subresourceRange = colorRange(),
-            };
-            c.vkCmdPipelineBarrier(target.command_buffer, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, null, 0, null, 1, &between);
-        }
+    } else {
+        try recordSampledPass(self, target, frame, frame.samples.len);
+    }
+    if (frame.captures.after_cursor) {
+        if (transfer_final)
+            recordCaptureCopy(target, .after_cursor)
+        else
+            recordCapture(
+                target,
+                .after_cursor,
+                c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                c.VK_ACCESS_SHADER_WRITE_BIT,
+            );
+        transfer_final = true;
     }
     for (self.prepared[0..batch.count], 0..) |prepared, index| {
         const token = prepared.imported_token orelse continue;
@@ -2405,7 +2685,7 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
     var release_barrier: c.VkImageMemoryBarrier = .{
         .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
         .pNext = null,
-        .srcAccessMask = c.VK_ACCESS_SHADER_WRITE_BIT,
+        .srcAccessMask = if (transfer_final) c.VK_ACCESS_TRANSFER_READ_BIT else c.VK_ACCESS_SHADER_WRITE_BIT,
         .dstAccessMask = 0,
         .oldLayout = c.VK_IMAGE_LAYOUT_GENERAL,
         .newLayout = c.VK_IMAGE_LAYOUT_GENERAL,
@@ -2416,7 +2696,7 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
     };
     c.vkCmdPipelineBarrier(
         target.command_buffer,
-        c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        if (transfer_final) c.VK_PIPELINE_STAGE_TRANSFER_BIT else c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         c.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
         0,
         0,
@@ -2448,6 +2728,7 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
     }
     target.state = .in_flight;
     target.initialized_layout = true;
+    target.captured = frame.captures;
     std.debug.assert(target.content_lease_count == 0);
     @memcpy(target.content_leases[0..content_token_count], content_tokens[0..content_token_count]);
     target.content_lease_count = content_token_count;
@@ -2794,7 +3075,7 @@ fn requireTargetFormat(device: c.VkPhysicalDevice, metadata: gbm.Metadata) !void
         .format = c.VK_FORMAT_B8G8R8A8_UNORM,
         .type = c.VK_IMAGE_TYPE_2D,
         .tiling = c.VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
-        .usage = c.VK_IMAGE_USAGE_STORAGE_BIT,
+        .usage = c.VK_IMAGE_USAGE_STORAGE_BIT | c.VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
         .flags = c.VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,
     };
     var external_properties: c.VkExternalImageFormatProperties = .{
@@ -2880,6 +3161,71 @@ fn createHostBuffer(self: *RealRenderer, size: usize, buffer: *c.VkBuffer, memor
     var mapped: ?*anyopaque = null;
     try vk(c.vkMapMemory(self.device, memory.*, 0, size, 0, &mapped), error.MapBufferFailed);
     map.* = mapped orelse return error.MapBufferFailed;
+}
+
+fn createReadbackBuffer(self: *RealRenderer, size: usize, buffer: *c.VkBuffer, memory: *c.VkDeviceMemory, map: **anyopaque) !void {
+    var info: c.VkBufferCreateInfo = .{
+        .sType = c.VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .pNext = null,
+        .flags = 0,
+        .size = size,
+        .usage = c.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = c.VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = 0,
+        .pQueueFamilyIndices = null,
+    };
+    try vk(c.vkCreateBuffer(self.device, &info, null, buffer), error.CreateReadbackBufferFailed);
+    var buffer_only_cleanup = true;
+    errdefer if (buffer_only_cleanup) c.vkDestroyBuffer(self.device, buffer.*, null);
+    var requirements: c.VkMemoryRequirements = undefined;
+    c.vkGetBufferMemoryRequirements(self.device, buffer.*, &requirements);
+    var allocation: c.VkMemoryAllocateInfo = .{
+        .sType = c.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .pNext = null,
+        .allocationSize = requirements.size,
+        .memoryTypeIndex = try memoryType(
+            self,
+            requirements.memoryTypeBits,
+            c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        ),
+    };
+    try vk(c.vkAllocateMemory(self.device, &allocation, null, memory), error.AllocateReadbackMemoryFailed);
+    buffer_only_cleanup = false;
+    errdefer {
+        c.vkDestroyBuffer(self.device, buffer.*, null);
+        c.vkFreeMemory(self.device, memory.*, null);
+    }
+    try vk(c.vkBindBufferMemory(self.device, buffer.*, memory.*, 0), error.BindReadbackMemoryFailed);
+    var mapped: ?*anyopaque = null;
+    try vk(c.vkMapMemory(self.device, memory.*, 0, size, 0, &mapped), error.MapReadbackFailed);
+    map.* = mapped orelse return error.MapReadbackFailed;
+}
+
+fn captureStride(width: u32) !u32 {
+    return std.math.mul(u32, width, 4) catch error.CaptureCapacityExceeded;
+}
+
+fn captureByteCount(width: u32, height: u32) !usize {
+    return std.math.mul(usize, try captureStride(width), height) catch
+        error.CaptureCapacityExceeded;
+}
+
+fn ensureReadbacks(self: *RealRenderer, target: *RealTarget, captures: Captures) !void {
+    for ([_]CapturePhase{ .before_cursor, .after_cursor }) |phase| {
+        const requested = switch (phase) {
+            .before_cursor => captures.before_cursor,
+            .after_cursor => captures.after_cursor,
+        };
+        const index = @intFromEnum(phase);
+        if (!requested or target.readback_buffers[index] != null) continue;
+        try createReadbackBuffer(
+            self,
+            target.readback_size,
+            &target.readback_buffers[index],
+            &target.readback_memories[index],
+            &target.readback_maps[index],
+        );
+    }
 }
 
 fn destroyBuffer(self: *RealRenderer, buffer: c.VkBuffer, memory: c.VkDeviceMemory) void {
