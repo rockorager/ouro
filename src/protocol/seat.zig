@@ -508,6 +508,25 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             return .{ .client = clientId(peer), .surface = surface };
         }
 
+        pub fn targetBelongsTo(
+            adapter: *const Self,
+            target: FocusTarget,
+            peer: wayring.io_uring.Peer,
+        ) bool {
+            _ = adapter;
+            return sameClient(target.client, clientId(peer));
+        }
+
+        pub fn surfaceHandleOn(
+            adapter: *Self,
+            server_objects: anytype,
+            peer: wayring.io_uring.Peer,
+            target: FocusTarget,
+        ) !objects.Handle {
+            if (!adapter.targetBelongsTo(target, peer)) return error.ForeignSurface;
+            return adapter.surfaceObject(server_objects, target);
+        }
+
         pub fn validateSeatOn(
             adapter: *Self,
             server_objects: anytype,
