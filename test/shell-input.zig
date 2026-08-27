@@ -1565,13 +1565,38 @@ test "shell-input: generated input-method client bridges focused text input" {
             });
             focus_clicked = true;
         }
-        if (app_handler.text_input_enter == 1 and method_handler.unavailable == 1) break;
+        if (app_handler.text_input_enter == 1 and method_handler.unavailable == 1 and
+            method_handler.grab_keymap == 1 and method_handler.grab_repeat == 1 and
+            method_handler.grab_modifiers >= 1) break;
         _ = linux.sched_yield();
     }
     try std.testing.expect(app_handler.mapped);
     try std.testing.expectEqual(@as(usize, 1), app_handler.text_input_enter);
     try std.testing.expect(method_handler.method != null);
     try std.testing.expectEqual(@as(usize, 1), method_handler.unavailable);
+    try std.testing.expectEqual(@as(usize, 1), method_handler.grab_keymap);
+    try std.testing.expectEqual(@as(usize, 1), method_handler.grab_repeat);
+    try std.testing.expectEqual(@as(usize, 1), method_handler.grab_modifiers);
+    try std.testing.expect(method_handler.grab_initial_valid);
+
+    try input.publish(&.{
+        .{ .keyboard_key = .{ .device = 42, .time_usec = 3_000, .key = 42, .pressed = true } },
+        .{ .keyboard_key = .{ .device = 42, .time_usec = 4_000, .key = 30, .pressed = true } },
+        .{ .keyboard_key = .{ .device = 42, .time_usec = 5_000, .key = 30, .pressed = false } },
+        .{ .keyboard_key = .{ .device = 42, .time_usec = 6_000, .key = 42, .pressed = false } },
+    });
+    for (0..512) |_| {
+        _ = try drainClient(&app_reactor, &app_driver, &app_handler);
+        _ = try drainClient(&method_reactor, &method_driver, &method_handler);
+        _ = try loop.turn(coordinator);
+        if (method_handler.grab_keys == 4 and method_handler.grab_modifiers == 3) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(input.event_count, input.cursor);
+    try std.testing.expect(coordinator.input_method_adapter.activeGrab() != null);
+    try std.testing.expectEqual(@as(usize, 4), method_handler.grab_keys);
+    try std.testing.expectEqual(@as(usize, 3), method_handler.grab_modifiers);
+    try std.testing.expect(method_handler.grab_keys_valid);
 
     try protocol.zwp_text_input_v3.encodeRequest(&app_actor.transmit, app_handler.text_input.?.id, .{ .enable = .{} });
     try protocol.zwp_text_input_v3.encodeRequest(&app_actor.transmit, app_handler.text_input.?.id, .{ .set_surrounding_text = .{ .text = "hello world", .cursor = 5, .anchor = 3 } });
@@ -2032,6 +2057,7 @@ const InputMethodHandler = struct {
     manager: ?wayring.objects.Handle = null,
     method: ?wayring.objects.Handle = null,
     rejected: ?wayring.objects.Handle = null,
+    keyboard_grab: ?wayring.objects.Handle = null,
     unavailable: usize = 0,
     activate: usize = 0,
     surrounding: usize = 0,
@@ -2041,6 +2067,12 @@ const InputMethodHandler = struct {
     order: usize = 0,
     state_valid: bool = true,
     event_failures: usize = 0,
+    grab_keymap: usize = 0,
+    grab_repeat: usize = 0,
+    grab_modifiers: usize = 0,
+    grab_keys: usize = 0,
+    grab_initial_valid: bool = true,
+    grab_keys_valid: bool = true,
 
     pub fn eventError(self: *@This(), _: wayring.io_uring.Peer, _: ClientCore.EventFailure) void {
         self.event_failures += 1;
@@ -2054,6 +2086,7 @@ const InputMethodHandler = struct {
                     if (self.method == null and self.seat != null and self.manager != null) {
                         self.method = (try protocol.zwp_input_method_manager_v2.construct_get_input_method(self.objects, self.queue, self.manager.?, .{ .seat = self.seat.?.id })).input_method;
                         self.rejected = (try protocol.zwp_input_method_manager_v2.construct_get_input_method(self.objects, self.queue, self.manager.?, .{ .seat = self.seat.?.id })).input_method;
+                        self.keyboard_grab = (try protocol.zwp_input_method_v2.construct_grab_keyboard(self.objects, self.queue, self.method.?, .{})).keyboard;
                     }
                 },
                 .global_remove => {},
@@ -2094,6 +2127,36 @@ const InputMethodHandler = struct {
                     self.state_valid = self.state_valid and self.order == 5;
                 },
                 else => {},
+            }
+        } else if (target.object.interface == &protocol.zwp_input_method_keyboard_grab_v2.info) {
+            switch (try protocol.zwp_input_method_keyboard_grab_v2.decodeEvent(message, fds)) {
+                .keymap => |v| {
+                    defer _ = linux.close(v.fd);
+                    self.grab_keymap += 1;
+                    self.grab_initial_valid = self.grab_initial_valid and
+                        v.format.value == protocol.wl_keyboard.keymap_format.xkb_v1.value and v.size > 0;
+                },
+                .repeat_info => |v| {
+                    self.grab_repeat += 1;
+                    self.grab_initial_valid = self.grab_initial_valid and v.rate == 25 and v.delay == 600;
+                },
+                .modifiers => |v| {
+                    self.grab_modifiers += 1;
+                    if (self.grab_modifiers == 1)
+                        self.grab_initial_valid = self.grab_initial_valid and v.mods_depressed == 0
+                    else if (self.grab_modifiers == 2)
+                        self.grab_keys_valid = self.grab_keys_valid and v.mods_depressed != 0
+                    else if (self.grab_modifiers == 3)
+                        self.grab_keys_valid = self.grab_keys_valid and v.mods_depressed == 0;
+                },
+                .key => |v| {
+                    const expected_keys = [_]u32{ 42, 30, 30, 42 };
+                    const expected_states = [_]u32{ 1, 1, 0, 0 };
+                    if (self.grab_keys >= expected_keys.len or
+                        v.key != expected_keys[self.grab_keys] or
+                        v.state.value != expected_states[self.grab_keys]) self.grab_keys_valid = false;
+                    self.grab_keys += 1;
+                },
             }
         } else if (target.object.interface == &ClientCore.Display.info) switch (try ClientCore.decodeDisplayEvent(self.objects, message, fds)) {
             .delete_id => {},

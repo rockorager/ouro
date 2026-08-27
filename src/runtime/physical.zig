@@ -378,6 +378,7 @@ pub fn Coordinator(comptime protocol: type) type {
         input_drag_accepted: bool = false,
         input_delivery_prepared: bool = false,
         input_delivery_event: ?input_api.Event = null,
+        input_method_key_owners: [0x300]?protocol_input_method.GrabId = [_]?protocol_input_method.GrabId{null} ** 0x300,
         manager: drm.Manager,
         shm: Shm,
         adapter: Adapter,
@@ -509,6 +510,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.input_drag_accepted = false;
             self.input_delivery_prepared = false;
             self.input_delivery_event = null;
+            @memset(&self.input_method_key_owners, null);
             self.render_device = null;
             self.syncobj_device = null;
             self.syncobj_adapter = null;
@@ -770,6 +772,11 @@ pub fn Coordinator(comptime protocol: type) type {
                 .resolveFn = resolveInputMethodSeat,
             }, config.input_method);
             errdefer self.input_method_adapter.deinit();
+            self.input_method_adapter.setKeyboardProvider(.{
+                .context = self,
+                .snapshotFn = inputMethodKeyboardSnapshot,
+                .duplicateKeymapFn = inputMethodDuplicateKeymap,
+            });
             self.dmabuf_adapter = try DmabufAdapter.init(allocator, config.linux_dmabuf);
             errdefer self.dmabuf_adapter.deinit();
             try self.adapter.setExternalImporter(self.dmabuf_adapter.externalImporter(Adapter));
@@ -2026,8 +2033,17 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.input_gesture_accepted = true;
             }
             if (!self.input_seat_accepted) {
-                if (!self.input_keyboard_consumed) if (self.input_delivery_event) |delivery_event|
-                    switch (delivery_event) {
+                if (self.input_delivery_event) |delivery_event| {
+                    if (delivery_event == .keyboard_key and
+                        (!self.input_keyboard_consumed or !delivery_event.keyboard_key.pressed))
+                    {
+                        const handled = self.consumeInputMethodKey(delivery_event) catch |err| switch (err) {
+                            error.Exhausted => return false,
+                            else => return err,
+                        };
+                        if (handled) self.input_keyboard_consumed = true;
+                    }
+                    if (!self.input_keyboard_consumed) switch (delivery_event) {
                         .pointer_motion => self.seat_adapter.consumePointerMotionAt(
                             delivery_event,
                             self.seat_adapter.pointerState().point,
@@ -2037,6 +2053,7 @@ pub fn Coordinator(comptime protocol: type) type {
                         error.Exhausted => return false,
                         else => return err,
                     };
+                }
                 self.input_seat_accepted = true;
             }
             if (!self.input_tablet_accepted) {
@@ -2079,7 +2096,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.input_delivery_event = null;
             self.stats.input_events += 1;
             self.markProtocolAll(ProtocolReady.seat | ProtocolReady.relative_pointer |
-                ProtocolReady.pointer_gestures | ProtocolReady.tablet);
+                ProtocolReady.pointer_gestures | ProtocolReady.tablet | ProtocolReady.input_method);
             try self.advanceShell();
             switch (event) {
                 .pointer_motion, .device_added, .device_removed => try self.requestCursorRedraw(),
@@ -2087,6 +2104,39 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             try self.processSeatEvents();
             try self.flushProtocol();
+            return true;
+        }
+
+        fn consumeInputMethodKey(self: *Self, event: input_api.Event) !bool {
+            const key_event = event.keyboard_key;
+            if (key_event.key >= self.input_method_key_owners.len) return false;
+            if (self.sessionLockActive()) return false;
+            const owner = self.input_method_key_owners[key_event.key];
+            const grab = if (key_event.pressed)
+                owner orelse self.input_method_adapter.activeGrab()
+            else
+                owner;
+            const id = grab orelse return false;
+            const live = self.input_method_adapter.activeGrabSeat(id) != null;
+            if (live and !self.input_method_adapter.canQueueGrab(id, 2)) return error.Exhausted;
+            const delivered = try self.seat_adapter.consumeGrabbedKeyboardKey(event);
+            if (delivered) |value| {
+                if (value.state != 0) {
+                    self.input_method_key_owners[value.key] = id;
+                } else {
+                    self.input_method_key_owners[value.key] = null;
+                }
+                if (live) {
+                    try self.input_method_adapter.queueKey(id, value.serial, value.time, value.key, value.state);
+                    if (value.modifiers) |modifiers| try self.input_method_adapter.queueModifiers(id, .{
+                        .serial = modifiers.serial,
+                        .depressed = modifiers.state.depressed,
+                        .latched = modifiers.state.latched,
+                        .locked = modifiers.state.locked,
+                        .group = modifiers.state.group,
+                    });
+                }
+            }
             return true;
         }
 
@@ -2543,8 +2593,12 @@ pub fn Coordinator(comptime protocol: type) type {
                 ProtocolReady.tablet);
             if (self.sessionLockActive()) {
                 self.session_lock_input_ready = false;
+                @memset(&self.input_method_key_owners, null);
                 self.interaction.suspendClientFocus();
                 var input_ready = true;
+                self.input_method_adapter.setGrabInhibited(true) catch {
+                    input_ready = false;
+                };
                 self.tablet_state.suspendFocus(0) catch {
                     input_ready = false;
                 };
@@ -2569,6 +2623,7 @@ pub fn Coordinator(comptime protocol: type) type {
             } else if (unlocked) {
                 self.session_lock_frame = null;
                 self.session_lock_input_ready = false;
+                try self.input_method_adapter.setGrabInhibited(false);
                 try self.syncLayerKeyboardFocus();
             }
             if (self.output) |output| {
@@ -2800,6 +2855,30 @@ pub fn Coordinator(comptime protocol: type) type {
             return if (validateTextInputSeat(context, peer, seat_object)) 0 else null;
         }
 
+        fn inputMethodKeyboardSnapshot(context: ?*anyopaque, seat: u32) protocol_input_method.KeyboardSnapshot {
+            const self: *Self = @ptrCast(@alignCast(context.?));
+            std.debug.assert(seat == 0);
+            const snapshot = self.seat_adapter.keyboardSnapshot();
+            return .{
+                .keymap_size = snapshot.keymap_size,
+                .repeat_rate = snapshot.repeat_rate,
+                .repeat_delay = snapshot.repeat_delay,
+                .modifiers = .{
+                    .serial = self.seat_adapter.nextSerial(),
+                    .depressed = snapshot.modifiers.depressed,
+                    .latched = snapshot.modifiers.latched,
+                    .locked = snapshot.modifiers.locked,
+                    .group = snapshot.modifiers.group,
+                },
+            };
+        }
+
+        fn inputMethodDuplicateKeymap(context: ?*anyopaque, seat: u32) !std.os.linux.fd_t {
+            const self: *Self = @ptrCast(@alignCast(context orelse return error.InvalidContext));
+            if (seat != 0) return error.InvalidSeat;
+            return self.seat_adapter.duplicateKeymap();
+        }
+
         fn validateGesturePointer(
             context: ?*anyopaque,
             peer: wayring.io_uring.Peer,
@@ -2960,6 +3039,8 @@ pub fn Coordinator(comptime protocol: type) type {
         fn flushProtocol(self: *Self) !void {
             try self.processDecorationEvents();
             try self.advanceShell();
+            self.input_method_adapter.advance();
+            self.markInputMethodProtocol();
             for (self.clients.items) |client| if (client.active and client.protocol_ready != 0)
                 try self.flushProtocolOn(client.peer);
         }

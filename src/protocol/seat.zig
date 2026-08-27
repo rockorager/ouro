@@ -187,6 +187,17 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             value: Outbound = undefined,
         };
 
+        pub const GrabbedKeyboardKey = struct {
+            serial: u32,
+            time: u32,
+            key: u32,
+            state: u32,
+            modifiers: ?struct {
+                serial: u32,
+                state: ModifierState,
+            },
+        };
+
         allocator: std.mem.Allocator,
         core: *CoreSurface,
         runtime: ?*Runtime = null,
@@ -638,6 +649,27 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             return adapter.issueSerial();
         }
 
+        pub fn keyboardSnapshot(adapter: *const Self) struct {
+            keymap_size: u32,
+            repeat_rate: i32,
+            repeat_delay: i32,
+            modifiers: ModifierState,
+        } {
+            return .{
+                .keymap_size = adapter.keymap_size,
+                .repeat_rate = adapter.repeat_rate,
+                .repeat_delay = adapter.repeat_delay,
+                .modifiers = adapter.modifiers,
+            };
+        }
+
+        /// The caller owns the returned descriptor.
+        pub fn duplicateKeymap(adapter: *const Self) !linux.fd_t {
+            const duplicated = linux.dup(adapter.keymap_fd);
+            if (linux.errno(duplicated) != .SUCCESS) return error.KeymapDuplicateFailed;
+            return @intCast(duplicated);
+        }
+
         /// Validates an input serial against the exact wl_seat resource named
         /// by an xdg_popup.grab request. Pointer-enter serials intentionally do
         /// not qualify: only a delivered button press establishes this token.
@@ -847,6 +879,16 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .tablet_pad_strip,
                 => {},
             }
+        }
+
+        /// Applies a normalized key event to the physical and aggregate seat
+        /// state without queueing wl_keyboard events. A null result means the
+        /// per-device change did not change the aggregate key state.
+        pub fn consumeGrabbedKeyboardKey(adapter: *Self, event: input.Event) !?GrabbedKeyboardKey {
+            return switch (event) {
+                .keyboard_key => |value| try adapter.keyboardKeyTransition(value, false),
+                else => error.NotKeyboardKey,
+            };
         }
 
         /// Queues a normalized pointer motion at an exact compositor-derived
@@ -1349,10 +1391,14 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         }
 
         fn keyboardKey(adapter: *Self, value: anytype) !void {
+            _ = try adapter.keyboardKeyTransition(value, true);
+        }
+
+        fn keyboardKeyTransition(adapter: *Self, value: anytype, deliver: bool) !?GrabbedKeyboardKey {
             if (value.key >= code_count) return error.InvalidCode;
             const device = try adapter.resolveDevice(value.device);
             const was = bitSet(&device.keys, value.key);
-            if (was == value.pressed) return;
+            if (was == value.pressed) return null;
             const aggregate_was = bitSet(&adapter.pressed_keys, value.key);
             const aggregate_after = value.pressed or adapter.otherDeviceHasKey(device, value.key);
             const aggregate_changed = aggregate_was != aggregate_after;
@@ -1371,14 +1417,28 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             const next_modifiers = modifierStateFor(next_keys, next_caps_lock, next_num_lock);
             const modifiers_changed = !std.meta.eql(adapter.modifiers, next_modifiers);
             const resource_count = adapter.keyboardResourceCount(target);
-            try adapter.ensureOutbound(resource_count *
+            if (deliver) try adapter.ensureOutbound(resource_count *
                 (1 + @as(usize, @intFromBool(modifiers_changed))));
             writeBit(&device.keys, value.key, value.pressed);
             adapter.rebuildPressed();
             adapter.caps_lock_active = next_caps_lock;
             adapter.num_lock_active = next_num_lock;
             adapter.modifiers = next_modifiers;
-            if (!aggregate_changed or target == null) return;
+            if (!aggregate_changed) return null;
+            if (!deliver) {
+                const serial = adapter.issueSerial();
+                return .{
+                    .serial = serial,
+                    .time = millis(value.time_usec),
+                    .key = value.key,
+                    .state = @intFromBool(value.pressed),
+                    .modifiers = if (modifiers_changed) .{
+                        .serial = adapter.issueSerial(),
+                        .state = next_modifiers,
+                    } else null,
+                };
+            }
+            if (target == null) return null;
             const delivery = target.?;
             const serial = adapter.issueSerial();
             for (adapter.keyboards, 0..) |slot, index| if (adapter.keyboardBelongs(&slot, delivery.client))
@@ -1401,6 +1461,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                         .state = next_modifiers,
                     } }) catch unreachable;
             }
+            return null;
         }
 
         fn modifierState(adapter: *const Self, keys: [state_words]u64) ModifierState {
@@ -2319,6 +2380,124 @@ test "seat: pointer grab retains focus and device removal cancels it" {
     const event = adapter.popEvent() orelse return error.MissingCancellation;
     try std.testing.expectEqual(TestAdapter.Event.pointer_grab_cancelled, std.meta.activeTag(event));
     try std.testing.expect(adapter.pointer_delivery == null);
+}
+
+test "seat: grabbed key press and release return aggregate events" {
+    var core: FakeCore = .{};
+    var adapter = try testAdapter(&core);
+    defer adapter.deinit();
+    const device: input.DeviceId = .{ .slot = 0, .generation = 2, .seat_generation = 8 };
+    try adapter.consume(.{ .device_added = .{
+        .device = device,
+        .info = .{ .capabilities = .{ .keyboard = true } },
+    } });
+
+    const press = (try adapter.consumeGrabbedKeyboardKey(.{ .keyboard_key = .{
+        .device = device,
+        .time_usec = 1_234_567,
+        .key = 30,
+        .pressed = true,
+    } })).?;
+    try std.testing.expectEqual(@as(u32, 1234), press.time);
+    try std.testing.expectEqual(@as(u32, 30), press.key);
+    try std.testing.expectEqual(@as(u32, 1), press.state);
+    try std.testing.expect(press.modifiers == null);
+    const released = (try adapter.consumeGrabbedKeyboardKey(.{ .keyboard_key = .{
+        .device = device,
+        .time_usec = 2_000_000,
+        .key = 30,
+        .pressed = false,
+    } })).?;
+    try std.testing.expectEqual(@as(u32, 0), released.state);
+    try std.testing.expect(released.serial != press.serial);
+    try std.testing.expect(!bitSet(&adapter.pressed_keys, 30));
+}
+
+test "seat: grabbed modifier transition returns its serial and state" {
+    var core: FakeCore = .{};
+    var adapter = try testAdapter(&core);
+    defer adapter.deinit();
+    const device: input.DeviceId = .{ .slot = 0, .generation = 2, .seat_generation = 8 };
+    try adapter.consume(.{ .device_added = .{
+        .device = device,
+        .info = .{ .capabilities = .{ .keyboard = true } },
+    } });
+    const result = (try adapter.consumeGrabbedKeyboardKey(.{ .keyboard_key = .{
+        .device = device,
+        .time_usec = 1,
+        .key = key_left_shift,
+        .pressed = true,
+    } })).?;
+    const modifiers = result.modifiers.?;
+    try std.testing.expectEqual(mod_shift, modifiers.state.depressed);
+    try std.testing.expect(modifiers.serial != result.serial);
+    try std.testing.expectEqual(mod_shift, adapter.modifiers.depressed);
+}
+
+test "seat: grabbed duplicate-device keys retain aggregate semantics" {
+    var core: FakeCore = .{};
+    var adapter = try testAdapter(&core);
+    defer adapter.deinit();
+    const first: input.DeviceId = .{ .slot = 0, .generation = 2, .seat_generation = 8 };
+    const second: input.DeviceId = .{ .slot = 1, .generation = 2, .seat_generation = 8 };
+    for ([_]input.DeviceId{ first, second }) |device| try adapter.consume(.{ .device_added = .{
+        .device = device,
+        .info = .{ .capabilities = .{ .keyboard = true } },
+    } });
+    try std.testing.expect((try adapter.consumeGrabbedKeyboardKey(.{ .keyboard_key = .{
+        .device = first,
+        .time_usec = 1,
+        .key = 30,
+        .pressed = true,
+    } })) != null);
+    try std.testing.expect((try adapter.consumeGrabbedKeyboardKey(.{ .keyboard_key = .{
+        .device = second,
+        .time_usec = 2,
+        .key = 30,
+        .pressed = true,
+    } })) == null);
+    try std.testing.expect((try adapter.consumeGrabbedKeyboardKey(.{ .keyboard_key = .{
+        .device = first,
+        .time_usec = 3,
+        .key = 30,
+        .pressed = false,
+    } })) == null);
+    try std.testing.expect(bitSet(&adapter.pressed_keys, 30));
+    try std.testing.expect((try adapter.consumeGrabbedKeyboardKey(.{ .keyboard_key = .{
+        .device = second,
+        .time_usec = 4,
+        .key = 30,
+        .pressed = false,
+    } })) != null);
+}
+
+test "seat: grabbed key queues no wl_keyboard outbound" {
+    var core: FakeCore = .{};
+    var adapter = try testAdapterWithCapacity(&core, 2, 4);
+    defer adapter.deinit();
+    const peer: wayring.io_uring.Peer = .{ .slot = 1, .generation = 7 };
+    const client = clientId(peer);
+    const target = try adapter.makeTarget(peer, .{ .index = 0, .generation = 1 });
+    const keyboard = try acquire(TestAdapter.KeyboardSlot, adapter.keyboards, &adapter.keyboard_free);
+    keyboard.client = client;
+    const device: input.DeviceId = .{ .slot = 0, .generation = 2, .seat_generation = 8 };
+    try adapter.consume(.{ .device_added = .{
+        .device = device,
+        .info = .{ .capabilities = .{ .keyboard = true } },
+    } });
+    try adapter.setKeyboardFocus(target);
+    clearTestOutbound(&adapter);
+    try adapter.enqueue(client, .{ .seat_name = .{ .index = 0, .generation = 1 } });
+    try adapter.enqueue(client, .{ .seat_name = .{ .index = 1, .generation = 1 } });
+    _ = (try adapter.consumeGrabbedKeyboardKey(.{ .keyboard_key = .{
+        .device = device,
+        .time_usec = 1,
+        .key = 30,
+        .pressed = true,
+    } })).?;
+    try std.testing.expectEqual(@as(usize, 2), adapter.pendingOutbound());
+    try std.testing.expectEqual(@as(usize, 0), countTestOutbound(&adapter, .keyboard_key));
+    try std.testing.expectEqual(@as(usize, 0), countTestOutbound(&adapter, .keyboard_modifiers));
 }
 
 test "seat: physical modifier and lock state follows the published keymap" {

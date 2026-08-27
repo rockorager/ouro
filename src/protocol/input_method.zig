@@ -2,7 +2,28 @@
 const std = @import("std");
 const wayring = @import("wayring");
 const objects = wayring.objects;
+const linux = std.os.linux;
 const none = std.math.maxInt(u32);
+
+pub const GrabId = packed struct { index: u32, generation: u32 };
+pub const Modifiers = struct { serial: u32 = 0, depressed: u32 = 0, latched: u32 = 0, locked: u32 = 0, group: u32 = 0 };
+pub const KeyboardSnapshot = struct {
+    keymap_size: u32,
+    repeat_rate: i32,
+    repeat_delay: i32,
+    modifiers: Modifiers,
+};
+pub const KeyboardProvider = struct {
+    context: ?*anyopaque = null,
+    snapshotFn: *const fn (?*anyopaque, u32) KeyboardSnapshot,
+    duplicateKeymapFn: *const fn (?*anyopaque, u32) anyerror!linux.fd_t,
+    pub fn snapshot(self: @This(), seat: u32) KeyboardSnapshot {
+        return self.snapshotFn(self.context, seat);
+    }
+    pub fn duplicateKeymap(self: @This(), seat: u32) !linux.fd_t {
+        return self.duplicateKeymapFn(self.context, seat);
+    }
+};
 
 pub const max_string_bytes = 4000;
 pub const SeatValidator = struct {
@@ -81,9 +102,9 @@ pub fn Adapter(comptime protocol: type, comptime TextInput: type) type {
         const ManagerSlot = struct { active: bool = false, next: u32 = none, resource: objects.Handle = .{ .id = 0, .generation = 0 }, peer: wayring.io_uring.Peer = undefined };
         const MethodId = packed struct { index: u32, generation: u32 };
         const MethodSlot = struct { active: bool = false, retired: bool = false, generation: u32 = 1, next: u32 = none, resource: objects.Handle = .{ .id = 0, .generation = 0 }, peer: wayring.io_uring.Peer = undefined, seat_key: u32 = 0, available: bool = false, enabled: bool = false, target: ?TextInput.DeviceId = null, done_serial: u32 = 0, pending: PendingEdit = .{} };
-        const Child = struct { active: bool = false, retired: bool = false, generation: u32 = 1, next: u32 = none, resource: objects.Handle = .{ .id = 0, .generation = 0 }, peer: wayring.io_uring.Peer = undefined, parent: MethodId = undefined };
-        const OutKind = enum { unavailable, activate, deactivate, surrounding, cause, content, done };
-        const Out = struct { active: bool = false, sequence: u64 = 0, peer: wayring.io_uring.Peer = undefined, method: MethodId = undefined, kind: OutKind = .unavailable, text_len: usize = 0, cursor: u32 = 0, anchor: u32 = 0, cause: u32 = 0, hints: u32 = 0, purpose: u32 = 0, storage: []u8 = &.{} };
+        const Child = struct { active: bool = false, retired: bool = false, generation: u32 = 1, next: u32 = none, resource: objects.Handle = .{ .id = 0, .generation = 0 }, peer: wayring.io_uring.Peer = undefined, parent: MethodId = undefined, order: u64 = 0, eligible: bool = true };
+        const OutKind = enum { unavailable, activate, deactivate, surrounding, cause, content, done, grab_keymap, grab_repeat, grab_modifiers, grab_key };
+        const Out = struct { active: bool = false, sequence: u64 = 0, peer: wayring.io_uring.Peer = undefined, method: MethodId = undefined, grab: GrabId = .{ .index = none, .generation = 0 }, kind: OutKind = .unavailable, text_len: usize = 0, cursor: u32 = 0, anchor: u32 = 0, cause: u32 = 0, hints: u32 = 0, purpose: u32 = 0, serial: u32 = 0, time: u32 = 0, key: u32 = 0, state: u32 = 0, modifiers: Modifiers = .{}, rate: i32 = 0, delay: i32 = 0, size: u32 = 0, storage: []u8 = &.{} };
 
         allocator: std.mem.Allocator,
         validator: SeatValidator,
@@ -101,6 +122,10 @@ pub fn Adapter(comptime protocol: type, comptime TextInput: type) type {
         grab_free: u32 = 0,
         out_len: usize = 0,
         next_sequence: u64 = 1,
+        provider: ?KeyboardProvider = null,
+        active_grab: ?GrabId = null,
+        grab_inhibited: bool = false,
+        grab_clock: u64 = 1,
         runtime: ?*Runtime = null,
         global: ?objects.Handle = null,
 
@@ -130,6 +155,7 @@ pub fn Adapter(comptime protocol: type, comptime TextInput: type) type {
             return .{ .allocator = a, .validator = validator, .text_input = ti, .managers = managers, .methods = methods, .popups = popups, .grabs = grabs, .outbound = outbound, .out_text = ot, .string_bytes = c.string_bytes };
         }
         pub fn deinit(self: *Self) void {
+            for (self.outbound) |*o| self.dropOut(o);
             self.allocator.free(self.out_text);
             self.allocator.free(self.outbound);
             self.allocator.free(self.grabs);
@@ -137,6 +163,14 @@ pub fn Adapter(comptime protocol: type, comptime TextInput: type) type {
             self.allocator.free(self.methods);
             self.allocator.free(self.managers);
             self.* = undefined;
+        }
+        pub fn setKeyboardProvider(self: *Self, provider: ?KeyboardProvider) void {
+            if (provider == null) {
+                if (self.active_grab) |id| self.retireGrabOutbound(id);
+                self.active_grab = null;
+            }
+            self.provider = provider;
+            self.promoteGrab();
         }
         pub fn install(self: *Self, runtime: *Runtime) !objects.Handle {
             if (self.runtime != null) return error.AlreadyInstalled;
@@ -220,6 +254,7 @@ pub fn Adapter(comptime protocol: type, comptime TextInput: type) type {
                         c.resource = admitted.id;
                     },
                     .grab_keyboard => |q| {
+                        const order = self.issueGrabOrder() catch return try self.noMemory(actor);
                         const c = self.acquireChild(self.grabs, &self.grab_free) catch return try self.noMemory(actor);
                         c.peer = peer;
                         c.parent = self.methodId(m);
@@ -228,13 +263,21 @@ pub fn Adapter(comptime protocol: type, comptime TextInput: type) type {
                             return try self.failure(actor, d.handle.id, e);
                         };
                         c.resource = admitted.keyboard;
+                        c.order = order;
+                        self.promoteGrab();
                     },
                 }
                 try d.finish(protocol, so, &actor.transmit);
                 return .continue_dispatch;
             }
             if (target.object.interface == &Popup.info) return self.childRequest(Popup, self.popups, peer, target, handle, actor, so, message, fds, &self.popup_free);
-            if (target.object.interface == &Grab.info) return self.childRequest(Grab, self.grabs, peer, target, handle, actor, so, message, fds, &self.grab_free);
+            if (target.object.interface == &Grab.info) {
+                const c = from(Child, self.grabs, target.object.context) orelse return null;
+                if (!std.meta.eql(c.resource, handle) or !same(c.peer, peer)) return null;
+                const d = try wayring.server.decodeRequest(Grab, so, message, fds);
+                try d.finish(protocol, so, &actor.transmit);
+                return .continue_dispatch;
+            }
             return null;
         }
         fn childRequest(self: *Self, comptime I: type, slots: []Child, peer: wayring.io_uring.Peer, target: objects.Dispatch, handle: objects.Handle, actor: *wayring.connection.Actor, so: anytype, message: wayring.wire.Message, fds: *wayring.ancillary.FdQueue, free: *u32) !?wayring.dispatch.Control {
@@ -314,9 +357,109 @@ pub fn Adapter(comptime protocol: type, comptime TextInput: type) type {
             }
             self.out_len += 1;
         }
+        /// Returns the exact generation physical input should pin pressed keys to.
+        pub fn activeGrab(self: *const Self) ?GrabId {
+            return if (self.grab_inhibited) null else self.active_grab;
+        }
+        pub fn activeGrabSeat(self: *Self, id: GrabId) ?u32 {
+            if (self.grab_inhibited) return null;
+            const c = self.resolveGrab(id) orelse return null;
+            const m = self.resolveMethod(c.parent) orelse return null;
+            return if (self.active_grab != null and std.meta.eql(self.active_grab.?, id)) m.seat_key else null;
+        }
+        pub fn queueKey(self: *Self, id: GrabId, serial: u32, time: u32, key: u32, state: u32) !void {
+            const c = self.liveActiveGrab(id) orelse return error.StaleGrab;
+            try self.enqueueGrab(c, id, .grab_key, .{ .serial = serial, .time = time, .key = key, .state = state });
+        }
+        pub fn queueModifiers(self: *Self, id: GrabId, modifiers: Modifiers) !void {
+            const c = self.liveActiveGrab(id) orelse return error.StaleGrab;
+            try self.enqueueGrab(c, id, .grab_modifiers, .{ .modifiers = modifiers });
+        }
+        pub fn canQueueGrab(self: *const Self, id: GrabId, count: usize) bool {
+            if (self.grab_inhibited or self.active_grab == null or !std.meta.eql(self.active_grab.?, id)) return false;
+            return self.canEnqueue(count);
+        }
+        pub fn setGrabInhibited(self: *Self, inhibited: bool) !void {
+            if (self.grab_inhibited == inhibited) return;
+            if (!inhibited) if (self.active_grab) |id| {
+                const c = self.resolveGrab(id) orelse return;
+                const m = self.resolveMethod(c.parent) orelse return;
+                if (!self.canEnqueue(1)) return error.Exhausted;
+                const modifiers = self.provider.?.snapshot(m.seat_key).modifiers;
+                try self.enqueueGrab(c, id, .grab_modifiers, .{ .modifiers = modifiers });
+            };
+            self.grab_inhibited = inhibited;
+        }
+        const GrabPayload = struct { serial: u32 = 0, time: u32 = 0, key: u32 = 0, state: u32 = 0, modifiers: Modifiers = .{}, rate: i32 = 0, delay: i32 = 0, size: u32 = 0 };
+        fn enqueueGrab(self: *Self, c: *Child, id: GrabId, kind: OutKind, p: GrabPayload) !void {
+            if (!self.canEnqueue(1)) return error.Exhausted;
+            self.normalizeSequence(1);
+            self.enqueueGrabAssumeCapacity(c, id, kind, p);
+        }
+        fn enqueueGrabAssumeCapacity(self: *Self, c: *Child, id: GrabId, kind: OutKind, p: GrabPayload) void {
+            var o: *Out = undefined;
+            for (self.outbound) |*x| if (!x.active) {
+                o = x;
+                break;
+            };
+            const storage = o.storage;
+            o.* = .{ .active = true, .sequence = self.next_sequence, .peer = c.peer, .grab = id, .kind = kind, .serial = p.serial, .time = p.time, .key = p.key, .state = p.state, .modifiers = p.modifiers, .rate = p.rate, .delay = p.delay, .size = p.size, .storage = storage };
+            self.next_sequence += 1;
+            self.out_len += 1;
+        }
+        /// First-created eligible grab wins; the oldest surviving waiter is promoted.
+        fn promoteGrab(self: *Self) void {
+            if (self.active_grab != null or self.provider == null or !self.canEnqueue(3)) return;
+            var best: ?*Child = null;
+            for (self.grabs) |*c| {
+                if (c.active and c.eligible and self.resolveMethod(c.parent) != null and self.resolveMethod(c.parent).?.available and (best == null or c.order < best.?.order)) best = c;
+            }
+            const c = best orelse return;
+            const m = self.resolveMethod(c.parent).?;
+            const snap = self.provider.?.snapshot(m.seat_key);
+            const id: GrabId = .{ .index = self.childIndex(self.grabs, c), .generation = c.generation };
+            self.normalizeSequence(3);
+            self.enqueueGrabAssumeCapacity(c, id, .grab_keymap, .{ .size = snap.keymap_size });
+            self.enqueueGrabAssumeCapacity(c, id, .grab_repeat, .{ .rate = snap.repeat_rate, .delay = snap.repeat_delay });
+            self.enqueueGrabAssumeCapacity(c, id, .grab_modifiers, .{ .modifiers = snap.modifiers });
+            self.active_grab = id;
+        }
         pub fn flushOn(self: *Self, peer: wayring.io_uring.Peer, so: anytype, queue: *wayring.tx.Queue) !usize {
             var count: usize = 0;
             while (self.oldest(peer)) |o| {
+                if (o.kind == .grab_keymap or o.kind == .grab_repeat or o.kind == .grab_modifiers or o.kind == .grab_key) {
+                    const c = self.resolveGrab(o.grab) orelse {
+                        self.dropOut(o);
+                        continue;
+                    };
+                    var keymap_fd: linux.fd_t = -1;
+                    if (o.kind == .grab_keymap) {
+                        const m = self.resolveMethod(c.parent) orelse {
+                            self.dropOut(o);
+                            continue;
+                        };
+                        keymap_fd = try self.provider.?.duplicateKeymap(m.seat_key);
+                    }
+                    var owns_keymap = keymap_fd >= 0;
+                    defer if (owns_keymap) {
+                        _ = linux.close(keymap_fd);
+                    };
+                    const event: Grab.Event = switch (o.kind) {
+                        .grab_keymap => .{ .keymap = .{ .format = protocol.wl_keyboard.keymap_format.xkb_v1, .fd = keymap_fd, .size = o.size } },
+                        .grab_repeat => .{ .repeat_info = .{ .rate = o.rate, .delay = o.delay } },
+                        .grab_modifiers => .{ .modifiers = .{ .serial = o.modifiers.serial, .mods_depressed = o.modifiers.depressed, .mods_latched = o.modifiers.latched, .mods_locked = o.modifiers.locked, .group = o.modifiers.group } },
+                        .grab_key => .{ .key = .{ .serial = o.serial, .time = o.time, .key = o.key, .state = protocol.wl_keyboard.key_state.fromInt(o.state) } },
+                        else => unreachable,
+                    };
+                    wayring.server.sendEvent(protocol, Grab, so, queue, c.resource, event) catch |err| switch (err) {
+                        error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return count,
+                        else => return err,
+                    };
+                    owns_keymap = false;
+                    self.dropOut(o);
+                    count += 1;
+                    continue;
+                }
                 const m = self.resolveMethod(o.method) orelse {
                     self.dropOut(o);
                     continue;
@@ -332,6 +475,7 @@ pub fn Adapter(comptime protocol: type, comptime TextInput: type) type {
                         .purpose = protocol.zwp_text_input_v3.content_purpose.fromInt(o.purpose),
                     } },
                     .done => .{ .done = .{} },
+                    else => unreachable,
                 };
                 wayring.server.sendEvent(protocol, Method, so, queue, m.resource, event) catch |err| switch (err) {
                     error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return count,
@@ -345,6 +489,9 @@ pub fn Adapter(comptime protocol: type, comptime TextInput: type) type {
         }
         pub fn pendingOutbound(self: *const Self) usize {
             return self.out_len;
+        }
+        pub fn advance(self: *Self) void {
+            self.promoteGrab();
         }
         pub fn pendingOutboundOn(self: *const Self, peer: wayring.io_uring.Peer) bool {
             for (self.outbound) |o| if (o.active and same(o.peer, peer)) return true;
@@ -367,7 +514,12 @@ pub fn Adapter(comptime protocol: type, comptime TextInput: type) type {
                 return true;
             }
             if (o.interface == &Popup.info) return self.removeChild(self.popups, &self.popup_free, h, o);
-            if (o.interface == &Grab.info) return self.removeChild(self.grabs, &self.grab_free, h, o);
+            if (o.interface == &Grab.info) {
+                const c = from(Child, self.grabs, o.context) orelse return false;
+                if (!std.meta.eql(c.resource, h)) return false;
+                self.releaseGrab(self.childIndex(self.grabs, c));
+                return true;
+            }
             return false;
         }
         pub fn disconnected(self: *Self, peer: wayring.io_uring.Peer) void {
@@ -378,7 +530,7 @@ pub fn Adapter(comptime protocol: type, comptime TextInput: type) type {
                 self.manager_free = i;
             };
             for (self.popups) |*c| if (c.active and same(c.peer, peer)) self.releaseChild(self.popups, &self.popup_free, self.childIndex(self.popups, c));
-            for (self.grabs) |*c| if (c.active and same(c.peer, peer)) self.releaseChild(self.grabs, &self.grab_free, self.childIndex(self.grabs, c));
+            for (self.grabs) |*c| if (c.active and same(c.peer, peer)) self.releaseGrab(self.childIndex(self.grabs, c));
             for (self.outbound) |*o| if (o.active and same(o.peer, peer)) self.dropOut(o);
         }
 
@@ -399,7 +551,12 @@ pub fn Adapter(comptime protocol: type, comptime TextInput: type) type {
                 if (c.active and std.meta.eql(c.parent, self.methodId(m))) c.parent.generation = 0;
             }
             for (self.grabs) |*c| {
-                if (c.active and std.meta.eql(c.parent, self.methodId(m))) c.parent.generation = 0;
+                if (c.active and std.meta.eql(c.parent, self.methodId(m))) {
+                    const id: GrabId = .{ .index = self.childIndex(self.grabs, c), .generation = c.generation };
+                    self.retireGrabOutbound(id);
+                    if (self.active_grab != null and std.meta.eql(self.active_grab.?, id)) self.active_grab = null;
+                    c.parent.generation = 0;
+                }
             }
             if (m.generation == std.math.maxInt(u32)) {
                 m.* = .{ .retired = true, .generation = m.generation };
@@ -407,6 +564,28 @@ pub fn Adapter(comptime protocol: type, comptime TextInput: type) type {
             }
             m.* = .{ .generation = m.generation + 1, .next = self.method_free };
             self.method_free = i;
+            self.promoteGrab();
+        }
+        fn resolveGrab(self: *Self, id: GrabId) ?*Child {
+            if (id.index >= self.grabs.len) return null;
+            const c = &self.grabs[id.index];
+            return if (c.active and c.generation == id.generation) c else null;
+        }
+        fn liveActiveGrab(self: *Self, id: GrabId) ?*Child {
+            if (self.active_grab == null or !std.meta.eql(self.active_grab.?, id)) return null;
+            return self.resolveGrab(id);
+        }
+        fn retireGrabOutbound(self: *Self, id: GrabId) void {
+            for (self.outbound) |*o| if (o.active and std.meta.eql(o.grab, id)) self.dropOut(o);
+        }
+        fn releaseGrab(self: *Self, i: u32) void {
+            const c = &self.grabs[i];
+            if (!c.active) return;
+            const id: GrabId = .{ .index = i, .generation = c.generation };
+            self.retireGrabOutbound(id);
+            if (self.active_grab != null and std.meta.eql(self.active_grab.?, id)) self.active_grab = null;
+            self.releaseChild(self.grabs, &self.grab_free, i);
+            self.promoteGrab();
         }
         fn acquireChild(_: *Self, slots: []Child, free: *u32) !*Child {
             if (free.* == none) return error.Exhausted;
@@ -453,6 +632,18 @@ pub fn Adapter(comptime protocol: type, comptime TextInput: type) type {
         }
         fn canEnqueue(self: *const Self, n: usize) bool {
             return self.outbound.len - self.out_len >= n and (self.next_sequence <= std.math.maxInt(u64) - n or self.out_len == 0);
+        }
+        fn normalizeSequence(self: *Self, n: usize) void {
+            if (self.next_sequence > std.math.maxInt(u64) - n) {
+                std.debug.assert(self.out_len == 0);
+                self.next_sequence = 1;
+            }
+        }
+        fn issueGrabOrder(self: *Self) !u64 {
+            if (self.grab_clock == std.math.maxInt(u64)) return error.Exhausted;
+            const order = self.grab_clock;
+            self.grab_clock += 1;
+            return order;
         }
         fn oldest(self: *Self, peer: wayring.io_uring.Peer) ?*Out {
             var result: ?*Out = null;
@@ -564,4 +755,59 @@ test "input method arbitration state edits generation and disconnect" {
     const reused = try a.acquireMethod();
     try std.testing.expect(old.generation != a.methodId(reused).generation);
     a.disconnected(one.peer);
+}
+
+test "input method keyboard grab orders sync, excludes stale generations, and promotes oldest waiter" {
+    const T = struct {
+        pub const DeviceId = packed struct { index: u32, generation: u32 };
+        pub const Event = struct { device: DeviceId, state: struct { enabled: bool }, surrounding: []const u8 = "" };
+        pub fn queueEdit(_: *@This(), _: DeviceId, _: anytype) !void {}
+    };
+    const A = Adapter(@import("core_protocol"), T);
+    var ti: T = .{};
+    var a = try A.init(std.testing.allocator, &ti, .{ .resolveFn = struct {
+        fn f(_: ?*anyopaque, _: wayring.io_uring.Peer, _: u32) ?u32 {
+            return 9;
+        }
+    }.f }, .{ .manager_capacity = 1, .method_capacity = 2, .popup_capacity = 1, .grab_capacity = 3, .outbound_capacity = 8, .string_bytes = 8 });
+    defer a.deinit();
+
+    const method = try a.acquireMethod();
+    method.available = true;
+    method.seat_key = 9;
+    method.peer = .{ .slot = 1, .generation = 1 };
+    const first = try a.acquireChild(a.grabs, &a.grab_free);
+    first.parent = a.methodId(method);
+    first.peer = method.peer;
+    first.order = 1;
+    const second = try a.acquireChild(a.grabs, &a.grab_free);
+    second.parent = a.methodId(method);
+    second.peer = method.peer;
+    second.order = 2;
+    a.setKeyboardProvider(.{
+        .snapshotFn = struct {
+            fn snapshot(_: ?*anyopaque, seat: u32) KeyboardSnapshot {
+                std.debug.assert(seat == 9);
+                return .{ .keymap_size = 12, .repeat_rate = 25, .repeat_delay = 600, .modifiers = .{ .serial = 4 } };
+            }
+        }.snapshot,
+        .duplicateKeymapFn = struct {
+            fn duplicate(_: ?*anyopaque, _: u32) !linux.fd_t {
+                const duplicated = linux.dup(0);
+                if (linux.errno(duplicated) != .SUCCESS) return error.DuplicateFailed;
+                return @intCast(duplicated);
+            }
+        }.duplicate,
+    });
+    const old = a.activeGrab().?;
+    try std.testing.expectEqual(@as(u32, 0), old.index);
+    try std.testing.expectEqual(A.OutKind.grab_keymap, a.oldest(method.peer).?.kind);
+    try a.queueKey(old, 7, 8, 30, 1);
+    a.releaseGrab(old.index);
+    const promoted = a.activeGrab().?;
+    try std.testing.expectEqual(@as(u32, 1), promoted.index);
+    try std.testing.expectError(error.StaleGrab, a.queueKey(old, 9, 10, 30, 0));
+    try a.queueModifiers(promoted, .{ .serial = 11, .depressed = 2 });
+    a.releaseGrab(promoted.index);
+    try std.testing.expect(a.activeGrab() == null);
 }
