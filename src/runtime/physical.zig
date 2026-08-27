@@ -88,6 +88,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const DataDeviceAdapter = protocol_data_device.Adapter(protocol);
         const PrimarySelectionAdapter = protocol_primary_selection.Adapter(protocol);
         const ExtDataControlAdapter = protocol_ext_data_control.Adapter(protocol);
+        const WlrDataControlAdapter = protocol_ext_data_control.WlrAdapter(protocol);
         const DmabufAdapter = protocol_linux_dmabuf.Adapter(protocol);
         const SyncobjAdapter = protocol_linux_drm_syncobj.Adapter(protocol, Adapter);
         const ActivationAdapter = protocol_xdg_activation.Adapter(protocol, Adapter);
@@ -193,12 +194,13 @@ pub fn Coordinator(comptime protocol: type) type {
             const idle_notify: u32 = 1 << 21;
             const tablet: u32 = 1 << 22;
             const ext_data_control: u32 = 1 << 23;
+            const wlr_data_control: u32 = 1 << 24;
             const all: u32 = decoration | shell | seat | data_device | dmabuf |
                 activation | relative_pointer | fractional_scale | output | core |
                 pointer_constraints | color_management | color_representation |
                 primary_selection | text_input | pointer_gestures |
                 shortcuts_inhibit | xdg_foreign | xdg_output | layer_shell | session_lock |
-                idle_notify | tablet | ext_data_control;
+                idle_notify | tablet | ext_data_control | wlr_data_control;
         };
         const Client = struct {
             active: bool = false,
@@ -289,6 +291,7 @@ pub fn Coordinator(comptime protocol: type) type {
             data_device: protocol_data_device.Config = .{},
             primary_selection: protocol_primary_selection.Config = .{},
             ext_data_control: protocol_ext_data_control.Config = .{},
+            wlr_data_control: protocol_ext_data_control.Config = .{ .global_version = 2 },
             text_input: protocol_text_input.Config = .{},
             linux_dmabuf: protocol_linux_dmabuf.Config = .{},
             linux_drm_syncobj: protocol_linux_drm_syncobj.Config = .{},
@@ -381,6 +384,7 @@ pub fn Coordinator(comptime protocol: type) type {
         data_device_adapter: DataDeviceAdapter,
         primary_selection_adapter: PrimarySelectionAdapter,
         ext_data_control_adapter: ExtDataControlAdapter,
+        wlr_data_control_adapter: WlrDataControlAdapter,
         text_input_adapter: TextInputAdapter,
         dmabuf_adapter: DmabufAdapter,
         syncobj_device: ?drm_syncobj.Device = null,
@@ -740,6 +744,13 @@ pub fn Coordinator(comptime protocol: type) type {
                 .set = extSetSelection,
             }, config.ext_data_control);
             errdefer self.ext_data_control_adapter.deinit();
+            self.wlr_data_control_adapter = try WlrDataControlAdapter.init(allocator, .{
+                .context = self,
+                .validSeat = extValidSeat,
+                .current = extCurrentSelection,
+                .set = extSetSelection,
+            }, config.wlr_data_control);
+            errdefer self.wlr_data_control_adapter.deinit();
             self.text_input_adapter = try TextInputAdapter.init(allocator, .{
                 .context = self,
                 .validateFn = validateTextInputSeat,
@@ -951,6 +962,9 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = try self.ext_data_control_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
+            _ = try self.wlr_data_control_adapter.install(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
             _ = try self.text_input_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
@@ -1087,6 +1101,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.dmabuf_adapter.deinit();
             self.text_input_adapter.deinit();
             self.primary_selection_adapter.deinit();
+            self.wlr_data_control_adapter.deinit();
             self.ext_data_control_adapter.deinit();
             self.data_device_adapter.deinit();
             self.pointer_constraints_adapter.deinit();
@@ -1151,6 +1166,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.foreign_adapter.disconnected(peer);
             self.text_input_adapter.disconnected(peer);
             self.primary_selection_adapter.disconnected(peer);
+            self.wlr_data_control_adapter.disconnected(peer);
             self.ext_data_control_adapter.disconnected(peer);
             self.alpha_modifier_adapter.disconnected(peer);
             self.pointer_warp_adapter.disconnected(peer);
@@ -1311,6 +1327,8 @@ pub fn Coordinator(comptime protocol: type) type {
             if (try self.data_device_adapter.request(peer, target, message, fds)) |control| {
                 if (!selectionEqual(regular_before, self.data_device_adapter.currentSelection()))
                     try self.ext_data_control_adapter.selectionChanged(false);
+                if (!selectionEqual(regular_before, self.data_device_adapter.currentSelection()))
+                    try self.wlr_data_control_adapter.selectionChanged(false);
                 if (self.data_device_adapter.pendingOutboundOn(peer))
                     self.markProtocol(peer, ProtocolReady.data_device);
                 try self.flushProtocol();
@@ -1320,6 +1338,8 @@ pub fn Coordinator(comptime protocol: type) type {
             if (try self.primary_selection_adapter.request(peer, target, message, fds)) |control| {
                 if (!selectionEqual(primary_before, self.primary_selection_adapter.currentSelection()))
                     try self.ext_data_control_adapter.selectionChanged(true);
+                if (!selectionEqual(primary_before, self.primary_selection_adapter.currentSelection()))
+                    try self.wlr_data_control_adapter.selectionChanged(true);
                 if (self.primary_selection_adapter.pendingOutboundOn(peer))
                     self.markProtocol(peer, ProtocolReady.primary_selection);
                 try self.flushProtocol();
@@ -1328,6 +1348,12 @@ pub fn Coordinator(comptime protocol: type) type {
             if (try self.ext_data_control_adapter.request(peer, target, message, fds)) |control| {
                 if (self.ext_data_control_adapter.pendingOutboundOn(peer))
                     self.markProtocol(peer, ProtocolReady.ext_data_control);
+                try self.flushProtocol();
+                return control;
+            }
+            if (try self.wlr_data_control_adapter.request(peer, target, message, fds)) |control| {
+                if (self.wlr_data_control_adapter.pendingOutboundOn(peer))
+                    self.markProtocol(peer, ProtocolReady.wlr_data_control);
                 try self.flushProtocol();
                 return control;
             }
@@ -2420,8 +2446,12 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.markProtocolAll(ProtocolReady.data_device);
             if (self.primary_selection_adapter.pendingOutbound() != 0)
                 self.markProtocolAll(ProtocolReady.primary_selection);
+            self.ext_data_control_adapter.retrySelectionChanges();
+            self.wlr_data_control_adapter.retrySelectionChanges();
             if (self.ext_data_control_adapter.pendingOutbound() != 0)
                 self.markProtocolAll(ProtocolReady.ext_data_control);
+            if (self.wlr_data_control_adapter.pendingOutbound() != 0)
+                self.markProtocolAll(ProtocolReady.wlr_data_control);
             self.markTextInputProtocol();
             self.markShortcutsInhibitProtocol();
             if (applied) self.markPointerConstraintsProtocol();
@@ -2564,7 +2594,8 @@ pub fn Coordinator(comptime protocol: type) type {
             else
                 try self.data_device_adapter.setControlledSelection(source);
             try self.ext_data_control_adapter.selectionChanged(primary);
-            self.markProtocolAll(ProtocolReady.ext_data_control |
+            try self.wlr_data_control_adapter.selectionChanged(primary);
+            self.markProtocolAll(ProtocolReady.ext_data_control | ProtocolReady.wlr_data_control |
                 if (primary) ProtocolReady.primary_selection else ProtocolReady.data_device);
         }
 
@@ -2908,6 +2939,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 flushed += try self.primary_selection_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.ext_data_control != 0)
                 flushed += try self.ext_data_control_adapter.flushOn(peer, objects, &actor.transmit);
+            if (client.protocol_ready & ProtocolReady.wlr_data_control != 0)
+                flushed += try self.wlr_data_control_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.text_input != 0)
                 flushed += try self.text_input_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.dmabuf != 0)
@@ -3015,6 +3048,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (ready & ProtocolReady.ext_data_control != 0 and
                 !self.ext_data_control_adapter.pendingOutboundOn(client.peer))
                 ready &= ~ProtocolReady.ext_data_control;
+            if (ready & ProtocolReady.wlr_data_control != 0 and
+                !self.wlr_data_control_adapter.pendingOutboundOn(client.peer))
+                ready &= ~ProtocolReady.wlr_data_control;
             if (ready & ProtocolReady.text_input != 0 and
                 !self.text_input_adapter.pendingOutboundOn(client.peer))
                 ready &= ~ProtocolReady.text_input;
@@ -4803,9 +4839,20 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.shell_adapter.resourceRemoved(handle, object);
             _ = self.seat_adapter.resourceRemoved(handle, object);
             _ = self.tablet_adapter.resourceRemoved(handle, object);
+            const regular_before = self.data_device_adapter.currentSelection();
+            const primary_before = self.primary_selection_adapter.currentSelection();
             _ = self.data_device_adapter.resourceRemoved(handle, object);
             _ = self.primary_selection_adapter.resourceRemoved(handle, object);
+            if (!selectionEqual(regular_before, self.data_device_adapter.currentSelection())) {
+                self.ext_data_control_adapter.selectionChanged(false) catch {};
+                self.wlr_data_control_adapter.selectionChanged(false) catch {};
+            }
+            if (!selectionEqual(primary_before, self.primary_selection_adapter.currentSelection())) {
+                self.ext_data_control_adapter.selectionChanged(true) catch {};
+                self.wlr_data_control_adapter.selectionChanged(true) catch {};
+            }
             _ = self.ext_data_control_adapter.resourceRemoved(handle, object);
+            _ = self.wlr_data_control_adapter.resourceRemoved(handle, object);
             _ = self.dmabuf_adapter.resourceRemoved(handle, object);
             if (self.syncobj_adapter) |*adapter| _ = adapter.resourceRemoved(handle, object);
             _ = self.activation_adapter.resourceRemoved(handle, object);

@@ -1,4 +1,4 @@
-//! Bounded ext-data-control owner for ext-data-control-v1.
+//! Flavor-parameterized bounded owner for ext and wlr data-control protocols.
 
 const std = @import("std");
 const wayring = @import("wayring");
@@ -26,14 +26,24 @@ pub const Config = struct {
 };
 
 pub fn Adapter(comptime protocol: type) type {
+    return Owner(protocol, .ext);
+}
+
+pub fn WlrAdapter(comptime protocol: type) type {
+    return Owner(protocol, .wlr);
+}
+
+const Flavor = enum { ext, wlr };
+
+fn Owner(comptime protocol: type, comptime flavor: Flavor) type {
     return struct {
         const Self = @This();
         const Runtime = wayring.server.Runtime(protocol);
         const Core = wayring.server.Core(protocol);
-        const Manager = protocol.ext_data_control_manager_v1;
-        const Source = protocol.ext_data_control_source_v1;
-        const Device = protocol.ext_data_control_device_v1;
-        const Offer = protocol.ext_data_control_offer_v1;
+        const Manager = if (flavor == .ext) protocol.ext_data_control_manager_v1 else protocol.zwlr_data_control_manager_v1;
+        const Source = if (flavor == .ext) protocol.ext_data_control_source_v1 else protocol.zwlr_data_control_source_v1;
+        const Device = if (flavor == .ext) protocol.ext_data_control_device_v1 else protocol.zwlr_data_control_device_v1;
+        const Offer = if (flavor == .ext) protocol.ext_data_control_offer_v1 else protocol.zwlr_data_control_offer_v1;
 
         pub const Coordinator = struct {
             context: *anyopaque,
@@ -49,7 +59,7 @@ pub fn Adapter(comptime protocol: type) type {
             next_free: u32 = none,
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
         };
-        const ManagerSlot = struct { header: Header = .{}, peer: wayring.io_uring.Peer = undefined };
+        const ManagerSlot = struct { header: Header = .{}, peer: wayring.io_uring.Peer = undefined, version: u32 = 1 };
         const SourceSlot = struct {
             header: Header = .{},
             peer: wayring.io_uring.Peer = undefined,
@@ -62,6 +72,7 @@ pub fn Adapter(comptime protocol: type) type {
             header: Header = .{},
             peer: wayring.io_uring.Peer = undefined,
             seat_object: u32 = 0,
+            version: u32 = 1,
         };
         const OfferSlot = struct {
             header: Header = .{},
@@ -109,6 +120,7 @@ pub fn Adapter(comptime protocol: type) type {
         outbound_len: usize = 0,
         next_sequence: u64 = 1,
         coordinator: Coordinator,
+        selection_dirty: [2]bool = .{ false, false },
 
         pub fn init(allocator: std.mem.Allocator, coordinator: Coordinator, c: Config) !Self {
             try c.validate();
@@ -169,6 +181,7 @@ pub fn Adapter(comptime protocol: type) type {
             const slot = acquire(ManagerSlot, self.managers, &self.manager_free) catch return error.OutOfMemory;
             slot.header.resource = binding.resource;
             slot.peer = binding.peer;
+            slot.version = binding.version;
             return slot;
         }
 
@@ -217,6 +230,7 @@ pub fn Adapter(comptime protocol: type) type {
                     const device = acquire(DeviceSlot, self.devices, &self.device_free) catch return self.noMemory(actor);
                     device.peer = manager.peer;
                     device.seat_object = payload.seat;
+                    device.version = manager.version;
                     const admitted = Manager.admit_get_data_device(so, decoded.handle, payload, .{ .id = device }) catch |err| {
                         release(DeviceSlot, self.devices, &self.device_free, indexOf(DeviceSlot, self.devices, device));
                         return self.failure(actor, decoded.handle.id, err);
@@ -224,7 +238,8 @@ pub fn Adapter(comptime protocol: type) type {
                     device.header.resource = admitted.id;
                     if (self.coordinator.validSeat(self.coordinator.context, device.peer, device.seat_object)) {
                         self.enqueueSelection(device, false) catch return self.noMemory(actor);
-                        self.enqueueSelection(device, true) catch return self.noMemory(actor);
+                        if (flavor == .ext or device.version >= 2)
+                            self.enqueueSelection(device, true) catch return self.noMemory(actor);
                     }
                 },
                 .destroy => {},
@@ -297,8 +312,30 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         pub fn selectionChanged(self: *Self, primary: bool) !void {
+            const dirty_index: usize = @intFromBool(primary);
+            self.prepareSelectionChanged(primary) catch |err| {
+                self.selection_dirty[dirty_index] = true;
+                return err;
+            };
+            self.selection_dirty[dirty_index] = false;
             for (self.devices) |*device| if (device.header.active and self.coordinator.validSeat(self.coordinator.context, device.peer, device.seat_object))
-                try self.enqueueSelection(device, primary);
+                if (!primary or flavor == .ext or device.version >= 2) try self.enqueueSelection(device, primary);
+        }
+        fn prepareSelectionChanged(self: *const Self, primary: bool) !void {
+            var count: usize = 0;
+            for (self.devices) |device| {
+                if (device.header.active and
+                    self.coordinator.validSeat(self.coordinator.context, device.peer, device.seat_object) and
+                    (!primary or flavor == .ext or device.version >= 2)) count += 1;
+            }
+            if (self.outboundFree() < count) return error.Exhausted;
+            if (self.coordinator.current(self.coordinator.context, primary) != null and self.offerFree() < count)
+                return error.Exhausted;
+        }
+        pub fn retrySelectionChanges(self: *Self) void {
+            inline for (.{ false, true }) |primary| {
+                if (self.selection_dirty[@intFromBool(primary)]) self.selectionChanged(primary) catch {};
+            }
         }
         fn enqueueSelection(self: *Self, device: *DeviceSlot, primary: bool) !void {
             var publication: Publication = .{ .device = self.deviceId(device), .primary = primary, .source = self.coordinator.current(self.coordinator.context, primary) };
@@ -647,6 +684,7 @@ fn optionalPeerEqual(a: ?wayring.io_uring.Peer, b: ?wayring.io_uring.Peer) bool 
 
 const test_protocol = @import("core_protocol");
 const TestAdapter = Adapter(test_protocol);
+const TestWlrAdapter = WlrAdapter(test_protocol);
 const TestSelections = struct {
     regular: ?SelectionSource = null,
     primary: ?SelectionSource = null,
@@ -712,4 +750,54 @@ test "ext data control generations make removed sources stale and close queued F
     release(TestAdapter.SourceSlot, adapter.sources, &adapter.source_free, id.index);
     try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(fd, linux.F.GETFD, 0)));
     try std.testing.expectError(error.Stale, adapter.resolveSource(id));
+}
+
+test "wlr data control v1 suppresses primary while v2 publishes both selections" {
+    var selections: TestSelections = .{};
+    const coordinator: TestWlrAdapter.Coordinator = .{
+        .context = &selections,
+        .validSeat = TestSelections.validSeat,
+        .current = TestSelections.current,
+        .set = TestSelections.set,
+    };
+    var adapter = try TestWlrAdapter.init(std.testing.allocator, coordinator, .{
+        .device_capacity = 2,
+        .outbound_capacity = 4,
+        .global_version = 2,
+    });
+    defer adapter.deinit();
+
+    const v1 = try acquire(TestWlrAdapter.DeviceSlot, adapter.devices, &adapter.device_free);
+    v1.peer = .{ .slot = 1, .generation = 1 };
+    v1.version = 1;
+    try adapter.enqueueSelection(v1, false);
+    try adapter.selectionChanged(true);
+    try std.testing.expectEqual(@as(usize, 1), adapter.pendingOutbound());
+
+    const v2 = try acquire(TestWlrAdapter.DeviceSlot, adapter.devices, &adapter.device_free);
+    v2.peer = .{ .slot = 2, .generation = 1 };
+    v2.version = 2;
+    try adapter.enqueueSelection(v2, false);
+    try adapter.enqueueSelection(v2, true);
+    try std.testing.expectEqual(@as(usize, 3), adapter.pendingOutbound());
+}
+
+test "data control retries a selection change after bounded backpressure" {
+    var selections: TestSelections = .{};
+    var adapter = try TestAdapter.init(std.testing.allocator, selections.coordinator(), .{
+        .device_capacity = 1,
+        .outbound_capacity = 1,
+    });
+    defer adapter.deinit();
+    const device = try acquire(TestAdapter.DeviceSlot, adapter.devices, &adapter.device_free);
+    device.peer = .{ .slot = 1, .generation = 1 };
+    try adapter.enqueueSelection(device, false);
+
+    try std.testing.expectError(error.Exhausted, adapter.selectionChanged(true));
+    try std.testing.expect(adapter.selection_dirty[1]);
+    adapter.dropOutbound(adapter.oldestOutbound(device.peer).?);
+    adapter.retrySelectionChanges();
+    try std.testing.expect(!adapter.selection_dirty[1]);
+    try std.testing.expectEqual(@as(usize, 1), adapter.pendingOutbound());
+    try std.testing.expect(adapter.oldestOutbound(device.peer).?.value.selection.primary);
 }
