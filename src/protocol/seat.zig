@@ -670,6 +670,66 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             return @intCast(duplicated);
         }
 
+        /// Replaces the seat keymap and transfers ownership of `fd` only after
+        /// every existing wl_keyboard has capacity for the update.
+        pub fn setKeymapOwned(adapter: *Self, fd: linux.fd_t, size: u32) !void {
+            if (size == 0) return error.InvalidKeymap;
+            var count: usize = 0;
+            for (adapter.keyboards) |slot| {
+                if (slot.header.active) count += 1;
+            }
+            try adapter.ensureOutbound(count);
+            for (adapter.keyboards, 0..) |slot, index| if (slot.header.active) {
+                adapter.enqueue(slot.client, .{ .keyboard_keymap = .{
+                    .index = @intCast(index),
+                    .generation = slot.header.generation,
+                } }) catch unreachable;
+            };
+            const previous = adapter.keymap_fd;
+            adapter.keymap_fd = fd;
+            adapter.keymap_size = size;
+            _ = linux.close(previous);
+        }
+
+        pub fn ownsSeat(adapter: *Self, peer: wayring.io_uring.Peer, object_id: u32) bool {
+            const runtime = adapter.runtime orelse return false;
+            const server_objects = runtime.clients.get(peer) catch return false;
+            return adapter.seatByObject(server_objects, peer, object_id) != null;
+        }
+
+        pub fn addVirtualKeyboard(adapter: *Self, device: input.DeviceId) !void {
+            try adapter.addDevice(device, .{ .keyboard = true });
+        }
+
+        pub fn removeVirtualKeyboard(adapter: *Self, device: input.DeviceId) !void {
+            try adapter.removeDevice(device);
+        }
+
+        /// Virtual input deliberately enters below physical input-method grab
+        /// routing so an input method cannot consume its own synthesized keys.
+        pub fn virtualKeyboardKey(
+            adapter: *Self,
+            device: input.DeviceId,
+            time_ms: u32,
+            key: u32,
+            pressed: bool,
+        ) !void {
+            try adapter.keyboardKey(.{
+                .device = device,
+                .time_usec = @as(u64, time_ms) * 1000,
+                .key = key,
+                .pressed = pressed,
+            });
+        }
+
+        pub fn virtualModifiers(adapter: *Self, state: ModifierState) !void {
+            try adapter.setModifiers(state);
+        }
+
+        pub fn restoreDerivedModifiers(adapter: *Self) !void {
+            try adapter.setModifiers(adapter.modifierState(adapter.pressed_keys));
+        }
+
         /// Validates an input serial against the exact wl_seat resource named
         /// by an xdg_popup.grab request. Pointer-enter serials intentionally do
         /// not qualify: only a delivered button press establishes this token.
