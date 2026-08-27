@@ -13,6 +13,7 @@ const pixman = @import("pixman.zig");
 const render_types = @import("types.zig");
 
 pub const Config = pixman.Config;
+pub const Readback = pixman.Readback;
 
 pub const Renderer = struct {
     implementation: pixman.Renderer,
@@ -37,6 +38,27 @@ pub const Renderer = struct {
         render_list: render_types.List,
         damage_plan: render_types.DamagePlan,
     ) !void {
+        try self.renderPhased(
+            target,
+            handle,
+            render_list,
+            damage_plan,
+            render_list.samples.len,
+            null,
+            null,
+        );
+    }
+
+    pub fn renderPhased(
+        self: *Renderer,
+        target: anytype,
+        handle: anytype,
+        render_list: render_types.List,
+        damage_plan: render_types.DamagePlan,
+        cursor_start: usize,
+        before_cursor: ?Readback,
+        after_cursor: ?Readback,
+    ) !void {
         try render_types.validateList(render_list);
         try render_types.validateOutput(damage_plan.output);
         const image = try target.image(handle);
@@ -50,7 +72,15 @@ pub const Renderer = struct {
         const mapping = try target.map(handle);
         var mapped = true;
         errdefer if (mapped) target.unmap(handle) catch {};
-        try self.implementation.draw(render_list, damage_plan, mapping.data, mapping.stride);
+        try self.implementation.drawPhased(
+            render_list,
+            damage_plan,
+            mapping.data,
+            mapping.stride,
+            cursor_start,
+            before_cursor,
+            after_cursor,
+        );
         try target.unmap(handle);
         mapped = false;
     }
@@ -230,6 +260,56 @@ fn renderFull(
     try renderWithDamage(renderer, target, render_list, &damage, true);
 }
 
+fn renderPhasedFull(
+    renderer: *Renderer,
+    target: *FakeTarget,
+    render_list: render_types.List,
+    cursor_start: usize,
+    before_cursor: ?Readback,
+    after_cursor: ?Readback,
+) !void {
+    var planned: [2]render_types.PlannedSample = undefined;
+    if (render_list.samples.len > planned.len) return error.SampleCapacityExceeded;
+    for (render_list.samples, 0..) |value, index| planned[index] = .{
+        .source_index = @intCast(index),
+        .sample = value.sample,
+        .presentation = value.presentation,
+        .crop = value.crop,
+        .destination = .{
+            .x = value.destination.x,
+            .y = value.destination.y,
+            .width = value.destination.width,
+            .height = value.destination.height,
+        },
+        .clip = .{
+            .x = value.clip.x,
+            .y = value.clip.y,
+            .width = value.clip.width,
+            .height = value.clip.height,
+        },
+        .transform = value.transform,
+        .global_alpha = value.global_alpha,
+    };
+    const damage = [_]render_types.Rect{.{
+        .x = 0,
+        .y = 0,
+        .width = render_list.output.width,
+        .height = render_list.output.height,
+    }};
+    try renderer.renderPhased(target, 0, render_list, .{
+        .output = render_list.output,
+        .samples = planned[0..render_list.samples.len],
+        .client_damage = &damage,
+        .scene_damage = &.{},
+        .repair_damage = &.{},
+        .render_damage = &damage,
+        .client_full = true,
+        .scene_full = false,
+        .repair_full = false,
+        .render_full = true,
+    }, cursor_start, before_cursor, after_cursor);
+}
+
 fn putPixel(bytes: []u8, offset: usize, value: u32) void {
     std.mem.writeInt(u32, bytes[offset..][0..4], value, .little);
 }
@@ -319,6 +399,67 @@ test "render: protocol z-order and clipping are exact" {
     var target = FakeTarget{ .width = 2, .height = 1, .stride = 8 };
     try renderFull(&renderer, &target, list(2, 1, &.{ lower, upper }));
     try expectPixels(&target, &.{ 0xffff0000, 0xff00ff00 });
+}
+
+test "render: phased readback separates base composition from cursor" {
+    var renderer = try Renderer.init(std.testing.allocator, .{
+        .max_samples = 2,
+        .max_source_width = 1,
+        .max_source_height = 1,
+    });
+    defer renderer.deinit();
+    const red = [_]u8{ 0, 0, 255, 255 };
+    const green = [_]u8{ 0, 255, 0, 255 };
+    const base = sample(&red, 1, 1, 4, .{ .x = 0, .y = 0, .width = 2, .height = 1 });
+    var cursor = sample(&green, 1, 1, 4, .{ .x = 1, .y = 0, .width = 1, .height = 1 });
+    cursor.sample.surface = 2;
+    var target = FakeTarget{ .width = 2, .height = 1, .stride = 12 };
+    var without_cursor = [_]u8{0xaa} ** 12;
+    var with_cursor = [_]u8{0xbb} ** 12;
+
+    try renderPhasedFull(
+        &renderer,
+        &target,
+        list(2, 1, &.{ base, cursor }),
+        1,
+        .{ .bytes = &without_cursor, .stride = 12 },
+        .{ .bytes = &with_cursor, .stride = 12 },
+    );
+
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255, 0, 0, 255, 255 }, without_cursor[0..8]);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255, 0, 255, 0, 255 }, with_cursor[0..8]);
+    try std.testing.expectEqualSlices(u8, &.{ 0xaa, 0xaa, 0xaa, 0xaa }, without_cursor[8..12]);
+    try std.testing.expectEqualSlices(u8, &.{ 0xbb, 0xbb, 0xbb, 0xbb }, with_cursor[8..12]);
+    try expectPixels(&target, &.{ 0xffff0000, 0xff00ff00 });
+    try std.testing.expectEqual(@as(usize, 1), target.map_count);
+    try std.testing.expectEqual(@as(usize, 1), target.unmap_count);
+}
+
+test "render: readback without render damage preserves current target" {
+    var renderer = try Renderer.init(std.testing.allocator, .{
+        .max_samples = 1,
+        .max_source_width = 1,
+        .max_source_height = 1,
+    });
+    defer renderer.deinit();
+    var target = FakeTarget{ .width = 2, .height = 1, .stride = 8 };
+    putPixel(&target.bytes, 0, 0xff112233);
+    putPixel(&target.bytes, 4, 0xff445566);
+    var readback: [8]u8 = undefined;
+    const render_list = list(2, 1, &.{});
+    try renderer.renderPhased(&target, 0, render_list, .{
+        .output = render_list.output,
+        .samples = &.{},
+        .client_damage = &.{},
+        .scene_damage = &.{},
+        .repair_damage = &.{},
+        .render_damage = &.{},
+        .client_full = false,
+        .scene_full = false,
+        .repair_full = false,
+        .render_full = false,
+    }, 0, .{ .bytes = &readback, .stride = 8 }, null);
+    try std.testing.expectEqualSlices(u8, target.bytes[0..8], &readback);
 }
 
 test "render: crop nearest scale and source stride padding are exact" {

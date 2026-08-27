@@ -19,6 +19,14 @@ pub const Config = struct {
     max_source_height: u32,
 };
 
+/// Compositor-owned tightly described readback storage. Protocol buffers are
+/// never passed to a renderer; the output path copies this result into guarded
+/// client storage only after the matching frame is presented.
+pub const Readback = struct {
+    bytes: []u8,
+    stride: u32,
+};
+
 pub const Error = std.mem.Allocator.Error || render.ValidationError || error{
     InvalidConfig,
     SampleCapacityExceeded,
@@ -95,8 +103,34 @@ pub const Renderer = struct {
         destination_bytes: []u8,
         destination_stride: u32,
     ) Error!void {
+        try self.drawPhased(
+            list,
+            plan,
+            destination_bytes,
+            destination_stride,
+            list.samples.len,
+            null,
+            null,
+        );
+    }
+
+    /// Draws samples below `cursor_start`, snapshots that exact composition,
+    /// then draws the remaining cursor samples and optionally snapshots again.
+    /// Both snapshots are full-output copies even when this frame repairs only
+    /// a damaged subset: unchanged target pixels contain the prior frame.
+    pub fn drawPhased(
+        self: *Renderer,
+        list: render.List,
+        plan: render.DamagePlan,
+        destination_bytes: []u8,
+        destination_stride: u32,
+        cursor_start: usize,
+        before_cursor: ?Readback,
+        after_cursor: ?Readback,
+    ) Error!void {
         if (list.samples.len > self.caches.len or plan.samples.len > self.caches.len)
             return error.SampleCapacityExceeded;
+        if (cursor_start > list.samples.len) return error.InvalidSourceIndex;
         try render.validateList(list);
         try render.validateOutput(plan.output);
         for (list.samples) |sample| {
@@ -114,6 +148,8 @@ pub const Renderer = struct {
             plan.output.height > std.math.maxInt(i32) or
             destination_stride > std.math.maxInt(i32))
             return error.InvalidTarget;
+        if (before_cursor) |readback| try validateReadback(readback, plan.output);
+        if (after_cursor) |readback| try validateReadback(readback, plan.output);
 
         const destination = c.pixman_image_create_bits(
             pixmanFormat(list.output_format),
@@ -147,37 +183,64 @@ pub const Renderer = struct {
                 clipped.height,
             ) == 0) return error.PixmanRegionFailed;
         }
-        if (c.pixman_region32_not_empty(&damage) == 0) return;
-        if (c.pixman_image_set_clip_region32(destination, &damage) == 0)
-            return error.PixmanRegionFailed;
+        const draws = c.pixman_region32_not_empty(&damage) != 0;
+        if (draws) {
+            if (c.pixman_image_set_clip_region32(destination, &damage) == 0)
+                return error.PixmanRegionFailed;
 
-        const alpha: u8 = if (list.output_format == .xrgb8888) 255 else list.clear.a;
-        var clear_color = c.pixman_color_t{
-            .red = @as(u16, premultiply(list.clear.r, alpha)) * 257,
-            .green = @as(u16, premultiply(list.clear.g, alpha)) * 257,
-            .blue = @as(u16, premultiply(list.clear.b, alpha)) * 257,
-            .alpha = @as(u16, alpha) * 257,
-        };
-        const clear = c.pixman_image_create_solid_fill(&clear_color) orelse
-            return error.PixmanImageFailed;
-        defer _ = c.pixman_image_unref(clear);
-        c.pixman_image_composite32(
-            c.PIXMAN_OP_SRC,
-            clear,
-            null,
-            destination,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            @intCast(plan.output.width),
-            @intCast(plan.output.height),
+            const alpha: u8 = if (list.output_format == .xrgb8888) 255 else list.clear.a;
+            var clear_color = c.pixman_color_t{
+                .red = @as(u16, premultiply(list.clear.r, alpha)) * 257,
+                .green = @as(u16, premultiply(list.clear.g, alpha)) * 257,
+                .blue = @as(u16, premultiply(list.clear.b, alpha)) * 257,
+                .alpha = @as(u16, alpha) * 257,
+            };
+            const clear = c.pixman_image_create_solid_fill(&clear_color) orelse
+                return error.PixmanImageFailed;
+            defer _ = c.pixman_image_unref(clear);
+            c.pixman_image_composite32(
+                c.PIXMAN_OP_SRC,
+                clear,
+                null,
+                destination,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                @intCast(plan.output.width),
+                @intCast(plan.output.height),
+            );
+        }
+
+        if (draws) try self.drawRange(list, plan, destination, 0, cursor_start);
+        if (before_cursor) |readback| try copyReadback(
+            readback,
+            destination_bytes,
+            destination_stride,
+            plan.output,
         );
+        if (draws) try self.drawRange(list, plan, destination, cursor_start, list.samples.len);
+        if (after_cursor) |readback| try copyReadback(
+            readback,
+            destination_bytes,
+            destination_stride,
+            plan.output,
+        );
+    }
 
+    fn drawRange(
+        self: *Renderer,
+        list: render.List,
+        plan: render.DamagePlan,
+        destination: *c.pixman_image_t,
+        source_start: usize,
+        source_end: usize,
+    ) Error!void {
         for (plan.samples, 0..) |planned, index| {
             if (planned.source_index >= list.samples.len) return error.InvalidSourceIndex;
+            if (planned.source_index < source_start or planned.source_index >= source_end) continue;
             var sample = list.samples[planned.source_index];
             if (!std.meta.eql(planned.sample, sample.sample) or
                 !std.meta.eql(planned.presentation, sample.presentation))
@@ -246,6 +309,32 @@ pub const Renderer = struct {
         }
     }
 };
+
+fn copyReadback(
+    readback: Readback,
+    source: []const u8,
+    source_stride: u32,
+    output: render.Size,
+) Error!void {
+    try validateReadback(readback, output);
+    const row_bytes = std.math.mul(u32, output.width, 4) catch return error.InvalidTarget;
+    for (0..output.height) |row| {
+        const source_start = @as(usize, source_stride) * row;
+        const destination_start = @as(usize, readback.stride) * row;
+        @memcpy(
+            readback.bytes[destination_start..][0..row_bytes],
+            source[source_start..][0..row_bytes],
+        );
+    }
+}
+
+fn validateReadback(readback: Readback, output: render.Size) Error!void {
+    const row_bytes = std.math.mul(u32, output.width, 4) catch return error.InvalidTarget;
+    const length = std.math.mul(usize, readback.stride, output.height) catch
+        return error.InvalidTarget;
+    if (readback.stride < row_bytes or readback.bytes.len < length)
+        return error.InvalidTarget;
+}
 
 fn deinitCaches(caches: []Cache) void {
     var index = caches.len;
