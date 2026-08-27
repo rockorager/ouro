@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const wayring = @import("wayring");
+const libc = @cImport(@cInclude("time.h"));
 const completion = @import("completion.zig");
 const compositor_api = @import("compositor.zig");
 const loop_api = @import("loop.zig");
@@ -4824,13 +4825,13 @@ fn callbackData(timestamp_ns: u64) u32 {
 }
 
 fn monotonicNs() !u64 {
-    var now: linux.timespec = undefined;
-    if (linux.errno(linux.clock_gettime(.MONOTONIC, &now)) != .SUCCESS)
+    var now: libc.struct_timespec = undefined;
+    if (libc.clock_gettime(libc.CLOCK_MONOTONIC, &now) != 0)
         return error.ClockUnavailable;
     return std.math.add(
         u64,
-        try std.math.mul(u64, @intCast(now.sec), std.time.ns_per_s),
-        @intCast(now.nsec),
+        try std.math.mul(u64, @intCast(now.tv_sec), std.time.ns_per_s),
+        @intCast(now.tv_nsec),
     );
 }
 
