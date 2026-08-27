@@ -900,7 +900,7 @@ pub fn Adapter(comptime protocol: type) type {
 
         pub fn surfaceResource(adapter: *Self, id: SurfaceId) !objects.Handle {
             if (id.index >= adapter.surfaces.len) return error.StaleSurface;
-            const slot = &adapter.surfaces[id.index];
+            const slot = adapter.surfaces[id.index];
             if (!slot.active or slot.resource.generation != id.generation)
                 return error.StaleSurface;
             return slot.resource;
@@ -1039,7 +1039,7 @@ pub fn Adapter(comptime protocol: type) type {
         /// latching attempt. This is intentionally infallible so the output
         /// submission boundary cannot fail after KMS accepts a frame.
         pub fn clearFifoBarriers(adapter: *Self) void {
-            for (adapter.surfaces) |*slot| {
+            for (adapter.surfaces) |slot| {
                 if (slot.active) slot.fifo_barrier = false;
             }
         }
@@ -2357,7 +2357,7 @@ pub fn Adapter(comptime protocol: type) type {
 
         fn surfaceForId(adapter: *Self, id: SurfaceId) !*SurfaceSlot {
             if (id.index >= adapter.surfaces.len) return error.StaleSurface;
-            const slot = &adapter.surfaces[id.index];
+            const slot = adapter.surfaces[id.index];
             if (!slot.active or slot.resource.generation != id.generation)
                 return error.StaleSurface;
             return slot;

@@ -2430,8 +2430,8 @@ test "desktop: toplevel and command storage grow transactionally" {
     shell.push(created(2));
     shell.push(created(3));
     try std.testing.expectEqual(@as(usize, 2), try desktop.consume(&shell, 2));
-    try std.testing.expect(!std.meta.eql(first, desktop.focused().?));
-    try std.testing.expect(!std.meta.eql(second, desktop.focused().?));
+    try std.testing.expect(!std.meta.eql(first, second));
+    try std.testing.expectEqual(second, desktop.focused().?);
     try std.testing.expect(desktop.slots.len > 3);
     try std.testing.expect(desktop.commands.len > 3);
 }

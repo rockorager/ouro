@@ -1843,7 +1843,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         }
 
         fn xdgSurfaceById(adapter: *Self, id: SurfaceId) ?*SurfaceSlot {
-            for (adapter.surfaces) |*surface|
+            for (adapter.surfaces) |surface|
                 if (surface.header.active and std.meta.eql(surface.surface_id, id)) return surface;
             return null;
         }

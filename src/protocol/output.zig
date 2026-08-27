@@ -706,7 +706,7 @@ test "output: resources and surface associations are peer scoped" {
     const object_a: objects.Object = .{
         .interface = &@import("core_protocol").wl_output.info,
         .version = 4,
-        .context = &adapter.resources[resource_a],
+        .context = adapter.resources[resource_a],
     };
     try std.testing.expectEqual(
         adapter.resources[resource_a].handle,
