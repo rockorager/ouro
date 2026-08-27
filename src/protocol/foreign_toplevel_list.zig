@@ -165,6 +165,20 @@ pub fn Adapter(comptime protocol: type) type {
                 .app_id = self.topText(self.top_app, id.index)[0..top.app_len],
             };
         }
+        pub fn toplevelForResource(
+            self: *Self,
+            peer: wayring.io_uring.Peer,
+            server_objects: anytype,
+            object_id: u32,
+        ) ?ToplevelId {
+            const resource = server_objects.namespace.lookupHandle(object_id) orelse return null;
+            const object = server_objects.namespace.resolve(resource) orelse return null;
+            if (object.interface != &Handle.info) return null;
+            const handle = from(HSlot, self.handles, object.context) orelse return null;
+            if (handle.closed or handle.resource == null or
+                !std.meta.eql(handle.resource.?, resource) or !samePeer(handle.peer, peer)) return null;
+            return handle.top;
+        }
         fn update(self: *Self, id: ToplevelId, value: []const u8, kind: Kind) !void {
             try self.validText(value);
             const t = try self.resolveTop(id);
