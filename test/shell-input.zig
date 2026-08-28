@@ -405,7 +405,8 @@ test "shell-input: security context filters nested manager before registry disco
             parent_handler.virtual_pointer_global_seen and
             parent_handler.foreign_toplevel_global_seen and
             parent_handler.image_output_global_seen and
-            parent_handler.image_toplevel_global_seen) break;
+            parent_handler.image_toplevel_global_seen and
+            parent_handler.image_copy_global_seen) break;
         _ = linux.sched_yield();
     }
     try std.testing.expect(parent_handler.security_manager != null);
@@ -417,6 +418,7 @@ test "shell-input: security context filters nested manager before registry disco
     try std.testing.expect(parent_handler.foreign_toplevel_global_seen);
     try std.testing.expect(parent_handler.image_output_global_seen);
     try std.testing.expect(parent_handler.image_toplevel_global_seen);
+    try std.testing.expect(parent_handler.image_copy_global_seen);
 
     var close_pair: [2]linux.fd_t = undefined;
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(
@@ -515,6 +517,7 @@ test "shell-input: security context filters nested manager before registry disco
     try std.testing.expect(!child_handler.foreign_toplevel_global_seen);
     try std.testing.expect(!child_handler.image_output_global_seen);
     try std.testing.expect(!child_handler.image_toplevel_global_seen);
+    try std.testing.expect(!child_handler.image_copy_global_seen);
     try std.testing.expect(child_handler.security_manager == null);
     var sandbox_peer: ?wayring.io_uring.Peer = null;
     for (coordinator.clients.items) |client_state| if (client_state.active and
@@ -3386,6 +3389,7 @@ const Handler = struct {
     test_image_capture_sources: bool = false,
     image_output_global_seen: bool = false,
     image_toplevel_global_seen: bool = false,
+    image_copy_global_seen: bool = false,
     security_global_seen: bool = false,
     ext_data_control_global_seen: bool = false,
     wlr_data_control_global_seen: bool = false,
@@ -3832,6 +3836,8 @@ const Handler = struct {
                 self.image_output_global_seen = true;
             if (std.mem.eql(u8, value.interface, protocol.ext_foreign_toplevel_image_capture_source_manager_v1.info.name))
                 self.image_toplevel_global_seen = true;
+            if (std.mem.eql(u8, value.interface, protocol.ext_image_copy_capture_manager_v1.info.name))
+                self.image_copy_global_seen = true;
             return;
         }
         if (std.mem.eql(u8, value.interface, protocol.wl_compositor.info.name))
@@ -3905,6 +3911,8 @@ const Handler = struct {
                     null,
                 );
         }
+        if (std.mem.eql(u8, value.interface, protocol.ext_image_copy_capture_manager_v1.info.name))
+            self.image_copy_global_seen = true;
         try self.maybeCreateImageCaptureSources();
     }
 
