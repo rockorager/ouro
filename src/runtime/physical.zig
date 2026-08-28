@@ -43,6 +43,7 @@ const drm_syncobj = @import("../drm_syncobj.zig");
 const protocol_xdg_activation = @import("../protocol/xdg_activation.zig");
 const protocol_xdg_decoration = @import("../protocol/xdg_decoration.zig");
 const protocol_xdg_dialog = @import("../protocol/xdg_dialog.zig");
+const protocol_xdg_toplevel_icon = @import("../protocol/xdg_toplevel_icon.zig");
 const protocol_wayland_fixes = @import("../protocol/wayland_fixes.zig");
 const protocol_xdg_system_bell = @import("../protocol/xdg_system_bell.zig");
 const protocol_relative_pointer = @import("../protocol/relative_pointer.zig");
@@ -105,6 +106,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const ActivationAdapter = protocol_xdg_activation.Adapter(protocol, Adapter);
         const DecorationAdapter = protocol_xdg_decoration.Adapter(protocol, ShellAdapter);
         const DialogAdapter = protocol_xdg_dialog.Adapter(protocol, ShellAdapter);
+        const ToplevelIconAdapter = protocol_xdg_toplevel_icon.Adapter(protocol, ShellAdapter, Shm);
         const WaylandFixesAdapter = protocol_wayland_fixes.Adapter(protocol);
         const SystemBellAdapter = protocol_xdg_system_bell.Adapter(protocol);
         const RelativePointerAdapter = protocol_relative_pointer.Adapter(protocol, SeatAdapter);
@@ -263,13 +265,14 @@ pub fn Coordinator(comptime protocol: type) type {
             const screencopy: u32 = 1 << 26;
             const foreign_toplevel_list: u32 = 1 << 27;
             const image_copy_capture: u32 = 1 << 28;
+            const xdg_toplevel_icon: u32 = 1 << 29;
             const all: u32 = decoration | shell | seat | data_device | dmabuf |
                 activation | relative_pointer | fractional_scale | output | core |
                 pointer_constraints | color_management | color_representation |
                 primary_selection | text_input | pointer_gestures |
                 shortcuts_inhibit | xdg_foreign | xdg_output | layer_shell | session_lock |
                 idle_notify | tablet | ext_data_control | wlr_data_control | input_method |
-                screencopy | foreign_toplevel_list | image_copy_capture;
+                screencopy | foreign_toplevel_list | image_copy_capture | xdg_toplevel_icon;
         };
         const Client = struct {
             active: bool = false,
@@ -380,6 +383,7 @@ pub fn Coordinator(comptime protocol: type) type {
             xdg_activation: protocol_xdg_activation.Config = .{},
             xdg_decoration: protocol_xdg_decoration.Config = .{},
             xdg_dialog: protocol_xdg_dialog.Config = .{},
+            xdg_toplevel_icon: protocol_xdg_toplevel_icon.Config = .{},
             relative_pointer: protocol_relative_pointer.Config = .{},
             pointer_gestures: protocol_pointer_gestures.Config = .{},
             idle_inhibit: protocol_idle_inhibit.Config = .{},
@@ -484,6 +488,7 @@ pub fn Coordinator(comptime protocol: type) type {
         activation_adapter: ActivationAdapter,
         decoration_adapter: DecorationAdapter,
         dialog_adapter: DialogAdapter,
+        toplevel_icon_adapter: ToplevelIconAdapter,
         wayland_fixes_adapter: WaylandFixesAdapter,
         system_bell_adapter: SystemBellAdapter,
         relative_pointer_adapter: RelativePointerAdapter,
@@ -781,6 +786,13 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.subcompositor_adapter.connect();
             self.shell_adapter = try ShellAdapter.init(allocator, &self.adapter, config.shell);
             errdefer self.shell_adapter.deinit();
+            self.toplevel_icon_adapter = try ToplevelIconAdapter.init(
+                allocator,
+                &self.shell_adapter,
+                &self.shm,
+                config.xdg_toplevel_icon,
+            );
+            errdefer self.toplevel_icon_adapter.deinit();
             self.desktop = try Desktop.init(allocator, config.desktop, config.interaction.bounds);
             errdefer self.desktop.deinit();
             self.foreign_toplevel_list_adapter = try ForeignToplevelListAdapter.init(
@@ -1179,6 +1191,9 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = try self.dialog_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
+            _ = try self.toplevel_icon_adapter.install(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
             _ = try self.wayland_fixes_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
@@ -1308,6 +1323,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.security_context_adapter.deinit();
             self.color_representation_adapter.deinit();
             self.color_management_adapter.deinit();
+            self.toplevel_icon_adapter.deinit();
             self.dialog_adapter.deinit();
             self.decoration_adapter.deinit();
             self.activation_adapter.deinit();
@@ -1631,6 +1647,12 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             if (try self.dialog_adapter.request(peer, target, message, fds)) |control| {
                 try self.advanceShell();
+                try self.flushProtocol();
+                return control;
+            }
+            if (try self.toplevel_icon_adapter.request(peer, target, message, fds)) |control| {
+                if (self.toplevel_icon_adapter.pendingOutbound(peer))
+                    self.markProtocol(peer, ProtocolReady.xdg_toplevel_icon);
                 try self.flushProtocol();
                 return control;
             }
@@ -2008,8 +2030,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 .{ .x = pointer.point.x, .y = pointer.point.y },
             );
             self.markPointerConstraintsProtocol();
-            if (self.shell_adapter.ownsSurface(id))
+            if (self.shell_adapter.ownsSurface(id)) {
                 self.shell_adapter.publishSurfaceCommitted(id) catch unreachable;
+                self.toplevel_icon_adapter.surfaceCommitted(id) catch unreachable;
+            }
             if (self.layer_shell_adapter.ownsSurface(id)) {
                 self.layer_shell_adapter.publishSurfaceCommitted(id) catch unreachable;
                 self.desktop.applyWorkArea(self.layerWorkArea(null) catch unreachable);
@@ -3705,6 +3729,8 @@ pub fn Coordinator(comptime protocol: type) type {
             var flushed: usize = 0;
             if (client.protocol_ready & ProtocolReady.decoration != 0)
                 flushed += try self.decoration_adapter.flushOn(peer, objects, &actor.transmit);
+            if (client.protocol_ready & ProtocolReady.xdg_toplevel_icon != 0)
+                flushed += try self.toplevel_icon_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.shell != 0 and
                 !self.decoration_adapter.readyOutbound(peer))
                 flushed += try self.shell_adapter.flushOn(objects, &actor.transmit);
@@ -3839,6 +3865,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (ready & ProtocolReady.decoration != 0 and
                 !self.decoration_adapter.pendingOutbound(client.peer))
                 ready &= ~ProtocolReady.decoration;
+            if (ready & ProtocolReady.xdg_toplevel_icon != 0 and
+                !self.toplevel_icon_adapter.pendingOutbound(client.peer))
+                ready &= ~ProtocolReady.xdg_toplevel_icon;
             if (ready & ProtocolReady.shell != 0 and
                 !self.shell_adapter.pendingOutboundOn(objects))
                 ready &= ~ProtocolReady.shell;
@@ -6112,6 +6141,7 @@ pub fn Coordinator(comptime protocol: type) type {
             if (removed_lock_surface) |id| self.queueLayerRemoval(id);
             self.decoration_adapter.toplevelRemoved(handle, object);
             self.dialog_adapter.toplevelRemoved(handle, object);
+            self.toplevel_icon_adapter.toplevelRemoved(handle, object);
             _ = self.shell_adapter.resourceRemoved(handle, object);
             _ = self.seat_adapter.resourceRemoved(handle, object);
             _ = self.tablet_adapter.resourceRemoved(handle, object);
@@ -6134,6 +6164,7 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.activation_adapter.resourceRemoved(handle, object);
             _ = self.decoration_adapter.resourceRemoved(handle, object);
             _ = self.dialog_adapter.resourceRemoved(handle, object);
+            _ = self.toplevel_icon_adapter.resourceRemoved(handle, object);
             _ = self.wayland_fixes_adapter.resourceRemoved(handle, object);
             _ = self.system_bell_adapter.resourceRemoved(handle, object);
             _ = self.relative_pointer_adapter.resourceRemoved(handle, object);
