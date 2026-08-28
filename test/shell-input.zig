@@ -60,6 +60,7 @@ test "shell-input: core compatibility extensions cross generated runtime" {
         _ = try drainClient(&reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
         if (handler.fixes != null and handler.system_bell != null and
+            handler.toplevel_drag_manager != null and
             handler.toplevel_icon_manager != null and handler.toplevel_icon_done == 1) break;
         _ = linux.sched_yield();
     }
@@ -67,6 +68,7 @@ test "shell-input: core compatibility extensions cross generated runtime" {
     try std.testing.expectEqual(@as(u32, 1), handler.fixes_version);
     try std.testing.expect(handler.system_bell != null);
     try std.testing.expectEqual(@as(u32, 1), handler.system_bell_version);
+    try std.testing.expect(handler.toplevel_drag_manager != null);
     try std.testing.expect(handler.toplevel_icon_manager != null);
     try std.testing.expectEqual(@as(usize, 1), handler.toplevel_icon_done);
 
@@ -148,6 +150,7 @@ const WaylandFixesHandler = struct {
     fixes_version: u32 = 0,
     system_bell: ?wayring.objects.Handle = null,
     system_bell_version: u32 = 0,
+    toplevel_drag_manager: ?wayring.objects.Handle = null,
     toplevel_icon_manager: ?wayring.objects.Handle = null,
     toplevel_icon_done: usize = 0,
     event_failures: usize = 0,
@@ -204,6 +207,16 @@ const WaylandFixesHandler = struct {
                     self.registry,
                     value.name,
                     &protocol.xdg_toplevel_icon_manager_v1.info,
+                    @min(value.version, 1),
+                    null,
+                );
+            } else if (std.mem.eql(u8, value.interface, protocol.xdg_toplevel_drag_manager_v1.info.name)) {
+                self.toplevel_drag_manager = try ClientCore.bind(
+                    self.objects,
+                    self.queue,
+                    self.registry,
+                    value.name,
+                    &protocol.xdg_toplevel_drag_manager_v1.info,
                     @min(value.version, 1),
                     null,
                 );

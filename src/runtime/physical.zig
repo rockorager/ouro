@@ -43,6 +43,7 @@ const drm_syncobj = @import("../drm_syncobj.zig");
 const protocol_xdg_activation = @import("../protocol/xdg_activation.zig");
 const protocol_xdg_decoration = @import("../protocol/xdg_decoration.zig");
 const protocol_xdg_dialog = @import("../protocol/xdg_dialog.zig");
+const protocol_xdg_toplevel_drag = @import("../protocol/xdg_toplevel_drag.zig");
 const protocol_xdg_toplevel_icon = @import("../protocol/xdg_toplevel_icon.zig");
 const protocol_wayland_fixes = @import("../protocol/wayland_fixes.zig");
 const protocol_xdg_system_bell = @import("../protocol/xdg_system_bell.zig");
@@ -106,6 +107,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const ActivationAdapter = protocol_xdg_activation.Adapter(protocol, Adapter);
         const DecorationAdapter = protocol_xdg_decoration.Adapter(protocol, ShellAdapter);
         const DialogAdapter = protocol_xdg_dialog.Adapter(protocol, ShellAdapter);
+        const ToplevelDragAdapter = protocol_xdg_toplevel_drag.Adapter(protocol, ShellAdapter, DataDeviceAdapter);
         const ToplevelIconAdapter = protocol_xdg_toplevel_icon.Adapter(protocol, ShellAdapter, Shm);
         const WaylandFixesAdapter = protocol_wayland_fixes.Adapter(protocol);
         const SystemBellAdapter = protocol_xdg_system_bell.Adapter(protocol);
@@ -187,6 +189,12 @@ pub fn Coordinator(comptime protocol: type) type {
             desktop: Desktop.ToplevelId = undefined,
             protocol_id: ForeignToplevelListAdapter.ToplevelId = undefined,
             seen: bool = false,
+        };
+        const ToplevelDragMove = struct {
+            toplevel: Desktop.ToplevelId,
+            initial: geometry.Rect,
+            pointer_start: geometry.Point,
+            pointer_current: geometry.Point,
         };
         const SurfaceScene = struct {
             root: Desktop.SceneWindow,
@@ -383,6 +391,7 @@ pub fn Coordinator(comptime protocol: type) type {
             xdg_activation: protocol_xdg_activation.Config = .{},
             xdg_decoration: protocol_xdg_decoration.Config = .{},
             xdg_dialog: protocol_xdg_dialog.Config = .{},
+            xdg_toplevel_drag: protocol_xdg_toplevel_drag.Config = .{},
             xdg_toplevel_icon: protocol_xdg_toplevel_icon.Config = .{},
             relative_pointer: protocol_relative_pointer.Config = .{},
             pointer_gestures: protocol_pointer_gestures.Config = .{},
@@ -456,6 +465,7 @@ pub fn Coordinator(comptime protocol: type) type {
         input_seat_accepted: bool = false,
         input_tablet_accepted: bool = false,
         input_drag_accepted: bool = false,
+        toplevel_drag_move: ?ToplevelDragMove = null,
         input_delivery_prepared: bool = false,
         input_delivery_event: ?input_api.Event = null,
         input_method_key_owners: [0x300]?protocol_input_method.GrabId = [_]?protocol_input_method.GrabId{null} ** 0x300,
@@ -488,6 +498,7 @@ pub fn Coordinator(comptime protocol: type) type {
         activation_adapter: ActivationAdapter,
         decoration_adapter: DecorationAdapter,
         dialog_adapter: DialogAdapter,
+        toplevel_drag_adapter: ToplevelDragAdapter,
         toplevel_icon_adapter: ToplevelIconAdapter,
         wayland_fixes_adapter: WaylandFixesAdapter,
         system_bell_adapter: SystemBellAdapter,
@@ -874,6 +885,13 @@ pub fn Coordinator(comptime protocol: type) type {
             errdefer self.pointer_constraints_adapter.deinit();
             self.data_device_adapter = try DataDeviceAdapter.init(allocator, config.data_device);
             errdefer self.data_device_adapter.deinit();
+            self.toplevel_drag_adapter = try ToplevelDragAdapter.init(
+                allocator,
+                &self.shell_adapter,
+                &self.data_device_adapter,
+                config.xdg_toplevel_drag,
+            );
+            errdefer self.toplevel_drag_adapter.deinit();
             self.primary_selection_adapter = try PrimarySelectionAdapter.init(allocator, config.primary_selection);
             errdefer self.primary_selection_adapter.deinit();
             self.ext_data_control_adapter = try ExtDataControlAdapter.init(allocator, .{
@@ -1158,6 +1176,9 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = try self.data_device_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
+            _ = try self.toplevel_drag_adapter.install(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
             _ = try self.primary_selection_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
@@ -1335,6 +1356,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.primary_selection_adapter.deinit();
             self.wlr_data_control_adapter.deinit();
             self.ext_data_control_adapter.deinit();
+            self.toplevel_drag_adapter.deinit();
             self.data_device_adapter.deinit();
             self.pointer_constraints_adapter.deinit();
             self.idle_notify_adapter.deinit();
@@ -1590,6 +1612,11 @@ pub fn Coordinator(comptime protocol: type) type {
                     try self.wlr_data_control_adapter.selectionChanged(false);
                 if (self.data_device_adapter.pendingOutboundOn(peer))
                     self.markProtocol(peer, ProtocolReady.data_device);
+                try self.syncToplevelDrag();
+                try self.flushProtocol();
+                return control;
+            }
+            if (try self.toplevel_drag_adapter.request(peer, target, message, fds)) |control| {
                 try self.flushProtocol();
                 return control;
             }
@@ -2363,8 +2390,11 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.tablet_adapter.drainState(&self.tablet_state) catch return false;
             if (!self.input_drag_accepted) {
                 switch (event) {
-                    .pointer_motion => |motion| self.syncDragTarget(motion.time_usec, true) catch |err| switch (err) {
-                        error.Exhausted => return false,
+                    .pointer_motion => |motion| {
+                        self.syncDragTarget(motion.time_usec, true) catch |err| switch (err) {
+                            error.Exhausted => return false,
+                        };
+                        try self.syncToplevelDrag();
                     },
                     .pointer_button => |button| if (!button.pressed)
                         self.syncDragTarget(button.time_usec, false) catch |err| switch (err) {
@@ -2377,7 +2407,10 @@ pub fn Coordinator(comptime protocol: type) type {
             switch (event) {
                 .pointer_button => |button| if (!button.pressed and
                     self.seat_adapter.grabState() == .idle)
-                    self.data_device_adapter.dropDrag() catch return false,
+                {
+                    self.data_device_adapter.dropDrag() catch return false;
+                    try self.syncToplevelDrag();
+                },
                 else => {},
             }
             self.input_interaction_accepted = false;
@@ -2503,7 +2536,26 @@ pub fn Coordinator(comptime protocol: type) type {
         fn syncDragTarget(self: *Self, time_usec: u64, emit_motion: bool) !void {
             if (!self.data_device_adapter.dragActive()) return;
             const pointer = self.seat_adapter.pointerState();
-            const target: ?DataDeviceAdapter.DragTarget = if (pointer.focus) |focus| target: {
+            const target: ?DataDeviceAdapter.DragTarget = if (self.toplevel_drag_adapter.activeAttachment()) |attachment| excluded: {
+                const excluded_id = self.desktop.idForShell(attachment.toplevel) catch
+                    break :excluded null;
+                const windows = self.desktop.sceneSnapshot(self.scene_windows) catch
+                    break :excluded null;
+                for (windows) |*window| {
+                    if (std.meta.eql(window.id, excluded_id)) window.visible = false;
+                }
+                const whole = self.interaction.pointerPosition();
+                var input_scene: InputScene = .{ .coordinator = self };
+                const hit = input_scene.topmost(Desktop.SceneWindow, windows, whole) orelse
+                    break :excluded null;
+                const handle = self.adapter.surfaceHandle(hit.surface) catch break :excluded null;
+                break :excluded .{
+                    .peer = self.adapter.surfacePeer(hit.surface) catch break :excluded null,
+                    .surface_object = handle.id,
+                    .x = std.math.mul(i32, hit.local.x, 256) catch break :excluded null,
+                    .y = std.math.mul(i32, hit.local.y, 256) catch break :excluded null,
+                };
+            } else if (pointer.focus) |focus| target: {
                 const handle = self.adapter.surfaceHandle(focus.surface) catch break :target null;
                 break :target .{
                     .peer = self.adapter.surfacePeer(focus.surface) catch break :target null,
@@ -2518,6 +2570,47 @@ pub fn Coordinator(comptime protocol: type) type {
                 @truncate(time_usec / 1000),
                 emit_motion,
             );
+        }
+
+        fn syncToplevelDrag(self: *Self) !void {
+            const attachment = self.toplevel_drag_adapter.activeAttachment() orelse {
+                self.toplevel_drag_move = null;
+                return;
+            };
+            const toplevel = self.desktop.idForShell(attachment.toplevel) catch {
+                self.toplevel_drag_move = null;
+                return;
+            };
+            const pointer = self.interaction.pointerPosition();
+            if (self.toplevel_drag_move) |*move| {
+                if (std.meta.eql(move.toplevel, toplevel)) {
+                    if (std.meta.eql(move.pointer_current, pointer)) return;
+                    try self.desktop.updateToplevelDrag(
+                        toplevel,
+                        move.initial,
+                        move.pointer_start,
+                        pointer,
+                    );
+                    move.pointer_current = pointer;
+                    return;
+                }
+            }
+            const value = try self.desktop.beginInteractive(.{
+                .id = toplevel,
+                .kind = .move,
+            }) orelse return;
+            var initial = value.rect;
+            if (!attachment.initially_mapped) {
+                initial.x = pointer.x -| attachment.x_offset;
+                initial.y = pointer.y -| attachment.y_offset;
+                try self.desktop.updateInteractive(toplevel, initial);
+            }
+            self.toplevel_drag_move = .{
+                .toplevel = toplevel,
+                .initial = initial,
+                .pointer_start = pointer,
+                .pointer_current = pointer,
+            };
         }
 
         fn pointerDeliveryEvent(self: *Self, event: input_api.Event) !?input_api.Event {
@@ -2638,6 +2731,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.interaction.setPopupGrab(self.desktop.popupGrabTarget());
             try self.syncDesktopTimer();
             if (self.desktop.takeSceneChanged()) try self.desktopSceneChanged();
+            try self.syncToplevelDrag();
             if (self.shell_adapter.pendingOutbound() != 0)
                 self.markProtocolAll(ProtocolReady.shell);
         }
@@ -6141,6 +6235,7 @@ pub fn Coordinator(comptime protocol: type) type {
             if (removed_lock_surface) |id| self.queueLayerRemoval(id);
             self.decoration_adapter.toplevelRemoved(handle, object);
             self.dialog_adapter.toplevelRemoved(handle, object);
+            self.toplevel_drag_adapter.toplevelRemoved(handle, object);
             self.toplevel_icon_adapter.toplevelRemoved(handle, object);
             _ = self.shell_adapter.resourceRemoved(handle, object);
             _ = self.seat_adapter.resourceRemoved(handle, object);
@@ -6164,7 +6259,9 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.activation_adapter.resourceRemoved(handle, object);
             _ = self.decoration_adapter.resourceRemoved(handle, object);
             _ = self.dialog_adapter.resourceRemoved(handle, object);
+            _ = self.toplevel_drag_adapter.resourceRemoved(handle, object);
             _ = self.toplevel_icon_adapter.resourceRemoved(handle, object);
+            self.syncToplevelDrag() catch {};
             _ = self.wayland_fixes_adapter.resourceRemoved(handle, object);
             _ = self.system_bell_adapter.resourceRemoved(handle, object);
             _ = self.relative_pointer_adapter.resourceRemoved(handle, object);

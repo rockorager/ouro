@@ -896,6 +896,11 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             return adapter.toplevelId(slot);
         }
 
+        pub fn toplevelMapped(adapter: *Self, id: ToplevelId) bool {
+            const slot = adapter.resolveToplevel(id) catch return false;
+            return slot.mapped;
+        }
+
         pub fn queuePing(adapter: *Self, id: ManagerId) !u32 {
             const slot = try adapter.resolveManager(id.index, id.generation);
             if (slot.ping_serial != null) return error.PingPending;

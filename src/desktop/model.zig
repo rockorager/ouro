@@ -401,6 +401,35 @@ pub fn Desktop(comptime Shell: type) type {
             try desktop.setFloatingGeometry(id, rect);
         }
 
+        pub fn updateToplevelDrag(
+            desktop: *Self,
+            id: ToplevelId,
+            initial: geometry.Rect,
+            start: geometry.Point,
+            current: geometry.Point,
+        ) !void {
+            const min_x = @as(i64, desktop.work_area.x) - initial.width + 1;
+            const max_x = @as(i64, desktop.work_area.x) + desktop.work_area.width - 1;
+            const min_y = @as(i64, desktop.work_area.y) - initial.height + 1;
+            const max_y = @as(i64, desktop.work_area.y) + desktop.work_area.height - 1;
+            const x = std.math.clamp(
+                @as(i64, initial.x) + current.x - start.x,
+                min_x,
+                max_x,
+            );
+            const y = std.math.clamp(
+                @as(i64, initial.y) + current.y - start.y,
+                min_y,
+                max_y,
+            );
+            try desktop.setFloatingGeometry(id, .{
+                .x = std.math.cast(i32, x) orelse return error.InvalidGeometry,
+                .y = std.math.cast(i32, y) orelse return error.InvalidGeometry,
+                .width = initial.width,
+                .height = initial.height,
+            });
+        }
+
         pub fn endInteractive(desktop: *Self, id: ToplevelId) !void {
             const index = desktop.resolveIndex(id) catch return;
             const slot = &desktop.slots[index];
@@ -2334,6 +2363,18 @@ test "desktop: focus history and tiled-floating transitions are deterministic" {
     try settleDesktop(&desktop, &shell);
     try std.testing.expectEqual(first, desktop.focused().?);
     try std.testing.expectEqual(geometry.Rect{ .x = 5, .y = 6, .width = 30, .height = 20 }, (try desktop.scene(first)).geometry);
+    const drag = (try desktop.beginInteractive(.{ .id = first, .kind = .move })).?;
+    try desktop.updateToplevelDrag(
+        first,
+        drag.rect,
+        .{ .x = 10, .y = 20 },
+        .{ .x = 25, .y = 12 },
+    );
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expectEqual(
+        geometry.Rect{ .x = 20, .y = -2, .width = 30, .height = 20 },
+        (try desktop.scene(first)).geometry,
+    );
 
     try desktop.focusNext();
     const second = try desktop.idForShell(.{ .index = 1, .generation = 1 });

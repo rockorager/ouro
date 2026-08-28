@@ -54,6 +54,7 @@ pub const linux_dmabuf = @import("protocol/linux_dmabuf.zig");
 pub const xdg_activation = @import("protocol/xdg_activation.zig");
 pub const xdg_decoration = @import("protocol/xdg_decoration.zig");
 pub const xdg_dialog = @import("protocol/xdg_dialog.zig");
+pub const xdg_toplevel_drag = @import("protocol/xdg_toplevel_drag.zig");
 pub const xdg_toplevel_icon = @import("protocol/xdg_toplevel_icon.zig");
 pub const wayland_fixes = @import("protocol/wayland_fixes.zig");
 pub const xdg_system_bell = @import("protocol/xdg_system_bell.zig");
@@ -143,6 +144,7 @@ test {
     _ = xdg_activation;
     _ = xdg_decoration;
     _ = xdg_dialog;
+    _ = xdg_toplevel_drag;
     _ = xdg_toplevel_icon;
     _ = relative_pointer;
     _ = pointer_gestures;
