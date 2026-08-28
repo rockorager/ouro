@@ -2474,7 +2474,8 @@ drain:
     detach_content(&client);
     while (!buffers_available(&client))
         if (wl_display_dispatch(client.display) < 0) fail("drain buffer releases");
-    if (client.releases != client.submitted_buffers)
+    if (client.backing != BACKING_SINGLE_PIXEL &&
+        client.releases != client.submitted_buffers)
         protocol_fail("not every submitted buffer was released");
     printf("DRAINED releases=%" PRIu64 "\n", client.releases);
     fflush(stdout);

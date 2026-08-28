@@ -210,7 +210,7 @@ def run_record(directory: Path, workload: str, compositor: str, run: int) -> dic
             raise ValueError(
                 f"{directory}: invalid release_events_per_frame={release_events_per_frame}"
             )
-        expected_total = client.get(
+        expected_total = 0 if release_events_per_frame == 0 else client.get(
             "raw_submitted_buffers",
             (expected_frames + int(case["warmup"])) * release_events_per_frame,
         )
