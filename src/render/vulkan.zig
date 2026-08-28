@@ -196,11 +196,55 @@ pub const Renderer = struct {
         cursor_start: usize,
         captures: vk.Captures,
     ) !std.posix.fd_t {
+        return self.renderCaptureInternal(
+            targets,
+            target,
+            handle,
+            list,
+            plan,
+            cursor_start,
+            captures,
+            null,
+        );
+    }
+
+    pub fn renderCaptureTo(
+        self: *Renderer,
+        targets: *Targets,
+        target: Target,
+        handle: framebuffer.Handle,
+        list: render_types.List,
+        plan: render_types.DamagePlan,
+        cursor_start: usize,
+        captures: vk.Captures,
+        destination: vk.CaptureDestination,
+    ) !std.posix.fd_t {
+        return self.renderCaptureInternal(
+            targets,
+            target,
+            handle,
+            list,
+            plan,
+            cursor_start,
+            captures,
+            destination,
+        );
+    }
+
+    fn renderCaptureInternal(
+        self: *Renderer,
+        targets: *Targets,
+        target: Target,
+        handle: framebuffer.Handle,
+        list: render_types.List,
+        plan: render_types.DamagePlan,
+        cursor_start: usize,
+        captures: vk.Captures,
+        capture_destination: ?vk.CaptureDestination,
+    ) !std.posix.fd_t {
         try render_types.validateList(list);
         try render_types.validateOutput(plan.output);
         if (cursor_start > list.samples.len) return error.InvalidSourceIndex;
-        if ((captures.before_cursor or captures.after_cursor) and !plan.render_full)
-            return error.CaptureRequiresFullRender;
         if (targets.owner != self.implementation) return error.TargetOwnerMismatch;
         if (plan.samples.len > std.math.maxInt(u32)) return error.SampleCapacityExceeded;
         if (plan.samples.len > self.samples.len) {
@@ -317,12 +361,59 @@ pub const Renderer = struct {
             .render_damage = self.damage[0..damage_count],
             .cursor_start = capture_cursor_start,
             .captures = captures,
+            .capture_destination = capture_destination,
         }) catch |err| {
             if (err == error.CompletionExportFailedAfterSubmit) record.terminal = true;
             return err;
         };
         if (completion_fd < 0) return error.InvalidCompletionFd;
         return completion_fd;
+    }
+
+    pub fn importCaptureTarget(self: *Renderer, import: gbm.Import) !vk.CaptureTarget {
+        if (import.plane_count != 1 or import.fds[0] < 0 or
+            import.modifier != gbm.modifier_linear or
+            (import.format != gbm.format_argb8888 and import.format != gbm.format_xrgb8888))
+            return error.UnsupportedCaptureTarget;
+        const duplicate = linux.fcntl(import.fds[0], linux.F.DUPFD_CLOEXEC, 0);
+        const fd: std.posix.fd_t = switch (linux.errno(duplicate)) {
+            .SUCCESS => @intCast(duplicate),
+            .MFILE => return error.ProcessFdQuotaExceeded,
+            .NFILE => return error.SystemFdQuotaExceeded,
+            .BADF => return error.InvalidExternalFd,
+            else => |err| return std.posix.unexpectedErrno(err),
+        };
+        return self.platform.importCaptureTarget(self.implementation, .{
+            .width = import.width,
+            .height = import.height,
+            .format = import.format,
+            .modifier = import.modifier,
+            .plane_count = import.plane_count,
+            .strides = import.strides,
+            .offsets = import.offsets,
+        }, fd);
+    }
+
+    pub fn supportsCaptureTarget(self: *Renderer, size: render_types.Size) bool {
+        const stride = std.math.mul(u32, size.width, 4) catch return false;
+        return self.platform.supportsCaptureTarget(self.implementation, .{
+            .width = size.width,
+            .height = size.height,
+            .format = gbm.format_xrgb8888,
+            .modifier = gbm.modifier_linear,
+            .plane_count = 1,
+            .strides = .{ stride, 0, 0, 0 },
+        });
+    }
+
+    pub fn destroyCaptureTarget(self: *Renderer, target: vk.CaptureTarget) void {
+        self.platform.destroyCaptureTarget(self.implementation, target);
+    }
+
+    pub fn prepareCaptureTarget(self: *Renderer, target: vk.CaptureTarget, import: gbm.Import) !void {
+        if (import.plane_count != 1 or import.fds[0] < 0)
+            return error.UnsupportedCaptureTarget;
+        return self.platform.prepareCaptureTarget(self.implementation, target, import.fds[0]);
     }
 
     /// Valid only after completion of the exact rendered target generation.
@@ -756,7 +847,9 @@ test "render-vulkan: capture preserves the packed cursor partition and target ge
         .client_full = true,
         .scene_full = false,
         .repair_full = false,
-        .render_full = true,
+        // Capture is valid after ordinary target repair; it does not require
+        // the current frame's render region to cover the whole output.
+        .render_full = false,
     };
     var target = FakeTarget{};
     const handle: framebuffer.Handle = .{ .slot = 0, .generation = 1 };
@@ -779,6 +872,24 @@ test "render-vulkan: capture preserves the packed cursor partition and target ge
         error.StaleTarget,
         renderer.readback(&targets, .{ .slot = 0, .generation = 2 }, .after_cursor),
     );
+
+    const destination: vk.CaptureDestination = .{
+        .target = @ptrFromInt(32),
+        .source = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+    };
+    _ = linux.close(try renderer.renderCaptureTo(
+        &targets,
+        target.target(),
+        handle,
+        list,
+        plan,
+        1,
+        .{ .after_cursor = true },
+        destination,
+    ));
+    try std.testing.expect(fake.last_capture_destination != null);
+    try std.testing.expectEqual(destination.target, fake.last_capture_destination.?.target);
+    try std.testing.expectEqual(destination.source, fake.last_capture_destination.?.source);
 }
 
 test "render-vulkan: odd source strides repack to aligned contiguous shader words" {
@@ -1060,6 +1171,7 @@ const FakePlatform = struct {
     lut_upload_count: usize = 0,
     last_cursor_start: usize = 0,
     last_captures: vk.Captures = .{},
+    last_capture_destination: ?vk.CaptureDestination = null,
     readback_bytes: [4]u8 = .{ 9, 10, 11, 12 },
 
     const vtable: vk.Platform.VTable = .{
@@ -1067,6 +1179,10 @@ const FakePlatform = struct {
         .destroy = destroy,
         .import_target = importTarget,
         .destroy_target = destroyTarget,
+        .supports_capture_target = supportsCaptureTarget,
+        .import_capture_target = importCaptureTarget,
+        .prepare_capture_target = prepareCaptureTarget,
+        .destroy_capture_target = destroyCaptureTarget,
         .draw = draw,
         .readback = readback,
         .content_provider = contentProvider,
@@ -1115,6 +1231,15 @@ const FakePlatform = struct {
         const self: *FakePlatform = @ptrCast(@alignCast(context));
         self.destroy_target_count += 1;
     }
+    fn importCaptureTarget(context: *anyopaque, _: vk.Renderer, _: gbm.Metadata, fd: std.posix.fd_t) !vk.CaptureTarget {
+        _ = linux.close(fd);
+        return context;
+    }
+    fn supportsCaptureTarget(_: *anyopaque, _: vk.Renderer, _: gbm.Metadata) bool {
+        return true;
+    }
+    fn prepareCaptureTarget(_: *anyopaque, _: vk.Renderer, _: vk.CaptureTarget, _: std.posix.fd_t) !void {}
+    fn destroyCaptureTarget(_: *anyopaque, _: vk.Renderer, _: vk.CaptureTarget) void {}
     fn draw(context: *anyopaque, _: vk.Renderer, _: vk.Target, frame: vk.Frame) !std.posix.fd_t {
         const self: *FakePlatform = @ptrCast(@alignCast(context));
         self.draw_count += 1;
@@ -1141,6 +1266,7 @@ const FakePlatform = struct {
         if (frame.render_damage.len != 0) self.last_damage = frame.render_damage[0];
         self.last_cursor_start = frame.cursor_start;
         self.last_captures = frame.captures;
+        self.last_capture_destination = frame.capture_destination;
         if (self.fail_after_submit) return error.CompletionExportFailedAfterSubmit;
         return eventFd();
     }

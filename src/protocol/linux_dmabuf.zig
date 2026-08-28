@@ -218,6 +218,13 @@ pub const Store = struct {
         return &slot.value;
     }
 
+    pub fn duplicateLease(store: *Store, lease: Lease) Error!Lease {
+        const slot = try store.resolveBuffer(lease.index, lease.generation);
+        if (!slot.resource_alive or slot.leases == 0) return error.StaleHandle;
+        slot.leases = std.math.add(usize, slot.leases, 1) catch return error.Exhausted;
+        return lease;
+    }
+
     pub fn bufferAlive(store: *Store, lease: Lease) bool {
         const slot = store.resolveBuffer(lease.index, lease.generation) catch return false;
         return slot.resource_alive;
@@ -635,6 +642,10 @@ pub fn Adapter(comptime protocol: type) type {
 
         pub fn leasedBuffer(adapter: *Self, lease: Lease) Error!*const Buffer {
             return adapter.store.leasedBuffer(lease);
+        }
+
+        pub fn duplicateLease(adapter: *Self, lease: Lease) Error!Lease {
+            return adapter.store.duplicateLease(lease);
         }
 
         pub fn releaseLease(adapter: *Self, lease: Lease) Error!void {
@@ -1099,13 +1110,18 @@ test "linux-dmabuf: retained attachment outlives destroyed buffer resource" {
     try store.addPlane(params, fd, 0, 0, 4, modifier_linear);
     const created = try store.createBuffer(params, 1, 1, drm_format_argb8888, 0);
     const lease = try store.retainBuffer(created);
+    const duplicate = try store.duplicateLease(lease);
+    try std.testing.expectEqual(lease, duplicate);
     try std.testing.expect(store.bufferAlive(lease));
     try store.destroyBuffer(created);
     try std.testing.expect(!store.bufferAlive(lease));
+    try std.testing.expectError(error.StaleHandle, store.duplicateLease(lease));
     try std.testing.expectError(error.StaleHandle, store.buffer(created));
     try std.testing.expectEqual(fd, (try store.leasedBuffer(lease)).planes[0].?.fd);
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(fd, linux.F.GETFD, 0)));
     try store.releaseLease(lease);
+    try std.testing.expectEqual(fd, (try store.leasedBuffer(duplicate)).planes[0].?.fd);
+    try store.releaseLease(duplicate);
     try expectClosed(fd);
     try std.testing.expectError(error.StaleHandle, store.leasedBuffer(lease));
     try store.destroyParams(params);

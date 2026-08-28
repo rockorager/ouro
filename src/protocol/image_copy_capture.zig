@@ -6,6 +6,14 @@ const std = @import("std");
 const wayring = @import("wayring");
 const objects = wayring.objects;
 const none = std.math.maxInt(u32);
+const drm_format_argb8888 = fourcc('A', 'R', '2', '4');
+const drm_format_xrgb8888 = fourcc('X', 'R', '2', '4');
+const drm_modifier_linear: u64 = 0;
+
+fn fourcc(a: u8, b: u8, c: u8, d: u8) u32 {
+    return @as(u32, a) | (@as(u32, b) << 8) | (@as(u32, c) << 16) |
+        (@as(u32, d) << 24);
+}
 
 pub const Config = struct {
     session_capacity: usize = 32,
@@ -33,7 +41,11 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
         pub const SourceTarget = SourceAdapter.Target;
         pub const CursorCaptureTarget = struct { source: SourceTarget, cursor: CursorTarget };
         pub const Target = union(enum) { source: SourceTarget, cursor: CursorCaptureTarget };
-        pub const Constraints = struct { width: u32, height: u32 };
+        pub const Constraints = struct {
+            width: u32,
+            height: u32,
+            dmabuf_device: ?u64 = null,
+        };
         pub const Point = struct { x: i32, y: i32 };
         pub const CursorInfo = struct { position: Point, hotspot: Point };
         pub const SessionId = packed struct { index: u32, generation: u32 };
@@ -103,6 +115,9 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
             buffer_size: Constraints,
             shm_argb,
             shm_xrgb,
+            dmabuf_device: u64,
+            dmabuf_argb,
+            dmabuf_xrgb,
             done,
             stopped,
             transform,
@@ -218,7 +233,10 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
         }
         fn acquireSession(self: *Self, peer: wayring.io_uring.Peer, source: ?SourceAdapter.SourceId, target: ?Target, constraints: ?Constraints, paint_cursors: bool) !*Session {
             const stopped = target == null;
-            const needed: usize = if (stopped) 1 else if (constraints != null) 4 else 0;
+            const needed: usize = if (stopped) 1 else if (constraints) |value|
+                4 + @as(usize, @intFromBool(value.dmabuf_device != null)) * 3
+            else
+                0;
             if (self.outbound.len - self.outbound_count < needed) return error.Exhausted;
             if (self.session_free == none) return error.Exhausted;
             const i = self.session_free;
@@ -668,7 +686,8 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
                 }
                 return;
             }
-            const needed: usize = 4 + @as(usize, @intFromBool(frame_pending));
+            const needed: usize = 4 + @as(usize, @intFromBool(c.?.dmabuf_device != null)) * 3 +
+                @as(usize, @intFromBool(frame_pending));
             if (self.outbound.len - self.outbound_count < needed) return error.Exhausted;
             s.constraints = c;
             try self.queueConstraints(id, c.?);
@@ -678,10 +697,16 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
             }
         }
         fn queueConstraints(self: *Self, id: SessionId, c: Constraints) !void {
-            if (self.outbound.len - self.outbound_count < 4) return error.Exhausted;
+            const needed: usize = 4 + @as(usize, @intFromBool(c.dmabuf_device != null)) * 3;
+            if (self.outbound.len - self.outbound_count < needed) return error.Exhausted;
             try self.enqueue(.{ .session = id }, .{ .buffer_size = c });
             try self.enqueue(.{ .session = id }, .shm_argb);
             try self.enqueue(.{ .session = id }, .shm_xrgb);
+            if (c.dmabuf_device) |device| {
+                try self.enqueue(.{ .session = id }, .{ .dmabuf_device = device });
+                try self.enqueue(.{ .session = id }, .dmabuf_argb);
+                try self.enqueue(.{ .session = id }, .dmabuf_xrgb);
+            }
             try self.enqueue(.{ .session = id }, .done);
         }
 
@@ -721,6 +746,15 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
                             .buffer_size => |size| .{ .buffer_size = .{ .width = size.width, .height = size.height } },
                             .shm_argb => .{ .shm_format = .{ .format = protocol.wl_shm.format.argb8888 } },
                             .shm_xrgb => .{ .shm_format = .{ .format = protocol.wl_shm.format.xrgb8888 } },
+                            .dmabuf_device => |*device| .{ .dmabuf_device = .{ .device = std.mem.asBytes(device) } },
+                            .dmabuf_argb => .{ .dmabuf_format = .{
+                                .format = drm_format_argb8888,
+                                .modifiers = std.mem.sliceAsBytes(&[_]u64{drm_modifier_linear}),
+                            } },
+                            .dmabuf_xrgb => .{ .dmabuf_format = .{
+                                .format = drm_format_xrgb8888,
+                                .modifiers = std.mem.sliceAsBytes(&[_]u64{drm_modifier_linear}),
+                            } },
                             .done => .{ .done = .{} },
                             .stopped => .{ .stopped = .{} },
                             else => unreachable,
@@ -1027,7 +1061,7 @@ test "image copy capture: generated events flush in protocol order" {
         .session_capacity = 1,
         .frame_capacity = 1,
         .capture_capacity = 1,
-        .outbound_capacity = 8,
+        .outbound_capacity = 12,
     });
     defer adapter.deinit();
     var server_objects = try objects.ServerObjects.init(
@@ -1048,7 +1082,7 @@ test "image copy capture: generated events flush in protocol order" {
         test_peer,
         session_resource,
         test_snapshot,
-        .{ .width = 64, .height = 32 },
+        .{ .width = 64, .height = 32, .dmabuf_device = 0x1234 },
         false,
     );
 
@@ -1058,18 +1092,45 @@ test "image copy capture: generated events flush in protocol order" {
     defer descriptors.deinit(std.testing.allocator);
     var queue = wayring.tx.Queue.init(&blocks, 256, &descriptors, 0);
     defer queue.deinit();
-    try std.testing.expectEqual(@as(usize, 4), try adapter.flushOn(test_peer, &server_objects, &queue));
+    try std.testing.expectEqual(@as(usize, 7), try adapter.flushOn(test_peer, &server_objects, &queue));
     var descriptor_scratch: [1]std.os.linux.fd_t = undefined;
     var control: [64]u8 align(@alignOf(std.os.linux.cmsghdr)) = undefined;
     var bytes = (try queue.snapshot(&descriptor_scratch, &control)).first;
-    const expected_session = [_]std.meta.Tag(protocol.ext_image_copy_capture_session_v1.Event){ .buffer_size, .shm_format, .shm_format, .done };
+    const expected_session = [_]std.meta.Tag(protocol.ext_image_copy_capture_session_v1.Event){
+        .buffer_size,
+        .shm_format,
+        .shm_format,
+        .dmabuf_device,
+        .dmabuf_format,
+        .dmabuf_format,
+        .done,
+    };
+    var dmabuf_formats: usize = 0;
     for (expected_session) |expected| {
         const message = (try wayring.wire.Message.decode(bytes)).?;
         try std.testing.expectEqual(@as(u32, 10), message.header.object_id);
         const event = try protocol.ext_image_copy_capture_session_v1.decodeEvent(message, &queue.descriptors);
         try std.testing.expectEqual(expected, std.meta.activeTag(event));
+        switch (event) {
+            .dmabuf_device => |value| try std.testing.expectEqualSlices(
+                u8,
+                std.mem.asBytes(&@as(u64, 0x1234)),
+                value.device,
+            ),
+            .dmabuf_format => |value| {
+                try std.testing.expect(value.format == drm_format_argb8888 or value.format == drm_format_xrgb8888);
+                try std.testing.expectEqualSlices(
+                    u8,
+                    std.mem.sliceAsBytes(&[_]u64{drm_modifier_linear}),
+                    value.modifiers,
+                );
+                dmabuf_formats += 1;
+            },
+            else => {},
+        }
         bytes = bytes[message.header.size..];
     }
+    try std.testing.expectEqual(@as(usize, 2), dmabuf_formats);
     try std.testing.expectEqual(@as(usize, 0), bytes.len);
 
     queue.deinit();

@@ -58,6 +58,12 @@ benchmark_workloads=(
     "dmabuf-sync-churn    dmabuf-sync-churn                    1       1280  720    300    3"
     "dmabuf-native-sync-full dmabuf-native-sync-full           1       1280  720    1000   3"
     "dmabuf-native-sync-churn dmabuf-native-sync-churn         1       1280  720    300    3"
+    "capture-shm-full      shm-full-capture-shm                 1       1280  720    300    3"
+    "capture-dmabuf-full   shm-full-capture-dmabuf              1       1280  720    300    3"
+    "capture-shm-sparse    shm-sparse-capture-shm               1       1280  720    300    3"
+    "capture-dmabuf-sparse shm-sparse-capture-dmabuf            1       1280  720    300    3"
+    "capture-shm-static    shm-static-capture-shm               1       1280  720    300    3"
+    "capture-dmabuf-static shm-static-capture-dmabuf            1       1280  720    300    3"
     "direct-scanout-dmabuf dmabuf-static                       1       1920  1200   1000   3"
     "mixed-sparse         shm-sparse,dmabuf-sparse             2       640   720    1000   3"
     "mixed-scale-8        shm-sparse,shm-sparse,shm-sparse,shm-sparse,dmabuf-sparse,dmabuf-sparse,dmabuf-sparse,dmabuf-sparse 8 640 360 1000 3"
@@ -108,7 +114,8 @@ benchmark_suite_contains() {
                 $workload == dmabuf-scale-8 || $workload == dmabuf-churn ||
                 $workload == mixed-scale-8 || $workload == color-parametric-shm ||
                 $workload == color-icc-shm || $workload == alpha-shm-full ||
-                $workload == alpha-dmabuf-full ]]
+                $workload == alpha-dmabuf-full || $workload == capture-shm-full ||
+                $workload == capture-dmabuf-full ]]
             ;;
         all) [[ $workload != *-scale-16 && $workload != *-scale-32 &&
             $workload != *-scale-64 && $workload != direct-scanout-* ]] ;;
@@ -133,6 +140,7 @@ benchmark_suite_contains() {
             $workload == shm-buffer-churn || $workload == dmabuf-churn ]] ;;
         native) [[ $workload == dmabuf-native-* ]] ;;
         sync) [[ $workload == dmabuf-sync-* || $workload == dmabuf-native-sync-* ]] ;;
+        capture) [[ $workload == capture-* ]] ;;
         scanout) [[ $workload == direct-scanout-* ]] ;;
         visibility) [[ $workload == shm-opaque-* || $workload == layers-clipped-* ||
             $workload == layers-hidden-damage-* || $workload == layers-occlusion-* ]] ;;

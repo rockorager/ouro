@@ -18,6 +18,7 @@ const input_api = @import("../backend/input/backend.zig");
 const input_platform = @import("../backend/input/platform.zig");
 const drm = @import("../backend/drm/manager.zig");
 const drm_platform = @import("../backend/drm/platform.zig");
+const gbm = @import("../backend/gbm.zig");
 const kms = @import("../backend/drm/output.zig");
 const output_api = @import("../output/drm.zig");
 const output_scheduler = @import("../output/headless.zig");
@@ -84,6 +85,66 @@ const surface_state = @import("../surface.zig");
 
 const linux = std.os.linux;
 const drag_icon_role_id: surface_state.RoleId = 0x646e_645f_6963_6f6e;
+
+fn copyCaptureRegion(
+    destination: []u8,
+    destination_stride: u32,
+    destination_width: u32,
+    destination_height: u32,
+    region: geometry.Rect,
+    source: output_api.CaptureReadback,
+    output: render.Size,
+) !void {
+    const destination_row_bytes = try std.math.mul(usize, destination_width, 4);
+    const destination_required = try std.math.mul(usize, destination_stride, destination_height);
+    const source_row_bytes = try std.math.mul(usize, output.width, 4);
+    const source_required = try std.math.mul(usize, source.stride, output.height);
+    if (destination_stride < destination_row_bytes or destination.len < destination_required or
+        source.stride < source_row_bytes or source.bytes.len < source_required)
+        return error.CaptureCapacityExceeded;
+
+    const source_left = @max(@as(i64, region.x), 0);
+    const source_right = @min(
+        @as(i64, region.x) + region.width,
+        @as(i64, output.width),
+    );
+    const has_columns = source_left < source_right;
+    const destination_x: usize = if (has_columns)
+        @intCast(source_left - @as(i64, region.x))
+    else
+        0;
+    const copy_bytes: usize = if (has_columns)
+        @intCast((source_right - source_left) * 4)
+    else
+        0;
+    const prefix_bytes = destination_x * 4;
+    if (prefix_bytes + copy_bytes > destination_row_bytes)
+        return error.CaptureCapacityExceeded;
+
+    for (0..destination_height) |destination_y| {
+        const destination_start = try std.math.mul(usize, destination_y, destination_stride);
+        const destination_row = destination[destination_start..][0..destination_row_bytes];
+        const source_y = @as(i64, region.y) + @as(i64, @intCast(destination_y));
+        if (!has_columns or source_y < 0 or source_y >= output.height) {
+            @memset(destination_row, 0);
+            continue;
+        }
+        const source_start = try std.math.add(
+            usize,
+            try std.math.mul(usize, @intCast(source_y), source.stride),
+            @as(usize, @intCast(source_left)) * 4,
+        );
+        if (source_start + copy_bytes > source.bytes.len)
+            return error.CaptureCapacityExceeded;
+        if (prefix_bytes != 0) @memset(destination_row[0..prefix_bytes], 0);
+        @memcpy(
+            destination_row[prefix_bytes..][0..copy_bytes],
+            source.bytes[source_start..][0..copy_bytes],
+        );
+        const suffix_start = prefix_bytes + copy_bytes;
+        if (suffix_start < destination_row.len) @memset(destination_row[suffix_start..], 0);
+    }
+}
 
 pub fn Coordinator(comptime protocol: type) type {
     return struct {
@@ -168,10 +229,14 @@ pub fn Coordinator(comptime protocol: type) type {
             copied: bool = false,
             success: bool = false,
         };
+        const ImageCopyDestination = union(enum) {
+            shm: wayring.shm.Store.Pin,
+            dmabuf: protocol_linux_dmabuf.Lease,
+        };
         const PendingImageCopy = struct {
             frame: ImageCopyCaptureAdapter.FrameId,
             peer: wayring.io_uring.Peer,
-            pin: wayring.shm.Store.Pin,
+            destination: ImageCopyDestination,
             region: geometry.Rect,
             width: u32,
             height: u32,
@@ -2881,7 +2946,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self: *Self,
             target: ImageCopyCaptureAdapter.Target,
         ) ?ImageCopyCaptureAdapter.Constraints {
-            return switch (target) {
+            const maybe_constraints: ?ImageCopyCaptureAdapter.Constraints = switch (target) {
                 .source => |source| switch (source) {
                     .output => |id| if (self.output) |output|
                         if (std.meta.eql(output.outputId(), id)) .{
@@ -2897,6 +2962,12 @@ pub fn Coordinator(comptime protocol: type) type {
                 },
                 .cursor => if (self.cursorCaptureState(target)) |state| state.constraints else null,
             };
+            var constraints = maybe_constraints orelse return null;
+            constraints.dmabuf_device = if (self.output) |output|
+                output.captureDmabufDevice(.{ .width = constraints.width, .height = constraints.height })
+            else
+                null;
+            return constraints;
         }
 
         pub fn cursorCaptureInfo(
@@ -4870,16 +4941,38 @@ pub fn Coordinator(comptime protocol: type) type {
                     .token = frameToken(pending.frame),
                     .cursor_start = cursor_start,
                     .overlay_cursor = pending.overlay_cursor,
-                    .bytes = self.screencopy_bytes,
-                    .stride = pending.full_stride,
+                    .destination = .{ .shm = .{
+                        .bytes = self.screencopy_bytes,
+                        .stride = pending.full_stride,
+                    } },
                 } else null
             else if (self.pending_image_copy) |pending|
                 if (pending.awaiting_output) .{
                     .token = imageFrameToken(pending.frame),
                     .cursor_start = cursor_start,
                     .overlay_cursor = pending.overlay_cursor,
-                    .bytes = self.screencopy_bytes,
-                    .stride = pending.full_stride,
+                    .destination = switch (pending.destination) {
+                        .shm => .{ .shm = .{
+                            .bytes = self.screencopy_bytes,
+                            .stride = pending.full_stride,
+                        } },
+                        .dmabuf => |lease| .{ .dmabuf = .{
+                            .import = try dmabufCaptureImport(try self.dmabuf_adapter.leasedBuffer(lease)),
+                            .source = .{
+                                .x = pending.region.x,
+                                .y = pending.region.y,
+                                .width = pending.width,
+                                .height = pending.height,
+                            },
+                            .lease = .{
+                                .context = &self.dmabuf_adapter,
+                                .token = dmabufLeaseToken(lease),
+                                .alive_fn = dmabufCaptureAlive,
+                                .duplicate_fn = dmabufCaptureDuplicate,
+                                .release_fn = dmabufCaptureRelease,
+                            },
+                        } },
+                    },
                 } else null
             else
                 null;
@@ -4889,11 +4982,11 @@ pub fn Coordinator(comptime protocol: type) type {
                 else
                     output.renderFrame(frame, &.{}, &.{}, &.{}, try monotonicNs());
                 const rendered = result catch |cause| {
-                    if (capture_request != null) try self.finishActiveCapture(false, 0);
+                    if (capture_request != null) try self.finishActiveCapture(false, 0, null);
                     return cause;
                 };
                 if (rendered == .retired) {
-                    if (capture_request != null) try self.finishActiveCapture(false, 0);
+                    if (capture_request != null) try self.finishActiveCapture(false, 0, null);
                     try self.finishOutcome(rendered.retired.frame, false);
                 }
                 return;
@@ -4916,7 +5009,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     try monotonicNs(),
                 );
             const render_result = result catch |cause| {
-                if (capture_request != null) try self.finishActiveCapture(false, 0);
+                if (capture_request != null) try self.finishActiveCapture(false, 0, null);
                 return cause;
             };
             switch (render_result) {
@@ -4930,7 +5023,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     _ = try self.retryRetainedOutcomes();
                 },
                 .retired => |failure| {
-                    if (capture_request != null) try self.finishActiveCapture(false, 0);
+                    if (capture_request != null) try self.finishActiveCapture(false, 0, null);
                     self.adapter.clearFifoBarriers();
                     try self.finishOutcome(failure.frame, false);
                 },
@@ -5102,14 +5195,20 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.scheduleClients();
         }
 
-        fn captured(context: *anyopaque, token: u64, success: bool, timestamp_ns: u64) !void {
+        fn captured(
+            context: *anyopaque,
+            token: u64,
+            success: bool,
+            timestamp_ns: u64,
+            readback: ?output_api.CaptureReadback,
+        ) !void {
             const self: *Self = @ptrCast(@alignCast(context));
             if (self.pending_screencopy) |pending| {
                 if (token != frameToken(pending.frame)) return error.InvalidCaptureToken;
-                try self.finishScreencopy(success, timestamp_ns);
+                try self.finishScreencopy(success, timestamp_ns, readback);
             } else if (self.pending_image_copy) |pending| {
                 if (token != imageFrameToken(pending.frame)) return error.InvalidCaptureToken;
-                try self.finishImageCopy(success, timestamp_ns);
+                try self.finishImageCopy(success, timestamp_ns, readback);
             } else return error.InvalidCaptureToken;
             try self.processScreencopyCaptures();
             try self.processImageCopyCaptures();
@@ -5119,7 +5218,7 @@ pub fn Coordinator(comptime protocol: type) type {
         fn processScreencopyCaptures(self: *Self) !void {
             if (self.pending_image_copy != null) return;
             if (self.pending_screencopy) |pending| {
-                if (!pending.awaiting_output) try self.finishScreencopy(false, 0);
+                if (!pending.awaiting_output) try self.finishScreencopy(false, 0, null);
                 return;
             }
             const output = self.output orelse return;
@@ -5156,7 +5255,7 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             self.screencopy_adapter.dropCapture();
             output.request(.damage, try monotonicNs()) catch {
-                try self.finishScreencopy(false, 0);
+                try self.finishScreencopy(false, 0, null);
                 return;
             };
             self.pending_screencopy.?.awaiting_output = true;
@@ -5166,7 +5265,7 @@ pub fn Coordinator(comptime protocol: type) type {
         fn processImageCopyCaptures(self: *Self) !void {
             if (self.pending_screencopy != null) return;
             if (self.pending_image_copy) |pending| {
-                if (!pending.awaiting_output) try self.finishImageCopy(false, 0);
+                if (!pending.awaiting_output) try self.finishImageCopy(false, 0, null);
                 return;
             }
             const output = self.output orelse return;
@@ -5179,26 +5278,6 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.failImageCopy(capture);
                 return;
             };
-            const token = self.shm.bufferToken(object) orelse {
-                try self.failImageCopy(capture);
-                return;
-            };
-            const info = self.shm.store.bufferInfo(token) catch {
-                try self.failImageCopy(capture);
-                return;
-            };
-            const stride = std.math.mul(u32, capture.width, 4) catch {
-                try self.failImageCopy(capture);
-                return;
-            };
-            if (info.width != capture.width or info.height != capture.height or info.stride != stride or
-                (info.format.value != protocol.wl_shm.format.argb8888.value and
-                    info.format.value != protocol.wl_shm.format.xrgb8888.value))
-            {
-                try self.image_copy_capture_adapter.fail(capture.frame, .buffer_constraints);
-                self.markProtocol(capture.peer, ProtocolReady.image_copy_capture);
-                return;
-            }
             const region: geometry.Rect = switch (capture.target) {
                 .source => |source| switch (source) {
                     .output => |id| if (std.meta.eql(id, output.outputId())) .{
@@ -5229,19 +5308,68 @@ pub fn Coordinator(comptime protocol: type) type {
                     return;
                 },
             };
-            const pin = self.shm.store.pin(token) catch {
+            const destination: ImageCopyDestination = if (self.shm.bufferToken(object)) |token| shm: {
+                const info = self.shm.store.bufferInfo(token) catch {
+                    try self.failImageCopy(capture);
+                    return;
+                };
+                const stride = std.math.mul(u32, capture.width, 4) catch {
+                    try self.failImageCopy(capture);
+                    return;
+                };
+                if (info.width != capture.width or info.height != capture.height or info.stride != stride or
+                    (info.format.value != protocol.wl_shm.format.argb8888.value and
+                        info.format.value != protocol.wl_shm.format.xrgb8888.value))
+                {
+                    try self.image_copy_capture_adapter.fail(capture.frame, .buffer_constraints);
+                    self.markProtocol(capture.peer, ProtocolReady.image_copy_capture);
+                    return;
+                }
+                break :shm .{ .shm = self.shm.store.pin(token) catch {
+                    try self.failImageCopy(capture);
+                    return;
+                } };
+            } else if (self.dmabuf_adapter.bufferFromObject(object)) |handle| dmabuf: {
+                if (output.rendererKind() != .vulkan) {
+                    try self.image_copy_capture_adapter.fail(capture.frame, .buffer_constraints);
+                    self.markProtocol(capture.peer, ProtocolReady.image_copy_capture);
+                    return;
+                }
+                const lease = self.dmabuf_adapter.retainBuffer(handle) catch {
+                    try self.failImageCopy(capture);
+                    return;
+                };
+                const buffer = self.dmabuf_adapter.leasedBuffer(lease) catch {
+                    self.dmabuf_adapter.releaseLease(lease) catch unreachable;
+                    try self.failImageCopy(capture);
+                    return;
+                };
+                _ = dmabufCaptureImport(buffer) catch {
+                    self.dmabuf_adapter.releaseLease(lease) catch unreachable;
+                    try self.image_copy_capture_adapter.fail(capture.frame, .buffer_constraints);
+                    self.markProtocol(capture.peer, ProtocolReady.image_copy_capture);
+                    return;
+                };
+                if (buffer.width != capture.width or buffer.height != capture.height) {
+                    self.dmabuf_adapter.releaseLease(lease) catch unreachable;
+                    try self.image_copy_capture_adapter.fail(capture.frame, .buffer_constraints);
+                    self.markProtocol(capture.peer, ProtocolReady.image_copy_capture);
+                    return;
+                }
+                break :dmabuf .{ .dmabuf = lease };
+            } else {
                 try self.failImageCopy(capture);
                 return;
             };
             const full_stride = std.math.mul(u32, output.planner.output.width, 4) catch {
-                self.shm.store.unpin(pin) catch unreachable;
+                try self.releaseImageCopyDestination(destination);
                 try self.failImageCopy(capture);
                 return;
             };
             self.pending_image_copy = .{
                 .frame = capture.frame,
                 .peer = capture.peer,
-                .pin = pin,
+                .destination = destination,
                 .region = region,
                 .width = capture.width,
                 .height = capture.height,
@@ -5252,11 +5380,52 @@ pub fn Coordinator(comptime protocol: type) type {
                 },
             };
             output.request(.damage, try monotonicNs()) catch {
-                try self.finishImageCopy(false, 0);
+                try self.finishImageCopy(false, 0, null);
                 return;
             };
             self.pending_image_copy.?.awaiting_output = true;
             try self.armTimer();
+        }
+
+        fn dmabufCaptureImport(buffer: *const protocol_linux_dmabuf.Buffer) !gbm.Import {
+            if (buffer.plane_count != 1 or buffer.planes[0] == null or
+                buffer.planes[0].?.modifier != gbm.modifier_linear or
+                (buffer.format != gbm.format_argb8888 and buffer.format != gbm.format_xrgb8888))
+                return error.UnsupportedCaptureTarget;
+            const plane = buffer.planes[0].?;
+            return .{
+                .width = buffer.width,
+                .height = buffer.height,
+                .format = buffer.format,
+                .modifier = plane.modifier,
+                .plane_count = buffer.plane_count,
+                .fds = .{ plane.fd, -1, -1, -1 },
+                .strides = .{ plane.stride, 0, 0, 0 },
+                .offsets = .{ plane.offset, 0, 0, 0 },
+            };
+        }
+
+        fn dmabufLeaseToken(lease: protocol_linux_dmabuf.Lease) u64 {
+            return (@as(u64, lease.generation) << 32) | lease.index;
+        }
+
+        fn dmabufLeaseFromToken(token: u64) protocol_linux_dmabuf.Lease {
+            return .{ .index = @truncate(token), .generation = @truncate(token >> 32) };
+        }
+
+        fn dmabufCaptureAlive(context: *anyopaque, token: u64) bool {
+            const adapter: *DmabufAdapter = @ptrCast(@alignCast(context));
+            return adapter.store.bufferAlive(dmabufLeaseFromToken(token));
+        }
+
+        fn dmabufCaptureDuplicate(context: *anyopaque, token: u64) !void {
+            const adapter: *DmabufAdapter = @ptrCast(@alignCast(context));
+            _ = try adapter.duplicateLease(dmabufLeaseFromToken(token));
+        }
+
+        fn dmabufCaptureRelease(context: *anyopaque, token: u64) void {
+            const adapter: *DmabufAdapter = @ptrCast(@alignCast(context));
+            adapter.releaseLease(dmabufLeaseFromToken(token)) catch unreachable;
         }
 
         fn failImageCopy(self: *Self, capture: ImageCopyCaptureAdapter.Capture) !void {
@@ -5267,25 +5436,37 @@ pub fn Coordinator(comptime protocol: type) type {
             self.markProtocol(capture.peer, ProtocolReady.image_copy_capture);
         }
 
-        fn finishActiveCapture(self: *Self, success: bool, timestamp_ns: u64) !void {
+        fn finishActiveCapture(
+            self: *Self,
+            success: bool,
+            timestamp_ns: u64,
+            readback: ?output_api.CaptureReadback,
+        ) !void {
             if (self.pending_screencopy != null)
-                return self.finishScreencopy(success, timestamp_ns);
+                return self.finishScreencopy(success, timestamp_ns, readback);
             if (self.pending_image_copy != null)
-                return self.finishImageCopy(success, timestamp_ns);
+                return self.finishImageCopy(success, timestamp_ns, readback);
             return error.MissingCapture;
         }
 
-        fn finishImageCopy(self: *Self, output_success: bool, timestamp_ns: u64) !void {
+        fn finishImageCopy(
+            self: *Self,
+            output_success: bool,
+            timestamp_ns: u64,
+            readback: ?output_api.CaptureReadback,
+        ) !void {
             const pending = &(self.pending_image_copy orelse return error.MissingCapture);
             if (!pending.copied) {
-                pending.success = false;
-                if (output_success) {
-                    if (self.copyImageCapture(pending)) |_| pending.success = true else |_| {}
+                pending.success = output_success;
+                if (output_success and std.meta.activeTag(pending.destination) == .shm) {
+                    self.copyImageCapture(
+                        pending,
+                        readback orelse return error.MissingCaptureReadback,
+                    ) catch {
+                        pending.success = false;
+                    };
                 }
-                self.shm.store.unpin(pending.pin) catch |cause| switch (cause) {
-                    error.StalePin => {},
-                    else => return cause,
-                };
+                try self.releaseImageCopyDestination(pending.destination);
                 pending.copied = true;
             }
             self.markProtocol(pending.peer, ProtocolReady.image_copy_capture);
@@ -5303,44 +5484,44 @@ pub fn Coordinator(comptime protocol: type) type {
             self.pending_image_copy = null;
         }
 
-        fn copyImageCapture(self: *Self, pending: *const PendingImageCopy) !void {
-            var access = try self.shm.store.writeAccess(pending.pin);
+        fn releaseImageCopyDestination(self: *Self, destination: ImageCopyDestination) !void {
+            switch (destination) {
+                .shm => |pin| self.shm.store.unpin(pin) catch |cause| switch (cause) {
+                    error.StalePin => {},
+                    else => return cause,
+                },
+                .dmabuf => |lease| self.dmabuf_adapter.releaseLease(lease) catch |cause| switch (cause) {
+                    error.StaleHandle => {},
+                    else => return cause,
+                },
+            }
+        }
+
+        fn copyImageCapture(
+            self: *Self,
+            pending: *const PendingImageCopy,
+            readback: output_api.CaptureReadback,
+        ) !void {
+            const pin = switch (pending.destination) {
+                .shm => |value| value,
+                .dmabuf => return error.InvalidCaptureDestination,
+            };
+            var access = try self.shm.store.writeAccess(pin);
             var ended = false;
             defer if (!ended) access.end() catch {};
             const destination_stride = try std.math.mul(usize, pending.width, 4);
             const required = try std.math.mul(usize, destination_stride, pending.height);
             if (required > access.bytes.len) return error.CaptureCapacityExceeded;
-            @memset(access.bytes[0..required], 0);
             const output = self.output orelse return error.OutputUnavailable;
-            const output_width: i64 = output.planner.output.width;
-            const output_height: i64 = output.planner.output.height;
-            const source_left = @max(@as(i64, pending.region.x), 0);
-            const source_right = @min(@as(i64, pending.region.x) + pending.region.width, output_width);
-            if (source_left < source_right) {
-                const copy_bytes: usize = @intCast((source_right - source_left) * 4);
-                const destination_x: usize = @intCast(source_left - @as(i64, pending.region.x));
-                for (0..pending.height) |destination_y| {
-                    const source_y = @as(i64, pending.region.y) + @as(i64, @intCast(destination_y));
-                    if (source_y < 0 or source_y >= output_height) continue;
-                    const source_start = try std.math.add(
-                        usize,
-                        try std.math.mul(usize, @intCast(source_y), pending.full_stride),
-                        @as(usize, @intCast(source_left)) * 4,
-                    );
-                    const destination_start = try std.math.add(
-                        usize,
-                        try std.math.mul(usize, destination_y, destination_stride),
-                        destination_x * 4,
-                    );
-                    if (source_start + copy_bytes > self.screencopy_bytes.len or
-                        destination_start + copy_bytes > required)
-                        return error.CaptureCapacityExceeded;
-                    @memcpy(
-                        access.bytes[destination_start..][0..copy_bytes],
-                        self.screencopy_bytes[source_start..][0..copy_bytes],
-                    );
-                }
-            }
+            try copyCaptureRegion(
+                access.bytes[0..required],
+                @intCast(destination_stride),
+                pending.width,
+                pending.height,
+                pending.region,
+                readback,
+                output.planner.output,
+            );
             try access.end();
             ended = true;
         }
@@ -5353,12 +5534,20 @@ pub fn Coordinator(comptime protocol: type) type {
             self.markProtocol(capture.peer, ProtocolReady.screencopy);
         }
 
-        fn finishScreencopy(self: *Self, output_success: bool, timestamp_ns: u64) !void {
+        fn finishScreencopy(
+            self: *Self,
+            output_success: bool,
+            timestamp_ns: u64,
+            readback: ?output_api.CaptureReadback,
+        ) !void {
             const pending = &(self.pending_screencopy orelse return error.MissingCapture);
             if (!pending.copied) {
                 pending.success = false;
                 if (output_success) {
-                    if (self.copyScreencopy(pending)) |_| {
+                    if (self.copyScreencopy(
+                        pending,
+                        readback orelse return error.MissingCaptureReadback,
+                    )) |_| {
                         pending.success = true;
                     } else |_| {}
                 }
@@ -5382,27 +5571,32 @@ pub fn Coordinator(comptime protocol: type) type {
             self.pending_screencopy = null;
         }
 
-        fn copyScreencopy(self: *Self, pending: *const PendingScreencopy) !void {
+        fn copyScreencopy(
+            self: *Self,
+            pending: *const PendingScreencopy,
+            readback: output_api.CaptureReadback,
+        ) !void {
             var access = try self.shm.store.writeAccess(pending.pin);
             var ended = false;
             defer if (!ended) access.end() catch {};
             const row_bytes = try std.math.mul(usize, pending.region.width, 4);
-            for (0..pending.region.height) |row| {
-                const source_row = try std.math.add(usize, pending.region.y, row);
-                const source_start = try std.math.add(
-                    usize,
-                    try std.math.mul(usize, source_row, pending.full_stride),
-                    try std.math.mul(usize, pending.region.x, 4),
-                );
-                const destination_start = try std.math.mul(usize, row, row_bytes);
-                if (source_start + row_bytes > self.screencopy_bytes.len or
-                    destination_start + row_bytes > access.bytes.len)
-                    return error.CaptureCapacityExceeded;
-                @memcpy(
-                    access.bytes[destination_start..][0..row_bytes],
-                    self.screencopy_bytes[source_start..][0..row_bytes],
-                );
-            }
+            const required = try std.math.mul(usize, row_bytes, pending.region.height);
+            if (required > access.bytes.len) return error.CaptureCapacityExceeded;
+            const output = self.output orelse return error.OutputUnavailable;
+            try copyCaptureRegion(
+                access.bytes[0..required],
+                @intCast(row_bytes),
+                pending.region.width,
+                pending.region.height,
+                .{
+                    .x = @intCast(pending.region.x),
+                    .y = @intCast(pending.region.y),
+                    .width = @intCast(pending.region.width),
+                    .height = @intCast(pending.region.height),
+                },
+                readback,
+                output.planner.output,
+            );
             try access.end();
             ended = true;
         }
@@ -6667,6 +6861,46 @@ test "physical: scene clip is the checked destination output intersection" {
         .{ .x = 9, .y = 0, .width = 2, .height = 2 },
         output,
     )) == null);
+}
+
+test "physical: capture readback copies full output without a clearing pass" {
+    const source = [_]u8{
+        1, 2,  3,  4,  5,  6,  7,  8,
+        9, 10, 11, 12, 13, 14, 15, 16,
+    };
+    var destination = [_]u8{0xaa} ** source.len;
+    try copyCaptureRegion(
+        &destination,
+        8,
+        2,
+        2,
+        .{ .x = 0, .y = 0, .width = 2, .height = 2 },
+        .{ .bytes = &source, .stride = 8 },
+        .{ .width = 2, .height = 2 },
+    );
+    try std.testing.expectEqualSlices(u8, &source, &destination);
+}
+
+test "physical: capture readback clears only out-of-output destination pixels" {
+    const zero = [_]u8{0} ** 4;
+    const source = [_]u8{
+        1, 2,  3,  4,  5,  6,  7,  8,
+        9, 10, 11, 12, 13, 14, 15, 16,
+    };
+    const expected = zero ++ zero ++ zero ++
+        zero ++ source[0..8].* ++
+        zero ++ source[8..16].*;
+    var destination = [_]u8{0xaa} ** expected.len;
+    try copyCaptureRegion(
+        &destination,
+        12,
+        3,
+        3,
+        .{ .x = -1, .y = -1, .width = 3, .height = 3 },
+        .{ .bytes = &source, .stride = 8 },
+        .{ .width = 2, .height = 2 },
+    );
+    try std.testing.expectEqualSlices(u8, &expected, &destination);
 }
 
 test "physical: window geometry origin alignment clamps hostile offsets" {

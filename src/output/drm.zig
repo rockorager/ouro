@@ -97,6 +97,14 @@ pub fn appliedSampleBinding(
 const Scheduler = scheduler_api.Scheduler(render.PresentationIdentity);
 pub const FrameOutcome = scheduler_api.FrameOutcome(render.PresentationIdentity);
 
+/// Renderer-owned capture bytes borrowed only for the synchronous
+/// `WaylandCallbacks.captured` call. The protocol/runtime owner must copy them
+/// into client storage before returning.
+pub const CaptureReadback = struct {
+    bytes: []const u8,
+    stride: u32,
+};
+
 /// The protocol/runtime implementation must transactionally activate and queue
 /// frame callbacks, then queue each sampled presentation's release callbacks
 /// and finish its lease. Returning an error retains the completed outcome for
@@ -105,7 +113,7 @@ pub const WaylandCallbacks = struct {
     context: *anyopaque,
     presented_fn: *const fn (*anyopaque, FrameOutcome, u32) anyerror!void,
     retired_fn: *const fn (*anyopaque, FrameOutcome) anyerror!void,
-    captured_fn: ?*const fn (*anyopaque, u64, bool, u64) anyerror!void = null,
+    captured_fn: ?*const fn (*anyopaque, u64, bool, u64, ?CaptureReadback) anyerror!void = null,
 
     pub fn presented(self: WaylandCallbacks, outcome: FrameOutcome, callback_data: u32) !void {
         return self.presented_fn(self.context, outcome, callback_data);
@@ -115,8 +123,15 @@ pub const WaylandCallbacks = struct {
         return self.retired_fn(self.context, outcome);
     }
 
-    pub fn captured(self: WaylandCallbacks, token: u64, success: bool, timestamp_ns: u64) !void {
-        if (self.captured_fn) |function| try function(self.context, token, success, timestamp_ns);
+    pub fn captured(
+        self: WaylandCallbacks,
+        token: u64,
+        success: bool,
+        timestamp_ns: u64,
+        readback: ?CaptureReadback,
+    ) !void {
+        if (self.captured_fn) |function|
+            try function(self.context, token, success, timestamp_ns, readback);
     }
 };
 
@@ -169,6 +184,17 @@ pub const RenderDevice = struct {
 
     pub fn rendererKind(self: *const RenderDevice) ?RendererKind {
         return if (self.renderer) |value| std.meta.activeTag(value) else null;
+    }
+
+    pub fn captureDmabufDevice(self: *RenderDevice, size: render.Size) ?u64 {
+        const renderer = &(self.renderer orelse return null);
+        switch (renderer.*) {
+            .vulkan => |*value| if (!value.supportsCaptureTarget(size)) return null,
+            .pixman => return null,
+        }
+        var status: c.struct_stat = undefined;
+        if (c.stat(self.card.devicePath().ptr, &status) != 0) return null;
+        return @intCast(status.st_rdev);
     }
 
     pub fn matches(self: *const RenderDevice, card: *const drm.Card) bool {
@@ -585,40 +611,63 @@ pub const RenderResult = union(enum) {
     retired: RenderFailure,
 };
 
+pub const CaptureDmabuf = struct {
+    import: gbm.Import,
+    source: render.Rect,
+    lease: CaptureLease,
+};
+
 pub const CaptureRequest = struct {
     token: u64,
     cursor_start: usize,
     overlay_cursor: bool,
-    bytes: []u8,
-    stride: u32,
+    destination: union(enum) {
+        shm: struct { bytes: []u8, stride: u32 },
+        dmabuf: CaptureDmabuf,
+    },
+};
+
+pub const CaptureLease = struct {
+    context: *anyopaque,
+    token: u64,
+    alive_fn: *const fn (*anyopaque, u64) bool,
+    duplicate_fn: *const fn (*anyopaque, u64) anyerror!void,
+    release_fn: *const fn (*anyopaque, u64) void,
+
+    fn alive(self: CaptureLease) bool {
+        return self.alive_fn(self.context, self.token);
+    }
+
+    fn duplicate(self: CaptureLease) !void {
+        return self.duplicate_fn(self.context, self.token);
+    }
+
+    fn release(self: CaptureLease) void {
+        self.release_fn(self.context, self.token);
+    }
+};
+
+const CachedCaptureTarget = struct {
+    lease: CaptureLease,
+    descriptor: gbm.Import,
+    target: vulkan_platform.CaptureTarget,
 };
 
 fn validateCapture(request: CaptureRequest, output: render.Size, sample_count: usize) !void {
     if (request.cursor_start > sample_count) return error.InvalidCursorPartition;
-    const row_bytes = std.math.mul(u32, output.width, 4) catch
-        return error.CaptureCapacityExceeded;
-    const byte_count = std.math.mul(usize, request.stride, output.height) catch
-        return error.CaptureCapacityExceeded;
-    if (request.stride < row_bytes or request.bytes.len < byte_count)
-        return error.CaptureCapacityExceeded;
-}
-
-fn copyCapture(
-    request: CaptureRequest,
-    source: vulkan_platform.Readback,
-    output: render.Size,
-) !void {
-    if (source.stride > request.stride) return error.CaptureCapacityExceeded;
-    const source_bytes = std.math.mul(usize, source.stride, output.height) catch
-        return error.CaptureCapacityExceeded;
-    if (source.bytes.len < source_bytes) return error.CaptureCapacityExceeded;
-    for (0..output.height) |row| {
-        const source_start = @as(usize, source.stride) * row;
-        const destination_start = @as(usize, request.stride) * row;
-        @memcpy(
-            request.bytes[destination_start..][0..source.stride],
-            source.bytes[source_start..][0..source.stride],
-        );
+    switch (request.destination) {
+        .shm => |destination| {
+            const row_bytes = std.math.mul(u32, output.width, 4) catch
+                return error.CaptureCapacityExceeded;
+            const byte_count = std.math.mul(usize, destination.stride, output.height) catch
+                return error.CaptureCapacityExceeded;
+            if (destination.stride < row_bytes or destination.bytes.len < byte_count)
+                return error.CaptureCapacityExceeded;
+        },
+        .dmabuf => |destination| if (destination.import.width != destination.source.width or
+            destination.import.height != destination.source.height or
+            destination.import.plane_count != 1)
+            return error.CaptureCapacityExceeded,
     }
 }
 
@@ -662,7 +711,8 @@ pub const Output = struct {
     in_flight_handle: ?framebuffer.Handle = null,
     pending_callback: ?FrameOutcome = null,
     pending_capture: ?CaptureRequest = null,
-    capture_copied: bool = false,
+    pending_capture_target: ?vulkan_platform.CaptureTarget = null,
+    capture_targets: std.ArrayListUnmanaged(CachedCaptureTarget) = .empty,
     event_cursor: usize = 0,
     paused: bool = false,
 
@@ -830,7 +880,8 @@ pub const Output = struct {
         self.in_flight_handle = null;
         self.pending_callback = null;
         self.pending_capture = null;
-        self.capture_copied = false;
+        self.pending_capture_target = null;
+        self.capture_targets = .empty;
         self.event_cursor = 0;
         self.import_cache_cursor = 0;
         self.paused = false;
@@ -841,11 +892,20 @@ pub const Output = struct {
     /// and releases imported targets while the pool/BOs remain alive, then R10
     /// removes framebuffers and BOs.
     pub fn destroy(self: *Output) !void {
-        if (!self.drainComplete() or self.pending_callback != null or self.pending_capture != null)
+        if (!self.drainComplete() or self.pending_callback != null or
+            self.pending_capture != null or self.pending_capture_target != null)
             return error.DrainIncomplete;
         try self.kms_output.destroy();
         try self.scanout_images.deinit();
         if (self.render_device.renderer) |*value| {
+            switch (value.*) {
+                .vulkan => |*renderer| for (self.capture_targets.items) |entry| {
+                    renderer.destroyCaptureTarget(entry.target);
+                    entry.lease.release();
+                },
+                .pixman => std.debug.assert(self.capture_targets.items.len == 0),
+            }
+            self.capture_targets.deinit(self.allocator);
             if (self.vulkan_targets) |*targets| switch (value.*) {
                 .vulkan => |*renderer| renderer.destroyTargets(targets),
                 .pixman => unreachable,
@@ -864,6 +924,42 @@ pub const Output = struct {
         const owns_render_device = self.owns_render_device;
         allocator.destroy(self);
         if (owns_render_device) render_device.destroy();
+    }
+
+    fn captureTarget(
+        self: *Output,
+        renderer: *vulkan.Renderer,
+        destination: CaptureDmabuf,
+    ) !vulkan_platform.CaptureTarget {
+        var index: usize = 0;
+        while (index < self.capture_targets.items.len) {
+            const entry = &self.capture_targets.items[index];
+            if (!entry.lease.alive()) {
+                renderer.destroyCaptureTarget(entry.target);
+                entry.lease.release();
+                _ = self.capture_targets.swapRemove(index);
+                continue;
+            }
+            if (entry.lease.context == destination.lease.context and
+                entry.lease.token == destination.lease.token and
+                std.meta.eql(entry.descriptor, destination.import))
+            {
+                try renderer.prepareCaptureTarget(entry.target, destination.import);
+                return entry.target;
+            }
+            index += 1;
+        }
+
+        try destination.lease.duplicate();
+        errdefer destination.lease.release();
+        const target = try renderer.importCaptureTarget(destination.import);
+        errdefer renderer.destroyCaptureTarget(target);
+        try self.capture_targets.append(self.allocator, .{
+            .lease = destination.lease,
+            .descriptor = destination.import,
+            .target = target,
+        });
+        return target;
     }
 
     pub fn rendererKind(self: *const Output) ?RendererKind {
@@ -936,6 +1032,10 @@ pub const Output = struct {
 
     pub fn outputId(self: *const Output) scheduler_api.OutputId {
         return self.scheduler.output;
+    }
+
+    pub fn captureDmabufDevice(self: *Output, size: render.Size) ?u64 {
+        return self.render_device.captureDmabufDevice(size);
     }
 
     pub fn currentFrameId(self: *const Output) ?scheduler_api.FrameId {
@@ -1017,7 +1117,7 @@ pub const Output = struct {
         bindSamples(color_list, bindings, self.sample_storage) catch |cause|
             return self.retireUnstartedRender(frame_id, cause);
         try self.scheduler.captureSamples(frame_id, self.sample_storage[0..bindings.len]);
-        if (try self.submitDirectScanout(frame_id, color_list, now_ns))
+        if (capture == null and try self.submitDirectScanout(frame_id, color_list, now_ns))
             return .submitted;
         const handle = self.pool.acquire() catch |cause|
             return self.retireRender(frame_id, cause);
@@ -1029,59 +1129,76 @@ pub const Output = struct {
             self.pool.discard(handle) catch {};
             return self.retireRender(frame_id, cause);
         };
-        const plan = (if (capture == null)
-            self.planner.prepare(handle, color_list, changes)
-        else
-            self.planner.prepareFull(handle, color_list, changes)) catch |cause| {
+        // Capture reads the complete acquired output image after ordinary
+        // per-image repair. Forcing full damage here would redraw unchanged
+        // output even though the planner already restores every stale region.
+        const plan = self.planner.prepare(handle, color_list, changes) catch |cause| {
             self.pool.discard(handle) catch {};
             return self.retireRender(frame_id, cause);
         };
 
         var in_fence: ?std.posix.fd_t = null;
+        var capture_target: ?vulkan_platform.CaptureTarget = null;
         const renderer = &(self.render_device.renderer orelse {
             return self.retireAndDiscard(frame_id, error.RendererUnavailable, handle);
         });
         switch (renderer.*) {
-            .pixman => |*value| if (capture) |capture_request|
-                value.renderPhased(
+            .pixman => |*value| if (capture) |capture_request| switch (capture_request.destination) {
+                .dmabuf => return self.retireAndDiscard(frame_id, error.RendererMismatch, handle),
+                .shm => |destination| value.renderPhased(
                     &self.pool,
                     handle,
                     list,
                     plan,
                     capture_request.cursor_start,
-                    if (capture_request.overlay_cursor) null else .{ .bytes = capture_request.bytes, .stride = capture_request.stride },
-                    if (capture_request.overlay_cursor) .{ .bytes = capture_request.bytes, .stride = capture_request.stride } else null,
+                    if (capture_request.overlay_cursor) null else .{ .bytes = destination.bytes, .stride = destination.stride },
+                    if (capture_request.overlay_cursor) .{ .bytes = destination.bytes, .stride = destination.stride } else null,
                 ) catch |cause| {
                     return self.retireAndDiscard(frame_id, cause, handle);
-                }
-            else
-                value.renderPool(&self.pool, handle, list, plan) catch |cause| {
-                    return self.retireAndDiscard(frame_id, cause, handle);
                 },
+            } else value.renderPool(&self.pool, handle, list, plan) catch |cause| {
+                return self.retireAndDiscard(frame_id, cause, handle);
+            },
             .vulkan => |*value| {
                 if (self.vulkan_targets == null)
                     return self.retireAndDiscard(frame_id, error.RendererUnavailable, handle);
-                const render_result = if (capture) |capture_request|
-                    value.renderCapture(
-                        &self.vulkan_targets.?,
-                        vulkan.Target.fromPool(&self.pool),
-                        handle,
-                        list,
-                        plan,
-                        capture_request.cursor_start,
-                        if (capture_request.overlay_cursor)
-                            .{ .after_cursor = true }
-                        else
-                            .{ .before_cursor = true },
-                    )
-                else
-                    value.renderPool(
-                        &self.vulkan_targets.?,
-                        &self.pool,
-                        handle,
-                        list,
-                        plan,
-                    );
+                const render_result = if (capture) |capture_request| capture_result: {
+                    const captures: vulkan_platform.Captures = if (capture_request.overlay_cursor)
+                        .{ .after_cursor = true }
+                    else
+                        .{ .before_cursor = true };
+                    break :capture_result switch (capture_request.destination) {
+                        .shm => value.renderCapture(
+                            &self.vulkan_targets.?,
+                            vulkan.Target.fromPool(&self.pool),
+                            handle,
+                            color_list,
+                            plan,
+                            capture_request.cursor_start,
+                            captures,
+                        ),
+                        .dmabuf => |destination| dmabuf: {
+                            capture_target = self.captureTarget(value, destination) catch |cause|
+                                return self.retireAndDiscard(frame_id, cause, handle);
+                            break :dmabuf value.renderCaptureTo(
+                                &self.vulkan_targets.?,
+                                vulkan.Target.fromPool(&self.pool),
+                                handle,
+                                color_list,
+                                plan,
+                                capture_request.cursor_start,
+                                captures,
+                                .{ .target = capture_target.?, .source = destination.source },
+                            );
+                        },
+                    };
+                } else value.renderPool(
+                    &self.vulkan_targets.?,
+                    &self.pool,
+                    handle,
+                    list,
+                    plan,
+                );
                 in_fence = render_result catch |cause| {
                     if (cause == error.CompletionExportFailedAfterSubmit) {
                         // The GPU has accepted work without exporting the only
@@ -1116,7 +1233,7 @@ pub const Output = struct {
         self.in_flight_frame = frame_id;
         self.in_flight_handle = handle;
         self.pending_capture = capture;
-        self.capture_copied = capture != null and std.meta.activeTag(renderer.*) == .pixman;
+        self.pending_capture_target = capture_target;
         self.planner.publish() catch unreachable;
         self.scheduler.submitPhysical(frame_id, now_ns) catch unreachable;
         return .submitted;
@@ -1230,29 +1347,38 @@ pub const Output = struct {
     ) !void {
         const capture_request = self.pending_capture orelse return;
         var success = presented;
-        if (success and !self.capture_copied) {
-            self.copyVulkanCapture(capture_request) catch {
-                success = false;
-            };
-            self.capture_copied = success;
-        }
-        try callbacks.captured(capture_request.token, success, timestamp_ns);
-        self.pending_capture = null;
-        self.capture_copied = false;
-    }
-
-    fn copyVulkanCapture(self: *Output, capture_request: CaptureRequest) !void {
-        const renderer = &(self.render_device.renderer orelse return error.RendererUnavailable);
-        const targets = &(self.vulkan_targets orelse return error.RendererUnavailable);
-        const readback = switch (renderer.*) {
-            .pixman => return error.RendererMismatch,
-            .vulkan => |*value| try value.readback(
-                targets,
-                self.in_flight_handle orelse return error.MissingCaptureTarget,
-                if (capture_request.overlay_cursor) .after_cursor else .before_cursor,
-            ),
+        var readback: ?CaptureReadback = null;
+        if (success) switch (capture_request.destination) {
+            .shm => |destination| {
+                const renderer = &(self.render_device.renderer orelse
+                    return error.RendererUnavailable);
+                switch (renderer.*) {
+                    .pixman => readback = .{
+                        .bytes = destination.bytes,
+                        .stride = destination.stride,
+                    },
+                    .vulkan => |*value| vulkan_readback: {
+                        const targets = &(self.vulkan_targets orelse return error.RendererUnavailable);
+                        const source = value.readback(
+                            targets,
+                            self.in_flight_handle orelse return error.MissingCaptureTarget,
+                            if (capture_request.overlay_cursor) .after_cursor else .before_cursor,
+                        ) catch {
+                            success = false;
+                            break :vulkan_readback;
+                        };
+                        readback = .{ .bytes = source.bytes, .stride = source.stride };
+                    },
+                }
+            },
+            .dmabuf => {},
         };
-        try copyCapture(capture_request, readback, self.planner.physical_output);
+        if (self.pending_capture_target) |target| {
+            _ = target;
+            self.pending_capture_target = null;
+        }
+        try callbacks.captured(capture_request.token, success, timestamp_ns, readback);
+        self.pending_capture = null;
     }
 
     /// Starts the Session-disable path. A submitted frame is allowed to flip
@@ -1817,8 +1943,7 @@ test "drm-sim: physical Pixman owner starts and drains in strict order" {
             .token = 77,
             .cursor_start = 0,
             .overlay_cursor = false,
-            .bytes = &captured_bytes,
-            .stride = 4,
+            .destination = .{ .shm = .{ .bytes = &captured_bytes, .stride = 4 } },
         },
     ));
     try std.testing.expectEqual(frame, output.in_flight_frame.?);
@@ -2028,11 +2153,19 @@ const SimFixture = struct {
     fn unexpectedPresented(_: *anyopaque, _: FrameOutcome, _: u32) !void {
         return error.UnexpectedPresentation;
     }
-    fn captured(context: *anyopaque, token: u64, success: bool, timestamp_ns: u64) !void {
+    fn captured(
+        context: *anyopaque,
+        token: u64,
+        success: bool,
+        timestamp_ns: u64,
+        readback: ?CaptureReadback,
+    ) !void {
         const self: *SimFixture = @ptrCast(@alignCast(context));
         try std.testing.expectEqual(@as(u64, 77), token);
         try std.testing.expect(success);
         try std.testing.expectEqual(@as(u64, 2_003_000_000), timestamp_ns);
+        try std.testing.expectEqual(@as(u32, 4), readback.?.stride);
+        try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 255 }, readback.?.bytes);
         if (self.capture_backpressure) {
             self.capture_backpressure = false;
             return error.Exhausted;

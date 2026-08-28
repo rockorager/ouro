@@ -102,6 +102,14 @@ Workloads are declared in `workloads.sh`:
   advertised-modifier DMA-BUF with explicit timeline synchronization. Missing
   protocol, DRM timeline, advertised modifier, or CPU-mappable allocation support
   is reported as unsupported rather than replaced with another path;
+- `capture-{shm,dmabuf}-{full,sparse,static}`: an ordinary 1280×720 SHM XDG
+  source workload captured into a persistent full-output destination. One
+  `ext-image-copy-capture-v1` capture is requested immediately after each
+  surface commit and completes before the next source frame. Destination
+  storage is either SHM or a one-plane LINEAR XRGB DMA-BUF. Absence of the
+  required protocol is reported as unsupported. The capture-ready lifecycle
+  proves protocol completion, but without readback it does not prove pixel
+  correctness;
 - `direct-scanout-dmabuf`: fullscreen-sized persistent DMA-BUF eligibility probe,
   only selected by `--suite scanout --scanout on`;
 - `mixed-sparse` and `mixed-scale-8`: equal SHM and DMA-BUF client populations
@@ -224,6 +232,7 @@ benchmark/run.sh --suite dynamic --runs 3
 benchmark/run.sh --suite capacity --runs 1  # High concurrent-client probes.
 benchmark/run.sh --suite native --runs 3
 benchmark/run.sh --suite sync --runs 3
+benchmark/run.sh --suite capture --runs 3
 benchmark/run.sh --suite visibility --runs 3
 benchmark/run.sh --suite lifecycle --frames 100 --duration 10
 benchmark/run.sh --suite cpu --renderer pixman --runs 3

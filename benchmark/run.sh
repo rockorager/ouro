@@ -28,7 +28,7 @@ usage: benchmark/run.sh [options]
 
   --suite NAME            quick, standard, all, shm, dmabuf, damage, viewport,
                           solid, scale, churn, mixed, color, alpha, composition, layers,
-                          dynamic, or capacity (default: quick)
+                          dynamic, capacity, or capture (default: quick)
   --runs N                repetitions per compositor/workload (default: 3)
   --workload NAME         run one workload instead of a suite
   --frames N              frames per client (default: 300)
@@ -108,7 +108,7 @@ if [[ $renderer == pixman ]]; then
     pacing=callback-only
 fi
 case "$selected_suite" in
-    quick|standard|all|shm|dmabuf|damage|viewport|solid|scale|churn|mixed|color|alpha|composition|layers|dynamic|capacity|native|sync|visibility|cpu|lifecycle|scanout) ;;
+    quick|standard|all|shm|dmabuf|damage|viewport|solid|scale|churn|mixed|color|alpha|composition|layers|dynamic|capacity|native|sync|capture|visibility|cpu|lifecycle|scanout) ;;
     *) echo "unknown suite: $selected_suite" >&2; exit 2 ;;
 esac
 if [[ $selected_suite == scanout && $scanout != on ]]; then

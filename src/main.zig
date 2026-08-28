@@ -315,6 +315,8 @@ fn compositorConfig() Compositor.Config {
             .object_capacity = 128,
             .object_quota = std.math.maxInt(u32),
             .buckets_per_client = 128,
+            // Vulkan may publish wp_linux_drm_syncobj_manager_v1 only after
+            // output discovery proves DRM syncobj support.
             .max_globals = 54,
             .registry_capacity = 4,
         },

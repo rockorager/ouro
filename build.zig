@@ -280,6 +280,45 @@ pub fn build(b: *std.Build) void {
     const benchmark_alpha_modifier_code_output = benchmark_alpha_modifier_code.addOutputFileArg(
         "alpha-modifier-v1-protocol.c",
     );
+    const benchmark_foreign_toplevel_xml = wayland_protocols.path(
+        "staging/ext-foreign-toplevel-list/ext-foreign-toplevel-list-v1.xml",
+    );
+    const benchmark_foreign_toplevel_header = b.addSystemCommand(&.{ benchmark_scanner, "client-header" });
+    benchmark_foreign_toplevel_header.addFileArg(benchmark_foreign_toplevel_xml);
+    const benchmark_foreign_toplevel_header_output = benchmark_foreign_toplevel_header.addOutputFileArg(
+        "ext-foreign-toplevel-list-v1-client-protocol.h",
+    );
+    const benchmark_foreign_toplevel_code = b.addSystemCommand(&.{ benchmark_scanner, "private-code" });
+    benchmark_foreign_toplevel_code.addFileArg(benchmark_foreign_toplevel_xml);
+    const benchmark_foreign_toplevel_code_output = benchmark_foreign_toplevel_code.addOutputFileArg(
+        "ext-foreign-toplevel-list-v1-protocol.c",
+    );
+    const benchmark_capture_source_xml = wayland_protocols.path(
+        "staging/ext-image-capture-source/ext-image-capture-source-v1.xml",
+    );
+    const benchmark_capture_source_header = b.addSystemCommand(&.{ benchmark_scanner, "client-header" });
+    benchmark_capture_source_header.addFileArg(benchmark_capture_source_xml);
+    const benchmark_capture_source_header_output = benchmark_capture_source_header.addOutputFileArg(
+        "ext-image-capture-source-v1-client-protocol.h",
+    );
+    const benchmark_capture_source_code = b.addSystemCommand(&.{ benchmark_scanner, "private-code" });
+    benchmark_capture_source_code.addFileArg(benchmark_capture_source_xml);
+    const benchmark_capture_source_code_output = benchmark_capture_source_code.addOutputFileArg(
+        "ext-image-capture-source-v1-protocol.c",
+    );
+    const benchmark_copy_capture_xml = wayland_protocols.path(
+        "staging/ext-image-copy-capture/ext-image-copy-capture-v1.xml",
+    );
+    const benchmark_copy_capture_header = b.addSystemCommand(&.{ benchmark_scanner, "client-header" });
+    benchmark_copy_capture_header.addFileArg(benchmark_copy_capture_xml);
+    const benchmark_copy_capture_header_output = benchmark_copy_capture_header.addOutputFileArg(
+        "ext-image-copy-capture-v1-client-protocol.h",
+    );
+    const benchmark_copy_capture_code = b.addSystemCommand(&.{ benchmark_scanner, "private-code" });
+    benchmark_copy_capture_code.addFileArg(benchmark_copy_capture_xml);
+    const benchmark_copy_capture_code_output = benchmark_copy_capture_code.addOutputFileArg(
+        "ext-image-copy-capture-v1-protocol.c",
+    );
     benchmark_client.root_module.addIncludePath(benchmark_xdg_header_output.dirname());
     benchmark_client.root_module.addIncludePath(benchmark_presentation_header_output.dirname());
     benchmark_client.root_module.addIncludePath(benchmark_dmabuf_header_output.dirname());
@@ -288,6 +327,9 @@ pub fn build(b: *std.Build) void {
     benchmark_client.root_module.addIncludePath(benchmark_viewporter_header_output.dirname());
     benchmark_client.root_module.addIncludePath(benchmark_single_pixel_header_output.dirname());
     benchmark_client.root_module.addIncludePath(benchmark_alpha_modifier_header_output.dirname());
+    benchmark_client.root_module.addIncludePath(benchmark_foreign_toplevel_header_output.dirname());
+    benchmark_client.root_module.addIncludePath(benchmark_capture_source_header_output.dirname());
+    benchmark_client.root_module.addIncludePath(benchmark_copy_capture_header_output.dirname());
     benchmark_client.root_module.addCSourceFile(.{
         .file = benchmark_xdg_code_output,
         .flags = &.{"-std=c11"},
@@ -318,6 +360,18 @@ pub fn build(b: *std.Build) void {
     });
     benchmark_client.root_module.addCSourceFile(.{
         .file = benchmark_alpha_modifier_code_output,
+        .flags = &.{"-std=c11"},
+    });
+    benchmark_client.root_module.addCSourceFile(.{
+        .file = benchmark_foreign_toplevel_code_output,
+        .flags = &.{"-std=c11"},
+    });
+    benchmark_client.root_module.addCSourceFile(.{
+        .file = benchmark_capture_source_code_output,
+        .flags = &.{"-std=c11"},
+    });
+    benchmark_client.root_module.addCSourceFile(.{
+        .file = benchmark_copy_capture_code_output,
         .flags = &.{"-std=c11"},
     });
     benchmark_client.root_module.addCSourceFile(.{

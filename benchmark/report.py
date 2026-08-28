@@ -152,11 +152,12 @@ def run_record(directory: Path, workload: str, compositor: str, run: int) -> dic
     if len(modes) != client_count or any(not mode for mode in modes):
         raise ValueError(f"{directory}: invalid client mode population")
     for index, client in enumerate(clients):
+        mode = modes[index]
         if client.get("pacing", "presentation") != expected_pacing:
             raise ValueError(f"{directory}: client pacing does not match case")
-        if client["workload"] != modes[index]:
+        if client["workload"] != mode:
             raise ValueError(
-                f"{directory}: client workload={client['workload']}, expected {modes[index]}"
+                f"{directory}: client workload={client['workload']}, expected {mode}"
             )
         for field in ("width", "height", "frames", "warmup"):
             if client[field] != int(case[field]):
@@ -174,6 +175,33 @@ def run_record(directory: Path, workload: str, compositor: str, run: int) -> dic
             )
         if client["discarded"] != 0:
             raise ValueError(f"{directory}: client discarded a measured frame")
+        if mode.endswith("-capture-shm"):
+            expected_capture_backing = "shm"
+        elif mode.endswith("-capture-dmabuf"):
+            expected_capture_backing = "dmabuf"
+        else:
+            expected_capture_backing = "none"
+        if client.get("capture_backing", "none") != expected_capture_backing:
+            raise ValueError(
+                f"{directory}: client capture_backing={client.get('capture_backing')}, "
+                f"expected {expected_capture_backing}"
+            )
+        expected_captures = expected_frames if expected_capture_backing != "none" else 0
+        if client.get("captures", 0) != expected_captures:
+            raise ValueError(
+                f"{directory}: client captures={client.get('captures', 0)}, "
+                f"expected {expected_captures}"
+            )
+        expected_raw_captures = (
+            expected_frames + int(case["warmup"])
+            if expected_capture_backing != "none"
+            else 0
+        )
+        if client.get("raw_captures", 0) != expected_raw_captures:
+            raise ValueError(
+                f"{directory}: client raw_captures={client.get('raw_captures', 0)}, "
+                f"expected {expected_raw_captures}"
+            )
         buffers_per_frame = client.get("buffers_per_frame", 1)
         if not isinstance(buffers_per_frame, int) or buffers_per_frame <= 0:
             raise ValueError(f"{directory}: invalid buffers_per_frame={buffers_per_frame}")
@@ -229,6 +257,7 @@ def run_record(directory: Path, workload: str, compositor: str, run: int) -> dic
         "gate_release_events": sum(client["releases"] for client in clients),
         "presented": sum(client["presented"] for client in clients),
         "discarded": sum(client["discarded"] for client in clients),
+        "captures": sum(client.get("captures", 0) for client in clients),
         "color_setup_ns": max(client.get("color_setup_ns", 0) for client in clients),
         "interval_p50_ns": percentile(intervals, 50) if intervals_complete else None,
         "interval_p95_ns": percentile(intervals, 95) if intervals_complete else None,
@@ -352,6 +381,11 @@ def aggregate(
                     "pacing": values[0]["case"].get("pacing", "presentation"),
                     "frames_per_client": frames,
                     "buffers_per_frame": buffers_per_frame,
+                    "captures_per_frame": (
+                        median(values, "captures") / (frames * clients)
+                        if kind == "paced"
+                        else 0
+                    ),
                     "gate_ns_median": median(values, "gate_ns"),
                     "color_setup_ns_median": median(values, "color_setup_ns"),
                     "actual_window_ns_median": actual_window_ns,
@@ -434,7 +468,11 @@ def print_markdown(summaries: list[dict[str, Any]], compositors: tuple[str, ...]
             summary for summary in summaries if summary["workload"] == workload
         ]
         lifecycle = next(
-            (summary for summary in workload_summaries if summary.get("kind") != "paced"),
+            (
+                summary
+                for summary in workload_summaries
+                if summary["status"] == "supported" and summary.get("kind") != "paced"
+            ),
             None,
         )
         if lifecycle is not None:

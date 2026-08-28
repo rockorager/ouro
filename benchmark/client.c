@@ -22,6 +22,8 @@
 #include <wayland-client.h>
 
 #include "alpha-modifier-v1-client-protocol.h"
+#include "ext-image-capture-source-v1-client-protocol.h"
+#include "ext-image-copy-capture-v1-client-protocol.h"
 #include "linux-dmabuf-v1-client-protocol.h"
 #include "linux-drm-syncobj-v1-client-protocol.h"
 #include "presentation-time-client-protocol.h"
@@ -47,6 +49,12 @@ enum backing {
     BACKING_SHM,
     BACKING_DMABUF,
     BACKING_SINGLE_PIXEL,
+};
+
+enum capture_backing {
+    CAPTURE_NONE,
+    CAPTURE_SHM,
+    CAPTURE_DMABUF,
 };
 
 enum pacing {
@@ -131,11 +139,22 @@ struct frame_wait {
     uint64_t observed_ns;
 };
 
+struct capture_buffer {
+    struct wl_buffer *proxy;
+    uint32_t *pixels;
+    struct gbm_device *gbm;
+    struct gbm_bo *bo;
+    size_t size;
+    int fd;
+    int drm_fd;
+};
+
 struct client {
     struct wl_display *display;
     struct wl_compositor *compositor;
     struct wl_subcompositor *subcompositor;
     struct wl_shm *shm;
+    struct wl_output *output;
     struct wp_single_pixel_buffer_manager_v1 *single_pixel_manager;
     struct wp_viewporter *viewporter;
     struct xdg_wm_base *wm_base;
@@ -146,6 +165,11 @@ struct client {
     struct wp_linux_drm_syncobj_surface_v1 *syncobj_surface;
     struct wp_color_manager_v1 *color_manager;
     struct wp_alpha_modifier_v1 *alpha_modifier_manager;
+    struct ext_output_image_capture_source_manager_v1 *capture_source_manager;
+    struct ext_image_copy_capture_manager_v1 *capture_manager;
+    struct ext_image_capture_source_v1 *capture_source;
+    struct ext_image_copy_capture_session_v1 *capture_session;
+    struct ext_image_copy_capture_frame_v1 *capture_frame;
     struct wp_color_management_surface_v1 *color_surface;
     struct wp_image_description_v1 *color_description;
     struct wp_viewport *viewport;
@@ -169,6 +193,7 @@ struct client {
     int32_t height;
     enum workload workload;
     enum backing backing;
+    enum capture_backing capture_backing;
     enum color_mode color_mode;
     enum scene_mode scene_mode;
     enum scene_action scene_action;
@@ -194,13 +219,25 @@ struct client {
     bool color_srgb_tf;
     bool color_srgb_primaries;
     bool color_ready;
+    bool capture_constraints_done;
+    bool capture_device_seen;
+    bool capture_format_seen;
+    bool capture_ready;
+    bool capture_failed;
+    bool capture_stopped;
     bool draining;
+    uint32_t capture_width;
+    uint32_t capture_height;
+    uint32_t capture_shm_format;
+    dev_t capture_device;
+    struct capture_buffer capture_buffer;
     uint64_t callbacks;
     uint64_t releases;
     uint64_t advisory_releases;
     uint64_t presented;
     uint64_t discarded;
     uint64_t submitted_buffers;
+    uint64_t captures;
     uint64_t color_setup_ns;
 };
 
@@ -537,6 +574,155 @@ static const struct zwp_linux_dmabuf_v1_listener dmabuf_listener = {
     .modifier = dmabuf_modifier,
 };
 
+static void capture_buffer_size(
+    void *data,
+    struct ext_image_copy_capture_session_v1 *session,
+    uint32_t width,
+    uint32_t height
+) {
+    (void)session;
+    struct client *client = data;
+    client->capture_width = width;
+    client->capture_height = height;
+}
+
+static void capture_shm_format(
+    void *data,
+    struct ext_image_copy_capture_session_v1 *session,
+    uint32_t format
+) {
+    (void)session;
+    struct client *client = data;
+    if (client->capture_backing != CAPTURE_SHM ||
+        (format != WL_SHM_FORMAT_XRGB8888 && format != WL_SHM_FORMAT_ARGB8888 &&
+            format != WL_SHM_FORMAT_XBGR8888 && format != WL_SHM_FORMAT_ABGR8888))
+        return;
+    if (!client->capture_format_seen || format == WL_SHM_FORMAT_XRGB8888 ||
+        format == WL_SHM_FORMAT_XBGR8888)
+        client->capture_shm_format = format;
+    client->capture_format_seen = true;
+}
+
+static void capture_dmabuf_device(
+    void *data,
+    struct ext_image_copy_capture_session_v1 *session,
+    struct wl_array *device
+) {
+    (void)session;
+    struct client *client = data;
+    if (device->size != sizeof(client->capture_device))
+        protocol_fail("capture DMA-BUF device has unexpected dev_t size");
+    memcpy(&client->capture_device, device->data, sizeof(client->capture_device));
+    client->capture_device_seen = true;
+}
+
+static void capture_dmabuf_format(
+    void *data,
+    struct ext_image_copy_capture_session_v1 *session,
+    uint32_t format,
+    struct wl_array *modifiers
+) {
+    (void)session;
+    struct client *client = data;
+    if (client->capture_backing != CAPTURE_DMABUF || format != DRM_FORMAT_XRGB8888) return;
+    uint64_t *modifier;
+    wl_array_for_each(modifier, modifiers)
+        if (*modifier == DRM_FORMAT_MOD_LINEAR) client->capture_format_seen = true;
+}
+
+static void capture_constraints_done(
+    void *data,
+    struct ext_image_copy_capture_session_v1 *session
+) {
+    (void)session;
+    ((struct client *)data)->capture_constraints_done = true;
+}
+
+static void capture_session_stopped(
+    void *data,
+    struct ext_image_copy_capture_session_v1 *session
+) {
+    (void)session;
+    ((struct client *)data)->capture_stopped = true;
+}
+
+static const struct ext_image_copy_capture_session_v1_listener capture_session_listener = {
+    .buffer_size = capture_buffer_size,
+    .shm_format = capture_shm_format,
+    .dmabuf_device = capture_dmabuf_device,
+    .dmabuf_format = capture_dmabuf_format,
+    .done = capture_constraints_done,
+    .stopped = capture_session_stopped,
+};
+
+static void capture_transform(
+    void *data,
+    struct ext_image_copy_capture_frame_v1 *frame,
+    uint32_t transform
+) {
+    (void)data;
+    (void)frame;
+    if (transform != WL_OUTPUT_TRANSFORM_NORMAL)
+        protocol_fail("capture buffer has unexpected transform");
+}
+
+static void capture_damage(
+    void *data,
+    struct ext_image_copy_capture_frame_v1 *frame,
+    int32_t x,
+    int32_t y,
+    int32_t width,
+    int32_t height
+) {
+    (void)data;
+    (void)frame;
+    if (width <= 0 || height <= 0 || x < 0 || y < 0)
+        protocol_fail("capture reported malformed damage");
+}
+
+static void capture_presentation_time(
+    void *data,
+    struct ext_image_copy_capture_frame_v1 *frame,
+    uint32_t tv_sec_hi,
+    uint32_t tv_sec_lo,
+    uint32_t tv_nsec
+) {
+    (void)data;
+    (void)frame;
+    (void)tv_sec_hi;
+    (void)tv_sec_lo;
+    if (tv_nsec >= UINT32_C(1000000000))
+        protocol_fail("capture reported malformed presentation time");
+}
+
+static void capture_ready(
+    void *data,
+    struct ext_image_copy_capture_frame_v1 *frame
+) {
+    (void)frame;
+    struct client *client = data;
+    client->capture_ready = true;
+    client->captures++;
+}
+
+static void capture_failed(
+    void *data,
+    struct ext_image_copy_capture_frame_v1 *frame,
+    uint32_t reason
+) {
+    (void)frame;
+    (void)reason;
+    ((struct client *)data)->capture_failed = true;
+}
+
+static const struct ext_image_copy_capture_frame_v1_listener capture_frame_listener = {
+    .transform = capture_transform,
+    .damage = capture_damage,
+    .presentation_time = capture_presentation_time,
+    .ready = capture_ready,
+    .failed = capture_failed,
+};
+
 static void registry_global(
     void *data,
     struct wl_registry *registry,
@@ -570,6 +756,13 @@ static void registry_global(
         );
     } else if (strcmp(interface, wl_shm_interface.name) == 0) {
         client->shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
+    } else if (strcmp(interface, wl_output_interface.name) == 0 && client->output == NULL) {
+        client->output = wl_registry_bind(
+            registry,
+            name,
+            &wl_output_interface,
+            version < 4 ? version : 4
+        );
     } else if (strcmp(interface, xdg_wm_base_interface.name) == 0) {
         client->wm_base = wl_registry_bind(registry, name, &xdg_wm_base_interface, 1);
     } else if (strcmp(interface, wp_presentation_interface.name) == 0) {
@@ -609,6 +802,23 @@ static void registry_global(
             registry,
             name,
             &wp_alpha_modifier_v1_interface,
+            1
+        );
+    } else if (strcmp(
+        interface,
+        ext_output_image_capture_source_manager_v1_interface.name
+    ) == 0) {
+        client->capture_source_manager = wl_registry_bind(
+            registry,
+            name,
+            &ext_output_image_capture_source_manager_v1_interface,
+            1
+        );
+    } else if (strcmp(interface, ext_image_copy_capture_manager_v1_interface.name) == 0) {
+        client->capture_manager = wl_registry_bind(
+            registry,
+            name,
+            &ext_image_copy_capture_manager_v1_interface,
             1
         );
     }
@@ -1127,6 +1337,176 @@ static void setup_explicit_sync(struct client *client) {
         protocol_fail("create explicit synchronization surface");
 }
 
+static void create_capture_buffer(struct client *client) {
+    struct capture_buffer *buffer = &client->capture_buffer;
+    *buffer = (struct capture_buffer){ .fd = -1, .drm_fd = -1 };
+    if (client->capture_width > INT32_MAX / 4 || client->capture_height > INT32_MAX ||
+        (size_t)client->capture_width > SIZE_MAX / 4 / (size_t)client->capture_height)
+        protocol_fail("capture buffer dimensions exceed client range");
+    buffer->size = (size_t)client->capture_width * (size_t)client->capture_height * 4;
+    if (client->capture_backing == CAPTURE_SHM) {
+        if (buffer->size > INT32_MAX) protocol_fail("capture SHM pool exceeds protocol range");
+        buffer->fd = memfd_create(
+            "ouro-benchmark-capture-shm",
+            MFD_CLOEXEC | MFD_ALLOW_SEALING
+        );
+        if (buffer->fd < 0 || ftruncate(buffer->fd, (off_t)buffer->size) != 0)
+            fail("create capture SHM");
+        buffer->pixels = mmap(
+            NULL,
+            buffer->size,
+            PROT_READ | PROT_WRITE,
+            MAP_SHARED,
+            buffer->fd,
+            0
+        );
+        if (buffer->pixels == MAP_FAILED) fail("map capture SHM");
+        struct wl_shm_pool *pool = wl_shm_create_pool(
+            client->shm,
+            buffer->fd,
+            (int32_t)buffer->size
+        );
+        if (pool == NULL) protocol_fail("create capture SHM pool");
+        buffer->proxy = wl_shm_pool_create_buffer(
+            pool,
+            0,
+            (int32_t)client->capture_width,
+            (int32_t)client->capture_height,
+            (int32_t)client->capture_width * 4,
+            client->capture_shm_format
+        );
+        wl_shm_pool_destroy(pool);
+    } else {
+        drmDevicePtr device = NULL;
+        if (drmGetDeviceFromDevId(client->capture_device, 0, &device) != 0)
+            unsupported("advertised capture DMA-BUF device");
+        const char *node = NULL;
+        if (device->available_nodes & (1 << DRM_NODE_RENDER))
+            node = device->nodes[DRM_NODE_RENDER];
+        else if (device->available_nodes & (1 << DRM_NODE_PRIMARY))
+            node = device->nodes[DRM_NODE_PRIMARY];
+        if (node == NULL) {
+            drmFreeDevice(&device);
+            unsupported("capture DMA-BUF DRM node");
+        }
+        buffer->drm_fd = open(node, O_RDWR | O_CLOEXEC);
+        drmFreeDevice(&device);
+        if (buffer->drm_fd < 0) fail("open capture DMA-BUF device");
+        buffer->gbm = gbm_create_device(buffer->drm_fd);
+        if (buffer->gbm == NULL) fail("create capture GBM device");
+        static const uint64_t modifiers[] = { DRM_FORMAT_MOD_LINEAR };
+        buffer->bo = gbm_bo_create_with_modifiers2(
+            buffer->gbm,
+            client->capture_width,
+            client->capture_height,
+            GBM_FORMAT_XRGB8888,
+            modifiers,
+            1,
+            GBM_BO_USE_RENDERING
+        );
+        if (buffer->bo == NULL || gbm_bo_get_plane_count(buffer->bo) != 1 ||
+            gbm_bo_get_modifier(buffer->bo) != DRM_FORMAT_MOD_LINEAR)
+            unsupported("one-plane LINEAR capture DMA-BUF allocation");
+        struct zwp_linux_buffer_params_v1 *params =
+            zwp_linux_dmabuf_v1_create_params(client->dmabuf);
+        const int fd = gbm_bo_get_fd_for_plane(buffer->bo, 0);
+        if (params == NULL || fd < 0) fail("export capture DMA-BUF");
+        zwp_linux_buffer_params_v1_add(
+            params,
+            fd,
+            0,
+            gbm_bo_get_offset(buffer->bo, 0),
+            gbm_bo_get_stride_for_plane(buffer->bo, 0),
+            0,
+            DRM_FORMAT_MOD_LINEAR
+        );
+        close(fd);
+        buffer->proxy = zwp_linux_buffer_params_v1_create_immed(
+            params,
+            (int32_t)client->capture_width,
+            (int32_t)client->capture_height,
+            DRM_FORMAT_XRGB8888,
+            0
+        );
+        zwp_linux_buffer_params_v1_destroy(params);
+    }
+    if (buffer->proxy == NULL) protocol_fail("create capture wl_buffer");
+    if (wl_display_roundtrip(client->display) < 0) fail("publish capture buffer");
+}
+
+static void setup_capture(struct client *client) {
+    if (client->capture_backing == CAPTURE_NONE) return;
+    if (client->output == NULL || client->capture_source_manager == NULL ||
+        client->capture_manager == NULL)
+        unsupported("ext-image-copy-capture-v1 output capture");
+    if (client->capture_backing == CAPTURE_DMABUF && client->dmabuf == NULL)
+        unsupported("linux-dmabuf-v1 capture destination");
+    client->capture_source = ext_output_image_capture_source_manager_v1_create_source(
+        client->capture_source_manager,
+        client->output
+    );
+    client->capture_session = ext_image_copy_capture_manager_v1_create_session(
+        client->capture_manager,
+        client->capture_source,
+        0
+    );
+    if (client->capture_source == NULL || client->capture_session == NULL ||
+        ext_image_copy_capture_session_v1_add_listener(
+            client->capture_session,
+            &capture_session_listener,
+            client
+        ) != 0)
+        protocol_fail("create capture session");
+    while (!client->capture_constraints_done && !client->capture_stopped)
+        if (wl_display_dispatch(client->display) < 0)
+            fail("wait for capture constraints");
+    if (client->capture_stopped) unsupported("live ext-image-copy-capture-v1 session");
+    if (client->capture_width == 0 || client->capture_height == 0 ||
+        !client->capture_format_seen)
+        unsupported("requested capture buffer format");
+    if (client->capture_backing == CAPTURE_DMABUF && !client->capture_device_seen)
+        unsupported("capture DMA-BUF device advertisement");
+    create_capture_buffer(client);
+}
+
+static void begin_capture(struct client *client) {
+    if (client->capture_backing == CAPTURE_NONE) return;
+    if (client->capture_frame != NULL)
+        protocol_fail("capture frame remained live across source commits");
+    client->capture_ready = false;
+    client->capture_failed = false;
+    client->capture_frame = ext_image_copy_capture_session_v1_create_frame(
+        client->capture_session
+    );
+    if (client->capture_frame == NULL || ext_image_copy_capture_frame_v1_add_listener(
+        client->capture_frame,
+        &capture_frame_listener,
+        client
+    ) != 0) protocol_fail("create capture frame");
+    ext_image_copy_capture_frame_v1_attach_buffer(
+        client->capture_frame,
+        client->capture_buffer.proxy
+    );
+    ext_image_copy_capture_frame_v1_damage_buffer(
+        client->capture_frame,
+        0,
+        0,
+        (int32_t)client->capture_width,
+        (int32_t)client->capture_height
+    );
+    ext_image_copy_capture_frame_v1_capture(client->capture_frame);
+}
+
+static void wait_for_capture(struct client *client) {
+    if (client->capture_backing == CAPTURE_NONE) return;
+    while (!client->capture_ready && !client->capture_failed && !client->capture_stopped)
+        if (wl_display_dispatch(client->display) < 0) fail("wait for captured frame");
+    if (client->capture_failed || client->capture_stopped)
+        protocol_fail("capture did not complete successfully");
+    ext_image_copy_capture_frame_v1_destroy(client->capture_frame);
+    client->capture_frame = NULL;
+}
+
 static void setup(struct client *client, const char *socket_path, const char *drm_path) {
     client->display = connect_path(socket_path);
     struct wl_registry *registry = wl_display_get_registry(client->display);
@@ -1226,6 +1606,7 @@ static void setup(struct client *client, const char *socket_path, const char *dr
                 fail("publish persistent buffer");
         }
     }
+    setup_capture(client);
     if (client->backing == BACKING_SINGLE_PIXEL) {
         wl_surface_attach(client->surface, client->buffers[0].proxy, 0, 0);
         wl_surface_damage_buffer(client->surface, 0, 0, 1, 1);
@@ -1491,7 +1872,9 @@ static void submit_scene_frame(
         wl_surface_commit(layer->surface);
     }
     wl_surface_commit(client->surface);
+    begin_capture(client);
     wait_for_frame(client, wait, pacing, sequence, NULL);
+    wait_for_capture(client);
 }
 
 static void submit_frame(
@@ -1615,7 +1998,9 @@ static void submit_frame(
         }
     }
     wl_surface_commit(client->surface);
+    begin_capture(client);
     wait_for_frame(client, wait, pacing, sequence, buffer);
+    wait_for_capture(client);
 }
 
 static void cleanup(struct client *client) {
@@ -1637,6 +2022,21 @@ static void cleanup(struct client *client) {
         free(client->scene_layers);
         destroy_buffer(&client->root_buffer);
     }
+    if (client->capture_frame != NULL)
+        ext_image_copy_capture_frame_v1_destroy(client->capture_frame);
+    if (client->capture_buffer.proxy != NULL)
+        wl_buffer_destroy(client->capture_buffer.proxy);
+    if (client->capture_buffer.pixels != NULL &&
+        client->capture_buffer.pixels != MAP_FAILED)
+        munmap(client->capture_buffer.pixels, client->capture_buffer.size);
+    if (client->capture_buffer.fd >= 0) close(client->capture_buffer.fd);
+    if (client->capture_buffer.bo != NULL) gbm_bo_destroy(client->capture_buffer.bo);
+    if (client->capture_buffer.gbm != NULL) gbm_device_destroy(client->capture_buffer.gbm);
+    if (client->capture_buffer.drm_fd >= 0) close(client->capture_buffer.drm_fd);
+    if (client->capture_session != NULL)
+        ext_image_copy_capture_session_v1_destroy(client->capture_session);
+    if (client->capture_source != NULL)
+        ext_image_capture_source_v1_destroy(client->capture_source);
     if (client->color_surface != NULL) wp_color_management_surface_v1_destroy(client->color_surface);
     if (client->color_description != NULL) wp_image_description_v1_destroy(client->color_description);
     if (client->alpha_modifier != NULL)
@@ -1650,6 +2050,10 @@ static void cleanup(struct client *client) {
     if (client->presentation != NULL) wp_presentation_destroy(client->presentation);
     if (client->alpha_modifier_manager != NULL)
         wp_alpha_modifier_v1_destroy(client->alpha_modifier_manager);
+    if (client->capture_manager != NULL)
+        ext_image_copy_capture_manager_v1_destroy(client->capture_manager);
+    if (client->capture_source_manager != NULL)
+        ext_output_image_capture_source_manager_v1_destroy(client->capture_source_manager);
     if (client->color_manager != NULL) wp_color_manager_v1_destroy(client->color_manager);
     if (client->dmabuf != NULL) zwp_linux_dmabuf_v1_destroy(client->dmabuf);
     if (client->syncobj_timeline != NULL)
@@ -1658,6 +2062,7 @@ static void cleanup(struct client *client) {
         wp_linux_drm_syncobj_manager_v1_destroy(client->syncobj_manager);
     if (client->wm_base != NULL) xdg_wm_base_destroy(client->wm_base);
     if (client->shm != NULL) wl_shm_destroy(client->shm);
+    if (client->output != NULL) wl_output_destroy(client->output);
     if (client->single_pixel_manager != NULL)
         wp_single_pixel_buffer_manager_v1_destroy(client->single_pixel_manager);
     if (client->viewporter != NULL) wp_viewporter_destroy(client->viewporter);
@@ -1705,7 +2110,25 @@ static void detach_content(struct client *client) {
     wl_surface_commit(client->surface);
 }
 
+static bool strip_suffix(char *name, const char *suffix) {
+    const size_t name_length = strlen(name);
+    const size_t suffix_length = strlen(suffix);
+    if (name_length < suffix_length ||
+        strcmp(name + name_length - suffix_length, suffix) != 0)
+        return false;
+    name[name_length - suffix_length] = '\0';
+    return true;
+}
+
 static void parse_workload(struct client *client, const char *name) {
+    char normalized[256];
+    if (strlen(name) >= sizeof(normalized)) protocol_fail("workload name is too long");
+    strcpy(normalized, name);
+    if (strip_suffix(normalized, "-capture-shm"))
+        client->capture_backing = CAPTURE_SHM;
+    else if (strip_suffix(normalized, "-capture-dmabuf"))
+        client->capture_backing = CAPTURE_DMABUF;
+    name = normalized;
     const char *workload;
     if (strncmp(name, "shm-", 4) == 0) {
         client->backing = BACKING_SHM;
@@ -1907,6 +2330,7 @@ int main(int argc, char **argv) {
         .width = (int32_t)parse_positive(argv[3], "width"),
         .height = (int32_t)parse_positive(argv[4], "height"),
         .drm_fd = -1,
+        .capture_buffer = { .fd = -1, .drm_fd = -1 },
     };
     parse_workload(&client, argv[2]);
     const enum pacing pacing = parse_pacing(argv[8]);
@@ -1955,6 +2379,7 @@ int main(int argc, char **argv) {
     const uint64_t presented_before = client.presented;
     const uint64_t discarded_before = client.discarded;
     const uint64_t submitted_buffers_before = client.submitted_buffers;
+    const uint64_t captures_before = client.captures;
     const uint64_t started_ns = monotonic_ns();
     uint64_t first_actual_ns = 0;
     uint64_t last_actual_ns = 0;
@@ -1988,13 +2413,14 @@ int main(int argc, char **argv) {
         "\"advisory_releases\":%" PRIu64 ","
         "\"presented\":%" PRIu64 ",\"discarded\":%" PRIu64 ","
         "\"submitted_buffers\":%" PRIu64 ","
+        "\"capture_backing\":\"%s\",\"captures\":%" PRIu64 ","
         "\"native_modifier\":%s,\"explicit_sync\":%s,"
         "\"modifier\":%" PRIu64 ",\"plane_count\":%u,"
         "\"color_setup_ns\":%" PRIu64 ","
         "\"raw_callbacks\":%" PRIu64 ",\"raw_releases\":%" PRIu64 ","
         "\"raw_advisory_releases\":%" PRIu64 ","
         "\"raw_presented\":%" PRIu64 ",\"raw_discarded\":%" PRIu64 ","
-        "\"raw_submitted_buffers\":%" PRIu64 ","
+        "\"raw_submitted_buffers\":%" PRIu64 ",\"raw_captures\":%" PRIu64 ","
         "\"start_to_gate_ns\":%" PRIu64 ",\"observed_window_ns\":%" PRIu64 ","
         "\"actual_window_ns\":%" PRIu64 ",\"first_actual_ns\":%" PRIu64 ","
         "\"last_actual_ns\":%" PRIu64 ",\"actual_intervals_ns\":[",
@@ -2012,6 +2438,9 @@ int main(int argc, char **argv) {
         client.presented - presented_before,
         client.discarded - discarded_before,
         client.submitted_buffers - submitted_buffers_before,
+        client.capture_backing == CAPTURE_SHM ? "shm" :
+            client.capture_backing == CAPTURE_DMABUF ? "dmabuf" : "none",
+        client.captures - captures_before,
         client.native_modifier ? "true" : "false",
         client.explicit_sync ? "true" : "false",
         client.backing == BACKING_DMABUF ? client.buffers[0].modifier : 0,
@@ -2023,6 +2452,7 @@ int main(int argc, char **argv) {
         client.presented,
         client.discarded,
         client.submitted_buffers,
+        client.captures,
         gated_ns - started_ns,
         last_observed_ns - first_observed_ns,
         last_actual_ns - first_actual_ns,
