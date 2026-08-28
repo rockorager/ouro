@@ -284,9 +284,13 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         }
 
         pub fn install(adapter: *Self, runtime: *Runtime) !objects.Handle {
-            if (adapter.runtime != null) return error.AlreadyInstalled;
+            if (adapter.global != null) return error.AlreadyInstalled;
+            const first_install = adapter.runtime == null;
+            if (!first_install and adapter.runtime.? != runtime) return error.AlreadyInstalled;
             adapter.runtime = runtime;
-            errdefer adapter.runtime = null;
+            errdefer if (first_install) {
+                adapter.runtime = null;
+            };
             const global = try runtime.addGlobalWithBinder(
                 &Seat.info,
                 adapter.global_version,
@@ -295,6 +299,34 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             );
             adapter.global = global;
             return global;
+        }
+
+        /// Withdraws this seat global while preserving already-bound seat and
+        /// child resources. A later install may republish the same isolated
+        /// seat after those resources and its virtual devices have retired.
+        pub fn removeGlobal(adapter: *Self) !void {
+            const runtime = adapter.runtime orelse return error.NotInstalled;
+            const global = adapter.global orelse return error.NotInstalled;
+            try runtime.removeGlobal(global);
+            adapter.global = null;
+        }
+
+        pub fn globalName(adapter: *const Self) ?u32 {
+            return if (adapter.global) |global| global.id else null;
+        }
+
+        pub fn resourceCount(adapter: *const Self) usize {
+            var count: usize = 0;
+            for (adapter.seats.entries.items) |slot| count += @intFromBool(slot.header.active);
+            for (adapter.pointers.entries.items) |slot| count += @intFromBool(slot.header.active);
+            for (adapter.keyboards.entries.items) |slot| count += @intFromBool(slot.header.active);
+            return count;
+        }
+
+        pub fn deviceCount(adapter: *const Self) usize {
+            var count: usize = 0;
+            for (adapter.devices) |slot| count += @intFromBool(slot.active);
+            return count;
         }
 
         fn bind(context: ?*anyopaque, binding: wayring.server.Binding) !?*anyopaque {
@@ -2760,6 +2792,8 @@ test "seat: child resources outlive seat release and stale generations are rejec
     var core: FakeCore = .{};
     var adapter = try testAdapter(&core);
     defer adapter.deinit();
+    try std.testing.expectEqual(@as(usize, 0), adapter.resourceCount());
+    try std.testing.expectEqual(@as(usize, 0), adapter.deviceCount());
     var server_objects = try wayring.objects.ServerObjects.init(
         std.testing.allocator,
         8,
@@ -2775,13 +2809,16 @@ test "seat: child resources outlive seat release and stale generations are rejec
     pointer.client = clientId(seat.peer);
     pointer.resource = try server_objects.insertClient(3, &test_protocol.wl_pointer.info, 9, pointer);
     const old_id = adapter.pointerId(pointer);
+    try std.testing.expectEqual(@as(usize, 2), adapter.resourceCount());
 
     const seat_object = server_objects.namespace.resolve(seat.resource).?.*;
     try std.testing.expect(adapter.resourceRemoved(seat.resource, seat_object));
+    try std.testing.expectEqual(@as(usize, 1), adapter.resourceCount());
     _ = try adapter.resolvePointer(old_id);
 
     const pointer_object = server_objects.namespace.resolve(pointer.resource).?.*;
     try std.testing.expect(adapter.resourceRemoved(pointer.resource, pointer_object));
+    try std.testing.expectEqual(@as(usize, 0), adapter.resourceCount());
     try std.testing.expectError(error.StalePointer, adapter.resolvePointer(old_id));
     const replacement = try adapter.pointers.acquire();
     try std.testing.expectEqual(old_id.index, adapter.pointerIndex(replacement));
