@@ -45,7 +45,7 @@ test "shell-input: core compatibility extensions cross generated runtime" {
         &reactor,
         try wayring.unix_socket.connect(path),
         .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 },
-        .{ .max_objects = 8, .max_client_ids = 7 },
+        .{ .max_objects = 16, .max_client_ids = 15 },
     );
     const actor = try client.actor();
     var driver = ClientDriver.init(&client);
@@ -61,7 +61,8 @@ test "shell-input: core compatibility extensions cross generated runtime" {
         _ = try loop.turn(coordinator);
         if (handler.fixes != null and handler.system_bell != null and
             handler.toplevel_drag_manager != null and
-            handler.toplevel_icon_manager != null and handler.toplevel_icon_done == 1) break;
+            handler.toplevel_icon_manager != null and handler.toplevel_icon_done == 1 and
+            handler.gtk_surface != null and handler.gtk_capabilities == 1) break;
         _ = linux.sched_yield();
     }
     try std.testing.expect(handler.fixes != null);
@@ -71,6 +72,29 @@ test "shell-input: core compatibility extensions cross generated runtime" {
     try std.testing.expect(handler.toplevel_drag_manager != null);
     try std.testing.expect(handler.toplevel_icon_manager != null);
     try std.testing.expectEqual(@as(usize, 1), handler.toplevel_icon_done);
+    try std.testing.expectEqual(@as(u32, 5), handler.gtk_shell_version);
+    try std.testing.expectEqual(@as(usize, 1), handler.gtk_capabilities);
+
+    try protocol.gtk_surface1.encodeRequest(
+        &actor.transmit,
+        handler.gtk_surface.?.id,
+        .{ .set_dbus_properties = .{
+            .application_id = "org.ouro.Test",
+            .app_menu_path = null,
+            .menubar_path = null,
+            .window_object_path = "/org/ouro/Test",
+            .application_object_path = null,
+            .unique_bus_name = null,
+        } },
+    );
+    try protocol.gtk_surface1.encodeRequest(&actor.transmit, handler.gtk_surface.?.id, .{ .set_modal = .{} });
+    try wayring.client.sendRequest(
+        protocol.gtk_surface1,
+        &client.objects,
+        &actor.transmit,
+        handler.gtk_surface.?,
+        .{ .release = .{} },
+    );
 
     try protocol.xdg_system_bell_v1.encodeRequest(
         &actor.transmit,
@@ -153,6 +177,12 @@ const WaylandFixesHandler = struct {
     toplevel_drag_manager: ?wayring.objects.Handle = null,
     toplevel_icon_manager: ?wayring.objects.Handle = null,
     toplevel_icon_done: usize = 0,
+    compositor: ?wayring.objects.Handle = null,
+    surface: ?wayring.objects.Handle = null,
+    gtk_shell: ?wayring.objects.Handle = null,
+    gtk_shell_version: u32 = 0,
+    gtk_surface: ?wayring.objects.Handle = null,
+    gtk_capabilities: usize = 0,
     event_failures: usize = 0,
 
     pub fn eventError(self: *WaylandFixesHandler, _: wayring.io_uring.Peer, _: ClientCore.EventFailure) void {
@@ -173,6 +203,15 @@ const WaylandFixesHandler = struct {
             switch (try protocol.xdg_toplevel_icon_manager_v1.decodeEvent(message, fds)) {
                 .icon_size => return error.UnexpectedPreferredIconSize,
                 .done => self.toplevel_icon_done += 1,
+            }
+            return .continue_dispatch;
+        }
+        if (target.object.interface == &protocol.gtk_shell1.info) {
+            switch (try protocol.gtk_shell1.decodeEvent(message, fds)) {
+                .capabilities => |value| {
+                    try std.testing.expectEqual(@as(u32, 0), value.capabilities);
+                    self.gtk_capabilities += 1;
+                },
             }
             return .continue_dispatch;
         }
@@ -220,10 +259,49 @@ const WaylandFixesHandler = struct {
                     @min(value.version, 1),
                     null,
                 );
+            } else if (std.mem.eql(u8, value.interface, protocol.wl_compositor.info.name)) {
+                self.compositor = try ClientCore.bind(
+                    self.objects,
+                    self.queue,
+                    self.registry,
+                    value.name,
+                    &protocol.wl_compositor.info,
+                    @min(value.version, 6),
+                    null,
+                );
+                try self.maybeCreateGtkSurface();
+            } else if (std.mem.eql(u8, value.interface, protocol.gtk_shell1.info.name)) {
+                self.gtk_shell_version = value.version;
+                self.gtk_shell = try ClientCore.bind(
+                    self.objects,
+                    self.queue,
+                    self.registry,
+                    value.name,
+                    &protocol.gtk_shell1.info,
+                    @min(value.version, 5),
+                    null,
+                );
+                try self.maybeCreateGtkSurface();
             },
             .global_remove => {},
         }
         return .continue_dispatch;
+    }
+
+    fn maybeCreateGtkSurface(self: *WaylandFixesHandler) !void {
+        if (self.gtk_surface != null or self.compositor == null or self.gtk_shell == null) return;
+        self.surface = (try protocol.wl_compositor.construct_create_surface(
+            self.objects,
+            self.queue,
+            self.compositor.?,
+            .{},
+        )).id;
+        self.gtk_surface = (try protocol.gtk_shell1.construct_get_gtk_surface(
+            self.objects,
+            self.queue,
+            self.gtk_shell.?,
+            .{ .surface = self.surface.?.id },
+        )).gtk_surface;
     }
 };
 
