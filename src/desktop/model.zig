@@ -196,6 +196,7 @@ pub fn Desktop(comptime Shell: type) type {
         destroyed: ?ToplevelId = null,
         destroyed_surface: ?Shell.SurfaceId = null,
         scene_changed: bool = false,
+        foreign_toplevel_changed: bool = false,
 
         pub fn init(
             allocator: std.mem.Allocator,
@@ -447,6 +448,14 @@ pub fn Desktop(comptime Shell: type) type {
             const changed = desktop.scene_changed;
             desktop.scene_changed = false;
             return changed;
+        }
+
+        pub fn foreignToplevelChanged(desktop: *const Self) bool {
+            return desktop.foreign_toplevel_changed;
+        }
+
+        pub fn markForeignToplevelSynced(desktop: *Self) void {
+            desktop.foreign_toplevel_changed = false;
         }
 
         pub fn transactionPending(desktop: *const Self) bool {
@@ -809,6 +818,9 @@ pub fn Desktop(comptime Shell: type) type {
                         try desktop.resetUnmapped(index);
                         return;
                     }
+                    desktop.foreign_toplevel_changed =
+                        desktop.slots[index].content_ready != commit.mapped or
+                        desktop.foreign_toplevel_changed;
                     desktop.slots[index].content_ready = commit.mapped;
                     desktop.slots[index].scene.content_ready = commit.mapped;
                     desktop.slots[index].target_scene.content_ready = commit.mapped;
@@ -1022,6 +1034,7 @@ pub fn Desktop(comptime Shell: type) type {
             desktop.live -= 1;
             try desktop.reflow();
             desktop.destroyed = id;
+            desktop.foreign_toplevel_changed = true;
         }
 
         fn setParent(desktop: *Self, id: ToplevelId, parent: ?ToplevelId) !void {
@@ -1062,6 +1075,8 @@ pub fn Desktop(comptime Shell: type) type {
                 desktop.removeTile(index);
             desktop.unmapParenting(index);
             const slot = &desktop.slots[index];
+            desktop.foreign_toplevel_changed = slot.content_ready or
+                desktop.foreign_toplevel_changed;
             slot.mode = .tiled;
             slot.floating = desktop.defaultFloating();
             slot.fullscreen = false;
@@ -1096,6 +1111,10 @@ pub fn Desktop(comptime Shell: type) type {
             if (source.title.len > desktop.metadata_bytes or source.app_id.len > desktop.metadata_bytes)
                 return error.MetadataTooLong;
             const slot = &desktop.slots[try desktop.resolveIndex(id)];
+            desktop.foreign_toplevel_changed =
+                !std.mem.eql(u8, slot.title[0..slot.title_len], source.title) or
+                !std.mem.eql(u8, slot.app_id[0..slot.app_id_len], source.app_id) or
+                desktop.foreign_toplevel_changed;
             @memcpy(slot.title[0..source.title.len], source.title);
             @memcpy(slot.app_id[0..source.app_id.len], source.app_id);
             slot.title_len = source.title.len;
@@ -1942,6 +1961,50 @@ fn settleDesktop(desktop: *TestDesktop, shell: *TestShell) !void {
         } });
     }
     _ = try desktop.consume(shell, shell.len);
+}
+
+test "desktop: foreign toplevel dirtiness excludes steady commits" {
+    var desktop = try initTestDesktop(8);
+    defer desktop.deinit();
+    var shell = TestShell{};
+    const shell_id: TestShell.ToplevelId = .{ .index = 0, .generation = 1 };
+
+    shell.push(created(0));
+    _ = try desktop.consume(&shell, 1);
+    try std.testing.expect(!desktop.foreignToplevelChanged());
+
+    shell.title = "title";
+    shell.app_id = "app";
+    shell.push(.{ .metadata_changed = shell_id });
+    _ = try desktop.consume(&shell, 1);
+    try std.testing.expect(desktop.foreignToplevelChanged());
+    desktop.markForeignToplevelSynced();
+
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expect(desktop.foreignToplevelChanged());
+    desktop.markForeignToplevelSynced();
+
+    shell.push(.{ .commit_ready = .{ .id = shell_id, .serial = 0 } });
+    _ = try desktop.consume(&shell, 1);
+    try std.testing.expect(!desktop.foreignToplevelChanged());
+
+    shell.push(.{ .metadata_changed = shell_id });
+    _ = try desktop.consume(&shell, 1);
+    try std.testing.expect(!desktop.foreignToplevelChanged());
+    shell.title = "new title";
+    shell.push(.{ .metadata_changed = shell_id });
+    _ = try desktop.consume(&shell, 1);
+    try std.testing.expect(desktop.foreignToplevelChanged());
+    desktop.markForeignToplevelSynced();
+
+    shell.push(.{ .commit_ready = .{ .id = shell_id, .serial = 0, .unmapped = true } });
+    _ = try desktop.consume(&shell, 1);
+    try std.testing.expect(desktop.foreignToplevelChanged());
+    desktop.markForeignToplevelSynced();
+
+    shell.push(.{ .toplevel_destroyed = shell_id });
+    _ = try desktop.consume(&shell, 1);
+    try std.testing.expect(desktop.foreignToplevelChanged());
 }
 
 test "desktop: shell events produce exact tiling, focus, metadata, and configures" {

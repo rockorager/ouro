@@ -273,6 +273,7 @@ pub fn Adapter(comptime protocol: type) type {
             return null;
         }
         pub fn pendingOutbound(self: *const Self, peer: wayring.io_uring.Peer) bool {
+            if (self.outbound_count == 0) return false;
             for (self.outbound) |o| if (o.active) {
                 if (o.kind == .finished) {
                     if (samePeer(self.lists[o.owner].peer, peer)) return true;

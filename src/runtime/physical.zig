@@ -2798,10 +2798,15 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (consumed == 0) break;
                 self.stats.shell_events += consumed;
             }
-            self.syncForeignToplevels() catch |cause| switch (cause) {
-                error.Exhausted => {},
-                else => return cause,
-            };
+            if (self.desktop.foreignToplevelChanged()) {
+                const synced = if (self.syncForeignToplevels())
+                    true
+                else |cause| switch (cause) {
+                    error.Exhausted => false,
+                    else => return cause,
+                };
+                if (synced) self.desktop.markForeignToplevelSynced();
+            }
             if (self.foreignToplevelOutbound())
                 self.markProtocolAll(ProtocolReady.foreign_toplevel_list);
             while (self.desktop.pendingCommands() != 0) {
