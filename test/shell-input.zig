@@ -343,10 +343,11 @@ test "shell-input: generated transient seat publishes before ready and retires i
     for (0..512) |_| {
         _ = try drainClient(&reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
-        if (handler.manager != null) break;
+        if (handler.manager != null and handler.virtual_pointer_manager != null) break;
         _ = linux.sched_yield();
     }
     try std.testing.expect(handler.manager != null);
+    try std.testing.expect(handler.virtual_pointer_manager != null);
 
     handler.creating = true;
     handler.transient = (try protocol.ext_transient_seat_manager_v1.construct_create(
@@ -370,6 +371,38 @@ test "shell-input: generated transient seat publishes before ready and retires i
 
     const transient = handler.transient.?;
     const seat = handler.seat.?;
+    const virtual_pointer = (try protocol.zwlr_virtual_pointer_manager_v1.construct_create_virtual_pointer(
+        &client.objects,
+        &actor.transmit,
+        handler.virtual_pointer_manager.?,
+        .{ .seat = seat.id },
+    )).id;
+    try submitClient(&reactor, &driver, &handler);
+    for (0..256) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.pointer_capability) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(handler.pointer_capability);
+
+    try wayring.client.sendRequest(
+        protocol.zwlr_virtual_pointer_v1,
+        &client.objects,
+        &actor.transmit,
+        virtual_pointer,
+        .{ .destroy = .{} },
+    );
+    try submitClient(&reactor, &driver, &handler);
+    for (0..256) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (!handler.pointer_capability and handler.capability_events >= 3) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(!handler.pointer_capability);
+    try std.testing.expect(handler.capability_events >= 3);
+
     try wayring.client.sendRequest(
         protocol.ext_transient_seat_v1,
         &client.objects,
@@ -427,6 +460,7 @@ const TransientSeatHandler = struct {
     queue: *wayring.tx.Queue,
     registry: wayring.objects.Handle,
     manager: ?wayring.objects.Handle = null,
+    virtual_pointer_manager: ?wayring.objects.Handle = null,
     transient: ?wayring.objects.Handle = null,
     seat: ?wayring.objects.Handle = null,
     creating: bool = false,
@@ -439,6 +473,8 @@ const TransientSeatHandler = struct {
     ready: usize = 0,
     denied: usize = 0,
     seat_events: usize = 0,
+    capability_events: usize = 0,
+    pointer_capability: bool = false,
     event_failures: usize = 0,
 
     pub fn eventError(self: *TransientSeatHandler, _: wayring.io_uring.Peer, _: ClientCore.EventFailure) void {
@@ -455,6 +491,8 @@ const TransientSeatHandler = struct {
             switch (try ClientCore.decodeRegistryEvent(self.objects, self.registry, message, fds)) {
                 .global => |value| if (std.mem.eql(u8, value.interface, protocol.ext_transient_seat_manager_v1.info.name)) {
                     self.manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.ext_transient_seat_manager_v1.info, 1, null);
+                } else if (std.mem.eql(u8, value.interface, protocol.zwlr_virtual_pointer_manager_v1.info.name)) {
+                    self.virtual_pointer_manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.zwlr_virtual_pointer_manager_v1.info, @min(value.version, 2), null);
                 } else if (std.mem.eql(u8, value.interface, protocol.wl_seat.info.name)) {
                     if (self.seat_name_count == self.seat_names.len) return error.TooManySeatGlobals;
                     self.seat_names[self.seat_name_count] = value.name;
@@ -482,7 +520,13 @@ const TransientSeatHandler = struct {
                 .denied => self.denied += 1,
             }
         } else if (target.object.interface == &protocol.wl_seat.info) {
-            _ = try protocol.wl_seat.decodeEvent(message, fds);
+            switch (try protocol.wl_seat.decodeEvent(message, fds)) {
+                .capabilities => |value| {
+                    self.pointer_capability = value.capabilities.contains(protocol.wl_seat.capability.pointer);
+                    self.capability_events += 1;
+                },
+                .name => {},
+            }
             self.seat_events += 1;
         } else return error.UnexpectedEvent;
         return .continue_dispatch;
