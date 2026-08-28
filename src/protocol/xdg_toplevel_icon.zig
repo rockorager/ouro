@@ -656,3 +656,79 @@ test "toplevel icon assignment snapshots name and publishes on commit" {
     try std.testing.expect(empty.immutable);
     try std.testing.expect(adapter.findAssignment(toplevel) == null);
 }
+
+test "toplevel icon assignment deep copies ordinary SHM variants" {
+    const protocol = @import("core_protocol");
+    const FakeShell = struct {
+        pub const SurfaceId = packed struct { index: u32, generation: u32 };
+        pub const ToplevelId = packed struct { index: u32, generation: u32 };
+
+        pub fn toplevelForSurface(_: *@This(), surface: SurfaceId) !ToplevelId {
+            return .{ .index = surface.index, .generation = surface.generation };
+        }
+    };
+    const TestShm = wayring.server.Shm(protocol);
+    const A = Adapter(protocol, FakeShell, TestShm);
+    const formats = [_]wayring.shm.Format{
+        .{ .value = protocol.wl_shm.format.argb8888.value, .bytes_per_pixel = 4 },
+        .{ .value = protocol.wl_shm.format.xrgb8888.value, .bytes_per_pixel = 4 },
+    };
+    var shm = try TestShm.init(std.testing.allocator, .{
+        .limits = .{ .max_pool_bytes = 4096 },
+        .pool_capacity = 1,
+        .buffer_capacity = 1,
+        .formats = &formats,
+    });
+    defer shm.deinit(std.testing.allocator);
+    var shell: FakeShell = .{};
+    var adapter = try A.init(std.testing.allocator, &shell, &shm, .{
+        .manager_capacity = 1,
+        .icon_capacity = 1,
+        .variant_capacity = 1,
+        .assignment_capacity = 1,
+        .name_bytes = 8,
+        .max_snapshot_bytes = 32,
+    });
+    defer adapter.deinit();
+
+    const linux = std.os.linux;
+    const result = linux.memfd_create("ouro-toplevel-icon-test", linux.MFD.CLOEXEC);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(result));
+    const fd: linux.fd_t = @intCast(result);
+    errdefer _ = linux.close(fd);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.ftruncate(fd, 16)));
+    const original = [_]u8{ 1, 2, 3, 4 } ** 4;
+    try std.testing.expectEqual(@as(usize, original.len), linux.pwrite(fd, &original, original.len, 0));
+    const pool = try shm.store.addPool(fd, 16);
+    const token = try shm.store.addBuffer(pool, formats[1], 0, 2, 2, 8);
+
+    const icon = try adapter.acquireIcon();
+    const variant = try adapter.acquireVariant();
+    variant.* = .{
+        .active = true,
+        .generation = variant.generation,
+        .icon_index = 0,
+        .icon_generation = icon.generation,
+        .buffer = .{ .id = 9, .generation = 1 },
+        .token = token,
+        .width = 2,
+        .scale = 1,
+        .stride = 8,
+        .format = formats[1],
+        .extent = 16,
+    };
+    const toplevel: FakeShell.ToplevelId = .{ .index = 3, .generation = 4 };
+    try adapter.assign(toplevel, icon);
+    const replacement = [_]u8{ 9, 8, 7, 6 } ** 4;
+    try std.testing.expectEqual(@as(usize, replacement.len), linux.pwrite(fd, &replacement, replacement.len, 0));
+    adapter.releaseIcon(0);
+    try shm.store.destroyBuffer(token);
+    try shm.store.destroyPoolResource(pool);
+
+    try adapter.surfaceCommitted(.{ .index = 3, .generation = 4 });
+    const snapshot_value = adapter.snapshot(toplevel).?;
+    try std.testing.expectEqual(@as(usize, 1), snapshot_value.variants.len);
+    try std.testing.expectEqualSlices(u8, &original, snapshot_value.variants[0].bytes);
+    try adapter.reset(toplevel);
+    try adapter.surfaceCommitted(.{ .index = 3, .generation = 4 });
+}
