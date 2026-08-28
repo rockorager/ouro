@@ -21,12 +21,6 @@ pub const Config = struct {
     }
 };
 
-pub const KeymapObserver = struct {
-    context: ?*anyopaque = null,
-    canUpdateFn: *const fn (?*anyopaque) bool,
-    updatedFn: *const fn (?*anyopaque) void,
-};
-
 pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
     return struct {
         const Self = @This();
@@ -37,6 +31,11 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
         pub const SeatResolver = struct {
             context: ?*anyopaque = null,
             resolveFn: *const fn (?*anyopaque, wayring.io_uring.Peer, u32) ?*Seat,
+        };
+        pub const KeymapObserver = struct {
+            context: ?*anyopaque = null,
+            canUpdateFn: *const fn (?*anyopaque, *Seat) bool,
+            updatedFn: *const fn (?*anyopaque, *Seat) void,
         };
         const ManagerSlot = struct {
             header: slot_pool.Header = .{},
@@ -51,6 +50,7 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
             seat: ?*Seat = null,
             keymap: bool = false,
             registered: bool = false,
+            modifier_owner: bool = false,
             deferred_fd: linux.fd_t = -1,
             deferred_size: u32 = 0,
             pressed: [key_words]u64 = [_]u64{0} ** key_words,
@@ -62,8 +62,7 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
         devices: slot_pool.Pool(Device),
         runtime: ?*Runtime = null,
         global: ?objects.Handle = null,
-        modifier_owner: ?DeviceId = null,
-        inhibited: bool = false,
+        inhibited_seat: ?*Seat = null,
         keymap_observer: ?KeymapObserver = null,
 
         pub fn init(allocator: std.mem.Allocator, seat_resolver: SeatResolver, config: Config) !Self {
@@ -149,8 +148,8 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                             return try self.protocolError(actor, decoded.handle.id, Keyboard.@"error".invalid_keymap_format.value, "invalid keymap format");
                         validateKeymap(fd, payload.size) catch
                             return try self.failure(actor, decoded.handle.id, error.InvalidKeymap);
-                        if (!self.inhibited) if (self.keymap_observer) |observer| {
-                            if (!observer.canUpdateFn(observer.context)) return try self.noMemory(actor);
+                        if (!self.inhibited(device)) if (self.keymap_observer) |observer| {
+                            if (!observer.canUpdateFn(observer.context, seat)) return try self.noMemory(actor);
                         };
                         const id = self.inputId(device);
                         const added = !device.registered;
@@ -158,7 +157,7 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                             seat.addVirtualKeyboard(id) catch return try self.noMemory(actor);
                             device.registered = true;
                         }
-                        if (self.inhibited) {
+                        if (self.inhibited(device)) {
                             if (device.deferred_fd >= 0) _ = linux.close(device.deferred_fd);
                             device.deferred_fd = fd;
                             device.deferred_size = payload.size;
@@ -172,7 +171,7 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                                 return try self.failure(actor, decoded.handle.id, err);
                             };
                             fd = -1;
-                            if (self.keymap_observer) |observer| observer.updatedFn(observer.context);
+                            if (self.keymap_observer) |observer| observer.updatedFn(observer.context, seat);
                         }
                         device.keymap = true;
                     },
@@ -183,7 +182,7 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                         };
                         if (!device.keymap) return try self.noKeymap(actor, decoded.handle.id);
                         if (payload.state > 1) return try self.failure(actor, decoded.handle.id, error.InvalidKeyState);
-                        if (device.registered and !self.inhibited) {
+                        if (device.registered and !self.inhibited(device)) {
                             if (payload.key >= key_count)
                                 return try self.failure(actor, decoded.handle.id, error.InvalidKeyCode);
                             const mask = @as(u64, 1) << @intCast(payload.key & 63);
@@ -202,10 +201,14 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                             return .continue_dispatch;
                         };
                         if (!device.keymap) return try self.noKeymap(actor, decoded.handle.id);
-                        if (device.registered and !self.inhibited) {
+                        if (device.registered and !self.inhibited(device)) {
                             seat.virtualModifiers(.{ .depressed = payload.mods_depressed, .latched = payload.mods_latched, .locked = payload.mods_locked, .group = payload.group }) catch |err|
                                 return try self.failure(actor, decoded.handle.id, err);
-                            self.modifier_owner = self.deviceId(device);
+                            for (self.devices.entries.items) |other| {
+                                if (other.header.active and other.seat == seat)
+                                    other.modifier_owner = false;
+                            }
+                            device.modifier_owner = true;
                         }
                     },
                 }
@@ -215,32 +218,39 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
             return null;
         }
 
-        pub fn clearModifierOwnerOnPhysicalInput(self: *Self) void {
-            self.modifier_owner = null;
+        pub fn clearModifierOwnerOnPhysicalInput(self: *Self, seat: *Seat) void {
+            for (self.devices.entries.items) |device| {
+                if (device.header.active and device.seat == seat)
+                    device.modifier_owner = false;
+            }
         }
 
-        pub fn setInhibited(self: *Self, inhibited: bool) !void {
-            if (inhibited) {
-                self.inhibited = true;
-                for (self.devices.entries.items) |device| if (device.header.active) try self.releasePressed(device);
-                if (self.modifierOwnerSeat()) |seat| {
+        pub fn setInhibited(self: *Self, seat: *Seat, enabled: bool) !void {
+            if (enabled) {
+                self.inhibited_seat = seat;
+                var restore = false;
+                for (self.devices.entries.items) |device| if (device.header.active and device.seat == seat) {
+                    try self.releasePressed(device);
+                    restore = restore or device.modifier_owner;
+                    device.modifier_owner = false;
+                };
+                if (restore) {
                     try seat.restoreDerivedModifiers();
-                    self.modifier_owner = null;
                 }
                 return;
             }
-            if (!self.inhibited) return;
+            if (self.inhibited_seat != seat) return;
             for (self.devices.entries.items) |device| {
-                if (!device.header.active or device.deferred_fd < 0) continue;
+                if (!device.header.active or device.seat != seat or device.deferred_fd < 0) continue;
                 if (self.keymap_observer) |observer| {
-                    if (!observer.canUpdateFn(observer.context)) return error.Exhausted;
+                    if (!observer.canUpdateFn(observer.context, seat)) return error.Exhausted;
                 }
-                try (device.seat orelse continue).setKeymapOwned(device.deferred_fd, device.deferred_size);
+                try seat.setKeymapOwned(device.deferred_fd, device.deferred_size);
                 device.deferred_fd = -1;
                 device.deferred_size = 0;
-                if (self.keymap_observer) |observer| observer.updatedFn(observer.context);
+                if (self.keymap_observer) |observer| observer.updatedFn(observer.context, seat);
             }
-            self.inhibited = false;
+            self.inhibited_seat = null;
         }
 
         pub fn resourceRemoved(self: *Self, handle: objects.Handle, object: objects.Object) bool {
@@ -270,11 +280,9 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
 
         fn releaseDevice(self: *Self, device: *Device) void {
             if (!device.header.active) return;
-            const id = self.deviceId(device);
             self.releasePressed(device) catch {};
             if (device.registered) if (device.seat) |seat| seat.removeVirtualKeyboard(self.inputId(device)) catch {};
-            if (self.modifier_owner != null and std.meta.eql(self.modifier_owner.?, id)) {
-                self.modifier_owner = null;
+            if (device.modifier_owner) {
                 if (device.seat) |seat| seat.restoreDerivedModifiers() catch {};
             }
             if (device.deferred_fd >= 0) _ = linux.close(device.deferred_fd);
@@ -300,11 +308,8 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
         fn deviceId(self: *Self, device: *const Device) DeviceId {
             return .{ .index = self.deviceIndex(device), .generation = device.header.generation };
         }
-        fn modifierOwnerSeat(self: *Self) ?*Seat {
-            const owner = self.modifier_owner orelse return null;
-            const device = self.devices.at(owner.index) orelse return null;
-            if (device.header.generation != owner.generation) return null;
-            return device.seat;
+        fn inhibited(self: *const Self, device: *const Device) bool {
+            return device.seat != null and device.seat == self.inhibited_seat;
         }
         fn deviceIndex(_: *const Self, device: *const Device) u32 {
             return device.header.index;
@@ -393,20 +398,31 @@ test "inhibition releases keys and applies the latest deferred keymap on resume"
     const A = Adapter(protocol, TestSeat);
     var seat: TestSeat = .{};
     defer seat.deinit();
-    var adapter = try A.init(std.testing.allocator, .{ .context = &seat, .resolveFn = resolveTestSeat }, .{ .manager_capacity = 1, .device_capacity = 1 });
+    var other_seat: TestSeat = .{};
+    defer other_seat.deinit();
+    var adapter = try A.init(std.testing.allocator, .{ .context = &seat, .resolveFn = resolveTestSeat }, .{ .manager_capacity = 1, .device_capacity = 2 });
     defer adapter.deinit();
     const device = try adapter.acquireDevice();
     device.seat = &seat;
     device.keymap = true;
     device.registered = true;
     device.pressed[30 / 64] |= @as(u64, 1) << (30 & 63);
-    adapter.modifier_owner = adapter.deviceId(device);
+    device.modifier_owner = true;
+    const other = try adapter.acquireDevice();
+    other.seat = &other_seat;
+    other.keymap = true;
+    other.registered = true;
+    other.pressed[31 / 64] |= @as(u64, 1) << (31 & 63);
+    other.modifier_owner = true;
 
-    try adapter.setInhibited(true);
-    try std.testing.expect(adapter.inhibited);
+    try adapter.setInhibited(&seat, true);
+    try std.testing.expect(adapter.inhibited_seat == &seat);
     try std.testing.expectEqual(@as(usize, 1), seat.releases);
     try std.testing.expectEqual(@as(usize, 1), seat.restores);
     try std.testing.expectEqual(@as(u64, 0), device.pressed[30 / 64]);
+    try std.testing.expectEqual(@as(usize, 0), other_seat.releases);
+    try std.testing.expect(other.pressed[31 / 64] != 0);
+    try std.testing.expect(other.modifier_owner);
 
     const fd = try testKeymapFd();
     defer _ = linux.close(fd);
@@ -414,8 +430,8 @@ test "inhibition releases keys and applies the latest deferred keymap on resume"
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(duplicated));
     device.deferred_fd = @intCast(duplicated);
     device.deferred_size = 4;
-    try adapter.setInhibited(false);
-    try std.testing.expect(!adapter.inhibited);
+    try adapter.setInhibited(&seat, false);
+    try std.testing.expect(adapter.inhibited_seat == null);
     try std.testing.expectEqual(@as(usize, 1), seat.keymap_updates);
     try std.testing.expectEqual(@as(linux.fd_t, -1), device.deferred_fd);
 }
@@ -435,7 +451,7 @@ test "only the exact modifier owner restores derived state on removal" {
     const second = try adapter.acquireDevice();
     second.seat = &second_seat;
     second.registered = true;
-    adapter.modifier_owner = adapter.deviceId(second);
+    second.modifier_owner = true;
 
     adapter.releaseDevice(first);
     try std.testing.expectEqual(@as(usize, 0), first_seat.restores);

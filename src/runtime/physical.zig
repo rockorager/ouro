@@ -2495,7 +2495,7 @@ pub fn Coordinator(comptime protocol: type) type {
                         if (delivery_event == .keyboard_key) keyboard_accepted = true;
                     }
                     if (keyboard_transition and keyboard_accepted)
-                        self.virtual_keyboard_adapter.clearModifierOwnerOnPhysicalInput();
+                        self.virtual_keyboard_adapter.clearModifierOwnerOnPhysicalInput(&self.seat_adapter);
                 }
                 self.input_seat_accepted = true;
             }
@@ -3483,7 +3483,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.input_method_adapter.setGrabInhibited(true) catch {
                     input_ready = false;
                 };
-                self.virtual_keyboard_adapter.setInhibited(true) catch {
+                self.virtual_keyboard_adapter.setInhibited(&self.seat_adapter, true) catch {
                     input_ready = false;
                 };
                 self.tablet_state.suspendFocus(0) catch {
@@ -3511,7 +3511,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.session_lock_frame = null;
                 self.session_lock_input_ready = false;
                 try self.input_method_adapter.setGrabInhibited(false);
-                try self.virtual_keyboard_adapter.setInhibited(false);
+                try self.virtual_keyboard_adapter.setInhibited(&self.seat_adapter, false);
                 try self.syncLayerKeyboardFocus();
             }
             if (self.output) |output| {
@@ -3775,13 +3775,15 @@ pub fn Coordinator(comptime protocol: type) type {
             return self.seat_adapter.duplicateKeymap();
         }
 
-        fn canUpdateInputMethodKeymap(context: ?*anyopaque) bool {
+        fn canUpdateInputMethodKeymap(context: ?*anyopaque, seat: *SeatAdapter) bool {
             const self: *Self = @ptrCast(@alignCast(context orelse return false));
+            if (seat != &self.seat_adapter) return true;
             return self.input_method_adapter.canQueueKeymapUpdate();
         }
 
-        fn inputMethodKeymapUpdated(context: ?*anyopaque) void {
+        fn inputMethodKeymapUpdated(context: ?*anyopaque, seat: *SeatAdapter) void {
             const self: *Self = @ptrCast(@alignCast(context orelse return));
+            if (seat != &self.seat_adapter) return;
             self.input_method_adapter.keymapUpdated() catch unreachable;
             self.markInputMethodProtocol();
         }
