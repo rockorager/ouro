@@ -24,6 +24,7 @@ pub const Config = struct {
 pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime CursorTarget: type) type {
     return struct {
         const Self = @This();
+        const Runtime = wayring.server.Runtime(protocol);
         const ProtocolCore = wayring.server.Core(protocol);
         const ManagerProtocol = protocol.ext_image_copy_capture_manager_v1;
         const SessionProtocol = protocol.ext_image_copy_capture_session_v1;
@@ -129,6 +130,8 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
         capture_count: usize = 0,
         outbound_count: usize = 0,
         sequence: u64 = 1,
+        runtime: ?*Runtime = null,
+        global: ?objects.Handle = null,
 
         pub fn init(allocator: std.mem.Allocator, c: Config) !Self {
             try c.validate();
@@ -156,6 +159,19 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
             self.allocator.free(self.cursor_sessions);
             self.allocator.free(self.sessions);
             self.* = undefined;
+        }
+
+        pub fn install(self: *Self, runtime: *Runtime) !objects.Handle {
+            if (self.runtime != null or self.global != null) return error.AlreadyInstalled;
+            self.runtime = runtime;
+            errdefer self.runtime = null;
+            self.global = try runtime.addGlobalWithBinder(&ManagerProtocol.info, 1, self, bindManager);
+            return self.global.?;
+        }
+
+        fn bindManager(context: ?*anyopaque, _: wayring.server.Binding) !?*anyopaque {
+            const self: *Self = @ptrCast(@alignCast(context orelse return error.InvalidContext));
+            return self;
         }
 
         /// Core admission API, also useful to runtimes which decode centrally.

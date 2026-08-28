@@ -70,6 +70,7 @@ const protocol_virtual_pointer = @import("../protocol/virtual_pointer.zig");
 const protocol_wlr_screencopy = @import("../protocol/wlr_screencopy.zig");
 const protocol_foreign_toplevel_list = @import("../protocol/foreign_toplevel_list.zig");
 const protocol_image_capture_source = @import("../protocol/image_capture_source.zig");
+const protocol_image_copy_capture = @import("../protocol/image_copy_capture.zig");
 const cursor_theme = @import("../cursor_theme.zig");
 const theme_cursor = @import("../scene/theme_cursor.zig");
 const desktop_model = @import("../desktop/model.zig");
@@ -134,6 +135,11 @@ pub fn Coordinator(comptime protocol: type) type {
             protocol,
             output_scheduler.OutputId,
             Desktop.ToplevelId,
+        );
+        const ImageCopyCaptureAdapter = protocol_image_copy_capture.Adapter(
+            protocol,
+            ImageCaptureSourceAdapter,
+            SeatAdapter.PointerId,
         );
         const TabletState = tablet_input.State(SeatAdapter.FocusTarget);
         const TabletAdapter = protocol_tablet_v2.Adapter(protocol, SeatAdapter);
@@ -238,13 +244,14 @@ pub fn Coordinator(comptime protocol: type) type {
             const input_method: u32 = 1 << 25;
             const screencopy: u32 = 1 << 26;
             const foreign_toplevel_list: u32 = 1 << 27;
+            const image_copy_capture: u32 = 1 << 28;
             const all: u32 = decoration | shell | seat | data_device | dmabuf |
                 activation | relative_pointer | fractional_scale | output | core |
                 pointer_constraints | color_management | color_representation |
                 primary_selection | text_input | pointer_gestures |
                 shortcuts_inhibit | xdg_foreign | xdg_output | layer_shell | session_lock |
                 idle_notify | tablet | ext_data_control | wlr_data_control | input_method |
-                screencopy | foreign_toplevel_list;
+                screencopy | foreign_toplevel_list | image_copy_capture;
         };
         const Client = struct {
             active: bool = false,
@@ -349,6 +356,7 @@ pub fn Coordinator(comptime protocol: type) type {
             wlr_screencopy: protocol_wlr_screencopy.Config = .{},
             foreign_toplevel_list: protocol_foreign_toplevel_list.Config = .{},
             image_capture_source: protocol_image_capture_source.Config = .{},
+            image_copy_capture: protocol_image_copy_capture.Config = .{},
             linux_dmabuf: protocol_linux_dmabuf.Config = .{},
             linux_drm_syncobj: protocol_linux_drm_syncobj.Config = .{},
             xdg_activation: protocol_xdg_activation.Config = .{},
@@ -451,6 +459,7 @@ pub fn Coordinator(comptime protocol: type) type {
         screencopy_adapter: ScreencopyAdapter,
         foreign_toplevel_list_adapter: ForeignToplevelListAdapter,
         image_capture_source_adapter: ImageCaptureSourceAdapter,
+        image_copy_capture_adapter: ImageCopyCaptureAdapter,
         dmabuf_adapter: DmabufAdapter,
         syncobj_device: ?drm_syncobj.Device = null,
         syncobj_adapter: ?SyncobjAdapter = null,
@@ -764,6 +773,11 @@ pub fn Coordinator(comptime protocol: type) type {
                 config.image_capture_source,
             );
             errdefer self.image_capture_source_adapter.deinit();
+            self.image_copy_capture_adapter = try ImageCopyCaptureAdapter.init(
+                allocator,
+                config.image_copy_capture,
+            );
+            errdefer self.image_copy_capture_adapter.deinit();
             self.interaction = try Interaction.init(allocator, config.interaction);
             errdefer self.interaction.deinit();
             self.seat_adapter = try SeatAdapter.init(
@@ -1297,6 +1311,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.interaction.deinit();
             self.desktop.deinit();
             self.foreign_toplevel_list_adapter.deinit();
+            self.image_copy_capture_adapter.deinit();
             self.image_capture_source_adapter.deinit();
             self.shell_adapter.deinit();
             if (self.syncobj_adapter) |*adapter| adapter.deinit();
@@ -1346,6 +1361,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.shortcuts_inhibit_adapter.disconnected(peer);
             self.foreign_adapter.disconnected(peer);
             self.foreign_toplevel_list_adapter.disconnected(peer);
+            self.image_copy_capture_adapter.disconnected(peer);
             self.image_capture_source_adapter.disconnected(peer);
             self.input_method_adapter.disconnected(peer);
             self.virtual_keyboard_adapter.disconnected(peer);
@@ -1639,6 +1655,34 @@ pub fn Coordinator(comptime protocol: type) type {
                 return control;
             }
             if (try self.image_capture_source_adapter.request(peer, target, message, fds, self)) |control| {
+                try self.flushProtocol();
+                return control;
+            }
+            if (try self.image_copy_capture_adapter.managerRequestOn(
+                actor,
+                objects,
+                peer,
+                target,
+                message,
+                fds,
+                &self.image_capture_source_adapter,
+                self,
+            )) |control| {
+                if (self.image_copy_capture_adapter.pendingOutbound(peer))
+                    self.markProtocol(peer, ProtocolReady.image_copy_capture);
+                try self.flushProtocol();
+                return control;
+            }
+            if (try self.image_copy_capture_adapter.requestOn(
+                actor,
+                objects,
+                peer,
+                target,
+                message,
+                fds,
+            )) |control| {
+                if (self.image_copy_capture_adapter.pendingOutbound(peer))
+                    self.markProtocol(peer, ProtocolReady.image_copy_capture);
                 try self.flushProtocol();
                 return control;
             }
@@ -2643,6 +2687,38 @@ pub fn Coordinator(comptime protocol: type) type {
             return null;
         }
 
+        pub fn resolveCursorTarget(
+            self: *Self,
+            _: wayring.io_uring.Peer,
+            server_objects: anytype,
+            _: ImageCaptureSourceAdapter.Target,
+            pointer_object: u32,
+        ) ?SeatAdapter.PointerId {
+            return self.seat_adapter.pointerIdOn(server_objects, pointer_object) catch null;
+        }
+
+        pub fn captureConstraints(
+            self: *Self,
+            target: ImageCopyCaptureAdapter.Target,
+        ) ?ImageCopyCaptureAdapter.Constraints {
+            return switch (target) {
+                .source => |source| switch (source) {
+                    .output => |id| if (self.output) |output|
+                        if (std.meta.eql(output.outputId(), id)) .{
+                            .width = output.planner.output.width,
+                            .height = output.planner.output.height,
+                        } else null
+                    else
+                        null,
+                    .toplevel => |id| if (self.desktop.scene(id)) |scene| .{
+                        .width = std.math.cast(u32, scene.geometry.width) orelse return null,
+                        .height = std.math.cast(u32, scene.geometry.height) orelse return null,
+                    } else |_| null,
+                },
+                .cursor => null,
+            };
+        }
+
         fn syncDesktopTimer(self: *Self) !void {
             const pending = self.desktop.transactionPending() and
                 self.desktop.pendingCommands() == 0 and !self.stopping;
@@ -3573,6 +3649,8 @@ pub fn Coordinator(comptime protocol: type) type {
                     objects,
                     &actor.transmit,
                 );
+            if (client.protocol_ready & ProtocolReady.image_copy_capture != 0)
+                flushed += try self.image_copy_capture_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.output != 0)
                 flushed += try self.output_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.xdg_output != 0)
@@ -3721,6 +3799,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (ready & ProtocolReady.foreign_toplevel_list != 0 and
                 !self.foreign_toplevel_list_adapter.pendingOutbound(client.peer))
                 ready &= ~ProtocolReady.foreign_toplevel_list;
+            if (ready & ProtocolReady.image_copy_capture != 0 and
+                !self.image_copy_capture_adapter.pendingOutbound(client.peer))
+                ready &= ~ProtocolReady.image_copy_capture;
             if (ready & ProtocolReady.output != 0 and
                 !self.output_adapter.pendingOutboundOn(client.peer))
                 ready &= ~ProtocolReady.output;
@@ -5771,6 +5852,7 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.virtual_pointer_adapter.resourceRemoved(handle, object);
             _ = self.screencopy_adapter.resourceRemoved(handle, object);
             _ = self.foreign_toplevel_list_adapter.resourceRemoved(handle, object);
+            _ = self.image_copy_capture_adapter.resourceRemoved(handle, object);
             _ = self.image_capture_source_adapter.resourceRemoved(handle, object);
             _ = self.text_input_adapter.resourceRemoved(handle, object);
             _ = self.subcompositor_adapter.resourceRemoved(handle, object);
