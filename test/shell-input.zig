@@ -679,6 +679,7 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
         .test_pointer_warp = true,
         .test_foreign_toplevel = true,
         .test_image_capture_sources = true,
+        .test_toplevel_drag = true,
     };
     try submitClient(&client_reactor, &driver, &handler);
 
@@ -687,6 +688,7 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     var input_sent = false;
     var key_sent = false;
     var drag_release_sent = false;
+    var toplevel_drag_active = false;
     var motion_redraw_sent = false;
     var two_layers_observed = false;
     var first_cursor_destination: ?ouro.render.Rect = null;
@@ -733,7 +735,13 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
             });
             key_sent = true;
         }
-        if (key_sent and !drag_release_sent and coordinator.data_device_adapter.dragActive() and
+        if (!toplevel_drag_active and handler.toplevel_drag_attached and
+            coordinator.toplevel_drag_adapter.activeAttachment() != null)
+        {
+            toplevel_drag_active = true;
+        }
+        if (key_sent and !drag_release_sent and motion_redraw_sent and toplevel_drag_active and
+            coordinator.data_device_adapter.dragActive() and
             input.cursor == input.event_count)
         {
             try input.publish(&.{.{ .pointer_button = .{
@@ -763,7 +771,7 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
             two_layers_observed = true;
         }
         if (coordinator.stats.presented == 2 and !motion_redraw_sent and
-            handler.drag_cancelled == 1 and input.cursor == input.event_count)
+            coordinator.data_device_adapter.dragActive() and input.cursor == input.event_count)
         {
             try input.publish(&.{.{ .pointer_motion = .{
                 .device = 42,
@@ -793,7 +801,7 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
         }
     }
 
-    try std.testing.expectEqual(@as(usize, 1), handler.configure_count);
+    try std.testing.expectEqual(@as(usize, 2), handler.configure_count);
     try std.testing.expect(handler.configure_serial != 0);
     try std.testing.expectEqual(handler.configure_serial, handler.acked_serial);
     try std.testing.expect(two_layers_observed);
@@ -816,6 +824,9 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     try std.testing.expectEqual(@as(usize, 1), handler.drag_source_actions);
     try std.testing.expectEqual(@as(usize, 1), handler.drag_enter);
     try std.testing.expectEqual(@as(usize, 1), handler.drag_leave);
+    try std.testing.expect(handler.toplevel_drag_attached);
+    try std.testing.expect(toplevel_drag_active);
+    try std.testing.expect(handler.toplevel_drag_destroyed);
     try std.testing.expectEqual(@as(usize, 1), handler.pointer_axis_source);
     try std.testing.expectEqual(@as(usize, 1), handler.pointer_axis);
     try std.testing.expectEqual(@as(usize, 1), handler.pointer_axis_value120);
@@ -3715,6 +3726,11 @@ const Handler = struct {
     data_device_manager: ?wayring.objects.Handle = null,
     data_device: ?wayring.objects.Handle = null,
     data_source: ?wayring.objects.Handle = null,
+    toplevel_drag_manager: ?wayring.objects.Handle = null,
+    toplevel_drag: ?wayring.objects.Handle = null,
+    test_toplevel_drag: bool = false,
+    toplevel_drag_attached: bool = false,
+    toplevel_drag_destroyed: bool = false,
     output: ?wayring.objects.Handle = null,
     idle_notifier: ?wayring.objects.Handle = null,
     idle_inhibit_manager: ?wayring.objects.Handle = null,
@@ -4098,6 +4114,18 @@ const Handler = struct {
                     try std.testing.expectEqual(self.surface.?.id, value.surface);
                     try std.testing.expect(value.id != null);
                     self.drag_enter += 1;
+                    if (self.test_toplevel_drag and !self.toplevel_drag_attached) {
+                        try protocol.xdg_toplevel_drag_v1.encodeRequest(
+                            self.queue,
+                            self.toplevel_drag.?.id,
+                            .{ .attach = .{
+                                .toplevel = self.toplevel.?.id,
+                                .x_offset = 1,
+                                .y_offset = 1,
+                            } },
+                        );
+                        self.toplevel_drag_attached = true;
+                    }
                 },
                 .leave => self.drag_leave += 1,
                 else => {},
@@ -4118,7 +4146,19 @@ const Handler = struct {
             }
         } else if (target.object.interface == &protocol.wl_data_source.info) {
             switch (try protocol.wl_data_source.decodeEvent(message, fds)) {
-                .cancelled => self.drag_cancelled += 1,
+                .cancelled => {
+                    self.drag_cancelled += 1;
+                    if (self.test_toplevel_drag and !self.toplevel_drag_destroyed) {
+                        try wayring.client.sendRequest(
+                            protocol.xdg_toplevel_drag_v1,
+                            self.objects,
+                            self.queue,
+                            self.toplevel_drag.?,
+                            .{ .destroy = .{} },
+                        );
+                        self.toplevel_drag_destroyed = true;
+                    }
+                },
                 else => {},
             }
         } else if (target.object.interface == &protocol.ext_idle_notification_v1.info) {
@@ -4225,6 +4265,19 @@ const Handler = struct {
         }
         if (std.mem.eql(u8, value.interface, protocol.wl_data_device_manager.info.name))
             self.data_device_manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_data_device_manager.info, @min(value.version, 3), null);
+        if (self.test_toplevel_drag and std.mem.eql(
+            u8,
+            value.interface,
+            protocol.xdg_toplevel_drag_manager_v1.info.name,
+        )) self.toplevel_drag_manager = try ClientCore.bind(
+            self.objects,
+            self.queue,
+            self.registry,
+            value.name,
+            &protocol.xdg_toplevel_drag_manager_v1.info,
+            1,
+            null,
+        );
         if (std.mem.eql(u8, value.interface, protocol.wl_output.info.name))
             self.output = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_output.info, @min(value.version, 4), null);
         if (std.mem.eql(u8, value.interface, protocol.ext_idle_notifier_v1.info.name))
@@ -4293,6 +4346,7 @@ const Handler = struct {
                 );
         }
         try self.maybeCreateImageCaptureSources();
+        try self.maybeCreateToplevelDrag();
     }
 
     fn maybeCreateImageCaptureSources(self: *Handler) !void {
@@ -4347,6 +4401,7 @@ const Handler = struct {
             self.data_device_manager.?,
             .{ .seat = self.seat.?.id },
         )).id;
+        try self.maybeCreateToplevelDrag();
     }
 
     fn maybeCreateShell(self: *Handler) !void {
@@ -4383,6 +4438,18 @@ const Handler = struct {
         });
         try protocol.wl_surface.encodeRequest(self.queue, self.surface.?.id, .{ .commit = .{} });
         self.shell_created = true;
+        try self.maybeCreateToplevelDrag();
+    }
+
+    fn maybeCreateToplevelDrag(self: *Handler) !void {
+        if (!self.test_toplevel_drag or self.toplevel_drag != null or
+            self.toplevel_drag_manager == null or self.data_source == null) return;
+        self.toplevel_drag = (try protocol.xdg_toplevel_drag_manager_v1.construct_get_xdg_toplevel_drag(
+            self.objects,
+            self.queue,
+            self.toplevel_drag_manager.?,
+            .{ .data_source = self.data_source.?.id },
+        )).id;
     }
 
     fn mapSurface(self: *Handler) !void {
