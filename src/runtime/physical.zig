@@ -1470,18 +1470,23 @@ pub fn Coordinator(comptime protocol: type) type {
 
         pub fn connected(self: *Self, peer: wayring.io_uring.Peer) void {
             if (self.peerLive(peer)) return;
-            var available: ?*Client = null;
-            for (self.clients.items) |*client| if (!client.active) {
-                available = client;
-                break;
+            const needed = std.math.add(usize, peer.slot, 1) catch {
+                _ = self.root.runtime.clients.prepareClose(peer) catch {};
+                return;
             };
-            const client = available orelse client: {
-                self.clients.append(self.allocator, .{}) catch {
+            if (self.clients.items.len < needed) {
+                const old_len = self.clients.items.len;
+                self.clients.resize(self.allocator, needed) catch {
                     _ = self.root.runtime.clients.prepareClose(peer) catch {};
                     return;
                 };
-                break :client &self.clients.items[self.clients.items.len - 1];
-            };
+                @memset(self.clients.items[old_len..], .{});
+            }
+            const client = &self.clients.items[peer.slot];
+            if (client.active) {
+                _ = self.root.runtime.clients.prepareClose(peer) catch {};
+                return;
+            }
             client.* = .{ .active = true, .peer = peer };
             self.client_count += 1;
             if (self.peer == null) self.peer = peer;
@@ -1516,11 +1521,10 @@ pub fn Coordinator(comptime protocol: type) type {
             self.alpha_modifier_adapter.disconnected(peer);
             self.pointer_warp_adapter.disconnected(peer);
             self.security_context_adapter.disconnected(peer);
-            for (self.clients.items) |*client| if (client.active and samePeer(client.peer, peer)) {
+            if (self.clientFor(peer)) |client| {
                 client.* = .{};
                 self.client_count -= 1;
-                break;
-            };
+            }
             if (self.peer) |current| if (samePeer(current, peer)) {
                 self.peer = null;
                 for (self.clients.items) |client| if (client.active) {
@@ -1545,9 +1549,9 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn peerLive(self: *const Self, peer: wayring.io_uring.Peer) bool {
-            for (self.clients.items) |client|
-                if (client.active and samePeer(client.peer, peer)) return true;
-            return false;
+            if (peer.slot >= self.clients.items.len) return false;
+            const client = &self.clients.items[peer.slot];
+            return client.active and samePeer(client.peer, peer);
         }
 
         fn scheduleClients(self: *Self) !void {
@@ -3999,9 +4003,9 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn clientFor(self: *Self, peer: wayring.io_uring.Peer) ?*Client {
-            for (self.clients.items) |*client|
-                if (client.active and samePeer(client.peer, peer)) return client;
-            return null;
+            if (peer.slot >= self.clients.items.len) return null;
+            const client = &self.clients.items[peer.slot];
+            return if (client.active and samePeer(client.peer, peer)) client else null;
         }
 
         fn markProtocol(self: *Self, peer: wayring.io_uring.Peer, ready: u32) void {
@@ -6267,7 +6271,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     self.association_surfaces,
                     needed,
                 );
-            for (self.clients.items) |client| if (client.active) {
+            for (self.clients.items) |*client| if (client.active) {
                 var count: usize = 0;
                 for (self.app_layers) |layer| {
                     if (!layer.active or layer.peer == null or
@@ -6287,9 +6291,9 @@ pub fn Coordinator(comptime protocol: type) type {
                     client.peer,
                     self.association_surfaces[0..count],
                 );
+                if (self.output_adapter.pendingOutboundOn(client.peer))
+                    client.protocol_ready |= ProtocolReady.output;
             };
-            if (self.output_adapter.pendingOutbound() != 0)
-                self.markProtocolAll(ProtocolReady.output);
         }
 
         fn consumeRetireAction(self: *Self, action: output_api.RetireAction) !void {
