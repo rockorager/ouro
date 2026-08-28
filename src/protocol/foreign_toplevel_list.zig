@@ -12,11 +12,13 @@ pub const Config = struct {
     handle_capacity: usize = 256,
     outbound_capacity: usize = 1024,
     metadata_capacity: usize = 256,
+    output_capacity: usize = 4,
 
     fn validate(c: Config) !void {
-        inline for (.{ c.list_capacity, c.toplevel_capacity, c.handle_capacity, c.outbound_capacity, c.metadata_capacity }) |n|
+        inline for (.{ c.list_capacity, c.toplevel_capacity, c.handle_capacity, c.outbound_capacity, c.metadata_capacity, c.output_capacity }) |n|
             if (n == 0 or n >= none) return error.InvalidConfig;
-        if (c.metadata_capacity > wayring.wire.max_message_len - 16 or c.outbound_capacity < 2)
+        if (c.metadata_capacity > wayring.wire.max_message_len - 16 or
+            c.handle_capacity < c.list_capacity or c.outbound_capacity < 2)
             return error.InvalidConfig;
     }
 };
@@ -29,8 +31,15 @@ pub fn Adapter(comptime protocol: type) type {
         const List = protocol.ext_foreign_toplevel_list_v1;
         const Handle = protocol.ext_foreign_toplevel_handle_v1;
         pub const ToplevelId = packed struct { index: u32, generation: u32 };
+        pub const OutputId = packed struct { value: u64 };
+        pub const State = packed struct {
+            maximized: bool = false,
+            minimized: bool = false,
+            activated: bool = false,
+            fullscreen: bool = false,
+        };
         const ListSlot = struct { header: slot_pool.Header = .{}, peer: wayring.io_uring.Peer = undefined, resource: objects.Handle = .{ .id = 0, .generation = 0 }, stopped: bool = false, finished_queued: bool = false };
-        const Top = struct { header: slot_pool.Header = .{}, serial: u64 = 0, title_len: usize = 0, app_len: usize = 0, title: []u8 = &.{}, app: []u8 = &.{} };
+        const Top = struct { header: slot_pool.Header = .{}, serial: u64 = 0, title_len: usize = 0, app_len: usize = 0, title: []u8 = &.{}, app: []u8 = &.{}, state: State = .{}, parent: ?ToplevelId = null, output_count: usize = 0 };
         const HSlot = struct { header: slot_pool.Header = .{}, list: u32 = 0, top: ToplevelId = undefined, peer: wayring.io_uring.Peer = undefined, resource: ?objects.Handle = null, closed: bool = false };
         const Kind = enum { announce, identifier, title, app_id, done, closed, finished };
         const Out = struct { active: bool = false, sequence: u64 = 0, kind: Kind = .done, owner: u32 = 0, text_len: usize = 0 };
@@ -41,7 +50,9 @@ pub fn Adapter(comptime protocol: type) type {
         handles: slot_pool.Pool(HSlot),
         outbound: []Out,
         out_text: []u8,
+        top_outputs: []OutputId,
         metadata_capacity: usize,
+        output_capacity: usize,
         outbound_count: usize = 0,
         sequence: u64 = 1,
         serial: u64 = 1,
@@ -66,14 +77,18 @@ pub fn Adapter(comptime protocol: type) type {
             ) catch return error.InvalidConfig;
             const out_text = try allocator.alloc(u8, outbound_metadata_bytes);
             errdefer allocator.free(out_text);
+            const output_count = std.math.mul(usize, c.toplevel_capacity, c.output_capacity) catch return error.InvalidConfig;
+            const top_outputs = try allocator.alloc(OutputId, output_count);
+            errdefer allocator.free(top_outputs);
             @memset(outbound, .{});
-            return .{ .allocator = allocator, .lists = lists, .tops = tops, .handles = handles, .outbound = outbound, .out_text = out_text, .metadata_capacity = c.metadata_capacity };
+            return .{ .allocator = allocator, .lists = lists, .tops = tops, .handles = handles, .outbound = outbound, .out_text = out_text, .top_outputs = top_outputs, .metadata_capacity = c.metadata_capacity, .output_capacity = c.output_capacity };
         }
         pub fn deinit(self: *Self) void {
             for (self.tops.entries.items) |top| {
                 if (top.title.len != 0) self.allocator.free(top.title);
                 if (top.app.len != 0) self.allocator.free(top.app);
             }
+            self.allocator.free(self.top_outputs);
             self.allocator.free(self.out_text);
             self.allocator.free(self.outbound);
             self.handles.deinit();
@@ -152,6 +167,51 @@ pub fn Adapter(comptime protocol: type) type {
                 .app_id = top.app[0..top.app_len],
             };
         }
+        pub fn state(self: *Self, id: ToplevelId) !State {
+            return (try self.resolveTop(id)).state;
+        }
+        pub fn updateState(self: *Self, id: ToplevelId, value: State) !bool {
+            const top = try self.resolveTop(id);
+            if (std.meta.eql(top.state, value)) return false;
+            top.state = value;
+            return true;
+        }
+        pub fn parent(self: *Self, id: ToplevelId) !?ToplevelId {
+            return (try self.resolveTop(id)).parent;
+        }
+        pub fn updateParent(self: *Self, id: ToplevelId, value: ?ToplevelId) !bool {
+            const top = try self.resolveTop(id);
+            if (value) |parent_id| {
+                _ = try self.resolveTop(parent_id);
+                if (std.meta.eql(id, parent_id)) return error.InvalidParent;
+            }
+            if (std.meta.eql(top.parent, value)) return false;
+            top.parent = value;
+            return true;
+        }
+        pub fn outputs(self: *Self, id: ToplevelId) ![]const OutputId {
+            const top = try self.resolveTop(id);
+            return self.topOutputs(id.index)[0..top.output_count];
+        }
+        pub fn addOutput(self: *Self, id: ToplevelId, output: OutputId) !bool {
+            const top = try self.resolveTop(id);
+            const values = self.topOutputs(id.index);
+            for (values[0..top.output_count]) |value| if (std.meta.eql(value, output)) return false;
+            if (top.output_count == values.len) return error.Exhausted;
+            values[top.output_count] = output;
+            top.output_count += 1;
+            return true;
+        }
+        pub fn removeOutput(self: *Self, id: ToplevelId, output: OutputId) !bool {
+            const top = try self.resolveTop(id);
+            const values = self.topOutputs(id.index);
+            for (values[0..top.output_count], 0..) |value, i| if (std.meta.eql(value, output)) {
+                if (i + 1 < top.output_count) values[i] = values[top.output_count - 1];
+                top.output_count -= 1;
+                return true;
+            };
+            return false;
+        }
         pub fn toplevelForResource(
             self: *Self,
             peer: wayring.io_uring.Peer,
@@ -192,6 +252,9 @@ pub fn Adapter(comptime protocol: type) type {
             for (self.handles.entries.items) |h| if (h.header.active and !h.closed and std.meta.eql(h.top, id)) {
                 h.closed = true;
                 self.enqueue(.closed, h.header.index, "") catch unreachable;
+            };
+            for (self.tops.entries.items) |top| if (top.header.active and top.parent != null and std.meta.eql(top.parent.?, id)) {
+                top.parent = null;
             };
             self.releaseTop(id.index);
         }
@@ -383,6 +446,9 @@ pub fn Adapter(comptime protocol: type) type {
         fn outText(self: *Self, i: u32) []u8 {
             return self.out_text[@as(usize, i) * self.metadata_capacity ..][0..self.metadata_capacity];
         }
+        fn topOutputs(self: *Self, i: u32) []OutputId {
+            return self.top_outputs[@as(usize, i) * self.output_capacity ..][0..self.output_capacity];
+        }
         fn failure(_: *Self, actor: *wayring.connection.Actor, id: u32, e: anyerror) !wayring.dispatch.Control {
             try ProtocolCore.postError(actor, id, 0, @errorName(e));
             return .stop;
@@ -410,6 +476,60 @@ test "foreign toplevel: identifiers, metadata, generations and growable ownershi
     const next = try a.publish(null, null);
     try std.testing.expect(next.generation != id.generation);
     try std.testing.expectError(error.InvalidMetadata, a.updateTitle(next, "abcdefghijklmnopqrstuvwxyz1234567"));
+}
+
+test "foreign toplevel: state and parent inventory is generation safe" {
+    const A = Adapter(@import("core_protocol"));
+    var a = try A.init(std.testing.allocator, .{
+        .list_capacity = 1,
+        .toplevel_capacity = 3,
+        .handle_capacity = 1,
+        .outbound_capacity = 2,
+        .metadata_capacity = 8,
+    });
+    defer a.deinit();
+    const parent = try a.publish(null, null);
+    const child = try a.publish(null, null);
+    try std.testing.expectEqual(A.State{}, try a.state(child));
+    try std.testing.expect(try a.updateState(child, .{ .activated = true }));
+    try std.testing.expect(!(try a.updateState(child, .{ .activated = true })));
+    try std.testing.expect((try a.state(child)).activated);
+
+    try std.testing.expectError(error.InvalidParent, a.updateParent(child, child));
+    try std.testing.expect(try a.updateParent(child, parent));
+    try std.testing.expect(!(try a.updateParent(child, parent)));
+    try a.close(parent);
+    try std.testing.expectEqual(@as(?A.ToplevelId, null), try a.parent(child));
+    try std.testing.expectError(error.StaleToplevel, a.updateParent(child, parent));
+    try std.testing.expectError(error.StaleToplevel, a.state(parent));
+}
+
+test "foreign toplevel: output membership is bounded and reset on reuse" {
+    const A = Adapter(@import("core_protocol"));
+    var a = try A.init(std.testing.allocator, .{
+        .list_capacity = 1,
+        .toplevel_capacity = 1,
+        .handle_capacity = 1,
+        .outbound_capacity = 2,
+        .metadata_capacity = 8,
+        .output_capacity = 2,
+    });
+    defer a.deinit();
+    const first = try a.publish(null, null);
+    const one: A.OutputId = .{ .value = 11 };
+    const two: A.OutputId = .{ .value = 22 };
+    try std.testing.expect(try a.addOutput(first, one));
+    try std.testing.expect(!(try a.addOutput(first, one)));
+    try std.testing.expect(try a.addOutput(first, two));
+    try std.testing.expectError(error.Exhausted, a.addOutput(first, .{ .value = 33 }));
+    try std.testing.expectEqual(@as(usize, 2), (try a.outputs(first)).len);
+    try std.testing.expect(try a.removeOutput(first, one));
+    try std.testing.expect(!(try a.removeOutput(first, one)));
+    try a.close(first);
+    try std.testing.expectError(error.StaleToplevel, a.addOutput(first, one));
+    const next = try a.publish(null, null);
+    try std.testing.expectEqual(@as(usize, 0), (try a.outputs(next)).len);
+    try std.testing.expectError(error.StaleToplevel, a.outputs(first));
 }
 
 test "foreign toplevel: bind retains ordered initial state and stop is atomic" {
