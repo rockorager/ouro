@@ -312,6 +312,74 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type) type {
             for (self.outbound) |o| if (o.active and self.ownerPeer(o.owner, peer)) return true;
             return false;
         }
+        pub fn flushOn(
+            self: *Self,
+            peer: wayring.io_uring.Peer,
+            server_objects: anytype,
+            queue: *wayring.tx.Queue,
+        ) !usize {
+            var count: usize = 0;
+            while (self.oldestOutbound(peer)) |out| {
+                switch (out.owner) {
+                    .session => |id| {
+                        const session = self.resolveSession(id) catch {
+                            self.discardOutbound(out);
+                            continue;
+                        };
+                        if (server_objects.namespace.resolve(session.resource) == null) {
+                            self.discardOutbound(out);
+                            continue;
+                        }
+                        const event: SessionProtocol.Event = switch (out.event) {
+                            .buffer_size => |size| .{ .buffer_size = .{ .width = size.width, .height = size.height } },
+                            .shm_argb => .{ .shm_format = .{ .format = protocol.wl_shm.format.argb8888 } },
+                            .shm_xrgb => .{ .shm_format = .{ .format = protocol.wl_shm.format.xrgb8888 } },
+                            .done => .{ .done = .{} },
+                            .stopped => .{ .stopped = .{} },
+                            else => unreachable,
+                        };
+                        SessionProtocol.encodeEvent(queue, session.resource.id, event) catch |cause| switch (cause) {
+                            error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return count,
+                            else => return cause,
+                        };
+                    },
+                    .frame => |id| {
+                        const frame = self.mutableFrame(id) catch {
+                            self.discardOutbound(out);
+                            continue;
+                        };
+                        if (server_objects.namespace.resolve(frame.resource) == null) {
+                            self.discardOutbound(out);
+                            continue;
+                        }
+                        const event: FrameProtocol.Event = switch (out.event) {
+                            .transform => .{ .transform = .{ .transform = protocol.wl_output.transform.normal } },
+                            .damage => |size| .{ .damage = .{
+                                .x = 0,
+                                .y = 0,
+                                .width = @intCast(size.width),
+                                .height = @intCast(size.height),
+                            } },
+                            .presentation => |timestamp| presentationEvent(timestamp),
+                            .ready => .{ .ready = .{} },
+                            .failed => |reason| .{ .failed = .{ .reason = switch (reason) {
+                                .unknown => FrameProtocol.failure_reason.unknown,
+                                .buffer_constraints => FrameProtocol.failure_reason.buffer_constraints,
+                                .stopped => FrameProtocol.failure_reason.stopped,
+                            } } },
+                            else => unreachable,
+                        };
+                        FrameProtocol.encodeEvent(queue, frame.resource.id, event) catch |cause| switch (cause) {
+                            error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return count,
+                            else => return cause,
+                        };
+                    },
+                }
+                self.discardOutbound(out);
+                count += 1;
+            }
+            return count;
+        }
         fn oldestOutbound(self: *Self, peer: wayring.io_uring.Peer) ?*Out {
             var oldest: ?*Out = null;
             for (self.outbound) |*event| {
@@ -326,6 +394,19 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type) type {
                 .session => |id| id.index < self.sessions.len and self.sessions[id.index].active and self.sessions[id.index].generation == id.generation and samePeer(self.sessions[id.index].peer, peer),
                 .frame => |id| id.index < self.frames.len and self.frames[id.index].active and self.frames[id.index].generation == id.generation and samePeer(self.frames[id.index].peer, peer),
             };
+        }
+        fn discardOutbound(self: *Self, out: *Out) void {
+            out.active = false;
+            self.outbound_count -= 1;
+        }
+
+        fn presentationEvent(timestamp_ns: u64) FrameProtocol.Event {
+            const seconds = timestamp_ns / std.time.ns_per_s;
+            return .{ .presentation_time = .{
+                .tv_sec_hi = @truncate(seconds >> 32),
+                .tv_sec_lo = @truncate(seconds),
+                .tv_nsec = @intCast(timestamp_ns % std.time.ns_per_s),
+            } };
         }
 
         pub fn resourceRemoved(self: *Self, h: objects.Handle, o: objects.Object) bool {
@@ -480,6 +561,83 @@ test "image copy capture: constraints and successful completion retain protocol 
         adapter.outbound_count -= 1;
     }
     try std.testing.expectError(error.AlreadyCaptured, adapter.capture(frame));
+}
+
+test "image copy capture: generated events flush in protocol order" {
+    const protocol = @import("core_protocol");
+    var adapter = try TestAdapter.init(std.testing.allocator, .{
+        .session_capacity = 1,
+        .frame_capacity = 1,
+        .capture_capacity = 1,
+        .outbound_capacity = 8,
+    });
+    defer adapter.deinit();
+    var server_objects = try objects.ServerObjects.init(
+        std.testing.allocator,
+        8,
+        2,
+        &protocol.wl_display.info,
+        null,
+    );
+    defer server_objects.deinit(std.testing.allocator);
+    const session_resource = try server_objects.insertClient(
+        10,
+        &protocol.ext_image_copy_capture_session_v1.info,
+        1,
+        null,
+    );
+    const session = try adapter.admitSession(
+        test_peer,
+        session_resource,
+        test_snapshot,
+        .{ .width = 64, .height = 32 },
+        false,
+    );
+
+    var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 256, 1);
+    defer blocks.deinit(std.testing.allocator);
+    var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 1);
+    defer descriptors.deinit(std.testing.allocator);
+    var queue = wayring.tx.Queue.init(&blocks, 256, &descriptors, 0);
+    defer queue.deinit();
+    try std.testing.expectEqual(@as(usize, 4), try adapter.flushOn(test_peer, &server_objects, &queue));
+    var descriptor_scratch: [1]std.os.linux.fd_t = undefined;
+    var control: [64]u8 align(@alignOf(std.os.linux.cmsghdr)) = undefined;
+    var bytes = (try queue.snapshot(&descriptor_scratch, &control)).first;
+    const expected_session = [_]std.meta.Tag(protocol.ext_image_copy_capture_session_v1.Event){ .buffer_size, .shm_format, .shm_format, .done };
+    for (expected_session) |expected| {
+        const message = (try wayring.wire.Message.decode(bytes)).?;
+        try std.testing.expectEqual(@as(u32, 10), message.header.object_id);
+        const event = try protocol.ext_image_copy_capture_session_v1.decodeEvent(message, &queue.descriptors);
+        try std.testing.expectEqual(expected, std.meta.activeTag(event));
+        bytes = bytes[message.header.size..];
+    }
+    try std.testing.expectEqual(@as(usize, 0), bytes.len);
+
+    queue.deinit();
+    queue = wayring.tx.Queue.init(&blocks, 256, &descriptors, 0);
+    const frame_resource = try server_objects.insertClient(
+        11,
+        &protocol.ext_image_copy_capture_frame_v1.info,
+        1,
+        null,
+    );
+    const frame = try adapter.createFrame(session, frame_resource);
+    try adapter.attachBuffer(frame, .{ .id = 12, .generation = 1 });
+    try adapter.capture(frame);
+    _ = adapter.takeCapture().?;
+    try adapter.complete(frame, 5 * std.time.ns_per_s + 17);
+    try std.testing.expectEqual(@as(usize, 4), try adapter.flushOn(test_peer, &server_objects, &queue));
+    bytes = (try queue.snapshot(&descriptor_scratch, &control)).first;
+    const expected_frame = [_]std.meta.Tag(protocol.ext_image_copy_capture_frame_v1.Event){ .transform, .damage, .presentation_time, .ready };
+    for (expected_frame) |expected| {
+        const message = (try wayring.wire.Message.decode(bytes)).?;
+        try std.testing.expectEqual(@as(u32, 11), message.header.object_id);
+        const event = try protocol.ext_image_copy_capture_frame_v1.decodeEvent(message, &queue.descriptors);
+        try std.testing.expectEqual(expected, std.meta.activeTag(event));
+        bytes = bytes[message.header.size..];
+    }
+    try std.testing.expectEqual(@as(usize, 0), bytes.len);
 }
 
 test "image copy capture: frame survives session and stale completion cannot alias reuse" {
