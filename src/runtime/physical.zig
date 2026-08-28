@@ -175,6 +175,11 @@ pub fn Coordinator(comptime protocol: type) type {
             copied: bool = false,
             success: bool = false,
         };
+        const CursorCaptureState = struct {
+            info: ImageCopyCaptureAdapter.CursorInfo,
+            constraints: ImageCopyCaptureAdapter.Constraints,
+            region: geometry.Rect,
+        };
         const ForeignToplevel = struct {
             active: bool = false,
             desktop: Desktop.ToplevelId = undefined,
@@ -1112,6 +1117,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
             _ = try self.image_capture_source_adapter.installToplevel(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
+            _ = try self.image_copy_capture_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
             _ = try self.output_adapter.install(&root.runtime);
@@ -2656,7 +2664,7 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             for (self.foreign_toplevels) |*entry| {
                 if (!entry.active or entry.seen) continue;
-                _ = self.image_capture_source_adapter.invalidate(.{ .toplevel = entry.desktop });
+                try self.invalidateCaptureSource(.{ .toplevel = entry.desktop });
                 try self.foreign_toplevel_list_adapter.close(entry.protocol_id);
                 entry.* = .{};
             }
@@ -2685,6 +2693,16 @@ pub fn Coordinator(comptime protocol: type) type {
             const object = server_objects.namespace.resolve(handle) orelse return null;
             _ = self.output_adapter.reference(peer, handle, object.*) catch return null;
             return if (self.output) |output| output.outputId() else null;
+        }
+
+        fn invalidateCaptureSource(self: *Self, target: ImageCaptureSourceAdapter.Target) !void {
+            _ = self.image_copy_capture_adapter.invalidate(target) catch |cause| {
+                if (cause == error.Exhausted)
+                    self.markProtocolAll(ProtocolReady.image_copy_capture);
+                return cause;
+            };
+            _ = self.image_capture_source_adapter.invalidate(target);
+            self.markProtocolAll(ProtocolReady.image_copy_capture);
         }
 
         pub fn resolveCaptureToplevel(
@@ -2731,7 +2749,69 @@ pub fn Coordinator(comptime protocol: type) type {
                         .height = std.math.cast(u32, scene.geometry.height) orelse return null,
                     } else |_| null,
                 },
-                .cursor => null,
+                .cursor => if (self.cursorCaptureState(target)) |state| state.constraints else null,
+            };
+        }
+
+        pub fn cursorCaptureInfo(
+            self: *Self,
+            target: ImageCopyCaptureAdapter.Target,
+        ) ?ImageCopyCaptureAdapter.CursorInfo {
+            return if (self.cursorCaptureState(target)) |state| state.info else null;
+        }
+
+        fn cursorCaptureState(
+            self: *Self,
+            target: ImageCopyCaptureAdapter.Target,
+        ) ?CursorCaptureState {
+            const cursor_target = switch (target) {
+                .cursor => |value| value,
+                .source => return null,
+            };
+            if (self.sessionLockActive() or !self.interaction.cursor.pointer_available) return null;
+            const pointer = self.interaction.pointerPosition();
+            var width: u32 = 0;
+            var height: u32 = 0;
+            var hotspot = self.interaction.cursor.hotspot;
+            if (self.themed_cursor.image) |image| {
+                width = image.width;
+                height = image.height;
+                hotspot = .{ .x = @intCast(image.x_hotspot), .y = @intCast(image.y_hotspot) };
+            } else if (self.cursor_layer.active) {
+                const sample = self.cursor_layer.sample orelse return null;
+                width = std.math.cast(u32, sample.destination.width) orelse return null;
+                height = std.math.cast(u32, sample.destination.height) orelse return null;
+            } else return null;
+            if (width == 0 or height == 0) return null;
+            const source_region: geometry.Rect = switch (cursor_target.source) {
+                .output => |id| if (self.output) |output|
+                    if (std.meta.eql(output.outputId(), id)) .{
+                        .x = 0,
+                        .y = 0,
+                        .width = @intCast(output.planner.output.width),
+                        .height = @intCast(output.planner.output.height),
+                    } else return null
+                else
+                    return null,
+                .toplevel => |id| (self.desktop.scene(id) catch return null).geometry,
+            };
+            const cursor_region: geometry.Rect = .{
+                .x = std.math.sub(i32, pointer.x, hotspot.x) catch return null,
+                .y = std.math.sub(i32, pointer.y, hotspot.y) catch return null,
+                .width = @intCast(width),
+                .height = @intCast(height),
+            };
+            if (!rectanglesIntersect(cursor_region, source_region)) return null;
+            return .{
+                .info = .{
+                    .position = .{
+                        .x = std.math.sub(i32, pointer.x, source_region.x) catch return null,
+                        .y = std.math.sub(i32, pointer.y, source_region.y) catch return null,
+                    },
+                    .hotspot = .{ .x = hotspot.x, .y = hotspot.y },
+                },
+                .constraints = .{ .width = width, .height = height },
+                .region = cursor_region,
             };
         }
 
@@ -3208,7 +3288,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 !std.mem.eql(u8, name, "zwlr_virtual_pointer_manager_v1") and
                 !std.mem.eql(u8, name, "ext_foreign_toplevel_list_v1") and
                 !std.mem.eql(u8, name, "ext_output_image_capture_source_manager_v1") and
-                !std.mem.eql(u8, name, "ext_foreign_toplevel_image_capture_source_manager_v1");
+                !std.mem.eql(u8, name, "ext_foreign_toplevel_image_capture_source_manager_v1") and
+                !std.mem.eql(u8, name, "ext_image_copy_capture_manager_v1");
         }
 
         fn commitSecurityContext(
@@ -3507,6 +3588,12 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.advanceShell();
             self.input_method_adapter.advance();
             self.markInputMethodProtocol();
+            if (self.image_copy_capture_adapter.refreshCursors(self)) |changed| {
+                if (changed != 0) self.markProtocolAll(ProtocolReady.image_copy_capture);
+            } else |cause| switch (cause) {
+                error.Exhausted => self.markProtocolAll(ProtocolReady.image_copy_capture),
+                else => return cause,
+            }
             for (self.clients.items) |client| if (client.active and client.protocol_ready != 0)
                 try self.flushProtocolOn(client.peer);
         }
@@ -4972,7 +5059,16 @@ pub fn Coordinator(comptime protocol: type) type {
                         return;
                     }).geometry,
                 },
-                .cursor => {
+                .cursor => if (self.cursorCaptureState(capture.target)) |state|
+                    if (state.constraints.width == capture.width and
+                        state.constraints.height == capture.height)
+                        state.region
+                    else {
+                        try self.image_copy_capture_adapter.fail(capture.frame, .buffer_constraints);
+                        self.markProtocol(capture.peer, ProtocolReady.image_copy_capture);
+                        return;
+                    }
+                else {
                     try self.failImageCopy(capture);
                     return;
                 },
@@ -4994,7 +5090,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 .width = capture.width,
                 .height = capture.height,
                 .full_stride = full_stride,
-                .overlay_cursor = capture.paint_cursors,
+                .overlay_cursor = capture.paint_cursors or switch (capture.target) {
+                    .cursor => true,
+                    .source => false,
+                },
             };
             output.request(.damage, try monotonicNs()) catch {
                 try self.finishImageCopy(false, 0);
@@ -5871,7 +5970,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 }
                 if (self.output_drain_started and output.drainComplete()) {
                     if (self.stopping) self.abandonPending();
-                    _ = self.image_capture_source_adapter.invalidate(.{ .output = output.outputId() });
+                    try self.invalidateCaptureSource(.{ .output = output.outputId() });
                     try output.destroy();
                     self.output = null;
                     self.stats.output_drains += 1;
@@ -5967,7 +6066,9 @@ pub fn Coordinator(comptime protocol: type) type {
             std.debug.assert(output.drainComplete());
             // Both terminal operations consume their owners even when a
             // platform close reports an error, so cleanup remains exactly-once.
-            _ = self.image_capture_source_adapter.invalidate(.{ .output = output.outputId() });
+            self.invalidateCaptureSource(.{ .output = output.outputId() }) catch {
+                _ = self.image_capture_source_adapter.invalidate(.{ .output = output.outputId() });
+            };
             output.destroy() catch {};
             self.output = null;
             self.manager.remove() catch {};
@@ -6296,6 +6397,13 @@ fn clipToOutput(destination: render.Rect, output: render.Size) !?render.Rect {
         .width = @intCast(clipped_right - left),
         .height = @intCast(clipped_bottom - top),
     };
+}
+
+fn rectanglesIntersect(a: geometry.Rect, b: geometry.Rect) bool {
+    return @as(i64, a.x) < @as(i64, b.x) + b.width and
+        @as(i64, b.x) < @as(i64, a.x) + a.width and
+        @as(i64, a.y) < @as(i64, b.y) + b.height and
+        @as(i64, b.y) < @as(i64, a.y) + a.height;
 }
 
 fn fixed24To16(value: i32) !i32 {

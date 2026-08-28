@@ -546,6 +546,24 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
                 };
             }
         }
+        pub fn refreshCursors(self: *Self, resolver: anytype) !usize {
+            var changed: usize = 0;
+            for (self.cursor_sessions, 0..) |*cursor, index| {
+                if (!cursor.active or cursor.target == null or cursor.source_target == null) continue;
+                const target: Target = .{ .cursor = .{
+                    .source = cursor.source_target.?,
+                    .cursor = cursor.target.?,
+                } };
+                const before = self.outbound_count;
+                try self.refreshCursor(
+                    .{ .index = @intCast(index), .generation = cursor.generation },
+                    resolver.cursorCaptureInfo(target),
+                    resolver.captureConstraints(target),
+                );
+                if (self.outbound_count != before) changed += 1;
+            }
+            return changed;
+        }
         fn constraintUpdateNeeded(self: *Self, id: SessionId, constraints: ?Constraints) !usize {
             const session = try self.resolveSession(id);
             if (session.stopped or (constraints != null and session.constraints != null and
