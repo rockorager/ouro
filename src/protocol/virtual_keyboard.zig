@@ -34,6 +34,10 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
         const Core = wayring.server.Core(protocol);
         const Manager = protocol.zwp_virtual_keyboard_manager_v1;
         const Keyboard = protocol.zwp_virtual_keyboard_v1;
+        pub const SeatResolver = struct {
+            context: ?*anyopaque = null,
+            resolveFn: *const fn (?*anyopaque, wayring.io_uring.Peer, u32) ?*Seat,
+        };
         const ManagerSlot = struct {
             header: slot_pool.Header = .{},
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
@@ -44,7 +48,7 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
             header: slot_pool.Header = .{},
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
             peer: wayring.io_uring.Peer = undefined,
-            seat_valid: bool = false,
+            seat: ?*Seat = null,
             keymap: bool = false,
             registered: bool = false,
             deferred_fd: linux.fd_t = -1,
@@ -53,7 +57,7 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
         };
 
         allocator: std.mem.Allocator,
-        seat: *Seat,
+        seat_resolver: SeatResolver,
         managers: slot_pool.Pool(ManagerSlot),
         devices: slot_pool.Pool(Device),
         runtime: ?*Runtime = null,
@@ -62,14 +66,14 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
         inhibited: bool = false,
         keymap_observer: ?KeymapObserver = null,
 
-        pub fn init(allocator: std.mem.Allocator, seat: *Seat, config: Config) !Self {
+        pub fn init(allocator: std.mem.Allocator, seat_resolver: SeatResolver, config: Config) !Self {
             try config.validate();
             try Manager.info.validateVersion(1);
             var managers = try slot_pool.Pool(ManagerSlot).init(allocator, config.manager_capacity);
             errdefer managers.deinit();
             var devices = try slot_pool.Pool(Device).init(allocator, config.device_capacity);
             errdefer devices.deinit();
-            return .{ .allocator = allocator, .seat = seat, .managers = managers, .devices = devices };
+            return .{ .allocator = allocator, .seat_resolver = seat_resolver, .managers = managers, .devices = devices };
         }
 
         pub fn deinit(self: *Self) void {
@@ -115,7 +119,7 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                     .create_virtual_keyboard => |payload| {
                         const device = self.acquireDevice() catch return try self.noMemory(actor);
                         device.peer = peer;
-                        device.seat_valid = self.seat.ownsSeat(peer, payload.seat);
+                        device.seat = self.seat_resolver.resolveFn(self.seat_resolver.context, peer, payload.seat);
                         const admitted = Manager.admit_create_virtual_keyboard(server_objects, decoded.handle, payload, .{ .id = device }) catch |err| {
                             self.releaseDevice(device);
                             return try self.failure(actor, decoded.handle.id, err);
@@ -137,10 +141,10 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                         defer {
                             if (fd >= 0) _ = linux.close(fd);
                         }
-                        if (!device.seat_valid) {
+                        const seat = device.seat orelse {
                             try decoded.finish(protocol, server_objects, &actor.transmit);
                             return .continue_dispatch;
-                        }
+                        };
                         if (payload.format.value != protocol.wl_keyboard.keymap_format.xkb_v1.value)
                             return try self.protocolError(actor, decoded.handle.id, Keyboard.@"error".invalid_keymap_format.value, "invalid keymap format");
                         validateKeymap(fd, payload.size) catch
@@ -151,7 +155,7 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                         const id = self.inputId(device);
                         const added = !device.registered;
                         if (added) {
-                            self.seat.addVirtualKeyboard(id) catch return try self.noMemory(actor);
+                            seat.addVirtualKeyboard(id) catch return try self.noMemory(actor);
                             device.registered = true;
                         }
                         if (self.inhibited) {
@@ -160,9 +164,9 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                             device.deferred_size = payload.size;
                             fd = -1;
                         } else {
-                            self.seat.setKeymapOwned(fd, payload.size) catch |err| {
+                            seat.setKeymapOwned(fd, payload.size) catch |err| {
                                 if (added) {
-                                    self.seat.removeVirtualKeyboard(id) catch {};
+                                    seat.removeVirtualKeyboard(id) catch {};
                                     device.registered = false;
                                 }
                                 return try self.failure(actor, decoded.handle.id, err);
@@ -173,10 +177,10 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                         device.keymap = true;
                     },
                     .key => |payload| {
-                        if (!device.seat_valid) {
+                        const seat = device.seat orelse {
                             try decoded.finish(protocol, server_objects, &actor.transmit);
                             return .continue_dispatch;
-                        }
+                        };
                         if (!device.keymap) return try self.noKeymap(actor, decoded.handle.id);
                         if (payload.state > 1) return try self.failure(actor, decoded.handle.id, error.InvalidKeyState);
                         if (device.registered and !self.inhibited) {
@@ -187,19 +191,19 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                             const pressed = payload.state == 1;
                             if ((word.* & mask != 0) != pressed) {
                                 if (pressed) word.* |= mask else word.* &= ~mask;
-                                self.seat.virtualKeyboardKey(self.inputId(device), payload.time, payload.key, pressed) catch |err|
+                                seat.virtualKeyboardKey(self.inputId(device), payload.time, payload.key, pressed) catch |err|
                                     return try self.failure(actor, decoded.handle.id, err);
                             }
                         }
                     },
                     .modifiers => |payload| {
-                        if (!device.seat_valid) {
+                        const seat = device.seat orelse {
                             try decoded.finish(protocol, server_objects, &actor.transmit);
                             return .continue_dispatch;
-                        }
+                        };
                         if (!device.keymap) return try self.noKeymap(actor, decoded.handle.id);
                         if (device.registered and !self.inhibited) {
-                            self.seat.virtualModifiers(.{ .depressed = payload.mods_depressed, .latched = payload.mods_latched, .locked = payload.mods_locked, .group = payload.group }) catch |err|
+                            seat.virtualModifiers(.{ .depressed = payload.mods_depressed, .latched = payload.mods_latched, .locked = payload.mods_locked, .group = payload.group }) catch |err|
                                 return try self.failure(actor, decoded.handle.id, err);
                             self.modifier_owner = self.deviceId(device);
                         }
@@ -219,8 +223,8 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
             if (inhibited) {
                 self.inhibited = true;
                 for (self.devices.entries.items) |device| if (device.header.active) try self.releasePressed(device);
-                if (self.modifier_owner != null) {
-                    try self.seat.restoreDerivedModifiers();
+                if (self.modifierOwnerSeat()) |seat| {
+                    try seat.restoreDerivedModifiers();
                     self.modifier_owner = null;
                 }
                 return;
@@ -231,7 +235,7 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                 if (self.keymap_observer) |observer| {
                     if (!observer.canUpdateFn(observer.context)) return error.Exhausted;
                 }
-                try self.seat.setKeymapOwned(device.deferred_fd, device.deferred_size);
+                try (device.seat orelse continue).setKeymapOwned(device.deferred_fd, device.deferred_size);
                 device.deferred_fd = -1;
                 device.deferred_size = 0;
                 if (self.keymap_observer) |observer| observer.updatedFn(observer.context);
@@ -268,10 +272,10 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
             if (!device.header.active) return;
             const id = self.deviceId(device);
             self.releasePressed(device) catch {};
-            if (device.registered) self.seat.removeVirtualKeyboard(self.inputId(device)) catch {};
+            if (device.registered) if (device.seat) |seat| seat.removeVirtualKeyboard(self.inputId(device)) catch {};
             if (self.modifier_owner != null and std.meta.eql(self.modifier_owner.?, id)) {
                 self.modifier_owner = null;
-                self.seat.restoreDerivedModifiers() catch {};
+                if (device.seat) |seat| seat.restoreDerivedModifiers() catch {};
             }
             if (device.deferred_fd >= 0) _ = linux.close(device.deferred_fd);
             self.devices.release(device);
@@ -282,7 +286,7 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                 var bits = word.*;
                 while (bits != 0) {
                     const bit: u6 = @intCast(@ctz(bits));
-                    try self.seat.virtualKeyboardKey(self.inputId(device), 0, @intCast(wi * 64 + bit), false);
+                    try (device.seat orelse return).virtualKeyboardKey(self.inputId(device), 0, @intCast(wi * 64 + bit), false);
                     bits &= bits - 1;
                 }
                 word.* = 0;
@@ -295,6 +299,12 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
         }
         fn deviceId(self: *Self, device: *const Device) DeviceId {
             return .{ .index = self.deviceIndex(device), .generation = device.header.generation };
+        }
+        fn modifierOwnerSeat(self: *Self) ?*Seat {
+            const owner = self.modifier_owner orelse return null;
+            const device = self.devices.at(owner.index) orelse return null;
+            if (device.header.generation != owner.generation) return null;
+            return device.seat;
         }
         fn deviceIndex(_: *const Self, device: *const Device) u32 {
             return device.header.index;
@@ -326,21 +336,6 @@ pub fn validateKeymap(fd: linux.fd_t, size: u32) !void {
     if (linux.errno(read) != .SUCCESS or read != 1 or last[0] != 0) return error.InvalidKeymap;
 }
 
-fn initFree(comptime T: type, slots: []T) void {
-    for (slots, 0..) |*slot, i| slot.* = .{ .next = if (i + 1 < slots.len) @intCast(i + 1) else none };
-}
-fn indexOf(comptime T: type, slots: []const T, pointer: *const T) u32 {
-    return @intCast((@intFromPtr(pointer) - @intFromPtr(slots.ptr)) / @sizeOf(T));
-}
-fn from(comptime T: type, slots: []T, context: ?*anyopaque) ?*T {
-    const pointer = context orelse return null;
-    const address = @intFromPtr(pointer);
-    const start = @intFromPtr(slots.ptr);
-    const end = start + slots.len * @sizeOf(T);
-    if (address < start or address >= end or (address - start) % @sizeOf(T) != 0) return null;
-    const slot = &slots[(address - start) / @sizeOf(T)];
-    return if (slot.active) slot else null;
-}
 fn same(a: wayring.io_uring.Peer, b: wayring.io_uring.Peer) bool {
     return std.meta.eql(a, b);
 }
@@ -379,6 +374,10 @@ const TestSeat = struct {
     }
 };
 
+fn resolveTestSeat(context: ?*anyopaque, _: wayring.io_uring.Peer, _: u32) ?*TestSeat {
+    return @ptrCast(@alignCast(context orelse return null));
+}
+
 test "keymap validation requires bounds, backing size, and final nul" {
     const fd = try testKeymapFd();
     defer _ = linux.close(fd);
@@ -394,10 +393,10 @@ test "inhibition releases keys and applies the latest deferred keymap on resume"
     const A = Adapter(protocol, TestSeat);
     var seat: TestSeat = .{};
     defer seat.deinit();
-    var adapter = try A.init(std.testing.allocator, &seat, .{ .manager_capacity = 1, .device_capacity = 1 });
+    var adapter = try A.init(std.testing.allocator, .{ .context = &seat, .resolveFn = resolveTestSeat }, .{ .manager_capacity = 1, .device_capacity = 1 });
     defer adapter.deinit();
     const device = try adapter.acquireDevice();
-    device.seat_valid = true;
+    device.seat = &seat;
     device.keymap = true;
     device.registered = true;
     device.pressed[30 / 64] |= @as(u64, 1) << (30 & 63);
@@ -424,27 +423,33 @@ test "inhibition releases keys and applies the latest deferred keymap on resume"
 test "only the exact modifier owner restores derived state on removal" {
     const protocol = @import("core_protocol");
     const A = Adapter(protocol, TestSeat);
-    var seat: TestSeat = .{};
-    defer seat.deinit();
-    var adapter = try A.init(std.testing.allocator, &seat, .{ .manager_capacity = 1, .device_capacity = 2 });
+    var first_seat: TestSeat = .{};
+    defer first_seat.deinit();
+    var second_seat: TestSeat = .{};
+    defer second_seat.deinit();
+    var adapter = try A.init(std.testing.allocator, .{ .context = &first_seat, .resolveFn = resolveTestSeat }, .{ .manager_capacity = 1, .device_capacity = 2 });
     defer adapter.deinit();
     const first = try adapter.acquireDevice();
+    first.seat = &first_seat;
     first.registered = true;
     const second = try adapter.acquireDevice();
+    second.seat = &second_seat;
     second.registered = true;
     adapter.modifier_owner = adapter.deviceId(second);
 
     adapter.releaseDevice(first);
-    try std.testing.expectEqual(@as(usize, 0), seat.restores);
+    try std.testing.expectEqual(@as(usize, 0), first_seat.restores);
+    try std.testing.expectEqual(@as(usize, 0), second_seat.restores);
     adapter.releaseDevice(second);
-    try std.testing.expectEqual(@as(usize, 1), seat.restores);
+    try std.testing.expectEqual(@as(usize, 0), first_seat.restores);
+    try std.testing.expectEqual(@as(usize, 1), second_seat.restores);
 }
 
 test "manager and keyboard ownership grow with stable contexts" {
     const A = Adapter(@import("core_protocol"), TestSeat);
     var seat: TestSeat = .{};
     defer seat.deinit();
-    var adapter = try A.init(std.testing.allocator, &seat, .{ .manager_capacity = 1, .device_capacity = 1 });
+    var adapter = try A.init(std.testing.allocator, .{ .context = &seat, .resolveFn = resolveTestSeat }, .{ .manager_capacity = 1, .device_capacity = 1 });
     defer adapter.deinit();
 
     const first_manager = try adapter.managers.acquire();

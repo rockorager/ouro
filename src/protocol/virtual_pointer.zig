@@ -27,7 +27,7 @@ pub const Validator = struct {
     validateFn: *const fn (?*anyopaque, wayring.io_uring.Peer, u32) bool,
 };
 
-pub fn Adapter(comptime protocol: type) type {
+pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
     return struct {
         const Self = @This();
         const Runtime = wayring.server.Runtime(protocol);
@@ -35,15 +35,19 @@ pub fn Adapter(comptime protocol: type) type {
         const Manager = protocol.zwlr_virtual_pointer_manager_v1;
         const Pointer = protocol.zwlr_virtual_pointer_v1;
 
+        pub const SeatResolver = struct {
+            context: ?*anyopaque = null,
+            resolveFn: *const fn (?*anyopaque, wayring.io_uring.Peer, ?u32) ?*Seat,
+        };
         pub const Event = union(enum) {
-            device_added: struct { device: input.DeviceId, info: platform.DeviceInfo },
-            device_removed: input.DeviceId,
-            motion: struct { device: input.DeviceId, time: u32, dx: i32, dy: i32 },
-            motion_absolute: struct { device: input.DeviceId, time: u32, x: u32, y: u32, x_extent: u32, y_extent: u32, output_mapped: bool },
-            button: struct { device: input.DeviceId, time: u32, button: u32, pressed: bool },
-            axis: struct { device: input.DeviceId, time: u32, axis: u32, value: i32, source: platform.AxisSource },
-            axis_stop: struct { device: input.DeviceId, time: u32, axis: u32, source: platform.AxisSource },
-            axis_discrete: struct { device: input.DeviceId, time: u32, axis: u32, value: i32, discrete: i32, source: platform.AxisSource },
+            device_added: struct { seat: *Seat, device: input.DeviceId, info: platform.DeviceInfo },
+            device_removed: struct { seat: *Seat, device: input.DeviceId },
+            motion: struct { seat: *Seat, device: input.DeviceId, time: u32, dx: i32, dy: i32 },
+            motion_absolute: struct { seat: *Seat, device: input.DeviceId, time: u32, x: u32, y: u32, x_extent: u32, y_extent: u32, output_mapped: bool },
+            button: struct { seat: *Seat, device: input.DeviceId, time: u32, button: u32, pressed: bool },
+            axis: struct { seat: *Seat, device: input.DeviceId, time: u32, axis: u32, value: i32, source: platform.AxisSource },
+            axis_stop: struct { seat: *Seat, device: input.DeviceId, time: u32, axis: u32, source: platform.AxisSource },
+            axis_discrete: struct { seat: *Seat, device: input.DeviceId, time: u32, axis: u32, value: i32, discrete: i32, source: platform.AxisSource },
         };
         const ManagerSlot = struct { header: slot_pool.Header = .{}, resource: objects.Handle = .{ .id = 0, .generation = 0 }, peer: wayring.io_uring.Peer = undefined };
         const Device = struct {
@@ -51,7 +55,7 @@ pub fn Adapter(comptime protocol: type) type {
             retiring: bool = false,
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
             peer: wayring.io_uring.Peer = undefined,
-            valid: bool = false,
+            seat: ?*Seat = null,
             output_mapped: bool = false,
             axis_source: platform.AxisSource = .wheel,
             pressed: [button_words]u64 = [_]u64{0} ** button_words,
@@ -67,10 +71,10 @@ pub fn Adapter(comptime protocol: type) type {
         normal_capacity: usize,
         runtime: ?*Runtime = null,
         global: ?objects.Handle = null,
-        seat_validator: ?Validator = null,
+        seat_resolver: SeatResolver,
         output_validator: ?Validator = null,
 
-        pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
+        pub fn init(allocator: std.mem.Allocator, seat_resolver: SeatResolver, config: Config) !Self {
             try config.validate();
             try Manager.info.validateVersion(2);
             var managers = try slot_pool.Pool(ManagerSlot).init(allocator, config.manager_capacity);
@@ -78,10 +82,7 @@ pub fn Adapter(comptime protocol: type) type {
             var devices = try slot_pool.Pool(Device).init(allocator, config.device_capacity);
             errdefer devices.deinit();
             const events = try allocator.alloc(Event, config.event_capacity + config.device_capacity);
-            return .{ .allocator = allocator, .managers = managers, .devices = devices, .events = events, .normal_capacity = config.event_capacity };
-        }
-        pub fn setSeatValidator(self: *Self, validator: ?Validator) void {
-            self.seat_validator = validator;
+            return .{ .allocator = allocator, .managers = managers, .devices = devices, .events = events, .normal_capacity = config.event_capacity, .seat_resolver = seat_resolver };
         }
         pub fn setOutputValidator(self: *Self, validator: ?Validator) void {
             self.output_validator = validator;
@@ -116,7 +117,7 @@ pub fn Adapter(comptime protocol: type) type {
             self.event_head = (self.event_head + 1) % self.events.len;
             self.event_count -= 1;
             if (event == .device_removed) {
-                const id = event.device_removed;
+                const id = event.device_removed.device;
                 if (id.slot >= 0xa000_0000) {
                     const i = id.slot - 0xa000_0000;
                     if (i < self.devices.entries.items.len) {
@@ -132,9 +133,9 @@ pub fn Adapter(comptime protocol: type) type {
             self.event_count += 1;
             self.normal_count += 1;
         }
-        fn pushRemoved(self: *Self, id: input.DeviceId) void {
+        fn pushRemoved(self: *Self, seat: *Seat, id: input.DeviceId) void {
             std.debug.assert(self.event_count < self.events.len);
-            self.events[(self.event_head + self.event_count) % self.events.len] = .{ .device_removed = id };
+            self.events[(self.event_head + self.event_count) % self.events.len] = .{ .device_removed = .{ .seat = seat, .device = id } };
             self.event_count += 1;
         }
 
@@ -160,15 +161,15 @@ pub fn Adapter(comptime protocol: type) type {
             const d = self.devices.fromContext(target.object.context) orelse return null;
             if (!std.meta.eql(d.resource, handle) or !same(d.peer, peer)) return null;
             const decoded = try wayring.server.decodeRequest(Pointer, server_objects, message, fds);
-            if (decoded.value != .destroy and !d.valid) {
+            if (decoded.value != .destroy and d.seat == null) {
                 try decoded.finish(protocol, server_objects, &actor.transmit);
                 return .continue_dispatch;
             }
             const id = self.inputId(d);
             switch (decoded.value) {
                 .destroy => {},
-                .motion => |p| self.push(.{ .motion = .{ .device = id, .time = p.time, .dx = p.dx, .dy = p.dy } }) catch return try self.noMemory(actor),
-                .motion_absolute => |p| self.push(.{ .motion_absolute = .{ .device = id, .time = p.time, .x = p.x, .y = p.y, .x_extent = p.x_extent, .y_extent = p.y_extent, .output_mapped = d.output_mapped } }) catch return try self.noMemory(actor),
+                .motion => |p| self.push(.{ .motion = .{ .seat = d.seat.?, .device = id, .time = p.time, .dx = p.dx, .dy = p.dy } }) catch return try self.noMemory(actor),
+                .motion_absolute => |p| self.push(.{ .motion_absolute = .{ .seat = d.seat.?, .device = id, .time = p.time, .x = p.x, .y = p.y, .x_extent = p.x_extent, .y_extent = p.y_extent, .output_mapped = d.output_mapped } }) catch return try self.noMemory(actor),
                 .button => |p| {
                     if (p.state.value > 1) return try self.failure(actor, decoded.handle.id, error.InvalidButtonState);
                     if (p.button >= button_count) return try self.failure(actor, decoded.handle.id, error.InvalidButtonCode);
@@ -179,12 +180,12 @@ pub fn Adapter(comptime protocol: type) type {
                         try decoded.finish(protocol, server_objects, &actor.transmit);
                         return .continue_dispatch;
                     }
-                    self.push(.{ .button = .{ .device = id, .time = p.time, .button = p.button, .pressed = pressed } }) catch return try self.noMemory(actor);
+                    self.push(.{ .button = .{ .seat = d.seat.?, .device = id, .time = p.time, .button = p.button, .pressed = pressed } }) catch return try self.noMemory(actor);
                     if (pressed) word.* |= mask else word.* &= ~mask;
                 },
                 .axis => |p| {
                     if (!validAxis(p.axis.value)) return try self.invalidAxis(actor, decoded.handle.id);
-                    self.push(.{ .axis = .{ .device = id, .time = p.time, .axis = p.axis.value, .value = p.value, .source = d.axis_source } }) catch return try self.noMemory(actor);
+                    self.push(.{ .axis = .{ .seat = d.seat.?, .device = id, .time = p.time, .axis = p.axis.value, .value = p.value, .source = d.axis_source } }) catch return try self.noMemory(actor);
                 },
                 .axis_source => |p| {
                     if (!validSource(p.axis_source.value)) return try self.invalidSource(actor, decoded.handle.id);
@@ -192,11 +193,11 @@ pub fn Adapter(comptime protocol: type) type {
                 },
                 .axis_stop => |p| {
                     if (!validAxis(p.axis.value)) return try self.invalidAxis(actor, decoded.handle.id);
-                    self.push(.{ .axis_stop = .{ .device = id, .time = p.time, .axis = p.axis.value, .source = d.axis_source } }) catch return try self.noMemory(actor);
+                    self.push(.{ .axis_stop = .{ .seat = d.seat.?, .device = id, .time = p.time, .axis = p.axis.value, .source = d.axis_source } }) catch return try self.noMemory(actor);
                 },
                 .axis_discrete => |p| {
                     if (!validAxis(p.axis.value)) return try self.invalidAxis(actor, decoded.handle.id);
-                    self.push(.{ .axis_discrete = .{ .device = id, .time = p.time, .axis = p.axis.value, .value = p.value, .discrete = p.discrete, .source = d.axis_source } }) catch return try self.noMemory(actor);
+                    self.push(.{ .axis_discrete = .{ .seat = d.seat.?, .device = id, .time = p.time, .axis = p.axis.value, .value = p.value, .discrete = p.discrete, .source = d.axis_source } }) catch return try self.noMemory(actor);
                 },
                 .frame => {},
             }
@@ -208,9 +209,9 @@ pub fn Adapter(comptime protocol: type) type {
             const d = self.acquire() catch return self.noMemoryVoid(actor);
             errdefer self.recycle(d);
             d.peer = peer;
-            d.valid = seat == null or if (self.seat_validator) |v| v.validateFn(v.context, peer, seat.?) else false;
+            d.seat = self.seat_resolver.resolveFn(self.seat_resolver.context, peer, seat);
             d.output_mapped = output != null and if (self.output_validator) |v| v.validateFn(v.context, peer, output.?) else false;
-            if (d.valid and self.normal_count == self.normal_capacity)
+            if (d.seat != null and self.normal_count == self.normal_capacity)
                 return self.noMemoryVoid(actor);
             const admitted = if (with_output)
                 Manager.admit_create_virtual_pointer_with_output(server_objects, parent, payload, .{ .id = d })
@@ -218,7 +219,7 @@ pub fn Adapter(comptime protocol: type) type {
                 Manager.admit_create_virtual_pointer(server_objects, parent, payload, .{ .id = d });
             const result = admitted catch |err| return self.failureVoid(actor, parent.id, err);
             d.resource = result.id;
-            if (d.valid) self.push(.{ .device_added = .{ .device = self.inputId(d), .info = .{ .capabilities = .{ .pointer = true } } } }) catch unreachable;
+            if (d.seat) |resolved| self.push(.{ .device_added = .{ .seat = resolved, .device = self.inputId(d), .info = .{ .capabilities = .{ .pointer = true } } } }) catch unreachable;
         }
 
         pub fn resourceRemoved(self: *Self, handle: objects.Handle, object: objects.Object) bool {
@@ -248,7 +249,7 @@ pub fn Adapter(comptime protocol: type) type {
         fn retire(self: *Self, d: *Device) void {
             if (!d.header.active or d.retiring) return;
             d.retiring = true;
-            if (d.valid) self.pushRemoved(self.inputId(d)) else self.recycle(d);
+            if (d.seat) |seat| self.pushRemoved(seat, self.inputId(d)) else self.recycle(d);
         }
         fn recycle(self: *Self, d: *Device) void {
             self.devices.release(d);
@@ -305,46 +306,47 @@ fn source(value: u32) platform.AxisSource {
         else => .wheel,
     };
 }
-fn initFree(comptime T: type, slots: []T) void {
-    for (slots, 0..) |*slot, i| slot.* = .{ .next = if (i + 1 < slots.len) @intCast(i + 1) else none };
-}
-fn indexOf(comptime T: type, slots: []const T, pointer: *const T) u32 {
-    return @intCast((@intFromPtr(pointer) - @intFromPtr(slots.ptr)) / @sizeOf(T));
-}
-fn from(comptime T: type, slots: []T, context: ?*anyopaque) ?*T {
-    const p = context orelse return null;
-    const a = @intFromPtr(p);
-    const start = @intFromPtr(slots.ptr);
-    const end = start + slots.len * @sizeOf(T);
-    if (a < start or a >= end or (a - start) % @sizeOf(T) != 0) return null;
-    const slot = &slots[(a - start) / @sizeOf(T)];
-    return if (slot.active) slot else null;
-}
 fn same(a: wayring.io_uring.Peer, b: wayring.io_uring.Peer) bool {
     return std.meta.eql(a, b);
 }
 
-test "cleanup reserve delays slot reuse" {
-    const A = Adapter(@import("core_protocol"));
-    var a = try A.init(std.testing.allocator, .{ .manager_capacity = 1, .device_capacity = 1, .event_capacity = 1 });
+test "cleanup reserve delays generation reuse" {
+    const TestSeat = struct {};
+    const Resolver = struct {
+        fn resolve(context: ?*anyopaque, _: wayring.io_uring.Peer, _: ?u32) ?*TestSeat {
+            return @ptrCast(@alignCast(context orelse return null));
+        }
+    };
+    const A = Adapter(@import("core_protocol"), TestSeat);
+    var seat: TestSeat = .{};
+    var a = try A.init(std.testing.allocator, .{ .context = &seat, .resolveFn = Resolver.resolve }, .{ .manager_capacity = 1, .device_capacity = 1, .event_capacity = 1 });
     defer a.deinit();
     const d = try a.acquire();
-    d.valid = true;
-    try a.push(.{ .device_added = .{ .device = a.inputId(d), .info = .{ .capabilities = .{ .pointer = true } } } });
+    d.seat = &seat;
+    try a.push(.{ .device_added = .{ .seat = &seat, .device = a.inputId(d), .info = .{ .capabilities = .{ .pointer = true } } } });
     const old = a.inputId(d);
     a.retire(d);
     const concurrent = try a.acquire();
     try std.testing.expect(concurrent != d);
     a.dropEvent();
-    try std.testing.expect(a.peekEvent().?.* == .device_removed);
+    const removed = a.peekEvent().?.device_removed;
+    try std.testing.expect(removed.seat == &seat);
+    try std.testing.expectEqual(old, removed.device);
     a.dropEvent();
     const replacement = try a.acquire();
     try std.testing.expect(replacement.header.generation != old.generation);
 }
 
 test "ownership growth preserves contexts and every removal beyond initial reserve" {
-    const A = Adapter(@import("core_protocol"));
-    var a = try A.init(std.testing.allocator, .{ .manager_capacity = 1, .device_capacity = 1, .event_capacity = 1 });
+    const TestSeat = struct {};
+    const Resolver = struct {
+        fn resolve(context: ?*anyopaque, _: wayring.io_uring.Peer, _: ?u32) ?*TestSeat {
+            return @ptrCast(@alignCast(context orelse return null));
+        }
+    };
+    const A = Adapter(@import("core_protocol"), TestSeat);
+    var seat: TestSeat = .{};
+    var a = try A.init(std.testing.allocator, .{ .context = &seat, .resolveFn = Resolver.resolve }, .{ .manager_capacity = 1, .device_capacity = 1, .event_capacity = 1 });
     defer a.deinit();
 
     const first_manager = try a.managers.acquire();
@@ -354,7 +356,7 @@ test "ownership growth preserves contexts and every removal beyond initial reser
     var devices: [4]*A.Device = undefined;
     for (&devices) |*device| {
         device.* = try a.acquire();
-        device.*.valid = true;
+        device.*.seat = &seat;
     }
     try std.testing.expect(devices[0] == a.devices.entries.items[0]);
     for (devices) |device| a.retire(device);

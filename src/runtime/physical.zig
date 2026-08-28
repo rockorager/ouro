@@ -198,7 +198,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const TextInputAdapter = protocol_text_input.Adapter(protocol);
         const InputMethodAdapter = protocol_input_method.Adapter(protocol, TextInputAdapter);
         const VirtualKeyboardAdapter = protocol_virtual_keyboard.Adapter(protocol, SeatAdapter);
-        const VirtualPointerAdapter = protocol_virtual_pointer.Adapter(protocol);
+        const VirtualPointerAdapter = protocol_virtual_pointer.Adapter(protocol, SeatAdapter);
         const ScreencopyAdapter = protocol_wlr_screencopy.Adapter(protocol);
         const ForeignToplevelListAdapter = protocol_foreign_toplevel_list.Adapter(protocol);
         const WorkspaceAdapter = protocol_workspace.Adapter(protocol);
@@ -1006,7 +1006,7 @@ pub fn Coordinator(comptime protocol: type) type {
             });
             self.virtual_keyboard_adapter = try VirtualKeyboardAdapter.init(
                 allocator,
-                &self.seat_adapter,
+                .{ .context = self, .resolveFn = resolveVirtualKeyboardSeat },
                 config.virtual_keyboard,
             );
             errdefer self.virtual_keyboard_adapter.deinit();
@@ -1017,13 +1017,10 @@ pub fn Coordinator(comptime protocol: type) type {
             });
             self.virtual_pointer_adapter = try VirtualPointerAdapter.init(
                 allocator,
+                .{ .context = self, .resolveFn = resolveVirtualPointerSeat },
                 config.virtual_pointer,
             );
             errdefer self.virtual_pointer_adapter.deinit();
-            self.virtual_pointer_adapter.setSeatValidator(.{
-                .context = self,
-                .validateFn = validateVirtualPointerSeat,
-            });
             self.virtual_pointer_adapter.setOutputValidator(.{
                 .context = self,
                 .validateFn = validateVirtualPointerOutput,
@@ -3789,13 +3786,25 @@ pub fn Coordinator(comptime protocol: type) type {
             self.markInputMethodProtocol();
         }
 
-        fn validateVirtualPointerSeat(
+        fn resolveVirtualKeyboardSeat(
             context: ?*anyopaque,
             peer: wayring.io_uring.Peer,
             seat_object: u32,
-        ) bool {
-            const self: *Self = @ptrCast(@alignCast(context orelse return false));
-            return self.seat_adapter.ownsSeat(peer, seat_object);
+        ) ?*SeatAdapter {
+            const self: *Self = @ptrCast(@alignCast(context orelse return null));
+            return if (self.seat_adapter.ownsSeat(peer, seat_object)) &self.seat_adapter else null;
+        }
+
+        fn resolveVirtualPointerSeat(
+            context: ?*anyopaque,
+            peer: wayring.io_uring.Peer,
+            seat_object: ?u32,
+        ) ?*SeatAdapter {
+            const self: *Self = @ptrCast(@alignCast(context orelse return null));
+            if (seat_object) |object| {
+                if (!self.seat_adapter.ownsSeat(peer, object)) return null;
+            }
+            return &self.seat_adapter;
         }
 
         fn validateVirtualPointerOutput(
@@ -4018,12 +4027,16 @@ pub fn Coordinator(comptime protocol: type) type {
             self.processing_virtual_pointer = true;
             defer self.processing_virtual_pointer = false;
             while (self.virtual_pointer_adapter.peekEvent()) |pending| {
+                const event_seat = switch (pending.*) {
+                    inline else => |value| value.seat,
+                };
+                std.debug.assert(event_seat == &self.seat_adapter);
                 const accepted = switch (pending.*) {
                     .device_added => |value| try self.acceptNormalizedInput(.{ .device_added = .{
                         .device = value.device,
                         .info = value.info,
                     } }),
-                    .device_removed => |value| try self.acceptNormalizedInput(.{ .device_removed = value }),
+                    .device_removed => |value| try self.acceptNormalizedInput(.{ .device_removed = value.device }),
                     .motion => |value| try self.acceptNormalizedInput(.{ .pointer_motion = .{
                         .device = value.device,
                         .time_usec = @as(u64, value.time) * 1000,
