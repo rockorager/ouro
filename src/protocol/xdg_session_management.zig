@@ -6,8 +6,12 @@
 //! used afterwards.
 
 const std = @import("std");
+const wayring = @import("wayring");
+const objects = wayring.objects;
 
 pub const Config = struct {
+    manager_resources: usize = 8,
+    outbound: usize = 64,
     session_resources: usize = 16,
     toplevel_resources: usize = 64,
     stored_sessions: usize = 16,
@@ -16,7 +20,7 @@ pub const Config = struct {
     max_string_bytes: usize = 256,
 
     fn validate(c: Config) !void {
-        inline for (.{ c.session_resources, c.toplevel_resources, c.stored_sessions, c.stored_toplevels, c.events, c.max_string_bytes }) |n|
+        inline for (.{ c.manager_resources, c.session_resources, c.toplevel_resources, c.stored_sessions, c.stored_toplevels, c.events, c.outbound, c.max_string_bytes }) |n|
             if (n == 0 or n > std.math.maxInt(u32)) return error.InvalidConfig;
     }
 };
@@ -160,6 +164,12 @@ pub fn Owner(comptime State: type, comptime ToplevelId: type) type {
             self.event_len -= 1;
             return event;
         }
+        pub fn sessionIdentifier(self: *const Self, id: StoredSessionId) ?[]const u8 {
+            if (id.index >= self.stored.len) return null;
+            const s = self.stored[id.index];
+            if (!s.live or s.generation != id.generation) return null;
+            return self.text(self.session_strings, id.index, s.id_len);
+        }
         fn session(self: *Self, id: SessionId) ?*SessionResource {
             if (id.index >= self.sessions.len) return null;
             const slot = &self.sessions[id.index];
@@ -264,6 +274,7 @@ pub fn Owner(comptime State: type, comptime ToplevelId: type) type {
             if (!self.validString(name)) return error.InvalidName;
             for (self.handles) |h| if (h.live and !h.inert and h.client == s.client and h.associated and std.meta.eql(h.toplevel, toplevel)) return error.AlreadyAdded;
             var record_i = self.findRecord(s.stored, name);
+            if (!restore and record_i != null) return error.NameInUse;
             const restoring = restore and record_i != null;
             if (restoring and mapped) return error.AlreadyMapped;
             if (record_i) |ri| for (self.handles) |h| if (h.live and !h.inert and h.record == ri and h.associated) return error.NameInUse;
@@ -372,9 +383,378 @@ pub fn Owner(comptime State: type, comptime ToplevelId: type) type {
     };
 }
 
+/// Generated-protocol transport for `Owner`.  The resolver is deliberately
+/// supplied by the shell integration: `toplevelIdOn` alone does not prove that
+/// an object belongs to the requesting client.
+pub fn Adapter(comptime protocol: type, comptime ShellAdapter: type, comptime State: type) type {
+    return struct {
+        const Self = @This();
+        const Runtime = wayring.server.Runtime(protocol);
+        const Core = wayring.server.Core(protocol);
+        const Manager = protocol.xdg_session_manager_v1;
+        const Session = protocol.xdg_session_v1;
+        const Toplevel = protocol.xdg_toplevel_session_v1;
+        const O = Owner(State, ShellAdapter.ToplevelId);
+
+        pub const ResolveToplevel = struct {
+            context: *anyopaque,
+            resolve: *const fn (*anyopaque, ShellAdapter.ToplevelId) anyerror!struct { peer: wayring.io_uring.Peer, mapped: bool },
+        };
+        const ManagerSlot = struct { active: bool = false, generation: u32 = 1, peer: wayring.io_uring.Peer = undefined, resource: objects.Handle = undefined };
+        const SessionSlot = struct { active: bool = false, generation: u32 = 1, peer: wayring.io_uring.Peer = undefined, resource: objects.Handle = undefined, owner: SessionId = undefined };
+        const ToplevelSlot = struct { active: bool = false, generation: u32 = 1, peer: wayring.io_uring.Peer = undefined, resource: objects.Handle = undefined, owner: ToplevelSessionId = undefined };
+        const Out = union(enum) { created: struct { id: SessionId, len: usize, bytes: []u8 }, restored: SessionId, replaced: SessionId, toplevel_restored: ToplevelSessionId };
+        const OutSlot = struct { active: bool = false, sequence: u64 = 0, value: Out = undefined };
+
+        allocator: std.mem.Allocator,
+        shell: *ShellAdapter,
+        owner: O,
+        resolver: ResolveToplevel,
+        generator: O.IdGenerator,
+        runtime: ?*Runtime = null,
+        global: ?objects.Handle = null,
+        managers: []ManagerSlot,
+        sessions: []SessionSlot,
+        toplevels: []ToplevelSlot,
+        outbound: []OutSlot,
+        out_bytes: []u8,
+        string_bytes: usize,
+        sequence: u64 = 1,
+
+        pub fn init(allocator: std.mem.Allocator, shell: *ShellAdapter, config: Config, resolver: ResolveToplevel, generator: O.IdGenerator) !Self {
+            try config.validate();
+            const managers = try allocator.alloc(ManagerSlot, config.manager_resources);
+            errdefer allocator.free(managers);
+            const sessions = try allocator.alloc(SessionSlot, config.session_resources);
+            errdefer allocator.free(sessions);
+            const toplevels = try allocator.alloc(ToplevelSlot, config.toplevel_resources);
+            errdefer allocator.free(toplevels);
+            const outbound = try allocator.alloc(OutSlot, config.outbound);
+            errdefer allocator.free(outbound);
+            const bytes = try allocator.alloc(u8, config.outbound * config.max_string_bytes);
+            errdefer allocator.free(bytes);
+            var owner = try O.init(allocator, config);
+            errdefer owner.deinit();
+            @memset(managers, .{});
+            @memset(sessions, .{});
+            @memset(toplevels, .{});
+            @memset(outbound, .{});
+            return .{ .allocator = allocator, .shell = shell, .owner = owner, .resolver = resolver, .generator = generator, .managers = managers, .sessions = sessions, .toplevels = toplevels, .outbound = outbound, .out_bytes = bytes, .string_bytes = config.max_string_bytes };
+        }
+        pub fn deinit(self: *Self) void {
+            self.owner.deinit();
+            self.allocator.free(self.out_bytes);
+            self.allocator.free(self.outbound);
+            self.allocator.free(self.toplevels);
+            self.allocator.free(self.sessions);
+            self.allocator.free(self.managers);
+            self.* = undefined;
+        }
+        pub fn install(self: *Self, runtime: *Runtime) !objects.Handle {
+            if (self.runtime != null) return error.AlreadyInstalled;
+            self.runtime = runtime;
+            errdefer self.runtime = null;
+            self.global = try runtime.addGlobalWithBinder(&Manager.info, 1, self, bind);
+            return self.global.?;
+        }
+        fn bind(context: ?*anyopaque, binding: wayring.server.Binding) !?*anyopaque {
+            const self: *Self = @ptrCast(@alignCast(context orelse return error.InvalidContext));
+            for (self.managers) |*s| if (!s.active) {
+                const g = s.generation;
+                s.* = .{ .active = true, .generation = g, .peer = binding.peer, .resource = binding.resource };
+                return s;
+            };
+            return error.OutOfMemory;
+        }
+        pub fn request(self: *Self, peer: wayring.io_uring.Peer, target: objects.Dispatch, message: wayring.wire.Message, fds: *wayring.ancillary.FdQueue) !?wayring.dispatch.Control {
+            const runtime = self.runtime orelse return error.NotInstalled;
+            return self.requestOn(try runtime.clients.reactor.getActor(peer), try runtime.clients.get(peer), peer, target, message, fds);
+        }
+        pub fn requestOn(self: *Self, actor: *wayring.connection.Actor, server_objects: anytype, peer: wayring.io_uring.Peer, target: objects.Dispatch, message: wayring.wire.Message, fds: *wayring.ancillary.FdQueue) !?wayring.dispatch.Control {
+            if (target.object.interface == &Manager.info) {
+                const m = fromContext(ManagerSlot, self.managers, target.object.context) orelse return null;
+                if (!samePeer(m.peer, peer) or m.resource.id != message.header.object_id) return null;
+                const decoded = try wayring.server.decodeRequest(Manager, server_objects, message, fds);
+                switch (decoded.value) {
+                    .destroy => {},
+                    .get_session => |v| {
+                        const slot = self.freeSession() orelse return try self.noMemory(actor);
+                        if (self.freeOutCount() < 2) return try self.noMemory(actor);
+                        const admitted = Manager.admit_get_session(server_objects, decoded.handle, v, .{ .id = slot }) catch return try self.noMemory(actor);
+                        const id = self.owner.getSession(clientId(peer), v.reason.value, v.session_id, self.generator) catch |err| {
+                            _ = server_objects.cancelClient(admitted.id) catch unreachable;
+                            return try self.ownerError(actor, decoded.handle.id, err);
+                        };
+                        slot.* = .{ .active = true, .generation = slot.generation, .peer = peer, .resource = admitted.id, .owner = id };
+                        try self.collectEvents();
+                    },
+                }
+                try decoded.finish(protocol, server_objects, &actor.transmit);
+                return .continue_dispatch;
+            }
+            if (target.object.interface == &Session.info) {
+                const s = fromContext(SessionSlot, self.sessions, target.object.context) orelse return null;
+                if (!s.active or !samePeer(s.peer, peer) or s.resource.id != message.header.object_id) return null;
+                const decoded = try wayring.server.decodeRequest(Session, server_objects, message, fds);
+                switch (decoded.value) {
+                    .destroy => self.releaseSession(s, false),
+                    .remove => self.releaseSession(s, true),
+                    .remove_toplevel => |v| self.owner.removeToplevel(s.owner, v.name) catch |err| return try self.sessionError(actor, decoded.handle.id, err),
+                    .add_toplevel => |v| if (try self.addToplevelOn(actor, server_objects, peer, s, decoded.handle, v, false)) |control| return control,
+                    .restore_toplevel => |v| if (try self.addToplevelOn(actor, server_objects, peer, s, decoded.handle, v, true)) |control| return control,
+                }
+                try decoded.finish(protocol, server_objects, &actor.transmit);
+                return .continue_dispatch;
+            }
+            if (target.object.interface == &Toplevel.info) {
+                const t = fromContext(ToplevelSlot, self.toplevels, target.object.context) orelse return null;
+                if (!t.active or !samePeer(t.peer, peer) or t.resource.id != message.header.object_id) return null;
+                const decoded = try wayring.server.decodeRequest(Toplevel, server_objects, message, fds);
+                switch (decoded.value) {
+                    .destroy => self.releaseToplevel(t),
+                    .rename => |v| self.owner.rename(t.owner, v.name) catch |err| return try self.sessionError(actor, decoded.handle.id, err),
+                }
+                try decoded.finish(protocol, server_objects, &actor.transmit);
+                return .continue_dispatch;
+            }
+            return null;
+        }
+
+        fn addToplevelOn(self: *Self, actor: *wayring.connection.Actor, server_objects: anytype, peer: wayring.io_uring.Peer, session: *SessionSlot, parent: objects.Handle, payload: anytype, comptime restoring: bool) !?wayring.dispatch.Control {
+            const slot = self.freeToplevel() orelse return try self.noMemory(actor);
+            if (self.freeOutCount() == 0) return try self.noMemory(actor);
+            const id = self.shell.toplevelIdOn(server_objects, payload.toplevel) catch return try self.sessionError(actor, parent.id, error.AlreadyAdded);
+            const resolved = self.resolver.resolve(self.resolver.context, id) catch return try self.sessionError(actor, parent.id, error.AlreadyAdded);
+            if (!samePeer(resolved.peer, peer)) return try self.sessionError(actor, parent.id, error.AlreadyAdded);
+            const admitted = if (restoring)
+                Session.admit_restore_toplevel(server_objects, parent, payload, .{ .id = slot }) catch return try self.noMemory(actor)
+            else
+                Session.admit_add_toplevel(server_objects, parent, payload, .{ .id = slot }) catch return try self.noMemory(actor);
+            const owner = self.owner.addToplevel(session.owner, id, resolved.mapped, payload.name, restoring) catch |err| {
+                _ = server_objects.cancelClient(admitted.id) catch unreachable;
+                return try self.sessionError(actor, parent.id, err);
+            };
+            slot.* = .{ .active = true, .generation = slot.generation, .peer = peer, .resource = admitted.id, .owner = owner };
+            try self.collectEvents();
+            return null;
+        }
+
+        fn collectEvents(self: *Self) !void {
+            while (self.owner.nextEvent()) |event| switch (event) {
+                .created => |v| {
+                    const text = self.owner.sessionIdentifier(v.stored) orelse continue;
+                    const out = self.reserve() orelse return error.Exhausted;
+                    const i = self.outIndex(out);
+                    const dst = self.out_bytes[i * self.string_bytes ..][0..self.string_bytes];
+                    @memcpy(dst[0..text.len], text);
+                    out.value = .{ .created = .{ .id = v.resource, .len = text.len, .bytes = dst } };
+                },
+                .restored => |id| (self.reserve() orelse return error.Exhausted).value = .{ .restored = id },
+                .replaced => |id| (self.reserve() orelse return error.Exhausted).value = .{ .replaced = id },
+                .toplevel_restored => |id| (self.reserve() orelse return error.Exhausted).value = .{ .toplevel_restored = id },
+                .associated => {},
+            };
+        }
+        pub fn pendingOutbound(self: *const Self, peer: wayring.io_uring.Peer) bool {
+            for (self.outbound) |o| if (o.active and self.outPeer(o.value, peer)) return true;
+            return false;
+        }
+        pub fn flushOn(self: *Self, peer: wayring.io_uring.Peer, server_objects: anytype, queue: *wayring.tx.Queue) !usize {
+            var n: usize = 0;
+            while (self.oldest(peer)) |o| {
+                switch (o.value) {
+                    .created => |v| if (self.sessionSlot(v.id)) |s| try wayring.server.sendEvent(protocol, Session, server_objects, queue, s.resource, .{ .created = .{ .session_id = v.bytes[0..v.len] } }),
+                    .restored => |id| if (self.sessionSlot(id)) |s| try wayring.server.sendEvent(protocol, Session, server_objects, queue, s.resource, .{ .restored = .{} }),
+                    .replaced => |id| if (self.sessionSlot(id)) |s| try wayring.server.sendEvent(protocol, Session, server_objects, queue, s.resource, .{ .replaced = .{} }),
+                    .toplevel_restored => |id| if (self.toplevelSlot(id)) |t| try wayring.server.sendEvent(protocol, Toplevel, server_objects, queue, t.resource, .{ .restored = .{} }),
+                }
+                o.active = false;
+                n += 1;
+            }
+            return n;
+        }
+        pub fn resourceRemoved(self: *Self, handle: objects.Handle, object: objects.Object) bool {
+            if (object.interface == &Manager.info) if (fromContext(ManagerSlot, self.managers, object.context)) |s| {
+                if (!std.meta.eql(s.resource, handle)) return false;
+                s.active = false;
+                s.generation = nextGeneration(s.generation);
+                return true;
+            };
+            if (object.interface == &Session.info) if (fromContext(SessionSlot, self.sessions, object.context)) |s| {
+                if (!std.meta.eql(s.resource, handle)) return false;
+                self.releaseSession(s, false);
+                return true;
+            };
+            if (object.interface == &Toplevel.info) if (fromContext(ToplevelSlot, self.toplevels, object.context)) |s| {
+                if (!std.meta.eql(s.resource, handle)) return false;
+                self.releaseToplevel(s);
+                return true;
+            };
+            return false;
+        }
+        pub fn disconnected(self: *Self, peer: wayring.io_uring.Peer) void {
+            for (self.sessions) |*s| if (s.active and samePeer(s.peer, peer)) self.releaseSession(s, false);
+            for (self.toplevels) |*t| if (t.active and samePeer(t.peer, peer)) self.releaseToplevel(t);
+            for (self.managers) |*m| if (m.active and samePeer(m.peer, peer)) {
+                m.active = false;
+                m.generation = nextGeneration(m.generation);
+            };
+        }
+        pub fn updateState(self: *Self, id: ShellAdapter.ToplevelId, state: State) void {
+            self.owner.updateState(id, state);
+        }
+        pub fn toplevelDestroyed(self: *Self, id: ShellAdapter.ToplevelId) void {
+            self.owner.toplevelDestroyed(id);
+        }
+        pub fn takeRestoreState(self: *Self, id: ToplevelSessionId) ?State {
+            return self.owner.takeRestoreState(id);
+        }
+        pub fn markRestoreApplied(self: *Self, id: ToplevelSessionId) !void {
+            try self.owner.markRestoreApplied(id);
+            try self.collectEvents();
+        }
+        pub fn nextEvent(self: *Self) ?O.Event {
+            return self.owner.nextEvent();
+        }
+        pub fn exportSession(self: *const Self, cursor: *usize) ?O.ExportSession {
+            return self.owner.exportSession(cursor);
+        }
+        pub fn exportToplevel(self: *const Self, cursor: *usize) ?O.ExportToplevel {
+            return self.owner.exportToplevel(cursor);
+        }
+
+        fn freeSession(self: *Self) ?*SessionSlot {
+            for (self.sessions) |*s| if (!s.active) return s;
+            return null;
+        }
+        fn freeToplevel(self: *Self) ?*ToplevelSlot {
+            for (self.toplevels) |*s| if (!s.active) return s;
+            return null;
+        }
+        fn sessionSlot(self: *Self, id: SessionId) ?*SessionSlot {
+            for (self.sessions) |*s| if (s.active and std.meta.eql(s.owner, id)) return s;
+            return null;
+        }
+        fn toplevelSlot(self: *Self, id: ToplevelSessionId) ?*ToplevelSlot {
+            for (self.toplevels) |*s| if (s.active and std.meta.eql(s.owner, id)) return s;
+            return null;
+        }
+        fn releaseSession(self: *Self, s: *SessionSlot, remove: bool) void {
+            if (!s.active) return;
+            self.owner.destroySession(s.owner, remove);
+            s.active = false;
+            s.generation = nextGeneration(s.generation);
+        }
+        fn releaseToplevel(self: *Self, s: *ToplevelSlot) void {
+            if (!s.active) return;
+            self.owner.destroyToplevelSession(s.owner);
+            s.active = false;
+            s.generation = nextGeneration(s.generation);
+        }
+        fn reserve(self: *Self) ?*OutSlot {
+            for (self.outbound) |*o| if (!o.active) {
+                o.active = true;
+                o.sequence = self.sequence;
+                self.sequence +%= 1;
+                return o;
+            };
+            return null;
+        }
+        fn freeOutCount(self: *const Self) usize {
+            var n: usize = 0;
+            for (self.outbound) |o| if (!o.active) {
+                n += 1;
+            };
+            return n;
+        }
+        fn outIndex(self: *const Self, o: *const OutSlot) usize {
+            return (@intFromPtr(o) - @intFromPtr(self.outbound.ptr)) / @sizeOf(OutSlot);
+        }
+        fn outPeer(self: *const Self, value: Out, peer: wayring.io_uring.Peer) bool {
+            return switch (value) {
+                .created => |v| if (self.sessionSlotConst(v.id)) |s| samePeer(s.peer, peer) else false,
+                .restored, .replaced => |id| if (self.sessionSlotConst(id)) |s| samePeer(s.peer, peer) else false,
+                .toplevel_restored => |id| if (self.toplevelSlotConst(id)) |s| samePeer(s.peer, peer) else false,
+            };
+        }
+        fn sessionSlotConst(self: *const Self, id: SessionId) ?*const SessionSlot {
+            for (self.sessions) |*s| if (s.active and std.meta.eql(s.owner, id)) return s;
+            return null;
+        }
+        fn toplevelSlotConst(self: *const Self, id: ToplevelSessionId) ?*const ToplevelSlot {
+            for (self.toplevels) |*s| if (s.active and std.meta.eql(s.owner, id)) return s;
+            return null;
+        }
+        fn oldest(self: *Self, peer: wayring.io_uring.Peer) ?*OutSlot {
+            var found: ?*OutSlot = null;
+            for (self.outbound) |*o| if (o.active and self.outPeer(o.value, peer) and (found == null or o.sequence < found.?.sequence)) {
+                found = o;
+            };
+            return found;
+        }
+        fn noMemory(_: *Self, actor: *wayring.connection.Actor) !wayring.dispatch.Control {
+            try Core.postError(actor, objects.display_id, 2, "out of memory");
+            return .stop;
+        }
+        fn ownerError(self: *Self, actor: *wayring.connection.Actor, id: u32, err: anyerror) !wayring.dispatch.Control {
+            return switch (err) {
+                error.InUse => self.protocolError(actor, id, Manager.@"error".in_use.value, "session in use"),
+                error.InvalidSessionId => self.protocolError(actor, id, Manager.@"error".invalid_session_id.value, "invalid session id"),
+                error.InvalidReason => self.protocolError(actor, id, Manager.@"error".invalid_reason.value, "invalid reason"),
+                error.Capacity, error.IdGenerationFailed => self.noMemory(actor),
+                else => self.protocolError(actor, id, 0, @errorName(err)),
+            };
+        }
+        fn sessionError(self: *Self, actor: *wayring.connection.Actor, id: u32, err: anyerror) !wayring.dispatch.Control {
+            return switch (err) {
+                error.NameInUse => self.protocolError(actor, id, Session.@"error".name_in_use.value, "name in use"),
+                error.AlreadyMapped => self.protocolError(actor, id, Session.@"error".already_mapped.value, "already mapped"),
+                error.InvalidName => self.protocolError(actor, id, Session.@"error".invalid_name.value, "invalid name"),
+                error.AlreadyAdded => self.protocolError(actor, id, Session.@"error".already_added.value, "already added"),
+                error.Capacity => self.noMemory(actor),
+                else => self.protocolError(actor, id, 0, @errorName(err)),
+            };
+        }
+        fn protocolError(_: *Self, actor: *wayring.connection.Actor, id: u32, code: u32, msg: []const u8) !wayring.dispatch.Control {
+            try Core.postError(actor, id, code, msg);
+            return .stop;
+        }
+    };
+}
+
+fn fromContext(comptime T: type, slots: []T, context: ?*anyopaque) ?*T {
+    const raw = context orelse return null;
+    const p: *T = @ptrCast(@alignCast(raw));
+    const address = @intFromPtr(p);
+    const start = @intFromPtr(slots.ptr);
+    const end = start + slots.len * @sizeOf(T);
+    return if (address >= start and address < end and (address - start) % @sizeOf(T) == 0) p else null;
+}
+fn samePeer(a: wayring.io_uring.Peer, b: wayring.io_uring.Peer) bool {
+    return a.slot == b.slot and a.generation == b.generation;
+}
+fn clientId(peer: wayring.io_uring.Peer) u64 {
+    return (@as(u64, peer.generation) << 32) | @as(u64, peer.slot);
+}
+fn nextGeneration(g: u32) u32 {
+    const n = g +% 1;
+    return if (n == 0) 1 else n;
+}
+
 fn testGenerate(_: *anyopaque, out: []u8) !usize {
     @memcpy(out[0..2], "s1");
     return 2;
+}
+
+test "wire adapter declarations compile against generated protocol" {
+    const Shell = struct {
+        pub const ToplevelId = packed struct { index: u32, generation: u32 };
+
+        pub fn toplevelIdOn(_: *@This(), _: anytype, object_id: u32) !ToplevelId {
+            return .{ .index = object_id, .generation = 1 };
+        }
+    };
+    std.testing.refAllDecls(Adapter(@import("core_protocol"), Shell, u32));
 }
 
 test "replacement, persistence, inertness, and generation reuse" {
