@@ -1683,6 +1683,111 @@ test "shell-input: screencopy captures clipped output into writable SHM" {
     try root.deinit();
 }
 
+test "shell-input: image copy capture publishes constraints and writes output SHM" {
+    const allocator = std.testing.allocator;
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-image-copy-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+
+    var fixture = try physical_fixture.Fixture.init();
+    defer fixture.deinit();
+    var root_config = physical_fixture.compositorConfig();
+    root_config.runtime.object_capacity = 24;
+    root_config.runtime.object_quota = 24;
+    const root = try Compositor.create(
+        allocator,
+        try wayring.unix_socket.listen(path, 1),
+        root_config,
+    );
+    var config = physical_fixture.coordinatorConfig();
+    config.router_capacity = 24;
+    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), config);
+    var loop = try Loop.init(
+        allocator,
+        root,
+        &coordinator.router,
+        &coordinator.timers,
+        coordinator,
+        .{ .completion_batch = 16 },
+    );
+    try coordinator.start(&loop);
+
+    var client_reactor: wayring.io_uring.Reactor = undefined;
+    try client_reactor.initOwned(
+        allocator,
+        .{ .entries = 16, .flags = 0 },
+        physical_fixture.clientReactorConfig(),
+    );
+    var client = try ClientConnection.attach(
+        allocator,
+        &client_reactor,
+        try wayring.unix_socket.connect(path),
+        .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 },
+        .{ .max_objects = 16, .max_client_ids = 15 },
+    );
+    const actor = try client.actor();
+    var driver = ClientDriver.init(&client);
+    const registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null);
+    var handler: ImageCopyHandler = .{
+        .objects = &client.objects,
+        .queue = &actor.transmit,
+        .registry = registry,
+    };
+    defer {
+        if (handler.read_fd >= 0) _ = linux.close(handler.read_fd);
+    }
+    try submitClient(&client_reactor, &driver, &handler);
+
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    var client_progress: ClientDriver.Progress = .{};
+    for (0..512) |_| {
+        client_progress = try drainClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.ready) break;
+        if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, client_reactor.ring);
+    }
+    try std.testing.expect(handler.ready);
+    try std.testing.expect(!handler.failed);
+    try std.testing.expect(!handler.stopped);
+    try std.testing.expectEqual(@as(usize, 1), handler.buffer_size_events);
+    try std.testing.expectEqual(@as(usize, 2), handler.shm_format_events);
+    try std.testing.expectEqual(@as(usize, 1), handler.constraints_done_events);
+    try std.testing.expectEqual(@as(usize, 1), handler.transform_events);
+    try std.testing.expectEqual(@as(usize, 1), handler.damage_events);
+    try std.testing.expectEqual(@as(usize, 1), handler.presentation_events);
+    try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+    var captured: [24]u8 = undefined;
+    const read = linux.pread(handler.read_fd, &captured, captured.len, 0);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(read));
+    try std.testing.expectEqual(@as(usize, captured.len), read);
+    const black_pixel = [_]u8{ 0, 0, 0, 0xff };
+    for (0..6) |pixel|
+        try std.testing.expectEqualSlices(u8, &black_pixel, captured[pixel * 4 ..][0..4]);
+
+    coordinator.disconnected(coordinator.peer.?);
+    _ = try client.prepareClose();
+    try submitClient(&client_reactor, &driver, &handler);
+    var drained = false;
+    for (0..256) |_| {
+        client_progress = try drainClient(&client_reactor, &driver, &handler);
+        const progress = try loop.turn(coordinator);
+        drained = progress.wayring.shutdown_complete and client_progress.quiescent and
+            coordinator.backendDrainComplete();
+        if (drained) break;
+        if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, client_reactor.ring);
+    }
+    try std.testing.expect(drained);
+    try client.deinit(allocator);
+    client_reactor.deinit(allocator);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
 test "shell-input: synchronized subsurface publishes with parent and receives pointer focus" {
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;
@@ -3026,6 +3131,208 @@ const ScreencopyHandler = struct {
             .{ .copy_with_damage = .{ .buffer = self.buffer.?.id } },
         );
         self.copy_requested = true;
+    }
+};
+
+const ImageCopyHandler = struct {
+    objects: *wayring.objects.ClientObjects,
+    queue: *wayring.tx.Queue,
+    registry: wayring.objects.Handle,
+    shm: ?wayring.objects.Handle = null,
+    output: ?wayring.objects.Handle = null,
+    source_manager: ?wayring.objects.Handle = null,
+    manager: ?wayring.objects.Handle = null,
+    source: ?wayring.objects.Handle = null,
+    session: ?wayring.objects.Handle = null,
+    frame: ?wayring.objects.Handle = null,
+    buffer: ?wayring.objects.Handle = null,
+    read_fd: linux.fd_t = -1,
+    output_ready: bool = false,
+    frame_requested: bool = false,
+    capture_requested: bool = false,
+    ready: bool = false,
+    failed: bool = false,
+    stopped: bool = false,
+    width: u32 = 0,
+    height: u32 = 0,
+    buffer_size_events: usize = 0,
+    shm_format_events: usize = 0,
+    constraints_done_events: usize = 0,
+    transform_events: usize = 0,
+    damage_events: usize = 0,
+    presentation_events: usize = 0,
+    event_failures: usize = 0,
+
+    pub fn eventError(
+        self: *ImageCopyHandler,
+        _: wayring.io_uring.Peer,
+        _: ClientCore.EventFailure,
+    ) void {
+        self.event_failures += 1;
+    }
+
+    pub fn event(
+        self: *ImageCopyHandler,
+        target: wayring.objects.Dispatch,
+        message: wayring.wire.Message,
+        fds: *wayring.ancillary.FdQueue,
+    ) !wayring.dispatch.Control {
+        if (target.object.interface == &ClientCore.Registry.info) {
+            switch (try ClientCore.decodeRegistryEvent(self.objects, self.registry, message, fds)) {
+                .global => |value| try self.bindGlobal(value),
+                .global_remove => {},
+            }
+            try self.maybeCreateSession();
+        } else if (target.object.interface == &protocol.wl_shm.info) {
+            _ = try protocol.wl_shm.decodeEvent(message, fds);
+        } else if (target.object.interface == &protocol.wl_output.info) {
+            switch (try protocol.wl_output.decodeEvent(message, fds)) {
+                .done => {
+                    self.output_ready = true;
+                    try self.maybeCreateSession();
+                },
+                else => {},
+            }
+        } else if (target.object.interface == &protocol.ext_image_copy_capture_session_v1.info) {
+            switch (try protocol.ext_image_copy_capture_session_v1.decodeEvent(message, fds)) {
+                .buffer_size => |value| {
+                    try std.testing.expectEqual(@as(u32, 3), value.width);
+                    try std.testing.expectEqual(@as(u32, 2), value.height);
+                    self.width = value.width;
+                    self.height = value.height;
+                    self.buffer_size_events += 1;
+                },
+                .shm_format => |value| {
+                    try std.testing.expect(
+                        value.format.value == protocol.wl_shm.format.argb8888.value or
+                            value.format.value == protocol.wl_shm.format.xrgb8888.value,
+                    );
+                    self.shm_format_events += 1;
+                },
+                .done => {
+                    self.constraints_done_events += 1;
+                    try self.requestFrame();
+                },
+                .stopped => self.stopped = true,
+                .dmabuf_device, .dmabuf_format => return error.UnexpectedDmabufCapture,
+            }
+        } else if (target.object.interface == &protocol.ext_image_copy_capture_frame_v1.info) {
+            switch (try protocol.ext_image_copy_capture_frame_v1.decodeEvent(message, fds)) {
+                .transform => |value| {
+                    try std.testing.expectEqual(protocol.wl_output.transform.normal, value.transform);
+                    self.transform_events += 1;
+                },
+                .damage => |value| {
+                    try std.testing.expectEqual(@as(i32, 0), value.x);
+                    try std.testing.expectEqual(@as(i32, 0), value.y);
+                    try std.testing.expectEqual(@as(i32, 3), value.width);
+                    try std.testing.expectEqual(@as(i32, 2), value.height);
+                    self.damage_events += 1;
+                },
+                .presentation_time => |value| {
+                    try std.testing.expect(value.tv_nsec < std.time.ns_per_s);
+                    self.presentation_events += 1;
+                },
+                .ready => self.ready = true,
+                .failed => self.failed = true,
+            }
+        } else if (target.object.interface == &ClientCore.Display.info) {
+            switch (try ClientCore.decodeDisplayEvent(self.objects, message, fds)) {
+                .delete_id => {},
+                .@"error" => return error.ServerProtocolError,
+            }
+        } else return error.UnexpectedEvent;
+        return .continue_dispatch;
+    }
+
+    fn bindGlobal(self: *ImageCopyHandler, value: anytype) !void {
+        if (std.mem.eql(u8, value.interface, protocol.wl_shm.info.name))
+            self.shm = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_shm.info, @min(value.version, 2), null);
+        if (std.mem.eql(u8, value.interface, protocol.wl_output.info.name))
+            self.output = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_output.info, @min(value.version, 4), null);
+        if (std.mem.eql(u8, value.interface, protocol.ext_output_image_capture_source_manager_v1.info.name))
+            self.source_manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.ext_output_image_capture_source_manager_v1.info, 1, null);
+        if (std.mem.eql(u8, value.interface, protocol.ext_image_copy_capture_manager_v1.info.name))
+            self.manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.ext_image_copy_capture_manager_v1.info, 1, null);
+    }
+
+    fn maybeCreateSession(self: *ImageCopyHandler) !void {
+        if (!self.output_ready or self.shm == null or self.output == null or
+            self.source_manager == null or self.manager == null) return;
+        if (self.source == null)
+            self.source = (try protocol.ext_output_image_capture_source_manager_v1.construct_create_source(
+                self.objects,
+                self.queue,
+                self.source_manager.?,
+                .{ .output = self.output.?.id },
+            )).source;
+        if (self.session == null)
+            self.session = (try protocol.ext_image_copy_capture_manager_v1.construct_create_session(
+                self.objects,
+                self.queue,
+                self.manager.?,
+                .{
+                    .source = self.source.?.id,
+                    .options = protocol.ext_image_copy_capture_manager_v1.options.fromInt(0),
+                },
+            )).session;
+    }
+
+    fn requestFrame(self: *ImageCopyHandler) !void {
+        if (self.frame_requested) return;
+        try std.testing.expectEqual(@as(u32, 3), self.width);
+        try std.testing.expectEqual(@as(u32, 2), self.height);
+        const descriptor = try ordinaryMemfd(24, 0, &([_]u8{0x55} ** 24));
+        const retained = linux.fcntl(descriptor, linux.F.DUPFD_CLOEXEC, 0);
+        if (linux.errno(retained) != .SUCCESS) return error.DuplicateFailed;
+        self.read_fd = @intCast(retained);
+        errdefer {
+            _ = linux.close(self.read_fd);
+            self.read_fd = -1;
+        }
+        const pool = try protocol.wl_shm.construct_create_pool(
+            self.objects,
+            self.queue,
+            self.shm.?,
+            .{ .fd = descriptor, .size = 24 },
+        );
+        self.buffer = (try protocol.wl_shm_pool.construct_create_buffer(
+            self.objects,
+            self.queue,
+            pool.id,
+            .{
+                .offset = 0,
+                .width = 3,
+                .height = 2,
+                .stride = 12,
+                .format = .xrgb8888,
+            },
+        )).id;
+        try wayring.client.sendRequest(
+            protocol.wl_shm_pool,
+            self.objects,
+            self.queue,
+            pool.id,
+            .{ .destroy = .{} },
+        );
+        self.frame = (try protocol.ext_image_copy_capture_session_v1.construct_create_frame(
+            self.objects,
+            self.queue,
+            self.session.?,
+            .{},
+        )).frame;
+        try protocol.ext_image_copy_capture_frame_v1.encodeRequest(
+            self.queue,
+            self.frame.?.id,
+            .{ .attach_buffer = .{ .buffer = self.buffer.?.id } },
+        );
+        try protocol.ext_image_copy_capture_frame_v1.encodeRequest(
+            self.queue,
+            self.frame.?.id,
+            .{ .capture = .{} },
+        );
+        self.frame_requested = true;
+        self.capture_requested = true;
     }
 };
 
