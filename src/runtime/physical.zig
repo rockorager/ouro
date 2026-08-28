@@ -1569,12 +1569,7 @@ pub fn Coordinator(comptime protocol: type) type {
             if (target.object.interface == &ServerCore.Display.info) {
                 switch (try self.root.runtime.decodeDisplayRequest(peer, message, fds, null)) {
                     .get_registry => {},
-                    .sync => |callback| try ServerCore.completeSync(
-                        objects,
-                        &actor.transmit,
-                        callback,
-                        0,
-                    ),
+                    .sync => |callback| try self.root.runtime.completeSync(peer, callback, 0),
                 }
                 return .continue_dispatch;
             }
