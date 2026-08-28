@@ -756,6 +756,7 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
         .registry = registry,
         .test_pointer_warp = true,
         .test_foreign_toplevel = true,
+        .test_wlr_foreign_toplevel = true,
         .test_image_capture_sources = true,
         .test_toplevel_drag = true,
     };
@@ -879,7 +880,7 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
         }
     }
 
-    try std.testing.expectEqual(@as(usize, 2), handler.configure_count);
+    try std.testing.expect(handler.configure_count >= 4);
     try std.testing.expect(handler.configure_serial != 0);
     try std.testing.expectEqual(handler.configure_serial, handler.acked_serial);
     try std.testing.expect(two_layers_observed);
@@ -933,6 +934,16 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     try std.testing.expect(handler.foreign_toplevel_identifier);
     try std.testing.expect(handler.foreign_toplevel_done >= 1);
     try std.testing.expectEqual(@as(usize, 1), handler.foreign_toplevel_finished);
+    try std.testing.expectEqual(@as(u32, 3), handler.wlr_foreign_toplevel_version);
+    try std.testing.expect(handler.wlr_foreign_toplevel_manager != null);
+    try std.testing.expect(handler.wlr_foreign_toplevel_handle != null);
+    try std.testing.expectEqual(@as(usize, 1), handler.wlr_foreign_toplevel_announcements);
+    try std.testing.expectEqual(@as(usize, 7), handler.wlr_foreign_toplevel_initial_order);
+    try std.testing.expect(handler.wlr_foreign_toplevel_done >= 4);
+    try std.testing.expectEqual(@as(usize, 3), handler.wlr_foreign_toplevel_control_phase);
+    try std.testing.expectEqual(@as(usize, 1), handler.wlr_foreign_toplevel_finished);
+    try std.testing.expectEqual(@as(usize, 1), handler.xdg_toplevel_close);
+    try std.testing.expectEqual(@as(usize, 0), coordinator.foreign_toplevel_list_adapter.pendingCommands());
     try std.testing.expect(handler.image_output_source != null);
     try std.testing.expect(handler.image_toplevel_source != null);
     try std.testing.expect(handler.image_cursor_session != null);
@@ -1067,6 +1078,16 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
             try waitForEither(&root.ring, client_reactor.ring);
     }
     try std.testing.expectEqual(@as(usize, 1), handler.foreign_toplevel_closed);
+    try std.testing.expectEqual(@as(usize, 1), handler.wlr_foreign_toplevel_closed);
+    try wayring.client.sendRequest(
+        protocol.zwlr_foreign_toplevel_handle_v1,
+        handler.objects,
+        handler.queue,
+        handler.wlr_foreign_toplevel_handle.?,
+        .{ .destroy = .{} },
+    );
+    handler.wlr_foreign_toplevel_handle = null;
+    try submitClient(&client_reactor, &driver, &handler);
     try std.testing.expect(coordinator.image_capture_source_adapter.snapshotForResource(
         capture_peer,
         capture_objects,
@@ -3824,6 +3845,16 @@ const Handler = struct {
     foreign_toplevel_finished: usize = 0,
     foreign_toplevel_closed: usize = 0,
     foreign_toplevel_global_seen: bool = false,
+    wlr_foreign_toplevel_manager: ?wayring.objects.Handle = null,
+    wlr_foreign_toplevel_handle: ?wayring.objects.Handle = null,
+    test_wlr_foreign_toplevel: bool = false,
+    wlr_foreign_toplevel_version: u32 = 0,
+    wlr_foreign_toplevel_announcements: usize = 0,
+    wlr_foreign_toplevel_initial_order: usize = 0,
+    wlr_foreign_toplevel_done: usize = 0,
+    wlr_foreign_toplevel_control_phase: usize = 0,
+    wlr_foreign_toplevel_finished: usize = 0,
+    wlr_foreign_toplevel_closed: usize = 0,
     image_output_manager: ?wayring.objects.Handle = null,
     image_toplevel_manager: ?wayring.objects.Handle = null,
     image_copy_manager: ?wayring.objects.Handle = null,
@@ -3877,6 +3908,7 @@ const Handler = struct {
     configure_count: usize = 0,
     configure_serial: u32 = 0,
     acked_serial: u32 = 0,
+    xdg_toplevel_close: usize = 0,
     pointer_enter: usize = 0,
     pointer_enter_serial: u32 = 0,
     pointer_warp_queued: bool = false,
@@ -4016,6 +4048,69 @@ const Handler = struct {
                 },
                 .closed => self.foreign_toplevel_closed += 1,
             }
+        } else if (target.object.interface == &protocol.zwlr_foreign_toplevel_manager_v1.info) {
+            switch (try protocol.zwlr_foreign_toplevel_manager_v1.decodeEvent(message, fds)) {
+                .toplevel => |value| {
+                    try std.testing.expectEqual(@as(usize, 0), self.wlr_foreign_toplevel_initial_order);
+                    self.wlr_foreign_toplevel_initial_order = 1;
+                    self.wlr_foreign_toplevel_announcements += 1;
+                    self.wlr_foreign_toplevel_handle = (try protocol.zwlr_foreign_toplevel_manager_v1.admit_event_toplevel(
+                        self.objects,
+                        self.wlr_foreign_toplevel_manager.?,
+                        value,
+                        .{},
+                    )).toplevel;
+                },
+                .finished => self.wlr_foreign_toplevel_finished += 1,
+            }
+        } else if (target.object.interface == &protocol.zwlr_foreign_toplevel_handle_v1.info) {
+            switch (try protocol.zwlr_foreign_toplevel_handle_v1.decodeEvent(message, fds)) {
+                .title => |value| {
+                    try std.testing.expectEqual(@as(usize, 1), self.wlr_foreign_toplevel_initial_order);
+                    try std.testing.expectEqualStrings("Foreign title", value.title);
+                    self.wlr_foreign_toplevel_initial_order = 2;
+                },
+                .app_id => |value| {
+                    try std.testing.expectEqual(@as(usize, 2), self.wlr_foreign_toplevel_initial_order);
+                    try std.testing.expectEqualStrings("org.example.Foreign", value.app_id);
+                    self.wlr_foreign_toplevel_initial_order = 3;
+                },
+                .output_enter => |value| {
+                    try std.testing.expect(self.wlr_foreign_toplevel_initial_order >= 6);
+                    try std.testing.expectEqual(self.output.?.id, value.output);
+                    self.wlr_foreign_toplevel_initial_order = 7;
+                },
+                .state => {
+                    if (self.wlr_foreign_toplevel_done == 0) {
+                        try std.testing.expectEqual(@as(usize, 3), self.wlr_foreign_toplevel_initial_order);
+                        self.wlr_foreign_toplevel_initial_order = 4;
+                    }
+                },
+                .parent => |value| {
+                    try std.testing.expectEqual(@as(usize, 4), self.wlr_foreign_toplevel_initial_order);
+                    try std.testing.expect(value.parent == null);
+                    self.wlr_foreign_toplevel_initial_order = 5;
+                },
+                .done => {
+                    self.wlr_foreign_toplevel_done += 1;
+                    if (self.wlr_foreign_toplevel_initial_order == 5) {
+                        try std.testing.expectEqual(@as(usize, 5), self.wlr_foreign_toplevel_initial_order);
+                        self.wlr_foreign_toplevel_initial_order = 6;
+                    } else if (self.wlr_foreign_toplevel_initial_order == 7 and self.wlr_foreign_toplevel_control_phase == 0) {
+                        self.wlr_foreign_toplevel_control_phase = 1;
+                        try protocol.zwlr_foreign_toplevel_handle_v1.encodeRequest(self.queue, self.wlr_foreign_toplevel_handle.?.id, .{ .set_maximized = .{} });
+                    } else if (self.wlr_foreign_toplevel_control_phase == 1) {
+                        self.wlr_foreign_toplevel_control_phase = 2;
+                        try protocol.zwlr_foreign_toplevel_handle_v1.encodeRequest(self.queue, self.wlr_foreign_toplevel_handle.?.id, .{ .unset_maximized = .{} });
+                    } else if (self.wlr_foreign_toplevel_control_phase == 2) {
+                        self.wlr_foreign_toplevel_control_phase = 3;
+                        try protocol.zwlr_foreign_toplevel_handle_v1.encodeRequest(self.queue, self.wlr_foreign_toplevel_handle.?.id, .{ .close = .{} });
+                        try protocol.zwlr_foreign_toplevel_manager_v1.encodeRequest(self.queue, self.wlr_foreign_toplevel_manager.?.id, .{ .stop = .{} });
+                    }
+                },
+                .closed => self.wlr_foreign_toplevel_closed += 1,
+                .output_leave => {},
+            }
         } else if (target.object.interface == &protocol.ext_image_copy_capture_cursor_session_v1.info) {
             switch (try protocol.ext_image_copy_capture_cursor_session_v1.decodeEvent(message, fds)) {
                 .enter => self.image_cursor_enter += 1,
@@ -4052,7 +4147,7 @@ const Handler = struct {
         } else if (target.object.interface == &protocol.xdg_toplevel.info) {
             switch (try protocol.xdg_toplevel.decodeEvent(message, fds)) {
                 .configure => {},
-                .close => {},
+                .close => self.xdg_toplevel_close += 1,
                 else => {},
             }
         } else if (target.object.interface == &protocol.xdg_surface.info) {
@@ -4382,6 +4477,22 @@ const Handler = struct {
             1,
             null,
         );
+        if (self.test_wlr_foreign_toplevel and std.mem.eql(
+            u8,
+            value.interface,
+            protocol.zwlr_foreign_toplevel_manager_v1.info.name,
+        )) {
+            self.wlr_foreign_toplevel_version = value.version;
+            self.wlr_foreign_toplevel_manager = try ClientCore.bind(
+                self.objects,
+                self.queue,
+                self.registry,
+                value.name,
+                &protocol.zwlr_foreign_toplevel_manager_v1.info,
+                @min(value.version, 3),
+                null,
+            );
+        }
         if (std.mem.eql(u8, value.interface, protocol.ext_foreign_toplevel_list_v1.info.name))
             self.foreign_toplevel_global_seen = true;
         if (std.mem.eql(u8, value.interface, protocol.ext_output_image_capture_source_manager_v1.info.name)) {

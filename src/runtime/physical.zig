@@ -1110,6 +1110,10 @@ pub fn Coordinator(comptime protocol: type) type {
             });
             self.output_adapter = try OutputAdapter.init(allocator, config.protocol_output);
             errdefer self.output_adapter.deinit();
+            self.foreign_toplevel_list_adapter.setOutputResolver(
+                self,
+                resolveForeignToplevelOutput,
+            );
             self.screencopy_adapter = try ScreencopyAdapter.init(allocator, config.wlr_screencopy);
             errdefer self.screencopy_adapter.deinit();
             self.screencopy_adapter.setOutputValidator(.{
@@ -1217,6 +1221,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
             _ = try self.foreign_toplevel_list_adapter.install(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
+            _ = try self.foreign_toplevel_list_adapter.installWlr();
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
             _ = try self.image_capture_source_adapter.installOutput(&root.runtime);
@@ -1805,6 +1812,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 return control;
             }
             if (try self.foreign_toplevel_list_adapter.request(peer, target, message, fds)) |control| {
+                try self.advanceShell();
                 if (self.foreign_toplevel_list_adapter.pendingOutbound(peer))
                     self.markProtocol(peer, ProtocolReady.foreign_toplevel_list);
                 try self.flushProtocol();
@@ -2802,6 +2810,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (consumed == 0) break;
                 self.stats.shell_events += consumed;
             }
+            try self.consumeForeignToplevelCommands();
             if (self.desktop.foreignToplevelChanged()) {
                 const synced = if (self.syncForeignToplevels())
                     true
@@ -2860,22 +2869,62 @@ pub fn Coordinator(comptime protocol: type) type {
                         break;
                     };
                     if (entry == null) return error.Exhausted;
-                    continue;
                 }
                 entry.?.seen = true;
+            }
+            for (self.foreign_toplevels) |*entry| {
+                if (!entry.active or !entry.seen) continue;
+                const metadata = try self.desktop.metadata(entry.desktop);
                 const published = try self.foreign_toplevel_list_adapter.metadata(
-                    entry.?.protocol_id,
+                    entry.protocol_id,
                 );
                 if (!std.mem.eql(u8, published.title, metadata.title))
                     try self.foreign_toplevel_list_adapter.updateTitle(
-                        entry.?.protocol_id,
+                        entry.protocol_id,
                         metadata.title,
                     );
                 if (!std.mem.eql(u8, published.app_id, metadata.app_id))
                     try self.foreign_toplevel_list_adapter.updateAppId(
-                        entry.?.protocol_id,
+                        entry.protocol_id,
                         metadata.app_id,
                     );
+                const state = try self.desktop.stateSnapshot(entry.desktop);
+                _ = try self.foreign_toplevel_list_adapter.updateState(entry.protocol_id, .{
+                    .maximized = state.maximized,
+                    .minimized = state.minimized,
+                    .activated = state.activated,
+                    .fullscreen = state.fullscreen,
+                });
+                const parent = if (state.parent) |parent_id|
+                    if (self.foreignToplevel(parent_id)) |parent_entry|
+                        parent_entry.protocol_id
+                    else
+                        null
+                else
+                    null;
+                _ = try self.foreign_toplevel_list_adapter.updateParent(entry.protocol_id, parent);
+                const output_id = if (self.output) |output| foreignOutputId(output.outputId()) else null;
+                while (true) {
+                    var stale: ?ForeignToplevelListAdapter.OutputId = null;
+                    for (try self.foreign_toplevel_list_adapter.outputs(entry.protocol_id)) |published_output| {
+                        if (output_id == null or !std.meta.eql(published_output, output_id.?)) {
+                            stale = published_output;
+                            break;
+                        }
+                    }
+                    if (stale) |published_output| {
+                        _ = try self.foreign_toplevel_list_adapter.removeOutput(
+                            entry.protocol_id,
+                            published_output,
+                        );
+                    } else break;
+                }
+                if (output_id) |current_output| {
+                    _ = try self.foreign_toplevel_list_adapter.addOutput(
+                        entry.protocol_id,
+                        current_output,
+                    );
+                }
             }
             for (self.foreign_toplevels) |*entry| {
                 if (!entry.active or entry.seen) continue;
@@ -2885,10 +2934,81 @@ pub fn Coordinator(comptime protocol: type) type {
             }
         }
 
+        fn consumeForeignToplevelCommands(self: *Self) !void {
+            while (self.foreign_toplevel_list_adapter.peekCommand()) |command| {
+                const entry = self.foreignToplevelProtocol(command.toplevel) orelse {
+                    self.foreign_toplevel_list_adapter.dropCommand();
+                    continue;
+                };
+                const result: anyerror!void = switch (command.request) {
+                    .set_maximized => self.desktop.setToplevelState(entry.desktop, .maximized, true),
+                    .unset_maximized => self.desktop.setToplevelState(entry.desktop, .maximized, false),
+                    .set_minimized => self.desktop.setToplevelState(entry.desktop, .minimized, true),
+                    .unset_minimized => self.desktop.setToplevelState(entry.desktop, .minimized, false),
+                    .set_fullscreen => |fullscreen_request| blk: {
+                        if (fullscreen_request.output) |output_object| {
+                            const objects = self.root.runtime.clients.get(command.peer) catch
+                                break :blk error.StalePeer;
+                            _ = self.resolveCaptureOutput(command.peer, objects, output_object) orelse
+                                break :blk error.StaleOutput;
+                        }
+                        break :blk self.desktop.setToplevelState(entry.desktop, .fullscreen, true);
+                    },
+                    .unset_fullscreen => self.desktop.setToplevelState(entry.desktop, .fullscreen, false),
+                    .activate => |activation_request| blk: {
+                        const objects = self.root.runtime.clients.get(command.peer) catch
+                            break :blk error.StalePeer;
+                        if (!self.seat_adapter.validateSeatOn(objects, command.peer, activation_request.seat))
+                            break :blk error.StaleSeat;
+                        break :blk self.desktop.focusToplevel(entry.desktop);
+                    },
+                    .close => blk: {
+                        const shell_id = self.desktop.shellToplevel(entry.desktop) catch |cause|
+                            break :blk cause;
+                        break :blk self.shell_adapter.queueClose(shell_id);
+                    },
+                    .set_rectangle => {},
+                };
+                result catch |cause| switch (cause) {
+                    error.Exhausted, error.Backpressure => return,
+                    error.StaleToplevel, error.StalePeer, error.StaleOutput, error.StaleSeat, error.NotVisible => {},
+                    else => return cause,
+                };
+                self.foreign_toplevel_list_adapter.dropCommand();
+            }
+        }
+
         fn foreignToplevel(self: *Self, id: Desktop.ToplevelId) ?*ForeignToplevel {
             for (self.foreign_toplevels) |*entry|
                 if (entry.active and std.meta.eql(entry.desktop, id)) return entry;
             return null;
+        }
+
+        fn foreignToplevelProtocol(
+            self: *Self,
+            id: ForeignToplevelListAdapter.ToplevelId,
+        ) ?*ForeignToplevel {
+            for (self.foreign_toplevels) |*entry|
+                if (entry.active and std.meta.eql(entry.protocol_id, id)) return entry;
+            return null;
+        }
+
+        fn resolveForeignToplevelOutput(
+            context: ?*anyopaque,
+            peer: wayring.io_uring.Peer,
+            id: ForeignToplevelListAdapter.OutputId,
+        ) ?u32 {
+            const self: *Self = @ptrCast(@alignCast(context orelse return null));
+            const output = self.output orelse return null;
+            const current = foreignOutputId(output.outputId());
+            if (!std.meta.eql(current, id)) return null;
+            var resources: [1]u32 = undefined;
+            const ids = self.output_adapter.resourceIds(peer, &resources) catch return null;
+            return if (ids.len == 0) null else ids[0];
+        }
+
+        fn foreignOutputId(id: output_scheduler.OutputId) ForeignToplevelListAdapter.OutputId {
+            return .{ .value = @as(u64, id.generation) << 32 | id.index };
         }
 
         fn foreignToplevelOutbound(self: *const Self) bool {
@@ -3508,6 +3628,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 !std.mem.eql(u8, name, "zwp_virtual_keyboard_manager_v1") and
                 !std.mem.eql(u8, name, "zwlr_virtual_pointer_manager_v1") and
                 !std.mem.eql(u8, name, "ext_foreign_toplevel_list_v1") and
+                !std.mem.eql(u8, name, "zwlr_foreign_toplevel_manager_v1") and
                 !std.mem.eql(u8, name, "ext_output_image_capture_source_manager_v1") and
                 !std.mem.eql(u8, name, "ext_foreign_toplevel_image_capture_source_manager_v1") and
                 !std.mem.eql(u8, name, "ext_image_copy_capture_manager_v1");

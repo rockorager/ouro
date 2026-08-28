@@ -42,6 +42,16 @@ pub fn Desktop(comptime Shell: type) type {
 
         pub const Mode = enum { tiled, floating };
 
+        pub const RequestedState = enum { fullscreen, maximized, minimized };
+
+        pub const StateSnapshot = struct {
+            maximized: bool,
+            minimized: bool,
+            activated: bool,
+            fullscreen: bool,
+            parent: ?ToplevelId,
+        };
+
         pub const InteractiveKind = union(enum) {
             move,
             resize: Shell.ResizeEdge,
@@ -507,6 +517,19 @@ pub fn Desktop(comptime Shell: type) type {
             try desktop.reflow();
         }
 
+        pub fn setToplevelState(
+            desktop: *Self,
+            id: ToplevelId,
+            state: RequestedState,
+            enabled: bool,
+        ) !void {
+            try desktop.requestState(id, switch (state) {
+                .fullscreen => .fullscreen,
+                .maximized => .maximized,
+                .minimized => .minimized,
+            }, enabled);
+        }
+
         pub fn focusNext(desktop: *Self) !void {
             const current = desktop.focused() orelse return;
             const current_index = try desktop.resolveIndex(current);
@@ -758,6 +781,18 @@ pub fn Desktop(comptime Shell: type) type {
                 .max_height = slot.max_height,
                 .dialog = slot.dialog,
                 .modal = slot.modal,
+            };
+        }
+
+        pub fn stateSnapshot(desktop: *const Self, id: ToplevelId) !StateSnapshot {
+            const index = try desktop.resolveIndex(id);
+            const slot = desktop.slots[index];
+            return .{
+                .maximized = slot.maximized,
+                .minimized = slot.minimized,
+                .activated = desktop.focus_len != 0 and desktop.focus[0] == index,
+                .fullscreen = slot.fullscreen,
+                .parent = slot.parent,
             };
         }
 
