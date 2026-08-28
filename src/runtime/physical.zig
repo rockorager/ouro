@@ -43,6 +43,7 @@ const drm_syncobj = @import("../drm_syncobj.zig");
 const protocol_xdg_activation = @import("../protocol/xdg_activation.zig");
 const protocol_xdg_decoration = @import("../protocol/xdg_decoration.zig");
 const protocol_xdg_dialog = @import("../protocol/xdg_dialog.zig");
+const protocol_gtk_shell = @import("../protocol/gtk_shell.zig");
 const protocol_xdg_toplevel_drag = @import("../protocol/xdg_toplevel_drag.zig");
 const protocol_xdg_toplevel_icon = @import("../protocol/xdg_toplevel_icon.zig");
 const protocol_wayland_fixes = @import("../protocol/wayland_fixes.zig");
@@ -107,6 +108,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const ActivationAdapter = protocol_xdg_activation.Adapter(protocol, Adapter);
         const DecorationAdapter = protocol_xdg_decoration.Adapter(protocol, ShellAdapter);
         const DialogAdapter = protocol_xdg_dialog.Adapter(protocol, ShellAdapter);
+        const GtkShellAdapter = protocol_gtk_shell.Adapter(protocol, Adapter);
         const ToplevelDragAdapter = protocol_xdg_toplevel_drag.Adapter(protocol, ShellAdapter, DataDeviceAdapter);
         const ToplevelIconAdapter = protocol_xdg_toplevel_icon.Adapter(protocol, ShellAdapter, Shm);
         const WaylandFixesAdapter = protocol_wayland_fixes.Adapter(protocol);
@@ -274,13 +276,14 @@ pub fn Coordinator(comptime protocol: type) type {
             const foreign_toplevel_list: u32 = 1 << 27;
             const image_copy_capture: u32 = 1 << 28;
             const xdg_toplevel_icon: u32 = 1 << 29;
+            const gtk_shell: u32 = 1 << 30;
             const all: u32 = decoration | shell | seat | data_device | dmabuf |
                 activation | relative_pointer | fractional_scale | output | core |
                 pointer_constraints | color_management | color_representation |
                 primary_selection | text_input | pointer_gestures |
                 shortcuts_inhibit | xdg_foreign | xdg_output | layer_shell | session_lock |
                 idle_notify | tablet | ext_data_control | wlr_data_control | input_method |
-                screencopy | foreign_toplevel_list | image_copy_capture | xdg_toplevel_icon;
+                screencopy | foreign_toplevel_list | image_copy_capture | xdg_toplevel_icon | gtk_shell;
         };
         const Client = struct {
             active: bool = false,
@@ -391,6 +394,7 @@ pub fn Coordinator(comptime protocol: type) type {
             xdg_activation: protocol_xdg_activation.Config = .{},
             xdg_decoration: protocol_xdg_decoration.Config = .{},
             xdg_dialog: protocol_xdg_dialog.Config = .{},
+            gtk_shell: protocol_gtk_shell.Config = .{},
             xdg_toplevel_drag: protocol_xdg_toplevel_drag.Config = .{},
             xdg_toplevel_icon: protocol_xdg_toplevel_icon.Config = .{},
             relative_pointer: protocol_relative_pointer.Config = .{},
@@ -498,6 +502,7 @@ pub fn Coordinator(comptime protocol: type) type {
         activation_adapter: ActivationAdapter,
         decoration_adapter: DecorationAdapter,
         dialog_adapter: DialogAdapter,
+        gtk_shell_adapter: GtkShellAdapter,
         toplevel_drag_adapter: ToplevelDragAdapter,
         toplevel_icon_adapter: ToplevelIconAdapter,
         wayland_fixes_adapter: WaylandFixesAdapter,
@@ -964,6 +969,12 @@ pub fn Coordinator(comptime protocol: type) type {
             errdefer self.decoration_adapter.deinit();
             self.dialog_adapter = try DialogAdapter.init(allocator, &self.shell_adapter, config.xdg_dialog);
             errdefer self.dialog_adapter.deinit();
+            self.gtk_shell_adapter = try GtkShellAdapter.init(allocator, &self.adapter, config.gtk_shell);
+            errdefer self.gtk_shell_adapter.deinit();
+            self.gtk_shell_adapter.setGestureValidator(.{
+                .context = self,
+                .validateFn = validateInteractiveGrab,
+            });
             self.wayland_fixes_adapter = .{};
             self.system_bell_adapter = .{};
             self.fractional_scale_adapter = try FractionalScaleAdapter.init(
@@ -1212,6 +1223,9 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = try self.dialog_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
+            _ = try self.gtk_shell_adapter.install(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
             _ = try self.toplevel_icon_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
@@ -1345,6 +1359,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.color_representation_adapter.deinit();
             self.color_management_adapter.deinit();
             self.toplevel_icon_adapter.deinit();
+            self.gtk_shell_adapter.deinit();
             self.dialog_adapter.deinit();
             self.decoration_adapter.deinit();
             self.activation_adapter.deinit();
@@ -1674,6 +1689,11 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             if (try self.dialog_adapter.request(peer, target, message, fds)) |control| {
                 try self.advanceShell();
+                try self.flushProtocol();
+                return control;
+            }
+            if (try self.gtk_shell_adapter.request(peer, target, message, fds)) |control| {
+                if (self.gtk_shell_adapter.pendingOutbound(peer)) self.markProtocol(peer, ProtocolReady.gtk_shell);
                 try self.flushProtocol();
                 return control;
             }
@@ -2725,8 +2745,16 @@ pub fn Coordinator(comptime protocol: type) type {
             if (self.foreignToplevelOutbound())
                 self.markProtocolAll(ProtocolReady.foreign_toplevel_list);
             while (self.desktop.pendingCommands() != 0) {
-                if (try self.desktop.flushConfigure(&self.shell_adapter)) |_|
+                const command = self.desktop.peekCommand();
+                const toplevel_commands = self.desktop.pendingToplevelCommands();
+                if (try self.desktop.flushConfigure(&self.shell_adapter)) |_| {
                     self.stats.configures += 1;
+                    if (self.desktop.pendingToplevelCommands() < toplevel_commands) if (command) |value| {
+                        const surface = self.shell_adapter.surfaceForToplevel(value.shell_id) catch continue;
+                        self.gtk_shell_adapter.queueConfigure(surface, value.configure.states);
+                        self.markProtocolAll(ProtocolReady.gtk_shell);
+                    };
+                }
             }
             self.interaction.setPopupGrab(self.desktop.popupGrabTarget());
             try self.syncDesktopTimer();
@@ -3825,6 +3853,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 flushed += try self.decoration_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.xdg_toplevel_icon != 0)
                 flushed += try self.toplevel_icon_adapter.flushOn(peer, objects, &actor.transmit);
+            if (client.protocol_ready & ProtocolReady.gtk_shell != 0)
+                flushed += try self.gtk_shell_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.shell != 0 and
                 !self.decoration_adapter.readyOutbound(peer))
                 flushed += try self.shell_adapter.flushOn(objects, &actor.transmit);
@@ -3962,6 +3992,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (ready & ProtocolReady.xdg_toplevel_icon != 0 and
                 !self.toplevel_icon_adapter.pendingOutbound(client.peer))
                 ready &= ~ProtocolReady.xdg_toplevel_icon;
+            if (ready & ProtocolReady.gtk_shell != 0 and
+                !self.gtk_shell_adapter.pendingOutbound(client.peer))
+                ready &= ~ProtocolReady.gtk_shell;
             if (ready & ProtocolReady.shell != 0 and
                 !self.shell_adapter.pendingOutboundOn(objects))
                 ready &= ~ProtocolReady.shell;
@@ -6220,6 +6253,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 } else |_| {}
             }
             if (removed_surface_candidate) |id| self.foreign_adapter.surfaceRemoved(id);
+            if (removed_surface_candidate) |id| self.gtk_shell_adapter.surfaceRemoved(id);
             const removed_subsurface = self.subcompositor_adapter.surfaceForResource(handle, &object);
             if (removed_subsurface) |id| {
                 self.queueLayerRemoval(id);
@@ -6259,6 +6293,7 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.activation_adapter.resourceRemoved(handle, object);
             _ = self.decoration_adapter.resourceRemoved(handle, object);
             _ = self.dialog_adapter.resourceRemoved(handle, object);
+            _ = self.gtk_shell_adapter.resourceRemoved(handle, object);
             _ = self.toplevel_drag_adapter.resourceRemoved(handle, object);
             _ = self.toplevel_icon_adapter.resourceRemoved(handle, object);
             self.syncToplevelDrag() catch {};

@@ -756,6 +756,12 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             return error.StaleSurface;
         }
 
+        pub fn surfaceForToplevel(adapter: *Self, id: ToplevelId) !SurfaceId {
+            const role = try adapter.resolveToplevel(id);
+            const surface = try adapter.resolveRoleSurface(role.xdg_surface_index, role.xdg_surface_generation);
+            return surface.surface_id;
+        }
+
         pub fn setForeignParent(adapter: *Self, child: SurfaceId, parent: SurfaceId) !void {
             try adapter.setParent(
                 try adapter.toplevelForSurface(child),

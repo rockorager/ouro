@@ -308,6 +308,10 @@ pub fn Desktop(comptime Shell: type) type {
             return desktop.commands[desktop.command_head];
         }
 
+        pub fn pendingToplevelCommands(desktop: *const Self) usize {
+            return desktop.command_len;
+        }
+
         pub fn dropCommand(desktop: *Self) void {
             if (desktop.command_len == 0) return;
             desktop.command_head = (desktop.command_head + 1) % desktop.commands.len;
