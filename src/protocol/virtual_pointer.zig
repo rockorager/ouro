@@ -4,6 +4,7 @@ const std = @import("std");
 const wayring = @import("wayring");
 const input = @import("../backend/input/backend.zig");
 const platform = @import("../backend/input/platform.zig");
+const slot_pool = @import("slot_pool.zig");
 const objects = wayring.objects;
 const none = std.math.maxInt(u32);
 const button_count = 0x300; // Linux input code namespace used by Ouro.
@@ -44,12 +45,10 @@ pub fn Adapter(comptime protocol: type) type {
             axis_stop: struct { device: input.DeviceId, time: u32, axis: u32, source: platform.AxisSource },
             axis_discrete: struct { device: input.DeviceId, time: u32, axis: u32, value: i32, discrete: i32, source: platform.AxisSource },
         };
-        const ManagerSlot = struct { active: bool = false, next: u32 = none, resource: objects.Handle = .{ .id = 0, .generation = 0 }, peer: wayring.io_uring.Peer = undefined };
+        const ManagerSlot = struct { header: slot_pool.Header = .{}, resource: objects.Handle = .{ .id = 0, .generation = 0 }, peer: wayring.io_uring.Peer = undefined };
         const Device = struct {
-            active: bool = false,
+            header: slot_pool.Header = .{},
             retiring: bool = false,
-            generation: u32 = 1,
-            next: u32 = none,
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
             peer: wayring.io_uring.Peer = undefined,
             valid: bool = false,
@@ -59,11 +58,9 @@ pub fn Adapter(comptime protocol: type) type {
         };
 
         allocator: std.mem.Allocator,
-        managers: []ManagerSlot,
-        devices: []Device,
+        managers: slot_pool.Pool(ManagerSlot),
+        devices: slot_pool.Pool(Device),
         events: []Event,
-        manager_free: u32 = 0,
-        device_free: u32 = 0,
         event_head: usize = 0,
         event_count: usize = 0,
         normal_count: usize = 0,
@@ -76,13 +73,11 @@ pub fn Adapter(comptime protocol: type) type {
         pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
             try config.validate();
             try Manager.info.validateVersion(2);
-            const managers = try allocator.alloc(ManagerSlot, config.manager_capacity);
-            errdefer allocator.free(managers);
-            const devices = try allocator.alloc(Device, config.device_capacity);
-            errdefer allocator.free(devices);
+            var managers = try slot_pool.Pool(ManagerSlot).init(allocator, config.manager_capacity);
+            errdefer managers.deinit();
+            var devices = try slot_pool.Pool(Device).init(allocator, config.device_capacity);
+            errdefer devices.deinit();
             const events = try allocator.alloc(Event, config.event_capacity + config.device_capacity);
-            initFree(ManagerSlot, managers);
-            initFree(Device, devices);
             return .{ .allocator = allocator, .managers = managers, .devices = devices, .events = events, .normal_capacity = config.event_capacity };
         }
         pub fn setSeatValidator(self: *Self, validator: ?Validator) void {
@@ -93,8 +88,8 @@ pub fn Adapter(comptime protocol: type) type {
         }
         pub fn deinit(self: *Self) void {
             self.allocator.free(self.events);
-            self.allocator.free(self.devices);
-            self.allocator.free(self.managers);
+            self.devices.deinit();
+            self.managers.deinit();
             self.* = undefined;
         }
         pub fn install(self: *Self, runtime: *Runtime) !objects.Handle {
@@ -107,11 +102,10 @@ pub fn Adapter(comptime protocol: type) type {
         }
         fn bind(context: ?*anyopaque, binding: wayring.server.Binding) !?*anyopaque {
             const self: *Self = @ptrCast(@alignCast(context orelse return error.InvalidContext));
-            if (self.manager_free == none) return error.OutOfMemory;
-            const i = self.manager_free;
-            self.manager_free = self.managers[i].next;
-            self.managers[i] = .{ .active = true, .resource = binding.resource, .peer = binding.peer };
-            return &self.managers[i];
+            const manager = self.managers.acquire() catch return error.OutOfMemory;
+            manager.resource = binding.resource;
+            manager.peer = binding.peer;
+            return manager;
         }
         pub fn peekEvent(self: *const Self) ?*const Event {
             return if (self.event_count == 0) null else &self.events[self.event_head];
@@ -125,9 +119,9 @@ pub fn Adapter(comptime protocol: type) type {
                 const id = event.device_removed;
                 if (id.slot >= 0xa000_0000) {
                     const i = id.slot - 0xa000_0000;
-                    if (i < self.devices.len) {
-                        const d = &self.devices[i];
-                        if (d.retiring and d.generation == id.generation) self.recycle(i);
+                    if (i < self.devices.entries.items.len) {
+                        const d = self.devices.entries.items[i];
+                        if (d.retiring and d.header.generation == id.generation) self.recycle(d);
                     }
                 }
             } else self.normal_count -= 1;
@@ -151,7 +145,7 @@ pub fn Adapter(comptime protocol: type) type {
         pub fn requestOn(self: *Self, actor: *wayring.connection.Actor, server_objects: anytype, peer: wayring.io_uring.Peer, target: objects.Dispatch, message: wayring.wire.Message, fds: *wayring.ancillary.FdQueue) !?wayring.dispatch.Control {
             const handle = server_objects.namespace.lookupHandle(message.header.object_id) orelse return null;
             if (target.object.interface == &Manager.info) {
-                const manager = from(ManagerSlot, self.managers, target.object.context) orelse return null;
+                const manager = self.managers.fromContext(target.object.context) orelse return null;
                 if (!std.meta.eql(manager.resource, handle) or !same(manager.peer, peer)) return null;
                 const decoded = try wayring.server.decodeRequest(Manager, server_objects, message, fds);
                 switch (decoded.value) {
@@ -163,7 +157,7 @@ pub fn Adapter(comptime protocol: type) type {
                 return .continue_dispatch;
             }
             if (target.object.interface != &Pointer.info) return null;
-            const d = from(Device, self.devices, target.object.context) orelse return null;
+            const d = self.devices.fromContext(target.object.context) orelse return null;
             if (!std.meta.eql(d.resource, handle) or !same(d.peer, peer)) return null;
             const decoded = try wayring.server.decodeRequest(Pointer, server_objects, message, fds);
             if (decoded.value != .destroy and !d.valid) {
@@ -212,7 +206,7 @@ pub fn Adapter(comptime protocol: type) type {
 
         fn create(self: *Self, actor: *wayring.connection.Actor, server_objects: anytype, peer: wayring.io_uring.Peer, parent: objects.Handle, seat: ?u32, output: ?u32, payload: anytype, comptime with_output: bool) !void {
             const d = self.acquire() catch return self.noMemoryVoid(actor);
-            errdefer self.recycle(self.deviceIndex(d));
+            errdefer self.recycle(d);
             d.peer = peer;
             d.valid = seat == null or if (self.seat_validator) |v| v.validateFn(v.context, peer, seat.?) else false;
             d.output_mapped = output != null and if (self.output_validator) |v| v.validateFn(v.context, peer, output.?) else false;
@@ -229,55 +223,49 @@ pub fn Adapter(comptime protocol: type) type {
 
         pub fn resourceRemoved(self: *Self, handle: objects.Handle, object: objects.Object) bool {
             if (object.interface == &Pointer.info) {
-                const d = from(Device, self.devices, object.context) orelse return false;
+                const d = self.devices.fromContext(object.context) orelse return false;
                 if (!std.meta.eql(d.resource, handle)) return false;
-                self.retire(self.deviceIndex(d));
+                self.retire(d);
                 return true;
             }
             if (object.interface == &Manager.info) {
-                const m = from(ManagerSlot, self.managers, object.context) orelse return false;
+                const m = self.managers.fromContext(object.context) orelse return false;
                 if (!std.meta.eql(m.resource, handle)) return false;
-                const i = indexOf(ManagerSlot, self.managers, m);
-                m.* = .{ .next = self.manager_free };
-                self.manager_free = i;
+                self.managers.release(m);
                 return true;
             }
             return false;
         }
         pub fn disconnected(self: *Self, peer: wayring.io_uring.Peer) void {
-            for (self.devices, 0..) |d, i| if (d.active and same(d.peer, peer)) self.retire(@intCast(i));
-            for (self.managers) |*m| if (m.active and same(m.peer, peer)) {
-                const i = indexOf(ManagerSlot, self.managers, m);
-                m.* = .{ .next = self.manager_free };
-                self.manager_free = i;
-            };
+            for (self.devices.entries.items) |d| if (d.header.active and !d.retiring and same(d.peer, peer)) self.retire(d);
+            for (self.managers.entries.items) |m| if (m.header.active and same(m.peer, peer)) self.managers.release(m);
         }
         fn acquire(self: *Self) !*Device {
-            if (self.device_free == none) return error.Exhausted;
-            const i = self.device_free;
-            const d = &self.devices[i];
-            self.device_free = d.next;
-            d.* = .{ .active = true, .generation = d.generation };
-            return d;
+            // Every newly owned slot carries one terminal-removal reservation.
+            try self.ensureEventStorage(self.normal_capacity + self.devices.entries.items.len + 1);
+            return self.devices.acquire();
         }
-        fn retire(self: *Self, i: u32) void {
-            const d = &self.devices[i];
-            if (!d.active) return;
-            d.active = false;
+        fn retire(self: *Self, d: *Device) void {
+            if (!d.header.active or d.retiring) return;
             d.retiring = true;
-            if (d.valid) self.pushRemoved(self.inputId(d)) else self.recycle(i);
+            if (d.valid) self.pushRemoved(self.inputId(d)) else self.recycle(d);
         }
-        fn recycle(self: *Self, i: u32) void {
-            const d = &self.devices[i];
-            const g = d.generation +% 1;
-            d.* = .{ .generation = if (g == 0) 1 else g, .next = self.device_free };
-            self.device_free = i;
+        fn recycle(self: *Self, d: *Device) void {
+            self.devices.release(d);
         }
         fn inputId(self: *const Self, d: *const Device) input.DeviceId {
-            return .{ .slot = 0xa000_0000 + self.deviceIndex(d), .generation = d.generation, .seat_generation = 0x5650_0002 };
+            return .{ .slot = 0xa000_0000 + self.deviceIndex(d), .generation = d.header.generation, .seat_generation = 0x5650_0002 };
         }
-        fn deviceIndex(self: *const Self, d: *const Device) u32 {
-            return indexOf(Device, self.devices, d);
+        fn deviceIndex(_: *const Self, d: *const Device) u32 {
+            return d.header.index;
+        }
+        fn ensureEventStorage(self: *Self, required: usize) !void {
+            if (required <= self.events.len) return;
+            const grown = try self.allocator.alloc(Event, required);
+            for (0..self.event_count) |i| grown[i] = self.events[(self.event_head + i) % self.events.len];
+            self.allocator.free(self.events);
+            self.events = grown;
+            self.event_head = 0;
         }
         fn noMemory(_: *Self, actor: *wayring.connection.Actor) !wayring.dispatch.Control {
             try Core.postError(actor, objects.display_id, 2, "out of memory");
@@ -336,7 +324,7 @@ fn same(a: wayring.io_uring.Peer, b: wayring.io_uring.Peer) bool {
     return std.meta.eql(a, b);
 }
 
-test "cleanup reserve delays generation reuse" {
+test "cleanup reserve delays slot reuse" {
     const A = Adapter(@import("core_protocol"));
     var a = try A.init(std.testing.allocator, .{ .manager_capacity = 1, .device_capacity = 1, .event_capacity = 1 });
     defer a.deinit();
@@ -344,11 +332,37 @@ test "cleanup reserve delays generation reuse" {
     d.valid = true;
     try a.push(.{ .device_added = .{ .device = a.inputId(d), .info = .{ .capabilities = .{ .pointer = true } } } });
     const old = a.inputId(d);
-    a.retire(0);
-    try std.testing.expectError(error.Exhausted, a.acquire());
+    a.retire(d);
+    const concurrent = try a.acquire();
+    try std.testing.expect(concurrent != d);
     a.dropEvent();
     try std.testing.expect(a.peekEvent().?.* == .device_removed);
     a.dropEvent();
     const replacement = try a.acquire();
-    try std.testing.expect(replacement.generation != old.generation);
+    try std.testing.expect(replacement.header.generation != old.generation);
+}
+
+test "ownership growth preserves contexts and every removal beyond initial reserve" {
+    const A = Adapter(@import("core_protocol"));
+    var a = try A.init(std.testing.allocator, .{ .manager_capacity = 1, .device_capacity = 1, .event_capacity = 1 });
+    defer a.deinit();
+
+    const first_manager = try a.managers.acquire();
+    _ = try a.managers.acquire();
+    try std.testing.expect(first_manager == a.managers.entries.items[0]);
+
+    var devices: [4]*A.Device = undefined;
+    for (&devices) |*device| {
+        device.* = try a.acquire();
+        device.*.valid = true;
+    }
+    try std.testing.expect(devices[0] == a.devices.entries.items[0]);
+    for (devices) |device| a.retire(device);
+    var removals: usize = 0;
+    while (a.peekEvent()) |event| {
+        try std.testing.expect(event.* == .device_removed);
+        removals += 1;
+        a.dropEvent();
+    }
+    try std.testing.expectEqual(devices.len, removals);
 }

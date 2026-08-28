@@ -4,6 +4,7 @@ const std = @import("std");
 const wayring = @import("wayring");
 const objects = wayring.objects;
 const none = std.math.maxInt(u32);
+const slot_pool = @import("slot_pool.zig");
 
 pub const Config = struct {
     drag_capacity: usize = 32,
@@ -31,9 +32,7 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type, comptime DataDevic
         };
 
         const Slot = struct {
-            active: bool = false,
-            generation: u32 = 1,
-            next_free: u32 = none,
+            header: slot_pool.Header = .{},
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
             peer: wayring.io_uring.Peer = undefined,
             source: DataDevice.DragSourceId = undefined,
@@ -45,8 +44,7 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type, comptime DataDevic
         data_device: *DataDevice,
         runtime: ?*Runtime = null,
         global: ?objects.Handle = null,
-        slots: []Slot,
-        free_head: u32 = 0,
+        slots: slot_pool.Pool(Slot),
 
         pub fn init(
             allocator: std.mem.Allocator,
@@ -55,20 +53,16 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type, comptime DataDevic
             config: Config,
         ) !Self {
             try config.validate();
-            const slots = try allocator.alloc(Slot, config.drag_capacity);
-            for (slots, 0..) |*slot, i| slot.* = .{
-                .next_free = if (i + 1 < slots.len) @intCast(i + 1) else none,
-            };
             return .{
                 .allocator = allocator,
                 .shell = shell,
                 .data_device = data_device,
-                .slots = slots,
+                .slots = try slot_pool.Pool(Slot).init(allocator, config.drag_capacity),
             };
         }
 
         pub fn deinit(self: *Self) void {
-            self.allocator.free(self.slots);
+            self.slots.deinit();
             self.* = undefined;
         }
 
@@ -196,8 +190,8 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type, comptime DataDevic
 
         /// Returns the mapped toplevel moved by the currently active DnD.
         pub fn activeAttachment(self: *Self) ?Attachment {
-            for (self.slots) |*slot| {
-                if (!slot.active or slot.attachment == null) continue;
+            for (self.slots.entries.items) |slot| {
+                if (!slot.header.active or slot.attachment == null) continue;
                 const attachment = slot.attachment.?;
                 if (self.shell.toplevelMapped(attachment.toplevel)) {
                     slot.attachment.?.mapped_once = true;
@@ -233,46 +227,28 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type, comptime DataDevic
         }
 
         fn detach(self: *Self, id: Shell.ToplevelId) void {
-            for (self.slots) |*slot| {
-                if (!slot.active or slot.attachment == null) continue;
+            for (self.slots.entries.items) |slot| {
+                if (!slot.header.active or slot.attachment == null) continue;
                 if (std.meta.eql(slot.attachment.?.toplevel, id)) slot.attachment = null;
             }
         }
 
         fn acquire(self: *Self) !*Slot {
-            if (self.free_head == none) return error.Exhausted;
-            const i = self.free_head;
-            const slot = &self.slots[i];
-            self.free_head = slot.next_free;
-            slot.* = .{ .active = true, .generation = slot.generation };
-            return slot;
+            return self.slots.acquire();
         }
 
         fn release(self: *Self, i: u32) void {
-            const slot = &self.slots[i];
-            if (!slot.active) return;
+            const slot = self.slots.at(i) orelse return;
             self.data_device.releaseToplevelDragSource(slot.source);
-            const generation = slot.generation +% 1;
-            slot.* = .{
-                .generation = if (generation == 0) 1 else generation,
-                .next_free = self.free_head,
-            };
-            self.free_head = i;
+            self.slots.release(slot);
         }
 
         fn fromObject(self: *Self, object: *const objects.Object) ?*Slot {
-            const ptr = object.context orelse return null;
-            const address = @intFromPtr(ptr);
-            const start = @intFromPtr(self.slots.ptr);
-            const end = start + self.slots.len * @sizeOf(Slot);
-            if (address < start or address >= end or (address - start) % @sizeOf(Slot) != 0)
-                return null;
-            const slot = &self.slots[(address - start) / @sizeOf(Slot)];
-            return if (slot.active) slot else null;
+            return self.slots.fromContext(object.context);
         }
 
-        fn index(self: *Self, slot: *Slot) u32 {
-            return @intCast((@intFromPtr(slot) - @intFromPtr(self.slots.ptr)) / @sizeOf(Slot));
+        fn index(_: *Self, slot: *Slot) u32 {
+            return slot.header.index;
         }
 
         fn noMemory(_: *Self, actor: *wayring.connection.Actor) !wayring.dispatch.Control {
@@ -304,6 +280,15 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type, comptime DataDevic
 
 fn samePeer(a: wayring.io_uring.Peer, b: wayring.io_uring.Peer) bool {
     return a.slot == b.slot and a.generation == b.generation;
+}
+
+test "xdg toplevel drag reservation grows with stable contexts" {
+    const Entry = struct { header: slot_pool.Header = .{} };
+    var pool = try slot_pool.Pool(Entry).init(std.testing.allocator, 1);
+    defer pool.deinit();
+    const first = try pool.acquire();
+    _ = try pool.acquire();
+    try std.testing.expect(first == pool.entries.items[0]);
 }
 
 test "xdg toplevel drag attachment follows active mapped source lifecycle" {
@@ -355,5 +340,5 @@ test "xdg toplevel drag attachment follows active mapped source lifecycle" {
     adapter.release(0);
     try std.testing.expectEqual(@as(usize, 1), data_device.releases);
     const replacement = try adapter.acquire();
-    try std.testing.expect(replacement.generation != 1);
+    try std.testing.expect(replacement.header.generation != 1);
 }

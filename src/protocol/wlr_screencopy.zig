@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const wayring = @import("wayring");
+const slot_pool = @import("slot_pool.zig");
 
 const objects = wayring.objects;
 const none = std.math.maxInt(u32);
@@ -73,16 +74,13 @@ pub fn Adapter(comptime protocol: type) type {
         };
 
         const ManagerSlot = struct {
-            active: bool = false,
-            next_free: u32 = none,
+            header: slot_pool.Header = .{},
             peer: wayring.io_uring.Peer = undefined,
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
         };
         const Phase = enum { advertised, queued, capturing, finished };
         const Frame = struct {
-            active: bool = false,
-            generation: u32 = 1,
-            next_free: u32 = none,
+            header: slot_pool.Header = .{},
             peer: wayring.io_uring.Peer = undefined,
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
             output: objects.Handle = .{ .id = 0, .generation = 0 },
@@ -113,12 +111,10 @@ pub fn Adapter(comptime protocol: type) type {
         };
 
         allocator: std.mem.Allocator,
-        managers: []ManagerSlot,
-        frames: []Frame,
+        managers: slot_pool.Pool(ManagerSlot),
+        frames: slot_pool.Pool(Frame),
         captures: []CaptureSlot,
         outbound: []Outbound,
-        manager_free: u32 = 0,
-        frame_free: u32 = 0,
         capture_count: usize = 0,
         outbound_count: usize = 0,
         next_sequence: u64 = 1,
@@ -133,15 +129,13 @@ pub fn Adapter(comptime protocol: type) type {
         pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
             try config.validate();
             try Manager.info.validateVersion(3);
-            const managers = try allocator.alloc(ManagerSlot, config.manager_capacity);
-            errdefer allocator.free(managers);
-            const frames = try allocator.alloc(Frame, config.frame_capacity);
-            errdefer allocator.free(frames);
+            var managers = try slot_pool.Pool(ManagerSlot).init(allocator, config.manager_capacity);
+            errdefer managers.deinit();
+            var frames = try slot_pool.Pool(Frame).init(allocator, config.frame_capacity);
+            errdefer frames.deinit();
             const captures = try allocator.alloc(CaptureSlot, config.capture_capacity);
             errdefer allocator.free(captures);
             const outbound = try allocator.alloc(Outbound, config.outbound_capacity);
-            initFree(ManagerSlot, managers);
-            initFree(Frame, frames);
             @memset(captures, .{});
             @memset(outbound, .{});
             return .{
@@ -156,8 +150,8 @@ pub fn Adapter(comptime protocol: type) type {
         pub fn deinit(self: *Self) void {
             self.allocator.free(self.outbound);
             self.allocator.free(self.captures);
-            self.allocator.free(self.frames);
-            self.allocator.free(self.managers);
+            self.frames.deinit();
+            self.managers.deinit();
             self.* = undefined;
         }
 
@@ -194,15 +188,10 @@ pub fn Adapter(comptime protocol: type) type {
 
         fn bind(context: ?*anyopaque, binding: wayring.server.Binding) !?*anyopaque {
             const self: *Self = @ptrCast(@alignCast(context orelse return error.InvalidContext));
-            if (self.manager_free == none) return error.OutOfMemory;
-            const index = self.manager_free;
-            self.manager_free = self.managers[index].next_free;
-            self.managers[index] = .{
-                .active = true,
-                .peer = binding.peer,
-                .resource = binding.resource,
-            };
-            return &self.managers[index];
+            const manager = try self.managers.acquire();
+            manager.peer = binding.peer;
+            manager.resource = binding.resource;
+            return manager;
         }
 
         pub fn request(
@@ -234,7 +223,7 @@ pub fn Adapter(comptime protocol: type) type {
         ) !?wayring.dispatch.Control {
             const handle = server_objects.namespace.lookupHandle(message.header.object_id) orelse return null;
             if (target.object.interface == &Manager.info) {
-                const manager = from(ManagerSlot, self.managers, target.object.context) orelse return null;
+                const manager = self.managers.fromContext(target.object.context) orelse return null;
                 if (!std.meta.eql(manager.resource, handle) or !samePeer(manager.peer, peer)) return null;
                 const decoded = try wayring.server.decodeRequest(Manager, server_objects, message, fds);
                 switch (decoded.value) {
@@ -258,7 +247,7 @@ pub fn Adapter(comptime protocol: type) type {
                 return .continue_dispatch;
             }
             if (target.object.interface != &FrameProtocol.info) return null;
-            const frame = from(Frame, self.frames, target.object.context) orelse return null;
+            const frame = self.frames.fromContext(target.object.context) orelse return null;
             if (!std.meta.eql(frame.resource, handle) or !samePeer(frame.peer, peer)) return null;
             const decoded = try wayring.server.decodeRequest(FrameProtocol, server_objects, message, fds);
             switch (decoded.value) {
@@ -501,44 +490,31 @@ pub fn Adapter(comptime protocol: type) type {
 
         pub fn resourceRemoved(self: *Self, handle: objects.Handle, object: objects.Object) bool {
             if (object.interface == &FrameProtocol.info) {
-                const frame = from(Frame, self.frames, object.context) orelse return false;
+                const frame = self.frames.fromContext(object.context) orelse return false;
                 if (!std.meta.eql(frame.resource, handle)) return false;
                 self.releaseFrame(self.frameIndex(frame));
                 return true;
             }
             if (object.interface == &Manager.info) {
-                const manager = from(ManagerSlot, self.managers, object.context) orelse return false;
+                const manager = self.managers.fromContext(object.context) orelse return false;
                 if (!std.meta.eql(manager.resource, handle)) return false;
-                const index = indexOf(ManagerSlot, self.managers, manager);
-                manager.* = .{ .next_free = self.manager_free };
-                self.manager_free = index;
+                self.managers.release(manager);
                 return true;
             }
             return false;
         }
 
         pub fn disconnected(self: *Self, peer: wayring.io_uring.Peer) void {
-            for (self.frames, 0..) |frame, index|
-                if (frame.active and samePeer(frame.peer, peer)) self.releaseFrame(@intCast(index));
-            for (self.managers) |*manager| if (manager.active and samePeer(manager.peer, peer)) {
-                const index = indexOf(ManagerSlot, self.managers, manager);
-                manager.* = .{ .next_free = self.manager_free };
-                self.manager_free = index;
-            };
+            for (self.frames.entries.items) |frame| if (frame.header.active and samePeer(frame.peer, peer)) self.releaseFrame(frame.header.index);
+            for (self.managers.entries.items) |manager| if (manager.header.active and samePeer(manager.peer, peer)) self.managers.release(manager);
         }
 
         fn acquireFrame(self: *Self) !*Frame {
-            if (self.frame_free == none) return error.Exhausted;
-            const index = self.frame_free;
-            const generation = self.frames[index].generation;
-            self.frame_free = self.frames[index].next_free;
-            self.frames[index] = .{ .active = true, .generation = generation };
-            return &self.frames[index];
+            return self.frames.acquire();
         }
 
         fn releaseFrame(self: *Self, index: u32) void {
-            const frame = &self.frames[index];
-            if (!frame.active) return;
+            const frame = self.frames.at(index) orelse return;
             const id = self.frameId(frame);
             for (self.captures) |*slot| if (slot.active and std.meta.eql(slot.capture.frame, id)) {
                 slot.active = false;
@@ -548,9 +524,7 @@ pub fn Adapter(comptime protocol: type) type {
                 slot.active = false;
                 self.outbound_count -= 1;
             };
-            const generation = nextGeneration(frame.generation);
-            frame.* = .{ .generation = generation, .next_free = self.frame_free };
-            self.frame_free = index;
+            self.frames.release(frame);
         }
 
         fn enqueue(self: *Self, id: FrameId, event: Event) !void {
@@ -599,24 +573,22 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         fn frameId(self: *const Self, frame: *const Frame) FrameId {
-            return .{ .index = self.frameIndex(frame), .generation = frame.generation };
+            return .{ .index = self.frameIndex(frame), .generation = frame.header.generation };
         }
 
-        fn frameIndex(self: *const Self, frame: *const Frame) u32 {
-            return indexOf(Frame, self.frames, frame);
+        fn frameIndex(_: *const Self, frame: *const Frame) u32 {
+            return frame.header.index;
         }
 
         fn resolve(self: *Self, id: FrameId) !*Frame {
-            if (id.index >= self.frames.len) return error.StaleFrame;
-            const frame = &self.frames[id.index];
-            if (!frame.active or frame.generation != id.generation) return error.StaleFrame;
+            const frame = @constCast(&self.frames).at(id.index) orelse return error.StaleFrame;
+            if (frame.header.generation != id.generation) return error.StaleFrame;
             return frame;
         }
 
         fn resolveConst(self: *const Self, id: FrameId) !*const Frame {
-            if (id.index >= self.frames.len) return error.StaleFrame;
-            const frame = &self.frames[id.index];
-            if (!frame.active or frame.generation != id.generation) return error.StaleFrame;
+            const frame = @constCast(&self.frames).at(id.index) orelse return error.StaleFrame;
+            if (frame.header.generation != id.generation) return error.StaleFrame;
             return frame;
         }
 
@@ -698,6 +670,16 @@ test "screencopy: regions are clipped to output extents" {
     try std.testing.expect(clipRegion(.{ .x = 0, .y = 0, .width = 0, .height = 10 }, 50, 60) == null);
 }
 
+test "screencopy: frame ownership grows without moving existing contexts" {
+    const A = Adapter(@import("core_protocol"));
+    var adapter = try A.init(std.testing.allocator, .{ .manager_capacity = 1, .frame_capacity = 1, .capture_capacity = 1, .outbound_capacity = 4 });
+    defer adapter.deinit();
+    const first = try adapter.acquireFrame();
+    const address = @intFromPtr(first);
+    _ = try adapter.acquireFrame();
+    try std.testing.expectEqual(address, @intFromPtr(adapter.frames.entries.items[0]));
+}
+
 test "screencopy: frame generations reject stale completion and cleanup retained work" {
     const A = Adapter(@import("core_protocol"));
     var adapter = try A.init(std.testing.allocator, .{
@@ -719,7 +701,7 @@ test "screencopy: frame generations reject stale completion and cleanup retained
     try std.testing.expectEqual(@as(usize, 0), adapter.outbound_count);
     try std.testing.expectError(error.StaleFrame, adapter.complete(old, null));
     const replacement = try adapter.acquireFrame();
-    try std.testing.expect(replacement.generation != old.generation);
+    try std.testing.expect(replacement.header.generation != old.generation);
 }
 
 test "screencopy: completion retains ordered success events" {

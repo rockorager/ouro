@@ -1,10 +1,14 @@
-//! Bounded pointer-warp-v1 manager and silent policy bridge.
+//! Growable pointer-warp-v1 manager and silent policy bridge.
 
 const std = @import("std");
 const wayring = @import("wayring");
 const objects = wayring.objects;
+const slot_pool = @import("slot_pool.zig");
 
-pub const Config = struct { resource_capacity: usize = 8 };
+pub const Config = struct {
+    /// Initial reservation only; manager ownership grows with client demand.
+    resource_capacity: usize = 8,
+};
 
 pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
     return struct {
@@ -26,15 +30,15 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         };
 
         const Resource = struct {
-            handle: objects.Handle,
-            peer: wayring.io_uring.Peer,
+            header: slot_pool.Header = .{},
+            handle: objects.Handle = .{ .id = 0, .generation = 0 },
+            peer: wayring.io_uring.Peer = undefined,
         };
 
         allocator: std.mem.Allocator,
         core: *CoreSurface,
         handler: Handler,
-        resources: std.ArrayListUnmanaged(*Resource) = .empty,
-        capacity: usize,
+        resources: slot_pool.Pool(Resource),
         runtime: ?*Runtime = null,
 
         pub fn init(
@@ -44,19 +48,16 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             config: Config,
         ) !Self {
             if (config.resource_capacity == 0) return error.InvalidConfig;
-            var self: Self = .{
+            return .{
                 .allocator = allocator,
                 .core = core,
                 .handler = handler,
-                .capacity = config.resource_capacity,
+                .resources = try slot_pool.Pool(Resource).init(allocator, config.resource_capacity),
             };
-            try self.resources.ensureTotalCapacity(allocator, config.resource_capacity);
-            return self;
         }
 
         pub fn deinit(self: *Self) void {
-            for (self.resources.items) |resource| self.allocator.destroy(resource);
-            self.resources.deinit(self.allocator);
+            self.resources.deinit();
             self.* = undefined;
         }
 
@@ -69,11 +70,9 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
 
         fn bind(context: ?*anyopaque, binding: wayring.server.Binding) !?*anyopaque {
             const self: *Self = @ptrCast(@alignCast(context orelse return error.InvalidContext));
-            if (self.resources.items.len == self.capacity) return error.OutOfMemory;
-            const resource = try self.allocator.create(Resource);
-            errdefer self.allocator.destroy(resource);
-            resource.* = .{ .handle = binding.resource, .peer = binding.peer };
-            self.resources.appendAssumeCapacity(resource);
+            const resource = try self.resources.acquire();
+            resource.handle = binding.resource;
+            resource.peer = binding.peer;
             return resource;
         }
 
@@ -122,27 +121,21 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         }
 
         pub fn disconnected(self: *Self, peer: wayring.io_uring.Peer) void {
-            var index = self.resources.items.len;
+            var index = self.resources.entries.items.len;
             while (index != 0) {
                 index -= 1;
-                const resource = self.resources.items[index];
-                if (samePeer(resource.peer, peer)) self.remove(resource);
+                const resource = self.resources.entries.items[index];
+                if (resource.header.active and samePeer(resource.peer, peer)) self.remove(resource);
             }
         }
 
         fn fromObject(self: *Self, object: *const objects.Object) ?*Resource {
             const context = object.context orelse return null;
-            for (self.resources.items) |resource|
-                if (@intFromPtr(resource) == @intFromPtr(context)) return resource;
-            return null;
+            return self.resources.fromContext(context);
         }
 
         fn remove(self: *Self, resource: *Resource) void {
-            for (self.resources.items, 0..) |item, index| if (item == resource) {
-                _ = self.resources.swapRemove(index);
-                self.allocator.destroy(resource);
-                return;
-            };
+            self.resources.release(resource);
         }
     };
 }

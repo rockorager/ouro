@@ -1,4 +1,4 @@
-//! Fixed-capacity ext-session-lock-v1 protocol owner.
+//! Growable ext-session-lock-v1 protocol owner with bounded event queues.
 //!
 //! This module deliberately contains no rendering, input, or authorization
 //! policy. The coordinator accepts the sole pending lock by observing
@@ -8,6 +8,7 @@
 const std = @import("std");
 const wayring = @import("wayring");
 const surface_state = @import("../surface.zig");
+const slot_pool = @import("slot_pool.zig");
 const objects = wayring.objects;
 const none = std.math.maxInt(u32);
 const role_id: surface_state.RoleId = 0x6578_745f_6c6f_636b;
@@ -46,17 +47,18 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
             mapped: bool,
         };
 
-        const Header = struct { active: bool = false, generation: u32 = 1, next_free: u32 = none, resource: objects.Handle = .{ .id = 0, .generation = 0 } };
-        const ManagerSlot = struct { header: Header = .{}, peer: wayring.io_uring.Peer = undefined };
+        const ManagerSlot = struct { header: slot_pool.Header = .{}, peer: wayring.io_uring.Peer = undefined, resource: objects.Handle = .{ .id = 0, .generation = 0 } };
         const LockSlot = struct {
-            header: Header = .{},
+            header: slot_pool.Header = .{},
+            resource: objects.Handle = .{ .id = 0, .generation = 0 },
             peer: wayring.io_uring.Peer = undefined,
             phase: Phase = .denied,
             event: ?enum { locked, finished } = null,
             finished_sent: bool = false,
         };
         const SurfaceSlot = struct {
-            header: Header = .{},
+            header: slot_pool.Header = .{},
+            resource: objects.Handle = .{ .id = 0, .generation = 0 },
             peer: wayring.io_uring.Peer = undefined,
             lock: LockId = undefined,
             surface: SurfaceId = undefined,
@@ -78,13 +80,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
         output: *OutputAdapter,
         runtime: ?*Runtime = null,
         global: ?objects.Handle = null,
-        managers: []ManagerSlot,
-        locks: []LockSlot,
-        surfaces: []SurfaceSlot,
+        managers: slot_pool.Pool(ManagerSlot),
+        locks: slot_pool.Pool(LockSlot),
+        surfaces: slot_pool.Pool(SurfaceSlot),
         outstanding: []Outstanding,
-        manager_free: u32 = 0,
-        lock_free: u32 = 0,
-        surface_free: u32 = 0,
         accepted: ?LockId = null,
         fail_closed: bool = false,
         unlocked_pending: bool = false,
@@ -94,25 +93,22 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
 
         pub fn init(allocator: std.mem.Allocator, core: *CoreSurface, output: *OutputAdapter, config: Config) !Self {
             try config.validate();
-            const managers = try allocator.alloc(ManagerSlot, config.manager_capacity);
-            errdefer allocator.free(managers);
-            const locks = try allocator.alloc(LockSlot, config.lock_capacity);
-            errdefer allocator.free(locks);
-            const surfaces = try allocator.alloc(SurfaceSlot, config.surface_capacity);
-            errdefer allocator.free(surfaces);
+            var managers = try slot_pool.Pool(ManagerSlot).init(allocator, config.manager_capacity);
+            errdefer managers.deinit();
+            var locks = try slot_pool.Pool(LockSlot).init(allocator, config.lock_capacity);
+            errdefer locks.deinit();
+            var surfaces = try slot_pool.Pool(SurfaceSlot).init(allocator, config.surface_capacity);
+            errdefer surfaces.deinit();
             const outstanding = try allocator.alloc(Outstanding, config.outstanding_configure_capacity);
             errdefer allocator.free(outstanding);
-            for (managers, 0..) |*v, i| v.* = .{ .header = .{ .next_free = if (i + 1 < managers.len) @intCast(i + 1) else none } };
-            for (locks, 0..) |*v, i| v.* = .{ .header = .{ .next_free = if (i + 1 < locks.len) @intCast(i + 1) else none } };
-            for (surfaces, 0..) |*v, i| v.* = .{ .header = .{ .next_free = if (i + 1 < surfaces.len) @intCast(i + 1) else none } };
             @memset(outstanding, .{});
             return .{ .allocator = allocator, .core = core, .output = output, .managers = managers, .locks = locks, .surfaces = surfaces, .outstanding = outstanding, .next_serial = config.initial_serial, .outbound_capacity = config.outbound_capacity };
         }
         pub fn deinit(self: *Self) void {
             self.allocator.free(self.outstanding);
-            self.allocator.free(self.surfaces);
-            self.allocator.free(self.locks);
-            self.allocator.free(self.managers);
+            self.surfaces.deinit();
+            self.locks.deinit();
+            self.managers.deinit();
             self.* = undefined;
         }
         pub fn install(self: *Self, runtime: *Runtime) !objects.Handle {
@@ -126,7 +122,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
             const self: *Self = @ptrCast(@alignCast(context orelse return error.InvalidContext));
             const s = self.acquireManager() catch return error.OutOfMemory;
             s.peer = binding.peer;
-            s.header.resource = binding.resource;
+            s.resource = binding.resource;
             return s;
         }
 
@@ -150,10 +146,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
         }
         pub fn surfaceIds(self: *const Self, output: []LockSurfaceId) ![]const LockSurfaceId {
             var count: usize = 0;
-            for (self.surfaces, 0..) |s, index| {
+            for (self.surfaces.entries.items) |s| {
                 if (!s.header.active) continue;
                 if (count == output.len) return error.OutputTooSmall;
-                output[count] = .{ .index = @intCast(index), .generation = s.header.generation };
+                output[count] = .{ .index = s.header.index, .generation = s.header.generation };
                 count += 1;
             }
             return output[0..count];
@@ -207,8 +203,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
         pub fn requestOn(self: *Self, actor: *wayring.connection.Actor, server_objects: anytype, peer: wayring.io_uring.Peer, target: objects.Dispatch, message: wayring.wire.Message, fds: *wayring.ancillary.FdQueue) !?wayring.dispatch.Control {
             const handle = server_objects.namespace.lookupHandle(message.header.object_id) orelse return null;
             if (target.object.interface == &Manager.info) {
-                const m = fromContext(ManagerSlot, self.managers, target.object.context) orelse return null;
-                if (!std.meta.eql(m.header.resource, handle) or !samePeer(m.peer, peer)) return null;
+                const m = self.managers.fromContext(target.object.context) orelse return null;
+                if (!std.meta.eql(m.resource, handle) or !samePeer(m.peer, peer)) return null;
                 const d = try wayring.server.decodeRequest(Manager, server_objects, message, fds);
                 switch (d.value) {
                     .destroy => {},
@@ -228,15 +224,15 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
                             self.releaseLock(id.index);
                             return try self.failure(actor, d.handle.id, err);
                         };
-                        l.header.resource = admitted.id;
+                        l.resource = admitted.id;
                     },
                 }
                 try d.finish(protocol, server_objects, &actor.transmit);
                 return .continue_dispatch;
             }
             if (target.object.interface == &Lock.info) {
-                const l = fromContext(LockSlot, self.locks, target.object.context) orelse return null;
-                if (!std.meta.eql(l.header.resource, handle) or !samePeer(l.peer, peer)) return null;
+                const l = self.locks.fromContext(target.object.context) orelse return null;
+                if (!std.meta.eql(l.resource, handle) or !samePeer(l.peer, peer)) return null;
                 const d = try wayring.server.decodeRequest(Lock, server_objects, message, fds);
                 switch (d.value) {
                     .destroy => if (l.phase == .locked) return try self.protocolError(actor, d.handle.id, Lock.@"error".invalid_destroy.value, "destroy while locked"),
@@ -252,8 +248,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
                 return .continue_dispatch;
             }
             if (target.object.interface == &LockSurface.info) {
-                const s = fromContext(SurfaceSlot, self.surfaces, target.object.context) orelse return null;
-                if (!std.meta.eql(s.header.resource, handle) or !samePeer(s.peer, peer)) return null;
+                const s = self.surfaces.fromContext(target.object.context) orelse return null;
+                if (!std.meta.eql(s.resource, handle) or !samePeer(s.peer, peer)) return null;
                 const d = try wayring.server.decodeRequest(LockSurface, server_objects, message, fds);
                 switch (d.value) {
                     .destroy => {},
@@ -279,7 +275,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
             // Ouro currently advertises one physical output. Distinct client
             // wl_output resources still identify that same output and may not
             // be used to evade duplicate-output validation.
-            for (self.surfaces) |s| if (s.header.active and std.meta.eql(s.lock, lid))
+            for (self.surfaces.entries.items) |s| if (s.header.active and std.meta.eql(s.lock, lid))
                 return try self.protocolError(actor, dh.id, Lock.@"error".duplicate_output.value, "duplicate output");
             const s = self.acquireSurface() catch return try self.failure(actor, dh.id, error.Exhausted);
             s.peer = peer;
@@ -296,7 +292,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
                 self.releaseSurface(self.surfaceIndex(s));
                 return try self.failure(actor, dh.id, err);
             };
-            s.header.resource = admitted.id;
+            s.resource = admitted.id;
             const snapshot = self.output.logicalSnapshot();
             const w = snapshot.width orelse 0;
             const h = snapshot.height orelse 0;
@@ -307,11 +303,11 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
 
         pub fn flushOn(self: *Self, peer: wayring.io_uring.Peer, os: anytype, queue: *wayring.tx.Queue) !usize {
             var count: usize = 0;
-            for (self.locks) |*l| if (l.header.active and l.event != null and samePeer(l.peer, peer) and os.namespace.resolve(l.header.resource) != null) {
+            for (self.locks.entries.items) |l| if (l.header.active and l.event != null and samePeer(l.peer, peer) and os.namespace.resolve(l.resource) != null) {
                 const event = l.event.?;
                 (switch (event) {
-                    .locked => Lock.encodeEvent(queue, l.header.resource.id, .{ .locked = .{} }),
-                    .finished => Lock.encodeEvent(queue, l.header.resource.id, .{ .finished = .{} }),
+                    .locked => Lock.encodeEvent(queue, l.resource.id, .{ .locked = .{} }),
+                    .finished => Lock.encodeEvent(queue, l.resource.id, .{ .finished = .{} }),
                 }) catch |e| switch (e) {
                     error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return count,
                     else => return e,
@@ -321,9 +317,9 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
                 self.outbound_len -= 1;
                 count += 1;
             };
-            for (self.surfaces) |*s| if (s.header.active and s.configure_pending and samePeer(s.peer, peer) and os.namespace.resolve(s.header.resource) != null) {
+            for (self.surfaces.entries.items) |s| if (s.header.active and s.configure_pending and samePeer(s.peer, peer) and os.namespace.resolve(s.resource) != null) {
                 const o = self.freeOutstanding() orelse return count;
-                LockSurface.encodeEvent(queue, s.header.resource.id, .{ .configure = .{ .serial = s.serial, .width = s.width, .height = s.height } }) catch |e| switch (e) {
+                LockSurface.encodeEvent(queue, s.resource.id, .{ .configure = .{ .serial = s.serial, .width = s.width, .height = s.height } }) catch |e| switch (e) {
                     error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return count,
                     else => return e,
                 };
@@ -335,32 +331,31 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
             return count;
         }
         pub fn pendingOutbound(self: *const Self, peer: wayring.io_uring.Peer) bool {
-            for (self.locks) |l| if (l.header.active and l.event != null and samePeer(l.peer, peer)) return true;
-            for (self.surfaces) |s| if (s.header.active and s.configure_pending and samePeer(s.peer, peer)) return true;
+            for (self.locks.entries.items) |l| if (l.header.active and l.event != null and samePeer(l.peer, peer)) return true;
+            for (self.surfaces.entries.items) |s| if (s.header.active and s.configure_pending and samePeer(s.peer, peer)) return true;
             return false;
         }
         pub fn disconnected(self: *Self, peer: wayring.io_uring.Peer) void {
-            for (self.surfaces, 0..) |s, i| if (s.header.active and samePeer(s.peer, peer)) self.releaseSurface(@intCast(i));
-            for (self.locks, 0..) |l, i| if (l.header.active and samePeer(l.peer, peer))
-                self.releaseLock(@intCast(i));
-            for (self.managers, 0..) |m, i| if (m.header.active and samePeer(m.peer, peer)) self.releaseManager(@intCast(i));
+            for (self.surfaces.entries.items) |s| if (s.header.active and samePeer(s.peer, peer)) self.releaseSurface(s.header.index);
+            for (self.locks.entries.items) |l| if (l.header.active and samePeer(l.peer, peer)) self.releaseLock(l.header.index);
+            for (self.managers.entries.items) |m| if (m.header.active and samePeer(m.peer, peer)) self.releaseManager(m.header.index);
         }
         pub fn resourceRemoved(self: *Self, h: objects.Handle, o: objects.Object) bool {
             if (o.interface == &Manager.info) {
-                const s = fromContext(ManagerSlot, self.managers, o.context) orelse return false;
-                if (!std.meta.eql(s.header.resource, h)) return false;
+                const s = self.managers.fromContext(o.context) orelse return false;
+                if (!std.meta.eql(s.resource, h)) return false;
                 self.releaseManager(self.managerIndex(s));
                 return true;
             }
             if (o.interface == &Lock.info) {
-                const s = fromContext(LockSlot, self.locks, o.context) orelse return false;
-                if (!std.meta.eql(s.header.resource, h)) return false;
+                const s = self.locks.fromContext(o.context) orelse return false;
+                if (!std.meta.eql(s.resource, h)) return false;
                 self.releaseLock(self.lockIndex(s));
                 return true;
             }
             if (o.interface == &LockSurface.info) {
-                const s = fromContext(SurfaceSlot, self.surfaces, o.context) orelse return false;
-                if (!std.meta.eql(s.header.resource, h)) return false;
+                const s = self.surfaces.fromContext(o.context) orelse return false;
+                if (!std.meta.eql(s.resource, h)) return false;
                 self.releaseSurface(self.surfaceIndex(s));
                 return true;
             }
@@ -372,8 +367,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
         }
         pub fn surfaceForResource(self: *Self, h: objects.Handle, o: objects.Object) ?SurfaceId {
             if (o.interface != &LockSurface.info) return null;
-            const s = fromContext(SurfaceSlot, self.surfaces, o.context) orelse return null;
-            if (!std.meta.eql(s.header.resource, h)) return null;
+            const s = self.surfaces.fromContext(o.context) orelse return null;
+            if (!std.meta.eql(s.resource, h)) return null;
             return s.surface;
         }
 
@@ -402,36 +397,20 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
             return n;
         }
         fn acquireManager(self: *Self) !*ManagerSlot {
-            if (self.manager_free == none) return error.Exhausted;
-            const i = self.manager_free;
-            const g = self.managers[i].header.generation;
-            self.manager_free = self.managers[i].header.next_free;
-            self.managers[i] = .{ .header = .{ .active = true, .generation = g } };
-            return &self.managers[i];
+            return self.managers.acquire();
         }
         fn acquireLock(self: *Self) !*LockSlot {
-            if (self.lock_free == none or self.outbound_len == self.outbound_capacity) return error.Exhausted;
-            const i = self.lock_free;
-            const g = self.locks[i].header.generation;
-            self.lock_free = self.locks[i].header.next_free;
-            self.locks[i] = .{ .header = .{ .active = true, .generation = g } };
-            return &self.locks[i];
+            if (self.outbound_len == self.outbound_capacity) return error.Exhausted;
+            return self.locks.acquire();
         }
         fn acquireSurface(self: *Self) !*SurfaceSlot {
-            if (self.surface_free == none) return error.Exhausted;
-            const i = self.surface_free;
-            const g = self.surfaces[i].header.generation;
-            self.surface_free = self.surfaces[i].header.next_free;
-            self.surfaces[i] = .{ .header = .{ .active = true, .generation = g } };
-            return &self.surfaces[i];
+            return self.surfaces.acquire();
         }
         fn releaseManager(self: *Self, i: u32) void {
-            const g = nextGeneration(self.managers[i].header.generation);
-            self.managers[i] = .{ .header = .{ .generation = g, .next_free = self.manager_free } };
-            self.manager_free = i;
+            self.managers.release(self.managers.at(i) orelse return);
         }
         fn releaseLock(self: *Self, i: u32) void {
-            const l = &self.locks[i];
+            const l = self.locks.at(i) orelse return;
             if (!l.header.active) return;
             const id = self.lockId(l);
             if (self.accepted) |accepted| if (std.meta.eql(accepted, id)) {
@@ -439,12 +418,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
                 self.accepted = null;
             };
             if (l.event != null) self.outbound_len -= 1;
-            const g = nextGeneration(l.header.generation);
-            l.* = .{ .header = .{ .generation = g, .next_free = self.lock_free } };
-            self.lock_free = i;
+            self.locks.release(l);
         }
         fn releaseSurface(self: *Self, i: u32) void {
-            const s = &self.surfaces[i];
+            const s = self.surfaces.at(i) orelse return;
             if (!s.header.active) return;
             if (s.configure_pending) self.outbound_len -= 1;
             const id = self.surfaceId(s);
@@ -452,24 +429,20 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
                 if (o.active and std.meta.eql(o.surface, id)) o.* = .{};
             }
             if (self.core.getSurfaceById(s.surface)) |core| core.role.deactivateObject(role_id) catch {} else |_| {}
-            const g = nextGeneration(s.header.generation);
-            s.* = .{ .header = .{ .generation = g, .next_free = self.surface_free } };
-            self.surface_free = i;
+            self.surfaces.release(s);
         }
         fn resolveLock(self: *const Self, id: LockId) !*LockSlot {
-            if (id.index >= self.locks.len) return error.StaleLock;
-            const s = &self.locks[id.index];
+            const s = @constCast(&self.locks).at(id.index) orelse return error.StaleLock;
             if (!s.header.active or s.header.generation != id.generation) return error.StaleLock;
             return s;
         }
         fn resolveSurface(self: *const Self, id: LockSurfaceId) !*SurfaceSlot {
-            if (id.index >= self.surfaces.len) return error.StaleSurface;
-            const s = &self.surfaces[id.index];
+            const s = @constCast(&self.surfaces).at(id.index) orelse return error.StaleSurface;
             if (!s.header.active or s.header.generation != id.generation) return error.StaleSurface;
             return s;
         }
         fn findSurface(self: *const Self, id: SurfaceId) ?*SurfaceSlot {
-            for (self.surfaces) |*s| if (s.header.active and std.meta.eql(s.surface, id)) return s;
+            for (self.surfaces.entries.items) |s| if (s.header.active and std.meta.eql(s.surface, id)) return s;
             return null;
         }
         fn lockId(self: *const Self, s: *const LockSlot) LockId {
@@ -478,14 +451,14 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
         fn surfaceId(self: *const Self, s: *const SurfaceSlot) LockSurfaceId {
             return .{ .index = self.surfaceIndex(s), .generation = s.header.generation };
         }
-        fn managerIndex(self: *const Self, s: *const ManagerSlot) u32 {
-            return @intCast((@intFromPtr(s) - @intFromPtr(self.managers.ptr)) / @sizeOf(ManagerSlot));
+        fn managerIndex(_: *const Self, s: *const ManagerSlot) u32 {
+            return s.header.index;
         }
-        fn lockIndex(self: *const Self, s: *const LockSlot) u32 {
-            return @intCast((@intFromPtr(s) - @intFromPtr(self.locks.ptr)) / @sizeOf(LockSlot));
+        fn lockIndex(_: *const Self, s: *const LockSlot) u32 {
+            return s.header.index;
         }
-        fn surfaceIndex(self: *const Self, s: *const SurfaceSlot) u32 {
-            return @intCast((@intFromPtr(s) - @intFromPtr(self.surfaces.ptr)) / @sizeOf(SurfaceSlot));
+        fn surfaceIndex(_: *const Self, s: *const SurfaceSlot) u32 {
+            return s.header.index;
         }
         fn protocolError(_: *Self, a: *wayring.connection.Actor, id: u32, code: u32, msg: []const u8) !wayring.dispatch.Control {
             try ProtocolCore.postError(a, id, code, msg);
@@ -521,6 +494,26 @@ test "session-lock: serial ordering handles wrap" {
     try std.testing.expect(serialAtOrBefore(9, 10));
     try std.testing.expect(!serialAtOrBefore(11, 10));
     try std.testing.expect(serialAtOrBefore(std.math.maxInt(u32), 1));
+}
+
+test "session-lock: lock ownership grows while accepted authorization stays exclusive" {
+    const FakeCore = struct {
+        pub const SurfaceId = struct { index: u32, generation: u32 };
+    };
+    const FakeOutput = struct {};
+    const A = Adapter(@import("core_protocol"), FakeCore, FakeOutput);
+    var core: FakeCore = .{};
+    var output: FakeOutput = .{};
+    var adapter = try A.init(std.testing.allocator, &core, &output, .{ .lock_capacity = 1, .outbound_capacity = 4 });
+    defer adapter.deinit();
+    const first = try adapter.acquireLock();
+    first.phase = .pending;
+    adapter.accepted = adapter.lockId(first);
+    const address = @intFromPtr(first);
+    const denied = try adapter.acquireLock();
+    denied.phase = .denied;
+    try std.testing.expectEqual(address, @intFromPtr(adapter.locks.entries.items[0]));
+    try std.testing.expectEqual(adapter.lockId(first), adapter.pendingLock().?);
 }
 
 test "session-lock: locked publication is explicit and client loss remains fail closed" {

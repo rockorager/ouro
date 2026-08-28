@@ -3,6 +3,7 @@
 const std = @import("std");
 const wayring = @import("wayring");
 const objects = wayring.objects;
+const slot_pool = @import("slot_pool.zig");
 const none = std.math.maxInt(u32);
 
 pub const Config = struct {
@@ -25,8 +26,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         const Scale = protocol.wp_fractional_scale_v1;
 
         const Slot = struct {
-            active: bool = false,
-            next_free: u32 = none,
+            header: slot_pool.Header = .{},
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
             surface: CoreSurface.SurfaceId = .{ .index = 0, .generation = 0 },
             peer: wayring.io_uring.Peer = undefined,
@@ -37,8 +37,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         core: *CoreSurface,
         runtime: ?*Runtime = null,
         global: ?objects.Handle = null,
-        slots: []Slot,
-        free_head: u32 = 0,
+        slots: slot_pool.Pool(Slot),
         preferred_scale: u32,
         event_pending_len: usize = 0,
 
@@ -48,10 +47,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             config: Config,
         ) !Self {
             try config.validate();
-            const slots = try allocator.alloc(Slot, config.resource_capacity);
-            for (slots, 0..) |*slot, slot_index| slot.* = .{
-                .next_free = if (slot_index + 1 < slots.len) @intCast(slot_index + 1) else none,
-            };
+            const slots = try slot_pool.Pool(Slot).init(allocator, config.resource_capacity);
             return .{
                 .allocator = allocator,
                 .core = core,
@@ -61,7 +57,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         }
 
         pub fn deinit(adapter: *Self) void {
-            adapter.allocator.free(adapter.slots);
+            adapter.slots.deinit();
             adapter.* = undefined;
         }
 
@@ -113,7 +109,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                             return try adapter.protocolError(actor, decoded.handle.id, "invalid fractional-scale surface");
                         const surface = adapter.core.surfaceIdObject(surface_handle, surface_object) catch
                             return try adapter.protocolError(actor, decoded.handle.id, "invalid fractional-scale surface");
-                        for (adapter.slots) |slot| if (slot.active and std.meta.eql(slot.surface, surface))
+                        for (adapter.slots.entries.items) |slot| if (slot.header.active and std.meta.eql(slot.surface, surface))
                             return try adapter.protocolError(actor, decoded.handle.id, "fractional scale already exists");
                         const slot = adapter.acquire() catch return try adapter.noMemory(actor);
                         const admitted = Manager.admit_get_fractional_scale(
@@ -122,7 +118,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                             value,
                             .{ .id = slot },
                         ) catch |cause| {
-                            adapter.release(adapter.index(slot));
+                            adapter.release(slot);
                             return try adapter.failure(actor, decoded.handle.id, cause);
                         };
                         slot.resource = admitted.id;
@@ -154,8 +150,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         ) !usize {
             var completed: usize = 0;
             if (adapter.event_pending_len == 0) return completed;
-            for (adapter.slots) |*slot| {
-                if (!slot.active or !samePeer(slot.peer, peer) or !slot.event_pending) continue;
+            for (adapter.slots.entries.items) |slot| {
+                if (!slot.header.active or !samePeer(slot.peer, peer) or !slot.event_pending) continue;
                 if (server_objects.namespace.resolve(slot.resource) == null) continue;
                 Scale.encodeEvent(queue, slot.resource.id, .{ .preferred_scale = .{
                     .scale = adapter.preferred_scale,
@@ -172,8 +168,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
 
         pub fn pendingOutbound(adapter: *const Self, peer: wayring.io_uring.Peer) bool {
             if (adapter.event_pending_len == 0) return false;
-            for (adapter.slots) |slot|
-                if (slot.active and samePeer(slot.peer, peer) and slot.event_pending) return true;
+            for (adapter.slots.entries.items) |slot|
+                if (slot.header.active and samePeer(slot.peer, peer) and slot.event_pending) return true;
             return false;
         }
 
@@ -181,7 +177,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             if (object.interface == &Scale.info) {
                 const slot = adapter.fromObject(&object) orelse return false;
                 if (!std.meta.eql(slot.resource, handle)) return false;
-                adapter.release(adapter.index(slot));
+                adapter.release(slot);
                 return true;
             }
             return object.interface == &Manager.info and
@@ -189,37 +185,19 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         }
 
         fn acquire(adapter: *Self) !*Slot {
-            if (adapter.free_head == none) return error.Exhausted;
-            const index_value = adapter.free_head;
-            const slot = &adapter.slots[index_value];
-            adapter.free_head = slot.next_free;
-            slot.* = .{ .active = true };
+            const slot = try adapter.slots.acquire();
             adapter.event_pending_len += 1;
             return slot;
         }
 
-        fn release(adapter: *Self, index_value: u32) void {
-            const slot = &adapter.slots[index_value];
-            if (!slot.active) return;
+        fn release(adapter: *Self, slot: *Slot) void {
+            if (!slot.header.active) return;
             if (slot.event_pending) adapter.event_pending_len -= 1;
-            slot.* = .{ .next_free = adapter.free_head };
-            adapter.free_head = index_value;
+            adapter.slots.release(slot);
         }
 
         fn fromObject(adapter: *Self, object: *const objects.Object) ?*Slot {
-            const pointer = object.context orelse return null;
-            const address = @intFromPtr(pointer);
-            const start = @intFromPtr(adapter.slots.ptr);
-            const bytes = std.math.mul(usize, adapter.slots.len, @sizeOf(Slot)) catch return null;
-            const end = std.math.add(usize, start, bytes) catch return null;
-            if (address < start or address >= end or (address - start) % @sizeOf(Slot) != 0)
-                return null;
-            const slot = &adapter.slots[(address - start) / @sizeOf(Slot)];
-            return if (slot.active and @intFromPtr(slot) == address) slot else null;
-        }
-
-        fn index(adapter: *Self, slot: *Slot) u32 {
-            return @intCast((@intFromPtr(slot) - @intFromPtr(adapter.slots.ptr)) / @sizeOf(Slot));
+            return adapter.slots.fromContext(object.context);
         }
 
         fn noMemory(adapter: *Self, actor: *wayring.connection.Actor) !wayring.dispatch.Control {
@@ -244,7 +222,7 @@ fn samePeer(a: wayring.io_uring.Peer, b: wayring.io_uring.Peer) bool {
     return a.slot == b.slot and a.generation == b.generation;
 }
 
-test "fractional scale: bounded slots retain one pending preferred scale" {
+test "fractional scale: initial reservation grows without moving contexts" {
     const protocol = @import("core_protocol");
     const FakeCore = struct {
         pub const SurfaceId = struct { index: u32, generation: u32 };
@@ -257,12 +235,13 @@ test "fractional scale: bounded slots retain one pending preferred scale" {
     });
     defer adapter.deinit();
     const slot = try adapter.acquire();
+    const original = @intFromPtr(slot);
     const peer: wayring.io_uring.Peer = .{ .slot = 1, .generation = 2 };
     slot.peer = peer;
     try std.testing.expect(slot.event_pending);
     try std.testing.expect(adapter.pendingOutbound(peer));
     try std.testing.expect(!adapter.pendingOutbound(.{ .slot = 2, .generation = 2 }));
-    try std.testing.expectError(error.Exhausted, adapter.acquire());
-    adapter.release(0);
-    try std.testing.expectEqual(@as(u32, 0), adapter.free_head);
+    _ = try adapter.acquire();
+    try std.testing.expectEqual(original, @intFromPtr(slot));
+    adapter.release(slot);
 }

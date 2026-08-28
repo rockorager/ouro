@@ -7,6 +7,7 @@
 const std = @import("std");
 const wayring = @import("wayring");
 const objects = wayring.objects;
+const slot_pool = @import("slot_pool.zig");
 const none = std.math.maxInt(u32);
 
 pub const Config = struct {
@@ -36,9 +37,7 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type) type {
 
         const Id = packed struct { index: u32, generation: u32 };
         const Slot = struct {
-            active: bool = false,
-            generation: u32 = 1,
-            next_free: u32 = none,
+            header: slot_pool.Header = .{},
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
             peer: wayring.io_uring.Peer = undefined,
             toplevel: Shell.ToplevelId = undefined,
@@ -50,9 +49,8 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type) type {
         runtime: ?*Runtime = null,
         global: ?objects.Handle = null,
         global_version: u32,
-        slots: []Slot,
+        slots: slot_pool.Pool(Slot),
         events: []Id,
-        free_head: u32 = 0,
         event_head: usize = 0,
         event_len: usize = 0,
         configure_pending_len: usize = 0,
@@ -60,12 +58,9 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type) type {
         pub fn init(allocator: std.mem.Allocator, shell: *Shell, config: Config) !Self {
             try config.validate();
             try Manager.info.validateVersion(config.global_version);
-            const slots = try allocator.alloc(Slot, config.resource_capacity);
-            errdefer allocator.free(slots);
+            var slots = try slot_pool.Pool(Slot).init(allocator, config.resource_capacity);
+            errdefer slots.deinit();
             const events = try allocator.alloc(Id, config.event_capacity);
-            for (slots, 0..) |*slot, slot_index| slot.* = .{
-                .next_free = if (slot_index + 1 < slots.len) @intCast(slot_index + 1) else none,
-            };
             return .{
                 .allocator = allocator,
                 .shell = shell,
@@ -77,7 +72,7 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type) type {
 
         pub fn deinit(self: *Self) void {
             self.allocator.free(self.events);
-            self.allocator.free(self.slots);
+            self.slots.deinit();
             self.* = undefined;
         }
 
@@ -153,7 +148,7 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type) type {
                             payload,
                             .{ .id = slot },
                         ) catch |err| {
-                            self.release(self.slotIndex(slot));
+                            self.release(slot);
                             return try self.failure(actor, decoded.handle.id, err);
                         };
                         slot.resource = admitted.id;
@@ -221,8 +216,8 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type) type {
         ) !usize {
             var completed: usize = 0;
             if (self.configure_pending_len == 0) return completed;
-            for (self.slots) |*slot| {
-                if (!slot.active or !samePeer(slot.peer, peer) or !slot.configure_pending)
+            for (self.slots.entries.items) |slot| {
+                if (!slot.header.active or !samePeer(slot.peer, peer) or !slot.configure_pending)
                     continue;
                 if (self.eventQueued(self.slotId(slot))) continue;
                 wayring.server.sendEvent(
@@ -245,16 +240,16 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type) type {
 
         pub fn pendingOutbound(self: *const Self, peer: wayring.io_uring.Peer) bool {
             if (self.configure_pending_len == 0) return false;
-            for (self.slots) |slot|
-                if (slot.active and samePeer(slot.peer, peer) and slot.configure_pending)
+            for (self.slots.entries.items) |slot|
+                if (slot.header.active and samePeer(slot.peer, peer) and slot.configure_pending)
                     return true;
             return false;
         }
 
         pub fn readyOutbound(self: *const Self, peer: wayring.io_uring.Peer) bool {
             if (self.configure_pending_len == 0) return false;
-            for (self.slots) |*slot| {
-                if (slot.active and samePeer(slot.peer, peer) and slot.configure_pending and
+            for (self.slots.entries.items) |slot| {
+                if (slot.header.active and samePeer(slot.peer, peer) and slot.configure_pending and
                     !self.eventQueued(self.slotId(slot))) return true;
             }
             return false;
@@ -272,14 +267,14 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type) type {
                     "xdg_toplevel destroyed before its decoration object",
                 ) catch {};
             }
-            self.release(self.slotIndex(slot));
+            self.release(slot);
         }
 
         pub fn resourceRemoved(self: *Self, handle: objects.Handle, object: objects.Object) bool {
             if (object.interface == &Decoration.info) {
                 const slot = self.fromObject(&object) orelse return false;
                 if (!std.meta.eql(slot.resource, handle)) return false;
-                self.release(self.slotIndex(slot));
+                self.release(slot);
                 return true;
             }
             return object.interface == &Manager.info and
@@ -304,57 +299,34 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type) type {
         }
 
         fn acquire(self: *Self) !*Slot {
-            if (self.free_head == none) return error.Exhausted;
-            const index_value = self.free_head;
-            const slot = &self.slots[index_value];
-            self.free_head = slot.next_free;
-            slot.* = .{ .active = true, .generation = slot.generation };
-            return slot;
+            return self.slots.acquire();
         }
 
-        fn release(self: *Self, index_value: u32) void {
-            const slot = &self.slots[index_value];
-            if (!slot.active) return;
+        fn release(self: *Self, slot: *Slot) void {
+            if (!slot.header.active) return;
             if (slot.configure_pending) self.configure_pending_len -= 1;
-            const generation = slot.generation +% 1;
-            slot.* = .{
-                .generation = if (generation == 0) 1 else generation,
-                .next_free = self.free_head,
-            };
-            self.free_head = index_value;
+            self.slots.release(slot);
         }
 
         fn resolve(self: *Self, slot_id: Id) !*Slot {
-            if (slot_id.index >= self.slots.len) return error.Stale;
-            const slot = &self.slots[slot_id.index];
-            if (!slot.active or slot.generation != slot_id.generation) return error.Stale;
+            const slot = self.slots.at(slot_id.index) orelse return error.Stale;
+            if (slot.header.generation != slot_id.generation) return error.Stale;
             return slot;
         }
 
         fn findToplevel(self: *Self, toplevel: Shell.ToplevelId) ?*Slot {
-            for (self.slots) |*slot|
-                if (slot.active and std.meta.eql(slot.toplevel, toplevel)) return slot;
+            for (self.slots.entries.items) |slot|
+                if (slot.header.active and std.meta.eql(slot.toplevel, toplevel)) return slot;
             return null;
         }
 
         fn fromObject(self: *Self, object: *const objects.Object) ?*Slot {
-            const pointer = object.context orelse return null;
-            const address = @intFromPtr(pointer);
-            const start = @intFromPtr(self.slots.ptr);
-            const size = std.math.mul(usize, self.slots.len, @sizeOf(Slot)) catch return null;
-            const end = std.math.add(usize, start, size) catch return null;
-            if (address < start or address >= end or (address - start) % @sizeOf(Slot) != 0)
-                return null;
-            const slot = &self.slots[(address - start) / @sizeOf(Slot)];
-            return if (slot.active and @intFromPtr(slot) == address) slot else null;
+            return self.slots.fromContext(object.context);
         }
 
         fn slotId(self: *const Self, slot: *const Slot) Id {
-            return .{ .index = self.slotIndex(slot), .generation = slot.generation };
-        }
-
-        fn slotIndex(self: *const Self, slot: *const Slot) u32 {
-            return @intCast((@intFromPtr(slot) - @intFromPtr(self.slots.ptr)) / @sizeOf(Slot));
+            _ = self;
+            return .{ .index = slot.header.index, .generation = slot.header.generation };
         }
 
         fn noMemory(_: *Self, actor: *wayring.connection.Actor) !wayring.dispatch.Control {
@@ -388,7 +360,7 @@ fn samePeer(a: wayring.io_uring.Peer, b: wayring.io_uring.Peer) bool {
     return a.slot == b.slot and a.generation == b.generation;
 }
 
-test "xdg decoration: bounded negotiation stays client-side and coalesces requests" {
+test "xdg decoration: reservation grows stably and negotiation coalesces requests" {
     const protocol = @import("core_protocol");
     const FakeShell = struct {
         pub const ToplevelId = packed struct { index: u32, generation: u32 };
@@ -409,6 +381,9 @@ test "xdg decoration: bounded negotiation stays client-side and coalesces reques
     );
     defer server_objects.deinit(std.testing.allocator);
     const slot = try adapter.acquire();
+    const original = @intFromPtr(slot);
+    _ = try adapter.acquire();
+    try std.testing.expectEqual(original, @intFromPtr(slot));
     slot.peer = .{ .slot = 1, .generation = 2 };
     slot.toplevel = .{ .index = 3, .generation = 4 };
     slot.resource = try server_objects.insertClient(
@@ -422,7 +397,6 @@ test "xdg decoration: bounded negotiation stays client-side and coalesces reques
     try std.testing.expect(adapter.pendingOutbound(slot.peer));
     try std.testing.expect(!adapter.readyOutbound(slot.peer));
     try std.testing.expectEqual(TestAdapter.Event{ .reconfigure = slot.toplevel }, adapter.peekEvent().?);
-    try std.testing.expectError(error.Exhausted, adapter.acquire());
     adapter.dropEvent();
     try std.testing.expect(adapter.readyOutbound(slot.peer));
     try std.testing.expectEqual(@as(?TestAdapter.Event, null), adapter.peekEvent());

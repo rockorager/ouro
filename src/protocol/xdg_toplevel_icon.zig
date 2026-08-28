@@ -7,6 +7,7 @@
 const std = @import("std");
 const wayring = @import("wayring");
 const objects = wayring.objects;
+const slot_pool = @import("slot_pool.zig");
 const none = std.math.maxInt(u32);
 
 pub const Config = struct {
@@ -45,28 +46,23 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type, comptime Shm: type
         };
 
         const ManagerSlot = struct {
-            active: bool = false,
-            generation: u32 = 1,
-            next_free: u32 = none,
+            header: slot_pool.Header = .{},
             peer: wayring.io_uring.Peer = undefined,
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
             done_pending: bool = false,
         };
 
         const IconSlot = struct {
-            active: bool = false,
-            generation: u32 = 1,
-            next_free: u32 = none,
+            header: slot_pool.Header = .{},
             peer: wayring.io_uring.Peer = undefined,
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
             name_len: usize = 0,
+            name: []u8 = &.{},
             immutable: bool = false,
         };
 
         const SourceVariant = struct {
-            active: bool = false,
-            generation: u32 = 1,
-            next_free: u32 = none,
+            header: slot_pool.Header = .{},
             icon_index: u32 = none,
             icon_generation: u32 = 0,
             buffer: objects.Handle = .{ .id = 0, .generation = 0 },
@@ -85,9 +81,7 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type, comptime Shm: type
         };
 
         const AssignmentSlot = struct {
-            active: bool = false,
-            generation: u32 = 1,
-            next_free: u32 = none,
+            header: slot_pool.Header = .{},
             toplevel: Shell.ToplevelId = undefined,
             pending_valid: bool = false,
             pending: ?OwnedSnapshot = null,
@@ -99,35 +93,23 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type, comptime Shm: type
         shm: *Shm,
         runtime: ?*Runtime = null,
         global: ?objects.Handle = null,
-        managers: []ManagerSlot,
-        icons: []IconSlot,
-        variants: []SourceVariant,
-        assignments: []AssignmentSlot,
-        names: []u8,
+        managers: slot_pool.Pool(ManagerSlot),
+        icons: slot_pool.Pool(IconSlot),
+        variants: slot_pool.Pool(SourceVariant),
+        assignments: slot_pool.Pool(AssignmentSlot),
         name_bytes: usize,
         snapshot_limit: usize,
         snapshot_bytes: usize = 0,
-        manager_free: u32 = 0,
-        icon_free: u32 = 0,
-        variant_free: u32 = 0,
-        assignment_free: u32 = 0,
 
         pub fn init(allocator: std.mem.Allocator, shell: *Shell, shm: *Shm, config: Config) !Self {
             try config.validate();
-            const managers = try allocator.alloc(ManagerSlot, config.manager_capacity);
-            errdefer allocator.free(managers);
-            const icons = try allocator.alloc(IconSlot, config.icon_capacity);
-            errdefer allocator.free(icons);
-            const variants = try allocator.alloc(SourceVariant, config.variant_capacity);
-            errdefer allocator.free(variants);
-            const assignments = try allocator.alloc(AssignmentSlot, config.assignment_capacity);
-            errdefer allocator.free(assignments);
-            const names = try allocator.alloc(u8, try std.math.mul(usize, config.icon_capacity, config.name_bytes));
-            errdefer allocator.free(names);
-            initFree(ManagerSlot, managers);
-            initFree(IconSlot, icons);
-            initFree(SourceVariant, variants);
-            initFree(AssignmentSlot, assignments);
+            var managers = try slot_pool.Pool(ManagerSlot).init(allocator, config.manager_capacity);
+            errdefer managers.deinit();
+            var icons = try slot_pool.Pool(IconSlot).init(allocator, config.icon_capacity);
+            errdefer icons.deinit();
+            var variants = try slot_pool.Pool(SourceVariant).init(allocator, config.variant_capacity);
+            errdefer variants.deinit();
+            const assignments = try slot_pool.Pool(AssignmentSlot).init(allocator, config.assignment_capacity);
             return .{
                 .allocator = allocator,
                 .shell = shell,
@@ -136,23 +118,22 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type, comptime Shm: type
                 .icons = icons,
                 .variants = variants,
                 .assignments = assignments,
-                .names = names,
                 .name_bytes = config.name_bytes,
                 .snapshot_limit = config.max_snapshot_bytes,
             };
         }
 
         pub fn deinit(self: *Self) void {
-            for (self.assignments) |*slot| if (slot.active) {
+            for (self.assignments.entries.items) |slot| if (slot.header.active) {
                 self.freeSnapshot(&slot.pending);
                 self.freeSnapshot(&slot.current);
             };
             std.debug.assert(self.snapshot_bytes == 0);
-            self.allocator.free(self.names);
-            self.allocator.free(self.assignments);
-            self.allocator.free(self.variants);
-            self.allocator.free(self.icons);
-            self.allocator.free(self.managers);
+            for (self.icons.entries.items) |slot| if (slot.name.len != 0) self.allocator.free(slot.name);
+            self.assignments.deinit();
+            self.variants.deinit();
+            self.icons.deinit();
+            self.managers.deinit();
             self.* = undefined;
         }
 
@@ -182,7 +163,7 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type, comptime Shm: type
         pub fn requestOn(self: *Self, actor: *wayring.connection.Actor, server_objects: anytype, peer: wayring.io_uring.Peer, target: objects.Dispatch, message: wayring.wire.Message, fds: *wayring.ancillary.FdQueue) !?wayring.dispatch.Control {
             const handle = server_objects.namespace.lookupHandle(message.header.object_id) orelse return null;
             if (target.object.interface == &Manager.info) {
-                const manager = from(ManagerSlot, self.managers, target.object.context) orelse return null;
+                const manager = from(ManagerSlot, &self.managers, target.object.context) orelse return null;
                 if (!std.meta.eql(manager.resource, handle) or !samePeer(manager.peer, peer)) return null;
                 const decoded = try wayring.server.decodeRequest(Manager, server_objects, message, fds);
                 switch (decoded.value) {
@@ -204,7 +185,7 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type, comptime Shm: type
                                 return try self.failure(actor, decoded.handle.id, error.InvalidIcon);
                             const object = server_objects.namespace.resolve(icon_handle) orelse
                                 return try self.failure(actor, decoded.handle.id, error.InvalidIcon);
-                            const icon = from(IconSlot, self.icons, object.context) orelse
+                            const icon = from(IconSlot, &self.icons, object.context) orelse
                                 return try self.failure(actor, decoded.handle.id, error.InvalidIcon);
                             if (object.interface != &Icon.info or !std.meta.eql(icon.resource, icon_handle) or !samePeer(icon.peer, peer))
                                 return try self.failure(actor, decoded.handle.id, error.InvalidIcon);
@@ -219,7 +200,7 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type, comptime Shm: type
                 return .continue_dispatch;
             }
             if (target.object.interface == &Icon.info) {
-                const icon = from(IconSlot, self.icons, target.object.context) orelse return null;
+                const icon = from(IconSlot, &self.icons, target.object.context) orelse return null;
                 if (!std.meta.eql(icon.resource, handle) or !samePeer(icon.peer, peer)) return null;
                 const decoded = try wayring.server.decodeRequest(Icon, server_objects, message, fds);
                 switch (decoded.value) {
@@ -248,10 +229,9 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type, comptime Shm: type
                         const variant = self.findVariant(icon, info.width, payload.scale) orelse
                             self.acquireVariant() catch return try self.noMemory(actor);
                         variant.* = .{
-                            .active = true,
-                            .generation = variant.generation,
-                            .icon_index = indexOf(IconSlot, self.icons, icon),
-                            .icon_generation = icon.generation,
+                            .header = variant.header,
+                            .icon_index = icon.header.index,
+                            .icon_generation = icon.header.generation,
                             .buffer = buffer_handle,
                             .token = token,
                             .width = info.width,
@@ -269,14 +249,14 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type, comptime Shm: type
         }
 
         pub fn pendingOutbound(self: *const Self, peer: wayring.io_uring.Peer) bool {
-            for (self.managers) |slot| if (slot.active and slot.done_pending and samePeer(slot.peer, peer)) return true;
+            for (self.managers.entries.items) |slot| if (slot.header.active and slot.done_pending and samePeer(slot.peer, peer)) return true;
             return false;
         }
 
         pub fn flushOn(self: *Self, peer: wayring.io_uring.Peer, server_objects: anytype, queue: *wayring.tx.Queue) !usize {
             var count: usize = 0;
-            for (self.managers) |*slot| {
-                if (!slot.active or !slot.done_pending or !samePeer(slot.peer, peer)) continue;
+            for (self.managers.entries.items) |slot| {
+                if (!slot.header.active or !slot.done_pending or !samePeer(slot.peer, peer)) continue;
                 if (server_objects.namespace.resolve(slot.resource) == null) {
                     slot.done_pending = false;
                     continue;
@@ -317,20 +297,20 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type, comptime Shm: type
 
         pub fn resourceRemoved(self: *Self, handle: objects.Handle, object: objects.Object) bool {
             if (object.interface == &Icon.info) {
-                const icon = from(IconSlot, self.icons, object.context) orelse return false;
+                const icon = from(IconSlot, &self.icons, object.context) orelse return false;
                 if (!std.meta.eql(icon.resource, handle)) return false;
                 self.releaseIcon(indexOf(IconSlot, self.icons, icon));
                 return true;
             }
             if (object.interface == &Manager.info) {
-                const manager = from(ManagerSlot, self.managers, object.context) orelse return false;
+                const manager = from(ManagerSlot, &self.managers, object.context) orelse return false;
                 if (!std.meta.eql(manager.resource, handle)) return false;
                 self.releaseManager(indexOf(ManagerSlot, self.managers, manager));
                 return true;
             }
             if (object.interface == &protocol.wl_buffer.info) {
-                for (self.variants) |*variant| {
-                    if (!variant.active or !std.meta.eql(variant.buffer, handle)) continue;
+                for (self.variants.entries.items) |variant| {
+                    if (!variant.header.active or !std.meta.eql(variant.buffer, handle)) continue;
                     const icon = self.resolveIcon(variant.icon_index, variant.icon_generation) catch {
                         self.releaseVariant(indexOf(SourceVariant, self.variants, variant));
                         continue;
@@ -373,7 +353,7 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type, comptime Shm: type
         fn copySnapshot(self: *Self, icon: *IconSlot) !OwnedSnapshot {
             var count: usize = 0;
             var total = icon.name_len;
-            for (self.variants) |variant| if (self.variantBelongs(variant, icon)) {
+            for (self.variants.entries.items) |variant| if (self.variantBelongs(variant.*, icon)) {
                 count += 1;
                 total = try std.math.add(usize, total, variant.extent);
             };
@@ -384,7 +364,8 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type, comptime Shm: type
             errdefer self.allocator.free(variants);
             var initialized: usize = 0;
             errdefer for (variants[0..initialized]) |variant| self.allocator.free(@constCast(variant.bytes));
-            for (self.variants) |source| {
+            for (self.variants.entries.items) |source_ptr| {
+                const source = source_ptr.*;
                 if (!self.variantBelongs(source, icon)) continue;
                 const bytes = copied: {
                     const destination = try self.allocator.alloc(u8, source.extent);
@@ -428,38 +409,43 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type, comptime Shm: type
         }
 
         fn acquireManager(self: *Self) !*ManagerSlot {
-            return acquire(ManagerSlot, self.managers, &self.manager_free);
+            return self.managers.acquire();
         }
         fn acquireIcon(self: *Self) !*IconSlot {
-            return acquire(IconSlot, self.icons, &self.icon_free);
+            const slot = try self.icons.acquire();
+            slot.name = self.allocator.alloc(u8, self.name_bytes) catch |err| {
+                self.icons.release(slot);
+                return err;
+            };
+            return slot;
         }
         fn acquireVariant(self: *Self) !*SourceVariant {
-            return acquire(SourceVariant, self.variants, &self.variant_free);
+            return self.variants.acquire();
         }
         fn acquireAssignment(self: *Self, toplevel: Shell.ToplevelId) !*AssignmentSlot {
-            const slot = try acquire(AssignmentSlot, self.assignments, &self.assignment_free);
+            const slot = try self.assignments.acquire();
             slot.toplevel = toplevel;
             return slot;
         }
 
         fn releaseManager(self: *Self, index: u32) void {
-            release(ManagerSlot, self.managers, &self.manager_free, index);
+            if (self.managers.at(index)) |slot| self.managers.release(slot);
         }
         fn releaseIcon(self: *Self, index: u32) void {
-            const icon = &self.icons[index];
-            if (!icon.active) return;
-            for (self.variants, 0..) |variant, i| if (self.variantBelongs(variant, icon)) self.releaseVariant(@intCast(i));
-            release(IconSlot, self.icons, &self.icon_free, index);
+            const icon = self.icons.at(index) orelse return;
+            for (self.variants.entries.items) |variant| if (self.variantBelongs(variant.*, icon)) self.releaseVariant(variant.header.index);
+            self.allocator.free(icon.name);
+            icon.name = &.{};
+            self.icons.release(icon);
         }
         fn releaseVariant(self: *Self, index: u32) void {
-            release(SourceVariant, self.variants, &self.variant_free, index);
+            if (self.variants.at(index)) |slot| self.variants.release(slot);
         }
         fn releaseAssignment(self: *Self, index: u32) void {
-            const slot = &self.assignments[index];
-            if (!slot.active) return;
+            const slot = self.assignments.at(index) orelse return;
             self.freeSnapshot(&slot.pending);
             self.freeSnapshot(&slot.current);
-            release(AssignmentSlot, self.assignments, &self.assignment_free, index);
+            self.assignments.release(slot);
         }
         fn releaseAssignmentIfEmpty(self: *Self, slot: *AssignmentSlot) void {
             if (!slot.pending_valid and slot.pending == null and slot.current == null)
@@ -467,33 +453,33 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type, comptime Shm: type
         }
 
         fn resolveIcon(self: *Self, index: u32, generation: u32) !*IconSlot {
-            if (index >= self.icons.len) return error.StaleIcon;
-            const slot = &self.icons[index];
-            if (!slot.active or slot.generation != generation) return error.StaleIcon;
+            const slot = self.icons.at(index) orelse return error.StaleIcon;
+            if (slot.header.generation != generation) return error.StaleIcon;
             return slot;
         }
         fn findVariant(self: *Self, icon: *IconSlot, width: u32, scale: i32) ?*SourceVariant {
-            for (self.variants) |*variant| if (self.variantBelongs(variant.*, icon) and variant.width == width and variant.scale == scale) return variant;
+            for (self.variants.entries.items) |variant| if (self.variantBelongs(variant.*, icon) and variant.width == width and variant.scale == scale) return variant;
             return null;
         }
         fn hasVariants(self: *const Self, icon: *const IconSlot) bool {
-            for (self.variants) |variant| if (self.variantBelongs(variant, icon)) return true;
+            for (self.variants.entries.items) |variant| if (self.variantBelongs(variant.*, icon)) return true;
             return false;
         }
         fn variantBelongs(self: *const Self, variant: SourceVariant, icon: *const IconSlot) bool {
-            return variant.active and variant.icon_index == indexOf(IconSlot, self.icons, icon) and variant.icon_generation == icon.generation;
+            _ = self;
+            return variant.header.active and variant.icon_index == icon.header.index and variant.icon_generation == icon.header.generation;
         }
         fn findAssignment(self: *Self, toplevel: Shell.ToplevelId) ?*AssignmentSlot {
-            for (self.assignments) |*slot| if (slot.active and std.meta.eql(slot.toplevel, toplevel)) return slot;
+            for (self.assignments.entries.items) |slot| if (slot.header.active and std.meta.eql(slot.toplevel, toplevel)) return slot;
             return null;
         }
         fn findAssignmentConst(self: *const Self, toplevel: Shell.ToplevelId) ?*const AssignmentSlot {
-            for (self.assignments) |*slot| if (slot.active and std.meta.eql(slot.toplevel, toplevel)) return slot;
+            for (self.assignments.entries.items) |slot| if (slot.header.active and std.meta.eql(slot.toplevel, toplevel)) return slot;
             return null;
         }
         fn iconName(self: *Self, icon: *IconSlot) []u8 {
-            const index = indexOf(IconSlot, self.icons, icon);
-            return self.names[index * self.name_bytes ..][0..self.name_bytes];
+            _ = self;
+            return icon.name;
         }
 
         fn noMemory(_: *Self, actor: *wayring.connection.Actor) !wayring.dispatch.Control {
@@ -518,39 +504,13 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type, comptime Shm: type
     };
 }
 
-fn initFree(comptime T: type, slots: []T) void {
-    for (slots, 0..) |*slot, i| slot.* = .{ .next_free = if (i + 1 < slots.len) @intCast(i + 1) else none };
+fn from(comptime T: type, pool: anytype, context: ?*anyopaque) ?*T {
+    return pool.fromContext(context);
 }
 
-fn acquire(comptime T: type, slots: []T, free_head: *u32) !*T {
-    if (free_head.* == none) return error.Exhausted;
-    const index = free_head.*;
-    const slot = &slots[index];
-    free_head.* = slot.next_free;
-    slot.* = .{ .active = true, .generation = slot.generation };
-    return slot;
-}
-
-fn release(comptime T: type, slots: []T, free_head: *u32, index: u32) void {
-    const slot = &slots[index];
-    if (!slot.active) return;
-    const next = slot.generation +% 1;
-    slot.* = .{ .generation = if (next == 0) 1 else next, .next_free = free_head.* };
-    free_head.* = index;
-}
-
-fn from(comptime T: type, slots: []T, context: ?*anyopaque) ?*T {
-    const pointer = context orelse return null;
-    const address = @intFromPtr(pointer);
-    const start = @intFromPtr(slots.ptr);
-    const end = start + slots.len * @sizeOf(T);
-    if (address < start or address >= end or (address - start) % @sizeOf(T) != 0) return null;
-    const slot = &slots[(address - start) / @sizeOf(T)];
-    return if (slot.active) slot else null;
-}
-
-fn indexOf(comptime T: type, slots: []const T, slot: *const T) u32 {
-    return @intCast((@intFromPtr(slot) - @intFromPtr(slots.ptr)) / @sizeOf(T));
+fn indexOf(comptime T: type, pool: anytype, slot: *const T) u32 {
+    _ = pool;
+    return slot.header.index;
 }
 
 fn samePeer(a: wayring.io_uring.Peer, b: wayring.io_uring.Peer) bool {
@@ -590,11 +550,12 @@ test "toplevel icon slots are bounded and generation safe" {
     });
     defer adapter.deinit();
     const first = try adapter.acquireIcon();
-    try std.testing.expectError(error.Exhausted, adapter.acquireIcon());
-    const generation = first.generation;
+    const grown = try adapter.acquireIcon();
+    try std.testing.expect(first != grown);
+    const generation = first.header.generation;
     adapter.releaseIcon(0);
     const second = try adapter.acquireIcon();
-    try std.testing.expect(second.generation != generation);
+    try std.testing.expect(second.header.generation != generation);
     try std.testing.expectEqual(@as(usize, 0), second.name_len);
     try std.testing.expect(!second.immutable);
 }
@@ -705,10 +666,9 @@ test "toplevel icon assignment deep copies ordinary SHM variants" {
     const icon = try adapter.acquireIcon();
     const variant = try adapter.acquireVariant();
     variant.* = .{
-        .active = true,
-        .generation = variant.generation,
+        .header = variant.header,
         .icon_index = 0,
-        .icon_generation = icon.generation,
+        .icon_generation = icon.header.generation,
         .buffer = .{ .id = 9, .generation = 1 },
         .token = token,
         .width = 2,

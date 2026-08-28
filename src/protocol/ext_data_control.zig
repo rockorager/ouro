@@ -1,4 +1,4 @@
-//! Flavor-parameterized bounded owner for ext and wlr data-control protocols.
+//! Flavor-parameterized growable owner for ext and wlr data-control protocols.
 
 const std = @import("std");
 const wayring = @import("wayring");
@@ -20,8 +20,7 @@ pub const Config = struct {
     fn validate(c: Config) !void {
         inline for (.{ c.manager_capacity, c.source_capacity, c.device_capacity, c.offer_capacity, c.mime_capacity, c.mime_bytes, c.outbound_capacity }) |n|
             if (n == 0 or n >= none) return error.InvalidConfig;
-        const slots = std.math.mul(usize, c.source_capacity, c.mime_capacity) catch return error.InvalidConfig;
-        _ = std.math.mul(usize, slots, c.mime_bytes) catch return error.InvalidConfig;
+        _ = std.math.mul(usize, c.mime_capacity, c.mime_bytes) catch return error.InvalidConfig;
     }
 };
 
@@ -106,13 +105,11 @@ fn Owner(comptime protocol: type, comptime flavor: Flavor) type {
         global_version: u32,
         mime_capacity: usize,
         mime_bytes: usize,
-        managers: []ManagerSlot,
-        sources: []SourceSlot,
-        devices: []DeviceSlot,
-        offers: []OfferSlot,
+        managers: std.ArrayListUnmanaged(*ManagerSlot),
+        sources: std.ArrayListUnmanaged(*SourceSlot),
+        devices: std.ArrayListUnmanaged(*DeviceSlot),
+        offers: std.ArrayListUnmanaged(*OfferSlot),
         outbound: []OutboundSlot,
-        mime_lengths: []u16,
-        mime_storage: []u8,
         manager_free: u32 = 0,
         source_free: u32 = 0,
         device_free: u32 = 0,
@@ -125,47 +122,42 @@ fn Owner(comptime protocol: type, comptime flavor: Flavor) type {
         pub fn init(allocator: std.mem.Allocator, coordinator: Coordinator, c: Config) !Self {
             try c.validate();
             try Manager.info.validateVersion(c.global_version);
-            const managers = try allocator.alloc(ManagerSlot, c.manager_capacity);
-            errdefer allocator.free(managers);
-            const sources = try allocator.alloc(SourceSlot, c.source_capacity);
-            errdefer allocator.free(sources);
-            const devices = try allocator.alloc(DeviceSlot, c.device_capacity);
-            errdefer allocator.free(devices);
-            const offers = try allocator.alloc(OfferSlot, c.offer_capacity);
-            errdefer allocator.free(offers);
+            var managers = try initSlots(ManagerSlot, allocator, c.manager_capacity);
+            errdefer deinitSlots(ManagerSlot, allocator, &managers);
+            var sources = try initSlots(SourceSlot, allocator, c.source_capacity);
+            errdefer deinitSlots(SourceSlot, allocator, &sources);
+            var devices = try initSlots(DeviceSlot, allocator, c.device_capacity);
+            errdefer deinitSlots(DeviceSlot, allocator, &devices);
+            var offers = try initSlots(OfferSlot, allocator, c.offer_capacity);
+            errdefer deinitSlots(OfferSlot, allocator, &offers);
             const outbound = try allocator.alloc(OutboundSlot, c.outbound_capacity);
             errdefer allocator.free(outbound);
-            const slots = try std.math.mul(usize, c.source_capacity, c.mime_capacity);
-            const lengths = try allocator.alloc(u16, slots);
-            errdefer allocator.free(lengths);
-            const storage = try allocator.alloc(u8, try std.math.mul(usize, slots, c.mime_bytes));
-            errdefer allocator.free(storage);
-            initHeaders(ManagerSlot, managers);
-            initHeaders(SourceSlot, sources);
-            initHeaders(DeviceSlot, devices);
-            initHeaders(OfferSlot, offers);
             @memset(outbound, .{});
-            @memset(lengths, 0);
-            for (sources, 0..) |*source, i| {
-                source.mime_lengths = lengths[i * c.mime_capacity ..][0..c.mime_capacity];
-                source.mime_storage = storage[i * c.mime_capacity * c.mime_bytes ..][0 .. c.mime_capacity * c.mime_bytes];
-            }
-            return .{ .allocator = allocator, .coordinator = coordinator, .global_version = c.global_version, .mime_capacity = c.mime_capacity, .mime_bytes = c.mime_bytes, .managers = managers, .sources = sources, .devices = devices, .offers = offers, .outbound = outbound, .mime_lengths = lengths, .mime_storage = storage };
+            return .{ .allocator = allocator, .coordinator = coordinator, .global_version = c.global_version, .mime_capacity = c.mime_capacity, .mime_bytes = c.mime_bytes, .managers = managers, .sources = sources, .devices = devices, .offers = offers, .outbound = outbound };
         }
 
         pub fn deinit(self: *Self) void {
-            for (self.outbound) |slot| {
+            for (self.outbound) |*slot| {
                 if (slot.active and slot.value == .source_send and slot.value.source_send.fd >= 0)
                     _ = linux.close(slot.value.source_send.fd);
             }
-            self.allocator.free(self.mime_storage);
-            self.allocator.free(self.mime_lengths);
             self.allocator.free(self.outbound);
-            self.allocator.free(self.offers);
-            self.allocator.free(self.devices);
-            self.allocator.free(self.sources);
-            self.allocator.free(self.managers);
+            deinitSlots(OfferSlot, self.allocator, &self.offers);
+            deinitSlots(DeviceSlot, self.allocator, &self.devices);
+            deinitSlots(SourceSlot, self.allocator, &self.sources);
+            deinitSlots(ManagerSlot, self.allocator, &self.managers);
             self.* = undefined;
+        }
+
+        fn acquireSource(self: *Self) !*SourceSlot {
+            const source = try acquire(SourceSlot, self.allocator, &self.sources, &self.source_free);
+            if (source.mime_lengths.len == 0) {
+                source.mime_lengths = try self.allocator.alloc(u16, self.mime_capacity);
+                errdefer self.allocator.free(source.mime_lengths);
+                source.mime_storage = try self.allocator.alloc(u8, try std.math.mul(usize, self.mime_capacity, self.mime_bytes));
+                @memset(source.mime_lengths, 0);
+            }
+            return source;
         }
 
         pub fn install(self: *Self, runtime: *Runtime) !objects.Handle {
@@ -178,7 +170,7 @@ fn Owner(comptime protocol: type, comptime flavor: Flavor) type {
         }
         fn bind(context: ?*anyopaque, binding: wayring.server.Binding) !?*anyopaque {
             const self: *Self = @ptrCast(@alignCast(context orelse return error.InvalidContext));
-            const slot = acquire(ManagerSlot, self.managers, &self.manager_free) catch return error.OutOfMemory;
+            const slot = acquire(ManagerSlot, self.allocator, &self.managers, &self.manager_free) catch return error.OutOfMemory;
             slot.header.resource = binding.resource;
             slot.peer = binding.peer;
             slot.version = binding.version;
@@ -192,22 +184,22 @@ fn Owner(comptime protocol: type, comptime flavor: Flavor) type {
         pub fn requestOn(self: *Self, actor: *wayring.connection.Actor, server_objects: anytype, peer: wayring.io_uring.Peer, target: objects.Dispatch, message: wayring.wire.Message, fds: *wayring.ancillary.FdQueue) !?wayring.dispatch.Control {
             const handle = server_objects.namespace.lookupHandle(message.header.object_id) orelse return null;
             if (target.object.interface == &Manager.info) {
-                const slot = fromContext(ManagerSlot, self.managers, target.object.context) orelse return null;
+                const slot = fromContext(ManagerSlot, self.managers.items, target.object.context) orelse return null;
                 if (!std.meta.eql(slot.header.resource, handle)) return null;
                 return try self.managerRequest(actor, server_objects, slot, message, fds);
             }
             if (target.object.interface == &Source.info) {
-                const slot = fromContext(SourceSlot, self.sources, target.object.context) orelse return null;
+                const slot = fromContext(SourceSlot, self.sources.items, target.object.context) orelse return null;
                 if (!std.meta.eql(slot.header.resource, handle)) return null;
                 return try self.sourceRequest(actor, server_objects, slot, message, fds);
             }
             if (target.object.interface == &Device.info) {
-                const slot = fromContext(DeviceSlot, self.devices, target.object.context) orelse return null;
+                const slot = fromContext(DeviceSlot, self.devices.items, target.object.context) orelse return null;
                 if (!std.meta.eql(slot.header.resource, handle)) return null;
                 return try self.deviceRequest(actor, server_objects, peer, slot, message, fds);
             }
             if (target.object.interface == &Offer.info) {
-                const slot = fromContext(OfferSlot, self.offers, target.object.context) orelse return null;
+                const slot = fromContext(OfferSlot, self.offers.items, target.object.context) orelse return null;
                 if (!std.meta.eql(slot.header.resource, handle)) return null;
                 return try self.offerRequest(actor, server_objects, slot, message, fds);
             }
@@ -218,21 +210,21 @@ fn Owner(comptime protocol: type, comptime flavor: Flavor) type {
             const decoded = try wayring.server.decodeRequest(Manager, so, message, fds);
             switch (decoded.value) {
                 .create_data_source => |payload| {
-                    const source = acquire(SourceSlot, self.sources, &self.source_free) catch return self.noMemory(actor);
+                    const source = self.acquireSource() catch return self.noMemory(actor);
                     source.peer = manager.peer;
                     const admitted = Manager.admit_create_data_source(so, decoded.handle, payload, .{ .id = source }) catch |err| {
-                        release(SourceSlot, self.sources, &self.source_free, indexOf(SourceSlot, self.sources, source));
+                        release(SourceSlot, self.sources.items, &self.source_free, indexOf(SourceSlot, self.sources.items, source));
                         return self.failure(actor, decoded.handle.id, err);
                     };
                     source.header.resource = admitted.id;
                 },
                 .get_data_device => |payload| {
-                    const device = acquire(DeviceSlot, self.devices, &self.device_free) catch return self.noMemory(actor);
+                    const device = acquire(DeviceSlot, self.allocator, &self.devices, &self.device_free) catch return self.noMemory(actor);
                     device.peer = manager.peer;
                     device.seat_object = payload.seat;
                     device.version = manager.version;
                     const admitted = Manager.admit_get_data_device(so, decoded.handle, payload, .{ .id = device }) catch |err| {
-                        release(DeviceSlot, self.devices, &self.device_free, indexOf(DeviceSlot, self.devices, device));
+                        release(DeviceSlot, self.devices.items, &self.device_free, indexOf(DeviceSlot, self.devices.items, device));
                         return self.failure(actor, decoded.handle.id, err);
                     };
                     device.header.resource = admitted.id;
@@ -318,12 +310,12 @@ fn Owner(comptime protocol: type, comptime flavor: Flavor) type {
                 return err;
             };
             self.selection_dirty[dirty_index] = false;
-            for (self.devices) |*device| if (device.header.active and self.coordinator.validSeat(self.coordinator.context, device.peer, device.seat_object))
+            for (self.devices.items) |device| if (device.header.active and self.coordinator.validSeat(self.coordinator.context, device.peer, device.seat_object))
                 if (!primary or flavor == .ext or device.version >= 2) try self.enqueueSelection(device, primary);
         }
         fn prepareSelectionChanged(self: *const Self, primary: bool) !void {
             var count: usize = 0;
-            for (self.devices) |device| {
+            for (self.devices.items) |device| {
                 if (device.header.active and
                     self.coordinator.validSeat(self.coordinator.context, device.peer, device.seat_object) and
                     (!primary or flavor == .ext or device.version >= 2)) count += 1;
@@ -340,14 +332,14 @@ fn Owner(comptime protocol: type, comptime flavor: Flavor) type {
         fn enqueueSelection(self: *Self, device: *DeviceSlot, primary: bool) !void {
             var publication: Publication = .{ .device = self.deviceId(device), .primary = primary, .source = self.coordinator.current(self.coordinator.context, primary) };
             if (publication.source) |source| {
-                const offer = try acquire(OfferSlot, self.offers, &self.offer_free);
+                const offer = try acquire(OfferSlot, self.allocator, &self.offers, &self.offer_free);
                 offer.peer = device.peer;
                 offer.device = publication.device;
                 offer.source = source;
                 publication.offer = self.offerId(offer);
             }
             self.enqueue(device.peer, .{ .selection = publication }) catch |err| {
-                if (publication.offer) |id| release(OfferSlot, self.offers, &self.offer_free, id.index);
+                if (publication.offer) |id| release(OfferSlot, self.offers.items, &self.offer_free, id.index);
                 return err;
             };
         }
@@ -369,7 +361,7 @@ fn Owner(comptime protocol: type, comptime flavor: Flavor) type {
             return self.outbound_len;
         }
         pub fn pendingOutboundOn(self: *const Self, peer: wayring.io_uring.Peer) bool {
-            for (self.outbound) |slot| if (slot.active and std.meta.eql(slot.peer, peer)) return true;
+            for (self.outbound) |*slot| if (slot.active and std.meta.eql(slot.peer, peer)) return true;
             return false;
         }
         fn emit(self: *Self, so: anytype, queue: *wayring.tx.Queue, outbound: *Outbound) !bool {
@@ -433,47 +425,47 @@ fn Owner(comptime protocol: type, comptime flavor: Flavor) type {
         }
 
         pub fn resourceRemoved(self: *Self, handle: objects.Handle, object: objects.Object) bool {
-            if (object.interface == &Manager.info) return self.removeSimple(ManagerSlot, self.managers, &self.manager_free, handle, object);
+            if (object.interface == &Manager.info) return self.removeSimple(ManagerSlot, self.managers.items, &self.manager_free, handle, object);
             if (object.interface == &Device.info) {
-                const slot = fromContext(DeviceSlot, self.devices, object.context) orelse return false;
+                const slot = fromContext(DeviceSlot, self.devices.items, object.context) orelse return false;
                 if (!std.meta.eql(slot.header.resource, handle)) return false;
                 self.dropDevice(self.deviceId(slot));
-                release(DeviceSlot, self.devices, &self.device_free, indexOf(DeviceSlot, self.devices, slot));
+                release(DeviceSlot, self.devices.items, &self.device_free, indexOf(DeviceSlot, self.devices.items, slot));
                 return true;
             }
             if (object.interface == &Offer.info) {
-                const slot = fromContext(OfferSlot, self.offers, object.context) orelse return false;
+                const slot = fromContext(OfferSlot, self.offers.items, object.context) orelse return false;
                 if (!std.meta.eql(slot.header.resource, handle)) return false;
-                release(OfferSlot, self.offers, &self.offer_free, indexOf(OfferSlot, self.offers, slot));
+                release(OfferSlot, self.offers.items, &self.offer_free, indexOf(OfferSlot, self.offers.items, slot));
                 return true;
             }
             if (object.interface == &Source.info) {
-                const slot = fromContext(SourceSlot, self.sources, object.context) orelse return false;
+                const slot = fromContext(SourceSlot, self.sources.items, object.context) orelse return false;
                 if (!std.meta.eql(slot.header.resource, handle)) return false;
                 const id = self.sourceId(slot);
                 const selected = self.selectionSource(slot);
                 inline for (.{ false, true }) |primary| if (self.coordinator.current(self.coordinator.context, primary)) |current|
                     if (current.eql(selected)) self.coordinator.set(self.coordinator.context, primary, null) catch {};
                 self.dropSource(id);
-                release(SourceSlot, self.sources, &self.source_free, id.index);
+                release(SourceSlot, self.sources.items, &self.source_free, id.index);
                 return true;
             }
             return false;
         }
         pub fn disconnected(self: *Self, peer: wayring.io_uring.Peer) void {
-            for (self.sources) |*source| if (source.header.active and std.meta.eql(source.peer, peer)) {
+            for (self.sources.items) |source| if (source.header.active and std.meta.eql(source.peer, peer)) {
                 const selected = self.selectionSource(source);
                 inline for (.{ false, true }) |primary| if (self.coordinator.current(self.coordinator.context, primary)) |current|
                     if (current.eql(selected)) self.coordinator.set(self.coordinator.context, primary, null) catch {};
             };
             for (self.outbound) |*slot| if (slot.active and std.meta.eql(slot.peer, peer)) self.dropOutbound(slot);
-            for (self.offers, 0..) |*slot, i| if (slot.header.active and std.meta.eql(slot.peer, peer)) release(OfferSlot, self.offers, &self.offer_free, @intCast(i));
-            for (self.devices, 0..) |*slot, i| if (slot.header.active and std.meta.eql(slot.peer, peer)) release(DeviceSlot, self.devices, &self.device_free, @intCast(i));
-            for (self.sources, 0..) |*slot, i| if (slot.header.active and std.meta.eql(slot.peer, peer)) {
+            for (self.offers.items, 0..) |slot, i| if (slot.header.active and std.meta.eql(slot.peer, peer)) release(OfferSlot, self.offers.items, &self.offer_free, @intCast(i));
+            for (self.devices.items, 0..) |slot, i| if (slot.header.active and std.meta.eql(slot.peer, peer)) release(DeviceSlot, self.devices.items, &self.device_free, @intCast(i));
+            for (self.sources.items, 0..) |slot, i| if (slot.header.active and std.meta.eql(slot.peer, peer)) {
                 self.dropSource(self.sourceId(slot));
-                release(SourceSlot, self.sources, &self.source_free, @intCast(i));
+                release(SourceSlot, self.sources.items, &self.source_free, @intCast(i));
             };
-            for (self.managers, 0..) |*slot, i| if (slot.header.active and std.meta.eql(slot.peer, peer)) release(ManagerSlot, self.managers, &self.manager_free, @intCast(i));
+            for (self.managers.items, 0..) |slot, i| if (slot.header.active and std.meta.eql(slot.peer, peer)) release(ManagerSlot, self.managers.items, &self.manager_free, @intCast(i));
         }
 
         fn addMime(self: *Self, source: *SourceSlot, value: []const u8) !void {
@@ -495,7 +487,7 @@ fn Owner(comptime protocol: type, comptime flavor: Flavor) type {
         fn sourceByObject(self: *Self, so: anytype, id: u32) ?*SourceSlot {
             const handle = so.namespace.lookupHandle(id) orelse return null;
             const object = so.namespace.resolve(handle) orelse return null;
-            const source = fromContext(SourceSlot, self.sources, object.context) orelse return null;
+            const source = fromContext(SourceSlot, self.sources.items, object.context) orelse return null;
             return if (std.meta.eql(source.header.resource, handle)) source else null;
         }
         fn enqueue(self: *Self, peer: wayring.io_uring.Peer, value: Outbound) !void {
@@ -524,18 +516,18 @@ fn Owner(comptime protocol: type, comptime flavor: Flavor) type {
         }
         fn deviceCount(self: *const Self, peer: wayring.io_uring.Peer) usize {
             var n: usize = 0;
-            for (self.devices) |slot| n += @intFromBool(slot.header.active and std.meta.eql(slot.peer, peer));
+            for (self.devices.items) |slot| n += @intFromBool(slot.header.active and std.meta.eql(slot.peer, peer));
             return n;
         }
         fn offerFree(self: *const Self) usize {
             var n: usize = 0;
-            for (self.offers) |slot| n += @intFromBool(!slot.header.active and !slot.header.retired);
+            for (self.offers.items) |slot| n += @intFromBool(!slot.header.active and !slot.header.retired);
             return n;
         }
         fn abandonOffer(self: *Self, publication: *Publication) void {
             const id = publication.offer orelse return;
             const offer = self.resolveOffer(id) catch return;
-            if (offer.header.resource.id == 0) release(OfferSlot, self.offers, &self.offer_free, id.index);
+            if (offer.header.resource.id == 0) release(OfferSlot, self.offers.items, &self.offer_free, id.index);
             publication.offer = null;
         }
         fn dropSource(self: *Self, id: Id) void {
@@ -555,7 +547,7 @@ fn Owner(comptime protocol: type, comptime flavor: Flavor) type {
                 self.dropOutbound(slot);
             };
         }
-        fn removeSimple(self: *Self, comptime T: type, slots: []T, free: *u32, handle: objects.Handle, object: objects.Object) bool {
+        fn removeSimple(self: *Self, comptime T: type, slots: []*T, free: *u32, handle: objects.Handle, object: objects.Object) bool {
             _ = self;
             const slot = fromContext(T, slots, object.context) orelse return false;
             if (!std.meta.eql(slot.header.resource, handle)) return false;
@@ -563,16 +555,16 @@ fn Owner(comptime protocol: type, comptime flavor: Flavor) type {
             return true;
         }
         fn resolveSource(self: *Self, id: Id) !*SourceSlot {
-            return resolve(SourceSlot, self.sources, id);
+            return resolve(SourceSlot, self.sources.items, id);
         }
         fn resolveDevice(self: *Self, id: Id) !*DeviceSlot {
-            return resolve(DeviceSlot, self.devices, id);
+            return resolve(DeviceSlot, self.devices.items, id);
         }
         fn resolveOffer(self: *Self, id: Id) !*OfferSlot {
-            return resolve(OfferSlot, self.offers, id);
+            return resolve(OfferSlot, self.offers.items, id);
         }
         fn sourceId(self: *Self, slot: *SourceSlot) Id {
-            return .{ .index = indexOf(SourceSlot, self.sources, slot), .generation = slot.header.generation };
+            return .{ .index = indexOf(SourceSlot, self.sources.items, slot), .generation = slot.header.generation };
         }
         fn selectionSource(self: *Self, slot: *SourceSlot) SelectionSource {
             return .{ .owner = self, .token = @bitCast(self.sourceId(slot)), .vtable = &selection_source_vtable };
@@ -607,10 +599,10 @@ fn Owner(comptime protocol: type, comptime flavor: Flavor) type {
             try self.enqueue(source.peer, .{ .source_cancelled = id });
         }
         fn deviceId(self: *Self, slot: *DeviceSlot) Id {
-            return .{ .index = indexOf(DeviceSlot, self.devices, slot), .generation = slot.header.generation };
+            return .{ .index = indexOf(DeviceSlot, self.devices.items, slot), .generation = slot.header.generation };
         }
         fn offerId(self: *Self, slot: *OfferSlot) Id {
-            return .{ .index = indexOf(OfferSlot, self.offers, slot), .generation = slot.header.generation };
+            return .{ .index = indexOf(OfferSlot, self.offers.items, slot), .generation = slot.header.generation };
         }
         fn noMemory(self: *Self, actor: *wayring.connection.Actor) !wayring.dispatch.Control {
             _ = self;
@@ -628,13 +620,38 @@ fn Owner(comptime protocol: type, comptime flavor: Flavor) type {
     };
 }
 
-fn initHeaders(comptime T: type, slots: []T) void {
-    for (slots, 0..) |*slot, i| slot.* = .{ .header = .{ .next_free = if (i + 1 < slots.len) @intCast(i + 1) else none } };
+fn initSlots(comptime T: type, allocator: std.mem.Allocator, capacity: usize) !std.ArrayListUnmanaged(*T) {
+    var slots: std.ArrayListUnmanaged(*T) = .empty;
+    errdefer deinitSlots(T, allocator, &slots);
+    try slots.ensureTotalCapacity(allocator, capacity);
+    for (0..capacity) |i| {
+        const slot = try allocator.create(T);
+        slot.* = .{ .header = .{ .next_free = if (i + 1 < capacity) @intCast(i + 1) else none } };
+        slots.appendAssumeCapacity(slot);
+    }
+    return slots;
 }
-fn acquire(comptime T: type, slots: []T, free: *u32) !*T {
-    if (free.* == none) return error.Exhausted;
+fn deinitSlots(comptime T: type, allocator: std.mem.Allocator, slots: *std.ArrayListUnmanaged(*T)) void {
+    for (slots.items) |slot| {
+        if (@hasField(T, "mime_lengths")) {
+            if (slot.mime_lengths.len != 0) allocator.free(slot.mime_lengths);
+            if (slot.mime_storage.len != 0) allocator.free(slot.mime_storage);
+        }
+        allocator.destroy(slot);
+    }
+    slots.deinit(allocator);
+}
+fn acquire(comptime T: type, allocator: std.mem.Allocator, slots: *std.ArrayListUnmanaged(*T), free: *u32) !*T {
+    if (free.* == none) {
+        if (slots.items.len >= none) return error.OutOfMemory;
+        const slot = try allocator.create(T);
+        errdefer allocator.destroy(slot);
+        slot.* = .{ .header = .{ .active = true } };
+        try slots.append(allocator, slot);
+        return slot;
+    }
     const i = free.*;
-    const slot = &slots[i];
+    const slot = slots.items[i];
     free.* = slot.header.next_free;
     const generation = slot.header.generation;
     const lengths = if (@hasField(T, "mime_lengths")) slot.mime_lengths else {};
@@ -646,8 +663,8 @@ fn acquire(comptime T: type, slots: []T, free: *u32) !*T {
     }
     return slot;
 }
-fn release(comptime T: type, slots: []T, free: *u32, i: u32) void {
-    const slot = &slots[i];
+fn release(comptime T: type, slots: []*T, free: *u32, i: u32) void {
+    const slot = slots[i];
     if (!slot.header.active) return;
     const generation = slot.header.generation;
     const lengths = if (@hasField(T, "mime_lengths")) slot.mime_lengths else {};
@@ -661,22 +678,23 @@ fn release(comptime T: type, slots: []T, free: *u32, i: u32) void {
         slot.mime_storage = storage;
     }
 }
-fn resolve(comptime T: type, slots: []T, id: anytype) !*T {
+fn resolve(comptime T: type, slots: []*T, id: anytype) !*T {
     if (id.index >= slots.len) return error.Stale;
-    const slot = &slots[id.index];
+    const slot = slots[id.index];
     if (!slot.header.active or slot.header.generation != id.generation) return error.Stale;
     return slot;
 }
-fn fromContext(comptime T: type, slots: []T, context: ?*anyopaque) ?*T {
-    const address = @intFromPtr(context orelse return null);
-    const start = @intFromPtr(slots.ptr);
-    if (address < start or address >= start + slots.len * @sizeOf(T) or (address - start) % @sizeOf(T) != 0) return null;
-    const slot: *T = @ptrCast(@alignCast(context.?));
-    return if (slot.header.active) slot else null;
+fn fromContext(comptime T: type, slots: []*T, context: ?*anyopaque) ?*T {
+    const slot: *T = @ptrCast(@alignCast(context orelse return null));
+    if (!slot.header.active) return null;
+    for (slots) |owned| if (owned == slot) return slot;
+    return null;
 }
-fn indexOf(comptime T: type, slots: []T, slot: *T) u32 {
-    return @intCast((@intFromPtr(slot) - @intFromPtr(slots.ptr)) / @sizeOf(T));
+fn indexOf(comptime T: type, slots: []*T, slot: *T) u32 {
+    for (slots, 0..) |owned, i| if (owned == slot) return @intCast(i);
+    unreachable;
 }
+
 fn optionalPeerEqual(a: ?wayring.io_uring.Peer, b: ?wayring.io_uring.Peer) bool {
     if (a == null or b == null) return a == null and b == null;
     return std.meta.eql(a.?, b.?);
@@ -710,7 +728,7 @@ test "ext data control copies and deduplicates bounded MIME values" {
     var selections: TestSelections = .{};
     var adapter = try TestAdapter.init(std.testing.allocator, selections.coordinator(), .{ .source_capacity = 1, .mime_capacity = 1, .mime_bytes = 8 });
     defer adapter.deinit();
-    const source = try acquire(TestAdapter.SourceSlot, adapter.sources, &adapter.source_free);
+    const source = try adapter.acquireSource();
     var value = [_]u8{ 't', 'e', 'x', 't' };
     try adapter.addMime(source, &value);
     value[0] = 'X';
@@ -725,7 +743,7 @@ test "ext data control publishes initial null selections and ignores inert seats
     var adapter = try TestAdapter.init(std.testing.allocator, selections.coordinator(), .{ .device_capacity = 1, .outbound_capacity = 2 });
     defer adapter.deinit();
     const peer: wayring.io_uring.Peer = .{ .slot = 2, .generation = 3 };
-    const device = try acquire(TestAdapter.DeviceSlot, adapter.devices, &adapter.device_free);
+    const device = try acquire(TestAdapter.DeviceSlot, adapter.allocator, &adapter.devices, &adapter.device_free);
     device.peer = peer;
     try adapter.enqueueSelection(device, false);
     try adapter.enqueueSelection(device, true);
@@ -739,7 +757,7 @@ test "ext data control generations make removed sources stale and close queued F
     var selections: TestSelections = .{};
     var adapter = try TestAdapter.init(std.testing.allocator, selections.coordinator(), .{ .source_capacity = 1, .mime_capacity = 1, .outbound_capacity = 1 });
     defer adapter.deinit();
-    const source = try acquire(TestAdapter.SourceSlot, adapter.sources, &adapter.source_free);
+    const source = try adapter.acquireSource();
     try adapter.addMime(source, "text");
     const id = adapter.sourceId(source);
     const raw = linux.eventfd(0, linux.EFD.CLOEXEC);
@@ -747,7 +765,7 @@ test "ext data control generations make removed sources stale and close queued F
     const fd: linux.fd_t = @intCast(raw);
     try adapter.enqueue(.{ .slot = 1, .generation = 1 }, .{ .source_send = .{ .source = id, .mime_index = 0, .fd = fd } });
     adapter.dropSource(id);
-    release(TestAdapter.SourceSlot, adapter.sources, &adapter.source_free, id.index);
+    release(TestAdapter.SourceSlot, adapter.sources.items, &adapter.source_free, id.index);
     try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(fd, linux.F.GETFD, 0)));
     try std.testing.expectError(error.Stale, adapter.resolveSource(id));
 }
@@ -767,14 +785,14 @@ test "wlr data control v1 suppresses primary while v2 publishes both selections"
     });
     defer adapter.deinit();
 
-    const v1 = try acquire(TestWlrAdapter.DeviceSlot, adapter.devices, &adapter.device_free);
+    const v1 = try acquire(TestWlrAdapter.DeviceSlot, adapter.allocator, &adapter.devices, &adapter.device_free);
     v1.peer = .{ .slot = 1, .generation = 1 };
     v1.version = 1;
     try adapter.enqueueSelection(v1, false);
     try adapter.selectionChanged(true);
     try std.testing.expectEqual(@as(usize, 1), adapter.pendingOutbound());
 
-    const v2 = try acquire(TestWlrAdapter.DeviceSlot, adapter.devices, &adapter.device_free);
+    const v2 = try acquire(TestWlrAdapter.DeviceSlot, adapter.allocator, &adapter.devices, &adapter.device_free);
     v2.peer = .{ .slot = 2, .generation = 1 };
     v2.version = 2;
     try adapter.enqueueSelection(v2, false);
@@ -789,7 +807,7 @@ test "data control retries a selection change after bounded backpressure" {
         .outbound_capacity = 1,
     });
     defer adapter.deinit();
-    const device = try acquire(TestAdapter.DeviceSlot, adapter.devices, &adapter.device_free);
+    const device = try acquire(TestAdapter.DeviceSlot, adapter.allocator, &adapter.devices, &adapter.device_free);
     device.peer = .{ .slot = 1, .generation = 1 };
     try adapter.enqueueSelection(device, false);
 
@@ -800,4 +818,19 @@ test "data control retries a selection change after bounded backpressure" {
     try std.testing.expect(!adapter.selection_dirty[1]);
     try std.testing.expectEqual(@as(usize, 1), adapter.pendingOutbound());
     try std.testing.expect(adapter.oldestOutbound(device.peer).?.value.selection.primary);
+}
+
+test "data control ownership grows past initial reservations" {
+    var selections: TestSelections = .{};
+    var adapter = try TestAdapter.init(std.testing.allocator, selections.coordinator(), .{ .manager_capacity = 1, .source_capacity = 1, .device_capacity = 1, .offer_capacity = 1 });
+    defer adapter.deinit();
+    const source = try adapter.acquireSource();
+    _ = try adapter.acquireSource();
+    _ = try acquire(TestAdapter.ManagerSlot, adapter.allocator, &adapter.managers, &adapter.manager_free);
+    _ = try acquire(TestAdapter.ManagerSlot, adapter.allocator, &adapter.managers, &adapter.manager_free);
+    _ = try acquire(TestAdapter.DeviceSlot, adapter.allocator, &adapter.devices, &adapter.device_free);
+    _ = try acquire(TestAdapter.DeviceSlot, adapter.allocator, &adapter.devices, &adapter.device_free);
+    _ = try acquire(TestAdapter.OfferSlot, adapter.allocator, &adapter.offers, &adapter.offer_free);
+    _ = try acquire(TestAdapter.OfferSlot, adapter.allocator, &adapter.offers, &adapter.offer_free);
+    try std.testing.expect(fromContext(TestAdapter.SourceSlot, adapter.sources.items, source) == source);
 }

@@ -1,4 +1,4 @@
-//! Bounded ownership for ext-image-capture-source-v1 factories and sources.
+//! Growable ownership for ext-image-capture-source-v1 factories and sources.
 
 const std = @import("std");
 const wayring = @import("wayring");
@@ -7,7 +7,9 @@ const objects = wayring.objects;
 const none = std.math.maxInt(u32);
 
 pub const Config = struct {
+    /// Initial allocation only; manager ownership grows with client demand.
     manager_capacity: usize = 8,
+    /// Initial allocation only; source ownership grows with client demand.
     source_capacity: usize = 64,
 
     fn validate(config: Config) !void {
@@ -40,43 +42,41 @@ pub fn Adapter(
         const ManagerKind = enum { output, toplevel };
         const Manager = struct {
             active: bool = false,
-            next_free: u32 = none,
+            index: u32,
             peer: wayring.io_uring.Peer = undefined,
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
             kind: ManagerKind = .output,
         };
         const Source = struct {
             active: bool = false,
+            index: u32,
             generation: u32 = 1,
-            next_free: u32 = none,
             peer: wayring.io_uring.Peer = undefined,
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
             target: ?Target = null,
         };
 
         allocator: std.mem.Allocator,
-        managers: []Manager,
-        sources: []Source,
-        manager_free: u32 = 0,
-        source_free: u32 = 0,
+        managers: std.ArrayListUnmanaged(*Manager) = .empty,
+        sources: std.ArrayListUnmanaged(*Source) = .empty,
         runtime: ?*Runtime = null,
         output_global: ?objects.Handle = null,
         toplevel_global: ?objects.Handle = null,
 
         pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
             try config.validate();
-            const managers = try allocator.alloc(Manager, config.manager_capacity);
-            errdefer allocator.free(managers);
-            const sources = try allocator.alloc(Source, config.source_capacity);
-            errdefer allocator.free(sources);
-            initFree(Manager, managers);
-            initFree(Source, sources);
-            return .{ .allocator = allocator, .managers = managers, .sources = sources };
+            var self: Self = .{ .allocator = allocator };
+            errdefer self.deinit();
+            try self.managers.ensureTotalCapacity(allocator, config.manager_capacity);
+            try self.sources.ensureTotalCapacity(allocator, config.source_capacity);
+            return self;
         }
 
         pub fn deinit(self: *Self) void {
-            self.allocator.free(self.sources);
-            self.allocator.free(self.managers);
+            for (self.sources.items) |source| self.allocator.destroy(source);
+            self.sources.deinit(self.allocator);
+            for (self.managers.items) |manager| self.allocator.destroy(manager);
+            self.managers.deinit(self.allocator);
             self.* = undefined;
         }
 
@@ -144,7 +144,7 @@ pub fn Adapter(
         ) !?wayring.dispatch.Control {
             const resource = server_objects.namespace.lookupHandle(message.header.object_id) orelse return null;
             if (target.object.interface == &OutputManager.info or target.object.interface == &ToplevelManager.info) {
-                const manager = from(Manager, self.managers, target.object.context) orelse return null;
+                const manager = from(Manager, self.managers.items, target.object.context) orelse return null;
                 if (!std.meta.eql(manager.resource, resource) or !samePeer(manager.peer, peer)) return null;
                 if (manager.kind == .output) {
                     const decoded = try wayring.server.decodeRequest(OutputManager, server_objects, message, fds);
@@ -172,7 +172,7 @@ pub fn Adapter(
                 return .continue_dispatch;
             }
             if (target.object.interface != &SourceProtocol.info) return null;
-            const source = from(Source, self.sources, target.object.context) orelse return null;
+            const source = from(Source, self.sources.items, target.object.context) orelse return null;
             if (!std.meta.eql(source.resource, resource) or !samePeer(source.peer, peer)) return null;
             const decoded = try wayring.server.decodeRequest(SourceProtocol, server_objects, message, fds);
             try decoded.finish(protocol, server_objects, &actor.transmit);
@@ -216,14 +216,14 @@ pub fn Adapter(
             const resource = server_objects.namespace.lookupHandle(object_id) orelse return null;
             const object = server_objects.namespace.resolve(resource) orelse return null;
             if (object.interface != &SourceProtocol.info) return null;
-            const source = from(Source, self.sources, object.context) orelse return null;
+            const source = from(Source, self.sources.items, object.context) orelse return null;
             if (!std.meta.eql(source.resource, resource) or !samePeer(source.peer, peer)) return null;
             return .{ .id = self.sourceId(source), .target = source.target };
         }
 
         pub fn invalidate(self: *Self, target: Target) usize {
             var count: usize = 0;
-            for (self.sources) |*source| {
+            for (self.sources.items) |source| {
                 if (!source.active or source.target == null or !std.meta.eql(source.target.?, target)) continue;
                 source.target = null;
                 count += 1;
@@ -233,13 +233,13 @@ pub fn Adapter(
 
         pub fn resourceRemoved(self: *Self, handle: objects.Handle, object: objects.Object) bool {
             if (object.interface == &SourceProtocol.info) {
-                const source = from(Source, self.sources, object.context) orelse return false;
+                const source = from(Source, self.sources.items, object.context) orelse return false;
                 if (!std.meta.eql(source.resource, handle)) return false;
                 self.releaseSource(self.sourceIndex(source));
                 return true;
             }
             if (object.interface == &OutputManager.info or object.interface == &ToplevelManager.info) {
-                const manager = from(Manager, self.managers, object.context) orelse return false;
+                const manager = from(Manager, self.managers.items, object.context) orelse return false;
                 if (!std.meta.eql(manager.resource, handle)) return false;
                 self.releaseManager(self.managerIndex(manager));
                 return true;
@@ -248,50 +248,61 @@ pub fn Adapter(
         }
 
         pub fn disconnected(self: *Self, peer: wayring.io_uring.Peer) void {
-            for (self.sources, 0..) |source, index|
-                if (source.active and samePeer(source.peer, peer)) self.releaseSource(@intCast(index));
-            for (self.managers, 0..) |manager, index|
-                if (manager.active and samePeer(manager.peer, peer)) self.releaseManager(@intCast(index));
+            for (self.sources.items) |source|
+                if (source.active and samePeer(source.peer, peer)) self.releaseSource(source.index);
+            for (self.managers.items) |manager|
+                if (manager.active and samePeer(manager.peer, peer)) self.releaseManager(manager.index);
         }
 
         fn acquireManager(self: *Self) !*Manager {
-            if (self.manager_free == none) return error.Exhausted;
-            const index = self.manager_free;
-            const next = self.managers[index].next_free;
-            self.managers[index] = .{ .active = true };
-            self.manager_free = next;
-            return &self.managers[index];
+            for (self.managers.items) |manager| if (!manager.active) {
+                const index = manager.index;
+                manager.* = .{ .active = true, .index = index };
+                return manager;
+            };
+            if (self.managers.items.len >= none) return error.OutOfMemory;
+            const manager = try self.allocator.create(Manager);
+            errdefer self.allocator.destroy(manager);
+            manager.* = .{ .active = true, .index = @intCast(self.managers.items.len) };
+            try self.managers.append(self.allocator, manager);
+            return manager;
         }
 
         fn acquireSource(self: *Self) !*Source {
-            if (self.source_free == none) return error.Exhausted;
-            const index = self.source_free;
-            const next = self.sources[index].next_free;
-            const generation = self.sources[index].generation;
-            self.sources[index] = .{ .active = true, .generation = generation };
-            self.source_free = next;
-            return &self.sources[index];
+            for (self.sources.items) |source| if (!source.active) {
+                const index = source.index;
+                const generation = source.generation;
+                source.* = .{ .active = true, .index = index, .generation = generation };
+                return source;
+            };
+            if (self.sources.items.len >= none) return error.OutOfMemory;
+            const source = try self.allocator.create(Source);
+            errdefer self.allocator.destroy(source);
+            source.* = .{ .active = true, .index = @intCast(self.sources.items.len) };
+            try self.sources.append(self.allocator, source);
+            return source;
         }
 
         fn releaseManager(self: *Self, index: u32) void {
-            self.managers[index] = .{ .next_free = self.manager_free };
-            self.manager_free = index;
+            const manager = self.managers.items[index];
+            manager.* = .{ .index = index };
         }
 
         fn releaseSource(self: *Self, index: u32) void {
-            const generation = nextGeneration(self.sources[index].generation);
-            self.sources[index] = .{ .generation = generation, .next_free = self.source_free };
-            self.source_free = index;
+            const source = self.sources.items[index];
+            source.* = .{ .index = index, .generation = nextGeneration(source.generation) };
         }
 
         fn sourceId(self: *Self, source: *const Source) SourceId {
             return .{ .index = self.sourceIndex(source), .generation = source.generation };
         }
         fn sourceIndex(self: *Self, source: *const Source) u32 {
-            return indexOf(Source, self.sources, source);
+            _ = self;
+            return source.index;
         }
         fn managerIndex(self: *Self, manager: *const Manager) u32 {
-            return indexOf(Manager, self.managers, manager);
+            _ = self;
+            return manager.index;
         }
 
         fn noMemory(_: *Self, actor: *wayring.connection.Actor) !wayring.dispatch.Control {
@@ -305,22 +316,11 @@ pub fn Adapter(
     };
 }
 
-fn initFree(comptime T: type, slots: []T) void {
-    for (slots, 0..) |*slot, index| slot.* = .{
-        .next_free = if (index + 1 < slots.len) @intCast(index + 1) else none,
-    };
-}
-fn indexOf(comptime T: type, slots: []const T, pointer: *const T) u32 {
-    return @intCast((@intFromPtr(pointer) - @intFromPtr(slots.ptr)) / @sizeOf(T));
-}
-fn from(comptime T: type, slots: []T, context: ?*anyopaque) ?*T {
+fn from(comptime T: type, slots: []const *T, context: ?*anyopaque) ?*T {
     const pointer = context orelse return null;
-    const address = @intFromPtr(pointer);
-    const start = @intFromPtr(slots.ptr);
-    if (address < start or address >= start + slots.len * @sizeOf(T) or (address - start) % @sizeOf(T) != 0)
-        return null;
-    const slot = &slots[(address - start) / @sizeOf(T)];
-    return if (slot.active) slot else null;
+    for (slots) |slot|
+        if (@intFromPtr(slot) == @intFromPtr(pointer)) return if (slot.active) slot else null;
+    return null;
 }
 fn nextGeneration(generation: u32) u32 {
     const next = generation +% 1;
@@ -355,4 +355,24 @@ test "image capture source: manager destruction does not release sources" {
     const source = try adapter.acquireSource();
     adapter.releaseManager(adapter.managerIndex(manager));
     try std.testing.expect(source.active);
+}
+
+test "image capture source: ownership grows beyond initial capacities" {
+    const Id = packed struct { index: u32, generation: u32 };
+    const A = Adapter(@import("core_protocol"), Id, Id);
+    var adapter = try A.init(std.testing.allocator, .{ .manager_capacity = 2, .source_capacity = 1 });
+    defer adapter.deinit();
+
+    const first_manager = try adapter.acquireManager();
+    _ = try adapter.acquireManager();
+    _ = try adapter.acquireManager();
+    try std.testing.expectEqual(@as(usize, 3), adapter.managers.items.len);
+    try std.testing.expect(first_manager == adapter.managers.items[0]);
+
+    const first_source = try adapter.acquireSource();
+    _ = try adapter.acquireSource();
+    _ = try adapter.acquireSource();
+    try std.testing.expectEqual(@as(usize, 3), adapter.sources.items.len);
+    try std.testing.expect(first_source == adapter.sources.items[0]);
+    try std.testing.expectEqual(@as(u32, 0), adapter.sourceId(first_source).index);
 }

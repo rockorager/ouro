@@ -1,4 +1,4 @@
-//! Bounded security-context-v1 resource, descriptor, and metadata ownership.
+//! Growable security-context-v1 ownership with bounded per-context metadata.
 
 const std = @import("std");
 const wayring = @import("wayring");
@@ -70,9 +70,6 @@ pub fn Adapter(comptime protocol: type) type {
         resources: std.ArrayListUnmanaged(*Resource) = .empty,
         listeners: std.ArrayListUnmanaged(*Listener) = .empty,
         clients: std.ArrayListUnmanaged(Client) = .empty,
-        resource_capacity: usize,
-        listener_capacity: usize,
-        client_capacity: usize,
         metadata_capacity: usize,
         metadata_used: usize = 0,
         runtime: ?*Runtime = null,
@@ -87,9 +84,6 @@ pub fn Adapter(comptime protocol: type) type {
             var self: Self = .{
                 .allocator = allocator,
                 .committer = committer,
-                .resource_capacity = config.resource_capacity,
-                .listener_capacity = config.listener_capacity,
-                .client_capacity = config.client_capacity,
                 .metadata_capacity = config.metadata_bytes,
             };
             errdefer self.resources.deinit(allocator);
@@ -159,8 +153,6 @@ pub fn Adapter(comptime protocol: type) type {
                 switch (decoded.value) {
                     .destroy => {},
                     .create_listener => |value| {
-                        if (self.listeners.items.len == self.listener_capacity)
-                            return try self.noMemory(actor);
                         var listen_owned = true;
                         var close_owned = true;
                         defer if (listen_owned) {
@@ -177,7 +169,8 @@ pub fn Adapter(comptime protocol: type) type {
                             return try self.noMemory(actor);
                         errdefer self.allocator.destroy(listener);
                         listener.* = .{ .listen_fd = value.listen_fd, .close_fd = value.close_fd };
-                        self.listeners.appendAssumeCapacity(listener);
+                        self.listeners.append(self.allocator, listener) catch
+                            return try self.noMemory(actor);
                         const child = self.createResource(.context, undefined, peer, listener) catch {
                             _ = self.listeners.pop();
                             self.allocator.destroy(listener);
@@ -249,12 +242,12 @@ pub fn Adapter(comptime protocol: type) type {
         /// receive can be submitted. Classification never depends on metadata.
         pub fn admit(self: *Self, peer: wayring.io_uring.Peer, listener: *Listener) !void {
             if (!listener.committed or listener.closing) return error.InactiveListener;
-            if (self.clients.items.len == self.client_capacity) return error.Exhausted;
             self.clients.appendAssumeCapacity(.{ .peer = peer, .listener = listener });
         }
 
-        pub fn canAdmit(self: *const Self) bool {
-            return self.clients.items.len < self.client_capacity;
+        pub fn canAdmit(self: *Self) bool {
+            self.clients.ensureUnusedCapacity(self.allocator, 1) catch return false;
+            return true;
         }
 
         pub fn sandboxed(self: *const Self, peer: wayring.io_uring.Peer) bool {
@@ -310,11 +303,10 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         fn createResource(self: *Self, kind: Kind, handle: objects.Handle, peer: wayring.io_uring.Peer, listener: ?*Listener) !*Resource {
-            if (self.resources.items.len == self.resource_capacity) return error.Exhausted;
             const resource = try self.allocator.create(Resource);
             errdefer self.allocator.destroy(resource);
             resource.* = .{ .kind = kind, .handle = handle, .peer = peer, .listener = listener };
-            self.resources.appendAssumeCapacity(resource);
+            try self.resources.append(self.allocator, resource);
             return resource;
         }
 
@@ -455,4 +447,24 @@ test "security-context classifies admitted peers independently of metadata" {
     try std.testing.expect(!adapter.sandboxed(.{ .slot = 2, .generation = 8 }));
     adapter.disconnected(peer);
     try std.testing.expect(!adapter.sandboxed(peer));
+}
+
+test "security-context client reservation grows beyond one" {
+    const TestAdapter = Adapter(@import("core_protocol"));
+    const Hooks = struct {
+        fn commit(_: ?*anyopaque, _: *Listener) !void {}
+    };
+    var adapter = try TestAdapter.init(
+        std.testing.allocator,
+        .{ .commitFn = Hooks.commit },
+        .{ .resource_capacity = 1, .listener_capacity = 1, .client_capacity = 1 },
+    );
+    defer adapter.deinit();
+
+    var listener: Listener = .{ .listen_fd = -1, .close_fd = -1, .committed = true };
+    try std.testing.expect(adapter.canAdmit());
+    try adapter.admit(.{ .slot = 1, .generation = 1 }, &listener);
+    try std.testing.expect(adapter.canAdmit());
+    try adapter.admit(.{ .slot = 2, .generation = 1 }, &listener);
+    try std.testing.expectEqual(@as(usize, 2), adapter.clients.items.len);
 }

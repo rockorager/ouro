@@ -3,6 +3,7 @@
 const std = @import("std");
 const wayring = @import("wayring");
 const objects = wayring.objects;
+const slot_pool = @import("slot_pool.zig");
 const none = std.math.maxInt(u32);
 
 pub const Config = struct {
@@ -23,9 +24,7 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type) type {
         const Dialog = protocol.xdg_dialog_v1;
 
         const Slot = struct {
-            active: bool = false,
-            generation: u32 = 1,
-            next_free: u32 = none,
+            header: slot_pool.Header = .{},
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
             peer: wayring.io_uring.Peer = undefined,
             toplevel: ?Shell.ToplevelId = null,
@@ -36,20 +35,16 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type) type {
         shell: *Shell,
         runtime: ?*Runtime = null,
         global: ?objects.Handle = null,
-        slots: []Slot,
-        free_head: u32 = 0,
+        slots: slot_pool.Pool(Slot),
 
         pub fn init(allocator: std.mem.Allocator, shell: *Shell, config: Config) !Self {
             try config.validate();
-            const slots = try allocator.alloc(Slot, config.resource_capacity);
-            for (slots, 0..) |*slot, i| slot.* = .{
-                .next_free = if (i + 1 < slots.len) @intCast(i + 1) else none,
-            };
+            const slots = try slot_pool.Pool(Slot).init(allocator, config.resource_capacity);
             return .{ .allocator = allocator, .shell = shell, .slots = slots };
         }
 
         pub fn deinit(self: *Self) void {
-            self.allocator.free(self.slots);
+            self.slots.deinit();
             self.* = undefined;
         }
 
@@ -89,7 +84,7 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type) type {
                         slot.peer = peer;
                         slot.toplevel = id;
                         const admitted = Manager.admit_get_xdg_dialog(server_objects, decoded.handle, payload, .{ .id = slot }) catch |err| {
-                            self.release(self.index(slot), false);
+                            self.release(slot, false);
                             return try self.failure(actor, decoded.handle.id, err);
                         };
                         slot.resource = admitted.id;
@@ -132,49 +127,31 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type) type {
             if (object.interface == &Dialog.info) {
                 const slot = self.fromObject(&object) orelse return false;
                 if (!std.meta.eql(slot.resource, handle)) return false;
-                self.release(self.index(slot), true);
+                self.release(slot, true);
                 return true;
             }
             return object.interface == &Manager.info and object.context == @as(?*anyopaque, @ptrCast(self));
         }
 
         fn acquire(self: *Self) !*Slot {
-            if (self.free_head == none) return error.Exhausted;
-            const i = self.free_head;
-            const slot = &self.slots[i];
-            self.free_head = slot.next_free;
-            slot.* = .{ .active = true, .generation = slot.generation };
-            return slot;
+            return self.slots.acquire();
         }
 
-        fn release(self: *Self, i: u32, clear: bool) void {
-            const slot = &self.slots[i];
-            if (!slot.active) return;
+        fn release(self: *Self, slot: *Slot, clear: bool) void {
+            if (!slot.header.active) return;
             if (clear) {
                 if (slot.toplevel) |id| _ = self.shell.setDialogState(id, false, false) catch {};
             }
-            const generation = slot.generation +% 1;
-            slot.* = .{ .generation = if (generation == 0) 1 else generation, .next_free = self.free_head };
-            self.free_head = i;
+            self.slots.release(slot);
         }
 
         fn find(self: *Self, id: Shell.ToplevelId) ?*Slot {
-            for (self.slots) |*slot| if (slot.active and slot.toplevel != null and std.meta.eql(slot.toplevel.?, id)) return slot;
+            for (self.slots.entries.items) |slot| if (slot.header.active and slot.toplevel != null and std.meta.eql(slot.toplevel.?, id)) return slot;
             return null;
         }
 
         fn fromObject(self: *Self, object: *const objects.Object) ?*Slot {
-            const ptr = object.context orelse return null;
-            const address = @intFromPtr(ptr);
-            const start = @intFromPtr(self.slots.ptr);
-            const end = start + self.slots.len * @sizeOf(Slot);
-            if (address < start or address >= end or (address - start) % @sizeOf(Slot) != 0) return null;
-            const slot = &self.slots[(address - start) / @sizeOf(Slot)];
-            return if (slot.active) slot else null;
-        }
-
-        fn index(self: *Self, slot: *Slot) u32 {
-            return @intCast((@intFromPtr(slot) - @intFromPtr(self.slots.ptr)) / @sizeOf(Slot));
+            return self.slots.fromContext(object.context);
         }
         fn noMemory(_: *Self, actor: *wayring.connection.Actor) !wayring.dispatch.Control {
             try Core.postError(actor, objects.display_id, 2, "out of memory");
@@ -222,15 +199,17 @@ test "xdg dialog slots are bounded, independent, inert, and generation safe" {
     first.toplevel = .{ .index = 0, .generation = 1 };
     _ = try shell.setDialogState(first.toplevel.?, true, false);
     try std.testing.expect(adapter.find(first.toplevel.?) != null);
-    try std.testing.expectError(error.Exhausted, adapter.acquire());
-    adapter.release(0, true);
+    const grown = try adapter.acquire();
+    try std.testing.expect(first != grown);
+    adapter.release(grown, false);
+    adapter.release(first, true);
     try std.testing.expect(!shell.states[0].dialog);
     const second = try adapter.acquire();
-    try std.testing.expect(second.generation != 1);
+    try std.testing.expect(second.header.generation != 1);
     second.toplevel = .{ .index = 1, .generation = 2 };
     second.modal = true;
     _ = try shell.setDialogState(second.toplevel.?, true, true);
     second.toplevel = null;
-    adapter.release(0, true);
+    adapter.release(second, true);
     try std.testing.expect(shell.states[1].dialog and shell.states[1].modal);
 }

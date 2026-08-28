@@ -2298,7 +2298,6 @@ pub fn Adapter(comptime protocol: type) type {
             const object = server_objects.namespace.resolve(handle) orelse
                 return error.UnknownObject;
             if (version >= 5 and (x != 0 or y != 0)) return error.InvalidOffset;
-            if (adapter.imports.available() == 0) return error.Exhausted;
 
             if (adapter.shm.bufferToken(object)) |token| {
                 const info = try adapter.shm.store.bufferInfo(token);
@@ -2499,7 +2498,12 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         fn acquireSinglePixel(adapter: *Self) !*SinglePixelSlot {
-            if (adapter.single_pixel_free == none) return error.Exhausted;
+            if (adapter.single_pixel_free == none)
+                try adapter.growSlots(
+                    SinglePixelSlot,
+                    &adapter.single_pixels,
+                    &adapter.single_pixel_free,
+                );
             const index = adapter.single_pixel_free;
             const slot = adapter.single_pixels[index];
             adapter.single_pixel_free = slot.next_free;
@@ -2515,7 +2519,12 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         fn acquireContentType(adapter: *Self) !*ContentTypeSlot {
-            if (adapter.content_type_free == none) return error.Exhausted;
+            if (adapter.content_type_free == none)
+                try adapter.growSlots(
+                    ContentTypeSlot,
+                    &adapter.content_types,
+                    &adapter.content_type_free,
+                );
             const index = adapter.content_type_free;
             const slot = adapter.content_types[index];
             adapter.content_type_free = slot.next_free;
@@ -2547,7 +2556,12 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         fn acquireTearingControl(adapter: *Self) !*TearingControlSlot {
-            if (adapter.tearing_control_free == none) return error.Exhausted;
+            if (adapter.tearing_control_free == none)
+                try adapter.growSlots(
+                    TearingControlSlot,
+                    &adapter.tearing_controls,
+                    &adapter.tearing_control_free,
+                );
             const index = adapter.tearing_control_free;
             const slot = adapter.tearing_controls[index];
             adapter.tearing_control_free = slot.next_free;
@@ -2579,7 +2593,8 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         fn acquireFifo(adapter: *Self) !*FifoSlot {
-            if (adapter.fifo_free == none) return error.Exhausted;
+            if (adapter.fifo_free == none)
+                try adapter.growSlots(FifoSlot, &adapter.fifos, &adapter.fifo_free);
             const index = adapter.fifo_free;
             const slot = adapter.fifos[index];
             adapter.fifo_free = slot.next_free;
@@ -3335,6 +3350,7 @@ const TestContext = struct {
             .content_type_capacity = 1,
             .tearing_control_capacity = 1,
             .fifo_capacity = 1,
+            .commit_timer_capacity = 1,
             .presentation_resource_capacity = 2,
             .presentation_feedback_capacity = 4,
             .region_operation_capacity = 16,
@@ -4319,6 +4335,69 @@ test "commit timing preserves exact ordered commits after timer destruction" {
     untimed.deinit();
 }
 
+test "commit timer slots grow beyond their initial reservation" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const manager = try context.server_objects.insertClient(
+        30,
+        &test_protocol.wp_commit_timing_manager_v1.info,
+        1,
+        &context.adapter,
+    );
+    const first_surface = try context.createSurface(10);
+    const second_surface = try context.createSurface(12);
+    try test_protocol.wp_commit_timing_manager_v1.encodeRequest(
+        &context.requests,
+        manager.id,
+        .{ .get_timer = .{ .id = 11, .surface = first_surface.id } },
+    );
+    _ = try context.dispatchCore();
+    const first_timer = context.server_objects.namespace.lookupHandle(11) orelse
+        return error.MissingCommitTimer;
+    const first_slot = context.adapter.commitTimerFromObject(
+        context.server_objects.namespace.resolve(first_timer) orelse
+            return error.MissingCommitTimer,
+    ) orelse return error.MissingCommitTimer;
+
+    try test_protocol.wp_commit_timing_manager_v1.encodeRequest(
+        &context.requests,
+        manager.id,
+        .{ .get_timer = .{ .id = 13, .surface = second_surface.id } },
+    );
+    _ = try context.dispatchCore();
+    try std.testing.expectEqual(@as(usize, 2), context.adapter.commit_timers.len);
+    try std.testing.expectEqual(first_slot, context.adapter.commit_timers[0]);
+    try std.testing.expectEqual(first_timer, first_slot.resource);
+    try std.testing.expectEqual(
+        try context.adapter.surfaceId(first_surface),
+        first_slot.surface.?,
+    );
+
+    try test_protocol.wp_commit_timer_v1.encodeRequest(
+        &context.requests,
+        first_timer.id,
+        .{ .set_timestamp = .{ .tv_sec_hi = 0, .tv_sec_lo = 3, .tv_nsec = 9 } },
+    );
+    _ = try context.dispatchCore();
+    try test_protocol.wl_surface.encodeRequest(
+        &context.requests,
+        first_surface.id,
+        .{ .commit = .{} },
+    );
+    _ = try context.dispatchCore();
+    var output: [1]TestAdapter.Applied = undefined;
+    var applied = (try context.adapter.tryApplyAt(
+        first_surface,
+        &output,
+        3 * std.time.ns_per_s + 9,
+    ))[0].payload;
+    defer applied.deinit();
+    try std.testing.expectEqual(
+        surface_state.CommitTimestamp{ .sec = 3, .nsec = 9 },
+        applied.surface.commit_timestamp.?,
+    );
+}
+
 test "commit timing rejects invalid timestamps" {
     const context = try TestContext.init();
     defer context.deinit();
@@ -5257,6 +5336,37 @@ test "surface region and viewport slots grow without moving live resources" {
     _ = try context.createViewport(try context.createSurface(17), 18);
     _ = try context.createViewport(try context.createSurface(19), 20);
     try std.testing.expectEqual(first_pointer, try context.adapter.getSurface(first));
+}
+
+test "long-lived extension slots grow beyond their initial reservation" {
+    const context = try TestContext.init();
+    defer context.deinit();
+
+    const first_pixel = try context.adapter.acquireSinglePixel();
+    first_pixel.bytes = .{ 1, 2, 3, 4 };
+    _ = try context.adapter.acquireSinglePixel();
+    _ = try context.adapter.acquireSinglePixel();
+    try std.testing.expectEqual(@as(usize, 4), context.adapter.single_pixels.len);
+    try std.testing.expectEqual(first_pixel, context.adapter.single_pixels[0]);
+    try std.testing.expectEqual([4]u8{ 1, 2, 3, 4 }, first_pixel.bytes);
+
+    const first_content_type = try context.adapter.acquireContentType();
+    _ = try context.adapter.acquireContentType();
+    _ = try context.adapter.acquireContentType();
+    try std.testing.expectEqual(@as(usize, 4), context.adapter.content_types.len);
+    try std.testing.expectEqual(first_content_type, context.adapter.content_types[0]);
+
+    const first_tearing_control = try context.adapter.acquireTearingControl();
+    _ = try context.adapter.acquireTearingControl();
+    _ = try context.adapter.acquireTearingControl();
+    try std.testing.expectEqual(@as(usize, 4), context.adapter.tearing_controls.len);
+    try std.testing.expectEqual(first_tearing_control, context.adapter.tearing_controls[0]);
+
+    const first_fifo = try context.adapter.acquireFifo();
+    _ = try context.adapter.acquireFifo();
+    _ = try context.adapter.acquireFifo();
+    try std.testing.expectEqual(@as(usize, 4), context.adapter.fifos.len);
+    try std.testing.expectEqual(first_fifo, context.adapter.fifos[0]);
 }
 
 test "commit-hook admission failure precedes ordinary core surface mutation" {

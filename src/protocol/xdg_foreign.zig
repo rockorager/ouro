@@ -4,6 +4,7 @@ const std = @import("std");
 const wayring = @import("wayring");
 const objects = wayring.objects;
 const linux = std.os.linux;
+const slot_pool = @import("slot_pool.zig");
 const none = std.math.maxInt(u32);
 
 pub const Config = struct {
@@ -31,9 +32,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime She
         const Id = packed struct { index: u32, generation: u32 };
 
         const Export = struct {
-            active: bool = false,
-            generation: u32 = 1,
-            next_free: u32 = none,
+            header: slot_pool.Header = .{},
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
             peer: wayring.io_uring.Peer = undefined,
             surface: CoreSurface.SurfaceId = undefined,
@@ -42,16 +41,14 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime She
             handle_pending: bool = false,
         };
         const Import = struct {
-            active: bool = false,
-            generation: u32 = 1,
-            next_free: u32 = none,
+            header: slot_pool.Header = .{},
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
             peer: wayring.io_uring.Peer = undefined,
             export_id: ?Id = null,
             destroyed_pending: bool = false,
         };
         const Relation = struct {
-            active: bool = false,
+            header: slot_pool.Header = .{},
             owner: Id = undefined,
             child: CoreSurface.SurfaceId = undefined,
             parent: CoreSurface.SurfaceId = undefined,
@@ -61,30 +58,25 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime She
         allocator: std.mem.Allocator,
         core: *CoreSurface,
         shell: *Shell,
-        exports: []Export,
-        imports: []Import,
-        relations: []Relation,
-        export_free: u32 = 0,
-        import_free: u32 = 0,
+        exports: slot_pool.Pool(Export),
+        imports: slot_pool.Pool(Import),
+        relations: slot_pool.Pool(Relation),
         runtime: ?*Runtime = null,
 
         pub fn init(allocator: std.mem.Allocator, core: *CoreSurface, shell: *Shell, config: Config) !Self {
             try config.validate();
-            const exports = try allocator.alloc(Export, config.export_capacity);
-            errdefer allocator.free(exports);
-            const imports = try allocator.alloc(Import, config.import_capacity);
-            errdefer allocator.free(imports);
-            const relations = try allocator.alloc(Relation, config.relation_capacity);
-            for (exports, 0..) |*slot, i| slot.* = .{ .next_free = if (i + 1 < exports.len) @intCast(i + 1) else none };
-            for (imports, 0..) |*slot, i| slot.* = .{ .next_free = if (i + 1 < imports.len) @intCast(i + 1) else none };
-            @memset(relations, .{});
+            var exports = try slot_pool.Pool(Export).init(allocator, config.export_capacity);
+            errdefer exports.deinit();
+            var imports = try slot_pool.Pool(Import).init(allocator, config.import_capacity);
+            errdefer imports.deinit();
+            const relations = try slot_pool.Pool(Relation).init(allocator, config.relation_capacity);
             return .{ .allocator = allocator, .core = core, .shell = shell, .exports = exports, .imports = imports, .relations = relations };
         }
 
         pub fn deinit(self: *Self) void {
-            self.allocator.free(self.relations);
-            self.allocator.free(self.imports);
-            self.allocator.free(self.exports);
+            self.relations.deinit();
+            self.imports.deinit();
+            self.exports.deinit();
             self.* = undefined;
         }
 
@@ -184,14 +176,14 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime She
 
         pub fn advanceRelations(self: *Self) !usize {
             var completed: usize = 0;
-            for (self.relations) |*relation| {
-                if (!relation.active or !relation.clear_pending) continue;
+            for (self.relations.entries.items) |relation| {
+                if (!relation.header.active or !relation.clear_pending) continue;
                 self.shell.clearForeignParent(relation.child, relation.parent) catch |err| switch (err) {
                     error.Exhausted => return completed,
                     error.StaleSurface, error.StaleToplevel, error.InvalidRole => {},
                     else => return err,
                 };
-                relation.* = .{};
+                self.relations.release(relation);
                 completed += 1;
             }
             return completed;
@@ -199,7 +191,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime She
 
         pub fn flushOn(self: *Self, peer: wayring.io_uring.Peer, _: anytype, queue: *wayring.tx.Queue) !usize {
             var completed: usize = 0;
-            for (self.exports) |*slot| if (slot.active and slot.handle_pending and samePeer(slot.peer, peer)) {
+            for (self.exports.entries.items) |slot| if (slot.header.active and slot.handle_pending and samePeer(slot.peer, peer)) {
                 Exported.encodeEvent(queue, slot.resource.id, .{ .handle = .{ .handle = &slot.handle } }) catch |err| switch (err) {
                     error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return completed,
                     else => return err,
@@ -207,7 +199,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime She
                 slot.handle_pending = false;
                 completed += 1;
             };
-            for (self.imports) |*slot| if (slot.active and slot.destroyed_pending and samePeer(slot.peer, peer)) {
+            for (self.imports.entries.items) |slot| if (slot.header.active and slot.destroyed_pending and samePeer(slot.peer, peer)) {
                 Imported.encodeEvent(queue, slot.resource.id, .destroyed) catch |err| switch (err) {
                     error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return completed,
                     else => return err,
@@ -219,15 +211,15 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime She
         }
 
         pub fn pendingOutbound(self: *const Self, peer: wayring.io_uring.Peer) bool {
-            for (self.exports) |slot| if (slot.active and slot.handle_pending and samePeer(slot.peer, peer)) return true;
-            for (self.imports) |slot| if (slot.active and slot.destroyed_pending and samePeer(slot.peer, peer)) return true;
+            for (self.exports.entries.items) |slot| if (slot.header.active and slot.handle_pending and samePeer(slot.peer, peer)) return true;
+            for (self.imports.entries.items) |slot| if (slot.header.active and slot.destroyed_pending and samePeer(slot.peer, peer)) return true;
             return false;
         }
 
         pub fn surfaceRemoved(self: *Self, surface: CoreSurface.SurfaceId) void {
-            for (self.exports) |*slot| if (slot.active and std.meta.eql(slot.surface, surface)) self.invalidateExport(self.exportId(slot));
-            for (self.relations) |*relation| {
-                if (relation.active and (std.meta.eql(relation.child, surface) or
+            for (self.exports.entries.items) |slot| if (slot.header.active and std.meta.eql(slot.surface, surface)) self.invalidateExport(self.exportId(slot));
+            for (self.relations.entries.items) |relation| {
+                if (relation.header.active and (std.meta.eql(relation.child, surface) or
                     std.meta.eql(relation.parent, surface))) relation.clear_pending = true;
             }
         }
@@ -251,13 +243,13 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime She
         }
 
         pub fn disconnected(self: *Self, peer: wayring.io_uring.Peer) void {
-            for (self.exports, 0..) |*slot, i| if (slot.active and samePeer(slot.peer, peer)) {
+            for (self.exports.entries.items) |slot| if (slot.header.active and samePeer(slot.peer, peer)) {
                 self.invalidateExport(self.exportId(slot));
-                self.releaseExport(@intCast(i));
+                self.releaseExport(slot.header.index);
             };
-            for (self.imports, 0..) |*slot, i| if (slot.active and samePeer(slot.peer, peer)) {
+            for (self.imports.entries.items) |slot| if (slot.header.active and samePeer(slot.peer, peer)) {
                 self.clearRelations(self.importId(slot));
-                self.releaseImport(@intCast(i));
+                self.releaseImport(slot.header.index);
             };
         }
 
@@ -272,28 +264,28 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime She
 
         fn assign(self: *Self, owner: Id, child: CoreSurface.SurfaceId, parent: CoreSurface.SurfaceId) !void {
             var available: ?*Relation = null;
-            for (self.relations) |*relation| {
-                if (relation.active and std.meta.eql(relation.child, child)) {
+            for (self.relations.entries.items) |relation| {
+                if (relation.header.active and std.meta.eql(relation.child, child)) {
                     available = relation;
                     break;
                 }
-                if (!relation.active and available == null) available = relation;
             }
-            const relation = available orelse return error.Exhausted;
+            const relation = available orelse try self.relations.acquire();
             try self.shell.setForeignParent(child, parent);
-            relation.* = .{ .active = true, .owner = owner, .child = child, .parent = parent };
+            const header = relation.header;
+            relation.* = .{ .header = header, .owner = owner, .child = child, .parent = parent };
         }
 
         fn clearRelations(self: *Self, owner: Id) void {
-            for (self.relations) |*relation| {
-                if (relation.active and std.meta.eql(relation.owner, owner)) relation.clear_pending = true;
+            for (self.relations.entries.items) |relation| {
+                if (relation.header.active and std.meta.eql(relation.owner, owner)) relation.clear_pending = true;
             }
         }
 
         fn invalidateExport(self: *Self, id: Id) void {
             const exported = self.resolveExport(id) catch return;
             exported.valid = false;
-            for (self.imports) |*slot| if (slot.active and slot.export_id != null and std.meta.eql(slot.export_id.?, id)) {
+            for (self.imports.entries.items) |slot| if (slot.header.active and slot.export_id != null and std.meta.eql(slot.export_id.?, id)) {
                 slot.export_id = null;
                 slot.destroyed_pending = true;
                 self.clearRelations(self.importId(slot));
@@ -317,8 +309,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime She
                 }
                 output.* = std.fmt.bytesToHex(bytes, .lower);
                 var collision = false;
-                for (self.exports) |*slot| {
-                    if (slot.active and &slot.handle != output and
+                for (self.exports.entries.items) |slot| {
+                    if (slot.header.active and &slot.handle != output and
                         std.mem.eql(u8, &slot.handle, output)) collision = true;
                 }
                 if (!collision) return;
@@ -327,45 +319,50 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime She
 
         fn findHandle(self: *const Self, handle: []const u8) ?Id {
             if (handle.len != 32) return null;
-            for (self.exports, 0..) |slot, i| if (slot.active and slot.valid and std.mem.eql(u8, &slot.handle, handle))
-                return .{ .index = @intCast(i), .generation = slot.generation };
+            for (self.exports.entries.items) |slot| if (slot.header.active and slot.valid and std.mem.eql(u8, &slot.handle, handle))
+                return .{ .index = slot.header.index, .generation = slot.header.generation };
             return null;
         }
 
         fn acquireExport(self: *Self) !*Export {
-            return acquire(Export, self.exports, &self.export_free);
+            return self.exports.acquire();
         }
         fn acquireImport(self: *Self) !*Import {
-            return acquire(Import, self.imports, &self.import_free);
+            return self.imports.acquire();
         }
         fn releaseExport(self: *Self, i: u32) void {
-            release(Export, self.exports, &self.export_free, i);
+            if (self.exports.at(i)) |slot| self.exports.release(slot);
         }
         fn releaseImport(self: *Self, i: u32) void {
-            release(Import, self.imports, &self.import_free, i);
+            if (self.imports.at(i)) |slot| self.imports.release(slot);
         }
         fn exportId(self: *const Self, slot: *const Export) Id {
-            return .{ .index = self.exportIndex(slot), .generation = slot.generation };
+            _ = self;
+            return .{ .index = slot.header.index, .generation = slot.header.generation };
         }
         fn importId(self: *const Self, slot: *const Import) Id {
-            return .{ .index = self.importIndex(slot), .generation = slot.generation };
+            _ = self;
+            return .{ .index = slot.header.index, .generation = slot.header.generation };
         }
         fn exportIndex(self: *const Self, slot: *const Export) u32 {
-            return indexOf(Export, self.exports, slot);
+            _ = self;
+            return slot.header.index;
         }
         fn importIndex(self: *const Self, slot: *const Import) u32 {
-            return indexOf(Import, self.imports, slot);
+            _ = self;
+            return slot.header.index;
         }
         fn resolveExport(self: *Self, id: Id) !*Export {
-            const slot = try resolve(Export, self.exports, id);
+            const slot = self.exports.at(id.index) orelse return error.Stale;
+            if (slot.header.generation != id.generation) return error.Stale;
             if (!slot.valid) return error.Stale;
             return slot;
         }
         fn exportFromObject(self: *Self, object: *const objects.Object) ?*Export {
-            return fromObject(Export, self.exports, object);
+            return self.exports.fromContext(object.context);
         }
         fn importFromObject(self: *Self, object: *const objects.Object) ?*Import {
-            return fromObject(Import, self.imports, object);
+            return self.imports.fromContext(object.context);
         }
         fn noMemory(_: *Self, actor: *wayring.connection.Actor) !wayring.dispatch.Control {
             try ProtocolCore.postError(actor, objects.display_id, 2, "out of memory");
@@ -384,45 +381,6 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime She
     };
 }
 
-fn acquire(comptime T: type, slots: []T, free: *u32) !*T {
-    if (free.* == none) return error.Exhausted;
-    const i = free.*;
-    const slot = &slots[i];
-    free.* = slot.next_free;
-    const generation = slot.generation;
-    slot.* = .{ .active = true, .generation = generation };
-    return slot;
-}
-fn release(comptime T: type, slots: []T, free: *u32, i: u32) void {
-    const slot = &slots[i];
-    if (!slot.active) return;
-    if (slot.generation == std.math.maxInt(u32)) {
-        slot.active = false;
-        return;
-    }
-    const generation = slot.generation + 1;
-    slot.* = .{ .generation = generation, .next_free = free.* };
-    free.* = i;
-}
-fn resolve(comptime T: type, slots: []T, id: anytype) !*T {
-    if (id.index >= slots.len) return error.Stale;
-    const slot = &slots[id.index];
-    if (!slot.active or slot.generation != id.generation) return error.Stale;
-    return slot;
-}
-fn indexOf(comptime T: type, slots: []const T, slot: *const T) u32 {
-    return @intCast((@intFromPtr(slot) - @intFromPtr(slots.ptr)) / @sizeOf(T));
-}
-fn fromObject(comptime T: type, slots: []T, object: *const objects.Object) ?*T {
-    const p = object.context orelse return null;
-    const a = @intFromPtr(p);
-    const s = @intFromPtr(slots.ptr);
-    const bytes = std.math.mul(usize, slots.len, @sizeOf(T)) catch return null;
-    const e = std.math.add(usize, s, bytes) catch return null;
-    if (a < s or a >= e or (a - s) % @sizeOf(T) != 0) return null;
-    const slot = &slots[(a - s) / @sizeOf(T)];
-    return if (slot.active) slot else null;
-}
 fn samePeer(a: wayring.io_uring.Peer, b: wayring.io_uring.Peer) bool {
     return a.slot == b.slot and a.generation == b.generation;
 }
@@ -461,8 +419,9 @@ test "xdg foreign: handles, invalidation, and relation cleanup are generational"
     const imported = try adapter.acquireImport();
     imported.export_id = export_id;
     const import_id = adapter.importId(imported);
-    adapter.relations[0] = .{
-        .active = true,
+    const relation = try adapter.relations.acquire();
+    relation.* = .{
+        .header = relation.header,
         .owner = import_id,
         .child = .{ .index = 3, .generation = 4 },
         .parent = exported.surface,
@@ -470,8 +429,25 @@ test "xdg foreign: handles, invalidation, and relation cleanup are generational"
     adapter.invalidateExport(export_id);
     try std.testing.expect(imported.export_id == null);
     try std.testing.expect(imported.destroyed_pending);
-    try std.testing.expect(adapter.relations[0].clear_pending);
+    try std.testing.expect(relation.clear_pending);
     try std.testing.expectEqual(@as(usize, 1), try adapter.advanceRelations());
     try std.testing.expectEqual(@as(usize, 1), shell.cleared);
-    try std.testing.expect(!adapter.relations[0].active);
+    try std.testing.expect(!relation.header.active);
+}
+
+test "xdg foreign initial reservations grow with stable contexts" {
+    const protocol = @import("core_protocol");
+    const FakeCore = struct {
+        pub const SurfaceId = packed struct { index: u32, generation: u32 };
+    };
+    const FakeShell = struct {};
+    const A = Adapter(protocol, FakeCore, FakeShell);
+    var core: FakeCore = .{};
+    var shell: FakeShell = .{};
+    var adapter = try A.init(std.testing.allocator, &core, &shell, .{ .export_capacity = 1, .import_capacity = 1, .relation_capacity = 1 });
+    defer adapter.deinit();
+    const first = try adapter.acquireExport();
+    const second = try adapter.acquireExport();
+    try std.testing.expect(adapter.exports.fromContext(first) == first);
+    try std.testing.expect(first != second);
 }

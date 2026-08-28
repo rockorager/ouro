@@ -3,6 +3,7 @@
 const std = @import("std");
 const wayring = @import("wayring");
 const objects = wayring.objects;
+const slot_pool = @import("slot_pool.zig");
 const none = std.math.maxInt(u32);
 
 pub const Config = struct {
@@ -32,9 +33,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         const Kind = enum { shell, surface };
         const Text = struct { offset: usize = 0, len: usize = 0 };
         const Slot = struct {
-            active: bool = false,
-            generation: u32 = 1,
-            next_free: u32 = none,
+            header: slot_pool.Header = .{},
             kind: Kind = .shell,
             handle: objects.Handle = .{ .id = 0, .generation = 0 },
             peer: wayring.io_uring.Peer = undefined,
@@ -47,28 +46,24 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             configure_pending: bool = false,
             states: [5]bool = .{false} ** 5,
             floating: bool = true,
+            text: ?[]u8 = null,
         };
 
         allocator: std.mem.Allocator,
         core: *CoreSurface,
         runtime: ?*Runtime = null,
-        slots: []Slot,
-        text: []u8,
+        slots: slot_pool.Pool(Slot),
         string_bytes: usize,
-        free_head: u32 = 0,
         validator: ?GestureValidator = null,
 
         pub fn init(allocator: std.mem.Allocator, core: *CoreSurface, config: Config) !Self {
             try config.validate();
-            const slots = try allocator.alloc(Slot, config.resource_capacity);
-            errdefer allocator.free(slots);
-            const text = try allocator.alloc(u8, config.resource_capacity * config.string_bytes);
-            for (slots, 0..) |*slot, i| slot.* = .{ .next_free = if (i + 1 < slots.len) @intCast(i + 1) else none };
-            return .{ .allocator = allocator, .core = core, .slots = slots, .text = text, .string_bytes = config.string_bytes };
+            const slots = try slot_pool.Pool(Slot).init(allocator, config.resource_capacity);
+            return .{ .allocator = allocator, .core = core, .slots = slots, .string_bytes = config.string_bytes };
         }
         pub fn deinit(self: *Self) void {
-            self.allocator.free(self.text);
-            self.allocator.free(self.slots);
+            for (self.slots.entries.items) |slot| if (slot.text) |text| self.allocator.free(text);
+            self.slots.deinit();
             self.* = undefined;
         }
         pub fn setGestureValidator(self: *Self, validator: GestureValidator) void {
@@ -102,7 +97,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                         if (self.findSurface(sid) != null) return try self.failure(actor, d.handle.id, error.SurfaceAlreadyHasGtkSurface);
                         const child = self.acquire(.surface, undefined, peer, slot.version, sid) catch return try self.noMemory(actor);
                         const admitted = Shell.admit_get_gtk_surface(server_objects, d.handle, v, .{ .gtk_surface = child }) catch |e| {
-                            self.release(self.index(child));
+                            self.release(child);
                             return try self.failure(actor, d.handle.id, e);
                         };
                         child.handle = admitted.gtk_surface;
@@ -149,7 +144,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         }
         pub fn flushOn(self: *Self, peer: wayring.io_uring.Peer, server_objects: anytype, queue: *wayring.tx.Queue) !usize {
             var count: usize = 0;
-            for (self.slots) |*slot| if (slot.active and samePeer(slot.peer, peer) and server_objects.namespace.resolve(slot.handle) != null) {
+            for (self.slots.entries.items) |slot| if (slot.header.active and samePeer(slot.peer, peer) and server_objects.namespace.resolve(slot.handle) != null) {
                 if (slot.capabilities_pending) {
                     try Shell.encodeEvent(queue, slot.handle.id, .{ .capabilities = .{ .capabilities = 0 } });
                     slot.capabilities_pending = false;
@@ -170,7 +165,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             return count;
         }
         pub fn pendingOutbound(self: *Self, peer: wayring.io_uring.Peer) bool {
-            for (self.slots) |s| if (s.active and samePeer(s.peer, peer) and (s.capabilities_pending or s.configure_pending)) return true;
+            for (self.slots.entries.items) |s| if (s.header.active and samePeer(s.peer, peer) and (s.capabilities_pending or s.configure_pending)) return true;
             return false;
         }
         pub fn surfaceRemoved(self: *Self, id: CoreSurface.SurfaceId) void {
@@ -182,23 +177,23 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         pub fn resourceRemoved(self: *Self, handle: objects.Handle, object: objects.Object) bool {
             const s = self.fromObject(&object) orelse return false;
             if (!std.meta.eql(s.handle, handle)) return false;
-            self.release(self.index(s));
+            self.release(s);
             return true;
         }
         fn acquire(self: *Self, kind: Kind, handle: objects.Handle, peer: wayring.io_uring.Peer, version: u32, surface: ?CoreSurface.SurfaceId) !*Slot {
-            if (self.free_head == none) return error.Exhausted;
-            const i = self.free_head;
-            const s = &self.slots[i];
-            self.free_head = s.next_free;
-            s.* = .{ .active = true, .generation = s.generation, .kind = kind, .handle = handle, .peer = peer, .version = version, .surface = surface };
+            const s = try self.slots.acquire();
+            s.kind = kind;
+            s.handle = handle;
+            s.peer = peer;
+            s.version = version;
+            s.surface = surface;
             return s;
         }
-        fn release(self: *Self, i: u32) void {
-            const s = &self.slots[i];
-            if (!s.active) return;
-            const g = s.generation +% 1;
-            s.* = .{ .generation = if (g == 0) 1 else g, .next_free = self.free_head };
-            self.free_head = i;
+        fn release(self: *Self, s: *Slot) void {
+            if (!s.header.active) return;
+            if (s.text) |text| self.allocator.free(text);
+            s.text = null;
+            self.slots.release(s);
         }
         fn replaceAll(self: *Self, s: *Slot, values: []const ?[]const u8) !void {
             var needed: usize = 0;
@@ -206,32 +201,24 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 needed = std.math.add(usize, needed, text.len) catch return error.StringTooLong;
             };
             if (needed > self.string_bytes) return error.StringTooLong;
-            const base = self.index(s) * self.string_bytes;
+            if (s.text == null) s.text = try self.allocator.alloc(u8, self.string_bytes);
+            const storage = s.text.?;
             var at: usize = 0;
             for (values, 0..) |v, i| {
                 s.strings[i] = .{ .offset = at, .len = if (v) |text| text.len else 0 };
                 if (v) |text| {
-                    @memcpy(self.text[base + at ..][0..text.len], text);
+                    @memcpy(storage[at..][0..text.len], text);
                     at += text.len;
                 }
             }
             s.used = needed;
         }
         fn findSurface(self: *Self, id: CoreSurface.SurfaceId) ?*Slot {
-            for (self.slots) |*s| if (s.active and s.kind == .surface and s.surface != null and std.meta.eql(s.surface.?, id)) return s;
+            for (self.slots.entries.items) |s| if (s.header.active and s.kind == .surface and s.surface != null and std.meta.eql(s.surface.?, id)) return s;
             return null;
         }
         fn fromObject(self: *Self, object: *const objects.Object) ?*Slot {
-            const p = object.context orelse return null;
-            const a = @intFromPtr(p);
-            const start = @intFromPtr(self.slots.ptr);
-            const end = start + self.slots.len * @sizeOf(Slot);
-            if (a < start or a >= end or (a - start) % @sizeOf(Slot) != 0) return null;
-            const s = &self.slots[(a - start) / @sizeOf(Slot)];
-            return if (s.active) s else null;
-        }
-        fn index(self: *Self, s: *Slot) u32 {
-            return @intCast((@intFromPtr(s) - @intFromPtr(self.slots.ptr)) / @sizeOf(Slot));
+            return self.slots.fromContext(object.context);
         }
         fn validSurfaceObject(self: *Self, server_objects: anytype, peer: wayring.io_uring.Peer, id: u32) bool {
             const h = server_objects.namespace.lookupHandle(id) orelse return false;
@@ -275,13 +262,16 @@ test "gtk slots recycle generation-safely and metadata replacement is atomic" {
     const peer: wayring.io_uring.Peer = .{ .slot = 1, .generation = 2 };
     const s = try a.acquire(.surface, .{ .id = 3, .generation = 4 }, peer, 5, .{ .index = 1, .generation = 1 });
     try a.replaceAll(s, &.{"abc"});
-    const old = a.text[0..3].*;
+    const old = s.text.?[0..3].*;
     try std.testing.expectError(error.StringTooLong, a.replaceAll(s, &.{ "abc", "def" }));
-    try std.testing.expectEqualSlices(u8, &old, a.text[0..3]);
-    const generation = s.generation;
-    a.release(0);
+    try std.testing.expectEqualSlices(u8, &old, s.text.?[0..3]);
+    const generation = s.header.generation;
+    const grown = try a.acquire(.shell, .{ .id = 8, .generation = 1 }, peer, 5, null);
+    try std.testing.expect(grown != s);
+    a.release(grown);
+    a.release(s);
     const reused = try a.acquire(.shell, .{ .id = 4, .generation = 5 }, peer, 5, null);
-    try std.testing.expect(reused.generation != generation);
+    try std.testing.expect(reused.header.generation != generation);
     try std.testing.expect(a.fromObject(&.{ .interface = &@import("core_protocol").gtk_shell1.info, .version = 5, .context = s }) == reused);
 }
 

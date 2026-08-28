@@ -3,6 +3,7 @@
 const std = @import("std");
 const wayring = @import("wayring");
 const objects = wayring.objects;
+const slot_pool = @import("slot_pool.zig");
 const none = std.math.maxInt(u32);
 
 pub const Config = struct {
@@ -32,8 +33,7 @@ pub fn Adapter(comptime protocol: type, comptime OutputAdapter: type) type {
             _padding: u3 = 0,
         };
         const Slot = struct {
-            active: bool = false,
-            next_free: u32 = none,
+            header: slot_pool.Header = .{},
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
             output: ?objects.Handle = null,
             peer: wayring.io_uring.Peer = undefined,
@@ -45,8 +45,7 @@ pub fn Adapter(comptime protocol: type, comptime OutputAdapter: type) type {
         output: *OutputAdapter,
         runtime: ?*Runtime = null,
         global: ?objects.Handle = null,
-        slots: []Slot,
-        free_head: u32 = 0,
+        slots: slot_pool.Pool(Slot),
         pending_len: usize = 0,
 
         pub fn init(
@@ -55,15 +54,12 @@ pub fn Adapter(comptime protocol: type, comptime OutputAdapter: type) type {
             config: Config,
         ) !Self {
             try config.validate();
-            const slots = try allocator.alloc(Slot, config.resource_capacity);
-            for (slots, 0..) |*slot, slot_index| slot.* = .{
-                .next_free = if (slot_index + 1 < slots.len) @intCast(slot_index + 1) else none,
-            };
+            const slots = try slot_pool.Pool(Slot).init(allocator, config.resource_capacity);
             return .{ .allocator = allocator, .output = output, .slots = slots };
         }
 
         pub fn deinit(adapter: *Self) void {
-            adapter.allocator.free(adapter.slots);
+            adapter.slots.deinit();
             adapter.* = undefined;
         }
 
@@ -118,7 +114,7 @@ pub fn Adapter(comptime protocol: type, comptime OutputAdapter: type) type {
                             value,
                             .{ .id = slot },
                         ) catch |cause| {
-                            adapter.release(adapter.index(slot));
+                            adapter.release(slot);
                             return try adapter.failure(actor, decoded.handle.id, cause);
                         };
                         slot.resource = admitted.id;
@@ -149,7 +145,7 @@ pub fn Adapter(comptime protocol: type, comptime OutputAdapter: type) type {
         pub fn publishMode(adapter: *Self) void {
             const snapshot = adapter.output.logicalSnapshot();
             if (snapshot.width == null or snapshot.height == null) return;
-            for (adapter.slots) |*slot| if (slot.active) {
+            for (adapter.slots.entries.items) |slot| if (slot.header.active) {
                 adapter.setPending(slot, .size);
                 adapter.setPending(slot, .marker);
             };
@@ -157,8 +153,8 @@ pub fn Adapter(comptime protocol: type, comptime OutputAdapter: type) type {
 
         pub fn pendingOutbound(adapter: *const Self, peer: wayring.io_uring.Peer) bool {
             if (adapter.pending_len == 0) return false;
-            for (adapter.slots) |slot|
-                if (slot.active and samePeer(slot.peer, peer) and pendingAny(slot.pending))
+            for (adapter.slots.entries.items) |slot|
+                if (slot.header.active and samePeer(slot.peer, peer) and pendingAny(slot.pending))
                     return true;
             return false;
         }
@@ -172,10 +168,10 @@ pub fn Adapter(comptime protocol: type, comptime OutputAdapter: type) type {
             var completed: usize = 0;
             if (adapter.pending_len == 0) return completed;
             const snapshot = adapter.output.logicalSnapshot();
-            for (adapter.slots) |*slot| {
-                if (!slot.active or !samePeer(slot.peer, peer) or !pendingAny(slot.pending)) continue;
+            for (adapter.slots.entries.items) |slot| {
+                if (!slot.header.active or !samePeer(slot.peer, peer) or !pendingAny(slot.pending)) continue;
                 if (server_objects.namespace.resolve(slot.resource) == null) {
-                    adapter.release(adapter.index(slot));
+                    adapter.release(slot);
                     continue;
                 }
                 for ([_]Event{ .position, .size, .name, .description, .marker }) |event| {
@@ -195,12 +191,12 @@ pub fn Adapter(comptime protocol: type, comptime OutputAdapter: type) type {
             if (object.interface == &XdgOutput.info) {
                 const slot = adapter.fromObject(object) orelse return false;
                 if (!std.meta.eql(slot.resource, handle)) return false;
-                adapter.release(adapter.index(slot));
+                adapter.release(slot);
                 return true;
             }
             if (object.interface == &Output.info) {
-                for (adapter.slots) |*slot| {
-                    if (slot.active and slot.output != null and
+                for (adapter.slots.entries.items) |slot| {
+                    if (slot.header.active and slot.output != null and
                         std.meta.eql(slot.output.?, handle)) slot.output = null;
                 }
                 return false;
@@ -210,20 +206,13 @@ pub fn Adapter(comptime protocol: type, comptime OutputAdapter: type) type {
         }
 
         fn acquire(adapter: *Self) !*Slot {
-            if (adapter.free_head == none) return error.Exhausted;
-            const index_value = adapter.free_head;
-            const slot = &adapter.slots[index_value];
-            adapter.free_head = slot.next_free;
-            slot.* = .{ .active = true };
-            return slot;
+            return adapter.slots.acquire();
         }
 
-        fn release(adapter: *Self, index_value: u32) void {
-            const slot = &adapter.slots[index_value];
-            if (!slot.active) return;
+        fn release(adapter: *Self, slot: *Slot) void {
+            if (!slot.header.active) return;
             adapter.pending_len -= @intFromBool(pendingAny(slot.pending));
-            slot.* = .{ .next_free = adapter.free_head };
-            adapter.free_head = index_value;
+            adapter.slots.release(slot);
         }
 
         fn queueSnapshot(adapter: *Self, slot: *Slot) void {
@@ -296,19 +285,7 @@ pub fn Adapter(comptime protocol: type, comptime OutputAdapter: type) type {
         }
 
         fn fromObject(adapter: *Self, object: objects.Object) ?*Slot {
-            const pointer = object.context orelse return null;
-            const address = @intFromPtr(pointer);
-            const start = @intFromPtr(adapter.slots.ptr);
-            const bytes = std.math.mul(usize, adapter.slots.len, @sizeOf(Slot)) catch return null;
-            const end = std.math.add(usize, start, bytes) catch return null;
-            if (address < start or address >= end or (address - start) % @sizeOf(Slot) != 0)
-                return null;
-            const slot = &adapter.slots[(address - start) / @sizeOf(Slot)];
-            return if (slot.active and @intFromPtr(slot) == address) slot else null;
-        }
-
-        fn index(adapter: *const Self, slot: *const Slot) u32 {
-            return @intCast((@intFromPtr(slot) - @intFromPtr(adapter.slots.ptr)) / @sizeOf(Slot));
+            return adapter.slots.fromContext(object.context);
         }
 
         fn noMemory(adapter: *Self, actor: *wayring.connection.Actor) !wayring.dispatch.Control {
@@ -464,6 +441,10 @@ test "xdg output: mode publication coalesces while retaining marker" {
     var adapter = try TestAdapter.init(std.testing.allocator, &output, .{ .resource_capacity = 1 });
     defer adapter.deinit();
     const slot = try adapter.acquire();
+    const grown = try adapter.acquire();
+    try std.testing.expect(grown != slot);
+    try std.testing.expect(adapter.slots.fromContext(slot) == slot);
+    adapter.release(grown);
     adapter.publishMode();
     adapter.publishMode();
     try std.testing.expect(slot.pending.size);

@@ -8,6 +8,7 @@
 const std = @import("std");
 const wayring = @import("wayring");
 const input = @import("../backend/input/backend.zig");
+const slot_pool = @import("slot_pool.zig");
 const objects = wayring.objects;
 const none = std.math.maxInt(u32);
 
@@ -34,9 +35,7 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
 
         const Id = packed struct { index: u32, generation: u32 };
         const Slot = struct {
-            active: bool = false,
-            generation: u32 = 1,
-            next_free: u32 = none,
+            header: slot_pool.Header = .{},
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
             peer: wayring.io_uring.Peer = undefined,
             pointer: Seat.PointerId = undefined,
@@ -59,21 +58,17 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
         runtime: ?*Runtime = null,
         global: ?objects.Handle = null,
         global_version: u32,
-        slots: []Slot,
+        slots: slot_pool.Pool(Slot),
         outbound: []Outbound,
         outbound_len: usize = 0,
-        free_head: u32 = 0,
         next_sequence: u64 = 1,
 
         pub fn init(allocator: std.mem.Allocator, seat: *Seat, config: Config) !Self {
             try config.validate();
             try Manager.info.validateVersion(config.global_version);
-            const slots = try allocator.alloc(Slot, config.resource_capacity);
-            errdefer allocator.free(slots);
+            var slots = try slot_pool.Pool(Slot).init(allocator, config.resource_capacity);
+            errdefer slots.deinit();
             const outbound = try allocator.alloc(Outbound, config.outbound_capacity);
-            for (slots, 0..) |*slot, slot_index| slot.* = .{
-                .next_free = if (slot_index + 1 < slots.len) @intCast(slot_index + 1) else none,
-            };
             @memset(outbound, .{});
             return .{
                 .allocator = allocator,
@@ -86,7 +81,7 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
 
         pub fn deinit(self: *Self) void {
             self.allocator.free(self.outbound);
-            self.allocator.free(self.slots);
+            self.slots.deinit();
             self.* = undefined;
         }
 
@@ -149,7 +144,7 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                             payload,
                             .{ .id = slot },
                         ) catch |err| {
-                            self.release(self.slotIndex(slot));
+                            self.release(slot);
                             return try self.failure(actor, decoded.handle.id, err);
                         };
                         slot.resource = admitted.id;
@@ -182,13 +177,13 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                 else => return,
             };
             var count: usize = 0;
-            for (self.slots) |slot|
-                count += @intFromBool(slot.active and self.seat.pointerFocused(slot.pointer));
+            for (self.slots.entries.items) |slot|
+                count += @intFromBool(slot.header.active and self.seat.pointerFocused(slot.pointer));
             if (self.outboundFree() < count) return error.Exhausted;
             const dx = fixed(motion.dx);
             const dy = fixed(motion.dy);
-            for (self.slots) |*slot| {
-                if (!slot.active or !self.seat.pointerFocused(slot.pointer)) continue;
+            for (self.slots.entries.items) |slot| {
+                if (!slot.header.active or !self.seat.pointerFocused(slot.pointer)) continue;
                 self.enqueue(slot.peer, .{
                     .relative = self.slotId(slot),
                     .time_usec = motion.time_usec,
@@ -257,7 +252,7 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                         self.outbound_len -= 1;
                     }
                 }
-                self.release(id.index);
+                self.release(slot);
                 return true;
             }
             return object.interface == &Manager.info and
@@ -265,51 +260,29 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
         }
 
         fn acquire(self: *Self) !*Slot {
-            if (self.free_head == none) return error.Exhausted;
-            const index = self.free_head;
-            const slot = &self.slots[index];
-            self.free_head = slot.next_free;
-            const generation = slot.generation;
-            slot.* = .{ .active = true, .generation = generation };
-            return slot;
+            return self.slots.acquire();
         }
 
-        fn release(self: *Self, index: u32) void {
-            const slot = &self.slots[index];
-            if (!slot.active) return;
-            const generation = slot.generation +% 1;
-            slot.* = .{
-                .generation = if (generation == 0) 1 else generation,
-                .next_free = self.free_head,
-            };
-            self.free_head = index;
+        fn release(self: *Self, slot: *Slot) void {
+            if (slot.header.active) self.slots.release(slot);
         }
 
         fn resolve(self: *Self, id: Id) !*Slot {
-            if (id.index >= self.slots.len) return error.Stale;
-            const slot = &self.slots[id.index];
-            if (!slot.active or slot.generation != id.generation) return error.Stale;
+            const slot = self.slots.at(id.index) orelse return error.Stale;
+            if (slot.header.generation != id.generation) return error.Stale;
             return slot;
         }
 
         fn fromObject(self: *Self, object: *const objects.Object) ?*Slot {
-            const pointer = object.context orelse return null;
-            const address = @intFromPtr(pointer);
-            const start = @intFromPtr(self.slots.ptr);
-            const size = std.math.mul(usize, self.slots.len, @sizeOf(Slot)) catch return null;
-            const end = std.math.add(usize, start, size) catch return null;
-            if (address < start or address >= end or (address - start) % @sizeOf(Slot) != 0)
-                return null;
-            const slot = &self.slots[(address - start) / @sizeOf(Slot)];
-            return if (slot.active and @intFromPtr(slot) == address) slot else null;
+            return self.slots.fromContext(object.context);
         }
 
-        fn slotId(self: *const Self, slot: *const Slot) Id {
-            return .{ .index = self.slotIndex(slot), .generation = slot.generation };
+        fn slotId(_: *const Self, slot: *const Slot) Id {
+            return .{ .index = slot.header.index, .generation = slot.header.generation };
         }
 
-        fn slotIndex(self: *const Self, slot: *const Slot) u32 {
-            return @intCast((@intFromPtr(slot) - @intFromPtr(self.slots.ptr)) / @sizeOf(Slot));
+        fn slotIndex(_: *const Self, slot: *const Slot) u32 {
+            return slot.header.index;
         }
 
         fn enqueue(self: *Self, peer: wayring.io_uring.Peer, motion: Motion) !void {
@@ -390,7 +363,7 @@ test "relative pointer: focused resources retain exact unclipped motion" {
     const TestAdapter = Adapter(protocol, FakeSeat);
     var seat: FakeSeat = .{};
     var adapter = try TestAdapter.init(std.testing.allocator, &seat, .{
-        .resource_capacity = 2,
+        .resource_capacity = 1,
         .outbound_capacity = 1,
     });
     defer adapter.deinit();

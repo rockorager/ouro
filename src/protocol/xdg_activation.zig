@@ -11,6 +11,7 @@ const wayring = @import("wayring");
 
 const linux = std.os.linux;
 const objects = wayring.objects;
+const slot_pool = @import("slot_pool.zig");
 const none = std.math.maxInt(u32);
 const token_bytes = 32;
 
@@ -55,19 +56,15 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             ) bool,
         };
 
-        const Header = struct {
-            active: bool = false,
-            generation: u32 = 1,
-            next_free: u32 = none,
-            resource: objects.Handle = .{ .id = 0, .generation = 0 },
-        };
         const ManagerSlot = struct {
-            header: Header = .{},
+            header: slot_pool.Header = .{},
+            resource: objects.Handle = .{ .id = 0, .generation = 0 },
             peer: wayring.io_uring.Peer = undefined,
         };
         const Serial = struct { value: u32, seat_object: u32 };
         const TokenSlot = struct {
-            header: Header = .{},
+            header: slot_pool.Header = .{},
+            resource: objects.Handle = .{ .id = 0, .generation = 0 },
             peer: wayring.io_uring.Peer = undefined,
             serial: ?Serial = null,
             surface: ?SurfaceId = null,
@@ -76,7 +73,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             token: [token_bytes]u8 = undefined,
         };
         const IssuedSlot = struct {
-            active: bool = false,
+            header: slot_pool.Header = .{},
             sequence: u64 = 0,
             token: [token_bytes]u8 = undefined,
         };
@@ -86,12 +83,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         runtime: ?*Runtime = null,
         global: ?objects.Handle = null,
         global_version: u32,
-        managers: []ManagerSlot,
-        tokens: []TokenSlot,
-        issued: []IssuedSlot,
+        managers: slot_pool.Pool(ManagerSlot),
+        tokens: slot_pool.Pool(TokenSlot),
+        issued: slot_pool.Pool(IssuedSlot),
         events: []Event,
-        manager_free: u32 = 0,
-        token_free: u32 = 0,
         event_head: usize = 0,
         event_len: usize = 0,
         done_pending_len: usize = 0,
@@ -101,17 +96,14 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         pub fn init(allocator: std.mem.Allocator, core: *CoreSurface, config: Config) !Self {
             try config.validate();
             try Activation.info.validateVersion(config.global_version);
-            const managers = try allocator.alloc(ManagerSlot, config.manager_capacity);
-            errdefer allocator.free(managers);
-            const tokens = try allocator.alloc(TokenSlot, config.token_resource_capacity);
-            errdefer allocator.free(tokens);
-            const issued = try allocator.alloc(IssuedSlot, config.issued_token_capacity);
-            errdefer allocator.free(issued);
+            var managers = try slot_pool.Pool(ManagerSlot).init(allocator, config.manager_capacity);
+            errdefer managers.deinit();
+            var tokens = try slot_pool.Pool(TokenSlot).init(allocator, config.token_resource_capacity);
+            errdefer tokens.deinit();
+            var issued = try slot_pool.Pool(IssuedSlot).init(allocator, config.issued_token_capacity);
+            errdefer issued.deinit();
             const events = try allocator.alloc(Event, config.event_capacity);
             errdefer allocator.free(events);
-            initHeaders(ManagerSlot, managers);
-            initHeaders(TokenSlot, tokens);
-            @memset(issued, .{});
             return .{
                 .allocator = allocator,
                 .core = core,
@@ -125,9 +117,9 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
 
         pub fn deinit(self: *Self) void {
             self.allocator.free(self.events);
-            self.allocator.free(self.issued);
-            self.allocator.free(self.tokens);
-            self.allocator.free(self.managers);
+            self.issued.deinit();
+            self.tokens.deinit();
+            self.managers.deinit();
             self.* = undefined;
         }
 
@@ -151,9 +143,9 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
 
         fn bind(context: ?*anyopaque, binding: wayring.server.Binding) !?*anyopaque {
             const self: *Self = @ptrCast(@alignCast(context orelse return error.InvalidContext));
-            const slot = acquire(ManagerSlot, self.managers, &self.manager_free) catch
+            const slot = self.managers.acquire() catch
                 return error.OutOfMemory;
-            slot.header.resource = binding.resource;
+            slot.resource = binding.resource;
             slot.peer = binding.peer;
             return slot;
         }
@@ -183,9 +175,9 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             const handle = server_objects.namespace.lookupHandle(message.header.object_id) orelse
                 return null;
             if (target.object.interface == &Activation.info) {
-                const manager = fromContext(ManagerSlot, self.managers, target.object.context) orelse
+                const manager = self.managers.fromContext(target.object.context) orelse
                     return null;
-                if (!std.meta.eql(manager.header.resource, handle)) return null;
+                if (!std.meta.eql(manager.resource, handle)) return null;
                 const decoded = try wayring.server.decodeRequest(
                     Activation,
                     server_objects,
@@ -195,7 +187,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 switch (decoded.value) {
                     .destroy => {},
                     .get_activation_token => |payload| {
-                        const slot = acquire(TokenSlot, self.tokens, &self.token_free) catch
+                        const slot = self.tokens.acquire() catch
                             return try self.noMemory(actor);
                         slot.peer = manager.peer;
                         const admitted = Activation.admit_get_activation_token(
@@ -204,10 +196,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                             payload,
                             .{ .id = slot },
                         ) catch |err| {
-                            release(TokenSlot, self.tokens, &self.token_free, indexOf(TokenSlot, self.tokens, slot));
+                            self.tokens.release(slot);
                             return try self.failure(actor, decoded.handle.id, err);
                         };
-                        slot.header.resource = admitted.id;
+                        slot.resource = admitted.id;
                     },
                     .activate => |payload| {
                         const target_id = self.surfaceId(server_objects, payload.surface) catch null;
@@ -218,9 +210,9 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 return .continue_dispatch;
             }
             if (target.object.interface == &Token.info) {
-                const slot = fromContext(TokenSlot, self.tokens, target.object.context) orelse
+                const slot = self.tokens.fromContext(target.object.context) orelse
                     return null;
-                if (!std.meta.eql(slot.header.resource, handle) or !samePeer(slot.peer, peer))
+                if (!std.meta.eql(slot.resource, handle) or !samePeer(slot.peer, peer))
                     return null;
                 const decoded = try wayring.server.decodeRequest(Token, server_objects, message, fds);
                 if (slot.committed and decoded.value != .destroy)
@@ -268,28 +260,18 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         }
 
         fn admitIssued(self: *Self, token: [token_bytes]u8) void {
-            var selected: *IssuedSlot = &self.issued[0];
-            for (self.issued) |*slot| {
-                if (!slot.active) {
-                    selected = slot;
-                    break;
-                }
-                if (slot.sequence < selected.sequence) selected = slot;
-            }
-            selected.* = .{
-                .active = true,
-                .sequence = self.next_sequence,
-                .token = token,
-            };
+            const selected = self.issued.acquire() catch return;
+            selected.sequence = self.next_sequence;
+            selected.token = token;
             self.next_sequence +%= 1;
             if (self.next_sequence == 0) self.next_sequence = 1;
         }
 
         fn consume(self: *Self, token: []const u8, surface: SurfaceId) void {
             if (token.len != token_bytes) return;
-            for (self.issued) |*slot| {
-                if (!slot.active or !std.mem.eql(u8, &slot.token, token)) continue;
-                slot.active = false;
+            for (self.issued.entries.items) |slot| {
+                if (!slot.header.active or !std.mem.eql(u8, &slot.token, token)) continue;
+                self.issued.release(slot);
                 if (self.event_len == self.events.len) return;
                 const tail = (self.event_head + self.event_len) % self.events.len;
                 self.events[tail] = .{ .activate = surface };
@@ -314,7 +296,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         ) !usize {
             var completed: usize = 0;
             if (self.done_pending_len == 0) return completed;
-            for (self.tokens) |*slot| {
+            for (self.tokens.entries.items) |slot| {
                 if (!slot.header.active or !samePeer(slot.peer, peer) or !slot.done_pending)
                     continue;
                 wayring.server.sendEvent(
@@ -322,7 +304,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     Token,
                     server_objects,
                     queue,
-                    slot.header.resource,
+                    slot.resource,
                     .{ .done = .{ .token = &slot.token } },
                 ) catch |err| switch (err) {
                     error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return completed,
@@ -337,7 +319,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
 
         pub fn pendingOutbound(self: *const Self, peer: wayring.io_uring.Peer) bool {
             if (self.done_pending_len == 0) return false;
-            for (self.tokens) |slot|
+            for (self.tokens.entries.items) |slot|
                 if (slot.header.active and samePeer(slot.peer, peer) and slot.done_pending)
                     return true;
             return false;
@@ -345,16 +327,16 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
 
         pub fn resourceRemoved(self: *Self, handle: objects.Handle, object: objects.Object) bool {
             if (object.interface == &Activation.info) {
-                const slot = fromContext(ManagerSlot, self.managers, object.context) orelse return false;
-                if (!std.meta.eql(slot.header.resource, handle)) return false;
-                release(ManagerSlot, self.managers, &self.manager_free, indexOf(ManagerSlot, self.managers, slot));
+                const slot = self.managers.fromContext(object.context) orelse return false;
+                if (!std.meta.eql(slot.resource, handle)) return false;
+                self.managers.release(slot);
                 return true;
             }
             if (object.interface == &Token.info) {
-                const slot = fromContext(TokenSlot, self.tokens, object.context) orelse return false;
-                if (!std.meta.eql(slot.header.resource, handle)) return false;
+                const slot = self.tokens.fromContext(object.context) orelse return false;
+                if (!std.meta.eql(slot.resource, handle)) return false;
                 if (slot.done_pending) self.done_pending_len -= 1;
-                release(TokenSlot, self.tokens, &self.token_free, indexOf(TokenSlot, self.tokens, slot));
+                self.tokens.release(slot);
                 return true;
             }
             return false;
@@ -414,47 +396,6 @@ fn fillToken(token: *[token_bytes]u8) !void {
     }
 }
 
-fn initHeaders(comptime T: type, slots: []T) void {
-    for (slots, 0..) |*slot, index| slot.* = .{ .header = .{
-        .next_free = if (index + 1 < slots.len) @intCast(index + 1) else none,
-    } };
-}
-
-fn acquire(comptime T: type, slots: []T, free_head: *u32) !*T {
-    if (free_head.* == none) return error.Exhausted;
-    const index = free_head.*;
-    const slot = &slots[index];
-    free_head.* = slot.header.next_free;
-    slot.* = .{ .header = .{ .active = true, .generation = slot.header.generation } };
-    return slot;
-}
-
-fn release(comptime T: type, slots: []T, free_head: *u32, index: u32) void {
-    const slot = &slots[index];
-    const generation = slot.header.generation +% 1;
-    slot.* = .{ .header = .{
-        .generation = if (generation == 0) 1 else generation,
-        .next_free = free_head.*,
-    } };
-    free_head.* = index;
-}
-
-fn fromContext(comptime T: type, slots: []T, context: ?*anyopaque) ?*T {
-    const pointer = context orelse return null;
-    const address = @intFromPtr(pointer);
-    const start = @intFromPtr(slots.ptr);
-    const size = std.math.mul(usize, slots.len, @sizeOf(T)) catch return null;
-    const end = std.math.add(usize, start, size) catch return null;
-    if (address < start or address >= end or (address - start) % @sizeOf(T) != 0)
-        return null;
-    const slot = &slots[(address - start) / @sizeOf(T)];
-    return if (slot.header.active and @intFromPtr(slot) == address) slot else null;
-}
-
-fn indexOf(comptime T: type, slots: []T, slot: *T) u32 {
-    return @intCast((@intFromPtr(slot) - @intFromPtr(slots.ptr)) / @sizeOf(T));
-}
-
 fn samePeer(a: wayring.io_uring.Peer, b: wayring.io_uring.Peer) bool {
     return a.slot == b.slot and a.generation == b.generation;
 }
@@ -492,7 +433,10 @@ test "xdg-activation: validated tokens are opaque, one-shot, and cross-client" {
                 serial == 41 and std.meta.eql(surface, TestAdapter.SurfaceId{ .index = 2, .generation = 5 });
         }
     }.validate });
-    const slot = try acquire(TestAdapter.TokenSlot, adapter.tokens, &adapter.token_free);
+    const slot = try adapter.tokens.acquire();
+    const grown = try adapter.tokens.acquire();
+    try std.testing.expect(grown != slot);
+    adapter.tokens.release(grown);
     slot.peer = .{ .slot = 1, .generation = 3 };
     slot.serial = .{ .seat_object = 7, .value = 41 };
     slot.surface = .{ .index = 2, .generation = 5 };
@@ -522,18 +466,18 @@ test "xdg-activation: ineffective requests still produce opaque done tokens" {
         .event_capacity = 1,
     });
     defer adapter.deinit();
-    const slot = try acquire(TestAdapter.TokenSlot, adapter.tokens, &adapter.token_free);
+    const slot = try adapter.tokens.acquire();
     slot.peer = .{ .slot = 1, .generation = 3 };
 
     try adapter.commitToken(slot);
 
     try std.testing.expect(slot.committed and slot.done_pending);
-    try std.testing.expect(!adapter.issued[0].active);
+    try std.testing.expectEqual(@as(usize, 0), adapter.issued.entries.items.len);
     adapter.consume(&slot.token, .{ .index = 1, .generation = 1 });
     try std.testing.expectEqual(@as(?TestAdapter.Event, null), adapter.popEvent());
 }
 
-test "xdg-activation: bounded issuance evicts the oldest token" {
+test "xdg-activation: issued token reservation grows without invalidating tokens" {
     const protocol = @import("core_protocol");
     const CoreSurface = @import("core_surface.zig").Adapter(protocol);
     const TestAdapter = Adapter(protocol, CoreSurface);
@@ -541,8 +485,8 @@ test "xdg-activation: bounded issuance evicts the oldest token" {
     var adapter = try TestAdapter.init(std.testing.allocator, &core, .{
         .manager_capacity = 1,
         .token_resource_capacity = 1,
-        .issued_token_capacity = 2,
-        .event_capacity = 2,
+        .issued_token_capacity = 1,
+        .event_capacity = 3,
     });
     defer adapter.deinit();
     const first: [token_bytes]u8 = @splat('a');
@@ -552,16 +496,17 @@ test "xdg-activation: bounded issuance evicts the oldest token" {
     adapter.admitIssued(second);
     adapter.admitIssued(third);
 
+    try std.testing.expectEqual(@as(usize, 3), adapter.issued.entries.items.len);
     adapter.consume(&first, .{ .index = 1, .generation = 1 });
-    try std.testing.expectEqual(@as(?TestAdapter.Event, null), adapter.popEvent());
     adapter.consume(&second, .{ .index = 2, .generation = 1 });
     adapter.consume(&third, .{ .index = 3, .generation = 1 });
+    try std.testing.expectEqual(
+        TestAdapter.Event{ .activate = .{ .index = 1, .generation = 1 } },
+        adapter.popEvent().?,
+    );
     try std.testing.expectEqual(
         TestAdapter.Event{ .activate = .{ .index = 2, .generation = 1 } },
         adapter.popEvent().?,
     );
-    try std.testing.expectEqual(
-        TestAdapter.Event{ .activate = .{ .index = 3, .generation = 1 } },
-        adapter.popEvent().?,
-    );
+    try std.testing.expectEqual(TestAdapter.Event{ .activate = .{ .index = 3, .generation = 1 } }, adapter.popEvent().?);
 }

@@ -2,6 +2,7 @@
 const std = @import("std");
 const wayring = @import("wayring");
 const objects = wayring.objects;
+const slot_pool = @import("slot_pool.zig");
 const none = std.math.maxInt(u32);
 
 pub const Focus = struct { peer: wayring.io_uring.Peer, surface: u32 };
@@ -49,8 +50,8 @@ pub fn Adapter(comptime protocol: type) type {
         const Input = protocol.zwp_text_input_v3;
         pub const DeviceId = packed struct { index: u32, generation: u32 };
         pub const Event = struct { device: DeviceId, peer: wayring.io_uring.Peer, seat: u32, state: State, surrounding: []const u8, serial: u32 };
-        const ManagerSlot = struct { active: bool = false, next: u32 = none, resource: objects.Handle = .{ .id = 0, .generation = 0 }, peer: wayring.io_uring.Peer = undefined };
-        const Device = struct { active: bool = false, focused: bool = false, retired: bool = false, generation: u32 = 1, next: u32 = none, resource: objects.Handle = .{ .id = 0, .generation = 0 }, peer: wayring.io_uring.Peer = undefined, seat: u32 = 0, pending: State = .{}, current: State = .{}, serial: u32 = 0, text: []u8 = &.{}, pending_text: []u8 = &.{} };
+        const ManagerSlot = struct { header: slot_pool.Header = .{}, resource: objects.Handle = .{ .id = 0, .generation = 0 }, peer: wayring.io_uring.Peer = undefined };
+        const Device = struct { header: slot_pool.Header = .{}, focused: bool = false, resource: objects.Handle = .{ .id = 0, .generation = 0 }, peer: wayring.io_uring.Peer = undefined, seat: u32 = 0, pending: State = .{}, current: State = .{}, serial: u32 = 0, text: []u8 = &.{}, pending_text: []u8 = &.{} };
         const EventSlot = struct { event: Event = undefined, text: []u8 = &.{} };
         const OutKind = enum { enter, leave, preedit, commit, delete, done };
         const Out = struct {
@@ -70,17 +71,14 @@ pub fn Adapter(comptime protocol: type) type {
         };
         allocator: std.mem.Allocator,
         validator: SeatValidator,
-        managers: []ManagerSlot,
-        devices: []Device,
+        managers: slot_pool.Pool(ManagerSlot),
+        devices: slot_pool.Pool(Device),
         events: []EventSlot,
         outbound: []Out,
-        all_device_text: []u8,
         all_event_text: []u8,
         all_out_text: []u8,
         surrounding_bytes: usize,
         edit_bytes: usize,
-        manager_free: u32 = 0,
-        device_free: u32 = 0,
         event_head: usize = 0,
         event_len: usize = 0,
         out_len: usize = 0,
@@ -91,45 +89,38 @@ pub fn Adapter(comptime protocol: type) type {
         pub fn init(a: std.mem.Allocator, v: SeatValidator, c: Config) !Self {
             try c.validate();
             try Manager.info.validateVersion(1);
-            const ms = try a.alloc(ManagerSlot, c.manager_capacity);
-            errdefer a.free(ms);
-            const ds = try a.alloc(Device, c.device_capacity);
-            errdefer a.free(ds);
+            var ms = try slot_pool.Pool(ManagerSlot).init(a, c.manager_capacity);
+            errdefer ms.deinit();
+            var ds = try slot_pool.Pool(Device).init(a, c.device_capacity);
+            errdefer ds.deinit();
             const es = try a.alloc(EventSlot, c.event_capacity);
             errdefer a.free(es);
             const os = try a.alloc(Out, c.outbound_capacity);
             errdefer a.free(os);
-            const device_text_count = try std.math.mul(usize, c.device_capacity, 2);
-            const device_text_bytes = try std.math.mul(usize, device_text_count, c.surrounding_bytes);
             const event_text_bytes = try std.math.mul(usize, c.event_capacity, c.surrounding_bytes);
             const outbound_text_bytes = try std.math.mul(usize, c.outbound_capacity, c.edit_string_bytes);
-            const dt = try a.alloc(u8, device_text_bytes);
-            errdefer a.free(dt);
             const et = try a.alloc(u8, event_text_bytes);
             errdefer a.free(et);
             const ot = try a.alloc(u8, outbound_text_bytes);
             errdefer a.free(ot);
-            for (ms, 0..) |*s, i| s.* = .{ .next = if (i + 1 < ms.len) @intCast(i + 1) else none };
-            for (ds, 0..) |*s, i| {
-                s.* = .{ .next = if (i + 1 < ds.len) @intCast(i + 1) else none };
-                s.text = dt[(i * 2) * c.surrounding_bytes ..][0..c.surrounding_bytes];
-                s.pending_text = dt[(i * 2 + 1) * c.surrounding_bytes ..][0..c.surrounding_bytes];
-            }
             for (es, 0..) |*s, i| s.text = et[i * c.surrounding_bytes ..][0..c.surrounding_bytes];
             for (os, 0..) |*s, i| {
                 s.* = .{};
                 s.storage = ot[i * c.edit_string_bytes ..][0..c.edit_string_bytes];
             }
-            return .{ .allocator = a, .validator = v, .managers = ms, .devices = ds, .events = es, .outbound = os, .all_device_text = dt, .all_event_text = et, .all_out_text = ot, .surrounding_bytes = c.surrounding_bytes, .edit_bytes = c.edit_string_bytes };
+            return .{ .allocator = a, .validator = v, .managers = ms, .devices = ds, .events = es, .outbound = os, .all_event_text = et, .all_out_text = ot, .surrounding_bytes = c.surrounding_bytes, .edit_bytes = c.edit_string_bytes };
         }
         pub fn deinit(s: *Self) void {
             s.allocator.free(s.all_out_text);
             s.allocator.free(s.all_event_text);
-            s.allocator.free(s.all_device_text);
+            for (s.devices.entries.items) |device| {
+                if (device.text.len != 0) s.allocator.free(device.text);
+                if (device.pending_text.len != 0) s.allocator.free(device.pending_text);
+            }
             s.allocator.free(s.outbound);
             s.allocator.free(s.events);
-            s.allocator.free(s.devices);
-            s.allocator.free(s.managers);
+            s.devices.deinit();
+            s.managers.deinit();
             s.* = undefined;
         }
         pub fn install(s: *Self, r: *Runtime) !objects.Handle {
@@ -142,11 +133,10 @@ pub fn Adapter(comptime protocol: type) type {
         }
         fn bind(ctx: ?*anyopaque, b: wayring.server.Binding) !?*anyopaque {
             const s: *Self = @ptrCast(@alignCast(ctx.?));
-            if (s.manager_free == none) return error.OutOfMemory;
-            const i = s.manager_free;
-            s.manager_free = s.managers[i].next;
-            s.managers[i] = .{ .active = true, .resource = b.resource, .peer = b.peer };
-            return &s.managers[i];
+            const manager = try s.managers.acquire();
+            manager.resource = b.resource;
+            manager.peer = b.peer;
+            return manager;
         }
         pub fn request(s: *Self, p: wayring.io_uring.Peer, t: objects.Dispatch, m: wayring.wire.Message, f: *wayring.ancillary.FdQueue) !?wayring.dispatch.Control {
             const r = s.runtime orelse return error.NotInstalled;
@@ -155,7 +145,7 @@ pub fn Adapter(comptime protocol: type) type {
         pub fn requestOn(s: *Self, a: *wayring.connection.Actor, so: anytype, p: wayring.io_uring.Peer, t: objects.Dispatch, m: wayring.wire.Message, f: *wayring.ancillary.FdQueue) !?wayring.dispatch.Control {
             const h = so.namespace.lookupHandle(m.header.object_id) orelse return null;
             if (t.object.interface == &Manager.info) {
-                const x = from(ManagerSlot, s.managers, t.object.context) orelse return null;
+                const x = s.managers.fromContext(t.object.context) orelse return null;
                 if (!std.meta.eql(x.resource, h) or !same(x.peer, p)) return null;
                 const d = try wayring.server.decodeRequest(Manager, so, m, f);
                 switch (d.value) {
@@ -168,7 +158,7 @@ pub fn Adapter(comptime protocol: type) type {
                         z.peer = p;
                         z.seat = q.seat;
                         const admitted = Manager.admit_get_text_input(so, d.handle, q, .{ .id = z }) catch |e| {
-                            s.release(s.index(z));
+                            s.release(z);
                             return try s.failure(a, d.handle.id, e);
                         };
                         z.resource = admitted.id;
@@ -182,7 +172,7 @@ pub fn Adapter(comptime protocol: type) type {
                 return .continue_dispatch;
             }
             if (t.object.interface == &Input.info) {
-                const z = from(Device, s.devices, t.object.context) orelse return null;
+                const z = s.devices.fromContext(t.object.context) orelse return null;
                 if (!std.meta.eql(z.resource, h) or !same(z.peer, p)) return null;
                 const d = try wayring.server.decodeRequest(Input, so, m, f);
                 switch (d.value) {
@@ -242,8 +232,8 @@ pub fn Adapter(comptime protocol: type) type {
             if (!z.focused) return;
             if (s.event_len == s.events.len) return error.Exhausted;
             if (z.pending.enabled) {
-                for (s.devices) |*other| {
-                    if (other != z and other.active and other.focused and other.current.enabled and
+                for (s.devices.entries.items) |other| {
+                    if (other != z and other.header.active and other.focused and other.current.enabled and
                         same(other.peer, z.peer) and other.seat == z.seat)
                     {
                         z.pending.enabled = false;
@@ -275,7 +265,7 @@ pub fn Adapter(comptime protocol: type) type {
         pub fn validateFocus(s: *const Self, f: ?Focus) !void {
             if (focusEq(s.focus, f)) return;
             var need: usize = 0;
-            for (s.devices) |z| if (z.active) {
+            for (s.devices.entries.items) |z| if (z.header.active) {
                 if (s.focus != null and same(z.peer, s.focus.?.peer)) need += 1;
                 if (f != null and same(z.peer, f.?.peer)) need += 1;
             };
@@ -285,8 +275,8 @@ pub fn Adapter(comptime protocol: type) type {
             if (focusEq(s.focus, f)) return;
             try s.validateFocus(f);
             if (s.focus) |old| {
-                for (s.devices) |*z| {
-                    if (z.active and same(z.peer, old.peer)) {
+                for (s.devices.entries.items) |z| {
+                    if (z.header.active and same(z.peer, old.peer)) {
                         try s.enqueue(z, .leave, old.surface, null);
                         z.focused = false;
                         z.pending = .{};
@@ -296,8 +286,8 @@ pub fn Adapter(comptime protocol: type) type {
             }
             s.focus = f;
             if (f) |new| {
-                for (s.devices) |*z| {
-                    if (z.active and same(z.peer, new.peer)) {
+                for (s.devices.entries.items) |z| {
+                    if (z.header.active and same(z.peer, new.peer)) {
                         try s.enqueue(z, .enter, new.surface, null);
                         z.focused = true;
                         z.pending = .{};
@@ -402,23 +392,23 @@ pub fn Adapter(comptime protocol: type) type {
         }
         pub fn resourceRemoved(s: *Self, h: objects.Handle, o: objects.Object) bool {
             if (o.interface == &Input.info) {
-                const z = from(Device, s.devices, o.context) orelse return false;
+                const z = s.devices.fromContext(o.context) orelse return false;
                 if (!std.meta.eql(z.resource, h)) return false;
-                s.release(s.index(z));
+                s.release(z);
                 return true;
             }
             if (o.interface == &Manager.info) {
-                const z = from(ManagerSlot, s.managers, o.context) orelse return false;
+                const z = s.managers.fromContext(o.context) orelse return false;
                 if (!std.meta.eql(z.resource, h)) return false;
-                s.releaseManager(s.managerIndex(z));
+                s.releaseManager(z);
                 return true;
             }
             return false;
         }
         pub fn disconnected(s: *Self, p: wayring.io_uring.Peer) void {
-            for (s.devices) |*z| if (z.active and same(z.peer, p)) s.release(s.index(z));
-            for (s.managers) |*z| {
-                if (z.active and same(z.peer, p)) s.releaseManager(s.managerIndex(z));
+            for (s.devices.entries.items) |z| if (z.header.active and same(z.peer, p)) s.release(z);
+            for (s.managers.entries.items) |z| {
+                if (z.header.active and same(z.peer, p)) s.releaseManager(z);
             }
             if (s.focus) |f| {
                 if (same(f.peer, p)) s.focus = null;
@@ -427,46 +417,38 @@ pub fn Adapter(comptime protocol: type) type {
             for (s.outbound) |*o| if (o.active and same(o.peer, p)) s.dropOut(o);
         }
         fn acquire(s: *Self) !*Device {
-            if (s.device_free == none) return error.Exhausted;
-            const i = s.device_free;
-            const z = &s.devices[i];
-            s.device_free = z.next;
-            const g = z.generation;
-            const t = z.text;
-            const pt = z.pending_text;
-            z.* = .{ .active = true, .generation = g, .text = t, .pending_text = pt };
+            const z = try s.devices.acquire();
+            if (z.text.len == 0) {
+                z.text = s.allocator.alloc(u8, s.surrounding_bytes) catch |err| {
+                    s.devices.release(z);
+                    return err;
+                };
+                z.pending_text = s.allocator.alloc(u8, s.surrounding_bytes) catch |err| {
+                    s.allocator.free(z.text);
+                    z.text = &.{};
+                    s.devices.release(z);
+                    return err;
+                };
+            }
             return z;
         }
-        fn releaseManager(s: *Self, i: u32) void {
-            const z = &s.managers[i];
-            if (!z.active) return;
-            z.* = .{ .next = s.manager_free };
-            s.manager_free = i;
+        fn releaseManager(s: *Self, z: *ManagerSlot) void {
+            if (z.header.active) s.managers.release(z);
         }
-        fn managerIndex(s: *const Self, z: *const ManagerSlot) u32 {
-            return @intCast((@intFromPtr(z) - @intFromPtr(s.managers.ptr)) / @sizeOf(ManagerSlot));
-        }
-        fn release(s: *Self, i: u32) void {
-            const z = &s.devices[i];
-            if (!z.active) return;
-            for (s.outbound) |*o| if (o.active and o.device.index == i and o.device.generation == z.generation) s.dropOut(o);
-            if (z.generation == std.math.maxInt(u32)) {
-                z.* = .{ .retired = true, .generation = z.generation, .text = z.text, .pending_text = z.pending_text };
-                return;
-            }
-            z.* = .{ .generation = z.generation + 1, .next = s.device_free, .text = z.text, .pending_text = z.pending_text };
-            s.device_free = i;
-        }
-        fn index(s: *const Self, z: *const Device) u32 {
-            return @intCast((@intFromPtr(z) - @intFromPtr(s.devices.ptr)) / @sizeOf(Device));
+        fn release(s: *Self, z: *Device) void {
+            if (!z.header.active) return;
+            for (s.outbound) |*o| if (o.active and o.device.index == z.header.index and o.device.generation == z.header.generation) s.dropOut(o);
+            s.allocator.free(z.text);
+            s.allocator.free(z.pending_text);
+            s.devices.release(z);
         }
         fn id(s: *const Self, z: *const Device) DeviceId {
-            return .{ .index = s.index(z), .generation = z.generation };
+            _ = s;
+            return .{ .index = z.header.index, .generation = z.header.generation };
         }
         fn resolve(s: *Self, device_id: DeviceId) ?*Device {
-            if (device_id.index >= s.devices.len) return null;
-            const z = &s.devices[device_id.index];
-            return if (z.active and z.generation == device_id.generation) z else null;
+            const z = s.devices.at(device_id.index) orelse return null;
+            return if (z.header.generation == device_id.generation) z else null;
         }
         fn oldest(s: *Self, p: wayring.io_uring.Peer) ?*Out {
             var result: ?*Out = null;
@@ -528,15 +510,6 @@ fn focusEq(a: ?Focus, b: ?Focus) bool {
 fn boundary(s: []const u8, i: usize) bool {
     return i == s.len or (s[i] & 0xc0) != 0x80;
 }
-fn from(comptime T: type, s: []T, c: ?*anyopaque) ?*T {
-    const p = c orelse return null;
-    const a = @intFromPtr(p);
-    const start = @intFromPtr(s.ptr);
-    if (a < start or a >= start + s.len * @sizeOf(T) or (a - start) % @sizeOf(T) != 0) return null;
-    const x = &s[(a - start) / @sizeOf(T)];
-    return if (x.active) x else null;
-}
-
 test "text input transactional bounded state" {
     const A = Adapter(@import("core_protocol"));
     const v: SeatValidator = .{ .validateFn = struct {
@@ -576,7 +549,7 @@ test "text input focus edits and stale generation" {
     z.current.enabled = true;
     try a.queueEdit(id, .{ .commit = "x" });
     try std.testing.expect(a.pendingOutboundOn(z.peer));
-    a.release(id.index);
+    a.release(z);
     try std.testing.expect(!a.pendingOutboundOn(z.peer));
     const n = try a.acquire();
     try std.testing.expect(id.generation != a.id(n).generation);
@@ -611,7 +584,33 @@ test "text input focus replacement preflights every leave and enter" {
     );
     try std.testing.expectEqual(@as(u32, 10), adapter.focus.?.surface);
     try std.testing.expectEqual(@as(usize, 0), adapter.out_len);
-    for (adapter.devices) |device| try std.testing.expect(device.focused);
+    for (adapter.devices.entries.items) |device| try std.testing.expect(device.focused);
+}
+
+test "text input manager and device reservations grow without moving contexts" {
+    const A = Adapter(@import("core_protocol"));
+    const validator: SeatValidator = .{ .validateFn = struct {
+        fn validate(_: ?*anyopaque, _: wayring.io_uring.Peer, _: u32) bool {
+            return true;
+        }
+    }.validate };
+    var adapter = try A.init(std.testing.allocator, validator, .{
+        .device_capacity = 1,
+        .event_capacity = 1,
+        .manager_capacity = 1,
+        .outbound_capacity = 2,
+        .surrounding_bytes = 8,
+        .edit_string_bytes = 8,
+    });
+    defer adapter.deinit();
+    const first_device = try adapter.acquire();
+    const first_manager = try adapter.managers.acquire();
+    const device_address = @intFromPtr(first_device);
+    const manager_address = @intFromPtr(first_manager);
+    _ = try adapter.acquire();
+    _ = try adapter.managers.acquire();
+    try std.testing.expectEqual(device_address, @intFromPtr(first_device));
+    try std.testing.expectEqual(manager_address, @intFromPtr(first_manager));
 }
 
 test "text input edit transaction retains event order and commit serial" {

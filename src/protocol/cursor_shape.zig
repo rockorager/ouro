@@ -3,6 +3,7 @@
 const std = @import("std");
 const wayring = @import("wayring");
 const objects = wayring.objects;
+const slot_pool = @import("slot_pool.zig");
 const none = std.math.maxInt(u32);
 
 pub const Shape = enum(u32) {
@@ -99,16 +100,12 @@ pub fn Adapter(comptime protocol: type) type {
             shape: Shape,
         };
         const ManagerSlot = struct {
-            active: bool = false,
-            next_free: u32 = none,
+            header: slot_pool.Header = .{},
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
             peer: wayring.io_uring.Peer = undefined,
         };
         const DeviceSlot = struct {
-            active: bool = false,
-            retired: bool = false,
-            generation: u32 = 1,
-            next_free: u32 = none,
+            header: slot_pool.Header = .{},
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
             peer: wayring.io_uring.Peer = undefined,
             pointer: u32 = 0,
@@ -116,11 +113,9 @@ pub fn Adapter(comptime protocol: type) type {
 
         allocator: std.mem.Allocator,
         validator: PointerValidator,
-        managers: []ManagerSlot,
-        devices: []DeviceSlot,
+        managers: slot_pool.Pool(ManagerSlot),
+        devices: slot_pool.Pool(DeviceSlot),
         events: []Event,
-        manager_free: u32 = 0,
-        device_free: u32 = 0,
         event_head: usize = 0,
         event_len: usize = 0,
         global_version: u32,
@@ -130,20 +125,18 @@ pub fn Adapter(comptime protocol: type) type {
         pub fn init(allocator: std.mem.Allocator, validator: PointerValidator, config: Config) !Self {
             try config.validate();
             try Manager.info.validateVersion(config.global_version);
-            const managers = try allocator.alloc(ManagerSlot, config.manager_capacity);
-            errdefer allocator.free(managers);
-            const devices = try allocator.alloc(DeviceSlot, config.device_capacity);
-            errdefer allocator.free(devices);
+            var managers = try slot_pool.Pool(ManagerSlot).init(allocator, config.manager_capacity);
+            errdefer managers.deinit();
+            var devices = try slot_pool.Pool(DeviceSlot).init(allocator, config.device_capacity);
+            errdefer devices.deinit();
             const events = try allocator.alloc(Event, config.event_capacity);
-            for (managers, 0..) |*slot, i| slot.* = .{ .next_free = if (i + 1 < managers.len) @intCast(i + 1) else none };
-            for (devices, 0..) |*slot, i| slot.* = .{ .next_free = if (i + 1 < devices.len) @intCast(i + 1) else none };
             return .{ .allocator = allocator, .validator = validator, .managers = managers, .devices = devices, .events = events, .global_version = config.global_version };
         }
 
         pub fn deinit(self: *Self) void {
             self.allocator.free(self.events);
-            self.allocator.free(self.devices);
-            self.allocator.free(self.managers);
+            self.devices.deinit();
+            self.managers.deinit();
             self.* = undefined;
         }
 
@@ -172,7 +165,7 @@ pub fn Adapter(comptime protocol: type) type {
         pub fn requestOn(self: *Self, actor: *wayring.connection.Actor, server_objects: anytype, peer: wayring.io_uring.Peer, target: objects.Dispatch, message: wayring.wire.Message, fds: *wayring.ancillary.FdQueue) !?wayring.dispatch.Control {
             const handle = server_objects.namespace.lookupHandle(message.header.object_id) orelse return null;
             if (target.object.interface == &Manager.info) {
-                const manager = fromContext(ManagerSlot, self.managers, target.object.context) orelse return null;
+                const manager = self.managers.fromContext(target.object.context) orelse return null;
                 if (!std.meta.eql(manager.resource, handle) or !samePeer(manager.peer, peer)) return null;
                 const decoded = try wayring.server.decodeRequest(Manager, server_objects, message, fds);
                 switch (decoded.value) {
@@ -202,7 +195,7 @@ pub fn Adapter(comptime protocol: type) type {
                 return .continue_dispatch;
             }
             if (target.object.interface == &Device.info) {
-                const slot = fromContext(DeviceSlot, self.devices, target.object.context) orelse return null;
+                const slot = self.devices.fromContext(target.object.context) orelse return null;
                 if (!std.meta.eql(slot.resource, handle) or !samePeer(slot.peer, peer)) return null;
                 const decoded = try wayring.server.decodeRequest(Device, server_objects, message, fds);
                 switch (decoded.value) {
@@ -233,23 +226,23 @@ pub fn Adapter(comptime protocol: type) type {
 
         pub fn resourceRemoved(self: *Self, handle: objects.Handle, object: objects.Object) bool {
             if (object.interface == &Device.info) {
-                const slot = fromContext(DeviceSlot, self.devices, object.context) orelse return false;
+                const slot = self.devices.fromContext(object.context) orelse return false;
                 if (!std.meta.eql(slot.resource, handle)) return false;
                 self.releaseDevice(self.deviceIndex(slot));
                 return true;
             }
             if (object.interface == &Manager.info) {
-                const slot = fromContext(ManagerSlot, self.managers, object.context) orelse return false;
+                const slot = self.managers.fromContext(object.context) orelse return false;
                 if (!std.meta.eql(slot.resource, handle)) return false;
-                releaseSimple(ManagerSlot, self.managers, &self.manager_free, indexOf(ManagerSlot, self.managers, slot));
+                self.managers.release(slot);
                 return true;
             }
             return false;
         }
 
         pub fn disconnected(self: *Self, peer: wayring.io_uring.Peer) void {
-            for (self.devices, 0..) |*slot, i| if (slot.active and samePeer(slot.peer, peer)) self.releaseDevice(@intCast(i));
-            for (self.managers, 0..) |*slot, i| if (slot.active and samePeer(slot.peer, peer)) releaseSimple(ManagerSlot, self.managers, &self.manager_free, @intCast(i));
+            for (self.devices.entries.items) |slot| if (slot.header.active and samePeer(slot.peer, peer)) self.releaseDevice(slot.header.index);
+            for (self.managers.entries.items) |slot| if (slot.header.active and samePeer(slot.peer, peer)) self.managers.release(slot);
             var retained: usize = 0;
             const old_len = self.event_len;
             const old_head = self.event_head;
@@ -265,26 +258,18 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         fn acquireManager(self: *Self) !*ManagerSlot {
-            return acquireSimple(ManagerSlot, self.managers, &self.manager_free);
+            return self.managers.acquire();
         }
         fn acquireDevice(self: *Self) !*DeviceSlot {
-            if (self.device_free == none) return error.Exhausted;
-            const i = self.device_free;
-            const slot = &self.devices[i];
-            self.device_free = slot.next_free;
-            const generation = slot.generation;
-            slot.* = .{ .active = true, .generation = generation };
-            return slot;
+            return self.devices.acquire();
         }
         fn releaseDevice(self: *Self, i: u32) void {
-            const slot = &self.devices[i];
-            if (!slot.active) return;
-            if (slot.generation == std.math.maxInt(u32)) {
-                slot.* = .{ .retired = true, .generation = slot.generation };
-            } else {
-                slot.* = .{ .generation = slot.generation + 1, .next_free = self.device_free };
-                self.device_free = i;
+            const slot = self.devices.at(i) orelse return;
+            if (slot.header.generation == std.math.maxInt(u32)) {
+                slot.* = .{ .header = .{ .generation = slot.header.generation, .index = i } };
+                return;
             }
+            self.devices.release(slot);
         }
         fn publishShape(self: *Self, slot: *DeviceSlot, serial: u32, shape: Shape) !void {
             if (!self.validator.validate(slot.peer, slot.pointer, serial)) return;
@@ -299,10 +284,11 @@ pub fn Adapter(comptime protocol: type) type {
             self.event_len += 1;
         }
         fn deviceIndex(self: *const Self, slot: *const DeviceSlot) u32 {
-            return indexOf(DeviceSlot, self.devices, slot);
+            _ = self;
+            return slot.header.index;
         }
         fn deviceId(self: *const Self, slot: *const DeviceSlot) DeviceId {
-            return .{ .index = self.deviceIndex(slot), .generation = slot.generation };
+            return .{ .index = self.deviceIndex(slot), .generation = slot.header.generation };
         }
         fn noMemory(_: *Self, actor: *wayring.connection.Actor) !wayring.dispatch.Control {
             try Core.postError(actor, objects.display_id, 2, "out of memory");
@@ -323,32 +309,6 @@ pub fn Adapter(comptime protocol: type) type {
 fn samePeer(a: wayring.io_uring.Peer, b: wayring.io_uring.Peer) bool {
     return a.slot == b.slot and a.generation == b.generation;
 }
-fn indexOf(comptime T: type, slots: []T, slot: *const T) u32 {
-    return @intCast((@intFromPtr(slot) - @intFromPtr(slots.ptr)) / @sizeOf(T));
-}
-fn fromContext(comptime T: type, slots: []T, context: ?*anyopaque) ?*T {
-    const pointer = context orelse return null;
-    const address = @intFromPtr(pointer);
-    const start = @intFromPtr(slots.ptr);
-    const size = std.math.mul(usize, slots.len, @sizeOf(T)) catch return null;
-    if (address < start or address >= start + size or (address - start) % @sizeOf(T) != 0) return null;
-    const slot = &slots[(address - start) / @sizeOf(T)];
-    return if (slot.active and @intFromPtr(slot) == address) slot else null;
-}
-fn acquireSimple(comptime T: type, slots: []T, free: *u32) !*T {
-    if (free.* == none) return error.Exhausted;
-    const i = free.*;
-    const slot = &slots[i];
-    free.* = slot.next_free;
-    slot.* = .{ .active = true };
-    return slot;
-}
-fn releaseSimple(comptime T: type, slots: []T, free: *u32, i: u32) void {
-    if (!slots[i].active) return;
-    slots[i] = .{ .next_free = free.* };
-    free.* = i;
-}
-
 test "cursor shape names and version boundaries" {
     const expected = [_][]const u8{ "default", "context-menu", "help", "pointer", "progress", "wait", "cell", "crosshair", "text", "vertical-text", "alias", "copy", "move", "no-drop", "not-allowed", "grab", "grabbing", "e-resize", "n-resize", "ne-resize", "nw-resize", "s-resize", "se-resize", "sw-resize", "w-resize", "ew-resize", "ns-resize", "nesw-resize", "nwse-resize", "col-resize", "row-resize", "all-scroll", "zoom-in", "zoom-out", "dnd-ask", "all-resize" };
     for (expected, 1..) |name, value| try std.testing.expectEqualStrings(name, (@as(Shape, @enumFromInt(value))).name());
@@ -375,7 +335,25 @@ test "cursor shape bounded generation and client cleanup" {
     second.peer = peer;
     try std.testing.expect(stale.generation != adapter.deviceId(second).generation);
     adapter.disconnected(peer);
-    try std.testing.expect(!second.active);
+    try std.testing.expect(!second.header.active);
+}
+
+test "cursor ownership grows beyond reservations without moving contexts" {
+    const protocol = @import("core_protocol");
+    const A = Adapter(protocol);
+    const validator: PointerValidator = .{ .validateFn = struct {
+        fn call(_: ?*anyopaque, _: wayring.io_uring.Peer, _: u32, _: u32) bool {
+            return true;
+        }
+    }.call };
+    var adapter = try A.init(std.testing.allocator, validator, .{ .manager_capacity = 1, .device_capacity = 1, .event_capacity = 1 });
+    defer adapter.deinit();
+    const manager = try adapter.acquireManager();
+    const device = try adapter.acquireDevice();
+    _ = try adapter.acquireManager();
+    _ = try adapter.acquireDevice();
+    try std.testing.expect(adapter.managers.fromContext(manager) == manager);
+    try std.testing.expect(adapter.devices.fromContext(device) == device);
 }
 
 test "cursor shape validation precedes bounded event admission" {

@@ -1,4 +1,4 @@
-//! Fixed-capacity wl_seat owner and protocol-neutral focus boundary.
+//! Growable wl_seat owner and protocol-neutral focus boundary.
 //!
 //! Physical device identities and events remain owned by the input backend.
 //! This adapter aggregates capabilities and pressed state, owns all seat child
@@ -10,6 +10,7 @@ const wayring = @import("wayring");
 const input = @import("../backend/input/backend.zig");
 const input_platform = @import("../backend/input/platform.zig");
 const surface_state = @import("../surface.zig");
+const slot_pool = @import("slot_pool.zig");
 
 const linux = std.os.linux;
 const objects = wayring.objects;
@@ -126,20 +127,16 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         };
         pub const PointerId = struct { index: u32, generation: u32 };
 
-        const Header = struct {
-            active: bool = false,
-            generation: u32 = 1,
-            next_free: u32 = none,
-            resource: objects.Handle = .{ .id = 0, .generation = 0 },
-        };
         const SeatSlot = struct {
-            header: Header = .{},
+            header: slot_pool.Header = .{},
+            resource: objects.Handle = .{ .id = 0, .generation = 0 },
             peer: wayring.io_uring.Peer = undefined,
             last_implicit_grab_serial: u32 = 0,
             last_user_action_serial: u32 = 0,
         };
         const PointerSlot = struct {
-            header: Header = .{},
+            header: slot_pool.Header = .{},
+            resource: objects.Handle = .{ .id = 0, .generation = 0 },
             seat_index: u32 = none,
             seat_generation: u32 = 0,
             client: ClientId = undefined,
@@ -147,7 +144,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             enter_serial: u32 = 0,
         };
         const KeyboardSlot = struct {
-            header: Header = .{},
+            header: slot_pool.Header = .{},
+            resource: objects.Handle = .{ .id = 0, .generation = 0 },
             seat_index: u32 = none,
             seat_generation: u32 = 0,
             client: ClientId = undefined,
@@ -210,18 +208,15 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         repeat_delay: i32,
         next_serial: u32,
         next_sequence: u64 = 1,
-        seats: []SeatSlot,
-        pointers: []PointerSlot,
-        keyboards: []KeyboardSlot,
+        seats: slot_pool.Pool(SeatSlot),
+        pointers: slot_pool.Pool(PointerSlot),
+        keyboards: slot_pool.Pool(KeyboardSlot),
         devices: []DeviceSlot,
         outbound: []OutboundSlot,
         outbound_len: usize = 0,
         events: []Event,
         event_head: usize = 0,
         event_len: usize = 0,
-        seat_free: u32,
-        pointer_free: u32,
-        keyboard_free: u32,
         pointer_devices: usize = 0,
         keyboard_devices: usize = 0,
         pressed_keys: [state_words]u64 = [_]u64{0} ** state_words,
@@ -238,12 +233,12 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         pub fn init(allocator: std.mem.Allocator, core: *CoreSurface, config: Config) !Self {
             try config.validate();
             try Seat.info.validateVersion(config.global_version);
-            const seats = try allocator.alloc(SeatSlot, config.seat_capacity);
-            errdefer allocator.free(seats);
-            const pointers = try allocator.alloc(PointerSlot, config.pointer_capacity);
-            errdefer allocator.free(pointers);
-            const keyboards = try allocator.alloc(KeyboardSlot, config.keyboard_capacity);
-            errdefer allocator.free(keyboards);
+            var seats = try slot_pool.Pool(SeatSlot).init(allocator, config.seat_capacity);
+            errdefer seats.deinit();
+            var pointers = try slot_pool.Pool(PointerSlot).init(allocator, config.pointer_capacity);
+            errdefer pointers.deinit();
+            var keyboards = try slot_pool.Pool(KeyboardSlot).init(allocator, config.keyboard_capacity);
+            errdefer keyboards.deinit();
             const devices = try allocator.alloc(DeviceSlot, config.device_capacity);
             errdefer allocator.free(devices);
             const outbound = try allocator.alloc(OutboundSlot, config.outbound_capacity);
@@ -255,9 +250,6 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             errdefer allocator.free(name);
             const keymap = try createKeymap(config.keymap);
             errdefer _ = linux.close(keymap.fd);
-            initHeaders(SeatSlot, seats);
-            initHeaders(PointerSlot, pointers);
-            initHeaders(KeyboardSlot, keyboards);
             @memset(devices, .{});
             @memset(outbound, .{});
             return .{
@@ -276,9 +268,6 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .devices = devices,
                 .outbound = outbound,
                 .events = events,
-                .seat_free = 0,
-                .pointer_free = 0,
-                .keyboard_free = 0,
             };
         }
 
@@ -288,9 +277,9 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             adapter.allocator.free(adapter.events);
             adapter.allocator.free(adapter.outbound);
             adapter.allocator.free(adapter.devices);
-            adapter.allocator.free(adapter.keyboards);
-            adapter.allocator.free(adapter.pointers);
-            adapter.allocator.free(adapter.seats);
+            adapter.keyboards.deinit();
+            adapter.pointers.deinit();
+            adapter.seats.deinit();
             adapter.* = undefined;
         }
 
@@ -310,14 +299,14 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
 
         fn bind(context: ?*anyopaque, binding: wayring.server.Binding) !?*anyopaque {
             const adapter: *Self = @ptrCast(@alignCast(context orelse return error.InvalidContext));
-            const slot = acquire(SeatSlot, adapter.seats, &adapter.seat_free) catch
+            const slot = adapter.seats.acquire() catch
                 return error.OutOfMemory;
-            slot.header.resource = binding.resource;
+            slot.resource = binding.resource;
             slot.peer = binding.peer;
             const id = adapter.seatId(slot);
             const client = clientId(binding.peer);
             adapter.ensureOutbound(2) catch {
-                release(SeatSlot, adapter.seats, &adapter.seat_free, id.index);
+                adapter.seats.release(adapter.seats.entries.items[id.index]);
                 return error.OutOfMemory;
             };
             adapter.enqueue(client, .{ .seat_capabilities = .{
@@ -352,18 +341,18 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             const object = target.object;
             const handle = server_objects.namespace.lookupHandle(message.header.object_id) orelse return null;
             if (object.interface == &Seat.info) {
-                const slot = fromContext(SeatSlot, adapter.seats, object.context) orelse return null;
-                if (!std.meta.eql(slot.header.resource, handle)) return null;
+                const slot = adapter.seats.fromContext(object.context) orelse return null;
+                if (!std.meta.eql(slot.resource, handle)) return null;
                 return try adapter.seatRequest(actor, server_objects, slot, message, fds);
             }
             if (object.interface == &Pointer.info) {
-                const slot = fromContext(PointerSlot, adapter.pointers, object.context) orelse return null;
-                if (!std.meta.eql(slot.header.resource, handle)) return null;
+                const slot = adapter.pointers.fromContext(object.context) orelse return null;
+                if (!std.meta.eql(slot.resource, handle)) return null;
                 return try adapter.pointerRequest(actor, server_objects, slot, message, fds);
             }
             if (object.interface == &Keyboard.info) {
-                const slot = fromContext(KeyboardSlot, adapter.keyboards, object.context) orelse return null;
-                if (!std.meta.eql(slot.header.resource, handle)) return null;
+                const slot = adapter.keyboards.fromContext(object.context) orelse return null;
+                if (!std.meta.eql(slot.resource, handle)) return null;
                 return try adapter.keyboardRequest(actor, server_objects, slot, message, fds);
             }
             return null;
@@ -375,7 +364,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .get_pointer => |payload| {
                     if (adapter.pointer_devices == 0)
                         return try adapter.protocolError(actor, decoded.handle.id, Seat.@"error".missing_capability.value, "pointer capability unavailable");
-                    const slot = acquire(PointerSlot, adapter.pointers, &adapter.pointer_free) catch
+                    const slot = adapter.pointers.acquire() catch
                         return try adapter.noMemory(actor);
                     slot.seat_index = adapter.seatIndex(seat);
                     slot.seat_generation = seat.header.generation;
@@ -383,14 +372,14 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     const focused = adapter.pointer_delivery != null and
                         sameClient(clientId(seat.peer), adapter.pointer_delivery.?.client);
                     if (focused) adapter.ensureOutbound(1) catch {
-                        release(PointerSlot, adapter.pointers, &adapter.pointer_free, adapter.pointerIndex(slot));
+                        adapter.pointers.release(slot);
                         return try adapter.noMemory(actor);
                     };
                     const admitted = Seat.admit_get_pointer(server_objects, decoded.handle, payload, .{ .id = slot }) catch |err| {
-                        release(PointerSlot, adapter.pointers, &adapter.pointer_free, adapter.pointerIndex(slot));
+                        adapter.pointers.release(slot);
                         return try adapter.failure(actor, decoded.handle.id, err);
                     };
-                    slot.header.resource = admitted.id;
+                    slot.resource = admitted.id;
                     if (adapter.pointer_delivery) |focus| if (focused) {
                         const serial = adapter.issueSerial();
                         try adapter.enqueue(clientId(seat.peer), .{ .pointer_enter = .{
@@ -406,21 +395,21 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .get_keyboard => |payload| {
                     if (adapter.keyboard_devices == 0)
                         return try adapter.protocolError(actor, decoded.handle.id, Seat.@"error".missing_capability.value, "keyboard capability unavailable");
-                    const slot = acquire(KeyboardSlot, adapter.keyboards, &adapter.keyboard_free) catch
+                    const slot = adapter.keyboards.acquire() catch
                         return try adapter.noMemory(actor);
                     slot.seat_index = adapter.seatIndex(seat);
                     slot.seat_generation = seat.header.generation;
                     slot.client = clientId(seat.peer);
                     const extra: usize = if (adapter.keyboard_focus != null) 4 else 2;
                     adapter.ensureOutbound(extra) catch {
-                        release(KeyboardSlot, adapter.keyboards, &adapter.keyboard_free, adapter.keyboardIndex(slot));
+                        adapter.keyboards.release(slot);
                         return try adapter.noMemory(actor);
                     };
                     const admitted = Seat.admit_get_keyboard(server_objects, decoded.handle, payload, .{ .id = slot }) catch |err| {
-                        release(KeyboardSlot, adapter.keyboards, &adapter.keyboard_free, adapter.keyboardIndex(slot));
+                        adapter.keyboards.release(slot);
                         return try adapter.failure(actor, decoded.handle.id, err);
                     };
-                    slot.header.resource = admitted.id;
+                    slot.resource = admitted.id;
                     const client = clientId(seat.peer);
                     adapter.enqueue(client, .{ .keyboard_keymap = adapter.keyboardId(slot) }) catch unreachable;
                     adapter.enqueue(client, .{ .keyboard_repeat = adapter.keyboardId(slot) }) catch unreachable;
@@ -484,23 +473,23 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
 
         pub fn resourceRemoved(adapter: *Self, handle: objects.Handle, object: objects.Object) bool {
             if (object.interface == &Seat.info) {
-                const slot = fromContext(SeatSlot, adapter.seats, object.context) orelse return false;
-                if (!std.meta.eql(slot.header.resource, handle)) return false;
+                const slot = adapter.seats.fromContext(object.context) orelse return false;
+                if (!std.meta.eql(slot.resource, handle)) return false;
                 adapter.releaseSeat(adapter.seatIndex(slot));
                 return true;
             }
             if (object.interface == &Pointer.info) {
-                const slot = fromContext(PointerSlot, adapter.pointers, object.context) orelse return false;
-                if (!std.meta.eql(slot.header.resource, handle)) return false;
+                const slot = adapter.pointers.fromContext(object.context) orelse return false;
+                if (!std.meta.eql(slot.resource, handle)) return false;
                 adapter.dropOutboundResource(.pointer, adapter.pointerIndex(slot), slot.header.generation);
-                release(PointerSlot, adapter.pointers, &adapter.pointer_free, adapter.pointerIndex(slot));
+                adapter.pointers.release(slot);
                 return true;
             }
             if (object.interface == &Keyboard.info) {
-                const slot = fromContext(KeyboardSlot, adapter.keyboards, object.context) orelse return false;
-                if (!std.meta.eql(slot.header.resource, handle)) return false;
+                const slot = adapter.keyboards.fromContext(object.context) orelse return false;
+                if (!std.meta.eql(slot.resource, handle)) return false;
                 adapter.dropOutboundResource(.keyboard, adapter.keyboardIndex(slot), slot.header.generation);
-                release(KeyboardSlot, adapter.keyboards, &adapter.keyboard_free, adapter.keyboardIndex(slot));
+                adapter.keyboards.release(slot);
                 return true;
             }
             if (std.mem.eql(u8, object.interface.name, "wl_surface")) {
@@ -549,9 +538,9 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             const object = server_objects.namespace.resolve(handle) orelse
                 return error.StalePointer;
             if (object.interface != &Pointer.info) return error.StalePointer;
-            const slot = fromContext(PointerSlot, adapter.pointers, object.context) orelse
+            const slot = adapter.pointers.fromContext(object.context) orelse
                 return error.StalePointer;
-            if (!std.meta.eql(slot.header.resource, handle)) return error.StalePointer;
+            if (!std.meta.eql(slot.resource, handle)) return error.StalePointer;
             return adapter.pointerId(slot);
         }
 
@@ -675,7 +664,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         pub fn setKeymapOwned(adapter: *Self, fd: linux.fd_t, size: u32) !void {
             if (size == 0) return error.InvalidKeymap;
             var count: usize = 0;
-            for (adapter.keyboards, 0..) |slot, index| {
+            for (adapter.keyboards.entries.items, 0..) |slot, index| {
                 if (!slot.header.active) continue;
                 const id: Id = .{ .index = @intCast(index), .generation = slot.header.generation };
                 var has_keymap = false;
@@ -689,7 +678,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     @as(usize, @intFromBool(!has_repeat));
             }
             try adapter.ensureOutbound(count);
-            for (adapter.keyboards, 0..) |slot, index| if (slot.header.active) {
+            for (adapter.keyboards.entries.items, 0..) |slot, index| if (slot.header.active) {
                 const id: Id = .{ .index = @intCast(index), .generation = slot.header.generation };
                 var has_keymap = false;
                 var has_repeat = false;
@@ -867,8 +856,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             const handle = server_objects.namespace.lookupHandle(seat_object) orelse return false;
             const object = server_objects.namespace.resolve(handle) orelse return false;
             if (object.interface != &Seat.info) return false;
-            const seat = fromContext(SeatSlot, adapter.seats, object.context) orelse return false;
-            return std.meta.eql(seat.header.resource, handle) and
+            const seat = adapter.seats.fromContext(object.context) orelse return false;
+            return std.meta.eql(seat.resource, handle) and
                 std.meta.eql(seat.peer, peer) and
                 seat.last_implicit_grab_serial == serial;
         }
@@ -892,7 +881,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             try adapter.ensureOutbound(count);
             if (old) |value| {
                 const serial = adapter.issueSerial();
-                for (adapter.keyboards, 0..) |slot, index| if (adapter.keyboardBelongs(&slot, value.client))
+                for (adapter.keyboards.entries.items, 0..) |slot, index| if (adapter.keyboardBelongs(slot, value.client))
                     adapter.enqueue(value.client, .{ .keyboard_leave = .{
                         .keyboard = .{ .index = @intCast(index), .generation = slot.header.generation },
                         .serial = serial,
@@ -902,14 +891,14 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             adapter.keyboard_focus = target;
             if (target) |value| {
                 const serial = adapter.issueSerial();
-                for (adapter.keyboards, 0..) |slot, index| if (adapter.keyboardBelongs(&slot, value.client))
+                for (adapter.keyboards.entries.items, 0..) |slot, index| if (adapter.keyboardBelongs(slot, value.client))
                     adapter.enqueue(value.client, .{ .keyboard_enter = .{
                         .keyboard = .{ .index = @intCast(index), .generation = slot.header.generation },
                         .serial = serial,
                         .target = value,
                         .pressed_keys = adapter.pressed_keys,
                     } }) catch unreachable;
-                for (adapter.keyboards, 0..) |slot, index| if (adapter.keyboardBelongs(&slot, value.client))
+                for (adapter.keyboards.entries.items, 0..) |slot, index| if (adapter.keyboardBelongs(slot, value.client))
                     adapter.enqueue(value.client, .{ .keyboard_modifiers = .{
                         .keyboard = .{ .index = @intCast(index), .generation = slot.header.generation },
                         .serial = serial,
@@ -929,7 +918,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             adapter.modifiers = state;
             if (target) |value| {
                 const serial = adapter.issueSerial();
-                for (adapter.keyboards, 0..) |keyboard, index| if (adapter.keyboardBelongs(&keyboard, value.client))
+                for (adapter.keyboards.entries.items, 0..) |keyboard, index| if (adapter.keyboardBelongs(keyboard, value.client))
                     adapter.enqueue(value.client, .{ .keyboard_modifiers = .{
                         .keyboard = .{ .index = @intCast(index), .generation = keyboard.header.generation },
                         .serial = serial,
@@ -1008,7 +997,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 adapter.pointer_point.x +|= fixedFromDelta(value.dx);
                 adapter.pointer_point.y +|= fixedFromDelta(value.dy);
             }
-            for (adapter.pointers, 0..) |slot, index| if (adapter.pointerBelongs(&slot, target.client)) {
+            for (adapter.pointers.entries.items, 0..) |slot, index| if (adapter.pointerBelongs(slot, target.client)) {
                 const id: Id = .{ .index = @intCast(index), .generation = slot.header.generation };
                 adapter.enqueue(target.client, .{ .pointer_motion = .{
                     .pointer = id,
@@ -1044,7 +1033,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             }
             for (0..code_count) |code| if (bitSet(&adapter.pressed_buttons, @intCast(code))) {
                 const serial = adapter.issueSerial();
-                for (adapter.pointers, 0..) |slot, index| if (adapter.pointerBelongs(&slot, target.client)) {
+                for (adapter.pointers.entries.items, 0..) |slot, index| if (adapter.pointerBelongs(slot, target.client)) {
                     const id: Id = .{ .index = @intCast(index), .generation = slot.header.generation };
                     adapter.enqueue(target.client, .{ .pointer_button = .{
                         .pointer = id,
@@ -1116,18 +1105,18 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             switch (value) {
                 .seat_capabilities => |v| {
                     const slot = adapter.resolveSeat(v.seat.index, v.seat.generation) catch return true;
-                    try Seat.encodeEvent(queue, slot.header.resource.id, .{ .capabilities = .{
+                    try Seat.encodeEvent(queue, slot.resource.id, .{ .capabilities = .{
                         .capabilities = Seat.capability.fromInt(v.value),
                     } });
                 },
                 .seat_name => |id| {
                     const slot = adapter.resolveSeat(id.index, id.generation) catch return true;
-                    try Seat.encodeEvent(queue, slot.header.resource.id, .{ .name = .{ .name = adapter.name } });
+                    try Seat.encodeEvent(queue, slot.resource.id, .{ .name = .{ .name = adapter.name } });
                 },
                 .pointer_enter => |v| {
                     const slot = adapter.resolvePointer(v.pointer) catch return true;
                     const surface = adapter.surfaceObject(server_objects, v.target) catch return true;
-                    try Pointer.encodeEvent(queue, slot.header.resource.id, .{ .enter = .{
+                    try Pointer.encodeEvent(queue, slot.resource.id, .{ .enter = .{
                         .serial = v.serial,
                         .surface = surface.id,
                         .surface_x = v.point.x,
@@ -1137,7 +1126,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .pointer_leave => |v| {
                     const slot = adapter.resolvePointer(v.pointer) catch return true;
                     const surface = adapter.surfaceObject(server_objects, v.target) catch return true;
-                    try Pointer.encodeEvent(queue, slot.header.resource.id, .{ .leave = .{
+                    try Pointer.encodeEvent(queue, slot.resource.id, .{ .leave = .{
                         .serial = v.serial,
                         .surface = surface.id,
                     } });
@@ -1145,7 +1134,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .pointer_motion => |v| {
                     const slot = adapter.resolvePointer(v.pointer) catch return true;
                     _ = adapter.surfaceObject(server_objects, v.target) catch return true;
-                    try Pointer.encodeEvent(queue, slot.header.resource.id, .{ .motion = .{
+                    try Pointer.encodeEvent(queue, slot.resource.id, .{ .motion = .{
                         .time = v.time,
                         .surface_x = v.point.x,
                         .surface_y = v.point.y,
@@ -1154,7 +1143,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .pointer_button => |v| {
                     const slot = adapter.resolvePointer(v.pointer) catch return true;
                     if (v.target) |target| _ = adapter.surfaceObject(server_objects, target) catch return true;
-                    try Pointer.encodeEvent(queue, slot.header.resource.id, .{ .button = .{
+                    try Pointer.encodeEvent(queue, slot.resource.id, .{ .button = .{
                         .serial = v.serial,
                         .time = v.time,
                         .button = v.button,
@@ -1164,8 +1153,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .pointer_axis_source => |v| {
                     const slot = adapter.resolvePointer(v.pointer) catch return true;
                     _ = adapter.surfaceObject(server_objects, v.target) catch return true;
-                    const object = server_objects.namespace.resolve(slot.header.resource) orelse return true;
-                    if (object.version >= 5) try Pointer.encodeEvent(queue, slot.header.resource.id, .{
+                    const object = server_objects.namespace.resolve(slot.resource) orelse return true;
+                    if (object.version >= 5) try Pointer.encodeEvent(queue, slot.resource.id, .{
                         .axis_source = .{ .axis_source = switch (v.source) {
                             .wheel => Pointer.axis_source.wheel,
                             .finger => Pointer.axis_source.finger,
@@ -1176,7 +1165,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .pointer_axis => |v| {
                     const slot = adapter.resolvePointer(v.pointer) catch return true;
                     _ = adapter.surfaceObject(server_objects, v.target) catch return true;
-                    try Pointer.encodeEvent(queue, slot.header.resource.id, .{ .axis = .{
+                    try Pointer.encodeEvent(queue, slot.resource.id, .{ .axis = .{
                         .time = v.time,
                         .axis = protocolAxis(v.axis, Pointer),
                         .value = v.value,
@@ -1185,23 +1174,23 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .pointer_axis_stop => |v| {
                     const slot = adapter.resolvePointer(v.pointer) catch return true;
                     _ = adapter.surfaceObject(server_objects, v.target) catch return true;
-                    const object = server_objects.namespace.resolve(slot.header.resource) orelse return true;
-                    if (object.version >= 5) try Pointer.encodeEvent(queue, slot.header.resource.id, .{
+                    const object = server_objects.namespace.resolve(slot.resource) orelse return true;
+                    if (object.version >= 5) try Pointer.encodeEvent(queue, slot.resource.id, .{
                         .axis_stop = .{ .time = v.time, .axis = protocolAxis(v.axis, Pointer) },
                     });
                 },
                 .pointer_axis_value120 => |v| {
                     const slot = adapter.resolvePointer(v.pointer) catch return true;
                     _ = adapter.surfaceObject(server_objects, v.target) catch return true;
-                    const object = server_objects.namespace.resolve(slot.header.resource) orelse return true;
+                    const object = server_objects.namespace.resolve(slot.resource) orelse return true;
                     if (object.version >= 8) {
-                        try Pointer.encodeEvent(queue, slot.header.resource.id, .{ .axis_value120 = .{
+                        try Pointer.encodeEvent(queue, slot.resource.id, .{ .axis_value120 = .{
                             .axis = protocolAxis(v.axis, Pointer),
                             .value120 = v.value120,
                         } });
                     } else if (object.version >= 5) {
                         const discrete = @divTrunc(v.value120, 120);
-                        if (discrete != 0) try Pointer.encodeEvent(queue, slot.header.resource.id, .{
+                        if (discrete != 0) try Pointer.encodeEvent(queue, slot.resource.id, .{
                             .axis_discrete = .{
                                 .axis = protocolAxis(v.axis, Pointer),
                                 .discrete = discrete,
@@ -1212,9 +1201,9 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .pointer_frame => |v| {
                     const slot = adapter.resolvePointer(v.pointer) catch return true;
                     if (v.target) |target| _ = adapter.surfaceObject(server_objects, target) catch return true;
-                    const object = server_objects.namespace.resolve(slot.header.resource) orelse return true;
+                    const object = server_objects.namespace.resolve(slot.resource) orelse return true;
                     if (object.version >= 5)
-                        try Pointer.encodeEvent(queue, slot.header.resource.id, .{ .frame = .{} });
+                        try Pointer.encodeEvent(queue, slot.resource.id, .{ .frame = .{} });
                 },
                 .keyboard_keymap => |id| {
                     const slot = adapter.resolveKeyboard(id) catch return true;
@@ -1225,7 +1214,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     defer if (owned) {
                         _ = linux.close(fd);
                     };
-                    try Keyboard.encodeEvent(queue, slot.header.resource.id, .{ .keymap = .{
+                    try Keyboard.encodeEvent(queue, slot.resource.id, .{ .keymap = .{
                         .format = Keyboard.keymap_format.xkb_v1,
                         .fd = fd,
                         .size = adapter.keymap_size,
@@ -1234,8 +1223,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 },
                 .keyboard_repeat => |id| {
                     const slot = adapter.resolveKeyboard(id) catch return true;
-                    const object = server_objects.namespace.resolve(slot.header.resource) orelse return true;
-                    if (object.version >= 4) try Keyboard.encodeEvent(queue, slot.header.resource.id, .{
+                    const object = server_objects.namespace.resolve(slot.resource) orelse return true;
+                    if (object.version >= 4) try Keyboard.encodeEvent(queue, slot.resource.id, .{
                         .repeat_info = .{ .rate = adapter.repeat_rate, .delay = adapter.repeat_delay },
                     });
                 },
@@ -1244,7 +1233,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     const surface = adapter.surfaceObject(server_objects, v.target) catch return true;
                     var keys: [code_count * 4]u8 = undefined;
                     const bytes = encodePressedKeys(&v.pressed_keys, &keys);
-                    try Keyboard.encodeEvent(queue, slot.header.resource.id, .{ .enter = .{
+                    try Keyboard.encodeEvent(queue, slot.resource.id, .{ .enter = .{
                         .serial = v.serial,
                         .surface = surface.id,
                         .keys = bytes,
@@ -1253,7 +1242,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .keyboard_leave => |v| {
                     const slot = adapter.resolveKeyboard(v.keyboard) catch return true;
                     const surface = adapter.surfaceObject(server_objects, v.target) catch return true;
-                    try Keyboard.encodeEvent(queue, slot.header.resource.id, .{ .leave = .{
+                    try Keyboard.encodeEvent(queue, slot.resource.id, .{ .leave = .{
                         .serial = v.serial,
                         .surface = surface.id,
                     } });
@@ -1261,7 +1250,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .keyboard_key => |v| {
                     const slot = adapter.resolveKeyboard(v.keyboard) catch return true;
                     _ = adapter.surfaceObject(server_objects, v.target) catch return true;
-                    try Keyboard.encodeEvent(queue, slot.header.resource.id, .{ .key = .{
+                    try Keyboard.encodeEvent(queue, slot.resource.id, .{ .key = .{
                         .serial = v.serial,
                         .time = v.time,
                         .key = v.key,
@@ -1271,7 +1260,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .keyboard_modifiers => |v| {
                     const slot = adapter.resolveKeyboard(v.keyboard) catch return true;
                     _ = adapter.surfaceObject(server_objects, v.target) catch return true;
-                    try Keyboard.encodeEvent(queue, slot.header.resource.id, .{ .modifiers = .{
+                    try Keyboard.encodeEvent(queue, slot.resource.id, .{ .modifiers = .{
                         .serial = v.serial,
                         .mods_depressed = v.state.depressed,
                         .mods_latched = v.state.latched,
@@ -1346,7 +1335,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     !bitSet(&keys_after, @intCast(code)))
                 {
                     const serial = adapter.issueSerial();
-                    for (adapter.keyboards, 0..) |keyboard, index| if (adapter.keyboardBelongs(&keyboard, target.client))
+                    for (adapter.keyboards.entries.items, 0..) |keyboard, index| if (adapter.keyboardBelongs(keyboard, target.client))
                         adapter.enqueue(target.client, .{ .keyboard_key = .{
                             .keyboard = .{ .index = @intCast(index), .generation = keyboard.header.generation },
                             .serial = serial,
@@ -1358,7 +1347,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 };
                 if (modifiers_changed) {
                     const serial = adapter.issueSerial();
-                    for (adapter.keyboards, 0..) |keyboard, index| if (adapter.keyboardBelongs(&keyboard, target.client))
+                    for (adapter.keyboards.entries.items, 0..) |keyboard, index| if (adapter.keyboardBelongs(keyboard, target.client))
                         adapter.enqueue(target.client, .{ .keyboard_modifiers = .{
                             .keyboard = .{ .index = @intCast(index), .generation = keyboard.header.generation },
                             .serial = serial,
@@ -1394,7 +1383,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             const serial = adapter.issueSerial();
             if (value.pressed and adapter.pointer_grab == .idle)
                 adapter.pointer_grab = .{ .active = delivery };
-            for (adapter.pointers, 0..) |slot, index| if (adapter.pointerBelongs(&slot, delivery.client)) {
+            for (adapter.pointers.entries.items, 0..) |slot, index| if (adapter.pointerBelongs(slot, delivery.client)) {
                 const id: Id = .{ .index = @intCast(index), .generation = slot.header.generation };
                 adapter.enqueue(delivery.client, .{ .pointer_button = .{
                     .pointer = id,
@@ -1433,7 +1422,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             const command_count = axis_commands + 2;
             const resource_count = adapter.pointerResourceCount(target.client);
             try adapter.ensureOutbound(command_count * resource_count);
-            for (adapter.pointers, 0..) |slot, index| if (adapter.pointerBelongs(&slot, target.client)) {
+            for (adapter.pointers.entries.items, 0..) |slot, index| if (adapter.pointerBelongs(slot, target.client)) {
                 const pointer: Id = .{ .index = @intCast(index), .generation = slot.header.generation };
                 adapter.enqueue(target.client, .{ .pointer_axis_source = .{
                     .pointer = pointer,
@@ -1528,7 +1517,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             if (target == null) return null;
             const delivery = target.?;
             const serial = adapter.issueSerial();
-            for (adapter.keyboards, 0..) |slot, index| if (adapter.keyboardBelongs(&slot, delivery.client))
+            for (adapter.keyboards.entries.items, 0..) |slot, index| if (adapter.keyboardBelongs(slot, delivery.client))
                 adapter.enqueue(delivery.client, .{ .keyboard_key = .{
                     .keyboard = .{ .index = @intCast(index), .generation = slot.header.generation },
                     .serial = serial,
@@ -1540,7 +1529,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             if (value.pressed) adapter.setUserActionSerial(delivery.client, serial);
             if (modifiers_changed) {
                 const modifier_serial = adapter.issueSerial();
-                for (adapter.keyboards, 0..) |slot, index| if (adapter.keyboardBelongs(&slot, delivery.client))
+                for (adapter.keyboards.entries.items, 0..) |slot, index| if (adapter.keyboardBelongs(slot, delivery.client))
                     adapter.enqueue(delivery.client, .{ .keyboard_modifiers = .{
                         .keyboard = .{ .index = @intCast(index), .generation = slot.header.generation },
                         .serial = modifier_serial,
@@ -1576,7 +1565,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             try adapter.ensureOutbound(count);
             if (old) |value| {
                 const serial = adapter.issueSerial();
-                for (adapter.pointers, 0..) |slot, index| if (adapter.pointerBelongs(&slot, value.client))
+                for (adapter.pointers.entries.items, 0..) |slot, index| if (adapter.pointerBelongs(slot, value.client))
                     adapter.enqueue(value.client, .{ .pointer_leave = .{
                         .pointer = .{ .index = @intCast(index), .generation = slot.header.generation },
                         .serial = serial,
@@ -1587,7 +1576,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             adapter.pointer_delivery = target;
             if (target) |value| {
                 const serial = adapter.issueSerial();
-                for (adapter.pointers, 0..) |slot, index| if (adapter.pointerBelongs(&slot, value.client))
+                for (adapter.pointers.entries.items, 0..) |slot, index| if (adapter.pointerBelongs(slot, value.client))
                     adapter.enqueue(value.client, .{ .pointer_enter = .{
                         .pointer = .{ .index = @intCast(index), .generation = slot.header.generation },
                         .serial = serial,
@@ -1627,7 +1616,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         fn capabilityPublicationCount(adapter: *const Self, old: u32, current: u32) usize {
             if (old == current) return 0;
             var count: usize = 0;
-            for (adapter.seats) |seat| if (seat.header.active) {
+            for (adapter.seats.entries.items) |seat| if (seat.header.active) {
                 count += 1;
             };
             return count;
@@ -1635,7 +1624,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
 
         fn enqueueCapabilities(adapter: *Self, old: u32, current: u32) !void {
             if (old == current) return;
-            for (adapter.seats, 0..) |seat, index| if (seat.header.active)
+            for (adapter.seats.entries.items, 0..) |seat, index| if (seat.header.active)
                 adapter.enqueue(clientId(seat.peer), .{ .seat_capabilities = .{
                     .seat = .{ .index = @intCast(index), .generation = seat.header.generation },
                     .value = current,
@@ -1721,7 +1710,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 adapter.next_serial +%= 1;
                 if (adapter.next_serial == 0) adapter.next_serial = 1;
                 var used = false;
-                for (adapter.pointers) |pointer| if (pointer.header.active and
+                for (adapter.pointers.entries.items) |pointer| if (pointer.header.active and
                     (pointer.last_serial == serial or pointer.enter_serial == serial))
                 {
                     used = true;
@@ -1732,24 +1721,24 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         }
 
         fn setLastPointerSerial(adapter: *Self, client: ClientId, serial: u32) void {
-            for (adapter.pointers) |*pointer| {
+            for (adapter.pointers.entries.items) |pointer| {
                 if (pointer.header.active and sameClient(pointer.client, client))
                     pointer.last_serial = serial;
             }
         }
 
         fn setPointerEnterSerial(adapter: *Self, client: ClientId, serial: u32) void {
-            for (adapter.pointers) |*pointer| {
+            for (adapter.pointers.entries.items) |pointer| {
                 if (pointer.header.active and sameClient(pointer.client, client))
                     pointer.enter_serial = serial;
             }
         }
 
         fn setImplicitGrabSerial(adapter: *Self, client: ClientId, serial: u32) void {
-            for (adapter.pointers) |pointer| {
+            for (adapter.pointers.entries.items) |pointer| {
                 if (!pointer.header.active or !sameClient(pointer.client, client)) continue;
-                if (pointer.seat_index >= adapter.seats.len) continue;
-                const seat = &adapter.seats[pointer.seat_index];
+                if (pointer.seat_index >= adapter.seats.entries.items.len) continue;
+                const seat = adapter.seats.entries.items[pointer.seat_index];
                 if (seat.header.active and seat.header.generation == pointer.seat_generation) {
                     seat.last_implicit_grab_serial = serial;
                     seat.last_user_action_serial = serial;
@@ -1758,7 +1747,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         }
 
         fn setUserActionSerial(adapter: *Self, client: ClientId, serial: u32) void {
-            for (adapter.seats) |*seat| {
+            for (adapter.seats.entries.items) |seat| {
                 if (seat.header.active and sameClient(clientId(seat.peer), client))
                     seat.last_user_action_serial = serial;
             }
@@ -1773,8 +1762,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             const handle = server_objects.namespace.lookupHandle(seat_object) orelse return null;
             const object = server_objects.namespace.resolve(handle) orelse return null;
             if (object.interface != &Seat.info) return null;
-            const seat = fromContext(SeatSlot, adapter.seats, object.context) orelse return null;
-            if (!std.meta.eql(seat.header.resource, handle) or !std.meta.eql(seat.peer, peer)) return null;
+            const seat = adapter.seats.fromContext(object.context) orelse return null;
+            if (!std.meta.eql(seat.resource, handle) or !std.meta.eql(seat.peer, peer)) return null;
             return seat;
         }
 
@@ -1803,18 +1792,18 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         }
 
         fn clientPresent(adapter: *Self, server_objects: anytype, client: ClientId) bool {
-            for (adapter.seats) |*seat| if (seat.header.active and sameClient(clientId(seat.peer), client)) {
-                const object = server_objects.namespace.resolve(seat.header.resource) orelse continue;
+            for (adapter.seats.entries.items) |seat| if (seat.header.active and sameClient(clientId(seat.peer), client)) {
+                const object = server_objects.namespace.resolve(seat.resource) orelse continue;
                 if (object.interface == &Seat.info and object.context == @as(?*anyopaque, @ptrCast(seat)))
                     return true;
             };
-            for (adapter.pointers) |*pointer| if (pointer.header.active and sameClient(pointer.client, client)) {
-                const object = server_objects.namespace.resolve(pointer.header.resource) orelse continue;
+            for (adapter.pointers.entries.items) |pointer| if (pointer.header.active and sameClient(pointer.client, client)) {
+                const object = server_objects.namespace.resolve(pointer.resource) orelse continue;
                 if (object.interface == &Pointer.info and object.context == @as(?*anyopaque, @ptrCast(pointer)))
                     return true;
             };
-            for (adapter.keyboards) |*keyboard| if (keyboard.header.active and sameClient(keyboard.client, client)) {
-                const object = server_objects.namespace.resolve(keyboard.header.resource) orelse continue;
+            for (adapter.keyboards.entries.items) |keyboard| if (keyboard.header.active and sameClient(keyboard.client, client)) {
+                const object = server_objects.namespace.resolve(keyboard.resource) orelse continue;
                 if (object.interface == &Keyboard.info and object.context == @as(?*anyopaque, @ptrCast(keyboard)))
                     return true;
             };
@@ -1850,7 +1839,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             const value: ?ClientId = client;
             if (value == null) return 0;
             var count: usize = 0;
-            for (adapter.pointers) |slot| if (adapter.pointerBelongs(&slot, value.?)) {
+            for (adapter.pointers.entries.items) |slot| if (adapter.pointerBelongs(slot, value.?)) {
                 count += 1;
             };
             return count;
@@ -1859,7 +1848,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         fn keyboardResourceCount(adapter: *const Self, target: ?FocusTarget) usize {
             if (target == null) return 0;
             var count: usize = 0;
-            for (adapter.keyboards) |slot| if (adapter.keyboardBelongs(&slot, target.?.client)) {
+            for (adapter.keyboards.entries.items) |slot| if (adapter.keyboardBelongs(slot, target.?.client)) {
                 count += 1;
             };
             return count;
@@ -1885,26 +1874,26 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             return null;
         }
         fn resolveSeat(adapter: *const Self, index: u32, generation: u32) !*SeatSlot {
-            if (index >= adapter.seats.len) return error.StaleSeat;
-            const slot = &adapter.seats[index];
+            if (index >= adapter.seats.entries.items.len) return error.StaleSeat;
+            const slot = adapter.seats.entries.items[index];
             if (!slot.header.active or slot.header.generation != generation) return error.StaleSeat;
             return slot;
         }
         fn resolvePointer(adapter: *Self, id: Id) !*PointerSlot {
-            if (id.index >= adapter.pointers.len) return error.StalePointer;
-            const slot = &adapter.pointers[id.index];
+            if (id.index >= adapter.pointers.entries.items.len) return error.StalePointer;
+            const slot = adapter.pointers.entries.items[id.index];
             if (!slot.header.active or slot.header.generation != id.generation) return error.StalePointer;
             return slot;
         }
         fn resolveKeyboard(adapter: *Self, id: Id) !*KeyboardSlot {
-            if (id.index >= adapter.keyboards.len) return error.StaleKeyboard;
-            const slot = &adapter.keyboards[id.index];
+            if (id.index >= adapter.keyboards.entries.items.len) return error.StaleKeyboard;
+            const slot = adapter.keyboards.entries.items[id.index];
             if (!slot.header.active or slot.header.generation != id.generation) return error.StaleKeyboard;
             return slot;
         }
 
         fn releaseSeat(adapter: *Self, index: u32) void {
-            const generation = adapter.seats[index].header.generation;
+            const generation = adapter.seats.entries.items[index].header.generation;
             for (adapter.outbound) |*slot| if (slot.active) switch (slot.value) {
                 .seat_capabilities => |value| {
                     if (value.seat.index == index and value.seat.generation == generation) {
@@ -1920,7 +1909,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 },
                 else => {},
             };
-            release(SeatSlot, adapter.seats, &adapter.seat_free, index);
+            adapter.seats.release(adapter.seats.entries.items[index]);
         }
 
         const ResourceKind = enum { pointer, keyboard };
@@ -1975,14 +1964,14 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         fn keyboardId(adapter: *Self, slot: *KeyboardSlot) Id {
             return .{ .index = adapter.keyboardIndex(slot), .generation = slot.header.generation };
         }
-        fn seatIndex(adapter: *Self, slot: *SeatSlot) u32 {
-            return @intCast((@intFromPtr(slot) - @intFromPtr(adapter.seats.ptr)) / @sizeOf(SeatSlot));
+        fn seatIndex(_: *Self, slot: *SeatSlot) u32 {
+            return slot.header.index;
         }
-        fn pointerIndex(adapter: *Self, slot: *PointerSlot) u32 {
-            return @intCast((@intFromPtr(slot) - @intFromPtr(adapter.pointers.ptr)) / @sizeOf(PointerSlot));
+        fn pointerIndex(_: *Self, slot: *PointerSlot) u32 {
+            return slot.header.index;
         }
-        fn keyboardIndex(adapter: *Self, slot: *KeyboardSlot) u32 {
-            return @intCast((@intFromPtr(slot) - @intFromPtr(adapter.keyboards.ptr)) / @sizeOf(KeyboardSlot));
+        fn keyboardIndex(_: *Self, slot: *KeyboardSlot) u32 {
+            return slot.header.index;
         }
 
         fn noMemory(adapter: *Self, actor: *wayring.connection.Actor) !wayring.dispatch.Control {
@@ -1999,43 +1988,6 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             return adapter.protocolError(actor, id, 0, @errorName(cause));
         }
     };
-}
-
-fn initHeaders(comptime T: type, slots: []T) void {
-    for (slots, 0..) |*slot, index| slot.* = .{ .header = .{
-        .next_free = if (index + 1 < slots.len) @intCast(index + 1) else none,
-    } };
-}
-
-fn acquire(comptime T: type, slots: []T, free: *u32) !*T {
-    if (free.* == none) return error.Exhausted;
-    const index = free.*;
-    const slot = &slots[index];
-    free.* = slot.header.next_free;
-    const generation = slot.header.generation;
-    slot.* = .{ .header = .{ .active = true, .generation = generation } };
-    return slot;
-}
-
-fn release(comptime T: type, slots: []T, free: *u32, index: u32) void {
-    const slot = &slots[index];
-    if (!slot.header.active) return;
-    slot.header.active = false;
-    if (slot.header.generation != std.math.maxInt(u32)) {
-        slot.header.generation += 1;
-        slot.header.next_free = free.*;
-        free.* = index;
-    } else slot.header.next_free = none;
-}
-
-fn fromContext(comptime T: type, slots: []T, context: ?*anyopaque) ?*T {
-    const pointer = context orelse return null;
-    const address = @intFromPtr(pointer);
-    const start = @intFromPtr(slots.ptr);
-    const end = start + slots.len * @sizeOf(T);
-    if (address < start or address >= end or (address - start) % @sizeOf(T) != 0) return null;
-    const slot: *T = @ptrCast(@alignCast(pointer));
-    return if (slot.header.active) slot else null;
 }
 
 fn clientId(peer: wayring.io_uring.Peer) SeatClientId {
@@ -2173,10 +2125,39 @@ fn clearTestOutbound(adapter: *TestAdapter) void {
 
 fn countTestOutbound(adapter: *const TestAdapter, tag: std.meta.Tag(TestAdapter.Outbound)) usize {
     var count: usize = 0;
-    for (adapter.outbound) |slot| if (slot.active and std.meta.activeTag(slot.value) == tag) {
+    for (adapter.outbound) |*slot| if (slot.active and std.meta.activeTag(slot.value) == tag) {
         count += 1;
     };
     return count;
+}
+
+test "seat: ownership reservations grow without invalidating contexts" {
+    var core: FakeCore = .{};
+    var adapter = try TestAdapter.init(std.testing.allocator, &core, .{
+        .seat_capacity = 1,
+        .pointer_capacity = 1,
+        .keyboard_capacity = 1,
+        .device_capacity = 1,
+        .outbound_capacity = 1,
+        .event_capacity = 1,
+        .keymap = default_keymap,
+    });
+    defer adapter.deinit();
+
+    const seat = try adapter.seats.acquire();
+    const seat_context: *anyopaque = seat;
+    _ = try adapter.seats.acquire();
+    try std.testing.expect(adapter.seats.fromContext(seat_context) == seat);
+
+    const pointer = try adapter.pointers.acquire();
+    const pointer_context: *anyopaque = pointer;
+    _ = try adapter.pointers.acquire();
+    try std.testing.expect(adapter.pointers.fromContext(pointer_context) == pointer);
+
+    const keyboard = try adapter.keyboards.acquire();
+    const keyboard_context: *anyopaque = keyboard;
+    _ = try adapter.keyboards.acquire();
+    try std.testing.expect(adapter.keyboards.fromContext(keyboard_context) == keyboard);
 }
 
 test "seat: capabilities aggregate exact physical generations" {
@@ -2212,9 +2193,9 @@ test "seat: serial wrap skips zero and live client pointer serials" {
     var core: FakeCore = .{};
     var adapter = try testAdapter(&core);
     defer adapter.deinit();
-    const first = try acquire(TestAdapter.SeatSlot, adapter.seats, &adapter.seat_free);
+    const first = try adapter.seats.acquire();
     first.peer = .{ .slot = 0, .generation = 3 };
-    const pointer = try acquire(TestAdapter.PointerSlot, adapter.pointers, &adapter.pointer_free);
+    const pointer = try adapter.pointers.acquire();
     pointer.client = clientId(first.peer);
     pointer.last_serial = 1;
 
@@ -2235,9 +2216,9 @@ test "seat: relative pointer lookup retains exact resource generation and focus"
     );
     defer server_objects.deinit(std.testing.allocator);
     const peer: wayring.io_uring.Peer = .{ .slot = 1, .generation = 7 };
-    const pointer = try acquire(TestAdapter.PointerSlot, adapter.pointers, &adapter.pointer_free);
+    const pointer = try adapter.pointers.acquire();
     pointer.client = clientId(peer);
-    pointer.header.resource = try server_objects.insertClient(
+    pointer.resource = try server_objects.insertClient(
         2,
         &test_protocol.wl_pointer.info,
         9,
@@ -2280,7 +2261,7 @@ test "seat: relative pointer lookup retains exact resource generation and focus"
         2,
         45,
     ));
-    release(TestAdapter.PointerSlot, adapter.pointers, &adapter.pointer_free, id.index);
+    adapter.pointers.release(adapter.pointers.entries.items[id.index]);
     try std.testing.expect(!adapter.pointerFocused(id));
     try std.testing.expect(!adapter.validateCursorShapeOn(&server_objects, peer, 2, 45));
 }
@@ -2298,14 +2279,14 @@ test "seat: popup grabs require the exact seat and delivered press serial" {
     );
     defer server_objects.deinit(std.testing.allocator);
     const peer: wayring.io_uring.Peer = .{ .slot = 1, .generation = 7 };
-    const seat = try acquire(TestAdapter.SeatSlot, adapter.seats, &adapter.seat_free);
+    const seat = try adapter.seats.acquire();
     seat.peer = peer;
     seat.last_implicit_grab_serial = 81;
-    seat.header.resource = try server_objects.insertClient(2, &test_protocol.wl_seat.info, 9, seat);
-    const other = try acquire(TestAdapter.SeatSlot, adapter.seats, &adapter.seat_free);
+    seat.resource = try server_objects.insertClient(2, &test_protocol.wl_seat.info, 9, seat);
+    const other = try adapter.seats.acquire();
     other.peer = peer;
     other.last_implicit_grab_serial = 82;
-    other.header.resource = try server_objects.insertClient(3, &test_protocol.wl_seat.info, 9, other);
+    other.resource = try server_objects.insertClient(3, &test_protocol.wl_seat.info, 9, other);
 
     try std.testing.expect(adapter.validatePopupGrabOn(&server_objects, peer, 2, 81));
     try std.testing.expect(!adapter.validatePopupGrabOn(&server_objects, peer, 2, 82));
@@ -2332,14 +2313,14 @@ test "seat: clipboard selections require the exact seat and latest user action s
     );
     defer server_objects.deinit(std.testing.allocator);
     const peer: wayring.io_uring.Peer = .{ .slot = 1, .generation = 7 };
-    const seat = try acquire(TestAdapter.SeatSlot, adapter.seats, &adapter.seat_free);
+    const seat = try adapter.seats.acquire();
     seat.peer = peer;
     seat.last_user_action_serial = 91;
-    seat.header.resource = try server_objects.insertClient(2, &test_protocol.wl_seat.info, 9, seat);
-    const other = try acquire(TestAdapter.SeatSlot, adapter.seats, &adapter.seat_free);
+    seat.resource = try server_objects.insertClient(2, &test_protocol.wl_seat.info, 9, seat);
+    const other = try adapter.seats.acquire();
     other.peer = peer;
     other.last_user_action_serial = 92;
-    other.header.resource = try server_objects.insertClient(3, &test_protocol.wl_seat.info, 9, other);
+    other.resource = try server_objects.insertClient(3, &test_protocol.wl_seat.info, 9, other);
 
     try std.testing.expect(adapter.validateSelectionOn(&server_objects, peer, 2, 91));
     try std.testing.expect(!adapter.validateSelectionOn(&server_objects, peer, 2, 92));
@@ -2367,10 +2348,10 @@ test "seat: activation requires the exact focused surface and latest user action
     defer server_objects.deinit(std.testing.allocator);
     const peer: wayring.io_uring.Peer = .{ .slot = 1, .generation = 7 };
     const surface: FakeCore.SurfaceId = .{ .index = 0, .generation = 1 };
-    const seat = try acquire(TestAdapter.SeatSlot, adapter.seats, &adapter.seat_free);
+    const seat = try adapter.seats.acquire();
     seat.peer = peer;
     seat.last_user_action_serial = 91;
-    seat.header.resource = try server_objects.insertClient(2, &test_protocol.wl_seat.info, 9, seat);
+    seat.resource = try server_objects.insertClient(2, &test_protocol.wl_seat.info, 9, seat);
     adapter.keyboard_focus = .{ .client = clientId(peer), .surface = surface };
 
     try std.testing.expect(adapter.validateActivationOn(&server_objects, peer, 2, 91, surface));
@@ -2406,10 +2387,10 @@ test "seat: interactive grabs require the exact active pointer-grab surface" {
     );
     defer server_objects.deinit(std.testing.allocator);
     const peer: wayring.io_uring.Peer = .{ .slot = 1, .generation = 7 };
-    const seat = try acquire(TestAdapter.SeatSlot, adapter.seats, &adapter.seat_free);
+    const seat = try adapter.seats.acquire();
     seat.peer = peer;
     seat.last_implicit_grab_serial = 101;
-    seat.header.resource = try server_objects.insertClient(2, &test_protocol.wl_seat.info, 9, seat);
+    seat.resource = try server_objects.insertClient(2, &test_protocol.wl_seat.info, 9, seat);
     const target: TestAdapter.FocusTarget = .{
         .client = clientId(peer),
         .surface = .{ .index = 3, .generation = 4 },
@@ -2565,7 +2546,7 @@ test "seat: grabbed key queues no wl_keyboard outbound" {
     const peer: wayring.io_uring.Peer = .{ .slot = 1, .generation = 7 };
     const client = clientId(peer);
     const target = try adapter.makeTarget(peer, .{ .index = 0, .generation = 1 });
-    const keyboard = try acquire(TestAdapter.KeyboardSlot, adapter.keyboards, &adapter.keyboard_free);
+    const keyboard = try adapter.keyboards.acquire();
     keyboard.client = client;
     const device: input.DeviceId = .{ .slot = 0, .generation = 2, .seat_generation = 8 };
     try adapter.consume(.{ .device_added = .{
@@ -2594,7 +2575,7 @@ test "seat: physical modifier and lock state follows the published keymap" {
     const peer: wayring.io_uring.Peer = .{ .slot = 1, .generation = 7 };
     const client = clientId(peer);
     const target = try adapter.makeTarget(peer, .{ .index = 0, .generation = 1 });
-    const keyboard = try acquire(TestAdapter.KeyboardSlot, adapter.keyboards, &adapter.keyboard_free);
+    const keyboard = try adapter.keyboards.acquire();
     keyboard.client = client;
     const device: input.DeviceId = .{ .slot = 0, .generation = 2, .seat_generation = 8 };
     try adapter.consume(.{ .device_added = .{
@@ -2661,7 +2642,7 @@ test "seat: pointer axis delivers wheel precision and explicit stops" {
     defer adapter.deinit();
     const peer: wayring.io_uring.Peer = .{ .slot = 1, .generation = 7 };
     const target = try adapter.makeTarget(peer, .{ .index = 0, .generation = 1 });
-    const pointer = try acquire(TestAdapter.PointerSlot, adapter.pointers, &adapter.pointer_free);
+    const pointer = try adapter.pointers.acquire();
     pointer.client = clientId(peer);
     try adapter.setPointerFocus(target, .{ .x = 0, .y = 0 });
     clearTestOutbound(&adapter);
@@ -2733,14 +2714,14 @@ test "seat: keymap FD delivery retains ownership across TX backpressure" {
         null,
     );
     defer server_objects.deinit(std.testing.allocator);
-    const seat = try acquire(TestAdapter.SeatSlot, adapter.seats, &adapter.seat_free);
+    const seat = try adapter.seats.acquire();
     seat.peer = .{ .slot = 0, .generation = 1 };
-    seat.header.resource = try server_objects.insertClient(2, &test_protocol.wl_seat.info, 9, seat);
-    const keyboard = try acquire(TestAdapter.KeyboardSlot, adapter.keyboards, &adapter.keyboard_free);
+    seat.resource = try server_objects.insertClient(2, &test_protocol.wl_seat.info, 9, seat);
+    const keyboard = try adapter.keyboards.acquire();
     keyboard.seat_index = adapter.seatIndex(seat);
     keyboard.seat_generation = seat.header.generation;
     keyboard.client = clientId(seat.peer);
-    keyboard.header.resource = try server_objects.insertClient(3, &test_protocol.wl_keyboard.info, 9, keyboard);
+    keyboard.resource = try server_objects.insertClient(3, &test_protocol.wl_keyboard.info, 9, keyboard);
     try adapter.enqueue(clientId(seat.peer), .{ .keyboard_keymap = adapter.keyboardId(keyboard) });
 
     var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 64, 2);
@@ -2787,22 +2768,22 @@ test "seat: child resources outlive seat release and stale generations are rejec
         null,
     );
     defer server_objects.deinit(std.testing.allocator);
-    const seat = try acquire(TestAdapter.SeatSlot, adapter.seats, &adapter.seat_free);
+    const seat = try adapter.seats.acquire();
     seat.peer = .{ .slot = 0, .generation = 1 };
-    seat.header.resource = try server_objects.insertClient(2, &test_protocol.wl_seat.info, 9, seat);
-    const pointer = try acquire(TestAdapter.PointerSlot, adapter.pointers, &adapter.pointer_free);
+    seat.resource = try server_objects.insertClient(2, &test_protocol.wl_seat.info, 9, seat);
+    const pointer = try adapter.pointers.acquire();
     pointer.client = clientId(seat.peer);
-    pointer.header.resource = try server_objects.insertClient(3, &test_protocol.wl_pointer.info, 9, pointer);
+    pointer.resource = try server_objects.insertClient(3, &test_protocol.wl_pointer.info, 9, pointer);
     const old_id = adapter.pointerId(pointer);
 
-    const seat_object = server_objects.namespace.resolve(seat.header.resource).?.*;
-    try std.testing.expect(adapter.resourceRemoved(seat.header.resource, seat_object));
+    const seat_object = server_objects.namespace.resolve(seat.resource).?.*;
+    try std.testing.expect(adapter.resourceRemoved(seat.resource, seat_object));
     _ = try adapter.resolvePointer(old_id);
 
-    const pointer_object = server_objects.namespace.resolve(pointer.header.resource).?.*;
-    try std.testing.expect(adapter.resourceRemoved(pointer.header.resource, pointer_object));
+    const pointer_object = server_objects.namespace.resolve(pointer.resource).?.*;
+    try std.testing.expect(adapter.resourceRemoved(pointer.resource, pointer_object));
     try std.testing.expectError(error.StalePointer, adapter.resolvePointer(old_id));
-    const replacement = try acquire(TestAdapter.PointerSlot, adapter.pointers, &adapter.pointer_free);
+    const replacement = try adapter.pointers.acquire();
     try std.testing.expectEqual(old_id.index, adapter.pointerIndex(replacement));
     try std.testing.expect(old_id.generation != replacement.header.generation);
 }
@@ -2819,9 +2800,9 @@ test "seat: button and key backpressure preserves exact retry" {
         .device = device,
         .info = .{ .capabilities = .{ .pointer = true, .keyboard = true } },
     } });
-    const pointer = try acquire(TestAdapter.PointerSlot, adapter.pointers, &adapter.pointer_free);
+    const pointer = try adapter.pointers.acquire();
     pointer.client = client;
-    const keyboard = try acquire(TestAdapter.KeyboardSlot, adapter.keyboards, &adapter.keyboard_free);
+    const keyboard = try adapter.keyboards.acquire();
     keyboard.client = client;
     try adapter.setPointerFocus(target, .{ .x = 0, .y = 0 });
     clearTestOutbound(&adapter);
@@ -2870,7 +2851,7 @@ test "seat: device add backpressure preserves identity for exact retry" {
     var core: FakeCore = .{};
     var adapter = try testAdapterWithCapacity(&core, 1, 2);
     defer adapter.deinit();
-    const seat = try acquire(TestAdapter.SeatSlot, adapter.seats, &adapter.seat_free);
+    const seat = try adapter.seats.acquire();
     seat.peer = .{ .slot = 0, .generation = 1 };
     const client = clientId(seat.peer);
     try adapter.enqueue(client, .{ .seat_name = adapter.seatId(seat) });
@@ -2903,11 +2884,11 @@ test "seat: device removal reserves cancellation releases and capabilities atomi
         .device = device,
         .info = .{ .capabilities = .{ .pointer = true, .keyboard = true } },
     } });
-    const seat = try acquire(TestAdapter.SeatSlot, adapter.seats, &adapter.seat_free);
+    const seat = try adapter.seats.acquire();
     seat.peer = peer;
-    const pointer = try acquire(TestAdapter.PointerSlot, adapter.pointers, &adapter.pointer_free);
+    const pointer = try adapter.pointers.acquire();
     pointer.client = client;
-    const keyboard = try acquire(TestAdapter.KeyboardSlot, adapter.keyboards, &adapter.keyboard_free);
+    const keyboard = try adapter.keyboards.acquire();
     keyboard.client = client;
     try adapter.setPointerFocus(target, .{ .x = 0, .y = 0 });
     clearTestOutbound(&adapter);
@@ -2967,7 +2948,7 @@ test "seat: removed grab surface completes cancellation once" {
         .device = device,
         .info = .{ .capabilities = .{ .pointer = true } },
     } });
-    const pointer = try acquire(TestAdapter.PointerSlot, adapter.pointers, &adapter.pointer_free);
+    const pointer = try adapter.pointers.acquire();
     pointer.client = client;
     try adapter.setPointerFocus(target, .{ .x = 0, .y = 0 });
     clearTestOutbound(&adapter);
@@ -2997,7 +2978,7 @@ test "seat: removed grab surface completes cancellation once" {
     try std.testing.expect(!anySet(&adapter.pressed_buttons));
     try std.testing.expect(!anySet(&adapter.devices[0].buttons));
     try std.testing.expectEqual(@as(usize, 2), adapter.pendingOutbound());
-    for (adapter.outbound) |slot| if (slot.active)
+    for (adapter.outbound) |*slot| if (slot.active)
         try std.testing.expect(!outboundTargets(slot.value, target.surface));
     try std.testing.expect(adapter.popEvent() == null);
     try adapter.cancelPointerGrab();
@@ -3047,12 +3028,12 @@ test "seat: surface removal retires ordinary commands but not terminal releases"
     const peer: wayring.io_uring.Peer = .{ .slot = 0, .generation = 3 };
     const client = clientId(peer);
     const target = try adapter.makeTarget(peer, .{ .index = 0, .generation = surface_handle.generation });
-    const pointer = try acquire(TestAdapter.PointerSlot, adapter.pointers, &adapter.pointer_free);
+    const pointer = try adapter.pointers.acquire();
     pointer.client = client;
-    pointer.header.resource = try server_objects.insertClient(3, &test_protocol.wl_pointer.info, 9, pointer);
-    const keyboard = try acquire(TestAdapter.KeyboardSlot, adapter.keyboards, &adapter.keyboard_free);
+    pointer.resource = try server_objects.insertClient(3, &test_protocol.wl_pointer.info, 9, pointer);
+    const keyboard = try adapter.keyboards.acquire();
     keyboard.client = client;
-    keyboard.header.resource = try server_objects.insertClient(4, &test_protocol.wl_keyboard.info, 9, keyboard);
+    keyboard.resource = try server_objects.insertClient(4, &test_protocol.wl_keyboard.info, 9, keyboard);
     const device: input.DeviceId = .{ .slot = 0, .generation = 5, .seat_generation = 7 };
     try adapter.consume(.{ .device_added = .{
         .device = device,
@@ -3127,9 +3108,9 @@ test "seat: keyboard enter retains admission-time pressed keys through backpress
     const peer: wayring.io_uring.Peer = .{ .slot = 0, .generation = 3 };
     const client = clientId(peer);
     const target = try adapter.makeTarget(peer, .{ .index = 0, .generation = surface_handle.generation });
-    const keyboard = try acquire(TestAdapter.KeyboardSlot, adapter.keyboards, &adapter.keyboard_free);
+    const keyboard = try adapter.keyboards.acquire();
     keyboard.client = client;
-    keyboard.header.resource = try server_objects.insertClient(4, &test_protocol.wl_keyboard.info, 9, keyboard);
+    keyboard.resource = try server_objects.insertClient(4, &test_protocol.wl_keyboard.info, 9, keyboard);
     const device: input.DeviceId = .{ .slot = 0, .generation = 5, .seat_generation = 7 };
     try adapter.consume(.{ .device_added = .{
         .device = device,

@@ -5,6 +5,7 @@ const input = @import("../backend/input/backend.zig");
 const objects = wayring.objects;
 const linux = std.os.linux;
 const c = @cImport(@cInclude("sys/stat.h"));
+const slot_pool = @import("slot_pool.zig");
 const none = std.math.maxInt(u32);
 const key_count = 0x300;
 const key_words = key_count / 64;
@@ -34,16 +35,13 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
         const Manager = protocol.zwp_virtual_keyboard_manager_v1;
         const Keyboard = protocol.zwp_virtual_keyboard_v1;
         const ManagerSlot = struct {
-            active: bool = false,
-            next: u32 = none,
+            header: slot_pool.Header = .{},
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
             peer: wayring.io_uring.Peer = undefined,
         };
         pub const DeviceId = packed struct { index: u32, generation: u32 };
         const Device = struct {
-            active: bool = false,
-            generation: u32 = 1,
-            next: u32 = none,
+            header: slot_pool.Header = .{},
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
             peer: wayring.io_uring.Peer = undefined,
             seat_valid: bool = false,
@@ -56,10 +54,8 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
 
         allocator: std.mem.Allocator,
         seat: *Seat,
-        managers: []ManagerSlot,
-        devices: []Device,
-        manager_free: u32 = 0,
-        device_free: u32 = 0,
+        managers: slot_pool.Pool(ManagerSlot),
+        devices: slot_pool.Pool(Device),
         runtime: ?*Runtime = null,
         global: ?objects.Handle = null,
         modifier_owner: ?DeviceId = null,
@@ -69,18 +65,17 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
         pub fn init(allocator: std.mem.Allocator, seat: *Seat, config: Config) !Self {
             try config.validate();
             try Manager.info.validateVersion(1);
-            const managers = try allocator.alloc(ManagerSlot, config.manager_capacity);
-            errdefer allocator.free(managers);
-            const devices = try allocator.alloc(Device, config.device_capacity);
-            initFree(ManagerSlot, managers);
-            initFree(Device, devices);
+            var managers = try slot_pool.Pool(ManagerSlot).init(allocator, config.manager_capacity);
+            errdefer managers.deinit();
+            var devices = try slot_pool.Pool(Device).init(allocator, config.device_capacity);
+            errdefer devices.deinit();
             return .{ .allocator = allocator, .seat = seat, .managers = managers, .devices = devices };
         }
 
         pub fn deinit(self: *Self) void {
-            for (self.devices, 0..) |device, i| if (device.active) self.releaseDevice(@intCast(i));
-            self.allocator.free(self.devices);
-            self.allocator.free(self.managers);
+            for (self.devices.entries.items) |device| if (device.header.active) self.releaseDevice(device);
+            self.devices.deinit();
+            self.managers.deinit();
             self.* = undefined;
         }
 
@@ -99,11 +94,10 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
 
         fn bind(context: ?*anyopaque, binding: wayring.server.Binding) !?*anyopaque {
             const self: *Self = @ptrCast(@alignCast(context orelse return error.InvalidContext));
-            if (self.manager_free == none) return error.OutOfMemory;
-            const i = self.manager_free;
-            self.manager_free = self.managers[i].next;
-            self.managers[i] = .{ .active = true, .resource = binding.resource, .peer = binding.peer };
-            return &self.managers[i];
+            const manager = self.managers.acquire() catch return error.OutOfMemory;
+            manager.resource = binding.resource;
+            manager.peer = binding.peer;
+            return manager;
         }
 
         pub fn request(self: *Self, peer: wayring.io_uring.Peer, target: objects.Dispatch, message: wayring.wire.Message, fds: *wayring.ancillary.FdQueue) !?wayring.dispatch.Control {
@@ -114,7 +108,7 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
         pub fn requestOn(self: *Self, actor: *wayring.connection.Actor, server_objects: anytype, peer: wayring.io_uring.Peer, target: objects.Dispatch, message: wayring.wire.Message, fds: *wayring.ancillary.FdQueue) !?wayring.dispatch.Control {
             const handle = server_objects.namespace.lookupHandle(message.header.object_id) orelse return null;
             if (target.object.interface == &Manager.info) {
-                const manager = from(ManagerSlot, self.managers, target.object.context) orelse return null;
+                const manager = self.managers.fromContext(target.object.context) orelse return null;
                 if (!std.meta.eql(manager.resource, handle) or !same(manager.peer, peer)) return null;
                 const decoded = try wayring.server.decodeRequest(Manager, server_objects, message, fds);
                 switch (decoded.value) {
@@ -123,7 +117,7 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                         device.peer = peer;
                         device.seat_valid = self.seat.ownsSeat(peer, payload.seat);
                         const admitted = Manager.admit_create_virtual_keyboard(server_objects, decoded.handle, payload, .{ .id = device }) catch |err| {
-                            self.releaseDevice(self.deviceIndex(device));
+                            self.releaseDevice(device);
                             return try self.failure(actor, decoded.handle.id, err);
                         };
                         device.resource = admitted.id;
@@ -133,7 +127,7 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                 return .continue_dispatch;
             }
             if (target.object.interface == &Keyboard.info) {
-                const device = from(Device, self.devices, target.object.context) orelse return null;
+                const device = self.devices.fromContext(target.object.context) orelse return null;
                 if (!std.meta.eql(device.resource, handle) or !same(device.peer, peer)) return null;
                 const decoded = try wayring.server.decodeRequest(Keyboard, server_objects, message, fds);
                 switch (decoded.value) {
@@ -224,7 +218,7 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
         pub fn setInhibited(self: *Self, inhibited: bool) !void {
             if (inhibited) {
                 self.inhibited = true;
-                for (self.devices) |*device| if (device.active) try self.releasePressed(device);
+                for (self.devices.entries.items) |device| if (device.header.active) try self.releasePressed(device);
                 if (self.modifier_owner != null) {
                     try self.seat.restoreDerivedModifiers();
                     self.modifier_owner = null;
@@ -232,8 +226,8 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                 return;
             }
             if (!self.inhibited) return;
-            for (self.devices) |*device| {
-                if (!device.active or device.deferred_fd < 0) continue;
+            for (self.devices.entries.items) |device| {
+                if (!device.header.active or device.deferred_fd < 0) continue;
                 if (self.keymap_observer) |observer| {
                     if (!observer.canUpdateFn(observer.context)) return error.Exhausted;
                 }
@@ -247,43 +241,31 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
 
         pub fn resourceRemoved(self: *Self, handle: objects.Handle, object: objects.Object) bool {
             if (object.interface == &Keyboard.info) {
-                const device = from(Device, self.devices, object.context) orelse return false;
+                const device = self.devices.fromContext(object.context) orelse return false;
                 if (!std.meta.eql(device.resource, handle)) return false;
-                self.releaseDevice(self.deviceIndex(device));
+                self.releaseDevice(device);
                 return true;
             }
             if (object.interface == &Manager.info) {
-                const manager = from(ManagerSlot, self.managers, object.context) orelse return false;
+                const manager = self.managers.fromContext(object.context) orelse return false;
                 if (!std.meta.eql(manager.resource, handle)) return false;
-                const i = indexOf(ManagerSlot, self.managers, manager);
-                manager.* = .{ .next = self.manager_free };
-                self.manager_free = i;
+                self.managers.release(manager);
                 return true;
             }
             return false;
         }
 
         pub fn disconnected(self: *Self, peer: wayring.io_uring.Peer) void {
-            for (self.devices, 0..) |device, i| if (device.active and same(device.peer, peer)) self.releaseDevice(@intCast(i));
-            for (self.managers) |*manager| if (manager.active and same(manager.peer, peer)) {
-                const i = indexOf(ManagerSlot, self.managers, manager);
-                manager.* = .{ .next = self.manager_free };
-                self.manager_free = i;
-            };
+            for (self.devices.entries.items) |device| if (device.header.active and same(device.peer, peer)) self.releaseDevice(device);
+            for (self.managers.entries.items) |manager| if (manager.header.active and same(manager.peer, peer)) self.managers.release(manager);
         }
 
         fn acquireDevice(self: *Self) !*Device {
-            if (self.device_free == none) return error.Exhausted;
-            const i = self.device_free;
-            const device = &self.devices[i];
-            self.device_free = device.next;
-            device.* = .{ .active = true, .generation = device.generation };
-            return device;
+            return self.devices.acquire();
         }
 
-        fn releaseDevice(self: *Self, i: u32) void {
-            const device = &self.devices[i];
-            if (!device.active) return;
+        fn releaseDevice(self: *Self, device: *Device) void {
+            if (!device.header.active) return;
             const id = self.deviceId(device);
             self.releasePressed(device) catch {};
             if (device.registered) self.seat.removeVirtualKeyboard(self.inputId(device)) catch {};
@@ -292,9 +274,7 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                 self.seat.restoreDerivedModifiers() catch {};
             }
             if (device.deferred_fd >= 0) _ = linux.close(device.deferred_fd);
-            const generation = device.generation +% 1;
-            device.* = .{ .generation = if (generation == 0) 1 else generation, .next = self.device_free };
-            self.device_free = i;
+            self.devices.release(device);
         }
 
         fn releasePressed(self: *Self, device: *Device) !void {
@@ -311,13 +291,13 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
 
         fn inputId(self: *Self, device: *const Device) input.DeviceId {
             const index = self.deviceIndex(device);
-            return .{ .slot = 0x8000_0000 | index, .generation = device.generation, .seat_generation = 0x564b_0001 };
+            return .{ .slot = 0x8000_0000 | index, .generation = device.header.generation, .seat_generation = 0x564b_0001 };
         }
         fn deviceId(self: *Self, device: *const Device) DeviceId {
-            return .{ .index = self.deviceIndex(device), .generation = device.generation };
+            return .{ .index = self.deviceIndex(device), .generation = device.header.generation };
         }
-        fn deviceIndex(self: *const Self, device: *const Device) u32 {
-            return indexOf(Device, self.devices, device);
+        fn deviceIndex(_: *const Self, device: *const Device) u32 {
+            return device.header.index;
         }
         fn noKeymap(self: *Self, actor: *wayring.connection.Actor, id: u32) !wayring.dispatch.Control {
             return self.protocolError(actor, id, Keyboard.@"error".no_keymap.value, "keymap must be set first");
@@ -450,16 +430,31 @@ test "only the exact modifier owner restores derived state on removal" {
     defer adapter.deinit();
     const first = try adapter.acquireDevice();
     first.registered = true;
-    const first_index = adapter.deviceIndex(first);
     const second = try adapter.acquireDevice();
     second.registered = true;
-    const second_index = adapter.deviceIndex(second);
     adapter.modifier_owner = adapter.deviceId(second);
 
-    adapter.releaseDevice(first_index);
+    adapter.releaseDevice(first);
     try std.testing.expectEqual(@as(usize, 0), seat.restores);
-    adapter.releaseDevice(second_index);
+    adapter.releaseDevice(second);
     try std.testing.expectEqual(@as(usize, 1), seat.restores);
+}
+
+test "manager and keyboard ownership grow with stable contexts" {
+    const A = Adapter(@import("core_protocol"), TestSeat);
+    var seat: TestSeat = .{};
+    defer seat.deinit();
+    var adapter = try A.init(std.testing.allocator, &seat, .{ .manager_capacity = 1, .device_capacity = 1 });
+    defer adapter.deinit();
+
+    const first_manager = try adapter.managers.acquire();
+    _ = try adapter.managers.acquire();
+    try std.testing.expect(first_manager == adapter.managers.entries.items[0]);
+    const first = try adapter.acquireDevice();
+    const first_id = adapter.deviceId(first);
+    _ = try adapter.acquireDevice();
+    try std.testing.expect(first == adapter.devices.entries.items[0]);
+    try std.testing.expectEqual(first_id, adapter.deviceId(first));
 }
 
 fn testKeymapFd() !linux.fd_t {

@@ -3,6 +3,7 @@
 const std = @import("std");
 const wayring = @import("wayring");
 const objects = wayring.objects;
+const slot_pool = @import("slot_pool.zig");
 const none = std.math.maxInt(u32);
 
 pub const SeatValidator = struct {
@@ -37,8 +38,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         };
 
         const Slot = struct {
-            active: bool = false,
-            next_free: u32 = none,
+            header: slot_pool.Header = .{},
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
             peer: wayring.io_uring.Peer = undefined,
             surface: CoreSurface.SurfaceId = undefined,
@@ -49,23 +49,19 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         allocator: std.mem.Allocator,
         core: *CoreSurface,
         validator: SeatValidator,
-        slots: []Slot,
-        free_head: u32 = 0,
+        slots: slot_pool.Pool(Slot),
         focus: ?Focus = null,
         runtime: ?*Runtime = null,
         global: ?objects.Handle = null,
 
         pub fn init(allocator: std.mem.Allocator, core: *CoreSurface, validator: SeatValidator, config: Config) !Self {
             try config.validate();
-            const slots = try allocator.alloc(Slot, config.inhibitor_capacity);
-            for (slots, 0..) |*slot, i| slot.* = .{
-                .next_free = if (i + 1 < slots.len) @intCast(i + 1) else none,
-            };
+            const slots = try slot_pool.Pool(Slot).init(allocator, config.inhibitor_capacity);
             return .{ .allocator = allocator, .core = core, .validator = validator, .slots = slots };
         }
 
         pub fn deinit(self: *Self) void {
-            self.allocator.free(self.slots);
+            self.slots.deinit();
             self.* = undefined;
         }
 
@@ -103,7 +99,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                         if (!samePeer(try self.core.surfacePeer(surface), peer) or
                             !self.validator.validate(peer, value.seat))
                             return try self.protocolError(actor, decoded.handle.id, "invalid shortcut-inhibitor seat or surface");
-                        for (self.slots) |slot| if (slot.active and samePeer(slot.peer, peer) and
+                        for (self.slots.entries.items) |slot| if (slot.header.active and samePeer(slot.peer, peer) and
                             std.meta.eql(slot.surface, surface))
                             return try self.protocolError(actor, decoded.handle.id, "shortcuts already inhibited");
                         const slot = self.acquire() catch return try self.noMemory(actor);
@@ -138,8 +134,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         /// as required by the protocol. Regaining focus queues active again.
         pub fn setFocus(self: *Self, focus: ?Focus) void {
             self.focus = focus;
-            for (self.slots) |*slot| {
-                if (!slot.active) continue;
+            for (self.slots.entries.items) |slot| {
+                if (!slot.header.active) continue;
                 const effective = focusMatches(focus, slot.peer, slot.surface);
                 if (effective and !slot.effective) slot.active_pending = true;
                 if (!effective) slot.active_pending = false;
@@ -148,14 +144,14 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         }
 
         pub fn shortcutsInhibited(self: *const Self) bool {
-            for (self.slots) |slot| if (slot.active and slot.effective) return true;
+            for (self.slots.entries.items) |slot| if (slot.header.active and slot.effective) return true;
             return false;
         }
 
         pub fn flushOn(self: *Self, peer: wayring.io_uring.Peer, _: anytype, queue: *wayring.tx.Queue) !usize {
             var completed: usize = 0;
-            for (self.slots) |*slot| {
-                if (!slot.active or !slot.active_pending or !samePeer(slot.peer, peer)) continue;
+            for (self.slots.entries.items) |slot| {
+                if (!slot.header.active or !slot.active_pending or !samePeer(slot.peer, peer)) continue;
                 Inhibitor.encodeEvent(queue, slot.resource.id, .active) catch |err| switch (err) {
                     error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return completed,
                     else => return err,
@@ -167,8 +163,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         }
 
         pub fn pendingOutbound(self: *const Self, peer: wayring.io_uring.Peer) bool {
-            for (self.slots) |slot|
-                if (slot.active and slot.active_pending and samePeer(slot.peer, peer)) return true;
+            for (self.slots.entries.items) |slot|
+                if (slot.header.active and slot.active_pending and samePeer(slot.peer, peer)) return true;
             return false;
         }
 
@@ -176,47 +172,34 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             if (object.interface == &Inhibitor.info) {
                 const slot = self.fromObject(&object) orelse return false;
                 if (!std.meta.eql(slot.resource, handle)) return false;
-                self.release(self.index(slot));
+                self.release(slot.header.index);
                 return true;
             }
             return object.interface == &Manager.info and object.context == @as(?*anyopaque, @ptrCast(self));
         }
 
         pub fn disconnected(self: *Self, peer: wayring.io_uring.Peer) void {
-            for (self.slots, 0..) |*slot, i|
-                if (slot.active and samePeer(slot.peer, peer)) self.release(@intCast(i));
+            for (self.slots.entries.items) |slot|
+                if (slot.header.active and samePeer(slot.peer, peer)) self.release(slot.header.index);
             if (self.focus) |focus| if (samePeer(focus.peer, peer)) self.setFocus(null);
         }
 
         fn acquire(self: *Self) !*Slot {
-            if (self.free_head == none) return error.Exhausted;
-            const i = self.free_head;
-            const slot = &self.slots[i];
-            self.free_head = slot.next_free;
-            slot.* = .{ .active = true };
-            return slot;
+            return self.slots.acquire();
         }
 
         fn release(self: *Self, i: u32) void {
-            const slot = &self.slots[i];
-            if (!slot.active) return;
-            slot.* = .{ .next_free = self.free_head };
-            self.free_head = i;
+            const slot = self.slots.at(i) orelse return;
+            self.slots.release(slot);
         }
 
         fn fromObject(self: *Self, object: *const objects.Object) ?*Slot {
-            const pointer = object.context orelse return null;
-            const address = @intFromPtr(pointer);
-            const start = @intFromPtr(self.slots.ptr);
-            const bytes = std.math.mul(usize, self.slots.len, @sizeOf(Slot)) catch return null;
-            const end = std.math.add(usize, start, bytes) catch return null;
-            if (address < start or address >= end or (address - start) % @sizeOf(Slot) != 0) return null;
-            const slot = &self.slots[(address - start) / @sizeOf(Slot)];
-            return if (slot.active) slot else null;
+            return self.slots.fromContext(object.context);
         }
 
         fn index(self: *const Self, slot: *const Slot) u32 {
-            return @intCast((@intFromPtr(slot) - @intFromPtr(self.slots.ptr)) / @sizeOf(Slot));
+            _ = self;
+            return slot.header.index;
         }
 
         fn noMemory(_: *Self, actor: *wayring.connection.Actor) !wayring.dispatch.Control {
@@ -277,4 +260,18 @@ test "keyboard shortcuts inhibit: focus activation and loss are exact" {
     try std.testing.expect(slot.active_pending);
     adapter.disconnected(peer);
     try std.testing.expect(!adapter.shortcutsInhibited());
+}
+
+test "keyboard shortcut ownership grows without moving original context" {
+    const protocol = @import("core_protocol");
+    const FakeCore = struct {
+        pub const SurfaceId = packed struct { index: u32, generation: u32 };
+    };
+    const A = Adapter(protocol, FakeCore);
+    var core: FakeCore = .{};
+    var adapter = try A.init(std.testing.allocator, &core, .{ .validateFn = acceptSeat }, .{ .inhibitor_capacity = 1 });
+    defer adapter.deinit();
+    const first = try adapter.acquire();
+    _ = try adapter.acquire();
+    try std.testing.expect(adapter.slots.fromContext(first) == first);
 }

@@ -1,4 +1,4 @@
-//! Bounded wl_data_device selection and drag-and-drop owner.
+//! Growable wl_data_device selection and drag-and-drop owner.
 //!
 //! Sources, MIME offers, focus/target publication, and receive FDs retain
 //! exact resource generations and survive transport backpressure.
@@ -30,10 +30,7 @@ pub const Config = struct {
             config.mime_bytes,
             config.outbound_capacity,
         }) |value| if (value == 0 or value >= none) return error.InvalidConfig;
-        const mime_slots = std.math.mul(usize, config.source_capacity, config.mime_capacity) catch
-            return error.InvalidConfig;
-        _ = std.math.mul(usize, mime_slots, config.mime_bytes) catch
-            return error.InvalidConfig;
+        _ = std.math.mul(usize, config.mime_capacity, config.mime_bytes) catch return error.InvalidConfig;
     }
 };
 
@@ -172,14 +169,12 @@ pub fn Adapter(comptime protocol: type) type {
         global_version: u32,
         mime_capacity: usize,
         mime_bytes: usize,
-        managers: []ManagerSlot,
-        sources: []SourceSlot,
-        devices: []DeviceSlot,
-        offers: []OfferSlot,
+        managers: std.ArrayListUnmanaged(*ManagerSlot),
+        sources: std.ArrayListUnmanaged(*SourceSlot),
+        devices: std.ArrayListUnmanaged(*DeviceSlot),
+        offers: std.ArrayListUnmanaged(*OfferSlot),
         outbound: []OutboundSlot,
         outbound_len: usize = 0,
-        mime_lengths: []u16,
-        mime_storage: []u8,
         manager_free: u32 = 0,
         source_free: u32 = 0,
         device_free: u32 = 0,
@@ -197,31 +192,17 @@ pub fn Adapter(comptime protocol: type) type {
         pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
             try config.validate();
             try Manager.info.validateVersion(config.global_version);
-            const managers = try allocator.alloc(ManagerSlot, config.manager_capacity);
-            errdefer allocator.free(managers);
-            const sources = try allocator.alloc(SourceSlot, config.source_capacity);
-            errdefer allocator.free(sources);
-            const devices = try allocator.alloc(DeviceSlot, config.device_capacity);
-            errdefer allocator.free(devices);
-            const offers = try allocator.alloc(OfferSlot, config.offer_capacity);
-            errdefer allocator.free(offers);
+            var managers = try initSlots(ManagerSlot, allocator, config.manager_capacity);
+            errdefer deinitSlots(ManagerSlot, allocator, &managers);
+            var sources = try initSlots(SourceSlot, allocator, config.source_capacity);
+            errdefer deinitSlots(SourceSlot, allocator, &sources);
+            var devices = try initSlots(DeviceSlot, allocator, config.device_capacity);
+            errdefer deinitSlots(DeviceSlot, allocator, &devices);
+            var offers = try initSlots(OfferSlot, allocator, config.offer_capacity);
+            errdefer deinitSlots(OfferSlot, allocator, &offers);
             const outbound = try allocator.alloc(OutboundSlot, config.outbound_capacity);
             errdefer allocator.free(outbound);
-            const mime_slots = try std.math.mul(usize, config.source_capacity, config.mime_capacity);
-            const mime_lengths = try allocator.alloc(u16, mime_slots);
-            errdefer allocator.free(mime_lengths);
-            const mime_storage = try allocator.alloc(u8, try std.math.mul(usize, mime_slots, config.mime_bytes));
-            errdefer allocator.free(mime_storage);
-            initHeaders(ManagerSlot, managers);
-            initHeaders(SourceSlot, sources);
-            initHeaders(DeviceSlot, devices);
-            initHeaders(OfferSlot, offers);
             @memset(outbound, .{});
-            @memset(mime_lengths, 0);
-            for (sources, 0..) |*source, index| {
-                source.mime_lengths = mime_lengths[index * config.mime_capacity ..][0..config.mime_capacity];
-                source.mime_storage = mime_storage[index * config.mime_capacity * config.mime_bytes ..][0 .. config.mime_capacity * config.mime_bytes];
-            }
             return .{
                 .allocator = allocator,
                 .global_version = config.global_version,
@@ -232,23 +213,30 @@ pub fn Adapter(comptime protocol: type) type {
                 .devices = devices,
                 .offers = offers,
                 .outbound = outbound,
-                .mime_lengths = mime_lengths,
-                .mime_storage = mime_storage,
             };
         }
 
         pub fn deinit(self: *Self) void {
-            for (self.outbound) |slot| if (slot.active and slot.value == .source_send) {
+            for (self.outbound) |*slot| if (slot.active and slot.value == .source_send) {
                 if (slot.value.source_send.fd >= 0) _ = linux.close(slot.value.source_send.fd);
             };
-            self.allocator.free(self.mime_storage);
-            self.allocator.free(self.mime_lengths);
             self.allocator.free(self.outbound);
-            self.allocator.free(self.offers);
-            self.allocator.free(self.devices);
-            self.allocator.free(self.sources);
-            self.allocator.free(self.managers);
+            deinitSlots(OfferSlot, self.allocator, &self.offers);
+            deinitSlots(DeviceSlot, self.allocator, &self.devices);
+            deinitSlots(SourceSlot, self.allocator, &self.sources);
+            deinitSlots(ManagerSlot, self.allocator, &self.managers);
             self.* = undefined;
+        }
+
+        fn acquireSource(self: *Self) !*SourceSlot {
+            const source = try acquire(SourceSlot, self.allocator, &self.sources, &self.source_free);
+            if (source.mime_lengths.len == 0) {
+                source.mime_lengths = try self.allocator.alloc(u16, self.mime_capacity);
+                errdefer self.allocator.free(source.mime_lengths);
+                source.mime_storage = try self.allocator.alloc(u8, try std.math.mul(usize, self.mime_capacity, self.mime_bytes));
+                @memset(source.mime_lengths, 0);
+            }
+            return source;
         }
 
         pub fn install(self: *Self, runtime: *Runtime) !objects.Handle {
@@ -307,7 +295,7 @@ pub fn Adapter(comptime protocol: type) type {
 
         fn bind(context: ?*anyopaque, binding: wayring.server.Binding) !?*anyopaque {
             const self: *Self = @ptrCast(@alignCast(context orelse return error.InvalidContext));
-            const slot = acquire(ManagerSlot, self.managers, &self.manager_free) catch
+            const slot = acquire(ManagerSlot, self.allocator, &self.managers, &self.manager_free) catch
                 return error.OutOfMemory;
             slot.header.resource = binding.resource;
             slot.peer = binding.peer;
@@ -338,22 +326,22 @@ pub fn Adapter(comptime protocol: type) type {
         ) !?wayring.dispatch.Control {
             const handle = server_objects.namespace.lookupHandle(message.header.object_id) orelse return null;
             if (target.object.interface == &Manager.info) {
-                const slot = fromContext(ManagerSlot, self.managers, target.object.context) orelse return null;
+                const slot = fromContext(ManagerSlot, self.managers.items, target.object.context) orelse return null;
                 if (!std.meta.eql(slot.header.resource, handle)) return null;
                 return try self.managerRequest(actor, server_objects, slot, message, fds);
             }
             if (target.object.interface == &Source.info) {
-                const slot = fromContext(SourceSlot, self.sources, target.object.context) orelse return null;
+                const slot = fromContext(SourceSlot, self.sources.items, target.object.context) orelse return null;
                 if (!std.meta.eql(slot.header.resource, handle)) return null;
                 return try self.sourceRequest(actor, server_objects, slot, message, fds);
             }
             if (target.object.interface == &Device.info) {
-                const slot = fromContext(DeviceSlot, self.devices, target.object.context) orelse return null;
+                const slot = fromContext(DeviceSlot, self.devices.items, target.object.context) orelse return null;
                 if (!std.meta.eql(slot.header.resource, handle)) return null;
                 return try self.deviceRequest(actor, server_objects, peer, slot, message, fds);
             }
             if (target.object.interface == &Offer.info) {
-                const slot = fromContext(OfferSlot, self.offers, target.object.context) orelse return null;
+                const slot = fromContext(OfferSlot, self.offers.items, target.object.context) orelse return null;
                 if (!std.meta.eql(slot.header.resource, handle)) return null;
                 return try self.offerRequest(actor, server_objects, slot, message, fds);
             }
@@ -364,22 +352,22 @@ pub fn Adapter(comptime protocol: type) type {
             const decoded = try wayring.server.decodeRequest(Manager, server_objects, message, fds);
             switch (decoded.value) {
                 .create_data_source => |payload| {
-                    const source = acquire(SourceSlot, self.sources, &self.source_free) catch
+                    const source = self.acquireSource() catch
                         return try self.noMemory(actor);
                     source.peer = manager.peer;
                     const admitted = Manager.admit_create_data_source(server_objects, decoded.handle, payload, .{ .id = source }) catch |err| {
-                        release(SourceSlot, self.sources, &self.source_free, indexOf(SourceSlot, self.sources, source));
+                        release(SourceSlot, self.sources.items, &self.source_free, indexOf(SourceSlot, self.sources.items, source));
                         return try self.failure(actor, decoded.handle.id, err);
                     };
                     source.header.resource = admitted.id;
                 },
                 .get_data_device => |payload| {
-                    const device = acquire(DeviceSlot, self.devices, &self.device_free) catch
+                    const device = acquire(DeviceSlot, self.allocator, &self.devices, &self.device_free) catch
                         return try self.noMemory(actor);
                     device.peer = manager.peer;
                     device.seat_object = payload.seat;
                     const admitted = Manager.admit_get_data_device(server_objects, decoded.handle, payload, .{ .id = device }) catch |err| {
-                        release(DeviceSlot, self.devices, &self.device_free, indexOf(DeviceSlot, self.devices, device));
+                        release(DeviceSlot, self.devices.items, &self.device_free, indexOf(DeviceSlot, self.devices.items, device));
                         return try self.failure(actor, decoded.handle.id, err);
                     };
                     device.header.resource = admitted.id;
@@ -587,7 +575,7 @@ pub fn Adapter(comptime protocol: type) type {
             if (self.outboundFree() < needed) return error.Exhausted;
             if (self.selection != null and self.offerFree() < needed) return error.Exhausted;
             self.focus = focus;
-            if (focus) |peer| for (self.devices) |*device| if (device.header.active and std.meta.eql(device.peer, peer))
+            if (focus) |peer| for (self.devices.items) |device| if (device.header.active and std.meta.eql(device.peer, peer))
                 self.enqueueSelection(device) catch unreachable;
         }
 
@@ -645,7 +633,7 @@ pub fn Adapter(comptime protocol: type) type {
                 const value = target orelse return;
                 const count = self.deviceCount(value.peer);
                 if (self.outboundFree() < count) return error.Exhausted;
-                for (self.devices) |*device| if (device.header.active and
+                for (self.devices.items) |device| if (device.header.active and
                     std.meta.eql(device.peer, value.peer))
                     self.enqueue(value.peer, .{ .drag_motion = .{
                         .device = self.deviceId(device),
@@ -660,7 +648,7 @@ pub fn Adapter(comptime protocol: type) type {
             const new_count = if (target) |new| self.deviceCount(new.peer) else 0;
             var old_action_count: usize = 0;
             if (drag.target) |old| {
-                for (self.offers) |offer| {
+                for (self.offers.items) |offer| {
                     old_action_count += @as(usize, @intFromBool(offer.header.active and offer.kind == .drag and
                         offer.current and offer.selected_action != 0 and std.meta.eql(offer.peer, old.peer))) * 2;
                 }
@@ -669,7 +657,7 @@ pub fn Adapter(comptime protocol: type) type {
             if (drag.source != null and self.offerFree() < new_count) return error.Exhausted;
 
             if (drag.target) |old| {
-                for (self.offers) |*offer| if (offer.header.active and offer.kind == .drag and
+                for (self.offers.items) |offer| if (offer.header.active and offer.kind == .drag and
                     offer.current and offer.selected_action != 0 and std.meta.eql(offer.peer, old.peer))
                 {
                     self.enqueue(drag.peer, .{ .source_action = .{
@@ -682,19 +670,19 @@ pub fn Adapter(comptime protocol: type) type {
                     } }) catch unreachable;
                     offer.selected_action = 0;
                 };
-                for (self.devices) |*device| if (device.header.active and
+                for (self.devices.items) |device| if (device.header.active and
                     std.meta.eql(device.peer, old.peer))
                     self.enqueue(old.peer, .{ .drag_leave = self.deviceId(device) }) catch unreachable;
                 self.clearCurrentDragOffers(old.peer);
             }
             self.drag.?.target = target;
             self.drag_target_clear_pending = false;
-            if (target) |new| for (self.devices) |*device| if (device.header.active and
+            if (target) |new| for (self.devices.items) |device| if (device.header.active and
                 std.meta.eql(device.peer, new.peer))
             {
                 var offer_id: ?Id = null;
                 if (drag.source) |source| {
-                    const offer = acquire(OfferSlot, self.offers, &self.offer_free) catch unreachable;
+                    const offer = acquire(OfferSlot, self.allocator, &self.offers, &self.offer_free) catch unreachable;
                     offer.peer = new.peer;
                     offer.device = self.deviceId(device);
                     offer.source = source;
@@ -723,7 +711,7 @@ pub fn Adapter(comptime protocol: type) type {
             const source_count: usize = @intFromBool(drag.source != null);
             if (self.outboundFree() < leave_count + source_count) return error.Exhausted;
             if (drag.target) |target| {
-                for (self.devices) |*device| if (device.header.active and
+                for (self.devices.items) |device| if (device.header.active and
                     std.meta.eql(device.peer, target.peer))
                     self.enqueue(target.peer, .{ .drag_leave = self.deviceId(device) }) catch unreachable;
                 self.clearCurrentDragOffers(target.peer);
@@ -742,7 +730,7 @@ pub fn Adapter(comptime protocol: type) type {
             const drag = self.drag orelse return;
             const target = drag.target orelse return self.cancelDrag();
             var accepted: usize = 0;
-            for (self.offers) |offer| {
+            for (self.offers.items) |offer| {
                 accepted += @as(usize, @intFromBool(offer.header.active and offer.kind == .drag and
                     offer.current and std.meta.eql(offer.peer, target.peer) and
                     offer.accepted_mime != null and (!offer.actions_required or offer.selected_action != 0)));
@@ -752,9 +740,9 @@ pub fn Adapter(comptime protocol: type) type {
             const device_count = self.deviceCount(target.peer);
             const source_count: usize = @intFromBool(drag.source != null);
             if (self.outboundFree() < device_count + source_count) return error.Exhausted;
-            for (self.devices) |*device| if (device.header.active and std.meta.eql(device.peer, target.peer))
+            for (self.devices.items) |device| if (device.header.active and std.meta.eql(device.peer, target.peer))
                 self.enqueue(target.peer, .{ .drag_drop = self.deviceId(device) }) catch unreachable;
-            for (self.offers) |*offer| if (offer.header.active and offer.kind == .drag and
+            for (self.offers.items) |offer| if (offer.header.active and offer.kind == .drag and
                 offer.current and std.meta.eql(offer.peer, target.peer))
             {
                 offer.dropped = offer.accepted_mime != null and
@@ -796,14 +784,14 @@ pub fn Adapter(comptime protocol: type) type {
             if (next != null and self.offerFree() < focus_count) return error.Exhausted;
             if (cancel_count != 0) try old.?.cancel();
             self.selection = next;
-            if (self.focus) |peer| for (self.devices) |*device| if (device.header.active and std.meta.eql(device.peer, peer))
+            if (self.focus) |peer| for (self.devices.items) |device| if (device.header.active and std.meta.eql(device.peer, peer))
                 self.enqueueSelection(device) catch unreachable;
         }
 
         fn enqueueSelection(self: *Self, device: *DeviceSlot) !void {
             var publication: Publication = .{ .device = self.deviceId(device), .source = self.selection };
             if (self.selection) |source| {
-                const offer = acquire(OfferSlot, self.offers, &self.offer_free) catch return error.Exhausted;
+                const offer = acquire(OfferSlot, self.allocator, &self.offers, &self.offer_free) catch return error.Exhausted;
                 offer.peer = device.peer;
                 offer.device = publication.device;
                 offer.selection_source = source;
@@ -841,7 +829,7 @@ pub fn Adapter(comptime protocol: type) type {
         pub fn pendingOutboundOn(self: *const Self, peer: wayring.io_uring.Peer) bool {
             if (self.drag_cancel_pending or self.drag_target_clear_pending) return true;
             if (self.outbound_len == 0) return false;
-            for (self.outbound) |slot|
+            for (self.outbound) |*slot|
                 if (slot.active and std.meta.eql(slot.peer, peer)) return true;
             return false;
         }
@@ -1014,26 +1002,26 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         pub fn resourceRemoved(self: *Self, handle: objects.Handle, object: objects.Object) bool {
-            if (object.interface == &Manager.info) return self.removeResource(ManagerSlot, self.managers, &self.manager_free, handle, object);
+            if (object.interface == &Manager.info) return self.removeResource(ManagerSlot, self.managers.items, &self.manager_free, handle, object);
             if (object.interface == &Device.info) {
-                const device = fromContext(DeviceSlot, self.devices, object.context) orelse return false;
+                const device = fromContext(DeviceSlot, self.devices.items, object.context) orelse return false;
                 if (!std.meta.eql(device.header.resource, handle)) return false;
                 const id = self.deviceId(device);
                 self.dropDeviceOutbound(id);
-                release(DeviceSlot, self.devices, &self.device_free, id.index);
+                release(DeviceSlot, self.devices.items, &self.device_free, id.index);
                 self.progressDragCancellation();
                 return true;
             }
             if (object.interface == &Offer.info) {
-                const offer = fromContext(OfferSlot, self.offers, object.context) orelse return false;
+                const offer = fromContext(OfferSlot, self.offers.items, object.context) orelse return false;
                 if (!std.meta.eql(offer.header.resource, handle)) return false;
                 const id = self.offerId(offer);
                 self.dropOfferOutbound(id);
-                release(OfferSlot, self.offers, &self.offer_free, id.index);
+                release(OfferSlot, self.offers.items, &self.offer_free, id.index);
                 return true;
             }
             if (object.interface == &Source.info) {
-                const source = fromContext(SourceSlot, self.sources, object.context) orelse return false;
+                const source = fromContext(SourceSlot, self.sources.items, object.context) orelse return false;
                 if (!std.meta.eql(source.header.resource, handle)) return false;
                 const id = self.sourceId(source);
                 if (self.selection) |selection| {
@@ -1046,14 +1034,14 @@ pub fn Adapter(comptime protocol: type) type {
                     }
                 }
                 self.dropSourceOutbound(id);
-                release(SourceSlot, self.sources, &self.source_free, id.index);
+                release(SourceSlot, self.sources.items, &self.source_free, id.index);
                 self.progressDragCancellation();
                 return true;
             }
             return false;
         }
 
-        fn removeResource(self: *Self, comptime T: type, slots: []T, free: *u32, handle: objects.Handle, object: objects.Object) bool {
+        fn removeResource(self: *Self, comptime T: type, slots: []*T, free: *u32, handle: objects.Handle, object: objects.Object) bool {
             _ = self;
             const slot = fromContext(T, slots, object.context) orelse return false;
             if (!std.meta.eql(slot.header.resource, handle)) return false;
@@ -1087,7 +1075,7 @@ pub fn Adapter(comptime protocol: type) type {
             const handle = server_objects.namespace.lookupHandle(object_id) orelse return null;
             const object = server_objects.namespace.resolve(handle) orelse return null;
             if (object.interface != &Source.info) return null;
-            const source = fromContext(SourceSlot, self.sources, object.context) orelse return null;
+            const source = fromContext(SourceSlot, self.sources.items, object.context) orelse return null;
             return if (std.meta.eql(source.header.resource, handle)) source else null;
         }
 
@@ -1121,13 +1109,13 @@ pub fn Adapter(comptime protocol: type) type {
 
         fn deviceCount(self: *const Self, peer: wayring.io_uring.Peer) usize {
             var count: usize = 0;
-            for (self.devices) |device| count += @intFromBool(device.header.active and std.meta.eql(device.peer, peer));
+            for (self.devices.items) |device| count += @intFromBool(device.header.active and std.meta.eql(device.peer, peer));
             return count;
         }
 
         fn offerFree(self: *const Self) usize {
             var count: usize = 0;
-            for (self.offers) |offer| count += @intFromBool(!offer.header.active and !offer.header.retired);
+            for (self.offers.items) |offer| count += @intFromBool(!offer.header.active and !offer.header.retired);
             return count;
         }
 
@@ -1146,7 +1134,7 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         fn clearCurrentDragOffers(self: *Self, peer: wayring.io_uring.Peer) void {
-            for (self.offers) |*offer| {
+            for (self.offers.items) |offer| {
                 if (offer.header.active and offer.kind == .drag and
                     offer.current and std.meta.eql(offer.peer, peer)) offer.current = false;
             }
@@ -1154,7 +1142,7 @@ pub fn Adapter(comptime protocol: type) type {
 
         fn dropSourceOutbound(self: *Self, id: Id) void {
             const selected_source = SelectionSource{ .owner = self, .token = @bitCast(id), .vtable = &selection_source_vtable };
-            for (self.offers) |*offer| {
+            for (self.offers.items) |offer| {
                 if (offer.header.active and offer.kind == .drag and
                     std.meta.eql(offer.source, id)) offer.current = false;
             }
@@ -1238,16 +1226,16 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         fn resolveSource(self: *Self, id: Id) !*SourceSlot {
-            return resolve(SourceSlot, self.sources, id);
+            return resolve(SourceSlot, self.sources.items, id);
         }
         fn resolveDevice(self: *Self, id: Id) !*DeviceSlot {
-            return resolve(DeviceSlot, self.devices, id);
+            return resolve(DeviceSlot, self.devices.items, id);
         }
         fn resolveOffer(self: *Self, id: Id) !*OfferSlot {
-            return resolve(OfferSlot, self.offers, id);
+            return resolve(OfferSlot, self.offers.items, id);
         }
         fn sourceId(self: *Self, slot: *SourceSlot) Id {
-            return .{ .index = indexOf(SourceSlot, self.sources, slot), .generation = slot.header.generation };
+            return .{ .index = indexOf(SourceSlot, self.sources.items, slot), .generation = slot.header.generation };
         }
         fn selectionSource(self: *Self, slot: *SourceSlot) SelectionSource {
             return .{ .owner = self, .token = @bitCast(self.sourceId(slot)), .vtable = &selection_source_vtable };
@@ -1282,13 +1270,13 @@ pub fn Adapter(comptime protocol: type) type {
             try self.enqueue(source.peer, .{ .source_cancelled = id });
         }
         fn deviceId(self: *Self, slot: *DeviceSlot) Id {
-            return .{ .index = indexOf(DeviceSlot, self.devices, slot), .generation = slot.header.generation };
+            return .{ .index = indexOf(DeviceSlot, self.devices.items, slot), .generation = slot.header.generation };
         }
         fn offerId(self: *Self, slot: *OfferSlot) Id {
-            return .{ .index = indexOf(OfferSlot, self.offers, slot), .generation = slot.header.generation };
+            return .{ .index = indexOf(OfferSlot, self.offers.items, slot), .generation = slot.header.generation };
         }
         fn releaseOffer(self: *Self, index: u32) void {
-            release(OfferSlot, self.offers, &self.offer_free, index);
+            release(OfferSlot, self.offers.items, &self.offer_free, index);
         }
 
         fn dragActionMask() u32 {
@@ -1332,16 +1320,38 @@ pub fn Adapter(comptime protocol: type) type {
     };
 }
 
-fn initHeaders(comptime T: type, slots: []T) void {
-    for (slots, 0..) |*slot, index| slot.* = .{ .header = .{
-        .next_free = if (index + 1 < slots.len) @intCast(index + 1) else none,
-    } };
+fn initSlots(comptime T: type, allocator: std.mem.Allocator, capacity: usize) !std.ArrayListUnmanaged(*T) {
+    var slots: std.ArrayListUnmanaged(*T) = .empty;
+    errdefer deinitSlots(T, allocator, &slots);
+    try slots.ensureTotalCapacity(allocator, capacity);
+    for (0..capacity) |i| {
+        const slot = try allocator.create(T);
+        slot.* = .{ .header = .{ .next_free = if (i + 1 < capacity) @intCast(i + 1) else none } };
+        slots.appendAssumeCapacity(slot);
+    }
+    return slots;
 }
-
-fn acquire(comptime T: type, slots: []T, free: *u32) !*T {
-    if (free.* == none) return error.Exhausted;
-    const index = free.*;
-    const slot = &slots[index];
+fn deinitSlots(comptime T: type, allocator: std.mem.Allocator, slots: *std.ArrayListUnmanaged(*T)) void {
+    for (slots.items) |slot| {
+        if (@hasField(T, "mime_lengths")) {
+            if (slot.mime_lengths.len != 0) allocator.free(slot.mime_lengths);
+            if (slot.mime_storage.len != 0) allocator.free(slot.mime_storage);
+        }
+        allocator.destroy(slot);
+    }
+    slots.deinit(allocator);
+}
+fn acquire(comptime T: type, allocator: std.mem.Allocator, slots: *std.ArrayListUnmanaged(*T), free: *u32) !*T {
+    if (free.* == none) {
+        if (slots.items.len >= none) return error.OutOfMemory;
+        const slot = try allocator.create(T);
+        errdefer allocator.destroy(slot);
+        slot.* = .{ .header = .{ .active = true } };
+        try slots.append(allocator, slot);
+        return slot;
+    }
+    const i = free.*;
+    const slot = slots.items[i];
     free.* = slot.header.next_free;
     const generation = slot.header.generation;
     const lengths = if (@hasField(T, "mime_lengths")) slot.mime_lengths else {};
@@ -1353,49 +1363,58 @@ fn acquire(comptime T: type, slots: []T, free: *u32) !*T {
     }
     return slot;
 }
-
-fn release(comptime T: type, slots: []T, free: *u32, index: u32) void {
-    const slot = &slots[index];
+fn release(comptime T: type, slots: []*T, free: *u32, i: u32) void {
+    const slot = slots[i];
     if (!slot.header.active) return;
     const generation = slot.header.generation;
     const lengths = if (@hasField(T, "mime_lengths")) slot.mime_lengths else {};
     const storage = if (@hasField(T, "mime_storage")) slot.mime_storage else {};
-    if (generation == std.math.maxInt(u32)) {
-        slot.* = .{ .header = .{ .retired = true, .generation = generation } };
-    } else {
+    if (generation == std.math.maxInt(u32)) slot.* = .{ .header = .{ .retired = true, .generation = generation } } else {
         slot.* = .{ .header = .{ .generation = generation + 1, .next_free = free.* } };
-        free.* = index;
+        free.* = i;
     }
     if (@hasField(T, "mime_lengths")) {
         slot.mime_lengths = lengths;
         slot.mime_storage = storage;
     }
 }
-
-fn resolve(comptime T: type, slots: []T, id: anytype) !*T {
+fn resolve(comptime T: type, slots: []*T, id: anytype) !*T {
     if (id.index >= slots.len) return error.Stale;
-    const slot = &slots[id.index];
+    const slot = slots[id.index];
     if (!slot.header.active or slot.header.generation != id.generation) return error.Stale;
     return slot;
 }
-
-fn fromContext(comptime T: type, slots: []T, context: ?*anyopaque) ?*T {
-    const pointer = context orelse return null;
-    const address = @intFromPtr(pointer);
-    const start = @intFromPtr(slots.ptr);
-    const end = start + slots.len * @sizeOf(T);
-    if (address < start or address >= end or (address - start) % @sizeOf(T) != 0) return null;
-    const slot: *T = @ptrCast(@alignCast(pointer));
-    return if (slot.header.active) slot else null;
+fn fromContext(comptime T: type, slots: []*T, context: ?*anyopaque) ?*T {
+    const slot: *T = @ptrCast(@alignCast(context orelse return null));
+    if (!slot.header.active) return null;
+    for (slots) |owned| if (owned == slot) return slot;
+    return null;
 }
-
-fn indexOf(comptime T: type, slots: []T, slot: *T) u32 {
-    return @intCast((@intFromPtr(slot) - @intFromPtr(slots.ptr)) / @sizeOf(T));
+fn indexOf(comptime T: type, slots: []*T, slot: *T) u32 {
+    for (slots, 0..) |owned, i| if (owned == slot) return @intCast(i);
+    unreachable;
 }
 
 fn optionalPeerEqual(a: ?wayring.io_uring.Peer, b: ?wayring.io_uring.Peer) bool {
     if (a == null or b == null) return a == null and b == null;
     return std.meta.eql(a.?, b.?);
+}
+
+test "data device ownership capacities are initial reservations" {
+    var adapter = try testAdapter(.{ .manager_capacity = 1, .source_capacity = 1, .device_capacity = 1, .offer_capacity = 1 });
+    defer adapter.deinit();
+    const manager = try acquire(TestAdapter.ManagerSlot, adapter.allocator, &adapter.managers, &adapter.manager_free);
+    const source = try adapter.acquireSource();
+    const device = try acquire(TestAdapter.DeviceSlot, adapter.allocator, &adapter.devices, &adapter.device_free);
+    const offer = try acquire(TestAdapter.OfferSlot, adapter.allocator, &adapter.offers, &adapter.offer_free);
+    _ = try acquire(TestAdapter.ManagerSlot, adapter.allocator, &adapter.managers, &adapter.manager_free);
+    _ = try adapter.acquireSource();
+    _ = try acquire(TestAdapter.DeviceSlot, adapter.allocator, &adapter.devices, &adapter.device_free);
+    _ = try acquire(TestAdapter.OfferSlot, adapter.allocator, &adapter.offers, &adapter.offer_free);
+    try std.testing.expect(fromContext(TestAdapter.ManagerSlot, adapter.managers.items, manager) == manager);
+    try std.testing.expect(fromContext(TestAdapter.SourceSlot, adapter.sources.items, source) == source);
+    try std.testing.expect(fromContext(TestAdapter.DeviceSlot, adapter.devices.items, device) == device);
+    try std.testing.expect(fromContext(TestAdapter.OfferSlot, adapter.offers.items, offer) == offer);
 }
 
 fn optionalDragTargetIdentityEqual(a: anytype, b: @TypeOf(a)) bool {
@@ -1448,7 +1467,7 @@ test "data device: toplevel drag source reservations are exclusive and generatio
     defer server_objects.deinit(std.testing.allocator);
     const peer: wayring.io_uring.Peer = .{ .slot = 3, .generation = 7 };
     const foreign: wayring.io_uring.Peer = .{ .slot = 4, .generation = 1 };
-    const source = try acquire(TestAdapter.SourceSlot, adapter.sources, &adapter.source_free);
+    const source = try adapter.acquireSource();
     source.peer = peer;
     source.header.resource = try server_objects.insertClient(
         4,
@@ -1481,8 +1500,8 @@ test "data device: toplevel drag source reservations are exclusive and generatio
     try std.testing.expectEqual(TestAdapter.DragSourceState.gone, adapter.toplevelDragSourceState(reserved));
 
     const old_generation = source.header.generation;
-    release(TestAdapter.SourceSlot, adapter.sources, &adapter.source_free, reserved.index);
-    const replacement = try acquire(TestAdapter.SourceSlot, adapter.sources, &adapter.source_free);
+    release(TestAdapter.SourceSlot, adapter.sources.items, &adapter.source_free, reserved.index);
+    const replacement = try adapter.acquireSource();
     try std.testing.expect(replacement.header.generation != old_generation);
     try std.testing.expectEqual(TestAdapter.DragSourceState.gone, adapter.toplevelDragSourceState(reserved));
 }
@@ -1499,12 +1518,12 @@ test "data device: accepted drag drops once and retains finish publication" {
     });
     defer adapter.deinit();
     const peer: wayring.io_uring.Peer = .{ .slot = 4, .generation = 2 };
-    const source = try acquire(TestAdapter.SourceSlot, adapter.sources, &adapter.source_free);
+    const source = try adapter.acquireSource();
     source.peer = peer;
     const source_id = adapter.sourceId(source);
-    const device = try acquire(TestAdapter.DeviceSlot, adapter.devices, &adapter.device_free);
+    const device = try acquire(TestAdapter.DeviceSlot, adapter.allocator, &adapter.devices, &adapter.device_free);
     device.peer = peer;
-    const offer = try acquire(TestAdapter.OfferSlot, adapter.offers, &adapter.offer_free);
+    const offer = try acquire(TestAdapter.OfferSlot, adapter.allocator, &adapter.offers, &adapter.offer_free);
     offer.peer = peer;
     offer.device = adapter.deviceId(device);
     offer.source = source_id;
@@ -1546,11 +1565,11 @@ test "data device: source destruction retains drag cancellation through backpres
     });
     defer adapter.deinit();
     const peer: wayring.io_uring.Peer = .{ .slot = 6, .generation = 3 };
-    const source = try acquire(TestAdapter.SourceSlot, adapter.sources, &adapter.source_free);
+    const source = try adapter.acquireSource();
     source.peer = peer;
     source.header.resource = .{ .id = 8, .generation = 1 };
     const source_id = adapter.sourceId(source);
-    const device = try acquire(TestAdapter.DeviceSlot, adapter.devices, &adapter.device_free);
+    const device = try acquire(TestAdapter.DeviceSlot, adapter.allocator, &adapter.devices, &adapter.device_free);
     device.peer = peer;
     const device_id = adapter.deviceId(device);
     adapter.drag = .{
@@ -1591,7 +1610,7 @@ test "data device: removing the exact drag origin cancels the session" {
     defer adapter.deinit();
     const peer: wayring.io_uring.Peer = .{ .slot = 1, .generation = 8 };
     const foreign_peer: wayring.io_uring.Peer = .{ .slot = 2, .generation = 4 };
-    const device = try acquire(TestAdapter.DeviceSlot, adapter.devices, &adapter.device_free);
+    const device = try acquire(TestAdapter.DeviceSlot, adapter.allocator, &adapter.devices, &adapter.device_free);
     device.peer = peer;
     adapter.drag = .{ .peer = peer, .source = null, .origin_object = 17, .icon_object = 19 };
     try adapter.updateDragTarget(.{ .peer = foreign_peer, .surface_object = 23, .x = 4, .y = 5 }, 1, 2, false);
@@ -1633,7 +1652,7 @@ test "data device: copied MIME types and offer capacity make replacement transac
     });
     defer adapter.deinit();
     const peer: wayring.io_uring.Peer = .{ .slot = 2, .generation = 9 };
-    const first = try acquire(TestAdapter.SourceSlot, adapter.sources, &adapter.source_free);
+    const first = try adapter.acquireSource();
     first.peer = peer;
     var offered = [_]u8{ 't', 'e', 'x', 't', '/', 'p', 'l', 'a', 'i', 'n' };
     try adapter.addMime(first, &offered);
@@ -1642,10 +1661,10 @@ test "data device: copied MIME types and offer capacity make replacement transac
     try adapter.addMime(first, "text/plain");
     try std.testing.expectEqual(@as(usize, 1), first.mime_count);
 
-    const second = try acquire(TestAdapter.SourceSlot, adapter.sources, &adapter.source_free);
+    const second = try adapter.acquireSource();
     second.peer = peer;
     try adapter.addMime(second, "text/html");
-    const device = try acquire(TestAdapter.DeviceSlot, adapter.devices, &adapter.device_free);
+    const device = try acquire(TestAdapter.DeviceSlot, adapter.allocator, &adapter.devices, &adapter.device_free);
     device.peer = peer;
     try adapter.setFocus(peer);
     for (adapter.outbound) |*slot| slot.active = false;
@@ -1674,11 +1693,11 @@ test "data device: dropping a source closes retained receive FDs and reserved of
     });
     defer adapter.deinit();
     const peer: wayring.io_uring.Peer = .{ .slot = 1, .generation = 4 };
-    const source = try acquire(TestAdapter.SourceSlot, adapter.sources, &adapter.source_free);
+    const source = try adapter.acquireSource();
     source.peer = peer;
     try adapter.addMime(source, "text/plain;charset=utf-8");
     const source_id = adapter.sourceId(source);
-    const device = try acquire(TestAdapter.DeviceSlot, adapter.devices, &adapter.device_free);
+    const device = try acquire(TestAdapter.DeviceSlot, adapter.allocator, &adapter.devices, &adapter.device_free);
     device.peer = peer;
     try adapter.setFocus(peer);
     for (adapter.outbound) |*slot| slot.active = false;
@@ -1726,12 +1745,12 @@ test "data device: publication emits offer, copied MIME list, then selection" {
     var output = wayring.tx.Queue.init(&blocks, 512, &descriptors, 0);
     defer output.deinit();
     const peer: wayring.io_uring.Peer = .{ .slot = 0, .generation = 3 };
-    const source = try acquire(TestAdapter.SourceSlot, adapter.sources, &adapter.source_free);
+    const source = try adapter.acquireSource();
     source.peer = peer;
     source.header.resource = try server_objects.insertClient(4, &test_protocol.wl_data_source.info, 3, source);
     try adapter.addMime(source, "text/plain");
     try adapter.addMime(source, "text/html");
-    const device = try acquire(TestAdapter.DeviceSlot, adapter.devices, &adapter.device_free);
+    const device = try acquire(TestAdapter.DeviceSlot, adapter.allocator, &adapter.devices, &adapter.device_free);
     device.peer = peer;
     device.header.resource = try server_objects.insertClient(5, &test_protocol.wl_data_device.info, 3, device);
     try adapter.setFocus(peer);
@@ -1790,7 +1809,7 @@ test "data device: receive FD stays owned while source send is backpressured" {
     var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 1);
     defer descriptors.deinit(std.testing.allocator);
     const peer: wayring.io_uring.Peer = .{ .slot = 0, .generation = 1 };
-    const source = try acquire(TestAdapter.SourceSlot, adapter.sources, &adapter.source_free);
+    const source = try adapter.acquireSource();
     source.peer = peer;
     source.header.resource = try server_objects.insertClient(4, &test_protocol.wl_data_source.info, 3, source);
     try adapter.addMime(source, "text/plain");

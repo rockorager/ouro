@@ -5,6 +5,7 @@
 const std = @import("std");
 const wayring = @import("wayring");
 const objects = wayring.objects;
+const slot_pool = @import("slot_pool.zig");
 const none = std.math.maxInt(u32);
 const drm_format_argb8888 = fourcc('A', 'R', '2', '4');
 const drm_format_xrgb8888 = fourcc('X', 'R', '2', '4');
@@ -64,6 +65,7 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
         pub const Failure = enum { unknown, buffer_constraints, stopped };
 
         const Session = struct {
+            header: slot_pool.Header = .{},
             active: bool = false,
             generation: u32 = 1,
             next_free: u32 = none,
@@ -78,6 +80,7 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
             successful: bool = false,
         };
         const CursorSession = struct {
+            header: slot_pool.Header = .{},
             active: bool = false,
             generation: u32 = 1,
             next_free: u32 = none,
@@ -95,6 +98,7 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
         };
         const Phase = enum { fresh, queued, started, finished };
         const Frame = struct {
+            header: slot_pool.Header = .{},
             active: bool = false,
             generation: u32 = 1,
             next_free: u32 = none,
@@ -134,14 +138,11 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
         const Out = struct { active: bool = false, sequence: u64 = 0, owner: Owner = undefined, event: Event = undefined };
 
         allocator: std.mem.Allocator,
-        sessions: []Session,
-        cursor_sessions: []CursorSession,
-        frames: []Frame,
+        sessions: slot_pool.Pool(Session),
+        cursor_sessions: slot_pool.Pool(CursorSession),
+        frames: slot_pool.Pool(Frame),
         captures: []CaptureSlot,
         outbound: []Out,
-        session_free: u32 = 0,
-        cursor_session_free: u32 = 0,
-        frame_free: u32 = 0,
         capture_count: usize = 0,
         outbound_count: usize = 0,
         sequence: u64 = 1,
@@ -150,19 +151,16 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
 
         pub fn init(allocator: std.mem.Allocator, c: Config) !Self {
             try c.validate();
-            const sessions = try allocator.alloc(Session, c.session_capacity);
-            errdefer allocator.free(sessions);
-            const cursor_sessions = try allocator.alloc(CursorSession, c.cursor_session_capacity);
-            errdefer allocator.free(cursor_sessions);
-            const frames = try allocator.alloc(Frame, c.frame_capacity);
-            errdefer allocator.free(frames);
+            var sessions = try slot_pool.Pool(Session).init(allocator, c.session_capacity);
+            errdefer sessions.deinit();
+            var cursor_sessions = try slot_pool.Pool(CursorSession).init(allocator, c.cursor_session_capacity);
+            errdefer cursor_sessions.deinit();
+            var frames = try slot_pool.Pool(Frame).init(allocator, c.frame_capacity);
+            errdefer frames.deinit();
             const captures = try allocator.alloc(CaptureSlot, c.capture_capacity);
             errdefer allocator.free(captures);
             const outbound = try allocator.alloc(Out, c.outbound_capacity);
             errdefer allocator.free(outbound);
-            initFree(Session, sessions);
-            initFree(CursorSession, cursor_sessions);
-            initFree(Frame, frames);
             @memset(captures, .{});
             @memset(outbound, .{});
             return .{ .allocator = allocator, .sessions = sessions, .cursor_sessions = cursor_sessions, .frames = frames, .captures = captures, .outbound = outbound };
@@ -170,9 +168,9 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
         pub fn deinit(self: *Self) void {
             self.allocator.free(self.outbound);
             self.allocator.free(self.captures);
-            self.allocator.free(self.frames);
-            self.allocator.free(self.cursor_sessions);
-            self.allocator.free(self.sessions);
+            self.frames.deinit();
+            self.cursor_sessions.deinit();
+            self.sessions.deinit();
             self.* = undefined;
         }
 
@@ -238,17 +236,16 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
             else
                 0;
             if (self.outbound.len - self.outbound_count < needed) return error.Exhausted;
-            if (self.session_free == none) return error.Exhausted;
-            const i = self.session_free;
-            const g = self.sessions[i].generation;
-            self.session_free = self.sessions[i].next_free;
-            self.sessions[i] = .{ .active = true, .generation = g, .peer = peer, .source = source, .target = target, .constraints = constraints, .paint_cursors = paint_cursors, .stopped = stopped };
+            const session = try self.sessions.acquire();
+            const i = session.header.index;
+            const g = session.header.generation;
+            session.* = .{ .header = session.header, .active = true, .generation = g, .peer = peer, .source = source, .target = target, .constraints = constraints, .paint_cursors = paint_cursors, .stopped = stopped };
             const id: SessionId = .{ .index = i, .generation = g };
-            if (self.sessions[i].stopped)
+            if (self.sessions.entries.items[i].stopped)
                 try self.enqueue(.{ .session = id }, .stopped)
             else if (constraints) |value|
                 try self.queueConstraints(id, value);
-            return &self.sessions[i];
+            return self.sessions.entries.items[i];
         }
         pub fn createFrame(self: *Self, id: SessionId, resource: objects.Handle) !FrameId {
             const frame = try self.acquireFrame(id);
@@ -258,12 +255,12 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
         fn acquireFrame(self: *Self, id: SessionId) !*Frame {
             const s = try self.resolveSession(id);
             if (s.frame != null) return error.DuplicateFrame;
-            if (self.frame_free == none) return error.Exhausted;
-            const i = self.frame_free;
-            const g = self.frames[i].generation;
-            self.frame_free = self.frames[i].next_free;
+            const frame = try self.frames.acquire();
+            const i = frame.header.index;
+            const g = frame.header.generation;
             const fid: FrameId = .{ .index = i, .generation = g };
-            self.frames[i] = .{
+            frame.* = .{
+                .header = frame.header,
                 .active = true,
                 .generation = g,
                 .peer = s.peer,
@@ -275,7 +272,7 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
                 .target_invalid = s.stopped,
             };
             s.frame = fid;
-            return &self.frames[i];
+            return self.frames.entries.items[i];
         }
         pub fn attachBuffer(self: *Self, id: FrameId, buffer: objects.Handle) !void {
             const f = try self.mutableFrame(id);
@@ -336,7 +333,7 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
         ) !?wayring.dispatch.Control {
             const resource = server_objects.namespace.lookupHandle(message.header.object_id) orelse return null;
             if (target.object.interface == &SessionProtocol.info) {
-                const session = from(Session, self.sessions, target.object.context) orelse return null;
+                const session = self.sessions.fromContext(target.object.context) orelse return null;
                 if (!std.meta.eql(session.resource, resource) or !samePeer(session.peer, peer)) return null;
                 const decoded = try wayring.server.decodeRequest(SessionProtocol, server_objects, message, fds);
                 switch (decoded.value) {
@@ -344,7 +341,7 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
                     .create_frame => |value| {
                         const frame = self.acquireFrame(self.sessionId(session)) catch |cause| switch (cause) {
                             error.DuplicateFrame => return try self.protocolError(actor, resource.id, SessionProtocol.@"error".duplicate_frame.value, "capture frame already exists"),
-                            error.Exhausted => return try self.noMemory(actor),
+                            error.OutOfMemory => return try self.noMemory(actor),
                             else => return cause,
                         };
                         var owned = true;
@@ -359,7 +356,7 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
                 return .continue_dispatch;
             }
             if (target.object.interface == &CursorProtocol.info) {
-                const cursor = from(CursorSession, self.cursor_sessions, target.object.context) orelse return null;
+                const cursor = self.cursor_sessions.fromContext(target.object.context) orelse return null;
                 if (!std.meta.eql(cursor.resource, resource) or !samePeer(cursor.peer, peer)) return null;
                 const decoded = try wayring.server.decodeRequest(CursorProtocol, server_objects, message, fds);
                 switch (decoded.value) {
@@ -393,7 +390,7 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
                 return .continue_dispatch;
             }
             if (target.object.interface != &FrameProtocol.info) return null;
-            const frame = from(Frame, self.frames, target.object.context) orelse return null;
+            const frame = self.frames.fromContext(target.object.context) orelse return null;
             if (!std.meta.eql(frame.resource, resource) or !samePeer(frame.peer, peer)) return null;
             const decoded = try wayring.server.decodeRequest(FrameProtocol, server_objects, message, fds);
             switch (decoded.value) {
@@ -512,11 +509,11 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
             target: ?CursorTarget,
             constraints: ?Constraints,
         ) !*CursorSession {
-            if (self.cursor_session_free == none) return error.Exhausted;
-            const index = self.cursor_session_free;
-            const generation = self.cursor_sessions[index].generation;
-            self.cursor_session_free = self.cursor_sessions[index].next_free;
-            self.cursor_sessions[index] = .{
+            const cursor = try self.cursor_sessions.acquire();
+            const index = cursor.header.index;
+            const generation = cursor.header.generation;
+            cursor.* = .{
+                .header = cursor.header,
                 .active = true,
                 .generation = generation,
                 .peer = peer,
@@ -525,7 +522,7 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
                 .target = target,
                 .constraints = constraints,
             };
-            return &self.cursor_sessions[index];
+            return self.cursor_sessions.entries.items[index];
         }
 
         pub fn refreshCursor(self: *Self, id: CursorSessionId, info: ?CursorInfo, constraints: ?Constraints) !void {
@@ -566,7 +563,7 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
         }
         pub fn refreshCursors(self: *Self, resolver: anytype) !usize {
             var changed: usize = 0;
-            for (self.cursor_sessions, 0..) |*cursor, index| {
+            for (self.cursor_sessions.entries.items, 0..) |cursor, index| {
                 if (!cursor.active or cursor.target == null or cursor.source_target == null) continue;
                 const target: Target = .{ .cursor = .{
                     .source = cursor.source_target.?,
@@ -619,34 +616,34 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
 
         pub fn invalidate(self: *Self, target: SourceTarget) !usize {
             var needed: usize = 0;
-            for (self.sessions) |s| {
+            for (self.sessions.entries.items) |s| {
                 if (s.active and !s.stopped and s.target != null and matchesSource(s.target.?, target))
                     needed += 1;
             }
-            for (self.frames) |f| {
+            for (self.frames.entries.items) |f| {
                 if (f.active and !f.target_invalid and f.target != null and
                     matchesSource(f.target.?, target) and (f.phase == .queued or f.phase == .started))
                     needed += 1;
             }
-            for (self.cursor_sessions) |cursor| {
+            for (self.cursor_sessions.entries.items) |cursor| {
                 if (cursor.active and cursor.target != null and cursor.source_target != null and
                     std.meta.eql(cursor.source_target.?, target) and cursor.entered)
                     needed += 1;
             }
             if (self.outbound.len - self.outbound_count < needed) return error.Exhausted;
             var n: usize = 0;
-            for (self.sessions, 0..) |*s, i| if (s.active and !s.stopped and s.target != null and matchesSource(s.target.?, target)) {
+            for (self.sessions.entries.items, 0..) |s, i| if (s.active and !s.stopped and s.target != null and matchesSource(s.target.?, target)) {
                 s.stopped = true;
                 s.target = null;
                 try self.enqueue(.{ .session = .{ .index = @intCast(i), .generation = s.generation } }, .stopped);
                 n += 1;
             };
-            for (self.frames, 0..) |*f, i| if (f.active and !f.target_invalid and f.target != null and matchesSource(f.target.?, target)) {
+            for (self.frames.entries.items, 0..) |f, i| if (f.active and !f.target_invalid and f.target != null and matchesSource(f.target.?, target)) {
                 f.target_invalid = true;
                 if (f.phase == .queued or f.phase == .started)
                     try self.finishFailure(.{ .index = @intCast(i), .generation = f.generation }, .stopped);
             };
-            for (self.cursor_sessions, 0..) |*cursor, i| {
+            for (self.cursor_sessions.entries.items, 0..) |cursor, i| {
                 if (!cursor.active or cursor.target == null or cursor.source_target == null or
                     !std.meta.eql(cursor.source_target.?, target)) continue;
                 if (cursor.entered)
@@ -833,9 +830,9 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
         }
         fn ownerPeer(self: *const Self, owner: Owner, peer: wayring.io_uring.Peer) bool {
             return switch (owner) {
-                .session => |id| id.index < self.sessions.len and self.sessions[id.index].active and self.sessions[id.index].generation == id.generation and samePeer(self.sessions[id.index].peer, peer),
-                .frame => |id| id.index < self.frames.len and self.frames[id.index].active and self.frames[id.index].generation == id.generation and samePeer(self.frames[id.index].peer, peer),
-                .cursor => |id| id.index < self.cursor_sessions.len and self.cursor_sessions[id.index].active and self.cursor_sessions[id.index].generation == id.generation and samePeer(self.cursor_sessions[id.index].peer, peer),
+                .session => |id| id.index < self.sessions.entries.items.len and self.sessions.entries.items[id.index].active and self.sessions.entries.items[id.index].generation == id.generation and samePeer(self.sessions.entries.items[id.index].peer, peer),
+                .frame => |id| id.index < self.frames.entries.items.len and self.frames.entries.items[id.index].active and self.frames.entries.items[id.index].generation == id.generation and samePeer(self.frames.entries.items[id.index].peer, peer),
+                .cursor => |id| id.index < self.cursor_sessions.entries.items.len and self.cursor_sessions.entries.items[id.index].active and self.cursor_sessions.entries.items[id.index].generation == id.generation and samePeer(self.cursor_sessions.entries.items[id.index].peer, peer),
             };
         }
         fn discardOutbound(self: *Self, out: *Out) void {
@@ -854,32 +851,32 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
 
         pub fn resourceRemoved(self: *Self, h: objects.Handle, o: objects.Object) bool {
             if (o.interface == &FrameProtocol.info) {
-                const f = from(Frame, self.frames, o.context) orelse return false;
+                const f = self.frames.fromContext(o.context) orelse return false;
                 if (!std.meta.eql(f.resource, h)) return false;
-                self.releaseFrame(indexOf(Frame, self.frames, f));
+                self.releaseFrame(f.header.index);
                 return true;
             }
             if (o.interface == &SessionProtocol.info) {
-                const s = from(Session, self.sessions, o.context) orelse return false;
+                const s = self.sessions.fromContext(o.context) orelse return false;
                 if (!std.meta.eql(s.resource, h)) return false;
-                self.releaseSession(indexOf(Session, self.sessions, s));
+                self.releaseSession(s.header.index);
                 return true;
             }
             if (o.interface == &CursorProtocol.info) {
-                const cursor = from(CursorSession, self.cursor_sessions, o.context) orelse return false;
+                const cursor = self.cursor_sessions.fromContext(o.context) orelse return false;
                 if (!std.meta.eql(cursor.resource, h)) return false;
-                self.releaseCursorSession(indexOf(CursorSession, self.cursor_sessions, cursor));
+                self.releaseCursorSession(cursor.header.index);
                 return true;
             }
             return false;
         }
         pub fn disconnected(self: *Self, peer: wayring.io_uring.Peer) void {
-            for (self.frames, 0..) |f, i| if (f.active and samePeer(f.peer, peer)) self.releaseFrame(@intCast(i));
-            for (self.sessions, 0..) |s, i| if (s.active and samePeer(s.peer, peer)) self.releaseSession(@intCast(i));
-            for (self.cursor_sessions, 0..) |cursor, i| if (cursor.active and samePeer(cursor.peer, peer)) self.releaseCursorSession(@intCast(i));
+            for (self.frames.entries.items, 0..) |f, i| if (f.active and samePeer(f.peer, peer)) self.releaseFrame(@intCast(i));
+            for (self.sessions.entries.items, 0..) |s, i| if (s.active and samePeer(s.peer, peer)) self.releaseSession(@intCast(i));
+            for (self.cursor_sessions.entries.items, 0..) |cursor, i| if (cursor.active and samePeer(cursor.peer, peer)) self.releaseCursorSession(@intCast(i));
         }
         fn releaseFrame(self: *Self, i: u32) void {
-            const f = &self.frames[i];
+            const f = self.frames.entries.items[i];
             if (!f.active) return;
             const sid = f.session;
             if (self.resolveSession(sid)) |s| {
@@ -888,27 +885,21 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
             const id = self.frameId(f);
             self.removeCaptures(id);
             self.dropOwner(.{ .frame = id });
-            const g = nextGeneration(f.generation);
-            f.* = .{ .generation = g, .next_free = self.frame_free };
-            self.frame_free = i;
+            self.frames.release(f);
         }
         fn releaseSession(self: *Self, i: u32) void {
-            const s = &self.sessions[i];
+            const s = self.sessions.entries.items[i];
             if (!s.active) return;
             const id: SessionId = .{ .index = i, .generation = s.generation };
             self.dropOwner(.{ .session = id });
-            const g = nextGeneration(s.generation);
-            s.* = .{ .generation = g, .next_free = self.session_free };
-            self.session_free = i;
+            self.sessions.release(s);
         }
         fn releaseCursorSession(self: *Self, i: u32) void {
-            const cursor = &self.cursor_sessions[i];
+            const cursor = self.cursor_sessions.entries.items[i];
             if (!cursor.active) return;
             const id = self.cursorSessionId(cursor);
             self.dropOwner(.{ .cursor = id });
-            const generation = nextGeneration(cursor.generation);
-            cursor.* = .{ .generation = generation, .next_free = self.cursor_session_free };
-            self.cursor_session_free = i;
+            self.cursor_sessions.release(cursor);
         }
         fn removeCaptures(self: *Self, id: FrameId) void {
             for (self.captures) |*slot| if (slot.active and std.meta.eql(slot.value.frame, id)) {
@@ -927,40 +918,43 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
             self.outbound_count = 0;
         }
         fn resolveSession(self: *Self, id: SessionId) !*Session {
-            if (id.index >= self.sessions.len) return error.StaleSession;
-            const s = &self.sessions[id.index];
+            const s = self.sessions.at(id.index) orelse return error.StaleSession;
             if (!s.active or s.generation != id.generation) return error.StaleSession;
             return s;
         }
         fn mutableFrame(self: *Self, id: FrameId) !*Frame {
-            if (id.index >= self.frames.len) return error.StaleFrame;
-            const f = &self.frames[id.index];
+            const f = self.frames.at(id.index) orelse return error.StaleFrame;
             if (!f.active or f.generation != id.generation) return error.StaleFrame;
             return f;
         }
         fn resolveCursorSession(self: *Self, id: CursorSessionId) !*CursorSession {
-            if (id.index >= self.cursor_sessions.len) return error.StaleCursorSession;
-            const cursor = &self.cursor_sessions[id.index];
+            const cursor = self.cursor_sessions.at(id.index) orelse return error.StaleCursorSession;
             if (!cursor.active or cursor.generation != id.generation) return error.StaleCursorSession;
             return cursor;
         }
         fn frameId(self: *const Self, f: *const Frame) FrameId {
-            return .{ .index = indexOf(Frame, self.frames, f), .generation = f.generation };
+            _ = self;
+            return .{ .index = f.header.index, .generation = f.generation };
         }
         fn frameIndex(self: *const Self, frame: *const Frame) u32 {
-            return indexOf(Frame, self.frames, frame);
+            _ = self;
+            return frame.header.index;
         }
         fn sessionId(self: *const Self, session: *const Session) SessionId {
-            return .{ .index = indexOf(Session, self.sessions, session), .generation = session.generation };
+            _ = self;
+            return .{ .index = session.header.index, .generation = session.generation };
         }
         fn sessionIndex(self: *const Self, session: *const Session) u32 {
-            return indexOf(Session, self.sessions, session);
+            _ = self;
+            return session.header.index;
         }
         fn cursorSessionId(self: *const Self, cursor: *const CursorSession) CursorSessionId {
-            return .{ .index = indexOf(CursorSession, self.cursor_sessions, cursor), .generation = cursor.generation };
+            _ = self;
+            return .{ .index = cursor.header.index, .generation = cursor.generation };
         }
         fn cursorSessionIndex(self: *const Self, cursor: *const CursorSession) u32 {
-            return indexOf(CursorSession, self.cursor_sessions, cursor);
+            _ = self;
+            return cursor.header.index;
         }
         fn noMemory(_: *Self, actor: *wayring.connection.Actor) !wayring.dispatch.Control {
             try ProtocolCore.postError(actor, objects.display_id, 2, "out of memory");
@@ -977,24 +971,6 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
     };
 }
 
-fn initFree(comptime T: type, slots: []T) void {
-    for (slots, 0..) |*s, i| s.* = .{ .next_free = if (i + 1 < slots.len) @intCast(i + 1) else none };
-}
-fn indexOf(comptime T: type, slots: []const T, p: *const T) u32 {
-    return @intCast((@intFromPtr(p) - @intFromPtr(slots.ptr)) / @sizeOf(T));
-}
-fn from(comptime T: type, slots: []T, ctx: ?*anyopaque) ?*T {
-    const p = ctx orelse return null;
-    const a = @intFromPtr(p);
-    const b = @intFromPtr(slots.ptr);
-    if (a < b or a >= b + slots.len * @sizeOf(T) or (a - b) % @sizeOf(T) != 0) return null;
-    const s = &slots[(a - b) / @sizeOf(T)];
-    return if (s.active) s else null;
-}
-fn nextGeneration(g: u32) u32 {
-    const n = g +% 1;
-    return if (n == 0) 1 else n;
-}
 fn samePeer(a: wayring.io_uring.Peer, b: wayring.io_uring.Peer) bool {
     return std.meta.eql(a, b);
 }
@@ -1012,6 +988,29 @@ const test_snapshot: TestSourceAdapter.Snapshot = .{
     .id = .{ .index = 1, .generation = 4 },
     .target = test_target,
 };
+
+test "image copy capture ownership reservations grow beyond one" {
+    var adapter = try TestAdapter.init(std.testing.allocator, .{
+        .session_capacity = 1,
+        .cursor_session_capacity = 1,
+        .frame_capacity = 1,
+        .capture_capacity = 1,
+        .outbound_capacity = 8,
+    });
+    defer adapter.deinit();
+
+    const first = try adapter.admitSession(test_peer, .{ .id = 10, .generation = 1 }, test_snapshot, null, false);
+    const first_ptr = try adapter.resolveSession(first);
+    const second = try adapter.admitSession(test_peer, .{ .id = 11, .generation = 1 }, test_snapshot, null, false);
+    try std.testing.expect(first_ptr == try adapter.resolveSession(first));
+    _ = try adapter.createFrame(first, .{ .id = 12, .generation = 1 });
+    _ = try adapter.createFrame(second, .{ .id = 13, .generation = 1 });
+    _ = try adapter.admitCursorSession(test_peer, .{ .id = 14, .generation = 1 }, test_snapshot, test_target.output, null);
+    _ = try adapter.admitCursorSession(test_peer, .{ .id = 15, .generation = 1 }, test_snapshot, test_target.output, null);
+    try std.testing.expectEqual(@as(usize, 2), adapter.sessions.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 2), adapter.frames.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 2), adapter.cursor_sessions.entries.items.len);
+}
 
 test "image copy capture: constraints and successful completion retain protocol order" {
     var adapter = try TestAdapter.init(std.testing.allocator, .{
@@ -1184,7 +1183,7 @@ test "image copy capture: generated session request admits frame resource" {
         false,
     );
     adapter.clearOutbound();
-    const session_slot = &adapter.sessions[session.index];
+    const session_slot = adapter.sessions.entries.items[session.index];
     session_slot.resource = try server_objects.insertClient(
         10,
         &protocol.ext_image_copy_capture_session_v1.info,
@@ -1215,10 +1214,10 @@ test "image copy capture: generated session request admits frame resource" {
         wayring.dispatch.Control.continue_dispatch,
         (try adapter.requestOn(&actor, &server_objects, test_peer, target, message, &requests.descriptors)).?,
     );
-    const frame = adapter.frames[0];
+    const frame = adapter.frames.entries.items[0];
     try std.testing.expect(frame.active);
     try std.testing.expectEqual(@as(u32, 11), frame.resource.id);
-    try std.testing.expect(server_objects.namespace.resolve(frame.resource).?.context == @as(?*anyopaque, @ptrCast(&adapter.frames[0])));
+    try std.testing.expect(server_objects.namespace.resolve(frame.resource).?.context == @as(?*anyopaque, @ptrCast(adapter.frames.entries.items[0])));
 }
 
 test "image copy capture: ordinary manager request validates and admits session" {
@@ -1283,9 +1282,9 @@ test "image copy capture: ordinary manager request validates and admits session"
         wayring.dispatch.Control.continue_dispatch,
         (try adapter.managerRequestOn(&actor, &server_objects, test_peer, target, message, &requests.descriptors, &sources, &resolver)).?,
     );
-    try std.testing.expect(adapter.sessions[0].active);
-    try std.testing.expect(adapter.sessions[0].paint_cursors);
-    try std.testing.expectEqual(@as(u32, 8), adapter.sessions[0].resource.id);
+    try std.testing.expect(adapter.sessions.entries.items[0].active);
+    try std.testing.expect(adapter.sessions.entries.items[0].paint_cursors);
+    try std.testing.expectEqual(@as(u32, 8), adapter.sessions.entries.items[0].resource.id);
     try std.testing.expectEqual(@as(usize, 4), adapter.outbound_count);
 }
 
@@ -1352,8 +1351,8 @@ test "image copy capture: generated cursor requests admit one independent nested
         wayring.dispatch.Control.continue_dispatch,
         (try adapter.managerRequestOn(&actor, &server_objects, test_peer, target, message, &requests.descriptors, &sources, &resolver)).?,
     );
-    try std.testing.expect(adapter.cursor_sessions[0].active);
-    try std.testing.expectEqual(@as(u32, 9), adapter.cursor_sessions[0].resource.id);
+    try std.testing.expect(adapter.cursor_sessions.entries.items[0].active);
+    try std.testing.expectEqual(@as(u32, 9), adapter.cursor_sessions.entries.items[0].resource.id);
 
     requests.deinit();
     requests = wayring.tx.Queue.init(&blocks, 128, &descriptors, 0);
@@ -1369,12 +1368,12 @@ test "image copy capture: generated cursor requests admit one independent nested
         wayring.dispatch.Control.continue_dispatch,
         (try adapter.requestOn(&actor, &server_objects, test_peer, target, message, &requests.descriptors)).?,
     );
-    try std.testing.expect(adapter.sessions[0].active);
-    try std.testing.expectEqual(@as(u32, 10), adapter.sessions[0].resource.id);
-    try std.testing.expectEqual(A.Target.cursor, std.meta.activeTag(adapter.sessions[0].target.?));
+    try std.testing.expect(adapter.sessions.entries.items[0].active);
+    try std.testing.expectEqual(@as(u32, 10), adapter.sessions.entries.items[0].resource.id);
+    try std.testing.expectEqual(A.Target.cursor, std.meta.activeTag(adapter.sessions.entries.items[0].target.?));
 
     adapter.releaseCursorSession(0);
-    try std.testing.expect(adapter.sessions[0].active);
+    try std.testing.expect(adapter.sessions.entries.items[0].active);
 }
 
 test "image copy capture: cursor metadata deduplicates and nested session has independent lifetime" {
@@ -1451,7 +1450,7 @@ test "image copy capture: source invalidation leaves cursor and stops nested ses
 
     try std.testing.expectEqual(@as(usize, 1), try adapter.invalidate(test_target));
     try std.testing.expect((try adapter.resolveSession(nested)).stopped);
-    try std.testing.expect(adapter.cursor_sessions[cursor.index].target == null);
+    try std.testing.expect(adapter.cursor_sessions.entries.items[cursor.index].target == null);
     try std.testing.expectEqual(@as(usize, 2), adapter.outbound_count);
     try std.testing.expectEqual(.stopped, std.meta.activeTag(adapter.oldestOutbound(test_peer).?.event));
     adapter.discardOutbound(adapter.oldestOutbound(test_peer).?);

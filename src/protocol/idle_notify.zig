@@ -4,6 +4,7 @@ const std = @import("std");
 const wayring = @import("wayring");
 const objects = wayring.objects;
 const none = std.math.maxInt(u32);
+const slot_pool = @import("slot_pool.zig");
 
 pub const SeatValidator = struct {
     context: ?*anyopaque = null,
@@ -42,9 +43,7 @@ pub fn Adapter(comptime protocol: type) type {
 
         const Event = enum { idled, resumed };
         const Slot = struct {
-            active: bool = false,
-            generation: u32 = 1,
-            next_free: u32 = none,
+            header: slot_pool.Header = .{},
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
             peer: wayring.io_uring.Peer = undefined,
             input_only: bool = false,
@@ -59,23 +58,18 @@ pub fn Adapter(comptime protocol: type) type {
         allocator: std.mem.Allocator,
         validator: SeatValidator,
         clock: Clock,
-        slots: []Slot,
-        free_head: u32 = 0,
+        slots: slot_pool.Pool(Slot),
         inhibited: bool = false,
         runtime: ?*Runtime = null,
         global: ?objects.Handle = null,
 
         pub fn init(allocator: std.mem.Allocator, validator: SeatValidator, clock: Clock, config: Config) !Self {
             try config.validate();
-            const slots = try allocator.alloc(Slot, config.notification_capacity);
-            for (slots, 0..) |*slot, i| slot.* = .{
-                .next_free = if (i + 1 < slots.len) @intCast(i + 1) else none,
-            };
-            return .{ .allocator = allocator, .validator = validator, .clock = clock, .slots = slots };
+            return .{ .allocator = allocator, .validator = validator, .clock = clock, .slots = try slot_pool.Pool(Slot).init(allocator, config.notification_capacity) };
         }
 
         pub fn deinit(self: *Self) void {
-            self.allocator.free(self.slots);
+            self.slots.deinit();
             self.* = undefined;
         }
 
@@ -141,11 +135,11 @@ pub fn Adapter(comptime protocol: type) type {
         /// Applies one user-activity boundary atomically across notifications.
         /// An idle notification retains idled/resumed ordering under TX pressure.
         pub fn activity(self: *Self, now_ns: u64) !void {
-            for (self.slots) |slot|
-                if (slot.active and slot.idle and slot.event_len == slot.events.len)
+            for (self.slots.entries.items) |slot|
+                if (slot.header.active and slot.idle and slot.event_len == slot.events.len)
                     return error.Exhausted;
-            for (self.slots) |*slot| {
-                if (!slot.active) continue;
+            for (self.slots.entries.items) |slot| {
+                if (!slot.header.active) continue;
                 if (slot.idle) try self.enqueue(slot, .resumed);
                 slot.idle = false;
                 slot.last_activity_ns = now_ns;
@@ -156,12 +150,12 @@ pub fn Adapter(comptime protocol: type) type {
         /// ignore this state as required by version 2 of the protocol.
         pub fn setInhibited(self: *Self, inhibited: bool, now_ns: u64) !void {
             if (self.inhibited == inhibited) return;
-            if (inhibited) for (self.slots) |slot|
-                if (slot.active and !slot.input_only and slot.idle and slot.event_len == slot.events.len)
+            if (inhibited) for (self.slots.entries.items) |slot|
+                if (slot.header.active and !slot.input_only and slot.idle and slot.event_len == slot.events.len)
                     return error.Exhausted;
             self.inhibited = inhibited;
-            for (self.slots) |*slot| {
-                if (!slot.active or slot.input_only) continue;
+            for (self.slots.entries.items) |slot| {
+                if (!slot.header.active or slot.input_only) continue;
                 if (inhibited and slot.idle) try self.enqueue(slot, .resumed);
                 slot.idle = false;
                 slot.last_activity_ns = now_ns;
@@ -169,13 +163,13 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         pub fn advance(self: *Self, now_ns: u64) !void {
-            for (self.slots) |slot| {
-                if (!slot.active or slot.idle or (!slot.input_only and self.inhibited)) continue;
+            for (self.slots.entries.items) |slot| {
+                if (!slot.header.active or slot.idle or (!slot.input_only and self.inhibited)) continue;
                 if (now_ns >= deadline(slot) and slot.event_len == slot.events.len) return error.Exhausted;
             }
-            for (self.slots) |*slot| {
-                if (!slot.active or slot.idle or (!slot.input_only and self.inhibited)) continue;
-                if (now_ns < deadline(slot.*)) continue;
+            for (self.slots.entries.items) |slot| {
+                if (!slot.header.active or slot.idle or (!slot.input_only and self.inhibited)) continue;
+                if (now_ns < deadline(slot)) continue;
                 try self.enqueue(slot, .idled);
                 slot.idle = true;
             }
@@ -183,8 +177,8 @@ pub fn Adapter(comptime protocol: type) type {
 
         pub fn nextDeadline(self: *const Self) ?u64 {
             var next: ?u64 = null;
-            for (self.slots) |slot| {
-                if (!slot.active or slot.idle or (!slot.input_only and self.inhibited)) continue;
+            for (self.slots.entries.items) |slot| {
+                if (!slot.header.active or slot.idle or (!slot.input_only and self.inhibited)) continue;
                 const value = deadline(slot);
                 if (next == null or value < next.?) next = value;
             }
@@ -193,7 +187,7 @@ pub fn Adapter(comptime protocol: type) type {
 
         pub fn flushOn(self: *Self, peer: wayring.io_uring.Peer, _: anytype, queue: *wayring.tx.Queue) !usize {
             var count: usize = 0;
-            for (self.slots) |*slot| while (slot.active and slot.event_len != 0 and samePeer(slot.peer, peer)) {
+            for (self.slots.entries.items) |slot| while (slot.header.active and slot.event_len != 0 and samePeer(slot.peer, peer)) {
                 const event = slot.events[slot.event_head];
                 (switch (event) {
                     .idled => Notification.encodeEvent(queue, slot.resource.id, .idled),
@@ -210,8 +204,8 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         pub fn pendingOutbound(self: *const Self, peer: wayring.io_uring.Peer) bool {
-            for (self.slots) |slot|
-                if (slot.active and slot.event_len != 0 and samePeer(slot.peer, peer)) return true;
+            for (self.slots.entries.items) |slot|
+                if (slot.header.active and slot.event_len != 0 and samePeer(slot.peer, peer)) return true;
             return false;
         }
 
@@ -226,8 +220,8 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         pub fn disconnected(self: *Self, peer: wayring.io_uring.Peer) void {
-            for (self.slots, 0..) |slot, i|
-                if (slot.active and samePeer(slot.peer, peer)) self.release(@intCast(i));
+            for (self.slots.entries.items) |slot|
+                if (slot.header.active and samePeer(slot.peer, peer)) self.release(slot.header.index);
         }
 
         fn enqueue(_: *Self, slot: *Slot, event: Event) !void {
@@ -237,38 +231,24 @@ pub fn Adapter(comptime protocol: type) type {
             slot.event_len += 1;
         }
 
-        fn deadline(slot: Slot) u64 {
+        fn deadline(slot: *const Slot) u64 {
             return slot.last_activity_ns +| slot.timeout_ns;
         }
 
         fn acquire(self: *Self) !*Slot {
-            if (self.free_head == none) return error.Exhausted;
-            const i = self.free_head;
-            const generation = self.slots[i].generation;
-            self.free_head = self.slots[i].next_free;
-            self.slots[i] = .{ .active = true, .generation = generation };
-            return &self.slots[i];
+            return self.slots.acquire();
         }
 
         fn release(self: *Self, i: u32) void {
-            const generation = if (self.slots[i].generation == std.math.maxInt(u32)) 0 else self.slots[i].generation + 1;
-            self.slots[i] = .{ .generation = generation, .next_free = if (generation == 0) none else self.free_head };
-            if (generation != 0) self.free_head = i;
+            self.slots.release(self.slots.at(i) orelse return);
         }
 
         fn fromObject(self: *Self, object: *const objects.Object) ?*Slot {
-            const pointer = object.context orelse return null;
-            const address = @intFromPtr(pointer);
-            const start = @intFromPtr(self.slots.ptr);
-            const bytes = std.math.mul(usize, self.slots.len, @sizeOf(Slot)) catch return null;
-            const end = std.math.add(usize, start, bytes) catch return null;
-            if (address < start or address >= end or (address - start) % @sizeOf(Slot) != 0) return null;
-            const slot = &self.slots[(address - start) / @sizeOf(Slot)];
-            return if (slot.active) slot else null;
+            return self.slots.fromContext(object.context);
         }
 
-        fn index(self: *const Self, slot: *const Slot) u32 {
-            return @intCast((@intFromPtr(slot) - @intFromPtr(self.slots.ptr)) / @sizeOf(Slot));
+        fn index(_: *const Self, slot: *const Slot) u32 {
+            return slot.header.index;
         }
 
         fn noMemory(_: *Self, actor: *wayring.connection.Actor) !wayring.dispatch.Control {
@@ -300,6 +280,16 @@ fn testSeat(_: ?*anyopaque, _: wayring.io_uring.Peer, _: u32) bool {
 
 fn testNow(_: ?*anyopaque) anyerror!u64 {
     return 0;
+}
+
+test "idle-notify: notification reservation grows with stable contexts" {
+    const A = Adapter(@import("core_protocol"));
+    var adapter = try A.init(std.testing.allocator, .{ .validateFn = testSeat }, .{ .nowFn = testNow }, .{ .notification_capacity = 1 });
+    defer adapter.deinit();
+    const first = try adapter.acquire();
+    const second = try adapter.acquire();
+    try std.testing.expect(first == adapter.slots.entries.items[0]);
+    try std.testing.expect(first != second);
 }
 
 test "idle-notify: input activity retains exact idled resumed ordering" {

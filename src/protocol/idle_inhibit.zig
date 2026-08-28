@@ -3,6 +3,7 @@
 const std = @import("std");
 const wayring = @import("wayring");
 const objects = wayring.objects;
+const slot_pool = @import("slot_pool.zig");
 const none = std.math.maxInt(u32);
 
 pub const Config = struct {
@@ -23,8 +24,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         const Inhibitor = protocol.zwp_idle_inhibitor_v1;
 
         const Slot = struct {
-            active: bool = false,
-            next_free: u32 = none,
+            header: slot_pool.Header = .{},
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
             surface: CoreSurface.SurfaceId = undefined,
             peer: wayring.io_uring.Peer = undefined,
@@ -32,23 +32,19 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
 
         allocator: std.mem.Allocator,
         core: *CoreSurface,
-        slots: []Slot,
-        free_head: u32 = 0,
+        slots: slot_pool.Pool(Slot),
         active_len: usize = 0,
         runtime: ?*Runtime = null,
         global: ?objects.Handle = null,
 
         pub fn init(allocator: std.mem.Allocator, core: *CoreSurface, config: Config) !Self {
             try config.validate();
-            const slots = try allocator.alloc(Slot, config.inhibitor_capacity);
-            for (slots, 0..) |*slot, i| slot.* = .{
-                .next_free = if (i + 1 < slots.len) @intCast(i + 1) else none,
-            };
+            const slots = try slot_pool.Pool(Slot).init(allocator, config.inhibitor_capacity);
             return .{ .allocator = allocator, .core = core, .slots = slots };
         }
 
         pub fn deinit(self: *Self) void {
-            self.allocator.free(self.slots);
+            self.slots.deinit();
             self.* = undefined;
         }
 
@@ -99,7 +95,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                             value,
                             .{ .id = slot },
                         ) catch |err| {
-                            self.release(self.index(slot));
+                            self.release(slot);
                             return try self.failure(actor, decoded.handle.id, err);
                         };
                         slot.resource = admitted.id;
@@ -121,8 +117,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         /// Returns whether at least one live inhibitor is associated with the
         /// exact surface generation. Visibility decides whether it is honored.
         pub fn hasInhibitor(self: *const Self, surface: CoreSurface.SurfaceId) bool {
-            for (self.slots) |slot|
-                if (slot.active and std.meta.eql(slot.surface, surface)) return true;
+            for (self.slots.entries.items) |slot|
+                if (slot.header.active and std.meta.eql(slot.surface, surface)) return true;
             return false;
         }
 
@@ -132,8 +128,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
 
         pub fn surfaces(self: *const Self, output: []CoreSurface.SurfaceId) ![]const CoreSurface.SurfaceId {
             var count: usize = 0;
-            for (self.slots) |slot| {
-                if (!slot.active) continue;
+            for (self.slots.entries.items) |slot| {
+                if (!slot.header.active) continue;
                 if (count == output.len) return error.OutputTooSmall;
                 output[count] = slot.surface;
                 count += 1;
@@ -145,7 +141,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             if (object.interface == &Inhibitor.info) {
                 const slot = self.fromObject(&object) orelse return false;
                 if (!std.meta.eql(slot.resource, handle)) return false;
-                self.release(self.index(slot));
+                self.release(slot);
                 return true;
             }
             return object.interface == &Manager.info and
@@ -153,42 +149,24 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         }
 
         pub fn disconnected(self: *Self, peer: wayring.io_uring.Peer) void {
-            for (self.slots, 0..) |*slot, i|
-                if (slot.active and samePeer(slot.peer, peer)) self.release(@intCast(i));
+            for (self.slots.entries.items) |slot|
+                if (slot.header.active and samePeer(slot.peer, peer)) self.release(slot);
         }
 
         fn acquire(self: *Self) !*Slot {
-            if (self.free_head == none) return error.Exhausted;
-            const i = self.free_head;
-            const slot = &self.slots[i];
-            self.free_head = slot.next_free;
-            slot.* = .{ .active = true };
+            const slot = try self.slots.acquire();
             self.active_len += 1;
             return slot;
         }
 
-        fn release(self: *Self, i: u32) void {
-            const slot = &self.slots[i];
-            if (!slot.active) return;
-            slot.* = .{ .next_free = self.free_head };
-            self.free_head = i;
+        fn release(self: *Self, slot: *Slot) void {
+            if (!slot.header.active) return;
+            self.slots.release(slot);
             self.active_len -= 1;
         }
 
         fn fromObject(self: *Self, object: *const objects.Object) ?*Slot {
-            const pointer = object.context orelse return null;
-            const address = @intFromPtr(pointer);
-            const start = @intFromPtr(self.slots.ptr);
-            const bytes = std.math.mul(usize, self.slots.len, @sizeOf(Slot)) catch return null;
-            const end = std.math.add(usize, start, bytes) catch return null;
-            if (address < start or address >= end or (address - start) % @sizeOf(Slot) != 0)
-                return null;
-            const slot = &self.slots[(address - start) / @sizeOf(Slot)];
-            return if (slot.active) slot else null;
-        }
-
-        fn index(self: *const Self, slot: *const Slot) u32 {
-            return @intCast((@intFromPtr(slot) - @intFromPtr(self.slots.ptr)) / @sizeOf(Slot));
+            return self.slots.fromContext(object.context);
         }
 
         fn noMemory(_: *Self, actor: *wayring.connection.Actor) !wayring.dispatch.Control {
@@ -238,7 +216,11 @@ test "idle inhibit: multiple associations are bounded and peer cleanup is exact"
 
     try std.testing.expect(adapter.hasInhibitor(surface));
     try std.testing.expectEqual(@as(usize, 3), adapter.activeCount());
-    try std.testing.expectError(error.Exhausted, adapter.acquire());
+    const original = @intFromPtr(first);
+    const grown = try adapter.acquire();
+    grown.peer = peer_a;
+    grown.surface = surface;
+    try std.testing.expectEqual(original, @intFromPtr(first));
     adapter.disconnected(peer_a);
     try std.testing.expect(!adapter.hasInhibitor(surface));
     try std.testing.expectEqual(@as(usize, 1), adapter.activeCount());

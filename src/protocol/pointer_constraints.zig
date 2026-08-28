@@ -8,6 +8,7 @@ const std = @import("std");
 const wayring = @import("wayring");
 const region = @import("../region.zig");
 const confinement = @import("../input/confinement.zig");
+const slot_pool = @import("slot_pool.zig");
 const objects = wayring.objects;
 
 const none = std.math.maxInt(u32);
@@ -72,9 +73,7 @@ pub fn Store(comptime SurfaceId: type, comptime PointerId: type) type {
         };
 
         const Slot = struct {
-            active: bool = false,
-            generation: u32 = 1,
-            next_free: u32 = none,
+            header: slot_pool.Header = .{},
             kind: Kind = .locked,
             lifetime: Lifetime = .persistent,
             surface: SurfaceId = undefined,
@@ -96,45 +95,20 @@ pub fn Store(comptime SurfaceId: type, comptime PointerId: type) type {
         pub const Point = struct { x: i32, y: i32 };
 
         allocator: std.mem.Allocator,
-        slots: []Slot,
-        region_storage: []region.Operation,
+        slots: slot_pool.Pool(Slot),
         events: []Event,
         region_capacity: usize,
-        free_head: u32 = 0,
         event_head: usize = 0,
         event_len: usize = 0,
 
         pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
             try config.validate();
-            const slots = try allocator.alloc(Slot, config.constraint_capacity);
-            errdefer allocator.free(slots);
-            const operations_per_slot = try std.math.mul(
-                usize,
-                config.region_operation_capacity,
-                2,
-            );
-            const region_storage = try allocator.alloc(
-                region.Operation,
-                try std.math.mul(
-                    usize,
-                    config.constraint_capacity,
-                    operations_per_slot,
-                ),
-            );
-            errdefer allocator.free(region_storage);
+            var slots = try slot_pool.Pool(Slot).init(allocator, config.constraint_capacity);
+            errdefer slots.deinit();
             const events = try allocator.alloc(Event, config.event_capacity);
-            for (slots, 0..) |*slot, slot_index| {
-                const offset = slot_index * operations_per_slot;
-                slot.* = .{
-                    .next_free = if (slot_index + 1 < slots.len) @intCast(slot_index + 1) else none,
-                    .current_region = region_storage[offset..][0..config.region_operation_capacity],
-                    .pending_region = region_storage[offset + config.region_operation_capacity ..][0..config.region_operation_capacity],
-                };
-            }
             return .{
                 .allocator = allocator,
                 .slots = slots,
-                .region_storage = region_storage,
                 .events = events,
                 .region_capacity = config.region_operation_capacity,
             };
@@ -142,8 +116,11 @@ pub fn Store(comptime SurfaceId: type, comptime PointerId: type) type {
 
         pub fn deinit(self: *Self) void {
             self.allocator.free(self.events);
-            self.allocator.free(self.region_storage);
-            self.allocator.free(self.slots);
+            for (self.slots.entries.items) |slot| if (slot.header.active) {
+                self.allocator.free(slot.current_region);
+                self.allocator.free(slot.pending_region);
+            };
+            self.slots.deinit();
             self.* = undefined;
         }
 
@@ -192,8 +169,8 @@ pub fn Store(comptime SurfaceId: type, comptime PointerId: type) type {
         }
 
         pub fn commitSurface(self: *Self, surface: SurfaceId) void {
-            for (self.slots) |*slot| {
-                if (!slot.active or slot.defunct or !std.meta.eql(slot.surface, surface)) continue;
+            for (self.slots.entries.items) |slot| {
+                if (!slot.header.active or slot.defunct or !std.meta.eql(slot.surface, surface)) continue;
                 self.publishSlot(slot);
             }
         }
@@ -209,8 +186,8 @@ pub fn Store(comptime SurfaceId: type, comptime PointerId: type) type {
             point: Point,
         ) !void {
             var required_events: usize = 0;
-            for (self.slots) |*slot| {
-                if (!slot.active or !std.meta.eql(slot.pointer, pointer)) continue;
+            for (self.slots.entries.items) |slot| {
+                if (!slot.header.active or !std.meta.eql(slot.pointer, pointer)) continue;
                 const qualifies = !slot.defunct and focus_surface != null and
                     std.meta.eql(slot.surface, focus_surface.?) and
                     self.containsSlotVersion(
@@ -230,16 +207,16 @@ pub fn Store(comptime SurfaceId: type, comptime PointerId: type) type {
             point: Point,
         ) !void {
             var required_events: usize = 0;
-            for (self.slots) |*slot| {
-                if (!slot.active or !std.meta.eql(slot.pointer, pointer)) continue;
+            for (self.slots.entries.items) |slot| {
+                if (!slot.header.active or !std.meta.eql(slot.pointer, pointer)) continue;
                 const qualifies = !slot.defunct and surface != null and
                     std.meta.eql(slot.surface, surface.?) and self.containsSlot(slot, point);
                 if (qualifies != slot.engaged) required_events += 1;
             }
             try self.ensureOrdinaryEventCapacity(required_events);
 
-            for (self.slots) |*slot| {
-                if (!slot.active or !std.meta.eql(slot.pointer, pointer)) continue;
+            for (self.slots.entries.items) |slot| {
+                if (!slot.header.active or !std.meta.eql(slot.pointer, pointer)) continue;
                 const qualifies = !slot.defunct and surface != null and
                     std.meta.eql(slot.surface, surface.?) and self.containsSlot(slot, point);
                 if (qualifies == slot.engaged) continue;
@@ -256,8 +233,8 @@ pub fn Store(comptime SurfaceId: type, comptime PointerId: type) type {
         }
 
         pub fn motionPolicy(self: *Self, pointer: PointerId) MotionPolicy {
-            for (self.slots) |*slot| {
-                if (!slot.active or !slot.engaged or !std.meta.eql(slot.pointer, pointer)) continue;
+            for (self.slots.entries.items) |slot| {
+                if (!slot.header.active or !slot.engaged or !std.meta.eql(slot.pointer, pointer)) continue;
                 return switch (slot.kind) {
                     .locked => .{ .locked = self.constraintId(slot) },
                     .confined => .{ .confined = self.constraintId(slot) },
@@ -318,15 +295,15 @@ pub fn Store(comptime SurfaceId: type, comptime PointerId: type) type {
 
         pub fn surfaceRemoved(self: *Self, surface: SurfaceId) void {
             var required_events: usize = 0;
-            for (self.slots) |*slot| {
-                if (slot.active and slot.engaged and std.meta.eql(slot.surface, surface)) {
+            for (self.slots.entries.items) |slot| {
+                if (slot.header.active and slot.engaged and std.meta.eql(slot.surface, surface)) {
                     required_events += 1;
                 }
             }
             std.debug.assert(required_events <= self.events.len - self.event_len);
 
-            for (self.slots) |*slot| {
-                if (!slot.active or !std.meta.eql(slot.surface, surface)) continue;
+            for (self.slots.entries.items) |slot| {
+                if (!slot.header.active or !std.meta.eql(slot.surface, surface)) continue;
                 if (slot.engaged) self.enqueueAssumeCapacity(.{ .deactivated = .{
                     .id = self.constraintId(slot),
                     .kind = slot.kind,
@@ -338,15 +315,15 @@ pub fn Store(comptime SurfaceId: type, comptime PointerId: type) type {
 
         pub fn pointerRemoved(self: *Self, pointer: PointerId) void {
             var required_events: usize = 0;
-            for (self.slots) |*slot| {
-                if (slot.active and slot.engaged and std.meta.eql(slot.pointer, pointer)) {
+            for (self.slots.entries.items) |slot| {
+                if (slot.header.active and slot.engaged and std.meta.eql(slot.pointer, pointer)) {
                     required_events += 1;
                 }
             }
             std.debug.assert(required_events <= self.events.len - self.event_len);
 
-            for (self.slots) |*slot| {
-                if (!slot.active or !std.meta.eql(slot.pointer, pointer)) continue;
+            for (self.slots.entries.items) |slot| {
+                if (!slot.header.active or !std.meta.eql(slot.pointer, pointer)) continue;
                 if (slot.engaged) self.enqueueAssumeCapacity(.{ .deactivated = .{
                     .id = self.constraintId(slot),
                     .kind = slot.kind,
@@ -414,7 +391,7 @@ pub fn Store(comptime SurfaceId: type, comptime PointerId: type) type {
         }
 
         fn ensureOrdinaryEventCapacity(self: *const Self, required_events: usize) !void {
-            const ordinary_capacity = self.events.len - self.slots.len;
+            const ordinary_capacity = self.events.len -| self.slots.entries.items.len;
             if (self.event_len > ordinary_capacity or
                 required_events > ordinary_capacity - self.event_len) return error.Exhausted;
         }
@@ -459,56 +436,39 @@ pub fn Store(comptime SurfaceId: type, comptime PointerId: type) type {
         }
 
         fn acquire(self: *Self) !*Slot {
-            if (self.free_head == none) return error.Exhausted;
-            const slot_index = self.free_head;
-            const slot = &self.slots[slot_index];
-            self.free_head = slot.next_free;
-            const generation = slot.generation;
-            const current_region = slot.current_region;
-            const pending_region = slot.pending_region;
-            slot.* = .{
-                .active = true,
-                .generation = generation,
-                .current_region = current_region,
-                .pending_region = pending_region,
-            };
+            const slot = try self.slots.acquire();
+            errdefer self.slots.release(slot);
+            slot.current_region = try self.allocator.alloc(region.Operation, self.region_capacity);
+            errdefer self.allocator.free(slot.current_region);
+            slot.pending_region = try self.allocator.alloc(region.Operation, self.region_capacity);
             return slot;
         }
 
         fn release(self: *Self, slot_index: u32) void {
-            const slot = &self.slots[slot_index];
-            if (!slot.active) return;
-            const generation = slot.generation +% 1;
-            const current_region = slot.current_region;
-            const pending_region = slot.pending_region;
-            slot.* = .{
-                .generation = if (generation == 0) 1 else generation,
-                .next_free = self.free_head,
-                .current_region = current_region,
-                .pending_region = pending_region,
-            };
-            self.free_head = slot_index;
+            const slot = self.slots.at(slot_index) orelse return;
+            self.allocator.free(slot.current_region);
+            self.allocator.free(slot.pending_region);
+            self.slots.release(slot);
         }
 
         fn resolve(self: *Self, constraint_id: ConstraintId) !*Slot {
-            if (constraint_id.index >= self.slots.len) return error.StaleConstraint;
-            const slot = &self.slots[constraint_id.index];
-            if (!slot.active or slot.generation != constraint_id.generation) return error.StaleConstraint;
+            const slot = self.slots.at(constraint_id.index) orelse return error.StaleConstraint;
+            if (slot.header.generation != constraint_id.generation) return error.StaleConstraint;
             return slot;
         }
 
         fn findSurface(self: *Self, surface: SurfaceId) ?*Slot {
-            for (self.slots) |*slot|
-                if (slot.active and std.meta.eql(slot.surface, surface)) return slot;
+            for (self.slots.entries.items) |slot|
+                if (slot.header.active and std.meta.eql(slot.surface, surface)) return slot;
             return null;
         }
 
-        fn constraintId(self: *const Self, slot: *const Slot) ConstraintId {
-            return .{ .index = self.slotIndex(slot), .generation = slot.generation };
+        fn constraintId(_: *const Self, slot: *const Slot) ConstraintId {
+            return .{ .index = slot.header.index, .generation = slot.header.generation };
         }
 
-        fn slotIndex(self: *const Self, slot: *const Slot) u32 {
-            return @intCast((@intFromPtr(slot) - @intFromPtr(self.slots.ptr)) / @sizeOf(Slot));
+        fn slotIndex(_: *const Self, slot: *const Slot) u32 {
+            return slot.header.index;
         }
     };
 }
@@ -530,9 +490,7 @@ pub fn Adapter(comptime protocol: type, comptime Core: type, comptime Seat: type
         pub const FocusPoint = struct { x: i32, y: i32 };
 
         const ResourceSlot = struct {
-            active: bool = false,
-            generation: u32 = 1,
-            next_free: u32 = none,
+            header: slot_pool.Header = .{},
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
             peer: wayring.io_uring.Peer = undefined,
             constraint: ?ConstraintId = null,
@@ -545,11 +503,10 @@ pub fn Adapter(comptime protocol: type, comptime Core: type, comptime Seat: type
         global: ?objects.Handle = null,
         global_version: u32,
         state: State,
-        resources: []ResourceSlot,
+        resources: slot_pool.Pool(ResourceSlot),
         region_scratch: []region.Operation,
         input_region_scratch: []region.Operation,
         boundary_scratch: []u64,
-        free_head: u32 = 0,
 
         pub fn init(
             allocator: std.mem.Allocator,
@@ -566,8 +523,8 @@ pub fn Adapter(comptime protocol: type, comptime Core: type, comptime Seat: type
                 .event_capacity = config.event_capacity,
             });
             errdefer state.deinit();
-            const resources = try allocator.alloc(ResourceSlot, config.constraint_capacity);
-            errdefer allocator.free(resources);
+            var resources = try slot_pool.Pool(ResourceSlot).init(allocator, config.constraint_capacity);
+            errdefer resources.deinit();
             const region_scratch = try allocator.alloc(region.Operation, config.region_operation_capacity);
             errdefer allocator.free(region_scratch);
             const input_region_scratch = try allocator.alloc(
@@ -582,9 +539,6 @@ pub fn Adapter(comptime protocol: type, comptime Core: type, comptime Seat: type
                     config.region_operation_capacity,
                 ),
             );
-            for (resources, 0..) |*slot, slot_index| slot.* = .{
-                .next_free = if (slot_index + 1 < resources.len) @intCast(slot_index + 1) else none,
-            };
             return .{
                 .allocator = allocator,
                 .core = core,
@@ -602,7 +556,7 @@ pub fn Adapter(comptime protocol: type, comptime Core: type, comptime Seat: type
             self.allocator.free(self.boundary_scratch);
             self.allocator.free(self.input_region_scratch);
             self.allocator.free(self.region_scratch);
-            self.allocator.free(self.resources);
+            self.resources.deinit();
             self.state.deinit();
             self.* = undefined;
         }
@@ -860,8 +814,8 @@ pub fn Adapter(comptime protocol: type, comptime Core: type, comptime Seat: type
             const event_id = switch (event) {
                 inline else => |payload| payload.id,
             };
-            for (self.resources) |slot|
-                if (slot.active and slot.constraint != null and
+            for (self.resources.entries.items) |slot|
+                if (slot.header.active and slot.constraint != null and
                     std.meta.eql(slot.constraint.?, event_id)) return samePeer(slot.peer, peer);
             return false;
         }
@@ -913,7 +867,7 @@ pub fn Adapter(comptime protocol: type, comptime Core: type, comptime Seat: type
                     Manager.@"error".already_constrained.value,
                     "surface already has a pointer constraint",
                 ),
-                error.Exhausted => return try self.noMemory(actor),
+                error.Exhausted, error.OutOfMemory => return try self.noMemory(actor),
             };
             errdefer self.state.destroy(constraint_id) catch {};
             const admitted = if (kind == .locked)
@@ -963,46 +917,27 @@ pub fn Adapter(comptime protocol: type, comptime Core: type, comptime Seat: type
         }
 
         fn acquire(self: *Self) !*ResourceSlot {
-            if (self.free_head == none) return error.Exhausted;
-            const slot_index = self.free_head;
-            const slot = &self.resources[slot_index];
-            self.free_head = slot.next_free;
-            slot.* = .{ .active = true, .generation = slot.generation };
-            return slot;
+            return self.resources.acquire();
         }
 
         fn release(self: *Self, slot_index: u32) void {
-            const slot = &self.resources[slot_index];
-            if (!slot.active) return;
-            const generation = slot.generation +% 1;
-            slot.* = .{
-                .generation = if (generation == 0) 1 else generation,
-                .next_free = self.free_head,
-            };
-            self.free_head = slot_index;
+            const slot = self.resources.at(slot_index) orelse return;
+            self.resources.release(slot);
         }
 
         fn findConstraint(self: *Self, constraint_id: ConstraintId) ?*ResourceSlot {
-            for (self.resources) |*slot|
-                if (slot.active and slot.constraint != null and
+            for (self.resources.entries.items) |slot|
+                if (slot.header.active and slot.constraint != null and
                     std.meta.eql(slot.constraint.?, constraint_id)) return slot;
             return null;
         }
 
         fn fromObject(self: *Self, object: *const objects.Object) ?*ResourceSlot {
-            const pointer = object.context orelse return null;
-            const address = @intFromPtr(pointer);
-            const start = @intFromPtr(self.resources.ptr);
-            const size = std.math.mul(usize, self.resources.len, @sizeOf(ResourceSlot)) catch return null;
-            const end = std.math.add(usize, start, size) catch return null;
-            if (address < start or address >= end or (address - start) % @sizeOf(ResourceSlot) != 0)
-                return null;
-            const slot = &self.resources[(address - start) / @sizeOf(ResourceSlot)];
-            return if (slot.active and @intFromPtr(slot) == address) slot else null;
+            return self.resources.fromContext(object.context);
         }
 
-        fn slotIndex(self: *const Self, slot: *const ResourceSlot) u32 {
-            return @intCast((@intFromPtr(slot) - @intFromPtr(self.resources.ptr)) / @sizeOf(ResourceSlot));
+        fn slotIndex(_: *const Self, slot: *const ResourceSlot) u32 {
+            return slot.header.index;
         }
 
         fn noMemory(_: *Self, actor: *wayring.connection.Actor) !wayring.dispatch.Control {
@@ -1222,6 +1157,22 @@ test "pointer constraints: teardown is exact and generations reject stale ids" {
     try store.updateFocus(pointer, surface, .{ .x = 0, .y = 0 });
     try store.destroy(new_id);
     try std.testing.expectEqual(@as(?TestStore.Event, null), store.popEvent());
+}
+
+test "pointer constraints: initial capacity grows without disturbing live state" {
+    const State = Store(u32, u32);
+    var state = try State.init(std.testing.allocator, .{
+        .constraint_capacity = 1,
+        .region_operation_capacity = 1,
+        .event_capacity = 2,
+    });
+    defer state.deinit();
+    const first = try state.create(.locked, .persistent, 1, 1, null);
+    const second = try state.create(.confined, .persistent, 2, 1, null);
+    try std.testing.expectEqual(@as(u32, 0), first.index);
+    try std.testing.expectEqual(@as(u32, 1), second.index);
+    try std.testing.expectEqual(@as(u32, 1), try state.constraintSurface(first));
+    try std.testing.expectEqual(@as(u32, 2), try state.constraintSurface(second));
 }
 
 test "pointer constraints: wire owner retains activation until publication" {

@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const wayring = @import("wayring");
+const slot_pool = @import("slot_pool.zig");
 const objects = wayring.objects;
 const none = std.math.maxInt(u32);
 
@@ -46,16 +47,13 @@ pub fn Adapter(comptime protocol: type) type {
         const Id = packed struct { index: u32, generation: u32 };
 
         const ManagerSlot = struct {
-            active: bool = false,
-            next_free: u32 = none,
+            header: slot_pool.Header = .{},
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
             peer: wayring.io_uring.Peer = undefined,
         };
         const Slot = struct {
-            active: bool = false,
+            header: slot_pool.Header = .{},
             retired: bool = false,
-            generation: u32 = 1,
-            next_free: u32 = none,
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
             peer: wayring.io_uring.Peer = undefined,
             pointer: PointerId = undefined,
@@ -77,11 +75,9 @@ pub fn Adapter(comptime protocol: type) type {
 
         allocator: std.mem.Allocator,
         validator: PointerValidator,
-        managers: []ManagerSlot,
-        slots: []Slot,
+        managers: slot_pool.Pool(ManagerSlot),
+        slots: slot_pool.Pool(Slot),
         outbound: []Outbound,
-        manager_free: u32 = 0,
-        free_head: u32 = 0,
         outbound_len: usize = 0,
         next_sequence: u64 = 1,
         global_version: u32,
@@ -91,25 +87,19 @@ pub fn Adapter(comptime protocol: type) type {
         pub fn init(allocator: std.mem.Allocator, validator: PointerValidator, config: Config) !Self {
             try config.validate();
             try Manager.info.validateVersion(config.global_version);
-            const managers = try allocator.alloc(ManagerSlot, config.manager_capacity);
-            errdefer allocator.free(managers);
-            const slots = try allocator.alloc(Slot, config.gesture_capacity);
-            errdefer allocator.free(slots);
+            var managers = try slot_pool.Pool(ManagerSlot).init(allocator, config.manager_capacity);
+            errdefer managers.deinit();
+            var slots = try slot_pool.Pool(Slot).init(allocator, config.gesture_capacity);
+            errdefer slots.deinit();
             const outbound = try allocator.alloc(Outbound, config.outbound_capacity);
-            for (managers, 0..) |*slot, i| slot.* = .{
-                .next_free = if (i + 1 < managers.len) @intCast(i + 1) else none,
-            };
-            for (slots, 0..) |*slot, i| slot.* = .{
-                .next_free = if (i + 1 < slots.len) @intCast(i + 1) else none,
-            };
             @memset(outbound, .{});
             return .{ .allocator = allocator, .validator = validator, .managers = managers, .slots = slots, .outbound = outbound, .global_version = config.global_version };
         }
 
         pub fn deinit(self: *Self) void {
             self.allocator.free(self.outbound);
-            self.allocator.free(self.slots);
-            self.allocator.free(self.managers);
+            self.slots.deinit();
+            self.managers.deinit();
             self.* = undefined;
         }
 
@@ -123,11 +113,9 @@ pub fn Adapter(comptime protocol: type) type {
 
         fn bind(context: ?*anyopaque, binding: wayring.server.Binding) !?*anyopaque {
             const self: *Self = @ptrCast(@alignCast(context orelse return error.InvalidContext));
-            if (self.manager_free == none) return error.OutOfMemory;
-            const index = self.manager_free;
-            const slot = &self.managers[index];
-            self.manager_free = slot.next_free;
-            slot.* = .{ .active = true, .resource = binding.resource, .peer = binding.peer };
+            const slot = try self.managers.acquire();
+            slot.resource = binding.resource;
+            slot.peer = binding.peer;
             return slot;
         }
 
@@ -203,7 +191,7 @@ pub fn Adapter(comptime protocol: type) type {
                 try self.postProtocolError(actor, manager.id, "invalid wl_pointer");
                 return null;
             };
-            for (self.slots) |slot| if (slot.active and slot.kind == kind and
+            for (self.slots.entries.items) |slot| if (slot.header.active and slot.kind == kind and
                 samePeer(slot.peer, peer) and std.meta.eql(slot.pointer, pointer))
             {
                 try self.postProtocolError(actor, manager.id, "gesture already exists for wl_pointer");
@@ -240,12 +228,12 @@ pub fn Adapter(comptime protocol: type) type {
         fn beginFocused(self: *Self, kind: Kind, seat: anytype, serial: u32, time: u32, surface: u32, fingers: u32) !void {
             if (surface == 0 or fingers == 0) return error.InvalidState;
             var count: usize = 0;
-            for (self.slots) |slot| if (slot.active and pointerFocused(seat, slot.pointer)) {
+            for (self.slots.entries.items) |slot| if (slot.header.active and pointerFocused(seat, slot.pointer)) {
                 if (slot.sequence_active) return error.InvalidState;
                 count += @intFromBool(slot.kind == kind);
             };
             try self.prepare(count);
-            for (self.slots) |*slot| if (slot.active and slot.kind == kind and pointerFocused(seat, slot.pointer)) {
+            for (self.slots.entries.items) |slot| if (slot.header.active and slot.kind == kind and pointerFocused(seat, slot.pointer)) {
                 self.enqueue(slot, .{ .begin = .{ .serial = serial, .time = time, .surface = surface, .fingers = fingers } }) catch unreachable;
                 slot.sequence_active = true;
             };
@@ -253,12 +241,12 @@ pub fn Adapter(comptime protocol: type) type {
         fn begin(self: *Self, kind: Kind, pointer: PointerId, serial: u32, time: u32, surface: u32, fingers: u32) !void {
             if (surface == 0 or fingers == 0) return error.InvalidState;
             var count: usize = 0;
-            for (self.slots) |slot| if (slot.active and std.meta.eql(slot.pointer, pointer)) {
+            for (self.slots.entries.items) |slot| if (slot.header.active and std.meta.eql(slot.pointer, pointer)) {
                 if (slot.sequence_active) return error.InvalidState;
                 count += @intFromBool(slot.kind == kind);
             };
             try self.prepare(count);
-            for (self.slots) |*slot| if (slot.active and slot.kind == kind and std.meta.eql(slot.pointer, pointer)) {
+            for (self.slots.entries.items) |slot| if (slot.header.active and slot.kind == kind and std.meta.eql(slot.pointer, pointer)) {
                 self.enqueue(slot, .{ .begin = .{ .serial = serial, .time = time, .surface = surface, .fingers = fingers } }) catch unreachable;
                 slot.sequence_active = true;
             };
@@ -278,18 +266,18 @@ pub fn Adapter(comptime protocol: type) type {
         }
         fn updateActive(self: *Self, kind: Kind, time: u32, delta: Fixed, scale: i32, rotation: i32) !void {
             var count: usize = 0;
-            for (self.slots) |slot| count += @intFromBool(slot.active and slot.sequence_active and slot.kind == kind);
+            for (self.slots.entries.items) |slot| count += @intFromBool(slot.header.active and slot.sequence_active and slot.kind == kind);
             if (count == 0) return;
             try self.prepare(count);
-            for (self.slots) |*slot| if (slot.active and slot.sequence_active and slot.kind == kind)
+            for (self.slots.entries.items) |slot| if (slot.header.active and slot.sequence_active and slot.kind == kind)
                 self.enqueue(slot, .{ .update = .{ .time = time, .dx = delta.dx, .dy = delta.dy, .scale = scale, .rotation = rotation } }) catch unreachable;
         }
         fn update(self: *Self, kind: Kind, pointer: PointerId, time: u32, delta: Fixed, scale: i32, rotation: i32) !void {
             var count: usize = 0;
-            for (self.slots) |slot| count += @intFromBool(slot.active and slot.sequence_active and slot.kind == kind and std.meta.eql(slot.pointer, pointer));
+            for (self.slots.entries.items) |slot| count += @intFromBool(slot.header.active and slot.sequence_active and slot.kind == kind and std.meta.eql(slot.pointer, pointer));
             if (count == 0) return;
             try self.prepare(count);
-            for (self.slots) |*slot| if (slot.active and slot.sequence_active and slot.kind == kind and std.meta.eql(slot.pointer, pointer))
+            for (self.slots.entries.items) |slot| if (slot.header.active and slot.sequence_active and slot.kind == kind and std.meta.eql(slot.pointer, pointer))
                 self.enqueue(slot, .{ .update = .{ .time = time, .dx = delta.dx, .dy = delta.dy, .scale = scale, .rotation = rotation } }) catch unreachable;
         }
 
@@ -313,20 +301,20 @@ pub fn Adapter(comptime protocol: type) type {
         }
         fn endActive(self: *Self, kind: Kind, serial: u32, time: u32, cancelled: bool) !void {
             var count: usize = 0;
-            for (self.slots) |slot| count += @intFromBool(slot.active and slot.sequence_active and slot.kind == kind);
+            for (self.slots.entries.items) |slot| count += @intFromBool(slot.header.active and slot.sequence_active and slot.kind == kind);
             if (count == 0) return;
             try self.prepare(count);
-            for (self.slots) |*slot| if (slot.active and slot.sequence_active and slot.kind == kind) {
+            for (self.slots.entries.items) |slot| if (slot.header.active and slot.sequence_active and slot.kind == kind) {
                 self.enqueue(slot, .{ .end = .{ .serial = serial, .time = time, .cancelled = @intFromBool(cancelled) } }) catch unreachable;
                 slot.sequence_active = false;
             };
         }
         fn end(self: *Self, kind: Kind, pointer: PointerId, serial: u32, time: u32, cancelled: bool) !void {
             var count: usize = 0;
-            for (self.slots) |slot| count += @intFromBool(slot.active and slot.sequence_active and slot.kind == kind and std.meta.eql(slot.pointer, pointer));
+            for (self.slots.entries.items) |slot| count += @intFromBool(slot.header.active and slot.sequence_active and slot.kind == kind and std.meta.eql(slot.pointer, pointer));
             if (count == 0) return;
             try self.prepare(count);
-            for (self.slots) |*slot| if (slot.active and slot.sequence_active and slot.kind == kind and std.meta.eql(slot.pointer, pointer)) {
+            for (self.slots.entries.items) |slot| if (slot.header.active and slot.sequence_active and slot.kind == kind and std.meta.eql(slot.pointer, pointer)) {
                 self.enqueue(slot, .{ .end = .{ .serial = serial, .time = time, .cancelled = @intFromBool(cancelled) } }) catch unreachable;
                 slot.sequence_active = false;
             };
@@ -382,43 +370,33 @@ pub fn Adapter(comptime protocol: type) type {
                 return true;
             };
             if (self.managerFromObject(&object)) |slot| if (std.meta.eql(slot.resource, handle)) {
-                const i: u32 = @intCast((@intFromPtr(slot) - @intFromPtr(self.managers.ptr)) / @sizeOf(ManagerSlot));
-                slot.* = .{ .next_free = self.manager_free };
-                self.manager_free = i;
+                self.managers.release(slot);
                 return true;
             };
             return false;
         }
 
         pub fn disconnected(self: *Self, peer: wayring.io_uring.Peer) void {
-            for (self.slots, 0..) |*slot, i| if (slot.active and samePeer(slot.peer, peer)) {
+            for (self.slots.entries.items) |slot| if (slot.header.active and samePeer(slot.peer, peer)) {
                 self.purge(self.slotId(slot));
-                self.release(@intCast(i));
+                self.release(slot.header.index);
             };
-            for (self.managers, 0..) |*slot, i| if (slot.active and samePeer(slot.peer, peer)) {
-                slot.* = .{ .next_free = self.manager_free };
-                self.manager_free = @intCast(i);
+            for (self.managers.entries.items) |slot| if (slot.header.active and samePeer(slot.peer, peer)) {
+                self.managers.release(slot);
             };
         }
 
         fn acquire(self: *Self) !*Slot {
-            if (self.free_head == none) return error.Exhausted;
-            const i = self.free_head;
-            const slot = &self.slots[i];
-            self.free_head = slot.next_free;
-            const generation = slot.generation;
-            slot.* = .{ .active = true, .generation = generation };
-            return slot;
+            return self.slots.acquire();
         }
         fn release(self: *Self, i: u32) void {
-            const slot = &self.slots[i];
-            if (!slot.active) return;
-            if (slot.generation == std.math.maxInt(u32)) {
-                slot.* = .{ .retired = true, .generation = slot.generation };
+            const slot = self.slots.at(i) orelse return;
+            if (slot.header.generation == std.math.maxInt(u32)) {
+                slot.header.active = false;
+                slot.retired = true;
                 return;
             }
-            slot.* = .{ .generation = slot.generation + 1, .next_free = self.free_head };
-            self.free_head = i;
+            self.slots.release(slot);
         }
         fn prepare(self: *Self, count: usize) !void {
             if (count > self.outbound.len - self.outbound_len) return error.Exhausted;
@@ -454,22 +432,21 @@ pub fn Adapter(comptime protocol: type) type {
             for (self.outbound) |*item| if (item.active and std.meta.eql(item.gesture, id)) self.dropOutbound(item);
         }
         fn resolve(self: *Self, id: Id) !*Slot {
-            if (id.index >= self.slots.len) return error.Stale;
-            const slot = &self.slots[id.index];
-            if (!slot.active or slot.generation != id.generation) return error.Stale;
+            const slot = self.slots.at(id.index) orelse return error.Stale;
+            if (slot.header.generation != id.generation) return error.Stale;
             return slot;
         }
-        fn slotId(self: *const Self, slot: *const Slot) Id {
-            return .{ .index = self.slotIndex(slot), .generation = slot.generation };
+        fn slotId(_: *const Self, slot: *const Slot) Id {
+            return .{ .index = slot.header.index, .generation = slot.header.generation };
         }
-        fn slotIndex(self: *const Self, slot: *const Slot) u32 {
-            return @intCast((@intFromPtr(slot) - @intFromPtr(self.slots.ptr)) / @sizeOf(Slot));
+        fn slotIndex(_: *const Self, slot: *const Slot) u32 {
+            return slot.header.index;
         }
         fn slotFromObject(self: *Self, object: *const objects.Object) ?*Slot {
-            return fromContext(Slot, self.slots, object.context);
+            return self.slots.fromContext(object.context);
         }
         fn managerFromObject(self: *Self, object: *const objects.Object) ?*ManagerSlot {
-            return fromContext(ManagerSlot, self.managers, object.context);
+            return self.managers.fromContext(object.context);
         }
         fn postNoMemory(_: *Self, actor: *wayring.connection.Actor) !void {
             try Core.postError(actor, objects.display_id, 2, "out of memory");
@@ -520,7 +497,7 @@ test "pointer gestures: bounded sequencing, fanout, cleanup, and retirement" {
     const protocol = @import("core_protocol");
     const A = Adapter(protocol);
     try std.testing.expectError(error.InvalidConfig, A.init(std.testing.allocator, .{ .validateFn = acceptPointer }, .{ .global_version = 4 }));
-    var adapter = try A.init(std.testing.allocator, .{ .validateFn = acceptPointer }, .{ .gesture_capacity = 3, .outbound_capacity = 2 });
+    var adapter = try A.init(std.testing.allocator, .{ .validateFn = acceptPointer }, .{ .gesture_capacity = 1, .outbound_capacity = 2 });
     defer adapter.deinit();
     const peer: wayring.io_uring.Peer = .{ .slot = 1, .generation = 2 };
     const pointer: PointerId = .{ .index = 9, .generation = 7 };
@@ -556,8 +533,8 @@ test "pointer gestures: bounded sequencing, fanout, cleanup, and retirement" {
     const stale = adapter.slotId(first);
     adapter.release(adapter.slotIndex(first));
     const reused = try adapter.acquire();
-    try std.testing.expect(stale.generation != reused.generation);
-    reused.generation = std.math.maxInt(u32);
+    try std.testing.expect(stale.generation != reused.header.generation);
+    reused.header.generation = std.math.maxInt(u32);
     adapter.release(adapter.slotIndex(reused));
     try std.testing.expect(reused.retired);
     adapter.disconnected(peer);

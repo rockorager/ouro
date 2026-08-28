@@ -1,10 +1,13 @@
-//! Bounded alpha-modifier-v1 ownership and double-buffered surface state.
+//! Growable alpha-modifier-v1 ownership and double-buffered surface state.
 
 const std = @import("std");
 const wayring = @import("wayring");
 const objects = wayring.objects;
 
-pub const Config = struct { resource_capacity: usize = 16 };
+pub const Config = struct {
+    /// Initial allocation only; resource ownership grows with client demand.
+    resource_capacity: usize = 16,
+};
 
 pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
     return struct {
@@ -27,14 +30,12 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         runtime: ?*Runtime = null,
         global: ?objects.Handle = null,
         resources: std.ArrayListUnmanaged(*Resource) = .empty,
-        resource_capacity: usize,
 
         pub fn init(allocator: std.mem.Allocator, core: *CoreSurface, config: Config) !Self {
             if (config.resource_capacity == 0) return error.InvalidConfig;
             var self: Self = .{
                 .allocator = allocator,
                 .core = core,
-                .resource_capacity = config.resource_capacity,
             };
             try self.resources.ensureTotalCapacity(allocator, config.resource_capacity);
             return self;
@@ -172,11 +173,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             peer: wayring.io_uring.Peer,
             surface: ?CoreSurface.SurfaceId,
         ) !*Resource {
-            if (self.resources.items.len == self.resource_capacity) return error.Exhausted;
             const resource = try self.allocator.create(Resource);
             errdefer self.allocator.destroy(resource);
             resource.* = .{ .kind = kind, .handle = handle, .peer = peer, .surface = surface };
-            self.resources.appendAssumeCapacity(resource);
+            try self.resources.append(self.allocator, resource);
             return resource;
         }
 

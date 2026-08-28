@@ -10,6 +10,7 @@ const std = @import("std");
 const wayring = @import("wayring");
 const linux = std.os.linux;
 const objects = wayring.objects;
+const slot_pool = @import("slot_pool.zig");
 
 const none = std.math.maxInt(u32);
 pub const max_planes = 4;
@@ -321,9 +322,9 @@ pub fn Adapter(comptime protocol: type) type {
         global: ?objects.Handle = null,
         global_version: u32,
         store: Store,
-        managers: SlotPool(ManagerSlot),
-        params: SlotPool(ParamsResource),
-        buffers: SlotPool(BufferResource),
+        managers: slot_pool.Pool(ManagerSlot),
+        params: slot_pool.Pool(ParamsResource),
+        buffers: slot_pool.Pool(BufferResource),
         pending_len: usize = 0,
 
         pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
@@ -331,13 +332,18 @@ pub fn Adapter(comptime protocol: type) type {
             try Dmabuf.info.validateVersion(config.global_version);
             var store = try Store.init(allocator, config);
             errdefer store.deinit();
+            var managers = try slot_pool.Pool(ManagerSlot).init(allocator, 4);
+            errdefer managers.deinit();
+            var params = try slot_pool.Pool(ParamsResource).init(allocator, 8);
+            errdefer params.deinit();
+            const buffers = try slot_pool.Pool(BufferResource).init(allocator, 16);
             return .{
                 .allocator = allocator,
                 .global_version = config.global_version,
                 .store = store,
-                .managers = .{ .allocator = allocator },
-                .params = .{ .allocator = allocator },
-                .buffers = .{ .allocator = allocator },
+                .managers = managers,
+                .params = params,
+                .buffers = buffers,
             };
         }
 
@@ -763,64 +769,6 @@ pub fn Adapter(comptime protocol: type) type {
             cause: anyerror,
         ) !wayring.dispatch.Control {
             return adapter.paramsError(actor, id, cause);
-        }
-    };
-}
-
-fn SlotPool(comptime T: type) type {
-    return struct {
-        allocator: std.mem.Allocator,
-        entries: std.ArrayListUnmanaged(*T) = .empty,
-        free_head: u32 = none,
-
-        fn deinit(pool: *@This()) void {
-            for (pool.entries.items) |entry| pool.allocator.destroy(entry);
-            pool.entries.deinit(pool.allocator);
-            pool.* = undefined;
-        }
-
-        fn acquire(pool: *@This()) !*T {
-            if (pool.free_head != none) {
-                const slot = pool.entries.items[pool.free_head];
-                pool.free_head = slot.header.next_free;
-                slot.* = .{ .header = .{
-                    .active = true,
-                    .generation = slot.header.generation,
-                    .index = slot.header.index,
-                } };
-                return slot;
-            }
-            if (pool.entries.items.len >= none) return error.Exhausted;
-            const slot = try pool.allocator.create(T);
-            errdefer pool.allocator.destroy(slot);
-            const index: u32 = @intCast(pool.entries.items.len);
-            slot.* = .{ .header = .{ .active = true, .index = index } };
-            try pool.entries.append(pool.allocator, slot);
-            return slot;
-        }
-
-        fn release(pool: *@This(), slot: *T) void {
-            std.debug.assert(slot.header.active);
-            const index = slot.header.index;
-            std.debug.assert(index < pool.entries.items.len and pool.entries.items[index] == slot);
-            slot.header.active = false;
-            slot.header.generation +%= 1;
-            if (slot.header.generation == 0) slot.header.generation = 1;
-            slot.header.next_free = pool.free_head;
-            pool.free_head = index;
-        }
-
-        fn at(pool: *@This(), index: u32) ?*T {
-            if (index >= pool.entries.items.len) return null;
-            const slot = pool.entries.items[index];
-            return if (slot.header.active) slot else null;
-        }
-
-        fn fromContext(pool: *@This(), context: ?*anyopaque) ?*T {
-            const pointer = context orelse return null;
-            for (pool.entries.items) |slot|
-                if (slot.header.active and @intFromPtr(slot) == @intFromPtr(pointer)) return slot;
-            return null;
         }
     };
 }
