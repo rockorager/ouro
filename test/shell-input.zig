@@ -403,7 +403,9 @@ test "shell-input: security context filters nested manager before registry disco
             parent_handler.input_method_global_seen and
             parent_handler.virtual_keyboard_global_seen and
             parent_handler.virtual_pointer_global_seen and
-            parent_handler.foreign_toplevel_global_seen) break;
+            parent_handler.foreign_toplevel_global_seen and
+            parent_handler.image_output_global_seen and
+            parent_handler.image_toplevel_global_seen) break;
         _ = linux.sched_yield();
     }
     try std.testing.expect(parent_handler.security_manager != null);
@@ -413,6 +415,8 @@ test "shell-input: security context filters nested manager before registry disco
     try std.testing.expect(parent_handler.virtual_keyboard_global_seen);
     try std.testing.expect(parent_handler.virtual_pointer_global_seen);
     try std.testing.expect(parent_handler.foreign_toplevel_global_seen);
+    try std.testing.expect(parent_handler.image_output_global_seen);
+    try std.testing.expect(parent_handler.image_toplevel_global_seen);
 
     var close_pair: [2]linux.fd_t = undefined;
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(
@@ -509,6 +513,8 @@ test "shell-input: security context filters nested manager before registry disco
     try std.testing.expect(!child_handler.virtual_keyboard_global_seen);
     try std.testing.expect(!child_handler.virtual_pointer_global_seen);
     try std.testing.expect(!child_handler.foreign_toplevel_global_seen);
+    try std.testing.expect(!child_handler.image_output_global_seen);
+    try std.testing.expect(!child_handler.image_toplevel_global_seen);
     try std.testing.expect(child_handler.security_manager == null);
     var sandbox_peer: ?wayring.io_uring.Peer = null;
     for (coordinator.clients.items) |client_state| if (client_state.active and
@@ -571,9 +577,9 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     var input = try FakeInput.init();
     defer input.deinit();
     var root_config = physical_fixture.compositorConfig();
-    root_config.runtime.object_capacity = 32;
-    root_config.runtime.object_quota = 32;
-    root_config.runtime.buckets_per_client = 32;
+    root_config.runtime.object_capacity = 64;
+    root_config.runtime.object_quota = 64;
+    root_config.runtime.buckets_per_client = 64;
     const root = try Compositor.create(
         allocator,
         try wayring.unix_socket.listen(path, 1),
@@ -623,7 +629,7 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
         &client_reactor,
         try wayring.unix_socket.connect(path),
         .{ .received_fd_budget = 2, .transmit_byte_budget = 4096, .transmit_fd_budget = 2 },
-        .{ .max_objects = 32, .max_client_ids = 31 },
+        .{ .max_objects = 64, .max_client_ids = 63 },
     );
     const actor = try client.actor();
     var driver = ClientDriver.init(&client);
@@ -634,6 +640,7 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
         .registry = registry,
         .test_pointer_warp = true,
         .test_foreign_toplevel = true,
+        .test_image_capture_sources = true,
     };
     try submitClient(&client_reactor, &driver, &handler);
 
@@ -799,6 +806,20 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     try std.testing.expect(handler.foreign_toplevel_identifier);
     try std.testing.expect(handler.foreign_toplevel_done >= 1);
     try std.testing.expectEqual(@as(usize, 1), handler.foreign_toplevel_finished);
+    try std.testing.expect(handler.image_output_source != null);
+    try std.testing.expect(handler.image_toplevel_source != null);
+    const capture_peer = coordinator.peer.?;
+    const capture_objects = try root.runtime.clients.get(capture_peer);
+    try std.testing.expect(coordinator.image_capture_source_adapter.snapshotForResource(
+        capture_peer,
+        capture_objects,
+        handler.image_output_source.?.id,
+    ).?.target != null);
+    try std.testing.expect(coordinator.image_capture_source_adapter.snapshotForResource(
+        capture_peer,
+        capture_objects,
+        handler.image_toplevel_source.?.id,
+    ).?.target != null);
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
 
     const motion_before_warp = handler.pointer_motion;
@@ -861,6 +882,11 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     try std.testing.expectEqual(@as(usize, 4), handler.output_enter);
     try std.testing.expect(handler.output_released);
     try std.testing.expect(handler.output_deleted);
+    try std.testing.expect(coordinator.image_capture_source_adapter.snapshotForResource(
+        capture_peer,
+        capture_objects,
+        handler.image_output_source.?.id,
+    ).?.target == null);
 
     try handler.destroyCursor();
     try submitClient(&client_reactor, &driver, &handler);
@@ -908,6 +934,11 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
             try waitForEither(&root.ring, client_reactor.ring);
     }
     try std.testing.expectEqual(@as(usize, 1), handler.foreign_toplevel_closed);
+    try std.testing.expect(coordinator.image_capture_source_adapter.snapshotForResource(
+        capture_peer,
+        capture_objects,
+        handler.image_toplevel_source.?.id,
+    ).?.target == null);
 
     coordinator.disconnected(coordinator.peer.?);
     _ = try client.prepareClose();
@@ -3348,6 +3379,13 @@ const Handler = struct {
     foreign_toplevel_finished: usize = 0,
     foreign_toplevel_closed: usize = 0,
     foreign_toplevel_global_seen: bool = false,
+    image_output_manager: ?wayring.objects.Handle = null,
+    image_toplevel_manager: ?wayring.objects.Handle = null,
+    image_output_source: ?wayring.objects.Handle = null,
+    image_toplevel_source: ?wayring.objects.Handle = null,
+    test_image_capture_sources: bool = false,
+    image_output_global_seen: bool = false,
+    image_toplevel_global_seen: bool = false,
     security_global_seen: bool = false,
     ext_data_control_global_seen: bool = false,
     wlr_data_control_global_seen: bool = false,
@@ -3504,6 +3542,7 @@ const Handler = struct {
                         value,
                         .{},
                     )).toplevel;
+                    try self.maybeCreateImageCaptureSources();
                 },
                 .finished => self.foreign_toplevel_finished += 1,
             }
@@ -3789,6 +3828,10 @@ const Handler = struct {
                 self.virtual_pointer_global_seen = true;
             if (std.mem.eql(u8, value.interface, protocol.ext_foreign_toplevel_list_v1.info.name))
                 self.foreign_toplevel_global_seen = true;
+            if (std.mem.eql(u8, value.interface, protocol.ext_output_image_capture_source_manager_v1.info.name))
+                self.image_output_global_seen = true;
+            if (std.mem.eql(u8, value.interface, protocol.ext_foreign_toplevel_image_capture_source_manager_v1.info.name))
+                self.image_toplevel_global_seen = true;
             return;
         }
         if (std.mem.eql(u8, value.interface, protocol.wl_compositor.info.name))
@@ -3836,6 +3879,51 @@ const Handler = struct {
         );
         if (std.mem.eql(u8, value.interface, protocol.ext_foreign_toplevel_list_v1.info.name))
             self.foreign_toplevel_global_seen = true;
+        if (std.mem.eql(u8, value.interface, protocol.ext_output_image_capture_source_manager_v1.info.name)) {
+            self.image_output_global_seen = true;
+            if (self.test_image_capture_sources)
+                self.image_output_manager = try ClientCore.bind(
+                    self.objects,
+                    self.queue,
+                    self.registry,
+                    value.name,
+                    &protocol.ext_output_image_capture_source_manager_v1.info,
+                    1,
+                    null,
+                );
+        }
+        if (std.mem.eql(u8, value.interface, protocol.ext_foreign_toplevel_image_capture_source_manager_v1.info.name)) {
+            self.image_toplevel_global_seen = true;
+            if (self.test_image_capture_sources)
+                self.image_toplevel_manager = try ClientCore.bind(
+                    self.objects,
+                    self.queue,
+                    self.registry,
+                    value.name,
+                    &protocol.ext_foreign_toplevel_image_capture_source_manager_v1.info,
+                    1,
+                    null,
+                );
+        }
+        try self.maybeCreateImageCaptureSources();
+    }
+
+    fn maybeCreateImageCaptureSources(self: *Handler) !void {
+        if (!self.test_image_capture_sources) return;
+        if (self.image_output_source == null and self.image_output_manager != null and self.output != null)
+            self.image_output_source = (try protocol.ext_output_image_capture_source_manager_v1.construct_create_source(
+                self.objects,
+                self.queue,
+                self.image_output_manager.?,
+                .{ .output = self.output.?.id },
+            )).source;
+        if (self.image_toplevel_source == null and self.image_toplevel_manager != null and self.foreign_toplevel_handle != null)
+            self.image_toplevel_source = (try protocol.ext_foreign_toplevel_image_capture_source_manager_v1.construct_create_source(
+                self.objects,
+                self.queue,
+                self.image_toplevel_manager.?,
+                .{ .toplevel_handle = self.foreign_toplevel_handle.?.id },
+            )).source;
     }
 
     fn maybeCreateDataDevice(self: *Handler) !void {

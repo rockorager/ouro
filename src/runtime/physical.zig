@@ -20,6 +20,7 @@ const drm = @import("../backend/drm/manager.zig");
 const drm_platform = @import("../backend/drm/platform.zig");
 const kms = @import("../backend/drm/output.zig");
 const output_api = @import("../output/drm.zig");
+const output_scheduler = @import("../output/headless.zig");
 const render = @import("../render/types.zig");
 const render_content = @import("../render/content.zig");
 const render_list = @import("../scene/render_list.zig");
@@ -68,6 +69,7 @@ const protocol_virtual_keyboard = @import("../protocol/virtual_keyboard.zig");
 const protocol_virtual_pointer = @import("../protocol/virtual_pointer.zig");
 const protocol_wlr_screencopy = @import("../protocol/wlr_screencopy.zig");
 const protocol_foreign_toplevel_list = @import("../protocol/foreign_toplevel_list.zig");
+const protocol_image_capture_source = @import("../protocol/image_capture_source.zig");
 const cursor_theme = @import("../cursor_theme.zig");
 const theme_cursor = @import("../scene/theme_cursor.zig");
 const desktop_model = @import("../desktop/model.zig");
@@ -128,6 +130,11 @@ pub fn Coordinator(comptime protocol: type) type {
         const VirtualPointerAdapter = protocol_virtual_pointer.Adapter(protocol);
         const ScreencopyAdapter = protocol_wlr_screencopy.Adapter(protocol);
         const ForeignToplevelListAdapter = protocol_foreign_toplevel_list.Adapter(protocol);
+        const ImageCaptureSourceAdapter = protocol_image_capture_source.Adapter(
+            protocol,
+            output_scheduler.OutputId,
+            Desktop.ToplevelId,
+        );
         const TabletState = tablet_input.State(SeatAdapter.FocusTarget);
         const TabletAdapter = protocol_tablet_v2.Adapter(protocol, SeatAdapter);
 
@@ -341,6 +348,7 @@ pub fn Coordinator(comptime protocol: type) type {
             virtual_pointer: protocol_virtual_pointer.Config = .{},
             wlr_screencopy: protocol_wlr_screencopy.Config = .{},
             foreign_toplevel_list: protocol_foreign_toplevel_list.Config = .{},
+            image_capture_source: protocol_image_capture_source.Config = .{},
             linux_dmabuf: protocol_linux_dmabuf.Config = .{},
             linux_drm_syncobj: protocol_linux_drm_syncobj.Config = .{},
             xdg_activation: protocol_xdg_activation.Config = .{},
@@ -442,6 +450,7 @@ pub fn Coordinator(comptime protocol: type) type {
         virtual_pointer_adapter: VirtualPointerAdapter,
         screencopy_adapter: ScreencopyAdapter,
         foreign_toplevel_list_adapter: ForeignToplevelListAdapter,
+        image_capture_source_adapter: ImageCaptureSourceAdapter,
         dmabuf_adapter: DmabufAdapter,
         syncobj_device: ?drm_syncobj.Device = null,
         syncobj_adapter: ?SyncobjAdapter = null,
@@ -750,6 +759,11 @@ pub fn Coordinator(comptime protocol: type) type {
                 config.foreign_toplevel_list,
             );
             errdefer self.foreign_toplevel_list_adapter.deinit();
+            self.image_capture_source_adapter = try ImageCaptureSourceAdapter.init(
+                allocator,
+                config.image_capture_source,
+            );
+            errdefer self.image_capture_source_adapter.deinit();
             self.interaction = try Interaction.init(allocator, config.interaction);
             errdefer self.interaction.deinit();
             self.seat_adapter = try SeatAdapter.init(
@@ -1065,6 +1079,12 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = try self.foreign_toplevel_list_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
+            _ = try self.image_capture_source_adapter.installOutput(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
+            _ = try self.image_capture_source_adapter.installToplevel(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
             _ = try self.output_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
@@ -1277,6 +1297,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.interaction.deinit();
             self.desktop.deinit();
             self.foreign_toplevel_list_adapter.deinit();
+            self.image_capture_source_adapter.deinit();
             self.shell_adapter.deinit();
             if (self.syncobj_adapter) |*adapter| adapter.deinit();
             self.syncobj_adapter = null;
@@ -1325,6 +1346,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.shortcuts_inhibit_adapter.disconnected(peer);
             self.foreign_adapter.disconnected(peer);
             self.foreign_toplevel_list_adapter.disconnected(peer);
+            self.image_capture_source_adapter.disconnected(peer);
             self.input_method_adapter.disconnected(peer);
             self.virtual_keyboard_adapter.disconnected(peer);
             self.virtual_pointer_adapter.disconnected(peer);
@@ -1613,6 +1635,10 @@ pub fn Coordinator(comptime protocol: type) type {
             if (try self.foreign_toplevel_list_adapter.request(peer, target, message, fds)) |control| {
                 if (self.foreign_toplevel_list_adapter.pendingOutbound(peer))
                     self.markProtocol(peer, ProtocolReady.foreign_toplevel_list);
+                try self.flushProtocol();
+                return control;
+            }
+            if (try self.image_capture_source_adapter.request(peer, target, message, fds, self)) |control| {
                 try self.flushProtocol();
                 return control;
             }
@@ -2570,6 +2596,7 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             for (self.foreign_toplevels) |*entry| {
                 if (!entry.active or entry.seen) continue;
+                _ = self.image_capture_source_adapter.invalidate(.{ .toplevel = entry.desktop });
                 try self.foreign_toplevel_list_adapter.close(entry.protocol_id);
                 entry.* = .{};
             }
@@ -2586,6 +2613,34 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (client.active and self.foreign_toplevel_list_adapter.pendingOutbound(client.peer))
                     return true;
             return false;
+        }
+
+        pub fn resolveCaptureOutput(
+            self: *Self,
+            peer: wayring.io_uring.Peer,
+            server_objects: anytype,
+            object_id: u32,
+        ) ?output_scheduler.OutputId {
+            const handle = server_objects.namespace.lookupHandle(object_id) orelse return null;
+            const object = server_objects.namespace.resolve(handle) orelse return null;
+            _ = self.output_adapter.reference(peer, handle, object.*) catch return null;
+            return if (self.output) |output| output.outputId() else null;
+        }
+
+        pub fn resolveCaptureToplevel(
+            self: *Self,
+            peer: wayring.io_uring.Peer,
+            server_objects: anytype,
+            object_id: u32,
+        ) ?Desktop.ToplevelId {
+            const protocol_id = self.foreign_toplevel_list_adapter.toplevelForResource(
+                peer,
+                server_objects,
+                object_id,
+            ) orelse return null;
+            for (self.foreign_toplevels) |entry|
+                if (entry.active and std.meta.eql(entry.protocol_id, protocol_id)) return entry.desktop;
+            return null;
         }
 
         fn syncDesktopTimer(self: *Self) !void {
@@ -3059,7 +3114,9 @@ pub fn Coordinator(comptime protocol: type) type {
                 !std.mem.eql(u8, name, "zwp_input_method_manager_v2") and
                 !std.mem.eql(u8, name, "zwp_virtual_keyboard_manager_v1") and
                 !std.mem.eql(u8, name, "zwlr_virtual_pointer_manager_v1") and
-                !std.mem.eql(u8, name, "ext_foreign_toplevel_list_v1");
+                !std.mem.eql(u8, name, "ext_foreign_toplevel_list_v1") and
+                !std.mem.eql(u8, name, "ext_output_image_capture_source_manager_v1") and
+                !std.mem.eql(u8, name, "ext_foreign_toplevel_image_capture_source_manager_v1");
         }
 
         fn commitSecurityContext(
@@ -5527,6 +5584,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 }
                 if (self.output_drain_started and output.drainComplete()) {
                     if (self.stopping) self.abandonPending();
+                    _ = self.image_capture_source_adapter.invalidate(.{ .output = output.outputId() });
                     try output.destroy();
                     self.output = null;
                     self.stats.output_drains += 1;
@@ -5622,6 +5680,7 @@ pub fn Coordinator(comptime protocol: type) type {
             std.debug.assert(output.drainComplete());
             // Both terminal operations consume their owners even when a
             // platform close reports an error, so cleanup remains exactly-once.
+            _ = self.image_capture_source_adapter.invalidate(.{ .output = output.outputId() });
             output.destroy() catch {};
             self.output = null;
             self.manager.remove() catch {};
@@ -5712,6 +5771,7 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.virtual_pointer_adapter.resourceRemoved(handle, object);
             _ = self.screencopy_adapter.resourceRemoved(handle, object);
             _ = self.foreign_toplevel_list_adapter.resourceRemoved(handle, object);
+            _ = self.image_capture_source_adapter.resourceRemoved(handle, object);
             _ = self.text_input_adapter.resourceRemoved(handle, object);
             _ = self.subcompositor_adapter.resourceRemoved(handle, object);
             if (layer_shell_removed and self.output != null) {
