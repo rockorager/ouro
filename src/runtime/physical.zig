@@ -75,6 +75,7 @@ const protocol_virtual_pointer = @import("../protocol/virtual_pointer.zig");
 const protocol_wlr_screencopy = @import("../protocol/wlr_screencopy.zig");
 const protocol_foreign_toplevel_list = @import("../protocol/foreign_toplevel_list.zig");
 const protocol_workspace = @import("../protocol/workspace.zig");
+const protocol_transient_seat = @import("../protocol/transient_seat.zig");
 const protocol_image_capture_source = @import("../protocol/image_capture_source.zig");
 const protocol_image_copy_capture = @import("../protocol/image_copy_capture.zig");
 const cursor_theme = @import("../cursor_theme.zig");
@@ -199,6 +200,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const InputMethodAdapter = protocol_input_method.Adapter(protocol, TextInputAdapter);
         const VirtualKeyboardAdapter = protocol_virtual_keyboard.Adapter(protocol, SeatAdapter);
         const VirtualPointerAdapter = protocol_virtual_pointer.Adapter(protocol, SeatAdapter);
+        const TransientSeatAdapter = protocol_transient_seat.Adapter(protocol, SeatAdapter);
         const ScreencopyAdapter = protocol_wlr_screencopy.Adapter(protocol);
         const ForeignToplevelListAdapter = protocol_foreign_toplevel_list.Adapter(protocol);
         const WorkspaceAdapter = protocol_workspace.Adapter(protocol);
@@ -554,6 +556,7 @@ pub fn Coordinator(comptime protocol: type) type {
         desktop: Desktop,
         interaction: Interaction,
         seat_adapter: SeatAdapter,
+        transient_seat_adapter: TransientSeatAdapter,
         tablet_state: TabletState,
         tablet_adapter: TabletAdapter,
         data_device_adapter: DataDeviceAdapter,
@@ -910,6 +913,13 @@ pub fn Coordinator(comptime protocol: type) type {
                 config.protocol_seat,
             );
             errdefer self.seat_adapter.deinit();
+            self.transient_seat_adapter = try TransientSeatAdapter.init(
+                allocator,
+                .{},
+                self,
+                initTransientSeat,
+            );
+            errdefer self.transient_seat_adapter.deinit();
             self.tablet_state = try TabletState.init(allocator, config.tablet_input);
             errdefer self.tablet_state.deinit();
             self.tablet_adapter = try TabletAdapter.init(
@@ -1266,6 +1276,9 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = try self.seat_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
+            _ = try self.transient_seat_adapter.install(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
             _ = try self.tablet_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
@@ -1454,6 +1467,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.dmabuf_adapter.deinit();
             self.virtual_pointer_adapter.deinit();
             self.virtual_keyboard_adapter.deinit();
+            self.transient_seat_adapter.deinit();
             self.input_method_adapter.deinit();
             self.text_input_adapter.deinit();
             self.primary_selection_adapter.deinit();
@@ -1537,6 +1551,8 @@ pub fn Coordinator(comptime protocol: type) type {
             self.input_method_adapter.disconnected(peer);
             self.virtual_keyboard_adapter.disconnected(peer);
             self.virtual_pointer_adapter.disconnected(peer);
+            self.transient_seat_adapter.disconnected(peer);
+            self.transient_seat_adapter.advance() catch {};
             self.screencopy_adapter.disconnected(peer);
             self.processVirtualPointerEvents() catch {};
             self.text_input_adapter.disconnected(peer);
@@ -1661,6 +1677,12 @@ pub fn Coordinator(comptime protocol: type) type {
                 return control;
             if (try self.shell_adapter.request(peer, target, message, fds)) |control| {
                 try self.advanceShell();
+                try self.flushProtocol();
+                return control;
+            }
+            if (try self.transient_seat_adapter.request(peer, target, message, fds)) |control| {
+                try self.advanceTransientSeats();
+                self.markProtocolAll(ProtocolReady.seat);
                 try self.flushProtocol();
                 return control;
             }
@@ -3794,7 +3816,8 @@ pub fn Coordinator(comptime protocol: type) type {
             seat_object: u32,
         ) ?*SeatAdapter {
             const self: *Self = @ptrCast(@alignCast(context orelse return null));
-            return if (self.seat_adapter.ownsSeat(peer, seat_object)) &self.seat_adapter else null;
+            if (self.seat_adapter.ownsSeat(peer, seat_object)) return &self.seat_adapter;
+            return self.transient_seat_adapter.resolveSeat(peer, seat_object);
         }
 
         fn resolveVirtualPointerSeat(
@@ -3804,9 +3827,28 @@ pub fn Coordinator(comptime protocol: type) type {
         ) ?*SeatAdapter {
             const self: *Self = @ptrCast(@alignCast(context orelse return null));
             if (seat_object) |object| {
-                if (!self.seat_adapter.ownsSeat(peer, object)) return null;
+                if (self.seat_adapter.ownsSeat(peer, object)) return &self.seat_adapter;
+                return self.transient_seat_adapter.resolveSeat(peer, object);
             }
             return &self.seat_adapter;
+        }
+
+        fn initTransientSeat(
+            context: ?*anyopaque,
+            allocator: std.mem.Allocator,
+            adapter: *SeatAdapter,
+        ) !void {
+            const self: *Self = @ptrCast(@alignCast(context orelse return error.InvalidContext));
+            adapter.* = try SeatAdapter.init(allocator, &self.adapter, .{
+                .seat_capacity = 4,
+                .pointer_capacity = 8,
+                .keyboard_capacity = 8,
+                .device_capacity = 16,
+                .outbound_capacity = 256,
+                .event_capacity = 16,
+                .name = "transient",
+                .keymap = protocol_seat.default_keymap,
+            });
         }
 
         fn validateVirtualPointerOutput(
@@ -4008,6 +4050,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn flushProtocol(self: *Self) !void {
+            try self.advanceTransientSeats();
             if (!self.processing_virtual_pointer) try self.processVirtualPointerEvents();
             try self.processDecorationEvents();
             try self.advanceShell();
@@ -4024,6 +4067,24 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.flushProtocolOn(client.peer);
         }
 
+        fn advanceTransientSeats(self: *Self) !void {
+            try self.transient_seat_adapter.advance();
+            while (true) {
+                const mutation = self.transient_seat_adapter.activeMutation() orelse
+                    (try self.transient_seat_adapter.nextMutation() orelse return);
+                while (true) switch (try self.root.runtime.publishNext()) {
+                    .sent => |peer| _ = try self.loop.?.driver.schedule(peer),
+                    .blocked => |peer| {
+                        _ = try self.loop.?.driver.schedule(peer);
+                        return;
+                    },
+                    .complete => break,
+                };
+                try self.transient_seat_adapter.mutationPublished(mutation);
+                self.markProtocolAll(ProtocolReady.seat);
+            }
+        }
+
         fn processVirtualPointerEvents(self: *Self) anyerror!void {
             if (self.processing_virtual_pointer) return;
             self.processing_virtual_pointer = true;
@@ -4032,8 +4093,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 const event_seat = switch (pending.*) {
                     inline else => |value| value.seat,
                 };
-                std.debug.assert(event_seat == &self.seat_adapter);
-                const accepted = switch (pending.*) {
+                const accepted = if (event_seat == &self.seat_adapter) switch (pending.*) {
                     .device_added => |value| try self.acceptNormalizedInput(.{ .device_added = .{
                         .device = value.device,
                         .info = value.info,
@@ -4102,10 +4162,102 @@ pub fn Coordinator(comptime protocol: type) type {
                         value.source,
                         false,
                     ),
-                };
+                } else try self.acceptTransientPointerEvent(event_seat, pending.*);
                 if (!accepted) break;
                 self.virtual_pointer_adapter.dropEvent();
             }
+        }
+
+        fn acceptTransientPointerEvent(self: *Self, seat: *SeatAdapter, event: VirtualPointerAdapter.Event) !bool {
+            const normalized: input_api.Event = switch (event) {
+                .device_added => |value| .{ .device_added = .{ .device = value.device, .info = value.info } },
+                .device_removed => |value| .{ .device_removed = value.device },
+                .motion => |value| .{ .pointer_motion = .{
+                    .device = value.device,
+                    .time_usec = @as(u64, value.time) * 1000,
+                    .dx = @as(f64, @floatFromInt(value.dx)) / 256.0,
+                    .dy = @as(f64, @floatFromInt(value.dy)) / 256.0,
+                } },
+                .motion_absolute => |value| absolute: {
+                    if (value.x_extent == 0 or value.y_extent == 0) return true;
+                    const bounds = self.outputBounds() catch return true;
+                    if (bounds.width <= 0 or bounds.height <= 0) return true;
+                    const x = @min(value.x, value.x_extent);
+                    const y = @min(value.y, value.y_extent);
+                    const target_x = @as(i64, bounds.x) + @as(i64, @intCast(
+                        (@as(u64, x) * @as(u64, @intCast(bounds.width - 1))) / value.x_extent,
+                    ));
+                    const target_y = @as(i64, bounds.y) + @as(i64, @intCast(
+                        (@as(u64, y) * @as(u64, @intCast(bounds.height - 1))) / value.y_extent,
+                    ));
+                    const current = self.transient_seat_adapter.pointerPosition(seat) orelse return true;
+                    break :absolute .{ .pointer_motion = .{
+                        .device = value.device,
+                        .time_usec = @as(u64, value.time) * 1000,
+                        .dx = @floatFromInt(target_x - @divFloor(current.x, 256)),
+                        .dy = @floatFromInt(target_y - @divFloor(current.y, 256)),
+                    } };
+                },
+                .button => |value| .{ .pointer_button = .{
+                    .device = value.device,
+                    .time_usec = @as(u64, value.time) * 1000,
+                    .button = value.button,
+                    .pressed = value.pressed,
+                } },
+                .axis => |value| virtualPointerAxisEvent(value.device, value.time, value.axis, @as(f64, @floatFromInt(value.value)) / 256.0, null, value.source, false),
+                .axis_stop => |value| virtualPointerAxisEvent(value.device, value.time, value.axis, 0, null, value.source, true),
+                .axis_discrete => |value| virtualPointerAxisEvent(
+                    value.device,
+                    value.time,
+                    value.axis,
+                    @as(f64, @floatFromInt(value.value)) / 256.0,
+                    @floatFromInt(std.math.clamp(@as(i64, value.discrete) * 120, std.math.minInt(i32), std.math.maxInt(i32))),
+                    value.source,
+                    false,
+                ),
+            };
+            if (normalized == .pointer_motion) {
+                const bounds = self.outputBounds() catch return true;
+                var position = self.transient_seat_adapter.pointerPosition(seat) orelse return true;
+                position.x = clampFixedPosition(position.x, normalized.pointer_motion.dx, bounds.x, bounds.width);
+                position.y = clampFixedPosition(position.y, normalized.pointer_motion.dy, bounds.y, bounds.height);
+                const whole: geometry.Point = .{ .x = @divFloor(position.x, 256), .y = @divFloor(position.y, 256) };
+                const windows = self.desktop.sceneSnapshot(self.scene_windows) catch return true;
+                var input_scene: InputScene = .{ .coordinator = self };
+                if (input_scene.topmost(Desktop.SceneWindow, windows, whole)) |hit| {
+                    const target = self.seatTarget(hit.surface) catch return true;
+                    const point: SeatAdapter.Point = .{
+                        .x = position.x -| ((whole.x -| hit.local.x) *| 256),
+                        .y = position.y -| ((whole.y -| hit.local.y) *| 256),
+                    };
+                    seat.setPointerFocus(target, point) catch |err| switch (err) {
+                        error.Exhausted => return false,
+                        else => return err,
+                    };
+                    seat.consumePointerMotionAt(normalized, point) catch |err| switch (err) {
+                        error.Exhausted => return false,
+                        else => return err,
+                    };
+                } else {
+                    seat.setPointerFocus(null, .{ .x = 0, .y = 0 }) catch |err| switch (err) {
+                        error.Exhausted => return false,
+                        else => return err,
+                    };
+                    seat.consume(normalized) catch |err| switch (err) {
+                        error.Exhausted => return false,
+                        else => return err,
+                    };
+                }
+                _ = self.transient_seat_adapter.setPointerPosition(seat, position);
+            } else {
+                seat.consume(normalized) catch |err| switch (err) {
+                    error.Exhausted => return false,
+                    else => return err,
+                };
+            }
+            self.markProtocolAll(ProtocolReady.seat);
+            try self.flushProtocol();
+            return true;
         }
 
         fn acceptVirtualPointerAxis(
@@ -4118,14 +4270,7 @@ pub fn Coordinator(comptime protocol: type) type {
             source: input_platform.AxisSource,
             stop: bool,
         ) !bool {
-            const present: input_platform.AxisValue = .{ .value = value, .value120 = value120, .stop = stop };
-            return self.acceptNormalizedInput(.{ .pointer_axis = .{
-                .device = device,
-                .time_usec = @as(u64, time) * 1000,
-                .source = source,
-                .vertical = if (axis == 0) present else null,
-                .horizontal = if (axis == 1) present else null,
-            } });
+            return self.acceptNormalizedInput(virtualPointerAxisEvent(device, time, axis, value, value120, source, stop));
         }
 
         fn flushProtocolOn(self: *Self, peer: wayring.io_uring.Peer) !void {
@@ -4142,8 +4287,11 @@ pub fn Coordinator(comptime protocol: type) type {
             if (client.protocol_ready & ProtocolReady.shell != 0 and
                 !self.decoration_adapter.readyOutbound(peer))
                 flushed += try self.shell_adapter.flushOn(objects, &actor.transmit);
-            if (client.protocol_ready & ProtocolReady.seat != 0)
+            if (client.protocol_ready & ProtocolReady.seat != 0) {
                 flushed += try self.seat_adapter.flushOn(objects, &actor.transmit);
+                flushed += try self.transient_seat_adapter.flushSeatsOn(objects, &actor.transmit);
+                flushed += try self.transient_seat_adapter.flushOn(peer, objects, &actor.transmit);
+            }
             if (client.protocol_ready & ProtocolReady.tablet != 0)
                 flushed += try self.tablet_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.data_device != 0)
@@ -4285,7 +4433,9 @@ pub fn Coordinator(comptime protocol: type) type {
                 !self.shell_adapter.pendingOutboundOn(objects))
                 ready &= ~ProtocolReady.shell;
             if (ready & ProtocolReady.seat != 0 and
-                !self.seat_adapter.pendingOutboundOn(objects))
+                !self.seat_adapter.pendingOutboundOn(objects) and
+                !self.transient_seat_adapter.pendingSeatOutboundOn(objects) and
+                !self.transient_seat_adapter.pendingOutbound(client.peer))
                 ready &= ~ProtocolReady.seat;
             if (ready & ProtocolReady.tablet != 0 and
                 !self.tablet_adapter.pendingOutbound(client.peer))
@@ -6733,6 +6883,7 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.input_method_adapter.resourceRemoved(handle, object);
             _ = self.virtual_keyboard_adapter.resourceRemoved(handle, object);
             _ = self.virtual_pointer_adapter.resourceRemoved(handle, object);
+            _ = self.transient_seat_adapter.resourceRemoved(handle, object);
             _ = self.screencopy_adapter.resourceRemoved(handle, object);
             _ = self.foreign_toplevel_list_adapter.resourceRemoved(handle, object);
             _ = self.workspace_adapter.resourceRemoved(handle, object);
@@ -6827,6 +6978,35 @@ test "alpha modifier UNORM converts to renderer alpha with rounded endpoints" {
     try std.testing.expectEqual(@as(u8, 0), alphaMultiplier(0));
     try std.testing.expectEqual(@as(u8, 128), alphaMultiplier(0x8080_8080));
     try std.testing.expectEqual(@as(u8, 255), alphaMultiplier(std.math.maxInt(u32)));
+}
+
+fn virtualPointerAxisEvent(
+    device: input_api.DeviceId,
+    time: u32,
+    axis: u32,
+    value: f64,
+    value120: ?f64,
+    source: input_platform.AxisSource,
+    stop: bool,
+) input_api.Event {
+    const present: input_platform.AxisValue = .{ .value = value, .value120 = value120, .stop = stop };
+    return .{ .pointer_axis = .{
+        .device = device,
+        .time_usec = @as(u64, time) * 1000,
+        .source = source,
+        .vertical = if (axis == 0) present else null,
+        .horizontal = if (axis == 1) present else null,
+    } };
+}
+
+fn clampFixedPosition(current: i32, delta: f64, origin: i32, extent: i32) i32 {
+    const minimum = @as(i64, origin) * 256;
+    const maximum = (@as(i64, origin) + @as(i64, extent) - 1) * 256;
+    return @intCast(std.math.clamp(
+        @as(i64, current) +| normalizedFixedDelta(delta),
+        minimum,
+        maximum,
+    ));
 }
 
 fn normalizedFixedDelta(value: f64) i64 {

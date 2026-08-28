@@ -41,6 +41,7 @@ pub fn build(b: *std.Build) void {
     generate_core_protocol.addFileArg(wayland_protocols.path("staging/ext-data-control/ext-data-control-v1.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("staging/ext-foreign-toplevel-list/ext-foreign-toplevel-list-v1.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("staging/ext-workspace/ext-workspace-v1.xml"));
+    generate_core_protocol.addFileArg(wayland_protocols.path("staging/ext-transient-seat/ext-transient-seat-v1.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("staging/ext-image-capture-source/ext-image-capture-source-v1.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("staging/ext-image-copy-capture/ext-image-copy-capture-v1.xml"));
     generate_core_protocol.addFileArg(wlr_protocols.path("unstable/wlr-data-control-unstable-v1.xml"));
@@ -99,6 +100,7 @@ pub fn build(b: *std.Build) void {
     generate_xdg_protocol.addFileArg(wayland_protocols.path("staging/ext-data-control/ext-data-control-v1.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("staging/ext-foreign-toplevel-list/ext-foreign-toplevel-list-v1.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("staging/ext-workspace/ext-workspace-v1.xml"));
+    generate_xdg_protocol.addFileArg(wayland_protocols.path("staging/ext-transient-seat/ext-transient-seat-v1.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("staging/ext-image-capture-source/ext-image-capture-source-v1.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("staging/ext-image-copy-capture/ext-image-copy-capture-v1.xml"));
     generate_xdg_protocol.addFileArg(wlr_protocols.path("unstable/wlr-data-control-unstable-v1.xml"));

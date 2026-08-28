@@ -305,6 +305,190 @@ const WaylandFixesHandler = struct {
     }
 };
 
+test "shell-input: generated transient seat publishes before ready and retires independently" {
+    const allocator = std.testing.allocator;
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-transient-seat-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+
+    var fixture = try physical_fixture.Fixture.init();
+    defer fixture.deinit();
+    var root_config = physical_fixture.compositorConfig();
+    root_config.runtime.object_capacity = 32;
+    root_config.runtime.object_quota = 24;
+    root_config.runtime.registry_capacity = 1;
+    root_config.runtime.max_globals = 64;
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), root_config);
+    var config = physical_fixture.coordinatorConfig();
+    config.router_capacity = 24;
+    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), config);
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
+    try coordinator.start(&loop);
+
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(allocator, .{ .entries = 16, .flags = 0 }, physical_fixture.clientReactorConfig());
+    var client = try ClientConnection.attach(
+        allocator,
+        &reactor,
+        try wayring.unix_socket.connect(path),
+        .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 },
+        .{ .max_objects = 24, .max_client_ids = 23 },
+    );
+    const actor = try client.actor();
+    var driver = ClientDriver.init(&client);
+    const registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null);
+    var handler: TransientSeatHandler = .{ .objects = &client.objects, .queue = &actor.transmit, .registry = registry };
+    try submitClient(&reactor, &driver, &handler);
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.manager != null) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(handler.manager != null);
+
+    handler.creating = true;
+    handler.transient = (try protocol.ext_transient_seat_manager_v1.construct_create(
+        &client.objects,
+        &actor.transmit,
+        handler.manager.?,
+        .{},
+    )).seat;
+    try submitClient(&reactor, &driver, &handler);
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.ready == 1 and handler.seat_events >= 2) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(usize, 1), handler.dynamic_global);
+    try std.testing.expectEqual(@as(usize, 1), handler.ready);
+    try std.testing.expectEqual(@as(usize, 0), handler.denied);
+    try std.testing.expect(handler.seat != null);
+    try std.testing.expect(handler.seat_events >= 2);
+
+    const transient = handler.transient.?;
+    const seat = handler.seat.?;
+    try wayring.client.sendRequest(
+        protocol.ext_transient_seat_v1,
+        &client.objects,
+        &actor.transmit,
+        transient,
+        .{ .destroy = .{} },
+    );
+    try submitClient(&reactor, &driver, &handler);
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.global_remove == 1 and client.objects.namespace.resolve(transient) == null) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(usize, 1), handler.global_remove);
+    try std.testing.expect(client.objects.namespace.resolve(transient) == null);
+    try std.testing.expect(client.objects.namespace.resolve(seat) != null);
+
+    try wayring.client.sendRequest(protocol.wl_seat, &client.objects, &actor.transmit, seat, .{ .release = .{} });
+    try wayring.client.sendRequest(
+        protocol.ext_transient_seat_manager_v1,
+        &client.objects,
+        &actor.transmit,
+        handler.manager.?,
+        .{ .destroy = .{} },
+    );
+    try submitClient(&reactor, &driver, &handler);
+    for (0..64) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+    }
+    try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+
+    _ = try client.prepareClose();
+    try submitClient(&reactor, &driver, &handler);
+    try coordinator.requestStop();
+    var drained = false;
+    for (0..512) |_| {
+        const cp = try drainClient(&reactor, &driver, &handler);
+        const progress = try loop.turn(coordinator);
+        drained = progress.wayring.shutdown_complete and cp.quiescent and coordinator.backendDrainComplete();
+        if (drained) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(drained);
+    try client.deinit(allocator);
+    reactor.deinit(allocator);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
+const TransientSeatHandler = struct {
+    objects: *wayring.objects.ClientObjects,
+    queue: *wayring.tx.Queue,
+    registry: wayring.objects.Handle,
+    manager: ?wayring.objects.Handle = null,
+    transient: ?wayring.objects.Handle = null,
+    seat: ?wayring.objects.Handle = null,
+    creating: bool = false,
+    seat_names: [4]u32 = undefined,
+    seat_versions: [4]u32 = undefined,
+    seat_name_count: usize = 0,
+    dynamic_name: ?u32 = null,
+    dynamic_global: usize = 0,
+    global_remove: usize = 0,
+    ready: usize = 0,
+    denied: usize = 0,
+    seat_events: usize = 0,
+    event_failures: usize = 0,
+
+    pub fn eventError(self: *TransientSeatHandler, _: wayring.io_uring.Peer, _: ClientCore.EventFailure) void {
+        self.event_failures += 1;
+    }
+
+    pub fn event(self: *TransientSeatHandler, target: wayring.objects.Dispatch, message: wayring.wire.Message, fds: *wayring.ancillary.FdQueue) !wayring.dispatch.Control {
+        if (target.object.interface == &ClientCore.Display.info) {
+            switch (try ClientCore.decodeDisplayEvent(self.objects, message, fds)) {
+                .delete_id => {},
+                .@"error" => return error.ServerProtocolError,
+            }
+        } else if (target.object.interface == &ClientCore.Registry.info) {
+            switch (try ClientCore.decodeRegistryEvent(self.objects, self.registry, message, fds)) {
+                .global => |value| if (std.mem.eql(u8, value.interface, protocol.ext_transient_seat_manager_v1.info.name)) {
+                    self.manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.ext_transient_seat_manager_v1.info, 1, null);
+                } else if (std.mem.eql(u8, value.interface, protocol.wl_seat.info.name)) {
+                    if (self.seat_name_count == self.seat_names.len) return error.TooManySeatGlobals;
+                    self.seat_names[self.seat_name_count] = value.name;
+                    self.seat_versions[self.seat_name_count] = value.version;
+                    self.seat_name_count += 1;
+                },
+                .global_remove => |value| {
+                    if (self.dynamic_name == value.name) self.global_remove += 1;
+                },
+            }
+        } else if (target.object.interface == &protocol.ext_transient_seat_v1.info) {
+            switch (try protocol.ext_transient_seat_v1.decodeEvent(message, fds)) {
+                .ready => |value| {
+                    try std.testing.expect(self.creating);
+                    var version: ?u32 = null;
+                    for (self.seat_names[0..self.seat_name_count], self.seat_versions[0..self.seat_name_count]) |name, candidate_version| {
+                        if (name == value.global_name) version = candidate_version;
+                    }
+                    try std.testing.expect(version != null);
+                    self.dynamic_name = value.global_name;
+                    self.dynamic_global += 1;
+                    self.seat = try ClientCore.bind(self.objects, self.queue, self.registry, value.global_name, &protocol.wl_seat.info, @min(version.?, 9), null);
+                    self.ready += 1;
+                },
+                .denied => self.denied += 1,
+            }
+        } else if (target.object.interface == &protocol.wl_seat.info) {
+            _ = try protocol.wl_seat.decodeEvent(message, fds);
+            self.seat_events += 1;
+        } else return error.UnexpectedEvent;
+        return .continue_dispatch;
+    }
+};
+
 test "shell-input: generated workspace client observes and activates the fixed workspace" {
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;
