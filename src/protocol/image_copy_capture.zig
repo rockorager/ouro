@@ -23,6 +23,7 @@ pub const Config = struct {
 pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type) type {
     return struct {
         const Self = @This();
+        const ProtocolCore = wayring.server.Core(protocol);
         const SessionProtocol = protocol.ext_image_copy_capture_session_v1;
         const FrameProtocol = protocol.ext_image_copy_capture_frame_v1;
         pub const Target = SourceAdapter.Target;
@@ -138,6 +139,11 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type) type {
             return id;
         }
         pub fn createFrame(self: *Self, id: SessionId, resource: objects.Handle) !FrameId {
+            const frame = try self.acquireFrame(id);
+            frame.resource = resource;
+            return self.frameId(frame);
+        }
+        fn acquireFrame(self: *Self, id: SessionId) !*Frame {
             const s = try self.resolveSession(id);
             if (s.frame != null) return error.DuplicateFrame;
             if (self.frame_free == none) return error.Exhausted;
@@ -149,7 +155,6 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type) type {
                 .active = true,
                 .generation = g,
                 .peer = s.peer,
-                .resource = resource,
                 .session = id,
                 .target = s.target,
                 .constraints = s.constraints,
@@ -158,7 +163,7 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type) type {
                 .target_invalid = s.stopped,
             };
             s.frame = fid;
-            return fid;
+            return &self.frames[i];
         }
         pub fn attachBuffer(self: *Self, id: FrameId, buffer: objects.Handle) !void {
             const f = try self.mutableFrame(id);
@@ -206,6 +211,68 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type) type {
                 frame.phase = .started;
                 return value;
             }
+        }
+
+        pub fn requestOn(
+            self: *Self,
+            actor: *wayring.connection.Actor,
+            server_objects: anytype,
+            peer: wayring.io_uring.Peer,
+            target: objects.Dispatch,
+            message: wayring.wire.Message,
+            fds: *wayring.ancillary.FdQueue,
+        ) !?wayring.dispatch.Control {
+            const resource = server_objects.namespace.lookupHandle(message.header.object_id) orelse return null;
+            if (target.object.interface == &SessionProtocol.info) {
+                const session = from(Session, self.sessions, target.object.context) orelse return null;
+                if (!std.meta.eql(session.resource, resource) or !samePeer(session.peer, peer)) return null;
+                const decoded = try wayring.server.decodeRequest(SessionProtocol, server_objects, message, fds);
+                switch (decoded.value) {
+                    .destroy => {},
+                    .create_frame => |value| {
+                        const frame = self.acquireFrame(self.sessionId(session)) catch |cause| switch (cause) {
+                            error.DuplicateFrame => return try self.protocolError(actor, resource.id, SessionProtocol.@"error".duplicate_frame.value, "capture frame already exists"),
+                            error.Exhausted => return try self.noMemory(actor),
+                            else => return cause,
+                        };
+                        var owned = true;
+                        defer if (owned) self.releaseFrame(self.frameIndex(frame));
+                        const admitted = SessionProtocol.admit_create_frame(server_objects, decoded.handle, value, .{ .frame = frame }) catch |cause|
+                            return try self.failure(actor, resource.id, cause);
+                        frame.resource = admitted.frame;
+                        owned = false;
+                    },
+                }
+                try decoded.finish(protocol, server_objects, &actor.transmit);
+                return .continue_dispatch;
+            }
+            if (target.object.interface != &FrameProtocol.info) return null;
+            const frame = from(Frame, self.frames, target.object.context) orelse return null;
+            if (!std.meta.eql(frame.resource, resource) or !samePeer(frame.peer, peer)) return null;
+            const decoded = try wayring.server.decodeRequest(FrameProtocol, server_objects, message, fds);
+            switch (decoded.value) {
+                .destroy => {},
+                .attach_buffer => |value| {
+                    const buffer = server_objects.namespace.lookupHandle(value.buffer) orelse return error.StaleHandle;
+                    self.attachBuffer(self.frameId(frame), buffer) catch |cause| switch (cause) {
+                        error.AlreadyCaptured => return try self.protocolError(actor, resource.id, FrameProtocol.@"error".already_captured.value, "frame already captured"),
+                        else => return cause,
+                    };
+                },
+                .damage_buffer => |value| self.damage(self.frameId(frame), value.x, value.y, value.width, value.height) catch |cause| switch (cause) {
+                    error.AlreadyCaptured => return try self.protocolError(actor, resource.id, FrameProtocol.@"error".already_captured.value, "frame already captured"),
+                    error.InvalidBufferDamage => return try self.protocolError(actor, resource.id, FrameProtocol.@"error".invalid_buffer_damage.value, "invalid buffer damage"),
+                    else => return cause,
+                },
+                .capture => self.capture(self.frameId(frame)) catch |cause| switch (cause) {
+                    error.NoBuffer => return try self.protocolError(actor, resource.id, FrameProtocol.@"error".no_buffer.value, "no buffer attached"),
+                    error.AlreadyCaptured => return try self.protocolError(actor, resource.id, FrameProtocol.@"error".already_captured.value, "frame already captured"),
+                    error.Exhausted => return try self.noMemory(actor),
+                    else => return cause,
+                },
+            }
+            try decoded.finish(protocol, server_objects, &actor.transmit);
+            return .continue_dispatch;
         }
         pub fn complete(self: *Self, id: FrameId, timestamp_ns: u64) !void {
             const f = try self.mutableFrame(id);
@@ -482,6 +549,24 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type) type {
         fn frameId(self: *const Self, f: *const Frame) FrameId {
             return .{ .index = indexOf(Frame, self.frames, f), .generation = f.generation };
         }
+        fn frameIndex(self: *const Self, frame: *const Frame) u32 {
+            return indexOf(Frame, self.frames, frame);
+        }
+        fn sessionId(self: *const Self, session: *const Session) SessionId {
+            return .{ .index = indexOf(Session, self.sessions, session), .generation = session.generation };
+        }
+        fn noMemory(_: *Self, actor: *wayring.connection.Actor) !wayring.dispatch.Control {
+            try ProtocolCore.postError(actor, objects.display_id, 2, "out of memory");
+            return .stop;
+        }
+        fn protocolError(_: *Self, actor: *wayring.connection.Actor, id: u32, code: u32, message: []const u8) !wayring.dispatch.Control {
+            try ProtocolCore.postError(actor, id, code, message);
+            return .stop;
+        }
+        fn failure(_: *Self, actor: *wayring.connection.Actor, id: u32, cause: anyerror) !wayring.dispatch.Control {
+            try ProtocolCore.postError(actor, id, 0, @errorName(cause));
+            return .stop;
+        }
     };
 }
 
@@ -638,6 +723,68 @@ test "image copy capture: generated events flush in protocol order" {
         bytes = bytes[message.header.size..];
     }
     try std.testing.expectEqual(@as(usize, 0), bytes.len);
+}
+
+test "image copy capture: generated session request admits frame resource" {
+    const protocol = @import("core_protocol");
+    var adapter = try TestAdapter.init(std.testing.allocator, .{
+        .session_capacity = 1,
+        .frame_capacity = 1,
+        .capture_capacity = 1,
+        .outbound_capacity = 8,
+    });
+    defer adapter.deinit();
+    var server_objects = try objects.ServerObjects.init(
+        std.testing.allocator,
+        8,
+        2,
+        &protocol.wl_display.info,
+        null,
+    );
+    defer server_objects.deinit(std.testing.allocator);
+    const session = try adapter.admitSession(
+        test_peer,
+        .{ .id = 10, .generation = 1 },
+        test_snapshot,
+        .{ .width = 64, .height = 32 },
+        false,
+    );
+    adapter.clearOutbound();
+    const session_slot = &adapter.sessions[session.index];
+    session_slot.resource = try server_objects.insertClient(
+        10,
+        &protocol.ext_image_copy_capture_session_v1.info,
+        1,
+        session_slot,
+    );
+
+    var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 512, 4);
+    defer blocks.deinit(std.testing.allocator);
+    var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 4);
+    defer descriptors.deinit(std.testing.allocator);
+    var fragment: [64]u8 = undefined;
+    var actor = wayring.connection.Actor.init(2, 7, &fragment, &descriptors, 1, &blocks, 256, 1);
+    defer actor.deinit();
+    var requests = wayring.tx.Queue.init(&blocks, 128, &descriptors, 0);
+    defer requests.deinit();
+    try protocol.ext_image_copy_capture_session_v1.encodeRequest(
+        &requests,
+        10,
+        .{ .create_frame = .{ .frame = 11 } },
+    );
+    var descriptor_scratch: [1]std.os.linux.fd_t = undefined;
+    var control: [64]u8 align(@alignOf(std.os.linux.cmsghdr)) = undefined;
+    const bytes = (try requests.snapshot(&descriptor_scratch, &control)).first;
+    const message = (try wayring.wire.Message.decode(bytes)).?;
+    const target = try server_objects.namespace.request(10, message.header.opcode);
+    try std.testing.expectEqual(
+        wayring.dispatch.Control.continue_dispatch,
+        (try adapter.requestOn(&actor, &server_objects, test_peer, target, message, &requests.descriptors)).?,
+    );
+    const frame = adapter.frames[0];
+    try std.testing.expect(frame.active);
+    try std.testing.expectEqual(@as(u32, 11), frame.resource.id);
+    try std.testing.expect(server_objects.namespace.resolve(frame.resource).?.context == @as(?*anyopaque, @ptrCast(&adapter.frames[0])));
 }
 
 test "image copy capture: frame survives session and stale completion cannot alias reuse" {
