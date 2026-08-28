@@ -305,6 +305,227 @@ const WaylandFixesHandler = struct {
     }
 };
 
+test "shell-input: generated workspace client observes and activates the fixed workspace" {
+    const allocator = std.testing.allocator;
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-workspace-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+
+    var fixture = try physical_fixture.Fixture.init();
+    defer fixture.deinit();
+    var root_config = physical_fixture.compositorConfig();
+    root_config.runtime.object_capacity = 24;
+    root_config.runtime.object_quota = 24;
+    root_config.runtime.registry_capacity = 1;
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), root_config);
+    var config = physical_fixture.coordinatorConfig();
+    config.router_capacity = 24;
+    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), config);
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
+    try coordinator.start(&loop);
+
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(allocator, .{ .entries = 16, .flags = 0 }, physical_fixture.clientReactorConfig());
+    var client = try ClientConnection.attach(
+        allocator,
+        &reactor,
+        try wayring.unix_socket.connect(path),
+        .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 },
+        .{ .max_objects = 16, .max_client_ids = 15 },
+    );
+    const actor = try client.actor();
+    var driver = ClientDriver.init(&client);
+    const registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null);
+    var handler: WorkspaceHandler = .{ .objects = &client.objects, .queue = &actor.transmit, .registry = registry };
+    try submitClient(&reactor, &driver, &handler);
+
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    var turns_after_activation: usize = 0;
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.activation_sent) turns_after_activation += 1;
+        if (handler.output_done == 1 and turns_after_activation >= 4 and
+            coordinator.workspace_adapter.pendingCommands() == 0) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(handler.manager != null);
+    try std.testing.expect(handler.group != null);
+    try std.testing.expect(handler.workspace != null);
+    try std.testing.expectEqual(@as(usize, 8), handler.initial_order);
+    try std.testing.expectEqual(@as(usize, 1), handler.initial_done);
+    try std.testing.expectEqual(@as(usize, 1), handler.output_enter);
+    try std.testing.expectEqual(@as(usize, 1), handler.output_done);
+    try std.testing.expect(handler.activation_sent);
+    try std.testing.expectEqual(@as(usize, 0), coordinator.workspace_adapter.pendingCommands());
+    try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+
+    try fixture.signalSession(.disable);
+    for (0..256) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (coordinator.output == null and handler.output_leave == 1 and handler.output_done == 2) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(coordinator.output == null);
+    try std.testing.expectEqual(@as(usize, 1), handler.output_leave);
+    try std.testing.expectEqual(@as(usize, 2), handler.output_done);
+
+    try protocol.ext_workspace_manager_v1.encodeRequest(&actor.transmit, handler.manager.?.id, .{ .stop = .{} });
+    try submitClient(&reactor, &driver, &handler);
+    for (0..256) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.finished == 1) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(usize, 1), handler.finished);
+
+    try wayring.client.sendRequest(protocol.ext_workspace_group_handle_v1, &client.objects, &actor.transmit, handler.group.?, .{ .destroy = .{} });
+    try wayring.client.sendRequest(protocol.ext_workspace_handle_v1, &client.objects, &actor.transmit, handler.workspace.?, .{ .destroy = .{} });
+    try submitClient(&reactor, &driver, &handler);
+    for (0..32) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+    }
+
+    _ = try client.prepareClose();
+    try submitClient(&reactor, &driver, &handler);
+    try coordinator.requestStop();
+    var drained = false;
+    for (0..256) |_| {
+        const cp = try drainClient(&reactor, &driver, &handler);
+        const progress = try loop.turn(coordinator);
+        drained = progress.wayring.shutdown_complete and cp.quiescent and coordinator.backendDrainComplete();
+        if (drained) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(drained);
+    try client.deinit(allocator);
+    reactor.deinit(allocator);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
+const WorkspaceHandler = struct {
+    objects: *wayring.objects.ClientObjects,
+    queue: *wayring.tx.Queue,
+    registry: wayring.objects.Handle,
+    output: ?wayring.objects.Handle = null,
+    manager: ?wayring.objects.Handle = null,
+    group: ?wayring.objects.Handle = null,
+    workspace: ?wayring.objects.Handle = null,
+    initial_order: usize = 0,
+    initial_done: usize = 0,
+    output_enter: usize = 0,
+    output_leave: usize = 0,
+    output_done: usize = 0,
+    finished: usize = 0,
+    activation_sent: bool = false,
+    event_failures: usize = 0,
+
+    pub fn eventError(self: *WorkspaceHandler, _: wayring.io_uring.Peer, _: ClientCore.EventFailure) void {
+        self.event_failures += 1;
+    }
+
+    pub fn event(self: *WorkspaceHandler, target: wayring.objects.Dispatch, message: wayring.wire.Message, fds: *wayring.ancillary.FdQueue) !wayring.dispatch.Control {
+        if (target.object.interface == &ClientCore.Registry.info) {
+            switch (try ClientCore.decodeRegistryEvent(self.objects, self.registry, message, fds)) {
+                .global => |value| if (std.mem.eql(u8, value.interface, protocol.wl_output.info.name)) {
+                    self.output = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_output.info, @min(value.version, 4), null);
+                } else if (std.mem.eql(u8, value.interface, protocol.ext_workspace_manager_v1.info.name)) {
+                    self.manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.ext_workspace_manager_v1.info, 1, null);
+                },
+                .global_remove => {},
+            }
+        } else if (target.object.interface == &protocol.wl_output.info) {
+            _ = try protocol.wl_output.decodeEvent(message, fds);
+        } else if (target.object.interface == &protocol.ext_workspace_manager_v1.info) {
+            switch (try protocol.ext_workspace_manager_v1.decodeEvent(message, fds)) {
+                .workspace_group => |value| {
+                    try std.testing.expectEqual(@as(usize, 0), self.initial_order);
+                    self.group = (try protocol.ext_workspace_manager_v1.admit_event_workspace_group(self.objects, self.manager.?, value, .{})).workspace_group;
+                    self.initial_order = 1;
+                },
+                .workspace => |value| {
+                    try std.testing.expectEqual(@as(usize, 2), self.initial_order);
+                    self.workspace = (try protocol.ext_workspace_manager_v1.admit_event_workspace(self.objects, self.manager.?, value, .{})).workspace;
+                    self.initial_order = 3;
+                },
+                .done => {
+                    if (self.initial_done == 0) {
+                        try std.testing.expectEqual(@as(usize, 8), self.initial_order);
+                        try protocol.ext_workspace_handle_v1.encodeRequest(self.queue, self.workspace.?.id, .{ .activate = .{} });
+                        try protocol.ext_workspace_manager_v1.encodeRequest(self.queue, self.manager.?.id, .{ .commit = .{} });
+                        self.activation_sent = true;
+                        self.initial_done = 1;
+                    } else {
+                        try std.testing.expectEqual(self.output_enter, self.output_done + 1 - self.output_leave);
+                        self.output_done += 1;
+                    }
+                },
+                .finished => self.finished += 1,
+            }
+        } else if (target.object.interface == &protocol.ext_workspace_group_handle_v1.info) {
+            switch (try protocol.ext_workspace_group_handle_v1.decodeEvent(message, fds)) {
+                .capabilities => |value| {
+                    try std.testing.expectEqual(@as(usize, 1), self.initial_order);
+                    try std.testing.expectEqual(@as(u32, 0), value.capabilities.value);
+                    self.initial_order = 2;
+                },
+                .workspace_enter => |value| {
+                    try std.testing.expectEqual(@as(usize, 7), self.initial_order);
+                    try std.testing.expectEqual(self.workspace.?.id, value.workspace);
+                    self.initial_order = 8;
+                },
+                .output_enter => |value| {
+                    try std.testing.expectEqual(self.output.?.id, value.output);
+                    self.output_enter += 1;
+                },
+                .output_leave => |value| {
+                    try std.testing.expectEqual(self.output.?.id, value.output);
+                    self.output_leave += 1;
+                },
+                .workspace_leave, .removed => return error.UnexpectedWorkspaceGroupEvent,
+            }
+        } else if (target.object.interface == &protocol.ext_workspace_handle_v1.info) {
+            switch (try protocol.ext_workspace_handle_v1.decodeEvent(message, fds)) {
+                .id => |value| {
+                    try std.testing.expectEqual(@as(usize, 3), self.initial_order);
+                    try std.testing.expectEqualStrings("ouro-0", value.id);
+                    self.initial_order = 4;
+                },
+                .name => |value| {
+                    try std.testing.expectEqual(@as(usize, 4), self.initial_order);
+                    try std.testing.expectEqualStrings("Ouro", value.name);
+                    self.initial_order = 5;
+                },
+                .state => |value| {
+                    try std.testing.expectEqual(@as(usize, 5), self.initial_order);
+                    try std.testing.expect(value.state.contains(protocol.ext_workspace_handle_v1.state.active));
+                    self.initial_order = 6;
+                },
+                .capabilities => |value| {
+                    try std.testing.expectEqual(@as(usize, 6), self.initial_order);
+                    try std.testing.expectEqual(protocol.ext_workspace_handle_v1.workspace_capabilities.activate, value.capabilities);
+                    self.initial_order = 7;
+                },
+                .coordinates => return error.UnexpectedWorkspaceCoordinates,
+                .removed => return error.UnexpectedWorkspaceRemoved,
+            }
+        } else if (target.object.interface == &ClientCore.Display.info) {
+            switch (try ClientCore.decodeDisplayEvent(self.objects, message, fds)) {
+                .delete_id => {},
+                .@"error" => return error.ServerProtocolError,
+            }
+        } else return error.UnexpectedEvent;
+        return .continue_dispatch;
+    }
+};
+
 test "shell-input: generated data-control client crosses ext and wlr runtime paths" {
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;
@@ -517,6 +738,7 @@ test "shell-input: security context filters nested manager before registry disco
             parent_handler.virtual_keyboard_global_seen and
             parent_handler.virtual_pointer_global_seen and
             parent_handler.foreign_toplevel_global_seen and
+            parent_handler.workspace_global_seen and
             parent_handler.image_output_global_seen and
             parent_handler.image_toplevel_global_seen and
             parent_handler.image_copy_global_seen) break;
@@ -529,6 +751,7 @@ test "shell-input: security context filters nested manager before registry disco
     try std.testing.expect(parent_handler.virtual_keyboard_global_seen);
     try std.testing.expect(parent_handler.virtual_pointer_global_seen);
     try std.testing.expect(parent_handler.foreign_toplevel_global_seen);
+    try std.testing.expect(parent_handler.workspace_global_seen);
     try std.testing.expect(parent_handler.image_output_global_seen);
     try std.testing.expect(parent_handler.image_toplevel_global_seen);
     try std.testing.expect(parent_handler.image_copy_global_seen);
@@ -628,6 +851,7 @@ test "shell-input: security context filters nested manager before registry disco
     try std.testing.expect(!child_handler.virtual_keyboard_global_seen);
     try std.testing.expect(!child_handler.virtual_pointer_global_seen);
     try std.testing.expect(!child_handler.foreign_toplevel_global_seen);
+    try std.testing.expect(!child_handler.workspace_global_seen);
     try std.testing.expect(!child_handler.image_output_global_seen);
     try std.testing.expect(!child_handler.image_toplevel_global_seen);
     try std.testing.expect(!child_handler.image_copy_global_seen);
@@ -3845,6 +4069,7 @@ const Handler = struct {
     foreign_toplevel_finished: usize = 0,
     foreign_toplevel_closed: usize = 0,
     foreign_toplevel_global_seen: bool = false,
+    workspace_global_seen: bool = false,
     wlr_foreign_toplevel_manager: ?wayring.objects.Handle = null,
     wlr_foreign_toplevel_handle: ?wayring.objects.Handle = null,
     test_wlr_foreign_toplevel: bool = false,
@@ -4413,6 +4638,8 @@ const Handler = struct {
                 self.virtual_pointer_global_seen = true;
             if (std.mem.eql(u8, value.interface, protocol.ext_foreign_toplevel_list_v1.info.name))
                 self.foreign_toplevel_global_seen = true;
+            if (std.mem.eql(u8, value.interface, protocol.ext_workspace_manager_v1.info.name))
+                self.workspace_global_seen = true;
             if (std.mem.eql(u8, value.interface, protocol.ext_output_image_capture_source_manager_v1.info.name))
                 self.image_output_global_seen = true;
             if (std.mem.eql(u8, value.interface, protocol.ext_foreign_toplevel_image_capture_source_manager_v1.info.name))

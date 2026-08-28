@@ -73,6 +73,7 @@ const protocol_virtual_keyboard = @import("../protocol/virtual_keyboard.zig");
 const protocol_virtual_pointer = @import("../protocol/virtual_pointer.zig");
 const protocol_wlr_screencopy = @import("../protocol/wlr_screencopy.zig");
 const protocol_foreign_toplevel_list = @import("../protocol/foreign_toplevel_list.zig");
+const protocol_workspace = @import("../protocol/workspace.zig");
 const protocol_image_capture_source = @import("../protocol/image_capture_source.zig");
 const protocol_image_copy_capture = @import("../protocol/image_copy_capture.zig");
 const cursor_theme = @import("../cursor_theme.zig");
@@ -198,6 +199,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const VirtualPointerAdapter = protocol_virtual_pointer.Adapter(protocol);
         const ScreencopyAdapter = protocol_wlr_screencopy.Adapter(protocol);
         const ForeignToplevelListAdapter = protocol_foreign_toplevel_list.Adapter(protocol);
+        const WorkspaceAdapter = protocol_workspace.Adapter(protocol);
         const ImageCaptureSourceAdapter = protocol_image_capture_source.Adapter(
             protocol,
             output_scheduler.OutputId,
@@ -342,13 +344,15 @@ pub fn Coordinator(comptime protocol: type) type {
             const image_copy_capture: u32 = 1 << 28;
             const xdg_toplevel_icon: u32 = 1 << 29;
             const gtk_shell: u32 = 1 << 30;
+            const workspace: u32 = 1 << 31;
             const all: u32 = decoration | shell | seat | data_device | dmabuf |
                 activation | relative_pointer | fractional_scale | output | core |
                 pointer_constraints | color_management | color_representation |
                 primary_selection | text_input | pointer_gestures |
                 shortcuts_inhibit | xdg_foreign | xdg_output | layer_shell | session_lock |
                 idle_notify | tablet | ext_data_control | wlr_data_control | input_method |
-                screencopy | foreign_toplevel_list | image_copy_capture | xdg_toplevel_icon | gtk_shell;
+                screencopy | foreign_toplevel_list | image_copy_capture | xdg_toplevel_icon | gtk_shell |
+                workspace;
         };
         const Client = struct {
             active: bool = false,
@@ -452,6 +456,7 @@ pub fn Coordinator(comptime protocol: type) type {
             virtual_pointer: protocol_virtual_pointer.Config = .{},
             wlr_screencopy: protocol_wlr_screencopy.Config = .{},
             foreign_toplevel_list: protocol_foreign_toplevel_list.Config = .{},
+            workspace: protocol_workspace.Config = .{},
             image_capture_source: protocol_image_capture_source.Config = .{},
             image_copy_capture: protocol_image_copy_capture.Config = .{},
             linux_dmabuf: protocol_linux_dmabuf.Config = .{},
@@ -559,6 +564,7 @@ pub fn Coordinator(comptime protocol: type) type {
         virtual_pointer_adapter: VirtualPointerAdapter,
         screencopy_adapter: ScreencopyAdapter,
         foreign_toplevel_list_adapter: ForeignToplevelListAdapter,
+        workspace_adapter: WorkspaceAdapter,
         image_capture_source_adapter: ImageCaptureSourceAdapter,
         image_copy_capture_adapter: ImageCopyCaptureAdapter,
         dmabuf_adapter: DmabufAdapter,
@@ -881,6 +887,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 config.foreign_toplevel_list,
             );
             errdefer self.foreign_toplevel_list_adapter.deinit();
+            self.workspace_adapter = try WorkspaceAdapter.init(allocator, config.workspace);
+            errdefer self.workspace_adapter.deinit();
             self.image_capture_source_adapter = try ImageCaptureSourceAdapter.init(
                 allocator,
                 config.image_capture_source,
@@ -1114,6 +1122,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 self,
                 resolveForeignToplevelOutput,
             );
+            self.workspace_adapter.setOutputResolver(self, resolveWorkspaceOutput);
             self.screencopy_adapter = try ScreencopyAdapter.init(allocator, config.wlr_screencopy);
             errdefer self.screencopy_adapter.deinit();
             self.screencopy_adapter.setOutputValidator(.{
@@ -1224,6 +1233,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
             _ = try self.foreign_toplevel_list_adapter.installWlr();
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
+            _ = try self.workspace_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
             _ = try self.image_capture_source_adapter.installOutput(&root.runtime);
@@ -1459,6 +1471,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.interaction.deinit();
             self.desktop.deinit();
             self.foreign_toplevel_list_adapter.deinit();
+            self.workspace_adapter.deinit();
             self.image_copy_capture_adapter.deinit();
             self.image_capture_source_adapter.deinit();
             self.shell_adapter.deinit();
@@ -1514,6 +1527,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.shortcuts_inhibit_adapter.disconnected(peer);
             self.foreign_adapter.disconnected(peer);
             self.foreign_toplevel_list_adapter.disconnected(peer);
+            self.workspace_adapter.disconnected(peer);
             self.image_copy_capture_adapter.disconnected(peer);
             self.image_capture_source_adapter.disconnected(peer);
             self.input_method_adapter.disconnected(peer);
@@ -1815,6 +1829,11 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.advanceShell();
                 if (self.foreign_toplevel_list_adapter.pendingOutbound(peer))
                     self.markProtocol(peer, ProtocolReady.foreign_toplevel_list);
+                try self.flushProtocol();
+                return control;
+            }
+            if (try self.workspace_adapter.request(peer, target, message, fds)) |control| {
+                try self.syncWorkspace();
                 try self.flushProtocol();
                 return control;
             }
@@ -3011,6 +3030,46 @@ pub fn Coordinator(comptime protocol: type) type {
             return .{ .value = @as(u64, id.generation) << 32 | id.index };
         }
 
+        fn syncWorkspace(self: *Self) !void {
+            const output_id: ?WorkspaceAdapter.OutputId = if (self.output) |output|
+                workspaceOutputId(output.outputId())
+            else
+                null;
+            self.workspace_adapter.synchronize(output_id, true) catch
+                self.markProtocolAll(ProtocolReady.workspace);
+            while (self.workspace_adapter.peekCommand()) |command| {
+                if (command.workspace_generation != 1) {
+                    self.workspace_adapter.dropCommand();
+                    continue;
+                }
+                self.workspace_adapter.dropCommand();
+            }
+            for (self.clients.items) |client| {
+                if (!client.active) continue;
+                const pending = self.workspace_adapter.outputResourcesChanged(client.peer) catch true;
+                if (pending) self.markProtocol(client.peer, ProtocolReady.workspace);
+            }
+        }
+
+        fn resolveWorkspaceOutput(
+            context: ?*anyopaque,
+            peer: wayring.io_uring.Peer,
+            id: WorkspaceAdapter.OutputId,
+        ) ?wayring.objects.Handle {
+            const self: *Self = @ptrCast(@alignCast(context orelse return null));
+            const output = self.output orelse return null;
+            if (!std.meta.eql(workspaceOutputId(output.outputId()), id)) return null;
+            var resources: [1]u32 = undefined;
+            const ids = self.output_adapter.resourceIds(peer, &resources) catch return null;
+            if (ids.len == 0) return null;
+            const objects = self.root.runtime.clients.get(peer) catch return null;
+            return objects.namespace.lookupHandle(ids[0]);
+        }
+
+        fn workspaceOutputId(id: output_scheduler.OutputId) WorkspaceAdapter.OutputId {
+            return .{ .value = @as(u64, id.generation) << 32 | id.index };
+        }
+
         fn foreignToplevelOutbound(self: *const Self) bool {
             for (self.clients.items) |client|
                 if (client.active and self.foreign_toplevel_list_adapter.pendingOutbound(client.peer))
@@ -3629,6 +3688,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 !std.mem.eql(u8, name, "zwlr_virtual_pointer_manager_v1") and
                 !std.mem.eql(u8, name, "ext_foreign_toplevel_list_v1") and
                 !std.mem.eql(u8, name, "zwlr_foreign_toplevel_manager_v1") and
+                !std.mem.eql(u8, name, "ext_workspace_manager_v1") and
                 !std.mem.eql(u8, name, "ext_output_image_capture_source_manager_v1") and
                 !std.mem.eql(u8, name, "ext_foreign_toplevel_image_capture_source_manager_v1") and
                 !std.mem.eql(u8, name, "ext_image_copy_capture_manager_v1");
@@ -3928,6 +3988,7 @@ pub fn Coordinator(comptime protocol: type) type {
             if (!self.processing_virtual_pointer) try self.processVirtualPointerEvents();
             try self.processDecorationEvents();
             try self.advanceShell();
+            try self.syncWorkspace();
             self.input_method_adapter.advance();
             self.markInputMethodProtocol();
             if (self.image_copy_capture_adapter.refreshCursors(self)) |changed| {
@@ -4102,6 +4163,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 flushed += try self.image_copy_capture_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.output != 0)
                 flushed += try self.output_adapter.flushOn(peer, objects, &actor.transmit);
+            if (client.protocol_ready & ProtocolReady.workspace != 0)
+                flushed += try self.workspace_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.xdg_output != 0)
                 flushed += try self.xdg_output_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.layer_shell != 0)
@@ -4260,6 +4323,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (ready & ProtocolReady.output != 0 and
                 !self.output_adapter.pendingOutboundOn(client.peer))
                 ready &= ~ProtocolReady.output;
+            if (ready & ProtocolReady.workspace != 0 and
+                !self.workspace_adapter.pendingOutbound(client.peer))
+                ready &= ~ProtocolReady.workspace;
             if (ready & ProtocolReady.xdg_output != 0 and
                 !self.xdg_output_adapter.pendingOutbound(client.peer))
                 ready &= ~ProtocolReady.xdg_output;
@@ -6641,6 +6707,7 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.virtual_pointer_adapter.resourceRemoved(handle, object);
             _ = self.screencopy_adapter.resourceRemoved(handle, object);
             _ = self.foreign_toplevel_list_adapter.resourceRemoved(handle, object);
+            _ = self.workspace_adapter.resourceRemoved(handle, object);
             _ = self.image_copy_capture_adapter.resourceRemoved(handle, object);
             _ = self.image_capture_source_adapter.resourceRemoved(handle, object);
             _ = self.text_input_adapter.resourceRemoved(handle, object);

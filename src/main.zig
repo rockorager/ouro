@@ -317,7 +317,7 @@ fn compositorConfig() Compositor.Config {
             .buckets_per_client = 128,
             // Vulkan may publish wp_linux_drm_syncobj_manager_v1 only after
             // output discovery proves DRM syncobj support.
-            .max_globals = 55,
+            .max_globals = 56,
             .registry_capacity = 4,
         },
     };
