@@ -65,6 +65,8 @@ pub fn Adapter(comptime protocol: type) type {
             context: *anyopaque,
             assign: *const fn (*anyopaque, wayring.io_uring.Peer, u32) bool,
         };
+        pub const DragSourceId = packed struct { index: u32, generation: u32 };
+        pub const DragSourceState = enum { reserved, active, ended, gone };
 
         const Id = packed struct { index: u32, generation: u32 };
         const Header = struct {
@@ -85,6 +87,7 @@ pub fn Adapter(comptime protocol: type) type {
             mime_lengths: []u16 = &.{},
             mime_storage: []u8 = &.{},
             used: bool = false,
+            toplevel_drag_reserved: bool = false,
             drag_actions_set: bool = false,
             drag_actions: u32 = 0,
         };
@@ -269,6 +272,39 @@ pub fn Adapter(comptime protocol: type) type {
             self.drag_icon_assigner = assigner;
         }
 
+        /// Reserves an unused source for xdg-toplevel-drag. The reservation is
+        /// generation-safe and prevents the source from becoming a clipboard
+        /// selection while leaving its ordinary drag setup requests available.
+        pub fn reserveToplevelDragSource(
+            self: *Self,
+            peer: wayring.io_uring.Peer,
+            server_objects: anytype,
+            object_id: u32,
+        ) !DragSourceId {
+            const source = self.sourceByObject(server_objects, object_id) orelse
+                return error.InvalidSource;
+            if (!std.meta.eql(source.peer, peer) or source.used or source.toplevel_drag_reserved)
+                return error.InvalidSource;
+            source.toplevel_drag_reserved = true;
+            return @bitCast(self.sourceId(source));
+        }
+
+        pub fn releaseToplevelDragSource(self: *Self, id: DragSourceId) void {
+            const source = self.resolveSource(@bitCast(id)) catch return;
+            source.toplevel_drag_reserved = false;
+        }
+
+        pub fn toplevelDragSourceState(self: *Self, id: DragSourceId) DragSourceState {
+            const internal: Id = @bitCast(id);
+            const source = self.resolveSource(internal) catch return .gone;
+            if (!source.toplevel_drag_reserved) return .gone;
+            if (!source.used) return .reserved;
+            if (self.drag) |drag| if (drag.source) |active| {
+                if (std.meta.eql(active, internal)) return .active;
+            };
+            return .ended;
+        }
+
         fn bind(context: ?*anyopaque, binding: wayring.server.Binding) !?*anyopaque {
             const self: *Self = @ptrCast(@alignCast(context orelse return error.InvalidContext));
             const slot = acquire(ManagerSlot, self.managers, &self.manager_free) catch
@@ -426,7 +462,8 @@ pub fn Adapter(comptime protocol: type) type {
                     const next: ?SelectionSource = if (payload.source) |object_id| source: {
                         const source = self.sourceByObject(server_objects, object_id) orelse
                             return try self.protocolError(actor, decoded.handle.id, Device.@"error".used_source.value, "invalid selection source");
-                        if (!std.meta.eql(source.peer, peer) or source.used)
+                        if (!std.meta.eql(source.peer, peer) or source.used or
+                            source.toplevel_drag_reserved)
                             return try self.protocolError(actor, decoded.handle.id, Device.@"error".used_source.value, "selection source was already used");
                         if (source.drag_actions_set)
                             return try self.protocolError(actor, source.header.resource.id, Source.@"error".invalid_source.value, "drag-and-drop source cannot become a selection");
@@ -1049,6 +1086,7 @@ pub fn Adapter(comptime protocol: type) type {
         fn sourceByObject(self: *Self, server_objects: anytype, object_id: u32) ?*SourceSlot {
             const handle = server_objects.namespace.lookupHandle(object_id) orelse return null;
             const object = server_objects.namespace.resolve(handle) orelse return null;
+            if (object.interface != &Source.info) return null;
             const source = fromContext(SourceSlot, self.sources, object.context) orelse return null;
             return if (std.meta.eql(source.header.resource, handle)) source else null;
         }
@@ -1387,6 +1425,66 @@ test "data device: drag action matching honors preference then stable policy" {
         action.none.value,
         TestAdapter.selectDragAction(action.copy.value, action.move.value, action.move.value),
     );
+}
+
+test "data device: toplevel drag source reservations are exclusive and generation safe" {
+    var adapter = try testAdapter(.{
+        .manager_capacity = 1,
+        .source_capacity = 1,
+        .device_capacity = 1,
+        .offer_capacity = 1,
+        .mime_capacity = 1,
+        .mime_bytes = 32,
+        .outbound_capacity = 1,
+    });
+    defer adapter.deinit();
+    var server_objects = try wayring.objects.ServerObjects.init(
+        std.testing.allocator,
+        8,
+        4,
+        &test_protocol.wl_display.info,
+        null,
+    );
+    defer server_objects.deinit(std.testing.allocator);
+    const peer: wayring.io_uring.Peer = .{ .slot = 3, .generation = 7 };
+    const foreign: wayring.io_uring.Peer = .{ .slot = 4, .generation = 1 };
+    const source = try acquire(TestAdapter.SourceSlot, adapter.sources, &adapter.source_free);
+    source.peer = peer;
+    source.header.resource = try server_objects.insertClient(
+        4,
+        &test_protocol.wl_data_source.info,
+        3,
+        source,
+    );
+
+    try std.testing.expectError(
+        error.InvalidSource,
+        adapter.reserveToplevelDragSource(foreign, &server_objects, 4),
+    );
+    const reserved = try adapter.reserveToplevelDragSource(peer, &server_objects, 4);
+    try std.testing.expectEqual(TestAdapter.DragSourceState.reserved, adapter.toplevelDragSourceState(reserved));
+    try std.testing.expectError(
+        error.InvalidSource,
+        adapter.reserveToplevelDragSource(peer, &server_objects, 4),
+    );
+
+    source.used = true;
+    adapter.drag = .{
+        .peer = peer,
+        .source = @bitCast(reserved),
+        .origin_object = 8,
+    };
+    try std.testing.expectEqual(TestAdapter.DragSourceState.active, adapter.toplevelDragSourceState(reserved));
+    adapter.drag = null;
+    try std.testing.expectEqual(TestAdapter.DragSourceState.ended, adapter.toplevelDragSourceState(reserved));
+    adapter.releaseToplevelDragSource(reserved);
+    try std.testing.expectEqual(TestAdapter.DragSourceState.gone, adapter.toplevelDragSourceState(reserved));
+
+    const old_generation = source.header.generation;
+    release(TestAdapter.SourceSlot, adapter.sources, &adapter.source_free, reserved.index);
+    const replacement = try acquire(TestAdapter.SourceSlot, adapter.sources, &adapter.source_free);
+    try std.testing.expect(replacement.header.generation != old_generation);
+    try std.testing.expectEqual(TestAdapter.DragSourceState.gone, adapter.toplevelDragSourceState(reserved));
 }
 
 test "data device: accepted drag drops once and retains finish publication" {
