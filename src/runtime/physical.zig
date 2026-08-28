@@ -44,6 +44,7 @@ const drm_syncobj = @import("../drm_syncobj.zig");
 const protocol_xdg_activation = @import("../protocol/xdg_activation.zig");
 const protocol_xdg_decoration = @import("../protocol/xdg_decoration.zig");
 const protocol_xdg_dialog = @import("../protocol/xdg_dialog.zig");
+const protocol_xdg_toplevel_tag = @import("../protocol/xdg_toplevel_tag.zig");
 const protocol_gtk_shell = @import("../protocol/gtk_shell.zig");
 const protocol_xdg_toplevel_drag = @import("../protocol/xdg_toplevel_drag.zig");
 const protocol_xdg_toplevel_icon = @import("../protocol/xdg_toplevel_icon.zig");
@@ -170,6 +171,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const ActivationAdapter = protocol_xdg_activation.Adapter(protocol, Adapter);
         const DecorationAdapter = protocol_xdg_decoration.Adapter(protocol, ShellAdapter);
         const DialogAdapter = protocol_xdg_dialog.Adapter(protocol, ShellAdapter);
+        const ToplevelTagAdapter = protocol_xdg_toplevel_tag.Adapter(protocol, ShellAdapter);
         const GtkShellAdapter = protocol_gtk_shell.Adapter(protocol, Adapter);
         const ToplevelDragAdapter = protocol_xdg_toplevel_drag.Adapter(protocol, ShellAdapter, DataDeviceAdapter);
         const ToplevelIconAdapter = protocol_xdg_toplevel_icon.Adapter(protocol, ShellAdapter, Shm);
@@ -573,6 +575,7 @@ pub fn Coordinator(comptime protocol: type) type {
         activation_adapter: ActivationAdapter,
         decoration_adapter: DecorationAdapter,
         dialog_adapter: DialogAdapter,
+        toplevel_tag_adapter: ToplevelTagAdapter,
         gtk_shell_adapter: GtkShellAdapter,
         toplevel_drag_adapter: ToplevelDragAdapter,
         toplevel_icon_adapter: ToplevelIconAdapter,
@@ -1042,6 +1045,7 @@ pub fn Coordinator(comptime protocol: type) type {
             errdefer self.decoration_adapter.deinit();
             self.dialog_adapter = try DialogAdapter.init(allocator, &self.shell_adapter, config.xdg_dialog);
             errdefer self.dialog_adapter.deinit();
+            self.toplevel_tag_adapter = ToplevelTagAdapter.init(&self.shell_adapter);
             self.gtk_shell_adapter = try GtkShellAdapter.init(allocator, &self.adapter, config.gtk_shell);
             errdefer self.gtk_shell_adapter.deinit();
             self.gtk_shell_adapter.setGestureValidator(.{
@@ -1305,6 +1309,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
             _ = try self.dialog_adapter.install(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
+            _ = try self.toplevel_tag_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
             _ = try self.gtk_shell_adapter.install(&root.runtime);
@@ -1773,6 +1780,11 @@ pub fn Coordinator(comptime protocol: type) type {
                 return control;
             }
             if (try self.dialog_adapter.request(peer, target, message, fds)) |control| {
+                try self.advanceShell();
+                try self.flushProtocol();
+                return control;
+            }
+            if (try self.toplevel_tag_adapter.request(peer, target, message, fds)) |control| {
                 try self.advanceShell();
                 try self.flushProtocol();
                 return control;
@@ -6678,6 +6690,7 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.activation_adapter.resourceRemoved(handle, object);
             _ = self.decoration_adapter.resourceRemoved(handle, object);
             _ = self.dialog_adapter.resourceRemoved(handle, object);
+            _ = self.toplevel_tag_adapter.resourceRemoved(handle, object);
             _ = self.gtk_shell_adapter.resourceRemoved(handle, object);
             _ = self.toplevel_drag_adapter.resourceRemoved(handle, object);
             _ = self.toplevel_icon_adapter.resourceRemoved(handle, object);

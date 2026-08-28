@@ -981,6 +981,7 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
         .test_pointer_warp = true,
         .test_foreign_toplevel = true,
         .test_wlr_foreign_toplevel = true,
+        .test_toplevel_tag = true,
         .test_image_capture_sources = true,
         .test_toplevel_drag = true,
     };
@@ -1168,6 +1169,13 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     try std.testing.expectEqual(@as(usize, 1), handler.wlr_foreign_toplevel_finished);
     try std.testing.expectEqual(@as(usize, 1), handler.xdg_toplevel_close);
     try std.testing.expectEqual(@as(usize, 0), coordinator.foreign_toplevel_list_adapter.pendingCommands());
+    try std.testing.expect(handler.toplevel_tag_set);
+    const tagged_peer = coordinator.peer.?;
+    const tagged_objects = try root.runtime.clients.get(tagged_peer);
+    const tagged_id = try coordinator.shell_adapter.toplevelIdOn(tagged_objects, handler.toplevel.?.id);
+    const tagged_metadata = try coordinator.shell_adapter.metadata(tagged_id);
+    try std.testing.expectEqualStrings("main", tagged_metadata.tag);
+    try std.testing.expectEqualStrings("Main window", tagged_metadata.description);
     try std.testing.expect(handler.image_output_source != null);
     try std.testing.expect(handler.image_toplevel_source != null);
     try std.testing.expect(handler.image_cursor_session != null);
@@ -4054,6 +4062,9 @@ const Handler = struct {
     test_toplevel_drag: bool = false,
     toplevel_drag_attached: bool = false,
     toplevel_drag_destroyed: bool = false,
+    toplevel_tag_manager: ?wayring.objects.Handle = null,
+    test_toplevel_tag: bool = false,
+    toplevel_tag_set: bool = false,
     output: ?wayring.objects.Handle = null,
     idle_notifier: ?wayring.objects.Handle = null,
     idle_inhibit_manager: ?wayring.objects.Handle = null,
@@ -4202,6 +4213,7 @@ const Handler = struct {
             if (!self.registry_only) {
                 try self.maybeCreateShell();
                 try self.maybeCreateDataDevice();
+                try self.maybeSetToplevelTag();
             }
         } else if (target.object.interface == &protocol.wl_shm.info) {
             _ = try protocol.wl_shm.decodeEvent(message, fds);
@@ -4680,6 +4692,8 @@ const Handler = struct {
         );
         if (std.mem.eql(u8, value.interface, protocol.wl_output.info.name))
             self.output = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_output.info, @min(value.version, 4), null);
+        if (self.test_toplevel_tag and std.mem.eql(u8, value.interface, protocol.xdg_toplevel_tag_manager_v1.info.name))
+            self.toplevel_tag_manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.xdg_toplevel_tag_manager_v1.info, 1, null);
         if (std.mem.eql(u8, value.interface, protocol.ext_idle_notifier_v1.info.name))
             self.idle_notifier = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.ext_idle_notifier_v1.info, @min(value.version, 2), null);
         if (std.mem.eql(u8, value.interface, protocol.zwp_idle_inhibit_manager_v1.info.name))
@@ -4855,6 +4869,17 @@ const Handler = struct {
         try protocol.wl_surface.encodeRequest(self.queue, self.surface.?.id, .{ .commit = .{} });
         self.shell_created = true;
         try self.maybeCreateToplevelDrag();
+    }
+
+    fn maybeSetToplevelTag(self: *Handler) !void {
+        if (!self.test_toplevel_tag or self.toplevel_tag_set or self.toplevel_tag_manager == null or self.toplevel == null) return;
+        try protocol.xdg_toplevel_tag_manager_v1.encodeRequest(self.queue, self.toplevel_tag_manager.?.id, .{
+            .set_toplevel_tag = .{ .toplevel = self.toplevel.?.id, .tag = "main" },
+        });
+        try protocol.xdg_toplevel_tag_manager_v1.encodeRequest(self.queue, self.toplevel_tag_manager.?.id, .{
+            .set_toplevel_description = .{ .toplevel = self.toplevel.?.id, .description = "Main window" },
+        });
+        self.toplevel_tag_set = true;
     }
 
     fn maybeCreateToplevelDrag(self: *Handler) !void {

@@ -58,6 +58,7 @@ pub const xdg_dialog = @import("protocol/xdg_dialog.zig");
 pub const gtk_shell = @import("protocol/gtk_shell.zig");
 pub const xdg_toplevel_drag = @import("protocol/xdg_toplevel_drag.zig");
 pub const xdg_toplevel_icon = @import("protocol/xdg_toplevel_icon.zig");
+pub const xdg_toplevel_tag = @import("protocol/xdg_toplevel_tag.zig");
 pub const wayland_fixes = @import("protocol/wayland_fixes.zig");
 pub const xdg_system_bell = @import("protocol/xdg_system_bell.zig");
 pub const relative_pointer = @import("protocol/relative_pointer.zig");
@@ -150,6 +151,7 @@ test {
     _ = gtk_shell;
     _ = xdg_toplevel_drag;
     _ = xdg_toplevel_icon;
+    _ = xdg_toplevel_tag;
     _ = relative_pointer;
     _ = pointer_gestures;
     _ = tablet_v2;

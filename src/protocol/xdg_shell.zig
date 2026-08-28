@@ -168,6 +168,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         pub const Metadata = struct {
             title: []const u8,
             app_id: []const u8,
+            tag: []const u8,
+            description: []const u8,
             min_width: i32,
             min_height: i32,
             max_width: i32,
@@ -258,6 +260,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             title_len: usize = 0,
             app_id: []u8 = &.{},
             app_id_len: usize = 0,
+            tag: []u8 = &.{},
+            tag_len: usize = 0,
+            description: []u8 = &.{},
+            description_len: usize = 0,
             min_width: i32 = 0,
             min_height: i32 = 0,
             max_width: i32 = 0,
@@ -385,6 +391,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 errdefer allocator.free(slot.title);
                 slot.app_id = try allocator.alloc(u8, config.metadata_bytes);
                 errdefer allocator.free(slot.app_id);
+                slot.tag = try allocator.alloc(u8, config.metadata_bytes);
+                errdefer allocator.free(slot.tag);
+                slot.description = try allocator.alloc(u8, config.metadata_bytes);
+                errdefer allocator.free(slot.description);
             }
             @memset(outbound, .{});
             @memset(outstanding, .{});
@@ -418,6 +428,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             for (adapter.toplevels) |slot| {
                 adapter.allocator.free(slot.title);
                 adapter.allocator.free(slot.app_id);
+                adapter.allocator.free(slot.tag);
+                adapter.allocator.free(slot.description);
             }
             freeSlots(ToplevelSlot, adapter.allocator, adapter.toplevels);
             freeSlots(SurfaceSlot, adapter.allocator, adapter.surfaces);
@@ -597,6 +609,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             return .{
                 .title = slot.title[0..slot.title_len],
                 .app_id = slot.app_id[0..slot.app_id_len],
+                .tag = slot.tag[0..slot.tag_len],
+                .description = slot.description[0..slot.description_len],
                 .min_width = slot.min_width,
                 .min_height = slot.min_height,
                 .max_width = slot.max_width,
@@ -613,6 +627,16 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             if (!changed) return false;
             adapter.setDialogStatePrepared(id, dialog, modal);
             return true;
+        }
+
+        pub fn setToplevelTag(adapter: *Self, id: ToplevelId, value: []const u8) !bool {
+            const slot = try adapter.resolveToplevel(id);
+            return adapter.setExtendedMetadata(slot, true, value);
+        }
+
+        pub fn setToplevelDescription(adapter: *Self, id: ToplevelId, value: []const u8) !bool {
+            const slot = try adapter.resolveToplevel(id);
+            return adapter.setExtendedMetadata(slot, false, value);
         }
 
         /// Reserves publication capacity without changing observable metadata.
@@ -1454,6 +1478,19 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             try adapter.publish(.{ .metadata_changed = adapter.toplevelId(slot) });
         }
 
+        fn setExtendedMetadata(adapter: *Self, slot: *ToplevelSlot, tag: bool, bytes: []const u8) !bool {
+            if (bytes.len > adapter.metadata_bytes) return error.MetadataTooLong;
+            if (!std.unicode.utf8ValidateSlice(bytes)) return error.InvalidUtf8;
+            const current = if (tag) slot.tag[0..slot.tag_len] else slot.description[0..slot.description_len];
+            if (std.mem.eql(u8, current, bytes)) return false;
+            if (!adapter.canPublishWithLive(adapter.live_toplevels, adapter.live_popups)) return error.Exhausted;
+            const destination = if (tag) slot.tag else slot.description;
+            @memcpy(destination[0..bytes.len], bytes);
+            if (tag) slot.tag_len = bytes.len else slot.description_len = bytes.len;
+            adapter.publishReserved(.{ .metadata_changed = adapter.toplevelId(slot) });
+            return true;
+        }
+
         fn validateToplevelGrab(adapter: *Self, slot: *ToplevelSlot, seat: u32, serial: u32) bool {
             const surface = adapter.resolveRoleSurface(
                 slot.xdg_surface_index,
@@ -1627,6 +1664,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             const old_len = adapter.toplevels.len;
             const old_title: []u8 = if (adapter.toplevel_free != none) adapter.toplevels[adapter.toplevel_free].title else &.{};
             const old_app_id: []u8 = if (adapter.toplevel_free != none) adapter.toplevels[adapter.toplevel_free].app_id else &.{};
+            const old_tag: []u8 = if (adapter.toplevel_free != none) adapter.toplevels[adapter.toplevel_free].tag else &.{};
+            const old_description: []u8 = if (adapter.toplevel_free != none) adapter.toplevels[adapter.toplevel_free].description else &.{};
             const slot = try acquireGrowing(ToplevelSlot, adapter.allocator, &adapter.toplevels, &adapter.toplevel_free);
             if (adapter.toplevels.len != old_len) {
                 slot.title = adapter.allocator.alloc(u8, adapter.metadata_bytes) catch |err| {
@@ -1639,9 +1678,29 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     release(ToplevelSlot, adapter.toplevels, &adapter.toplevel_free, @intCast(old_len));
                     return err;
                 };
+                slot.tag = adapter.allocator.alloc(u8, adapter.metadata_bytes) catch |err| {
+                    adapter.allocator.free(slot.app_id);
+                    adapter.allocator.free(slot.title);
+                    slot.app_id = &.{};
+                    slot.title = &.{};
+                    release(ToplevelSlot, adapter.toplevels, &adapter.toplevel_free, @intCast(old_len));
+                    return err;
+                };
+                slot.description = adapter.allocator.alloc(u8, adapter.metadata_bytes) catch |err| {
+                    adapter.allocator.free(slot.tag);
+                    adapter.allocator.free(slot.app_id);
+                    adapter.allocator.free(slot.title);
+                    slot.tag = &.{};
+                    slot.app_id = &.{};
+                    slot.title = &.{};
+                    release(ToplevelSlot, adapter.toplevels, &adapter.toplevel_free, @intCast(old_len));
+                    return err;
+                };
             } else {
                 slot.title = old_title;
                 slot.app_id = old_app_id;
+                slot.tag = old_tag;
+                slot.description = old_description;
             }
             return slot;
         }
@@ -1742,9 +1801,13 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             const slot = adapter.toplevels[index];
             const title = slot.title;
             const app_id = slot.app_id;
+            const tag = slot.tag;
+            const description = slot.description;
             release(ToplevelSlot, adapter.toplevels, &adapter.toplevel_free, index);
             slot.title = title;
             slot.app_id = app_id;
+            slot.tag = tag;
+            slot.description = description;
         }
         fn releasePopup(adapter: *Self, index: u32) void {
             const slot = adapter.popups[index];
@@ -3393,6 +3456,30 @@ test "xdg-shell: prepared dialog metadata publishes atomically" {
     try std.testing.expect(metadata.dialog and metadata.modal);
     try std.testing.expect(!try context.adapter.setDialogState(id, true, true));
     try std.testing.expect(context.adapter.popEvent() == null);
+}
+
+test "xdg-shell: toplevel tags validate and publish owned metadata" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const id = try context.createToplevel();
+
+    try std.testing.expect(try context.adapter.setToplevelTag(id, "main"));
+    try std.testing.expectEqual(id, switch (context.adapter.popEvent().?) {
+        .metadata_changed => |changed| changed,
+        else => return error.UnexpectedEvent,
+    });
+    try std.testing.expect(!try context.adapter.setToplevelTag(id, "main"));
+    try std.testing.expect(context.adapter.popEvent() == null);
+    try std.testing.expect(try context.adapter.setToplevelDescription(id, "Main window"));
+    _ = context.adapter.popEvent().?;
+    const metadata = try context.adapter.metadata(id);
+    try std.testing.expectEqualStrings("main", metadata.tag);
+    try std.testing.expectEqualStrings("Main window", metadata.description);
+
+    try std.testing.expectError(error.InvalidUtf8, context.adapter.setToplevelTag(id, "\xff"));
+    try std.testing.expectError(error.MetadataTooLong, context.adapter.setToplevelDescription(id, "description that exceeds the configured metadata capacity"));
+    try std.testing.expectEqualStrings("main", (try context.adapter.metadata(id)).tag);
+    try std.testing.expectEqualStrings("Main window", (try context.adapter.metadata(id)).description);
 }
 
 test "xdg-shell: unobserved create and destruction are both lossless at capacity" {
