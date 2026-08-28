@@ -76,6 +76,7 @@ pub const layer_shell = @import("protocol/layer_shell.zig");
 pub const session_lock = @import("protocol/session_lock.zig");
 pub const foreign_toplevel_list = @import("protocol/foreign_toplevel_list.zig");
 pub const image_capture_source = @import("protocol/image_capture_source.zig");
+pub const image_copy_capture = @import("protocol/image_copy_capture.zig");
 pub const scene_geometry = @import("scene/geometry.zig");
 pub const scene_hit_test = @import("scene/hit_test.zig");
 pub const scene_cursor = @import("scene/cursor.zig");
@@ -161,6 +162,7 @@ test {
     _ = session_lock;
     _ = foreign_toplevel_list;
     _ = image_capture_source;
+    _ = image_copy_capture;
     _ = scene_geometry;
     _ = scene_hit_test;
     _ = scene_cursor;
