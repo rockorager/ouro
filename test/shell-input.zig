@@ -811,6 +811,12 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     try std.testing.expectEqual(@as(usize, 1), handler.foreign_toplevel_finished);
     try std.testing.expect(handler.image_output_source != null);
     try std.testing.expect(handler.image_toplevel_source != null);
+    try std.testing.expect(handler.image_cursor_session != null);
+    try std.testing.expect(handler.image_cursor_enter >= 1);
+    try std.testing.expect(handler.image_cursor_position >= 1);
+    try std.testing.expect(handler.image_cursor_hotspot >= 1);
+    try std.testing.expectEqual(@as(i32, 0), handler.image_cursor_hotspot_x);
+    try std.testing.expectEqual(@as(i32, 0), handler.image_cursor_hotspot_y);
     const capture_peer = coordinator.peer.?;
     const capture_objects = try root.runtime.clients.get(capture_peer);
     try std.testing.expect(coordinator.image_capture_source_adapter.snapshotForResource(
@@ -3691,12 +3697,20 @@ const Handler = struct {
     foreign_toplevel_global_seen: bool = false,
     image_output_manager: ?wayring.objects.Handle = null,
     image_toplevel_manager: ?wayring.objects.Handle = null,
+    image_copy_manager: ?wayring.objects.Handle = null,
     image_output_source: ?wayring.objects.Handle = null,
     image_toplevel_source: ?wayring.objects.Handle = null,
+    image_cursor_session: ?wayring.objects.Handle = null,
     test_image_capture_sources: bool = false,
     image_output_global_seen: bool = false,
     image_toplevel_global_seen: bool = false,
     image_copy_global_seen: bool = false,
+    image_cursor_enter: usize = 0,
+    image_cursor_leave: usize = 0,
+    image_cursor_position: usize = 0,
+    image_cursor_hotspot: usize = 0,
+    image_cursor_hotspot_x: i32 = 0,
+    image_cursor_hotspot_y: i32 = 0,
     security_global_seen: bool = false,
     ext_data_control_global_seen: bool = false,
     wlr_data_control_global_seen: bool = false,
@@ -3873,6 +3887,17 @@ const Handler = struct {
                 },
                 .closed => self.foreign_toplevel_closed += 1,
             }
+        } else if (target.object.interface == &protocol.ext_image_copy_capture_cursor_session_v1.info) {
+            switch (try protocol.ext_image_copy_capture_cursor_session_v1.decodeEvent(message, fds)) {
+                .enter => self.image_cursor_enter += 1,
+                .leave => self.image_cursor_leave += 1,
+                .position => self.image_cursor_position += 1,
+                .hotspot => |value| {
+                    self.image_cursor_hotspot += 1;
+                    self.image_cursor_hotspot_x = value.x;
+                    self.image_cursor_hotspot_y = value.y;
+                },
+            }
         } else if (target.object.interface == &protocol.wl_surface.info) {
             switch (try protocol.wl_surface.decodeEvent(message, fds)) {
                 .enter => |value| {
@@ -3932,6 +3957,7 @@ const Handler = struct {
                         .{},
                     )).id;
                     self.input_requested = true;
+                    try self.maybeCreateImageCaptureSources();
                 },
                 .name => {},
             }
@@ -4218,8 +4244,19 @@ const Handler = struct {
                     null,
                 );
         }
-        if (std.mem.eql(u8, value.interface, protocol.ext_image_copy_capture_manager_v1.info.name))
+        if (std.mem.eql(u8, value.interface, protocol.ext_image_copy_capture_manager_v1.info.name)) {
             self.image_copy_global_seen = true;
+            if (self.test_image_capture_sources)
+                self.image_copy_manager = try ClientCore.bind(
+                    self.objects,
+                    self.queue,
+                    self.registry,
+                    value.name,
+                    &protocol.ext_image_copy_capture_manager_v1.info,
+                    1,
+                    null,
+                );
+        }
         try self.maybeCreateImageCaptureSources();
     }
 
@@ -4239,6 +4276,17 @@ const Handler = struct {
                 self.image_toplevel_manager.?,
                 .{ .toplevel_handle = self.foreign_toplevel_handle.?.id },
             )).source;
+        if (self.image_cursor_session == null and self.image_copy_manager != null and
+            self.image_output_source != null and self.pointer != null)
+            self.image_cursor_session = (try protocol.ext_image_copy_capture_manager_v1.construct_create_pointer_cursor_session(
+                self.objects,
+                self.queue,
+                self.image_copy_manager.?,
+                .{
+                    .source = self.image_output_source.?.id,
+                    .pointer = self.pointer.?.id,
+                },
+            )).session;
     }
 
     fn maybeCreateDataDevice(self: *Handler) !void {
