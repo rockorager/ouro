@@ -59,13 +59,16 @@ test "shell-input: core compatibility extensions cross generated runtime" {
     for (0..512) |_| {
         _ = try drainClient(&reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
-        if (handler.fixes != null and handler.system_bell != null) break;
+        if (handler.fixes != null and handler.system_bell != null and
+            handler.toplevel_icon_manager != null and handler.toplevel_icon_done == 1) break;
         _ = linux.sched_yield();
     }
     try std.testing.expect(handler.fixes != null);
     try std.testing.expectEqual(@as(u32, 1), handler.fixes_version);
     try std.testing.expect(handler.system_bell != null);
     try std.testing.expectEqual(@as(u32, 1), handler.system_bell_version);
+    try std.testing.expect(handler.toplevel_icon_manager != null);
+    try std.testing.expectEqual(@as(usize, 1), handler.toplevel_icon_done);
 
     try protocol.xdg_system_bell_v1.encodeRequest(
         &actor.transmit,
@@ -145,6 +148,8 @@ const WaylandFixesHandler = struct {
     fixes_version: u32 = 0,
     system_bell: ?wayring.objects.Handle = null,
     system_bell_version: u32 = 0,
+    toplevel_icon_manager: ?wayring.objects.Handle = null,
+    toplevel_icon_done: usize = 0,
     event_failures: usize = 0,
 
     pub fn eventError(self: *WaylandFixesHandler, _: wayring.io_uring.Peer, _: ClientCore.EventFailure) void {
@@ -159,6 +164,13 @@ const WaylandFixesHandler = struct {
     ) !wayring.dispatch.Control {
         if (target.object.interface == &ClientCore.Display.info) {
             _ = try ClientCore.decodeDisplayEvent(self.objects, message, fds);
+            return .continue_dispatch;
+        }
+        if (target.object.interface == &protocol.xdg_toplevel_icon_manager_v1.info) {
+            switch (try protocol.xdg_toplevel_icon_manager_v1.decodeEvent(message, fds)) {
+                .icon_size => return error.UnexpectedPreferredIconSize,
+                .done => self.toplevel_icon_done += 1,
+            }
             return .continue_dispatch;
         }
         if (target.object.interface != &ClientCore.Registry.info) return .continue_dispatch;
@@ -182,6 +194,16 @@ const WaylandFixesHandler = struct {
                     self.registry,
                     value.name,
                     &protocol.xdg_system_bell_v1.info,
+                    @min(value.version, 1),
+                    null,
+                );
+            } else if (std.mem.eql(u8, value.interface, protocol.xdg_toplevel_icon_manager_v1.info.name)) {
+                self.toplevel_icon_manager = try ClientCore.bind(
+                    self.objects,
+                    self.queue,
+                    self.registry,
+                    value.name,
+                    &protocol.xdg_toplevel_icon_manager_v1.info,
                     @min(value.version, 1),
                     null,
                 );
