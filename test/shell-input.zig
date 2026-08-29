@@ -1139,7 +1139,9 @@ test "shell-input: generated primary selection validates focus serial and transf
     var driver = ClientDriver.init(&client);
     const registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null);
     var handler: PrimarySelectionHandler = .{ .objects = &client.objects, .queue = &actor.transmit, .registry = registry };
-    defer if (handler.read_fd >= 0) _ = linux.close(handler.read_fd);
+    defer {
+        if (handler.read_fd >= 0) _ = linux.close(handler.read_fd);
+    }
     try submitClient(&reactor, &driver, &handler);
     for (0..256) |_| {
         _ = try drainClient(&reactor, &driver, &handler);
@@ -2266,6 +2268,7 @@ test "shell-input: two mapped toplevels sustain independent commit cycles" {
         .objects = &client.objects,
         .queue = &actor.transmit,
         .registry = registry,
+        .activation_mode = true,
     };
     try submitMultiClient(&client_reactor, &driver, &handler);
 
@@ -2327,6 +2330,14 @@ test "shell-input: two mapped toplevels sustain independent commit cycles" {
         .device = pointer_device,
         .info = .{ .capabilities = .{ .pointer = true } },
     } }));
+    for (0..128) |_| {
+        client_progress = try drainMultiClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.pointer != null) break;
+        if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, client_reactor.ring);
+    }
+    try std.testing.expect(handler.pointer != null);
     try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_motion = .{
         .device = pointer_device,
         .time_usec = 1,
@@ -2391,6 +2402,16 @@ test "shell-input: two mapped toplevels sustain independent commit cycles" {
         .pressed = true,
     } }));
     try std.testing.expectEqual(windows[0].id, coordinator.desktop.focused().?);
+    for (0..256) |_| {
+        client_progress = try drainMultiClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.activation_done == 1 and
+            std.meta.eql(coordinator.desktop.focused().?, windows[1].id)) break;
+        if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, client_reactor.ring);
+    }
+    try std.testing.expectEqual(@as(usize, 1), handler.activation_done);
+    try std.testing.expectEqual(windows[1].id, coordinator.desktop.focused().?);
 
     coordinator.disconnected(coordinator.peer.?);
     _ = try client.prepareClose();
@@ -3701,6 +3722,10 @@ const MultiHandler = struct {
     subcompositor: ?wayring.objects.Handle = null,
     shm: ?wayring.objects.Handle = null,
     wm_base: ?wayring.objects.Handle = null,
+    seat: ?wayring.objects.Handle = null,
+    pointer: ?wayring.objects.Handle = null,
+    activation: ?wayring.objects.Handle = null,
+    activation_token: ?wayring.objects.Handle = null,
     surfaces: [2]?wayring.objects.Handle = .{ null, null },
     subsurfaces: [2]?wayring.objects.Handle = .{ null, null },
     xdg_surfaces: [2]?wayring.objects.Handle = .{ null, null },
@@ -3716,6 +3741,9 @@ const MultiHandler = struct {
     surface_count: usize = 2,
     cycle_count: usize = two_toplevel_cycle_count,
     subsurface_mode: bool = false,
+    activation_mode: bool = false,
+    activation_requested: bool = false,
+    activation_done: usize = 0,
 
     pub fn eventError(
         self: *MultiHandler,
@@ -3741,6 +3769,43 @@ const MultiHandler = struct {
             _ = try protocol.wl_shm.decodeEvent(message, fds);
         } else if (target.object.interface == &protocol.xdg_toplevel.info) {
             _ = try protocol.xdg_toplevel.decodeEvent(message, fds);
+        } else if (target.object.interface == &protocol.wl_seat.info) {
+            switch (try protocol.wl_seat.decodeEvent(message, fds)) {
+                .capabilities => |value| {
+                    if (self.pointer == null and value.capabilities.contains(
+                        protocol.wl_seat.capability.pointer,
+                    )) {
+                        self.pointer = (try protocol.wl_seat.construct_get_pointer(
+                            self.objects,
+                            self.queue,
+                            self.seat.?,
+                            .{},
+                        )).id;
+                    }
+                },
+                .name => {},
+            }
+        } else if (target.object.interface == &protocol.wl_pointer.info) {
+            switch (try protocol.wl_pointer.decodeEvent(message, fds)) {
+                .button => |value| if (!self.activation_requested and
+                    value.state.value == protocol.wl_pointer.button_state.pressed.value)
+                    try self.requestActivation(value.serial),
+                else => {},
+            }
+        } else if (target.object.interface == &protocol.xdg_activation_token_v1.info) {
+            const value = try protocol.xdg_activation_token_v1.decodeEvent(message, fds);
+            try protocol.xdg_activation_v1.encodeRequest(self.queue, self.activation.?.id, .{
+                .activate = .{ .token = value.done.token, .surface = self.surfaces[1].?.id },
+            });
+            try wayring.client.sendRequest(
+                protocol.xdg_activation_token_v1,
+                self.objects,
+                self.queue,
+                self.activation_token.?,
+                .{ .destroy = .{} },
+            );
+            self.activation_token = null;
+            self.activation_done += 1;
         } else if (target.object.interface == &protocol.xdg_surface.info) {
             const index = self.indexFor(self.xdg_surfaces, message.header.object_id) orelse
                 return error.UnknownXdgSurface;
@@ -3811,6 +3876,10 @@ const MultiHandler = struct {
             self.shm = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_shm.info, @min(value.version, 2), null);
         if (std.mem.eql(u8, value.interface, protocol.xdg_wm_base.info.name))
             self.wm_base = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.xdg_wm_base.info, @min(value.version, 7), null);
+        if (self.activation_mode and std.mem.eql(u8, value.interface, protocol.wl_seat.info.name))
+            self.seat = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_seat.info, @min(value.version, 9), null);
+        if (self.activation_mode and std.mem.eql(u8, value.interface, protocol.xdg_activation_v1.info.name))
+            self.activation = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.xdg_activation_v1.info, 1, null);
     }
 
     fn maybeCreateShells(self: *MultiHandler) !void {
@@ -3919,6 +3988,32 @@ const MultiHandler = struct {
         if (self.cycles_started[index] >= self.cycle_count or
             self.buffers[index] != null or self.callbacks[index] != null) return;
         try self.mapSurface(index);
+    }
+
+    fn requestActivation(self: *MultiHandler, serial: u32) !void {
+        if (self.activation == null or self.seat == null or self.surfaces[0] == null or
+            self.surfaces[1] == null) return error.ActivationNotReady;
+        self.activation_token = (try protocol.xdg_activation_v1.construct_get_activation_token(
+            self.objects,
+            self.queue,
+            self.activation.?,
+            .{},
+        )).id;
+        try protocol.xdg_activation_token_v1.encodeRequest(self.queue, self.activation_token.?.id, .{
+            .set_serial = .{ .serial = serial, .seat = self.seat.?.id },
+        });
+        try protocol.xdg_activation_token_v1.encodeRequest(self.queue, self.activation_token.?.id, .{
+            .set_surface = .{ .surface = self.surfaces[0].?.id },
+        });
+        try protocol.xdg_activation_token_v1.encodeRequest(self.queue, self.activation_token.?.id, .{
+            .set_app_id = .{ .app_id = "ouro.activation.test" },
+        });
+        try protocol.xdg_activation_token_v1.encodeRequest(
+            self.queue,
+            self.activation_token.?.id,
+            .{ .commit = .{} },
+        );
+        self.activation_requested = true;
     }
 
     fn indexFor(
