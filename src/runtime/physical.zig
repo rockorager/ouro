@@ -1878,7 +1878,11 @@ pub fn Coordinator(comptime protocol: type) type {
             if (try self.dmabuf_adapter.request(peer, target, message, fds)) |control| {
                 if (self.dmabuf_adapter.pendingOutbound(peer))
                     self.markProtocol(peer, ProtocolReady.dmabuf);
-                try self.flushProtocol();
+                // DMA-BUF requests only mutate importer-local state and can
+                // only produce DMA-BUF events for their requesting peer.
+                // Preserve all already-marked peer output without advancing
+                // unrelated shell, session, and workspace state.
+                try self.flushProtocolOn(peer);
                 return control;
             }
             if (self.syncobj_adapter) |*adapter| {
@@ -7246,7 +7250,16 @@ pub fn Coordinator(comptime protocol: type) type {
             object: wayring.objects.Object,
         ) void {
             const self: *Self = @ptrCast(@alignCast(context.?));
-            self.markProtocolAll(ProtocolReady.all);
+            // Buffer/import destruction and one-shot callback retirement only
+            // remove ownership. None can expose outbound work in independent
+            // protocol adapters, so avoid forcing every client through a full
+            // readiness scan for frame and buffer churn.
+            if (object.interface != &protocol.wl_buffer.info and
+                object.interface != &protocol.wl_shm_pool.info and
+                object.interface != &protocol.zwp_linux_buffer_params_v1.info and
+                object.interface != &protocol.wl_callback.info and
+                object.interface != &protocol.wp_presentation_feedback.info)
+                self.markProtocolAll(ProtocolReady.all);
             const removed_surface_candidate: ?Adapter.SurfaceId = if (std.mem.eql(
                 u8,
                 object.interface.name,

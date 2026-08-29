@@ -1018,7 +1018,14 @@ fn importedImage(self: *RealRenderer, source: render.ExternalSource, size: rende
         return importedToken(entry, index);
     };
 
+    // Reclaim cache-only imports whose protocol source has gone away before
+    // consuming another slot. Persistent buffers remain cached, while buffer
+    // churn does not retain dead GEM objects up to the cache capacity.
     const index = for (self.imported_images, 0..) |entry, candidate| {
+        if (entry.occupied and entry.references == 1 and
+            !entry.source.alive_fn(entry.source.context, entry.source.token))
+            break candidate;
+    } else for (self.imported_images, 0..) |entry, candidate| {
         if (!entry.occupied) break candidate;
     } else evict: {
         for (0..self.imported_images.len) |_| {
