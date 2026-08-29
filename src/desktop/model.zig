@@ -365,7 +365,13 @@ pub fn Desktop(comptime Shell: type) type {
                 return serial;
             }
             const command = desktop.peekCommand() orelse return null;
-            const serial = try shell.queueToplevelConfigure(command.shell_id, command.configure);
+            const serial = shell.queueToplevelConfigure(command.shell_id, command.configure) catch |err| switch (err) {
+                error.StaleToplevel => {
+                    desktop.dropCommand();
+                    return null;
+                },
+                else => return err,
+            };
             if (desktop.resolveIndex(command.id)) |index| {
                 const slot = &desktop.slots[index];
                 if (std.meta.eql(slot.last_configure, command.configure)) {
@@ -1929,6 +1935,7 @@ const TestShell = struct {
     title: []const u8 = "",
     app_id: []const u8 = "",
     reject_configure: bool = false,
+    stale_configure: bool = false,
     configure_serial: u32 = 40,
     configured: ?ToplevelConfigure = null,
     popup_configured: ?PopupConfigure = null,
@@ -1968,6 +1975,7 @@ const TestShell = struct {
     ) !u32 {
         _ = id;
         if (shell.reject_configure) return error.Exhausted;
+        if (shell.stale_configure) return error.StaleToplevel;
         shell.configure_serial += 1;
         shell.configured = value;
         return shell.configure_serial;
@@ -2669,6 +2677,18 @@ test "desktop: shell outbound backpressure retains configure ownership" {
     try std.testing.expectEqual(@as(?u32, 41), try desktop.flushConfigure(&shell));
     try std.testing.expectEqual(@as(usize, 0), desktop.pendingCommands());
     try std.testing.expect(shell.configured.?.states.activated);
+}
+
+test "desktop: stale shell recipient consumes configure ownership" {
+    var desktop = try initTestDesktop(3);
+    defer desktop.deinit();
+    var shell = TestShell{};
+    shell.push(created(0));
+    _ = try desktop.consume(&shell, 1);
+    try beginInitialDesktop(&desktop, &shell);
+    shell.stale_configure = true;
+    try std.testing.expectEqual(@as(?u32, null), try desktop.flushConfigure(&shell));
+    try std.testing.expectEqual(@as(usize, 0), desktop.pendingCommands());
 }
 
 test "desktop: stale identity is rejected and exhausted generations retire" {

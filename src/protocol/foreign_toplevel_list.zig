@@ -231,6 +231,7 @@ pub fn Adapter(comptime protocol: type) type {
             top.title = try self.allocator.alloc(u8, self.metadata_capacity);
             top.app = try self.allocator.alloc(u8, self.metadata_capacity);
             const i = top.header.index;
+            try self.ensureTopOutputs(i);
             const gen = top.header.generation;
             top.serial = self.serial;
             self.serial +%= 1;
@@ -815,6 +816,19 @@ pub fn Adapter(comptime protocol: type) type {
         fn topOutputs(self: *Self, i: u32) []OutputId {
             return self.top_outputs[@as(usize, i) * self.output_capacity ..][0..self.output_capacity];
         }
+
+        fn ensureTopOutputs(self: *Self, index: u32) !void {
+            const needed = std.math.mul(
+                usize,
+                @as(usize, index) + 1,
+                self.output_capacity,
+            ) catch return error.OutOfMemory;
+            if (self.top_outputs.len >= needed) return;
+            var capacity = self.top_outputs.len;
+            while (capacity < needed)
+                capacity = std.math.mul(usize, capacity, 2) catch return error.OutOfMemory;
+            self.top_outputs = try self.allocator.realloc(self.top_outputs, capacity);
+        }
         fn failure(_: *Self, actor: *wayring.connection.Actor, id: u32, e: anyerror) !wayring.dispatch.Control {
             try ProtocolCore.postError(actor, id, 0, @errorName(e));
             return .stop;
@@ -858,6 +872,8 @@ test "foreign toplevel: identifiers, metadata, generations and growable ownershi
     const id = try a.publish("title", "app");
     const grown = try a.publish(null, null);
     try std.testing.expectEqual(@as(u32, 1), grown.index);
+    try std.testing.expect(try a.addOutput(grown, .{ .value = 7 }));
+    try std.testing.expectEqual(@as(u64, 7), (try a.outputs(grown))[0].value);
     try std.testing.expect((try a.metadata(id)).title.ptr == a.tops.entries.items[0].title.ptr);
     try a.close(id);
     try std.testing.expectError(error.StaleToplevel, a.updateTitle(id, "x"));

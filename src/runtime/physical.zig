@@ -3009,7 +3009,10 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn syncSessionState(self: *Self) !void {
-            const windows = try self.desktop.sceneSnapshot(self.scene_windows);
+            const windows = try self.desktop.sceneSnapshotGrowing(
+                self.allocator,
+                &self.scene_windows,
+            );
             for (windows) |window| {
                 const shell_id = self.desktop.shellToplevel(window.id) catch continue;
                 self.xdg_session_adapter.updateState(
@@ -3022,7 +3025,10 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn syncForeignToplevels(self: *Self) !void {
             for (self.foreign_toplevels) |*entry| entry.seen = false;
-            const windows = try self.desktop.sceneSnapshot(self.scene_windows);
+            const windows = try self.desktop.sceneSnapshotGrowing(
+                self.allocator,
+                &self.scene_windows,
+            );
             for (windows, 0..) |window, index| {
                 var duplicate = false;
                 for (windows[0..index]) |previous| if (std.meta.eql(previous.id, window.id)) {
@@ -3033,20 +3039,17 @@ pub fn Coordinator(comptime protocol: type) type {
                 const metadata = try self.desktop.metadata(window.id);
                 var entry = self.foreignToplevel(window.id);
                 if (entry == null) {
-                    for (self.foreign_toplevels) |*candidate| if (!candidate.active) {
-                        candidate.* = .{
-                            .active = true,
-                            .desktop = window.id,
-                            .protocol_id = try self.foreign_toplevel_list_adapter.publish(
-                                metadata.title,
-                                metadata.app_id,
-                            ),
-                            .seen = true,
-                        };
-                        entry = candidate;
-                        break;
+                    const candidate = try self.acquireForeignToplevel();
+                    candidate.* = .{
+                        .active = true,
+                        .desktop = window.id,
+                        .protocol_id = try self.foreign_toplevel_list_adapter.publish(
+                            metadata.title,
+                            metadata.app_id,
+                        ),
+                        .seen = true,
                     };
-                    if (entry == null) return error.Exhausted;
+                    entry = candidate;
                 }
                 entry.?.seen = true;
             }
@@ -3160,6 +3163,15 @@ pub fn Coordinator(comptime protocol: type) type {
             for (self.foreign_toplevels) |*entry|
                 if (entry.active and std.meta.eql(entry.desktop, id)) return entry;
             return null;
+        }
+
+        fn acquireForeignToplevel(self: *Self) !*ForeignToplevel {
+            for (self.foreign_toplevels) |*entry| if (!entry.active) return entry;
+            const old_len = self.foreign_toplevels.len;
+            const new_len = std.math.mul(usize, old_len, 2) catch return error.OutOfMemory;
+            self.foreign_toplevels = try self.allocator.realloc(self.foreign_toplevels, new_len);
+            @memset(self.foreign_toplevels[old_len..], .{});
+            return &self.foreign_toplevels[old_len];
         }
 
         fn foreignToplevelProtocol(

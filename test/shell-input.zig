@@ -2099,6 +2099,8 @@ test "shell-input: two mapped toplevels sustain independent commit cycles" {
         fixture.platforms(),
         config,
     );
+    coordinator.scene_windows = try allocator.realloc(coordinator.scene_windows, 1);
+    coordinator.foreign_toplevels = try allocator.realloc(coordinator.foreign_toplevels, 1);
     var loop = try Loop.init(
         allocator,
         root,
