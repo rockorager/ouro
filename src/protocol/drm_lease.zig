@@ -341,7 +341,8 @@ pub fn Adapter(comptime protocol: type, comptime DeviceId: type, comptime Connec
                     error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return sent,
                     else => return e,
                 };
-                self.closeEventFd(out.event);
+                // A successful enqueue transfers descriptor ownership to the
+                // transmit queue, which closes it after send completion.
                 self.removeOutAt(i);
                 sent += 1;
             }

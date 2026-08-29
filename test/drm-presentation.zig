@@ -158,6 +158,96 @@ test "physical DRM lease resolver grants the independent secondary tuple" {
     try root.deinit();
 }
 
+test "generated client leases a secondary connector and observes external revocation" {
+    const allocator = std.testing.allocator;
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-r15-lease-client-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), compositorConfig());
+    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), coordinatorConfig());
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
+    try coordinator.start(&loop);
+
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(allocator, .{ .entries = 16, .flags = 0 }, clientReactorConfig());
+    var client = try ClientConnection.attach(
+        allocator,
+        &reactor,
+        try wayring.unix_socket.connect(path),
+        .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 },
+        .{ .max_objects = 32, .max_client_ids = 31 },
+    );
+    var driver = ClientDriver.init(&client);
+    const actor = try client.actor();
+    const registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null);
+    var handler: LeaseClientHandler = .{
+        .objects = &client.objects,
+        .queue = &actor.transmit,
+        .registry = registry,
+    };
+    _ = try driver.schedule();
+    _ = try driver.prepare(&handler);
+    _ = try reactor.ring.submit();
+
+    _ = try loop.turn(coordinator);
+    for (0..32) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        if (coordinator.client_count == 1) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
+        _ = try loop.turn(coordinator);
+    }
+    try std.testing.expectEqual(@as(usize, 1), coordinator.client_count);
+    try fixture.signalSession(.enable);
+    for (0..256) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        if (handler.device != null and !handler.bind_flushed) {
+            try submitClient(&reactor, &driver, &handler);
+            handler.bind_flushed = true;
+        }
+        if (handler.submitted and !handler.lease_request_flushed) {
+            try submitClient(&reactor, &driver, &handler);
+            handler.lease_request_flushed = true;
+        }
+        if (handler.lease_fd_received) fixture.lease_active = false;
+        _ = try loop.turn(coordinator);
+        if (handler.finished == 1) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expect(handler.discovery_fd_received);
+    try std.testing.expect(handler.lease_fd_received);
+    try std.testing.expectEqual(@as(usize, 1), handler.finished);
+    try std.testing.expectEqual(@as(usize, 1), fixture.lease_create_count);
+    try std.testing.expectEqual(@as(usize, 0), fixture.lease_revoke_count);
+    try std.testing.expectEqualSlices(u32, &.{ 11, 31, 41 }, fixture.lease_objects[0..fixture.lease_object_count]);
+
+    _ = try client.prepareClose();
+    _ = try driver.schedule();
+    var client_progress = try driver.prepare(&handler);
+    _ = try reactor.ring.submit();
+    try coordinator.requestStop();
+    var drained = false;
+    for (0..256) |_| {
+        client_progress = try drainClient(&reactor, &driver, &handler);
+        const progress = try loop.turn(coordinator);
+        drained = progress.wayring.shutdown_complete and client_progress.quiescent and coordinator.backendDrainComplete();
+        if (drained) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expect(drained);
+    try client.deinit(allocator);
+    reactor.deinit(allocator);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
 test "no discovered DRM card fails startup and drains honestly" {
     const allocator = std.testing.allocator;
     var fixture = try Fixture.init();
@@ -743,6 +833,116 @@ const ClientHandler = struct {
     }
 };
 
+const LeaseClientHandler = struct {
+    objects: *wayring.objects.ClientObjects,
+    queue: *wayring.tx.Queue,
+    registry: wayring.objects.Handle,
+    device: ?wayring.objects.Handle = null,
+    connector: ?wayring.objects.Handle = null,
+    lease: ?wayring.objects.Handle = null,
+    discovery_fd_received: bool = false,
+    connector_name: bool = false,
+    connector_description: bool = false,
+    connector_id: bool = false,
+    connector_done: bool = false,
+    bind_flushed: bool = false,
+    submitted: bool = false,
+    lease_request_flushed: bool = false,
+    lease_fd_received: bool = false,
+    finished: usize = 0,
+
+    pub fn eventError(_: *LeaseClientHandler, _: wayring.io_uring.Peer, _: ClientCore.EventFailure) void {}
+
+    pub fn event(self: *LeaseClientHandler, target: wayring.objects.Dispatch, message: wayring.wire.Message, fds: *wayring.ancillary.FdQueue) !wayring.dispatch.Control {
+        if (target.object.interface == &ClientCore.Registry.info) {
+            switch (try ClientCore.decodeRegistryEvent(self.objects, self.registry, message, fds)) {
+                .global => |global| {
+                    if (std.mem.eql(u8, global.interface, protocol.wp_drm_lease_device_v1.info.name))
+                        self.device = try ClientCore.bind(
+                            self.objects,
+                            self.queue,
+                            self.registry,
+                            global.name,
+                            &protocol.wp_drm_lease_device_v1.info,
+                            1,
+                            null,
+                        );
+                },
+                .global_remove => {},
+            }
+        } else if (target.object.interface == &protocol.wp_drm_lease_device_v1.info) {
+            switch (try protocol.wp_drm_lease_device_v1.decodeEvent(message, fds)) {
+                .drm_fd => |value| {
+                    _ = linux.close(value.fd);
+                    self.discovery_fd_received = true;
+                },
+                .connector => |value| self.connector = (try protocol.wp_drm_lease_device_v1.admit_event_connector(
+                    self.objects,
+                    self.device.?,
+                    value,
+                    .{},
+                )).id,
+                .done => if (!self.submitted) {
+                    try std.testing.expect(self.discovery_fd_received and self.connector_name and
+                        self.connector_description and self.connector_id and self.connector_done);
+                    const request = (try protocol.wp_drm_lease_device_v1.construct_create_lease_request(
+                        self.objects,
+                        self.queue,
+                        self.device.?,
+                        .{},
+                    )).id;
+                    try wayring.client.sendRequest(
+                        protocol.wp_drm_lease_request_v1,
+                        self.objects,
+                        self.queue,
+                        request,
+                        .{ .request_connector = .{ .connector = self.connector.?.id } },
+                    );
+                    self.lease = (try protocol.wp_drm_lease_request_v1.construct_submit(
+                        self.objects,
+                        self.queue,
+                        request,
+                        .{},
+                    )).id;
+                    self.submitted = true;
+                },
+                .released => {},
+            }
+        } else if (target.object.interface == &protocol.wp_drm_lease_connector_v1.info) {
+            switch (try protocol.wp_drm_lease_connector_v1.decodeEvent(message, fds)) {
+                .name => |value| {
+                    try std.testing.expectEqualStrings("DRM-11", value.name);
+                    self.connector_name = true;
+                },
+                .description => |value| {
+                    try std.testing.expect(std.mem.indexOf(u8, value.description, "connector 11") != null);
+                    self.connector_description = true;
+                },
+                .connector_id => |value| {
+                    try std.testing.expectEqual(@as(u32, 11), value.connector_id);
+                    self.connector_id = true;
+                },
+                .done => self.connector_done = true,
+                .withdrawn => {},
+            }
+        } else if (target.object.interface == &protocol.wp_drm_lease_v1.info) {
+            switch (try protocol.wp_drm_lease_v1.decodeEvent(message, fds)) {
+                .lease_fd => |value| {
+                    _ = linux.close(value.leased_fd);
+                    self.lease_fd_received = true;
+                },
+                .finished => self.finished += 1,
+            }
+        } else if (target.object.interface == &ClientCore.Display.info) {
+            switch (try ClientCore.decodeDisplayEvent(self.objects, message, fds)) {
+                .delete_id => {},
+                .@"error" => return error.ServerProtocolError,
+            }
+        } else return error.UnexpectedEvent;
+        return .continue_dispatch;
+    }
+};
+
 pub const SessionCommand = enum { enable, disable };
 
 pub const Fixture = struct {
@@ -1061,14 +1261,14 @@ pub fn compositorConfig() Compositor.Config {
 pub fn clientReactorConfig() wayring.io_uring.Config {
     return .{ .receive_buffer_size = 4096, .receive_buffer_count = 4, .receive_control_capacity = 256, .fragment_block_size = 256, .fragment_block_count = 4, .transmit_block_size = 512, .transmit_block_count = 8, .descriptor_count = 4, .send_descriptor_capacity = 2 };
 }
-fn drainClient(reactor: *wayring.io_uring.Reactor, driver: *ClientDriver, handler: *ClientHandler) !ClientDriver.Progress {
+fn drainClient(reactor: *wayring.io_uring.Reactor, driver: *ClientDriver, handler: anytype) !ClientDriver.Progress {
     var completions: [16]linux.io_uring_cqe = undefined;
     const count = if (reactor.ring.cq_ready() == 0) 0 else try reactor.ring.copy_cqes(&completions, 0);
     const progress = try driver.dispatch(completions[0..count], handler);
     if (progress.prepared != 0 or progress.pending) _ = try reactor.ring.submit();
     return progress;
 }
-fn submitClient(reactor: *wayring.io_uring.Reactor, driver: *ClientDriver, handler: *ClientHandler) !void {
+fn submitClient(reactor: *wayring.io_uring.Reactor, driver: *ClientDriver, handler: anytype) !void {
     _ = try driver.schedule();
     _ = try driver.prepare(handler);
     _ = try reactor.ring.submit();
