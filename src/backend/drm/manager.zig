@@ -305,19 +305,52 @@ pub const Manager = struct {
         refresh_millihz: u32,
     ) !Snapshot {
         var result = try self.snapshot(handle);
-        const connector = result.selectedConnector();
-        const mode_end = try std.math.add(usize, connector.mode_start, connector.mode_count);
-        for (result.modes[connector.mode_start..mode_end], connector.mode_start..) |mode, index| {
-            if (mode.hdisplay == width and mode.vdisplay == height and
-                try std.math.mul(u32, mode.vrefresh, 1000) == refresh_millihz)
-            {
-                result.selection.mode_index = @intCast(index);
-                return result;
-            }
-        }
-        return error.UnsupportedMode;
+        result.selection.mode_index = try exactModeIndex(
+            result,
+            width,
+            height,
+            refresh_millihz,
+        );
+        return result;
+    }
+
+    /// Commits the selected mode only after the caller has successfully
+    /// activated that exact snapshot. This changes neither the topology
+    /// generation nor kernel state; later snapshots then describe the mode
+    /// which the output owner actually made current.
+    pub fn commitMode(
+        self: *Manager,
+        handle: Handle,
+        width: u32,
+        height: u32,
+        refresh_millihz: u32,
+    ) !void {
+        const snapshot_value = try self.snapshot(handle);
+        const index = try exactModeIndex(
+            snapshot_value,
+            width,
+            height,
+            refresh_millihz,
+        );
+        self.stores[self.active_store].selection.mode_index = index;
     }
 };
+
+fn exactModeIndex(
+    snapshot_value: Snapshot,
+    width: u32,
+    height: u32,
+    refresh_millihz: u32,
+) !u32 {
+    const connector = snapshot_value.selectedConnector();
+    const mode_end = try std.math.add(usize, connector.mode_start, connector.mode_count);
+    for (snapshot_value.modes[connector.mode_start..mode_end], connector.mode_start..) |mode, index| {
+        if (mode.hdisplay == width and mode.vdisplay == height and
+            try std.math.mul(u32, mode.vrefresh, 1000) == refresh_millihz)
+            return @intCast(index);
+    }
+    return error.UnsupportedMode;
+}
 
 fn chooseCard(cards: []Card) ?*const Card {
     if (cards.len == 0) return null;
@@ -544,11 +577,37 @@ test "drm: rescan publishes copied snapshots and rejects stale generations" {
         error.UnsupportedMode,
         manager.snapshotMode(first, selected_mode.hdisplay + 1, selected_mode.vdisplay, 60000),
     );
+    try std.testing.expectError(
+        error.UnsupportedMode,
+        manager.commitMode(first, selected_mode.hdisplay + 1, selected_mode.vdisplay, 60000),
+    );
     const second = (try manager.rescan()).?;
     try std.testing.expectError(error.StaleSnapshot, manager.snapshot(first));
     try std.testing.expectError(error.StaleSnapshot, manager.deviceFd(first));
     try std.testing.expectEqual(@as(u32, first.generation + 1), second.generation);
     try std.testing.expectEqual(@as(usize, 1), seat.device_open_count);
+}
+
+test "drm: committed mode selection is generation-safe and preserves topology ownership" {
+    var seat = FakeSeat{};
+    const session = try seat.createSession();
+    defer destroyTestSession(session);
+    var platform = FakeDrm{ .alternate_mode = true };
+    var manager = try Manager.init(std.testing.allocator, platform.platform(), session, "seat0", testConfig());
+    defer manager.deinit() catch unreachable;
+
+    const handle = (try manager.rescan()).?;
+    try manager.commitMode(handle, 1024, 768, 75000);
+    const selected = (try manager.snapshot(handle)).selectedMode();
+    try std.testing.expectEqual(@as(u16, 1024), selected.hdisplay);
+    try std.testing.expectEqual(@as(u16, 768), selected.vdisplay);
+    try std.testing.expectEqual(@as(u32, 75), selected.vrefresh);
+    try std.testing.expectEqual(@as(usize, 1), seat.device_open_count);
+    try std.testing.expectEqual(@as(usize, 0), seat.device_close_count);
+
+    const next = (try manager.rescan()).?;
+    try std.testing.expectError(error.StaleSnapshot, manager.commitMode(handle, 1280, 720, 60000));
+    try manager.commitMode(next, 1280, 720, 60000);
 }
 
 test "drm: disappearance removal is idempotent and retires Session device once" {
@@ -701,6 +760,7 @@ const FakeDrm = struct {
     caps_enabled: bool = false,
     topology_after_caps: bool = false,
     fail_topology: bool = false,
+    alternate_mode: bool = false,
 
     const vtable: Platform.VTable = .{ .discover = discover, .enable_client_caps = enableClientCaps, .read_topology = readTopology };
 
@@ -726,15 +786,16 @@ const FakeDrm = struct {
         self.topology_after_caps = self.caps_enabled;
         if (self.fail_topology) return error.FakeTopology;
         buffer.reset();
-        buffer.connectors[0] = .{ .id = 20, .connector_type = 1, .connector_type_id = 1, .connected = true, .desktop = true, .width_mm = 500, .height_mm = 300, .encoder_id = 30, .mode_start = 0, .mode_count = 1, .encoder_start = 0, .encoder_count = 1, .properties = .{ .crtc_id = 1 } };
+        buffer.connectors[0] = .{ .id = 20, .connector_type = 1, .connector_type_id = 1, .connected = true, .desktop = true, .width_mm = 500, .height_mm = 300, .encoder_id = 30, .mode_start = 0, .mode_count = if (self.alternate_mode) 2 else 1, .encoder_start = 0, .encoder_count = 1, .properties = .{ .crtc_id = 1 } };
         buffer.modes[0] = testMode(1280, 720, 60);
+        if (self.alternate_mode) buffer.modes[1] = testMode(1024, 768, 75);
         buffer.connector_encoders[0] = 30;
         buffer.encoders[0] = .{ .id = 30, .crtc_id = 40, .possible_crtcs = 1 };
         buffer.crtcs[0] = .{ .id = 40, .index = 0, .properties = .{ .active = 2, .mode_id = 3 } };
         buffer.planes[0] = .{ .id = 50, .possible_crtcs = 1, .plane_type_value = primary_plane_type, .format_start = 0, .format_count = 1, .properties = testPlaneProperties() };
         buffer.formats[0] = .{ .fourcc = 875713112, .modifier = api.modifier_invalid };
         buffer.connector_count = 1;
-        buffer.mode_count = 1;
+        buffer.mode_count = if (self.alternate_mode) 2 else 1;
         buffer.connector_encoder_count = 1;
         buffer.encoder_count = 1;
         buffer.crtc_count = 1;
