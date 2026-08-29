@@ -1100,6 +1100,124 @@ test "shell-input: generated data-control client crosses ext and wlr runtime pat
     try root.deinit();
 }
 
+test "shell-input: generated primary selection validates focus serial and transfers data" {
+    const allocator = std.testing.allocator;
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-primary-selection-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+
+    var fixture = try physical_fixture.Fixture.init();
+    defer fixture.deinit();
+    var input = try FakeInput.init();
+    defer input.deinit();
+    var root_config = physical_fixture.compositorConfig();
+    root_config.runtime.object_capacity = 32;
+    root_config.runtime.object_quota = 24;
+    root_config.runtime.actor.received_fd_budget = 2;
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), root_config);
+    var config = physical_fixture.coordinatorConfig();
+    config.router_capacity = 24;
+    var platforms = fixture.platforms();
+    platforms.input = input.platform();
+    const coordinator = try Coordinator.create(allocator, root, platforms, config);
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
+    try coordinator.start(&loop);
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(allocator, .{ .entries = 16, .flags = 0 }, physical_fixture.clientReactorConfig());
+    var client = try ClientConnection.attach(
+        allocator,
+        &reactor,
+        try wayring.unix_socket.connect(path),
+        .{ .received_fd_budget = 2, .transmit_byte_budget = 4096, .transmit_fd_budget = 2 },
+        .{ .max_objects = 24, .max_client_ids = 23 },
+    );
+    const actor = try client.actor();
+    var driver = ClientDriver.init(&client);
+    const registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null);
+    var handler: PrimarySelectionHandler = .{ .objects = &client.objects, .queue = &actor.transmit, .registry = registry };
+    defer if (handler.read_fd >= 0) _ = linux.close(handler.read_fd);
+    try submitClient(&reactor, &driver, &handler);
+    for (0..256) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.surface != null and handler.device != null and handler.source != null and coordinator.peer != null) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(handler.surface != null and handler.device != null and handler.source != null);
+    const peer = coordinator.peer.?;
+    try coordinator.primary_selection_adapter.setFocus(peer);
+    try input.publish(&.{.{ .device_added = .{
+        .device = 71,
+        .info = .{ .capabilities = .{ .keyboard = true } },
+    } }});
+    for (0..128) |_| {
+        _ = try loop.turn(coordinator);
+        _ = try drainClient(&reactor, &driver, &handler);
+        if (handler.keyboard != null) break;
+        _ = linux.sched_yield();
+    }
+    const surface_id = try coordinator.adapter.surfaceId(handler.surface.?);
+    try coordinator.seat_adapter.setKeyboardFocus(try coordinator.seat_adapter.makeTarget(peer, surface_id));
+    try input.publish(&.{.{ .keyboard_key = .{
+        .device = 71,
+        .time_usec = 1_000,
+        .key = 30,
+        .pressed = true,
+    } }});
+    for (0..512) |_| {
+        _ = try loop.turn(coordinator);
+        _ = try drainClient(&reactor, &driver, &handler);
+        if (handler.send_count == 1) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(usize, 1), handler.send_count);
+    try handler.expectTransfer("first");
+
+    try handler.replaceSelection();
+    try submitClient(&reactor, &driver, &handler);
+    for (0..512) |_| {
+        _ = try loop.turn(coordinator);
+        _ = try drainClient(&reactor, &driver, &handler);
+        if (handler.send_count == 2 and handler.cancelled == 1) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(usize, 1), handler.cancelled);
+    try std.testing.expectEqual(@as(usize, 2), handler.send_count);
+    try handler.expectTransfer("second");
+
+    try coordinator.primary_selection_adapter.setFocus(null);
+    for (0..128) |_| {
+        _ = try loop.turn(coordinator);
+        _ = try drainClient(&reactor, &driver, &handler);
+        if (handler.null_selections >= 2) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(usize, 2), handler.null_selections);
+    try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+
+    _ = try client.prepareClose();
+    try submitClient(&reactor, &driver, &handler);
+    try coordinator.requestStop();
+    var drained = false;
+    for (0..512) |_| {
+        const cp = try drainClient(&reactor, &driver, &handler);
+        const progress = try loop.turn(coordinator);
+        drained = progress.wayring.shutdown_complete and cp.quiescent and coordinator.backendDrainComplete();
+        if (drained) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(drained);
+    try client.deinit(allocator);
+    reactor.deinit(allocator);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
 test "shell-input: security context filters nested manager before registry discovery" {
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;
@@ -4500,6 +4618,128 @@ const DataControlHandler = struct {
             self.ext_device = (try protocol.ext_data_control_manager_v1.construct_get_data_device(self.objects, self.queue, self.ext_manager.?, .{ .seat = self.seat.?.id })).id;
         if (self.wlr_manager != null and self.wlr_device == null)
             self.wlr_device = (try protocol.zwlr_data_control_manager_v1.construct_get_data_device(self.objects, self.queue, self.wlr_manager.?, .{ .seat = self.seat.?.id })).id;
+    }
+};
+
+const PrimarySelectionHandler = struct {
+    objects: *wayring.objects.ClientObjects,
+    queue: *wayring.tx.Queue,
+    registry: wayring.objects.Handle,
+    compositor: ?wayring.objects.Handle = null,
+    seat: ?wayring.objects.Handle = null,
+    manager: ?wayring.objects.Handle = null,
+    surface: ?wayring.objects.Handle = null,
+    keyboard: ?wayring.objects.Handle = null,
+    device: ?wayring.objects.Handle = null,
+    source: ?wayring.objects.Handle = null,
+    offer: ?wayring.objects.Handle = null,
+    serial: u32 = 0,
+    offer_mimes: usize = 0,
+    selections: usize = 0,
+    null_selections: usize = 0,
+    cancelled: usize = 0,
+    send_count: usize = 0,
+    read_fd: linux.fd_t = -1,
+    event_failures: usize = 0,
+
+    pub fn eventError(self: *PrimarySelectionHandler, _: wayring.io_uring.Peer, _: ClientCore.EventFailure) void {
+        self.event_failures += 1;
+    }
+    pub fn event(self: *PrimarySelectionHandler, target: wayring.objects.Dispatch, message: wayring.wire.Message, fds: *wayring.ancillary.FdQueue) !wayring.dispatch.Control {
+        if (target.object.interface == &ClientCore.Registry.info) {
+            switch (try ClientCore.decodeRegistryEvent(self.objects, self.registry, message, fds)) {
+                .global => |value| {
+                    if (std.mem.eql(u8, value.interface, protocol.wl_compositor.info.name))
+                        self.compositor = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_compositor.info, @min(value.version, 6), null);
+                    if (std.mem.eql(u8, value.interface, protocol.wl_seat.info.name))
+                        self.seat = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_seat.info, @min(value.version, 9), null);
+                    if (std.mem.eql(u8, value.interface, protocol.zwp_primary_selection_device_manager_v1.info.name))
+                        self.manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.zwp_primary_selection_device_manager_v1.info, 1, null);
+                    try self.createObjects();
+                },
+                .global_remove => {},
+            }
+        } else if (target.object.interface == &protocol.wl_seat.info) {
+            switch (try protocol.wl_seat.decodeEvent(message, fds)) {
+                .capabilities => |value| {
+                    if (self.keyboard == null and value.capabilities.contains(protocol.wl_seat.capability.keyboard))
+                        self.keyboard = (try protocol.wl_seat.construct_get_keyboard(self.objects, self.queue, self.seat.?, .{})).id;
+                },
+                .name => {},
+            }
+        } else if (target.object.interface == &protocol.wl_keyboard.info) {
+            switch (try protocol.wl_keyboard.decodeEvent(message, fds)) {
+                .keymap => |value| _ = linux.close(value.fd),
+                .key => |value| if (value.state.value == protocol.wl_keyboard.key_state.pressed.value) {
+                    self.serial = value.serial;
+                    try protocol.zwp_primary_selection_device_v1.encodeRequest(self.queue, self.device.?.id, .{ .set_selection = .{ .source = self.source.?.id, .serial = value.serial } });
+                },
+                else => {},
+            }
+        } else if (target.object.interface == &protocol.zwp_primary_selection_device_v1.info) {
+            switch (try protocol.zwp_primary_selection_device_v1.decodeEvent(message, fds)) {
+                .data_offer => |value| self.offer = (try protocol.zwp_primary_selection_device_v1.admit_event_data_offer(self.objects, self.device.?, value, .{})).offer,
+                .selection => |value| {
+                    if (value.id) |id| {
+                        try std.testing.expectEqual(self.offer.?.id, id);
+                        self.selections += 1;
+                        var pipe: [2]linux.fd_t = undefined;
+                        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&pipe, .{ .CLOEXEC = true })));
+                        self.read_fd = pipe[0];
+                        try protocol.zwp_primary_selection_offer_v1.encodeRequest(self.queue, self.offer.?.id, .{ .receive = .{ .mime_type = "text/plain", .fd = pipe[1] } });
+                    } else self.null_selections += 1;
+                },
+            }
+        } else if (target.object.interface == &protocol.zwp_primary_selection_offer_v1.info) {
+            const value = try protocol.zwp_primary_selection_offer_v1.decodeEvent(message, fds);
+            try std.testing.expectEqualStrings("text/plain", value.offer.mime_type);
+            self.offer_mimes += 1;
+        } else if (target.object.interface == &protocol.zwp_primary_selection_source_v1.info) {
+            switch (try protocol.zwp_primary_selection_source_v1.decodeEvent(message, fds)) {
+                .send => |value| {
+                    try std.testing.expectEqualStrings("text/plain", value.mime_type);
+                    const bytes = if (self.send_count == 0) "first" else "second";
+                    try std.testing.expectEqual(bytes.len, linux.write(value.fd, bytes.ptr, bytes.len));
+                    _ = linux.close(value.fd);
+                    self.send_count += 1;
+                },
+                .cancelled => self.cancelled += 1,
+            }
+        } else if (target.object.interface == &protocol.wl_surface.info) {
+            _ = try protocol.wl_surface.decodeEvent(message, fds);
+        } else if (target.object.interface == &ClientCore.Display.info) {
+            switch (try ClientCore.decodeDisplayEvent(self.objects, message, fds)) {
+                .delete_id => {},
+                .@"error" => return error.ServerProtocolError,
+            }
+        } else return error.UnexpectedEvent;
+        return .continue_dispatch;
+    }
+    fn createObjects(self: *PrimarySelectionHandler) !void {
+        if (self.compositor != null and self.surface == null)
+            self.surface = (try protocol.wl_compositor.construct_create_surface(self.objects, self.queue, self.compositor.?, .{})).id;
+        if (self.seat != null and self.manager != null and self.device == null) {
+            self.device = (try protocol.zwp_primary_selection_device_manager_v1.construct_get_device(self.objects, self.queue, self.manager.?, .{ .seat = self.seat.?.id })).id;
+            try self.createSource();
+        }
+    }
+    fn createSource(self: *PrimarySelectionHandler) !void {
+        self.source = (try protocol.zwp_primary_selection_device_manager_v1.construct_create_source(self.objects, self.queue, self.manager.?, .{})).id;
+        try protocol.zwp_primary_selection_source_v1.encodeRequest(self.queue, self.source.?.id, .{ .offer = .{ .mime_type = "text/plain" } });
+    }
+    fn replaceSelection(self: *PrimarySelectionHandler) !void {
+        try self.createSource();
+        try protocol.zwp_primary_selection_device_v1.encodeRequest(self.queue, self.device.?.id, .{ .set_selection = .{ .source = self.source.?.id, .serial = self.serial } });
+    }
+    fn expectTransfer(self: *PrimarySelectionHandler, expected: []const u8) !void {
+        defer {
+            _ = linux.close(self.read_fd);
+            self.read_fd = -1;
+        }
+        var bytes: [16]u8 = undefined;
+        const count = linux.read(self.read_fd, &bytes, bytes.len);
+        try std.testing.expectEqual(expected.len, count);
+        try std.testing.expectEqualStrings(expected, bytes[0..count]);
     }
 };
 
