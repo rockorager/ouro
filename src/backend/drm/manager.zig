@@ -40,6 +40,28 @@ pub const Selection = struct {
     plane_index: u32,
 };
 
+pub const ScanoutCandidate = struct {
+    connector_index: u32,
+    mode_index: u32,
+    crtc_index: u32,
+    plane_index: u32,
+
+    fn selection(self: ScanoutCandidate) Selection {
+        return .{
+            .connector_index = self.connector_index,
+            .mode_index = self.mode_index,
+            .crtc_index = self.crtc_index,
+            .plane_index = self.plane_index,
+        };
+    }
+};
+
+pub const ClaimHandle = struct {
+    topology_generation: u32,
+    slot: u32,
+    generation: u64,
+};
+
 pub const Snapshot = struct {
     handle: Handle,
     card: Card,
@@ -76,6 +98,8 @@ pub const Event = union(enum) {
 
 const Storage = struct {
     buffer: api.TopologyBuffer,
+    candidates: []ScanoutCandidate,
+    candidate_count: usize = 0,
     selection: Selection = undefined,
 
     fn init(allocator: std.mem.Allocator, config: Config) !Storage {
@@ -92,6 +116,8 @@ const Storage = struct {
         const planes = try allocator.alloc(Plane, config.plane_capacity);
         errdefer allocator.free(planes);
         const formats = try allocator.alloc(Format, config.format_capacity);
+        errdefer allocator.free(formats);
+        const candidates = try allocator.alloc(ScanoutCandidate, config.connector_capacity);
         return .{ .buffer = .{
             .connectors = connectors,
             .modes = modes,
@@ -100,10 +126,11 @@ const Storage = struct {
             .crtcs = crtcs,
             .planes = planes,
             .formats = formats,
-        } };
+        }, .candidates = candidates };
     }
 
     fn deinit(self: *Storage, allocator: std.mem.Allocator) void {
+        allocator.free(self.candidates);
         allocator.free(self.buffer.formats);
         allocator.free(self.buffer.planes);
         allocator.free(self.buffer.crtcs);
@@ -113,6 +140,12 @@ const Storage = struct {
         allocator.free(self.buffer.connectors);
         self.* = undefined;
     }
+};
+
+const Claim = struct {
+    active: bool = false,
+    generation: u64 = 0,
+    candidate: ScanoutCandidate = undefined,
 };
 
 pub const Manager = struct {
@@ -128,6 +161,8 @@ pub const Manager = struct {
     card: Card = .{},
     generation: u32 = 0,
     present: bool = false,
+    claims: []Claim,
+    next_claim_generation: ?u64 = 1,
     events_buffer: []Event,
     event_count: usize = 0,
 
@@ -150,6 +185,9 @@ pub const Manager = struct {
         errdefer first.deinit(allocator);
         var second = try Storage.init(allocator, config);
         errdefer second.deinit(allocator);
+        const claims = try allocator.alloc(Claim, config.connector_capacity);
+        errdefer allocator.free(claims);
+        @memset(claims, .{});
         const event_storage = try allocator.alloc(Event, config.event_capacity);
         var manager: Manager = .{
             .allocator = allocator,
@@ -158,6 +196,7 @@ pub const Manager = struct {
             .seat_len = @intCast(seat.len),
             .cards = cards,
             .stores = .{ first, second },
+            .claims = claims,
             .events_buffer = event_storage,
         };
         @memcpy(manager.seat[0..seat.len], seat);
@@ -173,6 +212,7 @@ pub const Manager = struct {
         self.present = false;
         const allocator = self.allocator;
         allocator.free(self.events_buffer);
+        allocator.free(self.claims);
         self.stores[1].deinit(allocator);
         self.stores[0].deinit(allocator);
         allocator.free(self.cards);
@@ -228,8 +268,13 @@ pub const Manager = struct {
         const storage = &self.stores[next_store];
         try self.platform.readTopology(fd, &storage.buffer);
         try validateCounts(&storage.buffer);
-        storage.selection = try chooseOutput(&storage.buffer);
+        storage.candidate_count = try collectScanoutCandidates(&storage.buffer, storage.candidates);
+        storage.selection = choosePrimaryCandidate(
+            &storage.buffer,
+            storage.candidates[0..storage.candidate_count],
+        ).selection();
         if (self.generation == std.math.maxInt(u32)) return error.GenerationExhausted;
+        if (self.next_claim_generation == null) return error.GenerationExhausted;
 
         if (!same_device) {
             if (self.device) |old| {
@@ -237,6 +282,7 @@ pub const Manager = struct {
                 self.present = false;
                 self.session.closeDevice(old) catch |err| {
                     const retired = self.generation;
+                    self.invalidateClaims();
                     self.generation += 1;
                     self.events_buffer[self.event_count] = .{ .removed = retired };
                     self.event_count += 1;
@@ -248,8 +294,14 @@ pub const Manager = struct {
             self.card = selected_card.*;
         }
         self.active_store = next_store;
+        self.invalidateClaims();
         self.generation += 1;
         self.present = true;
+        self.claims[0] = .{
+            .active = true,
+            .generation = self.takeClaimGeneration(),
+            .candidate = candidateFromSelection(storage.selection),
+        };
         const handle: Handle = .{ .generation = self.generation };
         self.events_buffer[self.event_count] = .{ .snapshot = handle };
         self.event_count += 1;
@@ -267,6 +319,7 @@ pub const Manager = struct {
         const device = self.device;
         self.device = null;
         self.present = false;
+        self.invalidateClaims();
         self.generation += 1;
         self.events_buffer[self.event_count] = .{ .removed = retired };
         self.event_count += 1;
@@ -292,6 +345,76 @@ pub const Manager = struct {
             .formats = buffer.formats[0..buffer.format_count],
             .selection = storage.selection,
         };
+    }
+
+    /// Returns every connected desktop connector with a deterministic complete
+    /// connector/mode/CRTC/primary-plane tuple. The slice is borrowed from the
+    /// active topology and becomes invalid with `handle` on rescan or removal.
+    /// The primary tuple used by `snapshot` is already claimed by Ouro.
+    pub fn scanoutCandidates(self: *const Manager, handle: Handle) ![]const ScanoutCandidate {
+        if (!self.present or handle.generation != self.generation)
+            return error.StaleSnapshot;
+        const storage = &self.stores[self.active_store];
+        return storage.candidates[0..storage.candidate_count];
+    }
+
+    /// Exclusively claims one exact candidate. Claims reserve the connector,
+    /// CRTC, and primary plane together and remain valid only for this topology
+    /// generation. The compositor's primary candidate is reserved internally.
+    pub fn claimScanout(
+        self: *Manager,
+        handle: Handle,
+        candidate: ScanoutCandidate,
+    ) !ClaimHandle {
+        if (!self.present or handle.generation != self.generation)
+            return error.StaleSnapshot;
+        const candidates = try self.scanoutCandidates(handle);
+        var found = false;
+        for (candidates) |available| {
+            if (std.meta.eql(available, candidate)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return error.InvalidScanoutCandidate;
+
+        for (self.claims) |claim| {
+            if (!claim.active) continue;
+            if (claim.candidate.connector_index == candidate.connector_index)
+                return error.ConnectorClaimed;
+            if (claim.candidate.crtc_index == candidate.crtc_index or
+                claim.candidate.plane_index == candidate.plane_index)
+                return error.ScanoutConflict;
+        }
+        const claim_generation = self.next_claim_generation orelse
+            return error.GenerationExhausted;
+        for (self.claims, 0..) |*claim, index| {
+            if (claim.active) continue;
+            claim.* = .{
+                .active = true,
+                .generation = claim_generation,
+                .candidate = candidate,
+            };
+            self.advanceClaimGeneration();
+            return .{
+                .topology_generation = self.generation,
+                .slot = @intCast(index),
+                .generation = claim_generation,
+            };
+        }
+        return error.ClaimCapacityExceeded;
+    }
+
+    pub fn claimSnapshot(self: *const Manager, claim_handle: ClaimHandle) !Snapshot {
+        const claim = try self.getClaim(claim_handle);
+        var result = try self.snapshot(.{ .generation = claim_handle.topology_generation });
+        result.selection = claim.candidate.selection();
+        return result;
+    }
+
+    pub fn releaseScanout(self: *Manager, claim_handle: ClaimHandle) !void {
+        const claim = try self.getClaim(claim_handle);
+        claim.active = false;
     }
 
     /// Returns the current topology with an exact connector mode selected.
@@ -333,6 +456,34 @@ pub const Manager = struct {
             refresh_millihz,
         );
         self.stores[self.active_store].selection.mode_index = index;
+    }
+
+    fn getClaim(self: anytype, claim_handle: ClaimHandle) !@TypeOf(&self.claims[0]) {
+        if (!self.present or claim_handle.topology_generation != self.generation)
+            return error.StaleClaim;
+        if (claim_handle.slot >= self.claims.len) return error.StaleClaim;
+        const claim = &self.claims[claim_handle.slot];
+        if (!claim.active or claim.generation != claim_handle.generation)
+            return error.StaleClaim;
+        return claim;
+    }
+
+    fn invalidateClaims(self: *Manager) void {
+        for (self.claims) |*claim| claim.active = false;
+    }
+
+    fn takeClaimGeneration(self: *Manager) u64 {
+        const generation = self.next_claim_generation.?;
+        self.advanceClaimGeneration();
+        return generation;
+    }
+
+    fn advanceClaimGeneration(self: *Manager) void {
+        const generation = self.next_claim_generation.?;
+        self.next_claim_generation = if (generation == std.math.maxInt(u64))
+            null
+        else
+            generation + 1;
     }
 };
 
@@ -395,55 +546,106 @@ fn validateCounts(buffer: *const api.TopologyBuffer) !void {
 }
 
 fn chooseOutput(buffer: *const api.TopologyBuffer) !Selection {
-    var selected: ?Selection = null;
+    var selected: ?ScanoutCandidate = null;
     var saw_connector = false;
     var saw_crtc = false;
     for (buffer.connectors[0..buffer.connector_count], 0..) |connector, index| {
         if (!connector.connected or !connector.desktop or connector.mode_count == 0) continue;
         saw_connector = true;
-        var mode_index: usize = connector.mode_start;
-        const mode_end = @as(usize, connector.mode_start) + connector.mode_count;
-        var mode_candidate = mode_index + 1;
-        while (mode_candidate < mode_end) : (mode_candidate += 1) {
-            if (betterMode(buffer.modes[mode_candidate], buffer.modes[mode_index]))
-                mode_index = mode_candidate;
-        }
-
-        var crtc_index: ?usize = null;
-        var plane_index: ?usize = null;
-        for (buffer.crtcs[0..buffer.crtc_count], 0..) |crtc, candidate_index| {
-            if (!connectorSupportsCrtc(buffer, connector, crtc.index)) continue;
-            saw_crtc = true;
-            var candidate_plane: ?usize = null;
-            for (buffer.planes[0..buffer.plane_count], 0..) |plane, candidate_plane_index| {
-                if (plane.plane_type_value != primary_plane_type or plane.format_count == 0 or
-                    plane.possible_crtcs & (@as(u32, 1) << @intCast(crtc.index)) == 0)
-                    continue;
-                if (candidate_plane == null or
-                    plane.id < buffer.planes[candidate_plane.?].id)
-                    candidate_plane = candidate_plane_index;
-            }
-            if (candidate_plane == null) continue;
-            if (crtc_index == null or crtc.id < buffer.crtcs[crtc_index.?].id) {
-                crtc_index = candidate_index;
-                plane_index = candidate_plane;
-            }
-        }
-        const cri = crtc_index orelse continue;
-        const candidate: Selection = .{
-            .connector_index = @intCast(index),
-            .mode_index = @intCast(mode_index),
-            .crtc_index = @intCast(cri),
-            .plane_index = @intCast(plane_index.?),
-        };
+        const candidate = connectorCandidate(buffer, index, &saw_crtc) orelse continue;
         if (selected == null or connector.id <
             buffer.connectors[selected.?.connector_index].id)
             selected = candidate;
     }
-    if (selected) |selection| return selection;
+    if (selected) |selection| return selection.selection();
     if (!saw_connector) return error.NoConnectedOutput;
     if (!saw_crtc) return error.NoCompatibleCrtc;
     return error.NoPrimaryPlane;
+}
+
+fn collectScanoutCandidates(
+    buffer: *const api.TopologyBuffer,
+    candidates: []ScanoutCandidate,
+) !usize {
+    var count: usize = 0;
+    var saw_connector = false;
+    var saw_crtc = false;
+    for (buffer.connectors[0..buffer.connector_count], 0..) |connector, index| {
+        if (!connector.connected or !connector.desktop or connector.mode_count == 0) continue;
+        saw_connector = true;
+        const candidate = connectorCandidate(buffer, index, &saw_crtc) orelse continue;
+        if (count == candidates.len) return error.InvalidPlatformResult;
+        candidates[count] = candidate;
+        count += 1;
+    }
+    if (count != 0) return count;
+    if (!saw_connector) return error.NoConnectedOutput;
+    if (!saw_crtc) return error.NoCompatibleCrtc;
+    return error.NoPrimaryPlane;
+}
+
+fn connectorCandidate(
+    buffer: *const api.TopologyBuffer,
+    connector_index: usize,
+    saw_crtc: *bool,
+) ?ScanoutCandidate {
+    const connector = buffer.connectors[connector_index];
+    var mode_index: usize = connector.mode_start;
+    const mode_end = @as(usize, connector.mode_start) + connector.mode_count;
+    var mode_candidate = mode_index + 1;
+    while (mode_candidate < mode_end) : (mode_candidate += 1) {
+        if (betterMode(buffer.modes[mode_candidate], buffer.modes[mode_index]))
+            mode_index = mode_candidate;
+    }
+
+    var crtc_index: ?usize = null;
+    var plane_index: ?usize = null;
+    for (buffer.crtcs[0..buffer.crtc_count], 0..) |crtc, candidate_index| {
+        if (!connectorSupportsCrtc(buffer, connector, crtc.index)) continue;
+        saw_crtc.* = true;
+        var candidate_plane: ?usize = null;
+        for (buffer.planes[0..buffer.plane_count], 0..) |plane, candidate_plane_index| {
+            if (plane.plane_type_value != primary_plane_type or plane.format_count == 0 or
+                plane.possible_crtcs & (@as(u32, 1) << @intCast(crtc.index)) == 0)
+                continue;
+            if (candidate_plane == null or plane.id < buffer.planes[candidate_plane.?].id)
+                candidate_plane = candidate_plane_index;
+        }
+        if (candidate_plane == null) continue;
+        if (crtc_index == null or crtc.id < buffer.crtcs[crtc_index.?].id) {
+            crtc_index = candidate_index;
+            plane_index = candidate_plane;
+        }
+    }
+    return .{
+        .connector_index = @intCast(connector_index),
+        .mode_index = @intCast(mode_index),
+        .crtc_index = @intCast(crtc_index orelse return null),
+        .plane_index = @intCast(plane_index.?),
+    };
+}
+
+fn choosePrimaryCandidate(
+    buffer: *const api.TopologyBuffer,
+    candidates: []const ScanoutCandidate,
+) ScanoutCandidate {
+    std.debug.assert(candidates.len != 0);
+    var selected = candidates[0];
+    for (candidates[1..]) |candidate| {
+        if (buffer.connectors[candidate.connector_index].id <
+            buffer.connectors[selected.connector_index].id)
+            selected = candidate;
+    }
+    return selected;
+}
+
+fn candidateFromSelection(selection: Selection) ScanoutCandidate {
+    return .{
+        .connector_index = selection.connector_index,
+        .mode_index = selection.mode_index,
+        .crtc_index = selection.crtc_index,
+        .plane_index = selection.plane_index,
+    };
 }
 
 fn findEncoder(buffer: *const api.TopologyBuffer, id: u32) ?Encoder {
@@ -610,6 +812,86 @@ test "drm: committed mode selection is generation-safe and preserves topology ow
     try manager.commitMode(next, 1280, 720, 60000);
 }
 
+test "drm: scanout claims reserve complete tuples and recycle generation safely" {
+    var seat = FakeSeat{};
+    const session = try seat.createSession();
+    defer destroyTestSession(session);
+    var platform = FakeDrm{ .multiple_outputs = true };
+    var manager = try Manager.init(std.testing.allocator, platform.platform(), session, "seat0", testConfig());
+    defer manager.deinit() catch unreachable;
+
+    const handle = (try manager.rescan()).?;
+    const candidates = try manager.scanoutCandidates(handle);
+    try std.testing.expectEqual(@as(usize, 2), candidates.len);
+    try std.testing.expectError(
+        error.ConnectorClaimed,
+        manager.claimScanout(handle, candidates[0]),
+    );
+
+    const claim = try manager.claimScanout(handle, candidates[1]);
+    try std.testing.expectEqual(@as(u32, 21), (try manager.claimSnapshot(claim)).selectedConnector().id);
+    try std.testing.expectError(
+        error.ConnectorClaimed,
+        manager.claimScanout(handle, candidates[1]),
+    );
+    try manager.releaseScanout(claim);
+    try std.testing.expectError(error.StaleClaim, manager.claimSnapshot(claim));
+
+    const replacement = try manager.claimScanout(handle, candidates[1]);
+    try std.testing.expect(replacement.generation != claim.generation);
+    var invalid = candidates[1];
+    invalid.mode_index = 0;
+    try std.testing.expectError(
+        error.InvalidScanoutCandidate,
+        manager.claimScanout(handle, invalid),
+    );
+    try manager.releaseScanout(replacement);
+}
+
+test "drm: scanout claims reject shared CRTC and plane ownership" {
+    var seat = FakeSeat{};
+    const session = try seat.createSession();
+    defer destroyTestSession(session);
+    var platform = FakeDrm{ .multiple_outputs = true, .shared_scanout = true };
+    var manager = try Manager.init(std.testing.allocator, platform.platform(), session, "seat0", testConfig());
+    defer manager.deinit() catch unreachable;
+
+    const handle = (try manager.rescan()).?;
+    const candidates = try manager.scanoutCandidates(handle);
+    try std.testing.expectEqual(@as(usize, 2), candidates.len);
+    try std.testing.expectError(
+        error.ScanoutConflict,
+        manager.claimScanout(handle, candidates[1]),
+    );
+}
+
+test "drm: failed rescan preserves claims and successful rescan invalidates them" {
+    var seat = FakeSeat{};
+    const session = try seat.createSession();
+    defer destroyTestSession(session);
+    var platform = FakeDrm{ .multiple_outputs = true };
+    var manager = try Manager.init(std.testing.allocator, platform.platform(), session, "seat0", testConfig());
+    defer manager.deinit() catch unreachable;
+
+    const first = (try manager.rescan()).?;
+    const first_candidates = try manager.scanoutCandidates(first);
+    const claim = try manager.claimScanout(first, first_candidates[1]);
+    platform.fail_topology = true;
+    try std.testing.expectError(error.FakeTopology, manager.rescan());
+    try std.testing.expectEqual(@as(u32, 21), (try manager.claimSnapshot(claim)).selectedConnector().id);
+
+    platform.fail_topology = false;
+    const second = (try manager.rescan()).?;
+    try std.testing.expectError(error.StaleClaim, manager.claimSnapshot(claim));
+    try std.testing.expectError(error.StaleSnapshot, manager.scanoutCandidates(first));
+    const second_candidates = try manager.scanoutCandidates(second);
+    try std.testing.expectEqual(@as(usize, 2), second_candidates.len);
+    const second_claim = try manager.claimScanout(second, second_candidates[1]);
+    try manager.remove();
+    try std.testing.expectError(error.StaleClaim, manager.claimSnapshot(second_claim));
+    try std.testing.expectError(error.StaleSnapshot, manager.scanoutCandidates(second));
+}
+
 test "drm: disappearance removal is idempotent and retires Session device once" {
     var seat = FakeSeat{};
     const session = try seat.createSession();
@@ -761,6 +1043,8 @@ const FakeDrm = struct {
     topology_after_caps: bool = false,
     fail_topology: bool = false,
     alternate_mode: bool = false,
+    multiple_outputs: bool = false,
+    shared_scanout: bool = false,
 
     const vtable: Platform.VTable = .{ .discover = discover, .enable_client_caps = enableClientCaps, .read_topology = readTopology };
 
@@ -794,13 +1078,28 @@ const FakeDrm = struct {
         buffer.crtcs[0] = .{ .id = 40, .index = 0, .properties = .{ .active = 2, .mode_id = 3 } };
         buffer.planes[0] = .{ .id = 50, .possible_crtcs = 1, .plane_type_value = primary_plane_type, .format_start = 0, .format_count = 1, .properties = testPlaneProperties() };
         buffer.formats[0] = .{ .fourcc = 875713112, .modifier = api.modifier_invalid };
-        buffer.connector_count = 1;
-        buffer.mode_count = if (self.alternate_mode) 2 else 1;
-        buffer.connector_encoder_count = 1;
-        buffer.encoder_count = 1;
-        buffer.crtc_count = 1;
-        buffer.plane_count = 1;
-        buffer.format_count = 1;
+        if (self.multiple_outputs) {
+            const second_mode_index: u32 = if (self.alternate_mode) 2 else 1;
+            buffer.connectors[1] = .{ .id = 21, .connector_type = 1, .connector_type_id = 2, .connected = true, .desktop = true, .width_mm = 500, .height_mm = 300, .encoder_id = 31, .mode_start = second_mode_index, .mode_count = 1, .encoder_start = 1, .encoder_count = 1, .properties = .{ .crtc_id = 1 } };
+            buffer.modes[second_mode_index] = testMode(1920, 1080, 60);
+            buffer.connector_encoders[1] = 31;
+            buffer.encoders[1] = .{
+                .id = 31,
+                .crtc_id = if (self.shared_scanout) 40 else 41,
+                .possible_crtcs = if (self.shared_scanout) 1 else 2,
+            };
+            buffer.crtcs[1] = .{ .id = 41, .index = 1, .properties = .{ .active = 2, .mode_id = 3 } };
+            buffer.planes[1] = .{ .id = 51, .possible_crtcs = 2, .plane_type_value = primary_plane_type, .format_start = 1, .format_count = 1, .properties = testPlaneProperties() };
+            buffer.formats[1] = .{ .fourcc = 875713112, .modifier = api.modifier_invalid };
+        }
+        buffer.connector_count = if (self.multiple_outputs) 2 else 1;
+        buffer.mode_count = (if (self.alternate_mode) @as(usize, 2) else 1) +
+            @intFromBool(self.multiple_outputs);
+        buffer.connector_encoder_count = if (self.multiple_outputs) 2 else 1;
+        buffer.encoder_count = if (self.multiple_outputs) 2 else 1;
+        buffer.crtc_count = if (self.multiple_outputs) 2 else 1;
+        buffer.plane_count = if (self.multiple_outputs) 2 else 1;
+        buffer.format_count = if (self.multiple_outputs) 2 else 1;
     }
 };
 
