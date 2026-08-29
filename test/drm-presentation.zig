@@ -119,6 +119,45 @@ test "physical coordinator keeps serving until its final client disconnects" {
     try root.deinit();
 }
 
+test "physical DRM lease resolver grants the independent secondary tuple" {
+    const allocator = std.testing.allocator;
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-r15-lease-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), compositorConfig());
+    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), coordinatorConfig());
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
+    try coordinator.start(&loop);
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    for (0..32) |_| {
+        if (coordinator.output != null) break;
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+        _ = try loop.turn(coordinator);
+    }
+    const handle = coordinator.manager.currentHandle().?;
+    const candidates = try coordinator.manager.scanoutCandidates(handle);
+    try std.testing.expectEqual(@as(usize, 2), candidates.len);
+    const grant = (try coordinator.grantDrmLease(.physical, &.{.{
+        .topology_generation = handle.generation,
+        .candidate = candidates[1],
+    }})).?;
+    defer _ = linux.close(grant.fd);
+    try std.testing.expectEqualSlices(u32, &.{ 11, 31, 41 }, fixture.lease_objects[0..fixture.lease_object_count]);
+    try std.testing.expect(coordinator.revokeDrmLease(grant.token));
+    try std.testing.expectEqual(@as(usize, 1), fixture.lease_revoke_count);
+
+    try coordinator.requestStop();
+    try drainServer(root, coordinator, &loop);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
 test "no discovered DRM card fails startup and drains honestly" {
     const allocator = std.testing.allocator;
     var fixture = try Fixture.init();
@@ -731,6 +770,10 @@ pub const Fixture = struct {
     read_maps: usize = 0,
     unmaps: usize = 0,
     discover_cards: bool = true,
+    lease_objects: [6]u32 = undefined,
+    lease_object_count: usize = 0,
+    lease_create_count: usize = 0,
+    lease_revoke_count: usize = 0,
 
     pub fn init() !Fixture {
         return .{ .session_fd = try eventFd(), .drm_fd = try eventFd() };
@@ -776,9 +819,9 @@ pub const Fixture = struct {
         .discover = discover,
         .enable_client_caps = enableCaps,
         .read_topology = topology,
-        .open_lease_device = unsupportedLeaseDevice,
-        .create_lease = unsupportedLease,
-        .revoke_lease = unsupportedRevokeLease,
+        .open_lease_device = openLeaseDevice,
+        .create_lease = createLease,
+        .revoke_lease = revokeLease,
     };
     const gbm_vtable: ouro.gbm.Platform.VTable = .{
         .create_device = createGbm,
@@ -809,18 +852,24 @@ pub const Fixture = struct {
         return self;
     }
 
-    fn unsupportedLeaseDevice(_: *anyopaque, _: [:0]const u8) !std.posix.fd_t {
-        return error.Unsupported;
+    fn openLeaseDevice(_: *anyopaque, _: [:0]const u8) !std.posix.fd_t {
+        return eventFd();
     }
-    fn unsupportedLease(
-        _: *anyopaque,
+    fn createLease(
+        context: *anyopaque,
         _: std.posix.fd_t,
-        _: []const u32,
+        objects: []const u32,
     ) !ouro.drm_platform.LeaseResult {
-        return error.Unsupported;
+        const self: *Fixture = @ptrCast(@alignCast(context));
+        self.lease_create_count += 1;
+        self.lease_object_count = objects.len;
+        @memcpy(self.lease_objects[0..objects.len], objects);
+        return .{ .fd = try eventFd(), .lessee_id = @intCast(self.lease_create_count) };
     }
-    fn unsupportedRevokeLease(_: *anyopaque, _: std.posix.fd_t, _: u32) !void {
-        return error.Unsupported;
+    fn revokeLease(context: *anyopaque, _: std.posix.fd_t, lessee_id: u32) !void {
+        const self: *Fixture = @ptrCast(@alignCast(context));
+        try std.testing.expect(lessee_id != 0);
+        self.lease_revoke_count += 1;
     }
     fn closeSeat(context: *anyopaque, _: *anyopaque) !void {
         const self: *Fixture = @ptrCast(@alignCast(context));
@@ -884,13 +933,20 @@ pub const Fixture = struct {
         out.crtcs[0] = .{ .id = 30, .index = 0, .properties = .{ .active = 2, .mode_id = 3 } };
         out.planes[0] = .{ .id = 40, .possible_crtcs = 1, .plane_type_value = 1, .format_start = 0, .format_count = 1, .properties = .{ .plane_type = 4, .fb_id = 5, .crtc_id = 6, .src_x = 7, .src_y = 8, .src_w = 9, .src_h = 10, .crtc_x = 11, .crtc_y = 12, .crtc_w = 13, .crtc_h = 14 } };
         out.formats[0] = .{ .fourcc = ouro.gbm.format_xrgb8888, .modifier = ouro.gbm.modifier_linear };
-        out.connector_count = 1;
-        out.mode_count = 1;
-        out.connector_encoder_count = 1;
-        out.encoder_count = 1;
-        out.crtc_count = 1;
-        out.plane_count = 1;
-        out.format_count = 1;
+        out.connectors[1] = .{ .id = 11, .connector_type = 1, .connector_type_id = 2, .connected = true, .desktop = true, .width_mm = 2, .height_mm = 2, .encoder_id = 21, .mode_start = 1, .mode_count = 1, .encoder_start = 1, .encoder_count = 1, .properties = .{ .crtc_id = 1 } };
+        out.modes[1] = out.modes[0];
+        out.connector_encoders[1] = 21;
+        out.encoders[1] = .{ .id = 21, .crtc_id = 31, .possible_crtcs = 2 };
+        out.crtcs[1] = .{ .id = 31, .index = 1, .properties = .{ .active = 2, .mode_id = 3 } };
+        out.planes[1] = .{ .id = 41, .possible_crtcs = 2, .plane_type_value = 1, .format_start = 1, .format_count = 1, .properties = .{ .plane_type = 4, .fb_id = 5, .crtc_id = 6, .src_x = 7, .src_y = 8, .src_w = 9, .src_h = 10, .crtc_x = 11, .crtc_y = 12, .crtc_w = 13, .crtc_h = 14 } };
+        out.formats[1] = out.formats[0];
+        out.connector_count = 2;
+        out.mode_count = 2;
+        out.connector_encoder_count = 2;
+        out.encoder_count = 2;
+        out.crtc_count = 2;
+        out.plane_count = 2;
+        out.format_count = 2;
         _ = self;
     }
 
@@ -987,7 +1043,7 @@ pub const Fixture = struct {
 };
 
 pub fn coordinatorConfig() Coordinator.Config {
-    return .{ .router_capacity = 12, .timer_capacity = 6, .device_capacity = 1, .shm = .{ .limits = .{ .max_pool_bytes = 4096 }, .pool_capacity = 1, .buffer_capacity = 1, .formats = &shm_formats }, .surface = .{ .surface_capacity = 1, .region_capacity = 1, .viewport_capacity = 1, .presentation_resource_capacity = 1, .presentation_feedback_capacity = 2, .region_operation_capacity = 1, .frame_callback_capacity = 1, .release_callback_capacity = 1, .content_update_capacity = 1, .dependency_capacity = 1, .attachment_capacity = 1, .copy_capacity = 1, .max_copy_bytes = pixels.len }, .drm = .{ .card_capacity = 1, .connector_capacity = 1, .mode_capacity = 1, .connector_encoder_capacity = 1, .encoder_capacity = 1, .crtc_capacity = 1, .plane_capacity = 1, .format_capacity = 1, .event_capacity = 4 }, .output = .{ .output_id = .{ .index = 0, .generation = 1 }, .scheduler = .{ .refresh_ns = 4 * std.time.ns_per_ms, .render_budget_ns = std.time.ns_per_ms }, .renderer = .pixman, .image_count = 2, .max_samples = 2, .max_source_bytes = pixels.len, .max_source_width = 3, .max_source_height = 2, .kms = .{ .event_capacity = 2 } } };
+    return .{ .router_capacity = 12, .timer_capacity = 6, .device_capacity = 1, .shm = .{ .limits = .{ .max_pool_bytes = 4096 }, .pool_capacity = 1, .buffer_capacity = 1, .formats = &shm_formats }, .surface = .{ .surface_capacity = 1, .region_capacity = 1, .viewport_capacity = 1, .presentation_resource_capacity = 1, .presentation_feedback_capacity = 2, .region_operation_capacity = 1, .frame_callback_capacity = 1, .release_callback_capacity = 1, .content_update_capacity = 1, .dependency_capacity = 1, .attachment_capacity = 1, .copy_capacity = 1, .max_copy_bytes = pixels.len }, .drm = .{ .card_capacity = 1, .connector_capacity = 2, .mode_capacity = 2, .connector_encoder_capacity = 2, .encoder_capacity = 2, .crtc_capacity = 2, .plane_capacity = 2, .format_capacity = 2, .event_capacity = 4 }, .output = .{ .output_id = .{ .index = 0, .generation = 1 }, .scheduler = .{ .refresh_ns = 4 * std.time.ns_per_ms, .render_budget_ns = std.time.ns_per_ms }, .renderer = .pixman, .image_count = 2, .max_samples = 2, .max_source_bytes = pixels.len, .max_source_width = 3, .max_source_height = 2, .kms = .{ .event_capacity = 2 } } };
 }
 pub fn compositorConfig() Compositor.Config {
     return .{ .ring = .{ .entries = 32, .flags = 0 }, .reactor = clientReactorConfig(), .runtime = .{ .actor = .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 }, .object_capacity = 32, .object_quota = 32, .buckets_per_client = 32, .max_globals = 61, .registry_capacity = 1 } };
