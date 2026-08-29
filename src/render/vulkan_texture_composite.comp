@@ -29,7 +29,7 @@ layout(push_constant) uniform Frame {
     uvec4 clear_color;  // straight alpha, red, green, blue
     uvec4 output_info;  // width, height, format, sample count
     uvec4 damage;       // x, y, width, height
-    uvec4 output_color; // transfer, reference luminance bits, reserved, reserved
+    uvec4 output_color; // transfer, reference luminance bits, output LUT, sample start
 } frame;
 
 uint multiply_unorm(uint value, uint alpha) {
@@ -142,7 +142,8 @@ void main() {
     vec4 color = continuation
         ? imageLoad(linear_image, pixel)
         : vec4(decode_transfer(clear_electrical, frame.output_color.x) * alpha, alpha);
-    for (uint index = 0u; index < sample_count; ++index) {
+    uint sample_end = frame.output_color.w + sample_count;
+    for (uint index = frame.output_color.w; index < sample_end; ++index) {
         Sample item = items[index];
         ivec2 destination_end = item.destination.xy + item.destination.zw;
         ivec2 clip_end = item.clip.xy + item.clip.zw;

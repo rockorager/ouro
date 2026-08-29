@@ -2538,6 +2538,28 @@ fn recordSampledPass(
         c.VK_PIPELINE_BIND_POINT_COMPUTE,
         self.sampled_pipeline.?,
     );
+    if (pass_batch_count > 1) {
+        // Initialize linear light once, render each ordered descriptor batch
+        // only where it has visible samples, then encode the complete damage.
+        // This preserves blending across batches without making every damaged
+        // pixel test every sample in the scene.
+        c.vkCmdBindDescriptorSets(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 0, 1, &target.descriptor_sets[0], 0, null);
+        for (frame.render_damage) |damage|
+            recordSampledDispatch(self, target, frame, damage, intermediate_bit, 0);
+        recordSampledBarrier(target);
+
+        for (0..pass_batch_count) |batch_index| {
+            const partition = batchAt(sample_count, self.max_samples, batch_index);
+            c.vkCmdBindDescriptorSets(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 0, 1, &target.descriptor_sets[batch_index], 0, null);
+            recordSampledPartition(self, target, frame, partition);
+            recordSampledBarrier(target);
+        }
+
+        c.vkCmdBindDescriptorSets(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 0, 1, &target.descriptor_sets[0], 0, null);
+        for (frame.render_damage) |damage|
+            recordSampledDispatch(self, target, frame, damage, continuation_bit, 0);
+        return;
+    }
     for (0..pass_batch_count) |batch_index| {
         const partition = if (sample_count == 0)
             Batch{ .first = 0, .count = 0, .initialize = true }
@@ -2563,21 +2585,225 @@ fn recordSampledPass(
             c.vkCmdDispatch(target.command_buffer, (damage.width + 7) / 8, (damage.height + 7) / 8, 1);
         }
         if (batch_index + 1 < pass_batch_count) {
-            var between: c.VkImageMemoryBarrier = .{
-                .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                .pNext = null,
-                .srcAccessMask = c.VK_ACCESS_SHADER_WRITE_BIT,
-                .dstAccessMask = c.VK_ACCESS_SHADER_READ_BIT | c.VK_ACCESS_SHADER_WRITE_BIT,
-                .oldLayout = c.VK_IMAGE_LAYOUT_GENERAL,
-                .newLayout = c.VK_IMAGE_LAYOUT_GENERAL,
-                .srcQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
-                .dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
-                .image = target.linear_image,
-                .subresourceRange = colorRange(),
-            };
-            c.vkCmdPipelineBarrier(target.command_buffer, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, null, 0, null, 1, &between);
+            recordSampledBarrier(target);
         }
     }
+}
+
+fn recordSampledDispatch(
+    self: *RealRenderer,
+    target: *RealTarget,
+    frame: Frame,
+    damage: render.Rect,
+    encoded_count: u32,
+    sample_start: u32,
+) void {
+    const push: Push = .{
+        .clear_color = .{ frame.clear.a, frame.clear.r, frame.clear.g, frame.clear.b },
+        .output = .{ frame.output.width, frame.output.height, @intFromEnum(frame.output_format), encoded_count },
+        .damage = .{ @intCast(damage.x), @intCast(damage.y), damage.width, damage.height },
+        .output_color = .{
+            @intFromEnum(frame.output_color_description.transfer),
+            @bitCast(frame.output_color_description.reference_luminance),
+            if (frame.output_lut_slot) |slot| slot + 1 else 0,
+            sample_start,
+        },
+    };
+    c.vkCmdPushConstants(target.command_buffer, self.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(Push), &push);
+    c.vkCmdDispatch(target.command_buffer, (damage.width + 7) / 8, (damage.height + 7) / 8, 1);
+}
+
+fn recordSampledPartition(
+    self: *RealRenderer,
+    target: *RealTarget,
+    frame: Frame,
+    partition: Batch,
+) void {
+    for (frame.render_damage) |damage| {
+        const samples = frame.samples[partition.first..][0..partition.count];
+        var intersections: [sampled_image_capacity]?SampleIntersection = @splat(null);
+        var remaining: u32 = 0;
+        for (samples, 0..) |sample, index| {
+            intersections[index] = sampleIntersection(sample, damage);
+            if (intersections[index] != null)
+                remaining |= @as(u32, 1) << @intCast(index);
+        }
+        while (remaining != 0) {
+            var component = @as(u32, 1) << @intCast(@ctz(remaining));
+            remaining &= ~component;
+            var changed = true;
+            while (changed) {
+                changed = false;
+                var candidates = remaining;
+                while (candidates != 0) {
+                    const candidate_index: u5 = @intCast(@ctz(candidates));
+                    const candidate_bit = @as(u32, 1) << candidate_index;
+                    candidates &= ~candidate_bit;
+                    var members = component;
+                    while (members != 0) {
+                        const member_index: u5 = @intCast(@ctz(members));
+                        members &= ~(@as(u32, 1) << member_index);
+                        if (intersectionsOverlap(
+                            intersections[member_index].?,
+                            intersections[candidate_index].?,
+                        )) {
+                            component |= candidate_bit;
+                            remaining &= ~candidate_bit;
+                            changed = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (@popCount(component) == 1) {
+                const index: u5 = @intCast(@ctz(component));
+                const visible = intersections[index].?;
+                recordSampledDispatch(self, target, frame, .{
+                    .x = @intCast(visible.min_x),
+                    .y = @intCast(visible.min_y),
+                    .width = @intCast(visible.max_x - visible.min_x),
+                    .height = @intCast(visible.max_y - visible.min_y),
+                }, 1 | continuation_bit | intermediate_bit, index);
+            } else {
+                recordSampledComponent(
+                    self,
+                    target,
+                    frame,
+                    component,
+                    intersections[0..partition.count],
+                );
+            }
+        }
+    }
+}
+
+fn recordSampledComponent(
+    self: *RealRenderer,
+    target: *RealTarget,
+    frame: Frame,
+    component: u32,
+    intersections: []const ?SampleIntersection,
+) void {
+    const first: u5 = @intCast(@ctz(component));
+    const last: u5 = @intCast(31 - @clz(component));
+    const encoded_count = @as(u32, last) - first + 1 |
+        continuation_bit | intermediate_bit;
+    var damage_min_x: i64 = std.math.maxInt(i64);
+    var damage_min_y: i64 = std.math.maxInt(i64);
+    var damage_max_x: i64 = std.math.minInt(i64);
+    var damage_max_y: i64 = std.math.minInt(i64);
+    for (intersections, 0..) |intersection, index| {
+        if (component & (@as(u32, 1) << @intCast(index)) == 0) continue;
+        const visible = intersection.?;
+        damage_min_x = @min(damage_min_x, visible.min_x);
+        damage_min_y = @min(damage_min_y, visible.min_y);
+        damage_max_x = @max(damage_max_x, visible.max_x);
+        damage_max_y = @max(damage_max_y, visible.max_y);
+    }
+    var y = damage_min_y;
+    while (y < damage_max_y) {
+        var next_y = damage_max_y;
+        var active = false;
+        for (intersections, 0..) |intersection, index| {
+            if (component & (@as(u32, 1) << @intCast(index)) == 0) continue;
+            const visible = intersection.?;
+            if (visible.min_y > y) {
+                next_y = @min(next_y, visible.min_y);
+            } else if (visible.max_y > y) {
+                active = true;
+                next_y = @min(next_y, visible.max_y);
+            }
+        }
+        if (active) {
+            var x = damage_min_x;
+            while (x < damage_max_x) {
+                var run_start = damage_max_x;
+                for (intersections, 0..) |intersection, index| {
+                    if (component & (@as(u32, 1) << @intCast(index)) == 0) continue;
+                    const visible = intersection.?;
+                    if (visible.min_y <= y and visible.max_y > y and visible.max_x > x)
+                        run_start = @min(run_start, @max(x, visible.min_x));
+                }
+                if (run_start == damage_max_x) break;
+                var run_end = run_start;
+                var extended = true;
+                while (extended) {
+                    extended = false;
+                    for (intersections, 0..) |intersection, index| {
+                        if (component & (@as(u32, 1) << @intCast(index)) == 0) continue;
+                        const visible = intersection.?;
+                        if (visible.min_y <= y and visible.max_y > y and
+                            visible.min_x <= run_end and visible.max_x > run_end)
+                        {
+                            run_end = visible.max_x;
+                            extended = true;
+                        }
+                    }
+                }
+                recordSampledDispatch(self, target, frame, .{
+                    .x = @intCast(run_start),
+                    .y = @intCast(y),
+                    .width = @intCast(run_end - run_start),
+                    .height = @intCast(next_y - y),
+                }, encoded_count, first);
+                x = run_end;
+            }
+        }
+        y = next_y;
+    }
+}
+
+fn intersectionsOverlap(a: SampleIntersection, b: SampleIntersection) bool {
+    return @max(a.min_x, b.min_x) < @min(a.max_x, b.max_x) and
+        @max(a.min_y, b.min_y) < @min(a.max_y, b.max_y);
+}
+
+const SampleIntersection = struct {
+    min_x: i64,
+    min_y: i64,
+    max_x: i64,
+    max_y: i64,
+};
+
+fn sampleIntersection(sample: Sample, rect: render.Rect) ?SampleIntersection {
+    const rect_min_x: i64 = rect.x;
+    const rect_min_y: i64 = rect.y;
+    const rect_max_x = rect_min_x + rect.width;
+    const rect_max_y = rect_min_y + rect.height;
+    const destination_min_x: i64 = sample.destination[0];
+    const destination_min_y: i64 = sample.destination[1];
+    const destination_max_x = destination_min_x + sample.destination[2];
+    const destination_max_y = destination_min_y + sample.destination[3];
+    const clip_min_x: i64 = sample.clip[0];
+    const clip_min_y: i64 = sample.clip[1];
+    const clip_max_x = clip_min_x + sample.clip[2];
+    const clip_max_y = clip_min_y + sample.clip[3];
+    const visible: SampleIntersection = .{
+        .min_x = @max(rect_min_x, destination_min_x, clip_min_x),
+        .min_y = @max(rect_min_y, destination_min_y, clip_min_y),
+        .max_x = @min(rect_max_x, destination_max_x, clip_max_x),
+        .max_y = @min(rect_max_y, destination_max_y, clip_max_y),
+    };
+    return if (visible.min_x < visible.max_x and visible.min_y < visible.max_y)
+        visible
+    else
+        null;
+}
+
+fn recordSampledBarrier(target: *RealTarget) void {
+    var between: c.VkImageMemoryBarrier = .{
+        .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .pNext = null,
+        .srcAccessMask = c.VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = c.VK_ACCESS_SHADER_READ_BIT | c.VK_ACCESS_SHADER_WRITE_BIT,
+        .oldLayout = c.VK_IMAGE_LAYOUT_GENERAL,
+        .newLayout = c.VK_IMAGE_LAYOUT_GENERAL,
+        .srcQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
+        .image = target.linear_image,
+        .subresourceRange = colorRange(),
+    };
+    c.vkCmdPipelineBarrier(target.command_buffer, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, null, 0, null, 1, &between);
 }
 
 fn recordRestartSampledPass(target: *RealTarget) void {
