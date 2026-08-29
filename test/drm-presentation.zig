@@ -776,6 +776,9 @@ pub const Fixture = struct {
         .discover = discover,
         .enable_client_caps = enableCaps,
         .read_topology = topology,
+        .open_lease_device = unsupportedLeaseDevice,
+        .create_lease = unsupportedLease,
+        .revoke_lease = unsupportedRevokeLease,
     };
     const gbm_vtable: ouro.gbm.Platform.VTable = .{
         .create_device = createGbm,
@@ -804,6 +807,20 @@ pub const Fixture = struct {
         const self: *Fixture = @ptrCast(@alignCast(context));
         self.callback = callback;
         return self;
+    }
+
+    fn unsupportedLeaseDevice(_: *anyopaque, _: [:0]const u8) !std.posix.fd_t {
+        return error.Unsupported;
+    }
+    fn unsupportedLease(
+        _: *anyopaque,
+        _: std.posix.fd_t,
+        _: []const u32,
+    ) !ouro.drm_platform.LeaseResult {
+        return error.Unsupported;
+    }
+    fn unsupportedRevokeLease(_: *anyopaque, _: std.posix.fd_t, _: u32) !void {
+        return error.Unsupported;
     }
     fn closeSeat(context: *anyopaque, _: *anyopaque) !void {
         const self: *Fixture = @ptrCast(@alignCast(context));

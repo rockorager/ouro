@@ -4,6 +4,7 @@
 const std = @import("std");
 
 const c = @cImport({
+    @cInclude("fcntl.h");
     @cInclude("libudev.h");
     @cInclude("drm_fourcc.h");
     @cInclude("xf86drm.h");
@@ -108,6 +109,11 @@ pub const Format = struct {
     modifier: u64,
 };
 
+pub const LeaseResult = struct {
+    fd: std.posix.fd_t,
+    lessee_id: u32,
+};
+
 pub const Plane = struct {
     id: u32,
     possible_crtcs: u32,
@@ -154,6 +160,9 @@ pub const Platform = struct {
         discover: *const fn (*anyopaque, []Card, []const u8) anyerror!usize,
         enable_client_caps: *const fn (*anyopaque, std.posix.fd_t) anyerror!void,
         read_topology: *const fn (*anyopaque, std.posix.fd_t, *TopologyBuffer) anyerror!void,
+        open_lease_device: *const fn (*anyopaque, [:0]const u8) anyerror!std.posix.fd_t,
+        create_lease: *const fn (*anyopaque, std.posix.fd_t, []const u32) anyerror!LeaseResult,
+        revoke_lease: *const fn (*anyopaque, std.posix.fd_t, u32) anyerror!void,
     };
 
     pub fn discover(self: Platform, cards: []Card, seat: []const u8) !usize {
@@ -167,6 +176,18 @@ pub const Platform = struct {
     pub fn readTopology(self: Platform, fd: std.posix.fd_t, buffer: *TopologyBuffer) !void {
         return self.vtable.read_topology(self.context, fd, buffer);
     }
+
+    pub fn openLeaseDevice(self: Platform, path: [:0]const u8) !std.posix.fd_t {
+        return self.vtable.open_lease_device(self.context, path);
+    }
+
+    pub fn createLease(self: Platform, fd: std.posix.fd_t, objects: []const u32) !LeaseResult {
+        return self.vtable.create_lease(self.context, fd, objects);
+    }
+
+    pub fn revokeLease(self: Platform, fd: std.posix.fd_t, lessee_id: u32) !void {
+        return self.vtable.revoke_lease(self.context, fd, lessee_id);
+    }
 };
 
 var real_context: u8 = 0;
@@ -176,6 +197,9 @@ const real_vtable: Platform.VTable = .{
     .discover = realDiscover,
     .enable_client_caps = realEnableClientCaps,
     .read_topology = realReadTopology,
+    .open_lease_device = realOpenLeaseDevice,
+    .create_lease = realCreateLease,
+    .revoke_lease = realRevokeLease,
 };
 
 fn realDiscover(_: *anyopaque, cards: []Card, seat: []const u8) !usize {
@@ -347,6 +371,46 @@ fn realReadTopology(_: *anyopaque, fd: std.posix.fd_t, out: *TopologyBuffer) !vo
         };
         out.plane_count += 1;
     }
+}
+
+fn realOpenLeaseDevice(_: *anyopaque, path: [:0]const u8) !std.posix.fd_t {
+    const result = std.os.linux.open(path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+    if (std.os.linux.errno(result) != .SUCCESS) return error.OpenLeaseDeviceFailed;
+    const fd: std.posix.fd_t = @intCast(result);
+    errdefer _ = std.os.linux.close(fd);
+    const is_master = c.drmIsMaster(fd);
+    if (is_master < 0) return error.QueryLeaseDeviceMasterFailed;
+    if (is_master == 1 and c.drmDropMaster(fd) != 0)
+        return error.DropLeaseDeviceMasterFailed;
+    return fd;
+}
+
+fn realCreateLease(
+    _: *anyopaque,
+    fd: std.posix.fd_t,
+    objects: []const u32,
+) !LeaseResult {
+    if (objects.len == 0 or objects.len > std.math.maxInt(c_int))
+        return error.InvalidLeaseObjects;
+    var lessee_id: u32 = 0;
+    const lease_fd = c.drmModeCreateLease(
+        fd,
+        objects.ptr,
+        @intCast(objects.len),
+        c.O_CLOEXEC,
+        &lessee_id,
+    );
+    if (lease_fd < 0) return error.CreateLeaseFailed;
+    if (lessee_id == 0) {
+        _ = std.os.linux.close(lease_fd);
+        return error.CreateLeaseFailed;
+    }
+    return .{ .fd = lease_fd, .lessee_id = lessee_id };
+}
+
+fn realRevokeLease(_: *anyopaque, fd: std.posix.fd_t, lessee_id: u32) !void {
+    if (lessee_id == 0 or c.drmModeRevokeLease(fd, lessee_id) != 0)
+        return error.RevokeLeaseFailed;
 }
 
 const PropertyValue = struct { id: u32, value: u64 };

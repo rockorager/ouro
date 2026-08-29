@@ -18,6 +18,7 @@ pub const Platform = api.Platform;
 
 const seat_capacity = 64;
 const primary_plane_type: u64 = 1;
+const no_claim: u32 = std.math.maxInt(u32);
 
 pub const Config = struct {
     card_capacity: usize,
@@ -60,6 +61,17 @@ pub const ClaimHandle = struct {
     topology_generation: u32,
     slot: u32,
     generation: u64,
+};
+
+pub const LeaseHandle = struct {
+    topology_generation: u32,
+    slot: u32,
+    generation: u64,
+};
+
+pub const LeaseGrant = struct {
+    fd: std.posix.fd_t,
+    handle: LeaseHandle,
 };
 
 pub const Snapshot = struct {
@@ -146,6 +158,13 @@ const Claim = struct {
     active: bool = false,
     generation: u64 = 0,
     candidate: ScanoutCandidate = undefined,
+    lease_slot: u32 = no_claim,
+};
+
+const Lease = struct {
+    active: bool = false,
+    generation: u64 = 0,
+    lessee_id: u32 = 0,
 };
 
 pub const Manager = struct {
@@ -163,6 +182,9 @@ pub const Manager = struct {
     present: bool = false,
     claims: []Claim,
     next_claim_generation: ?u64 = 1,
+    leases: []Lease,
+    next_lease_generation: ?u64 = 1,
+    lease_objects: []u32,
     events_buffer: []Event,
     event_count: usize = 0,
 
@@ -188,6 +210,14 @@ pub const Manager = struct {
         const claims = try allocator.alloc(Claim, config.connector_capacity);
         errdefer allocator.free(claims);
         @memset(claims, .{});
+        const leases = try allocator.alloc(Lease, config.connector_capacity);
+        errdefer allocator.free(leases);
+        @memset(leases, .{});
+        const lease_objects = try allocator.alloc(
+            u32,
+            try std.math.mul(usize, config.connector_capacity, 3),
+        );
+        errdefer allocator.free(lease_objects);
         const event_storage = try allocator.alloc(Event, config.event_capacity);
         var manager: Manager = .{
             .allocator = allocator,
@@ -197,6 +227,8 @@ pub const Manager = struct {
             .cards = cards,
             .stores = .{ first, second },
             .claims = claims,
+            .leases = leases,
+            .lease_objects = lease_objects,
             .events_buffer = event_storage,
         };
         @memcpy(manager.seat[0..seat.len], seat);
@@ -207,16 +239,20 @@ pub const Manager = struct {
     /// its exactly-once close semantics apply even when the close reports an
     /// error. Storage is always reclaimed and this manager cannot be retried.
     pub fn deinit(self: *Manager) !void {
+        const revoke_result = self.revokeAllLeases(true);
         const close_result = if (self.device) |device| self.session.closeDevice(device) else {};
         self.device = null;
         self.present = false;
         const allocator = self.allocator;
         allocator.free(self.events_buffer);
+        allocator.free(self.lease_objects);
+        allocator.free(self.leases);
         allocator.free(self.claims);
         self.stores[1].deinit(allocator);
         self.stores[0].deinit(allocator);
         allocator.free(self.cards);
         self.* = undefined;
+        try revoke_result;
         return close_result;
     }
 
@@ -245,6 +281,7 @@ pub const Manager = struct {
     /// across enumeration ordering and card-node renumbering when udev exposes
     /// stable PCI/platform ancestry.
     pub fn rescan(self: *Manager) !?Handle {
+        if (self.hasActiveLease()) return error.LeasesActive;
         const card_count = try self.platform.discover(self.cards, self.seat[0..self.seat_len]);
         if (card_count > self.cards.len) return error.InvalidPlatformResult;
         const selected_card = chooseCard(self.cards[0..card_count]) orelse {
@@ -315,6 +352,7 @@ pub const Manager = struct {
         if (!self.present and self.device == null) return;
         if (self.event_count == self.events_buffer.len) return error.EventQueueFull;
         if (self.generation == std.math.maxInt(u32)) return error.GenerationExhausted;
+        const revoke_result = self.revokeAllLeases(true);
         const retired = self.generation;
         const device = self.device;
         self.device = null;
@@ -323,7 +361,9 @@ pub const Manager = struct {
         self.generation += 1;
         self.events_buffer[self.event_count] = .{ .removed = retired };
         self.event_count += 1;
-        if (device) |handle| try self.session.closeDevice(handle);
+        const close_result = if (device) |handle| self.session.closeDevice(handle) else {};
+        try revoke_result;
+        return close_result;
     }
 
     /// Returned slices borrow the active store and must not be retained across
@@ -414,7 +454,97 @@ pub const Manager = struct {
 
     pub fn releaseScanout(self: *Manager, claim_handle: ClaimHandle) !void {
         const claim = try self.getClaim(claim_handle);
+        if (claim.lease_slot != no_claim) return error.ClaimLeased;
         claim.active = false;
+    }
+
+    /// Opens a fresh non-master descriptor for protocol-side device discovery.
+    /// The caller owns the returned descriptor and must close it after enqueue.
+    pub fn openLeaseDevice(self: *Manager, handle: Handle) !std.posix.fd_t {
+        _ = try self.snapshot(handle);
+        return self.platform.openLeaseDevice(self.card.devicePath());
+    }
+
+    /// Creates one kernel lease from already-exclusive scanout claims. The
+    /// lease owns those claims until exact revocation; on failure no ownership
+    /// changes and no descriptor escapes.
+    pub fn createLease(
+        self: *Manager,
+        handle: Handle,
+        claim_handles: []const ClaimHandle,
+    ) !LeaseGrant {
+        if (claim_handles.len == 0 or claim_handles.len > self.claims.len)
+            return error.InvalidLease;
+        _ = try self.snapshot(handle);
+        const device = self.device orelse return error.StaleSnapshot;
+        const lease_generation = self.next_lease_generation orelse
+            return error.GenerationExhausted;
+        var lease_slot: ?usize = null;
+        for (self.leases, 0..) |lease, index| if (!lease.active) {
+            lease_slot = index;
+            break;
+        };
+        const slot = lease_slot orelse return error.LeaseCapacityExceeded;
+
+        var object_count: usize = 0;
+        const storage = &self.stores[self.active_store];
+        for (claim_handles, 0..) |claim_handle, index| {
+            const claim = try self.getClaim(claim_handle);
+            if (claim.lease_slot != no_claim) return error.ClaimLeased;
+            for (claim_handles[0..index]) |earlier|
+                if (std.meta.eql(earlier, claim_handle)) return error.DuplicateClaim;
+            const selection = claim.candidate.selection();
+            const object_ids = [_]u32{
+                storage.buffer.connectors[selection.connector_index].id,
+                storage.buffer.crtcs[selection.crtc_index].id,
+                storage.buffer.planes[selection.plane_index].id,
+            };
+            for (object_ids) |object_id| {
+                var duplicate = false;
+                for (self.lease_objects[0..object_count]) |existing|
+                    if (existing == object_id) {
+                        duplicate = true;
+                        break;
+                    };
+                if (!duplicate) {
+                    self.lease_objects[object_count] = object_id;
+                    object_count += 1;
+                }
+            }
+        }
+
+        const master_fd = try self.session.deviceFd(device);
+        const result = try self.platform.createLease(
+            master_fd,
+            self.lease_objects[0..object_count],
+        );
+        if (result.lessee_id == 0) {
+            _ = std.os.linux.close(result.fd);
+            return error.InvalidPlatformResult;
+        }
+        self.leases[slot] = .{
+            .active = true,
+            .generation = lease_generation,
+            .lessee_id = result.lessee_id,
+        };
+        for (claim_handles) |claim_handle|
+            (self.getClaim(claim_handle) catch unreachable).lease_slot = @intCast(slot);
+        self.advanceLeaseGeneration();
+        return .{
+            .fd = result.fd,
+            .handle = .{
+                .topology_generation = self.generation,
+                .slot = @intCast(slot),
+                .generation = lease_generation,
+            },
+        };
+    }
+
+    pub fn revokeLease(self: *Manager, lease_handle: LeaseHandle) !void {
+        const lease = try self.getLease(lease_handle);
+        const fd = try self.deviceFd(.{ .generation = lease_handle.topology_generation });
+        try self.platform.revokeLease(fd, lease.lessee_id);
+        self.releaseLease(@intCast(lease_handle.slot));
     }
 
     /// Returns the current topology with an exact connector mode selected.
@@ -468,6 +598,53 @@ pub const Manager = struct {
         return claim;
     }
 
+    fn getLease(self: *Manager, lease_handle: LeaseHandle) !*Lease {
+        if (!self.present or lease_handle.topology_generation != self.generation or
+            lease_handle.slot >= self.leases.len) return error.StaleLease;
+        const lease = &self.leases[lease_handle.slot];
+        if (!lease.active or lease.generation != lease_handle.generation)
+            return error.StaleLease;
+        return lease;
+    }
+
+    fn releaseLease(self: *Manager, slot: u32) void {
+        for (self.claims) |*claim| if (claim.active and claim.lease_slot == slot) {
+            claim.active = false;
+            claim.lease_slot = no_claim;
+        };
+        self.leases[slot].active = false;
+    }
+
+    fn revokeAllLeases(self: *Manager, terminal: bool) anyerror!void {
+        if (self.device == null) {
+            for (self.leases, 0..) |lease, index| if (lease.active)
+                self.releaseLease(@intCast(index));
+            return;
+        }
+        const fd = self.session.deviceFd(self.device.?) catch |err| {
+            if (terminal) {
+                for (self.leases, 0..) |lease, index| if (lease.active)
+                    self.releaseLease(@intCast(index));
+            }
+            return err;
+        };
+        var first_error: ?anyerror = null;
+        for (self.leases, 0..) |lease, index| {
+            if (!lease.active) continue;
+            self.platform.revokeLease(fd, lease.lessee_id) catch |err| {
+                if (first_error == null) first_error = err;
+                if (!terminal) continue;
+            };
+            self.releaseLease(@intCast(index));
+        }
+        if (first_error) |err| return err;
+    }
+
+    fn hasActiveLease(self: *const Manager) bool {
+        for (self.leases) |lease| if (lease.active) return true;
+        return false;
+    }
+
     fn invalidateClaims(self: *Manager) void {
         for (self.claims) |*claim| claim.active = false;
     }
@@ -481,6 +658,14 @@ pub const Manager = struct {
     fn advanceClaimGeneration(self: *Manager) void {
         const generation = self.next_claim_generation.?;
         self.next_claim_generation = if (generation == std.math.maxInt(u64))
+            null
+        else
+            generation + 1;
+    }
+
+    fn advanceLeaseGeneration(self: *Manager) void {
+        const generation = self.next_lease_generation.?;
+        self.next_lease_generation = if (generation == std.math.maxInt(u64))
             null
         else
             generation + 1;
@@ -892,6 +1077,71 @@ test "drm: failed rescan preserves claims and successful rescan invalidates them
     try std.testing.expectError(error.StaleSnapshot, manager.scanoutCandidates(second));
 }
 
+test "drm: kernel lease owns exact claim objects until generation-safe revocation" {
+    var seat = FakeSeat{};
+    const session = try seat.createSession();
+    defer destroyTestSession(session);
+    var platform = FakeDrm{ .multiple_outputs = true };
+    var manager = try Manager.init(std.testing.allocator, platform.platform(), session, "seat0", testConfig());
+    defer manager.deinit() catch unreachable;
+
+    const handle = (try manager.rescan()).?;
+    const discovery_fd = try manager.openLeaseDevice(handle);
+    _ = std.os.linux.close(discovery_fd);
+    const candidates = try manager.scanoutCandidates(handle);
+    const claim = try manager.claimScanout(handle, candidates[1]);
+    const grant = try manager.createLease(handle, &.{claim});
+    _ = std.os.linux.close(grant.fd);
+    try std.testing.expectEqual(@as(usize, 1), platform.lease_create_count);
+    try std.testing.expectEqualSlices(
+        u32,
+        &.{ 21, 41, 51 },
+        platform.lease_objects[0..platform.lease_object_count],
+    );
+    try std.testing.expectError(error.ClaimLeased, manager.releaseScanout(claim));
+    try std.testing.expectError(error.LeasesActive, manager.rescan());
+
+    platform.fail_revoke_lease = true;
+    try std.testing.expectError(error.FakeRevokeLease, manager.revokeLease(grant.handle));
+    try std.testing.expectError(error.ClaimLeased, manager.releaseScanout(claim));
+    platform.fail_revoke_lease = false;
+    try manager.revokeLease(grant.handle);
+    try std.testing.expectEqual(@as(usize, 2), platform.lease_revoke_count);
+    try std.testing.expectError(error.StaleLease, manager.revokeLease(grant.handle));
+    try std.testing.expectError(error.StaleClaim, manager.releaseScanout(claim));
+
+    const replacement = try manager.claimScanout(handle, candidates[1]);
+    try manager.releaseScanout(replacement);
+}
+
+test "drm: lease failure is atomic and terminal removal retires failed revocation" {
+    var seat = FakeSeat{};
+    const session = try seat.createSession();
+    defer destroyTestSession(session);
+    var platform = FakeDrm{ .multiple_outputs = true, .fail_create_lease = true };
+    var manager = try Manager.init(std.testing.allocator, platform.platform(), session, "seat0", testConfig());
+    defer manager.deinit() catch unreachable;
+
+    const handle = (try manager.rescan()).?;
+    const candidates = try manager.scanoutCandidates(handle);
+    const failed_claim = try manager.claimScanout(handle, candidates[1]);
+    try std.testing.expectError(
+        error.FakeCreateLease,
+        manager.createLease(handle, &.{failed_claim}),
+    );
+    try manager.releaseScanout(failed_claim);
+
+    platform.fail_create_lease = false;
+    const claim = try manager.claimScanout(handle, candidates[1]);
+    const grant = try manager.createLease(handle, &.{claim});
+    _ = std.os.linux.close(grant.fd);
+    platform.fail_revoke_lease = true;
+    try std.testing.expectError(error.FakeRevokeLease, manager.remove());
+    try std.testing.expectError(error.StaleLease, manager.revokeLease(grant.handle));
+    try std.testing.expectError(error.StaleSnapshot, manager.snapshot(handle));
+    try std.testing.expectEqual(@as(usize, 1), seat.device_close_count);
+}
+
 test "drm: disappearance removal is idempotent and retires Session device once" {
     var seat = FakeSeat{};
     const session = try seat.createSession();
@@ -1045,8 +1295,22 @@ const FakeDrm = struct {
     alternate_mode: bool = false,
     multiple_outputs: bool = false,
     shared_scanout: bool = false,
+    lease_objects: [6]u32 = undefined,
+    lease_object_count: usize = 0,
+    lease_create_count: usize = 0,
+    lease_revoke_count: usize = 0,
+    next_lessee_id: u32 = 1,
+    fail_create_lease: bool = false,
+    fail_revoke_lease: bool = false,
 
-    const vtable: Platform.VTable = .{ .discover = discover, .enable_client_caps = enableClientCaps, .read_topology = readTopology };
+    const vtable: Platform.VTable = .{
+        .discover = discover,
+        .enable_client_caps = enableClientCaps,
+        .read_topology = readTopology,
+        .open_lease_device = openLeaseDevice,
+        .create_lease = createLease,
+        .revoke_lease = revokeLease,
+    };
 
     fn platform(self: *FakeDrm) Platform {
         return .{ .context = self, .vtable = &vtable };
@@ -1100,6 +1364,37 @@ const FakeDrm = struct {
         buffer.crtc_count = if (self.multiple_outputs) 2 else 1;
         buffer.plane_count = if (self.multiple_outputs) 2 else 1;
         buffer.format_count = if (self.multiple_outputs) 2 else 1;
+    }
+
+    fn openLeaseDevice(_: *anyopaque, _: [:0]const u8) !std.posix.fd_t {
+        const result = std.os.linux.eventfd(0, std.os.linux.EFD.CLOEXEC);
+        if (std.os.linux.errno(result) != .SUCCESS) return error.FakeLeaseDevice;
+        return @intCast(result);
+    }
+
+    fn createLease(
+        context: *anyopaque,
+        fd: std.posix.fd_t,
+        objects: []const u32,
+    ) !api.LeaseResult {
+        const self: *FakeDrm = @ptrCast(@alignCast(context));
+        try std.testing.expectEqual(@as(std.posix.fd_t, 101), fd);
+        if (self.fail_create_lease) return error.FakeCreateLease;
+        self.lease_create_count += 1;
+        self.lease_object_count = objects.len;
+        @memcpy(self.lease_objects[0..objects.len], objects);
+        const result = std.os.linux.eventfd(0, std.os.linux.EFD.CLOEXEC);
+        if (std.os.linux.errno(result) != .SUCCESS) return error.FakeCreateLease;
+        defer self.next_lessee_id += 1;
+        return .{ .fd = @intCast(result), .lessee_id = self.next_lessee_id };
+    }
+
+    fn revokeLease(context: *anyopaque, fd: std.posix.fd_t, lessee_id: u32) !void {
+        const self: *FakeDrm = @ptrCast(@alignCast(context));
+        try std.testing.expectEqual(@as(std.posix.fd_t, 101), fd);
+        try std.testing.expect(lessee_id != 0);
+        self.lease_revoke_count += 1;
+        if (self.fail_revoke_lease) return error.FakeRevokeLease;
     }
 };
 
