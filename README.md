@@ -108,6 +108,11 @@ responsibilities:
   publish the selected output's actual compositor-space extent, stable name,
   and description, with `zxdg_output_v1.done` for versions 1–2 and the
   associated `wl_output.done` atomicity marker for version 3.
+- [Wlr output management](src/protocol/output_management.zig): each manager
+  receives a backpressure-safe head and mode snapshot, while generation-safe
+  configuration objects enforce complete, one-shot transactions. Ouro accepts
+  test/apply requests for its current fixed output state and explicitly fails
+  unsupported changes rather than reporting an unapplied configuration.
 - [Layer shell](src/protocol/layer_shell.zig): bounded
   `zwlr_layer_shell_v1` roles retain double-buffered anchors, margins,
   exclusive zones, layer, and keyboard-interactivity state; publish exact

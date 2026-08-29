@@ -67,6 +67,7 @@ const protocol_pointer_warp = @import("../protocol/pointer_warp.zig");
 const protocol_security_context = @import("../protocol/security_context.zig");
 const protocol_output = @import("../protocol/output.zig");
 const protocol_xdg_output = @import("../protocol/xdg_output.zig");
+const protocol_output_management = @import("../protocol/output_management.zig");
 const protocol_layer_shell = @import("../protocol/layer_shell.zig");
 const protocol_session_lock = @import("../protocol/session_lock.zig");
 const protocol_cursor_shape = @import("../protocol/cursor_shape.zig");
@@ -201,6 +202,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const SecurityContextAdapter = protocol_security_context.Adapter(protocol);
         const OutputAdapter = protocol_output.Adapter(protocol);
         const XdgOutputAdapter = protocol_xdg_output.Adapter(protocol, OutputAdapter);
+        const OutputManagementAdapter = protocol_output_management.Adapter(protocol);
         const LayerShellAdapter = protocol_layer_shell.Adapter(protocol, Adapter, OutputAdapter);
         const SessionLockAdapter = protocol_session_lock.Adapter(protocol, Adapter, OutputAdapter);
         const CursorShapeAdapter = protocol_cursor_shape.Adapter(protocol);
@@ -358,6 +360,7 @@ pub fn Coordinator(comptime protocol: type) type {
             const gtk_shell: u32 = 1 << 30;
             const workspace: u32 = 1 << 31;
             const xdg_session: u64 = 1 << 32;
+            const output_management: u64 = 1 << 33;
             const all: u64 = decoration | shell | seat | data_device | dmabuf |
                 activation | relative_pointer | fractional_scale | output | core |
                 pointer_constraints | color_management | color_representation |
@@ -365,7 +368,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 shortcuts_inhibit | xdg_foreign | xdg_output | layer_shell | session_lock |
                 idle_notify | tablet | ext_data_control | wlr_data_control | input_method |
                 screencopy | foreign_toplevel_list | image_copy_capture | xdg_toplevel_icon | gtk_shell |
-                workspace | xdg_session;
+                workspace | xdg_session | output_management;
         };
         const Client = struct {
             active: bool = false,
@@ -498,6 +501,7 @@ pub fn Coordinator(comptime protocol: type) type {
             enable_color_protocols: bool = false,
             protocol_output: protocol_output.Config = .{},
             xdg_output: protocol_xdg_output.Config = .{},
+            output_management: protocol_output_management.Config = .{},
             layer_shell: protocol_layer_shell.Config = .{},
             session_lock: protocol_session_lock.Config = .{},
             cursor_shape: protocol_cursor_shape.Config = .{},
@@ -616,6 +620,7 @@ pub fn Coordinator(comptime protocol: type) type {
         security_context_adapter: SecurityContextAdapter,
         output_adapter: OutputAdapter,
         xdg_output_adapter: XdgOutputAdapter,
+        output_management_adapter: OutputManagementAdapter,
         layer_shell_adapter: LayerShellAdapter,
         session_lock_adapter: SessionLockAdapter,
         cursor_shape_adapter: CursorShapeAdapter,
@@ -1190,6 +1195,13 @@ pub fn Coordinator(comptime protocol: type) type {
                 config.xdg_output,
             );
             errdefer self.xdg_output_adapter.deinit();
+            self.output_management_adapter = try OutputManagementAdapter.init(
+                allocator,
+                config.output_management,
+                1,
+                .{ .width = 1, .height = 1, .refresh_millihz = 1 },
+            );
+            errdefer self.output_management_adapter.deinit();
             self.layer_shell_adapter = try LayerShellAdapter.init(
                 allocator,
                 &self.adapter,
@@ -1302,6 +1314,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
             _ = try self.output_adapter.install(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
+            _ = try self.output_management_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
             _ = try self.screencopy_adapter.install(&root.runtime);
@@ -1500,6 +1515,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.session_lock_adapter.deinit();
             self.layer_shell_adapter.deinit();
             self.xdg_output_adapter.deinit();
+            self.output_management_adapter.deinit();
             self.screencopy_adapter.deinit();
             self.output_adapter.deinit();
             self.fractional_scale_adapter.deinit();
@@ -1599,6 +1615,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.xdg_session_adapter.disconnected(peer);
             self.foreign_toplevel_list_adapter.disconnected(peer);
             self.workspace_adapter.disconnected(peer);
+            self.output_management_adapter.disconnected(peer);
             self.image_copy_capture_adapter.disconnected(peer);
             self.image_capture_source_adapter.disconnected(peer);
             self.input_method_adapter.disconnected(peer);
@@ -1969,6 +1986,13 @@ pub fn Coordinator(comptime protocol: type) type {
             if (try self.xdg_output_adapter.request(peer, target, message, fds)) |control| {
                 if (self.xdg_output_adapter.pendingOutbound(peer))
                     self.markProtocol(peer, ProtocolReady.xdg_output);
+                try self.flushProtocol();
+                return control;
+            }
+            if (try self.output_management_adapter.request(peer, target, message, fds)) |control| {
+                try self.consumeOutputManagementCommands();
+                if (self.output_management_adapter.pendingOutbound(peer))
+                    self.markProtocol(peer, ProtocolReady.output_management);
                 try self.flushProtocol();
                 return control;
             }
@@ -3175,6 +3199,19 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (!client.active) continue;
                 const pending = self.workspace_adapter.outputResourcesChanged(client.peer) catch true;
                 if (pending) self.markProtocol(client.peer, ProtocolReady.workspace);
+            }
+        }
+
+        fn consumeOutputManagementCommands(self: *Self) !void {
+            while (self.output_management_adapter.peekCommand()) |command| {
+                // Ouro currently owns one fixed physical output. Testing or
+                // applying its already-active state is a valid no-op; changes
+                // remain rejected until the KMS mode transaction boundary can
+                // apply and roll them back atomically.
+                const result: protocol_output_management.Completion = if (self.output != null and
+                    std.meta.eql(command.desired, self.output_management_adapter.lifecycle.current)) .succeeded else .failed;
+                try self.output_management_adapter.completeCommand(result);
+                self.markProtocol(command.peer, ProtocolReady.output_management);
             }
         }
 
@@ -4510,6 +4547,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 flushed += try self.workspace_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.xdg_output != 0)
                 flushed += try self.xdg_output_adapter.flushOn(peer, objects, &actor.transmit);
+            if (client.protocol_ready & ProtocolReady.output_management != 0)
+                flushed += try self.output_management_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.layer_shell != 0)
                 flushed += try self.layer_shell_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.session_lock != 0)
@@ -4684,6 +4723,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (ready & ProtocolReady.xdg_output != 0 and
                 !self.xdg_output_adapter.pendingOutbound(client.peer))
                 ready &= ~ProtocolReady.xdg_output;
+            if (ready & ProtocolReady.output_management != 0 and
+                !self.output_management_adapter.pendingOutbound(client.peer))
+                ready &= ~ProtocolReady.output_management;
             if (ready & ProtocolReady.layer_shell != 0 and
                 !self.layer_shell_adapter.pendingOutbound(client.peer))
                 ready &= ~ProtocolReady.layer_shell;
@@ -4779,9 +4821,14 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.output.?.planner.output.height,
             );
             self.xdg_output_adapter.publishMode();
+            _ = try self.output_management_adapter.publish(.{
+                .width = @intCast(self.output.?.planner.output.width),
+                .height = @intCast(self.output.?.planner.output.height),
+                .refresh_millihz = @intCast(try std.math.mul(u32, mode.vrefresh, 1000)),
+            });
             try self.recomputeLayerConfigures();
             try self.recomputeSessionLockConfigures();
-            self.markProtocolAll(ProtocolReady.output | ProtocolReady.xdg_output |
+            self.markProtocolAll(ProtocolReady.output | ProtocolReady.xdg_output | ProtocolReady.output_management |
                 ProtocolReady.layer_shell | ProtocolReady.session_lock);
             self.next_output_generation = if (generation == std.math.maxInt(u32))
                 null
@@ -7057,6 +7104,7 @@ pub fn Coordinator(comptime protocol: type) type {
             const layer_shell_removed = self.layer_shell_adapter.resourceRemoved(handle, object);
             const session_lock_removed = self.session_lock_adapter.resourceRemoved(handle, object);
             _ = self.xdg_output_adapter.resourceRemoved(handle, object);
+            _ = self.output_management_adapter.resourceRemoved(handle, object);
             _ = self.output_adapter.resourceRemoved(handle, object);
             _ = self.cursor_shape_adapter.resourceRemoved(handle, object);
             _ = self.input_method_adapter.resourceRemoved(handle, object);

@@ -318,7 +318,7 @@ test "shell-input: generated transient seat publishes before ready and retires i
     root_config.runtime.object_capacity = 32;
     root_config.runtime.object_quota = 24;
     root_config.runtime.registry_capacity = 1;
-    root_config.runtime.max_globals = 64;
+    root_config.runtime.max_globals = 65;
     const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), root_config);
     var config = physical_fixture.coordinatorConfig();
     config.router_capacity = 24;
