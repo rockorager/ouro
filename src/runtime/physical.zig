@@ -17,6 +17,7 @@ const session_platform = @import("../backend/platform.zig");
 const input_api = @import("../backend/input/backend.zig");
 const input_platform = @import("../backend/input/platform.zig");
 const drm = @import("../backend/drm/manager.zig");
+const drm_gamma = @import("../backend/drm/gamma.zig");
 const drm_platform = @import("../backend/drm/platform.zig");
 const gbm = @import("../backend/gbm.zig");
 const kms = @import("../backend/drm/output.zig");
@@ -69,6 +70,7 @@ const protocol_output = @import("../protocol/output.zig");
 const protocol_xdg_output = @import("../protocol/xdg_output.zig");
 const protocol_output_management = @import("../protocol/output_management.zig");
 const protocol_output_power = @import("../protocol/output_power.zig");
+const protocol_gamma_control = @import("../protocol/gamma_control.zig");
 const protocol_layer_shell = @import("../protocol/layer_shell.zig");
 const protocol_session_lock = @import("../protocol/session_lock.zig");
 const protocol_cursor_shape = @import("../protocol/cursor_shape.zig");
@@ -206,6 +208,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const OutputManagementAdapter = protocol_output_management.Adapter(protocol);
         const PhysicalOutputId = enum { physical };
         const OutputPowerAdapter = protocol_output_power.Adapter(protocol, PhysicalOutputId, Self);
+        const GammaControlAdapter = protocol_gamma_control.Adapter(protocol, PhysicalOutputId, Self);
         const LayerShellAdapter = protocol_layer_shell.Adapter(protocol, Adapter, OutputAdapter);
         const SessionLockAdapter = protocol_session_lock.Adapter(protocol, Adapter, OutputAdapter);
         const CursorShapeAdapter = protocol_cursor_shape.Adapter(protocol);
@@ -371,6 +374,7 @@ pub fn Coordinator(comptime protocol: type) type {
             const xdg_session: u64 = 1 << 32;
             const output_management: u64 = 1 << 33;
             const output_power: u64 = 1 << 34;
+            const gamma_control: u64 = 1 << 35;
             const all: u64 = decoration | shell | seat | data_device | dmabuf |
                 activation | relative_pointer | fractional_scale | output | core |
                 pointer_constraints | color_management | color_representation |
@@ -378,7 +382,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 shortcuts_inhibit | xdg_foreign | xdg_output | layer_shell | session_lock |
                 idle_notify | tablet | ext_data_control | wlr_data_control | input_method |
                 screencopy | foreign_toplevel_list | image_copy_capture | xdg_toplevel_icon | gtk_shell |
-                workspace | xdg_session | output_management | output_power;
+                workspace | xdg_session | output_management | output_power | gamma_control;
         };
         const Client = struct {
             active: bool = false,
@@ -423,6 +427,7 @@ pub fn Coordinator(comptime protocol: type) type {
             session: session_platform.Platform = session_platform.real,
             input: ?input_platform.Platform = null,
             drm: drm_platform.Platform = drm_platform.real,
+            gamma: drm_gamma.Platform = drm_gamma.real,
             output: output_api.Platforms = .{},
         };
 
@@ -513,6 +518,7 @@ pub fn Coordinator(comptime protocol: type) type {
             xdg_output: protocol_xdg_output.Config = .{},
             output_management: protocol_output_management.Config = .{},
             output_power: protocol_output_power.Config = .{},
+            gamma_control: protocol_gamma_control.Config = .{},
             layer_shell: protocol_layer_shell.Config = .{},
             session_lock: protocol_session_lock.Config = .{},
             cursor_shape: protocol_cursor_shape.Config = .{},
@@ -575,6 +581,7 @@ pub fn Coordinator(comptime protocol: type) type {
         input_method_key_owners: [0x300]?protocol_input_method.GrabId = [_]?protocol_input_method.GrabId{null} ** 0x300,
         processing_virtual_pointer: bool = false,
         manager: drm.Manager,
+        gamma_platform: drm_gamma.Platform,
         shm: Shm,
         adapter: Adapter,
         subcompositor_adapter: SubcompositorAdapter,
@@ -633,6 +640,8 @@ pub fn Coordinator(comptime protocol: type) type {
         xdg_output_adapter: XdgOutputAdapter,
         output_management_adapter: OutputManagementAdapter,
         output_power_adapter: OutputPowerAdapter,
+        gamma_control_adapter: GammaControlAdapter,
+        gamma_owner: ?drm_gamma.Owner = null,
         output_management_modes: []protocol_output_management.ModeState,
         layer_shell_adapter: LayerShellAdapter,
         session_lock_adapter: SessionLockAdapter,
@@ -880,6 +889,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.output_drain_started = false;
             self.output_reconfigure = null;
             self.output_power_transition = null;
+            self.gamma_owner = null;
             self.stopping = false;
             self.session_disable_pending = false;
             self.stats = .{};
@@ -905,6 +915,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 config.drm,
             );
             errdefer self.manager.deinit() catch {};
+            self.gamma_platform = platforms.gamma;
             self.shm = try Shm.init(allocator, config.shm);
             errdefer self.shm.deinit(allocator);
             self.adapter = try Adapter.init(
@@ -1226,6 +1237,8 @@ pub fn Coordinator(comptime protocol: type) type {
             errdefer self.output_management_adapter.deinit();
             self.output_power_adapter = try OutputPowerAdapter.init(allocator, self, config.output_power);
             errdefer self.output_power_adapter.deinit();
+            self.gamma_control_adapter = try GammaControlAdapter.init(allocator, self, config.gamma_control);
+            errdefer self.gamma_control_adapter.deinit();
             self.layer_shell_adapter = try LayerShellAdapter.init(
                 allocator,
                 &self.adapter,
@@ -1344,6 +1357,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
             _ = try self.output_power_adapter.install(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
+            _ = try self.gamma_control_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
             _ = try self.screencopy_adapter.install(&root.runtime);
@@ -1510,6 +1526,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (self.input) |input| input.destroy() catch |err| {
                 first_error = err;
             };
+            self.retireGammaOwner() catch |err| {
+                if (first_error == null) first_error = err;
+            };
             self.manager.deinit() catch |err| {
                 if (first_error == null) first_error = err;
             };
@@ -1544,6 +1563,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.xdg_output_adapter.deinit();
             self.output_management_adapter.deinit();
             self.output_power_adapter.deinit();
+            self.gamma_control_adapter.deinit();
             self.allocator.free(self.output_management_modes);
             self.screencopy_adapter.deinit();
             self.output_adapter.deinit();
@@ -1646,6 +1666,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.workspace_adapter.disconnected(peer);
             self.output_management_adapter.disconnected(peer);
             self.output_power_adapter.disconnected(peer);
+            self.gamma_control_adapter.disconnected(peer);
             self.image_copy_capture_adapter.disconnected(peer);
             self.image_capture_source_adapter.disconnected(peer);
             self.input_method_adapter.disconnected(peer);
@@ -2043,6 +2064,12 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.consumeOutputPowerCommands();
                 if (self.output_power_adapter.pendingOutbound(peer))
                     self.markProtocol(peer, ProtocolReady.output_power);
+                try self.flushProtocol();
+                return control;
+            }
+            if (try self.gamma_control_adapter.request(peer, target, message, fds)) |control| {
+                if (self.gamma_control_adapter.pendingOutbound(peer))
+                    self.markProtocol(peer, ProtocolReady.gamma_control);
                 try self.flushProtocol();
                 return control;
             }
@@ -3306,6 +3333,52 @@ pub fn Coordinator(comptime protocol: type) type {
             };
         }
 
+        pub fn resolveGammaOutput(
+            self: *Self,
+            peer: wayring.io_uring.Peer,
+            handle: wayring.objects.Handle,
+            object: *wayring.objects.Object,
+        ) !struct { id: PhysicalOutputId, size: u32 } {
+            _ = try self.output_adapter.reference(peer, handle, object.*);
+            const owner = if (self.gamma_owner) |*value| value else return error.Unsupported;
+            return .{ .id = .physical, .size = try owner.size() };
+        }
+
+        pub fn applyGamma(self: *Self, output: PhysicalOutputId, ramps: []const u16) !void {
+            if (output != .physical) return error.InvalidOutput;
+            const owner = if (self.gamma_owner) |*value| value else return error.Unsupported;
+            try owner.apply(owner.generation, ramps);
+        }
+
+        pub fn resetGamma(self: *Self, output: PhysicalOutputId) !void {
+            if (output != .physical) return error.InvalidOutput;
+            const owner = if (self.gamma_owner) |*value| value else return error.Unsupported;
+            try owner.restore(owner.generation);
+        }
+
+        fn ensureGammaOwner(self: *Self, snapshot: drm.Snapshot) !void {
+            const crtc = snapshot.selectedCrtc().id;
+            if (self.gamma_owner) |owner| {
+                if (owner.generation != snapshot.handle.generation or owner.crtc != crtc)
+                    return error.StaleGammaOwner;
+                return;
+            }
+            self.gamma_owner = .{
+                .allocator = self.allocator,
+                .platform = self.gamma_platform,
+                .fd = try self.manager.deviceFd(snapshot.handle),
+                .crtc = crtc,
+                .generation = snapshot.handle.generation,
+            };
+        }
+
+        fn retireGammaOwner(self: *Self) !void {
+            const owner = if (self.gamma_owner) |*value| value else return;
+            try owner.restore(owner.generation);
+            owner.deinit();
+            self.gamma_owner = null;
+        }
+
         fn consumeOutputPowerCommands(self: *Self) !void {
             if (self.output_power_transition != null or self.output_reconfigure != null) return;
             while (self.output_power_adapter.peekCommand()) |command| {
@@ -4075,6 +4148,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 !std.mem.eql(u8, name, "zwlr_foreign_toplevel_manager_v1") and
                 !std.mem.eql(u8, name, "ext_workspace_manager_v1") and
                 !std.mem.eql(u8, name, "zwlr_output_power_manager_v1") and
+                !std.mem.eql(u8, name, "zwlr_gamma_control_manager_v1") and
                 !std.mem.eql(u8, name, "ext_output_image_capture_source_manager_v1") and
                 !std.mem.eql(u8, name, "ext_foreign_toplevel_image_capture_source_manager_v1") and
                 !std.mem.eql(u8, name, "ext_image_copy_capture_manager_v1");
@@ -4703,6 +4777,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 flushed += try self.output_management_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.output_power != 0)
                 flushed += try self.output_power_adapter.flushOn(peer, objects, &actor.transmit);
+            if (client.protocol_ready & ProtocolReady.gamma_control != 0)
+                flushed += try self.gamma_control_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.layer_shell != 0)
                 flushed += try self.layer_shell_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.session_lock != 0)
@@ -4884,6 +4960,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (ready & ProtocolReady.output_power != 0 and
                 !self.output_power_adapter.pendingOutbound(client.peer))
                 ready &= ~ProtocolReady.output_power;
+            if (ready & ProtocolReady.gamma_control != 0 and
+                !self.gamma_control_adapter.pendingOutbound(client.peer))
+                ready &= ~ProtocolReady.gamma_control;
             if (ready & ProtocolReady.layer_shell != 0 and
                 !self.layer_shell_adapter.pendingOutbound(client.peer))
                 ready &= ~ProtocolReady.layer_shell;
@@ -4909,7 +4988,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 => return error.DrmHardwareUnavailable,
                 else => return err,
             }) orelse return error.DrmHardwareUnavailable;
-            errdefer self.manager.remove() catch {};
+            errdefer {
+                self.retireGammaOwner() catch {};
+                self.manager.remove() catch {};
+            }
             const snapshot = try self.manager.snapshot(handle);
             try self.activateOutput(snapshot);
         }
@@ -4964,6 +5046,7 @@ pub fn Coordinator(comptime protocol: type) type {
             if (self.render_device == null)
                 self.render_device = self.output.?.takeRenderDevice();
             try self.ensureExplicitSync(snapshot.handle);
+            try self.ensureGammaOwner(snapshot);
             const work_area: @import("../scene/geometry.zig").Rect = .{
                 .x = 0,
                 .y = 0,
@@ -7119,7 +7202,10 @@ pub fn Coordinator(comptime protocol: type) type {
                         if (!self.stopping) {
                             try self.output_power_adapter.outputRemoved(.physical);
                             self.markProtocolAll(ProtocolReady.output_power);
+                            try self.gamma_control_adapter.outputRemoved(.physical);
+                            self.markProtocolAll(ProtocolReady.gamma_control);
                         }
+                        try self.retireGammaOwner();
                         try self.manager.remove();
                     }
                 }
@@ -7363,6 +7449,7 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.xdg_output_adapter.resourceRemoved(handle, object);
             _ = self.output_management_adapter.resourceRemoved(handle, object);
             _ = self.output_power_adapter.resourceRemoved(handle, object);
+            _ = self.gamma_control_adapter.resourceRemoved(handle, object);
             _ = self.output_adapter.resourceRemoved(handle, object);
             _ = self.cursor_shape_adapter.resourceRemoved(handle, object);
             _ = self.input_method_adapter.resourceRemoved(handle, object);

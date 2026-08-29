@@ -119,6 +119,9 @@ responsibilities:
   peer-owned `wl_output` controls serialize power and mode transitions. Power
   off drains only the active output pipeline while retaining the DRM card,
   renderer, scene ownership, and selected topology for exact recreation.
+- [Wlr gamma control](src/protocol/gamma_control.zig): validates exact regular-file
+  native-endian LUT payloads from offset zero. The DRM boundary snapshots the
+  hardware ramps before first mutation and retains restoration state on errors.
 - [Layer shell](src/protocol/layer_shell.zig): bounded
   `zwlr_layer_shell_v1` roles retain double-buffered anchors, margins,
   exclusive zones, layer, and keyboard-interactivity state; publish exact
