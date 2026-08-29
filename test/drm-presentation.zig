@@ -248,6 +248,78 @@ test "generated client leases a secondary connector and observes external revoca
     try root.deinit();
 }
 
+test "generated session lock publishes only after presentation and client loss stays fail closed" {
+    const allocator = std.testing.allocator;
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-r15-session-lock-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), compositorConfig());
+    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), coordinatorConfig());
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
+    try coordinator.start(&loop);
+
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(allocator, .{ .entries = 16, .flags = 0 }, clientReactorConfig());
+    var client = try ClientConnection.attach(
+        allocator,
+        &reactor,
+        try wayring.unix_socket.connect(path),
+        .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 },
+        .{ .max_objects = 32, .max_client_ids = 31 },
+    );
+    var driver = ClientDriver.init(&client);
+    const actor = try client.actor();
+    const registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null);
+    var handler: SessionLockClientHandler = .{
+        .objects = &client.objects,
+        .queue = &actor.transmit,
+        .registry = registry,
+    };
+    try submitClient(&reactor, &driver, &handler);
+
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.locked == 1) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expectEqual(@as(usize, 1), handler.configures);
+    try std.testing.expectEqual(@as(usize, 1), handler.locked);
+    try std.testing.expectEqual(@as(usize, 0), handler.finished);
+    try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+    try std.testing.expectEqual(@as(usize, 1), coordinator.stats.presented);
+    try std.testing.expect(coordinator.session_lock_adapter.isFailClosed());
+
+    _ = try client.prepareClose();
+    try submitClient(&reactor, &driver, &handler);
+    const client_progress = try drainClient(&reactor, &driver, &handler);
+    try std.testing.expect(client_progress.quiescent);
+    try client.deinit(allocator);
+    reactor.deinit(allocator);
+    for (0..256) |_| {
+        _ = try loop.turn(coordinator);
+        if (coordinator.client_count == 0) break;
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+    }
+    try std.testing.expectEqual(@as(usize, 0), coordinator.client_count);
+    try std.testing.expect(coordinator.session_lock_adapter.activeLock() == null);
+    try std.testing.expect(coordinator.session_lock_adapter.isFailClosed());
+    try std.testing.expect(!coordinator.stopping);
+
+    try coordinator.requestStop();
+    try drainServer(root, coordinator, &loop);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
 test "no discovered DRM card fails startup and drains honestly" {
     const allocator = std.testing.allocator;
     var fixture = try Fixture.init();
@@ -830,6 +902,136 @@ const ClientHandler = struct {
                 .a = std.math.maxInt(u32),
             },
         )).id;
+    }
+};
+
+const SessionLockClientHandler = struct {
+    objects: *wayring.objects.ClientObjects,
+    queue: *wayring.tx.Queue,
+    registry: wayring.objects.Handle,
+    compositor: ?wayring.objects.Handle = null,
+    shm: ?wayring.objects.Handle = null,
+    output: ?wayring.objects.Handle = null,
+    manager: ?wayring.objects.Handle = null,
+    lock: ?wayring.objects.Handle = null,
+    lock_surface: ?wayring.objects.Handle = null,
+    surface: ?wayring.objects.Handle = null,
+    buffer: ?wayring.objects.Handle = null,
+    output_ready: bool = false,
+    lock_requested: bool = false,
+    configures: usize = 0,
+    locked: usize = 0,
+    finished: usize = 0,
+    event_failures: usize = 0,
+
+    pub fn eventError(self: *SessionLockClientHandler, _: wayring.io_uring.Peer, _: ClientCore.EventFailure) void {
+        self.event_failures += 1;
+    }
+
+    pub fn event(self: *SessionLockClientHandler, target: wayring.objects.Dispatch, message: wayring.wire.Message, fds: *wayring.ancillary.FdQueue) !wayring.dispatch.Control {
+        if (target.object.interface == &ClientCore.Registry.info) {
+            switch (try ClientCore.decodeRegistryEvent(self.objects, self.registry, message, fds)) {
+                .global => |global| {
+                    if (std.mem.eql(u8, global.interface, protocol.wl_compositor.info.name))
+                        self.compositor = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wl_compositor.info, @min(global.version, 7), null);
+                    if (std.mem.eql(u8, global.interface, protocol.wl_shm.info.name))
+                        self.shm = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wl_shm.info, @min(global.version, 2), null);
+                    if (std.mem.eql(u8, global.interface, protocol.wl_output.info.name))
+                        self.output = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wl_output.info, @min(global.version, 4), null);
+                    if (std.mem.eql(u8, global.interface, protocol.ext_session_lock_manager_v1.info.name))
+                        self.manager = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.ext_session_lock_manager_v1.info, 1, null);
+                },
+                .global_remove => {},
+            }
+            try self.maybeRequestLock();
+        } else if (target.object.interface == &protocol.wl_shm.info) {
+            _ = try protocol.wl_shm.decodeEvent(message, fds);
+        } else if (target.object.interface == &protocol.wl_output.info) {
+            switch (try protocol.wl_output.decodeEvent(message, fds)) {
+                .done => {
+                    self.output_ready = true;
+                    try self.maybeRequestLock();
+                },
+                else => {},
+            }
+        } else if (target.object.interface == &protocol.ext_session_lock_v1.info) {
+            switch (try protocol.ext_session_lock_v1.decodeEvent(message, fds)) {
+                .locked => self.locked += 1,
+                .finished => self.finished += 1,
+            }
+        } else if (target.object.interface == &protocol.ext_session_lock_surface_v1.info) {
+            switch (try protocol.ext_session_lock_surface_v1.decodeEvent(message, fds)) {
+                .configure => |value| try self.commitConfigured(value.serial, value.width, value.height),
+            }
+        } else if (target.object.interface == &protocol.wl_surface.info) {
+            _ = try protocol.wl_surface.decodeEvent(message, fds);
+        } else if (target.object.interface == &protocol.wl_buffer.info) {
+            _ = try protocol.wl_buffer.decodeEvent(message, fds);
+        } else if (target.object.interface == &ClientCore.Display.info) {
+            switch (try ClientCore.decodeDisplayEvent(self.objects, message, fds)) {
+                .delete_id => {},
+                .@"error" => return error.ServerProtocolError,
+            }
+        } else return error.UnexpectedEvent;
+        return .continue_dispatch;
+    }
+
+    fn maybeRequestLock(self: *SessionLockClientHandler) !void {
+        if (self.lock_requested or !self.output_ready or self.compositor == null or
+            self.shm == null or self.output == null or self.manager == null) return;
+        self.lock = (try protocol.ext_session_lock_manager_v1.construct_lock(
+            self.objects,
+            self.queue,
+            self.manager.?,
+            .{},
+        )).id;
+        self.surface = (try protocol.wl_compositor.construct_create_surface(
+            self.objects,
+            self.queue,
+            self.compositor.?,
+            .{},
+        )).id;
+        self.lock_surface = (try protocol.ext_session_lock_v1.construct_get_lock_surface(
+            self.objects,
+            self.queue,
+            self.lock.?,
+            .{ .surface = self.surface.?.id, .output = self.output.?.id },
+        )).id;
+        self.lock_requested = true;
+    }
+
+    fn commitConfigured(self: *SessionLockClientHandler, serial: u32, width: u32, height: u32) !void {
+        try std.testing.expectEqual(@as(u32, 3), width);
+        try std.testing.expectEqual(@as(u32, 2), height);
+        try protocol.ext_session_lock_surface_v1.encodeRequest(
+            self.queue,
+            self.lock_surface.?.id,
+            .{ .ack_configure = .{ .serial = serial } },
+        );
+        const descriptor = try ordinaryMemfd(4096, 0, &pixels);
+        const pool = try protocol.wl_shm.construct_create_pool(
+            self.objects,
+            self.queue,
+            self.shm.?,
+            .{ .fd = descriptor, .size = 4096 },
+        );
+        self.buffer = (try protocol.wl_shm_pool.construct_create_buffer(
+            self.objects,
+            self.queue,
+            pool.id,
+            .{
+                .offset = 0,
+                .width = 3,
+                .height = 2,
+                .stride = 16,
+                .format = .xrgb8888,
+            },
+        )).id;
+        try wayring.client.sendRequest(protocol.wl_shm_pool, self.objects, self.queue, pool.id, .{ .destroy = .{} });
+        try wayring.client.sendRequest(protocol.wl_surface, self.objects, self.queue, self.surface.?, .{ .attach = .{ .buffer = self.buffer.?.id, .x = 0, .y = 0 } });
+        try wayring.client.sendRequest(protocol.wl_surface, self.objects, self.queue, self.surface.?, .{ .damage_buffer = .{ .x = 0, .y = 0, .width = 3, .height = 2 } });
+        try wayring.client.sendRequest(protocol.wl_surface, self.objects, self.queue, self.surface.?, .{ .commit = .{} });
+        self.configures += 1;
     }
 };
 
