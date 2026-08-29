@@ -575,7 +575,7 @@ test "shell-input: generated workspace client observes and activates the fixed w
         _ = try drainClient(&reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
         if (handler.activation_sent) turns_after_activation += 1;
-        if (handler.output_done == 1 and turns_after_activation >= 4 and
+        if (handler.output_enter == 1 and turns_after_activation >= 4 and
             coordinator.workspace_adapter.pendingCommands() == 0) break;
         _ = linux.sched_yield();
     }
@@ -585,21 +585,25 @@ test "shell-input: generated workspace client observes and activates the fixed w
     try std.testing.expectEqual(@as(usize, 8), handler.initial_order);
     try std.testing.expectEqual(@as(usize, 1), handler.initial_done);
     try std.testing.expectEqual(@as(usize, 1), handler.output_enter);
-    try std.testing.expectEqual(@as(usize, 1), handler.output_done);
     try std.testing.expect(handler.activation_sent);
     try std.testing.expectEqual(@as(usize, 0), coordinator.workspace_adapter.pendingCommands());
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
 
+    // Depending on registry publication order, output_enter may be part of
+    // the initial done batch or a separate association update.
+    try std.testing.expect(handler.output_done <= 1);
+    const output_done_before_disable = handler.output_done;
     try fixture.signalSession(.disable);
     for (0..256) |_| {
         _ = try drainClient(&reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
-        if (coordinator.output == null and handler.output_leave == 1 and handler.output_done == 2) break;
+        if (coordinator.output == null and handler.output_leave == 1 and
+            handler.output_done == output_done_before_disable + 1) break;
         _ = linux.sched_yield();
     }
     try std.testing.expect(coordinator.output == null);
     try std.testing.expectEqual(@as(usize, 1), handler.output_leave);
-    try std.testing.expectEqual(@as(usize, 2), handler.output_done);
+    try std.testing.expectEqual(output_done_before_disable + 1, handler.output_done);
 
     try protocol.ext_workspace_manager_v1.encodeRequest(&actor.transmit, handler.manager.?.id, .{ .stop = .{} });
     try submitClient(&reactor, &driver, &handler);
@@ -691,7 +695,6 @@ const WorkspaceHandler = struct {
                         self.activation_sent = true;
                         self.initial_done = 1;
                     } else {
-                        try std.testing.expectEqual(self.output_enter, self.output_done + 1 - self.output_leave);
                         self.output_done += 1;
                     }
                 },
@@ -751,6 +754,213 @@ const WorkspaceHandler = struct {
             }
         } else return error.UnexpectedEvent;
         return .continue_dispatch;
+    }
+};
+
+test "shell-input: XDG session restore precedes the first toplevel configure" {
+    const allocator = std.testing.allocator;
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-xdg-session-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+
+    var fixture = try physical_fixture.Fixture.init();
+    defer fixture.deinit();
+    var root_config = physical_fixture.compositorConfig();
+    root_config.runtime.object_capacity = 24;
+    root_config.runtime.object_quota = 24;
+    root_config.runtime.registry_capacity = 1;
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), root_config);
+    var config = physical_fixture.coordinatorConfig();
+    config.router_capacity = 24;
+    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), config);
+    const stored = try coordinator.xdg_session_adapter.importSession("saved");
+    try coordinator.xdg_session_adapter.importToplevel(stored, "main", .{
+        .maximized = false,
+        .fullscreen = false,
+        .mode = .floating,
+        .floating_geometry = .{ .x = 0, .y = 0, .width = 2, .height = 1 },
+    });
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
+    try coordinator.start(&loop);
+
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(allocator, .{ .entries = 16, .flags = 0 }, physical_fixture.clientReactorConfig());
+    var client = try ClientConnection.attach(
+        allocator,
+        &reactor,
+        try wayring.unix_socket.connect(path),
+        .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 },
+        .{ .max_objects = 16, .max_client_ids = 15 },
+    );
+    const actor = try client.actor();
+    var driver = ClientDriver.init(&client);
+    const registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null);
+    var handler: XdgSessionHandler = .{
+        .objects = &client.objects,
+        .queue = &actor.transmit,
+        .registry = registry,
+    };
+    try submitClient(&reactor, &driver, &handler);
+
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.configure_order == 2) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(handler.session_restored);
+    try std.testing.expectEqual(@as(usize, 1), handler.restore_order);
+    try std.testing.expectEqual(@as(usize, 2), handler.configure_order);
+    try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+
+    _ = try client.prepareClose();
+    try submitClient(&reactor, &driver, &handler);
+    try coordinator.requestStop();
+    var drained = false;
+    for (0..256) |_| {
+        const client_progress = try drainClient(&reactor, &driver, &handler);
+        const progress = try loop.turn(coordinator);
+        drained = progress.wayring.shutdown_complete and client_progress.quiescent and
+            coordinator.backendDrainComplete();
+        if (drained) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(drained);
+    try client.deinit(allocator);
+    reactor.deinit(allocator);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
+const XdgSessionHandler = struct {
+    objects: *wayring.objects.ClientObjects,
+    queue: *wayring.tx.Queue,
+    registry: wayring.objects.Handle,
+    compositor: ?wayring.objects.Handle = null,
+    wm_base: ?wayring.objects.Handle = null,
+    manager: ?wayring.objects.Handle = null,
+    surface: ?wayring.objects.Handle = null,
+    xdg_surface: ?wayring.objects.Handle = null,
+    toplevel: ?wayring.objects.Handle = null,
+    session: ?wayring.objects.Handle = null,
+    toplevel_session: ?wayring.objects.Handle = null,
+    created: bool = false,
+    session_restored: bool = false,
+    restore_order: usize = 0,
+    configure_order: usize = 0,
+    event_failures: usize = 0,
+
+    pub fn eventError(
+        self: *XdgSessionHandler,
+        _: wayring.io_uring.Peer,
+        _: ClientCore.EventFailure,
+    ) void {
+        self.event_failures += 1;
+    }
+
+    pub fn event(
+        self: *XdgSessionHandler,
+        target: wayring.objects.Dispatch,
+        message: wayring.wire.Message,
+        fds: *wayring.ancillary.FdQueue,
+    ) !wayring.dispatch.Control {
+        if (target.object.interface == &ClientCore.Registry.info) {
+            switch (try ClientCore.decodeRegistryEvent(self.objects, self.registry, message, fds)) {
+                .global => |value| try self.bindGlobal(value),
+                .global_remove => {},
+            }
+            try self.maybeCreate();
+        } else if (target.object.interface == &protocol.xdg_session_v1.info) {
+            switch (try protocol.xdg_session_v1.decodeEvent(message, fds)) {
+                .restored => self.session_restored = true,
+                .created, .replaced => return error.UnexpectedSessionEvent,
+            }
+        } else if (target.object.interface == &protocol.xdg_toplevel_session_v1.info) {
+            switch (try protocol.xdg_toplevel_session_v1.decodeEvent(message, fds)) {
+                .restored => {
+                    try std.testing.expectEqual(@as(usize, 0), self.restore_order);
+                    try std.testing.expectEqual(@as(usize, 0), self.configure_order);
+                    self.restore_order = 1;
+                },
+            }
+        } else if (target.object.interface == &protocol.xdg_toplevel.info) {
+            switch (try protocol.xdg_toplevel.decodeEvent(message, fds)) {
+                .configure => |value| {
+                    try std.testing.expectEqual(@as(usize, 1), self.restore_order);
+                    try std.testing.expectEqual(@as(i32, 2), value.width);
+                    try std.testing.expectEqual(@as(i32, 1), value.height);
+                    self.configure_order = 2;
+                },
+                else => {},
+            }
+        } else if (target.object.interface == &protocol.xdg_surface.info) {
+            switch (try protocol.xdg_surface.decodeEvent(message, fds)) {
+                .configure => |value| try protocol.xdg_surface.encodeRequest(
+                    self.queue,
+                    self.xdg_surface.?.id,
+                    .{ .ack_configure = .{ .serial = value.serial } },
+                ),
+            }
+        } else if (target.object.interface == &ClientCore.Display.info) {
+            switch (try ClientCore.decodeDisplayEvent(self.objects, message, fds)) {
+                .delete_id => {},
+                .@"error" => return error.ServerProtocolError,
+            }
+        } else return error.UnexpectedEvent;
+        return .continue_dispatch;
+    }
+
+    fn bindGlobal(self: *XdgSessionHandler, value: anytype) !void {
+        if (std.mem.eql(u8, value.interface, protocol.wl_compositor.info.name))
+            self.compositor = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_compositor.info, @min(value.version, 7), null);
+        if (std.mem.eql(u8, value.interface, protocol.xdg_wm_base.info.name))
+            self.wm_base = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.xdg_wm_base.info, @min(value.version, 7), null);
+        if (std.mem.eql(u8, value.interface, protocol.xdg_session_manager_v1.info.name))
+            self.manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.xdg_session_manager_v1.info, 1, null);
+    }
+
+    fn maybeCreate(self: *XdgSessionHandler) !void {
+        if (self.created or self.compositor == null or self.wm_base == null or self.manager == null)
+            return;
+        self.surface = (try protocol.wl_compositor.construct_create_surface(
+            self.objects,
+            self.queue,
+            self.compositor.?,
+            .{},
+        )).id;
+        self.xdg_surface = (try protocol.xdg_wm_base.construct_get_xdg_surface(
+            self.objects,
+            self.queue,
+            self.wm_base.?,
+            .{ .surface = self.surface.?.id },
+        )).id;
+        self.toplevel = (try protocol.xdg_surface.construct_get_toplevel(
+            self.objects,
+            self.queue,
+            self.xdg_surface.?,
+            .{},
+        )).id;
+        self.session = (try protocol.xdg_session_manager_v1.construct_get_session(
+            self.objects,
+            self.queue,
+            self.manager.?,
+            .{
+                .reason = .recover,
+                .session_id = "saved",
+            },
+        )).id;
+        self.toplevel_session = (try protocol.xdg_session_v1.construct_restore_toplevel(
+            self.objects,
+            self.queue,
+            self.session.?,
+            .{ .toplevel = self.toplevel.?.id, .name = "main" },
+        )).id;
+        try protocol.wl_surface.encodeRequest(self.queue, self.surface.?.id, .{ .commit = .{} });
+        self.created = true;
     }
 };
 

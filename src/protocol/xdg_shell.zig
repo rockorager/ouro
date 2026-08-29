@@ -604,6 +604,11 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             return event;
         }
 
+        pub fn peekEvent(adapter: *const Self) ?Event {
+            if (adapter.event_len == 0) return null;
+            return adapter.events[adapter.event_head];
+        }
+
         pub fn metadata(adapter: *Self, id: ToplevelId) !Metadata {
             const slot = try adapter.resolveToplevel(id);
             return .{

@@ -42,6 +42,7 @@ const protocol_linux_dmabuf = @import("../protocol/linux_dmabuf.zig");
 const protocol_linux_drm_syncobj = @import("../protocol/linux_drm_syncobj.zig");
 const drm_syncobj = @import("../drm_syncobj.zig");
 const protocol_xdg_activation = @import("../protocol/xdg_activation.zig");
+const protocol_xdg_session_management = @import("../protocol/xdg_session_management.zig");
 const protocol_xdg_decoration = @import("../protocol/xdg_decoration.zig");
 const protocol_xdg_dialog = @import("../protocol/xdg_dialog.zig");
 const protocol_xdg_toplevel_tag = @import("../protocol/xdg_toplevel_tag.zig");
@@ -161,6 +162,11 @@ pub fn Coordinator(comptime protocol: type) type {
         const SubcompositorAdapter = protocol_subcompositor.Adapter(protocol, Adapter);
         const ShellAdapter = xdg_shell.Adapter(protocol, Adapter);
         const Desktop = desktop_model.Desktop(ShellAdapter);
+        const XdgSessionAdapter = protocol_xdg_session_management.Adapter(
+            protocol,
+            ShellAdapter,
+            Desktop.RestorableState,
+        );
         const Interaction = interaction_model.Interaction(Desktop);
         const SeatAdapter = protocol_seat.Adapter(protocol, Adapter);
         const DataDeviceAdapter = protocol_data_device.Adapter(protocol);
@@ -349,19 +355,20 @@ pub fn Coordinator(comptime protocol: type) type {
             const xdg_toplevel_icon: u32 = 1 << 29;
             const gtk_shell: u32 = 1 << 30;
             const workspace: u32 = 1 << 31;
-            const all: u32 = decoration | shell | seat | data_device | dmabuf |
+            const xdg_session: u64 = 1 << 32;
+            const all: u64 = decoration | shell | seat | data_device | dmabuf |
                 activation | relative_pointer | fractional_scale | output | core |
                 pointer_constraints | color_management | color_representation |
                 primary_selection | text_input | pointer_gestures |
                 shortcuts_inhibit | xdg_foreign | xdg_output | layer_shell | session_lock |
                 idle_notify | tablet | ext_data_control | wlr_data_control | input_method |
                 screencopy | foreign_toplevel_list | image_copy_capture | xdg_toplevel_icon | gtk_shell |
-                workspace;
+                workspace | xdg_session;
         };
         const Client = struct {
             active: bool = false,
             peer: wayring.io_uring.Peer = undefined,
-            protocol_ready: u32 = 0,
+            protocol_ready: u64 = 0,
         };
         const Candidate = struct {
             peer: ?wayring.io_uring.Peer,
@@ -429,6 +436,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .outstanding_configure_capacity = 16,
                 .metadata_bytes = 256,
             },
+            xdg_session: protocol_xdg_session_management.Config = .{},
             desktop: desktop_model.Config = .{
                 .toplevel_capacity = 8,
                 .popup_capacity = 8,
@@ -553,6 +561,7 @@ pub fn Coordinator(comptime protocol: type) type {
         adapter: Adapter,
         subcompositor_adapter: SubcompositorAdapter,
         shell_adapter: ShellAdapter,
+        xdg_session_adapter: XdgSessionAdapter,
         desktop: Desktop,
         interaction: Interaction,
         seat_adapter: SeatAdapter,
@@ -879,6 +888,14 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.subcompositor_adapter.connect();
             self.shell_adapter = try ShellAdapter.init(allocator, &self.adapter, config.shell);
             errdefer self.shell_adapter.deinit();
+            self.xdg_session_adapter = try XdgSessionAdapter.init(
+                allocator,
+                &self.shell_adapter,
+                config.xdg_session,
+                .{ .context = self, .resolve = resolveSessionToplevel },
+                .{ .context = self, .generate = generateSessionId },
+            );
+            errdefer self.xdg_session_adapter.deinit();
             self.toplevel_icon_adapter = try ToplevelIconAdapter.init(
                 allocator,
                 &self.shell_adapter,
@@ -1240,6 +1257,9 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = try self.shell_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
+            _ = try self.xdg_session_adapter.install(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
             _ = try self.foreign_toplevel_list_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
@@ -1492,6 +1512,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.workspace_adapter.deinit();
             self.image_copy_capture_adapter.deinit();
             self.image_capture_source_adapter.deinit();
+            self.xdg_session_adapter.deinit();
             self.shell_adapter.deinit();
             if (self.syncobj_adapter) |*adapter| adapter.deinit();
             self.syncobj_adapter = null;
@@ -1544,6 +1565,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.syncIdleNotifications() catch {};
             self.shortcuts_inhibit_adapter.disconnected(peer);
             self.foreign_adapter.disconnected(peer);
+            self.xdg_session_adapter.disconnected(peer);
             self.foreign_toplevel_list_adapter.disconnected(peer);
             self.workspace_adapter.disconnected(peer);
             self.image_copy_capture_adapter.disconnected(peer);
@@ -1677,6 +1699,12 @@ pub fn Coordinator(comptime protocol: type) type {
                 return control;
             if (try self.shell_adapter.request(peer, target, message, fds)) |control| {
                 try self.advanceShell();
+                try self.flushProtocol();
+                return control;
+            }
+            if (try self.xdg_session_adapter.request(peer, target, message, fds)) |control| {
+                try self.syncSessionState();
+                self.markXdgSessionProtocol();
                 try self.flushProtocol();
                 return control;
             }
@@ -2853,13 +2881,26 @@ pub fn Coordinator(comptime protocol: type) type {
                     self.desktop.dropInteractiveRequest();
                     continue;
                 }
+                const pending_shell = self.desktop.peekEvent(&self.shell_adapter);
+                if (pending_shell) |event| switch (event) {
+                    .commit_ready => |commit| if (commit.initial_commit)
+                        try self.applySessionRestore(commit.id),
+                    else => {},
+                };
+                const destroyed_shell = if (pending_shell) |event| switch (event) {
+                    .toplevel_destroyed => |id| id,
+                    else => null,
+                } else null;
                 const consumed = self.desktop.consume(&self.shell_adapter, 1) catch |err| switch (err) {
                     error.Exhausted, error.Backpressure => break,
                     else => return err,
                 };
                 if (consumed == 0) break;
+                if (destroyed_shell) |id| self.xdg_session_adapter.toplevelDestroyed(id);
                 self.stats.shell_events += consumed;
             }
+            try self.syncSessionState();
+            self.markXdgSessionProtocol();
             try self.consumeForeignToplevelCommands();
             if (self.desktop.foreignToplevelChanged()) {
                 const synced = if (self.syncForeignToplevels())
@@ -2890,6 +2931,25 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.syncToplevelDrag();
             if (self.shell_adapter.pendingOutbound() != 0)
                 self.markProtocolAll(ProtocolReady.shell);
+        }
+
+        fn applySessionRestore(self: *Self, shell_id: ShellAdapter.ToplevelId) !void {
+            const pending = self.xdg_session_adapter.pendingRestore(shell_id) orelse return;
+            const state = pending.state orelse return;
+            const desktop_id = try self.desktop.idForShell(shell_id);
+            try self.desktop.restoreInitialState(desktop_id, state);
+            try self.xdg_session_adapter.markRestoreApplied(pending.handle);
+        }
+
+        fn syncSessionState(self: *Self) !void {
+            const windows = try self.desktop.sceneSnapshot(self.scene_windows);
+            for (windows) |window| {
+                const shell_id = self.desktop.shellToplevel(window.id) catch continue;
+                self.xdg_session_adapter.updateState(
+                    shell_id,
+                    try self.desktop.restorableState(window.id),
+                );
+            }
         }
 
         fn syncForeignToplevels(self: *Self) !void {
@@ -3570,6 +3630,40 @@ pub fn Coordinator(comptime protocol: type) type {
             const self: *Self = @ptrCast(@alignCast(context orelse return false));
             const objects = self.root.runtime.clients.get(peer) catch return false;
             return self.seat_adapter.validateSeatOn(objects, peer, seat);
+        }
+
+        fn resolveSessionToplevel(
+            context: *anyopaque,
+            id: ShellAdapter.ToplevelId,
+        ) !XdgSessionAdapter.ResolvedToplevel {
+            const self: *Self = @ptrCast(@alignCast(context));
+            const surface = try self.shell_adapter.surfaceForToplevel(id);
+            return .{
+                .peer = try self.adapter.surfacePeer(surface),
+                .mapped = self.shell_adapter.toplevelMapped(id),
+            };
+        }
+
+        fn generateSessionId(_: *anyopaque, out: []u8) !usize {
+            const random_len = 16;
+            const encoded_len = random_len * 2;
+            if (out.len < encoded_len) return error.BufferTooSmall;
+            var random: [random_len]u8 = undefined;
+            var filled: usize = 0;
+            while (filled < random.len) {
+                const result = linux.getrandom(random[filled..].ptr, random.len - filled, 0);
+                switch (linux.errno(result)) {
+                    .SUCCESS => filled += result,
+                    .INTR => continue,
+                    else => return error.RandomUnavailable,
+                }
+            }
+            const hex = "0123456789abcdef";
+            for (random, 0..) |byte, index| {
+                out[index * 2] = hex[byte >> 4];
+                out[index * 2 + 1] = hex[byte & 0x0f];
+            }
+            return encoded_len;
         }
 
         fn extValidSeat(context: *anyopaque, peer: wayring.io_uring.Peer, seat: u32) bool {
@@ -4284,6 +4378,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 flushed += try self.toplevel_icon_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.gtk_shell != 0)
                 flushed += try self.gtk_shell_adapter.flushOn(peer, objects, &actor.transmit);
+            if (client.protocol_ready & ProtocolReady.xdg_session != 0)
+                flushed += try self.xdg_session_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.shell != 0 and
                 !self.decoration_adapter.readyOutbound(peer))
                 flushed += try self.shell_adapter.flushOn(objects, &actor.transmit);
@@ -4367,12 +4463,12 @@ pub fn Coordinator(comptime protocol: type) type {
             return if (client.active and samePeer(client.peer, peer)) client else null;
         }
 
-        fn markProtocol(self: *Self, peer: wayring.io_uring.Peer, ready: u32) void {
+        fn markProtocol(self: *Self, peer: wayring.io_uring.Peer, ready: u64) void {
             const client = self.clientFor(peer) orelse return;
             client.protocol_ready |= ready;
         }
 
-        fn markProtocolAll(self: *Self, ready: u32) void {
+        fn markProtocolAll(self: *Self, ready: u64) void {
             for (self.clients.items) |*client| {
                 if (client.active) client.protocol_ready |= ready;
             }
@@ -4383,6 +4479,13 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (client.active and
                     self.pointer_constraints_adapter.pendingOutbound(client.peer))
                     client.protocol_ready |= ProtocolReady.pointer_constraints;
+            }
+        }
+
+        fn markXdgSessionProtocol(self: *Self) void {
+            for (self.clients.items) |*client| {
+                if (client.active and self.xdg_session_adapter.pendingOutbound(client.peer))
+                    client.protocol_ready |= ProtocolReady.xdg_session;
             }
         }
 
@@ -4429,6 +4532,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (ready & ProtocolReady.gtk_shell != 0 and
                 !self.gtk_shell_adapter.pendingOutbound(client.peer))
                 ready &= ~ProtocolReady.gtk_shell;
+            if (ready & ProtocolReady.xdg_session != 0 and
+                !self.xdg_session_adapter.pendingOutbound(client.peer))
+                ready &= ~ProtocolReady.xdg_session;
             if (ready & ProtocolReady.shell != 0 and
                 !self.shell_adapter.pendingOutboundOn(objects))
                 ready &= ~ProtocolReady.shell;
@@ -6834,6 +6940,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.toplevel_drag_adapter.toplevelRemoved(handle, object);
             self.toplevel_icon_adapter.toplevelRemoved(handle, object);
             _ = self.shell_adapter.resourceRemoved(handle, object);
+            _ = self.xdg_session_adapter.resourceRemoved(handle, object);
             _ = self.seat_adapter.resourceRemoved(handle, object);
             _ = self.tablet_adapter.resourceRemoved(handle, object);
             const regular_before = self.data_device_adapter.currentSelection();

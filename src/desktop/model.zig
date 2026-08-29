@@ -52,6 +52,13 @@ pub fn Desktop(comptime Shell: type) type {
             parent: ?ToplevelId,
         };
 
+        pub const RestorableState = struct {
+            maximized: bool,
+            fullscreen: bool,
+            mode: Mode,
+            floating_geometry: geometry.Rect,
+        };
+
         pub const InteractiveKind = union(enum) {
             move,
             resize: Shell.ResizeEdge,
@@ -312,6 +319,10 @@ pub fn Desktop(comptime Shell: type) type {
                 count += 1;
             }
             return count;
+        }
+
+        pub fn peekEvent(desktop: *const Self, shell: *const Shell) ?Shell.Event {
+            return desktop.pending_event orelse shell.peekEvent();
         }
 
         pub fn peekCommand(desktop: *const Self) ?Command {
@@ -794,6 +805,33 @@ pub fn Desktop(comptime Shell: type) type {
                 .fullscreen = slot.fullscreen,
                 .parent = slot.parent,
             };
+        }
+
+        pub fn restorableState(desktop: *const Self, id: ToplevelId) !RestorableState {
+            const slot = desktop.slots[try desktop.resolveIndex(id)];
+            return .{
+                .maximized = slot.maximized,
+                .fullscreen = slot.fullscreen,
+                .mode = slot.mode,
+                .floating_geometry = slot.floating,
+            };
+        }
+
+        /// Applies compositor-owned state before the initial empty commit is
+        /// consumed. No configure has been queued yet, so this is an atomic
+        /// field replacement; `beginInitialCommit` publishes the result once.
+        pub fn restoreInitialState(
+            desktop: *Self,
+            id: ToplevelId,
+            state: RestorableState,
+        ) !void {
+            try state.floating_geometry.validate();
+            const slot = &desktop.slots[try desktop.resolveIndex(id)];
+            if (slot.initial_committed) return error.AlreadyMapped;
+            slot.maximized = state.maximized;
+            slot.fullscreen = state.fullscreen;
+            slot.mode = state.mode;
+            slot.floating = state.floating_geometry;
         }
 
         pub fn idForShell(desktop: *const Self, shell_id: Shell.ToplevelId) !ToplevelId {
@@ -2115,6 +2153,31 @@ test "desktop: initial commit gates configure and unmap requires it again" {
     try beginInitialDesktop(&desktop, &shell);
     try std.testing.expect(desktop.slots[id.index].initial_committed);
     try std.testing.expectEqual(@as(usize, 1), desktop.pendingCommands());
+}
+
+test "desktop: restored state is published by the first configure" {
+    var desktop = try initTestDesktop(8);
+    defer desktop.deinit();
+    var shell = TestShell{};
+    shell.push(created(0));
+    _ = try desktop.consume(&shell, 1);
+    const id = try desktop.idForShell(.{ .index = 0, .generation = 1 });
+    const restored: TestDesktop.RestorableState = .{
+        .maximized = false,
+        .fullscreen = false,
+        .mode = .floating,
+        .floating_geometry = .{ .x = 7, .y = 9, .width = 40, .height = 30 },
+    };
+    try desktop.restoreInitialState(id, restored);
+    try std.testing.expectEqual(restored, try desktop.restorableState(id));
+
+    try beginInitialDesktop(&desktop, &shell);
+    try std.testing.expectEqual(@as(usize, 1), desktop.pendingCommands());
+    const command = desktop.peekCommand().?;
+    try std.testing.expectEqual(@as(i32, 40), command.configure.width);
+    try std.testing.expectEqual(@as(i32, 30), command.configure.height);
+    try std.testing.expect(!command.configure.states.tiled_left);
+    try std.testing.expectError(error.AlreadyMapped, desktop.restoreInitialState(id, restored));
 }
 
 test "desktop: toplevel parents preserve ancestor stacking and reparent on unmap" {

@@ -39,6 +39,7 @@ pub const Error = error{
     NameInUse,
     AlreadyAdded,
     AlreadyMapped,
+    DuplicateSession,
     Capacity,
     IdGenerationFailed,
 };
@@ -61,6 +62,10 @@ pub fn Owner(comptime State: type, comptime ToplevelId: type) type {
         };
         pub const ExportSession = struct { id: StoredSessionId, identifier: []const u8 };
         pub const ExportToplevel = struct { session: StoredSessionId, name: []const u8, state: State };
+        pub const PendingRestore = struct {
+            handle: ToplevelSessionId,
+            state: ?State,
+        };
 
         const SessionResource = struct {
             live: bool = false,
@@ -170,6 +175,42 @@ pub fn Owner(comptime State: type, comptime ToplevelId: type) type {
             if (!s.live or s.generation != id.generation) return null;
             return self.text(self.session_strings, id.index, s.id_len);
         }
+        pub fn importSession(self: *Self, identifier: []const u8) Error!StoredSessionId {
+            if (!self.validString(identifier)) return error.InvalidSessionId;
+            if (self.findStored(identifier) != null) return error.DuplicateSession;
+            const index = self.inactiveStored() orelse return error.Capacity;
+            self.put(self.session_strings, index, identifier);
+            self.stored[index].live = true;
+            self.stored[index].id_len = identifier.len;
+            return .{ .index = @intCast(index), .generation = self.stored[index].generation };
+        }
+        pub fn importToplevel(
+            self: *Self,
+            session_id: StoredSessionId,
+            name: []const u8,
+            state: State,
+        ) Error!void {
+            if (session_id.index >= self.stored.len or
+                !self.stored[session_id.index].live or
+                self.stored[session_id.index].generation != session_id.generation)
+                return error.InvalidSessionId;
+            if (!self.validString(name)) return error.InvalidName;
+            if (self.findRecord(session_id.index, name) != null) return error.NameInUse;
+            var index: ?usize = null;
+            for (self.records, 0..) |record, candidate| if (!record.live) {
+                index = candidate;
+                break;
+            };
+            const target = index orelse return error.Capacity;
+            self.put(self.name_strings, target, name);
+            self.records[target] = .{
+                .live = true,
+                .session = session_id.index,
+                .name_len = name.len,
+                .state = state,
+                .has_state = true,
+            };
+        }
         fn session(self: *Self, id: SessionId) ?*SessionResource {
             if (id.index >= self.sessions.len) return null;
             const slot = &self.sessions[id.index];
@@ -275,7 +316,7 @@ pub fn Owner(comptime State: type, comptime ToplevelId: type) type {
             for (self.handles) |h| if (h.live and !h.inert and h.client == s.client and h.associated and std.meta.eql(h.toplevel, toplevel)) return error.AlreadyAdded;
             var record_i = self.findRecord(s.stored, name);
             if (!restore and record_i != null) return error.NameInUse;
-            const restoring = restore and record_i != null;
+            const restoring = restore and record_i != null and self.records[record_i.?].has_state;
             if (restoring and mapped) return error.AlreadyMapped;
             if (record_i) |ri| for (self.handles) |h| if (h.live and !h.inert and h.record == ri and h.associated) return error.NameInUse;
             var hi: ?usize = null;
@@ -345,7 +386,9 @@ pub fn Owner(comptime State: type, comptime ToplevelId: type) type {
             }
         }
         pub fn updateState(self: *Self, toplevel: ToplevelId, state: State) void {
-            for (self.handles) |h| if (h.live and !h.inert and h.associated and std.meta.eql(h.toplevel, toplevel)) {
+            for (self.handles) |h| if (h.live and !h.inert and h.associated and
+                (!h.restore_pending or h.applied) and std.meta.eql(h.toplevel, toplevel))
+            {
                 self.records[h.record].state = state;
                 self.records[h.record].has_state = true;
             };
@@ -356,10 +399,24 @@ pub fn Owner(comptime State: type, comptime ToplevelId: type) type {
             h.state_taken = true;
             return self.records[h.record].state;
         }
+        pub fn pendingRestore(self: *Self, toplevel: ToplevelId) ?PendingRestore {
+            for (self.handles, 0..) |h, index| {
+                if (!h.live or h.inert or !h.associated or !h.restore_pending or h.applied or
+                    !std.meta.eql(h.toplevel, toplevel)) continue;
+                return .{
+                    .handle = .{ .index = @intCast(index), .generation = h.generation },
+                    .state = if (self.records[h.record].has_state)
+                        self.records[h.record].state
+                    else
+                        null,
+                };
+            }
+            return null;
+        }
         /// Must be called after applying state and before queuing initial configure.
         pub fn markRestoreApplied(self: *Self, id: ToplevelSessionId) Error!void {
             const h = self.handle(id) orelse return;
-            if (!h.restore_pending or !h.state_taken or h.applied) return;
+            if (!h.restore_pending or h.applied) return;
             try self.push(.{ .toplevel_restored = id });
             h.applied = true;
         }
@@ -396,9 +453,13 @@ pub fn Adapter(comptime protocol: type, comptime ShellAdapter: type, comptime St
         const Toplevel = protocol.xdg_toplevel_session_v1;
         const O = Owner(State, ShellAdapter.ToplevelId);
 
+        pub const ResolvedToplevel = struct {
+            peer: wayring.io_uring.Peer,
+            mapped: bool,
+        };
         pub const ResolveToplevel = struct {
             context: *anyopaque,
-            resolve: *const fn (*anyopaque, ShellAdapter.ToplevelId) anyerror!struct { peer: wayring.io_uring.Peer, mapped: bool },
+            resolve: *const fn (*anyopaque, ShellAdapter.ToplevelId) anyerror!ResolvedToplevel,
         };
         const ManagerSlot = struct { active: bool = false, generation: u32 = 1, peer: wayring.io_uring.Peer = undefined, resource: objects.Handle = undefined };
         const SessionSlot = struct { active: bool = false, generation: u32 = 1, peer: wayring.io_uring.Peer = undefined, resource: objects.Handle = undefined, owner: SessionId = undefined };
@@ -609,7 +670,11 @@ pub fn Adapter(comptime protocol: type, comptime ShellAdapter: type, comptime St
         pub fn takeRestoreState(self: *Self, id: ToplevelSessionId) ?State {
             return self.owner.takeRestoreState(id);
         }
+        pub fn pendingRestore(self: *Self, id: ShellAdapter.ToplevelId) ?O.PendingRestore {
+            return self.owner.pendingRestore(id);
+        }
         pub fn markRestoreApplied(self: *Self, id: ToplevelSessionId) !void {
+            if (self.freeOutCount() == 0) return error.Exhausted;
             try self.owner.markRestoreApplied(id);
             try self.collectEvents();
         }
@@ -621,6 +686,17 @@ pub fn Adapter(comptime protocol: type, comptime ShellAdapter: type, comptime St
         }
         pub fn exportToplevel(self: *const Self, cursor: *usize) ?O.ExportToplevel {
             return self.owner.exportToplevel(cursor);
+        }
+        pub fn importSession(self: *Self, identifier: []const u8) !StoredSessionId {
+            return self.owner.importSession(identifier);
+        }
+        pub fn importToplevel(
+            self: *Self,
+            session_id: StoredSessionId,
+            name: []const u8,
+            state: State,
+        ) !void {
+            try self.owner.importToplevel(session_id, name, state);
         }
 
         fn freeSession(self: *Self) ?*SessionSlot {
@@ -796,11 +872,41 @@ test "unknown restore is add; rename atomic; restore gate" {
     owner.destroySession(s, false);
     const restored = try owner.getSession(2, 1, "s1", generator);
     const rh = try owner.addToplevel(restored, 3, false, "a", true);
+    const pending = owner.pendingRestore(3).?;
+    try std.testing.expectEqual(rh, pending.handle);
+    try std.testing.expectEqual(@as(?u32, 7), pending.state);
     try std.testing.expectEqual(@as(?u32, 7), owner.takeRestoreState(rh));
     try owner.markRestoreApplied(rh);
+    try std.testing.expect(owner.pendingRestore(3) == null);
     var found = false;
     while (owner.nextEvent()) |event| {
         if (event == .toplevel_restored) found = true;
     }
     try std.testing.expect(found);
+}
+
+test "persistence import validates identity and restores exported state" {
+    const O = Owner(u32, u64);
+    var owner = try O.init(std.testing.allocator, .{
+        .stored_sessions = 1,
+        .stored_toplevels = 1,
+        .max_string_bytes = 8,
+    });
+    defer owner.deinit();
+    const stored = try owner.importSession("saved");
+    try std.testing.expectError(error.DuplicateSession, owner.importSession("saved"));
+    try owner.importToplevel(stored, "main", 77);
+    try std.testing.expectError(error.NameInUse, owner.importToplevel(stored, "main", 88));
+
+    var context: u8 = 0;
+    const generator: O.IdGenerator = .{ .context = &context, .generate = testGenerate };
+    const session = try owner.getSession(1, 2, "saved", generator);
+    _ = owner.nextEvent();
+    const handle = try owner.addToplevel(session, 4, false, "main", true);
+    try std.testing.expectEqual(@as(?u32, 77), owner.pendingRestore(4).?.state);
+    owner.updateState(4, 88);
+    try std.testing.expectEqual(@as(?u32, 77), owner.pendingRestore(4).?.state);
+    try owner.markRestoreApplied(handle);
+    owner.updateState(4, 99);
+    try std.testing.expectEqual(@as(u32, 99), owner.records[owner.handles[handle.index].record].state);
 }
