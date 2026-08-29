@@ -320,6 +320,84 @@ test "generated session lock publishes only after presentation and client loss s
     try root.deinit();
 }
 
+test "generated output management test succeeds and unsupported apply is non-mutating" {
+    const allocator = std.testing.allocator;
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-r15-output-management-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), compositorConfig());
+    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), coordinatorConfig());
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
+    try coordinator.start(&loop);
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    for (0..128) |_| {
+        _ = try loop.turn(coordinator);
+        if (coordinator.output != null) break;
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+    }
+    try std.testing.expect(coordinator.output != null);
+    const output_id = coordinator.output.?.outputId();
+
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(allocator, .{ .entries = 16, .flags = 0 }, clientReactorConfig());
+    var client = try ClientConnection.attach(
+        allocator,
+        &reactor,
+        try wayring.unix_socket.connect(path),
+        .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 },
+        .{ .max_objects = 24, .max_client_ids = 23 },
+    );
+    var driver = ClientDriver.init(&client);
+    const actor = try client.actor();
+    const registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null);
+    var handler: OutputManagementClientHandler = .{
+        .objects = &client.objects,
+        .queue = &actor.transmit,
+        .registry = registry,
+    };
+    try submitClient(&reactor, &driver, &handler);
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.failed == 1) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expectEqual(@as(usize, 1), handler.succeeded);
+    try std.testing.expectEqual(@as(usize, 1), handler.failed);
+    try std.testing.expectEqual(@as(usize, 0), handler.cancelled);
+    try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+    try std.testing.expectEqual(output_id, coordinator.output.?.outputId());
+    try std.testing.expectEqual(@as(usize, 1), coordinator.stats.selected_outputs);
+    try std.testing.expectEqual(@as(usize, 0), coordinator.stats.output_drains);
+    try std.testing.expectEqual(@as(i32, 3), coordinator.output_management_adapter.lifecycle.current.width);
+    try std.testing.expectEqual(@as(i32, 2), coordinator.output_management_adapter.lifecycle.current.height);
+
+    _ = try client.prepareClose();
+    try submitClient(&reactor, &driver, &handler);
+    try coordinator.requestStop();
+    var drained = false;
+    for (0..256) |_| {
+        const client_progress = try drainClient(&reactor, &driver, &handler);
+        const progress = try loop.turn(coordinator);
+        drained = progress.wayring.shutdown_complete and client_progress.quiescent and coordinator.backendDrainComplete();
+        if (drained) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expect(drained);
+    try client.deinit(allocator);
+    reactor.deinit(allocator);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
 test "no discovered DRM card fails startup and drains honestly" {
     const allocator = std.testing.allocator;
     var fixture = try Fixture.init();
@@ -1032,6 +1110,154 @@ const SessionLockClientHandler = struct {
         try wayring.client.sendRequest(protocol.wl_surface, self.objects, self.queue, self.surface.?, .{ .damage_buffer = .{ .x = 0, .y = 0, .width = 3, .height = 2 } });
         try wayring.client.sendRequest(protocol.wl_surface, self.objects, self.queue, self.surface.?, .{ .commit = .{} });
         self.configures += 1;
+    }
+};
+
+const OutputManagementClientHandler = struct {
+    objects: *wayring.objects.ClientObjects,
+    queue: *wayring.tx.Queue,
+    registry: wayring.objects.Handle,
+    manager: ?wayring.objects.Handle = null,
+    head: ?wayring.objects.Handle = null,
+    mode: ?wayring.objects.Handle = null,
+    serial: u32 = 0,
+    mode_width: i32 = 0,
+    mode_height: i32 = 0,
+    mode_refresh: i32 = 0,
+    mode_preferred: bool = false,
+    current_mode: bool = false,
+    test_submitted: bool = false,
+    apply_submitted: bool = false,
+    succeeded: usize = 0,
+    failed: usize = 0,
+    cancelled: usize = 0,
+    event_failures: usize = 0,
+
+    pub fn eventError(self: *OutputManagementClientHandler, _: wayring.io_uring.Peer, _: ClientCore.EventFailure) void {
+        self.event_failures += 1;
+    }
+
+    pub fn event(self: *OutputManagementClientHandler, target: wayring.objects.Dispatch, message: wayring.wire.Message, fds: *wayring.ancillary.FdQueue) !wayring.dispatch.Control {
+        if (target.object.interface == &ClientCore.Registry.info) {
+            switch (try ClientCore.decodeRegistryEvent(self.objects, self.registry, message, fds)) {
+                .global => |global| {
+                    if (std.mem.eql(u8, global.interface, protocol.zwlr_output_manager_v1.info.name)) self.manager = try ClientCore.bind(
+                        self.objects,
+                        self.queue,
+                        self.registry,
+                        global.name,
+                        &protocol.zwlr_output_manager_v1.info,
+                        @min(global.version, 4),
+                        null,
+                    );
+                },
+                .global_remove => {},
+            }
+        } else if (target.object.interface == &protocol.zwlr_output_manager_v1.info) {
+            switch (try protocol.zwlr_output_manager_v1.decodeEvent(message, fds)) {
+                .head => |value| self.head = (try protocol.zwlr_output_manager_v1.admit_event_head(
+                    self.objects,
+                    self.manager.?,
+                    value,
+                    .{},
+                )).head,
+                .done => |value| {
+                    self.serial = value.serial;
+                    if (!self.test_submitted) try self.submitTest();
+                },
+                .finished => {},
+            }
+        } else if (target.object.interface == &protocol.zwlr_output_head_v1.info) {
+            switch (try protocol.zwlr_output_head_v1.decodeEvent(message, fds)) {
+                .mode => |value| self.mode = (try protocol.zwlr_output_head_v1.admit_event_mode(
+                    self.objects,
+                    self.head.?,
+                    value,
+                    .{},
+                )).mode,
+                .current_mode => |value| self.current_mode = self.mode != null and value.mode == self.mode.?.id,
+                .name => |value| try std.testing.expectEqualStrings("Ouro-1", value.name),
+                .description => |value| try std.testing.expect(value.description.len != 0),
+                .enabled => |value| try std.testing.expectEqual(@as(i32, 1), value.enabled),
+                .position => |value| try std.testing.expect(value.x == 0 and value.y == 0),
+                .transform => |value| try std.testing.expectEqual(@as(i32, 0), value.transform.value),
+                .scale => |value| try std.testing.expectEqual(@as(i32, 256), value.scale),
+                .adaptive_sync => |value| try std.testing.expectEqual(@as(u32, 0), value.state.value),
+                .physical_size, .make, .model, .serial_number, .finished => {},
+            }
+        } else if (target.object.interface == &protocol.zwlr_output_mode_v1.info) {
+            switch (try protocol.zwlr_output_mode_v1.decodeEvent(message, fds)) {
+                .size => |value| {
+                    self.mode_width = value.width;
+                    self.mode_height = value.height;
+                },
+                .refresh => |value| self.mode_refresh = value.refresh,
+                .preferred => self.mode_preferred = true,
+                .finished => {},
+            }
+        } else if (target.object.interface == &protocol.zwlr_output_configuration_v1.info) {
+            switch (try protocol.zwlr_output_configuration_v1.decodeEvent(message, fds)) {
+                .succeeded => {
+                    self.succeeded += 1;
+                    if (!self.apply_submitted) try self.submitUnsupportedApply();
+                },
+                .failed => self.failed += 1,
+                .cancelled => self.cancelled += 1,
+            }
+        } else if (target.object.interface == &ClientCore.Display.info) {
+            switch (try ClientCore.decodeDisplayEvent(self.objects, message, fds)) {
+                .delete_id => {},
+                .@"error" => return error.ServerProtocolError,
+            }
+        } else return error.UnexpectedEvent;
+        return .continue_dispatch;
+    }
+
+    fn submitTest(self: *OutputManagementClientHandler) !void {
+        try std.testing.expect(self.head != null and self.mode != null and self.current_mode and
+            !self.mode_preferred and self.mode_width == 3 and self.mode_height == 2 and
+            self.mode_refresh == 60_000);
+        const configuration = (try protocol.zwlr_output_manager_v1.construct_create_configuration(
+            self.objects,
+            self.queue,
+            self.manager.?,
+            .{ .serial = self.serial },
+        )).id;
+        const configuration_head = (try protocol.zwlr_output_configuration_v1.construct_enable_head(
+            self.objects,
+            self.queue,
+            configuration,
+            .{ .head = self.head.?.id },
+        )).id;
+        try protocol.zwlr_output_configuration_head_v1.encodeRequest(
+            self.queue,
+            configuration_head.id,
+            .{ .set_mode = .{ .mode = self.mode.?.id } },
+        );
+        try protocol.zwlr_output_configuration_v1.encodeRequest(self.queue, configuration.id, .{ .@"test" = .{} });
+        self.test_submitted = true;
+    }
+
+    fn submitUnsupportedApply(self: *OutputManagementClientHandler) !void {
+        const configuration = (try protocol.zwlr_output_manager_v1.construct_create_configuration(
+            self.objects,
+            self.queue,
+            self.manager.?,
+            .{ .serial = self.serial },
+        )).id;
+        const configuration_head = (try protocol.zwlr_output_configuration_v1.construct_enable_head(
+            self.objects,
+            self.queue,
+            configuration,
+            .{ .head = self.head.?.id },
+        )).id;
+        try protocol.zwlr_output_configuration_head_v1.encodeRequest(
+            self.queue,
+            configuration_head.id,
+            .{ .set_custom_mode = .{ .width = 4, .height = 2, .refresh = 60_000 } },
+        );
+        try protocol.zwlr_output_configuration_v1.encodeRequest(self.queue, configuration.id, .{ .apply = .{} });
+        self.apply_submitted = true;
     }
 };
 
