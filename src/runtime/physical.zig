@@ -578,6 +578,7 @@ pub fn Coordinator(comptime protocol: type) type {
         toplevel_drag_move: ?ToplevelDragMove = null,
         input_delivery_prepared: bool = false,
         input_delivery_event: ?input_api.Event = null,
+        input_touch_delivery: TouchDelivery = .{},
         input_method_key_owners: [0x300]?protocol_input_method.GrabId = [_]?protocol_input_method.GrabId{null} ** 0x300,
         processing_virtual_pointer: bool = false,
         manager: drm.Manager,
@@ -744,6 +745,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.input_drag_accepted = false;
             self.input_delivery_prepared = false;
             self.input_delivery_event = null;
+            self.input_touch_delivery = .{};
             @memset(&self.input_method_key_owners, null);
             self.render_device = null;
             self.syncobj_device = null;
@@ -2606,6 +2608,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     error.Exhausted => return false,
                     else => return err,
                 };
+                self.input_touch_delivery = self.touchDelivery(event);
                 self.input_delivery_prepared = true;
             }
             if (!self.input_interaction_accepted) {
@@ -2673,6 +2676,12 @@ pub fn Coordinator(comptime protocol: type) type {
                                 delivery_event,
                                 self.seat_adapter.pointerState().point,
                             ),
+                            .touch_down,
+                            .touch_up,
+                            .touch_motion,
+                            .touch_frame,
+                            .touch_cancel,
+                            => self.consumeTouch(delivery_event, self.input_touch_delivery),
                             else => self.seat_adapter.consume(delivery_event),
                         }) catch |err| switch (err) {
                             error.Exhausted => return false,
@@ -2729,6 +2738,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.input_drag_accepted = false;
             self.input_delivery_prepared = false;
             self.input_delivery_event = null;
+            self.input_touch_delivery = .{};
             self.stats.input_events += 1;
             self.markProtocolAll(ProtocolReady.seat | ProtocolReady.relative_pointer |
                 ProtocolReady.pointer_gestures | ProtocolReady.tablet | ProtocolReady.input_method);
@@ -2958,6 +2968,104 @@ pub fn Coordinator(comptime protocol: type) type {
                     } };
                 },
             };
+        }
+
+        const TouchDelivery = struct {
+            target: ?SeatAdapter.FocusTarget = null,
+            point: ?SeatAdapter.Point = null,
+            offset: SeatAdapter.Point = .{ .x = 0, .y = 0 },
+        };
+
+        fn touchContact(value: anytype) SeatAdapter.TouchContactId {
+            return .{ .device = value.device, .id = @intCast(value.seat_slot) };
+        }
+
+        fn touchDelivery(self: *Self, event: input_api.Event) TouchDelivery {
+            const position = switch (event) {
+                .touch_down => |value| value,
+                .touch_motion => |value| value,
+                else => return .{},
+            };
+            const bounds = self.outputBounds() catch return .{};
+            const global_x = tabletCoordinate(position.x, bounds.x, bounds.width);
+            const global_y = tabletCoordinate(position.y, bounds.y, bounds.height);
+            const global_fixed: SeatAdapter.Point = .{
+                .x = gestureFixed(global_x),
+                .y = gestureFixed(global_y),
+            };
+            const target = switch (event) {
+                .touch_down => null,
+                .touch_motion => self.seat_adapter.touchTarget(touchContact(position)) orelse return .{},
+                else => unreachable,
+            };
+            if (target) |retained| {
+                return .{
+                    .target = retained.focus,
+                    .point = .{
+                        .x = global_fixed.x -| retained.offset.x,
+                        .y = global_fixed.y -| retained.offset.y,
+                    },
+                    .offset = retained.offset,
+                };
+            }
+            const whole: geometry.Point = .{
+                .x = @intFromFloat(@floor(global_x)),
+                .y = @intFromFloat(@floor(global_y)),
+            };
+            const windows = self.desktop.sceneSnapshot(self.scene_windows) catch return .{};
+            var input_scene: InputScene = .{ .coordinator = self };
+            const hit = input_scene.topmost(Desktop.SceneWindow, windows, whole) orelse return .{};
+            const point: SeatAdapter.Point = .{
+                .x = gestureFixed(global_x - @as(f64, @floatFromInt(whole.x - hit.local.x))),
+                .y = gestureFixed(global_y - @as(f64, @floatFromInt(whole.y - hit.local.y))),
+            };
+            return .{
+                .target = self.seatTarget(hit.surface) catch return .{},
+                .point = point,
+                .offset = .{
+                    .x = global_fixed.x -| point.x,
+                    .y = global_fixed.y -| point.y,
+                },
+            };
+        }
+
+        fn consumeTouch(self: *Self, event: input_api.Event, delivery: TouchDelivery) !void {
+            switch (event) {
+                .touch_down => |value| {
+                    const target = delivery.target orelse return;
+                    const point = delivery.point orelse return;
+                    _ = try self.seat_adapter.touchDown(
+                        touchContact(value),
+                        target,
+                        @truncate(value.time_usec / 1000),
+                        point,
+                        delivery.offset,
+                    );
+                },
+                .touch_motion => |value| {
+                    const point = delivery.point orelse return;
+                    self.seat_adapter.touchMotion(
+                        touchContact(value),
+                        @truncate(value.time_usec / 1000),
+                        point,
+                    ) catch |err| switch (err) {
+                        error.StaleContact => {},
+                        else => return err,
+                    };
+                },
+                .touch_up => |value| {
+                    _ = self.seat_adapter.touchUp(
+                        touchContact(value),
+                        @truncate(value.time_usec / 1000),
+                    ) catch |err| switch (err) {
+                        error.StaleContact => return,
+                        else => return err,
+                    };
+                },
+                .touch_frame => try self.seat_adapter.touchFrame(),
+                .touch_cancel => |value| try self.seat_adapter.touchCancelDevice(value.device),
+                else => return error.NotTouchEvent,
+            }
         }
 
         const TabletDelivery = struct {
@@ -3915,6 +4023,9 @@ pub fn Coordinator(comptime protocol: type) type {
                     input_ready = false;
                 };
                 self.seat_adapter.cancelPointerGrab() catch {
+                    input_ready = false;
+                };
+                self.seat_adapter.touchCancel() catch {
                     input_ready = false;
                 };
                 self.setKeyboardSurface(self.firstSessionLockSurface()) catch |err| switch (err) {

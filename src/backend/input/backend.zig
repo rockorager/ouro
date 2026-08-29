@@ -32,6 +32,20 @@ pub const PinchUpdate = struct {
     angle_delta: f64,
 };
 pub const GestureEnd = struct { device: DeviceId, time_usec: u64, cancelled: bool };
+pub const TouchContact = struct {
+    device: DeviceId,
+    time_usec: u64,
+    slot: u32,
+    seat_slot: u32,
+};
+pub const TouchPosition = struct {
+    device: DeviceId,
+    time_usec: u64,
+    slot: u32,
+    seat_slot: u32,
+    x: f64,
+    y: f64,
+};
 
 pub const Event = union(enum) {
     device_added: struct { device: DeviceId, info: platform_api.DeviceInfo },
@@ -53,6 +67,11 @@ pub const Event = union(enum) {
     pinch_end: GestureEnd,
     hold_begin: GestureBegin,
     hold_end: GestureEnd,
+    touch_down: TouchPosition,
+    touch_up: TouchContact,
+    touch_motion: TouchPosition,
+    touch_frame: struct { device: DeviceId },
+    touch_cancel: struct { device: DeviceId },
     keyboard_key: struct { device: DeviceId, time_usec: u64, key: u32, pressed: bool },
     tablet_tool_axis: struct {
         device: DeviceId,
@@ -474,6 +493,15 @@ pub const Backend = struct {
             .pinch_end => |value| self.push(.{ .pinch_end = try self.gestureEnd(value) }),
             .hold_begin => |value| self.push(.{ .hold_begin = try self.gestureBegin(value) }),
             .hold_end => |value| self.push(.{ .hold_end = try self.gestureEnd(value) }),
+            .touch_down => |value| self.push(.{ .touch_down = try self.touchPosition(value) }),
+            .touch_up => |value| self.push(.{ .touch_up = try self.touchContact(value) }),
+            .touch_motion => |value| self.push(.{ .touch_motion = try self.touchPosition(value) }),
+            .touch_frame => |value| self.push(.{ .touch_frame = .{
+                .device = try self.validateTouchDevice(value.device),
+            } }),
+            .touch_cancel => |value| self.push(.{ .touch_cancel = .{
+                .device = try self.validateTouchDevice(value.device),
+            } }),
             .keyboard_key => |value| {
                 const index = self.findReference(value.device) orelse return error.UnknownDevice;
                 if (value.key >= code_count) return error.InvalidCode;
@@ -597,6 +625,43 @@ pub const Backend = struct {
     fn validateGestureDevice(self: *const Backend, reference: platform_api.DeviceRef) !void {
         const index = self.findReference(reference) orelse return error.UnknownDevice;
         if (!self.devices[index].info.capabilities.pointer) return error.MissingCapability;
+    }
+
+    fn validateTouchDevice(self: *const Backend, reference: platform_api.DeviceRef) !DeviceId {
+        const index = self.findReference(reference) orelse return error.UnknownDevice;
+        if (!self.devices[index].info.capabilities.touch) return error.MissingCapability;
+        return self.idFor(index);
+    }
+
+    fn touchContact(self: *const Backend, value: platform_api.TouchContact) !TouchContact {
+        const device = try self.validateTouchDevice(value.device);
+        if (value.slot < 0 or value.seat_slot < 0) return error.InvalidTouchSlot;
+        return .{
+            .device = device,
+            .time_usec = value.time_usec,
+            .slot = @intCast(value.slot),
+            .seat_slot = @intCast(value.seat_slot),
+        };
+    }
+
+    fn touchPosition(self: *const Backend, value: platform_api.TouchPosition) !TouchPosition {
+        const contact = try self.touchContact(.{
+            .device = value.device,
+            .time_usec = value.time_usec,
+            .slot = value.slot,
+            .seat_slot = value.seat_slot,
+        });
+        if (!std.math.isFinite(value.x) or !std.math.isFinite(value.y) or
+            value.x < 0 or value.x > 1 or value.y < 0 or value.y > 1)
+            return error.InvalidTouchPosition;
+        return .{
+            .device = contact.device,
+            .time_usec = contact.time_usec,
+            .slot = contact.slot,
+            .seat_slot = contact.seat_slot,
+            .x = value.x,
+            .y = value.y,
+        };
     }
 
     fn gestureBegin(self: *const Backend, value: platform_api.GestureBegin) !GestureBegin {
@@ -904,6 +969,100 @@ fn destroyTestBackend(backend: *Backend) !void {
     session.clearEvents();
     session.state = .draining;
     try session.destroy();
+}
+
+test "input: multitouch preserves contacts frames cancellation and generations" {
+    var seat_fake: FakeSeat = .{};
+    var input_fake: FakeInput = .{};
+    const backend = try testBackend(&seat_fake, &input_fake, 16);
+    defer destroyTestBackend(backend) catch unreachable;
+
+    try backend.consume(.{ .device_added = .{
+        .device = 7,
+        .info = .{ .capabilities = .{ .touch = true } },
+    } });
+    const first = backend.events()[0].device_added.device;
+    try backend.consume(.{ .touch_down = .{
+        .device = 7,
+        .time_usec = 10,
+        .slot = 2,
+        .seat_slot = 4,
+        .x = 0.25,
+        .y = 0.75,
+    } });
+    try backend.consume(.{ .touch_down = .{
+        .device = 7,
+        .time_usec = 11,
+        .slot = 5,
+        .seat_slot = 8,
+        .x = 1,
+        .y = 0,
+    } });
+    try backend.consume(.{ .touch_frame = .{ .device = 7 } });
+    try backend.consume(.{ .touch_motion = .{
+        .device = 7,
+        .time_usec = 12,
+        .slot = 2,
+        .seat_slot = 4,
+        .x = 0.5,
+        .y = 0.6,
+    } });
+    try backend.consume(.{ .touch_up = .{
+        .device = 7,
+        .time_usec = 13,
+        .slot = 5,
+        .seat_slot = 8,
+    } });
+    try backend.consume(.{ .touch_frame = .{ .device = 7 } });
+    try backend.consume(.{ .touch_cancel = .{ .device = 7 } });
+
+    try std.testing.expectEqual(@as(usize, 8), backend.events().len);
+    try std.testing.expectEqual(@as(u32, 2), backend.events()[1].touch_down.slot);
+    try std.testing.expectEqual(@as(u32, 4), backend.events()[1].touch_down.seat_slot);
+    try std.testing.expectEqual(@as(u32, 5), backend.events()[2].touch_down.slot);
+    try std.testing.expect(backend.events()[3] == .touch_frame);
+    try std.testing.expectEqual(@as(u64, 12), backend.events()[4].touch_motion.time_usec);
+    try std.testing.expectEqual(@as(u32, 8), backend.events()[5].touch_up.seat_slot);
+    try std.testing.expect(backend.events()[6] == .touch_frame);
+    try std.testing.expect(backend.events()[7] == .touch_cancel);
+
+    const valid_count = backend.event_count;
+    try std.testing.expectError(error.InvalidTouchPosition, backend.consume(.{ .touch_motion = .{
+        .device = 7,
+        .time_usec = 14,
+        .slot = 2,
+        .seat_slot = 4,
+        .x = std.math.nan(f64),
+        .y = 0.5,
+    } }));
+    try std.testing.expectError(error.InvalidTouchPosition, backend.consume(.{ .touch_down = .{
+        .device = 7,
+        .time_usec = 14,
+        .slot = 2,
+        .seat_slot = 4,
+        .x = 1.01,
+        .y = 0.5,
+    } }));
+    try std.testing.expectError(error.InvalidTouchSlot, backend.consume(.{ .touch_up = .{
+        .device = 7,
+        .time_usec = 14,
+        .slot = -1,
+        .seat_slot = 4,
+    } }));
+    try std.testing.expectEqual(valid_count, backend.event_count);
+
+    try backend.consume(.{ .device_removed = 7 });
+    try std.testing.expect(backend.events()[valid_count] == .device_removed);
+    try std.testing.expectError(error.UnknownDevice, backend.consume(.{ .touch_cancel = .{ .device = 7 } }));
+    backend.clearEvents();
+    try backend.consume(.{ .device_added = .{
+        .device = 7,
+        .info = .{ .capabilities = .{ .touch = true } },
+    } });
+    const replacement = backend.events()[0].device_added.device;
+    try std.testing.expectEqual(first.slot, replacement.slot);
+    try std.testing.expect(first.generation != replacement.generation);
+    try std.testing.expectError(error.StaleDevice, backend.getDevice(first));
 }
 
 test "input: physical state remains distinct and device reuse advances generation" {

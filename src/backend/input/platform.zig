@@ -19,9 +19,10 @@ pub const max_tablet_pad_controls = 64;
 pub const Capabilities = packed struct {
     pointer: bool = false,
     keyboard: bool = false,
+    touch: bool = false,
     tablet_tool: bool = false,
     tablet_pad: bool = false,
-    _padding: u4 = 0,
+    _padding: u3 = 0,
 };
 
 pub const DeviceInfo = struct {
@@ -93,6 +94,20 @@ pub const PinchUpdate = struct {
     angle_delta: f64,
 };
 pub const GestureEnd = struct { device: DeviceRef, time_usec: u64, cancelled: bool };
+pub const TouchContact = struct {
+    device: DeviceRef,
+    time_usec: u64,
+    slot: i32,
+    seat_slot: i32,
+};
+pub const TouchPosition = struct {
+    device: DeviceRef,
+    time_usec: u64,
+    slot: i32,
+    seat_slot: i32,
+    x: f64,
+    y: f64,
+};
 
 pub const RawEvent = union(enum) {
     device_added: struct { device: DeviceRef, info: DeviceInfo },
@@ -114,6 +129,11 @@ pub const RawEvent = union(enum) {
     pinch_end: GestureEnd,
     hold_begin: GestureBegin,
     hold_end: GestureEnd,
+    touch_down: TouchPosition,
+    touch_up: TouchContact,
+    touch_motion: TouchPosition,
+    touch_frame: struct { device: DeviceRef },
+    touch_cancel: struct { device: DeviceRef },
     keyboard_key: struct { device: DeviceRef, time_usec: u64, key: u32, pressed: bool },
     tablet_tool_axis: struct {
         device: DeviceRef,
@@ -414,6 +434,40 @@ fn realNextEvent(_: *anyopaque, value: *anyopaque) !?RawEvent {
                     c.LIBINPUT_KEY_STATE_PRESSED,
             } };
         },
+        c.LIBINPUT_EVENT_TOUCH_DOWN,
+        c.LIBINPUT_EVENT_TOUCH_UP,
+        c.LIBINPUT_EVENT_TOUCH_MOTION,
+        c.LIBINPUT_EVENT_TOUCH_FRAME,
+        c.LIBINPUT_EVENT_TOUCH_CANCEL,
+        => blk: {
+            const touch = c.libinput_event_get_touch_event(event) orelse
+                return error.InvalidEvent;
+            const event_type = c.libinput_event_get_type(event);
+            if (event_type == c.LIBINPUT_EVENT_TOUCH_FRAME)
+                break :blk .{ .touch_frame = .{ .device = device } };
+            if (event_type == c.LIBINPUT_EVENT_TOUCH_CANCEL)
+                break :blk .{ .touch_cancel = .{ .device = device } };
+            const contact: TouchContact = .{
+                .device = device,
+                .time_usec = c.libinput_event_touch_get_time_usec(touch),
+                .slot = c.libinput_event_touch_get_slot(touch),
+                .seat_slot = c.libinput_event_touch_get_seat_slot(touch),
+            };
+            if (event_type == c.LIBINPUT_EVENT_TOUCH_UP)
+                break :blk .{ .touch_up = contact };
+            const position: TouchPosition = .{
+                .device = contact.device,
+                .time_usec = contact.time_usec,
+                .slot = contact.slot,
+                .seat_slot = contact.seat_slot,
+                .x = c.libinput_event_touch_get_x_transformed(touch, 1),
+                .y = c.libinput_event_touch_get_y_transformed(touch, 1),
+            };
+            break :blk if (event_type == c.LIBINPUT_EVENT_TOUCH_DOWN)
+                .{ .touch_down = position }
+            else
+                .{ .touch_motion = position };
+        },
         c.LIBINPUT_EVENT_TABLET_TOOL_AXIS,
         c.LIBINPUT_EVENT_TABLET_TOOL_PROXIMITY,
         c.LIBINPUT_EVENT_TABLET_TOOL_TIP,
@@ -509,6 +563,7 @@ fn deviceInfo(device: *c.struct_libinput_device) DeviceInfo {
     var capabilities: Capabilities = .{
         .pointer = c.libinput_device_has_capability(device, c.LIBINPUT_DEVICE_CAP_POINTER) != 0,
         .keyboard = c.libinput_device_has_capability(device, c.LIBINPUT_DEVICE_CAP_KEYBOARD) != 0,
+        .touch = c.libinput_device_has_capability(device, c.LIBINPUT_DEVICE_CAP_TOUCH) != 0,
         .tablet_tool = c.libinput_device_has_capability(device, c.LIBINPUT_DEVICE_CAP_TABLET_TOOL) != 0,
         .tablet_pad = c.libinput_device_has_capability(device, c.LIBINPUT_DEVICE_CAP_TABLET_PAD) != 0,
     };

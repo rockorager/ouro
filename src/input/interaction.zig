@@ -181,6 +181,12 @@ pub fn Interaction(comptime Desktop: type) type {
                 .pinch_end => |value| try self.acceptGesture(value.device),
                 .hold_begin => |value| try self.acceptGesture(value.device),
                 .hold_end => |value| try self.acceptGesture(value.device),
+                .touch_down,
+                .touch_up,
+                .touch_motion,
+                .touch_frame,
+                .touch_cancel,
+                => {},
                 .keyboard_key => |value| try self.keyboardKey(
                     desktop,
                     value.device,

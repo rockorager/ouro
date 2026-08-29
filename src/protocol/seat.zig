@@ -57,6 +57,8 @@ pub const Config = struct {
     seat_capacity: usize,
     pointer_capacity: usize,
     keyboard_capacity: usize,
+    touch_capacity: usize = 8,
+    touch_contact_capacity: usize = 32,
     device_capacity: usize,
     outbound_capacity: usize,
     event_capacity: usize,
@@ -72,6 +74,8 @@ pub const Config = struct {
             config.seat_capacity,
             config.pointer_capacity,
             config.keyboard_capacity,
+            config.touch_capacity,
+            config.touch_contact_capacity,
             config.device_capacity,
             config.outbound_capacity,
             config.event_capacity,
@@ -91,6 +95,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         const Seat = protocol.wl_seat;
         const Pointer = protocol.wl_pointer;
         const Keyboard = protocol.wl_keyboard;
+        const Touch = protocol.wl_touch;
 
         pub const SurfaceId = CoreSurface.SurfaceId;
         pub const ClientId = SeatClientId;
@@ -126,6 +131,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             pointer_grab_cancelled: FocusTarget,
         };
         pub const PointerId = struct { index: u32, generation: u32 };
+        pub const TouchId = PointerId;
+        pub const TouchContactId = struct { device: input.DeviceId, id: i32 };
 
         const SeatSlot = struct {
             header: slot_pool.Header = .{},
@@ -149,6 +156,23 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             seat_index: u32 = none,
             seat_generation: u32 = 0,
             client: ClientId = undefined,
+        };
+        const TouchSlot = struct {
+            header: slot_pool.Header = .{},
+            resource: objects.Handle = .{ .id = 0, .generation = 0 },
+            seat_index: u32 = none,
+            seat_generation: u32 = 0,
+            client: ClientId = undefined,
+            resource_generation: u64 = 0,
+            capability_generation: u32 = 0,
+            pending_frame_events: usize = 0,
+        };
+        const ContactSlot = struct {
+            active: bool = false,
+            contact: TouchContactId = undefined,
+            target: ?FocusTarget = null,
+            max_resource_generation: u64 = 0,
+            offset: Point = .{ .x = 0, .y = 0 },
         };
         const DeviceSlot = struct {
             active: bool = false,
@@ -176,6 +200,11 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             keyboard_leave: struct { keyboard: Id, serial: u32, target: FocusTarget },
             keyboard_key: struct { keyboard: Id, serial: u32, target: FocusTarget, time: u32, key: u32, pressed: bool },
             keyboard_modifiers: struct { keyboard: Id, serial: u32, target: FocusTarget, state: ModifierState },
+            touch_down: struct { touch: Id, serial: u32, time: u32, id: i32, target: FocusTarget, point: Point },
+            touch_up: struct { touch: Id, serial: u32, time: u32, id: i32 },
+            touch_motion: struct { touch: Id, time: u32, id: i32, point: Point },
+            touch_frame: struct { touch: Id, client: ClientId },
+            touch_cancel: struct { touch: Id, client: ClientId },
         };
         const Id = PointerId;
         const OutboundSlot = struct {
@@ -211,6 +240,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         seats: slot_pool.Pool(SeatSlot),
         pointers: slot_pool.Pool(PointerSlot),
         keyboards: slot_pool.Pool(KeyboardSlot),
+        touches: slot_pool.Pool(TouchSlot),
+        contacts: []ContactSlot,
         devices: []DeviceSlot,
         outbound: []OutboundSlot,
         outbound_len: usize = 0,
@@ -219,6 +250,9 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         event_len: usize = 0,
         pointer_devices: usize = 0,
         keyboard_devices: usize = 0,
+        touch_devices: usize = 0,
+        touch_capability_generation: u32 = 1,
+        next_touch_resource_generation: u64 = 1,
         pressed_keys: [state_words]u64 = [_]u64{0} ** state_words,
         pressed_buttons: [state_words]u64 = [_]u64{0} ** state_words,
         pointer_focus: ?FocusTarget = null,
@@ -239,6 +273,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             errdefer pointers.deinit();
             var keyboards = try slot_pool.Pool(KeyboardSlot).init(allocator, config.keyboard_capacity);
             errdefer keyboards.deinit();
+            var touches = try slot_pool.Pool(TouchSlot).init(allocator, config.touch_capacity);
+            errdefer touches.deinit();
+            const contacts = try allocator.alloc(ContactSlot, config.touch_contact_capacity);
+            errdefer allocator.free(contacts);
             const devices = try allocator.alloc(DeviceSlot, config.device_capacity);
             errdefer allocator.free(devices);
             const outbound = try allocator.alloc(OutboundSlot, config.outbound_capacity);
@@ -252,6 +290,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             errdefer _ = linux.close(keymap.fd);
             @memset(devices, .{});
             @memset(outbound, .{});
+            @memset(contacts, .{});
             return .{
                 .allocator = allocator,
                 .core = core,
@@ -265,6 +304,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .seats = seats,
                 .pointers = pointers,
                 .keyboards = keyboards,
+                .touches = touches,
+                .contacts = contacts,
                 .devices = devices,
                 .outbound = outbound,
                 .events = events,
@@ -277,6 +318,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             adapter.allocator.free(adapter.events);
             adapter.allocator.free(adapter.outbound);
             adapter.allocator.free(adapter.devices);
+            adapter.allocator.free(adapter.contacts);
+            adapter.touches.deinit();
             adapter.keyboards.deinit();
             adapter.pointers.deinit();
             adapter.seats.deinit();
@@ -320,6 +363,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             for (adapter.seats.entries.items) |slot| count += @intFromBool(slot.header.active);
             for (adapter.pointers.entries.items) |slot| count += @intFromBool(slot.header.active);
             for (adapter.keyboards.entries.items) |slot| count += @intFromBool(slot.header.active);
+            for (adapter.touches.entries.items) |slot| count += @intFromBool(slot.header.active);
             return count;
         }
 
@@ -386,6 +430,11 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 const slot = adapter.keyboards.fromContext(object.context) orelse return null;
                 if (!std.meta.eql(slot.resource, handle)) return null;
                 return try adapter.keyboardRequest(actor, server_objects, slot, message, fds);
+            }
+            if (object.interface == &Touch.info) {
+                const slot = adapter.touches.fromContext(object.context) orelse return null;
+                if (!std.meta.eql(slot.resource, handle)) return null;
+                return try adapter.touchRequest(actor, server_objects, slot, message, fds);
             }
             return null;
         }
@@ -461,7 +510,24 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                         } }) catch unreachable;
                     };
                 },
-                .get_touch => return try adapter.protocolError(actor, decoded.handle.id, Seat.@"error".missing_capability.value, "touch is not supported"),
+                .get_touch => |payload| {
+                    if (adapter.touch_devices == 0)
+                        return try adapter.protocolError(actor, decoded.handle.id, Seat.@"error".missing_capability.value, "touch capability unavailable");
+                    const slot = adapter.touches.acquire() catch return try adapter.noMemory(actor);
+                    slot.seat_index = adapter.seatIndex(seat);
+                    slot.seat_generation = seat.header.generation;
+                    slot.client = clientId(seat.peer);
+                    slot.resource_generation = adapter.next_touch_resource_generation;
+                    adapter.next_touch_resource_generation +%= 1;
+                    if (adapter.next_touch_resource_generation == 0) adapter.next_touch_resource_generation = 1;
+                    slot.capability_generation = adapter.touch_capability_generation;
+                    slot.pending_frame_events = 0;
+                    const admitted = Seat.admit_get_touch(server_objects, decoded.handle, payload, .{ .id = slot }) catch |err| {
+                        adapter.touches.release(slot);
+                        return try adapter.failure(actor, decoded.handle.id, err);
+                    };
+                    slot.resource = admitted.id;
+                },
                 .release => {},
             }
             try decoded.finish(protocol, server_objects, &actor.transmit);
@@ -503,6 +569,12 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             return .continue_dispatch;
         }
 
+        fn touchRequest(_: *Self, actor: *wayring.connection.Actor, server_objects: anytype, _: *TouchSlot, message: wayring.wire.Message, fds: *wayring.ancillary.FdQueue) !wayring.dispatch.Control {
+            const decoded = try wayring.server.decodeRequest(Touch, server_objects, message, fds);
+            try decoded.finish(protocol, server_objects, &actor.transmit);
+            return .continue_dispatch;
+        }
+
         pub fn resourceRemoved(adapter: *Self, handle: objects.Handle, object: objects.Object) bool {
             if (object.interface == &Seat.info) {
                 const slot = adapter.seats.fromContext(object.context) orelse return false;
@@ -522,6 +594,18 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 if (!std.meta.eql(slot.resource, handle)) return false;
                 adapter.dropOutboundResource(.keyboard, adapter.keyboardIndex(slot), slot.header.generation);
                 adapter.keyboards.release(slot);
+                return true;
+            }
+            if (object.interface == &Touch.info) {
+                const slot = adapter.touches.fromContext(object.context) orelse return false;
+                if (!std.meta.eql(slot.resource, handle)) return false;
+                adapter.dropOutboundResource(.touch, adapter.touchIndex(slot), slot.header.generation);
+                const owner = slot.client;
+                adapter.touches.release(slot);
+                if (adapter.touchResourceCount(owner) == 0)
+                    for (adapter.contacts) |*contact| if (contact.active and contact.target != null and sameClient(contact.target.?.client, owner)) {
+                        contact.target = null;
+                    };
                 return true;
             }
             if (std.mem.eql(u8, object.interface.name, "wl_surface")) {
@@ -985,6 +1069,11 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .tablet_pad_button,
                 .tablet_pad_ring,
                 .tablet_pad_strip,
+                .touch_down,
+                .touch_up,
+                .touch_motion,
+                .touch_frame,
+                .touch_cancel,
                 => {},
             }
         }
@@ -1011,6 +1100,145 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             switch (event) {
                 .pointer_motion => |value| try adapter.pointerMotion(value, point),
                 else => return error.NotPointerMotion,
+            }
+        }
+
+        /// Starts a contact on an exact generation-checked surface. The fixed
+        /// offset retains its down-time coordinate space for the implicit grab.
+        pub fn touchDown(adapter: *Self, contact: TouchContactId, target: FocusTarget, time_ms: u32, point: Point, offset: Point) !?u32 {
+            if (adapter.touch_devices == 0) return error.TouchUnavailable;
+            _ = try adapter.core.getSurfaceById(target.surface);
+            if (adapter.findContact(contact) != null) return error.DuplicateContact;
+            var available: ?*ContactSlot = null;
+            for (adapter.contacts) |*slot| if (!slot.active) {
+                available = slot;
+                break;
+            };
+            const slot = available orelse return error.ContactCapacityExhausted;
+            const max_generation = adapter.latestTouchResourceGeneration(target.client);
+            const count = adapter.touchResourceCountThrough(target.client, max_generation);
+            try adapter.ensureOutbound(count);
+            slot.* = .{
+                .active = true,
+                .contact = contact,
+                .target = if (count == 0) null else target,
+                .max_resource_generation = max_generation,
+                .offset = offset,
+            };
+            if (count == 0) return null;
+            const serial = adapter.issueSerial();
+            for (adapter.touches.entries.items, 0..) |touch, index| if (adapter.touchParticipates(touch, slot)) {
+                adapter.enqueue(target.client, .{ .touch_down = .{
+                    .touch = .{ .index = @intCast(index), .generation = touch.header.generation },
+                    .serial = serial,
+                    .time = time_ms,
+                    .id = contact.id,
+                    .target = target,
+                    .point = point,
+                } }) catch unreachable;
+                touch.pending_frame_events +|= 1;
+            };
+            adapter.setUserActionSerial(target.client, serial);
+            return serial;
+        }
+
+        pub fn touchMotion(adapter: *Self, contact: TouchContactId, time_ms: u32, point: Point) !void {
+            const active = adapter.findContact(contact) orelse return error.StaleContact;
+            const target = active.target orelse return;
+            const count = adapter.touchResourceCountForContact(active);
+            try adapter.ensureOutbound(count);
+            for (adapter.touches.entries.items, 0..) |touch, index| if (adapter.touchParticipates(touch, active)) {
+                adapter.enqueue(target.client, .{ .touch_motion = .{
+                    .touch = .{ .index = @intCast(index), .generation = touch.header.generation },
+                    .time = time_ms,
+                    .id = contact.id,
+                    .point = point,
+                } }) catch unreachable;
+                touch.pending_frame_events +|= 1;
+            };
+        }
+
+        pub const TouchTarget = struct { focus: FocusTarget, offset: Point };
+
+        pub fn touchTarget(adapter: *Self, contact: TouchContactId) ?TouchTarget {
+            const active = adapter.findContact(contact) orelse return null;
+            return .{ .focus = active.target orelse return null, .offset = active.offset };
+        }
+
+        pub fn touchUp(adapter: *Self, contact: TouchContactId, time_ms: u32) !?u32 {
+            const active = adapter.findContact(contact) orelse return error.StaleContact;
+            const target = active.target orelse {
+                active.active = false;
+                return null;
+            };
+            const count = adapter.touchResourceCountForContact(active);
+            try adapter.ensureOutbound(count);
+            const serial = adapter.issueSerial();
+            for (adapter.touches.entries.items, 0..) |touch, index| if (adapter.touchParticipates(touch, active)) {
+                adapter.enqueue(target.client, .{ .touch_up = .{
+                    .touch = .{ .index = @intCast(index), .generation = touch.header.generation },
+                    .serial = serial,
+                    .time = time_ms,
+                    .id = contact.id,
+                } }) catch unreachable;
+                touch.pending_frame_events +|= 1;
+            };
+            active.active = false;
+            return serial;
+        }
+
+        /// Terminates a backend batch. Exactly one frame is queued per live
+        /// resource which has an event in the unfinished batch.
+        pub fn touchFrame(adapter: *Self) !void {
+            var count: usize = 0;
+            for (adapter.touches.entries.items) |touch|
+                count += @intFromBool(adapter.touchActive(touch) and touch.pending_frame_events != 0);
+            try adapter.ensureOutbound(count);
+            for (adapter.touches.entries.items, 0..) |touch, index| if (adapter.touchActive(touch) and touch.pending_frame_events != 0) {
+                adapter.enqueue(touch.client, .{ .touch_frame = .{
+                    .touch = .{ .index = @intCast(index), .generation = touch.header.generation },
+                    .client = touch.client,
+                } }) catch unreachable;
+                touch.pending_frame_events = 0;
+            };
+        }
+
+        pub fn touchCancel(adapter: *Self) !void {
+            var count: usize = 0;
+            for (adapter.touches.entries.items) |touch|
+                count += @intFromBool(adapter.touchResourceHasContact(touch));
+            try adapter.ensureOutbound(count);
+            for (adapter.touches.entries.items, 0..) |touch, index| if (adapter.touchResourceHasContact(touch)) {
+                adapter.enqueue(touch.client, .{ .touch_cancel = .{
+                    .touch = .{ .index = @intCast(index), .generation = touch.header.generation },
+                    .client = touch.client,
+                } }) catch unreachable;
+                touch.pending_frame_events = 0;
+            };
+            for (adapter.contacts) |*contact| contact.active = false;
+        }
+
+        pub fn touchCancelDevice(adapter: *Self, device: input.DeviceId) !void {
+            var count: usize = 0;
+            for (adapter.touches.entries.items) |touch|
+                count += @intFromBool(adapter.touchResourceHasDeviceContact(touch, device));
+            try adapter.ensureOutbound(count);
+            for (adapter.touches.entries.items, 0..) |touch, index| if (adapter.touchResourceHasDeviceContact(touch, device)) {
+                adapter.enqueue(touch.client, .{ .touch_cancel = .{
+                    .touch = .{ .index = @intCast(index), .generation = touch.header.generation },
+                    .client = touch.client,
+                } }) catch unreachable;
+                touch.pending_frame_events = 0;
+            };
+            for (adapter.contacts) |contact| if (contact.active and std.meta.eql(contact.contact.device, device) and contact.target != null) {
+                const client = contact.target.?.client;
+                for (adapter.contacts) |*candidate| {
+                    if (candidate.active and candidate.target != null and sameClient(candidate.target.?.client, client))
+                        candidate.target = null;
+                }
+            };
+            for (adapter.contacts) |*contact| {
+                if (contact.active and std.meta.eql(contact.contact.device, device)) contact.active = false;
             }
         }
 
@@ -1300,6 +1528,34 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                         .group = v.state.group,
                     } });
                 },
+                .touch_down => |v| {
+                    const slot = adapter.resolveTouch(v.touch) catch return true;
+                    const surface = adapter.surfaceObject(server_objects, v.target) catch return true;
+                    try Touch.encodeEvent(queue, slot.resource.id, .{ .down = .{
+                        .serial = v.serial,
+                        .time = v.time,
+                        .surface = surface.id,
+                        .id = v.id,
+                        .x = v.point.x,
+                        .y = v.point.y,
+                    } });
+                },
+                .touch_up => |v| {
+                    const slot = adapter.resolveTouch(v.touch) catch return true;
+                    try Touch.encodeEvent(queue, slot.resource.id, .{ .up = .{ .serial = v.serial, .time = v.time, .id = v.id } });
+                },
+                .touch_motion => |v| {
+                    const slot = adapter.resolveTouch(v.touch) catch return true;
+                    try Touch.encodeEvent(queue, slot.resource.id, .{ .motion = .{ .time = v.time, .id = v.id, .x = v.point.x, .y = v.point.y } });
+                },
+                .touch_frame => |v| {
+                    const slot = adapter.resolveTouch(v.touch) catch return true;
+                    try Touch.encodeEvent(queue, slot.resource.id, .{ .frame = .{} });
+                },
+                .touch_cancel => |v| {
+                    const slot = adapter.resolveTouch(v.touch) catch return true;
+                    try Touch.encodeEvent(queue, slot.resource.id, .{ .cancel = .{} });
+                },
             }
             return true;
         }
@@ -1315,11 +1571,13 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             const old = adapter.capabilityBits();
             const pointer_devices = adapter.pointer_devices + @intFromBool(capabilities.pointer);
             const keyboard_devices = adapter.keyboard_devices + @intFromBool(capabilities.keyboard);
-            const current = capabilityBitsFor(pointer_devices, keyboard_devices);
+            const touch_devices = adapter.touch_devices + @intFromBool(capabilities.touch);
+            const current = capabilityBitsFor(pointer_devices, keyboard_devices, touch_devices);
             try adapter.ensureOutbound(adapter.capabilityPublicationCount(old, current));
             slot.* = .{ .active = true, .id = id, .capabilities = capabilities };
             adapter.pointer_devices = pointer_devices;
             adapter.keyboard_devices = keyboard_devices;
+            adapter.touch_devices = touch_devices;
             adapter.enqueueCapabilities(old, current) catch unreachable;
         }
 
@@ -1334,7 +1592,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             const publish_cancellation = adapter.pointer_grab == .active;
             const pointer_devices = adapter.pointer_devices - @intFromBool(slot.capabilities.pointer);
             const keyboard_devices = adapter.keyboard_devices - @intFromBool(slot.capabilities.keyboard);
-            const current = capabilityBitsFor(pointer_devices, keyboard_devices);
+            const touch_devices = adapter.touch_devices - @intFromBool(slot.capabilities.touch);
+            const current = capabilityBitsFor(pointer_devices, keyboard_devices, touch_devices);
             var release_count: usize = 0;
             for (0..code_count) |code| if (bitSet(&old_keys, @intCast(code)) and
                 !bitSet(&keys_after, @intCast(code)))
@@ -1352,12 +1611,26 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     return error.Exhausted;
                 outbound_needed += adapter.pointerCancellationOutbound();
             }
+            var touch_cancel_count: usize = 0;
+            var has_touch_contacts = false;
+            for (adapter.contacts) |contact| if (contact.active and std.meta.eql(contact.contact.device, id)) {
+                touch_cancel_count = adapter.touchCancelDeviceCount(id);
+                has_touch_contacts = true;
+                break;
+            };
+            outbound_needed += touch_cancel_count;
             try adapter.ensureOutbound(outbound_needed);
 
             if (cancel_grab) adapter.cancelPointerGrab() catch unreachable;
+            if (has_touch_contacts) adapter.touchCancelDevice(id) catch unreachable;
             slot.active = false;
             adapter.pointer_devices = pointer_devices;
             adapter.keyboard_devices = keyboard_devices;
+            adapter.touch_devices = touch_devices;
+            if (slot.capabilities.touch and touch_devices == 0) {
+                adapter.touch_capability_generation +%= 1;
+                if (adapter.touch_capability_generation == 0) adapter.touch_capability_generation = 1;
+            }
             adapter.pressed_keys = keys_after;
             const modifiers_changed = !std.meta.eql(adapter.modifiers, next_modifiers);
             adapter.modifiers = next_modifiers;
@@ -1639,6 +1912,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             }
             for (adapter.outbound) |*slot| {
                 if (slot.active and outboundTargets(slot.value, id)) {
+                    adapter.dropPendingTouchEvent(slot.value);
                     slot.active = false;
                     adapter.outbound_len -= 1;
                 }
@@ -1664,12 +1938,13 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         }
 
         fn capabilityBits(adapter: *const Self) u32 {
-            return capabilityBitsFor(adapter.pointer_devices, adapter.keyboard_devices);
+            return capabilityBitsFor(adapter.pointer_devices, adapter.keyboard_devices, adapter.touch_devices);
         }
 
-        fn capabilityBitsFor(pointer_devices: usize, keyboard_devices: usize) u32 {
+        fn capabilityBitsFor(pointer_devices: usize, keyboard_devices: usize, touch_devices: usize) u32 {
             return (if (pointer_devices != 0) Seat.capability.pointer.value else 0) |
-                (if (keyboard_devices != 0) Seat.capability.keyboard.value else 0);
+                (if (keyboard_devices != 0) Seat.capability.keyboard.value else 0) |
+                (if (touch_devices != 0) Seat.capability.touch.value else 0);
         }
 
         fn aggregateKeysWithout(adapter: *const Self, excluded: *const DeviceSlot) [state_words]u64 {
@@ -1839,6 +2114,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 if (object.interface == &Keyboard.info and object.context == @as(?*anyopaque, @ptrCast(keyboard)))
                     return true;
             };
+            for (adapter.touches.entries.items) |touch| if (touch.header.active and sameClient(touch.client, client)) {
+                const object = server_objects.namespace.resolve(touch.resource) orelse continue;
+                if (object.interface == &Touch.info and object.context == @as(?*anyopaque, @ptrCast(touch))) return true;
+            };
             return false;
         }
 
@@ -1898,6 +2177,71 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             return sameClient(slot.client, client);
         }
 
+        fn touchActive(adapter: *const Self, slot: *const TouchSlot) bool {
+            return slot.header.active and slot.capability_generation == adapter.touch_capability_generation;
+        }
+        fn touchResourceCount(adapter: *const Self, client: ClientId) usize {
+            var count: usize = 0;
+            for (adapter.touches.entries.items) |slot|
+                count += @intFromBool(adapter.touchActive(slot) and sameClient(slot.client, client));
+            return count;
+        }
+        fn latestTouchResourceGeneration(adapter: *const Self, client: ClientId) u64 {
+            var generation: u64 = 0;
+            for (adapter.touches.entries.items) |slot| {
+                if (adapter.touchActive(slot) and sameClient(slot.client, client))
+                    generation = @max(generation, slot.resource_generation);
+            }
+            return generation;
+        }
+        fn touchResourceCountThrough(adapter: *const Self, client: ClientId, generation: u64) usize {
+            var count: usize = 0;
+            for (adapter.touches.entries.items) |slot|
+                count += @intFromBool(adapter.touchActive(slot) and sameClient(slot.client, client) and
+                    slot.resource_generation <= generation);
+            return count;
+        }
+        fn findContact(adapter: *Self, id: TouchContactId) ?*ContactSlot {
+            for (adapter.contacts) |*slot| if (slot.active and std.meta.eql(slot.contact, id)) return slot;
+            return null;
+        }
+        fn touchParticipates(adapter: *const Self, touch: *const TouchSlot, contact: *const ContactSlot) bool {
+            const target = contact.target orelse return false;
+            return adapter.touchActive(touch) and sameClient(touch.client, target.client) and
+                touch.resource_generation <= contact.max_resource_generation;
+        }
+        fn touchResourceCountForContact(adapter: *const Self, contact: *const ContactSlot) usize {
+            var count: usize = 0;
+            for (adapter.touches.entries.items) |touch|
+                count += @intFromBool(adapter.touchParticipates(touch, contact));
+            return count;
+        }
+        fn touchResourceHasContact(adapter: *const Self, touch: *const TouchSlot) bool {
+            for (adapter.contacts) |contact|
+                if (contact.active and adapter.touchParticipates(touch, &contact)) return true;
+            return false;
+        }
+        fn touchResourceHasDeviceContact(adapter: *const Self, touch: *const TouchSlot, device: input.DeviceId) bool {
+            for (adapter.contacts) |contact|
+                if (contact.active and std.meta.eql(contact.contact.device, device) and
+                    adapter.touchParticipates(touch, &contact)) return true;
+            return false;
+        }
+        fn touchCancelDeviceCount(adapter: *const Self, device: input.DeviceId) usize {
+            var count: usize = 0;
+            for (adapter.touches.entries.items) |touch|
+                count += @intFromBool(adapter.touchResourceHasDeviceContact(touch, device));
+            return count;
+        }
+        fn dropPendingTouchEvent(adapter: *Self, value: Outbound) void {
+            const id = switch (value) {
+                .touch_down => |event| event.touch,
+                else => return,
+            };
+            const touch = adapter.resolveTouch(id) catch return;
+            if (touch.pending_frame_events != 0) touch.pending_frame_events -= 1;
+        }
+
         fn resolveDevice(adapter: *Self, id: input.DeviceId) !*DeviceSlot {
             return adapter.findDevice(id) orelse error.StaleDevice;
         }
@@ -1923,6 +2267,12 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             if (!slot.header.active or slot.header.generation != id.generation) return error.StaleKeyboard;
             return slot;
         }
+        fn resolveTouch(adapter: *Self, id: Id) !*TouchSlot {
+            if (id.index >= adapter.touches.entries.items.len) return error.StaleTouch;
+            const slot = adapter.touches.entries.items[id.index];
+            if (!slot.header.active or slot.header.generation != id.generation) return error.StaleTouch;
+            return slot;
+        }
 
         fn releaseSeat(adapter: *Self, index: u32) void {
             const generation = adapter.seats.entries.items[index].header.generation;
@@ -1944,7 +2294,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             adapter.seats.release(adapter.seats.entries.items[index]);
         }
 
-        const ResourceKind = enum { pointer, keyboard };
+        const ResourceKind = enum { pointer, keyboard, touch };
         fn dropOutboundResource(adapter: *Self, kind: ResourceKind, index: u32, generation: u32) void {
             for (adapter.outbound) |*slot| if (slot.active) {
                 const id: ?Id = switch (slot.value) {
@@ -1963,6 +2313,11 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     .keyboard_leave => |v| if (kind == .keyboard) v.keyboard else null,
                     .keyboard_key => |v| if (kind == .keyboard) v.keyboard else null,
                     .keyboard_modifiers => |v| if (kind == .keyboard) v.keyboard else null,
+                    .touch_down => |v| if (kind == .touch) v.touch else null,
+                    .touch_up => |v| if (kind == .touch) v.touch else null,
+                    .touch_motion => |v| if (kind == .touch) v.touch else null,
+                    .touch_frame => |v| if (kind == .touch) v.touch else null,
+                    .touch_cancel => |v| if (kind == .touch) v.touch else null,
                     else => null,
                 };
                 if (id == null) continue;
@@ -1995,6 +2350,9 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         }
         fn keyboardId(adapter: *Self, slot: *KeyboardSlot) Id {
             return .{ .index = adapter.keyboardIndex(slot), .generation = slot.header.generation };
+        }
+        fn touchIndex(_: *Self, slot: *TouchSlot) u32 {
+            return slot.header.index;
         }
         fn seatIndex(_: *Self, slot: *SeatSlot) u32 {
             return slot.header.index;
@@ -2103,6 +2461,7 @@ fn outboundTargets(value: anytype, surface: anytype) bool {
         .keyboard_leave => |v| std.meta.eql(v.target.surface, surface),
         .keyboard_key => |v| std.meta.eql(v.target.surface, surface),
         .keyboard_modifiers => |v| std.meta.eql(v.target.surface, surface),
+        .touch_down => |v| std.meta.eql(v.target.surface, surface),
         else => false,
     };
 }
@@ -2153,6 +2512,16 @@ fn testAdapterWithCapacity(core: *FakeCore, outbound_capacity: usize, event_capa
 fn clearTestOutbound(adapter: *TestAdapter) void {
     for (adapter.outbound) |*slot| slot.active = false;
     adapter.outbound_len = 0;
+}
+
+fn addTestTouchResource(adapter: *TestAdapter, client: TestAdapter.ClientId) !*TestAdapter.TouchSlot {
+    const touch = try adapter.touches.acquire();
+    touch.client = client;
+    touch.resource_generation = adapter.next_touch_resource_generation;
+    adapter.next_touch_resource_generation += 1;
+    touch.capability_generation = adapter.touch_capability_generation;
+    touch.pending_frame_events = 0;
+    return touch;
 }
 
 fn countTestOutbound(adapter: *const TestAdapter, tag: std.meta.Tag(TestAdapter.Outbound)) usize {
@@ -2219,6 +2588,144 @@ test "seat: capabilities aggregate exact physical generations" {
     } }));
     try adapter.consume(.{ .device_removed = second });
     try std.testing.expectEqual(test_protocol.wl_seat.capability.pointer.value, adapter.capabilityBits());
+}
+
+test "seat: touch contacts retain targets and frame marks across flushes" {
+    var core: FakeCore = .{};
+    var adapter = try testAdapter(&core);
+    defer adapter.deinit();
+    const peer: wayring.io_uring.Peer = .{ .slot = 0, .generation = 3 };
+    const client = clientId(peer);
+    const target = try adapter.makeTarget(peer, .{ .index = 0, .generation = 1 });
+    const device: input.DeviceId = .{ .slot = 0, .generation = 5, .seat_generation = 7 };
+    try adapter.consume(.{ .device_added = .{
+        .device = device,
+        .info = .{ .capabilities = .{ .touch = true } },
+    } });
+    const first = try addTestTouchResource(&adapter, client);
+    clearTestOutbound(&adapter);
+
+    const one: TestAdapter.TouchContactId = .{ .device = device, .id = 4 };
+    try std.testing.expect((try adapter.touchDown(
+        one,
+        target,
+        10,
+        .{ .x = 64, .y = 96 },
+        .{ .x = 256, .y = 512 },
+    )) != null);
+    try std.testing.expectEqual(@as(usize, 1), countTestOutbound(&adapter, .touch_down));
+    try std.testing.expectEqual(TestAdapter.TouchTarget{
+        .focus = target,
+        .offset = .{ .x = 256, .y = 512 },
+    }, adapter.touchTarget(one).?);
+
+    // Protocol flushing does not consume the backend frame boundary.
+    clearTestOutbound(&adapter);
+    try adapter.touchFrame();
+    try std.testing.expectEqual(@as(usize, 1), countTestOutbound(&adapter, .touch_frame));
+    try std.testing.expectEqual(@as(usize, 0), first.pending_frame_events);
+    clearTestOutbound(&adapter);
+
+    const second = try addTestTouchResource(&adapter, client);
+    try adapter.touchMotion(one, 11, .{ .x = 128, .y = 160 });
+    try std.testing.expectEqual(@as(usize, 1), countTestOutbound(&adapter, .touch_motion));
+    try std.testing.expectEqual(@as(usize, 1), first.pending_frame_events);
+    try std.testing.expectEqual(@as(usize, 0), second.pending_frame_events);
+
+    const two: TestAdapter.TouchContactId = .{ .device = device, .id = 8 };
+    _ = try adapter.touchDown(
+        two,
+        target,
+        12,
+        .{ .x = 192, .y = 224 },
+        .{ .x = 512, .y = 768 },
+    );
+    try std.testing.expectEqual(@as(usize, 2), countTestOutbound(&adapter, .touch_down));
+    try std.testing.expectEqual(@as(usize, 1), second.pending_frame_events);
+    try adapter.touchFrame();
+    try std.testing.expectEqual(@as(usize, 2), countTestOutbound(&adapter, .touch_frame));
+    const pending = adapter.pendingOutbound();
+    try adapter.touchFrame();
+    try std.testing.expectEqual(pending, adapter.pendingOutbound());
+
+    _ = try adapter.touchUp(one, 13);
+    _ = try adapter.touchUp(two, 14);
+    try std.testing.expect(adapter.touchTarget(one) == null);
+    try std.testing.expect(adapter.touchTarget(two) == null);
+}
+
+test "seat: touch device cancellation is atomic and client scoped" {
+    var core: FakeCore = .{};
+    var adapter = try testAdapterWithCapacity(&core, 4, 4);
+    defer adapter.deinit();
+    const peer_a: wayring.io_uring.Peer = .{ .slot = 0, .generation = 3 };
+    const peer_b: wayring.io_uring.Peer = .{ .slot = 1, .generation = 3 };
+    const target_a = try adapter.makeTarget(peer_a, .{ .index = 0, .generation = 1 });
+    const target_b = try adapter.makeTarget(peer_b, .{ .index = 0, .generation = 1 });
+    const device_a: input.DeviceId = .{ .slot = 0, .generation = 5, .seat_generation = 7 };
+    const device_b: input.DeviceId = .{ .slot = 1, .generation = 5, .seat_generation = 7 };
+    try adapter.consume(.{ .device_added = .{
+        .device = device_a,
+        .info = .{ .capabilities = .{ .touch = true } },
+    } });
+    try adapter.consume(.{ .device_added = .{
+        .device = device_b,
+        .info = .{ .capabilities = .{ .touch = true } },
+    } });
+    _ = try addTestTouchResource(&adapter, clientId(peer_a));
+    _ = try addTestTouchResource(&adapter, clientId(peer_b));
+    clearTestOutbound(&adapter);
+
+    const on_a: TestAdapter.TouchContactId = .{ .device = device_a, .id = 1 };
+    const other_device_same_client: TestAdapter.TouchContactId = .{ .device = device_b, .id = 2 };
+    const unrelated: TestAdapter.TouchContactId = .{ .device = device_b, .id = 3 };
+    _ = try adapter.touchDown(on_a, target_a, 1, .{ .x = 0, .y = 0 }, .{ .x = 0, .y = 0 });
+    _ = try adapter.touchDown(other_device_same_client, target_a, 2, .{ .x = 0, .y = 0 }, .{ .x = 0, .y = 0 });
+    _ = try adapter.touchDown(unrelated, target_b, 3, .{ .x = 0, .y = 0 }, .{ .x = 0, .y = 0 });
+    clearTestOutbound(&adapter);
+    for (0..adapter.outbound.len) |index|
+        try adapter.enqueue(clientId(peer_a), .{ .seat_name = .{ .index = @intCast(index), .generation = 1 } });
+
+    try std.testing.expectError(error.Exhausted, adapter.touchCancelDevice(device_a));
+    try std.testing.expect(adapter.findContact(on_a).?.target != null);
+    try std.testing.expect(adapter.findContact(other_device_same_client).?.target != null);
+    try std.testing.expect(adapter.findContact(unrelated).?.target != null);
+
+    clearTestOutbound(&adapter);
+    try adapter.touchCancelDevice(device_a);
+    try std.testing.expectEqual(@as(usize, 1), countTestOutbound(&adapter, .touch_cancel));
+    try std.testing.expect(adapter.findContact(on_a) == null);
+    try std.testing.expect(adapter.findContact(other_device_same_client).?.target == null);
+    try std.testing.expect(adapter.findContact(unrelated).?.target != null);
+    clearTestOutbound(&adapter);
+    try adapter.touchMotion(other_device_same_client, 4, .{ .x = 1, .y = 1 });
+    try std.testing.expectEqual(@as(usize, 0), adapter.pendingOutbound());
+    try adapter.touchMotion(unrelated, 5, .{ .x = 2, .y = 2 });
+    try std.testing.expectEqual(@as(usize, 1), countTestOutbound(&adapter, .touch_motion));
+
+    clearTestOutbound(&adapter);
+    const old_generation = adapter.touch_capability_generation;
+    try adapter.consume(.{ .device_removed = device_a });
+    try adapter.consume(.{ .device_removed = device_b });
+    try std.testing.expect(adapter.touch_capability_generation != old_generation);
+    try std.testing.expect(adapter.findContact(other_device_same_client) == null);
+    try std.testing.expect(adapter.findContact(unrelated) == null);
+    try adapter.consume(.{ .device_added = .{
+        .device = device_a,
+        .info = .{ .capabilities = .{ .touch = true } },
+    } });
+    clearTestOutbound(&adapter);
+    const ignored: TestAdapter.TouchContactId = .{ .device = device_a, .id = 9 };
+    try std.testing.expect((try adapter.touchDown(
+        ignored,
+        target_a,
+        6,
+        .{ .x = 0, .y = 0 },
+        .{ .x = 0, .y = 0 },
+    )) == null);
+    try std.testing.expectEqual(@as(usize, 0), adapter.pendingOutbound());
+    try std.testing.expect(adapter.findContact(ignored).?.target == null);
+    try std.testing.expect((try adapter.touchUp(ignored, 7)) == null);
 }
 
 test "seat: serial wrap skips zero and live client pointer serials" {
