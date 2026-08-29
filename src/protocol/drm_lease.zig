@@ -11,7 +11,7 @@ pub const Config = struct {
     request_capacity: usize = 64,
     selection_capacity: usize = 256,
     lease_capacity: usize = 64,
-    outbound_capacity: usize = 512,
+    outbound_capacity: usize = 1024,
     name_bytes: usize = 4096,
     description_bytes: usize = 16384,
 
@@ -52,7 +52,7 @@ pub fn Adapter(comptime protocol: type, comptime DeviceId: type, comptime Connec
         const Dev = struct { h: Header = .{}, peer: Peer = undefined, resource: Handle = undefined, device: DeviceId = undefined, dirty: bool = false, notify: bool = false };
         const Offer = struct { h: Header = .{}, peer: Peer = undefined, resource: ?Handle = null, device_owner: Id = undefined, inventory: Id = undefined, withdrawn: bool = false };
         const Req = struct { h: Header = .{}, peer: Peer = undefined, resource: Handle = undefined, device_owner: Id = undefined, invalid: bool = false };
-        const Ls = struct { h: Header = .{}, peer: Peer = undefined, resource: Handle = undefined, device_owner: Id = undefined, token: ?Token = null, finished: bool = false, finished_queued: bool = false };
+        const Ls = struct { h: Header = .{}, peer: Peer = undefined, resource: ?Handle = null, device_owner: Id = undefined, device: DeviceId = undefined, token: ?Token = null, revocation_pending: bool = false, finished: bool = false, finished_queued: bool = false };
         const Selection = struct { active: bool = false, owner: Id = undefined, lease_owner: bool = false, inventory: Id = undefined };
         const FdEvent = struct { owner: Id, fd: linux.fd_t };
         const Event = union(enum) { drm_fd: FdEvent, make_offer: Id, name: Id, description: Id, connector_id: Id, offer_done: Id, withdrawn: Id, device_done: Id, lease_fd: FdEvent, finished: Id };
@@ -123,11 +123,29 @@ pub fn Adapter(comptime protocol: type, comptime DeviceId: type, comptime Connec
         }
 
         pub fn install(self: *Self, runtime: *Runtime) !Handle {
-            if (self.runtime != null) return error.AlreadyInstalled;
+            if (self.global != null) return error.AlreadyInstalled;
+            const first_install = self.runtime == null;
+            if (!first_install and self.runtime.? != runtime) return error.AlreadyInstalled;
             self.runtime = runtime;
-            errdefer self.runtime = null;
+            errdefer if (first_install) {
+                self.runtime = null;
+            };
             self.global = try runtime.addGlobalWithBinder(&Device.info, 1, self, bind);
             return self.global.?;
+        }
+
+        /// Withdraws the lease-device global while preserving existing bound
+        /// resources so they can receive connector withdrawals and lease
+        /// completion. The same adapter may be installed again later.
+        pub fn removeGlobal(self: *Self) !void {
+            const runtime = self.runtime orelse return error.NotInstalled;
+            const global = self.global orelse return error.NotInstalled;
+            try runtime.removeGlobal(global);
+            self.global = null;
+        }
+
+        pub fn installed(self: *const Self) bool {
+            return self.global != null;
         }
 
         fn bind(ctx: ?*anyopaque, b: wayring.server.Binding) !?*anyopaque {
@@ -260,6 +278,7 @@ pub fn Adapter(comptime protocol: type, comptime DeviceId: type, comptime Connec
                         l.peer = peer;
                         l.resource = admitted.id;
                         l.device_owner = r.device_owner;
+                        l.device = d.device;
                         const lid = self.idOf(Ls, self.leases, l);
                         var stale = r.invalid;
                         var n: usize = 0;
@@ -299,7 +318,7 @@ pub fn Adapter(comptime protocol: type, comptime DeviceId: type, comptime Connec
             }
             if (target.object.interface == &Lease.info) {
                 const l = self.fromContext(Ls, self.leases, target.object.context) orelse return null;
-                if (!samePeer(l.peer, peer) or !std.meta.eql(l.resource, handle)) return null;
+                if (l.resource == null or !samePeer(l.peer, peer) or !std.meta.eql(l.resource.?, handle)) return null;
                 const decoded = try wayring.server.decodeRequest(Lease, so, message, fds);
                 try decoded.finish(protocol, so, &actor.transmit);
                 self.dropLease(l);
@@ -343,8 +362,8 @@ pub fn Adapter(comptime protocol: type, comptime DeviceId: type, comptime Connec
                 .offer_done => |x| if (self.offerSlot(x)) |o| if (o.resource) |h| try wayring.server.sendEvent(protocol, Connector, so, q, h, .{ .done = .{} }),
                 .withdrawn => |x| if (self.offerSlot(x)) |o| if (o.resource) |h| try wayring.server.sendEvent(protocol, Connector, so, q, h, .{ .withdrawn = .{} }),
                 .device_done => |x| if (self.deviceSlot(x)) |d| try wayring.server.sendEvent(protocol, Device, so, q, d.resource, .{ .done = .{} }),
-                .lease_fd => |x| if (self.leaseSlot(x.owner)) |l| try wayring.server.sendEvent(protocol, Lease, so, q, l.resource, .{ .lease_fd = .{ .leased_fd = x.fd } }),
-                .finished => |x| if (self.leaseSlot(x)) |l| try wayring.server.sendEvent(protocol, Lease, so, q, l.resource, .{ .finished = .{} }),
+                .lease_fd => |x| if (self.leaseSlot(x.owner)) |l| if (l.resource) |h| try wayring.server.sendEvent(protocol, Lease, so, q, h, .{ .lease_fd = .{ .leased_fd = x.fd } }),
+                .finished => |x| if (self.leaseSlot(x)) |l| if (l.resource) |h| try wayring.server.sendEvent(protocol, Lease, so, q, h, .{ .finished = .{} }),
             }
         }
 
@@ -364,7 +383,7 @@ pub fn Adapter(comptime protocol: type, comptime DeviceId: type, comptime Connec
                 self.retire(r);
                 return true;
             };
-            if (o.interface == &Lease.info) if (self.fromContext(Ls, self.leases, o.context)) |l| if (std.meta.eql(l.resource, h)) {
+            if (o.interface == &Lease.info) if (self.fromContext(Ls, self.leases, o.context)) |l| if (l.resource != null and std.meta.eql(l.resource.?, h)) {
                 self.dropLease(l);
                 return true;
             };
@@ -389,22 +408,77 @@ pub fn Adapter(comptime protocol: type, comptime DeviceId: type, comptime Connec
             return false;
         }
 
+        /// Retries revocations which could not complete when their protocol
+        /// resource disappeared. Returns true while backend ownership remains.
+        pub fn retryRevocations(self: *Self) bool {
+            var pending = false;
+            for (self.leases) |*l| {
+                if (!l.h.active or !l.revocation_pending) continue;
+                if (!self.revoke(l, true)) {
+                    pending = true;
+                    continue;
+                }
+                if (l.resource == null) self.retire(l) else {
+                    l.finished = true;
+                    self.queueFinished(l);
+                }
+            }
+            return pending;
+        }
+
+        /// Withdraws every offer and terminates every lease for a backend
+        /// device before its DRM topology disappears. Existing protocol
+        /// resources remain valid long enough to receive their terminal event.
+        pub fn deviceUnavailable(self: *Self, device: DeviceId) !void {
+            var event_count: usize = 0;
+            for (self.offers) |o| {
+                if (!o.h.active or o.withdrawn) continue;
+                const inv = self.inventorySlot(o.inventory) orelse continue;
+                if (!std.meta.eql(inv.device, device)) continue;
+                event_count += 1;
+                if (self.deviceSlot(o.device_owner)) |d| d.notify = true;
+            }
+            for (self.devices) |*d| if (d.h.active and d.notify) {
+                event_count += 1;
+                d.notify = false;
+            };
+            try self.ensureOut(event_count);
+
+            for (self.inventory) |*inv| if (inv.h.active and std.meta.eql(inv.device, device)) {
+                inv.present = false;
+                inv.available = false;
+            };
+            for (self.offers) |*o| {
+                if (!o.h.active or o.withdrawn) continue;
+                const inv = self.inventorySlot(o.inventory) orelse continue;
+                if (!std.meta.eql(inv.device, device)) continue;
+                o.withdrawn = true;
+                self.push(o.peer, .{ .withdrawn = self.idOf(Offer, self.offers, o) });
+                if (self.deviceSlot(o.device_owner)) |d| d.notify = true;
+            }
+            self.queueWithdrawalDone();
+            for (self.leases) |*l| if (l.h.active and std.meta.eql(l.device, device))
+                self.finishLease(l, true);
+        }
+
         fn finishLease(self: *Self, l: *Ls, revoke_backend: bool) void {
             if (l.finished) return;
             const id = self.idOf(Ls, self.leases, l);
             // An unsent lease descriptor is no longer useful after revocation.
             // Removing it also closes the adapter-owned descriptor exactly once.
             self.removeOutbound(.{ .lease = id }, null);
-            self.revoke(l, revoke_backend);
+            l.revocation_pending = revoke_backend;
+            if (!self.revoke(l, revoke_backend)) return;
             l.finished = true;
             self.queueFinished(l);
         }
-        fn revoke(self: *Self, l: *Ls, revoke_backend: bool) void {
+        fn revoke(self: *Self, l: *Ls, revoke_backend: bool) bool {
             const lid = self.idOf(Ls, self.leases, l);
             if (l.token) |t| {
-                if (revoke_backend) self.resolver.revokeDrmLease(t);
+                if (revoke_backend and !self.resolver.revokeDrmLease(t)) return false;
                 l.token = null;
             }
+            l.revocation_pending = false;
             for (self.selections) |*s| if (s.active and s.lease_owner and idEql(s.owner, lid)) {
                 if (self.inventorySlot(s.inventory)) |x| {
                     if (x.present) x.available = true;
@@ -412,17 +486,20 @@ pub fn Adapter(comptime protocol: type, comptime DeviceId: type, comptime Connec
                 }
                 s.active = false;
             };
+            return true;
         }
         fn dropLease(self: *Self, l: *Ls) void {
             if (!l.h.active) return;
             const id = self.idOf(Ls, self.leases, l);
-            self.revoke(l, true);
             self.removeOutbound(.{ .lease = id }, null);
+            l.resource = null;
+            l.revocation_pending = true;
+            if (!self.revoke(l, true)) return;
             self.retire(l);
         }
 
         fn queueFinished(self: *Self, l: *Ls) void {
-            if (!l.h.active or !l.finished or l.finished_queued or self.outbound_len == self.outbound.len) return;
+            if (!l.h.active or l.resource == null or !l.finished or l.finished_queued or self.outbound_len == self.outbound.len) return;
             l.finished_queued = true;
             self.push(l.peer, .{ .finished = self.idOf(Ls, self.leases, l) });
         }
@@ -668,15 +745,15 @@ pub fn Adapter(comptime protocol: type, comptime DeviceId: type, comptime Connec
         fn connectorDescription(self: *Self, x: *Inventory) []const u8 {
             return self.slotBytes(self.descriptions, x, self.inventory)[0..x.description_len];
         }
-        fn oom(_: *Self, a: *wayring.connection.Actor) !wayring.dispatch.Control {
+        fn oom(_: *Self, a: *wayring.connection.Actor) !?wayring.dispatch.Control {
             try Core.postError(a, objects.display_id, 2, "out of memory");
             return .stop;
         }
-        fn proto(_: *Self, a: *wayring.connection.Actor, id: u32, code: u32, msg: []const u8) !wayring.dispatch.Control {
+        fn proto(_: *Self, a: *wayring.connection.Actor, id: u32, code: u32, msg: []const u8) !?wayring.dispatch.Control {
             try Core.postError(a, id, code, msg);
             return .stop;
         }
-        fn fail(self: *Self, a: *wayring.connection.Actor, id: u32, e: anyerror) !wayring.dispatch.Control {
+        fn fail(self: *Self, a: *wayring.connection.Actor, id: u32, e: anyerror) !?wayring.dispatch.Control {
             return switch (e) {
                 error.OutOfMemory, error.Exhausted => self.oom(a),
                 else => self.proto(a, id, 0, @errorName(e)),
@@ -694,7 +771,9 @@ fn samePeer(a: wayring.io_uring.Peer, b: wayring.io_uring.Peer) bool {
 
 test "inventory metadata is stable, duplicate identity rejected, generations advance" {
     const R = struct {
-        pub fn revokeDrmLease(_: *@This(), _: u32) void {}
+        pub fn revokeDrmLease(_: *@This(), _: u32) bool {
+            return true;
+        }
     };
     const A = Adapter(@import("core_protocol"), u32, u32, u32, R);
     var r: R = .{};
@@ -713,7 +792,9 @@ test "inventory metadata is stable, duplicate identity rejected, generations adv
 
 test "offers are per binding and selection slots are reclaimed" {
     const R = struct {
-        pub fn revokeDrmLease(_: *@This(), _: u32) void {}
+        pub fn revokeDrmLease(_: *@This(), _: u32) bool {
+            return true;
+        }
     };
     const A = Adapter(@import("core_protocol"), u32, u32, u32, R);
     var r: R = .{};
@@ -741,7 +822,9 @@ test "offers are per binding and selection slots are reclaimed" {
 
 test "outbound ownership is exact and pressure is atomic" {
     const R = struct {
-        pub fn revokeDrmLease(_: *@This(), _: u32) void {}
+        pub fn revokeDrmLease(_: *@This(), _: u32) bool {
+            return true;
+        }
     };
     const A = Adapter(@import("core_protocol"), u32, u32, u32, R);
     var r: R = .{};
@@ -759,8 +842,9 @@ test "outbound ownership is exact and pressure is atomic" {
 test "lease revoke is exactly once and makes connector available" {
     const R = struct {
         revokes: usize = 0,
-        pub fn revokeDrmLease(s: *@This(), _: u32) void {
+        pub fn revokeDrmLease(s: *@This(), _: u32) bool {
             s.revokes += 1;
+            return true;
         }
     };
     const A = Adapter(@import("core_protocol"), u32, u32, u32, R);
@@ -782,7 +866,9 @@ test "lease revoke is exactly once and makes connector available" {
 
 test "withdrawal is ordered for pending per-peer offers and grouped by device" {
     const R = struct {
-        pub fn revokeDrmLease(_: *@This(), _: u32) void {}
+        pub fn revokeDrmLease(_: *@This(), _: u32) bool {
+            return true;
+        }
     };
     const A = Adapter(@import("core_protocol"), u32, u32, u32, R);
     var r: R = .{};
@@ -812,7 +898,9 @@ test "withdrawal is ordered for pending per-peer offers and grouped by device" {
 
 test "held withdrawn offer delays fresh generation until capacity returns" {
     const R = struct {
-        pub fn revokeDrmLease(_: *@This(), _: u32) void {}
+        pub fn revokeDrmLease(_: *@This(), _: u32) bool {
+            return true;
+        }
     };
     const A = Adapter(@import("core_protocol"), u32, u32, u32, R);
     var r: R = .{};
@@ -846,8 +934,9 @@ test "held withdrawn offer delays fresh generation until capacity returns" {
 test "external revocation defers finished without revoking backend" {
     const R = struct {
         revokes: usize = 0,
-        pub fn revokeDrmLease(s: *@This(), _: u32) void {
+        pub fn revokeDrmLease(s: *@This(), _: u32) bool {
             s.revokes += 1;
+            return true;
         }
     };
     const A = Adapter(@import("core_protocol"), u32, u32, u32, R);
@@ -859,6 +948,7 @@ test "external revocation defers finished without revoking backend" {
     inv.available = false;
     const l = a.acquire(A.Ls, a.leases).?;
     l.peer = .{ .slot = 1, .generation = 1 };
+    l.resource = .{ .id = 9, .generation = 1 };
     l.token = 9;
     const lid = a.idOf(A.Ls, a.leases, l);
     a.selections[0] = .{ .active = true, .owner = lid, .lease_owner = true, .inventory = a.idOf(A.Inventory, a.inventory, inv) };
@@ -878,7 +968,9 @@ test "external revocation defers finished without revoking backend" {
 
 test "dropping an owner closes its retained descriptor once" {
     const R = struct {
-        pub fn revokeDrmLease(_: *@This(), _: u32) void {}
+        pub fn revokeDrmLease(_: *@This(), _: u32) bool {
+            return true;
+        }
     };
     const A = Adapter(@import("core_protocol"), u32, u32, u32, R);
     var r: R = .{};
@@ -894,4 +986,65 @@ test "dropping an owner closes its retained descriptor once" {
     a.dropDevice(d);
     a.dropDevice(d);
     try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(fd, linux.F.GETFD, 0)));
+}
+
+test "failed lease revocation retains ownership for retry" {
+    const R = struct {
+        fail: bool = true,
+        calls: usize = 0,
+        pub fn revokeDrmLease(s: *@This(), _: u32) bool {
+            s.calls += 1;
+            if (s.fail) return false;
+            return true;
+        }
+    };
+    const A = Adapter(@import("core_protocol"), u32, u32, u32, R);
+    var r: R = .{};
+    var a = try A.init(std.testing.allocator, &r, .{});
+    defer a.deinit();
+    try a.addConnector(1, 2, 3, "A", "B", 4);
+    const inv = a.findInventory(1, 2, 3).?;
+    inv.available = false;
+    const l = a.acquire(A.Ls, a.leases).?;
+    l.device = 1;
+    l.token = 9;
+    const lid = a.idOf(A.Ls, a.leases, l);
+    a.selections[0] = .{ .active = true, .owner = lid, .lease_owner = true, .inventory = a.idOf(A.Inventory, a.inventory, inv) };
+
+    a.dropLease(l);
+    try std.testing.expect(l.h.active and l.token != null);
+    try std.testing.expect(!inv.available);
+    try std.testing.expect(a.retryRevocations());
+    r.fail = false;
+    try std.testing.expect(!a.retryRevocations());
+    try std.testing.expect(!l.h.active);
+    try std.testing.expect(inv.available);
+    try std.testing.expectEqual(@as(usize, 3), r.calls);
+}
+
+test "revocation retry leaves active leases untouched" {
+    const R = struct {
+        calls: usize = 0,
+        pub fn revokeDrmLease(s: *@This(), _: u32) bool {
+            s.calls += 1;
+            return true;
+        }
+    };
+    const A = Adapter(@import("core_protocol"), u32, u32, u32, R);
+    var r: R = .{};
+    var a = try A.init(std.testing.allocator, &r, .{});
+    defer a.deinit();
+    try a.addConnector(1, 2, 3, "A", "B", 4);
+    const inv = a.findInventory(1, 2, 3).?;
+    inv.available = false;
+    const l = a.acquire(A.Ls, a.leases).?;
+    l.device = 1;
+    l.token = 9;
+    const lid = a.idOf(A.Ls, a.leases, l);
+    a.selections[0] = .{ .active = true, .owner = lid, .lease_owner = true, .inventory = a.idOf(A.Inventory, a.inventory, inv) };
+
+    try std.testing.expect(!a.retryRevocations());
+    try std.testing.expectEqual(@as(usize, 0), r.calls);
+    try std.testing.expect(l.h.active and l.token != null);
+    try std.testing.expect(!inv.available);
 }

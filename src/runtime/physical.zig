@@ -71,6 +71,7 @@ const protocol_xdg_output = @import("../protocol/xdg_output.zig");
 const protocol_output_management = @import("../protocol/output_management.zig");
 const protocol_output_power = @import("../protocol/output_power.zig");
 const protocol_gamma_control = @import("../protocol/gamma_control.zig");
+const protocol_drm_lease = @import("../protocol/drm_lease.zig");
 const protocol_layer_shell = @import("../protocol/layer_shell.zig");
 const protocol_session_lock = @import("../protocol/session_lock.zig");
 const protocol_cursor_shape = @import("../protocol/cursor_shape.zig");
@@ -209,6 +210,18 @@ pub fn Coordinator(comptime protocol: type) type {
         const PhysicalOutputId = enum { physical };
         const OutputPowerAdapter = protocol_output_power.Adapter(protocol, PhysicalOutputId, Self);
         const GammaControlAdapter = protocol_gamma_control.Adapter(protocol, PhysicalOutputId, Self);
+        const DrmLeaseDeviceId = enum { physical };
+        const DrmLeaseConnectorId = struct {
+            topology_generation: u32,
+            candidate: drm.ScanoutCandidate,
+        };
+        const DrmLeaseAdapter = protocol_drm_lease.Adapter(
+            protocol,
+            DrmLeaseDeviceId,
+            DrmLeaseConnectorId,
+            drm.LeaseHandle,
+            Self,
+        );
         const LayerShellAdapter = protocol_layer_shell.Adapter(protocol, Adapter, OutputAdapter);
         const SessionLockAdapter = protocol_session_lock.Adapter(protocol, Adapter, OutputAdapter);
         const CursorShapeAdapter = protocol_cursor_shape.Adapter(protocol);
@@ -375,6 +388,7 @@ pub fn Coordinator(comptime protocol: type) type {
             const output_management: u64 = 1 << 33;
             const output_power: u64 = 1 << 34;
             const gamma_control: u64 = 1 << 35;
+            const drm_lease: u64 = 1 << 36;
             const all: u64 = decoration | shell | seat | data_device | dmabuf |
                 activation | relative_pointer | fractional_scale | output | core |
                 pointer_constraints | color_management | color_representation |
@@ -382,7 +396,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 shortcuts_inhibit | xdg_foreign | xdg_output | layer_shell | session_lock |
                 idle_notify | tablet | ext_data_control | wlr_data_control | input_method |
                 screencopy | foreign_toplevel_list | image_copy_capture | xdg_toplevel_icon | gtk_shell |
-                workspace | xdg_session | output_management | output_power | gamma_control;
+                workspace | xdg_session | output_management | output_power | gamma_control | drm_lease;
         };
         const Client = struct {
             active: bool = false,
@@ -519,6 +533,7 @@ pub fn Coordinator(comptime protocol: type) type {
             output_management: protocol_output_management.Config = .{},
             output_power: protocol_output_power.Config = .{},
             gamma_control: protocol_gamma_control.Config = .{},
+            drm_lease: protocol_drm_lease.Config = .{},
             layer_shell: protocol_layer_shell.Config = .{},
             session_lock: protocol_session_lock.Config = .{},
             cursor_shape: protocol_cursor_shape.Config = .{},
@@ -582,6 +597,12 @@ pub fn Coordinator(comptime protocol: type) type {
         input_method_key_owners: [0x300]?protocol_input_method.GrabId = [_]?protocol_input_method.GrabId{null} ** 0x300,
         processing_virtual_pointer: bool = false,
         manager: drm.Manager,
+        drm_lease_adapter: DrmLeaseAdapter,
+        drm_lease_claims: []drm.ClaimHandle,
+        drm_lease_desired: bool = false,
+        drm_lease_global_update: enum { none, adding, removing } = .none,
+        drm_lease_topology_generation: ?u32 = null,
+        drm_remove_pending: bool = false,
         gamma_platform: drm_gamma.Platform,
         shm: Shm,
         adapter: Adapter,
@@ -917,6 +938,17 @@ pub fn Coordinator(comptime protocol: type) type {
                 config.drm,
             );
             errdefer self.manager.deinit() catch {};
+            self.drm_lease_adapter = try DrmLeaseAdapter.init(allocator, self, config.drm_lease);
+            errdefer self.drm_lease_adapter.deinit();
+            self.drm_lease_claims = try allocator.alloc(
+                drm.ClaimHandle,
+                config.drm_lease.selection_capacity,
+            );
+            errdefer allocator.free(self.drm_lease_claims);
+            self.drm_lease_desired = false;
+            self.drm_lease_global_update = .none;
+            self.drm_lease_topology_generation = null;
+            self.drm_remove_pending = false;
             self.gamma_platform = platforms.gamma;
             self.shm = try Shm.init(allocator, config.shm);
             errdefer self.shm.deinit(allocator);
@@ -1531,6 +1563,8 @@ pub fn Coordinator(comptime protocol: type) type {
             self.retireGammaOwner() catch |err| {
                 if (first_error == null) first_error = err;
             };
+            self.drm_lease_adapter.deinit();
+            self.allocator.free(self.drm_lease_claims);
             self.manager.deinit() catch |err| {
                 if (first_error == null) first_error = err;
             };
@@ -1669,6 +1703,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.output_management_adapter.disconnected(peer);
             self.output_power_adapter.disconnected(peer);
             self.gamma_control_adapter.disconnected(peer);
+            self.drm_lease_adapter.disconnected(peer);
             self.image_copy_capture_adapter.disconnected(peer);
             self.image_capture_source_adapter.disconnected(peer);
             self.input_method_adapter.disconnected(peer);
@@ -2072,6 +2107,12 @@ pub fn Coordinator(comptime protocol: type) type {
             if (try self.gamma_control_adapter.request(peer, target, message, fds)) |control| {
                 if (self.gamma_control_adapter.pendingOutbound(peer))
                     self.markProtocol(peer, ProtocolReady.gamma_control);
+                try self.flushProtocol();
+                return control;
+            }
+            if (try self.drm_lease_adapter.requestOn(actor, objects, peer, target, message, fds)) |control| {
+                if (self.drm_lease_adapter.pendingOutbound(peer))
+                    self.markProtocol(peer, ProtocolReady.drm_lease);
                 try self.flushProtocol();
                 return control;
             }
@@ -3464,6 +3505,54 @@ pub fn Coordinator(comptime protocol: type) type {
             try owner.restore(owner.generation);
         }
 
+        pub fn allowDrmLease(self: *Self, binding: wayring.server.Binding) bool {
+            return !self.security_context_adapter.sandboxed(binding.peer) and
+                self.manager.currentHandle() != null;
+        }
+
+        pub fn resolveDrmLeaseDevice(_: *Self, _: wayring.server.Binding) DrmLeaseDeviceId {
+            return .physical;
+        }
+
+        pub fn openDrmLeaseDevice(self: *Self, device: DrmLeaseDeviceId) !std.posix.fd_t {
+            if (device != .physical) return error.InvalidDevice;
+            return self.manager.openLeaseDevice(
+                self.manager.currentHandle() orelse return error.StaleSnapshot,
+            );
+        }
+
+        pub fn grantDrmLease(
+            self: *Self,
+            device: DrmLeaseDeviceId,
+            connectors: []const DrmLeaseConnectorId,
+        ) !?struct { token: drm.LeaseHandle, fd: std.posix.fd_t } {
+            if (device != .physical or connectors.len == 0 or
+                connectors.len > self.drm_lease_claims.len) return null;
+            const handle = self.manager.currentHandle() orelse return null;
+            for (connectors) |connector|
+                if (connector.topology_generation != handle.generation) return null;
+            var claim_count: usize = 0;
+            errdefer for (self.drm_lease_claims[0..claim_count]) |claim|
+                self.manager.releaseScanout(claim) catch {};
+            for (connectors) |connector| {
+                self.drm_lease_claims[claim_count] = try self.manager.claimScanout(
+                    handle,
+                    connector.candidate,
+                );
+                claim_count += 1;
+            }
+            const grant = try self.manager.createLease(
+                handle,
+                self.drm_lease_claims[0..claim_count],
+            );
+            return .{ .token = grant.handle, .fd = grant.fd };
+        }
+
+        pub fn revokeDrmLease(self: *Self, token: drm.LeaseHandle) bool {
+            self.manager.revokeLease(token) catch return false;
+            return true;
+        }
+
         fn ensureGammaOwner(self: *Self, snapshot: drm.Snapshot) !void {
             const crtc = snapshot.selectedCrtc().id;
             if (self.gamma_owner) |owner| {
@@ -4260,6 +4349,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 !std.mem.eql(u8, name, "ext_workspace_manager_v1") and
                 !std.mem.eql(u8, name, "zwlr_output_power_manager_v1") and
                 !std.mem.eql(u8, name, "zwlr_gamma_control_manager_v1") and
+                !std.mem.eql(u8, name, "wp_drm_lease_device_v1") and
                 !std.mem.eql(u8, name, "ext_output_image_capture_source_manager_v1") and
                 !std.mem.eql(u8, name, "ext_foreign_toplevel_image_capture_source_manager_v1") and
                 !std.mem.eql(u8, name, "ext_image_copy_capture_manager_v1");
@@ -4590,6 +4680,11 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn flushProtocol(self: *Self) !void {
+            try self.advanceDrmLeaseGlobal();
+            _ = self.drm_lease_adapter.retryRevocations();
+            for (self.clients.items) |client| if (client.active and
+                self.drm_lease_adapter.pendingOutbound(client.peer))
+                self.markProtocol(client.peer, ProtocolReady.drm_lease);
             try self.advanceTransientSeats();
             if (!self.processing_virtual_pointer) try self.processVirtualPointerEvents();
             try self.processDecorationEvents();
@@ -4605,6 +4700,38 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             for (self.clients.items) |client| if (client.active and client.protocol_ready != 0)
                 try self.flushProtocolOn(client.peer);
+        }
+
+        fn advanceDrmLeaseGlobal(self: *Self) !void {
+            while (true) {
+                if (self.drm_lease_global_update == .none) {
+                    if (self.drm_lease_desired == self.drm_lease_adapter.installed()) return;
+                    if (self.drm_lease_desired) {
+                        _ = self.drm_lease_adapter.install(&self.root.runtime) catch |err| switch (err) {
+                            error.GlobalUpdateActive => return,
+                            else => return err,
+                        };
+                        self.drm_lease_global_update = .adding;
+                    } else {
+                        self.drm_lease_adapter.removeGlobal() catch |err| switch (err) {
+                            error.GlobalUpdateActive => return,
+                            else => return err,
+                        };
+                        self.drm_lease_global_update = .removing;
+                    }
+                }
+                while (true) switch (try self.root.runtime.publishNext()) {
+                    .sent => |peer| {
+                        if (self.loop) |loop| _ = try loop.driver.schedule(peer);
+                    },
+                    .blocked => |peer| {
+                        if (self.loop) |loop| _ = try loop.driver.schedule(peer);
+                        return;
+                    },
+                    .complete => break,
+                };
+                self.drm_lease_global_update = .none;
+            }
         }
 
         fn advanceTransientSeats(self: *Self) !void {
@@ -4890,6 +5017,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 flushed += try self.output_power_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.gamma_control != 0)
                 flushed += try self.gamma_control_adapter.flushOn(peer, objects, &actor.transmit);
+            if (client.protocol_ready & ProtocolReady.drm_lease != 0)
+                flushed += try self.drm_lease_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.layer_shell != 0)
                 flushed += try self.layer_shell_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.session_lock != 0)
@@ -5074,6 +5203,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (ready & ProtocolReady.gamma_control != 0 and
                 !self.gamma_control_adapter.pendingOutbound(client.peer))
                 ready &= ~ProtocolReady.gamma_control;
+            if (ready & ProtocolReady.drm_lease != 0 and
+                !self.drm_lease_adapter.pendingOutbound(client.peer))
+                ready &= ~ProtocolReady.drm_lease;
             if (ready & ProtocolReady.layer_shell != 0 and
                 !self.layer_shell_adapter.pendingOutbound(client.peer))
                 ready &= ~ProtocolReady.layer_shell;
@@ -5157,6 +5289,7 @@ pub fn Coordinator(comptime protocol: type) type {
             if (self.render_device == null)
                 self.render_device = self.output.?.takeRenderDevice();
             try self.ensureExplicitSync(snapshot.handle);
+            try self.ensureDrmLeasing(snapshot);
             try self.ensureGammaOwner(snapshot);
             const work_area: @import("../scene/geometry.zig").Rect = .{
                 .x = 0,
@@ -5254,6 +5387,48 @@ pub fn Coordinator(comptime protocol: type) type {
             device_owned = false;
             if (try self.root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
+        }
+
+        /// Publish the restricted lease device only after DRM discovery has a
+        /// stable topology. Ouro's own connector/CRTC/plane tuple is never
+        /// offered, nor is a candidate which aliases its active scanout tuple.
+        fn ensureDrmLeasing(self: *Self, snapshot: drm.Snapshot) !void {
+            if (self.drm_lease_topology_generation == snapshot.handle.generation) return;
+            for (try self.manager.scanoutCandidates(snapshot.handle)) |candidate| {
+                if (candidate.connector_index == snapshot.selection.connector_index or
+                    candidate.crtc_index == snapshot.selection.crtc_index or
+                    candidate.plane_index == snapshot.selection.plane_index) continue;
+                if (candidate.connector_index >= snapshot.connectors.len)
+                    return error.InvalidScanoutCandidate;
+                const connector = snapshot.connectors[candidate.connector_index];
+                var name_buffer: [64]u8 = undefined;
+                const name = try std.fmt.bufPrint(
+                    &name_buffer,
+                    "DRM-{d}",
+                    .{connector.id},
+                );
+                var description_buffer: [128]u8 = undefined;
+                const description = try std.fmt.bufPrint(
+                    &description_buffer,
+                    "DRM connector {d} ({d}x{d} mm)",
+                    .{ connector.id, connector.width_mm, connector.height_mm },
+                );
+                try self.drm_lease_adapter.addConnector(
+                    .physical,
+                    .{
+                        .topology_generation = snapshot.handle.generation,
+                        .candidate = candidate,
+                    },
+                    snapshot.handle.generation,
+                    name,
+                    description,
+                    connector.id,
+                );
+            }
+            self.drm_lease_desired = true;
+            try self.advanceDrmLeaseGlobal();
+            self.drm_lease_topology_generation = snapshot.handle.generation;
+            self.markProtocolAll(ProtocolReady.drm_lease);
         }
 
         fn refreshRetainedLayersForOutput(self: *Self) bool {
@@ -7317,8 +7492,23 @@ pub fn Coordinator(comptime protocol: type) type {
                             self.markProtocolAll(ProtocolReady.gamma_control);
                         }
                         try self.retireGammaOwner();
-                        try self.manager.remove();
+                        try self.drm_lease_adapter.deviceUnavailable(.physical);
+                        self.markProtocolAll(ProtocolReady.drm_lease);
+                        self.drm_lease_desired = false;
+                        self.drm_lease_topology_generation = null;
+                        self.drm_remove_pending = true;
+                        try self.advanceDrmLeaseGlobal();
                     }
+                }
+            }
+            if (self.output == null and self.drm_remove_pending) {
+                try self.advanceDrmLeaseGlobal();
+                if (self.drm_lease_global_update == .none and
+                    !self.drm_lease_adapter.installed() and
+                    !self.drm_lease_adapter.retryRevocations())
+                {
+                    try self.manager.remove();
+                    self.drm_remove_pending = false;
                 }
             }
             if (self.output == null and self.stopping) self.abandonPending();
@@ -7561,6 +7751,7 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.output_management_adapter.resourceRemoved(handle, object);
             _ = self.output_power_adapter.resourceRemoved(handle, object);
             _ = self.gamma_control_adapter.resourceRemoved(handle, object);
+            _ = self.drm_lease_adapter.resourceRemoved(handle, object);
             _ = self.output_adapter.resourceRemoved(handle, object);
             _ = self.cursor_shape_adapter.resourceRemoved(handle, object);
             _ = self.input_method_adapter.resourceRemoved(handle, object);
