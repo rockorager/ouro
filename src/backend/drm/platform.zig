@@ -163,6 +163,7 @@ pub const Platform = struct {
         open_lease_device: *const fn (*anyopaque, [:0]const u8) anyerror!std.posix.fd_t,
         create_lease: *const fn (*anyopaque, std.posix.fd_t, []const u32) anyerror!LeaseResult,
         revoke_lease: *const fn (*anyopaque, std.posix.fd_t, u32) anyerror!void,
+        list_lessees: *const fn (*anyopaque, std.posix.fd_t, []u32) anyerror!usize,
     };
 
     pub fn discover(self: Platform, cards: []Card, seat: []const u8) !usize {
@@ -188,6 +189,12 @@ pub const Platform = struct {
     pub fn revokeLease(self: Platform, fd: std.posix.fd_t, lessee_id: u32) !void {
         return self.vtable.revoke_lease(self.context, fd, lessee_id);
     }
+
+    pub fn listLessees(self: Platform, fd: std.posix.fd_t, storage: []u32) ![]const u32 {
+        const count = try self.vtable.list_lessees(self.context, fd, storage);
+        if (count > storage.len) return error.InvalidPlatformResult;
+        return storage[0..count];
+    }
 };
 
 var real_context: u8 = 0;
@@ -200,6 +207,7 @@ const real_vtable: Platform.VTable = .{
     .open_lease_device = realOpenLeaseDevice,
     .create_lease = realCreateLease,
     .revoke_lease = realRevokeLease,
+    .list_lessees = realListLessees,
 };
 
 fn realDiscover(_: *anyopaque, cards: []Card, seat: []const u8) !usize {
@@ -411,6 +419,15 @@ fn realCreateLease(
 fn realRevokeLease(_: *anyopaque, fd: std.posix.fd_t, lessee_id: u32) !void {
     if (lessee_id == 0 or c.drmModeRevokeLease(fd, lessee_id) != 0)
         return error.RevokeLeaseFailed;
+}
+
+fn realListLessees(_: *anyopaque, fd: std.posix.fd_t, storage: []u32) !usize {
+    const list = c.drmModeListLessees(fd) orelse return error.ListLesseesFailed;
+    defer c.drmFree(list);
+    if (list[0].count > storage.len) return error.LesseeCapacityExceeded;
+    const words: [*]const u32 = @ptrCast(list);
+    for (storage[0..list[0].count], 0..) |*entry, index| entry.* = words[index + 1];
+    return list[0].count;
 }
 
 const PropertyValue = struct { id: u32, value: u64 };

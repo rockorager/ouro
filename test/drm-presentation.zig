@@ -774,6 +774,7 @@ pub const Fixture = struct {
     lease_object_count: usize = 0,
     lease_create_count: usize = 0,
     lease_revoke_count: usize = 0,
+    lease_active: bool = false,
 
     pub fn init() !Fixture {
         return .{ .session_fd = try eventFd(), .drm_fd = try eventFd() };
@@ -822,6 +823,7 @@ pub const Fixture = struct {
         .open_lease_device = openLeaseDevice,
         .create_lease = createLease,
         .revoke_lease = revokeLease,
+        .list_lessees = listLessees,
     };
     const gbm_vtable: ouro.gbm.Platform.VTable = .{
         .create_device = createGbm,
@@ -864,12 +866,20 @@ pub const Fixture = struct {
         self.lease_create_count += 1;
         self.lease_object_count = objects.len;
         @memcpy(self.lease_objects[0..objects.len], objects);
+        self.lease_active = true;
         return .{ .fd = try eventFd(), .lessee_id = @intCast(self.lease_create_count) };
     }
     fn revokeLease(context: *anyopaque, _: std.posix.fd_t, lessee_id: u32) !void {
         const self: *Fixture = @ptrCast(@alignCast(context));
         try std.testing.expect(lessee_id != 0);
         self.lease_revoke_count += 1;
+        self.lease_active = false;
+    }
+    fn listLessees(context: *anyopaque, _: std.posix.fd_t, storage: []u32) !usize {
+        const self: *Fixture = @ptrCast(@alignCast(context));
+        if (!self.lease_active) return 0;
+        storage[0] = @intCast(self.lease_create_count);
+        return 1;
     }
     fn closeSeat(context: *anyopaque, _: *anyopaque) !void {
         const self: *Fixture = @ptrCast(@alignCast(context));

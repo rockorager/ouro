@@ -547,6 +547,25 @@ pub const Manager = struct {
         self.releaseLease(@intCast(lease_handle.slot));
     }
 
+    /// Retires and returns one kernel lease which disappeared outside Ouro.
+    pub fn pollRevokedLease(self: *Manager) !?LeaseHandle {
+        if (!self.present or !self.hasActiveLease()) return null;
+        const fd = try self.deviceFd(.{ .generation = self.generation });
+        const active = try self.platform.listLessees(fd, self.lease_objects);
+        for (self.leases, 0..) |lease, slot| {
+            if (!lease.active) continue;
+            if (std.mem.indexOfScalar(u32, active, lease.lessee_id) != null) continue;
+            const handle: LeaseHandle = .{
+                .topology_generation = self.generation,
+                .slot = @intCast(slot),
+                .generation = lease.generation,
+            };
+            self.releaseLease(@intCast(slot));
+            return handle;
+        }
+        return null;
+    }
+
     /// Returns the current topology with an exact connector mode selected.
     /// The returned slices retain the same borrowing lifetime as `snapshot`;
     /// this does not mutate the active selection or touch KMS state.
@@ -1114,6 +1133,26 @@ test "drm: kernel lease owns exact claim objects until generation-safe revocatio
     try manager.releaseScanout(replacement);
 }
 
+test "drm: external kernel revocation retires lease ownership exactly once" {
+    var seat = FakeSeat{};
+    const session = try seat.createSession();
+    defer destroyTestSession(session);
+    var platform = FakeDrm{ .multiple_outputs = true };
+    var manager = try Manager.init(std.testing.allocator, platform.platform(), session, "seat0", testConfig());
+    defer manager.deinit() catch unreachable;
+
+    const handle = (try manager.rescan()).?;
+    const claim = try manager.claimScanout(handle, (try manager.scanoutCandidates(handle))[1]);
+    const grant = try manager.createLease(handle, &.{claim});
+    try std.testing.expect((try manager.pollRevokedLease()) == null);
+    platform.externally_revoked_lessee = 1;
+    try std.testing.expectEqual(grant.handle, (try manager.pollRevokedLease()).?);
+    try std.testing.expect((try manager.pollRevokedLease()) == null);
+    try std.testing.expectError(error.StaleLease, manager.revokeLease(grant.handle));
+    const replacement = try manager.claimScanout(handle, (try manager.scanoutCandidates(handle))[1]);
+    try manager.releaseScanout(replacement);
+}
+
 test "drm: lease failure is atomic and terminal removal retires failed revocation" {
     var seat = FakeSeat{};
     const session = try seat.createSession();
@@ -1302,6 +1341,7 @@ const FakeDrm = struct {
     next_lessee_id: u32 = 1,
     fail_create_lease: bool = false,
     fail_revoke_lease: bool = false,
+    externally_revoked_lessee: ?u32 = null,
 
     const vtable: Platform.VTable = .{
         .discover = discover,
@@ -1310,6 +1350,7 @@ const FakeDrm = struct {
         .open_lease_device = openLeaseDevice,
         .create_lease = createLease,
         .revoke_lease = revokeLease,
+        .list_lessees = listLessees,
     };
 
     fn platform(self: *FakeDrm) Platform {
@@ -1395,6 +1436,19 @@ const FakeDrm = struct {
         try std.testing.expect(lessee_id != 0);
         self.lease_revoke_count += 1;
         if (self.fail_revoke_lease) return error.FakeRevokeLease;
+    }
+
+    fn listLessees(context: *anyopaque, fd: std.posix.fd_t, storage: []u32) !usize {
+        const self: *FakeDrm = @ptrCast(@alignCast(context));
+        try std.testing.expectEqual(@as(std.posix.fd_t, 101), fd);
+        var count: usize = 0;
+        for (1..self.next_lessee_id) |lessee_id| {
+            if (self.externally_revoked_lessee != null and
+                self.externally_revoked_lessee.? == lessee_id) continue;
+            storage[count] = @intCast(lessee_id);
+            count += 1;
+        }
+        return count;
     }
 };
 

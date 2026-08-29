@@ -4681,6 +4681,10 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn flushProtocol(self: *Self) !void {
             try self.advanceDrmLeaseGlobal();
+            while (try self.manager.pollRevokedLease()) |token| {
+                self.drm_lease_adapter.leaseRevoked(token) catch continue;
+                self.markProtocolAll(ProtocolReady.drm_lease);
+            }
             _ = self.drm_lease_adapter.retryRevocations();
             for (self.clients.items) |client| if (client.active and
                 self.drm_lease_adapter.pendingOutbound(client.peer))
