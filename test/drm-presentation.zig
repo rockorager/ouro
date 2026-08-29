@@ -836,6 +836,10 @@ fn runVertical(trigger: TerminalTrigger, source: ClientSource) !void {
     }
     try std.testing.expectEqual(@as(usize, 1), client_handler.presentation_discarded);
     try std.testing.expectEqual(@as(usize, 2), client_handler.presentation_deleted);
+    try std.testing.expectEqual(@as(usize, 1), client_handler.xdg_positions);
+    try std.testing.expectEqual(@as(usize, 1), client_handler.xdg_sizes);
+    try std.testing.expectEqual(@as(usize, 1), client_handler.xdg_names);
+    try std.testing.expectEqual(@as(usize, 1), client_handler.xdg_descriptions);
 
     if (trigger == .session_disable) {
         // Session disable quiesces R11, renderer, R10, then releases the DRM
@@ -860,6 +864,14 @@ fn runVertical(trigger: TerminalTrigger, source: ClientSource) !void {
         const replacement = coordinator.output orelse return error.OutputNotRecreated;
         try std.testing.expectEqual(@as(usize, 2), coordinator.stats.selected_outputs);
         try std.testing.expect(replacement.outputId().generation != first_frame.?.output.generation);
+        for (0..128) |_| {
+            _ = try drainClient(&client_reactor, &client_driver, &client_handler);
+            _ = try loop.turn(coordinator);
+            if (client_handler.xdg_sizes == 2) break;
+            if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
+                try waitForEither(&root.ring, client_reactor.ring);
+        }
+        try std.testing.expectEqual(@as(usize, 2), client_handler.xdg_sizes);
         try replacement.request(.damage, 1);
         const request_value = (try replacement.timerRequest(1)).?;
         const replacement_timer: ouro.timer.Handle = .{ .slot = 0, .generation = 1 };
@@ -908,6 +920,10 @@ fn runVertical(trigger: TerminalTrigger, source: ClientSource) !void {
     try std.testing.expectEqual(@as(usize, 1), client_handler.presentation_presented);
     try std.testing.expectEqual(@as(usize, 1), client_handler.presentation_discarded);
     try std.testing.expectEqual(@as(usize, 2), client_handler.presentation_deleted);
+    try std.testing.expectEqual(
+        @as(usize, if (trigger == .session_disable) 2 else 1),
+        client_handler.xdg_sizes,
+    );
     // The second commit secured renderer-owned content before it was abandoned,
     // so source release is delivered even though no frame callback is due.
     try std.testing.expectEqual(@as(usize, 2), client_handler.release_done);
@@ -938,6 +954,8 @@ const ClientHandler = struct {
     alpha_modifier_manager: ?wayring.objects.Handle = null,
     presentation: ?wayring.objects.Handle = null,
     output: ?wayring.objects.Handle = null,
+    xdg_output_manager: ?wayring.objects.Handle = null,
+    xdg_output: ?wayring.objects.Handle = null,
     surface: ?wayring.objects.Handle = null,
     frame: ?wayring.objects.Handle = null,
     release: ?wayring.objects.Handle = null,
@@ -953,6 +971,10 @@ const ClientHandler = struct {
     presentation_discarded: usize = 0,
     presentation_deleted: usize = 0,
     surface_enters: usize = 0,
+    xdg_positions: usize = 0,
+    xdg_sizes: usize = 0,
+    xdg_names: usize = 0,
+    xdg_descriptions: usize = 0,
     tablet_v2_announced: bool = false,
     source: ClientSource = .shm,
 
@@ -986,6 +1008,9 @@ const ClientHandler = struct {
                         self.presentation = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wp_presentation.info, 1, null);
                     if (std.mem.eql(u8, global.interface, protocol.wl_output.info.name))
                         self.output = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wl_output.info, @min(global.version, 4), null);
+                    if (std.mem.eql(u8, global.interface, protocol.zxdg_output_manager_v1.info.name))
+                        self.xdg_output_manager = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.zxdg_output_manager_v1.info, @min(global.version, 3), null);
+                    try self.maybeCreateXdgOutput();
                     const source_ready = switch (self.source) {
                         .shm => self.shm != null,
                         .alpha_shm => self.shm != null and self.alpha_modifier_manager != null,
@@ -1011,6 +1036,28 @@ const ClientHandler = struct {
                 },
                 .leave => |value| try std.testing.expectEqual(self.output.?.id, value.output),
                 else => {},
+            }
+        } else if (target.object.interface == &protocol.zxdg_output_v1.info) {
+            switch (try protocol.zxdg_output_v1.decodeEvent(message, fds)) {
+                .logical_position => |value| {
+                    try std.testing.expectEqual(@as(i32, 0), value.x);
+                    try std.testing.expectEqual(@as(i32, 0), value.y);
+                    self.xdg_positions += 1;
+                },
+                .logical_size => |value| {
+                    try std.testing.expectEqual(@as(i32, 3), value.width);
+                    try std.testing.expectEqual(@as(i32, 2), value.height);
+                    self.xdg_sizes += 1;
+                },
+                .name => |value| {
+                    try std.testing.expectEqualStrings("ouro-0", value.name);
+                    self.xdg_names += 1;
+                },
+                .description => |value| {
+                    try std.testing.expectEqualStrings("Ouro output", value.description);
+                    self.xdg_descriptions += 1;
+                },
+                .done => return error.UnexpectedXdgOutputDone,
             }
         } else if (target.object.interface == &protocol.wp_presentation.info) {
             const value = try wayring.client.decodeEvent(protocol.wp_presentation, self.objects, self.presentation.?, message, fds);
@@ -1061,6 +1108,16 @@ const ClientHandler = struct {
     fn queueWork(self: *ClientHandler) !void {
         try self.queueCommittedSurface();
         self.queued = true;
+    }
+
+    fn maybeCreateXdgOutput(self: *ClientHandler) !void {
+        if (self.xdg_output != null or self.xdg_output_manager == null or self.output == null) return;
+        self.xdg_output = (try protocol.zxdg_output_manager_v1.construct_get_xdg_output(
+            self.objects,
+            self.queue,
+            self.xdg_output_manager.?,
+            .{ .output = self.output.?.id },
+        )).id;
     }
 
     fn replaceCommittedSurface(self: *ClientHandler) !void {
