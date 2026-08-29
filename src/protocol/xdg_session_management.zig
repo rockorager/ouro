@@ -107,6 +107,7 @@ pub fn Owner(comptime State: type, comptime ToplevelId: type) type {
         events: []Event,
         event_head: usize = 0,
         event_len: usize = 0,
+        dirty: bool = false,
 
         pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
             try config.validate();
@@ -132,6 +133,7 @@ pub fn Owner(comptime State: type, comptime ToplevelId: type) type {
             @memset(self.handles, .{});
             self.event_head = 0;
             self.event_len = 0;
+            self.dirty = false;
             return self;
         }
 
@@ -182,6 +184,7 @@ pub fn Owner(comptime State: type, comptime ToplevelId: type) type {
             self.put(self.session_strings, index, identifier);
             self.stored[index].live = true;
             self.stored[index].id_len = identifier.len;
+            self.dirty = true;
             return .{ .index = @intCast(index), .generation = self.stored[index].generation };
         }
         pub fn importToplevel(
@@ -210,6 +213,7 @@ pub fn Owner(comptime State: type, comptime ToplevelId: type) type {
                 .state = state,
                 .has_state = true,
             };
+            self.dirty = true;
         }
         fn session(self: *Self, id: SessionId) ?*SessionResource {
             if (id.index >= self.sessions.len) return null;
@@ -265,6 +269,7 @@ pub fn Owner(comptime State: type, comptime ToplevelId: type) type {
                 if (len == 0 or len > target.len or !std.unicode.utf8ValidateSlice(target[0..len]) or self.findStored(target[0..len]) != null) return error.IdGenerationFailed;
                 self.stored[stored_i].live = true;
                 self.stored[stored_i].id_len = len;
+                self.dirty = true;
             }
             if (self.event_len == self.events.len) {
                 if (!restored) self.stored[stored_i].live = false;
@@ -302,6 +307,7 @@ pub fn Owner(comptime State: type, comptime ToplevelId: type) type {
                 self.stored[stored_i].live = false;
                 self.stored[stored_i].generation +%= 1;
                 if (self.stored[stored_i].generation == 0) self.stored[stored_i].generation = 1;
+                self.dirty = true;
             }
         }
 
@@ -333,6 +339,7 @@ pub fn Owner(comptime State: type, comptime ToplevelId: type) type {
                 const ri = record_i orelse return error.Capacity;
                 self.put(self.name_strings, ri, name);
                 self.records[ri] = .{ .live = true, .session = s.stored, .name_len = name.len };
+                self.dirty = true;
             }
             if (self.event_len == self.events.len) {
                 if (!restoring) self.records[record_i.?].live = false;
@@ -360,8 +367,10 @@ pub fn Owner(comptime State: type, comptime ToplevelId: type) type {
             if (!self.validString(name)) return error.InvalidName;
             const r = &self.records[h.record];
             if (self.findRecord(r.session, name)) |other| if (other != h.record) return error.NameInUse;
+            if (std.mem.eql(u8, name, self.text(self.name_strings, h.record, r.name_len))) return;
             self.put(self.name_strings, h.record, name);
             r.name_len = name.len;
+            self.dirty = true;
         }
         pub fn destroyToplevelSession(self: *Self, id: ToplevelSessionId) void {
             const h = self.handle(id) orelse return;
@@ -375,6 +384,7 @@ pub fn Owner(comptime State: type, comptime ToplevelId: type) type {
             if (!self.validString(name)) return error.InvalidName;
             const ri = self.findRecord(s.stored, name) orelse return;
             self.records[ri].live = false;
+            self.dirty = true;
             for (self.handles) |*h| if (h.live and h.record == ri) {
                 h.inert = true;
                 h.associated = false;
@@ -389,9 +399,17 @@ pub fn Owner(comptime State: type, comptime ToplevelId: type) type {
             for (self.handles) |h| if (h.live and !h.inert and h.associated and
                 (!h.restore_pending or h.applied) and std.meta.eql(h.toplevel, toplevel))
             {
+                if (self.records[h.record].has_state and std.meta.eql(self.records[h.record].state, state)) continue;
                 self.records[h.record].state = state;
                 self.records[h.record].has_state = true;
+                self.dirty = true;
             };
+        }
+        pub fn persistenceDirty(self: *const Self) bool {
+            return self.dirty;
+        }
+        pub fn persistenceSaved(self: *Self) void {
+            self.dirty = false;
         }
         pub fn takeRestoreState(self: *Self, id: ToplevelSessionId) ?State {
             const h = self.handle(id) orelse return null;
@@ -698,6 +716,12 @@ pub fn Adapter(comptime protocol: type, comptime ShellAdapter: type, comptime St
         ) !void {
             try self.owner.importToplevel(session_id, name, state);
         }
+        pub fn persistenceDirty(self: *const Self) bool {
+            return self.owner.persistenceDirty();
+        }
+        pub fn persistenceSaved(self: *Self) void {
+            self.owner.persistenceSaved();
+        }
 
         fn freeSession(self: *Self) ?*SessionSlot {
             for (self.sessions) |*s| if (!s.active) return s;
@@ -840,6 +864,9 @@ test "replacement, persistence, inertness, and generation reuse" {
     var context: u8 = 0;
     const generator: O.IdGenerator = .{ .context = &context, .generate = testGenerate };
     const first = try owner.getSession(1, 1, null, generator);
+    try std.testing.expect(owner.persistenceDirty());
+    owner.persistenceSaved();
+    try std.testing.expect(!owner.persistenceDirty());
     _ = owner.nextEvent();
     try std.testing.expectError(error.InUse, owner.getSession(1, 1, "s1", generator));
     const second = try owner.getSession(2, 2, "s1", generator);
@@ -847,7 +874,13 @@ test "replacement, persistence, inertness, and generation reuse" {
     _ = owner.nextEvent();
     _ = owner.nextEvent();
     const h = try owner.addToplevel(second, 9, false, "main", false);
+    try std.testing.expect(owner.persistenceDirty());
+    owner.persistenceSaved();
     owner.updateState(9, 42);
+    try std.testing.expect(owner.persistenceDirty());
+    owner.persistenceSaved();
+    owner.updateState(9, 42);
+    try std.testing.expect(!owner.persistenceDirty());
     owner.destroyToplevelSession(h);
     owner.destroySession(second, false);
     const third = try owner.getSession(2, 3, "s1", generator);

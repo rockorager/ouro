@@ -43,6 +43,7 @@ const protocol_linux_drm_syncobj = @import("../protocol/linux_drm_syncobj.zig");
 const drm_syncobj = @import("../drm_syncobj.zig");
 const protocol_xdg_activation = @import("../protocol/xdg_activation.zig");
 const protocol_xdg_session_management = @import("../protocol/xdg_session_management.zig");
+const session_persistence = @import("../session_persistence.zig");
 const protocol_xdg_decoration = @import("../protocol/xdg_decoration.zig");
 const protocol_xdg_dialog = @import("../protocol/xdg_dialog.zig");
 const protocol_xdg_toplevel_tag = @import("../protocol/xdg_toplevel_tag.zig");
@@ -167,6 +168,7 @@ pub fn Coordinator(comptime protocol: type) type {
             ShellAdapter,
             Desktop.RestorableState,
         );
+        const XdgSessionStore = session_persistence.Store(Desktop.RestorableState);
         const Interaction = interaction_model.Interaction(Desktop);
         const SeatAdapter = protocol_seat.Adapter(protocol, Adapter);
         const DataDeviceAdapter = protocol_data_device.Adapter(protocol);
@@ -437,6 +439,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .metadata_bytes = 256,
             },
             xdg_session: protocol_xdg_session_management.Config = .{},
+            xdg_session_store_path: ?[]const u8 = null,
             desktop: desktop_model.Config = .{
                 .toplevel_capacity = 8,
                 .popup_capacity = 8,
@@ -562,6 +565,8 @@ pub fn Coordinator(comptime protocol: type) type {
         subcompositor_adapter: SubcompositorAdapter,
         shell_adapter: ShellAdapter,
         xdg_session_adapter: XdgSessionAdapter,
+        xdg_session_store: ?XdgSessionStore = null,
+        xdg_session_store_failed: bool = false,
         desktop: Desktop,
         interaction: Interaction,
         seat_adapter: SeatAdapter,
@@ -666,6 +671,8 @@ pub fn Coordinator(comptime protocol: type) type {
         commit_timer: ?timer.Handle = null,
         commit_timer_canceling: bool = false,
         commit_timer_deadline: ?surface_state.CommitTimestamp = null,
+        xdg_session_store_timer: ?timer.Handle = null,
+        xdg_session_store_timer_canceling: bool = false,
         cursor_layer: Layer,
         output_drain_started: bool = false,
         stopping: bool = false,
@@ -744,7 +751,7 @@ pub fn Coordinator(comptime protocol: type) type {
             errdefer allocator.free(self.subsurface_scene_order);
             self.pending_surface_head = 0;
             self.pending_surface_len = 0;
-            if (config.timer_capacity < 5 or config.desktop_transaction_timeout_ns == 0 or
+            if (config.timer_capacity < 6 or config.desktop_transaction_timeout_ns == 0 or
                 config.output.max_samples < 2 or config.output.max_source_bytes == 0 or
                 config.protocol_output.association_capacity == 0)
                 return error.InvalidConfig;
@@ -817,6 +824,8 @@ pub fn Coordinator(comptime protocol: type) type {
             self.commit_timer = null;
             self.commit_timer_canceling = false;
             self.commit_timer_deadline = null;
+            self.xdg_session_store_timer = null;
+            self.xdg_session_store_timer_canceling = false;
             self.cursor_layer = .{};
             const cursor_path_requirement = std.math.add(
                 usize,
@@ -896,6 +905,20 @@ pub fn Coordinator(comptime protocol: type) type {
                 .{ .context = self, .generate = generateSessionId },
             );
             errdefer self.xdg_session_adapter.deinit();
+            self.xdg_session_store = null;
+            self.xdg_session_store_failed = false;
+            if (config.xdg_session_store_path) |path| {
+                self.xdg_session_store = try XdgSessionStore.init(allocator, .{
+                    .path = path,
+                    .max_sessions = config.xdg_session.stored_sessions,
+                    .max_toplevels = config.xdg_session.stored_toplevels,
+                    .max_string_bytes = config.xdg_session.max_string_bytes,
+                });
+                errdefer if (self.xdg_session_store) |*store| store.deinit();
+                _ = self.xdg_session_store.?.load(&self.xdg_session_adapter) catch |err| {
+                    std.log.warn("ignoring unreadable XDG session state at {s}: {s}", .{ path, @errorName(err) });
+                };
+            }
             self.toplevel_icon_adapter = try ToplevelIconAdapter.init(
                 allocator,
                 &self.shell_adapter,
@@ -1414,6 +1437,7 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.syncDesktopTimer();
             try self.syncIdleTimer();
             try self.syncCommitTimer();
+            try self.syncXdgSessionStoreTimer();
             try self.prepareSecurityClosures();
             try self.pauseOutput();
             try self.advanceDrain();
@@ -1434,6 +1458,11 @@ pub fn Coordinator(comptime protocol: type) type {
         pub fn destroy(self: *Self) !void {
             if (!self.backendDrainComplete()) return error.DrainIncomplete;
             var first_error: ?anyerror = null;
+            if (self.xdg_session_adapter.persistenceDirty()) if (self.xdg_session_store) |*store| {
+                store.save(&self.xdg_session_adapter) catch |err| {
+                    first_error = err;
+                };
+            };
             if (self.render_device) |device| device.destroy();
             self.render_device = null;
             if (self.input) |input| input.destroy() catch |err| {
@@ -1512,6 +1541,8 @@ pub fn Coordinator(comptime protocol: type) type {
             self.workspace_adapter.deinit();
             self.image_copy_capture_adapter.deinit();
             self.image_capture_source_adapter.deinit();
+            if (self.xdg_session_store) |*store| store.deinit();
+            self.xdg_session_store = null;
             self.xdg_session_adapter.deinit();
             self.shell_adapter.deinit();
             if (self.syncobj_adapter) |*adapter| adapter.deinit();
@@ -2002,6 +2033,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 };
                 if (self.commit_timer) |handle| if (std.meta.eql(handle, outcome.handle)) {
                     try self.commitTimerEvent(outcome.event);
+                    continue;
+                };
+                if (self.xdg_session_store_timer) |handle| if (std.meta.eql(handle, outcome.handle)) {
+                    try self.xdgSessionStoreTimerEvent(outcome.event);
                     continue;
                 };
                 if (self.desktop_timer) |handle| if (std.meta.eql(handle, outcome.handle)) {
@@ -2950,6 +2985,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     try self.desktop.restorableState(window.id),
                 );
             }
+            try self.syncXdgSessionStoreTimer();
         }
 
         fn syncForeignToplevels(self: *Self) !void {
@@ -3415,6 +3451,42 @@ pub fn Coordinator(comptime protocol: type) type {
             self.commit_timer_canceling = false;
             if (event == .fired and !was_canceling) try self.applyReady();
             try self.syncCommitTimer();
+        }
+
+        fn syncXdgSessionStoreTimer(self: *Self) !void {
+            const pending = !self.stopping and !self.xdg_session_store_failed and
+                self.xdg_session_store != null and self.xdg_session_adapter.persistenceDirty();
+            if (pending) {
+                if (self.xdg_session_store_timer == null) {
+                    const deadline_ns = std.math.add(u64, try monotonicNs(), std.time.ns_per_s) catch
+                        return error.InvalidDeadline;
+                    self.xdg_session_store_timer = try self.timers.arm(
+                        &self.router,
+                        &self.root.ring,
+                        try deadlineFromNs(deadline_ns),
+                    );
+                    self.xdg_session_store_timer_canceling = false;
+                }
+                return;
+            }
+            if (self.xdg_session_store_timer) |handle| if (!self.xdg_session_store_timer_canceling) {
+                try self.timers.cancel(&self.router, &self.root.ring, handle);
+                self.xdg_session_store_timer_canceling = true;
+            };
+        }
+
+        fn xdgSessionStoreTimerEvent(self: *Self, event: timer.Event) !void {
+            if (event == .pending_cleanup or event == .cleanup_complete) return;
+            const was_canceling = self.xdg_session_store_timer_canceling;
+            self.xdg_session_store_timer = null;
+            self.xdg_session_store_timer_canceling = false;
+            if (event == .fired and !was_canceling) if (self.xdg_session_store) |*store| {
+                store.save(&self.xdg_session_adapter) catch |err| {
+                    self.xdg_session_store_failed = true;
+                    std.log.err("disabling XDG session persistence after save failure: {s}", .{@errorName(err)});
+                };
+            };
+            try self.syncXdgSessionStoreTimer();
         }
 
         fn desktopTimerEvent(self: *Self, event: timer.Event) !void {

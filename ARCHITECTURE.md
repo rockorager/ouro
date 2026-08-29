@@ -232,6 +232,14 @@ Protocol event emission is resumable. If Wayring's TX storage is full, an
 outbound cursor and its owned payload remain queued until send completion frees
 capacity.
 
+XDG session-management state is a bounded compositor-owned snapshot, separate
+from live protocol resources. Ouro atomically replaces a versioned file beside
+its Wayland socket (`<socket>.sessions-v1`) at most one second after a session
+identifier, toplevel name, or restorable desktop state changes, and flushes
+again during clean shutdown. Startup validates the entire snapshot before
+importing any record; malformed or oversized state is ignored rather than
+partially restoring a desktop or preventing startup.
+
 ## Desktop model and layout
 
 The desktop model owns product semantics only:

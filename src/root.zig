@@ -83,6 +83,7 @@ pub const foreign_toplevel_list = @import("protocol/foreign_toplevel_list.zig");
 pub const workspace = @import("protocol/workspace.zig");
 pub const transient_seat = @import("protocol/transient_seat.zig");
 pub const xdg_session_management = @import("protocol/xdg_session_management.zig");
+pub const session_persistence = @import("session_persistence.zig");
 pub const image_capture_source = @import("protocol/image_capture_source.zig");
 pub const image_copy_capture = @import("protocol/image_copy_capture.zig");
 pub const scene_geometry = @import("scene/geometry.zig");
@@ -176,6 +177,7 @@ test {
     _ = workspace;
     _ = transient_seat;
     _ = xdg_session_management;
+    _ = session_persistence;
     _ = image_capture_source;
     _ = image_copy_capture;
     _ = scene_geometry;

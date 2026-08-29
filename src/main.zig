@@ -62,6 +62,8 @@ pub fn main(init: std.process.Init) !void {
 
     wayring.unix_socket.unlink(options.socket) catch {};
     defer wayring.unix_socket.unlink(options.socket) catch {};
+    const session_state_path = try std.fmt.allocPrint(allocator, "{s}.sessions-v1", .{options.socket});
+    defer allocator.free(session_state_path);
     const root = try Compositor.create(
         allocator,
         try wayring.unix_socket.listen(options.socket, 128),
@@ -71,7 +73,7 @@ pub fn main(init: std.process.Init) !void {
         .input = ouro.input_platform.real,
     }, .{
         .router_capacity = 16,
-        .timer_capacity = 5,
+        .timer_capacity = 6,
         .device_capacity = 36,
         .input = .{
             .device_capacity = 16,
@@ -110,6 +112,7 @@ pub fn main(init: std.process.Init) !void {
             .outstanding_configure_capacity = 32,
             .metadata_bytes = 256,
         },
+        .xdg_session_store_path = session_state_path,
         .desktop = .{
             .toplevel_capacity = 16,
             .popup_capacity = 8,
