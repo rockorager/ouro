@@ -77,6 +77,7 @@ pub const wlr_screencopy = @import("protocol/wlr_screencopy.zig");
 pub const pointer_constraints = @import("protocol/pointer_constraints.zig");
 pub const protocol_output = @import("protocol/output.zig");
 pub const xdg_output = @import("protocol/xdg_output.zig");
+pub const output_management = @import("protocol/output_management.zig");
 pub const layer_shell = @import("protocol/layer_shell.zig");
 pub const session_lock = @import("protocol/session_lock.zig");
 pub const foreign_toplevel_list = @import("protocol/foreign_toplevel_list.zig");
@@ -171,6 +172,7 @@ test {
     _ = pointer_constraints;
     _ = protocol_output;
     _ = xdg_output;
+    _ = output_management;
     _ = layer_shell;
     _ = session_lock;
     _ = foreign_toplevel_list;
