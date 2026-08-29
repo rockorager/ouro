@@ -398,6 +398,86 @@ test "generated output management test succeeds and unsupported apply is non-mut
     try root.deinit();
 }
 
+test "generated output power client drains and recreates the physical output" {
+    const allocator = std.testing.allocator;
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-r15-output-power-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), compositorConfig());
+    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), coordinatorConfig());
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
+    try coordinator.start(&loop);
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    for (0..128) |_| {
+        _ = try loop.turn(coordinator);
+        if (coordinator.output != null) break;
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+    }
+    try std.testing.expect(coordinator.output != null);
+    const initial_output = coordinator.output.?.outputId();
+
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(allocator, .{ .entries = 16, .flags = 0 }, clientReactorConfig());
+    var client = try ClientConnection.attach(
+        allocator,
+        &reactor,
+        try wayring.unix_socket.connect(path),
+        .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 },
+        .{ .max_objects = 16, .max_client_ids = 15 },
+    );
+    var driver = ClientDriver.init(&client);
+    const actor = try client.actor();
+    const registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null);
+    var handler: OutputPowerClientHandler = .{
+        .objects = &client.objects,
+        .queue = &actor.transmit,
+        .registry = registry,
+    };
+    try submitClient(&reactor, &driver, &handler);
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.mode_count == handler.modes.len) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expectEqualSlices(u32, &.{
+        protocol.zwlr_output_power_v1.mode.on.value,
+        protocol.zwlr_output_power_v1.mode.off.value,
+        protocol.zwlr_output_power_v1.mode.on.value,
+    }, &handler.modes);
+    try std.testing.expectEqual(@as(usize, 0), handler.failed);
+    try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+    try std.testing.expect(coordinator.output != null);
+    try std.testing.expect(!std.meta.eql(initial_output, coordinator.output.?.outputId()));
+    try std.testing.expectEqual(@as(usize, 2), coordinator.stats.selected_outputs);
+    try std.testing.expectEqual(@as(usize, 1), coordinator.stats.output_drains);
+
+    _ = try client.prepareClose();
+    try submitClient(&reactor, &driver, &handler);
+    try coordinator.requestStop();
+    var drained = false;
+    for (0..256) |_| {
+        const client_progress = try drainClient(&reactor, &driver, &handler);
+        const progress = try loop.turn(coordinator);
+        drained = progress.wayring.shutdown_complete and client_progress.quiescent and coordinator.backendDrainComplete();
+        if (drained) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expect(drained);
+    try client.deinit(allocator);
+    reactor.deinit(allocator);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
 test "no discovered DRM card fails startup and drains honestly" {
     const allocator = std.testing.allocator;
     var fixture = try Fixture.init();
@@ -1258,6 +1338,82 @@ const OutputManagementClientHandler = struct {
         );
         try protocol.zwlr_output_configuration_v1.encodeRequest(self.queue, configuration.id, .{ .apply = .{} });
         self.apply_submitted = true;
+    }
+};
+
+const OutputPowerClientHandler = struct {
+    objects: *wayring.objects.ClientObjects,
+    queue: *wayring.tx.Queue,
+    registry: wayring.objects.Handle,
+    manager: ?wayring.objects.Handle = null,
+    output: ?wayring.objects.Handle = null,
+    power: ?wayring.objects.Handle = null,
+    output_ready: bool = false,
+    modes: [3]u32 = undefined,
+    mode_count: usize = 0,
+    failed: usize = 0,
+    event_failures: usize = 0,
+
+    pub fn eventError(self: *OutputPowerClientHandler, _: wayring.io_uring.Peer, _: ClientCore.EventFailure) void {
+        self.event_failures += 1;
+    }
+
+    pub fn event(self: *OutputPowerClientHandler, target: wayring.objects.Dispatch, message: wayring.wire.Message, fds: *wayring.ancillary.FdQueue) !wayring.dispatch.Control {
+        if (target.object.interface == &ClientCore.Registry.info) {
+            switch (try ClientCore.decodeRegistryEvent(self.objects, self.registry, message, fds)) {
+                .global => |global| {
+                    if (std.mem.eql(u8, global.interface, protocol.wl_output.info.name))
+                        self.output = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wl_output.info, @min(global.version, 4), null);
+                    if (std.mem.eql(u8, global.interface, protocol.zwlr_output_power_manager_v1.info.name))
+                        self.manager = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.zwlr_output_power_manager_v1.info, 1, null);
+                },
+                .global_remove => {},
+            }
+            try self.maybeCreatePower();
+        } else if (target.object.interface == &protocol.wl_output.info) {
+            switch (try protocol.wl_output.decodeEvent(message, fds)) {
+                .done => {
+                    self.output_ready = true;
+                    try self.maybeCreatePower();
+                },
+                else => {},
+            }
+        } else if (target.object.interface == &protocol.zwlr_output_power_v1.info) {
+            switch (try protocol.zwlr_output_power_v1.decodeEvent(message, fds)) {
+                .mode => |value| {
+                    if (self.mode_count >= self.modes.len) return error.UnexpectedPowerMode;
+                    self.modes[self.mode_count] = value.mode.value;
+                    self.mode_count += 1;
+                    if (self.mode_count == 1) try self.setMode(.off);
+                    if (self.mode_count == 2) try self.setMode(.on);
+                },
+                .failed => self.failed += 1,
+            }
+        } else if (target.object.interface == &ClientCore.Display.info) {
+            switch (try ClientCore.decodeDisplayEvent(self.objects, message, fds)) {
+                .delete_id => {},
+                .@"error" => return error.ServerProtocolError,
+            }
+        } else return error.UnexpectedEvent;
+        return .continue_dispatch;
+    }
+
+    fn maybeCreatePower(self: *OutputPowerClientHandler) !void {
+        if (self.power != null or !self.output_ready or self.output == null or self.manager == null) return;
+        self.power = (try protocol.zwlr_output_power_manager_v1.construct_get_output_power(
+            self.objects,
+            self.queue,
+            self.manager.?,
+            .{ .output = self.output.?.id },
+        )).id;
+    }
+
+    fn setMode(self: *OutputPowerClientHandler, mode: protocol.zwlr_output_power_v1.mode) !void {
+        try protocol.zwlr_output_power_v1.encodeRequest(
+            self.queue,
+            self.power.?.id,
+            .{ .set_mode = .{ .mode = mode } },
+        );
     }
 };
 
