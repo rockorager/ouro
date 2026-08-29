@@ -19,8 +19,31 @@ pub const HeadState = struct {
     adaptive_sync: bool = false,
 };
 
+pub const ModeState = struct {
+    width: i32,
+    height: i32,
+    refresh_millihz: i32,
+    preferred: bool = false,
+
+    fn validate(mode: ModeState) !void {
+        if (mode.width <= 0 or mode.height <= 0 or mode.refresh_millihz <= 0)
+            return error.InvalidMode;
+    }
+
+    fn matches(mode: ModeState, state: HeadState) bool {
+        return mode.width == state.width and mode.height == state.height and
+            mode.refresh_millihz == state.refresh_millihz;
+    }
+
+    pub fn sameTiming(a: ModeState, b: ModeState) bool {
+        return a.width == b.width and a.height == b.height and
+            a.refresh_millihz == b.refresh_millihz;
+    }
+};
+
 pub const Config = struct {
     manager_capacity: usize = 8,
+    mode_capacity: usize = 64,
     configuration_capacity: usize = 32,
     outbound_capacity: usize = 256,
     name: []const u8 = "Ouro-1",
@@ -31,7 +54,9 @@ pub const Config = struct {
     physical_height_mm: ?i32 = null,
 
     fn validate(c: Config) !void {
-        if (c.manager_capacity == 0 or c.configuration_capacity == 0 or c.outbound_capacity < 16) return error.InvalidConfig;
+        if (c.manager_capacity == 0 or c.mode_capacity == 0 or
+            c.configuration_capacity == 0 or c.outbound_capacity < 16)
+            return error.InvalidConfig;
         if ((c.physical_width_mm == null) != (c.physical_height_mm == null)) return error.InvalidConfig;
         if (c.physical_width_mm) |width| if (width <= 0 or c.physical_height_mm.? <= 0) return error.InvalidConfig;
         inline for (.{ c.name, c.description }) |s| if (std.mem.indexOfScalar(u8, s, 0) != null) return error.InvalidConfig;
@@ -56,12 +81,12 @@ pub fn Adapter(comptime protocol: type) type {
         const ConfigurationHead = protocol.zwlr_output_configuration_head_v1;
         const Peer = wayring.io_uring.Peer;
 
-        const ManagerSlot = struct { header: slot_pool.Header = .{}, peer: Peer = undefined, resource: objects.Handle = .{ .id = 0, .generation = 0 }, version: u32 = 1, stopped: bool = false, head: ?objects.Handle = null, mode: ?objects.Handle = null };
-        const Child = struct { header: slot_pool.Header = .{}, manager: u32 = 0, peer: Peer = undefined, resource: ?objects.Handle = null };
+        const ManagerSlot = struct { header: slot_pool.Header = .{}, peer: Peer = undefined, resource: objects.Handle = .{ .id = 0, .generation = 0 }, version: u32 = 1, stopped: bool = false, head: ?objects.Handle = null };
+        const Child = struct { header: slot_pool.Header = .{}, manager: u32 = 0, peer: Peer = undefined, resource: ?objects.Handle = null, mode: ModeState = undefined };
         const ConfigSlot = struct { header: slot_pool.Header = .{}, manager: u32 = 0, peer: Peer = undefined, resource: ?objects.Handle = null, lifecycle: ConfigurationId = undefined, config_head: ?objects.Handle = null, destroyed: bool = false };
         const CHeadSlot = struct { header: slot_pool.Header = .{}, configuration: u32 = 0, peer: Peer = undefined, resource: ?objects.Handle = null };
         const Kind = enum { make_head, head_name, head_description, physical_size, make_mode, mode_size, mode_refresh, mode_preferred, enabled, current_mode, position, transform, scale, make, model, adaptive_sync, done, finished, succeeded, failed, cancelled };
-        const Out = struct { kind: Kind, owner: u32 };
+        const Out = struct { kind: Kind, owner: u32, mode: ?u32 = null };
         pub const WireCommand = struct { peer: Peer, configuration: ConfigurationId, wire_configuration: ?objects.Handle, operation: Operation, serial: u32, desired: HeadState };
 
         allocator: std.mem.Allocator,
@@ -70,6 +95,8 @@ pub fn Adapter(comptime protocol: type) type {
         description: []u8,
         make: ?[]u8,
         model: ?[]u8,
+        mode_inventory: []ModeState,
+        mode_count: usize,
         managers: slot_pool.Pool(ManagerSlot),
         heads: slot_pool.Pool(Child),
         modes: slot_pool.Pool(Child),
@@ -90,6 +117,8 @@ pub fn Adapter(comptime protocol: type) type {
             errdefer if (make) |value| allocator.free(value);
             const model = if (c.model) |value| try allocator.dupe(u8, value) else null;
             errdefer if (model) |value| allocator.free(value);
+            const mode_inventory = try allocator.alloc(ModeState, c.mode_capacity);
+            errdefer allocator.free(mode_inventory);
             var managers = try slot_pool.Pool(ManagerSlot).init(allocator, c.manager_capacity);
             errdefer managers.deinit();
             var heads = try slot_pool.Pool(Child).init(allocator, c.manager_capacity);
@@ -100,7 +129,13 @@ pub fn Adapter(comptime protocol: type) type {
             errdefer configurations.deinit();
             var config_heads = try slot_pool.Pool(CHeadSlot).init(allocator, c.configuration_capacity);
             errdefer config_heads.deinit();
-            return .{ .allocator = allocator, .config = c, .name = name, .description = description, .make = make, .model = model, .managers = managers, .heads = heads, .modes = modes, .configurations = configurations, .config_heads = config_heads, .lifecycle = try .init(allocator, c.configuration_capacity, serial, state) };
+            mode_inventory[0] = .{
+                .width = state.width,
+                .height = state.height,
+                .refresh_millihz = state.refresh_millihz,
+                .preferred = true,
+            };
+            return .{ .allocator = allocator, .config = c, .name = name, .description = description, .make = make, .model = model, .mode_inventory = mode_inventory, .mode_count = 1, .managers = managers, .heads = heads, .modes = modes, .configurations = configurations, .config_heads = config_heads, .lifecycle = try .init(allocator, c.configuration_capacity, serial, state) };
         }
         pub fn deinit(self: *Self) void {
             self.outbound.deinit(self.allocator);
@@ -112,6 +147,7 @@ pub fn Adapter(comptime protocol: type) type {
             self.managers.deinit();
             if (self.model) |value| self.allocator.free(value);
             if (self.make) |value| self.allocator.free(value);
+            self.allocator.free(self.mode_inventory);
             self.allocator.free(self.description);
             self.allocator.free(self.name);
             self.* = undefined;
@@ -123,29 +159,61 @@ pub fn Adapter(comptime protocol: type) type {
             self.global = try runtime.addGlobalWithBinder(&Manager.info, 4, self, bind);
             return self.global.?;
         }
+        /// Replaces the connector inventory before clients bind it. Repeating
+        /// an identical inventory is allowed while bindings are live, which
+        /// keeps output recreation independent from protocol object lifetime.
+        pub fn setModes(self: *Self, inventory: []const ModeState, current: HeadState) !void {
+            if (inventory.len == 0 or inventory.len > self.mode_inventory.len)
+                return error.InvalidModeInventory;
+            var current_present = false;
+            for (inventory, 0..) |mode, index| {
+                try mode.validate();
+                current_present = current_present or mode.matches(current);
+                for (inventory[0..index]) |previous| if (previous.sameTiming(mode))
+                    return error.DuplicateMode;
+            }
+            if (!current_present) return error.CurrentModeMissing;
+            if (sameInventory(self.mode_inventory[0..self.mode_count], inventory)) return;
+            for (self.managers.entries.items) |manager| if (manager.header.active)
+                return error.ModeInventoryInUse;
+            @memcpy(self.mode_inventory[0..inventory.len], inventory);
+            self.mode_count = inventory.len;
+        }
         fn bind(ctx: ?*anyopaque, binding: wayring.server.Binding) !?*anyopaque {
             const self: *Self = @ptrCast(@alignCast(ctx orelse return error.InvalidContext));
-            var needed: usize = 14;
+            var needed: usize = 9 + try std.math.mul(usize, self.mode_count, 3);
+            for (self.mode_inventory[0..self.mode_count]) |mode|
+                needed += @intFromBool(mode.preferred);
             needed += @intFromBool(self.config.physical_width_mm != null);
             needed += @intFromBool(binding.version >= 2 and self.config.make != null);
             needed += @intFromBool(binding.version >= 2 and self.config.model != null);
             needed += @intFromBool(binding.version >= 4);
             try self.ensureOutbound(needed);
+            const outbound_start = self.outbound.items.len;
+            errdefer self.outbound.items.len = outbound_start;
             const m = try self.managers.acquire();
-            errdefer self.managers.release(m);
+            errdefer self.releaseManager(m);
             m.peer = binding.peer;
             m.resource = binding.resource;
             m.version = binding.version;
             const h = try self.heads.acquire();
-            errdefer self.heads.release(h);
             h.manager = m.header.index;
             h.peer = binding.peer;
-            const mode = try self.modes.acquire();
-            errdefer self.modes.release(mode);
-            mode.manager = m.header.index;
-            mode.peer = binding.peer;
-            const kinds = [_]Kind{ .make_head, .head_name, .head_description, .physical_size, .make_mode, .mode_size, .mode_refresh, .mode_preferred, .enabled, .current_mode, .position, .transform, .scale, .make, .model, .adaptive_sync, .done };
-            for (kinds) |k| {
+            for ([_]Kind{ .make_head, .head_name, .head_description, .physical_size }) |k| {
+                if (k == .physical_size and self.config.physical_width_mm == null) continue;
+                self.outbound.appendAssumeCapacity(.{ .kind = k, .owner = m.header.index });
+            }
+            for (self.mode_inventory[0..self.mode_count]) |state| {
+                const mode = try self.modes.acquire();
+                mode.manager = m.header.index;
+                mode.peer = binding.peer;
+                mode.mode = state;
+                for ([_]Kind{ .make_mode, .mode_size, .mode_refresh, .mode_preferred }) |k| {
+                    if (k == .mode_preferred and !state.preferred) continue;
+                    self.outbound.appendAssumeCapacity(.{ .kind = k, .owner = m.header.index, .mode = mode.header.index });
+                }
+            }
+            for ([_]Kind{ .enabled, .current_mode, .position, .transform, .scale, .make, .model, .adaptive_sync, .done }) |k| {
                 if (k == .physical_size and self.config.physical_width_mm == null or k == .make and (binding.version < 2 or self.config.make == null) or k == .model and (binding.version < 2 or self.config.model == null) or k == .adaptive_sync and binding.version < 4) continue;
                 self.outbound.appendAssumeCapacity(.{ .kind = k, .owner = m.header.index });
             }
@@ -280,7 +348,7 @@ pub fn Adapter(comptime protocol: type) type {
                 const c = self.configurations.at(ch.configuration) orelse return null;
                 const d = try wayring.server.decodeRequest(ConfigurationHead, server_objects, message, fds);
                 switch (d.value) {
-                    .set_mode => |v| if (self.validMode(c, server_objects, v.mode)) try self.lifecycle.setMode(c.lifecycle, self.lifecycle.current.width, self.lifecycle.current.height, self.lifecycle.current.refresh_millihz) else return try self.protocolError(actor, d.handle.id, 2, "invalid mode"),
+                    .set_mode => |v| if (self.validMode(c, server_objects, v.mode)) |mode| try self.lifecycle.setMode(c.lifecycle, mode.mode.width, mode.mode.height, mode.mode.refresh_millihz) else return try self.protocolError(actor, d.handle.id, 2, "invalid mode"),
                     .set_custom_mode => |v| self.lifecycle.setMode(c.lifecycle, v.width, v.height, v.refresh) catch |e| return try self.headError(actor, d.handle.id, e),
                     .set_position => |v| try self.lifecycle.setPosition(c.lifecycle, v.x, v.y),
                     .set_transform => |v| self.lifecycle.setTransform(c.lifecycle, @intCast(v.transform.value)) catch |e| return try self.headError(actor, d.handle.id, e),
@@ -367,7 +435,6 @@ pub fn Adapter(comptime protocol: type) type {
             const m = self.managers.at(o.owner) orelse return;
             if (o.kind == .finished) return Manager.encodeEvent(q, m.resource.id, .{ .finished = .{} });
             const h = self.managerChild(&self.heads, o.owner) orelse return;
-            const mode = self.managerChild(&self.modes, o.owner) orelse return;
             const s = self.lifecycle.current;
             switch (o.kind) {
                 .make_head => {
@@ -379,15 +446,27 @@ pub fn Adapter(comptime protocol: type) type {
                 .head_description => try Head.encodeEvent(q, h.resource.?.id, .{ .description = .{ .description = self.description } }),
                 .physical_size => try Head.encodeEvent(q, h.resource.?.id, .{ .physical_size = .{ .width = self.config.physical_width_mm.?, .height = self.config.physical_height_mm.? } }),
                 .make_mode => {
+                    const mode = self.modeChild(o) orelse return;
                     const made = try Head.construct_event_mode(protocol, so, q, h.resource.?, .{ .mode = .{ .context = mode } });
                     mode.resource = made.mode;
-                    m.mode = made.mode;
                 },
-                .mode_size => try Mode.encodeEvent(q, mode.resource.?.id, .{ .size = .{ .width = s.width, .height = s.height } }),
-                .mode_refresh => try Mode.encodeEvent(q, mode.resource.?.id, .{ .refresh = .{ .refresh = s.refresh_millihz } }),
-                .mode_preferred => try Mode.encodeEvent(q, mode.resource.?.id, .{ .preferred = .{} }),
+                .mode_size => {
+                    const mode = self.modeChild(o) orelse return;
+                    try Mode.encodeEvent(q, mode.resource.?.id, .{ .size = .{ .width = mode.mode.width, .height = mode.mode.height } });
+                },
+                .mode_refresh => {
+                    const mode = self.modeChild(o) orelse return;
+                    try Mode.encodeEvent(q, mode.resource.?.id, .{ .refresh = .{ .refresh = mode.mode.refresh_millihz } });
+                },
+                .mode_preferred => {
+                    const mode = self.modeChild(o) orelse return;
+                    try Mode.encodeEvent(q, mode.resource.?.id, .{ .preferred = .{} });
+                },
                 .enabled => try Head.encodeEvent(q, h.resource.?.id, .{ .enabled = .{ .enabled = @intFromBool(s.enabled) } }),
-                .current_mode => if (s.enabled) try Head.encodeEvent(q, h.resource.?.id, .{ .current_mode = .{ .mode = mode.resource.?.id } }),
+                .current_mode => if (s.enabled) {
+                    if (self.currentMode(o.owner)) |mode| if (mode.resource) |resource|
+                        try Head.encodeEvent(q, h.resource.?.id, .{ .current_mode = .{ .mode = resource.id } });
+                },
                 .position => try Head.encodeEvent(q, h.resource.?.id, .{ .position = .{ .x = s.x, .y = s.y } }),
                 .transform => try Head.encodeEvent(q, h.resource.?.id, .{ .transform = .{ .transform = .fromInt(@intCast(s.transform)) } }),
                 .scale => try Head.encodeEvent(q, h.resource.?.id, .{ .scale = .{ .scale = @intCast(@divTrunc(@as(u64, s.scale_120) * 256, 120)) } }),
@@ -438,11 +517,14 @@ pub fn Adapter(comptime protocol: type) type {
             const x = self.heads.fromContext(obj.context) orelse return false;
             return obj.interface == &Head.info and x.manager == c.manager and samePeer(x.peer, c.peer) and x.resource != null and std.meta.eql(x.resource.?, h);
         }
-        fn validMode(self: *Self, c: *ConfigSlot, so: anytype, id: u32) bool {
-            const h = so.namespace.lookupHandle(id) orelse return false;
-            const obj = so.namespace.resolve(h) orelse return false;
-            const x = self.modes.fromContext(obj.context) orelse return false;
-            return obj.interface == &Mode.info and x.manager == c.manager and samePeer(x.peer, c.peer) and x.resource != null and std.meta.eql(x.resource.?, h);
+        fn validMode(self: *Self, c: *ConfigSlot, so: anytype, id: u32) ?*Child {
+            const h = so.namespace.lookupHandle(id) orelse return null;
+            const obj = so.namespace.resolve(h) orelse return null;
+            const x = self.modes.fromContext(obj.context) orelse return null;
+            if (obj.interface != &Mode.info or x.manager != c.manager or
+                !samePeer(x.peer, c.peer) or x.resource == null or
+                !std.meta.eql(x.resource.?, h)) return null;
+            return x;
         }
         fn findConfig(self: *Self, id: ConfigurationId) ?*ConfigSlot {
             for (self.configurations.entries.items) |c| if (c.header.active and std.meta.eql(c.lifecycle, id)) return c;
@@ -473,6 +555,16 @@ pub fn Adapter(comptime protocol: type) type {
             for (pool.entries.items) |x| if (x.header.active and x.manager == manager) return x;
             return null;
         }
+        fn modeChild(self: *Self, out: Out) ?*Child {
+            const index = out.mode orelse return null;
+            const mode = self.modes.at(index) orelse return null;
+            return if (mode.manager == out.owner) mode else null;
+        }
+        fn currentMode(self: *Self, manager: u32) ?*Child {
+            for (self.modes.entries.items) |mode| if (mode.header.active and
+                mode.manager == manager and mode.mode.matches(self.lifecycle.current)) return mode;
+            return null;
+        }
         fn ownerPeer(self: *const Self, o: Out) ?Peer {
             if (o.kind == .succeeded or o.kind == .failed or o.kind == .cancelled) {
                 if (o.owner >= self.configurations.entries.items.len) return null;
@@ -485,6 +577,11 @@ pub fn Adapter(comptime protocol: type) type {
         }
         fn samePeer(a: Peer, b: Peer) bool {
             return std.meta.eql(a, b);
+        }
+        fn sameInventory(a: []const ModeState, b: []const ModeState) bool {
+            if (a.len != b.len) return false;
+            for (a, b) |left, right| if (!std.meta.eql(left, right)) return false;
+            return true;
         }
     };
 }
@@ -672,4 +769,87 @@ test "configuration coverage stale cancellation one shot and FIFO completion" {
 test "Wayring output-management adapter compiles against generated protocol" {
     const A = Adapter(@import("core_protocol"));
     std.testing.refAllDecls(A);
+}
+
+test "output management inventory retains every exact mode and current selection" {
+    const A = Adapter(@import("core_protocol"));
+    const modes = [_]ModeState{
+        .{ .width = 1920, .height = 1080, .refresh_millihz = 60000, .preferred = true },
+        .{ .width = 1280, .height = 720, .refresh_millihz = 75000 },
+    };
+    var adapter = try A.init(
+        std.testing.allocator,
+        .{ .manager_capacity = 1, .mode_capacity = modes.len },
+        1,
+        .{ .width = 1280, .height = 720, .refresh_millihz = 75000 },
+    );
+    defer adapter.deinit();
+
+    try adapter.setModes(&modes, adapter.lifecycle.current);
+    try std.testing.expect(A.sameInventory(&modes, adapter.mode_inventory[0..adapter.mode_count]));
+    try adapter.setModes(&modes, adapter.lifecycle.current);
+    try std.testing.expectError(
+        error.DuplicateMode,
+        adapter.setModes(&.{
+            modes[0],
+            .{ .width = 1920, .height = 1080, .refresh_millihz = 60000 },
+        }, adapter.lifecycle.current),
+    );
+    try std.testing.expectError(
+        error.CurrentModeMissing,
+        adapter.setModes(&.{modes[0]}, adapter.lifecycle.current),
+    );
+
+    const manager = try adapter.managers.acquire();
+    const first = try adapter.modes.acquire();
+    first.manager = manager.header.index;
+    first.mode = modes[0];
+    const second = try adapter.modes.acquire();
+    second.manager = manager.header.index;
+    second.mode = modes[1];
+    try std.testing.expect(adapter.currentMode(manager.header.index) == second);
+    try std.testing.expectError(
+        error.ModeInventoryInUse,
+        adapter.setModes(&.{modes[1]}, adapter.lifecycle.current),
+    );
+    adapter.releaseManager(manager);
+}
+
+test "output management binding snapshots every mode in protocol order" {
+    const A = Adapter(@import("core_protocol"));
+    const modes = [_]ModeState{
+        .{ .width = 1920, .height = 1080, .refresh_millihz = 60000, .preferred = true },
+        .{ .width = 1280, .height = 720, .refresh_millihz = 75000 },
+    };
+    var adapter = try A.init(
+        std.testing.allocator,
+        .{ .manager_capacity = 1, .mode_capacity = modes.len },
+        1,
+        .{ .width = 1280, .height = 720, .refresh_millihz = 75000 },
+    );
+    defer adapter.deinit();
+    try adapter.setModes(&modes, adapter.lifecycle.current);
+    const peer: wayring.io_uring.Peer = .{ .slot = 3, .generation = 4 };
+    _ = try A.bind(&adapter, .{
+        .peer = peer,
+        .credentials = .{ .pid = 1, .uid = 2, .gid = 3 },
+        .global = .{ .id = 4, .generation = 1 },
+        .resource = .{ .id = 5, .generation = 2 },
+        .version = 4,
+    });
+
+    const expected = [_]A.Kind{
+        .make_head,      .head_name, .head_description,
+        .make_mode,      .mode_size, .mode_refresh,
+        .mode_preferred, .make_mode, .mode_size,
+        .mode_refresh,   .enabled,   .current_mode,
+        .position,       .transform, .scale,
+        .adaptive_sync,  .done,
+    };
+    try std.testing.expectEqual(expected.len, adapter.outbound.items.len);
+    for (expected, adapter.outbound.items) |kind, event|
+        try std.testing.expectEqual(kind, event.kind);
+    try std.testing.expect(adapter.outbound.items[3].mode != adapter.outbound.items[7].mode);
+    try std.testing.expectEqual(@as(usize, 2), adapter.modes.entries.items.len);
+    try std.testing.expect(adapter.currentMode(0) == adapter.modes.entries.items[1]);
 }

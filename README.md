@@ -109,12 +109,12 @@ responsibilities:
   and description, with `zxdg_output_v1.done` for versions 1–2 and the
   associated `wl_output.done` atomicity marker for version 3.
 - [Wlr output management](src/protocol/output_management.zig): each manager
-  receives a backpressure-safe head and mode snapshot, while generation-safe
-  configuration objects enforce complete, one-shot transactions. Ouro accepts
-  tests for exact connector modes and applies mode changes by quiescing and
-  recreating scanout with rollback to the prior mode if activation fails;
-  unsupported layout, transform, scale, and adaptive-sync changes fail rather
-  than being reported as applied.
+  receives a backpressure-safe head and complete deduplicated connector-mode
+  inventory, while generation-safe configuration objects enforce complete,
+  one-shot transactions. Mode resources select their exact advertised timing.
+  Ouro applies mode changes by quiescing and recreating scanout with rollback
+  to the prior mode if activation fails; unsupported layout, transform, scale,
+  and adaptive-sync changes fail rather than being reported as applied.
 - [Layer shell](src/protocol/layer_shell.zig): bounded
   `zwlr_layer_shell_v1` roles retain double-buffered anchors, margins,
   exclusive zones, layer, and keyboard-interactivity state; publish exact

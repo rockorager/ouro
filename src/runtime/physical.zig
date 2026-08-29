@@ -627,6 +627,7 @@ pub fn Coordinator(comptime protocol: type) type {
         output_adapter: OutputAdapter,
         xdg_output_adapter: XdgOutputAdapter,
         output_management_adapter: OutputManagementAdapter,
+        output_management_modes: []protocol_output_management.ModeState,
         layer_shell_adapter: LayerShellAdapter,
         session_lock_adapter: SessionLockAdapter,
         cursor_shape_adapter: CursorShapeAdapter,
@@ -864,6 +865,11 @@ pub fn Coordinator(comptime protocol: type) type {
             errdefer allocator.free(self.screencopy_bytes);
             self.pending_screencopy = null;
             self.pending_image_copy = null;
+            self.output_management_modes = try allocator.alloc(
+                protocol_output_management.ModeState,
+                config.output_management.mode_capacity,
+            );
+            errdefer allocator.free(self.output_management_modes);
             self.output_drain_started = false;
             self.output_reconfigure = null;
             self.stopping = false;
@@ -1524,6 +1530,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.layer_shell_adapter.deinit();
             self.xdg_output_adapter.deinit();
             self.output_management_adapter.deinit();
+            self.allocator.free(self.output_management_modes);
             self.screencopy_adapter.deinit();
             self.output_adapter.deinit();
             self.fractional_scale_adapter.deinit();
@@ -4812,6 +4819,23 @@ pub fn Coordinator(comptime protocol: type) type {
         /// terminal or should be followed by an exact rollback snapshot.
         fn activateOutput(self: *Self, snapshot: drm.Snapshot) !void {
             if (self.output != null or self.stopping) return error.InvalidState;
+            const connector = snapshot.selectedConnector();
+            const mode_end = try std.math.add(usize, connector.mode_start, connector.mode_count);
+            if (mode_end > snapshot.modes.len) return error.InvalidModeInventory;
+            const mode = snapshot.selectedMode();
+            const refresh = try std.math.mul(u32, mode.vrefresh, 1000);
+            try self.output_management_adapter.setModes(
+                try collectOutputModes(
+                    self.output_management_modes,
+                    snapshot.modes[connector.mode_start..mode_end],
+                ),
+                .{
+                    .width = mode.hdisplay,
+                    .height = mode.vdisplay,
+                    .refresh_millihz = std.math.cast(i32, refresh) orelse
+                        return error.InvalidMode,
+                },
+            );
             const generation = self.next_output_generation orelse
                 return error.GenerationExhausted;
             var output_config = self.output_config;
@@ -4853,8 +4877,6 @@ pub fn Coordinator(comptime protocol: type) type {
             self.interaction.applyBounds(work_area);
             const retained_visibility_changed = self.refreshRetainedLayersForOutput();
             self.output_drain_started = false;
-            const connector = snapshot.selectedConnector();
-            const mode = snapshot.selectedMode();
             try self.output_adapter.publishMode(
                 self.output.?.planner.output.width,
                 self.output.?.planner.output.height,
@@ -7308,6 +7330,56 @@ fn activateOutputWithRollback(owner: anytype, desired: anytype, previous: @TypeO
         },
     };
     return .succeeded;
+}
+
+fn collectOutputModes(
+    destination: []protocol_output_management.ModeState,
+    modes: []const drm.Mode,
+) ![]protocol_output_management.ModeState {
+    var count: usize = 0;
+    for (modes) |mode| {
+        const refresh = try std.math.mul(u32, mode.vrefresh, 1000);
+        const state: protocol_output_management.ModeState = .{
+            .width = mode.hdisplay,
+            .height = mode.vdisplay,
+            .refresh_millihz = std.math.cast(i32, refresh) orelse
+                return error.InvalidMode,
+            .preferred = mode.preferred(),
+        };
+        var duplicate: ?*protocol_output_management.ModeState = null;
+        for (destination[0..count]) |*existing| {
+            if (existing.sameTiming(state)) {
+                duplicate = existing;
+                break;
+            }
+        }
+        if (duplicate) |existing| {
+            existing.preferred = existing.preferred or state.preferred;
+            continue;
+        }
+        if (count == destination.len) return error.InvalidModeInventory;
+        destination[count] = state;
+        count += 1;
+    }
+    if (count == 0) return error.InvalidModeInventory;
+    return destination[0..count];
+}
+
+test "physical: output mode inventory deduplicates timings and preserves preferred" {
+    var storage: [2]protocol_output_management.ModeState = undefined;
+    const modes = [_]drm.Mode{
+        .{ .clock = 1, .hdisplay = 1920, .hsync_start = 1920, .hsync_end = 1920, .htotal = 1920, .hskew = 0, .vdisplay = 1080, .vsync_start = 1080, .vsync_end = 1080, .vtotal = 1080, .vscan = 0, .vrefresh = 60, .flags = 0, .mode_type = 0 },
+        .{ .clock = 2, .hdisplay = 1280, .hsync_start = 1280, .hsync_end = 1280, .htotal = 1280, .hskew = 0, .vdisplay = 720, .vsync_start = 720, .vsync_end = 720, .vtotal = 720, .vscan = 0, .vrefresh = 75, .flags = 0, .mode_type = 0 },
+        .{ .clock = 3, .hdisplay = 1920, .hsync_start = 1920, .hsync_end = 1920, .htotal = 1920, .hskew = 0, .vdisplay = 1080, .vsync_start = 1080, .vsync_end = 1080, .vtotal = 1080, .vscan = 0, .vrefresh = 60, .flags = 0, .mode_type = 1 << 3 },
+    };
+    const inventory = try collectOutputModes(&storage, &modes);
+    try std.testing.expectEqual(@as(usize, 2), inventory.len);
+    try std.testing.expect(inventory[0].preferred);
+    try std.testing.expectEqual(@as(i32, 75000), inventory[1].refresh_millihz);
+    try std.testing.expectError(
+        error.InvalidModeInventory,
+        collectOutputModes(storage[0..1], modes[0..2]),
+    );
 }
 
 test "physical: output replacement rolls back exactly once after activation failure" {
