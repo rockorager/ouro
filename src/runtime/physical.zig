@@ -1734,6 +1734,15 @@ pub fn Coordinator(comptime protocol: type) type {
             if (try self.shm.request(actor, objects, target, message, fds)) |control|
                 return control;
             if (try self.adapter.request(peer, target, message, fds)) |control| {
+                const SurfaceRequest = std.meta.Tag(protocol.wl_surface.Request);
+                const publishes_surface = target.object.interface != &protocol.wl_surface.info or
+                    message.header.opcode == @intFromEnum(SurfaceRequest.destroy) or
+                    message.header.opcode == @intFromEnum(SurfaceRequest.commit);
+                // Pending wl_surface state is private until commit. Creating a
+                // callback or changing pending attachment, damage, regions,
+                // scale, transform, or offset cannot advance the desktop or
+                // expose protocol output by itself.
+                if (!publishes_surface) return control;
                 if (self.surface == null) if (self.adapter.firstSurface()) |first| {
                     self.surface = first;
                     self.surface_id = try self.adapter.surfaceId(first);
@@ -3042,16 +3051,18 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn syncSessionState(self: *Self) !void {
-            const windows = try self.desktop.sceneSnapshotGrowing(
-                self.allocator,
-                &self.scene_windows,
-            );
-            for (windows) |window| {
-                const shell_id = self.desktop.shellToplevel(window.id) catch continue;
-                self.xdg_session_adapter.updateState(
-                    shell_id,
-                    try self.desktop.restorableState(window.id),
+            if (self.xdg_session_adapter.tracksToplevels()) {
+                const windows = try self.desktop.sceneSnapshotGrowing(
+                    self.allocator,
+                    &self.scene_windows,
                 );
+                for (windows) |window| {
+                    const shell_id = self.desktop.shellToplevel(window.id) catch continue;
+                    self.xdg_session_adapter.updateState(
+                        shell_id,
+                        try self.desktop.restorableState(window.id),
+                    );
+                }
             }
             try self.syncXdgSessionStoreTimer();
         }
@@ -3235,6 +3246,8 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn syncWorkspace(self: *Self) !void {
+            if (!self.workspace_adapter.hasManagers() and
+                self.workspace_adapter.pendingCommands() == 0) return;
             const output_id: ?WorkspaceAdapter.OutputId = if (self.output) |output|
                 workspaceOutputId(output.outputId())
             else
@@ -4735,6 +4748,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn markXdgSessionProtocol(self: *Self) void {
+            if (!self.xdg_session_adapter.hasPendingOutbound()) return;
             for (self.clients.items) |*client| {
                 if (client.active and self.xdg_session_adapter.pendingOutbound(client.peer))
                     client.protocol_ready |= ProtocolReady.xdg_session;
@@ -7250,15 +7264,22 @@ pub fn Coordinator(comptime protocol: type) type {
             object: wayring.objects.Object,
         ) void {
             const self: *Self = @ptrCast(@alignCast(context.?));
-            // Buffer/import destruction and one-shot callback retirement only
-            // remove ownership. None can expose outbound work in independent
-            // protocol adapters, so avoid forcing every client through a full
-            // readiness scan for frame and buffer churn.
+            // These transient resources have a single coordinator owner and
+            // cannot affect shell, input, output, or extension state.
+            if (object.interface == &protocol.wl_callback.info or
+                object.interface == &protocol.wp_presentation_feedback.info)
+            {
+                _ = self.adapter.resourceRemoved(handle, object);
+                return;
+            }
+            if (object.interface == &protocol.zwp_linux_buffer_params_v1.info) {
+                _ = self.dmabuf_adapter.resourceRemoved(handle, object);
+                return;
+            }
+            // Buffer and pool destruction only remove ownership and cannot
+            // expose outbound work in independent protocol adapters.
             if (object.interface != &protocol.wl_buffer.info and
-                object.interface != &protocol.wl_shm_pool.info and
-                object.interface != &protocol.zwp_linux_buffer_params_v1.info and
-                object.interface != &protocol.wl_callback.info and
-                object.interface != &protocol.wp_presentation_feedback.info)
+                object.interface != &protocol.wl_shm_pool.info)
                 self.markProtocolAll(ProtocolReady.all);
             const removed_surface_candidate: ?Adapter.SurfaceId = if (std.mem.eql(
                 u8,

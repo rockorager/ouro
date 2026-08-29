@@ -162,6 +162,10 @@ pub fn Adapter(comptime protocol: type) type {
         pub fn pendingCommands(self: *const Self) usize {
             return self.command_count;
         }
+        pub fn hasManagers(self: *const Self) bool {
+            for (self.managers) |manager| if (manager.active) return true;
+            return false;
+        }
         pub fn peekCommand(self: *const Self) ?Command {
             return if (self.command_count == 0) null else self.commands[self.command_head];
         }

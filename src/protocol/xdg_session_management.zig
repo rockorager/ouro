@@ -405,6 +405,11 @@ pub fn Owner(comptime State: type, comptime ToplevelId: type) type {
                 self.dirty = true;
             };
         }
+        pub fn tracksToplevels(self: *const Self) bool {
+            for (self.handles) |slot| if (slot.live and !slot.inert and
+                slot.associated and (!slot.restore_pending or slot.applied)) return true;
+            return false;
+        }
         pub fn persistenceDirty(self: *const Self) bool {
             return self.dirty;
         }
@@ -638,6 +643,10 @@ pub fn Adapter(comptime protocol: type, comptime ShellAdapter: type, comptime St
             for (self.outbound) |o| if (o.active and self.outPeer(o.value, peer)) return true;
             return false;
         }
+        pub fn hasPendingOutbound(self: *const Self) bool {
+            for (self.outbound) |out| if (out.active) return true;
+            return false;
+        }
         pub fn flushOn(self: *Self, peer: wayring.io_uring.Peer, server_objects: anytype, queue: *wayring.tx.Queue) !usize {
             var n: usize = 0;
             while (self.oldest(peer)) |o| {
@@ -681,6 +690,9 @@ pub fn Adapter(comptime protocol: type, comptime ShellAdapter: type, comptime St
         }
         pub fn updateState(self: *Self, id: ShellAdapter.ToplevelId, state: State) void {
             self.owner.updateState(id, state);
+        }
+        pub fn tracksToplevels(self: *const Self) bool {
+            return self.owner.tracksToplevels();
         }
         pub fn toplevelDestroyed(self: *Self, id: ShellAdapter.ToplevelId) void {
             self.owner.toplevelDestroyed(id);
