@@ -158,7 +158,7 @@ test "physical DRM lease resolver grants the independent secondary tuple" {
     try root.deinit();
 }
 
-test "generated client leases a secondary connector and observes external revocation" {
+test "generated client leases, withdraws, and rediscovers a secondary connector" {
     const allocator = std.testing.allocator;
     var fixture = try Fixture.init();
     defer fixture.deinit();
@@ -225,6 +225,50 @@ test "generated client leases a secondary connector and observes external revoca
     try std.testing.expectEqual(@as(usize, 1), fixture.lease_create_count);
     try std.testing.expectEqual(@as(usize, 0), fixture.lease_revoke_count);
     try std.testing.expectEqualSlices(u32, &.{ 11, 31, 41 }, fixture.lease_objects[0..fixture.lease_object_count]);
+
+    for (0..256) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.connector_done_count == 2) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expectEqual(@as(usize, 2), handler.connector_done_count);
+
+    try fixture.signalSession(.disable);
+    for (0..256) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        if (handler.release_requested and !handler.release_flushed) {
+            try submitClient(&reactor, &driver, &handler);
+            handler.release_flushed = true;
+        }
+        _ = try loop.turn(coordinator);
+        if (coordinator.output == null and handler.withdrawn == 2 and
+            handler.released == 1 and handler.global_removes == 1) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expectEqual(@as(usize, 2), handler.withdrawn);
+    try std.testing.expectEqual(@as(usize, 1), handler.released);
+    try std.testing.expectEqual(@as(usize, 1), handler.global_removes);
+    try std.testing.expectEqual(ouro.session.State.disabled, coordinator.session.state);
+
+    try fixture.signalSession(.enable);
+    for (0..256) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        if (handler.device != null and !handler.bind_flushed) {
+            try submitClient(&reactor, &driver, &handler);
+            handler.bind_flushed = true;
+        }
+        _ = try loop.turn(coordinator);
+        if (handler.globals == 2 and handler.connector_done_count == 3) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expectEqual(@as(usize, 2), handler.globals);
+    try std.testing.expectEqual(@as(usize, 3), handler.connector_done_count);
+    try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+    try std.testing.expect(coordinator.output != null);
 
     _ = try client.prepareClose();
     _ = try driver.schedule();
@@ -1733,14 +1777,27 @@ const LeaseClientHandler = struct {
     lease_request_flushed: bool = false,
     lease_fd_received: bool = false,
     finished: usize = 0,
+    global_name: ?u32 = null,
+    globals: usize = 0,
+    global_removes: usize = 0,
+    connector_done_count: usize = 0,
+    withdrawn: usize = 0,
+    released: usize = 0,
+    release_requested: bool = false,
+    release_flushed: bool = false,
+    event_failures: usize = 0,
 
-    pub fn eventError(_: *LeaseClientHandler, _: wayring.io_uring.Peer, _: ClientCore.EventFailure) void {}
+    pub fn eventError(self: *LeaseClientHandler, _: wayring.io_uring.Peer, _: ClientCore.EventFailure) void {
+        self.event_failures += 1;
+    }
 
     pub fn event(self: *LeaseClientHandler, target: wayring.objects.Dispatch, message: wayring.wire.Message, fds: *wayring.ancillary.FdQueue) !wayring.dispatch.Control {
         if (target.object.interface == &ClientCore.Registry.info) {
             switch (try ClientCore.decodeRegistryEvent(self.objects, self.registry, message, fds)) {
                 .global => |global| {
-                    if (std.mem.eql(u8, global.interface, protocol.wp_drm_lease_device_v1.info.name))
+                    if (std.mem.eql(u8, global.interface, protocol.wp_drm_lease_device_v1.info.name)) {
+                        self.global_name = global.name;
+                        self.globals += 1;
                         self.device = try ClientCore.bind(
                             self.objects,
                             self.queue,
@@ -1750,8 +1807,20 @@ const LeaseClientHandler = struct {
                             1,
                             null,
                         );
+                        self.bind_flushed = false;
+                    }
                 },
-                .global_remove => {},
+                .global_remove => |name| {
+                    if (self.global_name == name.name) {
+                        self.global_removes += 1;
+                        try protocol.wp_drm_lease_device_v1.encodeRequest(
+                            self.queue,
+                            self.device.?.id,
+                            .{ .release = .{} },
+                        );
+                        self.release_requested = true;
+                    }
+                },
             }
         } else if (target.object.interface == &protocol.wp_drm_lease_device_v1.info) {
             switch (try protocol.wp_drm_lease_device_v1.decodeEvent(message, fds)) {
@@ -1789,7 +1858,11 @@ const LeaseClientHandler = struct {
                     )).id;
                     self.submitted = true;
                 },
-                .released => {},
+                .released => {
+                    _ = try self.objects.retireLocal(self.device.?);
+                    self.device = null;
+                    self.released += 1;
+                },
             }
         } else if (target.object.interface == &protocol.wp_drm_lease_connector_v1.info) {
             switch (try protocol.wp_drm_lease_connector_v1.decodeEvent(message, fds)) {
@@ -1805,8 +1878,19 @@ const LeaseClientHandler = struct {
                     try std.testing.expectEqual(@as(u32, 11), value.connector_id);
                     self.connector_id = true;
                 },
-                .done => self.connector_done = true,
-                .withdrawn => {},
+                .done => {
+                    self.connector_done = true;
+                    self.connector_done_count += 1;
+                },
+                .withdrawn => {
+                    self.withdrawn += 1;
+                    const connector = self.objects.namespace.lookupHandle(message.header.object_id) orelse
+                        return error.MissingConnector;
+                    // The device release below retires its server-owned children.
+                    _ = try self.objects.removePeer(connector);
+                    if (self.connector != null and self.connector.?.id == connector.id)
+                        self.connector = null;
+                },
             }
         } else if (target.object.interface == &protocol.wp_drm_lease_v1.info) {
             switch (try protocol.wp_drm_lease_v1.decodeEvent(message, fds)) {
