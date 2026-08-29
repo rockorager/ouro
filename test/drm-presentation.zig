@@ -791,7 +791,7 @@ fn runVertical(trigger: TerminalTrigger, source: ClientSource) !void {
         else
             fixture.import_attempts == 2 and coordinator.pending_surface_len == 0 and
                 coordinator.cursor_layer.candidate == null;
-        if (second_consumed) break;
+        if (second_consumed and (source == .dmabuf or client_handler.surface_enters == 2)) break;
         if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
             try waitForEither(&root.ring, client_reactor.ring);
     }
@@ -826,6 +826,16 @@ fn runVertical(trigger: TerminalTrigger, source: ClientSource) !void {
     }
     try std.testing.expect(coordinator.surface != null);
     try std.testing.expect(!std.meta.eql(coordinator.surface.?, abandoned_surface));
+    for (0..128) |_| {
+        _ = try drainClient(&client_reactor, &client_driver, &client_handler);
+        _ = try loop.turn(coordinator);
+        if (client_handler.presentation_discarded == 1 and
+            client_handler.presentation_deleted == 2) break;
+        if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, client_reactor.ring);
+    }
+    try std.testing.expectEqual(@as(usize, 1), client_handler.presentation_discarded);
+    try std.testing.expectEqual(@as(usize, 2), client_handler.presentation_deleted);
 
     if (trigger == .session_disable) {
         // Session disable quiesces R11, renderer, R10, then releases the DRM
@@ -893,6 +903,11 @@ fn runVertical(trigger: TerminalTrigger, source: ClientSource) !void {
     try std.testing.expectEqual(@as(usize, 3), coordinator.presentations.available());
     try std.testing.expectEqual(@as(usize, 1), client_handler.frame_done);
     try std.testing.expect(client_handler.tablet_v2_announced);
+    try std.testing.expectEqual(@as(usize, 1), client_handler.presentation_clocks);
+    try std.testing.expectEqual(@as(usize, 1), client_handler.presentation_sync_outputs);
+    try std.testing.expectEqual(@as(usize, 1), client_handler.presentation_presented);
+    try std.testing.expectEqual(@as(usize, 1), client_handler.presentation_discarded);
+    try std.testing.expectEqual(@as(usize, 2), client_handler.presentation_deleted);
     // The second commit secured renderer-owned content before it was abandoned,
     // so source release is delivered even though no frame callback is due.
     try std.testing.expectEqual(@as(usize, 2), client_handler.release_done);
@@ -921,20 +936,31 @@ const ClientHandler = struct {
     single_pixel_manager: ?wayring.objects.Handle = null,
     viewporter: ?wayring.objects.Handle = null,
     alpha_modifier_manager: ?wayring.objects.Handle = null,
+    presentation: ?wayring.objects.Handle = null,
+    output: ?wayring.objects.Handle = null,
     surface: ?wayring.objects.Handle = null,
     frame: ?wayring.objects.Handle = null,
     release: ?wayring.objects.Handle = null,
+    feedback: ?wayring.objects.Handle = null,
     queued: bool = false,
     frame_done: usize = 0,
     release_done: usize = 0,
     frame_deleted: usize = 0,
     release_deleted: usize = 0,
+    presentation_clocks: usize = 0,
+    presentation_sync_outputs: usize = 0,
+    presentation_presented: usize = 0,
+    presentation_discarded: usize = 0,
+    presentation_deleted: usize = 0,
+    surface_enters: usize = 0,
     tablet_v2_announced: bool = false,
     source: ClientSource = .shm,
 
     fn complete(self: ClientHandler) bool {
         return self.frame_done == 1 and self.release_done == 1 and
-            self.frame_deleted == 1 and self.release_deleted == 1;
+            self.frame_deleted == 1 and self.release_deleted == 1 and
+            self.presentation_clocks == 1 and self.presentation_sync_outputs == 1 and
+            self.presentation_presented == 1 and self.presentation_deleted == 1;
     }
 
     pub fn event(self: *ClientHandler, target: wayring.objects.Dispatch, message: wayring.wire.Message, fds: *wayring.ancillary.FdQueue) !wayring.dispatch.Control {
@@ -956,13 +982,18 @@ const ClientHandler = struct {
                         self.viewporter = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wp_viewporter.info, @min(global.version, 1), null);
                     if (self.source == .alpha_shm and std.mem.eql(u8, global.interface, protocol.wp_alpha_modifier_v1.info.name))
                         self.alpha_modifier_manager = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wp_alpha_modifier_v1.info, @min(global.version, 1), null);
+                    if (std.mem.eql(u8, global.interface, protocol.wp_presentation.info.name))
+                        self.presentation = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wp_presentation.info, 1, null);
+                    if (std.mem.eql(u8, global.interface, protocol.wl_output.info.name))
+                        self.output = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wl_output.info, @min(global.version, 4), null);
                     const source_ready = switch (self.source) {
                         .shm => self.shm != null,
                         .alpha_shm => self.shm != null and self.alpha_modifier_manager != null,
                         .dmabuf => self.dmabuf != null,
                         .single_pixel => self.single_pixel_manager != null and self.viewporter != null,
                     };
-                    if (self.compositor != null and source_ready and !self.queued) try self.queueWork();
+                    if (self.compositor != null and self.presentation != null and self.output != null and
+                        source_ready and !self.queued) try self.queueWork();
                 },
                 .global_remove => {},
             }
@@ -970,6 +1001,40 @@ const ClientHandler = struct {
             _ = try wayring.client.decodeEvent(protocol.wl_shm, self.objects, self.shm.?, message, fds);
         } else if (target.object.interface == &protocol.zwp_linux_dmabuf_v1.info) {
             _ = try wayring.client.decodeEvent(protocol.zwp_linux_dmabuf_v1, self.objects, self.dmabuf.?, message, fds);
+        } else if (target.object.interface == &protocol.wl_output.info) {
+            _ = try protocol.wl_output.decodeEvent(message, fds);
+        } else if (target.object.interface == &protocol.wl_surface.info) {
+            switch (try protocol.wl_surface.decodeEvent(message, fds)) {
+                .enter => |value| {
+                    try std.testing.expectEqual(self.output.?.id, value.output);
+                    self.surface_enters += 1;
+                },
+                .leave => |value| try std.testing.expectEqual(self.output.?.id, value.output),
+                else => {},
+            }
+        } else if (target.object.interface == &protocol.wp_presentation.info) {
+            const value = try wayring.client.decodeEvent(protocol.wp_presentation, self.objects, self.presentation.?, message, fds);
+            try std.testing.expectEqual(@as(u32, @intFromEnum(linux.CLOCK.MONOTONIC)), value.clock_id.clk_id);
+            self.presentation_clocks += 1;
+        } else if (target.object.interface == &protocol.wp_presentation_feedback.info) {
+            const feedback_event = try wayring.client.decodeEvent(protocol.wp_presentation_feedback, self.objects, self.feedback.?, message, fds);
+            switch (feedback_event) {
+                .sync_output => |value| {
+                    try std.testing.expectEqual(self.output.?.id, value.output);
+                    self.presentation_sync_outputs += 1;
+                },
+                .presented => |value| {
+                    try std.testing.expectEqual(@as(u32, 0), value.tv_sec_hi);
+                    try std.testing.expectEqual(@as(u32, 2), value.tv_sec_lo);
+                    try std.testing.expectEqual(@as(u32, 3_000_000), value.tv_nsec);
+                    try std.testing.expectEqual(@as(u32, 4_000_000), value.refresh);
+                    try std.testing.expectEqual(@as(u32, 0), value.seq_hi);
+                    try std.testing.expectEqual(@as(u32, 0), value.seq_lo);
+                    try std.testing.expectEqual(@as(u32, 7), value.flags.value);
+                    self.presentation_presented += 1;
+                },
+                .discarded => self.presentation_discarded += 1,
+            }
         } else if (target.object.interface == &ClientCore.Callback.info) {
             const callback = self.objects.namespace.lookupHandle(message.header.object_id) orelse return error.MissingCallback;
             const callback_event = try ClientCore.decodeCallbackEvent(self.objects, callback, message, fds);
@@ -985,6 +1050,7 @@ const ClientHandler = struct {
                 .delete_id => |deleted| {
                     if (deleted.id == self.frame.?.id) self.frame_deleted += 1;
                     if (deleted.id == self.release.?.id) self.release_deleted += 1;
+                    if (deleted.id == self.feedback.?.id) self.presentation_deleted += 1;
                 },
                 .@"error" => return error.ServerProtocolError,
             }
@@ -1065,6 +1131,12 @@ const ClientHandler = struct {
         } });
         self.frame = (try protocol.wl_surface.construct_frame(self.objects, self.queue, surface, .{})).callback;
         self.release = (try protocol.wl_surface.construct_get_release(self.objects, self.queue, surface, .{})).callback;
+        self.feedback = (try protocol.wp_presentation.construct_feedback(
+            self.objects,
+            self.queue,
+            self.presentation.?,
+            .{ .surface = surface.id },
+        )).callback;
         try wayring.client.sendRequest(protocol.wl_surface, self.objects, self.queue, surface, .{ .commit = .{} });
         if (alpha_modifier) |handle| try wayring.client.sendRequest(
             protocol.wp_alpha_modifier_surface_v1,

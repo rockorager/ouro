@@ -7574,6 +7574,19 @@ pub fn Coordinator(comptime protocol: type) type {
             for (self.app_layers) |*layer| self.abandonLayer(layer);
         }
 
+        /// Terminates an applied layer which can no longer reach an output.
+        /// Its presentation token and feedback remain owned until the
+        /// discarded outcome (and any source release) can be delivered.
+        fn discardUnpresentedLayer(self: *Self, layer: *Layer) void {
+            if (layer.presentation == null or layer.content == null)
+                return self.abandonLayer(layer);
+            layer.active = false;
+            layer.feedback_outcome = .discarded;
+            layer.outcome_pending = true;
+            layer.retire_after_outcome = true;
+            _ = self.retryLayerOutcome(layer) catch {};
+        }
+
         fn abandonLayer(self: *Self, layer: *Layer) void {
             if (layer.presentation) |token| self.presentations.discard(token) catch unreachable;
             if (layer.content) |*content| content.deinit();
@@ -7816,10 +7829,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 for (self.app_layers) |*layer|
                     if (layer.id != null and std.meta.eql(layer.id.?, id) and
                         (self.output == null or self.output.?.in_flight_frame == null))
-                        self.abandonLayer(layer);
+                        self.discardUnpresentedLayer(layer);
                 if (self.cursor_layer.id != null and std.meta.eql(self.cursor_layer.id.?, id) and
                     (self.output == null or self.output.?.in_flight_frame == null))
-                    self.abandonLayer(&self.cursor_layer);
+                    self.discardUnpresentedLayer(&self.cursor_layer);
             }
             _ = self.adapter.resourceRemoved(handle, object);
             self.syncCommitTimer() catch {};
