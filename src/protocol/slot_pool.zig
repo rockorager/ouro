@@ -75,7 +75,11 @@ pub fn Pool(comptime T: type) type {
         }
 
         pub fn fromContext(pool: *Self, context: ?*anyopaque) ?*T {
-            const slot: *T = @ptrCast(@alignCast(context orelse return null));
+            const raw = context orelse return null;
+            const address = @intFromPtr(raw);
+            const slot = for (pool.entries.items) |entry| {
+                if (@intFromPtr(entry) == address) break entry;
+            } else return null;
             if (!slot.header.active or slot.header.index >= pool.entries.items.len or
                 pool.entries.items[slot.header.index] != slot)
                 return null;
@@ -110,4 +114,7 @@ test "slot pool grows without moving live contexts and reuses released slots" {
     const reused = try pool.acquire();
     try std.testing.expect(reused == second);
     try std.testing.expect(reused.header.generation != generation);
+
+    var foreign: Entry = .{};
+    try std.testing.expect(pool.fromContext(&foreign) == null);
 }
