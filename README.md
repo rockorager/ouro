@@ -111,8 +111,10 @@ responsibilities:
 - [Wlr output management](src/protocol/output_management.zig): each manager
   receives a backpressure-safe head and mode snapshot, while generation-safe
   configuration objects enforce complete, one-shot transactions. Ouro accepts
-  test/apply requests for its current fixed output state and explicitly fails
-  unsupported changes rather than reporting an unapplied configuration.
+  tests for exact connector modes and applies mode changes by quiescing and
+  recreating scanout with rollback to the prior mode if activation fails;
+  unsupported layout, transform, scale, and adaptive-sync changes fail rather
+  than being reported as applied.
 - [Layer shell](src/protocol/layer_shell.zig): bounded
   `zwlr_layer_shell_v1` roles retain double-buffered anchors, margins,
   exclusive zones, layer, and keyboard-interactivity state; publish exact

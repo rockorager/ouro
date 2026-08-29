@@ -228,6 +228,12 @@ pub fn Coordinator(comptime protocol: type) type {
         const TabletAdapter = protocol_tablet_v2.Adapter(protocol, SeatAdapter);
 
         const Imported = struct {};
+        const OutputReconfigure = struct {
+            peer: wayring.io_uring.Peer,
+            configuration: protocol_output_management.ConfigurationId,
+            previous: protocol_output_management.HeadState,
+            desired: protocol_output_management.HeadState,
+        };
         const Presentations = presentation.Queue(Imported);
         const PendingSurface = struct {
             handle: wayring.objects.Handle,
@@ -680,6 +686,7 @@ pub fn Coordinator(comptime protocol: type) type {
         xdg_session_store_timer_canceling: bool = false,
         cursor_layer: Layer,
         output_drain_started: bool = false,
+        output_reconfigure: ?OutputReconfigure = null,
         stopping: bool = false,
         session_disable_pending: bool = false,
         stats: Stats = .{},
@@ -858,6 +865,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.pending_screencopy = null;
             self.pending_image_copy = null;
             self.output_drain_started = false;
+            self.output_reconfigure = null;
             self.stopping = false;
             self.session_disable_pending = false;
             self.stats = .{};
@@ -3203,16 +3211,26 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn consumeOutputManagementCommands(self: *Self) !void {
+            if (self.output_reconfigure != null) return;
             while (self.output_management_adapter.peekCommand()) |command| {
                 const supported = self.outputManagementModeSupported(command.desired);
-                // Testing validates exact connector modes without mutating KMS.
-                // Applying a changed mode remains rejected until output
-                // recreation has an atomic rollback boundary; reapplying the
-                // current state is a valid no-op.
-                const accepted = supported and (command.operation == .@"test" or
-                    std.meta.eql(command.desired, self.output_management_adapter.lifecycle.current));
-                const result: protocol_output_management.Completion = if (accepted) .succeeded else .failed;
-                try self.output_management_adapter.completeCommand(result);
+                const unchanged = std.meta.eql(
+                    command.desired,
+                    self.output_management_adapter.lifecycle.current,
+                );
+                if (supported and command.operation == .apply and !unchanged) {
+                    self.output_reconfigure = .{
+                        .peer = command.peer,
+                        .configuration = command.configuration,
+                        .previous = self.output_management_adapter.lifecycle.current,
+                        .desired = command.desired,
+                    };
+                    errdefer self.output_reconfigure = null;
+                    try self.pauseOutput();
+                    return;
+                }
+                const accepted = supported and (command.operation == .@"test" or unchanged);
+                try self.output_management_adapter.completeCommand(if (accepted) .succeeded else .failed);
                 self.markProtocol(command.peer, ProtocolReady.output_management);
             }
         }
@@ -4765,8 +4783,6 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn createOutput(self: *Self) !void {
             if (self.output != null or self.stopping) return;
-            const generation = self.next_output_generation orelse
-                return error.GenerationExhausted;
             const handle = (self.manager.rescan() catch |err| switch (err) {
                 error.NoConnectedOutput,
                 error.NoCompatibleCrtc,
@@ -4774,7 +4790,18 @@ pub fn Coordinator(comptime protocol: type) type {
                 => return error.DrmHardwareUnavailable,
                 else => return err,
             }) orelse return error.DrmHardwareUnavailable;
+            errdefer self.manager.remove() catch {};
             const snapshot = try self.manager.snapshot(handle);
+            try self.activateOutput(snapshot);
+        }
+
+        /// Activates a borrowed snapshot while retaining Manager's device and
+        /// topology ownership. Callers decide whether a failed activation is
+        /// terminal or should be followed by an exact rollback snapshot.
+        fn activateOutput(self: *Self, snapshot: drm.Snapshot) !void {
+            if (self.output != null or self.stopping) return error.InvalidState;
+            const generation = self.next_output_generation orelse
+                return error.GenerationExhausted;
             var output_config = self.output_config;
             output_config.output_id.generation = generation;
             var output_committed = false;
@@ -4859,8 +4886,10 @@ pub fn Coordinator(comptime protocol: type) type {
             output_committed = true;
             if (self.anyAppLayerActive() or self.cursor_layer.active or
                 retained_visibility_changed or self.sessionLockActive())
-                try self.output.?.request(.damage, try monotonicNs());
-            try self.armTimer();
+                self.output.?.request(.damage, monotonicNs() catch
+                    return error.ActivatedOutputFailure) catch
+                    return error.ActivatedOutputFailure;
+            self.armTimer() catch return error.ActivatedOutputFailure;
         }
 
         /// The global is advertised only after the selected renderer/KMS DRM
@@ -6933,6 +6962,10 @@ pub fn Coordinator(comptime protocol: type) type {
                     self.output_drain_started = true;
                 }
                 if (self.output_drain_started and output.drainComplete()) {
+                    if (!self.stopping and self.output_reconfigure != null) {
+                        try self.finishOutputReconfigure(output);
+                        return;
+                    }
                     if (self.stopping) self.abandonPending();
                     try self.invalidateCaptureSource(.{ .output = output.outputId() });
                     try output.destroy();
@@ -6953,6 +6986,44 @@ pub fn Coordinator(comptime protocol: type) type {
             if (self.output == null and input_drained and self.stopping and
                 self.session.state != .draining)
                 try self.session.beginDrain(&self.router, &self.root.ring);
+        }
+
+        fn finishOutputReconfigure(self: *Self, old_output: *output_api.Output) !void {
+            const pending = self.output_reconfigure orelse return error.InvalidState;
+            const handle = self.manager.currentHandle() orelse return error.StaleSnapshot;
+            const previous = try self.manager.snapshotMode(
+                handle,
+                @intCast(pending.previous.width),
+                @intCast(pending.previous.height),
+                @intCast(pending.previous.refresh_millihz),
+            );
+            const desired = try self.manager.snapshotMode(
+                handle,
+                @intCast(pending.desired.width),
+                @intCast(pending.desired.height),
+                @intCast(pending.desired.refresh_millihz),
+            );
+
+            try self.invalidateCaptureSource(.{ .output = old_output.outputId() });
+            try old_output.destroy();
+            self.output = null;
+            self.stats.output_drains += 1;
+
+            const result = try activateOutputWithRollback(self, desired, previous);
+            if (result == .succeeded) try self.manager.commitMode(
+                handle,
+                @intCast(pending.desired.width),
+                @intCast(pending.desired.height),
+                @intCast(pending.desired.refresh_millihz),
+            );
+            self.output_reconfigure = null;
+            if (self.output_management_adapter.peekCommand()) |command| {
+                if (std.meta.eql(command.configuration, pending.configuration)) {
+                    try self.output_management_adapter.completeCommand(result);
+                    self.markProtocol(pending.peer, ProtocolReady.output_management);
+                }
+            }
+            try self.consumeOutputManagementCommands();
         }
 
         /// Drops applied protocol/presentation ownership only after the output
@@ -7035,7 +7106,6 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             output.destroy() catch {};
             self.output = null;
-            self.manager.remove() catch {};
         }
 
         fn resourceRemoved(
@@ -7215,6 +7285,61 @@ fn longestCursorShapeName() usize {
     var longest: usize = 0;
     for (protocol_cursor_shape.shape_names) |name| longest = @max(longest, name.len);
     return longest;
+}
+
+fn activateOutputWithRollback(owner: anytype, desired: anytype, previous: @TypeOf(desired)) !protocol_output_management.Completion {
+    owner.activateOutput(desired) catch |err| switch (err) {
+        error.ActivatedOutputFailure => return err,
+        else => {
+            try owner.activateOutput(previous);
+            return .failed;
+        },
+    };
+    return .succeeded;
+}
+
+test "physical: output replacement rolls back exactly once after activation failure" {
+    const Fake = struct {
+        attempts: [2]u8 = undefined,
+        count: usize = 0,
+        fail: ?u8,
+        committed_fail: ?u8 = null,
+
+        fn activateOutput(self: *@This(), snapshot: u8) !void {
+            self.attempts[self.count] = snapshot;
+            self.count += 1;
+            if (self.committed_fail == snapshot) return error.ActivatedOutputFailure;
+            if (self.fail == snapshot) return error.ActivationFailed;
+        }
+    };
+
+    var success = Fake{ .fail = null };
+    try std.testing.expectEqual(
+        protocol_output_management.Completion.succeeded,
+        try activateOutputWithRollback(&success, @as(u8, 2), 1),
+    );
+    try std.testing.expectEqualSlices(u8, &.{2}, success.attempts[0..success.count]);
+
+    var rollback = Fake{ .fail = 2 };
+    try std.testing.expectEqual(
+        protocol_output_management.Completion.failed,
+        try activateOutputWithRollback(&rollback, @as(u8, 2), 1),
+    );
+    try std.testing.expectEqualSlices(u8, &.{ 2, 1 }, rollback.attempts[0..rollback.count]);
+
+    var terminal = Fake{ .fail = 1 };
+    try std.testing.expectError(
+        error.ActivationFailed,
+        activateOutputWithRollback(&terminal, @as(u8, 1), 1),
+    );
+    try std.testing.expectEqualSlices(u8, &.{ 1, 1 }, terminal.attempts[0..terminal.count]);
+
+    var committed = Fake{ .fail = null, .committed_fail = 2 };
+    try std.testing.expectError(
+        error.ActivatedOutputFailure,
+        activateOutputWithRollback(&committed, @as(u8, 2), 1),
+    );
+    try std.testing.expectEqualSlices(u8, &.{2}, committed.attempts[0..committed.count]);
 }
 
 fn alphaMultiplier(multiplier: u32) u8 {
