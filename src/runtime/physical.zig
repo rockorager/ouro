@@ -68,6 +68,7 @@ const protocol_security_context = @import("../protocol/security_context.zig");
 const protocol_output = @import("../protocol/output.zig");
 const protocol_xdg_output = @import("../protocol/xdg_output.zig");
 const protocol_output_management = @import("../protocol/output_management.zig");
+const protocol_output_power = @import("../protocol/output_power.zig");
 const protocol_layer_shell = @import("../protocol/layer_shell.zig");
 const protocol_session_lock = @import("../protocol/session_lock.zig");
 const protocol_cursor_shape = @import("../protocol/cursor_shape.zig");
@@ -203,6 +204,8 @@ pub fn Coordinator(comptime protocol: type) type {
         const OutputAdapter = protocol_output.Adapter(protocol);
         const XdgOutputAdapter = protocol_xdg_output.Adapter(protocol, OutputAdapter);
         const OutputManagementAdapter = protocol_output_management.Adapter(protocol);
+        const PhysicalOutputId = enum { physical };
+        const OutputPowerAdapter = protocol_output_power.Adapter(protocol, PhysicalOutputId, Self);
         const LayerShellAdapter = protocol_layer_shell.Adapter(protocol, Adapter, OutputAdapter);
         const SessionLockAdapter = protocol_session_lock.Adapter(protocol, Adapter, OutputAdapter);
         const CursorShapeAdapter = protocol_cursor_shape.Adapter(protocol);
@@ -367,6 +370,7 @@ pub fn Coordinator(comptime protocol: type) type {
             const workspace: u32 = 1 << 31;
             const xdg_session: u64 = 1 << 32;
             const output_management: u64 = 1 << 33;
+            const output_power: u64 = 1 << 34;
             const all: u64 = decoration | shell | seat | data_device | dmabuf |
                 activation | relative_pointer | fractional_scale | output | core |
                 pointer_constraints | color_management | color_representation |
@@ -374,7 +378,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 shortcuts_inhibit | xdg_foreign | xdg_output | layer_shell | session_lock |
                 idle_notify | tablet | ext_data_control | wlr_data_control | input_method |
                 screencopy | foreign_toplevel_list | image_copy_capture | xdg_toplevel_icon | gtk_shell |
-                workspace | xdg_session | output_management;
+                workspace | xdg_session | output_management | output_power;
         };
         const Client = struct {
             active: bool = false,
@@ -508,6 +512,7 @@ pub fn Coordinator(comptime protocol: type) type {
             protocol_output: protocol_output.Config = .{},
             xdg_output: protocol_xdg_output.Config = .{},
             output_management: protocol_output_management.Config = .{},
+            output_power: protocol_output_power.Config = .{},
             layer_shell: protocol_layer_shell.Config = .{},
             session_lock: protocol_session_lock.Config = .{},
             cursor_shape: protocol_cursor_shape.Config = .{},
@@ -627,6 +632,7 @@ pub fn Coordinator(comptime protocol: type) type {
         output_adapter: OutputAdapter,
         xdg_output_adapter: XdgOutputAdapter,
         output_management_adapter: OutputManagementAdapter,
+        output_power_adapter: OutputPowerAdapter,
         output_management_modes: []protocol_output_management.ModeState,
         layer_shell_adapter: LayerShellAdapter,
         session_lock_adapter: SessionLockAdapter,
@@ -688,6 +694,7 @@ pub fn Coordinator(comptime protocol: type) type {
         cursor_layer: Layer,
         output_drain_started: bool = false,
         output_reconfigure: ?OutputReconfigure = null,
+        output_power_transition: ?OutputPowerAdapter.Command = null,
         stopping: bool = false,
         session_disable_pending: bool = false,
         stats: Stats = .{},
@@ -872,6 +879,7 @@ pub fn Coordinator(comptime protocol: type) type {
             errdefer allocator.free(self.output_management_modes);
             self.output_drain_started = false;
             self.output_reconfigure = null;
+            self.output_power_transition = null;
             self.stopping = false;
             self.session_disable_pending = false;
             self.stats = .{};
@@ -1216,6 +1224,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 .{ .width = 1, .height = 1, .refresh_millihz = 1 },
             );
             errdefer self.output_management_adapter.deinit();
+            self.output_power_adapter = try OutputPowerAdapter.init(allocator, self, config.output_power);
+            errdefer self.output_power_adapter.deinit();
             self.layer_shell_adapter = try LayerShellAdapter.init(
                 allocator,
                 &self.adapter,
@@ -1331,6 +1341,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
             _ = try self.output_management_adapter.install(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
+            _ = try self.output_power_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
             _ = try self.screencopy_adapter.install(&root.runtime);
@@ -1530,6 +1543,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.layer_shell_adapter.deinit();
             self.xdg_output_adapter.deinit();
             self.output_management_adapter.deinit();
+            self.output_power_adapter.deinit();
             self.allocator.free(self.output_management_modes);
             self.screencopy_adapter.deinit();
             self.output_adapter.deinit();
@@ -1631,6 +1645,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.foreign_toplevel_list_adapter.disconnected(peer);
             self.workspace_adapter.disconnected(peer);
             self.output_management_adapter.disconnected(peer);
+            self.output_power_adapter.disconnected(peer);
             self.image_copy_capture_adapter.disconnected(peer);
             self.image_capture_source_adapter.disconnected(peer);
             self.input_method_adapter.disconnected(peer);
@@ -2008,6 +2023,13 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.consumeOutputManagementCommands();
                 if (self.output_management_adapter.pendingOutbound(peer))
                     self.markProtocol(peer, ProtocolReady.output_management);
+                try self.flushProtocol();
+                return control;
+            }
+            if (try self.output_power_adapter.request(peer, target, message, fds)) |control| {
+                try self.consumeOutputPowerCommands();
+                if (self.output_power_adapter.pendingOutbound(peer))
+                    self.markProtocol(peer, ProtocolReady.output_power);
                 try self.flushProtocol();
                 return control;
             }
@@ -3230,7 +3252,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn consumeOutputManagementCommands(self: *Self) !void {
-            if (self.output_reconfigure != null) return;
+            if (self.output_reconfigure != null or self.output_power_transition != null) return;
             while (self.output_management_adapter.peekCommand()) |command| {
                 const supported = self.outputManagementModeSupported(command.desired);
                 const unchanged = std.meta.eql(
@@ -3252,6 +3274,60 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.output_management_adapter.completeCommand(if (accepted) .succeeded else .failed);
                 self.markProtocol(command.peer, ProtocolReady.output_management);
             }
+        }
+
+        pub fn resolveOutput(
+            self: *Self,
+            peer: wayring.io_uring.Peer,
+            handle: wayring.objects.Handle,
+            object: *wayring.objects.Object,
+        ) !struct { id: PhysicalOutputId, mode: protocol_output_power.Mode } {
+            _ = try self.output_adapter.reference(peer, handle, object.*);
+            return .{
+                .id = .physical,
+                .mode = if (self.output == null) .off else .on,
+            };
+        }
+
+        fn consumeOutputPowerCommands(self: *Self) !void {
+            if (self.output_power_transition != null or self.output_reconfigure != null) return;
+            while (self.output_power_adapter.peekCommand()) |command| {
+                const currently_on = self.output != null;
+                if ((command.mode == .on) == currently_on) {
+                    try self.output_power_adapter.completeCommand(command, .succeeded);
+                    self.markProtocol(command.peer, ProtocolReady.output_power);
+                    continue;
+                }
+                if (self.stopping or self.session_disable_pending) {
+                    try self.output_power_adapter.completeCommand(command, .failed);
+                    self.markProtocol(command.peer, ProtocolReady.output_power);
+                    continue;
+                }
+                if (command.mode == .off) {
+                    self.output_power_transition = command;
+                    try self.pauseOutput();
+                    return;
+                }
+                const handle = self.manager.currentHandle() orelse {
+                    try self.output_power_adapter.completeCommand(command, .failed);
+                    self.markProtocol(command.peer, ProtocolReady.output_power);
+                    continue;
+                };
+                const snapshot = self.manager.snapshot(handle) catch {
+                    try self.output_power_adapter.completeCommand(command, .failed);
+                    self.markProtocol(command.peer, ProtocolReady.output_power);
+                    continue;
+                };
+                self.activateOutput(snapshot) catch {
+                    try self.output_power_adapter.completeCommand(command, .failed);
+                    self.markProtocol(command.peer, ProtocolReady.output_power);
+                    continue;
+                };
+                try self.syncOutputAssociations();
+                try self.output_power_adapter.completeCommand(command, .succeeded);
+                self.markProtocol(command.peer, ProtocolReady.output_power);
+            }
+            try self.consumeOutputManagementCommands();
         }
 
         fn outputManagementModeSupported(
@@ -3981,6 +4057,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 !std.mem.eql(u8, name, "ext_foreign_toplevel_list_v1") and
                 !std.mem.eql(u8, name, "zwlr_foreign_toplevel_manager_v1") and
                 !std.mem.eql(u8, name, "ext_workspace_manager_v1") and
+                !std.mem.eql(u8, name, "zwlr_output_power_manager_v1") and
                 !std.mem.eql(u8, name, "ext_output_image_capture_source_manager_v1") and
                 !std.mem.eql(u8, name, "ext_foreign_toplevel_image_capture_source_manager_v1") and
                 !std.mem.eql(u8, name, "ext_image_copy_capture_manager_v1");
@@ -4607,6 +4684,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 flushed += try self.xdg_output_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.output_management != 0)
                 flushed += try self.output_management_adapter.flushOn(peer, objects, &actor.transmit);
+            if (client.protocol_ready & ProtocolReady.output_power != 0)
+                flushed += try self.output_power_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.layer_shell != 0)
                 flushed += try self.layer_shell_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.session_lock != 0)
@@ -4784,6 +4863,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (ready & ProtocolReady.output_management != 0 and
                 !self.output_management_adapter.pendingOutbound(client.peer))
                 ready &= ~ProtocolReady.output_management;
+            if (ready & ProtocolReady.output_power != 0 and
+                !self.output_power_adapter.pendingOutbound(client.peer))
+                ready &= ~ProtocolReady.output_power;
             if (ready & ProtocolReady.layer_shell != 0 and
                 !self.layer_shell_adapter.pendingOutbound(client.peer))
                 ready &= ~ProtocolReady.layer_shell;
@@ -7005,7 +7087,23 @@ pub fn Coordinator(comptime protocol: type) type {
                     try output.destroy();
                     self.output = null;
                     self.stats.output_drains += 1;
-                    try self.manager.remove();
+                    if (!self.stopping and self.output_power_transition != null) {
+                        const command = self.output_power_transition.?;
+                        self.output_power_transition = null;
+                        if (self.output_power_adapter.peekCommand()) |current| {
+                            if (std.meta.eql(current, command)) {
+                                try self.output_power_adapter.completeCommand(command, .succeeded);
+                                self.markProtocol(command.peer, ProtocolReady.output_power);
+                            }
+                        }
+                        try self.consumeOutputPowerCommands();
+                    } else {
+                        if (!self.stopping) {
+                            try self.output_power_adapter.outputRemoved(.physical);
+                            self.markProtocolAll(ProtocolReady.output_power);
+                        }
+                        try self.manager.remove();
+                    }
                 }
             }
             if (self.output == null and self.stopping) self.abandonPending();
@@ -7230,6 +7328,7 @@ pub fn Coordinator(comptime protocol: type) type {
             const session_lock_removed = self.session_lock_adapter.resourceRemoved(handle, object);
             _ = self.xdg_output_adapter.resourceRemoved(handle, object);
             _ = self.output_management_adapter.resourceRemoved(handle, object);
+            _ = self.output_power_adapter.resourceRemoved(handle, object);
             _ = self.output_adapter.resourceRemoved(handle, object);
             _ = self.cursor_shape_adapter.resourceRemoved(handle, object);
             _ = self.input_method_adapter.resourceRemoved(handle, object);

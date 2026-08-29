@@ -115,6 +115,10 @@ responsibilities:
   Ouro applies mode changes by quiescing and recreating scanout with rollback
   to the prior mode if activation fails; unsupported layout, transform, scale,
   and adaptive-sync changes fail rather than being reported as applied.
+- [Wlr output power management](src/protocol/output_power.zig): restricted,
+  peer-owned `wl_output` controls serialize power and mode transitions. Power
+  off drains only the active output pipeline while retaining the DRM card,
+  renderer, scene ownership, and selected topology for exact recreation.
 - [Layer shell](src/protocol/layer_shell.zig): bounded
   `zwlr_layer_shell_v1` roles retain double-buffered anchors, margins,
   exclusive zones, layer, and keyboard-interactivity state; publish exact
