@@ -478,6 +478,101 @@ test "generated output power client drains and recreates the physical output" {
     try root.deinit();
 }
 
+test "generated gamma control applies exact ramps and restores on reuse" {
+    const allocator = std.testing.allocator;
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-r15-gamma-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), compositorConfig());
+    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), coordinatorConfig());
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
+    try coordinator.start(&loop);
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    for (0..128) |_| {
+        _ = try loop.turn(coordinator);
+        if (coordinator.output != null) break;
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+    }
+
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(allocator, .{ .entries = 16, .flags = 0 }, clientReactorConfig());
+    var client = try ClientConnection.attach(
+        allocator,
+        &reactor,
+        try wayring.unix_socket.connect(path),
+        .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 },
+        .{ .max_objects = 16, .max_client_ids = 15 },
+    );
+    var driver = ClientDriver.init(&client);
+    const actor = try client.actor();
+    const registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null);
+    var handler: GammaClientHandler = .{ .objects = &client.objects, .queue = &actor.transmit, .registry = registry };
+    try submitClient(&reactor, &driver, &handler);
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (fixture.gamma_sets == 1) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0) try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expectEqualSlices(u16, &GammaClientHandler.first_ramps, &fixture.gamma_current);
+    try std.testing.expectEqual(@as(usize, 1), fixture.gamma_gets);
+
+    try handler.destroyControl();
+    try submitClient(&reactor, &driver, &handler);
+    for (0..128) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (fixture.gamma_sets == 2) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0) try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expectEqualSlices(u16, &fixture.gamma_original, &fixture.gamma_current);
+    try handler.createControl();
+    try submitClient(&reactor, &driver, &handler);
+    for (0..256) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (fixture.gamma_sets == 3) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0) try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expectEqualSlices(u16, &GammaClientHandler.second_ramps, &fixture.gamma_current);
+    try std.testing.expectEqual(@as(usize, 1), fixture.gamma_gets);
+    try handler.destroyControl();
+    try submitClient(&reactor, &driver, &handler);
+    for (0..128) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (fixture.gamma_sets == 4) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0) try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expectEqualSlices(u16, &fixture.gamma_original, &fixture.gamma_current);
+    try std.testing.expectEqual(@as(usize, 2), handler.gamma_sizes);
+    try std.testing.expectEqual(@as(usize, 0), handler.failed);
+    try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+
+    _ = try client.prepareClose();
+    try submitClient(&reactor, &driver, &handler);
+    try coordinator.requestStop();
+    var drained = false;
+    for (0..256) |_| {
+        const client_progress = try drainClient(&reactor, &driver, &handler);
+        const progress = try loop.turn(coordinator);
+        drained = progress.wayring.shutdown_complete and client_progress.quiescent and coordinator.backendDrainComplete();
+        if (drained) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0) try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expect(drained);
+    try client.deinit(allocator);
+    reactor.deinit(allocator);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
 test "no discovered DRM card fails startup and drains honestly" {
     const allocator = std.testing.allocator;
     var fixture = try Fixture.init();
@@ -1417,6 +1512,81 @@ const OutputPowerClientHandler = struct {
     }
 };
 
+const GammaClientHandler = struct {
+    pub const first_ramps = [_]u16{ 10, 20, 30, 40, 50, 60 };
+    pub const second_ramps = [_]u16{ 11, 21, 31, 41, 51, 61 };
+
+    objects: *wayring.objects.ClientObjects,
+    queue: *wayring.tx.Queue,
+    registry: wayring.objects.Handle,
+    manager: ?wayring.objects.Handle = null,
+    output: ?wayring.objects.Handle = null,
+    control: ?wayring.objects.Handle = null,
+    output_ready: bool = false,
+    gamma_sizes: usize = 0,
+    failed: usize = 0,
+    event_failures: usize = 0,
+
+    pub fn eventError(self: *GammaClientHandler, _: wayring.io_uring.Peer, _: ClientCore.EventFailure) void {
+        self.event_failures += 1;
+    }
+    pub fn event(self: *GammaClientHandler, target: wayring.objects.Dispatch, message: wayring.wire.Message, fds: *wayring.ancillary.FdQueue) !wayring.dispatch.Control {
+        if (target.object.interface == &ClientCore.Registry.info) {
+            switch (try ClientCore.decodeRegistryEvent(self.objects, self.registry, message, fds)) {
+                .global => |global| {
+                    if (std.mem.eql(u8, global.interface, protocol.wl_output.info.name))
+                        self.output = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wl_output.info, @min(global.version, 4), null);
+                    if (std.mem.eql(u8, global.interface, protocol.zwlr_gamma_control_manager_v1.info.name))
+                        self.manager = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.zwlr_gamma_control_manager_v1.info, 1, null);
+                },
+                .global_remove => {},
+            }
+            try self.maybeCreateControl();
+        } else if (target.object.interface == &protocol.wl_output.info) {
+            switch (try protocol.wl_output.decodeEvent(message, fds)) {
+                .done => {
+                    self.output_ready = true;
+                    try self.maybeCreateControl();
+                },
+                else => {},
+            }
+        } else if (target.object.interface == &protocol.zwlr_gamma_control_v1.info) {
+            switch (try protocol.zwlr_gamma_control_v1.decodeEvent(message, fds)) {
+                .gamma_size => |value| {
+                    try std.testing.expectEqual(@as(u32, 2), value.size);
+                    self.gamma_sizes += 1;
+                    const ramps = if (self.gamma_sizes == 1) &first_ramps else &second_ramps;
+                    const fd = try ordinaryMemfd(@sizeOf(@TypeOf(first_ramps)), 0, std.mem.sliceAsBytes(ramps));
+                    try protocol.zwlr_gamma_control_v1.encodeRequest(self.queue, self.control.?.id, .{ .set_gamma = .{ .fd = fd } });
+                },
+                .failed => self.failed += 1,
+            }
+        } else if (target.object.interface == &ClientCore.Display.info) {
+            switch (try ClientCore.decodeDisplayEvent(self.objects, message, fds)) {
+                .delete_id => {},
+                .@"error" => return error.ServerProtocolError,
+            }
+        } else return error.UnexpectedEvent;
+        return .continue_dispatch;
+    }
+    fn maybeCreateControl(self: *GammaClientHandler) !void {
+        if (self.control != null or !self.output_ready or self.output == null or self.manager == null) return;
+        try self.createControl();
+    }
+    fn createControl(self: *GammaClientHandler) !void {
+        self.control = (try protocol.zwlr_gamma_control_manager_v1.construct_get_gamma_control(
+            self.objects,
+            self.queue,
+            self.manager.?,
+            .{ .output = self.output.?.id },
+        )).id;
+    }
+    fn destroyControl(self: *GammaClientHandler) !void {
+        try wayring.client.sendRequest(protocol.zwlr_gamma_control_v1, self.objects, self.queue, self.control.?, .{ .destroy = .{} });
+        self.control = null;
+    }
+};
+
 const LeaseClientHandler = struct {
     objects: *wayring.objects.ClientObjects,
     queue: *wayring.tx.Queue,
@@ -1559,6 +1729,10 @@ pub const Fixture = struct {
     lease_create_count: usize = 0,
     lease_revoke_count: usize = 0,
     lease_active: bool = false,
+    gamma_original: [6]u16 = .{ 1, 2, 3, 4, 5, 6 },
+    gamma_current: [6]u16 = .{ 1, 2, 3, 4, 5, 6 },
+    gamma_gets: usize = 0,
+    gamma_sets: usize = 0,
 
     pub fn init() !Fixture {
         return .{ .session_fd = try eventFd(), .drm_fd = try eventFd() };
@@ -1578,6 +1752,7 @@ pub const Fixture = struct {
         return .{
             .session = .{ .context = self, .vtable = &session_vtable },
             .drm = .{ .context = self, .vtable = &drm_vtable },
+            .gamma = .{ .context = self, .size_fn = gammaSize, .get_fn = gammaGet, .set_fn = gammaSet },
             .output = .{
                 .gbm = .{ .context = self, .vtable = &gbm_vtable },
                 .framebuffer = .{ .context = self, .vtable = &framebuffer_vtable },
@@ -1664,6 +1839,26 @@ pub const Fixture = struct {
         if (!self.lease_active) return 0;
         storage[0] = @intCast(self.lease_create_count);
         return 1;
+    }
+    fn gammaSize(_: *anyopaque, _: linux.fd_t, crtc: u32) !u32 {
+        try std.testing.expectEqual(@as(u32, 30), crtc);
+        return 2;
+    }
+    fn gammaGet(context: *anyopaque, _: linux.fd_t, crtc: u32, r: []u16, g: []u16, b: []u16) !void {
+        const self: *Fixture = @ptrCast(@alignCast(context));
+        try std.testing.expectEqual(@as(u32, 30), crtc);
+        @memcpy(r, self.gamma_original[0..2]);
+        @memcpy(g, self.gamma_original[2..4]);
+        @memcpy(b, self.gamma_original[4..6]);
+        self.gamma_gets += 1;
+    }
+    fn gammaSet(context: *anyopaque, _: linux.fd_t, crtc: u32, r: []const u16, g: []const u16, b: []const u16) !void {
+        const self: *Fixture = @ptrCast(@alignCast(context));
+        try std.testing.expectEqual(@as(u32, 30), crtc);
+        @memcpy(self.gamma_current[0..2], r);
+        @memcpy(self.gamma_current[2..4], g);
+        @memcpy(self.gamma_current[4..6], b);
+        self.gamma_sets += 1;
     }
     fn closeSeat(context: *anyopaque, _: *anyopaque) !void {
         const self: *Fixture = @ptrCast(@alignCast(context));
