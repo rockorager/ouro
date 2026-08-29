@@ -30,6 +30,7 @@ pub fn build(b: *std.Build) void {
     generate_core_protocol.addFileArg(wayland_protocols.path("staging/fifo/fifo-v1.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("staging/commit-timing/commit-timing-v1.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("staging/linux-drm-syncobj/linux-drm-syncobj-v1.xml"));
+    generate_core_protocol.addFileArg(wayland_protocols.path("staging/drm-lease/drm-lease-v1.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("staging/xdg-activation/xdg-activation-v1.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("staging/xdg-dialog/xdg-dialog-v1.xml"));
     generate_core_protocol.addFileArg(wayland_protocols.path("staging/xdg-toplevel-drag/xdg-toplevel-drag-v1.xml"));
@@ -93,6 +94,7 @@ pub fn build(b: *std.Build) void {
     generate_xdg_protocol.addFileArg(wayland_protocols.path("staging/fifo/fifo-v1.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("staging/commit-timing/commit-timing-v1.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("staging/linux-drm-syncobj/linux-drm-syncobj-v1.xml"));
+    generate_xdg_protocol.addFileArg(wayland_protocols.path("staging/drm-lease/drm-lease-v1.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("staging/xdg-activation/xdg-activation-v1.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("staging/xdg-dialog/xdg-dialog-v1.xml"));
     generate_xdg_protocol.addFileArg(wayland_protocols.path("staging/xdg-toplevel-drag/xdg-toplevel-drag-v1.xml"));

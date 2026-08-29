@@ -81,6 +81,7 @@ pub const xdg_output = @import("protocol/xdg_output.zig");
 pub const output_management = @import("protocol/output_management.zig");
 pub const output_power = @import("protocol/output_power.zig");
 pub const gamma_control = @import("protocol/gamma_control.zig");
+pub const drm_lease = @import("protocol/drm_lease.zig");
 pub const layer_shell = @import("protocol/layer_shell.zig");
 pub const session_lock = @import("protocol/session_lock.zig");
 pub const foreign_toplevel_list = @import("protocol/foreign_toplevel_list.zig");
@@ -176,6 +177,7 @@ test {
     _ = protocol_output;
     _ = xdg_output;
     _ = output_management;
+    _ = drm_lease;
     _ = layer_shell;
     _ = session_lock;
     _ = foreign_toplevel_list;
