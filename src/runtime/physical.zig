@@ -3204,15 +3204,36 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn consumeOutputManagementCommands(self: *Self) !void {
             while (self.output_management_adapter.peekCommand()) |command| {
-                // Ouro currently owns one fixed physical output. Testing or
-                // applying its already-active state is a valid no-op; changes
-                // remain rejected until the KMS mode transaction boundary can
-                // apply and roll them back atomically.
-                const result: protocol_output_management.Completion = if (self.output != null and
-                    std.meta.eql(command.desired, self.output_management_adapter.lifecycle.current)) .succeeded else .failed;
+                const supported = self.outputManagementModeSupported(command.desired);
+                // Testing validates exact connector modes without mutating KMS.
+                // Applying a changed mode remains rejected until output
+                // recreation has an atomic rollback boundary; reapplying the
+                // current state is a valid no-op.
+                const accepted = supported and (command.operation == .@"test" or
+                    std.meta.eql(command.desired, self.output_management_adapter.lifecycle.current));
+                const result: protocol_output_management.Completion = if (accepted) .succeeded else .failed;
                 try self.output_management_adapter.completeCommand(result);
                 self.markProtocol(command.peer, ProtocolReady.output_management);
             }
+        }
+
+        fn outputManagementModeSupported(
+            self: *Self,
+            desired: protocol_output_management.HeadState,
+        ) bool {
+            if (!desired.enabled or desired.x != 0 or desired.y != 0 or
+                desired.transform != 0 or desired.scale_120 != 120 or desired.adaptive_sync)
+                return false;
+            if (desired.width <= 0 or desired.height <= 0 or desired.refresh_millihz <= 0)
+                return false;
+            const handle = self.manager.currentHandle() orelse return false;
+            _ = self.manager.snapshotMode(
+                handle,
+                @intCast(desired.width),
+                @intCast(desired.height),
+                @intCast(desired.refresh_millihz),
+            ) catch return false;
+            return true;
         }
 
         fn resolveWorkspaceOutput(

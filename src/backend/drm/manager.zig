@@ -188,6 +188,10 @@ pub const Manager = struct {
         self.event_count = 0;
     }
 
+    pub fn currentHandle(self: *const Manager) ?Handle {
+        return if (self.present) .{ .generation = self.generation } else null;
+    }
+
     /// Borrows the active card FD for child DRM/GBM owners. The FD remains
     /// owned by Session and is valid only while this generation stays current.
     pub fn deviceFd(self: *Manager, handle: Handle) !std.posix.fd_t {
@@ -288,6 +292,30 @@ pub const Manager = struct {
             .formats = buffer.formats[0..buffer.format_count],
             .selection = storage.selection,
         };
+    }
+
+    /// Returns the current topology with an exact connector mode selected.
+    /// The returned slices retain the same borrowing lifetime as `snapshot`;
+    /// this does not mutate the active selection or touch KMS state.
+    pub fn snapshotMode(
+        self: *const Manager,
+        handle: Handle,
+        width: u32,
+        height: u32,
+        refresh_millihz: u32,
+    ) !Snapshot {
+        var result = try self.snapshot(handle);
+        const connector = result.selectedConnector();
+        const mode_end = try std.math.add(usize, connector.mode_start, connector.mode_count);
+        for (result.modes[connector.mode_start..mode_end], connector.mode_start..) |mode, index| {
+            if (mode.hdisplay == width and mode.vdisplay == height and
+                try std.math.mul(u32, mode.vrefresh, 1000) == refresh_millihz)
+            {
+                result.selection.mode_index = @intCast(index);
+                return result;
+            }
+        }
+        return error.UnsupportedMode;
     }
 };
 
@@ -504,6 +532,18 @@ test "drm: rescan publishes copied snapshots and rejects stale generations" {
     try std.testing.expectEqual(@as(u32, 20), first_snapshot.selectedConnector().id);
     try std.testing.expectEqual(@as(u32, 40), first_snapshot.selectedCrtc().id);
     try std.testing.expectEqual(@as(u32, 50), first_snapshot.selectedPlane().id);
+    const selected_mode = first_snapshot.selectedMode();
+    const exact = try manager.snapshotMode(
+        first,
+        selected_mode.hdisplay,
+        selected_mode.vdisplay,
+        try std.math.mul(u32, selected_mode.vrefresh, 1000),
+    );
+    try std.testing.expectEqual(first_snapshot.selection.mode_index, exact.selection.mode_index);
+    try std.testing.expectError(
+        error.UnsupportedMode,
+        manager.snapshotMode(first, selected_mode.hdisplay + 1, selected_mode.vdisplay, 60000),
+    );
     const second = (try manager.rescan()).?;
     try std.testing.expectError(error.StaleSnapshot, manager.snapshot(first));
     try std.testing.expectError(error.StaleSnapshot, manager.deviceFd(first));
