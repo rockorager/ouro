@@ -211,7 +211,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const OutputAdapter = protocol_output.Adapter(protocol);
         const XdgOutputAdapter = protocol_xdg_output.Adapter(protocol, OutputAdapter);
         const OutputManagementAdapter = protocol_output_management.Adapter(protocol);
-        const PhysicalOutputId = enum { physical };
+        const PhysicalOutputId = packed struct { index: u32, generation: u32 };
         const OutputPowerAdapter = protocol_output_power.Adapter(protocol, PhysicalOutputId, Self);
         const GammaControlAdapter = protocol_gamma_control.Adapter(protocol, PhysicalOutputId, Self);
         const DrmLeaseDeviceId = enum { physical };
@@ -256,6 +256,15 @@ pub fn Coordinator(comptime protocol: type) type {
             configuration: protocol_output_management.ConfigurationId,
             previous: protocol_output_management.HeadState,
             desired: protocol_output_management.HeadState,
+        };
+        const PhysicalOutput = struct {
+            id: PhysicalOutputId,
+            claim: ?drm.ClaimHandle = null,
+            protocol_output: OutputAdapter.OutputId,
+            management_head: protocol_output_management.HeadId,
+            kms_output: ?*output_api.Output = null,
+            drain_started: bool = false,
+            reconfigure: ?OutputReconfigure = null,
         };
         const Presentations = presentation.Queue(Imported);
         const PendingSurface = struct {
@@ -663,9 +672,10 @@ pub fn Coordinator(comptime protocol: type) type {
         pointer_warp_adapter: PointerWarpAdapter,
         security_context_adapter: SecurityContextAdapter,
         output_adapter: OutputAdapter,
-        protocol_output_id: OutputAdapter.OutputId,
         xdg_output_adapter: XdgOutputAdapter,
         output_management_adapter: OutputManagementAdapter,
+        physical_outputs: []PhysicalOutput,
+        physical_output_count: usize,
         output_power_adapter: OutputPowerAdapter,
         gamma_control_adapter: GammaControlAdapter,
         gamma_owner: ?drm_gamma.Owner = null,
@@ -686,6 +696,8 @@ pub fn Coordinator(comptime protocol: type) type {
         cursor_size: u32,
         presentations: Presentations,
         render_device: ?*output_api.RenderDevice = null,
+        /// Borrowed compatibility view of the primary record while physical
+        /// scheduling migrates to the complete output inventory.
         output: ?*output_api.Output = null,
         next_output_generation: ?u32,
         loop: ?*Loop = null,
@@ -728,8 +740,6 @@ pub fn Coordinator(comptime protocol: type) type {
         xdg_session_store_timer: ?timer.Handle = null,
         xdg_session_store_timer_canceling: bool = false,
         cursor_layer: Layer,
-        output_drain_started: bool = false,
-        output_reconfigure: ?OutputReconfigure = null,
         output_power_transition: ?OutputPowerAdapter.Command = null,
         stopping: bool = false,
         session_disable_pending: bool = false,
@@ -914,8 +924,6 @@ pub fn Coordinator(comptime protocol: type) type {
                 config.output_management.mode_capacity,
             );
             errdefer allocator.free(self.output_management_modes);
-            self.output_drain_started = false;
-            self.output_reconfigure = null;
             self.output_power_transition = null;
             self.gamma_owner = null;
             self.stopping = false;
@@ -1250,7 +1258,6 @@ pub fn Coordinator(comptime protocol: type) type {
             });
             self.output_adapter = try OutputAdapter.init(allocator, config.protocol_output);
             errdefer self.output_adapter.deinit();
-            self.protocol_output_id = self.output_adapter.primaryOutput();
             self.foreign_toplevel_list_adapter.setOutputResolver(
                 self,
                 resolveForeignToplevelOutput,
@@ -1288,6 +1295,14 @@ pub fn Coordinator(comptime protocol: type) type {
                 },
             );
             errdefer self.output_management_adapter.deinit();
+            self.physical_outputs = try allocator.alloc(PhysicalOutput, config.drm.connector_capacity);
+            errdefer allocator.free(self.physical_outputs);
+            self.physical_outputs[0] = .{
+                .id = .{ .index = 0, .generation = 1 },
+                .protocol_output = self.output_adapter.primaryOutput(),
+                .management_head = self.output_management_adapter.lifecycle.primary,
+            };
+            self.physical_output_count = 1;
             self.output_power_adapter = try OutputPowerAdapter.init(allocator, self, config.output_power);
             errdefer self.output_power_adapter.deinit();
             self.gamma_control_adapter = try GammaControlAdapter.init(allocator, self, config.gamma_control);
@@ -1614,6 +1629,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.layer_shell_adapter.deinit();
             self.xdg_output_adapter.deinit();
             self.output_management_adapter.deinit();
+            self.allocator.free(self.physical_outputs);
             self.output_power_adapter.deinit();
             self.gamma_control_adapter.deinit();
             self.allocator.free(self.output_management_modes);
@@ -3430,7 +3446,7 @@ pub fn Coordinator(comptime protocol: type) type {
             if (!std.meta.eql(current, id)) return null;
             var resources: [1]u32 = undefined;
             const ids = self.output_adapter.resourceIds(
-                self.protocol_output_id,
+                self.primaryPhysicalOutput().protocol_output,
                 peer,
                 &resources,
             ) catch return null;
@@ -3439,6 +3455,16 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn foreignOutputId(id: output_scheduler.OutputId) ForeignToplevelListAdapter.OutputId {
             return .{ .value = @as(u64, id.generation) << 32 | id.index };
+        }
+
+        fn primaryPhysicalOutput(self: *const Self) *const PhysicalOutput {
+            std.debug.assert(self.physical_output_count != 0);
+            return &self.physical_outputs[0];
+        }
+
+        fn primaryPhysicalOutputMutable(self: *Self) *PhysicalOutput {
+            std.debug.assert(self.physical_output_count != 0);
+            return &self.physical_outputs[0];
         }
 
         fn syncWorkspace(self: *Self) !void {
@@ -3465,7 +3491,8 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn consumeOutputManagementCommands(self: *Self) !void {
-            if (self.output_reconfigure != null or self.output_power_transition != null) return;
+            const physical = self.primaryPhysicalOutputMutable();
+            if (physical.reconfigure != null or self.output_power_transition != null) return;
             while (self.output_management_adapter.peekCommand()) |command| {
                 const supported = self.outputManagementModeSupported(command.desired);
                 const unchanged = std.meta.eql(
@@ -3473,13 +3500,13 @@ pub fn Coordinator(comptime protocol: type) type {
                     self.output_management_adapter.lifecycle.current,
                 );
                 if (supported and command.operation == .apply and !unchanged) {
-                    self.output_reconfigure = .{
+                    physical.reconfigure = .{
                         .peer = command.peer,
                         .configuration = command.configuration,
                         .previous = self.output_management_adapter.lifecycle.current,
                         .desired = command.desired,
                     };
-                    errdefer self.output_reconfigure = null;
+                    errdefer physical.reconfigure = null;
                     try self.pauseOutput();
                     return;
                 }
@@ -3495,9 +3522,12 @@ pub fn Coordinator(comptime protocol: type) type {
             handle: wayring.objects.Handle,
             object: *wayring.objects.Object,
         ) !struct { id: PhysicalOutputId, mode: protocol_output_power.Mode } {
-            _ = try self.output_adapter.reference(peer, handle, object.*);
+            const reference = try self.output_adapter.reference(peer, handle, object.*);
+            const physical = self.primaryPhysicalOutputMutable();
+            if (!std.meta.eql(reference.output, physical.protocol_output))
+                return error.InvalidOutput;
             return .{
-                .id = .physical,
+                .id = physical.id,
                 .mode = if (self.output == null) .off else .on,
             };
         }
@@ -3508,19 +3538,22 @@ pub fn Coordinator(comptime protocol: type) type {
             handle: wayring.objects.Handle,
             object: *wayring.objects.Object,
         ) !struct { id: PhysicalOutputId, size: u32 } {
-            _ = try self.output_adapter.reference(peer, handle, object.*);
+            const reference = try self.output_adapter.reference(peer, handle, object.*);
+            const physical = self.primaryPhysicalOutputMutable();
+            if (!std.meta.eql(reference.output, physical.protocol_output))
+                return error.InvalidOutput;
             const owner = if (self.gamma_owner) |*value| value else return error.Unsupported;
-            return .{ .id = .physical, .size = try owner.size() };
+            return .{ .id = physical.id, .size = try owner.size() };
         }
 
         pub fn applyGamma(self: *Self, output: PhysicalOutputId, ramps: []const u16) !void {
-            if (output != .physical) return error.InvalidOutput;
+            if (!std.meta.eql(output, self.primaryPhysicalOutput().id)) return error.InvalidOutput;
             const owner = if (self.gamma_owner) |*value| value else return error.Unsupported;
             try owner.apply(owner.generation, ramps);
         }
 
         pub fn resetGamma(self: *Self, output: PhysicalOutputId) !void {
-            if (output != .physical) return error.InvalidOutput;
+            if (!std.meta.eql(output, self.primaryPhysicalOutput().id)) return error.InvalidOutput;
             const owner = if (self.gamma_owner) |*value| value else return error.Unsupported;
             try owner.restore(owner.generation);
         }
@@ -3597,7 +3630,8 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn consumeOutputPowerCommands(self: *Self) !void {
-            if (self.output_power_transition != null or self.output_reconfigure != null) return;
+            if (self.output_power_transition != null or
+                self.primaryPhysicalOutput().reconfigure != null) return;
             while (self.output_power_adapter.peekCommand()) |command| {
                 const currently_on = self.output != null;
                 if ((command.mode == .on) == currently_on) {
@@ -3672,7 +3706,7 @@ pub fn Coordinator(comptime protocol: type) type {
             if (!std.meta.eql(workspaceOutputId(output.outputId()), id)) return null;
             var resources: [1]u32 = undefined;
             const ids = self.output_adapter.resourceIds(
-                self.protocol_output_id,
+                self.primaryPhysicalOutput().protocol_output,
                 peer,
                 &resources,
             ) catch return null;
@@ -5305,11 +5339,14 @@ pub fn Coordinator(comptime protocol: type) type {
                 => return error.DrmHardwareUnavailable,
                 else => return err,
             }) orelse return error.DrmHardwareUnavailable;
+            const physical = self.primaryPhysicalOutputMutable();
+            physical.claim = try self.manager.primaryClaim(handle);
             errdefer {
+                physical.claim = null;
                 self.retireGammaOwner() catch {};
                 self.manager.remove() catch {};
             }
-            const snapshot = try self.manager.snapshot(handle);
+            const snapshot = try self.manager.claimSnapshot(physical.claim.?);
             try self.activateOutput(
                 snapshot,
                 self.output_management_adapter.lifecycle.current.scale_120,
@@ -5366,6 +5403,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     snapshot,
                     output_config,
                 );
+            self.primaryPhysicalOutputMutable().kms_output = self.output;
             if (self.render_device == null)
                 self.render_device = self.output.?.takeRenderDevice();
             try self.ensureDmabuf(snapshot.handle);
@@ -5373,16 +5411,21 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.ensureDrmLeasing(snapshot);
             try self.ensureGammaOwner(snapshot);
             try self.output_adapter.publishMode(
-                self.protocol_output_id,
+                self.primaryPhysicalOutput().protocol_output,
                 self.output.?.planner.output.width,
                 self.output.?.planner.output.height,
                 try std.math.mul(u32, mode.vrefresh, 1000),
                 connector.width_mm,
                 connector.height_mm,
             );
-            try self.output_adapter.publishScale(self.protocol_output_id, scale_120);
+            try self.output_adapter.publishScale(
+                self.primaryPhysicalOutput().protocol_output,
+                scale_120,
+            );
             try self.fractional_scale_adapter.publishPreferredScale(scale_120);
-            try self.xdg_output_adapter.publishMode(self.protocol_output_id);
+            try self.xdg_output_adapter.publishMode(
+                self.primaryPhysicalOutput().protocol_output,
+            );
             const work_area: geometry.Rect = .{
                 .x = 0,
                 .y = 0,
@@ -5395,7 +5438,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.desktop.applyWorkArea(work_area);
             self.interaction.applyBounds(work_area);
             const retained_visibility_changed = self.refreshRetainedLayersForOutput();
-            self.output_drain_started = false;
+            self.primaryPhysicalOutputMutable().drain_started = false;
             const screencopy_stride = try std.math.mul(
                 u32,
                 self.output.?.planner.output.width,
@@ -6336,7 +6379,7 @@ pub fn Coordinator(comptime protocol: type) type {
             for (ids) |id| {
                 const state = try self.layer_shell_adapter.state(id);
                 if (!state.mapped or state.layer != selected or
-                    !std.meta.eql(state.output, self.protocol_output_id)) continue;
+                    !std.meta.eql(state.output, self.primaryPhysicalOutput().protocol_output)) continue;
                 try self.appendSceneRoot(state.surface, count, output_bounds);
                 const popups = try self.desktop.externalPopupSnapshot(
                     state.surface,
@@ -6357,7 +6400,7 @@ pub fn Coordinator(comptime protocol: type) type {
             for (ids) |id| {
                 const state = try self.session_lock_adapter.surfaceState(id);
                 if (!state.mapped or !std.meta.eql(state.lock, active) or
-                    !std.meta.eql(state.output_id, self.protocol_output_id)) continue;
+                    !std.meta.eql(state.output_id, self.primaryPhysicalOutput().protocol_output)) continue;
                 try self.appendSceneRoot(state.surface, count, output_bounds);
             }
         }
@@ -7053,7 +7096,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 const actor = try self.root.runtime.clients.reactor.getActor(peer);
                 var output_storage: [64]u32 = undefined;
                 const output_resources = try self.output_adapter.resourceIds(
-                    self.protocol_output_id,
+                    self.primaryPhysicalOutput().protocol_output,
                     peer,
                     &output_storage,
                 );
@@ -7382,7 +7425,9 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn outputBounds(self: *const Self) !geometry.Rect {
             if (self.output == null) return error.NoOutput;
-            const snapshot = try self.output_adapter.logicalSnapshot(self.protocol_output_id);
+            const snapshot = try self.output_adapter.logicalSnapshot(
+                self.primaryPhysicalOutput().protocol_output,
+            );
             return .{
                 .x = snapshot.x,
                 .y = snapshot.y,
@@ -7573,7 +7618,10 @@ pub fn Coordinator(comptime protocol: type) type {
         fn pauseOutput(self: *Self) !void {
             const output = self.output orelse return;
             if (!output.accepting_frames) return;
-            try self.output_adapter.setAvailable(self.protocol_output_id, false);
+            try self.output_adapter.setAvailable(
+                self.primaryPhysicalOutput().protocol_output,
+                false,
+            );
             self.screencopy_adapter.setAvailable(false);
             self.markProtocolAll(ProtocolReady.output);
             if (try output.requestPause()) |action| try self.consumeRetireAction(action);
@@ -7605,7 +7653,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     count += 1;
                 }
                 try self.output_adapter.reconcileSurfaces(
-                    self.protocol_output_id,
+                    self.primaryPhysicalOutput().protocol_output,
                     client.peer,
                     self.association_surfaces[0..count],
                 );
@@ -7636,12 +7684,13 @@ pub fn Coordinator(comptime protocol: type) type {
                 _ = input.quiesceComplete();
             }
             if (self.output) |output| {
-                if (output.paused and !self.output_drain_started) {
+                const physical = self.primaryPhysicalOutputMutable();
+                if (output.paused and !physical.drain_started) {
                     try output.beginDrain(&self.router, &self.root.ring);
-                    self.output_drain_started = true;
+                    physical.drain_started = true;
                 }
-                if (self.output_drain_started and output.drainComplete()) {
-                    if (!self.stopping and self.output_reconfigure != null) {
+                if (physical.drain_started and output.drainComplete()) {
+                    if (!self.stopping and physical.reconfigure != null) {
                         try self.finishOutputReconfigure(output);
                         return;
                     }
@@ -7649,6 +7698,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     try self.invalidateCaptureSource(.{ .output = output.outputId() });
                     try output.destroy();
                     self.output = null;
+                    physical.kms_output = null;
                     self.stats.output_drains += 1;
                     if (!self.stopping and self.output_power_transition != null) {
                         const command = self.output_power_transition.?;
@@ -7662,9 +7712,9 @@ pub fn Coordinator(comptime protocol: type) type {
                         try self.consumeOutputPowerCommands();
                     } else {
                         if (!self.stopping) {
-                            try self.output_power_adapter.outputRemoved(.physical);
+                            try self.output_power_adapter.outputRemoved(physical.id);
                             self.markProtocolAll(ProtocolReady.output_power);
-                            try self.gamma_control_adapter.outputRemoved(.physical);
+                            try self.gamma_control_adapter.outputRemoved(physical.id);
                             self.markProtocolAll(ProtocolReady.gamma_control);
                         }
                         try self.retireGammaOwner();
@@ -7684,6 +7734,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     !self.drm_lease_adapter.retryRevocations())
                 {
                     try self.manager.remove();
+                    self.primaryPhysicalOutputMutable().claim = null;
                     self.drm_remove_pending = false;
                 }
             }
@@ -7702,7 +7753,8 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn finishOutputReconfigure(self: *Self, old_output: *output_api.Output) !void {
-            const pending = self.output_reconfigure orelse return error.InvalidState;
+            const physical = self.primaryPhysicalOutputMutable();
+            const pending = physical.reconfigure orelse return error.InvalidState;
             const handle = self.manager.currentHandle() orelse return error.StaleSnapshot;
             const previous = try self.manager.snapshotMode(
                 handle,
@@ -7720,6 +7772,7 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.invalidateCaptureSource(.{ .output = old_output.outputId() });
             try old_output.destroy();
             self.output = null;
+            physical.kms_output = null;
             self.stats.output_drains += 1;
 
             const result = try activateOutputWithRollback(
@@ -7735,7 +7788,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 @intCast(pending.desired.height),
                 @intCast(pending.desired.refresh_millihz),
             );
-            self.output_reconfigure = null;
+            physical.reconfigure = null;
             if (self.output_management_adapter.peekCommand()) |command| {
                 if (std.meta.eql(command.configuration, pending.configuration)) {
                     try self.output_management_adapter.completeCommand(result);
@@ -7816,7 +7869,10 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn cleanupUnstartedOutput(self: *Self) void {
             const output = self.output orelse return;
-            self.output_adapter.setAvailable(self.protocol_output_id, false) catch unreachable;
+            self.output_adapter.setAvailable(
+                self.primaryPhysicalOutput().protocol_output,
+                false,
+            ) catch unreachable;
             self.screencopy_adapter.setAvailable(false);
             if (output.accepting_frames) {
                 if (output.requestPause() catch unreachable) |action|
@@ -7838,6 +7894,7 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             output.destroy() catch {};
             self.output = null;
+            self.primaryPhysicalOutputMutable().kms_output = null;
         }
 
         fn resourceRemoved(

@@ -812,6 +812,21 @@ fn runVertical(trigger: TerminalTrigger, source: ClientSource) !void {
     try std.testing.expectEqual(@as(u32, 10), coordinator.output.?.kms_output.connector.id);
     try std.testing.expectEqual(@as(u32, 30), coordinator.output.?.kms_output.crtc.id);
     try std.testing.expectEqual(@as(u32, 40), coordinator.output.?.kms_output.plane.id);
+    try std.testing.expectEqual(@as(usize, 1), coordinator.physical_output_count);
+    const physical = coordinator.physical_outputs[0];
+    try std.testing.expectEqual(coordinator.output, physical.kms_output);
+    try std.testing.expectEqual(
+        @as(u32, 10),
+        (try coordinator.manager.claimSnapshot(physical.claim.?)).selectedConnector().id,
+    );
+    try std.testing.expectEqual(
+        coordinator.output_adapter.primaryOutput(),
+        physical.protocol_output,
+    );
+    try std.testing.expectEqual(
+        coordinator.output_management_adapter.lifecycle.primary,
+        physical.management_head,
+    );
 
     // Admit a second ordinary SHM commit, but replace its exact generational
     // surface before the render deadline. Disable then proves that an applied
@@ -885,6 +900,8 @@ fn runVertical(trigger: TerminalTrigger, source: ClientSource) !void {
             _ = try loop.turn(coordinator);
         }
         try std.testing.expect(coordinator.output == null);
+        try std.testing.expect(coordinator.physical_outputs[0].kms_output == null);
+        try std.testing.expect(coordinator.physical_outputs[0].claim == null);
         try std.testing.expectEqual(ouro.session.State.disabled, coordinator.session.state);
         try std.testing.expectEqual(@as(usize, 0), coordinator.session.deviceCount());
         try std.testing.expectEqual(@as(usize, 1), coordinator.stats.output_drains);
