@@ -308,6 +308,10 @@ pub fn Adapter(comptime protocol: type) type {
             );
         }
 
+        pub fn outputPublished(adapter: *const Self, id: OutputId) !bool {
+            return (try adapter.resolveOutputConst(id)).global != null;
+        }
+
         /// Discards an output which has never been globally published or bound.
         /// Published output removal is a separate backpressure-aware lifecycle.
         pub fn discardOutput(adapter: *Self, id: OutputId) !void {
@@ -1122,6 +1126,7 @@ test "output: identities isolate snapshots resources and surface associations" {
         .name = "unpublished",
         .description = "Unpublished output",
     });
+    try std.testing.expect(!try adapter.outputPublished(unpublished));
     try std.testing.expectEqualStrings(
         "unpublished",
         (try adapter.logicalSnapshot(unpublished)).name,

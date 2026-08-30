@@ -617,6 +617,7 @@ pub fn Coordinator(comptime protocol: type) type {
         drm_lease_global_update: enum { none, adding, removing } = .none,
         drm_lease_topology_generation: ?u32 = null,
         drm_remove_pending: bool = false,
+        output_global_index: usize = 1,
         gamma_platform: drm_gamma.Platform,
         shm: Shm,
         adapter: Adapter,
@@ -958,6 +959,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.drm_lease_global_update = .none;
             self.drm_lease_topology_generation = null;
             self.drm_remove_pending = false;
+            self.output_global_index = 1;
             self.gamma_platform = platforms.gamma;
             self.shm = try Shm.init(allocator, config.shm);
             errdefer self.shm.deinit(allocator);
@@ -4895,6 +4897,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn flushProtocol(self: *Self) !void {
+            try self.advanceOutputGlobals();
             try self.advanceDrmLeaseGlobal();
             while (try self.manager.pollRevokedLease()) |token| {
                 self.drm_lease_adapter.leaseRevoked(token) catch continue;
@@ -4919,6 +4922,29 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             for (self.clients.items) |client| if (client.active and client.protocol_ready != 0)
                 try self.flushProtocolOn(client.peer);
+        }
+
+        fn advanceOutputGlobals(self: *Self) !void {
+            while (self.output_global_index < self.physical_output_count) {
+                const physical = &self.physical_outputs[self.output_global_index];
+                if (!try self.output_adapter.outputPublished(physical.protocol_output)) {
+                    self.output_adapter.publishOutput(physical.protocol_output) catch |err| switch (err) {
+                        error.GlobalUpdateActive => return,
+                        else => return err,
+                    };
+                }
+                while (true) switch (try self.root.runtime.publishNext()) {
+                    .sent => |peer| {
+                        if (self.loop) |loop| _ = try loop.driver.schedule(peer);
+                    },
+                    .blocked => |peer| {
+                        if (self.loop) |loop| _ = try loop.driver.schedule(peer);
+                        return;
+                    },
+                    .complete => break,
+                };
+                self.output_global_index += 1;
+            }
         }
 
         fn advanceDrmLeaseGlobal(self: *Self) !void {
