@@ -160,6 +160,85 @@ test "physical DRM lease resolver grants the independent secondary tuple" {
     try root.deinit();
 }
 
+test "physical coordinator activates and drains every desktop connector" {
+    const allocator = std.testing.allocator;
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    fixture.second_desktop = true;
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-r15-plural-output-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), compositorConfig());
+    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), coordinatorConfig());
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
+    try coordinator.start(&loop);
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    for (0..128) |_| {
+        _ = try loop.turn(coordinator);
+        if (coordinator.physical_output_count == 2 and
+            coordinator.physical_outputs[0].kms_output != null and
+            coordinator.physical_outputs[1].kms_output != null and
+            coordinator.output_global_index == 2) break;
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+    }
+    try std.testing.expectEqual(@as(usize, 2), coordinator.physical_output_count);
+    try std.testing.expectEqual(@as(u32, 10), coordinator.physical_outputs[0].connector_id);
+    try std.testing.expectEqual(@as(u32, 11), coordinator.physical_outputs[1].connector_id);
+    try std.testing.expect(coordinator.physical_outputs[0].kms_output != null);
+    try std.testing.expect(coordinator.physical_outputs[1].kms_output != null);
+    try std.testing.expect(!std.meta.eql(
+        coordinator.physical_outputs[0].kms_output.?.outputId(),
+        coordinator.physical_outputs[1].kms_output.?.outputId(),
+    ));
+    const secondary = try coordinator.output_adapter.logicalSnapshot(
+        coordinator.physical_outputs[1].protocol_output,
+    );
+    try std.testing.expectEqual(@as(i32, 3), secondary.x);
+    try std.testing.expectEqual(@as(?i32, 3), secondary.width);
+    try std.testing.expect((try coordinator.output_management_adapter.lifecycle.currentHead(
+        coordinator.physical_outputs[1].management_head,
+    )).enabled);
+    try std.testing.expectEqual(@as(usize, 0), (try coordinator.manager.leaseCandidates(
+        coordinator.manager.currentHandle().?,
+    )).len);
+
+    try fixture.signalSession(.disable);
+    for (0..256) |_| {
+        _ = try loop.turn(coordinator);
+        var active = false;
+        for (coordinator.physical_outputs[0..coordinator.physical_output_count]) |physical|
+            active = active or physical.kms_output != null;
+        if (!active and coordinator.session.state == .disabled) break;
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+    }
+    for (coordinator.physical_outputs[0..coordinator.physical_output_count]) |physical|
+        try std.testing.expect(physical.kms_output == null);
+    for (coordinator.physical_outputs[0..coordinator.physical_output_count]) |physical|
+        try std.testing.expect(!(try coordinator.output_management_adapter.lifecycle.currentHead(
+            physical.management_head,
+        )).enabled);
+
+    try fixture.signalSession(.enable);
+    for (0..128) |_| {
+        _ = try loop.turn(coordinator);
+        if (coordinator.physical_outputs[0].kms_output != null and
+            coordinator.physical_outputs[1].kms_output != null) break;
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+    }
+    try std.testing.expectEqual(@as(usize, 2), coordinator.physical_output_count);
+    try std.testing.expect(coordinator.physical_outputs[0].kms_output != null);
+    try std.testing.expect(coordinator.physical_outputs[1].kms_output != null);
+
+    try coordinator.requestStop();
+    try drainServer(root, coordinator, &loop);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
 test "generated client leases, withdraws, and rediscovers a secondary connector" {
     const allocator = std.testing.allocator;
     var fixture = try Fixture.init();
@@ -1938,13 +2017,13 @@ pub const Fixture = struct {
     drm_fd: linux.fd_t,
     callback: ?*ouro.backend_platform.CallbackContext = null,
     command: SessionCommand = .enable,
-    bo_bytes: [6][32]u8 align(4) = .{[_]u8{0} ** 32} ** 6,
+    bo_bytes: [12][32]u8 align(4) = .{[_]u8{0} ** 32} ** 12,
     bo_count: usize = 0,
     bo_destroyed: usize = 0,
     output_bo_destroyed: usize = 0,
     framebuffer_removed: usize = 0,
     framebuffer_removal_before_bo: bool = false,
-    requests: [4]u8 = .{0} ** 4,
+    requests: [8]u8 = .{0} ** 8,
     request_count: usize = 0,
     flip_userdata: ?*anyopaque = null,
     page_flips: usize = 0,
@@ -1958,6 +2037,7 @@ pub const Fixture = struct {
     read_maps: usize = 0,
     unmaps: usize = 0,
     discover_cards: bool = true,
+    second_desktop: bool = false,
     lease_objects: [6]u32 = undefined,
     lease_object_count: usize = 0,
     lease_create_count: usize = 0,
@@ -2156,7 +2236,7 @@ pub const Fixture = struct {
         out.crtcs[0] = .{ .id = 30, .index = 0, .properties = .{ .active = 2, .mode_id = 3 } };
         out.planes[0] = .{ .id = 40, .possible_crtcs = 1, .plane_type_value = 1, .format_start = 0, .format_count = 1, .properties = .{ .plane_type = 4, .fb_id = 5, .crtc_id = 6, .src_x = 7, .src_y = 8, .src_w = 9, .src_h = 10, .crtc_x = 11, .crtc_y = 12, .crtc_w = 13, .crtc_h = 14 } };
         out.formats[0] = .{ .fourcc = ouro.gbm.format_xrgb8888, .modifier = ouro.gbm.modifier_linear };
-        out.connectors[1] = .{ .id = 11, .connector_type = 1, .connector_type_id = 2, .connected = true, .desktop = false, .width_mm = 2, .height_mm = 2, .encoder_id = 21, .mode_start = 1, .mode_count = 1, .encoder_start = 1, .encoder_count = 1, .properties = .{ .crtc_id = 1 } };
+        out.connectors[1] = .{ .id = 11, .connector_type = 1, .connector_type_id = 2, .connected = true, .desktop = self.second_desktop, .width_mm = 2, .height_mm = 2, .encoder_id = 21, .mode_start = 1, .mode_count = 1, .encoder_start = 1, .encoder_count = 1, .properties = .{ .crtc_id = 1 } };
         out.modes[1] = out.modes[0];
         out.connector_encoders[1] = 21;
         out.encoders[1] = .{ .id = 21, .crtc_id = 31, .possible_crtcs = 2 };
@@ -2170,7 +2250,6 @@ pub const Fixture = struct {
         out.crtc_count = 2;
         out.plane_count = 2;
         out.format_count = 2;
-        _ = self;
     }
 
     fn createGbm(context: *anyopaque, _: linux.fd_t) !ouro.gbm.Device {
@@ -2269,7 +2348,7 @@ pub fn coordinatorConfig() Coordinator.Config {
     return .{ .router_capacity = 12, .timer_capacity = 6, .device_capacity = 1, .shm = .{ .limits = .{ .max_pool_bytes = 4096 }, .pool_capacity = 1, .buffer_capacity = 1, .formats = &shm_formats }, .surface = .{ .surface_capacity = 1, .region_capacity = 1, .viewport_capacity = 1, .presentation_resource_capacity = 1, .presentation_feedback_capacity = 2, .region_operation_capacity = 1, .frame_callback_capacity = 1, .release_callback_capacity = 1, .content_update_capacity = 1, .dependency_capacity = 1, .attachment_capacity = 1, .copy_capacity = 1, .max_copy_bytes = pixels.len }, .drm = .{ .card_capacity = 1, .connector_capacity = 2, .mode_capacity = 2, .connector_encoder_capacity = 2, .encoder_capacity = 2, .crtc_capacity = 2, .plane_capacity = 2, .format_capacity = 2, .event_capacity = 4 }, .output = .{ .output_id = .{ .index = 0, .generation = 1 }, .scheduler = .{ .refresh_ns = 4 * std.time.ns_per_ms, .render_budget_ns = std.time.ns_per_ms }, .renderer = .pixman, .image_count = 2, .max_samples = 2, .max_source_bytes = pixels.len, .max_source_width = 3, .max_source_height = 2, .kms = .{ .event_capacity = 2 } } };
 }
 pub fn compositorConfig() Compositor.Config {
-    return .{ .ring = .{ .entries = 32, .flags = 0 }, .reactor = clientReactorConfig(), .runtime = .{ .actor = .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 }, .object_capacity = 32, .object_quota = 32, .buckets_per_client = 32, .max_globals = 61, .registry_capacity = 1 } };
+    return .{ .ring = .{ .entries = 32, .flags = 0 }, .reactor = clientReactorConfig(), .runtime = .{ .actor = .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 }, .object_capacity = 32, .object_quota = 32, .buckets_per_client = 32, .max_globals = 62, .registry_capacity = 1 } };
 }
 pub fn clientReactorConfig() wayring.io_uring.Config {
     return .{ .receive_buffer_size = 4096, .receive_buffer_count = 4, .receive_control_capacity = 256, .fragment_block_size = 256, .fragment_block_count = 4, .transmit_block_size = 512, .transmit_block_count = 8, .descriptor_count = 4, .send_descriptor_capacity = 2 };
