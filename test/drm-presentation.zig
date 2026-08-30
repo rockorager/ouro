@@ -250,7 +250,7 @@ test "physical coordinator retires a disconnected secondary output" {
     defer wayring.unix_socket.unlink(path) catch {};
 
     const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), compositorConfig());
-    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), coordinatorConfig());
+    const coordinator = try Coordinator.create(allocator, root, fixture.platformsWithHotplug(), coordinatorConfig());
     var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
     try coordinator.start(&loop);
     _ = try loop.turn(coordinator);
@@ -265,7 +265,7 @@ test "physical coordinator retires a disconnected secondary output" {
     const protocol_output = coordinator.physical_outputs[1].protocol_output;
     const management_head = coordinator.physical_outputs[1].management_head;
     fixture.second_desktop = false;
-    try coordinator.requestConnectorRemoval(11);
+    try fixture.signalHotplug();
     for (0..256) |_| {
         _ = try loop.turn(coordinator);
         if (!coordinator.physical_outputs[1].connected and
@@ -2299,6 +2299,8 @@ pub const SessionCommand = enum { enable, disable };
 pub const Fixture = struct {
     session_fd: linux.fd_t,
     drm_fd: linux.fd_t,
+    hotplug_fd: linux.fd_t,
+    hotplug_pending: bool = false,
     callback: ?*ouro.backend_platform.CallbackContext = null,
     command: SessionCommand = .enable,
     bo_bytes: [12][32]u8 align(4) = .{[_]u8{0} ** 32} ** 12,
@@ -2334,12 +2336,17 @@ pub const Fixture = struct {
     fail_create_bo_at: ?usize = null,
 
     pub fn init() !Fixture {
-        return .{ .session_fd = try eventFd(), .drm_fd = try eventFd() };
+        const session_fd = try eventFd();
+        errdefer _ = linux.close(session_fd);
+        const drm_fd = try eventFd();
+        errdefer _ = linux.close(drm_fd);
+        return .{ .session_fd = session_fd, .drm_fd = drm_fd, .hotplug_fd = try eventFd() };
     }
 
     pub fn deinit(self: *Fixture) void {
         if (self.session_fd >= 0) _ = linux.close(self.session_fd);
         if (self.drm_fd >= 0) _ = linux.close(self.drm_fd);
+        if (self.hotplug_fd >= 0) _ = linux.close(self.hotplug_fd);
     }
 
     pub fn signalSession(self: *Fixture, command: SessionCommand) !void {
@@ -2358,6 +2365,17 @@ pub const Fixture = struct {
                 .atomic = .{ .context = self, .vtable = &atomic_vtable },
             },
         };
+    }
+
+    pub fn platformsWithHotplug(self: *Fixture) Coordinator.Platforms {
+        var result = self.platforms();
+        result.hotplug = .{ .context = self, .vtable = &hotplug_vtable };
+        return result;
+    }
+
+    pub fn signalHotplug(self: *Fixture) !void {
+        self.hotplug_pending = true;
+        try signalFd(self.hotplug_fd);
     }
 
     pub fn signalOutput(self: *Fixture) !void {
@@ -2382,6 +2400,12 @@ pub const Fixture = struct {
         .create_lease = createLease,
         .revoke_lease = revokeLease,
         .list_lessees = listLessees,
+    };
+    const hotplug_vtable: ouro.drm_hotplug.Platform.VTable = .{
+        .create = hotplugCreate,
+        .destroy = hotplugDestroy,
+        .get_fd = hotplugGetFd,
+        .next_event = hotplugNextEvent,
     };
     const gbm_vtable: ouro.gbm.Platform.VTable = .{
         .create_device = createGbm,
@@ -2539,6 +2563,21 @@ pub const Fixture = struct {
 
     fn createGbm(context: *anyopaque, _: linux.fd_t) !ouro.gbm.Device {
         return context;
+    }
+
+    fn hotplugCreate(context: *anyopaque) !*anyopaque {
+        return context;
+    }
+    fn hotplugDestroy(_: *anyopaque, _: *anyopaque) void {}
+    fn hotplugGetFd(_: *anyopaque, context: *anyopaque) !linux.fd_t {
+        return (@as(*Fixture, @ptrCast(@alignCast(context)))).hotplug_fd;
+    }
+    fn hotplugNextEvent(_: *anyopaque, context: *anyopaque) !?ouro.drm_hotplug.Event {
+        const self: *Fixture = @ptrCast(@alignCast(context));
+        if (!self.hotplug_pending) return null;
+        self.hotplug_pending = false;
+        try consumeFd(self.hotplug_fd);
+        return .change;
     }
     fn destroyGbm(context: *anyopaque, _: ouro.gbm.Device) void {
         (@as(*Fixture, @ptrCast(@alignCast(context)))).gbm_destroyed += 1;

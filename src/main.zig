@@ -71,8 +71,9 @@ pub fn main(init: std.process.Init) !void {
     );
     const coordinator = Coordinator.create(allocator, root, .{
         .input = ouro.input_platform.real,
+        .hotplug = ouro.drm_hotplug.real,
     }, .{
-        .router_capacity = 16,
+        .router_capacity = 17,
         .timer_capacity = 6,
         .device_capacity = 36,
         .input = .{

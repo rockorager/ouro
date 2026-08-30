@@ -20,6 +20,7 @@ const session_platform = @import("../backend/platform.zig");
 const input_api = @import("../backend/input/backend.zig");
 const input_platform = @import("../backend/input/platform.zig");
 const drm = @import("../backend/drm/manager.zig");
+const drm_hotplug = @import("../backend/drm/hotplug.zig");
 const drm_gamma = @import("../backend/drm/gamma.zig");
 const drm_platform = @import("../backend/drm/platform.zig");
 const gbm = @import("../backend/gbm.zig");
@@ -463,6 +464,7 @@ pub fn Coordinator(comptime protocol: type) type {
         pub const Platforms = struct {
             session: session_platform.Platform = session_platform.real,
             input: ?input_platform.Platform = null,
+            hotplug: ?drm_hotplug.Platform = null,
             drm: drm_platform.Platform = drm_platform.real,
             gamma: drm_gamma.Platform = drm_gamma.real,
             output: output_api.Platforms = .{},
@@ -620,6 +622,8 @@ pub fn Coordinator(comptime protocol: type) type {
         input_method_key_owners: [0x300]?protocol_input_method.GrabId = [_]?protocol_input_method.GrabId{null} ** 0x300,
         processing_virtual_pointer: bool = false,
         manager: drm.Manager,
+        hotplug: ?drm_hotplug.Monitor = null,
+        hotplug_connector_ids: []u32,
         drm_lease_adapter: DrmLeaseAdapter,
         drm_lease_claims: []drm.ClaimHandle,
         drm_lease_desired: bool = false,
@@ -958,6 +962,13 @@ pub fn Coordinator(comptime protocol: type) type {
                 config.drm,
             );
             errdefer self.manager.deinit() catch {};
+            self.hotplug = if (platforms.hotplug) |platform|
+                try drm_hotplug.Monitor.init(platform)
+            else
+                null;
+            errdefer if (self.hotplug) |*monitor| monitor.deinit();
+            self.hotplug_connector_ids = try allocator.alloc(u32, config.drm.connector_capacity);
+            errdefer allocator.free(self.hotplug_connector_ids);
             self.drm_lease_adapter = try DrmLeaseAdapter.init(allocator, self, config.drm_lease);
             errdefer self.drm_lease_adapter.deinit();
             self.drm_lease_claims = try allocator.alloc(
@@ -1548,6 +1559,7 @@ pub fn Coordinator(comptime protocol: type) type {
         pub fn start(self: *Self, loop: *Loop) !void {
             if (self.loop != null) return error.AlreadyStarted;
             self.loop = loop;
+            if (self.hotplug) |*monitor| try monitor.start(&self.router, &self.root.ring);
             try self.session.prepareReadiness(&self.router, &self.root.ring);
             try self.processSession();
             try self.processInput();
@@ -1571,6 +1583,7 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.syncCommitTimer();
             try self.syncXdgSessionStoreTimer();
             try self.prepareSecurityClosures();
+            if (self.hotplug) |*monitor| try monitor.beginDrain(&self.router, &self.root.ring);
             try self.pauseAllOutputs();
             try self.advanceDrain();
         }
@@ -1579,6 +1592,7 @@ pub fn Coordinator(comptime protocol: type) type {
             return self.stopping and !self.anyKmsOutput() and
                 self.pending_screencopy == null and self.pending_image_copy == null and
                 (self.input == null or self.input.?.drainComplete()) and
+                (self.hotplug == null or self.hotplug.?.drainComplete()) and
                 self.session.drainComplete() and self.timers.idle() and
                 self.icc_poll == null and !self.icc_poll_canceling and
                 self.security_context_adapter.drainComplete();
@@ -1600,6 +1614,8 @@ pub fn Coordinator(comptime protocol: type) type {
             if (self.input) |input| input.destroy() catch |err| {
                 first_error = err;
             };
+            if (self.hotplug) |*monitor| monitor.deinit();
+            self.allocator.free(self.hotplug_connector_ids);
             self.retireGammaOwner() catch |err| {
                 if (first_error == null) first_error = err;
             };
@@ -2209,6 +2225,16 @@ pub fn Coordinator(comptime protocol: type) type {
                         outcome.cqe.res,
                     );
                 },
+                .hotplug_ready => {
+                    const monitor = if (self.hotplug) |*value| value else return error.UnknownToken;
+                    try monitor.complete(
+                        &self.router,
+                        &self.root.ring,
+                        outcome.token,
+                        outcome.cqe.res,
+                    );
+                    try self.processHotplug();
+                },
                 else => return error.UnexpectedCompletion,
             };
             for (timer_outcomes) |outcome| {
@@ -2243,6 +2269,20 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.prepareSecurityClosures();
             try self.armTimer();
             try self.advanceDrain();
+        }
+
+        fn processHotplug(self: *Self) !void {
+            const monitor = if (self.hotplug) |*value| value else return;
+            if (!monitor.takeChanged() or self.stopping or self.manager.currentHandle() == null)
+                return;
+            const connectors = try self.manager.probeDesktopConnectorIds(
+                self.hotplug_connector_ids,
+            );
+            for (self.physical_outputs[1..self.physical_output_count]) |physical| {
+                if (!physical.connected or physical.removing) continue;
+                if (std.mem.indexOfScalar(u32, connectors, physical.connector_id) == null)
+                    try self.requestConnectorRemoval(physical.connector_id);
+            }
         }
 
         fn armIccPoll(self: *Self) !void {

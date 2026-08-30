@@ -407,6 +407,22 @@ pub const Manager = struct {
         return storage.candidates[0..storage.candidate_count];
     }
 
+    /// Reads the current kernel inventory without invalidating active claims.
+    /// The result is connector identity only; ownership changes still require
+    /// the coordinator to drain outputs before a generation-changing rescan.
+    pub fn probeDesktopConnectorIds(self: *Manager, output: []u32) ![]const u32 {
+        if (!self.present) return error.StaleSnapshot;
+        const fd = try self.session.deviceFd(self.device orelse return error.StaleSnapshot);
+        const probe = &self.stores[self.active_store ^ 1];
+        try self.platform.readTopology(fd, &probe.buffer);
+        try validateCounts(&probe.buffer);
+        probe.candidate_count = try collectScanoutCandidates(&probe.buffer, probe.candidates);
+        if (probe.candidate_count > output.len) return error.OutputTooSmall;
+        for (probe.candidates[0..probe.candidate_count], 0..) |candidate, index|
+            output[index] = probe.buffer.connectors[candidate.connector_index].id;
+        return output[0..probe.candidate_count];
+    }
+
     /// Returns connected non-desktop connectors with complete scanout tuples.
     /// These are kept separate from compositor-owned desktop outputs so a
     /// connector cannot be both globally displayed and advertised for lease.
@@ -1149,6 +1165,14 @@ test "drm: scanout claims reserve complete tuples and recycle generation safely"
     );
 
     const claim = try manager.claimScanout(handle, candidates[1]);
+    try std.testing.expectEqual(@as(u32, 21), (try manager.claimSnapshot(claim)).selectedConnector().id);
+    var connector_ids: [2]u32 = undefined;
+    try std.testing.expectEqualSlices(
+        u32,
+        &.{ 20, 21 },
+        try manager.probeDesktopConnectorIds(&connector_ids),
+    );
+    try std.testing.expectEqual(handle, manager.currentHandle().?);
     try std.testing.expectEqual(@as(u32, 21), (try manager.claimSnapshot(claim)).selectedConnector().id);
     const secondary_mode = try manager.claimSnapshotMode(claim, 1920, 1080, 60000);
     try std.testing.expectEqual(@as(u32, 21), secondary_mode.selectedConnector().id);

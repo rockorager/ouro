@@ -28,6 +28,7 @@ pub const input_platform = @import("backend/input/platform.zig");
 pub const input_backend = @import("backend/input/backend.zig");
 pub const gbm = @import("backend/gbm.zig");
 pub const drm_platform = @import("backend/drm/platform.zig");
+pub const drm_hotplug = @import("backend/drm/hotplug.zig");
 pub const drm_gamma = @import("backend/drm/gamma.zig");
 pub const drm = @import("backend/drm/manager.zig");
 pub const drm_framebuffer = @import("backend/drm/framebuffer.zig");
@@ -130,6 +131,7 @@ test {
     _ = input_backend;
     _ = gbm;
     _ = drm_platform;
+    _ = drm_hotplug;
     _ = drm;
     _ = drm_framebuffer;
     _ = drm_atomic;
