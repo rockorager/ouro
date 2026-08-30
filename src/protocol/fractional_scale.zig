@@ -30,6 +30,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
             surface: CoreSurface.SurfaceId = .{ .index = 0, .generation = 0 },
             peer: wayring.io_uring.Peer = undefined,
+            preferred_scale: u32 = 120,
             event_pending: bool = true,
         };
 
@@ -154,7 +155,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 if (!slot.header.active or !samePeer(slot.peer, peer) or !slot.event_pending) continue;
                 if (server_objects.namespace.resolve(slot.resource) == null) continue;
                 Scale.encodeEvent(queue, slot.resource.id, .{ .preferred_scale = .{
-                    .scale = adapter.preferred_scale,
+                    .scale = slot.preferred_scale,
                 } }) catch |err| switch (err) {
                     error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return completed,
                     else => return err,
@@ -180,10 +181,30 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             if (adapter.preferred_scale == preferred_scale) return;
             adapter.preferred_scale = preferred_scale;
             for (adapter.slots.entries.items) |slot| {
-                if (!slot.header.active or slot.event_pending) continue;
-                slot.event_pending = true;
-                adapter.event_pending_len += 1;
+                if (!slot.header.active or slot.preferred_scale == preferred_scale) continue;
+                slot.preferred_scale = preferred_scale;
+                adapter.queueEvent(slot);
             }
+        }
+
+        /// Publishes the preferred scale for one surface without changing the
+        /// default inherited by future bindings. Returns false when the
+        /// surface has no fractional-scale object.
+        pub fn publishSurfacePreferredScale(
+            adapter: *Self,
+            surface: CoreSurface.SurfaceId,
+            preferred_scale: u32,
+        ) !bool {
+            if (preferred_scale == 0) return error.InvalidScale;
+            for (adapter.slots.entries.items) |slot| {
+                if (!slot.header.active or !std.meta.eql(slot.surface, surface)) continue;
+                if (slot.preferred_scale != preferred_scale) {
+                    slot.preferred_scale = preferred_scale;
+                    adapter.queueEvent(slot);
+                }
+                return true;
+            }
+            return false;
         }
 
         pub fn resourceRemoved(adapter: *Self, handle: objects.Handle, object: objects.Object) bool {
@@ -199,8 +220,15 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
 
         fn acquire(adapter: *Self) !*Slot {
             const slot = try adapter.slots.acquire();
+            slot.preferred_scale = adapter.preferred_scale;
             adapter.event_pending_len += 1;
             return slot;
+        }
+
+        fn queueEvent(adapter: *Self, slot: *Slot) void {
+            if (slot.event_pending) return;
+            slot.event_pending = true;
+            adapter.event_pending_len += 1;
         }
 
         fn release(adapter: *Self, slot: *Slot) void {
@@ -269,16 +297,41 @@ test "fractional scale: changed preference republishes each live resource once" 
     defer adapter.deinit();
     const first = try adapter.acquire();
     const second = try adapter.acquire();
+    first.surface = .{ .index = 1, .generation = 2 };
+    second.surface = .{ .index = 3, .generation = 4 };
     first.event_pending = false;
     second.event_pending = false;
     adapter.event_pending_len = 0;
 
     try adapter.publishPreferredScale(180);
     try std.testing.expectEqual(@as(u32, 180), adapter.preferred_scale);
+    try std.testing.expectEqual(@as(u32, 180), first.preferred_scale);
+    try std.testing.expectEqual(@as(u32, 180), second.preferred_scale);
     try std.testing.expect(first.event_pending);
     try std.testing.expect(second.event_pending);
     try std.testing.expectEqual(@as(usize, 2), adapter.event_pending_len);
     try adapter.publishPreferredScale(180);
     try std.testing.expectEqual(@as(usize, 2), adapter.event_pending_len);
+
+    first.event_pending = false;
+    second.event_pending = false;
+    adapter.event_pending_len = 0;
+    try std.testing.expect(try adapter.publishSurfacePreferredScale(first.surface, 240));
+    try std.testing.expectEqual(@as(u32, 180), adapter.preferred_scale);
+    try std.testing.expectEqual(@as(u32, 240), first.preferred_scale);
+    try std.testing.expectEqual(@as(u32, 180), second.preferred_scale);
+    try std.testing.expect(first.event_pending);
+    try std.testing.expect(!second.event_pending);
+    try std.testing.expectEqual(@as(usize, 1), adapter.event_pending_len);
+    try std.testing.expect(try adapter.publishSurfacePreferredScale(first.surface, 240));
+    try std.testing.expectEqual(@as(usize, 1), adapter.event_pending_len);
+    try std.testing.expect(!try adapter.publishSurfacePreferredScale(
+        .{ .index = 9, .generation = 9 },
+        300,
+    ));
     try std.testing.expectError(error.InvalidScale, adapter.publishPreferredScale(0));
+    try std.testing.expectError(
+        error.InvalidScale,
+        adapter.publishSurfacePreferredScale(first.surface, 0),
+    );
 }
