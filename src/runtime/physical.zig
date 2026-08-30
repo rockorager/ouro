@@ -696,9 +696,6 @@ pub fn Coordinator(comptime protocol: type) type {
         cursor_size: u32,
         presentations: Presentations,
         render_device: ?*output_api.RenderDevice = null,
-        /// Borrowed compatibility view of the primary record while physical
-        /// scheduling migrates to the complete output inventory.
-        output: ?*output_api.Output = null,
         next_output_generation: ?u32,
         loop: ?*Loop = null,
         clients: std.ArrayListUnmanaged(Client) = .empty,
@@ -768,7 +765,6 @@ pub fn Coordinator(comptime protocol: type) type {
             self.input_config = config.input;
             self.seat_len = @intCast(config.seat.len);
             @memcpy(self.seat[0..config.seat.len], config.seat);
-            self.output = null;
             self.input = null;
             self.input_event_cursor = 0;
             self.input_interaction_accepted = false;
@@ -1567,7 +1563,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         pub fn backendDrainComplete(self: *const Self) bool {
-            return self.stopping and self.output == null and
+            return self.stopping and self.primaryKmsOutput() == null and
                 self.pending_screencopy == null and self.pending_image_copy == null and
                 (self.input == null or self.input.?.drainComplete()) and
                 self.session.drainComplete() and self.timers.idle() and
@@ -2219,7 +2215,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     try self.desktopTimerEvent(outcome.event);
                     continue;
                 };
-                if (self.output) |output| {
+                if (self.primaryKmsOutput()) |output| {
                     const request_value = try output.timerEvent(
                         outcome.handle,
                         outcome.event,
@@ -2570,7 +2566,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 );
                 return;
             }
-            if (self.output) |output| {
+            if (self.primaryKmsOutput()) |output| {
                 try output.completeReadiness(
                     &self.router,
                     &self.root.ring,
@@ -2603,7 +2599,7 @@ pub fn Coordinator(comptime protocol: type) type {
                         }
                         self.session_disable_pending = true;
                         if (self.input != null) try self.processInput();
-                        if (self.output) |output| {
+                        if (self.primaryKmsOutput()) |output| {
                             if (try output.terminalDeviceTeardown()) |action|
                                 try self.consumeRetireAction(action);
                         }
@@ -3336,7 +3332,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 else
                     null;
                 _ = try self.foreign_toplevel_list_adapter.updateParent(entry.protocol_id, parent);
-                const output_id = if (self.output) |output| foreignOutputId(output.outputId()) else null;
+                const output_id = if (self.primaryKmsOutput()) |output|
+                    foreignOutputId(output.outputId())
+                else
+                    null;
                 while (true) {
                     var stale: ?ForeignToplevelListAdapter.OutputId = null;
                     for (try self.foreign_toplevel_list_adapter.outputs(entry.protocol_id)) |published_output| {
@@ -3441,7 +3440,7 @@ pub fn Coordinator(comptime protocol: type) type {
             id: ForeignToplevelListAdapter.OutputId,
         ) ?u32 {
             const self: *Self = @ptrCast(@alignCast(context orelse return null));
-            const output = self.output orelse return null;
+            const output = self.primaryKmsOutput() orelse return null;
             const current = foreignOutputId(output.outputId());
             if (!std.meta.eql(current, id)) return null;
             var resources: [1]u32 = undefined;
@@ -3467,10 +3466,14 @@ pub fn Coordinator(comptime protocol: type) type {
             return &self.physical_outputs[0];
         }
 
+        pub fn primaryKmsOutput(self: *const Self) ?*output_api.Output {
+            return self.primaryPhysicalOutput().kms_output;
+        }
+
         fn syncWorkspace(self: *Self) !void {
             if (!self.workspace_adapter.hasManagers() and
                 self.workspace_adapter.pendingCommands() == 0) return;
-            const output_id: ?WorkspaceAdapter.OutputId = if (self.output) |output|
+            const output_id: ?WorkspaceAdapter.OutputId = if (self.primaryKmsOutput()) |output|
                 workspaceOutputId(output.outputId())
             else
                 null;
@@ -3528,7 +3531,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 return error.InvalidOutput;
             return .{
                 .id = physical.id,
-                .mode = if (self.output == null) .off else .on,
+                .mode = if (self.primaryKmsOutput() == null) .off else .on,
             };
         }
 
@@ -3633,7 +3636,7 @@ pub fn Coordinator(comptime protocol: type) type {
             if (self.output_power_transition != null or
                 self.primaryPhysicalOutput().reconfigure != null) return;
             while (self.output_power_adapter.peekCommand()) |command| {
-                const currently_on = self.output != null;
+                const currently_on = self.primaryKmsOutput() != null;
                 if ((command.mode == .on) == currently_on) {
                     try self.output_power_adapter.completeCommand(command, .succeeded);
                     self.markProtocol(command.peer, ProtocolReady.output_power);
@@ -3702,7 +3705,7 @@ pub fn Coordinator(comptime protocol: type) type {
             id: WorkspaceAdapter.OutputId,
         ) ?wayring.objects.Handle {
             const self: *Self = @ptrCast(@alignCast(context orelse return null));
-            const output = self.output orelse return null;
+            const output = self.primaryKmsOutput() orelse return null;
             if (!std.meta.eql(workspaceOutputId(output.outputId()), id)) return null;
             var resources: [1]u32 = undefined;
             const ids = self.output_adapter.resourceIds(
@@ -3735,7 +3738,7 @@ pub fn Coordinator(comptime protocol: type) type {
             const handle = server_objects.namespace.lookupHandle(object_id) orelse return null;
             const object = server_objects.namespace.resolve(handle) orelse return null;
             _ = self.output_adapter.reference(peer, handle, object.*) catch return null;
-            return if (self.output) |output| output.outputId() else null;
+            return if (self.primaryKmsOutput()) |output| output.outputId() else null;
         }
 
         fn invalidateCaptureSource(self: *Self, target: ImageCaptureSourceAdapter.Target) !void {
@@ -3780,7 +3783,7 @@ pub fn Coordinator(comptime protocol: type) type {
         ) ?ImageCopyCaptureAdapter.Constraints {
             const maybe_constraints: ?ImageCopyCaptureAdapter.Constraints = switch (target) {
                 .source => |source| switch (source) {
-                    .output => |id| if (self.output) |output|
+                    .output => |id| if (self.primaryKmsOutput()) |output|
                         if (std.meta.eql(output.outputId(), id)) .{
                             .width = output.planner.output.width,
                             .height = output.planner.output.height,
@@ -3798,7 +3801,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .cursor => if (self.cursorCaptureState(target)) |state| state.constraints else null,
             };
             var constraints = maybe_constraints orelse return null;
-            constraints.dmabuf_device = if (self.output) |output|
+            constraints.dmabuf_device = if (self.primaryKmsOutput()) |output|
                 output.captureDmabufDevice(.{ .width = constraints.width, .height = constraints.height })
             else
                 null;
@@ -3836,7 +3839,7 @@ pub fn Coordinator(comptime protocol: type) type {
             } else return null;
             if (width == 0 or height == 0) return null;
             const source_region: geometry.Rect = switch (cursor_target.source) {
-                .output => |id| if (self.output) |output|
+                .output => |id| if (self.primaryKmsOutput()) |output|
                     if (std.meta.eql(output.outputId(), id)) self.outputBounds() catch return null else return null
                 else
                     return null,
@@ -4065,7 +4068,7 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn desktopSceneChanged(self: *Self) !void {
             try self.syncIdleNotifications();
-            const output = self.output orelse return;
+            const output = self.primaryKmsOutput() orelse return;
             _ = self.refreshRetainedLayersForOutput();
             output.request(.damage, try monotonicNs()) catch |err| switch (err) {
                 error.OutputPaused => return,
@@ -4233,7 +4236,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.virtual_keyboard_adapter.setInhibited(&self.seat_adapter, false);
                 try self.syncLayerKeyboardFocus();
             }
-            if (self.output) |output| {
+            if (self.primaryKmsOutput()) |output| {
                 output.planner.invalidateAll();
                 output.request(.damage, try monotonicNs()) catch |err| switch (err) {
                     error.OutputPaused => return,
@@ -4606,7 +4609,7 @@ pub fn Coordinator(comptime protocol: type) type {
         ) bool {
             const self: *Self = @ptrCast(@alignCast(context orelse return false));
             _ = self.output_adapter.reference(peer, handle, object) catch return false;
-            return self.output != null;
+            return self.primaryKmsOutput() != null;
         }
 
         fn validateScreencopyBuffer(
@@ -4774,7 +4777,7 @@ pub fn Coordinator(comptime protocol: type) type {
         fn requestCursorRedraw(self: *Self) !void {
             if (!self.cursor_layer.active and self.themed_cursor.image == null and
                 self.themed_cursor_previous == null) return;
-            if (self.output) |output| {
+            if (self.primaryKmsOutput()) |output| {
                 output.request(.damage, try monotonicNs()) catch |err| switch (err) {
                     error.OutputPaused => return,
                     else => return err,
@@ -5331,7 +5334,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn createOutput(self: *Self) !void {
-            if (self.output != null or self.stopping) return;
+            if (self.primaryKmsOutput() != null or self.stopping) return;
             const handle = (self.manager.rescan() catch |err| switch (err) {
                 error.NoConnectedOutput,
                 error.NoCompatibleCrtc,
@@ -5357,7 +5360,7 @@ pub fn Coordinator(comptime protocol: type) type {
         /// topology ownership. Callers decide whether a failed activation is
         /// terminal or should be followed by an exact rollback snapshot.
         fn activateOutput(self: *Self, snapshot: drm.Snapshot, scale_120: u32) !void {
-            if (self.output != null or self.stopping) return error.InvalidState;
+            if (self.primaryKmsOutput() != null or self.stopping) return error.InvalidState;
             const connector = snapshot.selectedConnector();
             const mode_end = try std.math.add(usize, connector.mode_start, connector.mode_count);
             if (mode_end > snapshot.modes.len) return error.InvalidModeInventory;
@@ -5386,7 +5389,7 @@ pub fn Coordinator(comptime protocol: type) type {
             errdefer {
                 if (!output_committed) self.cleanupUnstartedOutput();
             }
-            self.output = if (self.render_device) |render_device|
+            const output = if (self.render_device) |render_device|
                 try output_api.Output.createWithRenderDevice(
                     self.allocator,
                     self.platforms.output,
@@ -5403,17 +5406,17 @@ pub fn Coordinator(comptime protocol: type) type {
                     snapshot,
                     output_config,
                 );
-            self.primaryPhysicalOutputMutable().kms_output = self.output;
+            self.primaryPhysicalOutputMutable().kms_output = output;
             if (self.render_device == null)
-                self.render_device = self.output.?.takeRenderDevice();
+                self.render_device = output.takeRenderDevice();
             try self.ensureDmabuf(snapshot.handle);
             try self.ensureExplicitSync(snapshot.handle);
             try self.ensureDrmLeasing(snapshot);
             try self.ensureGammaOwner(snapshot);
             try self.output_adapter.publishMode(
                 self.primaryPhysicalOutput().protocol_output,
-                self.output.?.planner.output.width,
-                self.output.?.planner.output.height,
+                output.planner.output.width,
+                output.planner.output.height,
                 try std.math.mul(u32, mode.vrefresh, 1000),
                 connector.width_mm,
                 connector.height_mm,
@@ -5434,32 +5437,32 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             try self.desktop.validateWorkArea(work_area);
             try self.interaction.validateBounds(work_area);
-            try self.output.?.prepareReadiness(&self.router, &self.root.ring);
+            try output.prepareReadiness(&self.router, &self.root.ring);
             self.desktop.applyWorkArea(work_area);
             self.interaction.applyBounds(work_area);
             const retained_visibility_changed = self.refreshRetainedLayersForOutput();
             self.primaryPhysicalOutputMutable().drain_started = false;
             const screencopy_stride = try std.math.mul(
                 u32,
-                self.output.?.planner.output.width,
+                output.planner.output.width,
                 4,
             );
             const screencopy_bytes = try std.math.mul(
                 usize,
                 screencopy_stride,
-                self.output.?.planner.output.height,
+                output.planner.output.height,
             );
             self.screencopy_bytes = try self.allocator.realloc(
                 self.screencopy_bytes,
                 screencopy_bytes,
             );
             try self.screencopy_adapter.publishMode(
-                self.output.?.planner.output.width,
-                self.output.?.planner.output.height,
+                output.planner.output.width,
+                output.planner.output.height,
             );
             _ = try self.output_management_adapter.publish(.{
-                .width = @intCast(self.output.?.planner.output.width),
-                .height = @intCast(self.output.?.planner.output.height),
+                .width = @intCast(output.planner.output.width),
+                .height = @intCast(output.planner.output.height),
                 .refresh_millihz = @intCast(try std.math.mul(u32, mode.vrefresh, 1000)),
                 .scale_120 = scale_120,
             });
@@ -5476,7 +5479,7 @@ pub fn Coordinator(comptime protocol: type) type {
             output_committed = true;
             if (self.anyAppLayerActive() or self.cursor_layer.active or
                 retained_visibility_changed or self.sessionLockActive())
-                self.output.?.request(.damage, monotonicNs() catch
+                output.request(.damage, monotonicNs() catch
                     return error.ActivatedOutputFailure) catch
                     return error.ActivatedOutputFailure;
             self.armTimer() catch return error.ActivatedOutputFailure;
@@ -5652,7 +5655,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn applyReady(self: *Self) !void {
-            if (self.output) |output| if (output.in_flight_frame != null) {
+            if (self.primaryKmsOutput()) |output| if (output.in_flight_frame != null) {
                 try self.syncCommitTimer();
                 return;
             };
@@ -5666,12 +5669,13 @@ pub fn Coordinator(comptime protocol: type) type {
                 const before_len = self.pending_surface_len;
                 const pending = self.pending_surfaces[self.pending_surface_head];
                 const applied = try self.applyPendingSurface(pending);
-                if (applied and self.output == null) self.adapter.clearFifoBarriers();
+                if (applied and self.primaryKmsOutput() == null)
+                    self.adapter.clearFifoBarriers();
                 changed = applied or changed;
                 if (self.pending_surface_len == before_len)
                     _ = self.rotatePendingSurface();
             }
-            if (changed) if (self.output) |output| {
+            if (changed) if (self.primaryKmsOutput()) |output| {
                 try output.request(.damage, try monotonicNs());
                 try self.armTimer();
             };
@@ -5800,7 +5804,7 @@ pub fn Coordinator(comptime protocol: type) type {
             const destination_size = content.surface.size;
             if (destination_size.width == 0 or destination_size.height == 0)
                 return error.InvalidDestination;
-            const output_bounds: geometry.Rect = if (self.output != null)
+            const output_bounds: geometry.Rect = if (self.primaryKmsOutput() != null)
                 try self.outputBounds()
             else
                 .{
@@ -5890,7 +5894,7 @@ pub fn Coordinator(comptime protocol: type) type {
                             .external => |external| external,
                             .shm, .single_pixel => unreachable,
                         };
-                        const output = self.output orelse
+                        const output = self.primaryKmsOutput() orelse
                             return try self.discardPendingCandidate(layer, pending.id);
                         imported_source = output.mapClientBuffer(.{
                             .context = external.context,
@@ -6149,7 +6153,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn renderFrame(self: *Self, frame: @import("../output/headless.zig").FrameId) !void {
-            const output = self.output orelse return;
+            const output = self.primaryKmsOutput() orelse return;
             const output_bounds = try self.outputBounds();
             var sample_count: usize = 0;
             if (self.sessionLockActive()) {
@@ -6512,7 +6516,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn processOutput(self: *Self) !void {
-            const output = self.output orelse return;
+            const output = self.primaryKmsOutput() orelse return;
             try output.processKmsEvents(.{
                 .context = self,
                 .presented_fn = presented,
@@ -6562,7 +6566,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (!pending.awaiting_output) try self.finishScreencopy(false, 0, null);
                 return;
             }
-            const output = self.output orelse return;
+            const output = self.primaryKmsOutput() orelse return;
             const pending_capture = self.screencopy_adapter.peekCapture() orelse return;
             const capture = pending_capture.*;
             const server_objects = self.root.runtime.clients.get(capture.peer) catch {
@@ -6609,7 +6613,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (!pending.awaiting_output) try self.finishImageCopy(false, 0, null);
                 return;
             }
-            const output = self.output orelse return;
+            const output = self.primaryKmsOutput() orelse return;
             const capture = self.image_copy_capture_adapter.takeCapture() orelse return;
             const server_objects = self.root.runtime.clients.get(capture.peer) catch {
                 try self.failImageCopy(capture);
@@ -6760,7 +6764,7 @@ pub fn Coordinator(comptime protocol: type) type {
             buffer: *const protocol_linux_dmabuf.Buffer,
         ) !void {
             const self: *Self = @ptrCast(@alignCast(context));
-            const output = self.output orelse return error.RendererUnavailable;
+            const output = self.primaryKmsOutput() orelse return error.RendererUnavailable;
             try output.validateClientBuffer(try dmabufImport(buffer));
         }
 
@@ -6871,7 +6875,7 @@ pub fn Coordinator(comptime protocol: type) type {
             const destination_stride = try std.math.mul(usize, pending.width, 4);
             const required = try std.math.mul(usize, destination_stride, pending.height);
             if (required > access.bytes.len) return error.CaptureCapacityExceeded;
-            const output = self.output orelse return error.OutputUnavailable;
+            const output = self.primaryKmsOutput() orelse return error.OutputUnavailable;
             try copyCaptureRegion(
                 access.bytes[0..required],
                 @intCast(destination_stride),
@@ -6941,7 +6945,7 @@ pub fn Coordinator(comptime protocol: type) type {
             const row_bytes = try std.math.mul(usize, pending.region.width, 4);
             const required = try std.math.mul(usize, row_bytes, pending.region.height);
             if (required > access.bytes.len) return error.CaptureCapacityExceeded;
-            const output = self.output orelse return error.OutputUnavailable;
+            const output = self.primaryKmsOutput() orelse return error.OutputUnavailable;
             try copyCaptureRegion(
                 access.bytes[0..required],
                 @intCast(row_bytes),
@@ -7011,7 +7015,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     if (self.session_lock_adapter.pendingLock()) |lock| {
                         self.session_lock_adapter.publishLocked(lock) catch |err| switch (err) {
                             error.Exhausted => {
-                                if (self.output) |output| {
+                                if (self.primaryKmsOutput()) |output| {
                                     output.request(.damage, try monotonicNs()) catch {};
                                     self.armTimer() catch {};
                                 }
@@ -7022,7 +7026,7 @@ pub fn Coordinator(comptime protocol: type) type {
                         if (peer) |value| self.markProtocol(value, ProtocolReady.session_lock);
                     }
                 } else if (self.sessionLockActive()) {
-                    if (self.output) |output| {
+                    if (self.primaryKmsOutput()) |output| {
                         output.request(.damage, try monotonicNs()) catch {};
                         self.armTimer() catch {};
                     }
@@ -7072,7 +7076,7 @@ pub fn Coordinator(comptime protocol: type) type {
             if (self.cursor_layer.outcome_pending and
                 (!self.cursor_layer.source_release_pending or self.cursor_layer.retains_source))
                 changed = (try self.retryLayerOutcome(&self.cursor_layer)) or changed;
-            if (changed) if (self.output) |output| {
+            if (changed) if (self.primaryKmsOutput()) |output| {
                 try output.request(.damage, try monotonicNs());
                 try self.armTimer();
             };
@@ -7424,7 +7428,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn outputBounds(self: *const Self) !geometry.Rect {
-            if (self.output == null) return error.NoOutput;
+            if (self.primaryKmsOutput() == null) return error.NoOutput;
             const snapshot = try self.output_adapter.logicalSnapshot(
                 self.primaryPhysicalOutput().protocol_output,
             );
@@ -7604,7 +7608,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn armTimer(self: *Self) !void {
-            const output = self.output orelse return;
+            const output = self.primaryKmsOutput() orelse return;
             const now = try monotonicNs();
             const request_value = (try output.timerRequest(now)) orelse return;
             const handle = try self.timers.arm(
@@ -7616,7 +7620,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn pauseOutput(self: *Self) !void {
-            const output = self.output orelse return;
+            const output = self.primaryKmsOutput() orelse return;
             if (!output.accepting_frames) return;
             try self.output_adapter.setAvailable(
                 self.primaryPhysicalOutput().protocol_output,
@@ -7683,7 +7687,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 }
                 _ = input.quiesceComplete();
             }
-            if (self.output) |output| {
+            if (self.primaryKmsOutput()) |output| {
                 const physical = self.primaryPhysicalOutputMutable();
                 if (output.paused and !physical.drain_started) {
                     try output.beginDrain(&self.router, &self.root.ring);
@@ -7697,7 +7701,6 @@ pub fn Coordinator(comptime protocol: type) type {
                     if (self.stopping) self.abandonPending();
                     try self.invalidateCaptureSource(.{ .output = output.outputId() });
                     try output.destroy();
-                    self.output = null;
                     physical.kms_output = null;
                     self.stats.output_drains += 1;
                     if (!self.stopping and self.output_power_transition != null) {
@@ -7727,7 +7730,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     }
                 }
             }
-            if (self.output == null and self.drm_remove_pending) {
+            if (self.primaryKmsOutput() == null and self.drm_remove_pending) {
                 try self.advanceDrmLeaseGlobal();
                 if (self.drm_lease_global_update == .none and
                     !self.drm_lease_adapter.installed() and
@@ -7738,16 +7741,18 @@ pub fn Coordinator(comptime protocol: type) type {
                     self.drm_remove_pending = false;
                 }
             }
-            if (self.output == null and self.stopping) self.abandonPending();
+            if (self.primaryKmsOutput() == null and self.stopping) self.abandonPending();
             const input_quiescent = self.input == null or
                 self.input.?.state == .suspended or self.input.?.state == .draining;
-            if (self.output == null and input_quiescent and self.session_disable_pending) {
+            if (self.primaryKmsOutput() == null and input_quiescent and
+                self.session_disable_pending)
+            {
                 if (self.session.state == .disabling)
                     try self.session.acknowledgeDisable(true);
                 self.session_disable_pending = false;
             }
             const input_drained = self.input == null or self.input.?.drainComplete();
-            if (self.output == null and input_drained and self.stopping and
+            if (self.primaryKmsOutput() == null and input_drained and self.stopping and
                 self.session.state != .draining)
                 try self.session.beginDrain(&self.router, &self.root.ring);
         }
@@ -7771,7 +7776,6 @@ pub fn Coordinator(comptime protocol: type) type {
 
             try self.invalidateCaptureSource(.{ .output = old_output.outputId() });
             try old_output.destroy();
-            self.output = null;
             physical.kms_output = null;
             self.stats.output_drains += 1;
 
@@ -7861,14 +7865,14 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             self.removed_layers[self.removed_layer_len] = .{ .id = id, .state = state };
             self.removed_layer_len += 1;
-            if (self.output) |output| {
+            if (self.primaryKmsOutput()) |output| {
                 output.request(.damage, monotonicNs() catch return) catch return;
                 self.armTimer() catch {};
             }
         }
 
         fn cleanupUnstartedOutput(self: *Self) void {
-            const output = self.output orelse return;
+            const output = self.primaryKmsOutput() orelse return;
             self.output_adapter.setAvailable(
                 self.primaryPhysicalOutput().protocol_output,
                 false,
@@ -7893,7 +7897,6 @@ pub fn Coordinator(comptime protocol: type) type {
                 _ = self.image_capture_source_adapter.invalidate(.{ .output = output.outputId() });
             };
             output.destroy() catch {};
-            self.output = null;
             self.primaryPhysicalOutputMutable().kms_output = null;
         }
 
@@ -8017,11 +8020,11 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.image_capture_source_adapter.resourceRemoved(handle, object);
             _ = self.text_input_adapter.resourceRemoved(handle, object);
             _ = self.subcompositor_adapter.resourceRemoved(handle, object);
-            if (layer_shell_removed and self.output != null) {
+            if (layer_shell_removed and self.primaryKmsOutput() != null) {
                 self.desktop.applyWorkArea(self.layerWorkArea(null) catch self.outputBounds() catch unreachable);
                 self.syncLayerPopupRoots() catch {};
                 self.syncLayerKeyboardFocus() catch {};
-                self.output.?.request(.damage, monotonicNs() catch 0) catch {};
+                self.primaryKmsOutput().?.request(.damage, monotonicNs() catch 0) catch {};
             }
             if (session_lock_removed) self.sessionLockChanged() catch {};
             if (idle_inhibit_removed or idle_notify_removed) self.syncIdleNotifications() catch {};
@@ -8063,10 +8066,12 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.interaction.surfaceDestroyed(id);
                 for (self.app_layers) |*layer|
                     if (layer.id != null and std.meta.eql(layer.id.?, id) and
-                        (self.output == null or self.output.?.in_flight_frame == null))
+                        (self.primaryKmsOutput() == null or
+                            self.primaryKmsOutput().?.in_flight_frame == null))
                         self.discardUnpresentedLayer(layer);
                 if (self.cursor_layer.id != null and std.meta.eql(self.cursor_layer.id.?, id) and
-                    (self.output == null or self.output.?.in_flight_frame == null))
+                    (self.primaryKmsOutput() == null or
+                        self.primaryKmsOutput().?.in_flight_frame == null))
                     self.discardUnpresentedLayer(&self.cursor_layer);
             }
             _ = self.adapter.resourceRemoved(handle, object);

@@ -135,7 +135,7 @@ test "physical DRM lease resolver grants the independent secondary tuple" {
     _ = try loop.turn(coordinator);
     try fixture.signalSession(.enable);
     for (0..32) |_| {
-        if (coordinator.output != null) break;
+        if (coordinator.primaryKmsOutput() != null) break;
         if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
         _ = try loop.turn(coordinator);
     }
@@ -243,7 +243,7 @@ test "generated client leases, withdraws, and rediscovers a secondary connector"
             handler.release_flushed = true;
         }
         _ = try loop.turn(coordinator);
-        if (coordinator.output == null and handler.withdrawn == 2 and
+        if (coordinator.primaryKmsOutput() == null and handler.withdrawn == 2 and
             handler.released == 1 and handler.global_removes == 1) break;
         if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
             try waitForEither(&root.ring, reactor.ring);
@@ -268,7 +268,7 @@ test "generated client leases, withdraws, and rediscovers a secondary connector"
     try std.testing.expectEqual(@as(usize, 2), handler.globals);
     try std.testing.expectEqual(@as(usize, 3), handler.connector_done_count);
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
-    try std.testing.expect(coordinator.output != null);
+    try std.testing.expect(coordinator.primaryKmsOutput() != null);
 
     _ = try client.prepareClose();
     _ = try driver.schedule();
@@ -381,11 +381,11 @@ test "generated output management test succeeds and unsupported apply is non-mut
     try fixture.signalSession(.enable);
     for (0..128) |_| {
         _ = try loop.turn(coordinator);
-        if (coordinator.output != null) break;
+        if (coordinator.primaryKmsOutput() != null) break;
         if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
     }
-    try std.testing.expect(coordinator.output != null);
-    const output_id = coordinator.output.?.outputId();
+    try std.testing.expect(coordinator.primaryKmsOutput() != null);
+    const output_id = coordinator.primaryKmsOutput().?.outputId();
 
     var reactor: wayring.io_uring.Reactor = undefined;
     try reactor.initOwned(allocator, .{ .entries = 16, .flags = 0 }, clientReactorConfig());
@@ -416,7 +416,7 @@ test "generated output management test succeeds and unsupported apply is non-mut
     try std.testing.expectEqual(@as(usize, 1), handler.failed);
     try std.testing.expectEqual(@as(usize, 0), handler.cancelled);
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
-    try std.testing.expectEqual(output_id, coordinator.output.?.outputId());
+    try std.testing.expectEqual(output_id, coordinator.primaryKmsOutput().?.outputId());
     try std.testing.expectEqual(@as(usize, 1), coordinator.stats.selected_outputs);
     try std.testing.expectEqual(@as(usize, 0), coordinator.stats.output_drains);
     try std.testing.expectEqual(@as(i32, 3), coordinator.output_management_adapter.lifecycle.current.width);
@@ -459,11 +459,11 @@ test "generated output power client drains and recreates the physical output" {
     try fixture.signalSession(.enable);
     for (0..128) |_| {
         _ = try loop.turn(coordinator);
-        if (coordinator.output != null) break;
+        if (coordinator.primaryKmsOutput() != null) break;
         if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
     }
-    try std.testing.expect(coordinator.output != null);
-    const initial_output = coordinator.output.?.outputId();
+    try std.testing.expect(coordinator.primaryKmsOutput() != null);
+    const initial_output = coordinator.primaryKmsOutput().?.outputId();
 
     var reactor: wayring.io_uring.Reactor = undefined;
     try reactor.initOwned(allocator, .{ .entries = 16, .flags = 0 }, clientReactorConfig());
@@ -497,8 +497,10 @@ test "generated output power client drains and recreates the physical output" {
     }, &handler.modes);
     try std.testing.expectEqual(@as(usize, 0), handler.failed);
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
-    try std.testing.expect(coordinator.output != null);
-    try std.testing.expect(!std.meta.eql(initial_output, coordinator.output.?.outputId()));
+    try std.testing.expect(coordinator.primaryKmsOutput() != null);
+    try std.testing.expect(
+        !std.meta.eql(initial_output, coordinator.primaryKmsOutput().?.outputId()),
+    );
     try std.testing.expectEqual(@as(usize, 2), coordinator.stats.selected_outputs);
     try std.testing.expectEqual(@as(usize, 1), coordinator.stats.output_drains);
 
@@ -539,7 +541,7 @@ test "generated gamma control applies exact ramps and restores on reuse" {
     try fixture.signalSession(.enable);
     for (0..128) |_| {
         _ = try loop.turn(coordinator);
-        if (coordinator.output != null) break;
+        if (coordinator.primaryKmsOutput() != null) break;
         if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
     }
 
@@ -635,7 +637,7 @@ test "no discovered DRM card fails startup and drains honestly" {
     try fixture.signalSession(.enable);
     try waitReady(&root.ring);
     try std.testing.expectError(error.DrmHardwareUnavailable, loop.turn(coordinator));
-    try std.testing.expect(coordinator.output == null);
+    try std.testing.expect(coordinator.primaryKmsOutput() == null);
     try std.testing.expectEqual(@as(usize, 0), fixture.device_closes);
 
     try coordinator.requestStop();
@@ -689,7 +691,7 @@ test "output readiness exhaustion destroys output and releases device" {
     try fixture.signalSession(.enable);
     try waitReady(&root.ring);
     try std.testing.expectError(error.Exhausted, loop.turn(coordinator));
-    try std.testing.expect(coordinator.output == null);
+    try std.testing.expect(coordinator.primaryKmsOutput() == null);
     try std.testing.expectEqual(initial_area, coordinator.desktop.workArea());
     try std.testing.expectEqual(initial_pointer, coordinator.interaction.pointerPosition());
     try std.testing.expectEqual(initial_commands, coordinator.desktop.pendingCommands());
@@ -765,7 +767,7 @@ fn runVertical(trigger: TerminalTrigger, source: ClientSource) !void {
             cursor_assigned = true;
         };
         if (coordinator.stats.submitted == 1 and !observed_identity) {
-            first_frame = coordinator.output.?.currentFrameId().?;
+            first_frame = coordinator.primaryKmsOutput().?.currentFrameId().?;
             const sample = coordinator.cursor_layer.sample.?;
             const binding = coordinator.cursor_layer.binding.?;
             try std.testing.expectEqual(binding.sample, sample.sample);
@@ -809,12 +811,21 @@ fn runVertical(trigger: TerminalTrigger, source: ClientSource) !void {
         // have all been released by the first completed presentation.
         try std.testing.expectEqual(@as(usize, 3), fixture.unmaps);
     }
-    try std.testing.expectEqual(@as(u32, 10), coordinator.output.?.kms_output.connector.id);
-    try std.testing.expectEqual(@as(u32, 30), coordinator.output.?.kms_output.crtc.id);
-    try std.testing.expectEqual(@as(u32, 40), coordinator.output.?.kms_output.plane.id);
+    try std.testing.expectEqual(
+        @as(u32, 10),
+        coordinator.primaryKmsOutput().?.kms_output.connector.id,
+    );
+    try std.testing.expectEqual(
+        @as(u32, 30),
+        coordinator.primaryKmsOutput().?.kms_output.crtc.id,
+    );
+    try std.testing.expectEqual(
+        @as(u32, 40),
+        coordinator.primaryKmsOutput().?.kms_output.plane.id,
+    );
     try std.testing.expectEqual(@as(usize, 1), coordinator.physical_output_count);
     const physical = coordinator.physical_outputs[0];
-    try std.testing.expectEqual(coordinator.output, physical.kms_output);
+    try std.testing.expectEqual(coordinator.primaryKmsOutput(), physical.kms_output);
     try std.testing.expectEqual(
         @as(u32, 10),
         (try coordinator.manager.claimSnapshot(physical.claim.?)).selectedConnector().id,
@@ -895,11 +906,12 @@ fn runVertical(trigger: TerminalTrigger, source: ClientSource) !void {
         // device before libseat acknowledgement. The client remains connected.
         try fixture.signalSession(.disable);
         for (0..128) |_| {
-            if (coordinator.output == null and coordinator.session.state == .disabled) break;
+            if (coordinator.primaryKmsOutput() == null and
+                coordinator.session.state == .disabled) break;
             if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
             _ = try loop.turn(coordinator);
         }
-        try std.testing.expect(coordinator.output == null);
+        try std.testing.expect(coordinator.primaryKmsOutput() == null);
         try std.testing.expect(coordinator.physical_outputs[0].kms_output == null);
         try std.testing.expect(coordinator.physical_outputs[0].claim == null);
         try std.testing.expectEqual(ouro.session.State.disabled, coordinator.session.state);
@@ -908,11 +920,11 @@ fn runVertical(trigger: TerminalTrigger, source: ClientSource) !void {
 
         try fixture.signalSession(.enable);
         for (0..128) |_| {
-            if (coordinator.output != null) break;
+            if (coordinator.primaryKmsOutput() != null) break;
             if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
             _ = try loop.turn(coordinator);
         }
-        const replacement = coordinator.output orelse return error.OutputNotRecreated;
+        const replacement = coordinator.primaryKmsOutput() orelse return error.OutputNotRecreated;
         try std.testing.expectEqual(@as(usize, 2), coordinator.stats.selected_outputs);
         try std.testing.expect(replacement.outputId().generation != first_frame.?.output.generation);
         for (0..128) |_| {

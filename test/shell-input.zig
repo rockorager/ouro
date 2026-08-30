@@ -597,11 +597,11 @@ test "shell-input: generated workspace client observes and activates the fixed w
     for (0..256) |_| {
         _ = try drainClient(&reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
-        if (coordinator.output == null and handler.output_leave == 1 and
+        if (coordinator.primaryKmsOutput() == null and handler.output_leave == 1 and
             handler.output_done == output_done_before_disable + 1) break;
         _ = linux.sched_yield();
     }
-    try std.testing.expect(coordinator.output == null);
+    try std.testing.expect(coordinator.primaryKmsOutput() == null);
     try std.testing.expectEqual(@as(usize, 1), handler.output_leave);
     try std.testing.expectEqual(output_done_before_disable + 1, handler.output_done);
 
@@ -1627,7 +1627,7 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
         {
             const app = coordinator.app_layers[0].sample.?;
             const cursor = coordinator.cursor_layer.sample.?;
-            const submitted = coordinator.output.?.sample_storage[0..2];
+            const submitted = coordinator.primaryKmsOutput().?.sample_storage[0..2];
             try std.testing.expectEqual(coordinator.app_layers[0].binding.?.surface, submitted[0].surface);
             try std.testing.expectEqual(app.sample, coordinator.app_layers[0].binding.?.sample);
             try std.testing.expectEqual(app.presentation, submitted[0].presentation);
@@ -1660,7 +1660,7 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
         {
             const app = coordinator.app_layers[0].sample.?;
             const cursor = coordinator.cursor_layer.sample.?;
-            const submitted = coordinator.output.?.sample_storage[0..2];
+            const submitted = coordinator.primaryKmsOutput().?.sample_storage[0..2];
             try std.testing.expectEqual(coordinator.app_layers[0].binding.?.surface, submitted[0].surface);
             try std.testing.expectEqual(app.presentation, submitted[0].presentation);
             try std.testing.expectEqual(coordinator.cursor_layer.binding.?.surface, submitted[1].surface);
@@ -1799,17 +1799,17 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
 
     const retained_app = coordinator.app_layers[0].sample.?;
     const retained_cursor = coordinator.cursor_layer.sample.?;
-    const first_output_generation = coordinator.output.?.outputId().generation;
+    const first_output_generation = coordinator.primaryKmsOutput().?.outputId().generation;
     try fixture.signalSession(.disable);
     for (0..128) |_| {
         client_progress = try drainClient(&client_reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
-        if (coordinator.output == null and coordinator.session.state == .disabled and
+        if (coordinator.primaryKmsOutput() == null and coordinator.session.state == .disabled and
             handler.output_leave == 2) break;
         if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
             try waitForEither(&root.ring, client_reactor.ring);
     }
-    try std.testing.expect(coordinator.output == null);
+    try std.testing.expect(coordinator.primaryKmsOutput() == null);
     try std.testing.expectEqual(@as(usize, 2), handler.output_leave);
     try std.testing.expect(coordinator.app_layers[0].active);
     try std.testing.expect(coordinator.cursor_layer.active);
@@ -1827,7 +1827,9 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     try std.testing.expect(coordinator.stats.submitted >= submitted_before_disable);
     try std.testing.expect(coordinator.stats.submitted <= submitted_before_disable + 1);
     try std.testing.expectEqual(presented_before_disable + 1, coordinator.stats.presented);
-    try std.testing.expect(coordinator.output.?.outputId().generation != first_output_generation);
+    try std.testing.expect(
+        coordinator.primaryKmsOutput().?.outputId().generation != first_output_generation,
+    );
     try std.testing.expectEqual(retained_app.sample, coordinator.app_layers[0].sample.?.sample);
     try std.testing.expectEqual(retained_cursor.sample, coordinator.cursor_layer.sample.?.sample);
     try std.testing.expectEqual(@as(usize, 4), handler.output_enter);
@@ -2285,7 +2287,7 @@ test "shell-input: two mapped toplevels sustain independent commit cycles" {
                 active += 1;
             };
             try std.testing.expectEqual(@as(usize, 2), active);
-            const submitted = coordinator.output.?.sample_storage[0..2];
+            const submitted = coordinator.primaryKmsOutput().?.sample_storage[0..2];
             try std.testing.expect(!std.meta.eql(submitted[0].surface, submitted[1].surface));
             const windows = try coordinator.desktop.sceneSnapshot(coordinator.scene_windows);
             const first = findLayer(coordinator.app_layers, windows[0].surface) orelse
@@ -2523,7 +2525,7 @@ test "shell-input: layer surface adopts and presents an xdg popup" {
                 handler.popup_surface.?.id,
                 (try coordinator.adapter.surfaceHandle(popups[0].surface)).id,
             );
-            const submitted = coordinator.output.?.sample_storage[0..2];
+            const submitted = coordinator.primaryKmsOutput().?.sample_storage[0..2];
             const layer = findLayer(coordinator.app_layers, layer_state.surface) orelse
                 return error.MissingLayerSurface;
             const popup = findLayer(coordinator.app_layers, popups[0].surface) orelse
@@ -2852,7 +2854,7 @@ test "shell-input: synchronized subsurface publishes with parent and receives po
                 return error.MissingRootLayer;
             const child_layer = findLayer(coordinator.app_layers, child_id) orelse
                 return error.MissingChildLayer;
-            const submitted = coordinator.output.?.sample_storage[0..2];
+            const submitted = coordinator.primaryKmsOutput().?.sample_storage[0..2];
             try std.testing.expectEqual(root_layer.binding.?.surface, submitted[0].surface);
             try std.testing.expectEqual(child_layer.binding.?.surface, submitted[1].surface);
             try std.testing.expectEqual(@as(i32, 1), child_layer.sample.?.destination.x);
