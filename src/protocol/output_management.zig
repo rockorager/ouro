@@ -589,12 +589,19 @@ pub fn Adapter(comptime protocol: type) type {
 pub const Operation = enum { apply, @"test" };
 pub const Completion = enum { succeeded, failed, cancelled };
 pub const ConfigurationId = packed struct { index: u32, generation: u32 };
+pub const HeadId = packed struct { index: u32, generation: u32 };
+
+pub const DesiredHead = struct {
+    id: HeadId,
+    state: HeadState,
+};
 
 pub const Command = struct {
     id: ConfigurationId,
     operation: Operation,
     serial: u32,
     desired: HeadState,
+    heads: []const DesiredHead,
 };
 
 const Configuration = struct {
@@ -604,6 +611,13 @@ const Configuration = struct {
     covered: bool = false,
     submitted: bool = false,
     pending: bool = false,
+    heads: std.ArrayListUnmanaged(ConfigHead) = .empty,
+};
+
+const ConfigHead = struct {
+    id: HeadId,
+    desired: HeadState,
+    covered: bool = false,
     mode_set: bool = false,
     position_set: bool = false,
     transform_set: bool = false,
@@ -611,88 +625,178 @@ const Configuration = struct {
     adaptive_sync_set: bool = false,
 };
 
+const LifecycleHead = struct { header: slot_pool.Header = .{}, current: HeadState = undefined };
+
 /// Request lifecycle shared by the eventual Wayring transport adapter. Object
 /// contexts are allocated separately and therefore remain stable as it grows.
 pub const Lifecycle = struct {
     allocator: std.mem.Allocator,
     configurations: slot_pool.Pool(Configuration),
+    heads: slot_pool.Pool(LifecycleHead),
     commands: std.ArrayListUnmanaged(Command) = .empty,
     command_head: usize = 0,
     serial: u32,
     current: HeadState,
+    primary: HeadId,
 
     pub fn init(allocator: std.mem.Allocator, initial_capacity: usize, serial: u32, current: HeadState) !Lifecycle {
         if (serial == 0) return error.InvalidSerial;
-        return .{ .allocator = allocator, .configurations = try .init(allocator, initial_capacity), .serial = serial, .current = current };
+        var configurations = try slot_pool.Pool(Configuration).init(allocator, initial_capacity);
+        errdefer configurations.deinit();
+        var heads = try slot_pool.Pool(LifecycleHead).init(allocator, 1);
+        errdefer heads.deinit();
+        const head = try heads.acquire();
+        head.current = current;
+        return .{ .allocator = allocator, .configurations = configurations, .heads = heads, .serial = serial, .current = current, .primary = .{ .index = head.header.index, .generation = head.header.generation } };
     }
     pub fn deinit(self: *Lifecycle) void {
+        for (self.commands.items) |command| self.allocator.free(command.heads);
         self.commands.deinit(self.allocator);
+        for (self.configurations.entries.items) |c| c.heads.deinit(self.allocator);
         self.configurations.deinit();
+        self.heads.deinit();
         self.* = undefined;
     }
     pub fn create(self: *Lifecycle, serial: u32) !ConfigurationId {
         const c = try self.configurations.acquire();
+        errdefer self.configurations.release(c);
         c.serial = serial;
         c.desired = self.current;
+        c.heads.clearRetainingCapacity();
+        errdefer c.heads.deinit(self.allocator);
+        for (self.heads.entries.items) |head| if (head.header.active) try c.heads.append(self.allocator, .{
+            .id = .{ .index = head.header.index, .generation = head.header.generation },
+            .desired = head.current,
+        });
         return .{ .index = c.header.index, .generation = c.header.generation };
     }
+    pub fn addHead(self: *Lifecycle, state: HeadState) !HeadId {
+        for (self.configurations.entries.items) |c|
+            if (c.header.active and !c.submitted)
+                try c.heads.ensureUnusedCapacity(self.allocator, 1);
+        const head = try self.heads.acquire();
+        head.current = state;
+        const id: HeadId = .{ .index = head.header.index, .generation = head.header.generation };
+        for (self.configurations.entries.items) |c|
+            if (c.header.active and !c.submitted)
+                c.heads.appendAssumeCapacity(.{ .id = id, .desired = state });
+        return id;
+    }
+    pub fn removeHead(self: *Lifecycle, id: HeadId) !void {
+        if (std.meta.eql(id, self.primary)) return error.PrimaryHead;
+        const head = try self.getHead(id);
+        self.heads.release(head);
+        for (self.configurations.entries.items) |c| if (c.header.active and !c.submitted) {
+            for (c.heads.items, 0..) |configured, i| if (std.meta.eql(configured.id, id)) {
+                _ = c.heads.orderedRemove(i);
+                break;
+            };
+        };
+    }
+    pub fn currentHead(self: *Lifecycle, id: HeadId) !HeadState {
+        return (try self.getHead(id)).current;
+    }
     pub fn enable(self: *Lifecycle, id: ConfigurationId) !void {
+        return self.enableHead(id, self.primary);
+    }
+    pub fn enableHead(self: *Lifecycle, id: ConfigurationId, head: HeadId) !void {
         const c = try self.get(id);
-        if (c.covered) return error.AlreadyConfiguredHead;
-        c.covered = true;
-        c.desired.enabled = true;
+        const h = try self.configHead(c, head);
+        if (h.covered) return error.AlreadyConfiguredHead;
+        h.covered = true;
+        h.desired.enabled = true;
+        if (std.meta.eql(head, self.primary)) {
+            c.covered = true;
+            c.desired = h.desired;
+        }
     }
     pub fn disable(self: *Lifecycle, id: ConfigurationId) !void {
+        return self.disableHead(id, self.primary);
+    }
+    pub fn disableHead(self: *Lifecycle, id: ConfigurationId, head: HeadId) !void {
         const c = try self.get(id);
-        if (c.covered) return error.AlreadyConfiguredHead;
-        c.covered = true;
-        c.desired.enabled = false;
+        const h = try self.configHead(c, head);
+        if (h.covered) return error.AlreadyConfiguredHead;
+        h.covered = true;
+        h.desired.enabled = false;
+        if (std.meta.eql(head, self.primary)) {
+            c.covered = true;
+            c.desired = h.desired;
+        }
     }
     pub fn setMode(self: *Lifecycle, id: ConfigurationId, width: i32, height: i32, refresh: i32) !void {
-        const c = try self.mutableHead(id);
-        if (c.mode_set) return error.AlreadySet;
+        return self.setHeadMode(id, self.primary, width, height, refresh);
+    }
+    pub fn setHeadMode(self: *Lifecycle, id: ConfigurationId, head: HeadId, width: i32, height: i32, refresh: i32) !void {
+        const c = try self.get(id);
+        const h = try self.mutableHead(c, head);
+        if (h.mode_set) return error.AlreadySet;
         if (width <= 0 or height <= 0 or refresh <= 0) return error.InvalidMode;
-        c.mode_set = true;
-        c.desired.width = width;
-        c.desired.height = height;
-        c.desired.refresh_millihz = refresh;
+        h.mode_set = true;
+        h.desired.width = width;
+        h.desired.height = height;
+        h.desired.refresh_millihz = refresh;
+        self.updatePrimaryDesired(c, head, h.desired);
     }
     pub fn setPosition(self: *Lifecycle, id: ConfigurationId, x: i32, y: i32) !void {
-        const c = try self.mutableHead(id);
-        if (c.position_set) return error.AlreadySet;
-        c.position_set = true;
-        c.desired.x = x;
-        c.desired.y = y;
+        return self.setHeadPosition(id, self.primary, x, y);
+    }
+    pub fn setHeadPosition(self: *Lifecycle, id: ConfigurationId, head: HeadId, x: i32, y: i32) !void {
+        const c = try self.get(id);
+        const h = try self.mutableHead(c, head);
+        if (h.position_set) return error.AlreadySet;
+        h.position_set = true;
+        h.desired.x = x;
+        h.desired.y = y;
+        self.updatePrimaryDesired(c, head, h.desired);
     }
     pub fn setTransform(self: *Lifecycle, id: ConfigurationId, value: i32) !void {
-        const c = try self.mutableHead(id);
-        if (c.transform_set) return error.AlreadySet;
+        return self.setHeadTransform(id, self.primary, value);
+    }
+    pub fn setHeadTransform(self: *Lifecycle, id: ConfigurationId, head: HeadId, value: i32) !void {
+        const c = try self.get(id);
+        const h = try self.mutableHead(c, head);
+        if (h.transform_set) return error.AlreadySet;
         if (value < 0 or value > 7) return error.InvalidTransform;
-        c.transform_set = true;
-        c.desired.transform = value;
+        h.transform_set = true;
+        h.desired.transform = value;
+        self.updatePrimaryDesired(c, head, h.desired);
     }
     pub fn setScale120(self: *Lifecycle, id: ConfigurationId, value: u32) !void {
-        const c = try self.mutableHead(id);
-        if (c.scale_set) return error.AlreadySet;
+        return self.setHeadScale120(id, self.primary, value);
+    }
+    pub fn setHeadScale120(self: *Lifecycle, id: ConfigurationId, head: HeadId, value: u32) !void {
+        const c = try self.get(id);
+        const h = try self.mutableHead(c, head);
+        if (h.scale_set) return error.AlreadySet;
         if (value == 0) return error.InvalidScale;
-        c.scale_set = true;
-        c.desired.scale_120 = value;
+        h.scale_set = true;
+        h.desired.scale_120 = value;
+        self.updatePrimaryDesired(c, head, h.desired);
     }
     pub fn setAdaptiveSync(self: *Lifecycle, id: ConfigurationId, value: bool) !void {
-        const c = try self.mutableHead(id);
-        if (c.adaptive_sync_set) return error.AlreadySet;
-        c.adaptive_sync_set = true;
-        c.desired.adaptive_sync = value;
+        return self.setHeadAdaptiveSync(id, self.primary, value);
+    }
+    pub fn setHeadAdaptiveSync(self: *Lifecycle, id: ConfigurationId, head: HeadId, value: bool) !void {
+        const c = try self.get(id);
+        const h = try self.mutableHead(c, head);
+        if (h.adaptive_sync_set) return error.AlreadySet;
+        h.adaptive_sync_set = true;
+        h.desired.adaptive_sync = value;
+        self.updatePrimaryDesired(c, head, h.desired);
     }
     pub fn submit(self: *Lifecycle, id: ConfigurationId, operation: Operation) !?Command {
         const c = try self.get(id);
         if (c.submitted) return error.AlreadyUsed;
-        if (!c.covered) return error.UnconfiguredHead;
+        for (c.heads.items) |head| if (!head.covered) return error.UnconfiguredHead;
         if (c.serial != self.serial) {
             c.submitted = true;
             return null; // transport emits cancelled directly
         }
-        const command: Command = .{ .id = id, .operation = operation, .serial = c.serial, .desired = c.desired };
+        const desired = try self.allocator.alloc(DesiredHead, c.heads.items.len);
+        errdefer self.allocator.free(desired);
+        for (c.heads.items, desired) |head, *out| out.* = .{ .id = head.id, .state = head.desired };
+        const command: Command = .{ .id = id, .operation = operation, .serial = c.serial, .desired = c.desired, .heads = desired };
         try self.commands.append(self.allocator, command);
         c.submitted = true;
         c.pending = true;
@@ -708,8 +812,15 @@ pub const Lifecycle = struct {
         if (!c.pending) return error.NoPendingCommand;
         c.pending = false;
         self.command_head += 1;
-        if (result == .succeeded and command.operation == .apply) self.current = command.desired;
+        if (result == .succeeded and command.operation == .apply) {
+            for (command.heads) |desired| {
+                const head = self.getHead(desired.id) catch continue;
+                head.current = desired.state;
+            }
+            self.current = (try self.getHead(self.primary)).current;
+        }
         if (self.command_head == self.commands.items.len) {
+            for (self.commands.items) |queued| self.allocator.free(queued.heads);
             self.commands.clearRetainingCapacity();
             self.command_head = 0;
         }
@@ -718,23 +829,41 @@ pub const Lifecycle = struct {
     pub fn destroy(self: *Lifecycle, id: ConfigurationId) !void {
         const c = try self.get(id);
         if (c.pending) return error.CommandPending;
+        c.heads.deinit(self.allocator);
         self.configurations.release(c);
     }
     pub fn disconnect(self: *Lifecycle) void {
+        for (self.commands.items) |command| self.allocator.free(command.heads);
         self.commands.clearRetainingCapacity();
         self.command_head = 0;
-        for (self.configurations.entries.items) |c| if (c.header.active) self.configurations.release(c);
+        for (self.configurations.entries.items) |c| if (c.header.active) {
+            c.heads.deinit(self.allocator);
+            self.configurations.release(c);
+        };
     }
-    fn mutableHead(self: *Lifecycle, id: ConfigurationId) !*Configuration {
-        const c = try self.get(id);
+    fn mutableHead(self: *Lifecycle, c: *Configuration, head: HeadId) !*ConfigHead {
         if (c.submitted) return error.AlreadyUsed;
-        if (!c.covered or !c.desired.enabled) return error.HeadNotEnabled;
-        return c;
+        const configured = try self.configHead(c, head);
+        if (!configured.covered or !configured.desired.enabled) return error.HeadNotEnabled;
+        return configured;
+    }
+    fn updatePrimaryDesired(self: *Lifecycle, c: *Configuration, head: HeadId, state: HeadState) void {
+        if (std.meta.eql(head, self.primary)) c.desired = state;
     }
     fn get(self: *Lifecycle, id: ConfigurationId) !*Configuration {
         const c = self.configurations.at(id.index) orelse return error.InvalidConfiguration;
         if (c.header.generation != id.generation) return error.InvalidConfiguration;
         return c;
+    }
+    fn getHead(self: *Lifecycle, id: HeadId) !*LifecycleHead {
+        const head = self.heads.at(id.index) orelse return error.InvalidHead;
+        if (head.header.generation != id.generation) return error.InvalidHead;
+        return head;
+    }
+    fn configHead(self: *Lifecycle, c: *Configuration, id: HeadId) !*ConfigHead {
+        _ = try self.getHead(id);
+        for (c.heads.items) |*head| if (std.meta.eql(head.id, id)) return head;
+        return error.InvalidHead;
     }
 };
 
@@ -764,6 +893,78 @@ test "configuration coverage stale cancellation one shot and FIFO completion" {
     l.disconnect();
     try std.testing.expect(l.peek() == null);
     try std.testing.expectError(error.InvalidConfiguration, l.enable(reused));
+}
+
+test "configuration covers and atomically applies every exact head" {
+    const primary_state: HeadState = .{
+        .width = 1920,
+        .height = 1080,
+        .refresh_millihz = 60000,
+    };
+    const secondary_state: HeadState = .{
+        .width = 1280,
+        .height = 720,
+        .refresh_millihz = 60000,
+        .x = 1920,
+    };
+    var lifecycle = try Lifecycle.init(std.testing.allocator, 2, 9, primary_state);
+    defer lifecycle.deinit();
+    const secondary = try lifecycle.addHead(secondary_state);
+    const configuration = try lifecycle.create(9);
+
+    try lifecycle.enable(configuration);
+    try lifecycle.setPosition(configuration, -1920, 0);
+    try std.testing.expectError(error.UnconfiguredHead, lifecycle.submit(configuration, .apply));
+    try lifecycle.enableHead(configuration, secondary);
+    try std.testing.expectError(
+        error.AlreadyConfiguredHead,
+        lifecycle.disableHead(configuration, secondary),
+    );
+    try lifecycle.setHeadPosition(configuration, secondary, 0, 240);
+    const command = (try lifecycle.submit(configuration, .apply)).?;
+    try std.testing.expectEqual(@as(usize, 2), command.heads.len);
+    try std.testing.expectEqual(@as(i32, -1920), command.heads[0].state.x);
+    try std.testing.expectEqual(@as(i32, 240), command.heads[1].state.y);
+    try std.testing.expectEqual(primary_state, try lifecycle.currentHead(lifecycle.primary));
+    try std.testing.expectEqual(secondary_state, try lifecycle.currentHead(secondary));
+
+    _ = try lifecycle.complete(configuration, .succeeded);
+    try std.testing.expectEqual(@as(i32, -1920), (try lifecycle.currentHead(lifecycle.primary)).x);
+    try std.testing.expectEqual(@as(i32, 240), (try lifecycle.currentHead(secondary)).y);
+}
+
+test "head removal cannot let a stale identity cover its recycled slot" {
+    var lifecycle = try Lifecycle.init(std.testing.allocator, 1, 3, .{
+        .width = 800,
+        .height = 600,
+        .refresh_millihz = 60000,
+    });
+    defer lifecycle.deinit();
+    const removed = try lifecycle.addHead(.{
+        .width = 1024,
+        .height = 768,
+        .refresh_millihz = 60000,
+        .x = 800,
+    });
+    const configuration = try lifecycle.create(3);
+    try lifecycle.removeHead(removed);
+    const recycled = try lifecycle.addHead(.{
+        .width = 1280,
+        .height = 720,
+        .refresh_millihz = 60000,
+        .x = 800,
+    });
+    try std.testing.expectEqual(removed.index, recycled.index);
+    try std.testing.expect(removed.generation != recycled.generation);
+    try std.testing.expectError(error.InvalidHead, lifecycle.enableHead(configuration, removed));
+
+    try lifecycle.enable(configuration);
+    try std.testing.expectError(error.UnconfiguredHead, lifecycle.submit(configuration, .@"test"));
+    try lifecycle.disableHead(configuration, recycled);
+    const command = (try lifecycle.submit(configuration, .@"test")).?;
+    try std.testing.expectEqual(recycled, command.heads[1].id);
+    try std.testing.expect(!command.heads[1].state.enabled);
+    try std.testing.expectError(error.PrimaryHead, lifecycle.removeHead(lifecycle.primary));
 }
 
 test "Wayring output-management adapter compiles against generated protocol" {
