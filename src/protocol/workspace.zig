@@ -11,12 +11,13 @@ pub const Config = struct {
     workspace_handle_capacity: usize = 8,
     outbound_capacity: usize = 96,
     command_capacity: usize = 16,
+    output_capacity: usize = 64,
     string_capacity: usize = 64,
     id: []const u8 = "ouro-0",
     name: []const u8 = "Ouro",
 
     fn validate(c: Config) !void {
-        inline for (.{ c.manager_capacity, c.group_handle_capacity, c.workspace_handle_capacity, c.outbound_capacity, c.command_capacity, c.string_capacity }) |n|
+        inline for (.{ c.manager_capacity, c.group_handle_capacity, c.workspace_handle_capacity, c.outbound_capacity, c.command_capacity, c.output_capacity, c.string_capacity }) |n|
             if (n == 0 or n >= none) return error.InvalidConfig;
         if (c.group_handle_capacity < c.manager_capacity or c.workspace_handle_capacity < c.manager_capacity or
             c.id.len > c.string_capacity or c.name.len > c.string_capacity or
@@ -34,7 +35,8 @@ pub fn Adapter(comptime protocol: type) type {
         const Workspace = protocol.ext_workspace_handle_v1;
         pub const OutputId = packed struct { value: u64 };
         pub const Command = struct { peer: wayring.io_uring.Peer, workspace_generation: u32 };
-        const ManagerSlot = struct { active: bool = false, generation: u32 = 1, next_free: u32 = none, peer: wayring.io_uring.Peer = undefined, resource: objects.Handle = .{ .id = 0, .generation = 0 }, stopped: bool = false, staged: bool = false, finished: bool = false, announced_output: ?OutputId = null, announced_output_resource: ?objects.Handle = null };
+        const ManagerSlot = struct { active: bool = false, generation: u32 = 1, next_free: u32 = none, peer: wayring.io_uring.Peer = undefined, resource: objects.Handle = .{ .id = 0, .generation = 0 }, stopped: bool = false, staged: bool = false, finished: bool = false };
+        const AnnouncedOutput = struct { active: bool = false, output: OutputId = .{ .value = 0 }, resource: objects.Handle = .{ .id = 0, .generation = 0 } };
         const Child = struct { active: bool = false, generation: u32 = 1, next_free: u32 = none, manager: u32 = none, manager_generation: u32 = 0, peer: wayring.io_uring.Peer = undefined, resource: ?objects.Handle = null };
         const Kind = enum { group_new, group_capabilities, output_leave, output_enter, workspace_new, id, name, state, workspace_capabilities, workspace_enter, done, finished };
         const Out = struct { active: bool = false, sequence: u64 = 0, manager: u32 = 0, manager_generation: u32 = 0, kind: Kind = .done, text_len: usize = 0, output: OutputId = .{ .value = 0 }, output_resource: ?objects.Handle = null, active_state: bool = false };
@@ -46,6 +48,8 @@ pub fn Adapter(comptime protocol: type) type {
         outbound: []Out,
         out_text: []u8,
         commands: []Command,
+        outputs: []OutputId,
+        announced_outputs: []AnnouncedOutput,
         workspace_id: []u8,
         workspace_name: []u8,
         string_capacity: usize,
@@ -55,10 +59,10 @@ pub fn Adapter(comptime protocol: type) type {
         outbound_count: usize = 0,
         command_head: usize = 0,
         command_count: usize = 0,
+        output_count: usize = 0,
         sequence: u64 = 1,
         inventory_generation: u32 = 1,
         active: bool = true,
-        output: ?OutputId = null,
         runtime: ?*Runtime = null,
         global: ?objects.Handle = null,
         resolver_context: ?*anyopaque = null,
@@ -80,6 +84,10 @@ pub fn Adapter(comptime protocol: type) type {
             errdefer allocator.free(out_text);
             const commands = try allocator.alloc(Command, c.command_capacity);
             errdefer allocator.free(commands);
+            const outputs = try allocator.alloc(OutputId, c.output_capacity);
+            errdefer allocator.free(outputs);
+            const announced_outputs = try allocator.alloc(AnnouncedOutput, try std.math.mul(usize, c.manager_capacity, c.output_capacity));
+            errdefer allocator.free(announced_outputs);
             const id = try allocator.alloc(u8, c.string_capacity);
             errdefer allocator.free(id);
             const name = try allocator.alloc(u8, c.string_capacity);
@@ -90,12 +98,15 @@ pub fn Adapter(comptime protocol: type) type {
             initFree(Child, groups);
             initFree(Child, workspaces);
             @memset(outbound, .{});
-            return .{ .allocator = allocator, .managers = managers, .groups = groups, .workspaces = workspaces, .outbound = outbound, .out_text = out_text, .commands = commands, .workspace_id = id[0..c.id.len], .workspace_name = name[0..c.name.len], .string_capacity = c.string_capacity };
+            @memset(announced_outputs, .{});
+            return .{ .allocator = allocator, .managers = managers, .groups = groups, .workspaces = workspaces, .outbound = outbound, .out_text = out_text, .commands = commands, .outputs = outputs, .announced_outputs = announced_outputs, .workspace_id = id[0..c.id.len], .workspace_name = name[0..c.name.len], .string_capacity = c.string_capacity };
         }
         pub fn deinit(self: *Self) void {
             self.allocator.free(self.workspace_name.ptr[0..self.string_capacity]);
             self.allocator.free(self.workspace_id.ptr[0..self.string_capacity]);
             self.allocator.free(self.commands);
+            self.allocator.free(self.announced_outputs);
+            self.allocator.free(self.outputs);
             self.allocator.free(self.out_text);
             self.allocator.free(self.outbound);
             self.allocator.free(self.workspaces);
@@ -114,27 +125,38 @@ pub fn Adapter(comptime protocol: type) type {
             self.resolver_context = context;
             self.resolver = resolver;
         }
-        pub fn synchronize(self: *Self, output: ?OutputId, active: bool) !void {
-            const old_output = self.output;
-            const changed_output = !std.meta.eql(self.output, output);
+        pub fn synchronize(self: *Self, outputs: []const OutputId, active: bool) !void {
+            if (outputs.len > self.outputs.len) return error.Exhausted;
+            const changed_outputs = !sameOutputs(self.outputs[0..self.output_count], outputs);
             const changed_active = self.active != active;
-            if (!changed_output and !changed_active) return;
+            if (!changed_outputs and !changed_active) return;
             var n: usize = 0;
-            for (self.managers) |m| {
+            for (self.managers, 0..) |m, mi| {
                 if (!m.active or m.stopped) continue;
-                if (changed_output and old_output != null and std.meta.eql(m.announced_output, old_output) and m.announced_output_resource != null) n += 1;
-                if (changed_output and output != null and self.resolveOutput(m.peer, output.?) != null) n += 1;
+                if (changed_outputs) {
+                    for (self.announcedFor(mi)) |announced| {
+                        if (announced.active and !containsOutput(outputs, announced.output)) n += 1;
+                    }
+                    for (outputs) |output| {
+                        if (!self.managerAnnounced(mi, output) and self.resolveOutput(m.peer, output) != null) n += 1;
+                    }
+                }
                 if (changed_active) n += 1;
                 n += 1;
             }
             try self.ensureOut(n);
-            self.output = output;
+            @memcpy(self.outputs[0..outputs.len], outputs);
+            self.output_count = outputs.len;
             self.active = active;
             for (self.managers, 0..) |*m, i| if (m.active and !m.stopped) {
-                if (changed_output and old_output != null and std.meta.eql(m.announced_output, old_output) and m.announced_output_resource != null)
-                    try self.enqueue(@intCast(i), .output_leave, "", old_output, m.announced_output_resource);
-                if (changed_output and output != null) if (self.resolveOutput(m.peer, output.?)) |resource|
-                    try self.enqueue(@intCast(i), .output_enter, "", output, resource);
+                if (changed_outputs) {
+                    for (self.announcedFor(i)) |announced|
+                        if (announced.active and !containsOutput(outputs, announced.output))
+                            try self.enqueue(@intCast(i), .output_leave, "", announced.output, announced.resource);
+                    for (outputs) |output|
+                        if (!self.managerAnnounced(i, output)) if (self.resolveOutput(m.peer, output)) |resource|
+                            try self.enqueue(@intCast(i), .output_enter, "", output, resource);
+                }
                 if (changed_active) try self.enqueue(@intCast(i), .state, "", null, null);
                 try self.enqueue(@intCast(i), .done, "", null, null);
             };
@@ -143,16 +165,23 @@ pub fn Adapter(comptime protocol: type) type {
         /// membership is not duplicated.
         pub fn outputResourcesChanged(self: *Self, peer: wayring.io_uring.Peer) !bool {
             var queued = false;
-            for (self.managers, 0..) |*m, i| if (m.active and !m.stopped and samePeer(m.peer, peer) and self.output != null) {
-                var pending = false;
-                for (self.outbound) |o| if (o.active and o.manager == i and o.manager_generation == m.generation and o.kind == .output_enter and std.meta.eql(o.output, self.output.?)) {
-                    pending = true;
-                    break;
-                };
-                if (!pending and !std.meta.eql(m.announced_output, self.output)) {
-                    const resource = self.resolveOutput(m.peer, self.output.?) orelse continue;
-                    try self.ensureOut(2);
-                    try self.enqueue(@intCast(i), .output_enter, "", self.output, resource);
+            for (self.managers, 0..) |*m, i| if (m.active and !m.stopped and samePeer(m.peer, peer)) {
+                var manager_queued = false;
+                for (self.outputs[0..self.output_count]) |output| {
+                    var pending = false;
+                    for (self.outbound) |o| if (o.active and o.manager == i and o.manager_generation == m.generation and o.kind == .output_enter and std.meta.eql(o.output, output)) {
+                        pending = true;
+                        break;
+                    };
+                    if (!pending and !self.managerAnnounced(i, output)) {
+                        const resource = self.resolveOutput(m.peer, output) orelse continue;
+                        try self.ensureOut(1);
+                        try self.enqueue(@intCast(i), .output_enter, "", output, resource);
+                        manager_queued = true;
+                    }
+                }
+                if (manager_queued) {
+                    try self.ensureOut(1);
                     try self.enqueue(@intCast(i), .done, "", null, null);
                     queued = true;
                 }
@@ -178,9 +207,10 @@ pub fn Adapter(comptime protocol: type) type {
 
         fn bind(context: ?*anyopaque, b: wayring.server.Binding) !?*anyopaque {
             const self: *Self = @ptrCast(@alignCast(context orelse return error.InvalidContext));
-            const output_resource = if (self.output) |output| self.resolveOutput(b.peer, output) else null;
-            const has_output = output_resource != null;
-            const needed: usize = 9 + @as(usize, @intFromBool(has_output));
+            var output_count: usize = 0;
+            for (self.outputs[0..self.output_count]) |output|
+                output_count += @intFromBool(self.resolveOutput(b.peer, output) != null);
+            const needed = 9 + output_count;
             if (self.manager_free == none or self.group_free == none or self.workspace_free == none) return error.OutOfMemory;
             try self.ensureOut(needed);
             const mi = self.takeManager(b);
@@ -190,7 +220,8 @@ pub fn Adapter(comptime protocol: type) type {
             _ = wi;
             try self.enqueue(mi, .group_new, "", null, null);
             try self.enqueue(mi, .group_capabilities, "", null, null);
-            if (has_output) try self.enqueue(mi, .output_enter, "", self.output, output_resource);
+            for (self.outputs[0..self.output_count]) |output| if (self.resolveOutput(b.peer, output)) |resource|
+                try self.enqueue(mi, .output_enter, "", output, resource);
             try self.enqueue(mi, .workspace_new, "", null, null);
             try self.enqueue(mi, .id, self.workspace_id, null, null);
             try self.enqueue(mi, .name, self.workspace_name, null, null);
@@ -303,14 +334,10 @@ pub fn Adapter(comptime protocol: type) type {
                         };
                         if (o.kind == .output_enter) {
                             try wayring.server.sendEvent(protocol, Group, server_objects, queue, g.?.resource.?, .{ .output_enter = .{ .output = output.id } });
-                            m.announced_output = o.output;
-                            m.announced_output_resource = output;
+                            self.announceOutput(mi, o.output, output);
                         } else {
                             try wayring.server.sendEvent(protocol, Group, server_objects, queue, g.?.resource.?, .{ .output_leave = .{ .output = output.id } });
-                            if (std.meta.eql(m.announced_output, o.output)) {
-                                m.announced_output = null;
-                                m.announced_output_resource = null;
-                            }
+                            self.withdrawOutput(mi, o.output);
                         }
                     },
                     .group_capabilities => if (g != null and g.?.resource != null) try wayring.server.sendEvent(protocol, Group, server_objects, queue, g.?.resource.?, .{ .capabilities = .{ .capabilities = Group.group_capabilities.fromInt(0) } }),
@@ -401,6 +428,35 @@ pub fn Adapter(comptime protocol: type) type {
         fn resolveOutput(self: *Self, peer: wayring.io_uring.Peer, id: OutputId) ?objects.Handle {
             return (self.resolver orelse return null)(self.resolver_context, peer, id);
         }
+        fn announcedFor(self: *Self, mi: usize) []AnnouncedOutput {
+            const capacity = self.outputs.len;
+            return self.announced_outputs[mi * capacity ..][0..capacity];
+        }
+        fn managerAnnounced(self: *Self, mi: usize, output: OutputId) bool {
+            for (self.announcedFor(mi)) |announced|
+                if (announced.active and std.meta.eql(announced.output, output)) return true;
+            return false;
+        }
+        fn announceOutput(self: *Self, mi: usize, output: OutputId, resource: objects.Handle) void {
+            for (self.announcedFor(mi)) |*announced| {
+                if (announced.active and std.meta.eql(announced.output, output)) {
+                    announced.resource = resource;
+                    return;
+                }
+            }
+            for (self.announcedFor(mi)) |*announced| if (!announced.active) {
+                announced.* = .{ .active = true, .output = output, .resource = resource };
+                return;
+            };
+            unreachable;
+        }
+        fn withdrawOutput(self: *Self, mi: usize, output: OutputId) void {
+            for (self.announcedFor(mi)) |*announced|
+                if (announced.active and std.meta.eql(announced.output, output)) {
+                    announced.* = .{};
+                    return;
+                };
+        }
         fn takeManager(self: *Self, b: wayring.server.Binding) u32 {
             const i = self.manager_free;
             self.manager_free = self.managers[i].next_free;
@@ -446,6 +502,7 @@ pub fn Adapter(comptime protocol: type) type {
             };
             const g = nextGeneration(self.managers[mi].generation);
             self.managers[mi] = .{ .generation = g, .next_free = self.manager_free };
+            @memset(self.announcedFor(mi), .{});
             self.manager_free = mi;
         }
     };
@@ -460,6 +517,15 @@ fn nextGeneration(g: u32) u32 {
 }
 fn samePeer(a: wayring.io_uring.Peer, b: wayring.io_uring.Peer) bool {
     return std.meta.eql(a, b);
+}
+fn containsOutput(outputs: anytype, output: @TypeOf(outputs[0])) bool {
+    for (outputs) |candidate| if (std.meta.eql(candidate, output)) return true;
+    return false;
+}
+fn sameOutputs(a: anytype, b: []const @TypeOf(a[0])) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| if (!std.meta.eql(left, right)) return false;
+    return true;
 }
 fn indexOf(comptime T: type, slice: []T, value: *T) u32 {
     return @intCast((@intFromPtr(value) - @intFromPtr(slice.ptr)) / @sizeOf(T));
@@ -487,11 +553,11 @@ test "workspace output replacement snapshots leave enter and one done" {
     defer adapter.deinit();
     adapter.setOutputResolver(null, resolveTestOutput);
     adapter.managers[0].active = true;
-    adapter.managers[0].announced_output = .{ .value = 4 };
-    adapter.managers[0].announced_output_resource = .{ .id = 4, .generation = 1 };
+    adapter.announcedFor(0)[0] = .{ .active = true, .output = .{ .value = 4 }, .resource = .{ .id = 4, .generation = 1 } };
     adapter.manager_free = none;
-    adapter.output = .{ .value = 4 };
-    try adapter.synchronize(.{ .value = 9 }, true);
+    adapter.outputs[0] = .{ .value = 4 };
+    adapter.output_count = 1;
+    try adapter.synchronize(&.{.{ .value = 9 }}, true);
     var kinds: [3]TestAdapter.Kind = undefined;
     var outputs: [2]TestAdapter.OutputId = undefined;
     var ki: usize = 0;
@@ -509,15 +575,42 @@ test "workspace output replacement snapshots leave enter and one done" {
     try std.testing.expectEqual(@as(u64, 9), outputs[1].value);
 }
 
+test "workspace plural output reconciliation retains shared membership" {
+    var adapter = try TestAdapter.init(std.testing.allocator, .{
+        .manager_capacity = 1,
+        .group_handle_capacity = 1,
+        .workspace_handle_capacity = 1,
+        .outbound_capacity = 8,
+        .output_capacity = 3,
+    });
+    defer adapter.deinit();
+    adapter.setOutputResolver(null, resolveTestOutput);
+    adapter.managers[0].active = true;
+    adapter.announcedFor(0)[0] = .{ .active = true, .output = .{ .value = 4 }, .resource = .{ .id = 4, .generation = 1 } };
+    adapter.announcedFor(0)[1] = .{ .active = true, .output = .{ .value = 7 }, .resource = .{ .id = 7, .generation = 1 } };
+    adapter.outputs[0] = .{ .value = 4 };
+    adapter.outputs[1] = .{ .value = 7 };
+    adapter.output_count = 2;
+
+    try adapter.synchronize(&.{ .{ .value = 7 }, .{ .value = 9 } }, true);
+
+    try std.testing.expectEqual(@as(usize, 3), adapter.outbound_count);
+    try std.testing.expectEqual(TestAdapter.Kind.output_leave, adapter.outbound[0].kind);
+    try std.testing.expectEqual(@as(u64, 4), adapter.outbound[0].output.value);
+    try std.testing.expectEqual(TestAdapter.Kind.output_enter, adapter.outbound[1].kind);
+    try std.testing.expectEqual(@as(u64, 9), adapter.outbound[1].output.value);
+    try std.testing.expectEqual(TestAdapter.Kind.done, adapter.outbound[2].kind);
+}
+
 test "workspace null output transition queues leave and done" {
     var adapter = try TestAdapter.init(std.testing.allocator, .{ .manager_capacity = 1, .group_handle_capacity = 1, .workspace_handle_capacity = 1, .outbound_capacity = 4 });
     defer adapter.deinit();
     adapter.setOutputResolver(null, resolveTestOutput);
     adapter.managers[0].active = true;
-    adapter.managers[0].announced_output = .{ .value = 7 };
-    adapter.managers[0].announced_output_resource = .{ .id = 7, .generation = 1 };
-    adapter.output = .{ .value = 7 };
-    try adapter.synchronize(null, true);
+    adapter.announcedFor(0)[0] = .{ .active = true, .output = .{ .value = 7 }, .resource = .{ .id = 7, .generation = 1 } };
+    adapter.outputs[0] = .{ .value = 7 };
+    adapter.output_count = 1;
+    try adapter.synchronize(&.{}, true);
     try std.testing.expectEqual(@as(usize, 2), adapter.outbound_count);
     try std.testing.expectEqual(TestAdapter.Kind.output_leave, adapter.outbound[0].kind);
     try std.testing.expectEqual(@as(u64, 7), adapter.outbound[0].output.value);
@@ -544,7 +637,7 @@ test "workspace unchanged synchronization does not queue done forever" {
     });
     defer adapter.deinit();
     adapter.managers[0].active = true;
-    try adapter.synchronize(null, true);
+    try adapter.synchronize(&.{}, true);
     try std.testing.expectEqual(@as(usize, 0), adapter.outbound_count);
 }
 

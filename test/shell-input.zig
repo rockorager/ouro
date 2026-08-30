@@ -542,6 +542,7 @@ test "shell-input: generated workspace client observes and activates the fixed w
 
     var fixture = try physical_fixture.Fixture.init();
     defer fixture.deinit();
+    fixture.second_desktop = true;
     var root_config = physical_fixture.compositorConfig();
     root_config.runtime.object_capacity = 24;
     root_config.runtime.object_quota = 24;
@@ -575,7 +576,7 @@ test "shell-input: generated workspace client observes and activates the fixed w
         _ = try drainClient(&reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
         if (handler.activation_sent) turns_after_activation += 1;
-        if (handler.output_enter == 1 and turns_after_activation >= 4 and
+        if (handler.output_enter == 2 and turns_after_activation >= 4 and
             coordinator.workspace_adapter.pendingCommands() == 0) break;
         _ = linux.sched_yield();
     }
@@ -584,26 +585,27 @@ test "shell-input: generated workspace client observes and activates the fixed w
     try std.testing.expect(handler.workspace != null);
     try std.testing.expectEqual(@as(usize, 8), handler.initial_order);
     try std.testing.expectEqual(@as(usize, 1), handler.initial_done);
-    try std.testing.expectEqual(@as(usize, 1), handler.output_enter);
+    try std.testing.expectEqual(@as(usize, 2), handler.output_enter);
     try std.testing.expect(handler.activation_sent);
     try std.testing.expectEqual(@as(usize, 0), coordinator.workspace_adapter.pendingCommands());
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
 
     // Depending on registry publication order, output_enter may be part of
     // the initial done batch or a separate association update.
-    try std.testing.expect(handler.output_done <= 1);
+    try std.testing.expect(handler.output_done <= 2);
     const output_done_before_disable = handler.output_done;
     try fixture.signalSession(.disable);
     for (0..256) |_| {
         _ = try drainClient(&reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
-        if (coordinator.primaryKmsOutput() == null and handler.output_leave == 1 and
-            handler.output_done == output_done_before_disable + 1) break;
+        if (coordinator.primaryKmsOutput() == null) break;
         _ = linux.sched_yield();
     }
     try std.testing.expect(coordinator.primaryKmsOutput() == null);
-    try std.testing.expectEqual(@as(usize, 1), handler.output_leave);
-    try std.testing.expectEqual(output_done_before_disable + 1, handler.output_done);
+    // Session suspension removes scanout ownership, not the physical output.
+    // Workspace membership therefore remains associated with the connector.
+    try std.testing.expectEqual(@as(usize, 0), handler.output_leave);
+    try std.testing.expectEqual(output_done_before_disable, handler.output_done);
 
     try protocol.ext_workspace_manager_v1.encodeRequest(&actor.transmit, handler.manager.?.id, .{ .stop = .{} });
     try submitClient(&reactor, &driver, &handler);
@@ -646,7 +648,8 @@ const WorkspaceHandler = struct {
     objects: *wayring.objects.ClientObjects,
     queue: *wayring.tx.Queue,
     registry: wayring.objects.Handle,
-    output: ?wayring.objects.Handle = null,
+    outputs: [2]wayring.objects.Handle = undefined,
+    output_count: usize = 0,
     manager: ?wayring.objects.Handle = null,
     group: ?wayring.objects.Handle = null,
     workspace: ?wayring.objects.Handle = null,
@@ -667,7 +670,8 @@ const WorkspaceHandler = struct {
         if (target.object.interface == &ClientCore.Registry.info) {
             switch (try ClientCore.decodeRegistryEvent(self.objects, self.registry, message, fds)) {
                 .global => |value| if (std.mem.eql(u8, value.interface, protocol.wl_output.info.name)) {
-                    self.output = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_output.info, @min(value.version, 4), null);
+                    self.outputs[self.output_count] = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_output.info, @min(value.version, 4), null);
+                    self.output_count += 1;
                 } else if (std.mem.eql(u8, value.interface, protocol.ext_workspace_manager_v1.info.name)) {
                     self.manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.ext_workspace_manager_v1.info, 1, null);
                 },
@@ -713,11 +717,11 @@ const WorkspaceHandler = struct {
                     self.initial_order = 8;
                 },
                 .output_enter => |value| {
-                    try std.testing.expectEqual(self.output.?.id, value.output);
+                    try std.testing.expect(self.hasOutput(value.output));
                     self.output_enter += 1;
                 },
                 .output_leave => |value| {
-                    try std.testing.expectEqual(self.output.?.id, value.output);
+                    try std.testing.expect(self.hasOutput(value.output));
                     self.output_leave += 1;
                 },
                 .workspace_leave, .removed => return error.UnexpectedWorkspaceGroupEvent,
@@ -754,6 +758,12 @@ const WorkspaceHandler = struct {
             }
         } else return error.UnexpectedEvent;
         return .continue_dispatch;
+    }
+
+    fn hasOutput(self: *const WorkspaceHandler, id: u32) bool {
+        for (self.outputs[0..self.output_count]) |output|
+            if (output.id == id) return true;
+        return false;
     }
 };
 

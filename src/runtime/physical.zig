@@ -662,6 +662,7 @@ pub fn Coordinator(comptime protocol: type) type {
         screencopy_adapter: ScreencopyAdapter,
         foreign_toplevel_list_adapter: ForeignToplevelListAdapter,
         workspace_adapter: WorkspaceAdapter,
+        workspace_output_ids: []WorkspaceAdapter.OutputId,
         image_capture_source_adapter: ImageCaptureSourceAdapter,
         image_copy_capture_adapter: ImageCopyCaptureAdapter,
         dmabuf_adapter: DmabufAdapter,
@@ -771,6 +772,8 @@ pub fn Coordinator(comptime protocol: type) type {
             config: Config,
         ) !*Self {
             if (config.foreign_toplevel_list.metadata_capacity < config.desktop.metadata_bytes)
+                return error.InvalidConfig;
+            if (config.workspace.output_capacity < config.drm.connector_capacity)
                 return error.InvalidConfig;
             const self = try allocator.create(Self);
             errdefer allocator.destroy(self);
@@ -1046,6 +1049,11 @@ pub fn Coordinator(comptime protocol: type) type {
             errdefer self.foreign_toplevel_list_adapter.deinit();
             self.workspace_adapter = try WorkspaceAdapter.init(allocator, config.workspace);
             errdefer self.workspace_adapter.deinit();
+            self.workspace_output_ids = try allocator.alloc(
+                WorkspaceAdapter.OutputId,
+                config.workspace.output_capacity,
+            );
+            errdefer allocator.free(self.workspace_output_ids);
             self.image_capture_source_adapter = try ImageCaptureSourceAdapter.init(
                 allocator,
                 config.image_capture_source,
@@ -1702,6 +1710,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.interaction.deinit();
             self.desktop.deinit();
             self.foreign_toplevel_list_adapter.deinit();
+            self.allocator.free(self.workspace_output_ids);
             self.workspace_adapter.deinit();
             self.image_copy_capture_adapter.deinit();
             self.image_capture_source_adapter.deinit();
@@ -3654,19 +3663,22 @@ pub fn Coordinator(comptime protocol: type) type {
             id: WorkspaceAdapter.OutputId,
         ) ?*const PhysicalOutput {
             for (self.physical_outputs[0..self.physical_output_count]) |*physical|
-                if (physical.kms_output) |output|
-                    if (std.meta.eql(workspaceOutputId(output.outputId()), id)) return physical;
+                if (physical.connected and
+                    std.meta.eql(workspaceOutputId(physical.protocol_output), id)) return physical;
             return null;
         }
 
         fn syncWorkspace(self: *Self) !void {
             if (!self.workspace_adapter.hasManagers() and
                 self.workspace_adapter.pendingCommands() == 0) return;
-            const output_id: ?WorkspaceAdapter.OutputId = if (self.primaryKmsOutput()) |output|
-                workspaceOutputId(output.outputId())
-            else
-                null;
-            self.workspace_adapter.synchronize(output_id, true) catch
+            var output_count: usize = 0;
+            for (self.physical_outputs[0..self.physical_output_count]) |physical| {
+                if (!physical.connected or
+                    !try self.output_adapter.outputPublished(physical.protocol_output)) continue;
+                self.workspace_output_ids[output_count] = workspaceOutputId(physical.protocol_output);
+                output_count += 1;
+            }
+            self.workspace_adapter.synchronize(self.workspace_output_ids[0..output_count], true) catch
                 self.markProtocolAll(ProtocolReady.workspace);
             while (self.workspace_adapter.peekCommand()) |command| {
                 if (command.workspace_generation != 1) {
@@ -3978,7 +3990,7 @@ pub fn Coordinator(comptime protocol: type) type {
             return objects.namespace.lookupHandle(ids[0]);
         }
 
-        fn workspaceOutputId(id: output_scheduler.OutputId) WorkspaceAdapter.OutputId {
+        fn workspaceOutputId(id: OutputAdapter.OutputId) WorkspaceAdapter.OutputId {
             return .{ .value = @as(u64, id.generation) << 32 | id.index };
         }
 
