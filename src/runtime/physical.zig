@@ -1270,7 +1270,16 @@ pub fn Coordinator(comptime protocol: type) type {
                 allocator,
                 config.output_management,
                 1,
-                .{ .width = 1, .height = 1, .refresh_millihz = 1 },
+                .{
+                    .width = 1,
+                    .height = 1,
+                    .refresh_millihz = 1,
+                    .scale_120 = try std.math.mul(
+                        u32,
+                        @intCast(config.protocol_output.scale),
+                        120,
+                    ),
+                },
             );
             errdefer self.output_management_adapter.deinit();
             self.output_power_adapter = try OutputPowerAdapter.init(allocator, self, config.output_power);
@@ -3606,7 +3615,10 @@ pub fn Coordinator(comptime protocol: type) type {
                     self.markProtocol(command.peer, ProtocolReady.output_power);
                     continue;
                 };
-                self.activateOutput(snapshot) catch {
+                self.activateOutput(
+                    snapshot,
+                    self.output_management_adapter.lifecycle.current.scale_120,
+                ) catch {
                     try self.output_power_adapter.completeCommand(command, .failed);
                     self.markProtocol(command.peer, ProtocolReady.output_power);
                     continue;
@@ -3623,10 +3635,13 @@ pub fn Coordinator(comptime protocol: type) type {
             desired: protocol_output_management.HeadState,
         ) bool {
             if (!desired.enabled or desired.x != 0 or desired.y != 0 or
-                desired.transform != 0 or desired.scale_120 != 120 or desired.adaptive_sync)
+                desired.transform != 0 or desired.adaptive_sync)
                 return false;
             if (desired.width <= 0 or desired.height <= 0 or desired.refresh_millihz <= 0)
                 return false;
+            const scale = geometry.OutputScale.init(desired.scale_120) catch return false;
+            _ = scale.logicalDimension(@intCast(desired.width)) catch return false;
+            _ = scale.logicalDimension(@intCast(desired.height)) catch return false;
             const handle = self.manager.currentHandle() orelse return false;
             _ = self.manager.snapshotMode(
                 handle,
@@ -3724,10 +3739,13 @@ pub fn Coordinator(comptime protocol: type) type {
                         } else null
                     else
                         null,
-                    .toplevel => |id| if (self.desktop.scene(id)) |scene| .{
-                        .width = std.math.cast(u32, scene.geometry.width) orelse return null,
-                        .height = std.math.cast(u32, scene.geometry.height) orelse return null,
-                    } else |_| null,
+                    .toplevel => |id| if (self.desktop.scene(id)) |scene|
+                        if (self.physicalSceneRect(scene.geometry)) |physical| .{
+                            .width = @intCast(physical.width),
+                            .height = @intCast(physical.height),
+                        } else null
+                    else |_|
+                        null,
                 },
                 .cursor => if (self.cursorCaptureState(target)) |state| state.constraints else null,
             };
@@ -3771,12 +3789,7 @@ pub fn Coordinator(comptime protocol: type) type {
             if (width == 0 or height == 0) return null;
             const source_region: geometry.Rect = switch (cursor_target.source) {
                 .output => |id| if (self.output) |output|
-                    if (std.meta.eql(output.outputId(), id)) .{
-                        .x = 0,
-                        .y = 0,
-                        .width = @intCast(output.planner.output.width),
-                        .height = @intCast(output.planner.output.height),
-                    } else return null
+                    if (std.meta.eql(output.outputId(), id)) self.outputBounds() catch return null else return null
                 else
                     return null,
                 .toplevel => |id| (self.desktop.scene(id) catch return null).geometry,
@@ -3788,16 +3801,57 @@ pub fn Coordinator(comptime protocol: type) type {
                 .height = @intCast(height),
             };
             if (!rectanglesIntersect(cursor_region, source_region)) return null;
+            const physical_source = self.physicalSceneRect(source_region) orelse return null;
+            const physical_cursor = self.physicalSceneRect(cursor_region) orelse return null;
+            const scale = geometry.OutputScale.init(
+                self.output_management_adapter.lifecycle.current.scale_120,
+            ) catch return null;
+            const physical_hotspot_x = scale.physicalEdge(hotspot.x) catch return null;
+            const physical_hotspot_y = scale.physicalEdge(hotspot.y) catch return null;
+            const physical_pointer_x = scale.physicalEdge(pointer.x) catch return null;
+            const physical_pointer_y = scale.physicalEdge(pointer.y) catch return null;
             return .{
                 .info = .{
                     .position = .{
-                        .x = std.math.sub(i32, pointer.x, source_region.x) catch return null,
-                        .y = std.math.sub(i32, pointer.y, source_region.y) catch return null,
+                        .x = std.math.sub(
+                            i32,
+                            std.math.cast(i32, physical_pointer_x) orelse return null,
+                            physical_source.x,
+                        ) catch return null,
+                        .y = std.math.sub(
+                            i32,
+                            std.math.cast(i32, physical_pointer_y) orelse return null,
+                            physical_source.y,
+                        ) catch return null,
                     },
-                    .hotspot = .{ .x = hotspot.x, .y = hotspot.y },
+                    .hotspot = .{
+                        .x = std.math.cast(i32, physical_hotspot_x) orelse return null,
+                        .y = std.math.cast(i32, physical_hotspot_y) orelse return null,
+                    },
                 },
-                .constraints = .{ .width = width, .height = height },
-                .region = cursor_region,
+                .constraints = .{
+                    .width = @intCast(physical_cursor.width),
+                    .height = @intCast(physical_cursor.height),
+                },
+                .region = physical_cursor,
+            };
+        }
+
+        fn physicalSceneRect(self: *const Self, rect: geometry.Rect) ?geometry.Rect {
+            const scale = geometry.OutputScale.init(
+                self.output_management_adapter.lifecycle.current.scale_120,
+            ) catch return null;
+            const physical = scaleRenderRect(.{
+                .x = rect.x,
+                .y = rect.y,
+                .width = std.math.cast(u32, rect.width) orelse return null,
+                .height = std.math.cast(u32, rect.height) orelse return null,
+            }, scale) catch return null;
+            return .{
+                .x = physical.x,
+                .y = physical.y,
+                .width = std.math.cast(i32, physical.width) orelse return null,
+                .height = std.math.cast(i32, physical.height) orelse return null,
             };
         }
 
@@ -5241,18 +5295,24 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.manager.remove() catch {};
             }
             const snapshot = try self.manager.snapshot(handle);
-            try self.activateOutput(snapshot);
+            try self.activateOutput(
+                snapshot,
+                self.output_management_adapter.lifecycle.current.scale_120,
+            );
         }
 
         /// Activates a borrowed snapshot while retaining Manager's device and
         /// topology ownership. Callers decide whether a failed activation is
         /// terminal or should be followed by an exact rollback snapshot.
-        fn activateOutput(self: *Self, snapshot: drm.Snapshot) !void {
+        fn activateOutput(self: *Self, snapshot: drm.Snapshot, scale_120: u32) !void {
             if (self.output != null or self.stopping) return error.InvalidState;
             const connector = snapshot.selectedConnector();
             const mode_end = try std.math.add(usize, connector.mode_start, connector.mode_count);
             if (mode_end > snapshot.modes.len) return error.InvalidModeInventory;
             const mode = snapshot.selectedMode();
+            const output_scale = try geometry.OutputScale.init(scale_120);
+            const logical_width = try output_scale.logicalDimension(mode.hdisplay);
+            const logical_height = try output_scale.logicalDimension(mode.vdisplay);
             const refresh = try std.math.mul(u32, mode.vrefresh, 1000);
             try self.output_management_adapter.setModes(
                 try collectOutputModes(
@@ -5297,11 +5357,21 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.ensureExplicitSync(snapshot.handle);
             try self.ensureDrmLeasing(snapshot);
             try self.ensureGammaOwner(snapshot);
-            const work_area: @import("../scene/geometry.zig").Rect = .{
+            try self.output_adapter.publishMode(
+                self.output.?.planner.output.width,
+                self.output.?.planner.output.height,
+                try std.math.mul(u32, mode.vrefresh, 1000),
+                connector.width_mm,
+                connector.height_mm,
+            );
+            try self.output_adapter.publishScale(scale_120);
+            try self.fractional_scale_adapter.publishPreferredScale(scale_120);
+            self.xdg_output_adapter.publishMode();
+            const work_area: geometry.Rect = .{
                 .x = 0,
                 .y = 0,
-                .width = @intCast(self.output.?.planner.output.width),
-                .height = @intCast(self.output.?.planner.output.height),
+                .width = logical_width,
+                .height = logical_height,
             };
             try self.desktop.validateWorkArea(work_area);
             try self.interaction.validateBounds(work_area);
@@ -5310,13 +5380,6 @@ pub fn Coordinator(comptime protocol: type) type {
             self.interaction.applyBounds(work_area);
             const retained_visibility_changed = self.refreshRetainedLayersForOutput();
             self.output_drain_started = false;
-            try self.output_adapter.publishMode(
-                self.output.?.planner.output.width,
-                self.output.?.planner.output.height,
-                try std.math.mul(u32, mode.vrefresh, 1000),
-                connector.width_mm,
-                connector.height_mm,
-            );
             const screencopy_stride = try std.math.mul(
                 u32,
                 self.output.?.planner.output.width,
@@ -5335,15 +5398,16 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.output.?.planner.output.width,
                 self.output.?.planner.output.height,
             );
-            self.xdg_output_adapter.publishMode();
             _ = try self.output_management_adapter.publish(.{
                 .width = @intCast(self.output.?.planner.output.width),
                 .height = @intCast(self.output.?.planner.output.height),
                 .refresh_millihz = @intCast(try std.math.mul(u32, mode.vrefresh, 1000)),
+                .scale_120 = scale_120,
             });
             try self.recomputeLayerConfigures();
             try self.recomputeSessionLockConfigures();
-            self.markProtocolAll(ProtocolReady.output | ProtocolReady.xdg_output | ProtocolReady.output_management |
+            self.markProtocolAll(ProtocolReady.output | ProtocolReady.xdg_output |
+                ProtocolReady.fractional_scale | ProtocolReady.output_management |
                 ProtocolReady.layer_shell | ProtocolReady.session_lock);
             self.next_output_generation = if (generation == std.math.maxInt(u32))
                 null
@@ -5452,7 +5516,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn refreshRetainedLayersForOutput(self: *Self) bool {
-            const output_size = self.output.?.planner.output;
+            const output_size = self.logicalOutputSize() catch return false;
             var visibility_changed = false;
             for (self.app_layers) |*layer| if (layer.active) {
                 const id = layer.id orelse unreachable;
@@ -5677,8 +5741,8 @@ pub fn Coordinator(comptime protocol: type) type {
             const destination_size = content.surface.size;
             if (destination_size.width == 0 or destination_size.height == 0)
                 return error.InvalidDestination;
-            const output_size: render.Size = if (self.output) |output|
-                output.planner.output
+            const output_size: render.Size = if (self.output != null)
+                try self.logicalOutputSize()
             else
                 .{ .width = destination_size.width, .height = destination_size.height };
             const has_window_geometry = if (surface_scene) |scene|
@@ -6022,28 +6086,34 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn renderFrame(self: *Self, frame: @import("../output/headless.zig").FrameId) !void {
             const output = self.output orelse return;
+            const logical_output = try self.logicalOutputSize();
             var sample_count: usize = 0;
             if (self.sessionLockActive()) {
-                try self.appendSessionLock(&sample_count, output.planner.output);
+                try self.appendSessionLock(&sample_count, logical_output);
                 self.session_lock_frame = frame;
             } else {
-                try self.appendLayerShell(.background, &sample_count, output.planner.output);
-                try self.appendLayerShell(.bottom, &sample_count, output.planner.output);
+                try self.appendLayerShell(.background, &sample_count, logical_output);
+                try self.appendLayerShell(.bottom, &sample_count, logical_output);
                 const windows = try self.desktop.sceneSnapshotGrowing(
                     self.allocator,
                     &self.scene_windows,
                 );
                 for (windows) |window| {
                     if (!window.visible) continue;
-                    try self.appendSceneRoot(window.surface, &sample_count, output.planner.output);
+                    try self.appendSceneRoot(window.surface, &sample_count, logical_output);
                 }
-                try self.appendLayerShell(.top, &sample_count, output.planner.output);
-                try self.appendLayerShell(.overlay, &sample_count, output.planner.output);
+                try self.appendLayerShell(.top, &sample_count, logical_output);
+                try self.appendLayerShell(.overlay, &sample_count, logical_output);
             }
             var change_count = sample_count;
+            const output_scale = try geometry.OutputScale.init(
+                self.output_management_adapter.lifecycle.current.scale_120,
+            );
             for (self.removed_layers[0..self.removed_layer_len]) |removed| {
                 try self.ensureFrameStorage(@max(sample_count, change_count) + 1);
-                self.frame_changes[change_count] = .{ .previous = removed.state };
+                self.frame_changes[change_count] = .{
+                    .previous = try scaleSurfaceState(removed.state, output_scale),
+                };
                 change_count += 1;
             }
             const cursor_start = sample_count;
@@ -6053,18 +6123,19 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (try self.interaction.cursor.composite(.{
                     .surface = self.cursor_layer.id.?,
                     .sample = self.cursor_layer.sample.?,
-                }, output.planner.output)) |cursor_sample| {
+                }, logical_output)) |cursor_sample| {
                     try self.ensureFrameStorage(@max(sample_count, change_count) + 1);
-                    self.frame_samples[sample_count] = cursor_sample;
+                    self.frame_samples[sample_count] = try scaleSample(cursor_sample, output_scale);
                     self.frame_bindings[sample_count] = self.cursor_layer.binding.?;
-                    self.frame_changes[change_count] = self.cursor_layer.change.?;
-                    self.frame_changes[change_count].current = damage.SurfaceState.fromSample(cursor_sample, .{
+                    var logical_change = self.cursor_layer.change.?;
+                    logical_change.current = damage.SurfaceState.fromSample(cursor_sample, .{
                         .width = cursor_sample.destination.width,
                         .height = cursor_sample.destination.height,
                     });
-                    self.frame_changes[change_count].invalidate_bounds = true;
+                    logical_change.invalidate_bounds = true;
+                    self.frame_changes[change_count] = try scaleChange(logical_change, output_scale);
                     self.cursor_layer.sample = cursor_sample;
-                    self.cursor_layer.change = self.frame_changes[change_count];
+                    self.cursor_layer.change = logical_change;
                     sample_count += 1;
                     change_count += 1;
                 }
@@ -6073,33 +6144,42 @@ pub fn Coordinator(comptime protocol: type) type {
             self.themed_cursor.setPointerAvailable(self.interaction.cursor.pointer_available);
             var next_themed_cursor_previous = self.themed_cursor_previous;
             if (self.themed_cursor.image != null) {
-                if (try self.themed_cursor.sample(output.planner.output)) |sample| {
+                if (try self.themed_cursor.sample(logical_output)) |sample| {
                     try self.ensureFrameStorage(@max(sample_count, change_count) + 1);
-                    self.frame_samples[sample_count] = sample;
+                    self.frame_samples[sample_count] = try scaleSample(sample, output_scale);
                     self.frame_bindings[sample_count] = self.themed_cursor.sampleBinding(output_api.SampleBinding);
-                    self.frame_changes[change_count] = try self.themed_cursor.damageChange(
+                    var logical_change = try self.themed_cursor.damageChange(
                         self.themed_cursor_previous,
-                        output.planner.output,
+                        logical_output,
                     );
-                    self.frame_changes[change_count].invalidate_bounds = true;
-                    next_themed_cursor_previous = self.frame_changes[change_count].current;
+                    logical_change.invalidate_bounds = true;
+                    self.frame_changes[change_count] = try scaleChange(logical_change, output_scale);
+                    next_themed_cursor_previous = logical_change.current;
                     sample_count += 1;
                     change_count += 1;
                 } else if (self.themed_cursor_previous != null) {
                     try self.ensureFrameStorage(@max(sample_count, change_count) + 1);
-                    self.frame_changes[change_count] = .{ .previous = self.themed_cursor_previous };
+                    self.frame_changes[change_count] = .{ .previous = try scaleSurfaceState(
+                        self.themed_cursor_previous.?,
+                        output_scale,
+                    ) };
                     next_themed_cursor_previous = null;
                     change_count += 1;
                 }
             } else if (self.themed_cursor_previous != null) {
                 try self.ensureFrameStorage(@max(sample_count, change_count) + 1);
-                self.frame_changes[change_count] = .{ .previous = self.themed_cursor_previous };
+                self.frame_changes[change_count] = .{ .previous = try scaleSurfaceState(
+                    self.themed_cursor_previous.?,
+                    output_scale,
+                ) };
                 next_themed_cursor_previous = null;
                 change_count += 1;
             }
             if (self.client_cursor_hidden_previous) |previous| {
                 try self.ensureFrameStorage(@max(sample_count, change_count) + 1);
-                self.frame_changes[change_count] = .{ .previous = previous };
+                self.frame_changes[change_count] = .{
+                    .previous = try scaleSurfaceState(previous, output_scale),
+                };
                 change_count += 1;
             }
             const capture_request: ?output_api.CaptureRequest = if (self.pending_screencopy) |pending|
@@ -6253,9 +6333,12 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (!layer.active) continue;
                 if (!try self.refreshSubsurfaceLayer(layer, output_size)) continue;
                 try self.ensureFrameStorage(count.* + 1);
-                self.frame_samples[count.*] = layer.sample.?;
+                const output_scale = try geometry.OutputScale.init(
+                    self.output_management_adapter.lifecycle.current.scale_120,
+                );
+                self.frame_samples[count.*] = try scaleSample(layer.sample.?, output_scale);
                 self.frame_bindings[count.*] = layer.binding.?;
-                self.frame_changes[count.*] = layer.change.?;
+                self.frame_changes[count.*] = try scaleChange(layer.change.?, output_scale);
                 count.* += 1;
             }
         }
@@ -6455,10 +6538,13 @@ pub fn Coordinator(comptime protocol: type) type {
                         try self.failImageCopy(capture);
                         return;
                     },
-                    .toplevel => |id| (self.desktop.scene(id) catch {
+                    .toplevel => |id| self.physicalSceneRect((self.desktop.scene(id) catch {
                         try self.failImageCopy(capture);
                         return;
-                    }).geometry,
+                    }).geometry) orelse {
+                        try self.failImageCopy(capture);
+                        return;
+                    },
                 },
                 .cursor => if (self.cursorCaptureState(capture.target)) |state|
                     if (state.constraints.width == capture.width and
@@ -7227,13 +7313,19 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn outputBounds(self: *const Self) !geometry.Rect {
-            const output = self.output orelse return error.NoOutput;
+            if (self.output == null) return error.NoOutput;
+            const snapshot = self.output_adapter.logicalSnapshot();
             return .{
                 .x = 0,
                 .y = 0,
-                .width = @intCast(output.planner.output.width),
-                .height = @intCast(output.planner.output.height),
+                .width = snapshot.width orelse return error.NoOutput,
+                .height = snapshot.height orelse return error.NoOutput,
             };
+        }
+
+        fn logicalOutputSize(self: *const Self) !render.Size {
+            const bounds = try self.outputBounds();
+            return .{ .width = @intCast(bounds.width), .height = @intCast(bounds.height) };
         }
 
         fn layerWorkArea(self: *Self, pending_surface: ?Adapter.SurfaceId) !geometry.Rect {
@@ -7566,7 +7658,13 @@ pub fn Coordinator(comptime protocol: type) type {
             self.output = null;
             self.stats.output_drains += 1;
 
-            const result = try activateOutputWithRollback(self, desired, previous);
+            const result = try activateOutputWithRollback(
+                self,
+                desired,
+                previous,
+                pending.desired.scale_120,
+                pending.previous.scale_120,
+            );
             if (result == .succeeded) try self.manager.commitMode(
                 handle,
                 @intCast(pending.desired.width),
@@ -7876,11 +7974,17 @@ fn longestCursorShapeName() usize {
     return longest;
 }
 
-fn activateOutputWithRollback(owner: anytype, desired: anytype, previous: @TypeOf(desired)) !protocol_output_management.Completion {
-    owner.activateOutput(desired) catch |err| switch (err) {
+fn activateOutputWithRollback(
+    owner: anytype,
+    desired: anytype,
+    previous: @TypeOf(desired),
+    desired_scale_120: u32,
+    previous_scale_120: u32,
+) !protocol_output_management.Completion {
+    owner.activateOutput(desired, desired_scale_120) catch |err| switch (err) {
         error.ActivatedOutputFailure => return err,
         else => {
-            try owner.activateOutput(previous);
+            try owner.activateOutput(previous, previous_scale_120);
             return .failed;
         },
     };
@@ -7940,12 +8044,14 @@ test "physical: output mode inventory deduplicates timings and preserves preferr
 test "physical: output replacement rolls back exactly once after activation failure" {
     const Fake = struct {
         attempts: [2]u8 = undefined,
+        scales: [2]u32 = undefined,
         count: usize = 0,
         fail: ?u8,
         committed_fail: ?u8 = null,
 
-        fn activateOutput(self: *@This(), snapshot: u8) !void {
+        fn activateOutput(self: *@This(), snapshot: u8, scale_120: u32) !void {
             self.attempts[self.count] = snapshot;
+            self.scales[self.count] = scale_120;
             self.count += 1;
             if (self.committed_fail == snapshot) return error.ActivatedOutputFailure;
             if (self.fail == snapshot) return error.ActivationFailed;
@@ -7955,30 +8061,47 @@ test "physical: output replacement rolls back exactly once after activation fail
     var success = Fake{ .fail = null };
     try std.testing.expectEqual(
         protocol_output_management.Completion.succeeded,
-        try activateOutputWithRollback(&success, @as(u8, 2), 1),
+        try activateOutputWithRollback(&success, @as(u8, 2), 1, 180, 120),
     );
     try std.testing.expectEqualSlices(u8, &.{2}, success.attempts[0..success.count]);
+    try std.testing.expectEqualSlices(u32, &.{180}, success.scales[0..success.count]);
 
     var rollback = Fake{ .fail = 2 };
     try std.testing.expectEqual(
         protocol_output_management.Completion.failed,
-        try activateOutputWithRollback(&rollback, @as(u8, 2), 1),
+        try activateOutputWithRollback(&rollback, @as(u8, 2), 1, 180, 120),
     );
     try std.testing.expectEqualSlices(u8, &.{ 2, 1 }, rollback.attempts[0..rollback.count]);
+    try std.testing.expectEqualSlices(u32, &.{ 180, 120 }, rollback.scales[0..rollback.count]);
 
     var terminal = Fake{ .fail = 1 };
     try std.testing.expectError(
         error.ActivationFailed,
-        activateOutputWithRollback(&terminal, @as(u8, 1), 1),
+        activateOutputWithRollback(&terminal, @as(u8, 1), 1, 180, 120),
     );
     try std.testing.expectEqualSlices(u8, &.{ 1, 1 }, terminal.attempts[0..terminal.count]);
 
     var committed = Fake{ .fail = null, .committed_fail = 2 };
     try std.testing.expectError(
         error.ActivatedOutputFailure,
-        activateOutputWithRollback(&committed, @as(u8, 2), 1),
+        activateOutputWithRollback(&committed, @as(u8, 2), 1, 180, 120),
     );
     try std.testing.expectEqualSlices(u8, &.{2}, committed.attempts[0..committed.count]);
+}
+
+test "physical: logical render rectangles scale adjacent edges without gaps" {
+    const scale = try geometry.OutputScale.init(156);
+    const left = try scaleRenderRect(.{ .x = -1, .y = 2, .width = 3, .height = 5 }, scale);
+    const right = try scaleRenderRect(.{ .x = 2, .y = 2, .width = 4, .height = 5 }, scale);
+    try std.testing.expectEqual(@as(i32, -1), left.x);
+    try std.testing.expectEqual(@as(u32, 4), left.width);
+    try std.testing.expectEqual(@as(i64, left.x) + left.width, right.x);
+    try std.testing.expectEqual(left.y, right.y);
+    try std.testing.expectEqual(left.height, right.height);
+    try std.testing.expectError(
+        error.InvalidDestination,
+        scaleRenderRect(.{ .x = 0, .y = 0, .width = 1, .height = 1 }, try geometry.OutputScale.init(1)),
+    );
 }
 
 fn alphaMultiplier(multiplier: u32) u8 {
@@ -8194,6 +8317,45 @@ fn clipToOutput(destination: render.Rect, output: render.Size) !?render.Rect {
         .width = @intCast(clipped_right - left),
         .height = @intCast(clipped_bottom - top),
     };
+}
+
+fn scaleRenderRect(rect: render.Rect, scale: geometry.OutputScale) !render.Rect {
+    const logical_right = std.math.add(i64, rect.x, rect.width) catch
+        return error.InvalidDestination;
+    const logical_bottom = std.math.add(i64, rect.y, rect.height) catch
+        return error.InvalidDestination;
+    const left = scale.physicalEdge(rect.x) catch return error.InvalidDestination;
+    const top = scale.physicalEdge(rect.y) catch return error.InvalidDestination;
+    const right = scale.physicalEdge(logical_right) catch return error.InvalidDestination;
+    const bottom = scale.physicalEdge(logical_bottom) catch return error.InvalidDestination;
+    if (right <= left or bottom <= top) return error.InvalidDestination;
+    return .{
+        .x = std.math.cast(i32, left) orelse return error.InvalidDestination,
+        .y = std.math.cast(i32, top) orelse return error.InvalidDestination,
+        .width = std.math.cast(u32, right - left) orelse return error.InvalidDestination,
+        .height = std.math.cast(u32, bottom - top) orelse return error.InvalidDestination,
+    };
+}
+
+fn scaleSample(sample_value: render.SurfaceSample, scale: geometry.OutputScale) !render.SurfaceSample {
+    var result = sample_value;
+    result.destination = try scaleRenderRect(result.destination, scale);
+    result.clip = try scaleRenderRect(result.clip, scale);
+    return result;
+}
+
+fn scaleSurfaceState(state: damage.SurfaceState, scale: geometry.OutputScale) !damage.SurfaceState {
+    var result = state;
+    result.destination = try scaleRenderRect(result.destination, scale);
+    result.clip = try scaleRenderRect(result.clip, scale);
+    return result;
+}
+
+fn scaleChange(change: damage.Change, scale: geometry.OutputScale) !damage.Change {
+    var result = change;
+    result.previous = if (change.previous) |state| try scaleSurfaceState(state, scale) else null;
+    result.current = if (change.current) |state| try scaleSurfaceState(state, scale) else null;
+    return result;
 }
 
 fn rectanglesIntersect(a: geometry.Rect, b: geometry.Rect) bool {

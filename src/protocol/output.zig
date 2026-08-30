@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const wayring = @import("wayring");
+const geometry = @import("../scene/geometry.zig");
 
 const objects = wayring.objects;
 const none = std.math.maxInt(u32);
@@ -199,6 +200,9 @@ pub fn Adapter(comptime protocol: type) type {
                 physical_width_mm > std.math.maxInt(i32) or
                 physical_height_mm > std.math.maxInt(i32))
                 return error.InvalidMode;
+            const scale = geometry.OutputScale.init(adapter.scale_120) catch unreachable;
+            _ = scale.logicalDimension(width) catch return error.InvalidMode;
+            _ = scale.logicalDimension(height) catch return error.InvalidMode;
             var event_count: usize = 0;
             for (adapter.resources) |resource| {
                 if (resource.active) event_count += if (resource.version >= 2) 3 else 2;
@@ -230,6 +234,11 @@ pub fn Adapter(comptime protocol: type) type {
                 @divTrunc(@as(u64, scale_120) + 119, 120) > std.math.maxInt(i32))
                 return error.InvalidScale;
             if (adapter.scale_120 == scale_120) return;
+            const scale = geometry.OutputScale.init(scale_120) catch unreachable;
+            if (adapter.mode) |mode| {
+                _ = scale.logicalDimension(@intCast(mode.width)) catch return error.InvalidScale;
+                _ = scale.logicalDimension(@intCast(mode.height)) catch return error.InvalidScale;
+            }
             var event_count: usize = 0;
             for (adapter.resources) |resource| {
                 if (resource.active and resource.version >= 2) event_count += 2;
@@ -430,13 +439,14 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         pub fn logicalSnapshot(adapter: *const Self) LogicalSnapshot {
+            const scale = geometry.OutputScale.init(adapter.scale_120) catch unreachable;
             return .{
                 .width = if (adapter.mode) |mode|
-                    @intCast(@divTrunc(@as(u64, @intCast(mode.width)) * 120, adapter.scale_120))
+                    scale.logicalDimension(@intCast(mode.width)) catch unreachable
                 else
                     null,
                 .height = if (adapter.mode) |mode|
-                    @intCast(@divTrunc(@as(u64, @intCast(mode.height)) * 120, adapter.scale_120))
+                    scale.logicalDimension(@intCast(mode.height)) catch unreachable
                 else
                     null,
                 .name = adapter.name,
@@ -838,4 +848,6 @@ test "output: fractional scale republishes integer fallback and logical size" {
     try adapter.publishScale(156);
     try std.testing.expectEqual(@as(usize, 2), adapter.outbound_len);
     try std.testing.expectError(error.InvalidScale, adapter.publishScale(0));
+    try std.testing.expectError(error.InvalidScale, adapter.publishScale(230_401));
+    try std.testing.expectEqual(@as(u32, 156), adapter.scale_120);
 }
