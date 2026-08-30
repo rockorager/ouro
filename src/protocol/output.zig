@@ -253,6 +253,16 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         pub fn addOutput(adapter: *Self, config: OutputConfig) !OutputId {
+            const id = try adapter.addOutputUnpublished(config);
+            errdefer adapter.discardOutput(id) catch unreachable;
+            if (adapter.runtime != null) try adapter.publishOutput(id);
+            return id;
+        }
+
+        /// Reserves exact output identity and metadata without mutating the
+        /// runtime global table. This lets a coordinator prepare related
+        /// protocol state atomically before making the output discoverable.
+        pub fn addOutputUnpublished(adapter: *Self, config: OutputConfig) !OutputId {
             try config.validate();
             const scale = geometry.OutputScale.init(config.scale_120) catch return error.InvalidConfig;
             _ = scale;
@@ -282,22 +292,45 @@ pub fn Adapter(comptime protocol: type) type {
                 .physical_height_mm = config.physical_height_mm,
                 .scale_120 = config.scale_120,
             };
-            const id = adapter.outputIdFor(index);
-            if (adapter.runtime) |runtime| {
-                output.adapter = adapter;
-                output.global = runtime.addGlobalWithBinder(
-                    &Output.info,
-                    adapter.global_version,
-                    output,
-                    bind,
-                ) catch |err| {
-                    const generation = output.generation;
-                    output.* = .{ .generation = generation, .next_free = adapter.output_free };
-                    adapter.output_free = index;
-                    return err;
+            return adapter.outputIdFor(index);
+        }
+
+        pub fn publishOutput(adapter: *Self, id: OutputId) !void {
+            const output = try adapter.resolveOutput(id);
+            if (output.global != null) return error.OutputPublished;
+            const runtime = adapter.runtime orelse return error.NotInstalled;
+            output.adapter = adapter;
+            output.global = try runtime.addGlobalWithBinder(
+                &Output.info,
+                adapter.global_version,
+                output,
+                bind,
+            );
+        }
+
+        /// Discards an output which has never been globally published or bound.
+        /// Published output removal is a separate backpressure-aware lifecycle.
+        pub fn discardOutput(adapter: *Self, id: OutputId) !void {
+            if (std.meta.eql(id, adapter.primary_output)) return error.PrimaryOutput;
+            const output = try adapter.resolveOutput(id);
+            if (output.global != null) return error.OutputPublished;
+            for (adapter.resources) |resource|
+                if (resource.active and std.meta.eql(resource.output, id))
+                    return error.OutputInUse;
+            for (adapter.associations) |association|
+                if (association.active and std.meta.eql(association.output, id))
+                    return error.OutputInUse;
+            adapter.freeOutputStrings(output);
+            const generation = output.generation;
+            if (generation == std.math.maxInt(u32)) {
+                output.* = .{ .generation = generation };
+            } else {
+                output.* = .{
+                    .generation = generation + 1,
+                    .next_free = adapter.output_free,
                 };
+                adapter.output_free = id.index;
             }
-            return id;
         }
 
         pub fn publishMode(
@@ -1085,6 +1118,23 @@ test "output: identities isolate snapshots resources and surface associations" {
     });
     defer adapter.deinit();
     const primary = adapter.primaryOutput();
+    const unpublished = try adapter.addOutputUnpublished(.{
+        .name = "unpublished",
+        .description = "Unpublished output",
+    });
+    try std.testing.expectEqualStrings(
+        "unpublished",
+        (try adapter.logicalSnapshot(unpublished)).name,
+    );
+    try adapter.discardOutput(unpublished);
+    try std.testing.expectError(error.StaleOutput, adapter.logicalSnapshot(unpublished));
+    const recycled = try adapter.addOutputUnpublished(.{
+        .name = "recycled",
+        .description = "Recycled output",
+    });
+    try std.testing.expectEqual(unpublished.index, recycled.index);
+    try std.testing.expect(recycled.generation != unpublished.generation);
+    try adapter.discardOutput(recycled);
     const secondary = try adapter.addOutput(.{
         .name = "secondary",
         .description = "Secondary output",
@@ -1191,4 +1241,35 @@ test "output: identities isolate snapshots resources and surface associations" {
     );
     try std.testing.expectEqual(@as(i32, 2048), (try adapter.logicalSnapshot(secondary)).x);
     try std.testing.expectEqual(@as(i32, 0), (try adapter.logicalSnapshot(primary)).x);
+}
+
+test "output: unpublished discard rejects primary and never aliases exhausted generation" {
+    const TestAdapter = Adapter(@import("core_protocol"));
+    var adapter = try TestAdapter.init(std.testing.allocator, .{
+        .name = "primary",
+        .description = "Primary output",
+    });
+    defer adapter.deinit();
+
+    try std.testing.expectError(
+        error.PrimaryOutput,
+        adapter.discardOutput(adapter.primaryOutput()),
+    );
+    const output = try adapter.addOutputUnpublished(.{
+        .name = "terminal",
+        .description = "Terminal output",
+    });
+    adapter.outputs[output.index].generation = std.math.maxInt(u32);
+    const terminal: TestAdapter.OutputId = .{
+        .index = output.index,
+        .generation = std.math.maxInt(u32),
+    };
+    try adapter.discardOutput(terminal);
+    const replacement = try adapter.addOutputUnpublished(.{
+        .name = "replacement",
+        .description = "Replacement output",
+    });
+    try std.testing.expect(replacement.index != terminal.index);
+    try std.testing.expectError(error.StaleOutput, adapter.logicalSnapshot(terminal));
+    try adapter.discardOutput(replacement);
 }
