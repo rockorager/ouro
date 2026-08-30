@@ -3424,14 +3424,24 @@ pub fn Coordinator(comptime protocol: type) type {
                 else
                     null;
                 _ = try self.foreign_toplevel_list_adapter.updateParent(entry.protocol_id, parent);
-                const output_id = if (self.primaryKmsOutput()) |output|
-                    foreignOutputId(output.outputId())
-                else
-                    null;
+                const scene = self.desktop.scene(entry.desktop) catch continue;
+                const destination: render.Rect = .{
+                    .x = scene.geometry.x,
+                    .y = scene.geometry.y,
+                    .width = std.math.cast(u32, scene.geometry.width) orelse continue,
+                    .height = std.math.cast(u32, scene.geometry.height) orelse continue,
+                };
                 while (true) {
                     var stale: ?ForeignToplevelListAdapter.OutputId = null;
                     for (try self.foreign_toplevel_list_adapter.outputs(entry.protocol_id)) |published_output| {
-                        if (output_id == null or !std.meta.eql(published_output, output_id.?)) {
+                        const physical = self.physicalOutputForForeignId(published_output);
+                        if (physical == null or try clipToOutput(
+                            destination,
+                            self.outputBoundsFor(physical.?) catch {
+                                stale = published_output;
+                                break;
+                            },
+                        ) == null) {
                             stale = published_output;
                             break;
                         }
@@ -3443,10 +3453,13 @@ pub fn Coordinator(comptime protocol: type) type {
                         );
                     } else break;
                 }
-                if (output_id) |current_output| {
+                for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                    const output = physical.kms_output orelse continue;
+                    const bounds = self.outputBoundsFor(physical) catch continue;
+                    if (try clipToOutput(destination, bounds) == null) continue;
                     _ = try self.foreign_toplevel_list_adapter.addOutput(
                         entry.protocol_id,
-                        current_output,
+                        foreignOutputId(output.outputId()),
                     );
                 }
             }
