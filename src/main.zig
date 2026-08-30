@@ -20,6 +20,7 @@ const shm_formats = [_]wayring.shm.Format{
 const Options = struct {
     socket: []const u8 = "/tmp/ouro.sock",
     renderer: ouro.real_output.RendererPreference = .vulkan_then_pixman,
+    drm_device: ?[]const u8 = null,
     output_icc: ?[]const u8 = null,
 };
 
@@ -149,6 +150,7 @@ pub fn main(init: std.process.Init) !void {
             .plane_capacity = 64,
             .format_capacity = 8192,
             .event_capacity = 16,
+            .device_path = options.drm_device,
         },
         .output = .{
             .output_id = .{ .index = 0, .generation = 1 },
@@ -255,6 +257,9 @@ fn parseOptions(args: std.process.Args) !Options {
         } else if (std.mem.startsWith(u8, argument, "--socket=")) {
             options.socket = argument["--socket=".len..];
             if (options.socket.len == 0) return error.InvalidSocket;
+        } else if (std.mem.startsWith(u8, argument, "--drm-device=")) {
+            options.drm_device = argument["--drm-device=".len..];
+            if (options.drm_device.?.len == 0) return error.InvalidDrmDevice;
         } else if (std.mem.startsWith(u8, argument, "--output-icc=")) {
             options.output_icc = argument["--output-icc=".len..];
             if (options.output_icc.?.len == 0) return error.InvalidOutputIcc;
@@ -265,11 +270,12 @@ fn parseOptions(args: std.process.Args) !Options {
 
 fn usage() void {
     std.debug.print(
-        \\usage: ouro [--socket=PATH] [--renderer=auto|pixman|vulkan] [--output-icc=PATH]
+        \\usage: ouro [--socket=PATH] [--renderer=auto|pixman|vulkan] [--drm-device=PATH] [--output-icc=PATH]
         \\
         \\  auto    try Vulkan, then fall back to Pixman at startup
         \\  pixman  require the CPU Pixman renderer
         \\  vulkan  require Vulkan and KMS IN_FENCE_FD (no host wait)
+        \\  --drm-device  require this DRM card instead of automatic selection
         \\  --output-icc  apply an ICC v2/v4 output profile and VCGT (Vulkan only)
         \\
     , .{});

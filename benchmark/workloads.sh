@@ -96,6 +96,12 @@ benchmark_workloads=(
     "layers-occlusion-toggle-8 shm-scene-occlusion-toggle-8    1       640   360    600    3"
     "layers-clipped-2     shm-scene-clipped-2                  1       960   540    600    3"
     "layers-hidden-damage-2 shm-scene-hidden-damage-2          1       960   540    600    3"
+    "outputs-control-shm-full shm-full                         1       960   720    1000   3 paced outputs"
+    "outputs-control-shm-sparse shm-sparse                     1       960   720    1000   3 paced outputs"
+    "outputs-shm-full     shm-full                             0       960   720    1000   3 paced outputs"
+    "outputs-shm-sparse   shm-sparse                           0       960   720    1000   3 paced outputs"
+    "outputs-dmabuf-full  dmabuf-full                          0       960   720    1000   3 paced outputs"
+    "outputs-dmabuf-sparse dmabuf-sparse                       0       960   720    1000   3 paced outputs"
 )
 
 benchmark_suite_contains() {
@@ -118,7 +124,8 @@ benchmark_suite_contains() {
                 $workload == capture-dmabuf-full ]]
             ;;
         all) [[ $workload != *-scale-16 && $workload != *-scale-32 &&
-            $workload != *-scale-64 && $workload != direct-scanout-* ]] ;;
+            $workload != *-scale-64 && $workload != direct-scanout-* &&
+            $workload != outputs-* ]] ;;
         shm) [[ $workload == shm-* && $workload != *-scale-16 && $workload != *-scale-32 && $workload != *-scale-64 ]] ;;
         dmabuf) [[ $workload == dmabuf-* && $workload != *-scale-16 && $workload != *-scale-32 && $workload != *-scale-64 ]] ;;
         damage) [[ $workload == *-moving || $workload == *-multirect-* ]] ;;
@@ -141,6 +148,7 @@ benchmark_suite_contains() {
         native) [[ $workload == dmabuf-native-* ]] ;;
         sync) [[ $workload == dmabuf-sync-* || $workload == dmabuf-native-sync-* ]] ;;
         capture) [[ $workload == capture-* ]] ;;
+        outputs) [[ $workload == outputs-* ]] ;;
         scanout) [[ $workload == direct-scanout-* ]] ;;
         visibility) [[ $workload == shm-opaque-* || $workload == layers-clipped-* ||
             $workload == layers-hidden-damage-* || $workload == layers-occlusion-* ]] ;;

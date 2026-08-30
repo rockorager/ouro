@@ -337,6 +337,19 @@ pub fn build(b: *std.Build) void {
     const benchmark_copy_capture_code_output = benchmark_copy_capture_code.addOutputFileArg(
         "ext-image-copy-capture-v1-protocol.c",
     );
+    const benchmark_layer_shell_xml = wlr_protocols.path(
+        "unstable/wlr-layer-shell-unstable-v1.xml",
+    );
+    const benchmark_layer_shell_header = b.addSystemCommand(&.{ benchmark_scanner, "client-header" });
+    benchmark_layer_shell_header.addFileArg(benchmark_layer_shell_xml);
+    const benchmark_layer_shell_header_output = benchmark_layer_shell_header.addOutputFileArg(
+        "wlr-layer-shell-unstable-v1-client-protocol.h",
+    );
+    const benchmark_layer_shell_code = b.addSystemCommand(&.{ benchmark_scanner, "private-code" });
+    benchmark_layer_shell_code.addFileArg(benchmark_layer_shell_xml);
+    const benchmark_layer_shell_code_output = benchmark_layer_shell_code.addOutputFileArg(
+        "wlr-layer-shell-unstable-v1-protocol.c",
+    );
     benchmark_client.root_module.addIncludePath(benchmark_xdg_header_output.dirname());
     benchmark_client.root_module.addIncludePath(benchmark_presentation_header_output.dirname());
     benchmark_client.root_module.addIncludePath(benchmark_dmabuf_header_output.dirname());
@@ -348,6 +361,7 @@ pub fn build(b: *std.Build) void {
     benchmark_client.root_module.addIncludePath(benchmark_foreign_toplevel_header_output.dirname());
     benchmark_client.root_module.addIncludePath(benchmark_capture_source_header_output.dirname());
     benchmark_client.root_module.addIncludePath(benchmark_copy_capture_header_output.dirname());
+    benchmark_client.root_module.addIncludePath(benchmark_layer_shell_header_output.dirname());
     benchmark_client.root_module.addCSourceFile(.{
         .file = benchmark_xdg_code_output,
         .flags = &.{"-std=c11"},
@@ -390,6 +404,10 @@ pub fn build(b: *std.Build) void {
     });
     benchmark_client.root_module.addCSourceFile(.{
         .file = benchmark_copy_capture_code_output,
+        .flags = &.{"-std=c11"},
+    });
+    benchmark_client.root_module.addCSourceFile(.{
+        .file = benchmark_layer_shell_code_output,
         .flags = &.{"-std=c11"},
     });
     benchmark_client.root_module.addCSourceFile(.{

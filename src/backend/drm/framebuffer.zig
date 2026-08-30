@@ -1,4 +1,5 @@
-//! Fixed-capacity GBM scanout pool and DRM framebuffer lifetime owner.
+//! Fixed-capacity scanout pool and DRM framebuffer lifetime owner. Vulkan uses
+//! GBM BOs; Pixman uses lifetime-mapped DRM dumb buffers.
 //! The pool must be fully drained and destroyed before its borrowed R9
 //! snapshot/FD may be invalidated by rescan, removal, or session disable.
 
@@ -20,6 +21,8 @@ pub const Platform = struct {
     pub const VTable = struct {
         add: *const fn (*anyopaque, std.posix.fd_t, gbm.Metadata) anyerror!u32,
         remove: *const fn (*anyopaque, std.posix.fd_t, u32) anyerror!void,
+        create_dumb: *const fn (*anyopaque, std.posix.fd_t, u32, u32, u32) anyerror!DumbBuffer,
+        destroy_dumb: *const fn (*anyopaque, std.posix.fd_t, DumbBuffer) void,
     };
 
     pub fn add(self: Platform, fd: std.posix.fd_t, metadata: gbm.Metadata) !u32 {
@@ -29,12 +32,31 @@ pub const Platform = struct {
     pub fn remove(self: Platform, fd: std.posix.fd_t, id: u32) !void {
         return self.vtable.remove(self.context, fd, id);
     }
+
+    pub fn createDumb(
+        self: Platform,
+        fd: std.posix.fd_t,
+        width: u32,
+        height: u32,
+        format: u32,
+    ) !DumbBuffer {
+        return self.vtable.create_dumb(self.context, fd, width, height, format);
+    }
+
+    pub fn destroyDumb(self: Platform, fd: std.posix.fd_t, buffer: DumbBuffer) void {
+        self.vtable.destroy_dumb(self.context, fd, buffer);
+    }
 };
 
 var real_context: u8 = 0;
 pub const real: Platform = .{ .context = &real_context, .vtable = &real_vtable };
 
-const real_vtable: Platform.VTable = .{ .add = realAdd, .remove = realRemove };
+const real_vtable: Platform.VTable = .{
+    .add = realAdd,
+    .remove = realRemove,
+    .create_dumb = realCreateDumb,
+    .destroy_dumb = realDestroyDumb,
+};
 
 fn realAdd(_: *anyopaque, fd: std.posix.fd_t, metadata: gbm.Metadata) !u32 {
     var framebuffer_id: u32 = 0;
@@ -76,11 +98,55 @@ fn realRemove(_: *anyopaque, fd: std.posix.fd_t, id: u32) !void {
     if (c.drmModeRmFB(fd, id) != 0) return error.RemoveFramebufferFailed;
 }
 
+pub const DumbBuffer = struct {
+    handle: u32,
+    stride: u32,
+    bytes: []align(std.heap.page_size_min) u8,
+};
+
+fn realCreateDumb(
+    _: *anyopaque,
+    fd: std.posix.fd_t,
+    width: u32,
+    height: u32,
+    format: u32,
+) !DumbBuffer {
+    if (format != gbm.format_xrgb8888 and format != gbm.format_argb8888)
+        return error.UnsupportedDumbFormat;
+    var handle: u32 = 0;
+    var stride: u32 = 0;
+    var size: u64 = 0;
+    if (c.drmModeCreateDumbBuffer(fd, width, height, 32, 0, &handle, &stride, &size) != 0 or
+        handle == 0 or stride == 0 or size == 0 or size > std.math.maxInt(usize))
+        return error.CreateDumbBufferFailed;
+    errdefer _ = c.drmModeDestroyDumbBuffer(fd, handle);
+    var offset: u64 = 0;
+    if (c.drmModeMapDumbBuffer(fd, handle, &offset) != 0)
+        return error.MapDumbBufferFailed;
+    const bytes = try std.posix.mmap(
+        null,
+        @intCast(size),
+        .{ .READ = true, .WRITE = true },
+        .{ .TYPE = .SHARED },
+        fd,
+        offset,
+    );
+    return .{ .handle = handle, .stride = stride, .bytes = bytes };
+}
+
+fn realDestroyDumb(_: *anyopaque, fd: std.posix.fd_t, buffer: DumbBuffer) void {
+    std.posix.munmap(buffer.bytes);
+    _ = c.drmModeDestroyDumbBuffer(fd, buffer.handle);
+}
+
 pub const Config = struct {
     capacity: usize = default_capacity,
-    /// CPU startup uses only GBM targets requested and reported as linear.
-    /// GPU startup may fall back to another explicit scanout modifier.
+    /// CPU startup requires linear targets. GPU startup may fall back to
+    /// another explicit scanout modifier.
     linear_only: bool = false,
+    /// Pixman targets use lifetime-mapped DRM dumb buffers rather than a GBM
+    /// transfer mapping whose writes may require an unmap before scanout.
+    cpu_mapped: bool = false,
 };
 
 pub const Handle = struct {
@@ -102,12 +168,14 @@ pub const Mapping = struct {
 };
 
 const Slot = struct {
-    bo: gbm.Bo,
+    bo: ?gbm.Bo = null,
+    dumb: ?DumbBuffer = null,
     metadata: gbm.Metadata,
     framebuffer_id: u32,
     generation: u32 = 1,
     state: State = .free,
     mapping: ?gbm.Mapping = null,
+    mapped: bool = false,
 };
 
 pub const Pool = struct {
@@ -140,21 +208,60 @@ pub const Pool = struct {
         var created: usize = 0;
         errdefer cleanupCreated(gbm_platform, drm_platform, fd, slots[0..created]);
         while (created < slots.len) : (created += 1) {
-            const bo = try gbm_platform.createBo(device, allocation);
-            errdefer gbm_platform.destroyBo(bo);
-            var metadata = try gbm_platform.getMetadata(bo);
-            // The ordinary GBM allocation API does not retain an explicit
-            // modifier and Mesa may report INVALID even when LINEAR usage was
-            // required. This path is linear by construction; explicit tiled
-            // allocations remain subject to exact modifier validation.
-            if (allocation.modifier == gbm.modifier_linear and
-                metadata.modifier == gbm.modifier_invalid)
-                metadata.modifier = gbm.modifier_linear;
+            var bo: ?gbm.Bo = null;
+            var dumb: ?DumbBuffer = null;
+            var metadata: gbm.Metadata = undefined;
+            if (config.cpu_mapped) {
+                const buffer = try drm_platform.createDumb(
+                    fd,
+                    allocation.width,
+                    allocation.height,
+                    allocation.format,
+                );
+                dumb = buffer;
+                errdefer drm_platform.destroyDumb(fd, buffer);
+                const row_bytes = std.math.mul(u32, allocation.width, 4) catch
+                    return error.InvalidDumbBuffer;
+                const required_bytes = std.math.mul(
+                    usize,
+                    buffer.stride,
+                    allocation.height,
+                ) catch return error.InvalidDumbBuffer;
+                if (buffer.handle == 0 or buffer.stride < row_bytes or
+                    buffer.bytes.len < required_bytes)
+                    return error.InvalidDumbBuffer;
+                metadata = .{
+                    .width = allocation.width,
+                    .height = allocation.height,
+                    .format = allocation.format,
+                    .modifier = gbm.modifier_linear,
+                    .plane_count = 1,
+                };
+                metadata.handles[0] = buffer.handle;
+                metadata.strides[0] = buffer.stride;
+            } else {
+                const buffer = try gbm_platform.createBo(device, allocation);
+                bo = buffer;
+                errdefer gbm_platform.destroyBo(buffer);
+                metadata = try gbm_platform.getMetadata(buffer);
+                // The ordinary GBM allocation API does not retain an explicit
+                // modifier and Mesa may report INVALID even when LINEAR usage
+                // was required. This path is linear by construction; explicit
+                // tiled allocations remain subject to exact modifier validation.
+                if (allocation.modifier == gbm.modifier_linear and
+                    metadata.modifier == gbm.modifier_invalid)
+                    metadata.modifier = gbm.modifier_linear;
+            }
+            errdefer if (dumb) |buffer|
+                drm_platform.destroyDumb(fd, buffer)
+            else
+                gbm_platform.destroyBo(bo.?);
             try validateMetadata(allocation, metadata);
             const framebuffer_id = try drm_platform.add(fd, metadata);
             if (framebuffer_id == 0) return error.InvalidFramebufferId;
             slots[created] = .{
                 .bo = bo,
+                .dumb = dumb,
                 .metadata = metadata,
                 .framebuffer_id = framebuffer_id,
             };
@@ -182,13 +289,16 @@ pub const Pool = struct {
             index -= 1;
             const slot = &self.slots[index];
             if (slot.mapping) |mapping| {
-                self.gbm_platform.unmap(slot.bo, mapping.token);
+                self.gbm_platform.unmap(slot.bo.?, mapping.token);
                 slot.mapping = null;
             }
             self.drm_platform.remove(self.fd, slot.framebuffer_id) catch |err| {
                 if (first_error == null) first_error = err;
             };
-            self.gbm_platform.destroyBo(slot.bo);
+            if (slot.dumb) |buffer|
+                self.drm_platform.destroyDumb(self.fd, buffer)
+            else
+                self.gbm_platform.destroyBo(slot.bo.?);
         }
         self.gbm_platform.destroyDevice(self.device);
         const allocator = self.allocator;
@@ -220,30 +330,39 @@ pub const Pool = struct {
         const slot = try self.get(handle);
         if (slot.state != .acquired) return error.InvalidTransition;
         if (plane >= slot.metadata.plane_count) return error.InvalidPlane;
-        return self.gbm_platform.exportPlaneFd(slot.bo, plane);
+        return self.gbm_platform.exportPlaneFd(slot.bo orelse return error.NotExportable, plane);
     }
 
     pub fn map(self: *Pool, handle: Handle) !Mapping {
         const slot = try self.get(handle);
         if (slot.state != .acquired) return error.InvalidTransition;
-        if (slot.mapping != null) return error.AlreadyMapped;
+        if (slot.mapped) return error.AlreadyMapped;
         if (slot.metadata.modifier != gbm.modifier_linear)
             return error.NotLinear;
-        const mapping = try self.gbm_platform.map(slot.bo, .write);
+        if (slot.dumb) |buffer| {
+            slot.mapped = true;
+            return .{ .data = buffer.bytes, .stride = buffer.stride };
+        }
+        const bo = slot.bo orelse return error.InvalidBacking;
+        const mapping = try self.gbm_platform.map(bo, .write);
         const length = std.math.mul(usize, mapping.stride, slot.metadata.height) catch {
-            self.gbm_platform.unmap(slot.bo, mapping.token);
+            self.gbm_platform.unmap(bo, mapping.token);
             return error.MappingTooLarge;
         };
         slot.mapping = mapping;
+        slot.mapped = true;
         return .{ .data = mapping.data[0..length], .stride = mapping.stride };
     }
 
     pub fn unmap(self: *Pool, handle: Handle) !void {
         const slot = try self.get(handle);
         if (slot.state != .acquired) return error.InvalidTransition;
-        const mapping = slot.mapping orelse return error.NotMapped;
-        self.gbm_platform.unmap(slot.bo, mapping.token);
-        slot.mapping = null;
+        if (!slot.mapped) return error.NotMapped;
+        if (slot.mapping) |mapping| {
+            self.gbm_platform.unmap(slot.bo.?, mapping.token);
+            slot.mapping = null;
+        }
+        slot.mapped = false;
     }
 
     /// Preflight used immediately before an external KMS commit. A successful
@@ -252,7 +371,7 @@ pub const Pool = struct {
     pub fn validateSubmit(self: *Pool, handle: Handle) !void {
         const slot = try self.get(handle);
         if (slot.state != .acquired) return error.InvalidTransition;
-        if (slot.mapping != null) return error.StillMapped;
+        if (slot.mapped) return error.StillMapped;
     }
 
     pub fn submit(self: *Pool, handle: Handle) !void {
@@ -266,7 +385,7 @@ pub const Pool = struct {
     pub fn discard(self: *Pool, handle: Handle) !void {
         const slot = try self.get(handle);
         if (slot.state != .acquired) return error.InvalidTransition;
-        if (slot.mapping != null) return error.StillMapped;
+        if (slot.mapped) return error.StillMapped;
         try recycle(slot);
     }
 
@@ -371,7 +490,10 @@ fn cleanupCreated(
     while (index != 0) {
         index -= 1;
         drm_platform.remove(fd, slots[index].framebuffer_id) catch {};
-        gbm_platform.destroyBo(slots[index].bo);
+        if (slots[index].dumb) |buffer|
+            drm_platform.destroyDumb(fd, buffer)
+        else
+            gbm_platform.destroyBo(slots[index].bo.?);
     }
 }
 
@@ -514,6 +636,37 @@ test "scanout: map lifetime is explicit and only linear acquired images map" {
     try pool.deinit();
 }
 
+test "scanout: CPU targets retain dumb mappings across submissions" {
+    var fixture = TestSnapshot.init(&.{.{
+        .fourcc = gbm.format_xrgb8888,
+        .modifier = gbm.modifier_linear,
+    }});
+    var fake = FakePlatform{};
+    var pool = try Pool.init(
+        std.testing.allocator,
+        fake.gbmPlatform(),
+        fake.drmPlatform(),
+        17,
+        fixture.snapshot(),
+        .{ .capacity = 1, .linear_only = true, .cpu_mapped = true },
+    );
+    const first = try pool.acquire();
+    _ = try pool.map(first);
+    try pool.unmap(first);
+    try pool.submit(first);
+    try pool.release(first);
+    const second = try pool.acquire();
+    _ = try pool.map(second);
+    try pool.unmap(second);
+    try pool.discard(second);
+    try pool.deinit();
+    try std.testing.expectEqual(@as(usize, 1), fake.dumb_create_count);
+    try std.testing.expectEqual(@as(usize, 1), fake.dumb_destroy_count);
+    try std.testing.expectEqual(@as(usize, 0), fake.bo_create_count);
+    try std.testing.expectEqual(@as(usize, 0), fake.map_count);
+    try std.testing.expectEqual(@as(usize, 0), fake.unmap_count);
+}
+
 test "scanout: transitions exhaustion and stale generations are rejected" {
     var fixture = TestSnapshot.init(&.{.{ .fourcc = gbm.format_xrgb8888, .modifier = gbm.modifier_linear }});
     var fake = FakePlatform{};
@@ -609,16 +762,23 @@ const FakePlatform = struct {
     remove_count: usize = 0,
     map_count: usize = 0,
     unmap_count: usize = 0,
+    dumb_create_count: usize = 0,
+    dumb_destroy_count: usize = 0,
     fail_bo_at: usize = 0,
     fail_add_at: usize = 0,
     fail_remove: bool = false,
     metadata_mismatch: bool = false,
     plane_count: u8 = 1,
     modifier: u64 = gbm.modifier_linear,
-    bytes: [64 * 48]u8 = [_]u8{0} ** (64 * 48),
+    bytes: [256 * 48]u8 align(std.heap.page_size_min) = [_]u8{0} ** (256 * 48),
 
     const gbm_vtable: gbm.Platform.VTable = .{ .create_device = createDevice, .destroy_device = destroyDevice, .create_bo = createBo, .import_bo = importBo, .destroy_bo = destroyBo, .metadata = metadata, .export_plane_fd = exportPlaneFd, .map = map, .unmap = unmap };
-    const drm_vtable: Platform.VTable = .{ .add = add, .remove = remove };
+    const drm_vtable: Platform.VTable = .{
+        .add = add,
+        .remove = remove,
+        .create_dumb = createDumb,
+        .destroy_dumb = destroyDumb,
+    };
 
     fn gbmPlatform(self: *FakePlatform) gbm.Platform {
         return .{ .context = self, .vtable = &gbm_vtable };
@@ -712,5 +872,26 @@ const FakePlatform = struct {
         self.removed[self.remove_count] = id;
         self.remove_count += 1;
         if (self.fail_remove) return error.FakeRemove;
+    }
+
+    fn createDumb(
+        context: *anyopaque,
+        _: std.posix.fd_t,
+        _: u32,
+        _: u32,
+        _: u32,
+    ) !DumbBuffer {
+        const self: *FakePlatform = @ptrCast(@alignCast(context));
+        self.dumb_create_count += 1;
+        return .{
+            .handle = @intCast(200 + self.dumb_create_count),
+            .stride = 256,
+            .bytes = &self.bytes,
+        };
+    }
+
+    fn destroyDumb(context: *anyopaque, _: std.posix.fd_t, _: DumbBuffer) void {
+        const self: *FakePlatform = @ptrCast(@alignCast(context));
+        self.dumb_destroy_count += 1;
     }
 };

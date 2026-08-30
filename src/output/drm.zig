@@ -2022,6 +2022,8 @@ test "drm-sim: physical Pixman owner starts and drains in strict order" {
 
 const SimFixture = struct {
     bytes: [4][4]u8 align(4) = [_][4]u8{[_]u8{0} ** 4} ** 4,
+    dumb_bytes: [4][std.heap.page_size_min]u8 align(std.heap.page_size_min) =
+        [_][std.heap.page_size_min]u8{[_]u8{0} ** std.heap.page_size_min} ** 4,
     bo_count: usize = 0,
     bos_destroyed: usize = 0,
     framebuffers_removed: usize = 0,
@@ -2050,6 +2052,8 @@ const SimFixture = struct {
     const framebuffer_vtable: framebuffer.Platform.VTable = .{
         .add = addFramebuffer,
         .remove = removeFramebuffer,
+        .create_dumb = createDumb,
+        .destroy_dumb = destroyDumb,
     };
     const atomic_vtable: atomic.Platform.VTable = .{
         .create_blob = createBlob,
@@ -2148,6 +2152,26 @@ const SimFixture = struct {
         if (self.framebuffers_removed == 0)
             self.pool_removal_started_before_bo = self.bos_destroyed == 0;
         self.framebuffers_removed += 1;
+    }
+    fn createDumb(
+        context: *anyopaque,
+        _: std.posix.fd_t,
+        _: u32,
+        _: u32,
+        _: u32,
+    ) !framebuffer.DumbBuffer {
+        const self: *SimFixture = @ptrCast(@alignCast(context));
+        const index = self.bo_count;
+        self.bo_count += 1;
+        return .{
+            .handle = @intCast(index + 1),
+            .stride = 4,
+            .bytes = &self.dumb_bytes[index],
+        };
+    }
+    fn destroyDumb(context: *anyopaque, _: std.posix.fd_t, _: framebuffer.DumbBuffer) void {
+        const self: *SimFixture = @ptrCast(@alignCast(context));
+        self.bos_destroyed += 1;
     }
     fn createBlob(_: *anyopaque, _: std.posix.fd_t, _: drm.Mode) !u32 {
         return 1;

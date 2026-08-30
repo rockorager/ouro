@@ -30,6 +30,7 @@ pub const Config = struct {
     plane_capacity: usize,
     format_capacity: usize,
     event_capacity: usize,
+    device_path: ?[]const u8 = null,
 };
 
 pub const Handle = struct { generation: u32 };
@@ -178,6 +179,8 @@ pub const Manager = struct {
     session: *session_api.Session,
     seat: [seat_capacity]u8 = [_]u8{0} ** seat_capacity,
     seat_len: u8,
+    device_path: [api.path_capacity]u8 = [_]u8{0} ** api.path_capacity,
+    device_path_len: u16 = 0,
     cards: []Card,
     stores: [2]Storage,
     active_store: u1 = 0,
@@ -205,6 +208,9 @@ pub const Manager = struct {
             config.connector_encoder_capacity == 0 or config.encoder_capacity == 0 or
             config.crtc_capacity == 0 or config.plane_capacity == 0 or
             config.format_capacity == 0 or config.event_capacity == 0)
+            return error.InvalidConfig;
+        if (config.device_path) |path| if (path.len == 0 or path.len > api.path_capacity or
+            std.mem.indexOfScalar(u8, path, 0) != null)
             return error.InvalidConfig;
         const cards = try allocator.alloc(Card, config.card_capacity);
         errdefer allocator.free(cards);
@@ -237,6 +243,10 @@ pub const Manager = struct {
             .events_buffer = event_storage,
         };
         @memcpy(manager.seat[0..seat.len], seat);
+        if (config.device_path) |path| {
+            @memcpy(manager.device_path[0..path.len], path);
+            manager.device_path_len = @intCast(path.len);
+        }
         return manager;
     }
 
@@ -281,15 +291,18 @@ pub const Manager = struct {
         return self.session.deviceFd(self.device orelse return error.StaleSnapshot);
     }
 
-    /// Enumerates the active seat, selects boot_vga first and otherwise the
-    /// lexicographically smallest udev syspath. The syspath fallback is stable
-    /// across enumeration ordering and card-node renumbering when udev exposes
-    /// stable PCI/platform ancestry.
+    /// Enumerates the active seat and selects the configured device path when
+    /// present. Otherwise selects boot_vga first, then the lexicographically
+    /// smallest udev syspath. The syspath fallback is stable across enumeration
+    /// ordering and card-node renumbering when udev exposes stable ancestry.
     pub fn rescan(self: *Manager) !?Handle {
         if (self.hasActiveLease()) return error.LeasesActive;
         const card_count = try self.platform.discover(self.cards, self.seat[0..self.seat_len]);
         if (card_count > self.cards.len) return error.InvalidPlatformResult;
-        const selected_card = chooseCard(self.cards[0..card_count]) orelse {
+        const selected_card = selectCard(
+            self.cards[0..card_count],
+            self.device_path[0..self.device_path_len],
+        ) orelse {
             try self.remove();
             return null;
         };
@@ -836,6 +849,12 @@ fn chooseCard(cards: []Card) ?*const Card {
     return selected;
 }
 
+fn selectCard(cards: []Card, device_path: []const u8) ?*const Card {
+    if (device_path.len == 0) return chooseCard(cards);
+    for (cards) |*card| if (std.mem.eql(u8, card.devicePath(), device_path)) return card;
+    return null;
+}
+
 fn validateCounts(buffer: *const api.TopologyBuffer) !void {
     if (buffer.connector_count > buffer.connectors.len or
         buffer.mode_count > buffer.modes.len or
@@ -1018,6 +1037,11 @@ test "drm: boot VGA and stable fallback selection ignore enumeration order" {
     cards[1].boot_vga = false;
     cards[2].boot_vga = false;
     try std.testing.expectEqualStrings("/dev/dri/card0", chooseCard(&cards).?.devicePath());
+    try std.testing.expectEqualStrings(
+        "/dev/dri/card2",
+        selectCard(&cards, "/dev/dri/card2").?.devicePath(),
+    );
+    try std.testing.expect(selectCard(&cards, "/dev/dri/card9") == null);
 }
 
 test "drm: deterministic output assignment prefers mode then lowest compatible IDs" {

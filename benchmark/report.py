@@ -151,6 +151,7 @@ def run_record(directory: Path, workload: str, compositor: str, run: int) -> dic
         modes *= client_count
     if len(modes) != client_count or any(not mode for mode in modes):
         raise ValueError(f"{directory}: invalid client mode population")
+    placement = case.get("placement", "xdg")
     for index, client in enumerate(clients):
         mode = modes[index]
         if client.get("pacing", "presentation") != expected_pacing:
@@ -164,6 +165,12 @@ def run_record(directory: Path, workload: str, compositor: str, run: int) -> dic
                 raise ValueError(
                     f"{directory}: client {field}={client[field]}, expected {case[field]}"
                 )
+        expected_output_index = index if placement == "outputs" else -1
+        if client.get("output_index", -1) != expected_output_index:
+            raise ValueError(
+                f"{directory}: client output_index={client.get('output_index')}, "
+                f"expected {expected_output_index}"
+            )
         if client["callbacks"] != expected_frames:
             raise ValueError(
                 f"{directory}: client callbacks={client['callbacks']}, expected {expected_frames}"

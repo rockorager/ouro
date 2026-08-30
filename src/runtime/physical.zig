@@ -4275,13 +4275,8 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn desktopSceneChanged(self: *Self) !void {
             try self.syncIdleNotifications();
-            const output = self.primaryKmsOutput() orelse return;
             _ = self.refreshRetainedLayersForOutput();
-            output.request(.damage, try monotonicNs()) catch |err| switch (err) {
-                error.OutputPaused => return,
-                else => return err,
-            };
-            try self.armTimer();
+            try self.requestOutputDamage();
         }
 
         fn applyInteractionCommands(self: *Self) !void {
@@ -4444,14 +4439,9 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.virtual_keyboard_adapter.setInhibited(&self.seat_adapter, false);
                 try self.syncLayerKeyboardFocus();
             }
-            if (self.primaryKmsOutput()) |output| {
-                output.planner.invalidateAll();
-                output.request(.damage, try monotonicNs()) catch |err| switch (err) {
-                    error.OutputPaused => return,
-                    else => return err,
-                };
-                try self.armTimer();
-            }
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical|
+                if (physical.kms_output) |output| output.planner.invalidateAll();
+            try self.requestOutputDamage();
             try self.syncIdleNotifications();
         }
 
@@ -4986,13 +4976,22 @@ pub fn Coordinator(comptime protocol: type) type {
         fn requestCursorRedraw(self: *Self) !void {
             if (!self.cursor_layer.active and self.themed_cursor.image == null and
                 self.themed_cursor_previous == null) return;
-            if (self.primaryKmsOutput()) |output| {
-                output.request(.damage, try monotonicNs()) catch |err| switch (err) {
-                    error.OutputPaused => return,
+            try self.requestOutputDamage();
+        }
+
+        fn requestOutputDamage(self: *Self) !void {
+            const now = try monotonicNs();
+            var requested = false;
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                if (!physical.connected) continue;
+                const output = physical.kms_output orelse continue;
+                output.request(.damage, now) catch |err| switch (err) {
+                    error.OutputPaused => continue,
                     else => return err,
                 };
-                try self.armTimer();
+                requested = true;
             }
+            if (requested) try self.armTimer();
         }
 
         fn flushProtocol(self: *Self) !void {
@@ -5867,7 +5866,11 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.desktop.validateWorkArea(work_area);
                 try self.interaction.validateBounds(work_area);
             }
-            try output.prepareReadiness(&self.router, &self.root.ring);
+            // Every output on this manager shares one DRM fd. A single poll
+            // dispatches all page-flip records through their commit userdata;
+            // polling once per CRTC lets the first completion drain the fd and
+            // makes later completions misclassify EAGAIN as a device failure.
+            if (primary) try output.prepareReadiness(&self.router, &self.root.ring);
             if (primary and publish_protocol) {
                 self.desktop.applyWorkArea(work_area);
                 self.interaction.applyBounds(work_area);
@@ -6191,10 +6194,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (self.pending_surface_len == before_len)
                     _ = self.rotatePendingSurface();
             }
-            if (changed) if (self.primaryKmsOutput()) |output| {
-                try output.request(.damage, try monotonicNs());
-                try self.armTimer();
-            };
+            if (changed) try self.requestOutputDamage();
             try self.syncCommitTimer();
         }
 
@@ -6873,7 +6873,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .submitted => {
                     self.adapter.clearFifoBarriers();
                     self.stats.submitted += 1;
-                    self.markFrameChangesApplied();
+                    self.markFrameChangesApplied(self.frame_bindings[0..sample_count]);
                     self.themed_cursor_previous = next_themed_cursor_previous;
                     self.client_cursor_hidden_previous = null;
                     self.removed_layer_len = 0;
@@ -6887,10 +6887,18 @@ pub fn Coordinator(comptime protocol: type) type {
             }
         }
 
-        fn markFrameChangesApplied(self: *Self) void {
-            for (self.app_layers) |*layer| if (layer.active)
-                markLayerChangeApplied(layer);
-            if (self.cursor_layer.active) markLayerChangeApplied(&self.cursor_layer);
+        fn markFrameChangesApplied(self: *Self, bindings: []const output_api.SampleBinding) void {
+            for (bindings) |binding| {
+                for (self.app_layers) |*layer| {
+                    if (!layer.active or layer.binding == null or
+                        !std.meta.eql(layer.binding.?, binding)) continue;
+                    markLayerChangeApplied(layer);
+                    break;
+                }
+                if (self.cursor_layer.active and self.cursor_layer.binding != null and
+                    std.meta.eql(self.cursor_layer.binding.?, binding))
+                    markLayerChangeApplied(&self.cursor_layer);
+            }
         }
 
         fn markLayerChangeApplied(layer: *Layer) void {
@@ -7613,10 +7621,7 @@ pub fn Coordinator(comptime protocol: type) type {
             if (self.cursor_layer.outcome_pending and
                 (!self.cursor_layer.source_release_pending or self.cursor_layer.retains_source))
                 changed = (try self.retryLayerOutcome(&self.cursor_layer)) or changed;
-            if (changed) if (self.primaryKmsOutput()) |output| {
-                try output.request(.damage, try monotonicNs());
-                try self.armTimer();
-            };
+            if (changed) try self.requestOutputDamage();
             return changed;
         }
 
@@ -8220,6 +8225,11 @@ pub fn Coordinator(comptime protocol: type) type {
                 physical.removing = true;
                 errdefer physical.removing = false;
                 try self.pausePhysicalOutput(physical);
+                // An output without the shared DRM readiness poll may pause
+                // and drain synchronously, leaving no completion to drive the
+                // coordinator's normal drain/removal passes.
+                try self.advanceDrain();
+                try self.advancePhysicalOutputRemovals();
                 return;
             }
             return error.InvalidOutput;
@@ -8612,10 +8622,7 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             self.removed_layers[self.removed_layer_len] = .{ .id = id, .state = state };
             self.removed_layer_len += 1;
-            if (self.primaryKmsOutput()) |output| {
-                output.request(.damage, monotonicNs() catch return) catch return;
-                self.armTimer() catch {};
-            }
+            self.requestOutputDamage() catch return;
         }
 
         fn cleanupUnstartedOutput(self: *Self, physical: *PhysicalOutput) void {
@@ -8772,7 +8779,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.desktop.applyWorkArea(self.layerWorkArea(null) catch self.outputBounds() catch unreachable);
                 self.syncLayerPopupRoots() catch {};
                 self.syncLayerKeyboardFocus() catch {};
-                self.primaryKmsOutput().?.request(.damage, monotonicNs() catch 0) catch {};
+                self.requestOutputDamage() catch {};
             }
             if (session_lock_removed) self.sessionLockChanged() catch {};
             if (idle_inhibit_removed or idle_notify_removed) self.syncIdleNotifications() catch {};

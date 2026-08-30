@@ -1190,9 +1190,9 @@ fn runVertical(trigger: TerminalTrigger, source: ClientSource) !void {
     if (source == .dmabuf) {
         try std.testing.expectEqual(@as(usize, 2), fixture.imported_bos);
         try std.testing.expectEqual(@as(usize, 2), fixture.read_maps);
-        // The target map, create-time validation map, and retained-source map
-        // have all been released by the first completed presentation.
-        try std.testing.expectEqual(@as(usize, 3), fixture.unmaps);
+        // Dumb targets retain their lifetime mapping. The imported validation
+        // and retained-source mappings are released by first presentation.
+        try std.testing.expectEqual(@as(usize, 2), fixture.unmaps);
     }
     try std.testing.expectEqual(
         @as(u32, 10),
@@ -2445,6 +2445,9 @@ pub const Fixture = struct {
     callback: ?*ouro.backend_platform.CallbackContext = null,
     command: SessionCommand = .enable,
     bo_bytes: [12][32]u8 align(4) = .{[_]u8{0} ** 32} ** 12,
+    dumb_bytes: [12][std.heap.page_size_min]u8 align(std.heap.page_size_min) =
+        .{[_]u8{0} ** std.heap.page_size_min} ** 12,
+    dumb_count: usize = 0,
     bo_count: usize = 0,
     bo_destroyed: usize = 0,
     output_bo_destroyed: usize = 0,
@@ -2560,7 +2563,12 @@ pub const Fixture = struct {
         .map = mapBo,
         .unmap = unmapBo,
     };
-    const framebuffer_vtable: ouro.drm_framebuffer.Platform.VTable = .{ .add = addFb, .remove = removeFb };
+    const framebuffer_vtable: ouro.drm_framebuffer.Platform.VTable = .{
+        .add = addFb,
+        .remove = removeFb,
+        .create_dumb = createDumb,
+        .destroy_dumb = destroyDumb,
+    };
     const atomic_vtable: ouro.drm_atomic.Platform.VTable = .{
         .create_blob = createBlob,
         .destroy_blob = destroyBlob,
@@ -2782,6 +2790,33 @@ pub const Fixture = struct {
         if (self.framebuffer_removed == 0)
             self.framebuffer_removal_before_bo = self.output_bo_destroyed == 0;
         self.framebuffer_removed += 1;
+    }
+    fn createDumb(
+        context: *anyopaque,
+        _: linux.fd_t,
+        _: u32,
+        _: u32,
+        _: u32,
+    ) !ouro.drm_framebuffer.DumbBuffer {
+        const self: *Fixture = @ptrCast(@alignCast(context));
+        if (self.fail_create_bo_at == self.bo_count) {
+            self.fail_create_bo_at = null;
+            self.bo_count += 1;
+            return error.CreateDumbBufferFailed;
+        }
+        const index = self.dumb_count;
+        self.dumb_count += 1;
+        self.bo_count += 1;
+        return .{
+            .handle = @intCast(index + 1),
+            .stride = 16,
+            .bytes = &self.dumb_bytes[index],
+        };
+    }
+    fn destroyDumb(context: *anyopaque, _: linux.fd_t, _: ouro.drm_framebuffer.DumbBuffer) void {
+        const self: *Fixture = @ptrCast(@alignCast(context));
+        self.bo_destroyed += 1;
+        self.output_bo_destroyed += 1;
     }
     fn createBlob(_: *anyopaque, _: linux.fd_t, _: ouro.drm.Mode) !u32 {
         return 1;

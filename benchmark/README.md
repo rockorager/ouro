@@ -53,6 +53,11 @@ refresh periods as missed refreshes.
 `run.sh` performs orchestration outside the timed client: isolated runtime and
 seat ownership, fixed post-socket readiness, exact compositor PID snapshots,
 optional `perf stat`, independent termination, and raw artifact retention.
+Multi-output rows bind one layer-shell surface to each configured `wl_output`,
+ordered by advertised logical position, so placement does not depend on each
+compositor's XDG toplevel policy. Before timing, every client requires the exact
+configured output count and validates its target's current mode and rounded
+refresh rate. The comparator layouts use the same left-to-right output order.
 Direct scanout is disabled for normal Sway and Hyprland runs so those workloads
 exercise composition. `--renderer pixman` selects Ouro and Sway's Pixman paths;
 the default is Vulkan. The separate `--suite scanout --scanout on` family only
@@ -172,6 +177,14 @@ Workloads are declared in `workloads.sh`:
   immutable and have no client-owned storage to protect; the client does not
   gate reuse on `wl_buffer.release`, but separately records any release events
   a compositor chooses to send rather than fabricating a required count.
+- `outputs-control-shm-{full,sparse}`: one 960×720 layer-shell client pinned to
+  the first configured output, for measuring the same rendered surface with one
+  output and with an otherwise-idle second output.
+- `outputs-{shm,dmabuf}-{full,sparse}`: one 960×720 layer-shell client pinned to
+  each configured output, exercising all output render/presentation paths
+  concurrently. This suite requires at least two outputs at one common refresh
+  rate. Modes may differ, but every requested mode must already be the mode Ouro
+  selects for that physical connector because Ouro has no output-mode CLI.
 
 Most declarations repeat one client mode for the requested population. Mixed
 workloads use a comma-separated mode list with exactly one entry per client.
@@ -202,11 +215,11 @@ that window; `client-churn-shm` serially connects, maps, presents once, drains,
 and disconnects `--frames` independent clients. The report shows CPU, process
 ticks, context switches, RSS/HWM, and lifecycle operations/s where applicable.
 
-Output scale and output transform are not currently cross-compositor benchmark
-axes: Ouro's physical executable does not expose output scale/transform
-configuration. Surface buffer transforms are not an honest substitute. Add the
-axis only after all comparators can be configured and the applied output state
-can be recorded. This limitation does not block client-side viewporter scaling.
+Output count is a cross-compositor axis, but output scale and output transform
+are not: Ouro's physical executable does not expose scale/transform
+configuration. Surface buffer transforms are not an honest substitute. Add
+those axes only after all comparators can be configured equivalently. This
+limitation does not block client-side viewporter scaling.
 
 ## Running
 
@@ -233,6 +246,8 @@ benchmark/run.sh --suite capacity --runs 1  # High concurrent-client probes.
 benchmark/run.sh --suite native --runs 3
 benchmark/run.sh --suite sync --runs 3
 benchmark/run.sh --suite capture --runs 3
+benchmark/run.sh --suite outputs --runs 3 \
+  --outputs 'eDP-1:1920x1200@60,DP-1:1920x1080@60'
 benchmark/run.sh --suite visibility --runs 3
 benchmark/run.sh --suite lifecycle --frames 100 --duration 10
 benchmark/run.sh --suite cpu --renderer pixman --runs 3
@@ -250,6 +265,19 @@ while another Ouro, Sway, or Hyprland process or DRM holder exists. Raw logs,
 process snapshots, generated comparator configs, perf counters, metadata, and
 the aggregated `results.json` are written beneath `benchmark-results/`, which
 is intentionally ignored by Git.
+
+`--outputs` names physical connectors for Sway and Hyprland and declares their
+expected modes. Ouro currently activates every eligible desktop connector and
+publishes implementation-defined output names, so benchmark clients match
+outputs by logical position rather than connector name. Include every connected
+desktop output: an extra or missing `wl_output` rejects the run instead of
+silently measuring a different topology. Ouro lays outputs out horizontally;
+the generated comparator configurations reproduce that layout.
+
+VKMS can provide multiple connectors for functional and CPU/Pixman checks on a
+single-display host. It has no render node, so run the `outputs-shm-*` workloads
+individually with `--renderer pixman`; do not treat those software-display
+results as Vulkan, GPU, scanout, or physical-display performance.
 
 `--perf=auto` uses an already installed and permitted `perf`; `--perf=on`
 requires it; `--perf=off` records only `/proc` counters. `report.py` performs no
