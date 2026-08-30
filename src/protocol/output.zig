@@ -254,6 +254,14 @@ pub fn Adapter(comptime protocol: type) type {
             return adapter.primary_output;
         }
 
+        /// Changes the compositor's default output without changing either
+        /// output's protocol identity or published state.
+        pub fn promotePrimary(adapter: *Self, id: OutputId) !void {
+            const output = try adapter.resolveOutput(id);
+            if (output.retired) return error.OutputRetired;
+            adapter.primary_output = id;
+        }
+
         pub fn addOutput(adapter: *Self, config: OutputConfig) !OutputId {
             const id = try adapter.addOutputUnpublished(config);
             errdefer adapter.discardOutput(id) catch unreachable;
@@ -1201,6 +1209,10 @@ test "output: identities isolate snapshots resources and surface associations" {
     try std.testing.expect(adapter.outputs.len > 1);
     try adapter.publishMode(primary, 1920, 1200, 60_000, 600, 340);
     try adapter.publishMode(secondary, 2560, 1440, 144_000, 700, 390);
+    try adapter.promotePrimary(secondary);
+    try std.testing.expectEqual(secondary, adapter.primaryOutput());
+    try std.testing.expectError(error.PrimaryOutput, adapter.discardOutput(secondary));
+    try adapter.promotePrimary(primary);
 
     const primary_snapshot = try adapter.logicalSnapshot(primary);
     try std.testing.expectEqual(@as(i32, 0), primary_snapshot.x);

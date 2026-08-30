@@ -306,6 +306,10 @@ pub fn Adapter(comptime protocol: type) type {
             self.allocator.free(removed.description);
             self.allocator.free(removed.name);
         }
+        pub fn promotePrimary(self: *Self, id: HeadId) !void {
+            _ = self.findInventory(id) orelse return error.InvalidHead;
+            try self.lifecycle.promotePrimary(id);
+        }
         pub fn publish(self: *Self, state: HeadState) !u32 {
             try self.ensureOutbound(self.synchronizeCount());
             try self.lifecycle.publishHead(self.lifecycle.primary, state);
@@ -927,6 +931,16 @@ pub const Lifecycle = struct {
     pub fn currentHead(self: *Lifecycle, id: HeadId) !HeadState {
         return (try self.getHead(id)).current;
     }
+    pub fn promotePrimary(self: *Lifecycle, id: HeadId) !void {
+        const head = try self.getHead(id);
+        self.primary = id;
+        self.current = head.current;
+        for (self.configurations.entries.items) |c| if (c.header.active and !c.submitted) {
+            const configured = try self.configHead(c, id);
+            c.desired = configured.desired;
+            c.covered = configured.covered;
+        };
+    }
     pub fn publishHead(self: *Lifecycle, id: HeadId, state: HeadState) !void {
         const head = try self.getHead(id);
         head.current = state;
@@ -1201,6 +1215,41 @@ test "head removal cannot let a stale identity cover its recycled slot" {
     try std.testing.expectEqual(recycled, command.heads[1].id);
     try std.testing.expect(!command.heads[1].state.enabled);
     try std.testing.expectError(error.PrimaryHead, lifecycle.removeHead(lifecycle.primary));
+}
+
+test "primary head promotion preserves identities and pending configuration state" {
+    const first_state: HeadState = .{
+        .width = 800,
+        .height = 600,
+        .refresh_millihz = 60000,
+    };
+    const second_state: HeadState = .{
+        .width = 1024,
+        .height = 768,
+        .refresh_millihz = 75000,
+        .x = 800,
+    };
+    var lifecycle = try Lifecycle.init(std.testing.allocator, 1, 3, first_state);
+    defer lifecycle.deinit();
+    const first = lifecycle.primary;
+    const second = try lifecycle.addHead(second_state);
+    const configuration = try lifecycle.create(3);
+    try lifecycle.disableHead(configuration, first);
+    try lifecycle.enableHead(configuration, second);
+    try lifecycle.setHeadPosition(configuration, second, 0, 0);
+
+    try lifecycle.promotePrimary(second);
+    try std.testing.expectEqual(second, lifecycle.primary);
+    try std.testing.expectEqual(second_state, lifecycle.current);
+    try std.testing.expect((try lifecycle.get(configuration)).covered);
+    try std.testing.expectEqual(
+        @as(i32, 0),
+        (try lifecycle.get(configuration)).desired.x,
+    );
+    try lifecycle.removeHead(first);
+    const command = (try lifecycle.submit(configuration, .apply)).?;
+    try std.testing.expectEqual(@as(usize, 1), command.heads.len);
+    try std.testing.expectEqual(second, command.heads[0].id);
 }
 
 test "Wayring output-management adapter compiles against generated protocol" {
