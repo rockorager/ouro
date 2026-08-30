@@ -1749,6 +1749,8 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     try std.testing.expectEqual(@as(usize, 1), handler.wlr_foreign_toplevel_announcements);
     try std.testing.expectEqual(@as(usize, 7), handler.wlr_foreign_toplevel_initial_order);
     try std.testing.expect(handler.wlr_foreign_toplevel_done >= 1);
+    try std.testing.expectEqual(@as(usize, 1), handler.wlr_foreign_toplevel_output_enter);
+    try std.testing.expectEqual(@as(usize, 0), handler.wlr_foreign_toplevel_output_leave);
     try std.testing.expectEqual(@as(usize, 0), coordinator.foreign_toplevel_list_adapter.pendingCommands());
     try std.testing.expect(handler.toplevel_tag_set);
     const tagged_peer = coordinator.peer.?;
@@ -1813,12 +1815,13 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
         client_progress = try drainClient(&client_reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
         if (coordinator.primaryKmsOutput() == null and coordinator.session.state == .disabled and
-            handler.output_leave == 2) break;
+            handler.output_leave == 2 and handler.wlr_foreign_toplevel_output_leave == 1) break;
         if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
             try waitForEither(&root.ring, client_reactor.ring);
     }
     try std.testing.expect(coordinator.primaryKmsOutput() == null);
     try std.testing.expectEqual(@as(usize, 2), handler.output_leave);
+    try std.testing.expectEqual(@as(usize, 1), handler.wlr_foreign_toplevel_output_leave);
     try std.testing.expect(coordinator.app_layers[0].active);
     try std.testing.expect(coordinator.cursor_layer.active);
     try std.testing.expectEqual(retained_app.sample, coordinator.app_layers[0].sample.?.sample);
@@ -1828,7 +1831,7 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
         client_progress = try drainClient(&client_reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
         if (coordinator.stats.presented == presented_before_disable + 1 and handler.output_enter == 4 and
-            handler.output_deleted) break;
+            handler.wlr_foreign_toplevel_output_enter == 2 and handler.output_deleted) break;
         if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
             try waitForEither(&root.ring, client_reactor.ring);
     }
@@ -1841,6 +1844,7 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     try std.testing.expectEqual(retained_app.sample, coordinator.app_layers[0].sample.?.sample);
     try std.testing.expectEqual(retained_cursor.sample, coordinator.cursor_layer.sample.?.sample);
     try std.testing.expectEqual(@as(usize, 4), handler.output_enter);
+    try std.testing.expectEqual(@as(usize, 2), handler.wlr_foreign_toplevel_output_enter);
     try std.testing.expect(handler.output_released);
     try std.testing.expect(handler.output_deleted);
     try std.testing.expect(coordinator.image_capture_source_adapter.snapshotForResource(
@@ -4921,6 +4925,8 @@ const Handler = struct {
     wlr_foreign_toplevel_announcements: usize = 0,
     wlr_foreign_toplevel_initial_order: usize = 0,
     wlr_foreign_toplevel_done: usize = 0,
+    wlr_foreign_toplevel_output_enter: usize = 0,
+    wlr_foreign_toplevel_output_leave: usize = 0,
     wlr_foreign_toplevel_finished: usize = 0,
     wlr_foreign_toplevel_closed: usize = 0,
     image_output_manager: ?wayring.objects.Handle = null,
@@ -5148,6 +5154,7 @@ const Handler = struct {
                     try std.testing.expect(self.wlr_foreign_toplevel_initial_order >= 6);
                     try std.testing.expectEqual(self.output.?.id, value.output);
                     self.wlr_foreign_toplevel_initial_order = 7;
+                    self.wlr_foreign_toplevel_output_enter += 1;
                 },
                 .state => {
                     if (self.wlr_foreign_toplevel_done == 0) {
@@ -5168,7 +5175,10 @@ const Handler = struct {
                     }
                 },
                 .closed => self.wlr_foreign_toplevel_closed += 1,
-                .output_leave => {},
+                .output_leave => |value| {
+                    try std.testing.expectEqual(self.output.?.id, value.output);
+                    self.wlr_foreign_toplevel_output_leave += 1;
+                },
             }
         } else if (target.object.interface == &protocol.ext_image_copy_capture_cursor_session_v1.info) {
             switch (try protocol.ext_image_copy_capture_cursor_session_v1.decodeEvent(message, fds)) {

@@ -712,6 +712,7 @@ pub fn Coordinator(comptime protocol: type) type {
         pending_screencopy: ?PendingScreencopy = null,
         pending_image_copy: ?PendingImageCopy = null,
         foreign_toplevels: []ForeignToplevel,
+        foreign_toplevel_outputs_dirty: bool = false,
         cursor_path: []u8,
         cursor_directory_len: usize,
         cursor_size: u32,
@@ -2500,8 +2501,13 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             try self.processSeatEvents();
             try self.syncOutputAssociations();
-            try self.flushProtocol();
             try self.advanceDrain();
+            try self.syncForeignToplevelOutputChanges();
+            try self.flushProtocol();
+            if (self.foreign_toplevel_outputs_dirty) {
+                try self.syncForeignToplevelOutputChanges();
+                try self.flushProtocol();
+            }
         }
 
         fn validateSurfaceCommit(context: *anyopaque, id: Adapter.SurfaceId) !void {
@@ -3327,7 +3333,10 @@ pub fn Coordinator(comptime protocol: type) type {
                     error.Exhausted => false,
                     else => return cause,
                 };
-                if (synced) self.desktop.markForeignToplevelSynced();
+                if (synced) {
+                    self.desktop.markForeignToplevelSynced();
+                    self.foreign_toplevel_outputs_dirty = false;
+                }
             }
             if (self.foreignToplevelOutbound())
                 self.markProtocolAll(ProtocolReady.foreign_toplevel_list);
@@ -3467,12 +3476,12 @@ pub fn Coordinator(comptime protocol: type) type {
                     } else break;
                 }
                 for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
-                    const output = physical.kms_output orelse continue;
+                    if (physical.kms_output == null) continue;
                     const bounds = self.outputBoundsFor(physical) catch continue;
                     if (try clipToOutput(destination, bounds) == null) continue;
                     _ = try self.foreign_toplevel_list_adapter.addOutput(
                         entry.protocol_id,
-                        foreignOutputId(output.outputId()),
+                        foreignOutputId(physical.protocol_output),
                     );
                 }
             }
@@ -3482,6 +3491,19 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.foreign_toplevel_list_adapter.close(entry.protocol_id);
                 entry.* = .{};
             }
+        }
+
+        fn syncForeignToplevelOutputChanges(self: *Self) !void {
+            if (!self.foreign_toplevel_outputs_dirty) return;
+            const synced = if (self.syncForeignToplevels())
+                true
+            else |cause| switch (cause) {
+                error.Exhausted => false,
+                else => return cause,
+            };
+            if (synced) self.foreign_toplevel_outputs_dirty = false;
+            if (self.foreignToplevelOutbound())
+                self.markProtocolAll(ProtocolReady.foreign_toplevel_list);
         }
 
         fn consumeForeignToplevelCommands(self: *Self) !void {
@@ -3568,7 +3590,7 @@ pub fn Coordinator(comptime protocol: type) type {
             return if (ids.len == 0) null else ids[0];
         }
 
-        fn foreignOutputId(id: output_scheduler.OutputId) ForeignToplevelListAdapter.OutputId {
+        fn foreignOutputId(id: OutputAdapter.OutputId) ForeignToplevelListAdapter.OutputId {
             return .{ .value = @as(u64, id.generation) << 32 | id.index };
         }
 
@@ -3653,8 +3675,8 @@ pub fn Coordinator(comptime protocol: type) type {
             id: ForeignToplevelListAdapter.OutputId,
         ) ?*const PhysicalOutput {
             for (self.physical_outputs[0..self.physical_output_count]) |*physical|
-                if (physical.kms_output) |output|
-                    if (std.meta.eql(foreignOutputId(output.outputId()), id)) return physical;
+                if (physical.connected and
+                    std.meta.eql(foreignOutputId(physical.protocol_output), id)) return physical;
             return null;
         }
 
@@ -6042,6 +6064,7 @@ pub fn Coordinator(comptime protocol: type) type {
             else
                 generation + 1;
             self.stats.selected_outputs += 1;
+            self.foreign_toplevel_outputs_dirty = true;
             output_committed = true;
             if (self.anyAppLayerActive() or self.cursor_layer.active or
                 retained_visibility_changed or self.sessionLockActive())
@@ -6100,6 +6123,7 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.recomputeSessionLockConfigures();
             self.output_associations_dirty = true;
             try self.syncOutputAssociations();
+            self.foreign_toplevel_outputs_dirty = true;
             self.markProtocolAll(ProtocolReady.output | ProtocolReady.xdg_output |
                 ProtocolReady.fractional_scale | ProtocolReady.output_management |
                 ProtocolReady.layer_shell | ProtocolReady.session_lock);
@@ -8665,6 +8689,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     try self.invalidateCaptureSource(.{ .output = output.outputId() });
                     try output.destroy();
                     physical.kms_output = null;
+                    self.foreign_toplevel_outputs_dirty = true;
                     self.stats.output_drains += 1;
                     var head_state = try self.output_management_adapter.lifecycle.currentHead(
                         physical.management_head,

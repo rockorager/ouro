@@ -569,7 +569,7 @@ pub fn Adapter(comptime protocol: type) type {
             return null;
         }
         pub fn pendingOutbound(self: *const Self, peer: wayring.io_uring.Peer) bool {
-            if (self.outbound_count == 0) return false;
+            if (self.outbound_count == 0 and self.woutbound_count == 0) return false;
             for (self.outbound) |o| if (o.active) {
                 if (o.kind == .finished) {
                     if (o.owner < self.lists.entries.items.len) {
@@ -1024,6 +1024,7 @@ test "foreign toplevel: wlr bind ordering, version gates, updates and stop isola
     const id = try adapter.publish("", "app");
     const peer: wayring.io_uring.Peer = .{ .slot = 4, .generation = 9 };
     _ = try A.bindWlr(&adapter, .{ .peer = peer, .credentials = .{ .pid = 1, .uid = 2, .gid = 3 }, .global = .{ .id = 3, .generation = 1 }, .resource = .{ .id = 4, .generation = 1 }, .version = 3 });
+    try std.testing.expect(adapter.pendingOutbound(peer));
     const expected = [_]A.WKind{ .announce, .title, .app_id, .state, .parent, .done };
     for (expected) |kind| {
         const event = adapter.oldestW(peer).?;
