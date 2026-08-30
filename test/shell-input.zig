@@ -2461,9 +2461,10 @@ test "shell-input: layer surface adopts and presents an xdg popup" {
 
     var fixture = try physical_fixture.Fixture.init();
     defer fixture.deinit();
+    fixture.second_desktop = true;
     var root_config = physical_fixture.compositorConfig();
-    root_config.runtime.object_capacity = 48;
-    root_config.runtime.object_quota = 48;
+    root_config.runtime.object_capacity = 52;
+    root_config.runtime.object_quota = 52;
     const root = try Compositor.create(
         allocator,
         try wayring.unix_socket.listen(path, 1),
@@ -2503,7 +2504,7 @@ test "shell-input: layer surface adopts and presents an xdg popup" {
         &client_reactor,
         try wayring.unix_socket.connect(path),
         .{ .received_fd_budget = 2, .transmit_byte_budget = 4096, .transmit_fd_budget = 2 },
-        .{ .max_objects = 48, .max_client_ids = 47 },
+        .{ .max_objects = 52, .max_client_ids = 51 },
     );
     const actor = try client.actor();
     var driver = ClientDriver.init(&client);
@@ -2512,6 +2513,7 @@ test "shell-input: layer surface adopts and presents an xdg popup" {
         .objects = &client.objects,
         .queue = &actor.transmit,
         .registry = registry,
+        .minimum_outputs = 2,
     };
     try submitLayerPopupClient(&client_reactor, &driver, &handler);
 
@@ -2539,13 +2541,14 @@ test "shell-input: layer surface adopts and presents an xdg popup" {
                 handler.popup_surface.?.id,
                 (try coordinator.adapter.surfaceHandle(popups[0].surface)).id,
             );
-            const submitted = coordinator.primaryKmsOutput().?.sample_storage[0..2];
+            const submitted = coordinator.physical_outputs[1].kms_output.?.sample_storage[0..2];
             const layer = findLayer(coordinator.app_layers, layer_state.surface) orelse
                 return error.MissingLayerSurface;
             const popup = findLayer(coordinator.app_layers, popups[0].surface) orelse
                 return error.MissingPopupSurface;
             try std.testing.expectEqual(layer.binding.?.surface, submitted[0].surface);
             try std.testing.expectEqual(popup.binding.?.surface, submitted[1].surface);
+            try std.testing.expectEqual(@as(i32, 3), layer.sample.?.destination.x);
             try std.testing.expectEqual(@as(usize, 0), (try coordinator.desktop.sceneSnapshot(coordinator.scene_windows)).len);
             observed = true;
         }
@@ -4412,6 +4415,9 @@ const LayerPopupHandler = struct {
     compositor: ?wayring.objects.Handle = null,
     shm: ?wayring.objects.Handle = null,
     wm_base: ?wayring.objects.Handle = null,
+    output: ?wayring.objects.Handle = null,
+    output_count: usize = 0,
+    minimum_outputs: usize = 0,
     layer_shell: ?wayring.objects.Handle = null,
     layer_surface: ?wayring.objects.Handle = null,
     layer_wl_surface: ?wayring.objects.Handle = null,
@@ -4447,6 +4453,10 @@ const LayerPopupHandler = struct {
             try self.maybeCreate();
         } else if (target.object.interface == &protocol.wl_shm.info) {
             _ = try protocol.wl_shm.decodeEvent(message, fds);
+        } else if (target.object.interface == &protocol.wl_output.info) {
+            _ = try protocol.wl_output.decodeEvent(message, fds);
+        } else if (target.object.interface == &protocol.wl_surface.info) {
+            _ = try protocol.wl_surface.decodeEvent(message, fds);
         } else if (target.object.interface == &protocol.zwlr_layer_surface_v1.info) {
             switch (try protocol.zwlr_layer_surface_v1.decodeEvent(message, fds)) {
                 .configure => |value| {
@@ -4511,13 +4521,18 @@ const LayerPopupHandler = struct {
             self.shm = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_shm.info, @min(value.version, 2), null);
         if (std.mem.eql(u8, value.interface, protocol.xdg_wm_base.info.name))
             self.wm_base = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.xdg_wm_base.info, @min(value.version, 7), null);
+        if (std.mem.eql(u8, value.interface, protocol.wl_output.info.name)) {
+            self.output = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_output.info, @min(value.version, 4), null);
+            self.output_count += 1;
+        }
         if (std.mem.eql(u8, value.interface, protocol.zwlr_layer_shell_v1.info.name))
             self.layer_shell = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.zwlr_layer_shell_v1.info, @min(value.version, 5), null);
     }
 
     fn maybeCreate(self: *LayerPopupHandler) !void {
         if (self.created or self.compositor == null or self.shm == null or
-            self.wm_base == null or self.layer_shell == null) return;
+            self.wm_base == null or self.layer_shell == null or
+            self.output_count < self.minimum_outputs) return;
         self.layer_wl_surface = (try protocol.wl_compositor.construct_create_surface(
             self.objects,
             self.queue,
@@ -4530,7 +4545,7 @@ const LayerPopupHandler = struct {
             self.layer_shell.?,
             .{
                 .surface = self.layer_wl_surface.?.id,
-                .output = null,
+                .output = if (self.output) |output| output.id else null,
                 .layer = .top,
                 .namespace = "ouro-test",
             },

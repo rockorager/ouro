@@ -8237,10 +8237,24 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn layerWorkArea(self: *Self, pending_surface: ?Adapter.SurfaceId) !geometry.Rect {
-            var area = try self.outputBounds();
+            return self.layerWorkAreaFor(
+                self.primaryPhysicalOutput().protocol_output,
+                pending_surface,
+            );
+        }
+
+        fn layerWorkAreaFor(
+            self: *Self,
+            output: OutputAdapter.OutputId,
+            pending_surface: ?Adapter.SurfaceId,
+        ) !geometry.Rect {
+            const physical = self.physicalOutputForProtocolId(output) orelse
+                return error.InvalidOutput;
+            var area = try self.outputBoundsFor(physical);
             const ids = try self.layer_shell_adapter.ids(self.layer_surface_ids);
             for (ids) |layer_id| {
                 var state = try self.layer_shell_adapter.state(layer_id);
+                if (!std.meta.eql(state.output, output)) continue;
                 var mapped = state.mapped;
                 if (pending_surface != null and std.meta.eql(state.surface, pending_surface.?)) {
                     state = self.layer_shell_adapter.pendingStateForSurface(state.surface) orelse
@@ -8293,8 +8307,13 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn layerGeometry(self: *Self, state: LayerShellAdapter.State) !geometry.Rect {
-            const bounds = try self.outputBounds();
-            const area = if (state.exclusive_zone == 0) self.desktop.workArea() else bounds;
+            const physical = self.physicalOutputForProtocolId(state.output) orelse
+                return error.InvalidOutput;
+            const bounds = try self.outputBoundsFor(physical);
+            const area = if (state.exclusive_zone == 0)
+                try self.layerWorkAreaFor(state.output, null)
+            else
+                bounds;
             const surface = try self.adapter.getSurfaceById(state.surface);
             const size = surface.committedSize();
             if (size.width == 0 or size.height == 0 or
@@ -8345,9 +8364,12 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn layerConfigureSize(self: *Self, state: LayerShellAdapter.State) !render.Size {
             const area = if (state.exclusive_zone == 0)
-                try self.layerWorkArea(null)
+                try self.layerWorkAreaFor(state.output, null)
             else
-                try self.outputBounds();
+                try self.outputBoundsFor(
+                    self.physicalOutputForProtocolId(state.output) orelse
+                        return error.InvalidOutput,
+                );
             const available_width = try std.math.sub(
                 i32,
                 try std.math.sub(i32, area.width, state.margins.left),
