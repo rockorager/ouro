@@ -277,6 +277,10 @@ pub fn Coordinator(comptime protocol: type) type {
             session_lock_frame: ?output_scheduler.FrameId = null,
             drain_started: bool = false,
             reconfigure: ?OutputReconfigure = null,
+            damage_requested: u64 = 0,
+            damage_applied: u64 = 0,
+            themed_cursor_previous: ?damage.SurfaceState = null,
+            client_cursor_previous: ?damage.SurfaceState = null,
         };
         const Presentations = presentation.Queue(Imported);
         const PendingSurface = struct {
@@ -707,8 +711,6 @@ pub fn Coordinator(comptime protocol: type) type {
         cursor_shape_adapter: CursorShapeAdapter,
         cursor_cache: cursor_theme.Cache,
         themed_cursor: theme_cursor.Cursor = .{},
-        themed_cursor_previous: ?damage.SurfaceState = null,
-        client_cursor_hidden_previous: ?damage.SurfaceState = null,
         screencopy_bytes: []u8,
         pending_screencopy: ?PendingScreencopy = null,
         pending_image_copy: ?PendingImageCopy = null,
@@ -935,8 +937,6 @@ pub fn Coordinator(comptime protocol: type) type {
             self.cursor_directory_len = config.cursor_directory.len;
             self.cursor_size = config.cursor_size;
             self.themed_cursor = .{};
-            self.themed_cursor_previous = null;
-            self.client_cursor_hidden_previous = null;
             self.screencopy_bytes = try allocator.alloc(u8, 0);
             errdefer allocator.free(self.screencopy_bytes);
             self.pending_screencopy = null;
@@ -3722,6 +3722,16 @@ pub fn Coordinator(comptime protocol: type) type {
             return null;
         }
 
+        fn physicalOutputForKmsIdMutable(
+            self: *Self,
+            id: output_scheduler.OutputId,
+        ) ?*PhysicalOutput {
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical|
+                if (physical.kms_output) |output|
+                    if (std.meta.eql(output.outputId(), id)) return physical;
+            return null;
+        }
+
         fn physicalOutputForForeignId(
             self: *const Self,
             id: ForeignToplevelListAdapter.OutputId,
@@ -5038,11 +5048,6 @@ pub fn Coordinator(comptime protocol: type) type {
                 const image = self.cursorImage(event.shape.name()) orelse
                     self.cursorImage(protocol_cursor_shape.fallback_name);
                 if (image) |value| {
-                    if (self.cursor_layer.active) {
-                        if (self.cursor_layer.change) |change| {
-                            if (change.current) |current| self.client_cursor_hidden_previous = current;
-                        }
-                    }
                     self.interaction.cursorRequest(null, .{ .x = 0, .y = 0 });
                     _ = self.themed_cursor.setImage(value);
                     try self.requestCursorRedraw();
@@ -5147,7 +5152,6 @@ pub fn Coordinator(comptime protocol: type) type {
                 switch (event) {
                     .cursor_requested => |request_value| {
                         _ = self.themed_cursor.setImage(null);
-                        self.client_cursor_hidden_previous = null;
                         self.interaction.cursorRequest(
                             request_value.surface,
                             .{ .x = request_value.hotspot.x, .y = request_value.hotspot.y },
@@ -5163,8 +5167,15 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn requestCursorRedraw(self: *Self) !void {
             if (!self.cursor_layer.active and self.themed_cursor.image == null and
-                self.themed_cursor_previous == null) return;
+                !self.anyCursorPrevious()) return;
             try self.requestOutputDamage();
+        }
+
+        fn anyCursorPrevious(self: *const Self) bool {
+            for (self.physical_outputs[0..self.physical_output_count]) |physical|
+                if (physical.themed_cursor_previous != null or
+                    physical.client_cursor_previous != null) return true;
+            return false;
         }
 
         fn requestPhysicalOutputDamage(
@@ -5177,6 +5188,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 error.OutputPaused => return false,
                 else => return err,
             };
+            physical.damage_requested +%= 1;
             return true;
         }
 
@@ -6155,8 +6167,10 @@ pub fn Coordinator(comptime protocol: type) type {
             output_committed = true;
             if (self.anyAppLayerActive() or self.cursor_layer.active or
                 retained_visibility_changed or self.sessionLockActive())
-                output.request(.damage, monotonicNs() catch
-                    return error.ActivatedOutputFailure) catch
+                if (!(requestPhysicalOutputDamage(
+                    physical,
+                    monotonicNs() catch return error.ActivatedOutputFailure,
+                ) catch return error.ActivatedOutputFailure))
                     return error.ActivatedOutputFailure;
             self.armTimer() catch return error.ActivatedOutputFailure;
         }
@@ -6940,8 +6954,9 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn renderFrame(self: *Self, frame: @import("../output/headless.zig").FrameId) !void {
-            const physical = self.physicalOutputForKmsId(frame.output) orelse return;
+            const physical = self.physicalOutputForKmsIdMutable(frame.output) orelse return;
             const output = physical.kms_output orelse return;
+            const damage_generation = physical.damage_requested;
             const output_bounds = try self.outputBoundsFor(physical);
             var sample_count: usize = 0;
             if (self.sessionLockActive()) {
@@ -6981,6 +6996,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 change_count += 1;
             }
             const cursor_start = sample_count;
+            var next_client_cursor_previous = physical.client_cursor_previous;
+            var client_cursor_visible = false;
             if (!self.sessionLockActive() and self.cursor_layer.active and
                 self.themed_cursor.image == null)
             {
@@ -6995,12 +7012,15 @@ pub fn Coordinator(comptime protocol: type) type {
                         output_scale,
                     );
                     self.frame_bindings[sample_count] = self.cursor_layer.binding.?;
-                    var logical_change = self.cursor_layer.change.?;
-                    logical_change.current = damage.SurfaceState.fromSample(cursor_sample, .{
+                    const current = damage.SurfaceState.fromSample(cursor_sample, .{
                         .width = cursor_sample.destination.width,
                         .height = cursor_sample.destination.height,
                     });
-                    logical_change.invalidate_bounds = true;
+                    const logical_change: damage.Change = .{
+                        .previous = physical.client_cursor_previous,
+                        .current = current,
+                        .invalidate_bounds = true,
+                    };
                     self.frame_changes[change_count] = try scaleChange(
                         logical_change,
                         output_bounds,
@@ -7011,14 +7031,25 @@ pub fn Coordinator(comptime protocol: type) type {
                         self.cursor_layer.sample.?.destination,
                     )) self.output_associations_dirty = true;
                     self.cursor_layer.sample = cursor_sample;
-                    self.cursor_layer.change = logical_change;
+                    next_client_cursor_previous = current;
+                    client_cursor_visible = true;
                     sample_count += 1;
                     change_count += 1;
                 }
             }
+            if (!client_cursor_visible and physical.client_cursor_previous != null) {
+                try self.ensureFrameStorage(@max(sample_count, change_count) + 1);
+                self.frame_changes[change_count] = .{ .previous = try scaleSurfaceState(
+                    physical.client_cursor_previous.?,
+                    output_bounds,
+                    output_scale,
+                ) };
+                next_client_cursor_previous = null;
+                change_count += 1;
+            }
             self.themed_cursor.move(self.interaction.cursor.position);
             self.themed_cursor.setPointerAvailable(self.interaction.cursor.pointer_available);
-            var next_themed_cursor_previous = self.themed_cursor_previous;
+            var next_themed_cursor_previous = physical.themed_cursor_previous;
             if (self.themed_cursor.image != null) {
                 if (try self.themed_cursor.sample(output_bounds)) |sample| {
                     try self.ensureFrameStorage(@max(sample_count, change_count) + 1);
@@ -7029,7 +7060,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     );
                     self.frame_bindings[sample_count] = self.themed_cursor.sampleBinding(output_api.SampleBinding);
                     var logical_change = try self.themed_cursor.damageChange(
-                        self.themed_cursor_previous,
+                        physical.themed_cursor_previous,
                         output_bounds,
                     );
                     logical_change.invalidate_bounds = true;
@@ -7041,31 +7072,24 @@ pub fn Coordinator(comptime protocol: type) type {
                     next_themed_cursor_previous = logical_change.current;
                     sample_count += 1;
                     change_count += 1;
-                } else if (self.themed_cursor_previous != null) {
+                } else if (physical.themed_cursor_previous != null) {
                     try self.ensureFrameStorage(@max(sample_count, change_count) + 1);
                     self.frame_changes[change_count] = .{ .previous = try scaleSurfaceState(
-                        self.themed_cursor_previous.?,
+                        physical.themed_cursor_previous.?,
                         output_bounds,
                         output_scale,
                     ) };
                     next_themed_cursor_previous = null;
                     change_count += 1;
                 }
-            } else if (self.themed_cursor_previous != null) {
+            } else if (physical.themed_cursor_previous != null) {
                 try self.ensureFrameStorage(@max(sample_count, change_count) + 1);
                 self.frame_changes[change_count] = .{ .previous = try scaleSurfaceState(
-                    self.themed_cursor_previous.?,
+                    physical.themed_cursor_previous.?,
                     output_bounds,
                     output_scale,
                 ) };
                 next_themed_cursor_previous = null;
-                change_count += 1;
-            }
-            if (self.client_cursor_hidden_previous) |previous| {
-                try self.ensureFrameStorage(@max(sample_count, change_count) + 1);
-                self.frame_changes[change_count] = .{
-                    .previous = try scaleSurfaceState(previous, output_bounds, output_scale),
-                };
                 change_count += 1;
             }
             const capture_request: ?output_api.CaptureRequest = if (self.pending_screencopy) |pending|
@@ -7120,6 +7144,13 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (rendered == .retired) {
                     if (capture_request != null) try self.finishActiveCapture(false, 0, null);
                     try self.finishOutcome(rendered.retired.frame, false);
+                } else {
+                    self.outputDamageSubmitted(
+                        physical,
+                        damage_generation,
+                        next_themed_cursor_previous,
+                        next_client_cursor_previous,
+                    );
                 }
                 return;
             }
@@ -7146,12 +7177,13 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             switch (render_result) {
                 .submitted => {
-                    self.adapter.clearFifoBarriers();
                     self.stats.submitted += 1;
-                    self.markFrameChangesApplied(self.frame_bindings[0..sample_count]);
-                    self.themed_cursor_previous = next_themed_cursor_previous;
-                    self.client_cursor_hidden_previous = null;
-                    self.removed_layer_len = 0;
+                    self.outputDamageSubmitted(
+                        physical,
+                        damage_generation,
+                        next_themed_cursor_previous,
+                        next_client_cursor_previous,
+                    );
                     _ = try self.retryRetainedOutcomes();
                 },
                 .retired => |failure| {
@@ -7162,18 +7194,34 @@ pub fn Coordinator(comptime protocol: type) type {
             }
         }
 
-        fn markFrameChangesApplied(self: *Self, bindings: []const output_api.SampleBinding) void {
-            for (bindings) |binding| {
-                for (self.app_layers) |*layer| {
-                    if (!layer.active or layer.binding == null or
-                        !std.meta.eql(layer.binding.?, binding)) continue;
-                    markLayerChangeApplied(layer);
-                    break;
-                }
-                if (self.cursor_layer.active and self.cursor_layer.binding != null and
-                    std.meta.eql(self.cursor_layer.binding.?, binding))
-                    markLayerChangeApplied(&self.cursor_layer);
+        fn outputDamageSubmitted(
+            self: *Self,
+            physical: *PhysicalOutput,
+            damage_generation: u64,
+            next_themed_cursor_previous: ?damage.SurfaceState,
+            next_client_cursor_previous: ?damage.SurfaceState,
+        ) void {
+            physical.damage_applied = damage_generation;
+            physical.themed_cursor_previous = next_themed_cursor_previous;
+            physical.client_cursor_previous = next_client_cursor_previous;
+            if (!self.allOutputDamageApplied()) return;
+            self.adapter.clearFifoBarriers();
+            self.markFrameChangesApplied();
+            self.removed_layer_len = 0;
+        }
+
+        fn allOutputDamageApplied(self: *const Self) bool {
+            for (self.physical_outputs[0..self.physical_output_count]) |physical| {
+                if (physical.kms_output == null) continue;
+                if (physical.damage_applied != physical.damage_requested) return false;
             }
+            return true;
+        }
+
+        fn markFrameChangesApplied(self: *Self) void {
+            for (self.app_layers) |*layer|
+                if (layer.active) markLayerChangeApplied(layer);
+            if (self.cursor_layer.active) markLayerChangeApplied(&self.cursor_layer);
         }
 
         fn markLayerChangeApplied(layer: *Layer) void {
@@ -7402,7 +7450,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.failQueuedScreencopy(capture);
                 return;
             };
-            const physical = self.physicalOutputForProtocolId(reference.output) orelse {
+            const physical = self.physicalOutputForProtocolIdMutable(reference.output) orelse {
                 try self.failQueuedScreencopy(capture);
                 return;
             };
@@ -7454,10 +7502,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 .overlay_cursor = capture.overlay_cursor,
             };
             self.screencopy_adapter.dropCapture();
-            output.request(.damage, try monotonicNs()) catch {
+            if (!(requestPhysicalOutputDamage(physical, try monotonicNs()) catch false)) {
                 try self.finishScreencopy(false, 0, null);
                 return;
-            };
+            }
             self.pending_screencopy.?.awaiting_output = true;
             try self.armTimer();
         }
@@ -7470,6 +7518,10 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             const capture = self.image_copy_capture_adapter.takeCapture() orelse return;
             const output = self.captureKmsOutput(capture.target) orelse {
+                try self.failImageCopy(capture);
+                return;
+            };
+            const physical = self.physicalOutputForKmsIdMutable(output.outputId()) orelse {
                 try self.failImageCopy(capture);
                 return;
             };
@@ -7605,10 +7657,10 @@ pub fn Coordinator(comptime protocol: type) type {
                     .source => false,
                 },
             };
-            output.request(.damage, try monotonicNs()) catch {
+            if (!(requestPhysicalOutputDamage(physical, try monotonicNs()) catch false)) {
                 try self.finishImageCopy(false, 0, null);
                 return;
-            };
+            }
             self.pending_image_copy.?.awaiting_output = true;
             try self.armTimer();
         }
@@ -7864,7 +7916,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn finishOutcome(self: *Self, outcome: output_api.FrameOutcome, was_presented: bool) !void {
-            const physical = self.physicalOutputForKmsId(outcome.frame.output);
+            const physical = self.physicalOutputForKmsIdMutable(outcome.frame.output);
             if (was_presented) {
                 for (self.app_layers) |*layer| {
                     if (layer.retired_source) |*source| source.releasable = true;
@@ -7911,8 +7963,11 @@ pub fn Coordinator(comptime protocol: type) type {
                     if (self.session_lock_adapter.pendingLock()) |lock| {
                         self.session_lock_adapter.publishLocked(lock) catch |err| switch (err) {
                             error.Exhausted => {
-                                if (owner.kms_output) |output| {
-                                    output.request(.damage, try monotonicNs()) catch {};
+                                if (owner.kms_output != null) {
+                                    _ = requestPhysicalOutputDamage(
+                                        owner,
+                                        try monotonicNs(),
+                                    ) catch false;
                                     self.armTimer() catch {};
                                 }
                             },
@@ -7922,8 +7977,11 @@ pub fn Coordinator(comptime protocol: type) type {
                         if (peer) |value| self.markProtocol(value, ProtocolReady.session_lock);
                     }
                 } else if (self.sessionLockActive()) {
-                    if (owner.kms_output) |output| {
-                        output.request(.damage, try monotonicNs()) catch {};
+                    if (owner.kms_output != null) {
+                        _ = requestPhysicalOutputDamage(
+                            owner,
+                            try monotonicNs(),
+                        ) catch false;
                         self.armTimer() catch {};
                     }
                 }
