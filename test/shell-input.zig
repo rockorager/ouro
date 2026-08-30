@@ -1714,9 +1714,7 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     try std.testing.expectEqual(@as(i32, 15 * 256), handler.pointer_axis_fixed);
     try std.testing.expectEqual(@as(i32, 120), handler.pointer_axis_value120_value);
     try std.testing.expectEqual(@as(usize, 1), handler.keyboard_key);
-    try std.testing.expectEqual(@as(usize, 1), handler.buffer_release);
-    try std.testing.expect(handler.buffer_release_order != 0);
-    try std.testing.expect(handler.buffer_release_order < handler.frame_done_order);
+    try std.testing.expectEqual(@as(usize, 0), handler.buffer_release);
     try std.testing.expect(handler.output_geometry);
     try std.testing.expectEqual(@as(i32, 1), handler.output_physical_width);
     try std.testing.expectEqual(@as(i32, 1), handler.output_physical_height);
@@ -1853,6 +1851,22 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     try std.testing.expect(!coordinator.cursor_layer.active);
     try std.testing.expect(coordinator.app_layers[0].active);
     try std.testing.expect(handler.output_deleted);
+
+    try protocol.wl_surface.encodeRequest(handler.queue, handler.surface.?.id, .{
+        .attach = .{ .buffer = null, .x = 0, .y = 0 },
+    });
+    try protocol.wl_surface.encodeRequest(handler.queue, handler.surface.?.id, .{ .commit = .{} });
+    try submitClient(&client_reactor, &driver, &handler);
+    for (0..64) |_| {
+        client_progress = try drainClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.buffer_release == 1 and !coordinator.app_layers[0].active) break;
+        if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, client_reactor.ring);
+    }
+    try std.testing.expectEqual(@as(usize, 1), handler.buffer_release);
+    try std.testing.expect(handler.buffer_release_order > handler.frame_done_order);
+    try std.testing.expect(!coordinator.app_layers[0].active);
 
     try wayring.client.sendRequest(
         protocol.xdg_toplevel,

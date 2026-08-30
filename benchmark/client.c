@@ -125,6 +125,7 @@ struct dmabuf_modifier {
 
 struct benchmark_output {
     struct wl_output *proxy;
+    uint32_t version;
     int32_t x;
     int32_t y;
     int32_t width;
@@ -896,12 +897,13 @@ static void registry_global(
     } else if (strcmp(interface, wl_output_interface.name) == 0) {
         if (client->output_count == MAX_OUTPUTS) protocol_fail("too many wl_output globals");
         struct benchmark_output *output = &client->outputs[client->output_count++];
+        output->version = version < 4 ? version : 4;
         output->scale = 1;
         output->proxy = wl_registry_bind(
             registry,
             name,
             &wl_output_interface,
-            version < 4 ? version : 4
+            output->version
         );
         if (output->proxy == NULL ||
             wl_output_add_listener(output->proxy, &output_listener, output) != 0)
@@ -1059,6 +1061,8 @@ static void create_shm_buffer(struct client *client, struct frame_buffer *buffer
     buffer->fd = memfd_create("ouro-benchmark-shm", MFD_CLOEXEC | MFD_ALLOW_SEALING);
     if (buffer->fd < 0 || ftruncate(buffer->fd, (off_t)buffer->size) != 0)
         fail("create SHM buffer");
+    if (fcntl(buffer->fd, F_ADD_SEALS, F_SEAL_SHRINK) != 0)
+        fail("seal SHM buffer against shrinking");
     buffer->pixels = mmap(NULL, buffer->size, PROT_READ | PROT_WRITE, MAP_SHARED, buffer->fd, 0);
     if (buffer->pixels == MAP_FAILED) fail("map SHM buffer");
     write_buffer(buffer);
@@ -1704,6 +1708,24 @@ static void select_benchmark_output(struct client *client) {
     client->output = client->selected_output->proxy;
 }
 
+static void wait_for_output_state(struct client *client) {
+    if (client->target_output_index < 0) return;
+    if (client->output_count != client->expected_output_count)
+        protocol_fail("advertised output count does not match benchmark configuration");
+    // A compositor may defer wl_output snapshots until after the registry
+    // roundtrip callback, so select only after every bound output is complete.
+    while (true) {
+        bool complete = true;
+        for (size_t index = 0; complete && index < client->output_count; index++) {
+            const struct benchmark_output *output = &client->outputs[index];
+            complete = output->current_mode && (output->version < 2 || output->done) &&
+                (output->version < 4 || output->name[0] != '\0');
+        }
+        if (complete) return;
+        if (wl_display_dispatch(client->display) < 0) fail("collect output state");
+    }
+}
+
 static void setup(struct client *client, const char *socket_path, const char *drm_path) {
     client->display = connect_path(socket_path);
     struct wl_registry *registry = wl_display_get_registry(client->display);
@@ -1713,6 +1735,7 @@ static void setup(struct client *client, const char *socket_path, const char *dr
         fail("discover globals");
     if (wl_display_roundtrip(client->display) < 0) fail("collect output state");
     wl_registry_destroy(registry);
+    wait_for_output_state(client);
     if (client->compositor == NULL || client->presentation == NULL)
         protocol_fail("wl_compositor and wp_presentation are required");
     select_benchmark_output(client);
@@ -2719,7 +2742,7 @@ drain:
     client.draining = true;
     detach_content(&client);
     while (!buffers_available(&client))
-        if (wl_display_dispatch(client.display) < 0) fail("drain buffer releases");
+        if (wl_display_roundtrip(client.display) < 0) fail("drain buffer releases");
     if (client.backing != BACKING_SINGLE_PIXEL &&
         client.releases != client.submitted_buffers)
         protocol_fail("not every submitted buffer was released");
