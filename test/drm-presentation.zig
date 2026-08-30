@@ -321,6 +321,64 @@ test "physical coordinator retires a disconnected secondary output" {
     try root.deinit();
 }
 
+test "physical coordinator fails over from a disconnected primary output" {
+    const allocator = std.testing.allocator;
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    fixture.second_desktop = true;
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-r15-output-failover-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), compositorConfig());
+    const coordinator = try Coordinator.create(allocator, root, fixture.platformsWithHotplug(), coordinatorConfig());
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
+    try coordinator.start(&loop);
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    for (0..128) |_| {
+        _ = try loop.turn(coordinator);
+        if (coordinator.physical_output_count == 2 and
+            coordinator.physical_outputs[1].kms_output != null and
+            coordinator.output_global_index == 2) break;
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+    }
+    const primary_protocol = coordinator.physical_outputs[0].protocol_output;
+    const secondary_protocol = coordinator.physical_outputs[1].protocol_output;
+    const secondary_head = coordinator.physical_outputs[1].management_head;
+
+    fixture.first_desktop = false;
+    try fixture.signalHotplug();
+    for (0..512) |_| {
+        _ = try loop.turn(coordinator);
+        if (!coordinator.topology_refresh_pending and
+            coordinator.physical_outputs[0].connector_id == 11 and
+            coordinator.physical_outputs[0].kms_output != null and
+            !coordinator.physical_outputs[1].connected and
+            !coordinator.physical_outputs[1].removing) break;
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+    }
+    try std.testing.expectEqual(@as(u32, 11), coordinator.physical_outputs[0].connector_id);
+    try std.testing.expect(coordinator.physical_outputs[0].kms_output != null);
+    try std.testing.expect(try coordinator.output_adapter.outputPublished(primary_protocol));
+    try std.testing.expect(!coordinator.physical_outputs[1].connected);
+    try std.testing.expect(!(try coordinator.output_adapter.outputPublished(secondary_protocol)));
+    try std.testing.expectError(
+        error.InvalidHead,
+        coordinator.output_management_adapter.lifecycle.currentHead(secondary_head),
+    );
+    try std.testing.expectEqual(@as(?i32, 3), (try coordinator.output_adapter.logicalSnapshot(
+        primary_protocol,
+    )).width);
+
+    try coordinator.requestStop();
+    try drainServer(root, coordinator, &loop);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
 test "generated output management applies two heads atomically" {
     try generatedMultiHeadApply(false);
 }
@@ -2350,6 +2408,7 @@ pub const Fixture = struct {
     read_maps: usize = 0,
     unmaps: usize = 0,
     discover_cards: bool = true,
+    first_desktop: bool = true,
     second_desktop: bool = false,
     lease_objects: [6]u32 = undefined,
     lease_object_count: usize = 0,
@@ -2565,7 +2624,7 @@ pub const Fixture = struct {
     fn topology(context: *anyopaque, _: linux.fd_t, out: *ouro.drm_platform.TopologyBuffer) !void {
         const self: *Fixture = @ptrCast(@alignCast(context));
         out.reset();
-        out.connectors[0] = .{ .id = 10, .connector_type = 1, .connector_type_id = 1, .connected = true, .desktop = true, .width_mm = 1, .height_mm = 1, .encoder_id = 20, .mode_start = 0, .mode_count = 1, .encoder_start = 0, .encoder_count = 1, .properties = .{ .crtc_id = 1 } };
+        out.connectors[0] = .{ .id = 10, .connector_type = 1, .connector_type_id = 1, .connected = true, .desktop = self.first_desktop, .width_mm = 1, .height_mm = 1, .encoder_id = 20, .mode_start = 0, .mode_count = 1, .encoder_start = 0, .encoder_count = 1, .properties = .{ .crtc_id = 1 } };
         out.modes[0] = .{ .clock = 1, .hdisplay = 3, .hsync_start = 3, .hsync_end = 3, .htotal = 3, .hskew = 0, .vdisplay = 2, .vsync_start = 2, .vsync_end = 2, .vtotal = 2, .vscan = 0, .vrefresh = 60, .flags = 0, .mode_type = 0 };
         out.connector_encoders[0] = 20;
         out.encoders[0] = .{ .id = 20, .crtc_id = 30, .possible_crtcs = 1 };

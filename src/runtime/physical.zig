@@ -2280,6 +2280,11 @@ pub fn Coordinator(comptime protocol: type) type {
             const connectors = try self.manager.probeDesktopConnectorIds(
                 self.hotplug_connector_ids,
             );
+            const primary_missing = std.mem.indexOfScalar(
+                u32,
+                connectors,
+                self.primaryPhysicalOutput().connector_id,
+            ) == null;
             var added = false;
             for (connectors) |connector_id| {
                 var known = false;
@@ -2293,10 +2298,11 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             for (self.physical_outputs[1..self.physical_output_count]) |physical| {
                 if (!physical.connected or physical.removing) continue;
-                if (std.mem.indexOfScalar(u32, connectors, physical.connector_id) == null)
+                if (primary_missing or
+                    std.mem.indexOfScalar(u32, connectors, physical.connector_id) == null)
                     try self.requestConnectorRemoval(physical.connector_id);
             }
-            if (added) try self.requestTopologyRefresh();
+            if (primary_missing or added) try self.requestTopologyRefresh();
         }
 
         fn requestTopologyRefresh(self: *Self) !void {
@@ -5070,7 +5076,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     physical.removal_protocol_retired = true;
                     self.markProtocolAll(ProtocolReady.output_management |
                         ProtocolReady.output_power | ProtocolReady.gamma_control);
-                    if (!self.stopping) {
+                    if (!self.stopping and !self.topology_refresh_pending) {
                         try self.publishOutputLayout();
                         try self.consumeOutputManagementCommands();
                     }
@@ -8405,6 +8411,8 @@ pub fn Coordinator(comptime protocol: type) type {
             );
             try self.activateAdditionalOutputs(handle);
             try self.advanceOutputGlobals();
+            try self.publishOutputLayout();
+            try self.consumeOutputManagementCommands();
             self.topology_refresh_pending = false;
         }
 
