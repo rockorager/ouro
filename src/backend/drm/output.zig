@@ -494,6 +494,12 @@ pub const Output = struct {
         return error.UnknownToken;
     }
 
+    pub fn ownsReadinessToken(self: *const Output, token: completion.Token) bool {
+        if (self.poll_token) |poll| if (sameToken(poll, token)) return true;
+        if (self.cancel_token) |cancel| if (sameToken(cancel, token)) return true;
+        return false;
+    }
+
     /// Requires scanout quiescence first. Poll-remove and target CQEs may arrive
     /// in either order; callback/request storage remains alive until both do.
     pub fn beginDrain(self: *Output, router: *completion.Router, ring: *linux.IoUring) !void {
@@ -901,9 +907,14 @@ test "kms: poll cancellation CQEs drain in either order" {
     output.cancel_token = cancel;
     output.state = .draining;
     var ring: linux.IoUring = undefined;
+    try std.testing.expect(output.ownsReadinessToken(poll));
+    try std.testing.expect(output.ownsReadinessToken(cancel));
     try output.completeReadiness(&router, &ring, cancel, 0);
+    try std.testing.expect(!output.ownsReadinessToken(cancel));
+    try std.testing.expect(output.ownsReadinessToken(poll));
     try std.testing.expect(!output.drainComplete());
     try output.completeReadiness(&router, &ring, poll, negativeErrno(.CANCELED));
+    try std.testing.expect(!output.ownsReadinessToken(poll));
     try std.testing.expect(output.drainComplete());
     try output.destroy();
 

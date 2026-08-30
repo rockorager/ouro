@@ -263,6 +263,7 @@ pub fn Coordinator(comptime protocol: type) type {
             protocol_output: OutputAdapter.OutputId,
             management_head: protocol_output_management.HeadId,
             kms_output: ?*output_api.Output = null,
+            session_lock_frame: ?output_scheduler.FrameId = null,
             drain_started: bool = false,
             reconfigure: ?OutputReconfigure = null,
         };
@@ -724,7 +725,6 @@ pub fn Coordinator(comptime protocol: type) type {
         layer_surface_ids: []LayerShellAdapter.LayerSurfaceId,
         lock_surface_ids: []SessionLockAdapter.LockSurfaceId,
         inhibitor_surface_ids: []Adapter.SurfaceId,
-        session_lock_frame: ?@import("../output/headless.zig").FrameId = null,
         session_lock_input_ready: bool = false,
         desktop_timer: ?timer.Handle = null,
         desktop_timer_canceling: bool = false,
@@ -2215,7 +2215,8 @@ pub fn Coordinator(comptime protocol: type) type {
                     try self.desktopTimerEvent(outcome.event);
                     continue;
                 };
-                if (self.primaryKmsOutput()) |output| {
+                for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                    const output = physical.kms_output orelse continue;
                     const request_value = try output.timerEvent(
                         outcome.handle,
                         outcome.event,
@@ -2566,7 +2567,9 @@ pub fn Coordinator(comptime protocol: type) type {
                 );
                 return;
             }
-            if (self.primaryKmsOutput()) |output| {
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                const output = physical.kms_output orelse continue;
+                if (!output.ownsReadinessToken(outcome.token)) continue;
                 try output.completeReadiness(
                     &self.router,
                     &self.root.ring,
@@ -4277,7 +4280,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 };
                 self.session_lock_input_ready = input_ready;
             } else if (unlocked) {
-                self.session_lock_frame = null;
+                for (self.physical_outputs[0..self.physical_output_count]) |*physical|
+                    physical.session_lock_frame = null;
                 self.session_lock_input_ready = false;
                 try self.input_method_adapter.setGrabInhibited(false);
                 try self.virtual_keyboard_adapter.setInhibited(&self.seat_adapter, false);
@@ -6201,29 +6205,38 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn renderFrame(self: *Self, frame: @import("../output/headless.zig").FrameId) !void {
-            const output = self.primaryKmsOutput() orelse return;
-            const output_bounds = try self.outputBounds();
+            const physical = self.physicalOutputForKmsId(frame.output) orelse return;
+            const output = physical.kms_output orelse return;
+            const output_bounds = try self.outputBoundsFor(physical);
             var sample_count: usize = 0;
             if (self.sessionLockActive()) {
-                try self.appendSessionLock(&sample_count, output_bounds);
-                self.session_lock_frame = frame;
+                try self.appendSessionLock(physical, &sample_count, output_bounds);
+                self.physical_outputs[physical.id.index].session_lock_frame = frame;
             } else {
-                try self.appendLayerShell(.background, &sample_count, output_bounds);
-                try self.appendLayerShell(.bottom, &sample_count, output_bounds);
+                try self.appendLayerShell(physical, .background, &sample_count, output_bounds);
+                try self.appendLayerShell(physical, .bottom, &sample_count, output_bounds);
                 const windows = try self.desktop.sceneSnapshotGrowing(
                     self.allocator,
                     &self.scene_windows,
                 );
                 for (windows) |window| {
                     if (!window.visible) continue;
-                    try self.appendSceneRoot(window.surface, &sample_count, output_bounds);
+                    try self.appendSceneRoot(
+                        physical,
+                        window.surface,
+                        &sample_count,
+                        output_bounds,
+                    );
                 }
-                try self.appendLayerShell(.top, &sample_count, output_bounds);
-                try self.appendLayerShell(.overlay, &sample_count, output_bounds);
+                try self.appendLayerShell(physical, .top, &sample_count, output_bounds);
+                try self.appendLayerShell(physical, .overlay, &sample_count, output_bounds);
             }
             var change_count = sample_count;
+            const head_state = try self.output_management_adapter.lifecycle.currentHead(
+                physical.management_head,
+            );
             const output_scale = try geometry.OutputScale.init(
-                self.output_management_adapter.lifecycle.current.scale_120,
+                head_state.scale_120,
             );
             for (self.removed_layers[0..self.removed_layer_len]) |removed| {
                 try self.ensureFrameStorage(@max(sample_count, change_count) + 1);
@@ -6423,6 +6436,7 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn appendLayerShell(
             self: *Self,
+            physical: *const PhysicalOutput,
             selected: LayerShellAdapter.Layer,
             count: *usize,
             output_bounds: geometry.Rect,
@@ -6431,19 +6445,20 @@ pub fn Coordinator(comptime protocol: type) type {
             for (ids) |id| {
                 const state = try self.layer_shell_adapter.state(id);
                 if (!state.mapped or state.layer != selected or
-                    !std.meta.eql(state.output, self.primaryPhysicalOutput().protocol_output)) continue;
-                try self.appendSceneRoot(state.surface, count, output_bounds);
+                    !std.meta.eql(state.output, physical.protocol_output)) continue;
+                try self.appendSceneRoot(physical, state.surface, count, output_bounds);
                 const popups = try self.desktop.externalPopupSnapshot(
                     state.surface,
                     self.popup_scene_windows,
                 );
                 for (popups) |popup| if (popup.visible)
-                    try self.appendSceneRoot(popup.surface, count, output_bounds);
+                    try self.appendSceneRoot(physical, popup.surface, count, output_bounds);
             }
         }
 
         fn appendSessionLock(
             self: *Self,
+            physical: *const PhysicalOutput,
             count: *usize,
             output_bounds: geometry.Rect,
         ) !void {
@@ -6452,13 +6467,14 @@ pub fn Coordinator(comptime protocol: type) type {
             for (ids) |id| {
                 const state = try self.session_lock_adapter.surfaceState(id);
                 if (!state.mapped or !std.meta.eql(state.lock, active) or
-                    !std.meta.eql(state.output_id, self.primaryPhysicalOutput().protocol_output)) continue;
-                try self.appendSceneRoot(state.surface, count, output_bounds);
+                    !std.meta.eql(state.output_id, physical.protocol_output)) continue;
+                try self.appendSceneRoot(physical, state.surface, count, output_bounds);
             }
         }
 
         fn appendSceneRoot(
             self: *Self,
+            physical: *const PhysicalOutput,
             root: Adapter.SurfaceId,
             count: *usize,
             output_bounds: geometry.Rect,
@@ -6469,8 +6485,11 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (!layer.active) continue;
                 if (!try self.refreshSubsurfaceLayer(layer, output_bounds)) continue;
                 try self.ensureFrameStorage(count.* + 1);
+                const head_state = try self.output_management_adapter.lifecycle.currentHead(
+                    physical.management_head,
+                );
                 const output_scale = try geometry.OutputScale.init(
-                    self.output_management_adapter.lifecycle.current.scale_120,
+                    head_state.scale_120,
                 );
                 self.frame_samples[count.*] = try scaleSample(
                     layer.sample.?,
@@ -6564,13 +6583,15 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn processOutput(self: *Self) !void {
-            const output = self.primaryKmsOutput() orelse return;
-            try output.processKmsEvents(.{
-                .context = self,
-                .presented_fn = presented,
-                .retired_fn = retired,
-                .captured_fn = captured,
-            });
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                const output = physical.kms_output orelse continue;
+                try output.processKmsEvents(.{
+                    .context = self,
+                    .presented_fn = presented,
+                    .retired_fn = retired,
+                    .captured_fn = captured,
+                });
+            }
             try self.processScreencopyCaptures();
             try self.processImageCopyCaptures();
         }
@@ -7057,13 +7078,17 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (layer.active and !self.layerSurfaceLive(layer)) self.abandonLayer(layer);
             if (self.cursor_layer.active and !self.layerSurfaceLive(&self.cursor_layer))
                 self.abandonLayer(&self.cursor_layer);
-            if (self.session_lock_frame) |secure_frame| if (std.meta.eql(secure_frame, outcome.frame)) {
-                self.session_lock_frame = null;
+            const physical = self.physicalOutputForKmsId(outcome.frame.output);
+            if (physical) |owner| if (owner.session_lock_frame) |secure_frame| if (std.meta.eql(
+                secure_frame,
+                outcome.frame,
+            )) {
+                self.physical_outputs[owner.id.index].session_lock_frame = null;
                 if (was_presented) {
                     if (self.session_lock_adapter.pendingLock()) |lock| {
                         self.session_lock_adapter.publishLocked(lock) catch |err| switch (err) {
                             error.Exhausted => {
-                                if (self.primaryKmsOutput()) |output| {
+                                if (owner.kms_output) |output| {
                                     output.request(.damage, try monotonicNs()) catch {};
                                     self.armTimer() catch {};
                                 }
@@ -7074,7 +7099,7 @@ pub fn Coordinator(comptime protocol: type) type {
                         if (peer) |value| self.markProtocol(value, ProtocolReady.session_lock);
                     }
                 } else if (self.sessionLockActive()) {
-                    if (self.primaryKmsOutput()) |output| {
+                    if (owner.kms_output) |output| {
                         output.request(.damage, try monotonicNs()) catch {};
                         self.armTimer() catch {};
                     }
@@ -7663,15 +7688,17 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn armTimer(self: *Self) !void {
-            const output = self.primaryKmsOutput() orelse return;
             const now = try monotonicNs();
-            const request_value = (try output.timerRequest(now)) orelse return;
-            const handle = try self.timers.arm(
-                &self.router,
-                &self.root.ring,
-                request_value.deadline,
-            );
-            try output.timerArmed(request_value, handle, now);
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                const output = physical.kms_output orelse continue;
+                const request_value = (try output.timerRequest(now)) orelse continue;
+                const handle = try self.timers.arm(
+                    &self.router,
+                    &self.root.ring,
+                    request_value.deadline,
+                );
+                try output.timerArmed(request_value, handle, now);
+            }
         }
 
         fn pauseOutput(self: *Self) !void {

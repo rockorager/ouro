@@ -1439,6 +1439,10 @@ pub const Output = struct {
         try self.kms_output.completeReadiness(router, ring, token, result);
     }
 
+    pub fn ownsReadinessToken(self: *const Output, token: completion.Token) bool {
+        return self.kms_output.ownsReadinessToken(token);
+    }
+
     pub fn beginDrain(self: *Output, router: *completion.Router, ring: *linux.IoUring) !void {
         if (!self.paused) return error.ScanoutNotQuiescent;
         try self.kms_output.beginDrain(router, ring);
