@@ -2544,6 +2544,9 @@ test "shell-input: layer surface adopts and presents an xdg popup" {
             const layer_ids = try coordinator.layer_shell_adapter.ids(coordinator.layer_surface_ids);
             try std.testing.expectEqual(@as(usize, 1), layer_ids.len);
             const layer_state = try coordinator.layer_shell_adapter.state(layer_ids[0]);
+            const work_area: @TypeOf(coordinator.desktop.workArea()) =
+                .{ .x = 0, .y = 1, .width = 6, .height = 1 };
+            try std.testing.expectEqual(work_area, coordinator.desktop.workArea());
             var popup_storage: [2]@TypeOf(coordinator.scene_windows[0]) = undefined;
             const popups = try coordinator.desktop.externalPopupSnapshot(
                 layer_state.surface,
@@ -4568,7 +4571,10 @@ const LayerPopupHandler = struct {
             .set_size = .{ .width = 3, .height = 2 },
         });
         try protocol.zwlr_layer_surface_v1.encodeRequest(self.queue, self.layer_surface.?.id, .{
-            .set_anchor = .{ .anchor = .{ .value = 5 } },
+            .set_anchor = .{ .anchor = .{ .value = 13 } },
+        });
+        try protocol.zwlr_layer_surface_v1.encodeRequest(self.queue, self.layer_surface.?.id, .{
+            .set_exclusive_zone = .{ .zone = 1 },
         });
 
         try protocol.wl_surface.encodeRequest(self.queue, self.layer_wl_surface.?.id, .{ .commit = .{} });

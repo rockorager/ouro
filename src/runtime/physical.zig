@@ -8395,10 +8395,6 @@ pub fn Coordinator(comptime protocol: type) type {
             return null;
         }
 
-        fn outputBounds(self: *const Self) !geometry.Rect {
-            return self.outputBoundsFor(self.primaryPhysicalOutput());
-        }
-
         fn virtualPointerOutputBounds(self: *const Self, output: ?u64) !geometry.Rect {
             const value = output orelse return self.globalOutputBounds();
             const id: OutputAdapter.OutputId = .{
@@ -8470,10 +8466,38 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn layerWorkArea(self: *Self, pending_surface: ?Adapter.SurfaceId) !geometry.Rect {
-            return self.layerWorkAreaFor(
-                self.primaryPhysicalOutput().protocol_output,
-                pending_surface,
-            );
+            var area = try self.globalOutputBounds();
+            var top: i32 = 0;
+            var bottom: i32 = 0;
+            var left: i32 = 0;
+            var right: i32 = 0;
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                if (physical.kms_output == null) continue;
+                const bounds = try self.outputBoundsFor(physical);
+                const local = try self.layerWorkAreaFor(
+                    physical.protocol_output,
+                    pending_surface,
+                );
+                if (bounds.y == area.y) top = @max(top, local.y - bounds.y);
+                const bounds_bottom = @as(i64, bounds.y) + bounds.height;
+                const local_bottom = @as(i64, local.y) + local.height;
+                if (bounds_bottom == @as(i64, area.y) + area.height)
+                    bottom = @max(bottom, @as(i32, @intCast(bounds_bottom - local_bottom)));
+                if (bounds.x == area.x) left = @max(left, local.x - bounds.x);
+                const bounds_right = @as(i64, bounds.x) + bounds.width;
+                const local_right = @as(i64, local.x) + local.width;
+                if (bounds_right == @as(i64, area.x) + area.width)
+                    right = @max(right, @as(i32, @intCast(bounds_right - local_right)));
+            }
+            const top_amount = @min(top, area.height - 1);
+            area.y += top_amount;
+            area.height -= top_amount;
+            area.height -= @min(bottom, area.height - 1);
+            const left_amount = @min(left, area.width - 1);
+            area.x += left_amount;
+            area.width -= left_amount;
+            area.width -= @min(right, area.width - 1);
+            return area;
         }
 
         fn layerWorkAreaFor(
@@ -9361,7 +9385,8 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.text_input_adapter.resourceRemoved(handle, object);
             _ = self.subcompositor_adapter.resourceRemoved(handle, object);
             if (layer_shell_removed and self.primaryKmsOutput() != null) {
-                self.desktop.applyWorkArea(self.layerWorkArea(null) catch self.outputBounds() catch unreachable);
+                self.desktop.applyWorkArea(self.layerWorkArea(null) catch
+                    self.globalOutputBounds() catch unreachable);
                 self.syncLayerPopupRoots() catch {};
                 self.syncLayerKeyboardFocus() catch {};
                 self.requestOutputDamage() catch {};
