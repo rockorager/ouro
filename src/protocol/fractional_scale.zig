@@ -187,6 +187,13 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             }
         }
 
+        /// Changes the fallback inherited by future bindings without
+        /// disturbing the output-specific preference of live surfaces.
+        pub fn setDefaultPreferredScale(adapter: *Self, preferred_scale: u32) !void {
+            if (preferred_scale == 0) return error.InvalidScale;
+            adapter.preferred_scale = preferred_scale;
+        }
+
         /// Publishes the preferred scale for one surface without changing the
         /// default inherited by future bindings. Returns false when the
         /// surface has no fractional-scale object.
@@ -329,7 +336,12 @@ test "fractional scale: changed preference republishes each live resource once" 
         .{ .index = 9, .generation = 9 },
         300,
     ));
+    try adapter.setDefaultPreferredScale(300);
+    try std.testing.expectEqual(@as(u32, 300), adapter.preferred_scale);
+    try std.testing.expectEqual(@as(u32, 240), first.preferred_scale);
+    try std.testing.expectEqual(@as(u32, 180), second.preferred_scale);
     try std.testing.expectError(error.InvalidScale, adapter.publishPreferredScale(0));
+    try std.testing.expectError(error.InvalidScale, adapter.setDefaultPreferredScale(0));
     try std.testing.expectError(
         error.InvalidScale,
         adapter.publishSurfacePreferredScale(first.surface, 0),

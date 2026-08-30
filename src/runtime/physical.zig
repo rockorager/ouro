@@ -5888,7 +5888,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     physical.protocol_output,
                     scale_120,
                 );
-                if (primary) try self.fractional_scale_adapter.publishPreferredScale(scale_120);
+                if (primary) try self.fractional_scale_adapter.setDefaultPreferredScale(scale_120);
                 try self.xdg_output_adapter.publishMode(physical.protocol_output);
             }
             if (primary and publish_protocol) {
@@ -5968,7 +5968,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 requested.y,
             );
             if (std.meta.eql(physical.id, self.primaryPhysicalOutput().id)) {
-                try self.fractional_scale_adapter.publishPreferredScale(requested.scale_120);
+                try self.fractional_scale_adapter.setDefaultPreferredScale(requested.scale_120);
                 const stride = try std.math.mul(u32, output.planner.output.width, 4);
                 const bytes = try std.math.mul(usize, stride, output.planner.output.height);
                 self.screencopy_bytes = try self.allocator.realloc(self.screencopy_bytes, bytes);
@@ -8270,9 +8270,40 @@ pub fn Coordinator(comptime protocol: type) type {
                         self.association_surfaces[0..count],
                     );
                 }
+                for (self.app_layers) |*layer|
+                    try self.publishLayerPreferredScale(layer, client.peer);
+                try self.publishLayerPreferredScale(&self.cursor_layer, client.peer);
                 if (self.output_adapter.pendingOutboundOn(client.peer))
                     client.protocol_ready |= ProtocolReady.output;
+                if (self.fractional_scale_adapter.pendingOutbound(client.peer))
+                    client.protocol_ready |= ProtocolReady.fractional_scale;
             };
+        }
+
+        fn publishLayerPreferredScale(
+            self: *Self,
+            layer: *const Layer,
+            peer: wayring.io_uring.Peer,
+        ) !void {
+            if (!layer.active or layer.peer == null or !samePeer(layer.peer.?, peer)) return;
+            const surface = layer.id orelse return;
+            const sample = layer.sample orelse return;
+            var preferred_scale: ?u32 = null;
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                if (!physical.connected) continue;
+                const bounds = self.outputBoundsFor(physical) catch continue;
+                if (try clipToOutput(sample.destination, bounds) == null) continue;
+                const state = try self.output_management_adapter.lifecycle.currentHead(
+                    physical.management_head,
+                );
+                preferred_scale = @max(preferred_scale orelse 0, state.scale_120);
+            }
+            if (preferred_scale) |scale| {
+                _ = try self.fractional_scale_adapter.publishSurfacePreferredScale(
+                    surface,
+                    scale,
+                );
+            }
         }
 
         fn consumeRetireAction(self: *Self, action: output_api.RetireAction) !void {
