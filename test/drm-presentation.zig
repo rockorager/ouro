@@ -372,6 +372,15 @@ test "physical coordinator fails over from a disconnected primary output" {
     const primary_head = coordinator.physical_outputs[0].management_head;
     const secondary_protocol = coordinator.physical_outputs[1].protocol_output;
     const secondary_head = coordinator.physical_outputs[1].management_head;
+    try coordinator.output_adapter.publishScale(secondary_protocol, 240);
+    var secondary_state = try coordinator.output_management_adapter.lifecycle.currentHead(
+        secondary_head,
+    );
+    secondary_state.scale_120 = 240;
+    _ = try coordinator.output_management_adapter.publishHead(
+        secondary_head,
+        secondary_state,
+    );
 
     fixture.first_desktop = false;
     try fixture.signalHotplug();
@@ -398,7 +407,11 @@ test "physical coordinator fails over from a disconnected primary output" {
         secondary_head,
         coordinator.output_management_adapter.lifecycle.primary,
     );
-    try std.testing.expectEqual(@as(?i32, 3), (try coordinator.output_adapter.logicalSnapshot(
+    try std.testing.expectEqual(
+        @as(u32, 240),
+        coordinator.fractional_scale_adapter.preferred_scale,
+    );
+    try std.testing.expectEqual(@as(?i32, 1), (try coordinator.output_adapter.logicalSnapshot(
         secondary_protocol,
     )).width);
 

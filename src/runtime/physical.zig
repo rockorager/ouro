@@ -3641,11 +3641,12 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn promotePrimaryPhysicalOutput(self: *Self, physical: *PhysicalOutput) !void {
             _ = try self.output_adapter.logicalSnapshot(physical.protocol_output);
-            _ = try self.output_management_adapter.lifecycle.currentHead(
+            const state = try self.output_management_adapter.lifecycle.currentHead(
                 physical.management_head,
             );
             try self.output_management_adapter.promotePrimary(physical.management_head);
             try self.output_adapter.promotePrimary(physical.protocol_output);
+            try self.fractional_scale_adapter.setDefaultPreferredScale(state.scale_120);
         }
 
         pub fn primaryKmsOutput(self: *const Self) ?*output_api.Output {
