@@ -5062,17 +5062,24 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.requestOutputDamage();
         }
 
+        fn requestPhysicalOutputDamage(
+            physical: *PhysicalOutput,
+            now: u64,
+        ) !bool {
+            if (!physical.connected) return false;
+            const output = physical.kms_output orelse return false;
+            output.request(.damage, now) catch |err| switch (err) {
+                error.OutputPaused => return false,
+                else => return err,
+            };
+            return true;
+        }
+
         fn requestOutputDamage(self: *Self) !void {
             const now = try monotonicNs();
             var requested = false;
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
-                if (!physical.connected) continue;
-                const output = physical.kms_output orelse continue;
-                output.request(.damage, now) catch |err| switch (err) {
-                    error.OutputPaused => continue,
-                    else => return err,
-                };
-                requested = true;
+                requested = try requestPhysicalOutputDamage(physical, now) or requested;
             }
             if (requested) try self.armTimer();
         }
@@ -6246,18 +6253,43 @@ pub fn Coordinator(comptime protocol: type) type {
                 const index = (self.pending_surface_head + offset) % self.pending_surfaces.len;
                 remaining += @max(1, self.pending_surfaces[index].commits);
             }
-            var changed = false;
+            var global_damage = false;
+            var damage_requested = false;
+            var damage_requested_at: ?u64 = null;
             while (remaining != 0 and self.pending_surface_len != 0) : (remaining -= 1) {
                 const before_len = self.pending_surface_len;
                 const pending = self.pending_surfaces[self.pending_surface_head];
                 const applied = try self.applyPendingSurface(pending);
                 if (applied and self.primaryKmsOutput() == null)
                     self.adapter.clearFifoBarriers();
-                changed = applied or changed;
+                if (applied and !global_damage) {
+                    // A layer-shell root is permanently assigned to one output.
+                    // Other surface graphs may cross outputs, so keep their
+                    // damage request conservative until their bounds are known.
+                    if (self.layer_shell_adapter.stateForSurface(pending.id)) |state| {
+                        if (self.physicalOutputForProtocolIdMutable(state.output)) |physical| {
+                            const now = damage_requested_at orelse blk: {
+                                const value = try monotonicNs();
+                                damage_requested_at = value;
+                                break :blk value;
+                            };
+                            damage_requested = try requestPhysicalOutputDamage(physical, now) or
+                                damage_requested;
+                        }
+                    } else {
+                        global_damage = true;
+                    }
+                }
                 if (self.pending_surface_len == before_len)
                     _ = self.rotatePendingSurface();
             }
-            if (changed) try self.requestOutputDamage();
+            if (global_damage) {
+                const now = damage_requested_at orelse try monotonicNs();
+                for (self.physical_outputs[0..self.physical_output_count]) |*physical|
+                    damage_requested = try requestPhysicalOutputDamage(physical, now) or
+                        damage_requested;
+            }
+            if (damage_requested) try self.armTimer();
             try self.syncCommitTimer();
         }
 
