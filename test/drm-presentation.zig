@@ -198,6 +198,10 @@ test "physical coordinator activates and drains every desktop connector" {
     );
     try std.testing.expectEqual(@as(i32, 3), secondary.x);
     try std.testing.expectEqual(@as(?i32, 3), secondary.width);
+    const global_bounds: @TypeOf(coordinator.desktop.workArea()) =
+        .{ .x = 0, .y = 0, .width = 6, .height = 2 };
+    try std.testing.expectEqual(global_bounds, coordinator.desktop.workArea());
+    try std.testing.expectEqual(global_bounds, coordinator.interaction.bounds);
     try std.testing.expect((try coordinator.output_management_adapter.lifecycle.currentHead(
         coordinator.physical_outputs[1].management_head,
     )).enabled);

@@ -5855,6 +5855,7 @@ pub fn Coordinator(comptime protocol: type) type {
             );
             try self.activateAdditionalOutputs(handle);
             try self.advanceOutputGlobals();
+            try self.publishOutputLayout();
         }
 
         fn activateAdditionalOutputs(self: *Self, handle: drm.Handle) !void {
