@@ -34,11 +34,11 @@ pub const Error = error{
 };
 
 pub const Config = struct {
-    global_version: u32 = 4,
+    global_version: u32 = 6,
     feedback_slots: u32 = 8,
 
     fn validate(config: Config) Error!void {
-        if (config.global_version == 0 or config.global_version > 4 or config.feedback_slots == 0)
+        if (config.global_version == 0 or config.global_version > 6 or config.feedback_slots == 0)
             return error.InvalidConfig;
     }
 };
@@ -127,6 +127,10 @@ pub const Store = struct {
         const slot = try acquireStoreSlot(ParamsSlot, store.allocator, &store.params, &store.params_free);
         const index = slot.index;
         return .{ .index = index, .generation = slot.generation };
+    }
+
+    pub fn paramsUsed(store: *Store, handle: Handle) Error!bool {
+        return (try store.resolveParams(handle)).used;
     }
 
     /// Takes ownership of `fd`, including when the request is rejected.
@@ -321,6 +325,7 @@ pub fn Adapter(comptime protocol: type) type {
             header: Header = .{},
             peer: wayring.io_uring.Peer = undefined,
             state: Handle = undefined,
+            sampling_device: ?linux.dev_t = null,
             pending: Pending = .none,
         };
         const BufferResource = struct {
@@ -330,6 +335,7 @@ pub fn Adapter(comptime protocol: type) type {
         const FeedbackResource = struct {
             header: Header = .{},
             peer: wayring.io_uring.Peer = undefined,
+            version: u32 = 4,
             stage: u8 = 0,
         };
         const FormatEntry = extern struct {
@@ -424,7 +430,8 @@ pub fn Adapter(comptime protocol: type) type {
             slot.header.resource = binding.resource;
             slot.peer = binding.peer;
             slot.version = binding.version;
-            adapter.pending_len += 1;
+            slot.advertisement = if (binding.version >= 4) 4 else 0;
+            if (slot.advertisement < 4) adapter.pending_len += 1;
             return slot;
         }
 
@@ -471,6 +478,7 @@ pub fn Adapter(comptime protocol: type) type {
                             adapter.params.release(slot);
                             return try adapter.noMemory(actor);
                         };
+                        slot.sampling_device = null;
                         const admitted = Dmabuf.admit_create_params(
                             server_objects,
                             decoded.handle,
@@ -486,6 +494,7 @@ pub fn Adapter(comptime protocol: type) type {
                     .get_default_feedback => |payload| {
                         const slot = adapter.acquireFeedback() catch return try adapter.noMemory(actor);
                         slot.peer = manager.peer;
+                        slot.version = manager.version;
                         const admitted = Dmabuf.admit_get_default_feedback(server_objects, decoded.handle, payload, .{ .id = slot }) catch |cause| {
                             adapter.feedback.release(slot);
                             return try adapter.failure(actor, decoded.handle.id, cause);
@@ -502,6 +511,7 @@ pub fn Adapter(comptime protocol: type) type {
                             return try adapter.failure(actor, decoded.handle.id, error.InvalidSurface);
                         const slot = adapter.acquireFeedback() catch return try adapter.noMemory(actor);
                         slot.peer = manager.peer;
+                        slot.version = manager.version;
                         const admitted = Dmabuf.admit_get_surface_feedback(server_objects, decoded.handle, payload, .{ .id = slot }) catch |cause| {
                             adapter.feedback.release(slot);
                             return try adapter.failure(actor, decoded.handle.id, cause);
@@ -578,7 +588,7 @@ pub fn Adapter(comptime protocol: type) type {
                         },
                         else => return try adapter.paramsError(actor, decoded.handle.id, cause),
                     };
-                    adapter.validateCreated(created) catch {
+                    adapter.validateCreated(slot, created) catch {
                         adapter.store.destroyBuffer(created) catch unreachable;
                         slot.pending = .failed;
                         adapter.pending_len += 1;
@@ -607,7 +617,7 @@ pub fn Adapter(comptime protocol: type) type {
                         error.InvalidWlBuffer
                     else
                         cause);
-                    adapter.validateCreated(created) catch {
+                    adapter.validateCreated(slot, created) catch {
                         adapter.store.destroyBuffer(created) catch unreachable;
                         return try adapter.paramsError(actor, decoded.handle.id, error.InvalidWlBuffer);
                     };
@@ -628,13 +638,24 @@ pub fn Adapter(comptime protocol: type) type {
                     };
                     buffer.header.resource = admitted.buffer_id;
                 },
-                .set_sampling_device => return try adapter.paramsError(actor, decoded.handle.id, error.InvalidDeviceSize),
+                .set_sampling_device => |payload| {
+                    if (payload.device.len != @sizeOf(linux.dev_t))
+                        return try adapter.paramsError(actor, decoded.handle.id, error.InvalidDeviceSize);
+                    if (try adapter.store.paramsUsed(slot.state))
+                        return try adapter.paramsError(actor, decoded.handle.id, error.AlreadyUsed);
+                    var device: linux.dev_t = undefined;
+                    @memcpy(std.mem.asBytes(&device), payload.device);
+                    slot.sampling_device = device;
+                },
             }
             try decoded.finish(protocol, server_objects, &actor.transmit);
             return .continue_dispatch;
         }
 
-        fn validateCreated(adapter: *Self, handle: Handle) !void {
+        fn validateCreated(adapter: *Self, slot: *const ParamsResource, handle: Handle) !void {
+            if (slot.sampling_device) |device|
+                if (!std.mem.eql(u8, std.mem.asBytes(&device), &adapter.device))
+                    return error.UnsupportedSamplingDevice;
             const validator = adapter.import_validator orelse return;
             try validator.validate(try adapter.store.buffer(handle));
         }
@@ -725,8 +746,31 @@ pub fn Adapter(comptime protocol: type) type {
             }
             for (adapter.feedback.entries.items) |slot| {
                 if (!slot.header.active or !samePeer(slot.peer, peer)) continue;
-                while (slot.stage < 7) {
-                    const event: Feedback.Event = switch (slot.stage) {
+                const stage_count = feedbackStageCount(slot.version);
+                while (slot.stage < stage_count) {
+                    const event: Feedback.Event = if (slot.version >= 6) switch (slot.stage) {
+                        0 => {
+                            const duplicated = linux.fcntl(adapter.format_table_fd, linux.F.DUPFD_CLOEXEC, 0);
+                            if (linux.errno(duplicated) != .SUCCESS) return error.SystemCallFailed;
+                            const fd: linux.fd_t = @intCast(duplicated);
+                            Feedback.encodeEvent(queue, slot.header.resource.id, .{ .format_table = .{ .fd = fd, .size = @sizeOf(@TypeOf(format_entries)) } }) catch |err| {
+                                _ = linux.close(fd);
+                                switch (err) {
+                                    error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return completed,
+                                    else => return err,
+                                }
+                            };
+                            slot.stage += 1;
+                            completed += 1;
+                            continue;
+                        },
+                        1 => .{ .tranche_target_device = .{ .device = &adapter.device } },
+                        2 => .{ .tranche_flags = .{ .flags = Feedback.tranche_flags.sampling } },
+                        3 => .{ .tranche_formats = .{ .indices = &format_indices } },
+                        4 => .{ .tranche_done = .{} },
+                        5 => .{ .done = .{} },
+                        else => unreachable,
+                    } else switch (slot.stage) {
                         0 => {
                             const duplicated = linux.fcntl(adapter.format_table_fd, linux.F.DUPFD_CLOEXEC, 0);
                             if (linux.errno(duplicated) != .SUCCESS) return error.SystemCallFailed;
@@ -771,7 +815,8 @@ pub fn Adapter(comptime protocol: type) type {
                 if (slot.header.active and samePeer(slot.peer, peer) and slot.pending != .none)
                     return true;
             for (adapter.feedback.entries.items) |slot|
-                if (slot.header.active and samePeer(slot.peer, peer) and slot.stage < 7)
+                if (slot.header.active and samePeer(slot.peer, peer) and
+                    slot.stage < feedbackStageCount(slot.version))
                     return true;
             return false;
         }
@@ -874,7 +919,7 @@ pub fn Adapter(comptime protocol: type) type {
             if (object.interface == &Feedback.info) {
                 const slot = adapter.feedback.fromContext(object.context) orelse return false;
                 if (!std.meta.eql(slot.header.resource, handle)) return false;
-                if (slot.stage < 7) adapter.pending_len -= 1;
+                if (slot.stage < feedbackStageCount(slot.version)) adapter.pending_len -= 1;
                 adapter.feedback.release(slot);
                 return true;
             }
@@ -922,7 +967,13 @@ pub fn Adapter(comptime protocol: type) type {
             if (adapter.feedback.free_head == slot_pool.none and
                 adapter.feedback.entries.items.len >= adapter.feedback_limit)
                 return error.OutOfMemory;
-            return adapter.feedback.acquire();
+            const slot = try adapter.feedback.acquire();
+            slot.stage = 0;
+            return slot;
+        }
+
+        fn feedbackStageCount(version: u32) u8 {
+            return if (version >= 6) 6 else 7;
         }
 
         fn createFormatTable() !linux.fd_t {
@@ -1041,6 +1092,46 @@ test "linux-dmabuf: generated wire adapter is complete" {
     adapter.deinit();
 }
 
+test "linux-dmabuf: sampling device gates renderer import" {
+    const TestAdapter = Adapter(@import("core_protocol"));
+    const Gate = struct {
+        calls: usize = 0,
+
+        fn validate(context: *anyopaque, _: *const Buffer) !void {
+            const gate: *@This() = @ptrCast(@alignCast(context));
+            gate.calls += 1;
+        }
+    };
+
+    var adapter = try TestAdapter.init(std.testing.allocator, .{});
+    defer adapter.deinit();
+    var gate: Gate = .{};
+    adapter.setImportValidator(.{ .context = &gate, .validate_fn = Gate.validate });
+    const device: linux.dev_t = 0x1234;
+    @memcpy(&adapter.device, std.mem.asBytes(&device));
+
+    const params = try adapter.params.acquire();
+    params.state = try adapter.store.createParams();
+    const fd = try sizedFd(4);
+    try adapter.store.addPlane(params.state, fd, 0, 0, 4, modifier_linear);
+    const buffer = try adapter.store.createBuffer(params.state, 1, 1, drm_format_argb8888, 0);
+
+    params.sampling_device = 0x5678;
+    try std.testing.expectError(
+        error.UnsupportedSamplingDevice,
+        adapter.validateCreated(params, buffer),
+    );
+    try std.testing.expectEqual(@as(usize, 0), gate.calls);
+    params.sampling_device = device;
+    try adapter.validateCreated(params, buffer);
+    try std.testing.expectEqual(@as(usize, 1), gate.calls);
+
+    try adapter.store.destroyBuffer(buffer);
+    try adapter.store.destroyParams(params.state);
+    adapter.params.release(params);
+    try expectClosed(fd);
+}
+
 test "linux-dmabuf: resource and descriptor stores grow without moving live entries" {
     const TestAdapter = Adapter(@import("core_protocol"));
     var adapter = try TestAdapter.init(std.testing.allocator, .{});
@@ -1141,7 +1232,7 @@ test "linux-dmabuf: legacy advertisements survive transmit backpressure" {
     try std.testing.expectEqual(@as(usize, 0), bytes.len);
 }
 
-test "linux-dmabuf: immutable feedback resumes with exact sequence and table" {
+test "linux-dmabuf: version 6 feedback resumes with sampling tranche and no main device" {
     const protocol = @import("core_protocol");
     const TestAdapter = Adapter(protocol);
     var adapter = try TestAdapter.init(std.testing.allocator, .{ .feedback_slots = 1 });
@@ -1163,6 +1254,7 @@ test "linux-dmabuf: immutable feedback resumes with exact sequence and table" {
     const peer: wayring.io_uring.Peer = .{ .slot = 9, .generation = 3 };
     const feedback = try adapter.acquireFeedback();
     feedback.peer = peer;
+    feedback.version = 6;
     feedback.header.resource = try server_objects.insertClient(
         7,
         &protocol.zwp_linux_dmabuf_feedback_v1.info,
@@ -1180,7 +1272,7 @@ test "linux-dmabuf: immutable feedback resumes with exact sequence and table" {
 
     var output = wayring.tx.Queue.init(&blocks, 512, &descriptors, 1);
     defer output.deinit();
-    try std.testing.expectEqual(@as(usize, 7), try adapter.flushOn(peer, &server_objects, &output));
+    try std.testing.expectEqual(@as(usize, 6), try adapter.flushOn(peer, &server_objects, &output));
     try std.testing.expect(!adapter.pendingOutbound(peer));
     var descriptor_scratch: [2]linux.fd_t = undefined;
     var control: [128]u8 align(@alignOf(linux.cmsghdr)) = undefined;
@@ -1193,7 +1285,6 @@ test "linux-dmabuf: immutable feedback resumes with exact sequence and table" {
     var bytes = snapshot.first;
     const tags = [_]std.meta.Tag(protocol.zwp_linux_dmabuf_feedback_v1.Event){
         .format_table,
-        .main_device,
         .tranche_target_device,
         .tranche_flags,
         .tranche_formats,
@@ -1212,12 +1303,13 @@ test "linux-dmabuf: immutable feedback resumes with exact sequence and table" {
             try std.testing.expectEqualSlices(u8, std.mem.asBytes(&TestAdapter.format_entries), &table);
             _ = linux.close(event.format_table.fd);
         } else if (index == 1) {
-            try std.testing.expectEqualSlices(u8, std.mem.asBytes(&device), event.main_device.device);
-        } else if (index == 2) {
             try std.testing.expectEqualSlices(u8, std.mem.asBytes(&device), event.tranche_target_device.device);
+        } else if (index == 2) {
+            try std.testing.expectEqual(
+                protocol.zwp_linux_dmabuf_feedback_v1.tranche_flags.sampling.value,
+                event.tranche_flags.flags.value,
+            );
         } else if (index == 3) {
-            try std.testing.expectEqual(@as(u32, 0), event.tranche_flags.flags.value);
-        } else if (index == 4) {
             try std.testing.expectEqualSlices(u8, &TestAdapter.format_indices, event.tranche_formats.indices);
         }
         bytes = bytes[message.header.size..];
