@@ -95,6 +95,7 @@ pub const Platform = struct {
         draw: *const fn (*anyopaque, Renderer, Target, Frame) anyerror!std.posix.fd_t,
         readback: *const fn (*anyopaque, Renderer, Target, CapturePhase) anyerror!Readback,
         content_provider: *const fn (*anyopaque, Renderer) ?render_content.Provider,
+        validate_external: *const fn (*anyopaque, Renderer, render.ExternalSource, render.Size, render.PixelFormat) anyerror!void,
         packs_sources: *const fn (*anyopaque, Renderer) bool,
         cache_lut: *const fn (*anyopaque, Renderer, *const icc.Lut) anyerror!u32,
     };
@@ -134,6 +135,15 @@ pub const Platform = struct {
     pub fn contentProvider(self: Platform, renderer: Renderer) ?render_content.Provider {
         return self.vtable.content_provider(self.context, renderer);
     }
+    pub fn validateExternal(
+        self: Platform,
+        renderer: Renderer,
+        source: render.ExternalSource,
+        size: render.Size,
+        format: render.PixelFormat,
+    ) !void {
+        try self.vtable.validate_external(self.context, renderer, source, size, format);
+    }
     pub fn packsSources(self: Platform, renderer: Renderer) bool {
         return self.vtable.packs_sources(self.context, renderer);
     }
@@ -157,6 +167,7 @@ const real_vtable: Platform.VTable = .{
     .draw = realDraw,
     .readback = realReadback,
     .content_provider = realContentProvider,
+    .validate_external = realValidateExternal,
     .packs_sources = realPacksSources,
     .cache_lut = realCacheLut,
 };
@@ -942,6 +953,27 @@ fn validateRetainedExternal(
     format: render.PixelFormat,
 ) !void {
     try requireExternalSampling(@ptrCast(@alignCast(context)), source, size, format);
+}
+
+fn realValidateExternal(
+    _: *anyopaque,
+    renderer: Renderer,
+    source: render.ExternalSource,
+    size: render.Size,
+    format: render.PixelFormat,
+) !void {
+    const self: *RealRenderer = @ptrCast(@alignCast(renderer));
+    var candidate = source;
+    candidate.context = self;
+    candidate.token = std.math.maxInt(u64);
+    candidate.alive_fn = validationSourceAlive;
+    const token = try importedImage(self, candidate, size, format);
+    const entry = importedFromToken(self, token) orelse unreachable;
+    destroyImportedImage(self, entry);
+}
+
+fn validationSourceAlive(_: *anyopaque, _: u64) bool {
+    return false;
 }
 
 fn requireExternalSampling(

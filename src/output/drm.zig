@@ -470,6 +470,10 @@ fn validateDirectMetadata(import: gbm.Import, metadata: gbm.Metadata) !void {
         return error.ImportMetadataMismatch;
 }
 
+fn validationSourceAlive(_: *anyopaque, _: u64) bool {
+    return false;
+}
+
 /// Imports and read-maps one client DMA-BUF long enough for the renderer
 /// content store to take its immutable bounded copy. GBM owns any required
 /// driver staging and implicit synchronization for the mapping lifetime.
@@ -964,6 +968,28 @@ pub const Output = struct {
 
     pub fn rendererKind(self: *const Output) ?RendererKind {
         return self.render_device.rendererKind();
+    }
+
+    pub fn validateClientBuffer(self: *Output, import: gbm.Import) !void {
+        const format = formatFromDrm(import.format) orelse return error.UnsupportedFormat;
+        const renderer = &(self.render_device.renderer orelse return error.RendererUnavailable);
+        switch (renderer.*) {
+            .pixman => {
+                var source = try mapImportedSource(self.pool.gbm_platform, self.pool.device, import);
+                source.deinit();
+            },
+            .vulkan => |*value| try value.validateExternal(.{
+                .context = self,
+                .token = 0,
+                .alive_fn = validationSourceAlive,
+                .drm_format = import.format,
+                .modifier = import.modifier,
+                .plane_count = import.plane_count,
+                .fds = import.fds,
+                .strides = import.strides,
+                .offsets = import.offsets,
+            }, .{ .width = import.width, .height = import.height }, format),
+        }
     }
 
     pub fn mapClientBuffer(

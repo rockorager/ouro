@@ -803,11 +803,11 @@ fn runVertical(trigger: TerminalTrigger, source: ClientSource) !void {
     try std.testing.expectEqual(@as(usize, 1), coordinator.stats.imported_disposals);
     try std.testing.expectEqual(@as(usize, 1), fixture.page_flips);
     if (source == .dmabuf) {
-        try std.testing.expectEqual(@as(usize, 1), fixture.imported_bos);
-        try std.testing.expectEqual(@as(usize, 1), fixture.read_maps);
-        // One target map and the transient imported-source read map have both
-        // been released by the first completed presentation.
-        try std.testing.expectEqual(@as(usize, 2), fixture.unmaps);
+        try std.testing.expectEqual(@as(usize, 2), fixture.imported_bos);
+        try std.testing.expectEqual(@as(usize, 2), fixture.read_maps);
+        // The target map, create-time validation map, and retained-source map
+        // have all been released by the first completed presentation.
+        try std.testing.expectEqual(@as(usize, 3), fixture.unmaps);
     }
     try std.testing.expectEqual(@as(u32, 10), coordinator.output.?.kms_output.connector.id);
     try std.testing.expectEqual(@as(u32, 30), coordinator.output.?.kms_output.crtc.id);
@@ -818,7 +818,6 @@ fn runVertical(trigger: TerminalTrigger, source: ClientSource) !void {
     // presentation with no possible physical outcome is abandoned exactly
     // once and cannot target the replacement surface.
     const first_surface_id = coordinator.cursor_layer.id.?;
-    if (source == .dmabuf) fixture.fail_imports = true;
     try client_handler.replaceCommittedSurface();
     try submitClient(&client_reactor, &client_driver, &client_handler);
     for (0..128) |_| {
@@ -830,32 +829,23 @@ fn runVertical(trigger: TerminalTrigger, source: ClientSource) !void {
             coordinator.interaction.cursorRequest(id, .{ .x = 0, .y = 0 });
             _ = try loop.turn(coordinator);
         };
-        const second_consumed = if (source != .dmabuf)
-            coordinator.stats.applied == 2 and coordinator.cursor_layer.content != null
-        else
-            fixture.import_attempts == 2 and coordinator.pending_surface_len == 0 and
-                coordinator.cursor_layer.candidate == null;
-        if (second_consumed and (source == .dmabuf or client_handler.surface_enters == 2)) break;
+        const second_consumed = coordinator.stats.applied == 2 and
+            coordinator.cursor_layer.content != null;
+        if (second_consumed and client_handler.surface_enters == 2) break;
         if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
             try waitForEither(&root.ring, client_reactor.ring);
     }
-    const abandoned_surface = if (source != .dmabuf) coordinator.cursor_layer.surface.? else coordinator.surface.?;
-    if (source != .dmabuf) {
-        try std.testing.expectEqual(@as(usize, 2), coordinator.stats.applied);
-        try std.testing.expect(!coordinator.cursor_layer.source_release_pending);
-        try std.testing.expect(coordinator.cursor_layer.content.?.attachment_lease == null);
-        try std.testing.expect(coordinator.cursor_layer.content.?.release_callbacks == null);
-        try std.testing.expect(coordinator.cursor_layer.content.?.surface.attachment.?.buffer == null);
-    } else {
-        // A buffer accepted by the DMA-BUF protocol may become unimportable
-        // later. The commit is discarded and released without a protocol
-        // error, compositor failure, or permanent retry.
-        try std.testing.expectEqual(@as(usize, 1), coordinator.stats.applied);
-        try std.testing.expectEqual(@as(usize, 2), fixture.import_attempts);
-        try std.testing.expectEqual(@as(usize, 1), fixture.imported_bos);
-        try std.testing.expect(coordinator.cursor_layer.content == null);
-        try std.testing.expect(!coordinator.stopping);
+    const abandoned_surface = coordinator.cursor_layer.surface.?;
+    try std.testing.expectEqual(@as(usize, 2), coordinator.stats.applied);
+    try std.testing.expect(!coordinator.cursor_layer.source_release_pending);
+    try std.testing.expect(coordinator.cursor_layer.content.?.attachment_lease == null);
+    try std.testing.expect(coordinator.cursor_layer.content.?.release_callbacks == null);
+    try std.testing.expect(coordinator.cursor_layer.content.?.surface.attachment.?.buffer == null);
+    if (source == .dmabuf) {
+        try std.testing.expectEqual(@as(usize, 4), fixture.import_attempts);
+        try std.testing.expectEqual(@as(usize, 4), fixture.imported_bos);
     }
+    try std.testing.expect(!coordinator.stopping);
     try std.testing.expectEqual(@as(usize, 1), coordinator.stats.submitted);
 
     try client_handler.replaceWithEmptySurface();
@@ -1917,7 +1907,7 @@ pub const Fixture = struct {
     drm_fd: linux.fd_t,
     callback: ?*ouro.backend_platform.CallbackContext = null,
     command: SessionCommand = .enable,
-    bo_bytes: [4][32]u8 align(4) = .{[_]u8{0} ** 32} ** 4,
+    bo_bytes: [6][32]u8 align(4) = .{[_]u8{0} ** 32} ** 6,
     bo_count: usize = 0,
     bo_destroyed: usize = 0,
     output_bo_destroyed: usize = 0,

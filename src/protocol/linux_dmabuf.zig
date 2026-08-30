@@ -69,6 +69,15 @@ pub const Buffer = struct {
     plane_count: u8,
 };
 
+pub const ImportValidator = struct {
+    context: *anyopaque,
+    validate_fn: *const fn (*anyopaque, *const Buffer) anyerror!void,
+
+    pub fn validate(validator: ImportValidator, buffer: *const Buffer) !void {
+        try validator.validate_fn(validator.context, buffer);
+    }
+};
+
 const ParamsSlot = struct {
     active: bool = false,
     generation: u32 = 1,
@@ -348,6 +357,7 @@ pub fn Adapter(comptime protocol: type) type {
         feedback_limit: u32,
         format_table_fd: linux.fd_t,
         device: [@sizeOf(linux.dev_t)]u8 = undefined,
+        import_validator: ?ImportValidator = null,
         pending_len: usize = 0,
 
         pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
@@ -401,6 +411,10 @@ pub fn Adapter(comptime protocol: type) type {
             );
             adapter.global = global;
             return global;
+        }
+
+        pub fn setImportValidator(adapter: *Self, validator: ?ImportValidator) void {
+            adapter.import_validator = validator;
         }
 
         fn bind(context: ?*anyopaque, binding: wayring.server.Binding) !?*anyopaque {
@@ -564,6 +578,13 @@ pub fn Adapter(comptime protocol: type) type {
                         },
                         else => return try adapter.paramsError(actor, decoded.handle.id, cause),
                     };
+                    adapter.validateCreated(created) catch {
+                        adapter.store.destroyBuffer(created) catch unreachable;
+                        slot.pending = .failed;
+                        adapter.pending_len += 1;
+                        try decoded.finish(protocol, server_objects, &actor.transmit);
+                        return .continue_dispatch;
+                    };
                     const buffer = adapter.buffers.acquire() catch {
                         adapter.store.destroyBuffer(created) catch unreachable;
                         slot.pending = .failed;
@@ -586,6 +607,10 @@ pub fn Adapter(comptime protocol: type) type {
                         error.InvalidWlBuffer
                     else
                         cause);
+                    adapter.validateCreated(created) catch {
+                        adapter.store.destroyBuffer(created) catch unreachable;
+                        return try adapter.paramsError(actor, decoded.handle.id, error.InvalidWlBuffer);
+                    };
                     const buffer = adapter.buffers.acquire() catch {
                         adapter.store.destroyBuffer(created) catch unreachable;
                         return try adapter.paramsError(actor, decoded.handle.id, error.InvalidWlBuffer);
@@ -607,6 +632,11 @@ pub fn Adapter(comptime protocol: type) type {
             }
             try decoded.finish(protocol, server_objects, &actor.transmit);
             return .continue_dispatch;
+        }
+
+        fn validateCreated(adapter: *Self, handle: Handle) !void {
+            const validator = adapter.import_validator orelse return;
+            try validator.validate(try adapter.store.buffer(handle));
         }
 
         pub fn flushOn(

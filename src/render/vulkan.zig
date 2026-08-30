@@ -144,6 +144,15 @@ pub const Renderer = struct {
         return self.platform.contentProvider(self.implementation);
     }
 
+    pub fn validateExternal(
+        self: *Renderer,
+        source: render_types.ExternalSource,
+        size: render_types.Size,
+        format: render_types.PixelFormat,
+    ) !void {
+        try self.platform.validateExternal(self.implementation, source, size, format);
+    }
+
     /// Requires every target to be out of KMS ownership. Platform destruction
     /// performs the terminal fence wait before releasing imported BO state.
     pub fn destroyTargets(self: *Renderer, targets: *Targets) void {
@@ -1186,6 +1195,7 @@ const FakePlatform = struct {
         .draw = draw,
         .readback = readback,
         .content_provider = contentProvider,
+        .validate_external = validateExternal,
         .packs_sources = packsSources,
         .cache_lut = cacheLut,
     };
@@ -1201,6 +1211,13 @@ const FakePlatform = struct {
     fn contentProvider(_: *anyopaque, _: vk.Renderer) ?@import("content.zig").Provider {
         return null;
     }
+    fn validateExternal(
+        _: *anyopaque,
+        _: vk.Renderer,
+        _: render_types.ExternalSource,
+        _: render_types.Size,
+        _: render_types.PixelFormat,
+    ) !void {}
     fn packsSources(context: *anyopaque, _: vk.Renderer) bool {
         const self: *FakePlatform = @ptrCast(@alignCast(context));
         return self.pack_sources;

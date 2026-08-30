@@ -1153,6 +1153,10 @@ pub fn Coordinator(comptime protocol: type) type {
             });
             self.dmabuf_adapter = try DmabufAdapter.init(allocator, config.linux_dmabuf);
             errdefer self.dmabuf_adapter.deinit();
+            self.dmabuf_adapter.setImportValidator(.{
+                .context = self,
+                .validate_fn = validateDmabufImport,
+            });
             try self.adapter.setExternalImporter(self.dmabuf_adapter.externalImporter(Adapter));
             self.activation_adapter = try ActivationAdapter.init(
                 allocator,
@@ -6640,10 +6644,16 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn dmabufCaptureImport(buffer: *const protocol_linux_dmabuf.Buffer) !gbm.Import {
-            if (buffer.plane_count != 1 or buffer.planes[0] == null or
-                buffer.planes[0].?.modifier != gbm.modifier_linear or
-                (buffer.format != gbm.format_argb8888 and buffer.format != gbm.format_xrgb8888))
+            const import = try dmabufImport(buffer);
+            if (import.modifier != gbm.modifier_linear)
                 return error.UnsupportedCaptureTarget;
+            return import;
+        }
+
+        fn dmabufImport(buffer: *const protocol_linux_dmabuf.Buffer) !gbm.Import {
+            if (buffer.plane_count != 1 or buffer.planes[0] == null or
+                (buffer.format != gbm.format_argb8888 and buffer.format != gbm.format_xrgb8888))
+                return error.UnsupportedDmabuf;
             const plane = buffer.planes[0].?;
             return .{
                 .width = buffer.width,
@@ -6655,6 +6665,15 @@ pub fn Coordinator(comptime protocol: type) type {
                 .strides = .{ plane.stride, 0, 0, 0 },
                 .offsets = .{ plane.offset, 0, 0, 0 },
             };
+        }
+
+        fn validateDmabufImport(
+            context: *anyopaque,
+            buffer: *const protocol_linux_dmabuf.Buffer,
+        ) !void {
+            const self: *Self = @ptrCast(@alignCast(context));
+            const output = self.output orelse return error.RendererUnavailable;
+            try output.validateClientBuffer(try dmabufImport(buffer));
         }
 
         fn dmabufLeaseToken(lease: protocol_linux_dmabuf.Lease) u64 {
