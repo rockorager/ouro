@@ -861,6 +861,7 @@ test "generated output power client drains and recreates the physical output" {
     const allocator = std.testing.allocator;
     var fixture = try Fixture.init();
     defer fixture.deinit();
+    fixture.second_desktop = true;
     var path_storage: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-r15-output-power-{d}.sock", .{linux.getpid()});
     wayring.unix_socket.unlink(path) catch {};
@@ -874,11 +875,14 @@ test "generated output power client drains and recreates the physical output" {
     try fixture.signalSession(.enable);
     for (0..128) |_| {
         _ = try loop.turn(coordinator);
-        if (coordinator.primaryKmsOutput() != null) break;
+        if (coordinator.physical_output_count == 2 and
+            coordinator.physical_outputs[0].kms_output != null and
+            coordinator.physical_outputs[1].kms_output != null) break;
         if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
     }
     try std.testing.expect(coordinator.primaryKmsOutput() != null);
-    const initial_output = coordinator.primaryKmsOutput().?.outputId();
+    const initial_primary = coordinator.primaryKmsOutput().?.outputId();
+    const initial_secondary = coordinator.physical_outputs[1].kms_output.?.outputId();
 
     var reactor: wayring.io_uring.Reactor = undefined;
     try reactor.initOwned(allocator, .{ .entries = 16, .flags = 0 }, clientReactorConfig());
@@ -913,10 +917,15 @@ test "generated output power client drains and recreates the physical output" {
     try std.testing.expectEqual(@as(usize, 0), handler.failed);
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
     try std.testing.expect(coordinator.primaryKmsOutput() != null);
-    try std.testing.expect(
-        !std.meta.eql(initial_output, coordinator.primaryKmsOutput().?.outputId()),
+    try std.testing.expectEqual(initial_primary, coordinator.primaryKmsOutput().?.outputId());
+    try std.testing.expect(!std.meta.eql(
+        initial_secondary,
+        coordinator.physical_outputs[1].kms_output.?.outputId(),
+    ));
+    try std.testing.expectEqual(
+        @as(usize, 3),
+        coordinator.stats.selected_outputs,
     );
-    try std.testing.expectEqual(@as(usize, 2), coordinator.stats.selected_outputs);
     try std.testing.expectEqual(@as(usize, 1), coordinator.stats.output_drains);
 
     _ = try client.prepareClose();

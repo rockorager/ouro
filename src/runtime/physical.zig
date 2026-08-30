@@ -3596,6 +3596,25 @@ pub fn Coordinator(comptime protocol: type) type {
             return null;
         }
 
+        fn physicalOutputForProtocolIdMutable(
+            self: *Self,
+            id: OutputAdapter.OutputId,
+        ) ?*PhysicalOutput {
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical|
+                if (physical.connected and std.meta.eql(physical.protocol_output, id))
+                    return physical;
+            return null;
+        }
+
+        fn physicalOutputForIdMutable(
+            self: *Self,
+            id: PhysicalOutputId,
+        ) ?*PhysicalOutput {
+            if (id.index >= self.physical_output_count) return null;
+            const physical = &self.physical_outputs[id.index];
+            return if (physical.connected and std.meta.eql(physical.id, id)) physical else null;
+        }
+
         fn physicalOutputForManagementHead(
             self: *const Self,
             id: protocol_output_management.HeadId,
@@ -3738,12 +3757,11 @@ pub fn Coordinator(comptime protocol: type) type {
             object: *wayring.objects.Object,
         ) !struct { id: PhysicalOutputId, mode: protocol_output_power.Mode } {
             const reference = try self.output_adapter.reference(peer, handle, object.*);
-            const physical = self.primaryPhysicalOutputMutable();
-            if (!std.meta.eql(reference.output, physical.protocol_output))
+            const physical = self.physicalOutputForProtocolIdMutable(reference.output) orelse
                 return error.InvalidOutput;
             return .{
                 .id = physical.id,
-                .mode = if (self.primaryKmsOutput() == null) .off else .on,
+                .mode = if (physical.kms_output == null) .off else .on,
             };
         }
 
@@ -3848,7 +3866,12 @@ pub fn Coordinator(comptime protocol: type) type {
             if (self.output_power_transition != null or
                 self.output_reconfigure != null) return;
             while (self.output_power_adapter.peekCommand()) |command| {
-                const currently_on = self.primaryKmsOutput() != null;
+                const physical = self.physicalOutputForIdMutable(command.output) orelse {
+                    try self.output_power_adapter.completeCommand(command, .failed);
+                    self.markProtocol(command.peer, ProtocolReady.output_power);
+                    continue;
+                };
+                const currently_on = physical.kms_output != null;
                 if ((command.mode == .on) == currently_on) {
                     try self.output_power_adapter.completeCommand(command, .succeeded);
                     self.markProtocol(command.peer, ProtocolReady.output_power);
@@ -3861,22 +3884,30 @@ pub fn Coordinator(comptime protocol: type) type {
                 }
                 if (command.mode == .off) {
                     self.output_power_transition = command;
-                    try self.pauseOutput();
+                    try self.pausePhysicalOutput(physical);
                     return;
                 }
-                const handle = self.manager.currentHandle() orelse {
+                const claim = physical.claim orelse {
                     try self.output_power_adapter.completeCommand(command, .failed);
                     self.markProtocol(command.peer, ProtocolReady.output_power);
                     continue;
                 };
-                const snapshot = self.manager.snapshot(handle) catch {
+                const snapshot = self.manager.claimSnapshot(claim) catch {
                     try self.output_power_adapter.completeCommand(command, .failed);
                     self.markProtocol(command.peer, ProtocolReady.output_power);
                     continue;
                 };
-                self.activateOutput(
+                const state = self.output_management_adapter.lifecycle.currentHead(
+                    physical.management_head,
+                ) catch {
+                    try self.output_power_adapter.completeCommand(command, .failed);
+                    self.markProtocol(command.peer, ProtocolReady.output_power);
+                    continue;
+                };
+                self.activatePhysicalOutput(
+                    physical,
                     snapshot,
-                    self.output_management_adapter.lifecycle.current.scale_120,
+                    state.scale_120,
                 ) catch {
                     try self.output_power_adapter.completeCommand(command, .failed);
                     self.markProtocol(command.peer, ProtocolReady.output_power);
@@ -8440,8 +8471,11 @@ pub fn Coordinator(comptime protocol: type) type {
                         head_state,
                     );
                     self.markProtocolAll(ProtocolReady.output_management);
-                    const primary = std.meta.eql(physical.id, self.primaryPhysicalOutput().id);
-                    if (primary and !self.stopping and self.output_power_transition != null) {
+                    const power_transition = if (self.output_power_transition) |command|
+                        std.meta.eql(command.output, physical.id)
+                    else
+                        false;
+                    if (!self.stopping and power_transition) {
                         const command = self.output_power_transition.?;
                         self.output_power_transition = null;
                         if (self.output_power_adapter.peekCommand()) |current| {
