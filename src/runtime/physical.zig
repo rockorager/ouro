@@ -4088,7 +4088,9 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             return switch (source) {
                 .output => |id| (self.physicalOutputForKmsId(id) orelse return null).kms_output,
-                .toplevel => self.primaryKmsOutput(),
+                .toplevel => |id| (self.physicalOutputForSceneRect(
+                    (self.desktop.scene(id) catch return null).geometry,
+                ) orelse return null).kms_output,
             };
         }
 
@@ -4178,7 +4180,22 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn physicalSceneRect(self: *Self, rect: geometry.Rect) ?geometry.Rect {
-            return self.physicalSceneRectFor(rect, self.primaryPhysicalOutput());
+            return self.physicalSceneRectFor(
+                rect,
+                self.physicalOutputForSceneRect(rect) orelse return null,
+            );
+        }
+
+        fn physicalOutputForSceneRect(
+            self: *const Self,
+            rect: geometry.Rect,
+        ) ?*const PhysicalOutput {
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                if (!physical.connected or physical.kms_output == null) continue;
+                const bounds = self.outputBoundsFor(physical) catch continue;
+                if (rectanglesIntersect(rect, bounds)) return physical;
+            }
+            return null;
         }
 
         fn physicalSceneRectFor(
