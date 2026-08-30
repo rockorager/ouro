@@ -952,6 +952,7 @@ test "generated gamma control applies exact ramps and restores on reuse" {
     const allocator = std.testing.allocator;
     var fixture = try Fixture.init();
     defer fixture.deinit();
+    fixture.second_desktop = true;
     var path_storage: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-r15-gamma-{d}.sock", .{linux.getpid()});
     wayring.unix_socket.unlink(path) catch {};
@@ -965,7 +966,9 @@ test "generated gamma control applies exact ramps and restores on reuse" {
     try fixture.signalSession(.enable);
     for (0..128) |_| {
         _ = try loop.turn(coordinator);
-        if (coordinator.primaryKmsOutput() != null) break;
+        if (coordinator.physical_output_count == 2 and
+            coordinator.physical_outputs[0].kms_output != null and
+            coordinator.physical_outputs[1].kms_output != null) break;
         if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
     }
 
@@ -990,6 +993,7 @@ test "generated gamma control applies exact ramps and restores on reuse" {
         if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0) try waitForEither(&root.ring, reactor.ring);
     }
     try std.testing.expectEqualSlices(u16, &GammaClientHandler.first_ramps, &fixture.gamma_current);
+    try std.testing.expectEqual(@as(u32, 31), fixture.gamma_crtc);
     try std.testing.expectEqual(@as(usize, 1), fixture.gamma_gets);
 
     try handler.destroyControl();
@@ -2530,6 +2534,7 @@ pub const Fixture = struct {
     gamma_current: [6]u16 = .{ 1, 2, 3, 4, 5, 6 },
     gamma_gets: usize = 0,
     gamma_sets: usize = 0,
+    gamma_crtc: u32 = 0,
     fail_create_bo_at: ?usize = null,
 
     pub fn init() !Fixture {
@@ -2665,13 +2670,14 @@ pub const Fixture = struct {
         storage[0] = @intCast(self.lease_create_count);
         return 1;
     }
-    fn gammaSize(_: *anyopaque, _: linux.fd_t, crtc: u32) !u32 {
-        try std.testing.expectEqual(@as(u32, 30), crtc);
+    fn gammaSize(context: *anyopaque, _: linux.fd_t, crtc: u32) !u32 {
+        const self: *Fixture = @ptrCast(@alignCast(context));
+        self.gamma_crtc = crtc;
         return 2;
     }
     fn gammaGet(context: *anyopaque, _: linux.fd_t, crtc: u32, r: []u16, g: []u16, b: []u16) !void {
         const self: *Fixture = @ptrCast(@alignCast(context));
-        try std.testing.expectEqual(@as(u32, 30), crtc);
+        self.gamma_crtc = crtc;
         @memcpy(r, self.gamma_original[0..2]);
         @memcpy(g, self.gamma_original[2..4]);
         @memcpy(b, self.gamma_original[4..6]);
@@ -2679,7 +2685,7 @@ pub const Fixture = struct {
     }
     fn gammaSet(context: *anyopaque, _: linux.fd_t, crtc: u32, r: []const u16, g: []const u16, b: []const u16) !void {
         const self: *Fixture = @ptrCast(@alignCast(context));
-        try std.testing.expectEqual(@as(u32, 30), crtc);
+        self.gamma_crtc = crtc;
         @memcpy(self.gamma_current[0..2], r);
         @memcpy(self.gamma_current[2..4], g);
         @memcpy(self.gamma_current[4..6], b);

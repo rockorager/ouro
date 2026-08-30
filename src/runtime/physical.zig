@@ -273,6 +273,7 @@ pub fn Coordinator(comptime protocol: type) type {
             protocol_output: OutputAdapter.OutputId,
             management_head: protocol_output_management.HeadId,
             kms_output: ?*output_api.Output = null,
+            gamma_owner: ?drm_gamma.Owner = null,
             session_lock_frame: ?output_scheduler.FrameId = null,
             drain_started: bool = false,
             reconfigure: ?OutputReconfigure = null,
@@ -697,7 +698,6 @@ pub fn Coordinator(comptime protocol: type) type {
         physical_output_count: usize,
         output_power_adapter: OutputPowerAdapter,
         gamma_control_adapter: GammaControlAdapter,
-        gamma_owner: ?drm_gamma.Owner = null,
         output_management_modes: []protocol_output_management.ModeState,
         layer_shell_adapter: LayerShellAdapter,
         session_lock_adapter: SessionLockAdapter,
@@ -939,7 +939,6 @@ pub fn Coordinator(comptime protocol: type) type {
             );
             errdefer allocator.free(self.output_management_modes);
             self.output_power_transition = null;
-            self.gamma_owner = null;
             self.stopping = false;
             self.session_disable_pending = false;
             self.stats = .{};
@@ -1620,7 +1619,7 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             if (self.hotplug) |*monitor| monitor.deinit();
             self.allocator.free(self.hotplug_connector_ids);
-            self.retireGammaOwner() catch |err| {
+            self.retireGammaOwners() catch |err| {
                 if (first_error == null) first_error = err;
             };
             self.drm_lease_adapter.deinit();
@@ -3772,22 +3771,23 @@ pub fn Coordinator(comptime protocol: type) type {
             object: *wayring.objects.Object,
         ) !struct { id: PhysicalOutputId, size: u32 } {
             const reference = try self.output_adapter.reference(peer, handle, object.*);
-            const physical = self.primaryPhysicalOutputMutable();
-            if (!std.meta.eql(reference.output, physical.protocol_output))
+            const physical = self.physicalOutputForProtocolIdMutable(reference.output) orelse
                 return error.InvalidOutput;
-            const owner = if (self.gamma_owner) |*value| value else return error.Unsupported;
+            const owner = if (physical.gamma_owner) |*value| value else return error.Unsupported;
             return .{ .id = physical.id, .size = try owner.size() };
         }
 
         pub fn applyGamma(self: *Self, output: PhysicalOutputId, ramps: []const u16) !void {
-            if (!std.meta.eql(output, self.primaryPhysicalOutput().id)) return error.InvalidOutput;
-            const owner = if (self.gamma_owner) |*value| value else return error.Unsupported;
+            const physical = self.physicalOutputForIdMutable(output) orelse
+                return error.InvalidOutput;
+            const owner = if (physical.gamma_owner) |*value| value else return error.Unsupported;
             try owner.apply(owner.generation, ramps);
         }
 
         pub fn resetGamma(self: *Self, output: PhysicalOutputId) !void {
-            if (!std.meta.eql(output, self.primaryPhysicalOutput().id)) return error.InvalidOutput;
-            const owner = if (self.gamma_owner) |*value| value else return error.Unsupported;
+            const physical = self.physicalOutputForIdMutable(output) orelse
+                return error.InvalidOutput;
+            const owner = if (physical.gamma_owner) |*value| value else return error.Unsupported;
             try owner.restore(owner.generation);
         }
 
@@ -3839,14 +3839,18 @@ pub fn Coordinator(comptime protocol: type) type {
             return true;
         }
 
-        fn ensureGammaOwner(self: *Self, snapshot: drm.Snapshot) !void {
+        fn ensureGammaOwner(
+            self: *Self,
+            physical: *PhysicalOutput,
+            snapshot: drm.Snapshot,
+        ) !void {
             const crtc = snapshot.selectedCrtc().id;
-            if (self.gamma_owner) |owner| {
+            if (physical.gamma_owner) |owner| {
                 if (owner.generation != snapshot.handle.generation or owner.crtc != crtc)
                     return error.StaleGammaOwner;
                 return;
             }
-            self.gamma_owner = .{
+            physical.gamma_owner = .{
                 .allocator = self.allocator,
                 .platform = self.gamma_platform,
                 .fd = try self.manager.deviceFd(snapshot.handle),
@@ -3855,11 +3859,20 @@ pub fn Coordinator(comptime protocol: type) type {
             };
         }
 
-        fn retireGammaOwner(self: *Self) !void {
-            const owner = if (self.gamma_owner) |*value| value else return;
+        fn retireGammaOwner(_: *Self, physical: *PhysicalOutput) !void {
+            const owner = if (physical.gamma_owner) |*value| value else return;
             try owner.restore(owner.generation);
             owner.deinit();
-            self.gamma_owner = null;
+            physical.gamma_owner = null;
+        }
+
+        fn retireGammaOwners(self: *Self) !void {
+            var first_error: ?anyerror = null;
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical|
+                self.retireGammaOwner(physical) catch |err| if (first_error == null) {
+                    first_error = err;
+                };
+            if (first_error) |err| return err;
         }
 
         fn consumeOutputPowerCommands(self: *Self) !void {
@@ -5131,6 +5144,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     try self.output_management_adapter.removeHead(physical.management_head);
                     try self.output_power_adapter.outputRemoved(physical.id);
                     try self.gamma_control_adapter.outputRemoved(physical.id);
+                    try self.retireGammaOwner(physical);
                     if (physical.claim) |claim| self.manager.releaseScanout(claim) catch |err| switch (err) {
                         error.StaleClaim => {},
                         else => return err,
@@ -5696,7 +5710,7 @@ pub fn Coordinator(comptime protocol: type) type {
             physical.claim = try self.manager.primaryClaim(handle);
             errdefer {
                 physical.claim = null;
-                self.retireGammaOwner() catch {};
+                self.retireGammaOwners() catch {};
                 self.manager.remove() catch {};
             }
             const snapshot = try self.manager.claimSnapshot(physical.claim.?);
@@ -5920,7 +5934,9 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.ensureDmabuf(snapshot.handle);
             try self.ensureExplicitSync(snapshot.handle);
             try self.ensureDrmLeasing(snapshot);
-            if (primary) try self.ensureGammaOwner(snapshot);
+            const gamma_owner_created = physical.gamma_owner == null;
+            try self.ensureGammaOwner(physical, snapshot);
+            errdefer if (gamma_owner_created) self.retireGammaOwner(physical) catch {};
             const work_area: geometry.Rect = .{
                 .x = 0,
                 .y = 0,
@@ -8506,7 +8522,7 @@ pub fn Coordinator(comptime protocol: type) type {
             if (!self.anyKmsOutput() and !self.drm_remove_pending and
                 (self.stopping or self.session_disable_pending))
             {
-                try self.retireGammaOwner();
+                try self.retireGammaOwners();
                 try self.drm_lease_adapter.deviceUnavailable(.physical);
                 self.markProtocolAll(ProtocolReady.drm_lease);
                 self.drm_lease_desired = false;
@@ -8551,7 +8567,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.drm_lease_adapter.installed() or
                 self.drm_lease_adapter.retryRevocations()) return;
 
-            try self.retireGammaOwner();
+            try self.retireGammaOwners();
             const handle = (self.manager.rescan() catch |cause| switch (cause) {
                 error.NoConnectedOutput => return,
                 else => return cause,
