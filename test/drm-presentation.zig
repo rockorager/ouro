@@ -527,14 +527,26 @@ test "physical coordinator replaces the last disconnected output exactly" {
 }
 
 test "generated output management applies two heads atomically" {
-    try generatedMultiHeadApply(false);
+    try generatedMultiHeadApply(false, false, false);
 }
 
 test "generated output management rolls back every head" {
-    try generatedMultiHeadApply(true);
+    try generatedMultiHeadApply(true, false, false);
 }
 
-fn generatedMultiHeadApply(fail_second_activation: bool) !void {
+test "generated output management disables a secondary head atomically" {
+    try generatedMultiHeadApply(false, true, false);
+}
+
+test "generated output management re-enables a secondary head atomically" {
+    try generatedMultiHeadApply(false, true, true);
+}
+
+fn generatedMultiHeadApply(
+    fail_second_activation: bool,
+    disable_second: bool,
+    reenable_second: bool,
+) !void {
     const allocator = std.testing.allocator;
     var fixture = try Fixture.init();
     defer fixture.deinit();
@@ -579,6 +591,8 @@ fn generatedMultiHeadApply(fail_second_activation: bool) !void {
         .objects = &client.objects,
         .queue = &actor.transmit,
         .registry = registry,
+        .disable_second = disable_second,
+        .reenable_second = reenable_second,
     };
     try submitClient(&reactor, &driver, &handler);
     for (0..512) |_| {
@@ -587,29 +601,62 @@ fn generatedMultiHeadApply(fail_second_activation: bool) !void {
             try submitClient(&reactor, &driver, &handler);
             handler.apply_flushed = true;
         }
+        if (handler.reenable_submitted and !handler.reenable_flushed) {
+            try submitClient(&reactor, &driver, &handler);
+            handler.reenable_flushed = true;
+        }
         _ = try loop.turn(coordinator);
-        if (handler.succeeded == 1 or handler.failed == 1) break;
+        if (handler.succeeded == @as(usize, 1) + @intFromBool(reenable_second) or
+            handler.failed == 1) break;
         if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
             try waitForEither(&root.ring, reactor.ring);
     }
-    try std.testing.expectEqual(@as(usize, @intFromBool(!fail_second_activation)), handler.succeeded);
+    try std.testing.expectEqual(
+        if (fail_second_activation) 0 else @as(usize, 1) + @intFromBool(reenable_second),
+        handler.succeeded,
+    );
     try std.testing.expectEqual(@as(usize, @intFromBool(fail_second_activation)), handler.failed);
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
-    try std.testing.expectEqual(@as(i32, if (fail_second_activation) 0 else 3), (try coordinator.output_management_adapter.lifecycle.currentHead(
+    try std.testing.expectEqual(@as(i32, if (fail_second_activation or disable_second) 0 else 3), (try coordinator.output_management_adapter.lifecycle.currentHead(
         coordinator.physical_outputs[0].management_head,
     )).x);
-    try std.testing.expectEqual(@as(i32, if (fail_second_activation) 3 else 0), (try coordinator.output_management_adapter.lifecycle.currentHead(
+    try std.testing.expectEqual(@as(i32, if (fail_second_activation or disable_second) 3 else 0), (try coordinator.output_management_adapter.lifecycle.currentHead(
         coordinator.physical_outputs[1].management_head,
     )).x);
-    try std.testing.expect(!std.meta.eql(
-        first_ids[0],
-        coordinator.physical_outputs[0].kms_output.?.outputId(),
-    ));
-    try std.testing.expect(!std.meta.eql(
-        first_ids[1],
-        coordinator.physical_outputs[1].kms_output.?.outputId(),
-    ));
-    try std.testing.expectEqual(@as(usize, 2), coordinator.stats.output_drains);
+    if (disable_second and !reenable_second) {
+        try std.testing.expectEqual(
+            first_ids[0],
+            coordinator.physical_outputs[0].kms_output.?.outputId(),
+        );
+        try std.testing.expect(coordinator.physical_outputs[1].kms_output == null);
+        try std.testing.expect(!(try coordinator.output_management_adapter.lifecycle.currentHead(
+            coordinator.physical_outputs[1].management_head,
+        )).enabled);
+        try std.testing.expectEqual(@as(usize, 1), coordinator.stats.output_drains);
+    } else if (!reenable_second) {
+        try std.testing.expect(!std.meta.eql(
+            first_ids[0],
+            coordinator.physical_outputs[0].kms_output.?.outputId(),
+        ));
+        try std.testing.expect(!std.meta.eql(
+            first_ids[1],
+            coordinator.physical_outputs[1].kms_output.?.outputId(),
+        ));
+        try std.testing.expectEqual(@as(usize, 2), coordinator.stats.output_drains);
+    } else {
+        try std.testing.expectEqual(
+            first_ids[0],
+            coordinator.physical_outputs[0].kms_output.?.outputId(),
+        );
+        try std.testing.expect(!std.meta.eql(
+            first_ids[1],
+            coordinator.physical_outputs[1].kms_output.?.outputId(),
+        ));
+        try std.testing.expect((try coordinator.output_management_adapter.lifecycle.currentHead(
+            coordinator.physical_outputs[1].management_head,
+        )).enabled);
+        try std.testing.expectEqual(@as(usize, 1), coordinator.stats.output_drains);
+    }
 
     _ = try client.prepareClose();
     try submitClient(&reactor, &driver, &handler);
@@ -2185,6 +2232,10 @@ const MultiOutputManagementClientHandler = struct {
     serial: u32 = 0,
     apply_submitted: bool = false,
     apply_flushed: bool = false,
+    disable_second: bool = false,
+    reenable_second: bool = false,
+    reenable_submitted: bool = false,
+    reenable_flushed: bool = false,
     succeeded: usize = 0,
     failed: usize = 0,
     event_failures: usize = 0,
@@ -2247,7 +2298,11 @@ const MultiOutputManagementClientHandler = struct {
             _ = try protocol.zwlr_output_mode_v1.decodeEvent(message, fds);
         } else if (target.object.interface == &protocol.zwlr_output_configuration_v1.info) {
             switch (try protocol.zwlr_output_configuration_v1.decodeEvent(message, fds)) {
-                .succeeded => self.succeeded += 1,
+                .succeeded => {
+                    self.succeeded += 1;
+                    if (self.reenable_second and self.succeeded == 1)
+                        try self.submitReenable();
+                },
                 .failed => self.failed += 1,
                 .cancelled => {},
             }
@@ -2275,6 +2330,14 @@ const MultiOutputManagementClientHandler = struct {
             .{ .serial = self.serial },
         )).id;
         for (self.heads, self.modes, 0..) |head, mode, index| {
+            if (self.disable_second and index == 1) {
+                try protocol.zwlr_output_configuration_v1.encodeRequest(
+                    self.queue,
+                    configuration.id,
+                    .{ .disable_head = .{ .head = head.?.id } },
+                );
+                continue;
+            }
             const configuration_head = (try protocol.zwlr_output_configuration_v1.construct_enable_head(
                 self.objects,
                 self.queue,
@@ -2289,11 +2352,47 @@ const MultiOutputManagementClientHandler = struct {
             try protocol.zwlr_output_configuration_head_v1.encodeRequest(
                 self.queue,
                 configuration_head.id,
-                .{ .set_position = .{ .x = if (index == 0) 3 else 0, .y = 0 } },
+                .{ .set_position = .{
+                    .x = if (self.disable_second) 0 else if (index == 0) 3 else 0,
+                    .y = 0,
+                } },
             );
         }
         try protocol.zwlr_output_configuration_v1.encodeRequest(self.queue, configuration.id, .{ .apply = .{} });
         self.apply_submitted = true;
+    }
+
+    fn submitReenable(self: *MultiOutputManagementClientHandler) !void {
+        const configuration = (try protocol.zwlr_output_manager_v1.construct_create_configuration(
+            self.objects,
+            self.queue,
+            self.manager.?,
+            .{ .serial = self.serial },
+        )).id;
+        for (self.heads, self.modes, 0..) |head, mode, index| {
+            const configuration_head = (try protocol.zwlr_output_configuration_v1.construct_enable_head(
+                self.objects,
+                self.queue,
+                configuration,
+                .{ .head = head.?.id },
+            )).id;
+            try protocol.zwlr_output_configuration_head_v1.encodeRequest(
+                self.queue,
+                configuration_head.id,
+                .{ .set_mode = .{ .mode = mode.?.id } },
+            );
+            try protocol.zwlr_output_configuration_head_v1.encodeRequest(
+                self.queue,
+                configuration_head.id,
+                .{ .set_position = .{ .x = if (index == 0) 0 else 3, .y = 0 } },
+            );
+        }
+        try protocol.zwlr_output_configuration_v1.encodeRequest(
+            self.queue,
+            configuration.id,
+            .{ .apply = .{} },
+        );
+        self.reenable_submitted = true;
     }
 };
 

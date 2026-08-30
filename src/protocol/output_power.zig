@@ -184,6 +184,23 @@ pub fn Adapter(comptime protocol: type, comptime OutputId: type, comptime Resolv
             self.advanceCommand();
         }
 
+        pub fn publishMode(self: *Self, output: OutputId, mode: Mode) !void {
+            var count: usize = 0;
+            for (self.slots.entries.items) |slot| {
+                if (slot.header.active and slot.valid and std.meta.eql(slot.output, output))
+                    count += 1;
+            }
+            try self.ensureOutbound(count);
+            for (self.slots.entries.items) |slot| {
+                if (slot.header.active and slot.valid and std.meta.eql(slot.output, output)) {
+                    self.outbound.appendAssumeCapacity(.{
+                        .owner = id(slot),
+                        .event = .{ .mode = mode },
+                    });
+                }
+            }
+        }
+
         /// Invalidates controls for one exact output generation. Queued
         /// commands for them are discarded before exclusivity is reusable.
         pub fn outputRemoved(self: *Self, output: OutputId) !void {
@@ -394,6 +411,26 @@ test "output power: duplicate control fails without taking exclusivity" {
     try std.testing.expect(adapter.findOtherOutput(candidate, 42));
     adapter.release(owner);
     try std.testing.expect(!adapter.findOtherOutput(candidate, 42));
+}
+
+test "output power: external mode publication targets the exact output" {
+    const protocol = @import("core_protocol");
+    if (!@hasDecl(protocol, "zwlr_output_power_manager_v1")) return error.SkipZigTest;
+    const Resolver = struct {};
+    const A = Adapter(protocol, u32, Resolver);
+    var resolver = Resolver{};
+    var adapter = try A.init(std.testing.allocator, &resolver, .{ .initial_capacity = 2 });
+    defer adapter.deinit();
+    const first = try adapter.slots.acquire();
+    first.output = 41;
+    const second = try adapter.slots.acquire();
+    second.output = 42;
+
+    try adapter.publishMode(42, .off);
+
+    try std.testing.expectEqual(@as(usize, 1), adapter.outbound.items.len);
+    try std.testing.expectEqual(A.id(second), adapter.outbound.items[0].owner);
+    try std.testing.expectEqual(Mode.off, adapter.outbound.items[0].event.mode);
 }
 
 test "output power: completion capacity is reserved and commands are FIFO" {

@@ -3820,12 +3820,13 @@ pub fn Coordinator(comptime protocol: type) type {
             desired: []const protocol_output_management.DesiredHead,
         ) bool {
             if (desired.len != self.connectedPhysicalOutputCount()) return false;
+            var enabled: usize = 0;
             for (desired) |head| {
                 const physical = self.physicalOutputForManagementHead(head.id) orelse return false;
-                if (physical.kms_output == null or
-                    !self.outputManagementModeSupported(physical, head.state)) return false;
+                if (!self.outputManagementModeSupported(physical, head.state)) return false;
+                enabled += @intFromBool(head.state.enabled);
             }
-            return true;
+            return enabled != 0;
         }
 
         fn outputManagementCommandUnchanged(
@@ -4039,8 +4040,9 @@ pub fn Coordinator(comptime protocol: type) type {
             physical: *const PhysicalOutput,
             desired: protocol_output_management.HeadState,
         ) bool {
-            if (!desired.enabled or desired.transform != 0 or desired.adaptive_sync)
+            if (desired.transform != 0 or desired.adaptive_sync)
                 return false;
+            if (!desired.enabled) return true;
             if (desired.width <= 0 or desired.height <= 0 or desired.refresh_millihz <= 0)
                 return false;
             const scale = geometry.OutputScale.init(desired.scale_120) catch return false;
@@ -9045,9 +9047,9 @@ pub fn Coordinator(comptime protocol: type) type {
         fn outputReconfigureReady(self: *Self) bool {
             const transaction = self.output_reconfigure orelse return false;
             for (self.physical_outputs[0..self.physical_output_count]) |physical| {
-                if (physical.reconfigure == null) continue;
+                const pending = physical.reconfigure orelse continue;
                 const output = physical.kms_output orelse {
-                    if (transaction.phase == .rollback) continue;
+                    if (transaction.phase == .rollback or !pending.previous.enabled) continue;
                     return false;
                 };
                 if (!physical.drain_started or !output.drainComplete()) return false;
@@ -9060,8 +9062,11 @@ pub fn Coordinator(comptime protocol: type) type {
             if (transaction.phase == .rollback)
                 return self.finishOutputReconfigureRollback(transaction);
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
-                if (physical.reconfigure == null) continue;
-                const output = physical.kms_output orelse return error.InvalidState;
+                const pending = physical.reconfigure orelse continue;
+                const output = physical.kms_output orelse {
+                    if (!pending.previous.enabled) continue;
+                    return error.InvalidState;
+                };
                 try self.invalidateCaptureSource(.{ .output = output.outputId() });
                 try output.destroy();
                 physical.kms_output = null;
@@ -9070,6 +9075,7 @@ pub fn Coordinator(comptime protocol: type) type {
 
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
                 const pending = physical.reconfigure orelse continue;
+                if (!pending.desired.enabled) continue;
                 const claim = physical.claim orelse return error.StaleClaim;
                 const desired = try self.manager.claimSnapshotMode(
                     claim,
@@ -9096,6 +9102,14 @@ pub fn Coordinator(comptime protocol: type) type {
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
                 const pending = physical.reconfigure orelse continue;
                 const state = pending.desired;
+                if (!state.enabled) {
+                    _ = try self.output_management_adapter.publishHead(
+                        physical.management_head,
+                        state,
+                    );
+                    try self.output_power_adapter.publishMode(physical.id, .off);
+                    continue;
+                }
                 const claim = physical.claim orelse return error.StaleClaim;
                 const snapshot = try self.manager.claimSnapshotMode(
                     claim,
@@ -9104,6 +9118,8 @@ pub fn Coordinator(comptime protocol: type) type {
                     @intCast(state.refresh_millihz),
                 );
                 try self.publishActivatedPhysicalOutput(physical, snapshot, state);
+                if (!pending.previous.enabled)
+                    try self.output_power_adapter.publishMode(physical.id, .on);
                 try self.manager.commitClaimMode(
                     claim,
                     @intCast(state.width),
@@ -9126,6 +9142,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     physical.kms_output = null;
                 }
                 const pending = physical.reconfigure.?;
+                if (!pending.previous.enabled) continue;
                 const claim = physical.claim orelse return error.StaleClaim;
                 const previous = try self.manager.claimSnapshotMode(
                     claim,
@@ -9142,6 +9159,14 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
                 const pending = physical.reconfigure orelse continue;
+                if (!pending.previous.enabled) {
+                    _ = try self.output_management_adapter.publishHead(
+                        physical.management_head,
+                        pending.previous,
+                    );
+                    try self.output_power_adapter.publishMode(physical.id, .off);
+                    continue;
+                }
                 const claim = physical.claim orelse return error.StaleClaim;
                 const previous = try self.manager.claimSnapshotMode(
                     claim,
@@ -9150,6 +9175,8 @@ pub fn Coordinator(comptime protocol: type) type {
                     @intCast(pending.previous.refresh_millihz),
                 );
                 try self.publishActivatedPhysicalOutput(physical, previous, pending.previous);
+                if (!pending.desired.enabled)
+                    try self.output_power_adapter.publishMode(physical.id, .on);
             }
             try self.completeOutputReconfigure(transaction, .failed);
         }
@@ -9163,6 +9190,7 @@ pub fn Coordinator(comptime protocol: type) type {
             for (self.physical_outputs[0..self.physical_output_count]) |*physical|
                 physical.reconfigure = null;
             self.output_reconfigure = null;
+            self.markProtocolAll(ProtocolReady.output_power);
             if (self.output_management_adapter.peekCommand()) |command| {
                 if (std.meta.eql(command.configuration, transaction.configuration)) {
                     try self.output_management_adapter.completeCommand(result);
@@ -9170,6 +9198,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 }
             }
             try self.consumeOutputManagementCommands();
+            try self.consumeOutputPowerCommands();
         }
 
         /// Drops applied protocol/presentation ownership only after the output
