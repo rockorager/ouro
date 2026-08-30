@@ -4172,7 +4172,7 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             return switch (source) {
                 .output => |id| (self.physicalOutputForKmsId(id) orelse return null).kms_output,
-                .toplevel => |id| (self.physicalOutputForSceneRect(
+                .toplevel => |id| (self.physicalOutputContainingSceneRect(
                     (self.desktop.scene(id) catch return null).geometry,
                 ) orelse return null).kms_output,
             };
@@ -4266,18 +4266,18 @@ pub fn Coordinator(comptime protocol: type) type {
         fn physicalSceneRect(self: *Self, rect: geometry.Rect) ?geometry.Rect {
             return self.physicalSceneRectFor(
                 rect,
-                self.physicalOutputForSceneRect(rect) orelse return null,
+                self.physicalOutputContainingSceneRect(rect) orelse return null,
             );
         }
 
-        fn physicalOutputForSceneRect(
+        fn physicalOutputContainingSceneRect(
             self: *const Self,
             rect: geometry.Rect,
         ) ?*const PhysicalOutput {
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
                 if (!physical.connected or physical.kms_output == null) continue;
                 const bounds = self.outputBoundsFor(physical) catch continue;
-                if (rectanglesIntersect(rect, bounds)) return physical;
+                if (rectangleContains(bounds, rect)) return physical;
             }
             return null;
         }
@@ -9907,6 +9907,12 @@ fn rectanglesIntersect(a: geometry.Rect, b: geometry.Rect) bool {
         @as(i64, b.y) < @as(i64, a.y) + a.height;
 }
 
+fn rectangleContains(outer: geometry.Rect, inner: geometry.Rect) bool {
+    return inner.x >= outer.x and inner.y >= outer.y and
+        @as(i64, inner.x) + inner.width <= @as(i64, outer.x) + outer.width and
+        @as(i64, inner.y) + inner.height <= @as(i64, outer.y) + outer.height;
+}
+
 fn fixed24ScaledTo16(value: i32, scale: i64) !i64 {
     const scaled = std.math.mul(i64, value, scale) catch return error.InvalidCrop;
     return std.math.mul(i64, scaled, 256) catch error.InvalidCrop;
@@ -10149,4 +10155,16 @@ test "physical: retained candidate matches only its exact pending owner" {
         .id = Id{ .index = 5, .generation = 8 },
         .handle = Handle{ .id = 15, .generation = 18 },
     }));
+}
+
+test "physical: capture rectangles require exact output containment" {
+    const secondary: geometry.Rect = .{ .x = 3, .y = 0, .width = 3, .height = 2 };
+    try std.testing.expect(rectangleContains(
+        secondary,
+        .{ .x = 3, .y = 0, .width = 3, .height = 2 },
+    ));
+    try std.testing.expect(!rectangleContains(
+        secondary,
+        .{ .x = 2, .y = 0, .width = 2, .height = 2 },
+    ));
 }
