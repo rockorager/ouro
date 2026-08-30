@@ -458,6 +458,7 @@ pub fn Coordinator(comptime protocol: type) type {
             outcome_pending: bool = false,
             callback_data: ?u32 = null,
             feedback_outcome: ?Adapter.PresentationOutcome = null,
+            feedback_output: ?OutputAdapter.OutputId = null,
             retire_after_outcome: bool = false,
             retire_after_source_release: bool = false,
             retains_source: bool = false,
@@ -7714,6 +7715,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn finishOutcome(self: *Self, outcome: output_api.FrameOutcome, was_presented: bool) !void {
+            const physical = self.physicalOutputForKmsId(outcome.frame.output);
             if (was_presented) {
                 for (self.app_layers) |*layer| {
                     if (layer.retired_source) |*source| source.releasable = true;
@@ -7744,13 +7746,13 @@ pub fn Coordinator(comptime protocol: type) type {
                     } }
                 else
                     .discarded;
+                layer.feedback_output = if (physical) |owner| owner.protocol_output else null;
                 layer.outcome_pending = true;
             }
             for (self.app_layers) |*layer|
                 if (layer.active and !self.layerSurfaceLive(layer)) self.abandonLayer(layer);
             if (self.cursor_layer.active and !self.layerSurfaceLive(&self.cursor_layer))
                 self.abandonLayer(&self.cursor_layer);
-            const physical = self.physicalOutputForKmsId(outcome.frame.output);
             if (physical) |owner| if (owner.session_lock_frame) |secure_frame| if (std.meta.eql(
                 secure_frame,
                 outcome.frame,
@@ -7841,11 +7843,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 const objects = try self.root.runtime.clients.get(peer);
                 const actor = try self.root.runtime.clients.reactor.getActor(peer);
                 var output_storage: [64]u32 = undefined;
-                const output_resources = try self.output_adapter.resourceIds(
-                    self.primaryPhysicalOutput().protocol_output,
-                    peer,
-                    &output_storage,
-                );
+                const output_resources = if (layer.feedback_output) |output|
+                    try self.output_adapter.resourceIds(output, peer, &output_storage)
+                else
+                    output_storage[0..0];
                 _ = self.adapter.completePresentationFeedbackOn(
                     objects,
                     &actor.transmit,
@@ -7881,6 +7882,7 @@ pub fn Coordinator(comptime protocol: type) type {
             layer.presentation = null;
             layer.outcome_pending = false;
             layer.feedback_outcome = null;
+            layer.feedback_output = null;
             if (layer.retire_after_outcome) {
                 layer.retire_after_outcome = false;
                 if (layer.source_release_pending and
