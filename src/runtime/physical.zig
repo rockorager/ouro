@@ -95,6 +95,7 @@ const interaction_model = @import("../input/interaction.zig");
 const tablet_input = @import("../input/tablet.zig");
 const confinement = @import("../input/confinement.zig");
 const surface_state = @import("../surface.zig");
+const viewport = @import("../viewport.zig");
 
 const linux = std.os.linux;
 const drag_icon_role_id: surface_state.RoleId = 0x646e_645f_6963_6f6e;
@@ -8138,12 +8139,40 @@ fn renderUploadDamage(source: anytype) render.UploadDamage {
 }
 
 fn sourceCrop(update: anytype, width: u32, height: u32) !render.SourceRect {
-    if (update.viewport.source()) |source| return .{
-        .x = try fixed24To16(source.x),
-        .y = try fixed24To16(source.y),
-        .width = try fixed24To16(source.width),
-        .height = try fixed24To16(source.height),
-    };
+    if (update.viewport.source()) |source| {
+        const scale: i64 = update.scale;
+        const x0 = try fixed24ScaledTo16(source.x, scale);
+        const y0 = try fixed24ScaledTo16(source.y, scale);
+        const x1 = try fixed24ScaledTo16(
+            std.math.add(i32, source.x, source.width) catch return error.InvalidCrop,
+            scale,
+        );
+        const y1 = try fixed24ScaledTo16(
+            std.math.add(i32, source.y, source.height) catch return error.InvalidCrop,
+            scale,
+        );
+        const native_width = std.math.mul(i64, width, render.fixed_one) catch
+            return error.InvalidCrop;
+        const native_height = std.math.mul(i64, height, render.fixed_one) catch
+            return error.InvalidCrop;
+        const edges: [4]i64 = switch (update.transform) {
+            .normal => .{ x0, y0, x1, y1 },
+            .@"90" => .{ y0, native_height - x1, y1, native_height - x0 },
+            .@"180" => .{ native_width - x1, native_height - y1, native_width - x0, native_height - y0 },
+            .@"270" => .{ native_width - y1, x0, native_width - y0, x1 },
+            .flipped => .{ native_width - x1, y0, native_width - x0, y1 },
+            .flipped_90 => .{ y0, x0, y1, x1 },
+            .flipped_180 => .{ x0, native_height - y1, x1, native_height - y0 },
+            .flipped_270 => .{ native_width - y1, native_height - x1, native_width - y0, native_height - x0 },
+        };
+        if (edges[2] <= edges[0] or edges[3] <= edges[1]) return error.InvalidCrop;
+        return .{
+            .x = std.math.cast(i32, edges[0]) orelse return error.InvalidCrop,
+            .y = std.math.cast(i32, edges[1]) orelse return error.InvalidCrop,
+            .width = std.math.cast(i32, edges[2] - edges[0]) orelse return error.InvalidCrop,
+            .height = std.math.cast(i32, edges[3] - edges[1]) orelse return error.InvalidCrop,
+        };
+    }
     return render.SourceRect.pixels(0, 0, @intCast(width), @intCast(height));
 }
 
@@ -8174,8 +8203,9 @@ fn rectanglesIntersect(a: geometry.Rect, b: geometry.Rect) bool {
         @as(i64, b.y) < @as(i64, a.y) + a.height;
 }
 
-fn fixed24To16(value: i32) !i32 {
-    return std.math.mul(i32, value, 256) catch error.InvalidCrop;
+fn fixed24ScaledTo16(value: i32, scale: i64) !i64 {
+    const scaled = std.math.mul(i64, value, scale) catch return error.InvalidCrop;
+    return std.math.mul(i64, scaled, 256) catch error.InvalidCrop;
 }
 
 fn alignedOrigin(target: i32, geometry_offset: i32) i32 {
@@ -8324,6 +8354,53 @@ test "physical: window geometry origin alignment clamps hostile offsets" {
         std.math.maxInt(i32),
         std.math.minInt(i32),
     ));
+}
+
+test "physical: viewport source maps through buffer scale and inverse transform" {
+    const Update = struct {
+        viewport: viewport.State,
+        transform: surface_state.Transform,
+        scale: i32,
+    };
+    const source: viewport.Source = .{
+        .x = viewport.fixed_one,
+        .y = 2 * viewport.fixed_one,
+        .width = 3 * viewport.fixed_one,
+        .height = 2 * viewport.fixed_one,
+    };
+    const expected = [_]render.SourceRect{
+        render.SourceRect.pixels(1, 2, 3, 2),
+        render.SourceRect.pixels(2, 2, 2, 3),
+        render.SourceRect.pixels(4, 2, 3, 2),
+        render.SourceRect.pixels(4, 1, 2, 3),
+        render.SourceRect.pixels(4, 2, 3, 2),
+        render.SourceRect.pixels(2, 1, 2, 3),
+        render.SourceRect.pixels(1, 2, 3, 2),
+        render.SourceRect.pixels(4, 2, 2, 3),
+    };
+    for (expected, 0..) |crop, transform_value| {
+        try std.testing.expectEqual(crop, try sourceCrop(Update{
+            .viewport = .{ .source_rect = source },
+            .transform = @enumFromInt(transform_value),
+            .scale = 1,
+        }, 8, 6));
+    }
+
+    try std.testing.expectEqual(render.SourceRect{
+        .x = render.fixed_one,
+        .y = render.fixed_one / 2,
+        .width = 4 * render.fixed_one,
+        .height = 3 * render.fixed_one,
+    }, try sourceCrop(Update{
+        .viewport = .{ .source_rect = .{
+            .x = viewport.fixed_one / 2,
+            .y = viewport.fixed_one / 4,
+            .width = 2 * viewport.fixed_one,
+            .height = 3 * viewport.fixed_one / 2,
+        } },
+        .transform = .normal,
+        .scale = 2,
+    }, 8, 6));
 }
 
 test "physical: wrapped pending removal preserves exact order and counts" {
