@@ -125,9 +125,6 @@ pub fn Adapter(comptime protocol: type) type {
         capture_count: usize = 0,
         outbound_count: usize = 0,
         next_sequence: u64 = 1,
-        width: u32 = 0,
-        height: u32 = 0,
-        available: bool = false,
         runtime: ?*Runtime = null,
         global: ?objects.Handle = null,
         output_validator: ?OutputValidator = null,
@@ -168,20 +165,6 @@ pub fn Adapter(comptime protocol: type) type {
 
         pub fn setBufferValidator(self: *Self, validator: ?BufferValidator) void {
             self.buffer_validator = validator;
-        }
-
-        pub fn publishMode(self: *Self, width: u32, height: u32) !void {
-            if (width == 0 or height == 0 or width > std.math.maxInt(i32) or
-                height > std.math.maxInt(i32))
-                return error.InvalidMode;
-            _ = std.math.mul(u32, width, 4) catch return error.InvalidMode;
-            self.width = width;
-            self.height = height;
-            self.available = true;
-        }
-
-        pub fn setAvailable(self: *Self, available: bool) void {
-            self.available = available;
         }
 
         pub fn install(self: *Self, runtime: *Runtime) !objects.Handle {

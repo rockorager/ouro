@@ -286,6 +286,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const PendingScreencopy = struct {
             frame: ScreencopyAdapter.FrameId,
             peer: wayring.io_uring.Peer,
+            output: output_scheduler.OutputId,
             pin: wayring.shm.Store.Pin,
             region: ScreencopyAdapter.Region,
             full_stride: u32,
@@ -301,6 +302,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const PendingImageCopy = struct {
             frame: ImageCopyCaptureAdapter.FrameId,
             peer: wayring.io_uring.Peer,
+            output: output_scheduler.OutputId,
             destination: ImageCopyDestination,
             region: geometry.Rect,
             width: u32,
@@ -5895,26 +5897,6 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (primary) try self.fractional_scale_adapter.setDefaultPreferredScale(scale_120);
                 try self.xdg_output_adapter.publishMode(physical.protocol_output);
             }
-            if (primary and publish_protocol) {
-                const screencopy_stride = try std.math.mul(
-                    u32,
-                    output.planner.output.width,
-                    4,
-                );
-                const screencopy_bytes = try std.math.mul(
-                    usize,
-                    screencopy_stride,
-                    output.planner.output.height,
-                );
-                self.screencopy_bytes = try self.allocator.realloc(
-                    self.screencopy_bytes,
-                    screencopy_bytes,
-                );
-                try self.screencopy_adapter.publishMode(
-                    output.planner.output.width,
-                    output.planner.output.height,
-                );
-            }
             if (publish_protocol) {
                 var head_state = try self.output_management_adapter.lifecycle.currentHead(
                     physical.management_head,
@@ -5973,13 +5955,6 @@ pub fn Coordinator(comptime protocol: type) type {
             );
             if (std.meta.eql(physical.id, self.primaryPhysicalOutput().id)) {
                 try self.fractional_scale_adapter.setDefaultPreferredScale(requested.scale_120);
-                const stride = try std.math.mul(u32, output.planner.output.width, 4);
-                const bytes = try std.math.mul(usize, stride, output.planner.output.height);
-                self.screencopy_bytes = try self.allocator.realloc(self.screencopy_bytes, bytes);
-                try self.screencopy_adapter.publishMode(
-                    output.planner.output.width,
-                    output.planner.output.height,
-                );
             }
             try self.xdg_output_adapter.publishMode(physical.protocol_output);
             var state = requested;
@@ -6798,7 +6773,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 change_count += 1;
             }
             const capture_request: ?output_api.CaptureRequest = if (self.pending_screencopy) |pending|
-                if (pending.awaiting_output) .{
+                if (pending.awaiting_output and std.meta.eql(pending.output, frame.output)) .{
                     .token = frameToken(pending.frame),
                     .cursor_start = cursor_start,
                     .overlay_cursor = pending.overlay_cursor,
@@ -6808,7 +6783,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     } },
                 } else null
             else if (self.pending_image_copy) |pending|
-                if (pending.awaiting_output) .{
+                if (pending.awaiting_output and std.meta.eql(pending.output, frame.output)) .{
                     .token = imageFrameToken(pending.frame),
                     .cursor_start = cursor_start,
                     .overlay_cursor = pending.overlay_cursor,
@@ -7103,10 +7078,29 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (!pending.awaiting_output) try self.finishScreencopy(false, 0, null);
                 return;
             }
-            const output = self.primaryKmsOutput() orelse return;
             const pending_capture = self.screencopy_adapter.peekCapture() orelse return;
             const capture = pending_capture.*;
             const server_objects = self.root.runtime.clients.get(capture.peer) catch {
+                try self.failQueuedScreencopy(capture);
+                return;
+            };
+            const output_object = server_objects.namespace.resolve(capture.output) orelse {
+                try self.failQueuedScreencopy(capture);
+                return;
+            };
+            const reference = self.output_adapter.reference(
+                capture.peer,
+                capture.output,
+                output_object.*,
+            ) catch {
+                try self.failQueuedScreencopy(capture);
+                return;
+            };
+            const physical = self.physicalOutputForProtocolId(reference.output) orelse {
+                try self.failQueuedScreencopy(capture);
+                return;
+            };
+            const output = physical.kms_output orelse {
                 try self.failQueuedScreencopy(capture);
                 return;
             };
@@ -7127,9 +7121,27 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.failQueuedScreencopy(capture);
                 return;
             };
+            const capture_bytes = std.math.mul(
+                usize,
+                full_stride,
+                output.planner.output.height,
+            ) catch {
+                self.shm.store.unpin(pin) catch unreachable;
+                try self.failQueuedScreencopy(capture);
+                return;
+            };
+            self.screencopy_bytes = self.allocator.realloc(
+                self.screencopy_bytes,
+                capture_bytes,
+            ) catch {
+                self.shm.store.unpin(pin) catch unreachable;
+                try self.failQueuedScreencopy(capture);
+                return;
+            };
             self.pending_screencopy = .{
                 .frame = capture.frame,
                 .peer = capture.peer,
+                .output = output.outputId(),
                 .pin = pin,
                 .region = capture.region,
                 .full_stride = full_stride,
@@ -7150,8 +7162,11 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (!pending.awaiting_output) try self.finishImageCopy(false, 0, null);
                 return;
             }
-            const output = self.primaryKmsOutput() orelse return;
             const capture = self.image_copy_capture_adapter.takeCapture() orelse return;
+            const output = self.captureKmsOutput(capture.target) orelse {
+                try self.failImageCopy(capture);
+                return;
+            };
             const server_objects = self.root.runtime.clients.get(capture.peer) catch {
                 try self.failImageCopy(capture);
                 return;
@@ -7251,9 +7266,29 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.failImageCopy(capture);
                 return;
             };
+            if (std.meta.activeTag(destination) == .shm) {
+                const capture_bytes = std.math.mul(
+                    usize,
+                    full_stride,
+                    output.planner.output.height,
+                ) catch {
+                    try self.releaseImageCopyDestination(destination);
+                    try self.failImageCopy(capture);
+                    return;
+                };
+                self.screencopy_bytes = self.allocator.realloc(
+                    self.screencopy_bytes,
+                    capture_bytes,
+                ) catch {
+                    try self.releaseImageCopyDestination(destination);
+                    try self.failImageCopy(capture);
+                    return;
+                };
+            }
             self.pending_image_copy = .{
                 .frame = capture.frame,
                 .peer = capture.peer,
+                .output = output.outputId(),
                 .destination = destination,
                 .region = region,
                 .width = capture.width,
@@ -7412,7 +7447,9 @@ pub fn Coordinator(comptime protocol: type) type {
             const destination_stride = try std.math.mul(usize, pending.width, 4);
             const required = try std.math.mul(usize, destination_stride, pending.height);
             if (required > access.bytes.len) return error.CaptureCapacityExceeded;
-            const output = self.primaryKmsOutput() orelse return error.OutputUnavailable;
+            const physical = self.physicalOutputForKmsId(pending.output) orelse
+                return error.OutputUnavailable;
+            const output = physical.kms_output orelse return error.OutputUnavailable;
             try copyCaptureRegion(
                 access.bytes[0..required],
                 @intCast(destination_stride),
@@ -7482,7 +7519,9 @@ pub fn Coordinator(comptime protocol: type) type {
             const row_bytes = try std.math.mul(usize, pending.region.width, 4);
             const required = try std.math.mul(usize, row_bytes, pending.region.height);
             if (required > access.bytes.len) return error.CaptureCapacityExceeded;
-            const output = self.primaryKmsOutput() orelse return error.OutputUnavailable;
+            const physical = self.physicalOutputForKmsId(pending.output) orelse
+                return error.OutputUnavailable;
+            const output = physical.kms_output orelse return error.OutputUnavailable;
             try copyCaptureRegion(
                 access.bytes[0..required],
                 @intCast(row_bytes),
@@ -8202,13 +8241,11 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn pauseOutput(self: *Self) !void {
             try self.pausePhysicalOutput(self.primaryPhysicalOutputMutable());
-            self.screencopy_adapter.setAvailable(false);
         }
 
         fn pauseAllOutputs(self: *Self) !void {
             for (self.physical_outputs[0..self.physical_output_count]) |*physical|
                 try self.pausePhysicalOutput(physical);
-            self.screencopy_adapter.setAvailable(false);
         }
 
         /// Begins terminal removal of one non-primary desktop connector. A
@@ -8659,8 +8696,6 @@ pub fn Coordinator(comptime protocol: type) type {
                 physical.protocol_output,
                 false,
             ) catch unreachable;
-            if (std.meta.eql(physical.id, self.primaryPhysicalOutput().id))
-                self.screencopy_adapter.setAvailable(false);
             if (output.accepting_frames) {
                 if (output.requestPause() catch unreachable) |action|
                     self.consumeRetireAction(action) catch unreachable;
