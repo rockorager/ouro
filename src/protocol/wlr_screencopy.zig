@@ -373,6 +373,7 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         pub fn peekCapture(self: *Self) ?*const Capture {
+            if (self.capture_count == 0) return null;
             while (self.oldestCapture()) |slot| {
                 const frame = self.resolve(slot.capture.frame) catch {
                     slot.active = false;

@@ -740,6 +740,7 @@ pub fn Coordinator(comptime protocol: type) type {
         removed_layers: []RemovedLayer,
         removed_layer_len: usize = 0,
         association_surfaces: []wayring.objects.Handle,
+        output_associations_dirty: bool = true,
         layer_surface_ids: []LayerShellAdapter.LayerSurfaceId,
         lock_surface_ids: []SessionLockAdapter.LockSurfaceId,
         inhibitor_surface_ids: []Adapter.SurfaceId,
@@ -879,6 +880,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 config.output.max_samples,
             );
             errdefer allocator.free(self.association_surfaces);
+            self.output_associations_dirty = true;
             self.layer_surface_ids = try allocator.alloc(
                 LayerShellAdapter.LayerSurfaceId,
                 config.layer_shell.resource_capacity,
@@ -1878,6 +1880,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 return control;
             }
             if (try self.fractional_scale_adapter.request(peer, target, message, fds)) |control| {
+                self.output_associations_dirty = true;
+                try self.syncOutputAssociations();
                 if (self.fractional_scale_adapter.pendingOutbound(peer))
                     self.markProtocol(peer, ProtocolReady.fractional_scale);
                 try self.flushProtocol();
@@ -4467,6 +4471,7 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn sessionLockChanged(self: *Self) !void {
             const unlocked = self.session_lock_adapter.takeUnlocked();
+            self.output_associations_dirty = true;
             self.markProtocolAll(ProtocolReady.seat | ProtocolReady.data_device |
                 ProtocolReady.primary_selection | ProtocolReady.text_input |
                 ProtocolReady.tablet);
@@ -5993,6 +5998,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.markProtocolAll(ProtocolReady.output | ProtocolReady.xdg_output |
                     ProtocolReady.fractional_scale | ProtocolReady.output_management |
                     ProtocolReady.layer_shell | ProtocolReady.session_lock);
+                self.output_associations_dirty = true;
             }
             self.next_output_generation = if (generation == std.math.maxInt(u32))
                 null
@@ -6055,6 +6061,7 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.refreshRetainedLayersForOutput();
             try self.recomputeLayerConfigures();
             try self.recomputeSessionLockConfigures();
+            self.output_associations_dirty = true;
             try self.syncOutputAssociations();
             self.markProtocolAll(ProtocolReady.output | ProtocolReady.xdg_output |
                 ProtocolReady.fractional_scale | ProtocolReady.output_management |
@@ -6215,6 +6222,8 @@ pub fn Coordinator(comptime protocol: type) type {
                     visibility_changed = true;
                     continue;
                 };
+                if (!std.meta.eql(sample.destination, layer.sample.?.destination))
+                    self.output_associations_dirty = true;
                 const previous = layer.change.?.current;
                 layer.sample = sample;
                 layer.change = .{
@@ -6576,6 +6585,12 @@ pub fn Coordinator(comptime protocol: type) type {
                 .id = candidate.id,
                 .content = content.*,
             };
+            const association_changed = !layerAssociationMatches(
+                layer,
+                published.peer,
+                published.surface,
+                sample.destination,
+            );
             const previous = if (layer.change) |change| change.current else null;
             layer.candidate = null;
             if (!prepared.replaces) if (layer.rendered) |previous_handle|
@@ -6600,6 +6615,7 @@ pub fn Coordinator(comptime protocol: type) type {
             layer.retains_source = retained_source;
             layer.sample = sample;
             layer.binding = binding;
+            if (association_changed) self.output_associations_dirty = true;
             self.finishPendingCandidate(pending.id);
             self.stats.applied += 1;
             if (!retained_source and render_device.content.ready(rendered))
@@ -6742,6 +6758,7 @@ pub fn Coordinator(comptime protocol: type) type {
             layer.retire_after_outcome = true;
             // Visibility changes at commit consumption, independently of
             // live-client release encoding retained below.
+            if (layerHasOutputAssociation(layer)) self.output_associations_dirty = true;
             layer.active = false;
             self.finishPendingCandidate(pending_id);
             _ = try self.retryLayerOutcome(layer);
@@ -6816,6 +6833,10 @@ pub fn Coordinator(comptime protocol: type) type {
                         output_bounds,
                         output_scale,
                     );
+                    if (!std.meta.eql(
+                        cursor_sample.destination,
+                        self.cursor_layer.sample.?.destination,
+                    )) self.output_associations_dirty = true;
                     self.cursor_layer.sample = cursor_sample;
                     self.cursor_layer.change = logical_change;
                     sample_count += 1;
@@ -7087,6 +7108,8 @@ pub fn Coordinator(comptime protocol: type) type {
             sample.clip = try clipToOutput(sample.destination, output_bounds) orelse return false;
             if (std.meta.eql(sample.destination, layer.sample.?.destination) and
                 std.meta.eql(sample.clip, layer.sample.?.clip)) return true;
+            if (!std.meta.eql(sample.destination, layer.sample.?.destination))
+                self.output_associations_dirty = true;
             const natural_size = layer.change.?.current.?.surface_size;
             const previous = layer.change.?.current;
             layer.sample = sample;
@@ -8404,6 +8427,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn syncOutputAssociations(self: *Self) !void {
+            if (!self.output_associations_dirty) return;
             const needed = std.math.add(usize, self.app_layers.len, 1) catch
                 return error.OutOfMemory;
             if (self.association_surfaces.len < needed)
@@ -8450,6 +8474,24 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (self.fractional_scale_adapter.pendingOutbound(client.peer))
                     client.protocol_ready |= ProtocolReady.fractional_scale;
             };
+            self.output_associations_dirty = false;
+        }
+
+        fn layerHasOutputAssociation(layer: *const Layer) bool {
+            return layer.active and layer.peer != null and layer.surface != null and
+                layer.sample != null;
+        }
+
+        fn layerAssociationMatches(
+            layer: *const Layer,
+            peer: ?wayring.io_uring.Peer,
+            surface: wayring.objects.Handle,
+            destination: render.Rect,
+        ) bool {
+            if (!layerHasOutputAssociation(layer) or peer == null) return false;
+            return samePeer(layer.peer.?, peer.?) and
+                std.meta.eql(layer.surface.?, surface) and
+                std.meta.eql(layer.sample.?.destination, destination);
         }
 
         fn publishLayerPreferredScale(
@@ -8491,6 +8533,21 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn advanceDrain(self: *Self) !void {
+            if (!self.stopping and !self.session_disable_pending and
+                !self.drm_remove_pending and !self.topology_refresh_pending and
+                self.output_reconfigure == null and self.output_power_transition == null)
+            {
+                var pending = false;
+                for (self.physical_outputs[0..self.physical_output_count]) |physical| {
+                    if (physical.removing or physical.drain_started or
+                        (physical.kms_output != null and physical.kms_output.?.paused))
+                    {
+                        pending = true;
+                        break;
+                    }
+                }
+                if (!pending) return;
+            }
             if (self.input) |input| {
                 if (self.stopping and input.state != .draining) {
                     try self.processInput();
@@ -8769,6 +8826,7 @@ pub fn Coordinator(comptime protocol: type) type {
         fn discardUnpresentedLayer(self: *Self, layer: *Layer) void {
             if (layer.presentation == null or layer.content == null)
                 return self.abandonLayer(layer);
+            if (layerHasOutputAssociation(layer)) self.output_associations_dirty = true;
             layer.active = false;
             layer.feedback_outcome = .discarded;
             layer.outcome_pending = true;
@@ -8777,6 +8835,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn abandonLayer(self: *Self, layer: *Layer) void {
+            if (layerHasOutputAssociation(layer)) self.output_associations_dirty = true;
             if (layer.presentation) |token| self.presentations.discard(token) catch unreachable;
             if (layer.content) |*content| content.deinit();
             if (layer.candidate) |*candidate| candidate.content.deinit();
@@ -8794,6 +8853,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn retireLayer(self: *Self, layer: *Layer) void {
+            if (layerHasOutputAssociation(layer)) self.output_associations_dirty = true;
             layer.active = false;
             if (layer.presentation != null) {
                 layer.retire_after_outcome = true;

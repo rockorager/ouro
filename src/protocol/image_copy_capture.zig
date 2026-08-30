@@ -306,6 +306,7 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
             };
         }
         pub fn takeCapture(self: *Self) ?Capture {
+            if (self.capture_count == 0) return null;
             while (true) {
                 var best: ?*CaptureSlot = null;
                 for (self.captures) |*c| {
