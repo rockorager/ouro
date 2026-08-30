@@ -5462,7 +5462,21 @@ pub fn Coordinator(comptime protocol: type) type {
         /// topology ownership. Callers decide whether a failed activation is
         /// terminal or should be followed by an exact rollback snapshot.
         fn activateOutput(self: *Self, snapshot: drm.Snapshot, scale_120: u32) !void {
-            if (self.primaryKmsOutput() != null or self.stopping) return error.InvalidState;
+            return self.activatePhysicalOutput(
+                self.primaryPhysicalOutputMutable(),
+                snapshot,
+                scale_120,
+            );
+        }
+
+        fn activatePhysicalOutput(
+            self: *Self,
+            physical: *PhysicalOutput,
+            snapshot: drm.Snapshot,
+            scale_120: u32,
+        ) !void {
+            if (physical.kms_output != null or self.stopping) return error.InvalidState;
+            const primary = std.meta.eql(physical.id, self.primaryPhysicalOutput().id);
             const connector = snapshot.selectedConnector();
             const mode_end = try std.math.add(usize, connector.mode_start, connector.mode_count);
             if (mode_end > snapshot.modes.len) return error.InvalidModeInventory;
@@ -5471,7 +5485,7 @@ pub fn Coordinator(comptime protocol: type) type {
             const logical_width = try output_scale.logicalDimension(mode.hdisplay);
             const logical_height = try output_scale.logicalDimension(mode.vdisplay);
             const refresh = try std.math.mul(u32, mode.vrefresh, 1000);
-            try self.output_management_adapter.setModes(
+            if (primary) try self.output_management_adapter.setModes(
                 try collectOutputModes(
                     self.output_management_modes,
                     snapshot.modes[connector.mode_start..mode_end],
@@ -5486,10 +5500,11 @@ pub fn Coordinator(comptime protocol: type) type {
             const generation = self.next_output_generation orelse
                 return error.GenerationExhausted;
             var output_config = self.output_config;
+            output_config.output_id.index = physical.id.index;
             output_config.output_id.generation = generation;
             var output_committed = false;
             errdefer {
-                if (!output_committed) self.cleanupUnstartedOutput();
+                if (!output_committed) self.cleanupUnstartedOutput(physical);
             }
             const output = if (self.render_device) |render_device|
                 try output_api.Output.createWithRenderDevice(
@@ -5508,15 +5523,15 @@ pub fn Coordinator(comptime protocol: type) type {
                     snapshot,
                     output_config,
                 );
-            self.primaryPhysicalOutputMutable().kms_output = output;
+            physical.kms_output = output;
             if (self.render_device == null)
                 self.render_device = output.takeRenderDevice();
             try self.ensureDmabuf(snapshot.handle);
             try self.ensureExplicitSync(snapshot.handle);
             try self.ensureDrmLeasing(snapshot);
-            try self.ensureGammaOwner(snapshot);
+            if (primary) try self.ensureGammaOwner(snapshot);
             try self.output_adapter.publishMode(
-                self.primaryPhysicalOutput().protocol_output,
+                physical.protocol_output,
                 output.planner.output.width,
                 output.planner.output.height,
                 try std.math.mul(u32, mode.vrefresh, 1000),
@@ -5524,50 +5539,60 @@ pub fn Coordinator(comptime protocol: type) type {
                 connector.height_mm,
             );
             try self.output_adapter.publishScale(
-                self.primaryPhysicalOutput().protocol_output,
+                physical.protocol_output,
                 scale_120,
             );
-            try self.fractional_scale_adapter.publishPreferredScale(scale_120);
-            try self.xdg_output_adapter.publishMode(
-                self.primaryPhysicalOutput().protocol_output,
-            );
+            if (primary) try self.fractional_scale_adapter.publishPreferredScale(scale_120);
+            try self.xdg_output_adapter.publishMode(physical.protocol_output);
             const work_area: geometry.Rect = .{
                 .x = 0,
                 .y = 0,
                 .width = logical_width,
                 .height = logical_height,
             };
-            try self.desktop.validateWorkArea(work_area);
-            try self.interaction.validateBounds(work_area);
+            if (primary) {
+                try self.desktop.validateWorkArea(work_area);
+                try self.interaction.validateBounds(work_area);
+            }
             try output.prepareReadiness(&self.router, &self.root.ring);
-            self.desktop.applyWorkArea(work_area);
-            self.interaction.applyBounds(work_area);
-            const retained_visibility_changed = self.refreshRetainedLayersForOutput();
-            self.primaryPhysicalOutputMutable().drain_started = false;
-            const screencopy_stride = try std.math.mul(
-                u32,
-                output.planner.output.width,
-                4,
+            if (primary) {
+                self.desktop.applyWorkArea(work_area);
+                self.interaction.applyBounds(work_area);
+            }
+            const retained_visibility_changed = primary and self.refreshRetainedLayersForOutput();
+            physical.drain_started = false;
+            if (primary) {
+                const screencopy_stride = try std.math.mul(
+                    u32,
+                    output.planner.output.width,
+                    4,
+                );
+                const screencopy_bytes = try std.math.mul(
+                    usize,
+                    screencopy_stride,
+                    output.planner.output.height,
+                );
+                self.screencopy_bytes = try self.allocator.realloc(
+                    self.screencopy_bytes,
+                    screencopy_bytes,
+                );
+                try self.screencopy_adapter.publishMode(
+                    output.planner.output.width,
+                    output.planner.output.height,
+                );
+            }
+            var head_state = try self.output_management_adapter.lifecycle.currentHead(
+                physical.management_head,
             );
-            const screencopy_bytes = try std.math.mul(
-                usize,
-                screencopy_stride,
-                output.planner.output.height,
+            head_state.enabled = true;
+            head_state.width = @intCast(output.planner.output.width);
+            head_state.height = @intCast(output.planner.output.height);
+            head_state.refresh_millihz = @intCast(try std.math.mul(u32, mode.vrefresh, 1000));
+            head_state.scale_120 = scale_120;
+            _ = try self.output_management_adapter.publishHead(
+                physical.management_head,
+                head_state,
             );
-            self.screencopy_bytes = try self.allocator.realloc(
-                self.screencopy_bytes,
-                screencopy_bytes,
-            );
-            try self.screencopy_adapter.publishMode(
-                output.planner.output.width,
-                output.planner.output.height,
-            );
-            _ = try self.output_management_adapter.publish(.{
-                .width = @intCast(output.planner.output.width),
-                .height = @intCast(output.planner.output.height),
-                .refresh_millihz = @intCast(try std.math.mul(u32, mode.vrefresh, 1000)),
-                .scale_120 = scale_120,
-            });
             try self.recomputeLayerConfigures();
             try self.recomputeSessionLockConfigures();
             self.markProtocolAll(ProtocolReady.output | ProtocolReady.xdg_output |
@@ -7890,14 +7915,15 @@ pub fn Coordinator(comptime protocol: type) type {
             const physical = self.primaryPhysicalOutputMutable();
             const pending = physical.reconfigure orelse return error.InvalidState;
             const handle = self.manager.currentHandle() orelse return error.StaleSnapshot;
-            const previous = try self.manager.snapshotMode(
-                handle,
+            const claim = physical.claim orelse return error.StaleClaim;
+            const previous = try self.manager.claimSnapshotMode(
+                claim,
                 @intCast(pending.previous.width),
                 @intCast(pending.previous.height),
                 @intCast(pending.previous.refresh_millihz),
             );
-            const desired = try self.manager.snapshotMode(
-                handle,
+            const desired = try self.manager.claimSnapshotMode(
+                claim,
                 @intCast(pending.desired.width),
                 @intCast(pending.desired.height),
                 @intCast(pending.desired.refresh_millihz),
@@ -8000,13 +8026,14 @@ pub fn Coordinator(comptime protocol: type) type {
             }
         }
 
-        fn cleanupUnstartedOutput(self: *Self) void {
-            const output = self.primaryKmsOutput() orelse return;
+        fn cleanupUnstartedOutput(self: *Self, physical: *PhysicalOutput) void {
+            const output = physical.kms_output orelse return;
             self.output_adapter.setAvailable(
-                self.primaryPhysicalOutput().protocol_output,
+                physical.protocol_output,
                 false,
             ) catch unreachable;
-            self.screencopy_adapter.setAvailable(false);
+            if (std.meta.eql(physical.id, self.primaryPhysicalOutput().id))
+                self.screencopy_adapter.setAvailable(false);
             if (output.accepting_frames) {
                 if (output.requestPause() catch unreachable) |action|
                     self.consumeRetireAction(action) catch unreachable;
@@ -8026,7 +8053,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 _ = self.image_capture_source_adapter.invalidate(.{ .output = output.outputId() });
             };
             output.destroy() catch {};
-            self.primaryPhysicalOutputMutable().kms_output = null;
+            physical.kms_output = null;
         }
 
         fn resourceRemoved(
