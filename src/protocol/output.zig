@@ -1,4 +1,4 @@
-//! Dynamically growing wl_output owner for one physical desktop output.
+//! Dynamically growing wl_output owner for physical desktop outputs.
 
 const std = @import("std");
 const wayring = @import("wayring");
@@ -8,6 +8,7 @@ const objects = wayring.objects;
 const none = std.math.maxInt(u32);
 
 pub const Config = struct {
+    output_capacity: usize = 1,
     resource_capacity: usize = 4,
     association_capacity: usize = 16,
     outbound_capacity: usize = 64,
@@ -21,12 +22,46 @@ pub const Config = struct {
     scale: i32 = 1,
 
     fn validate(config: Config) !void {
-        if (config.resource_capacity == 0 or config.resource_capacity >= none or
+        if (config.output_capacity == 0 or config.output_capacity >= none or
+            config.resource_capacity == 0 or config.resource_capacity >= none or
             config.association_capacity == 0 or config.association_capacity >= none or
             config.outbound_capacity == 0 or config.outbound_capacity >= none or
             config.scale <= 0)
             return error.InvalidConfig;
         if (config.physical_width_mm < 0 or config.physical_height_mm < 0)
+            return error.InvalidConfig;
+        inline for (.{ config.name, config.description, config.make, config.model }) |value|
+            if (value.len == 0 or std.mem.indexOfScalar(u8, value, 0) != null)
+                return error.InvalidConfig;
+    }
+
+    fn output(config: Config) !OutputConfig {
+        return .{
+            .name = config.name,
+            .description = config.description,
+            .make = config.make,
+            .model = config.model,
+            .physical_width_mm = config.physical_width_mm,
+            .physical_height_mm = config.physical_height_mm,
+            .scale_120 = try std.math.mul(u32, @intCast(config.scale), 120),
+        };
+    }
+};
+
+pub const OutputConfig = struct {
+    name: []const u8,
+    description: []const u8,
+    make: []const u8 = "Ouro",
+    model: []const u8 = "Unknown",
+    logical_x: i32 = 0,
+    logical_y: i32 = 0,
+    physical_width_mm: i32 = 0,
+    physical_height_mm: i32 = 0,
+    scale_120: u32 = 120,
+
+    fn validate(config: OutputConfig) !void {
+        if (config.scale_120 == 0 or config.physical_width_mm < 0 or
+            config.physical_height_mm < 0)
             return error.InvalidConfig;
         inline for (.{ config.name, config.description, config.make, config.model }) |value|
             if (value.len == 0 or std.mem.indexOfScalar(u8, value, 0) != null)
@@ -41,19 +76,42 @@ pub fn Adapter(comptime protocol: type) type {
         const Output = protocol.wl_output;
 
         const Id = struct { index: u32, generation: u32 };
+        pub const OutputId = struct { index: u32, generation: u32 };
         pub const Reference = struct {
             handle: objects.Handle,
+            output: OutputId,
         };
         pub const LogicalSnapshot = struct {
+            x: i32,
+            y: i32,
             width: ?i32,
             height: ?i32,
             name: []const u8,
             description: []const u8,
         };
+        const OutputState = struct {
+            active: bool = false,
+            generation: u32 = 1,
+            next_free: u32 = none,
+            adapter: ?*Self = null,
+            global: ?objects.Handle = null,
+            name: []u8 = &.{},
+            description: []u8 = &.{},
+            make: []u8 = &.{},
+            model: []u8 = &.{},
+            logical_x: i32 = 0,
+            logical_y: i32 = 0,
+            physical_width_mm: i32 = 0,
+            physical_height_mm: i32 = 0,
+            scale_120: u32 = 120,
+            mode: ?Mode = null,
+            available: bool = false,
+        };
         const Resource = struct {
             active: bool = false,
             generation: u32 = 1,
             next_free: u32 = none,
+            output: OutputId = .{ .index = 0, .generation = 0 },
             peer: wayring.io_uring.Peer = undefined,
             handle: objects.Handle = .{ .id = 0, .generation = 0 },
             version: u32 = 0,
@@ -62,6 +120,7 @@ pub fn Adapter(comptime protocol: type) type {
             active: bool = false,
             desired: bool = false,
             next_free: u32 = none,
+            output: OutputId = .{ .index = 0, .generation = 0 },
             peer: wayring.io_uring.Peer = undefined,
             surface: objects.Handle = .{ .id = 0, .generation = 0 },
             entered: std.ArrayListUnmanaged(u32) = .empty,
@@ -77,17 +136,10 @@ pub fn Adapter(comptime protocol: type) type {
 
         allocator: std.mem.Allocator,
         runtime: ?*Runtime = null,
-        global: ?objects.Handle = null,
         global_version: u32,
-        name: []u8,
-        description: []u8,
-        make: []u8,
-        model: []u8,
-        physical_width_mm: i32,
-        physical_height_mm: i32,
-        scale_120: u32,
-        mode: ?Mode = null,
-        available: bool = false,
+        outputs: []*OutputState,
+        output_free: u32,
+        primary_output: OutputId,
         resources: []*Resource,
         resource_free: u32,
         associations: []Association,
@@ -100,6 +152,10 @@ pub fn Adapter(comptime protocol: type) type {
         pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
             try config.validate();
             try Output.info.validateVersion(config.global_version);
+            const outputs = try allocator.alloc(*OutputState, config.output_capacity);
+            errdefer allocator.free(outputs);
+            var outputs_initialized: usize = 0;
+            errdefer for (outputs[0..outputs_initialized]) |output| allocator.destroy(output);
             const resources = try allocator.alloc(*Resource, config.resource_capacity);
             errdefer allocator.free(resources);
             var resources_initialized: usize = 0;
@@ -108,14 +164,13 @@ pub fn Adapter(comptime protocol: type) type {
             errdefer allocator.free(associations);
             const outbound = try allocator.alloc(Outbound, config.outbound_capacity);
             errdefer allocator.free(outbound);
-            const name = try allocator.dupe(u8, config.name);
-            errdefer allocator.free(name);
-            const description = try allocator.dupe(u8, config.description);
-            errdefer allocator.free(description);
-            const make = try allocator.dupe(u8, config.make);
-            errdefer allocator.free(make);
-            const model = try allocator.dupe(u8, config.model);
-            errdefer allocator.free(model);
+            for (outputs, 0..) |*output, index| {
+                output.* = try allocator.create(OutputState);
+                outputs_initialized += 1;
+                output.*.* = .{
+                    .next_free = if (index + 1 < outputs.len) @intCast(index + 1) else none,
+                };
+            }
             for (resources, 0..) |*resource, index| {
                 resource.* = try allocator.create(Resource);
                 resources_initialized += 1;
@@ -127,34 +182,33 @@ pub fn Adapter(comptime protocol: type) type {
                 .next_free = if (index + 1 < associations.len) @intCast(index + 1) else none,
             };
             @memset(outbound, .{});
-            return .{
+            var adapter: Self = .{
                 .allocator = allocator,
                 .global_version = config.global_version,
-                .name = name,
-                .description = description,
-                .make = make,
-                .model = model,
-                .physical_width_mm = config.physical_width_mm,
-                .physical_height_mm = config.physical_height_mm,
-                .scale_120 = try std.math.mul(u32, @intCast(config.scale), 120),
+                .outputs = outputs,
+                .output_free = 0,
+                .primary_output = undefined,
                 .resources = resources,
                 .resource_free = 0,
                 .associations = associations,
                 .association_free = 0,
                 .outbound = outbound,
             };
+            adapter.primary_output = try adapter.addOutput(try config.output());
+            return adapter;
         }
 
         pub fn deinit(adapter: *Self) void {
-            adapter.allocator.free(adapter.model);
-            adapter.allocator.free(adapter.make);
-            adapter.allocator.free(adapter.description);
-            adapter.allocator.free(adapter.name);
             adapter.allocator.free(adapter.outbound);
             for (adapter.associations) |*association| association.entered.deinit(adapter.allocator);
             adapter.allocator.free(adapter.associations);
             for (adapter.resources) |resource| adapter.allocator.destroy(resource);
             adapter.allocator.free(adapter.resources);
+            for (adapter.outputs) |output| {
+                if (output.active) adapter.freeOutputStrings(output);
+                adapter.allocator.destroy(output);
+            }
+            adapter.allocator.free(adapter.outputs);
             adapter.* = undefined;
         }
 
@@ -162,20 +216,28 @@ pub fn Adapter(comptime protocol: type) type {
             if (adapter.runtime != null) return error.AlreadyInstalled;
             adapter.runtime = runtime;
             errdefer adapter.runtime = null;
-            const global = try runtime.addGlobalWithBinder(
-                &Output.info,
-                adapter.global_version,
-                adapter,
-                bind,
-            );
-            adapter.global = global;
-            return global;
+            var primary_global: ?objects.Handle = null;
+            for (adapter.outputs, 0..) |output, index| {
+                if (!output.active) continue;
+                output.adapter = adapter;
+                output.global = try runtime.addGlobalWithBinder(
+                    &Output.info,
+                    adapter.global_version,
+                    output,
+                    bind,
+                );
+                if (index == adapter.primary_output.index) primary_global = output.global;
+            }
+            return primary_global orelse unreachable;
         }
 
         fn bind(context: ?*anyopaque, binding: wayring.server.Binding) !?*anyopaque {
-            const adapter: *Self = @ptrCast(@alignCast(context orelse return error.InvalidContext));
+            const output: *OutputState = @ptrCast(@alignCast(context orelse return error.InvalidContext));
+            const adapter = output.adapter orelse return error.InvalidContext;
+            const output_id = adapter.outputIdFor(adapter.outputIndexFor(output));
             const index = adapter.acquireResource() catch return error.OutOfMemory;
             const resource = adapter.resources[index];
+            resource.output = output_id;
             resource.peer = binding.peer;
             resource.handle = binding.resource;
             resource.version = binding.version;
@@ -186,8 +248,61 @@ pub fn Adapter(comptime protocol: type) type {
             return resource;
         }
 
+        pub fn primaryOutput(adapter: *const Self) OutputId {
+            return adapter.primary_output;
+        }
+
+        pub fn addOutput(adapter: *Self, config: OutputConfig) !OutputId {
+            try config.validate();
+            const scale = geometry.OutputScale.init(config.scale_120) catch return error.InvalidConfig;
+            _ = scale;
+            if (adapter.output_free == none) try adapter.growOutputs();
+            const index = adapter.output_free;
+            const output = adapter.outputs[index];
+            const name = try adapter.allocator.dupe(u8, config.name);
+            errdefer adapter.allocator.free(name);
+            const description = try adapter.allocator.dupe(u8, config.description);
+            errdefer adapter.allocator.free(description);
+            const make = try adapter.allocator.dupe(u8, config.make);
+            errdefer adapter.allocator.free(make);
+            const model = try adapter.allocator.dupe(u8, config.model);
+            errdefer adapter.allocator.free(model);
+            adapter.output_free = output.next_free;
+            output.* = .{
+                .active = true,
+                .generation = output.generation,
+                .adapter = if (adapter.runtime != null) adapter else null,
+                .name = name,
+                .description = description,
+                .make = make,
+                .model = model,
+                .logical_x = config.logical_x,
+                .logical_y = config.logical_y,
+                .physical_width_mm = config.physical_width_mm,
+                .physical_height_mm = config.physical_height_mm,
+                .scale_120 = config.scale_120,
+            };
+            const id = adapter.outputIdFor(index);
+            if (adapter.runtime) |runtime| {
+                output.adapter = adapter;
+                output.global = runtime.addGlobalWithBinder(
+                    &Output.info,
+                    adapter.global_version,
+                    output,
+                    bind,
+                ) catch |err| {
+                    const generation = output.generation;
+                    output.* = .{ .generation = generation, .next_free = adapter.output_free };
+                    adapter.output_free = index;
+                    return err;
+                };
+            }
+            return id;
+        }
+
         pub fn publishMode(
             adapter: *Self,
+            output_id: OutputId,
             width: u32,
             height: u32,
             refresh_millihz: u32,
@@ -200,24 +315,28 @@ pub fn Adapter(comptime protocol: type) type {
                 physical_width_mm > std.math.maxInt(i32) or
                 physical_height_mm > std.math.maxInt(i32))
                 return error.InvalidMode;
-            const scale = geometry.OutputScale.init(adapter.scale_120) catch unreachable;
+            const output = try adapter.resolveOutput(output_id);
+            const scale = geometry.OutputScale.init(output.scale_120) catch unreachable;
             _ = scale.logicalDimension(width) catch return error.InvalidMode;
             _ = scale.logicalDimension(height) catch return error.InvalidMode;
             var event_count: usize = 0;
             for (adapter.resources) |resource| {
-                if (resource.active) event_count += if (resource.version >= 2) 3 else 2;
+                if (resource.active and std.meta.eql(resource.output, output_id))
+                    event_count += if (resource.version >= 2) 3 else 2;
             }
             try adapter.ensureOutbound(event_count);
-            adapter.physical_width_mm = @intCast(physical_width_mm);
-            adapter.physical_height_mm = @intCast(physical_height_mm);
-            adapter.mode = .{
+            output.physical_width_mm = @intCast(physical_width_mm);
+            output.physical_height_mm = @intCast(physical_height_mm);
+            output.mode = .{
                 .width = @intCast(width),
                 .height = @intCast(height),
                 .refresh_millihz = @intCast(refresh_millihz),
             };
-            adapter.available = true;
+            output.available = true;
             adapter.associations_dirty = true;
-            for (adapter.resources, 0..) |resource, index| if (resource.active) {
+            for (adapter.resources, 0..) |resource, index| if (resource.active and
+                std.meta.eql(resource.output, output_id))
+            {
                 const id = adapter.idFor(@intCast(index));
                 adapter.enqueue(id, .geometry) catch unreachable;
                 adapter.enqueue(id, .mode) catch unreachable;
@@ -229,33 +348,56 @@ pub fn Adapter(comptime protocol: type) type {
         /// integer wl_output event rounds upward as required for clients that
         /// do not bind fractional-scale-v1; xdg-output consumes the exact
         /// logical dimensions from `logicalSnapshot`.
-        pub fn publishScale(adapter: *Self, scale_120: u32) !void {
+        pub fn publishScale(adapter: *Self, output_id: OutputId, scale_120: u32) !void {
             if (scale_120 == 0 or
                 @divTrunc(@as(u64, scale_120) + 119, 120) > std.math.maxInt(i32))
                 return error.InvalidScale;
-            if (adapter.scale_120 == scale_120) return;
+            const output = try adapter.resolveOutput(output_id);
+            if (output.scale_120 == scale_120) return;
             const scale = geometry.OutputScale.init(scale_120) catch unreachable;
-            if (adapter.mode) |mode| {
+            if (output.mode) |mode| {
                 _ = scale.logicalDimension(@intCast(mode.width)) catch return error.InvalidScale;
                 _ = scale.logicalDimension(@intCast(mode.height)) catch return error.InvalidScale;
             }
             var event_count: usize = 0;
             for (adapter.resources) |resource| {
-                if (resource.active and resource.version >= 2) event_count += 2;
+                if (resource.active and resource.version >= 2 and
+                    std.meta.eql(resource.output, output_id)) event_count += 2;
             }
             try adapter.ensureOutbound(event_count);
-            adapter.scale_120 = scale_120;
+            output.scale_120 = scale_120;
             for (adapter.resources, 0..) |resource, index| {
-                if (!resource.active or resource.version < 2) continue;
+                if (!resource.active or resource.version < 2 or
+                    !std.meta.eql(resource.output, output_id)) continue;
                 const id = adapter.idFor(@intCast(index));
                 adapter.enqueue(id, .scale) catch unreachable;
                 adapter.enqueue(id, .done) catch unreachable;
             }
         }
 
-        pub fn setAvailable(adapter: *Self, available: bool) void {
-            if (adapter.available != available) adapter.associations_dirty = true;
-            adapter.available = available;
+        pub fn publishPosition(adapter: *Self, output_id: OutputId, x: i32, y: i32) !void {
+            const output = try adapter.resolveOutput(output_id);
+            if (output.logical_x == x and output.logical_y == y) return;
+            var event_count: usize = 0;
+            for (adapter.resources) |resource| {
+                if (resource.active and std.meta.eql(resource.output, output_id))
+                    event_count += if (resource.version >= 2) 2 else 1;
+            }
+            try adapter.ensureOutbound(event_count);
+            output.logical_x = x;
+            output.logical_y = y;
+            for (adapter.resources, 0..) |resource, index| {
+                if (!resource.active or !std.meta.eql(resource.output, output_id)) continue;
+                const id = adapter.idFor(@intCast(index));
+                adapter.enqueue(id, .geometry) catch unreachable;
+                if (resource.version >= 2) adapter.enqueue(id, .done) catch unreachable;
+            }
+        }
+
+        pub fn setAvailable(adapter: *Self, output_id: OutputId, available: bool) !void {
+            const output = try adapter.resolveOutput(output_id);
+            if (output.available != available) adapter.associations_dirty = true;
+            output.available = available;
         }
 
         /// Reconciles the mapped surface set without directly writing the
@@ -263,9 +405,11 @@ pub fn Adapter(comptime protocol: type) type {
         /// generated event is accepted.
         pub fn reconcileSurfaces(
             adapter: *Self,
+            output_id: OutputId,
             peer: wayring.io_uring.Peer,
             surfaces: []const objects.Handle,
         ) !void {
+            _ = try adapter.resolveOutput(output_id);
             for (surfaces, 0..) |surface, index| {
                 if (surface.id == 0 or surface.generation == 0) return error.InvalidSurface;
                 for (surfaces[0..index]) |previous|
@@ -273,13 +417,14 @@ pub fn Adapter(comptime protocol: type) type {
             }
             var required: usize = 0;
             for (surfaces) |surface| {
-                if (adapter.findAssociation(peer, surface) == null) required += 1;
+                if (adapter.findAssociation(output_id, peer, surface) == null) required += 1;
             }
             try adapter.ensureAssociations(required);
 
             var changed = false;
             for (adapter.associations) |*association| {
-                if (!association.active or !samePeer(association.peer, peer)) continue;
+                if (!association.active or !std.meta.eql(association.output, output_id) or
+                    !samePeer(association.peer, peer)) continue;
                 var desired = false;
                 for (surfaces) |surface| if (std.meta.eql(association.surface, surface)) {
                     desired = true;
@@ -291,8 +436,9 @@ pub fn Adapter(comptime protocol: type) type {
                 }
             }
             for (surfaces) |surface| {
-                if (adapter.findAssociation(peer, surface) == null) {
+                if (adapter.findAssociation(output_id, peer, surface) == null) {
                     const association = adapter.acquireAssociation() catch unreachable;
+                    association.output = output_id;
                     association.peer = peer;
                     association.surface = surface;
                     association.desired = true;
@@ -302,7 +448,8 @@ pub fn Adapter(comptime protocol: type) type {
             var index: usize = 0;
             while (index < adapter.associations.len) : (index += 1) {
                 const association = &adapter.associations[index];
-                if (association.active and samePeer(association.peer, peer) and
+                if (association.active and std.meta.eql(association.output, output_id) and
+                    samePeer(association.peer, peer) and
                     !association.desired and association.entered.items.len == 0)
                 {
                     adapter.releaseAssociation(@intCast(index));
@@ -358,8 +505,12 @@ pub fn Adapter(comptime protocol: type) type {
             peer: wayring.io_uring.Peer,
             handle: objects.Handle,
         ) void {
-            if (adapter.findAssociation(peer, handle)) |association| {
-                adapter.releaseAssociation(adapter.associationIndex(association));
+            var index: usize = 0;
+            while (index < adapter.associations.len) : (index += 1) {
+                const association = &adapter.associations[index];
+                if (!association.active or !samePeer(association.peer, peer) or
+                    !std.meta.eql(association.surface, handle)) continue;
+                adapter.releaseAssociation(@intCast(index));
                 adapter.associations_dirty = true;
             }
         }
@@ -377,10 +528,12 @@ pub fn Adapter(comptime protocol: type) type {
             if (!adapter.associations_dirty) return false;
             for (adapter.associations) |association| {
                 if (!association.active or !samePeer(association.peer, peer)) continue;
+                const output = adapter.resolveOutput(association.output) catch continue;
                 for (adapter.resources, 0..) |resource, index| {
-                    if (!resource.active or !samePeer(resource.peer, peer)) continue;
+                    if (!resource.active or !samePeer(resource.peer, peer) or
+                        !std.meta.eql(resource.output, association.output)) continue;
                     const entered = isEntered(&association, @intCast(index));
-                    if (entered != (adapter.available and association.desired)) return true;
+                    if (entered != (output.available and association.desired)) return true;
                 }
             }
             return false;
@@ -412,12 +565,15 @@ pub fn Adapter(comptime protocol: type) type {
 
         pub fn resourceIds(
             adapter: *const Self,
+            output_id: OutputId,
             peer: wayring.io_uring.Peer,
             output: []u32,
         ) ![]const u32 {
+            _ = try adapter.resolveOutputConst(output_id);
             var count: usize = 0;
             for (adapter.resources) |resource| {
-                if (!resource.active or !samePeer(resource.peer, peer)) continue;
+                if (!resource.active or !samePeer(resource.peer, peer) or
+                    !std.meta.eql(resource.output, output_id)) continue;
                 if (count == output.len) return error.OutputTooSmall;
                 output[count] = resource.handle.id;
                 count += 1;
@@ -435,22 +591,26 @@ pub fn Adapter(comptime protocol: type) type {
             const resource = adapter.fromContext(object.context) orelse return error.ForeignResource;
             if (!resource.active or !samePeer(resource.peer, peer) or
                 !std.meta.eql(resource.handle, handle)) return error.ForeignResource;
-            return .{ .handle = resource.handle };
+            _ = try adapter.resolveOutput(resource.output);
+            return .{ .handle = resource.handle, .output = resource.output };
         }
 
-        pub fn logicalSnapshot(adapter: *const Self) LogicalSnapshot {
-            const scale = geometry.OutputScale.init(adapter.scale_120) catch unreachable;
+        pub fn logicalSnapshot(adapter: *const Self, output_id: OutputId) !LogicalSnapshot {
+            const output = try adapter.resolveOutputConst(output_id);
+            const scale = geometry.OutputScale.init(output.scale_120) catch unreachable;
             return .{
-                .width = if (adapter.mode) |mode|
+                .x = output.logical_x,
+                .y = output.logical_y,
+                .width = if (output.mode) |mode|
                     scale.logicalDimension(@intCast(mode.width)) catch unreachable
                 else
                     null,
-                .height = if (adapter.mode) |mode|
+                .height = if (output.mode) |mode|
                     scale.logicalDimension(@intCast(mode.height)) catch unreachable
                 else
                     null,
-                .name = adapter.name,
-                .description = adapter.description,
+                .name = output.name,
+                .description = output.description,
             };
         }
 
@@ -473,10 +633,15 @@ pub fn Adapter(comptime protocol: type) type {
                     adapter.releaseAssociation(@intCast(association_index));
                     continue;
                 }
+                const output = adapter.resolveOutput(association.output) catch {
+                    adapter.releaseAssociation(@intCast(association_index));
+                    continue;
+                };
                 for (adapter.resources, 0..) |resource, resource_index| {
-                    if (!resource.active or !samePeer(resource.peer, peer)) continue;
+                    if (!resource.active or !samePeer(resource.peer, peer) or
+                        !std.meta.eql(resource.output, association.output)) continue;
                     const entered = isEntered(association, @intCast(resource_index));
-                    const should_enter = adapter.available and association.desired;
+                    const should_enter = output.available and association.desired;
                     if (entered == should_enter) continue;
                     if (should_enter) try association.entered.ensureUnusedCapacity(adapter.allocator, 1);
                     protocol.wl_surface.encodeEvent(
@@ -504,12 +669,13 @@ pub fn Adapter(comptime protocol: type) type {
 
         fn queueSnapshot(adapter: *Self, id: Id) !void {
             const resource = try adapter.resolve(id);
-            var count: usize = 1 + @as(usize, @intFromBool(adapter.mode != null));
+            const output = try adapter.resolveOutput(resource.output);
+            var count: usize = 1 + @as(usize, @intFromBool(output.mode != null));
             if (resource.version >= 2) count += 2;
             if (resource.version >= 4) count += 2;
             try adapter.ensureOutbound(count);
             adapter.enqueue(id, .geometry) catch unreachable;
-            if (adapter.mode != null) adapter.enqueue(id, .mode) catch unreachable;
+            if (output.mode != null) adapter.enqueue(id, .mode) catch unreachable;
             if (resource.version >= 2) adapter.enqueue(id, .scale) catch unreachable;
             if (resource.version >= 4) {
                 adapter.enqueue(id, .name) catch unreachable;
@@ -520,28 +686,29 @@ pub fn Adapter(comptime protocol: type) type {
 
         fn emit(adapter: *Self, queue: *wayring.tx.Queue, outbound: Outbound) !void {
             const resource = adapter.resolve(outbound.resource) catch return;
+            const output = adapter.resolveOutput(resource.output) catch return;
             const event: Output.Event = switch (outbound.event) {
                 .geometry => .{ .geometry = .{
-                    .x = 0,
-                    .y = 0,
-                    .physical_width = adapter.physical_width_mm,
-                    .physical_height = adapter.physical_height_mm,
+                    .x = output.logical_x,
+                    .y = output.logical_y,
+                    .physical_width = output.physical_width_mm,
+                    .physical_height = output.physical_height_mm,
                     .subpixel = Output.subpixel.unknown,
-                    .make = adapter.make,
-                    .model = adapter.model,
+                    .make = output.make,
+                    .model = output.model,
                     .transform = Output.transform.normal,
                 } },
                 .mode => .{ .mode = .{
                     .flags = Output.mode.fromInt(Output.mode.current.value | Output.mode.preferred.value),
-                    .width = adapter.mode.?.width,
-                    .height = adapter.mode.?.height,
-                    .refresh = adapter.mode.?.refresh_millihz,
+                    .width = output.mode.?.width,
+                    .height = output.mode.?.height,
+                    .refresh = output.mode.?.refresh_millihz,
                 } },
                 .scale => .{ .scale = .{
-                    .factor = @intCast(@divTrunc(@as(u64, adapter.scale_120) + 119, 120)),
+                    .factor = @intCast(@divTrunc(@as(u64, output.scale_120) + 119, 120)),
                 } },
-                .name => .{ .name = .{ .name = adapter.name } },
-                .description => .{ .description = .{ .description = adapter.description } },
+                .name => .{ .name = .{ .name = output.name } },
+                .description => .{ .description = .{ .description = output.description } },
                 .done => .{ .done = .{} },
             };
             try Output.encodeEvent(queue, resource.handle.id, event);
@@ -587,11 +754,13 @@ pub fn Adapter(comptime protocol: type) type {
 
         fn findAssociation(
             adapter: *Self,
+            output: OutputId,
             peer: wayring.io_uring.Peer,
             surface: objects.Handle,
         ) ?*Association {
             for (adapter.associations) |*association|
-                if (association.active and samePeer(association.peer, peer) and
+                if (association.active and std.meta.eql(association.output, output) and
+                    samePeer(association.peer, peer) and
                     std.meta.eql(association.surface, surface))
                     return association;
             return null;
@@ -651,10 +820,11 @@ pub fn Adapter(comptime protocol: type) type {
         fn hasPendingAssociations(adapter: *const Self) bool {
             for (adapter.associations) |association| {
                 if (!association.active) continue;
+                const output = adapter.resolveOutputConst(association.output) catch continue;
                 for (adapter.resources, 0..) |resource, index| {
-                    if (!resource.active) continue;
+                    if (!resource.active or !std.meta.eql(resource.output, association.output)) continue;
                     const entered = isEntered(&association, @intCast(index));
-                    if (entered != (adapter.available and association.desired)) return true;
+                    if (entered != (output.available and association.desired)) return true;
                 }
             }
             return false;
@@ -682,6 +852,48 @@ pub fn Adapter(comptime protocol: type) type {
             const resource: *Resource = @ptrCast(@alignCast(context orelse return null));
             for (adapter.resources) |candidate| if (candidate == resource) return resource;
             return null;
+        }
+
+        fn outputIdFor(adapter: *const Self, index: u32) OutputId {
+            return .{ .index = index, .generation = adapter.outputs[index].generation };
+        }
+
+        fn resolveOutput(adapter: *Self, id: OutputId) !*OutputState {
+            if (id.index >= adapter.outputs.len) return error.StaleOutput;
+            const output = adapter.outputs[id.index];
+            if (!output.active or output.generation != id.generation) return error.StaleOutput;
+            return output;
+        }
+
+        fn resolveOutputConst(adapter: *const Self, id: OutputId) !*const OutputState {
+            if (id.index >= adapter.outputs.len) return error.StaleOutput;
+            const output = adapter.outputs[id.index];
+            if (!output.active or output.generation != id.generation) return error.StaleOutput;
+            return output;
+        }
+
+        fn outputIndexFor(adapter: *const Self, output: *const OutputState) u32 {
+            for (adapter.outputs, 0..) |candidate, index|
+                if (candidate == output) return @intCast(index);
+            unreachable;
+        }
+
+        fn freeOutputStrings(adapter: *Self, output: *OutputState) void {
+            adapter.allocator.free(output.model);
+            adapter.allocator.free(output.make);
+            adapter.allocator.free(output.description);
+            adapter.allocator.free(output.name);
+        }
+
+        fn growOutputs(adapter: *Self) !void {
+            if (adapter.outputs.len >= none) return error.OutOfMemory;
+            const output = try adapter.allocator.create(OutputState);
+            errdefer adapter.allocator.destroy(output);
+            const old_len = adapter.outputs.len;
+            adapter.outputs = try adapter.allocator.realloc(adapter.outputs, old_len + 1);
+            output.* = .{};
+            adapter.outputs[old_len] = output;
+            adapter.output_free = @intCast(old_len);
         }
 
         fn growResources(adapter: *Self) !void {
@@ -733,12 +945,15 @@ test "output: resources and surface associations are peer scoped" {
         .outbound_capacity = 18,
     });
     defer adapter.deinit();
+    const output = adapter.primaryOutput();
     const peer_a: wayring.io_uring.Peer = .{ .slot = 1, .generation = 4 };
     const peer_b: wayring.io_uring.Peer = .{ .slot = 2, .generation = 7 };
     const resource_a = try adapter.acquireResource();
+    adapter.resources[resource_a].output = output;
     adapter.resources[resource_a].peer = peer_a;
     adapter.resources[resource_a].handle = .{ .id = 9, .generation = 2 };
     const resource_b = try adapter.acquireResource();
+    adapter.resources[resource_b].output = output;
     adapter.resources[resource_b].peer = peer_b;
     adapter.resources[resource_b].handle = .{ .id = 9, .generation = 3 };
     const object_a: objects.Object = .{
@@ -764,16 +979,16 @@ test "output: resources and surface associations are peer scoped" {
     try std.testing.expectEqual(adapter.idFor(resource_b), adapter.oldestOutbound(peer_b).?.resource);
 
     var ids: [2]u32 = undefined;
-    try std.testing.expectEqualSlices(u32, &.{9}, try adapter.resourceIds(peer_a, &ids));
-    try std.testing.expectEqualSlices(u32, &.{9}, try adapter.resourceIds(peer_b, &ids));
+    try std.testing.expectEqualSlices(u32, &.{9}, try adapter.resourceIds(output, peer_a, &ids));
+    try std.testing.expectEqualSlices(u32, &.{9}, try adapter.resourceIds(output, peer_b, &ids));
     const surface: objects.Handle = .{ .id = 12, .generation = 5 };
-    try adapter.reconcileSurfaces(peer_a, &.{surface});
-    try adapter.reconcileSurfaces(peer_b, &.{surface});
-    try std.testing.expect(adapter.findAssociation(peer_a, surface) != null);
-    try std.testing.expect(adapter.findAssociation(peer_b, surface) != null);
-    try adapter.reconcileSurfaces(peer_a, &.{});
-    try std.testing.expect(adapter.findAssociation(peer_a, surface) == null);
-    try std.testing.expect(adapter.findAssociation(peer_b, surface).?.desired);
+    try adapter.reconcileSurfaces(output, peer_a, &.{surface});
+    try adapter.reconcileSurfaces(output, peer_b, &.{surface});
+    try std.testing.expect(adapter.findAssociation(output, peer_a, surface) != null);
+    try std.testing.expect(adapter.findAssociation(output, peer_b, surface) != null);
+    try adapter.reconcileSurfaces(output, peer_a, &.{});
+    try std.testing.expect(adapter.findAssociation(output, peer_a, surface) == null);
+    try std.testing.expect(adapter.findAssociation(output, peer_b, surface).?.desired);
 }
 
 test "output: storage grows beyond initial capacities" {
@@ -784,15 +999,18 @@ test "output: storage grows beyond initial capacities" {
         .outbound_capacity = 1,
     });
     defer adapter.deinit();
+    const output = adapter.primaryOutput();
     const peer: wayring.io_uring.Peer = .{ .slot = 3, .generation = 8 };
 
     const first = try adapter.acquireResource();
     const first_context = adapter.resources[first];
+    first_context.output = output;
     first_context.peer = peer;
     first_context.handle = .{ .id = 20, .generation = 1 };
     var index: usize = 1;
     while (index < 70) : (index += 1) {
         const resource_index = try adapter.acquireResource();
+        adapter.resources[resource_index].output = output;
         adapter.resources[resource_index].peer = peer;
         adapter.resources[resource_index].handle = .{ .id = @intCast(20 + index), .generation = 1 };
     }
@@ -804,9 +1022,10 @@ test "output: storage grows beyond initial capacities" {
         .{ .id = 101, .generation = 1 },
         .{ .id = 102, .generation = 1 },
     };
-    try adapter.reconcileSurfaces(peer, &surfaces);
+    try adapter.reconcileSurfaces(output, peer, &surfaces);
     try std.testing.expect(adapter.associations.len > 1);
-    for (surfaces) |surface| try std.testing.expect(adapter.findAssociation(peer, surface) != null);
+    for (surfaces) |surface|
+        try std.testing.expect(adapter.findAssociation(output, peer, surface) != null);
 
     try adapter.enqueue(adapter.idFor(first), .geometry);
     try adapter.ensureOutbound(3);
@@ -832,22 +1051,144 @@ test "output: fractional scale republishes integer fallback and logical size" {
         .outbound_capacity = 1,
     });
     defer adapter.deinit();
-    try adapter.publishMode(1920, 1200, 60_000, 600, 340);
+    const output = adapter.primaryOutput();
+    try adapter.publishMode(output, 1920, 1200, 60_000, 600, 340);
     const resource_index = try adapter.acquireResource();
     const resource = adapter.resources[resource_index];
+    resource.output = output;
     resource.peer = .{ .slot = 1, .generation = 1 };
     resource.version = 4;
     resource.handle = .{ .id = 7, .generation = 1 };
 
-    try adapter.publishScale(156);
-    const snapshot = adapter.logicalSnapshot();
+    try adapter.publishScale(output, 156);
+    const snapshot = try adapter.logicalSnapshot(output);
     try std.testing.expectEqual(@as(?i32, 1476), snapshot.width);
     try std.testing.expectEqual(@as(?i32, 923), snapshot.height);
     try std.testing.expectEqual(@as(usize, 2), adapter.outbound_len);
     try std.testing.expect(adapter.oldestOutbound(resource.peer).?.event == .scale);
-    try adapter.publishScale(156);
+    try adapter.publishScale(output, 156);
     try std.testing.expectEqual(@as(usize, 2), adapter.outbound_len);
-    try std.testing.expectError(error.InvalidScale, adapter.publishScale(0));
-    try std.testing.expectError(error.InvalidScale, adapter.publishScale(230_401));
-    try std.testing.expectEqual(@as(u32, 156), adapter.scale_120);
+    try std.testing.expectError(error.InvalidScale, adapter.publishScale(output, 0));
+    try std.testing.expectError(error.InvalidScale, adapter.publishScale(output, 230_401));
+    try std.testing.expectEqual(@as(u32, 156), adapter.outputs[output.index].scale_120);
+}
+
+test "output: identities isolate snapshots resources and surface associations" {
+    const TestAdapter = Adapter(@import("core_protocol"));
+    var adapter = try TestAdapter.init(std.testing.allocator, .{
+        .output_capacity = 1,
+        .resource_capacity = 2,
+        .association_capacity = 2,
+        .outbound_capacity = 2,
+        .name = "primary",
+        .description = "Primary output",
+    });
+    defer adapter.deinit();
+    const primary = adapter.primaryOutput();
+    const secondary = try adapter.addOutput(.{
+        .name = "secondary",
+        .description = "Secondary output",
+        .logical_x = 1920,
+        .logical_y = -40,
+        .scale_120 = 180,
+    });
+    try std.testing.expect(primary.index != secondary.index);
+    try std.testing.expect(adapter.outputs.len > 1);
+    try adapter.publishMode(primary, 1920, 1200, 60_000, 600, 340);
+    try adapter.publishMode(secondary, 2560, 1440, 144_000, 700, 390);
+
+    const primary_snapshot = try adapter.logicalSnapshot(primary);
+    try std.testing.expectEqual(@as(i32, 0), primary_snapshot.x);
+    try std.testing.expectEqual(@as(i32, 0), primary_snapshot.y);
+    try std.testing.expectEqual(@as(?i32, 1920), primary_snapshot.width);
+    try std.testing.expectEqualStrings("primary", primary_snapshot.name);
+    const secondary_snapshot = try adapter.logicalSnapshot(secondary);
+    try std.testing.expectEqual(@as(i32, 1920), secondary_snapshot.x);
+    try std.testing.expectEqual(@as(i32, -40), secondary_snapshot.y);
+    try std.testing.expectEqual(@as(?i32, 1706), secondary_snapshot.width);
+    try std.testing.expectEqual(@as(?i32, 960), secondary_snapshot.height);
+    try std.testing.expectEqualStrings("secondary", secondary_snapshot.name);
+
+    const peer: wayring.io_uring.Peer = .{ .slot = 4, .generation = 9 };
+    const primary_resource = try adapter.acquireResource();
+    adapter.resources[primary_resource].output = primary;
+    adapter.resources[primary_resource].peer = peer;
+    adapter.resources[primary_resource].handle = .{ .id = 20, .generation = 1 };
+    const secondary_resource = try adapter.acquireResource();
+    adapter.resources[secondary_resource].output = secondary;
+    adapter.resources[secondary_resource].peer = peer;
+    adapter.resources[secondary_resource].handle = .{ .id = 21, .generation = 1 };
+    var resource_storage: [2]u32 = undefined;
+    try std.testing.expectEqualSlices(
+        u32,
+        &.{20},
+        try adapter.resourceIds(primary, peer, &resource_storage),
+    );
+    try std.testing.expectEqualSlices(
+        u32,
+        &.{21},
+        try adapter.resourceIds(secondary, peer, &resource_storage),
+    );
+
+    const surface_a: objects.Handle = .{ .id = 30, .generation = 2 };
+    const surface_b: objects.Handle = .{ .id = 31, .generation = 3 };
+    try adapter.reconcileSurfaces(primary, peer, &.{surface_a});
+    try adapter.reconcileSurfaces(secondary, peer, &.{surface_b});
+    try std.testing.expect(adapter.findAssociation(primary, peer, surface_a) != null);
+    try std.testing.expect(adapter.findAssociation(primary, peer, surface_b) == null);
+    try std.testing.expect(adapter.findAssociation(secondary, peer, surface_a) == null);
+    try std.testing.expect(adapter.findAssociation(secondary, peer, surface_b) != null);
+
+    const protocol = @import("core_protocol");
+    var server_objects = try objects.ServerObjects.init(
+        std.testing.allocator,
+        32,
+        2,
+        &protocol.wl_display.info,
+        null,
+    );
+    defer server_objects.deinit(std.testing.allocator);
+    _ = try server_objects.insertClient(surface_a.id, &protocol.wl_surface.info, 6, null);
+    _ = try server_objects.insertClient(surface_b.id, &protocol.wl_surface.info, 6, null);
+    var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 256, 1);
+    defer blocks.deinit(std.testing.allocator);
+    var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 1);
+    defer descriptors.deinit(std.testing.allocator);
+    var queue = wayring.tx.Queue.init(&blocks, 256, &descriptors, 0);
+    defer queue.deinit();
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        try adapter.flushOn(peer, &server_objects, &queue),
+    );
+    var descriptor_scratch: [1]std.os.linux.fd_t = undefined;
+    var control: [64]u8 align(@alignOf(std.os.linux.cmsghdr)) = undefined;
+    const queued = try queue.snapshot(&descriptor_scratch, &control);
+    var bytes = queued.first;
+    for ([_]struct { surface: u32, output: u32 }{
+        .{ .surface = surface_a.id, .output = 20 },
+        .{ .surface = surface_b.id, .output = 21 },
+    }) |expected| {
+        const message = (try wayring.wire.Message.decode(bytes)).?;
+        try std.testing.expectEqual(expected.surface, message.header.object_id);
+        const event = try protocol.wl_surface.decodeEvent(message, &queue.descriptors);
+        try std.testing.expectEqual(
+            protocol.wl_surface.Event{ .enter = .{ .output = expected.output } },
+            event,
+        );
+        bytes = bytes[message.header.size..];
+    }
+    try std.testing.expectEqual(@as(usize, 0), bytes.len);
+
+    adapter.outbound_len = 0;
+    @memset(adapter.outbound, .{});
+    adapter.resources[primary_resource].version = 4;
+    adapter.resources[secondary_resource].version = 4;
+    try adapter.publishPosition(secondary, 2048, 0);
+    try std.testing.expectEqual(@as(usize, 2), adapter.outbound_len);
+    try std.testing.expectEqual(
+        adapter.idFor(secondary_resource),
+        adapter.oldestOutbound(peer).?.resource,
+    );
+    try std.testing.expectEqual(@as(i32, 2048), (try adapter.logicalSnapshot(secondary)).x);
+    try std.testing.expectEqual(@as(i32, 0), (try adapter.logicalSnapshot(primary)).x);
 }

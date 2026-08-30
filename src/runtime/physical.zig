@@ -663,6 +663,7 @@ pub fn Coordinator(comptime protocol: type) type {
         pointer_warp_adapter: PointerWarpAdapter,
         security_context_adapter: SecurityContextAdapter,
         output_adapter: OutputAdapter,
+        protocol_output_id: OutputAdapter.OutputId,
         xdg_output_adapter: XdgOutputAdapter,
         output_management_adapter: OutputManagementAdapter,
         output_power_adapter: OutputPowerAdapter,
@@ -1249,6 +1250,7 @@ pub fn Coordinator(comptime protocol: type) type {
             });
             self.output_adapter = try OutputAdapter.init(allocator, config.protocol_output);
             errdefer self.output_adapter.deinit();
+            self.protocol_output_id = self.output_adapter.primaryOutput();
             self.foreign_toplevel_list_adapter.setOutputResolver(
                 self,
                 resolveForeignToplevelOutput,
@@ -3427,7 +3429,11 @@ pub fn Coordinator(comptime protocol: type) type {
             const current = foreignOutputId(output.outputId());
             if (!std.meta.eql(current, id)) return null;
             var resources: [1]u32 = undefined;
-            const ids = self.output_adapter.resourceIds(peer, &resources) catch return null;
+            const ids = self.output_adapter.resourceIds(
+                self.protocol_output_id,
+                peer,
+                &resources,
+            ) catch return null;
             return if (ids.len == 0) null else ids[0];
         }
 
@@ -3665,7 +3671,11 @@ pub fn Coordinator(comptime protocol: type) type {
             const output = self.output orelse return null;
             if (!std.meta.eql(workspaceOutputId(output.outputId()), id)) return null;
             var resources: [1]u32 = undefined;
-            const ids = self.output_adapter.resourceIds(peer, &resources) catch return null;
+            const ids = self.output_adapter.resourceIds(
+                self.protocol_output_id,
+                peer,
+                &resources,
+            ) catch return null;
             if (ids.len == 0) return null;
             const objects = self.root.runtime.clients.get(peer) catch return null;
             return objects.namespace.lookupHandle(ids[0]);
@@ -5362,15 +5372,16 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.ensureDrmLeasing(snapshot);
             try self.ensureGammaOwner(snapshot);
             try self.output_adapter.publishMode(
+                self.protocol_output_id,
                 self.output.?.planner.output.width,
                 self.output.?.planner.output.height,
                 try std.math.mul(u32, mode.vrefresh, 1000),
                 connector.width_mm,
                 connector.height_mm,
             );
-            try self.output_adapter.publishScale(scale_120);
+            try self.output_adapter.publishScale(self.protocol_output_id, scale_120);
             try self.fractional_scale_adapter.publishPreferredScale(scale_120);
-            self.xdg_output_adapter.publishMode();
+            try self.xdg_output_adapter.publishMode(self.protocol_output_id);
             const work_area: geometry.Rect = .{
                 .x = 0,
                 .y = 0,
@@ -7007,7 +7018,11 @@ pub fn Coordinator(comptime protocol: type) type {
                 const objects = try self.root.runtime.clients.get(peer);
                 const actor = try self.root.runtime.clients.reactor.getActor(peer);
                 var output_storage: [64]u32 = undefined;
-                const output_resources = try self.output_adapter.resourceIds(peer, &output_storage);
+                const output_resources = try self.output_adapter.resourceIds(
+                    self.protocol_output_id,
+                    peer,
+                    &output_storage,
+                );
                 _ = self.adapter.completePresentationFeedbackOn(
                     objects,
                     &actor.transmit,
@@ -7333,10 +7348,10 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn outputBounds(self: *const Self) !geometry.Rect {
             if (self.output == null) return error.NoOutput;
-            const snapshot = self.output_adapter.logicalSnapshot();
+            const snapshot = try self.output_adapter.logicalSnapshot(self.protocol_output_id);
             return .{
-                .x = 0,
-                .y = 0,
+                .x = snapshot.x,
+                .y = snapshot.y,
                 .width = snapshot.width orelse return error.NoOutput,
                 .height = snapshot.height orelse return error.NoOutput,
             };
@@ -7529,7 +7544,7 @@ pub fn Coordinator(comptime protocol: type) type {
         fn pauseOutput(self: *Self) !void {
             const output = self.output orelse return;
             if (!output.accepting_frames) return;
-            self.output_adapter.setAvailable(false);
+            try self.output_adapter.setAvailable(self.protocol_output_id, false);
             self.screencopy_adapter.setAvailable(false);
             self.markProtocolAll(ProtocolReady.output);
             if (try output.requestPause()) |action| try self.consumeRetireAction(action);
@@ -7561,6 +7576,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     count += 1;
                 }
                 try self.output_adapter.reconcileSurfaces(
+                    self.protocol_output_id,
                     client.peer,
                     self.association_surfaces[0..count],
                 );
@@ -7771,7 +7787,7 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn cleanupUnstartedOutput(self: *Self) void {
             const output = self.output orelse return;
-            self.output_adapter.setAvailable(false);
+            self.output_adapter.setAvailable(self.protocol_output_id, false) catch unreachable;
             self.screencopy_adapter.setAvailable(false);
             if (output.accepting_frames) {
                 if (output.requestPause() catch unreachable) |action|

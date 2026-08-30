@@ -35,7 +35,8 @@ pub fn Adapter(comptime protocol: type, comptime OutputAdapter: type) type {
         const Slot = struct {
             header: slot_pool.Header = .{},
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
-            output: ?objects.Handle = null,
+            output_resource: ?objects.Handle = null,
+            output: OutputAdapter.OutputId = .{ .index = 0, .generation = 0 },
             peer: wayring.io_uring.Peer = undefined,
             version: u32 = 0,
             pending: Pending = .{},
@@ -118,10 +119,11 @@ pub fn Adapter(comptime protocol: type, comptime OutputAdapter: type) type {
                             return try adapter.failure(actor, decoded.handle.id, cause);
                         };
                         slot.resource = admitted.id;
-                        slot.output = reference.handle;
+                        slot.output_resource = reference.handle;
+                        slot.output = reference.output;
                         slot.peer = peer;
                         slot.version = @min(target.object.version, XdgOutput.info.version);
-                        adapter.queueSnapshot(slot);
+                        try adapter.queueSnapshot(slot);
                     },
                 }
                 try decoded.finish(protocol, server_objects, &actor.transmit);
@@ -142,11 +144,23 @@ pub fn Adapter(comptime protocol: type, comptime OutputAdapter: type) type {
 
         /// Publishes the changed logical size after the wl_output mode owner
         /// has accepted its corresponding physical mode.
-        pub fn publishMode(adapter: *Self) void {
-            const snapshot = adapter.output.logicalSnapshot();
+        pub fn publishMode(adapter: *Self, output: OutputAdapter.OutputId) !void {
+            const snapshot = try adapter.output.logicalSnapshot(output);
             if (snapshot.width == null or snapshot.height == null) return;
-            for (adapter.slots.entries.items) |slot| if (slot.header.active) {
+            for (adapter.slots.entries.items) |slot| if (slot.header.active and
+                std.meta.eql(slot.output, output))
+            {
                 adapter.setPending(slot, .size);
+                adapter.setPending(slot, .marker);
+            };
+        }
+
+        pub fn publishPosition(adapter: *Self, output: OutputAdapter.OutputId) !void {
+            _ = try adapter.output.logicalSnapshot(output);
+            for (adapter.slots.entries.items) |slot| if (slot.header.active and
+                std.meta.eql(slot.output, output))
+            {
+                adapter.setPending(slot, .position);
                 adapter.setPending(slot, .marker);
             };
         }
@@ -167,13 +181,16 @@ pub fn Adapter(comptime protocol: type, comptime OutputAdapter: type) type {
         ) !usize {
             var completed: usize = 0;
             if (adapter.pending_len == 0) return completed;
-            const snapshot = adapter.output.logicalSnapshot();
             for (adapter.slots.entries.items) |slot| {
                 if (!slot.header.active or !samePeer(slot.peer, peer) or !pendingAny(slot.pending)) continue;
                 if (server_objects.namespace.resolve(slot.resource) == null) {
                     adapter.release(slot);
                     continue;
                 }
+                const snapshot = adapter.output.logicalSnapshot(slot.output) catch {
+                    adapter.release(slot);
+                    continue;
+                };
                 for ([_]Event{ .position, .size, .name, .description, .marker }) |event| {
                     if (!isPending(slot.pending, event)) continue;
                     adapter.emit(server_objects, queue, slot, event, snapshot) catch |err| switch (err) {
@@ -196,8 +213,8 @@ pub fn Adapter(comptime protocol: type, comptime OutputAdapter: type) type {
             }
             if (object.interface == &Output.info) {
                 for (adapter.slots.entries.items) |slot| {
-                    if (slot.header.active and slot.output != null and
-                        std.meta.eql(slot.output.?, handle)) slot.output = null;
+                    if (slot.header.active and slot.output_resource != null and
+                        std.meta.eql(slot.output_resource.?, handle)) slot.output_resource = null;
                 }
                 return false;
             }
@@ -215,8 +232,8 @@ pub fn Adapter(comptime protocol: type, comptime OutputAdapter: type) type {
             adapter.slots.release(slot);
         }
 
-        fn queueSnapshot(adapter: *Self, slot: *Slot) void {
-            const snapshot = adapter.output.logicalSnapshot();
+        fn queueSnapshot(adapter: *Self, slot: *Slot) !void {
+            const snapshot = try adapter.output.logicalSnapshot(slot.output);
             adapter.setPending(slot, .position);
             if (snapshot.width != null) adapter.setPending(slot, .size);
             if (slot.version >= 2) {
@@ -262,7 +279,7 @@ pub fn Adapter(comptime protocol: type, comptime OutputAdapter: type) type {
             _ = adapter;
             switch (event) {
                 .position => try XdgOutput.encodeEvent(queue, slot.resource.id, .{
-                    .logical_position = .{ .x = 0, .y = 0 },
+                    .logical_position = .{ .x = snapshot.x, .y = snapshot.y },
                 }),
                 .size => if (snapshot.width) |width| try XdgOutput.encodeEvent(
                     queue,
@@ -277,7 +294,7 @@ pub fn Adapter(comptime protocol: type, comptime OutputAdapter: type) type {
                 }),
                 .marker => if (slot.version < 3) {
                     try XdgOutput.encodeEvent(queue, slot.resource.id, .{ .done = .{} });
-                } else if (slot.output) |output_handle| {
+                } else if (slot.output_resource) |output_handle| {
                     if (server_objects.namespace.resolve(output_handle) != null)
                         try Output.encodeEvent(queue, output_handle.id, .{ .done = .{} });
                 },
@@ -332,15 +349,18 @@ fn samePeer(a: wayring.io_uring.Peer, b: wayring.io_uring.Peer) bool {
 test "xdg output: snapshot terminator follows negotiated version" {
     const protocol = @import("core_protocol");
     const FakeOutput = struct {
+        pub const OutputId = struct { index: u32, generation: u32 };
         pub const LogicalSnapshot = struct {
+            x: i32,
+            y: i32,
             width: ?i32,
             height: ?i32,
             name: []const u8,
             description: []const u8,
         };
 
-        pub fn logicalSnapshot(_: *@This()) LogicalSnapshot {
-            return .{ .width = 1920, .height = 1200, .name = "ouro-0", .description = "Ouro output" };
+        pub fn logicalSnapshot(_: *@This(), _: OutputId) !LogicalSnapshot {
+            return .{ .x = 0, .y = 0, .width = 1920, .height = 1200, .name = "ouro-0", .description = "Ouro output" };
         }
     };
     const TestAdapter = Adapter(protocol, FakeOutput);
@@ -365,13 +385,14 @@ test "xdg output: snapshot terminator follows negotiated version" {
             @intCast(version),
             slot,
         );
-        slot.output = try server_objects.insertClient(
+        slot.output = .{ .index = 0, .generation = 1 };
+        slot.output_resource = try server_objects.insertClient(
             5,
             &protocol.wl_output.info,
             4,
             null,
         );
-        adapter.queueSnapshot(slot);
+        try adapter.queueSnapshot(slot);
 
         var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 512, 1);
         defer blocks.deinit(std.testing.allocator);
@@ -425,15 +446,18 @@ test "xdg output: snapshot terminator follows negotiated version" {
 test "xdg output: mode publication coalesces while retaining marker" {
     const protocol = @import("core_protocol");
     const FakeOutput = struct {
+        pub const OutputId = struct { index: u32, generation: u32 };
         pub const LogicalSnapshot = struct {
+            x: i32,
+            y: i32,
             width: ?i32,
             height: ?i32,
             name: []const u8,
             description: []const u8,
         };
 
-        pub fn logicalSnapshot(_: *@This()) LogicalSnapshot {
-            return .{ .width = 1280, .height = 720, .name = "ouro-0", .description = "Ouro output" };
+        pub fn logicalSnapshot(_: *@This(), _: OutputId) !LogicalSnapshot {
+            return .{ .x = 0, .y = 0, .width = 1280, .height = 720, .name = "ouro-0", .description = "Ouro output" };
         }
     };
     const TestAdapter = Adapter(protocol, FakeOutput);
@@ -445,8 +469,10 @@ test "xdg output: mode publication coalesces while retaining marker" {
     try std.testing.expect(grown != slot);
     try std.testing.expect(adapter.slots.fromContext(slot) == slot);
     adapter.release(grown);
-    adapter.publishMode();
-    adapter.publishMode();
+    const output_id: FakeOutput.OutputId = .{ .index = 0, .generation = 1 };
+    slot.output = output_id;
+    try adapter.publishMode(output_id);
+    try adapter.publishMode(output_id);
     try std.testing.expect(slot.pending.size);
     try std.testing.expect(slot.pending.marker);
     try std.testing.expectEqual(@as(usize, 1), adapter.pending_len);

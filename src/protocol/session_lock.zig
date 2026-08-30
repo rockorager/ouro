@@ -44,6 +44,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
             lock: LockId,
             surface: SurfaceId,
             output: objects.Handle,
+            output_id: OutputAdapter.OutputId,
             mapped: bool,
         };
 
@@ -64,6 +65,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
             surface: SurfaceId = undefined,
             wl_surface: objects.Handle = .{ .id = 0, .generation = 0 },
             output: objects.Handle = .{ .id = 0, .generation = 0 },
+            output_id: OutputAdapter.OutputId = .{ .index = 0, .generation = 0 },
             configure_pending: bool = false,
             serial: u32 = 0,
             width: u32 = 0,
@@ -156,7 +158,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
         }
         pub fn surfaceState(self: *const Self, id: LockSurfaceId) !SurfaceState {
             const s = try self.resolveSurface(id);
-            return .{ .lock = s.lock, .surface = s.surface, .output = s.output, .mapped = s.mapped };
+            return .{ .lock = s.lock, .surface = s.surface, .output = s.output, .output_id = s.output_id, .mapped = s.mapped };
         }
         pub fn ownsSurface(self: *const Self, surface: SurfaceId) bool {
             return self.findSurface(surface) != null;
@@ -270,19 +272,18 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
             if (core.sequence != 0 or core.current_buffer != null or core.hasPendingBufferAttachment()) return try self.protocolError(actor, dh.id, Lock.@"error".already_constructed.value, "surface has content");
             const oh = os.namespace.lookupHandle(v.output) orelse return try self.protocolError(actor, dh.id, Lock.@"error".role.value, "invalid output");
             const oo = os.namespace.resolve(oh) orelse return try self.protocolError(actor, dh.id, Lock.@"error".role.value, "invalid output");
-            const output = (self.output.reference(peer, oh, oo.*) catch return try self.protocolError(actor, dh.id, Lock.@"error".role.value, "foreign output")).handle;
+            const output = self.output.reference(peer, oh, oo.*) catch return try self.protocolError(actor, dh.id, Lock.@"error".role.value, "foreign output");
             const lid = self.lockId(lock);
-            // Ouro currently advertises one physical output. Distinct client
-            // wl_output resources still identify that same output and may not
-            // be used to evade duplicate-output validation.
-            for (self.surfaces.entries.items) |s| if (s.header.active and std.meta.eql(s.lock, lid))
+            for (self.surfaces.entries.items) |s| if (s.header.active and
+                std.meta.eql(s.lock, lid) and std.meta.eql(s.output_id, output.output))
                 return try self.protocolError(actor, dh.id, Lock.@"error".duplicate_output.value, "duplicate output");
             const s = self.acquireSurface() catch return try self.failure(actor, dh.id, error.Exhausted);
             s.peer = peer;
             s.lock = lid;
             s.surface = sid;
             s.wl_surface = wh;
-            s.output = output;
+            s.output = output.handle;
+            s.output_id = output.output;
             core.role.assign(role_id, true) catch {
                 self.releaseSurface(self.surfaceIndex(s));
                 return try self.protocolError(actor, dh.id, Lock.@"error".role.value, "surface role");
@@ -293,7 +294,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
                 return try self.failure(actor, dh.id, err);
             };
             s.resource = admitted.id;
-            const snapshot = self.output.logicalSnapshot();
+            const snapshot = try self.output.logicalSnapshot(s.output_id);
             const w = snapshot.width orelse 0;
             const h = snapshot.height orelse 0;
             self.queueConfigure(self.surfaceId(s), @intCast(@max(w, 0)), @intCast(@max(h, 0))) catch
@@ -500,7 +501,9 @@ test "session-lock: lock ownership grows while accepted authorization stays excl
     const FakeCore = struct {
         pub const SurfaceId = struct { index: u32, generation: u32 };
     };
-    const FakeOutput = struct {};
+    const FakeOutput = struct {
+        pub const OutputId = struct { index: u32, generation: u32 };
+    };
     const A = Adapter(@import("core_protocol"), FakeCore, FakeOutput);
     var core: FakeCore = .{};
     var output: FakeOutput = .{};
@@ -521,7 +524,9 @@ test "session-lock: locked publication is explicit and client loss remains fail 
     const FakeCore = struct {
         pub const SurfaceId = struct { index: u32, generation: u32 };
     };
-    const FakeOutput = struct {};
+    const FakeOutput = struct {
+        pub const OutputId = struct { index: u32, generation: u32 };
+    };
     const TestAdapter = Adapter(test_protocol, FakeCore, FakeOutput);
     var core: FakeCore = .{};
     var output: FakeOutput = .{};
@@ -553,7 +558,9 @@ test "session-lock: pending lock retirement permits a later attempt" {
     const FakeCore = struct {
         pub const SurfaceId = struct { index: u32, generation: u32 };
     };
-    const FakeOutput = struct {};
+    const FakeOutput = struct {
+        pub const OutputId = struct { index: u32, generation: u32 };
+    };
     const TestAdapter = Adapter(test_protocol, FakeCore, FakeOutput);
     var core: FakeCore = .{};
     var output: FakeOutput = .{};
@@ -604,7 +611,9 @@ test "session-lock: configure ack gates exact prospective commit dimensions" {
             return &core.surface;
         }
     };
-    const FakeOutput = struct {};
+    const FakeOutput = struct {
+        pub const OutputId = struct { index: u32, generation: u32 };
+    };
     const TestAdapter = Adapter(test_protocol, FakeCore, FakeOutput);
     var core: FakeCore = .{};
     var output: FakeOutput = .{};

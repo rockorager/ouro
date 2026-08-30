@@ -65,6 +65,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
         pub const Margins = struct { top: i32 = 0, right: i32 = 0, bottom: i32 = 0, left: i32 = 0 };
         pub const State = struct {
             surface: SurfaceId,
+            output: OutputAdapter.OutputId,
             layer: Layer,
             width: u32,
             height: u32,
@@ -95,7 +96,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
             peer: wayring.io_uring.Peer = undefined,
             surface: SurfaceId = undefined,
             wl_surface: objects.Handle = .{ .id = 0, .generation = 0 },
-            output: ?objects.Handle = null,
+            output_resource: ?objects.Handle = null,
+            output: OutputAdapter.OutputId = .{ .index = 0, .generation = 0 },
             namespace: []u8 = &.{},
             namespace_len: usize = 0,
             pending: Pending = .{},
@@ -194,17 +196,21 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
                             return try self.managerError(actor, decoded.handle.id, Manager.@"error".role.value, "surface already has a role");
                         if (surface.sequence != 0 or surface.current_buffer != null or surface.hasPendingBufferAttachment())
                             return try self.managerError(actor, decoded.handle.id, Manager.@"error".already_constructed.value, "surface already has a role or content");
-                        var output_ref: ?objects.Handle = null;
+                        var output_resource: ?objects.Handle = null;
+                        var output = self.output.primaryOutput();
                         if (v.output) |oid| {
                             const oh = server_objects.namespace.lookupHandle(oid) orelse return try self.managerError(actor, decoded.handle.id, Manager.@"error".role.value, "invalid output");
                             const oo = server_objects.namespace.resolve(oh) orelse return try self.managerError(actor, decoded.handle.id, Manager.@"error".role.value, "invalid output");
-                            output_ref = (self.output.reference(peer, oh, oo.*) catch return try self.managerError(actor, decoded.handle.id, Manager.@"error".role.value, "foreign output")).handle;
+                            const reference = self.output.reference(peer, oh, oo.*) catch return try self.managerError(actor, decoded.handle.id, Manager.@"error".role.value, "foreign output");
+                            output_resource = reference.handle;
+                            output = reference.output;
                         }
                         const slot = self.acquire() catch return try self.noMemory(actor);
                         slot.peer = peer;
                         slot.surface = sid;
                         slot.wl_surface = wh;
-                        slot.output = output_ref;
+                        slot.output_resource = output_resource;
+                        slot.output = output;
                         slot.pending.layer = layer;
                         slot.committed.layer = layer;
                         @memcpy(slot.namespace[0..v.namespace.len], v.namespace);
@@ -350,7 +356,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
             s.configure_height = height;
         }
         fn queueConfigureSlot(self: *Self, s: *Slot) !void {
-            const snapshot = self.output.logicalSnapshot();
+            const snapshot = try self.output.logicalSnapshot(s.output);
             const width: u32 = if (s.committed.width != 0) s.committed.width else if (snapshot.width) |v| @intCast(@max(v, 0)) else 0;
             const height: u32 = if (s.committed.height != 0) s.committed.height else if (snapshot.height) |v| @intCast(@max(v, 0)) else 0;
             try self.queueConfigureSlotSize(s, width, height);
@@ -412,8 +418,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
                 if (self.find(sid)) |s| self.release(self.index(s));
             }
             if (std.mem.eql(u8, object.interface.name, "wl_output")) for (self.slots.entries.items) |s| {
-                if (s.header.active and s.output != null and std.meta.eql(s.output.?, handle))
-                    s.output = null;
+                if (s.header.active and s.output_resource != null and
+                    std.meta.eql(s.output_resource.?, handle)) s.output_resource = null;
             };
             return false;
         }
@@ -511,7 +517,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
             return stateValueWith(s, s.committed);
         }
         fn stateValueWith(s: *const Slot, value: Pending) State {
-            return .{ .surface = s.surface, .layer = value.layer, .width = value.width, .height = value.height, .anchors = value.anchors, .exclusive_zone = value.exclusive_zone, .exclusive_edge = value.exclusive_edge, .margins = value.margins, .keyboard_interactivity = value.keyboard, .mapped = s.mapped, .namespace = s.namespace[0..s.namespace_len], .last_acknowledged_configure = s.last_ack };
+            return .{ .surface = s.surface, .output = s.output, .layer = value.layer, .width = value.width, .height = value.height, .anchors = value.anchors, .exclusive_zone = value.exclusive_zone, .exclusive_edge = value.exclusive_edge, .margins = value.margins, .keyboard_interactivity = value.keyboard, .mapped = s.mapped, .namespace = s.namespace[0..s.namespace_len], .last_acknowledged_configure = s.last_ack };
         }
         fn parseLayer(v: u32) !Layer {
             return switch (v) {
@@ -614,7 +620,9 @@ test "layer shell: ownership grows past initial reservation without moving conte
     const FakeCore = struct {
         pub const SurfaceId = struct { index: u32, generation: u32 };
     };
-    const FakeOutput = struct {};
+    const FakeOutput = struct {
+        pub const OutputId = struct { index: u32, generation: u32 };
+    };
     const A = Adapter(@import("core_protocol"), FakeCore, FakeOutput);
     var core: FakeCore = .{};
     var output: FakeOutput = .{};
@@ -652,13 +660,16 @@ test "layer shell: commit lifecycle requires an acknowledged configure and reset
         }
     };
     const FakeOutput = struct {
-        pub fn logicalSnapshot(_: *@This()) struct {
+        pub const OutputId = struct { index: u32, generation: u32 };
+        pub fn logicalSnapshot(_: *@This(), _: OutputId) !struct {
+            x: i32,
+            y: i32,
             width: ?i32,
             height: ?i32,
             name: []const u8,
             description: []const u8,
         } {
-            return .{ .width = 1920, .height = 1200, .name = "ouro-0", .description = "Ouro output" };
+            return .{ .x = 0, .y = 0, .width = 1920, .height = 1200, .name = "ouro-0", .description = "Ouro output" };
         }
     };
     const TestAdapter = Adapter(test_protocol, FakeCore, FakeOutput);
@@ -732,7 +743,9 @@ test "layer shell: acknowledgements accept any sent outstanding configure once" 
     const FakeCore = struct {
         pub const SurfaceId = packed struct { index: u32, generation: u32 };
     };
-    const FakeOutput = struct {};
+    const FakeOutput = struct {
+        pub const OutputId = struct { index: u32, generation: u32 };
+    };
     const TestAdapter = Adapter(test_protocol, FakeCore, FakeOutput);
     var core: FakeCore = .{};
     var output_state: FakeOutput = .{};
@@ -764,14 +777,17 @@ test "layer shell: configure survives transport backpressure" {
         pub const SurfaceId = packed struct { index: u32, generation: u32 };
     };
     const FakeOutput = struct {
+        pub const OutputId = struct { index: u32, generation: u32 };
         pub const LogicalSnapshot = struct {
+            x: i32,
+            y: i32,
             width: ?i32,
             height: ?i32,
             name: []const u8,
             description: []const u8,
         };
-        pub fn logicalSnapshot(_: *@This()) LogicalSnapshot {
-            return .{ .width = 1920, .height = 1200, .name = "ouro-0", .description = "Ouro output" };
+        pub fn logicalSnapshot(_: *@This(), _: OutputId) !LogicalSnapshot {
+            return .{ .x = 0, .y = 0, .width = 1920, .height = 1200, .name = "ouro-0", .description = "Ouro output" };
         }
     };
     const TestAdapter = Adapter(test_protocol, FakeCore, FakeOutput);
