@@ -4054,6 +4054,9 @@ pub fn Coordinator(comptime protocol: type) type {
                 ) catch return null,
                 .toplevel => |id| (self.desktop.scene(id) catch return null).geometry,
             };
+            const output = self.captureKmsOutput(target) orelse return null;
+            const physical = self.physicalOutputForKmsId(output.outputId()) orelse return null;
+            const output_bounds = self.outputBoundsFor(physical) catch return null;
             const cursor_region: geometry.Rect = .{
                 .x = std.math.sub(i32, pointer.x, hotspot.x) catch return null,
                 .y = std.math.sub(i32, pointer.y, hotspot.y) catch return null,
@@ -4061,15 +4064,18 @@ pub fn Coordinator(comptime protocol: type) type {
                 .height = @intCast(height),
             };
             if (!rectanglesIntersect(cursor_region, source_region)) return null;
-            const physical_source = self.physicalSceneRect(source_region) orelse return null;
-            const physical_cursor = self.physicalSceneRect(cursor_region) orelse return null;
-            const scale = geometry.OutputScale.init(
-                self.output_management_adapter.lifecycle.current.scale_120,
+            const physical_source = self.physicalSceneRectFor(source_region, physical) orelse return null;
+            const physical_cursor = self.physicalSceneRectFor(cursor_region, physical) orelse return null;
+            const head = self.output_management_adapter.lifecycle.currentHead(
+                physical.management_head,
             ) catch return null;
+            const scale = geometry.OutputScale.init(head.scale_120) catch return null;
             const physical_hotspot_x = scale.physicalEdge(hotspot.x) catch return null;
             const physical_hotspot_y = scale.physicalEdge(hotspot.y) catch return null;
-            const physical_pointer_x = scale.physicalEdge(pointer.x) catch return null;
-            const physical_pointer_y = scale.physicalEdge(pointer.y) catch return null;
+            const relative_pointer_x = std.math.sub(i64, pointer.x, output_bounds.x) catch return null;
+            const relative_pointer_y = std.math.sub(i64, pointer.y, output_bounds.y) catch return null;
+            const physical_pointer_x = scale.physicalEdge(relative_pointer_x) catch return null;
+            const physical_pointer_y = scale.physicalEdge(relative_pointer_y) catch return null;
             return .{
                 .info = .{
                     .position = .{
@@ -4097,11 +4103,20 @@ pub fn Coordinator(comptime protocol: type) type {
             };
         }
 
-        fn physicalSceneRect(self: *const Self, rect: geometry.Rect) ?geometry.Rect {
-            const output_bounds = self.outputBounds() catch return null;
-            const scale = geometry.OutputScale.init(
-                self.output_management_adapter.lifecycle.current.scale_120,
+        fn physicalSceneRect(self: *Self, rect: geometry.Rect) ?geometry.Rect {
+            return self.physicalSceneRectFor(rect, self.primaryPhysicalOutput());
+        }
+
+        fn physicalSceneRectFor(
+            self: *Self,
+            rect: geometry.Rect,
+            physical_output: *const PhysicalOutput,
+        ) ?geometry.Rect {
+            const output_bounds = self.outputBoundsFor(physical_output) catch return null;
+            const head = self.output_management_adapter.lifecycle.currentHead(
+                physical_output.management_head,
             ) catch return null;
+            const scale = geometry.OutputScale.init(head.scale_120) catch return null;
             const physical = scaleRenderRect(.{
                 .x = rect.x,
                 .y = rect.y,
