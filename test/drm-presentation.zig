@@ -723,7 +723,7 @@ test "generated session lock publishes only after presentation and client loss s
     try std.testing.expectEqual(@as(usize, 1), handler.locked);
     try std.testing.expectEqual(@as(usize, 0), handler.finished);
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
-    try std.testing.expectEqual(@as(usize, 1), coordinator.stats.presented);
+    try std.testing.expectEqual(@as(usize, 2), coordinator.stats.presented);
     try std.testing.expect(coordinator.session_lock_adapter.isFailClosed());
     const lock_ids = try coordinator.session_lock_adapter.surfaceIds(coordinator.lock_surface_ids);
     try std.testing.expectEqual(@as(usize, 1), lock_ids.len);
@@ -2476,6 +2476,9 @@ const LeaseClientHandler = struct {
 pub const SessionCommand = enum { enable, disable };
 
 pub const Fixture = struct {
+    const AtomicRequest = struct { crtc: u32 = 0 };
+    const PendingFlip = struct { userdata: ?*anyopaque = null, crtc: u32 = 0 };
+
     session_fd: linux.fd_t,
     drm_fd: linux.fd_t,
     hotplug_fd: linux.fd_t,
@@ -2491,9 +2494,9 @@ pub const Fixture = struct {
     output_bo_destroyed: usize = 0,
     framebuffer_removed: usize = 0,
     framebuffer_removal_before_bo: bool = false,
-    requests: [12]u8 = .{0} ** 12,
+    requests: [12]AtomicRequest = .{AtomicRequest{}} ** 12,
     request_count: usize = 0,
-    flip_userdata: [4]?*anyopaque = .{null} ** 4,
+    pending_flips: [4]PendingFlip = .{PendingFlip{}} ** 4,
     flip_head: usize = 0,
     flip_len: usize = 0,
     page_flips: usize = 0,
@@ -2872,13 +2875,21 @@ pub const Fixture = struct {
         (@as(*Fixture, @ptrCast(@alignCast(context)))).request_destroyed += 1;
     }
     fn resetRequest(_: *anyopaque, _: ouro.drm_atomic.Request) void {}
-    fn addProperty(_: *anyopaque, _: ouro.drm_atomic.Request, _: u32, _: u32, _: u64) !void {}
-    fn atomicCommit(context: *anyopaque, _: linux.fd_t, _: ouro.drm_atomic.Request, flags: ouro.drm_atomic.CommitFlags, userdata: ?*anyopaque) !void {
+    fn addProperty(_: *anyopaque, request: ouro.drm_atomic.Request, object: u32, _: u32, _: u64) !void {
+        if (object == 30 or object == 31)
+            (@as(*AtomicRequest, @ptrCast(@alignCast(request)))).crtc = object;
+    }
+    fn atomicCommit(context: *anyopaque, _: linux.fd_t, request: ouro.drm_atomic.Request, flags: ouro.drm_atomic.CommitFlags, userdata: ?*anyopaque) !void {
         const self: *Fixture = @ptrCast(@alignCast(context));
         if (flags.page_flip_event) {
-            if (self.flip_len == self.flip_userdata.len) return error.FlipQueueFull;
-            const index = (self.flip_head + self.flip_len) % self.flip_userdata.len;
-            self.flip_userdata[index] = userdata;
+            if (self.flip_len == self.pending_flips.len) return error.FlipQueueFull;
+            const index = (self.flip_head + self.flip_len) % self.pending_flips.len;
+            const atomic_request: *AtomicRequest = @ptrCast(@alignCast(request));
+            if (atomic_request.crtc == 0) return error.MissingCrtc;
+            self.pending_flips[index] = .{
+                .userdata = userdata,
+                .crtc = atomic_request.crtc,
+            };
             self.flip_len += 1;
             try signalFd(self.drm_fd);
         }
@@ -2888,12 +2899,14 @@ pub const Fixture = struct {
         if (self.flip_len == 0) return;
         try consumeFd(self.drm_fd);
         while (self.flip_len != 0) {
-            const userdata = self.flip_userdata[self.flip_head] orelse return error.MissingFlip;
-            self.flip_userdata[self.flip_head] = null;
-            self.flip_head = (self.flip_head + 1) % self.flip_userdata.len;
+            const flip = self.pending_flips[self.flip_head];
+            const userdata = flip.userdata orelse return error.MissingFlip;
+            if (flip.crtc == 0) return error.MissingCrtc;
+            self.pending_flips[self.flip_head] = .{};
+            self.flip_head = (self.flip_head + 1) % self.pending_flips.len;
             self.flip_len -= 1;
             self.page_flips += 1;
-            callback(userdata, 1, 2, 3000, 30);
+            callback(userdata, 1, 2, 3000, flip.crtc);
         }
     }
 };
