@@ -467,6 +467,26 @@ pub const Manager = struct {
         return result;
     }
 
+    /// Returns one claim's exact connector/CRTC/plane tuple with a requested
+    /// connector mode selected. This preserves claim ownership and does not
+    /// mutate the primary selection or KMS state.
+    pub fn claimSnapshotMode(
+        self: *const Manager,
+        claim_handle: ClaimHandle,
+        width: u32,
+        height: u32,
+        refresh_millihz: u32,
+    ) !Snapshot {
+        var result = try self.claimSnapshot(claim_handle);
+        result.selection.mode_index = try exactModeIndex(
+            result,
+            width,
+            height,
+            refresh_millihz,
+        );
+        return result;
+    }
+
     pub fn releaseScanout(self: *Manager, claim_handle: ClaimHandle) !void {
         const claim = try self.getClaim(claim_handle);
         if (claim.lease_slot != no_claim) return error.ClaimLeased;
@@ -1051,12 +1071,23 @@ test "drm: scanout claims reserve complete tuples and recycle generation safely"
 
     const claim = try manager.claimScanout(handle, candidates[1]);
     try std.testing.expectEqual(@as(u32, 21), (try manager.claimSnapshot(claim)).selectedConnector().id);
+    const secondary_mode = try manager.claimSnapshotMode(claim, 1920, 1080, 60000);
+    try std.testing.expectEqual(@as(u32, 21), secondary_mode.selectedConnector().id);
+    try std.testing.expectEqual(@as(u16, 1920), secondary_mode.selectedMode().hdisplay);
+    try std.testing.expectError(
+        error.UnsupportedMode,
+        manager.claimSnapshotMode(claim, 1280, 720, 60000),
+    );
     try std.testing.expectError(
         error.ConnectorClaimed,
         manager.claimScanout(handle, candidates[1]),
     );
     try manager.releaseScanout(claim);
     try std.testing.expectError(error.StaleClaim, manager.claimSnapshot(claim));
+    try std.testing.expectError(
+        error.StaleClaim,
+        manager.claimSnapshotMode(claim, 1920, 1080, 60000),
+    );
 
     const replacement = try manager.claimScanout(handle, candidates[1]);
     try std.testing.expect(replacement.generation != claim.generation);

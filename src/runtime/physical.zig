@@ -3480,6 +3480,15 @@ pub fn Coordinator(comptime protocol: type) type {
             return null;
         }
 
+        fn physicalOutputForManagementHead(
+            self: *const Self,
+            id: protocol_output_management.HeadId,
+        ) ?*const PhysicalOutput {
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical|
+                if (std.meta.eql(physical.management_head, id)) return physical;
+            return null;
+        }
+
         fn physicalOutputForKmsId(
             self: *const Self,
             id: output_scheduler.OutputId,
@@ -3537,12 +3546,10 @@ pub fn Coordinator(comptime protocol: type) type {
             const physical = self.primaryPhysicalOutputMutable();
             if (physical.reconfigure != null or self.output_power_transition != null) return;
             while (self.output_management_adapter.peekCommand()) |command| {
-                const supported = self.outputManagementModeSupported(command.desired);
-                const unchanged = std.meta.eql(
-                    command.desired,
-                    self.output_management_adapter.lifecycle.current,
-                );
-                if (supported and command.operation == .apply and !unchanged) {
+                const supported = self.outputManagementCommandSupported(command.heads);
+                const unchanged = self.outputManagementCommandUnchanged(command.heads);
+                const primary_changed_only = self.outputManagementPrimaryChangedOnly(command.heads);
+                if (supported and command.operation == .apply and primary_changed_only) {
                     physical.reconfigure = .{
                         .peer = command.peer,
                         .configuration = command.configuration,
@@ -3557,6 +3564,48 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.output_management_adapter.completeCommand(if (accepted) .succeeded else .failed);
                 self.markProtocol(command.peer, ProtocolReady.output_management);
             }
+        }
+
+        fn outputManagementCommandSupported(
+            self: *Self,
+            desired: []const protocol_output_management.DesiredHead,
+        ) bool {
+            if (desired.len != self.physical_output_count) return false;
+            for (desired) |head| {
+                const physical = self.physicalOutputForManagementHead(head.id) orelse return false;
+                if (physical.kms_output == null or
+                    !self.outputManagementModeSupported(physical, head.state)) return false;
+            }
+            return true;
+        }
+
+        fn outputManagementCommandUnchanged(
+            self: *Self,
+            desired: []const protocol_output_management.DesiredHead,
+        ) bool {
+            for (desired) |head| {
+                const current = self.output_management_adapter.lifecycle.currentHead(head.id) catch
+                    return false;
+                if (!std.meta.eql(head.state, current)) return false;
+            }
+            return true;
+        }
+
+        /// Until one drain transaction owns every changed KMS output, applying
+        /// more than the primary head would expose a partial configuration.
+        fn outputManagementPrimaryChangedOnly(
+            self: *Self,
+            desired: []const protocol_output_management.DesiredHead,
+        ) bool {
+            var primary_changed = false;
+            for (desired) |head| {
+                const current = self.output_management_adapter.lifecycle.currentHead(head.id) catch
+                    return false;
+                if (std.meta.eql(head.state, current)) continue;
+                if (!std.meta.eql(head.id, self.primaryPhysicalOutput().management_head)) return false;
+                primary_changed = true;
+            }
+            return primary_changed;
         }
 
         pub fn resolveOutput(
@@ -3719,6 +3768,7 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn outputManagementModeSupported(
             self: *Self,
+            physical: *const PhysicalOutput,
             desired: protocol_output_management.HeadState,
         ) bool {
             if (!desired.enabled or desired.x != 0 or desired.y != 0 or
@@ -3729,9 +3779,9 @@ pub fn Coordinator(comptime protocol: type) type {
             const scale = geometry.OutputScale.init(desired.scale_120) catch return false;
             _ = scale.logicalDimension(@intCast(desired.width)) catch return false;
             _ = scale.logicalDimension(@intCast(desired.height)) catch return false;
-            const handle = self.manager.currentHandle() orelse return false;
-            _ = self.manager.snapshotMode(
-                handle,
+            const claim = physical.claim orelse return false;
+            _ = self.manager.claimSnapshotMode(
+                claim,
                 @intCast(desired.width),
                 @intCast(desired.height),
                 @intCast(desired.refresh_millihz),
