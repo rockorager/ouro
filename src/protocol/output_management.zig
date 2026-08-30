@@ -82,12 +82,12 @@ pub fn Adapter(comptime protocol: type) type {
         const Peer = wayring.io_uring.Peer;
 
         const ManagerSlot = struct { header: slot_pool.Header = .{}, peer: Peer = undefined, resource: objects.Handle = .{ .id = 0, .generation = 0 }, version: u32 = 1, stopped: bool = false, head: ?objects.Handle = null };
-        const Child = struct { header: slot_pool.Header = .{}, manager: u32 = 0, peer: Peer = undefined, resource: ?objects.Handle = null, mode: ModeState = undefined };
+        const Child = struct { header: slot_pool.Header = .{}, manager: u32 = 0, peer: Peer = undefined, resource: ?objects.Handle = null, head: HeadId = undefined, mode: ModeState = undefined };
         const ConfigSlot = struct { header: slot_pool.Header = .{}, manager: u32 = 0, peer: Peer = undefined, resource: ?objects.Handle = null, lifecycle: ConfigurationId = undefined, config_head: ?objects.Handle = null, destroyed: bool = false };
-        const CHeadSlot = struct { header: slot_pool.Header = .{}, configuration: u32 = 0, peer: Peer = undefined, resource: ?objects.Handle = null };
+        const CHeadSlot = struct { header: slot_pool.Header = .{}, configuration: u32 = 0, peer: Peer = undefined, resource: ?objects.Handle = null, head: HeadId = undefined };
         const Kind = enum { make_head, head_name, head_description, physical_size, make_mode, mode_size, mode_refresh, mode_preferred, enabled, current_mode, position, transform, scale, make, model, adaptive_sync, done, finished, succeeded, failed, cancelled };
         const Out = struct { kind: Kind, owner: u32, mode: ?u32 = null };
-        pub const WireCommand = struct { peer: Peer, configuration: ConfigurationId, wire_configuration: ?objects.Handle, operation: Operation, serial: u32, desired: HeadState };
+        pub const WireCommand = struct { peer: Peer, configuration: ConfigurationId, wire_configuration: ?objects.Handle, operation: Operation, serial: u32, desired: HeadState, heads: []const DesiredHead };
 
         allocator: std.mem.Allocator,
         config: Config,
@@ -199,6 +199,7 @@ pub fn Adapter(comptime protocol: type) type {
             const h = try self.heads.acquire();
             h.manager = m.header.index;
             h.peer = binding.peer;
+            h.head = self.lifecycle.primary;
             for ([_]Kind{ .make_head, .head_name, .head_description, .physical_size }) |k| {
                 if (k == .physical_size and self.config.physical_width_mm == null) continue;
                 self.outbound.appendAssumeCapacity(.{ .kind = k, .owner = m.header.index });
@@ -207,6 +208,7 @@ pub fn Adapter(comptime protocol: type) type {
                 const mode = try self.modes.acquire();
                 mode.manager = m.header.index;
                 mode.peer = binding.peer;
+                mode.head = self.lifecycle.primary;
                 mode.mode = state;
                 for ([_]Kind{ .make_mode, .mode_size, .mode_refresh, .mode_preferred }) |k| {
                     if (k == .mode_preferred and !state.preferred) continue;
@@ -221,7 +223,7 @@ pub fn Adapter(comptime protocol: type) type {
         }
         pub fn publish(self: *Self, state: HeadState) !u32 {
             try self.ensureOutbound(self.synchronizeCount());
-            self.lifecycle.current = state;
+            try self.lifecycle.publishHead(self.lifecycle.primary, state);
             self.lifecycle.serial +%= 1;
             if (self.lifecycle.serial == 0) self.lifecycle.serial = 1;
             self.queueSynchronization();
@@ -250,7 +252,7 @@ pub fn Adapter(comptime protocol: type) type {
         pub fn peekCommand(self: *Self) ?WireCommand {
             const c = self.lifecycle.peek() orelse return null;
             const w = self.findConfig(c.id);
-            return .{ .peer = w.?.peer, .configuration = c.id, .wire_configuration = w.?.resource, .operation = c.operation, .serial = c.serial, .desired = c.desired };
+            return .{ .peer = w.?.peer, .configuration = c.id, .wire_configuration = w.?.resource, .operation = c.operation, .serial = c.serial, .desired = c.desired, .heads = c.heads };
         }
         pub fn completeCommand(self: *Self, result: Completion) !void {
             const cmd = self.lifecycle.peek() orelse return error.NoPendingCommand;
@@ -321,19 +323,22 @@ pub fn Adapter(comptime protocol: type) type {
                 const d = try wayring.server.decodeRequest(ConfigurationWire, server_objects, message, fds);
                 switch (d.value) {
                     .enable_head => |v| {
-                        if (!self.validHead(c, server_objects, v.head)) return try self.protocolError(actor, d.handle.id, 1, "head belongs to another manager");
-                        self.lifecycle.enable(c.lifecycle) catch |e| return try self.configError(actor, d.handle.id, e);
+                        const selected = self.validHead(c, server_objects, v.head) orelse
+                            return try self.protocolError(actor, d.handle.id, 1, "head belongs to another manager");
+                        self.lifecycle.enableHead(c.lifecycle, selected.head) catch |e| return try self.configError(actor, d.handle.id, e);
                         const ch = try self.config_heads.acquire();
                         errdefer self.config_heads.release(ch);
                         ch.configuration = c.header.index;
                         ch.peer = peer;
+                        ch.head = selected.head;
                         const made = try ConfigurationWire.admit_enable_head(server_objects, d.handle, v, .{ .id = ch });
                         ch.resource = made.id;
                         c.config_head = made.id;
                     },
                     .disable_head => |v| {
-                        if (!self.validHead(c, server_objects, v.head)) return try self.protocolError(actor, d.handle.id, 1, "invalid head");
-                        self.lifecycle.disable(c.lifecycle) catch |e| return try self.configError(actor, d.handle.id, e);
+                        const selected = self.validHead(c, server_objects, v.head) orelse
+                            return try self.protocolError(actor, d.handle.id, 1, "invalid head");
+                        self.lifecycle.disableHead(c.lifecycle, selected.head) catch |e| return try self.configError(actor, d.handle.id, e);
                     },
                     .apply => try self.submit(c, .apply),
                     .@"test" => try self.submit(c, .@"test"),
@@ -348,14 +353,14 @@ pub fn Adapter(comptime protocol: type) type {
                 const c = self.configurations.at(ch.configuration) orelse return null;
                 const d = try wayring.server.decodeRequest(ConfigurationHead, server_objects, message, fds);
                 switch (d.value) {
-                    .set_mode => |v| if (self.validMode(c, server_objects, v.mode)) |mode| try self.lifecycle.setMode(c.lifecycle, mode.mode.width, mode.mode.height, mode.mode.refresh_millihz) else return try self.protocolError(actor, d.handle.id, 2, "invalid mode"),
-                    .set_custom_mode => |v| self.lifecycle.setMode(c.lifecycle, v.width, v.height, v.refresh) catch |e| return try self.headError(actor, d.handle.id, e),
-                    .set_position => |v| try self.lifecycle.setPosition(c.lifecycle, v.x, v.y),
-                    .set_transform => |v| self.lifecycle.setTransform(c.lifecycle, @intCast(v.transform.value)) catch |e| return try self.headError(actor, d.handle.id, e),
-                    .set_scale => |v| self.lifecycle.setScale120(c.lifecycle, if (v.scale > 0) @intCast(@divTrunc(@as(i64, v.scale) * 120, 256)) else 0) catch |e| return try self.headError(actor, d.handle.id, e),
+                    .set_mode => |v| if (self.validMode(c, ch.head, server_objects, v.mode)) |mode| try self.lifecycle.setHeadMode(c.lifecycle, ch.head, mode.mode.width, mode.mode.height, mode.mode.refresh_millihz) else return try self.protocolError(actor, d.handle.id, 2, "invalid mode"),
+                    .set_custom_mode => |v| self.lifecycle.setHeadMode(c.lifecycle, ch.head, v.width, v.height, v.refresh) catch |e| return try self.headError(actor, d.handle.id, e),
+                    .set_position => |v| try self.lifecycle.setHeadPosition(c.lifecycle, ch.head, v.x, v.y),
+                    .set_transform => |v| self.lifecycle.setHeadTransform(c.lifecycle, ch.head, @intCast(v.transform.value)) catch |e| return try self.headError(actor, d.handle.id, e),
+                    .set_scale => |v| self.lifecycle.setHeadScale120(c.lifecycle, ch.head, if (v.scale > 0) @intCast(@divTrunc(@as(i64, v.scale) * 120, 256)) else 0) catch |e| return try self.headError(actor, d.handle.id, e),
                     .set_adaptive_sync => |v| {
                         if (v.state.value > 1) return try self.protocolError(actor, d.handle.id, 6, "invalid adaptive sync");
-                        try self.lifecycle.setAdaptiveSync(c.lifecycle, v.state.value == 1);
+                        try self.lifecycle.setHeadAdaptiveSync(c.lifecycle, ch.head, v.state.value == 1);
                     },
                 }
                 try d.finish(protocol, server_objects, &actor.transmit);
@@ -511,17 +516,21 @@ pub fn Adapter(comptime protocol: type) type {
             for (self.configurations.entries.items) |c| if (c.header.active and samePeer(c.peer, peer)) self.destroyConfig(c);
             for (self.managers.entries.items) |m| if (m.header.active and samePeer(m.peer, peer)) self.releaseManager(m);
         }
-        fn validHead(self: *Self, c: *ConfigSlot, so: anytype, id: u32) bool {
-            const h = so.namespace.lookupHandle(id) orelse return false;
-            const obj = so.namespace.resolve(h) orelse return false;
-            const x = self.heads.fromContext(obj.context) orelse return false;
-            return obj.interface == &Head.info and x.manager == c.manager and samePeer(x.peer, c.peer) and x.resource != null and std.meta.eql(x.resource.?, h);
+        fn validHead(self: *Self, c: *ConfigSlot, so: anytype, id: u32) ?*Child {
+            const h = so.namespace.lookupHandle(id) orelse return null;
+            const obj = so.namespace.resolve(h) orelse return null;
+            const x = self.heads.fromContext(obj.context) orelse return null;
+            if (obj.interface != &Head.info or x.manager != c.manager or
+                !samePeer(x.peer, c.peer) or x.resource == null or
+                !std.meta.eql(x.resource.?, h)) return null;
+            return x;
         }
-        fn validMode(self: *Self, c: *ConfigSlot, so: anytype, id: u32) ?*Child {
+        fn validMode(self: *Self, c: *ConfigSlot, head: HeadId, so: anytype, id: u32) ?*Child {
             const h = so.namespace.lookupHandle(id) orelse return null;
             const obj = so.namespace.resolve(h) orelse return null;
             const x = self.modes.fromContext(obj.context) orelse return null;
             if (obj.interface != &Mode.info or x.manager != c.manager or
+                !std.meta.eql(x.head, head) or
                 !samePeer(x.peer, c.peer) or x.resource == null or
                 !std.meta.eql(x.resource.?, h)) return null;
             return x;
@@ -695,6 +704,11 @@ pub const Lifecycle = struct {
     }
     pub fn currentHead(self: *Lifecycle, id: HeadId) !HeadState {
         return (try self.getHead(id)).current;
+    }
+    pub fn publishHead(self: *Lifecycle, id: HeadId, state: HeadState) !void {
+        const head = try self.getHead(id);
+        head.current = state;
+        if (std.meta.eql(id, self.primary)) self.current = state;
     }
     pub fn enable(self: *Lifecycle, id: ConfigurationId) !void {
         return self.enableHead(id, self.primary);
