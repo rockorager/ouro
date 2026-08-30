@@ -65,7 +65,16 @@ pub const Config = struct {
     }
 };
 
-/// Wayring transport for Ouro's current singleton physical output.  Wire
+pub const HeadInfo = struct {
+    name: []const u8,
+    description: []const u8,
+    make: ?[]const u8 = null,
+    model: ?[]const u8 = null,
+    physical_width_mm: ?i32 = null,
+    physical_height_mm: ?i32 = null,
+};
+
+/// Wayring transport for compositor-owned physical output inventory. Wire
 /// objects are per-manager: in particular a head or mode from one binding can
 /// never be used by another binding, even when both belong to one client.
 pub fn Adapter(comptime protocol: type) type {
@@ -81,20 +90,18 @@ pub fn Adapter(comptime protocol: type) type {
         const ConfigurationHead = protocol.zwlr_output_configuration_head_v1;
         const Peer = wayring.io_uring.Peer;
 
-        const ManagerSlot = struct { header: slot_pool.Header = .{}, peer: Peer = undefined, resource: objects.Handle = .{ .id = 0, .generation = 0 }, version: u32 = 1, stopped: bool = false, head: ?objects.Handle = null };
-        const Child = struct { header: slot_pool.Header = .{}, manager: u32 = 0, peer: Peer = undefined, resource: ?objects.Handle = null, head: HeadId = undefined, mode: ModeState = undefined };
+        const ManagerSlot = struct { header: slot_pool.Header = .{}, peer: Peer = undefined, resource: objects.Handle = .{ .id = 0, .generation = 0 }, version: u32 = 1, stopped: bool = false };
+        const Child = struct { header: slot_pool.Header = .{}, manager: u32 = 0, peer: Peer = undefined, resource: ?objects.Handle = null, head: HeadId = undefined, mode: ModeState = undefined, retired: bool = false };
         const ConfigSlot = struct { header: slot_pool.Header = .{}, manager: u32 = 0, peer: Peer = undefined, resource: ?objects.Handle = null, lifecycle: ConfigurationId = undefined, config_head: ?objects.Handle = null, destroyed: bool = false };
         const CHeadSlot = struct { header: slot_pool.Header = .{}, configuration: u32 = 0, peer: Peer = undefined, resource: ?objects.Handle = null, head: HeadId = undefined };
-        const Kind = enum { make_head, head_name, head_description, physical_size, make_mode, mode_size, mode_refresh, mode_preferred, enabled, current_mode, position, transform, scale, make, model, adaptive_sync, done, finished, succeeded, failed, cancelled };
-        const Out = struct { kind: Kind, owner: u32, mode: ?u32 = null };
+        const Kind = enum { make_head, head_name, head_description, physical_size, make_mode, mode_size, mode_refresh, mode_preferred, enabled, current_mode, position, transform, scale, make, model, adaptive_sync, done, head_finished, finished, succeeded, failed, cancelled };
+        const Out = struct { kind: Kind, owner: u32, head: ?u32 = null, mode: ?u32 = null };
+        const InventoryHead = struct { id: HeadId, name: []u8, description: []u8, make: ?[]u8, model: ?[]u8, physical_width_mm: ?i32, physical_height_mm: ?i32, modes: []ModeState };
         pub const WireCommand = struct { peer: Peer, configuration: ConfigurationId, wire_configuration: ?objects.Handle, operation: Operation, serial: u32, desired: HeadState, heads: []const DesiredHead };
 
         allocator: std.mem.Allocator,
         config: Config,
-        name: []u8,
-        description: []u8,
-        make: ?[]u8,
-        model: ?[]u8,
+        inventory: std.ArrayListUnmanaged(InventoryHead) = .empty,
         mode_inventory: []ModeState,
         mode_count: usize,
         managers: slot_pool.Pool(ManagerSlot),
@@ -135,21 +142,29 @@ pub fn Adapter(comptime protocol: type) type {
                 .refresh_millihz = state.refresh_millihz,
                 .preferred = true,
             };
-            return .{ .allocator = allocator, .config = c, .name = name, .description = description, .make = make, .model = model, .mode_inventory = mode_inventory, .mode_count = 1, .managers = managers, .heads = heads, .modes = modes, .configurations = configurations, .config_heads = config_heads, .lifecycle = try .init(allocator, c.configuration_capacity, serial, state) };
+            var lifecycle = try Lifecycle.init(allocator, c.configuration_capacity, serial, state);
+            errdefer lifecycle.deinit();
+            var self: Self = .{ .allocator = allocator, .config = c, .mode_inventory = mode_inventory, .mode_count = 1, .managers = managers, .heads = heads, .modes = modes, .configurations = configurations, .config_heads = config_heads, .lifecycle = lifecycle };
+            try self.inventory.append(allocator, .{ .id = lifecycle.primary, .name = name, .description = description, .make = make, .model = model, .physical_width_mm = c.physical_width_mm, .physical_height_mm = c.physical_height_mm, .modes = mode_inventory[0..1] });
+            return self;
         }
         pub fn deinit(self: *Self) void {
             self.outbound.deinit(self.allocator);
-            self.lifecycle.deinit();
             self.config_heads.deinit();
             self.configurations.deinit();
             self.modes.deinit();
             self.heads.deinit();
             self.managers.deinit();
-            if (self.model) |value| self.allocator.free(value);
-            if (self.make) |value| self.allocator.free(value);
+            for (self.inventory.items) |item| {
+                if (!std.meta.eql(item.id, self.lifecycle.primary)) self.allocator.free(item.modes);
+                if (item.model) |value| self.allocator.free(value);
+                if (item.make) |value| self.allocator.free(value);
+                self.allocator.free(item.description);
+                self.allocator.free(item.name);
+            }
+            self.inventory.deinit(self.allocator);
             self.allocator.free(self.mode_inventory);
-            self.allocator.free(self.description);
-            self.allocator.free(self.name);
+            self.lifecycle.deinit();
             self.* = undefined;
         }
         pub fn install(self: *Self, runtime: *Runtime) !objects.Handle {
@@ -178,16 +193,12 @@ pub fn Adapter(comptime protocol: type) type {
                 return error.ModeInventoryInUse;
             @memcpy(self.mode_inventory[0..inventory.len], inventory);
             self.mode_count = inventory.len;
+            self.inventory.items[0].modes = self.mode_inventory[0..inventory.len];
         }
         fn bind(ctx: ?*anyopaque, binding: wayring.server.Binding) !?*anyopaque {
             const self: *Self = @ptrCast(@alignCast(ctx orelse return error.InvalidContext));
-            var needed: usize = 9 + try std.math.mul(usize, self.mode_count, 3);
-            for (self.mode_inventory[0..self.mode_count]) |mode|
-                needed += @intFromBool(mode.preferred);
-            needed += @intFromBool(self.config.physical_width_mm != null);
-            needed += @intFromBool(binding.version >= 2 and self.config.make != null);
-            needed += @intFromBool(binding.version >= 2 and self.config.model != null);
-            needed += @intFromBool(binding.version >= 4);
+            var needed: usize = 1;
+            for (self.inventory.items) |*item| needed += self.snapshotCount(item, binding.version);
             try self.ensureOutbound(needed);
             const outbound_start = self.outbound.items.len;
             errdefer self.outbound.items.len = outbound_start;
@@ -196,30 +207,104 @@ pub fn Adapter(comptime protocol: type) type {
             m.peer = binding.peer;
             m.resource = binding.resource;
             m.version = binding.version;
-            const h = try self.heads.acquire();
-            h.manager = m.header.index;
-            h.peer = binding.peer;
-            h.head = self.lifecycle.primary;
-            for ([_]Kind{ .make_head, .head_name, .head_description, .physical_size }) |k| {
-                if (k == .physical_size and self.config.physical_width_mm == null) continue;
-                self.outbound.appendAssumeCapacity(.{ .kind = k, .owner = m.header.index });
-            }
-            for (self.mode_inventory[0..self.mode_count]) |state| {
-                const mode = try self.modes.acquire();
-                mode.manager = m.header.index;
-                mode.peer = binding.peer;
-                mode.head = self.lifecycle.primary;
-                mode.mode = state;
-                for ([_]Kind{ .make_mode, .mode_size, .mode_refresh, .mode_preferred }) |k| {
-                    if (k == .mode_preferred and !state.preferred) continue;
-                    self.outbound.appendAssumeCapacity(.{ .kind = k, .owner = m.header.index, .mode = mode.header.index });
-                }
-            }
-            for ([_]Kind{ .enabled, .current_mode, .position, .transform, .scale, .make, .model, .adaptive_sync, .done }) |k| {
-                if (k == .physical_size and self.config.physical_width_mm == null or k == .make and (binding.version < 2 or self.config.make == null) or k == .model and (binding.version < 2 or self.config.model == null) or k == .adaptive_sync and binding.version < 4) continue;
-                self.outbound.appendAssumeCapacity(.{ .kind = k, .owner = m.header.index });
-            }
+            for (self.inventory.items) |*item| try self.queueSnapshot(m, item);
+            self.outbound.appendAssumeCapacity(.{ .kind = .done, .owner = m.header.index });
             return m;
+        }
+        pub fn addHead(self: *Self, info: HeadInfo, modes_: []const ModeState, state: HeadState) !HeadId {
+            try validateHeadInfo(info);
+            try validateModes(modes_, state);
+            var needed: usize = 0;
+            for (self.managers.entries.items) |m| {
+                if (m.header.active and !m.stopped) needed += self.snapshotCountRaw(info, modes_, m.version) + 1;
+            }
+            try self.ensureOutbound(needed);
+            try self.inventory.ensureUnusedCapacity(self.allocator, 1);
+            var inserted = false;
+            const modes = try self.allocator.dupe(ModeState, modes_);
+            errdefer if (!inserted) self.allocator.free(modes);
+            const name = try self.allocator.dupe(u8, info.name);
+            errdefer if (!inserted) self.allocator.free(name);
+            const description = try self.allocator.dupe(u8, info.description);
+            errdefer if (!inserted) self.allocator.free(description);
+            const make = if (info.make) |v| try self.allocator.dupe(u8, v) else null;
+            errdefer if (!inserted) if (make) |v| self.allocator.free(v);
+            const model = if (info.model) |v| try self.allocator.dupe(u8, v) else null;
+            errdefer if (!inserted) if (model) |v| self.allocator.free(v);
+            const id = try self.lifecycle.addHead(state);
+            errdefer if (!inserted) self.lifecycle.removeHead(id) catch {};
+            const outbound_start = self.outbound.items.len;
+            self.inventory.appendAssumeCapacity(.{ .id = id, .name = name, .description = description, .make = make, .model = model, .physical_width_mm = info.physical_width_mm, .physical_height_mm = info.physical_height_mm, .modes = modes });
+            inserted = true;
+            errdefer {
+                self.outbound.items.len = outbound_start;
+                for (self.heads.entries.items) |h|
+                    if (h.header.active and std.meta.eql(h.head, id)) self.retireWireHead(h);
+                const removed = self.inventory.pop().?;
+                self.allocator.free(removed.modes);
+                if (removed.model) |v| self.allocator.free(v);
+                if (removed.make) |v| self.allocator.free(v);
+                self.allocator.free(removed.description);
+                self.allocator.free(removed.name);
+                self.lifecycle.removeHead(id) catch {};
+            }
+            for (self.managers.entries.items) |m| if (m.header.active and !m.stopped) {
+                try self.queueSnapshot(m, &self.inventory.items[self.inventory.items.len - 1]);
+                self.outbound.appendAssumeCapacity(.{ .kind = .done, .owner = m.header.index });
+            };
+            return id;
+        }
+        pub fn publishHead(self: *Self, id: HeadId, state: HeadState) !u32 {
+            _ = self.findInventory(id) orelse return error.InvalidHead;
+            try self.ensureOutbound(self.synchronizeHeadCount(id));
+            try self.lifecycle.publishHead(id, state);
+            self.lifecycle.serial +%= 1;
+            if (self.lifecycle.serial == 0) self.lifecycle.serial = 1;
+            self.queueHeadSynchronization(id);
+            return self.lifecycle.serial;
+        }
+        pub fn synchronizeHead(self: *Self, id: HeadId) !void {
+            _ = self.findInventory(id) orelse return error.InvalidHead;
+            try self.ensureOutbound(self.synchronizeHeadCount(id));
+            self.queueHeadSynchronization(id);
+        }
+        pub fn removeHead(self: *Self, id: HeadId) !void {
+            const index = self.findInventoryIndex(id) orelse return error.InvalidHead;
+            if (std.meta.eql(id, self.lifecycle.primary)) return error.PrimaryHead;
+            _ = try self.lifecycle.currentHead(id);
+            var additional: usize = 0;
+            var removable: usize = 0;
+            for (self.managers.entries.items) |m| {
+                if (!m.header.active) continue;
+                const h = self.findWireHead(m.header.index, id) orelse continue;
+                removable += self.queuedHeadEventCount(m.header.index, h.header.index);
+                if (!m.stopped) additional += 1 + @as(usize, @intFromBool(h.resource != null));
+            }
+            if (additional > self.config.outbound_capacity -| (self.outbound.items.len - removable))
+                return error.Exhausted;
+            try self.outbound.ensureUnusedCapacity(self.allocator, additional);
+            try self.lifecycle.removeHead(id);
+            const removed = self.inventory.orderedRemove(index);
+            for (self.managers.entries.items) |m| {
+                if (!m.header.active) continue;
+                const h = self.findWireHead(m.header.index, id) orelse continue;
+                self.removeQueuedHeadEvents(m.header.index, h.header.index);
+                if (m.stopped) {
+                    if (h.resource == null) self.retireWireHead(h);
+                    continue;
+                }
+                if (h.resource != null) {
+                    self.outbound.appendAssumeCapacity(.{ .kind = .head_finished, .owner = m.header.index, .head = h.header.index });
+                } else {
+                    self.retireWireHead(h);
+                }
+                self.outbound.appendAssumeCapacity(.{ .kind = .done, .owner = m.header.index });
+            }
+            self.allocator.free(removed.modes);
+            if (removed.model) |v| self.allocator.free(v);
+            if (removed.make) |v| self.allocator.free(v);
+            self.allocator.free(removed.description);
+            self.allocator.free(removed.name);
         }
         pub fn publish(self: *Self, state: HeadState) !u32 {
             try self.ensureOutbound(self.synchronizeCount());
@@ -236,17 +321,45 @@ pub fn Adapter(comptime protocol: type) type {
         fn synchronizeCount(self: *const Self) usize {
             var needed: usize = 0;
             for (self.managers.entries.items) |m| {
-                if (m.header.active and !m.stopped)
-                    needed += if (m.version >= 4) 7 else 6;
+                if (!m.header.active or m.stopped) continue;
+                for (self.inventory.items) |item| {
+                    if (self.findWireHead(m.header.index, item.id) != null) {
+                        needed += if (m.version >= 4) 6 else 5;
+                    }
+                }
+                needed += 1;
             }
             return needed;
         }
         fn queueSynchronization(self: *Self) void {
             for (self.managers.entries.items) |m| {
                 if (!m.header.active or m.stopped) continue;
-                for ([_]Kind{ .enabled, .current_mode, .position, .transform, .scale, .adaptive_sync, .done }) |k| {
-                    if (k != .adaptive_sync or m.version >= 4) self.outbound.appendAssumeCapacity(.{ .kind = k, .owner = m.header.index });
+                for (self.inventory.items) |item| {
+                    const h = self.findWireHead(m.header.index, item.id) orelse continue;
+                    for ([_]Kind{ .enabled, .current_mode, .position, .transform, .scale, .adaptive_sync }) |k|
+                        if (k != .adaptive_sync or m.version >= 4) self.outbound.appendAssumeCapacity(.{
+                            .kind = k,
+                            .owner = m.header.index,
+                            .head = h.header.index,
+                        });
                 }
+                self.outbound.appendAssumeCapacity(.{ .kind = .done, .owner = m.header.index });
+            }
+        }
+        fn synchronizeHeadCount(self: *const Self, id: HeadId) usize {
+            var needed: usize = 0;
+            for (self.managers.entries.items) |m| {
+                if (m.header.active and !m.stopped and self.findWireHead(m.header.index, id) != null) needed += if (m.version >= 4) 7 else 6;
+            }
+            return needed;
+        }
+        fn queueHeadSynchronization(self: *Self, id: HeadId) void {
+            for (self.managers.entries.items) |m| {
+                if (!m.header.active or m.stopped) continue;
+                const h = self.findWireHead(m.header.index, id) orelse continue;
+                for ([_]Kind{ .enabled, .current_mode, .position, .transform, .scale, .adaptive_sync }) |k|
+                    if (k != .adaptive_sync or m.version >= 4) self.outbound.appendAssumeCapacity(.{ .kind = k, .owner = m.header.index, .head = h.header.index });
+                self.outbound.appendAssumeCapacity(.{ .kind = .done, .owner = m.header.index });
             }
         }
         pub fn peekCommand(self: *Self) ?WireCommand {
@@ -403,6 +516,102 @@ pub fn Adapter(comptime protocol: type) type {
             try self.outbound.ensureUnusedCapacity(self.allocator, additional);
         }
 
+        fn snapshotCountRaw(self: *const Self, info: HeadInfo, modes: []const ModeState, version: u32) usize {
+            _ = self;
+            var count: usize = 8 + modes.len * 3;
+            for (modes) |mode| count += @intFromBool(mode.preferred);
+            count += @intFromBool(info.physical_width_mm != null);
+            count += @intFromBool(version >= 2 and info.make != null);
+            count += @intFromBool(version >= 2 and info.model != null);
+            count += @intFromBool(version >= 4);
+            return count;
+        }
+        fn snapshotCount(self: *const Self, item: *const InventoryHead, version: u32) usize {
+            return self.snapshotCountRaw(.{ .name = item.name, .description = item.description, .make = item.make, .model = item.model, .physical_width_mm = item.physical_width_mm, .physical_height_mm = item.physical_height_mm }, item.modes, version);
+        }
+        fn queueSnapshot(self: *Self, m: *ManagerSlot, item: *const InventoryHead) !void {
+            const h = try self.heads.acquire();
+            h.manager = m.header.index;
+            h.peer = m.peer;
+            h.head = item.id;
+            for ([_]Kind{ .make_head, .head_name, .head_description, .physical_size }) |k| {
+                if (k == .physical_size and item.physical_width_mm == null) continue;
+                self.outbound.appendAssumeCapacity(.{ .kind = k, .owner = m.header.index, .head = h.header.index });
+            }
+            for (item.modes) |state| {
+                const mode = try self.modes.acquire();
+                mode.manager = m.header.index;
+                mode.peer = m.peer;
+                mode.head = item.id;
+                mode.mode = state;
+                for ([_]Kind{ .make_mode, .mode_size, .mode_refresh, .mode_preferred }) |k| {
+                    if (k == .mode_preferred and !state.preferred) continue;
+                    self.outbound.appendAssumeCapacity(.{ .kind = k, .owner = m.header.index, .head = h.header.index, .mode = mode.header.index });
+                }
+            }
+            for ([_]Kind{ .enabled, .current_mode, .position, .transform, .scale, .make, .model, .adaptive_sync }) |k| {
+                if (k == .make and (m.version < 2 or item.make == null) or k == .model and (m.version < 2 or item.model == null) or k == .adaptive_sync and m.version < 4) continue;
+                self.outbound.appendAssumeCapacity(.{ .kind = k, .owner = m.header.index, .head = h.header.index });
+            }
+        }
+        fn findInventoryIndex(self: *const Self, id: HeadId) ?usize {
+            for (self.inventory.items, 0..) |item, i| if (std.meta.eql(item.id, id)) return i;
+            return null;
+        }
+        fn findInventory(self: *const Self, id: HeadId) ?*const InventoryHead {
+            const i = self.findInventoryIndex(id) orelse return null;
+            return &self.inventory.items[i];
+        }
+        fn findWireHead(self: *const Self, manager: u32, id: HeadId) ?*Child {
+            for (self.heads.entries.items) |h| if (h.header.active and h.manager == manager and std.meta.eql(h.head, id)) return h;
+            return null;
+        }
+        fn retireWireHead(self: *Self, h: *Child) void {
+            for (self.modes.entries.items) |m| if (m.header.active and m.manager == h.manager and std.meta.eql(m.head, h.head)) self.modes.release(m);
+            self.heads.release(h);
+        }
+        fn markWireHeadFinished(self: *Self, h: *Child) void {
+            h.retired = true;
+            for (self.modes.entries.items) |mode| {
+                if (mode.header.active and mode.manager == h.manager and std.meta.eql(mode.head, h.head)) {
+                    mode.retired = true;
+                }
+            }
+        }
+        fn queuedHeadEventCount(self: *const Self, manager: u32, head: u32) usize {
+            var count: usize = 0;
+            for (self.outbound.items) |event|
+                count += @intFromBool(event.owner == manager and event.head == head);
+            return count;
+        }
+        fn removeQueuedHeadEvents(self: *Self, manager: u32, head: u32) void {
+            var index: usize = 0;
+            while (index < self.outbound.items.len) {
+                const event = self.outbound.items[index];
+                if (event.owner == manager and event.head == head) {
+                    _ = self.outbound.orderedRemove(index);
+                } else {
+                    index += 1;
+                }
+            }
+        }
+        fn validateHeadInfo(info: HeadInfo) !void {
+            if ((info.physical_width_mm == null) != (info.physical_height_mm == null)) return error.InvalidConfig;
+            if (info.physical_width_mm) |w| if (w <= 0 or info.physical_height_mm.? <= 0) return error.InvalidConfig;
+            inline for (.{ info.name, info.description }) |s| if (std.mem.indexOfScalar(u8, s, 0) != null) return error.InvalidConfig;
+            inline for (.{ info.make, info.model }) |v| if (v) |s| if (std.mem.indexOfScalar(u8, s, 0) != null) return error.InvalidConfig;
+        }
+        fn validateModes(modes: []const ModeState, state: HeadState) !void {
+            if (modes.len == 0) return error.InvalidModeInventory;
+            var current = false;
+            for (modes, 0..) |mode, i| {
+                try mode.validate();
+                current = current or mode.matches(state);
+                for (modes[0..i]) |previous| if (previous.sameTiming(mode)) return error.DuplicateMode;
+            }
+            if (!current) return error.CurrentModeMissing;
+        }
+
         pub fn flushOn(self: *Self, peer: Peer, server_objects: anytype, queue: *wayring.tx.Queue) !usize {
             var sent: usize = 0;
             var i: usize = 0;
@@ -439,17 +648,24 @@ pub fn Adapter(comptime protocol: type) type {
             }
             const m = self.managers.at(o.owner) orelse return;
             if (o.kind == .finished) return Manager.encodeEvent(q, m.resource.id, .{ .finished = .{} });
-            const h = self.managerChild(&self.heads, o.owner) orelse return;
-            const s = self.lifecycle.current;
+            if (o.kind == .done) return Manager.encodeEvent(q, m.resource.id, .{ .done = .{ .serial = self.lifecycle.serial } });
+            const h = self.headChild(o) orelse return;
+            const item = self.findInventory(h.head);
+            if (o.kind == .head_finished) {
+                try Head.encodeEvent(q, h.resource.?.id, .{ .finished = .{} });
+                self.markWireHeadFinished(h);
+                return;
+            }
+            const metadata = item orelse return;
+            const s = self.lifecycle.currentHead(h.head) catch return;
             switch (o.kind) {
                 .make_head => {
                     const made = try Manager.construct_event_head(protocol, so, q, m.resource, .{ .head = .{ .context = h } });
                     h.resource = made.head;
-                    m.head = made.head;
                 },
-                .head_name => try Head.encodeEvent(q, h.resource.?.id, .{ .name = .{ .name = self.name } }),
-                .head_description => try Head.encodeEvent(q, h.resource.?.id, .{ .description = .{ .description = self.description } }),
-                .physical_size => try Head.encodeEvent(q, h.resource.?.id, .{ .physical_size = .{ .width = self.config.physical_width_mm.?, .height = self.config.physical_height_mm.? } }),
+                .head_name => try Head.encodeEvent(q, h.resource.?.id, .{ .name = .{ .name = metadata.name } }),
+                .head_description => try Head.encodeEvent(q, h.resource.?.id, .{ .description = .{ .description = metadata.description } }),
+                .physical_size => try Head.encodeEvent(q, h.resource.?.id, .{ .physical_size = .{ .width = metadata.physical_width_mm.?, .height = metadata.physical_height_mm.? } }),
                 .make_mode => {
                     const mode = self.modeChild(o) orelse return;
                     const made = try Head.construct_event_mode(protocol, so, q, h.resource.?, .{ .mode = .{ .context = mode } });
@@ -469,16 +685,15 @@ pub fn Adapter(comptime protocol: type) type {
                 },
                 .enabled => try Head.encodeEvent(q, h.resource.?.id, .{ .enabled = .{ .enabled = @intFromBool(s.enabled) } }),
                 .current_mode => if (s.enabled) {
-                    if (self.currentMode(o.owner)) |mode| if (mode.resource) |resource|
+                    if (self.currentModeFor(o.owner, h.head)) |mode| if (mode.resource) |resource|
                         try Head.encodeEvent(q, h.resource.?.id, .{ .current_mode = .{ .mode = resource.id } });
                 },
                 .position => try Head.encodeEvent(q, h.resource.?.id, .{ .position = .{ .x = s.x, .y = s.y } }),
                 .transform => try Head.encodeEvent(q, h.resource.?.id, .{ .transform = .{ .transform = .fromInt(@intCast(s.transform)) } }),
                 .scale => try Head.encodeEvent(q, h.resource.?.id, .{ .scale = .{ .scale = @intCast(@divTrunc(@as(u64, s.scale_120) * 256, 120)) } }),
-                .make => try Head.encodeEvent(q, h.resource.?.id, .{ .make = .{ .make = self.make.? } }),
-                .model => try Head.encodeEvent(q, h.resource.?.id, .{ .model = .{ .model = self.model.? } }),
+                .make => try Head.encodeEvent(q, h.resource.?.id, .{ .make = .{ .make = metadata.make.? } }),
+                .model => try Head.encodeEvent(q, h.resource.?.id, .{ .model = .{ .model = metadata.model.? } }),
                 .adaptive_sync => try Head.encodeEvent(q, h.resource.?.id, .{ .adaptive_sync = .{ .state = .fromInt(@intFromBool(s.adaptive_sync)) } }),
-                .done => try Manager.encodeEvent(q, m.resource.id, .{ .done = .{ .serial = self.lifecycle.serial } }),
                 else => unreachable,
             }
         }
@@ -521,6 +736,7 @@ pub fn Adapter(comptime protocol: type) type {
             const obj = so.namespace.resolve(h) orelse return null;
             const x = self.heads.fromContext(obj.context) orelse return null;
             if (obj.interface != &Head.info or x.manager != c.manager or
+                x.retired or
                 !samePeer(x.peer, c.peer) or x.resource == null or
                 !std.meta.eql(x.resource.?, h)) return null;
             return x;
@@ -530,6 +746,7 @@ pub fn Adapter(comptime protocol: type) type {
             const obj = so.namespace.resolve(h) orelse return null;
             const x = self.modes.fromContext(obj.context) orelse return null;
             if (obj.interface != &Mode.info or x.manager != c.manager or
+                x.retired or
                 !std.meta.eql(x.head, head) or
                 !samePeer(x.peer, c.peer) or x.resource == null or
                 !std.meta.eql(x.resource.?, h)) return null;
@@ -559,19 +776,24 @@ pub fn Adapter(comptime protocol: type) type {
             for (self.modes.entries.items) |x| if (x.header.active and x.manager == m.header.index) self.modes.release(x);
             self.managers.release(m);
         }
-        fn managerChild(self: *Self, pool: *slot_pool.Pool(Child), manager: u32) ?*Child {
-            _ = self;
-            for (pool.entries.items) |x| if (x.header.active and x.manager == manager) return x;
-            return null;
+        fn headChild(self: *Self, out: Out) ?*Child {
+            const index = out.head orelse return null;
+            const head = self.heads.at(index) orelse return null;
+            return if (head.manager == out.owner) head else null;
         }
         fn modeChild(self: *Self, out: Out) ?*Child {
             const index = out.mode orelse return null;
             const mode = self.modes.at(index) orelse return null;
             return if (mode.manager == out.owner) mode else null;
         }
-        fn currentMode(self: *Self, manager: u32) ?*Child {
+        fn currentModeFor(self: *Self, manager: u32, id: HeadId) ?*Child {
+            const state = self.lifecycle.currentHead(id) catch return null;
             for (self.modes.entries.items) |mode| if (mode.header.active and
-                mode.manager == manager and mode.mode.matches(self.lifecycle.current)) return mode;
+                mode.manager == manager and std.meta.eql(mode.head, id) and mode.mode.matches(state)) return mode;
+            return null;
+        }
+        fn currentMode(self: *Self, manager: u32) ?*Child {
+            for (self.modes.entries.items) |mode| if (mode.header.active and mode.manager == manager and mode.mode.matches(self.lifecycle.current)) return mode;
             return null;
         }
         fn ownerPeer(self: *const Self, o: Out) ?Peer {
@@ -1067,4 +1289,77 @@ test "output management binding snapshots every mode in protocol order" {
     try std.testing.expect(adapter.outbound.items[3].mode != adapter.outbound.items[7].mode);
     try std.testing.expectEqual(@as(usize, 2), adapter.modes.entries.items.len);
     try std.testing.expect(adapter.currentMode(0) == adapter.modes.entries.items[1]);
+}
+
+test "output management binds two exact heads and targets synchronization" {
+    const A = Adapter(@import("core_protocol"));
+    const primary: HeadState = .{ .width = 800, .height = 600, .refresh_millihz = 60000 };
+    const secondary_state: HeadState = .{ .width = 1024, .height = 768, .refresh_millihz = 75000, .x = 800 };
+    var adapter = try A.init(std.testing.allocator, .{ .manager_capacity = 1, .mode_capacity = 2 }, 1, primary);
+    defer adapter.deinit();
+    const secondary = try adapter.addHead(.{ .name = "second", .description = "Second output" }, &.{.{ .width = 1024, .height = 768, .refresh_millihz = 75000, .preferred = true }}, secondary_state);
+    _ = try A.bind(&adapter, .{ .peer = .{ .slot = 7, .generation = 2 }, .credentials = .{ .pid = 1, .uid = 2, .gid = 3 }, .global = .{ .id = 4, .generation = 1 }, .resource = .{ .id = 5, .generation = 2 }, .version = 4 });
+
+    try std.testing.expectEqual(@as(usize, 2), adapter.heads.entries.items.len);
+    try std.testing.expect(!std.meta.eql(adapter.heads.entries.items[0].head, adapter.heads.entries.items[1].head));
+    try std.testing.expectEqual(A.Kind.done, adapter.outbound.items[adapter.outbound.items.len - 1].kind);
+    var done_count: usize = 0;
+    for (adapter.outbound.items) |event| done_count += @intFromBool(event.kind == .done);
+    try std.testing.expectEqual(@as(usize, 1), done_count);
+
+    adapter.outbound.clearRetainingCapacity();
+    try adapter.synchronizeHead(secondary);
+    for (adapter.outbound.items[0 .. adapter.outbound.items.len - 1]) |event|
+        try std.testing.expectEqual(adapter.heads.entries.items[1].header.index, event.head.?);
+    try std.testing.expect(adapter.currentModeFor(0, secondary).?.mode.matches(secondary_state));
+
+    adapter.outbound.clearRetainingCapacity();
+    try adapter.synchronize();
+    var synchronized_done: usize = 0;
+    for (adapter.outbound.items) |event| synchronized_done += @intFromBool(event.kind == .done);
+    try std.testing.expectEqual(@as(usize, 1), synchronized_done);
+
+    adapter.outbound.clearRetainingCapacity();
+    const secondary_wire = adapter.findWireHead(0, secondary).?;
+    secondary_wire.resource = .{ .id = 99, .generation = 1 };
+    try adapter.removeHead(secondary);
+    try std.testing.expectEqual(@as(usize, 1), adapter.inventory.items.len);
+    try std.testing.expectError(error.InvalidHead, adapter.lifecycle.currentHead(secondary));
+    try std.testing.expectEqualSlices(A.Kind, &.{ .head_finished, .done }, &.{
+        adapter.outbound.items[0].kind,
+        adapter.outbound.items[1].kind,
+    });
+    try std.testing.expect(secondary_wire.header.active);
+    adapter.markWireHeadFinished(secondary_wire);
+    try std.testing.expect(secondary_wire.header.active and secondary_wire.retired);
+}
+
+test "output management live addition is outbound-capacity atomic" {
+    const A = Adapter(@import("core_protocol"));
+    const state: HeadState = .{ .width = 800, .height = 600, .refresh_millihz = 60000 };
+    var adapter = try A.init(std.testing.allocator, .{ .manager_capacity = 1, .outbound_capacity = 16 }, 1, state);
+    defer adapter.deinit();
+    _ = try A.bind(&adapter, .{ .peer = .{ .slot = 1, .generation = 1 }, .credentials = .{ .pid = 1, .uid = 2, .gid = 3 }, .global = .{ .id = 2, .generation = 1 }, .resource = .{ .id = 3, .generation = 1 }, .version = 1 });
+    const before = adapter.outbound.items.len;
+    try std.testing.expectError(error.Exhausted, adapter.addHead(.{ .name = "second", .description = "Second" }, &.{.{ .width = 800, .height = 600, .refresh_millihz = 60000 }}, state));
+    try std.testing.expectEqual(before, adapter.outbound.items.len);
+    try std.testing.expectEqual(@as(usize, 1), adapter.inventory.items.len);
+}
+
+test "output management stopped manager receives no hotplug inventory" {
+    const A = Adapter(@import("core_protocol"));
+    const state: HeadState = .{ .width = 800, .height = 600, .refresh_millihz = 60000 };
+    var adapter = try A.init(std.testing.allocator, .{ .manager_capacity = 1 }, 1, state);
+    defer adapter.deinit();
+    _ = try A.bind(&adapter, .{ .peer = .{ .slot = 1, .generation = 1 }, .credentials = .{ .pid = 1, .uid = 2, .gid = 3 }, .global = .{ .id = 2, .generation = 1 }, .resource = .{ .id = 3, .generation = 1 }, .version = 4 });
+    const manager = adapter.managers.entries.items[0];
+    manager.stopped = true;
+    adapter.outbound.clearRetainingCapacity();
+    const secondary = try adapter.addHead(
+        .{ .name = "second", .description = "Second" },
+        &.{.{ .width = 800, .height = 600, .refresh_millihz = 60000 }},
+        state,
+    );
+    try std.testing.expectEqual(@as(usize, 0), adapter.outbound.items.len);
+    try std.testing.expect(adapter.findWireHead(manager.header.index, secondary) == null);
 }
