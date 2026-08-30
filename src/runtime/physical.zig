@@ -3440,12 +3440,10 @@ pub fn Coordinator(comptime protocol: type) type {
             id: ForeignToplevelListAdapter.OutputId,
         ) ?u32 {
             const self: *Self = @ptrCast(@alignCast(context orelse return null));
-            const output = self.primaryKmsOutput() orelse return null;
-            const current = foreignOutputId(output.outputId());
-            if (!std.meta.eql(current, id)) return null;
+            const physical = self.physicalOutputForForeignId(id) orelse return null;
             var resources: [1]u32 = undefined;
             const ids = self.output_adapter.resourceIds(
-                self.primaryPhysicalOutput().protocol_output,
+                physical.protocol_output,
                 peer,
                 &resources,
             ) catch return null;
@@ -3468,6 +3466,45 @@ pub fn Coordinator(comptime protocol: type) type {
 
         pub fn primaryKmsOutput(self: *const Self) ?*output_api.Output {
             return self.primaryPhysicalOutput().kms_output;
+        }
+
+        fn physicalOutputForProtocolId(
+            self: *const Self,
+            id: OutputAdapter.OutputId,
+        ) ?*const PhysicalOutput {
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical|
+                if (std.meta.eql(physical.protocol_output, id)) return physical;
+            return null;
+        }
+
+        fn physicalOutputForKmsId(
+            self: *const Self,
+            id: output_scheduler.OutputId,
+        ) ?*const PhysicalOutput {
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical|
+                if (physical.kms_output) |output|
+                    if (std.meta.eql(output.outputId(), id)) return physical;
+            return null;
+        }
+
+        fn physicalOutputForForeignId(
+            self: *const Self,
+            id: ForeignToplevelListAdapter.OutputId,
+        ) ?*const PhysicalOutput {
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical|
+                if (physical.kms_output) |output|
+                    if (std.meta.eql(foreignOutputId(output.outputId()), id)) return physical;
+            return null;
+        }
+
+        fn physicalOutputForWorkspaceId(
+            self: *const Self,
+            id: WorkspaceAdapter.OutputId,
+        ) ?*const PhysicalOutput {
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical|
+                if (physical.kms_output) |output|
+                    if (std.meta.eql(workspaceOutputId(output.outputId()), id)) return physical;
+            return null;
         }
 
         fn syncWorkspace(self: *Self) !void {
@@ -3705,11 +3742,10 @@ pub fn Coordinator(comptime protocol: type) type {
             id: WorkspaceAdapter.OutputId,
         ) ?wayring.objects.Handle {
             const self: *Self = @ptrCast(@alignCast(context orelse return null));
-            const output = self.primaryKmsOutput() orelse return null;
-            if (!std.meta.eql(workspaceOutputId(output.outputId()), id)) return null;
+            const physical = self.physicalOutputForWorkspaceId(id) orelse return null;
             var resources: [1]u32 = undefined;
             const ids = self.output_adapter.resourceIds(
-                self.primaryPhysicalOutput().protocol_output,
+                physical.protocol_output,
                 peer,
                 &resources,
             ) catch return null;
@@ -3737,8 +3773,9 @@ pub fn Coordinator(comptime protocol: type) type {
         ) ?output_scheduler.OutputId {
             const handle = server_objects.namespace.lookupHandle(object_id) orelse return null;
             const object = server_objects.namespace.resolve(handle) orelse return null;
-            _ = self.output_adapter.reference(peer, handle, object.*) catch return null;
-            return if (self.primaryKmsOutput()) |output| output.outputId() else null;
+            const reference = self.output_adapter.reference(peer, handle, object.*) catch return null;
+            const physical = self.physicalOutputForProtocolId(reference.output) orelse return null;
+            return if (physical.kms_output) |output| output.outputId() else null;
         }
 
         fn invalidateCaptureSource(self: *Self, target: ImageCaptureSourceAdapter.Target) !void {
@@ -3783,13 +3820,10 @@ pub fn Coordinator(comptime protocol: type) type {
         ) ?ImageCopyCaptureAdapter.Constraints {
             const maybe_constraints: ?ImageCopyCaptureAdapter.Constraints = switch (target) {
                 .source => |source| switch (source) {
-                    .output => |id| if (self.primaryKmsOutput()) |output|
-                        if (std.meta.eql(output.outputId(), id)) .{
-                            .width = output.planner.output.width,
-                            .height = output.planner.output.height,
-                        } else null
-                    else
-                        null,
+                    .output => |id| if (self.physicalOutputForKmsId(id)) |physical| .{
+                        .width = physical.kms_output.?.planner.output.width,
+                        .height = physical.kms_output.?.planner.output.height,
+                    } else null,
                     .toplevel => |id| if (self.desktop.scene(id)) |scene|
                         if (self.physicalSceneRect(scene.geometry)) |physical| .{
                             .width = @intCast(physical.width),
@@ -3801,11 +3835,25 @@ pub fn Coordinator(comptime protocol: type) type {
                 .cursor => if (self.cursorCaptureState(target)) |state| state.constraints else null,
             };
             var constraints = maybe_constraints orelse return null;
-            constraints.dmabuf_device = if (self.primaryKmsOutput()) |output|
+            constraints.dmabuf_device = if (self.captureKmsOutput(target)) |output|
                 output.captureDmabufDevice(.{ .width = constraints.width, .height = constraints.height })
             else
                 null;
             return constraints;
+        }
+
+        fn captureKmsOutput(
+            self: *const Self,
+            target: ImageCopyCaptureAdapter.Target,
+        ) ?*output_api.Output {
+            const source = switch (target) {
+                .source => |value| value,
+                .cursor => |value| value.source,
+            };
+            return switch (source) {
+                .output => |id| (self.physicalOutputForKmsId(id) orelse return null).kms_output,
+                .toplevel => self.primaryKmsOutput(),
+            };
         }
 
         pub fn cursorCaptureInfo(
@@ -3839,10 +3887,9 @@ pub fn Coordinator(comptime protocol: type) type {
             } else return null;
             if (width == 0 or height == 0) return null;
             const source_region: geometry.Rect = switch (cursor_target.source) {
-                .output => |id| if (self.primaryKmsOutput()) |output|
-                    if (std.meta.eql(output.outputId(), id)) self.outputBounds() catch return null else return null
-                else
-                    return null,
+                .output => |id| self.outputBoundsFor(
+                    self.physicalOutputForKmsId(id) orelse return null,
+                ) catch return null,
                 .toplevel => |id| (self.desktop.scene(id) catch return null).geometry,
             };
             const cursor_region: geometry.Rect = .{
@@ -4597,8 +4644,8 @@ pub fn Coordinator(comptime protocol: type) type {
             const server_objects = self.root.runtime.clients.get(peer) catch return false;
             const handle = server_objects.namespace.lookupHandle(output_object) orelse return false;
             const object = server_objects.namespace.resolve(handle) orelse return false;
-            _ = self.output_adapter.reference(peer, handle, object.*) catch return false;
-            return true;
+            const reference = self.output_adapter.reference(peer, handle, object.*) catch return false;
+            return self.physicalOutputForProtocolId(reference.output) != null;
         }
 
         fn validateScreencopyOutput(
@@ -4608,8 +4655,9 @@ pub fn Coordinator(comptime protocol: type) type {
             object: wayring.objects.Object,
         ) bool {
             const self: *Self = @ptrCast(@alignCast(context orelse return false));
-            _ = self.output_adapter.reference(peer, handle, object) catch return false;
-            return self.primaryKmsOutput() != null;
+            const reference = self.output_adapter.reference(peer, handle, object) catch return false;
+            const physical = self.physicalOutputForProtocolId(reference.output) orelse return false;
+            return physical.kms_output != null;
         }
 
         fn validateScreencopyBuffer(
@@ -7428,9 +7476,16 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn outputBounds(self: *const Self) !geometry.Rect {
-            if (self.primaryKmsOutput() == null) return error.NoOutput;
+            return self.outputBoundsFor(self.primaryPhysicalOutput());
+        }
+
+        fn outputBoundsFor(
+            self: *const Self,
+            physical: *const PhysicalOutput,
+        ) !geometry.Rect {
+            if (physical.kms_output == null) return error.NoOutput;
             const snapshot = try self.output_adapter.logicalSnapshot(
-                self.primaryPhysicalOutput().protocol_output,
+                physical.protocol_output,
             );
             return .{
                 .x = snapshot.x,
