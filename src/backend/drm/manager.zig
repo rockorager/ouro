@@ -112,6 +112,8 @@ const Storage = struct {
     buffer: api.TopologyBuffer,
     candidates: []ScanoutCandidate,
     candidate_count: usize = 0,
+    lease_candidates: []ScanoutCandidate,
+    lease_candidate_count: usize = 0,
     selection: Selection = undefined,
 
     fn init(allocator: std.mem.Allocator, config: Config) !Storage {
@@ -130,6 +132,8 @@ const Storage = struct {
         const formats = try allocator.alloc(Format, config.format_capacity);
         errdefer allocator.free(formats);
         const candidates = try allocator.alloc(ScanoutCandidate, config.connector_capacity);
+        errdefer allocator.free(candidates);
+        const lease_candidates = try allocator.alloc(ScanoutCandidate, config.connector_capacity);
         return .{ .buffer = .{
             .connectors = connectors,
             .modes = modes,
@@ -138,10 +142,11 @@ const Storage = struct {
             .crtcs = crtcs,
             .planes = planes,
             .formats = formats,
-        }, .candidates = candidates };
+        }, .candidates = candidates, .lease_candidates = lease_candidates };
     }
 
     fn deinit(self: *Storage, allocator: std.mem.Allocator) void {
+        allocator.free(self.lease_candidates);
         allocator.free(self.candidates);
         allocator.free(self.buffer.formats);
         allocator.free(self.buffer.planes);
@@ -306,6 +311,10 @@ pub const Manager = struct {
         try self.platform.readTopology(fd, &storage.buffer);
         try validateCounts(&storage.buffer);
         storage.candidate_count = try collectScanoutCandidates(&storage.buffer, storage.candidates);
+        storage.lease_candidate_count = try collectLeaseCandidates(
+            &storage.buffer,
+            storage.lease_candidates,
+        );
         storage.selection = choosePrimaryCandidate(
             &storage.buffer,
             storage.candidates[0..storage.candidate_count],
@@ -398,6 +407,16 @@ pub const Manager = struct {
         return storage.candidates[0..storage.candidate_count];
     }
 
+    /// Returns connected non-desktop connectors with complete scanout tuples.
+    /// These are kept separate from compositor-owned desktop outputs so a
+    /// connector cannot be both globally displayed and advertised for lease.
+    pub fn leaseCandidates(self: *const Manager, handle: Handle) ![]const ScanoutCandidate {
+        if (!self.present or handle.generation != self.generation)
+            return error.StaleSnapshot;
+        const storage = &self.stores[self.active_store];
+        return storage.lease_candidates[0..storage.lease_candidate_count];
+    }
+
     /// Returns the exact claim reserved for the primary snapshot selection.
     /// This gives compositor output records the same generation-safe ownership
     /// handle used for additional scanout tuples.
@@ -433,6 +452,30 @@ pub const Manager = struct {
         }
         if (!found) return error.InvalidScanoutCandidate;
 
+        return self.claimCandidate(candidate);
+    }
+
+    pub fn claimLease(
+        self: *Manager,
+        handle: Handle,
+        candidate: ScanoutCandidate,
+    ) !ClaimHandle {
+        if (!self.present or handle.generation != self.generation)
+            return error.StaleSnapshot;
+        const candidates = try self.leaseCandidates(handle);
+        var found = false;
+        for (candidates) |available| {
+            if (std.meta.eql(available, candidate)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return error.InvalidScanoutCandidate;
+
+        return self.claimCandidate(candidate);
+    }
+
+    fn claimCandidate(self: *Manager, candidate: ScanoutCandidate) !ClaimHandle {
         for (self.claims) |claim| {
             if (!claim.active) continue;
             if (claim.candidate.connector_index == candidate.connector_index)
@@ -823,6 +866,22 @@ fn collectScanoutCandidates(
     return error.NoPrimaryPlane;
 }
 
+fn collectLeaseCandidates(
+    buffer: *const api.TopologyBuffer,
+    candidates: []ScanoutCandidate,
+) !usize {
+    var count: usize = 0;
+    var saw_crtc = false;
+    for (buffer.connectors[0..buffer.connector_count], 0..) |connector, index| {
+        if (!connector.connected or connector.desktop or connector.mode_count == 0) continue;
+        const candidate = connectorCandidate(buffer, index, &saw_crtc) orelse continue;
+        if (count == candidates.len) return error.InvalidPlatformResult;
+        candidates[count] = candidate;
+        count += 1;
+    }
+    return count;
+}
+
 fn connectorCandidate(
     buffer: *const api.TopologyBuffer,
     connector_index: usize,
@@ -1098,6 +1157,32 @@ test "drm: scanout claims reserve complete tuples and recycle generation safely"
         manager.claimScanout(handle, invalid),
     );
     try manager.releaseScanout(replacement);
+}
+
+test "drm: lease candidates exclude compositor-owned desktop connectors" {
+    var seat = FakeSeat{};
+    const session = try seat.createSession();
+    defer destroyTestSession(session);
+    var platform = FakeDrm{ .multiple_outputs = true, .second_desktop = false };
+    var manager = try Manager.init(std.testing.allocator, platform.platform(), session, "seat0", testConfig());
+    defer manager.deinit() catch unreachable;
+
+    const handle = (try manager.rescan()).?;
+    try std.testing.expectEqual(@as(usize, 1), (try manager.scanoutCandidates(handle)).len);
+    const lease_candidates = try manager.leaseCandidates(handle);
+    try std.testing.expectEqual(@as(usize, 1), lease_candidates.len);
+    try std.testing.expectEqual(@as(u32, 21), (try manager.snapshot(handle)).connectors[lease_candidates[0].connector_index].id);
+    try std.testing.expectError(
+        error.InvalidScanoutCandidate,
+        manager.claimScanout(handle, lease_candidates[0]),
+    );
+    const claim = try manager.claimLease(handle, lease_candidates[0]);
+    try std.testing.expectEqual(@as(u32, 21), (try manager.claimSnapshot(claim)).selectedConnector().id);
+    try std.testing.expectError(
+        error.InvalidScanoutCandidate,
+        manager.claimLease(handle, (try manager.scanoutCandidates(handle))[0]),
+    );
+    try manager.releaseScanout(claim);
 }
 
 test "drm: primary claim is exact and generation safe" {
@@ -1401,6 +1486,7 @@ const FakeDrm = struct {
     fail_topology: bool = false,
     alternate_mode: bool = false,
     multiple_outputs: bool = false,
+    second_desktop: bool = true,
     shared_scanout: bool = false,
     lease_objects: [6]u32 = undefined,
     lease_object_count: usize = 0,
@@ -1453,7 +1539,7 @@ const FakeDrm = struct {
         buffer.formats[0] = .{ .fourcc = 875713112, .modifier = api.modifier_invalid };
         if (self.multiple_outputs) {
             const second_mode_index: u32 = if (self.alternate_mode) 2 else 1;
-            buffer.connectors[1] = .{ .id = 21, .connector_type = 1, .connector_type_id = 2, .connected = true, .desktop = true, .width_mm = 500, .height_mm = 300, .encoder_id = 31, .mode_start = second_mode_index, .mode_count = 1, .encoder_start = 1, .encoder_count = 1, .properties = .{ .crtc_id = 1 } };
+            buffer.connectors[1] = .{ .id = 21, .connector_type = 1, .connector_type_id = 2, .connected = true, .desktop = self.second_desktop, .width_mm = 500, .height_mm = 300, .encoder_id = 31, .mode_start = second_mode_index, .mode_count = 1, .encoder_start = 1, .encoder_count = 1, .properties = .{ .crtc_id = 1 } };
             buffer.modes[second_mode_index] = testMode(1920, 1080, 60);
             buffer.connector_encoders[1] = 31;
             buffer.encoders[1] = .{

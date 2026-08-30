@@ -3680,7 +3680,7 @@ pub fn Coordinator(comptime protocol: type) type {
             errdefer for (self.drm_lease_claims[0..claim_count]) |claim|
                 self.manager.releaseScanout(claim) catch {};
             for (connectors) |connector| {
-                self.drm_lease_claims[claim_count] = try self.manager.claimScanout(
+                self.drm_lease_claims[claim_count] = try self.manager.claimLease(
                     handle,
                     connector.candidate,
                 );
@@ -5638,14 +5638,11 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         /// Publish the restricted lease device only after DRM discovery has a
-        /// stable topology. Ouro's own connector/CRTC/plane tuple is never
-        /// offered, nor is a candidate which aliases its active scanout tuple.
+        /// stable topology. Only connected non-desktop connectors are offered;
+        /// compositor-owned desktop outputs remain exclusively scanout-owned.
         fn ensureDrmLeasing(self: *Self, snapshot: drm.Snapshot) !void {
             if (self.drm_lease_topology_generation == snapshot.handle.generation) return;
-            for (try self.manager.scanoutCandidates(snapshot.handle)) |candidate| {
-                if (candidate.connector_index == snapshot.selection.connector_index or
-                    candidate.crtc_index == snapshot.selection.crtc_index or
-                    candidate.plane_index == snapshot.selection.plane_index) continue;
+            for (try self.manager.leaseCandidates(snapshot.handle)) |candidate| {
                 if (candidate.connector_index >= snapshot.connectors.len)
                     return error.InvalidScanoutCandidate;
                 const connector = snapshot.connectors[candidate.connector_index];

@@ -141,10 +141,12 @@ test "physical DRM lease resolver grants the independent secondary tuple" {
     }
     const handle = coordinator.manager.currentHandle().?;
     const candidates = try coordinator.manager.scanoutCandidates(handle);
-    try std.testing.expectEqual(@as(usize, 2), candidates.len);
+    try std.testing.expectEqual(@as(usize, 1), candidates.len);
+    const lease_candidates = try coordinator.manager.leaseCandidates(handle);
+    try std.testing.expectEqual(@as(usize, 1), lease_candidates.len);
     const grant = (try coordinator.grantDrmLease(.physical, &.{.{
         .topology_generation = handle.generation,
-        .candidate = candidates[1],
+        .candidate = lease_candidates[0],
     }})).?;
     defer _ = linux.close(grant.fd);
     try std.testing.expectEqualSlices(u32, &.{ 11, 31, 41 }, fixture.lease_objects[0..fixture.lease_object_count]);
@@ -2154,7 +2156,7 @@ pub const Fixture = struct {
         out.crtcs[0] = .{ .id = 30, .index = 0, .properties = .{ .active = 2, .mode_id = 3 } };
         out.planes[0] = .{ .id = 40, .possible_crtcs = 1, .plane_type_value = 1, .format_start = 0, .format_count = 1, .properties = .{ .plane_type = 4, .fb_id = 5, .crtc_id = 6, .src_x = 7, .src_y = 8, .src_w = 9, .src_h = 10, .crtc_x = 11, .crtc_y = 12, .crtc_w = 13, .crtc_h = 14 } };
         out.formats[0] = .{ .fourcc = ouro.gbm.format_xrgb8888, .modifier = ouro.gbm.modifier_linear };
-        out.connectors[1] = .{ .id = 11, .connector_type = 1, .connector_type_id = 2, .connected = true, .desktop = true, .width_mm = 2, .height_mm = 2, .encoder_id = 21, .mode_start = 1, .mode_count = 1, .encoder_start = 1, .encoder_count = 1, .properties = .{ .crtc_id = 1 } };
+        out.connectors[1] = .{ .id = 11, .connector_type = 1, .connector_type_id = 2, .connected = true, .desktop = false, .width_mm = 2, .height_mm = 2, .encoder_id = 21, .mode_start = 1, .mode_count = 1, .encoder_start = 1, .encoder_count = 1, .properties = .{ .crtc_id = 1 } };
         out.modes[1] = out.modes[0];
         out.connector_encoders[1] = 21;
         out.encoders[1] = .{ .id = 21, .crtc_id = 31, .possible_crtcs = 2 };
