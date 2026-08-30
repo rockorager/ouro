@@ -20,8 +20,9 @@ pub const Config = struct {
     outbound_capacity: usize = 32,
     surrounding_bytes: usize = 4000,
     edit_string_bytes: usize = 4000,
+    language_bytes: usize = 64,
     fn validate(c: @This()) !void {
-        inline for (.{ c.manager_capacity, c.device_capacity, c.event_capacity, c.outbound_capacity, c.surrounding_bytes, c.edit_string_bytes }) |n| if (n == 0 or n >= none) return error.InvalidConfig;
+        inline for (.{ c.manager_capacity, c.device_capacity, c.event_capacity, c.outbound_capacity, c.surrounding_bytes, c.edit_string_bytes, c.language_bytes }) |n| if (n == 0 or n >= none) return error.InvalidConfig;
         if (c.surrounding_bytes > 4000) return error.InvalidConfig;
     }
 };
@@ -38,8 +39,12 @@ pub const State = struct {
     purpose: u32 = 0,
     has_rectangle: bool = false,
     rectangle: Rectangle = .{},
+    submit_available: bool = false,
+    input_panel_visible: bool = false,
 };
-pub const Edit = struct { preedit: ?[]const u8 = null, cursor_begin: i32 = 0, cursor_end: i32 = 0, commit: ?[]const u8 = null, delete_before: u32 = 0, delete_after: u32 = 0 };
+pub const PreeditHintKind = enum(u32) { whole = 1, selection, prediction, prefix, suffix, spelling_error, compose_error };
+pub const PreeditHint = struct { start: u32, end: u32, hint: PreeditHintKind };
+pub const Edit = struct { preedit: ?[]const u8 = null, cursor_begin: i32 = 0, cursor_end: i32 = 0, hints: []const PreeditHint = &.{}, commit: ?[]const u8 = null, delete_before: u32 = 0, delete_after: u32 = 0 };
 
 pub fn Adapter(comptime protocol: type) type {
     return struct {
@@ -50,10 +55,10 @@ pub fn Adapter(comptime protocol: type) type {
         const Input = protocol.zwp_text_input_v3;
         pub const DeviceId = packed struct { index: u32, generation: u32 };
         pub const Event = struct { device: DeviceId, peer: wayring.io_uring.Peer, seat: u32, state: State, surrounding: []const u8, serial: u32 };
-        const ManagerSlot = struct { header: slot_pool.Header = .{}, resource: objects.Handle = .{ .id = 0, .generation = 0 }, peer: wayring.io_uring.Peer = undefined };
-        const Device = struct { header: slot_pool.Header = .{}, focused: bool = false, resource: objects.Handle = .{ .id = 0, .generation = 0 }, peer: wayring.io_uring.Peer = undefined, seat: u32 = 0, pending: State = .{}, current: State = .{}, serial: u32 = 0, text: []u8 = &.{}, pending_text: []u8 = &.{} };
+        const ManagerSlot = struct { header: slot_pool.Header = .{}, resource: objects.Handle = .{ .id = 0, .generation = 0 }, peer: wayring.io_uring.Peer = undefined, version: u32 = 1 };
+        const Device = struct { header: slot_pool.Header = .{}, focused: bool = false, resource: objects.Handle = .{ .id = 0, .generation = 0 }, peer: wayring.io_uring.Peer = undefined, seat: u32 = 0, version: u32 = 1, pending: State = .{}, current: State = .{}, serial: u32 = 0, text: []u8 = &.{}, pending_text: []u8 = &.{} };
         const EventSlot = struct { event: Event = undefined, text: []u8 = &.{} };
-        const OutKind = enum { enter, leave, preedit, commit, delete, done };
+        const OutKind = enum { enter, leave, preedit, preedit_hint, commit, delete, action, language, done };
         const Out = struct {
             active: bool = false,
             sequence: u64 = 0,
@@ -67,6 +72,9 @@ pub fn Adapter(comptime protocol: type) type {
             delete_before: u32 = 0,
             delete_after: u32 = 0,
             serial: u32 = 0,
+            start: u32 = 0,
+            end: u32 = 0,
+            value: u32 = 0,
             storage: []u8 = &.{},
         };
         allocator: std.mem.Allocator,
@@ -77,6 +85,9 @@ pub fn Adapter(comptime protocol: type) type {
         outbound: []Out,
         all_event_text: []u8,
         all_out_text: []u8,
+        language: []u8,
+        language_len: usize = 0,
+        language_known: bool = false,
         surrounding_bytes: usize,
         edit_bytes: usize,
         event_head: usize = 0,
@@ -88,7 +99,7 @@ pub fn Adapter(comptime protocol: type) type {
         global: ?objects.Handle = null,
         pub fn init(a: std.mem.Allocator, v: SeatValidator, c: Config) !Self {
             try c.validate();
-            try Manager.info.validateVersion(1);
+            try Manager.info.validateVersion(2);
             var ms = try slot_pool.Pool(ManagerSlot).init(a, c.manager_capacity);
             errdefer ms.deinit();
             var ds = try slot_pool.Pool(Device).init(a, c.device_capacity);
@@ -103,16 +114,19 @@ pub fn Adapter(comptime protocol: type) type {
             errdefer a.free(et);
             const ot = try a.alloc(u8, outbound_text_bytes);
             errdefer a.free(ot);
+            const language = try a.alloc(u8, c.language_bytes);
+            errdefer a.free(language);
             for (es, 0..) |*s, i| s.text = et[i * c.surrounding_bytes ..][0..c.surrounding_bytes];
             for (os, 0..) |*s, i| {
                 s.* = .{};
                 s.storage = ot[i * c.edit_string_bytes ..][0..c.edit_string_bytes];
             }
-            return .{ .allocator = a, .validator = v, .managers = ms, .devices = ds, .events = es, .outbound = os, .all_event_text = et, .all_out_text = ot, .surrounding_bytes = c.surrounding_bytes, .edit_bytes = c.edit_string_bytes };
+            return .{ .allocator = a, .validator = v, .managers = ms, .devices = ds, .events = es, .outbound = os, .all_event_text = et, .all_out_text = ot, .language = language, .surrounding_bytes = c.surrounding_bytes, .edit_bytes = c.edit_string_bytes };
         }
         pub fn deinit(s: *Self) void {
             s.allocator.free(s.all_out_text);
             s.allocator.free(s.all_event_text);
+            s.allocator.free(s.language);
             for (s.devices.entries.items) |device| {
                 if (device.text.len != 0) s.allocator.free(device.text);
                 if (device.pending_text.len != 0) s.allocator.free(device.pending_text);
@@ -127,7 +141,7 @@ pub fn Adapter(comptime protocol: type) type {
             if (s.runtime != null) return error.AlreadyInstalled;
             s.runtime = r;
             errdefer s.runtime = null;
-            const g = try r.addGlobalWithBinder(&Manager.info, 1, s, bind);
+            const g = try r.addGlobalWithBinder(&Manager.info, 2, s, bind);
             s.global = g;
             return g;
         }
@@ -136,6 +150,7 @@ pub fn Adapter(comptime protocol: type) type {
             const manager = try s.managers.acquire();
             manager.resource = b.resource;
             manager.peer = b.peer;
+            manager.version = b.version;
             return manager;
         }
         pub fn request(s: *Self, p: wayring.io_uring.Peer, t: objects.Dispatch, m: wayring.wire.Message, f: *wayring.ancillary.FdQueue) !?wayring.dispatch.Control {
@@ -152,11 +167,14 @@ pub fn Adapter(comptime protocol: type) type {
                     .destroy => {},
                     .get_text_input => |q| {
                         if (!s.validator.validate(p, q.seat)) return try s.protocolError(a, d.handle.id, 0, "invalid wl_seat");
-                        if (s.focus != null and same(s.focus.?.peer, p) and !s.canEnqueue(1))
+                        const outbound_needed = @as(usize, @intFromBool(s.focus != null and same(s.focus.?.peer, p))) +
+                            @as(usize, @intFromBool(x.version >= 2 and s.language_known));
+                        if (!s.canEnqueue(outbound_needed))
                             return try s.noMemory(a);
                         const z = s.acquire() catch return try s.noMemory(a);
                         z.peer = p;
                         z.seat = q.seat;
+                        z.version = x.version;
                         const admitted = Manager.admit_get_text_input(so, d.handle, q, .{ .id = z }) catch |e| {
                             s.release(z);
                             return try s.failure(a, d.handle.id, e);
@@ -166,6 +184,8 @@ pub fn Adapter(comptime protocol: type) type {
                             z.focused = true;
                             try s.enqueue(z, .enter, s.focus.?.surface, null);
                         }
+                        if (z.version >= 2 and s.language_known)
+                            try s.enqueue(z, .language, 0, .{ .text = s.language[0..s.language_len] });
                     },
                 }
                 try d.finish(protocol, so, &a.transmit);
@@ -184,9 +204,14 @@ pub fn Adapter(comptime protocol: type) type {
                         }
                         z.pending = .{};
                         z.pending.enabled = true;
+                        z.current.input_panel_visible = false;
                     },
                     .disable => {
-                        if (z.focused) z.pending.enabled = false;
+                        if (z.focused) {
+                            z.pending.enabled = false;
+                            z.pending.input_panel_visible = false;
+                            z.current.input_panel_visible = false;
+                        }
                     },
                     .set_surrounding_text => |q| {
                         if (!z.focused) {
@@ -212,12 +237,31 @@ pub fn Adapter(comptime protocol: type) type {
                         }
                     },
                     .commit => s.commit(z) catch return try s.noMemory(a),
-                    else => {},
+                    .set_available_actions => |q| {
+                        const submit = parseAvailableActions(q.available_actions) catch
+                            return try s.protocolError(
+                                a,
+                                d.handle.id,
+                                Input.@"error".invalid_action.value,
+                                "invalid or duplicate text-input action",
+                            );
+                        if (z.focused) z.pending.submit_available = submit;
+                    },
+                    .show_input_panel => if (z.focused) {
+                        setInputPanelVisible(z, true);
+                    },
+                    .hide_input_panel => if (z.focused) {
+                        setInputPanelVisible(z, false);
+                    },
                 }
                 try d.finish(protocol, so, &a.transmit);
                 return .continue_dispatch;
             }
             return null;
+        }
+        fn setInputPanelVisible(z: *Device, visible: bool) void {
+            z.pending.input_panel_visible = visible;
+            z.current.input_panel_visible = visible;
         }
         fn setSurrounding(s: *Self, z: *Device, text: []const u8, c: i32, a: i32) !void {
             if (text.len > s.surrounding_bytes or text.len > 4000 or !std.unicode.utf8ValidateSlice(text) or c < 0 or a < 0 or c > text.len or a > text.len or !boundary(text, @intCast(c)) or !boundary(text, @intCast(a))) return error.Invalid;
@@ -302,7 +346,13 @@ pub fn Adapter(comptime protocol: type) type {
                 return error.NotFocused;
             if ((e.preedit != null and e.preedit.?.len > s.edit_bytes) or
                 (e.commit != null and e.commit.?.len > s.edit_bytes)) return error.StringTooLong;
+            var valid_hints: usize = 0;
+            if (z.version >= 2 and e.preedit != null) {
+                for (e.hints) |hint|
+                    valid_hints += @intFromBool(validPreeditHint(e.preedit.?, hint));
+            }
             const need: usize = @as(usize, @intFromBool(e.preedit != null)) +
+                valid_hints +
                 @as(usize, @intFromBool(e.commit != null)) +
                 @as(usize, @intFromBool(e.delete_before != 0 or e.delete_after != 0)) + 1;
             if (!s.canEnqueue(need)) return error.Exhausted;
@@ -311,12 +361,54 @@ pub fn Adapter(comptime protocol: type) type {
                 .cursor_begin = e.cursor_begin,
                 .cursor_end = e.cursor_end,
             });
+            if (z.version >= 2 and e.preedit != null) for (e.hints) |hint| {
+                if (!validPreeditHint(e.preedit.?, hint)) continue;
+                try s.enqueue(z, .preedit_hint, 0, .{
+                    .start = hint.start,
+                    .end = hint.end,
+                    .value = @intFromEnum(hint.hint),
+                });
+            };
             if (e.commit) |text| try s.enqueue(z, .commit, 0, .{ .text = text });
             if (e.delete_before != 0 or e.delete_after != 0) try s.enqueue(z, .delete, 0, .{
                 .delete_before = e.delete_before,
                 .delete_after = e.delete_after,
             });
             try s.enqueue(z, .done, 0, .{ .serial = z.serial });
+        }
+
+        pub fn queueSubmit(s: *Self, device_id: DeviceId, serial: u32) !void {
+            const z = s.resolve(device_id) orelse return error.StaleDevice;
+            if (z.version < 2 or !z.focused or !z.current.enabled or
+                !z.current.submit_available) return error.ActionUnavailable;
+            if (serial == 0) return error.InvalidSerial;
+            if (!s.canEnqueue(2)) return error.Exhausted;
+            try s.enqueue(z, .action, 0, .{
+                .value = Input.action.submit.value,
+                .serial = serial,
+            });
+            try s.enqueue(z, .done, 0, .{ .serial = z.serial });
+        }
+
+        pub fn setLanguage(s: *Self, language: []const u8) !void {
+            if (language.len > s.language.len or std.mem.indexOfScalar(u8, language, 0) != null)
+                return error.InvalidLanguage;
+            var needed: usize = 0;
+            for (s.devices.entries.items) |z|
+                needed += @intFromBool(z.header.active and z.version >= 2);
+            if (!s.canEnqueue(needed)) return error.Exhausted;
+            @memcpy(s.language[0..language.len], language);
+            s.language_len = language.len;
+            s.language_known = true;
+            for (s.devices.entries.items) |z| {
+                if (!z.header.active or z.version < 2) continue;
+                try s.enqueue(z, .language, 0, .{ .text = language });
+            }
+        }
+
+        pub fn state(s: *Self, device_id: DeviceId) !State {
+            const z = s.resolve(device_id) orelse return error.StaleDevice;
+            return z.current;
         }
         const OutPayload = struct {
             text: ?[]const u8 = null,
@@ -325,6 +417,9 @@ pub fn Adapter(comptime protocol: type) type {
             delete_before: u32 = 0,
             delete_after: u32 = 0,
             serial: u32 = 0,
+            start: u32 = 0,
+            end: u32 = 0,
+            value: u32 = 0,
         };
         fn enqueue(s: *Self, z: *Device, k: OutKind, surface: u32, payload: ?OutPayload) !void {
             if (s.out_len == s.outbound.len) return error.Exhausted;
@@ -352,6 +447,9 @@ pub fn Adapter(comptime protocol: type) type {
                 o.delete_before = value.delete_before;
                 o.delete_after = value.delete_after;
                 o.serial = value.serial;
+                o.start = value.start;
+                o.end = value.end;
+                o.value = value.value;
             }
             s.out_len += 1;
         }
@@ -370,11 +468,21 @@ pub fn Adapter(comptime protocol: type) type {
                         .cursor_begin = o.cursor_begin,
                         .cursor_end = o.cursor_end,
                     } },
+                    .preedit_hint => .{ .preedit_hint = .{
+                        .start = o.start,
+                        .end = o.end,
+                        .hint = Input.preedit_hint.fromInt(o.value),
+                    } },
                     .commit => .{ .commit_string = .{ .text = o.storage[0..o.text_len] } },
                     .delete => .{ .delete_surrounding_text = .{
                         .before_length = o.delete_before,
                         .after_length = o.delete_after,
                     } },
+                    .action => .{ .action = .{
+                        .action = Input.action.fromInt(o.value),
+                        .serial = o.serial,
+                    } },
+                    .language => .{ .language = .{ .language = o.storage[0..o.text_len] } },
                     .done => .{ .done = .{ .serial = o.serial } },
                 };
                 wayring.server.sendEvent(protocol, Input, so, q, z.resource, ev) catch |err| switch (err) {
@@ -509,6 +617,33 @@ fn focusEq(a: ?Focus, b: ?Focus) bool {
 }
 fn boundary(s: []const u8, i: usize) bool {
     return i == s.len or (s[i] & 0xc0) != 0x80;
+}
+fn parseAvailableActions(bytes: []const u8) !bool {
+    if (bytes.len % @sizeOf(u32) != 0) return error.InvalidAction;
+    var submit = false;
+    var offset: usize = 0;
+    while (offset < bytes.len) : (offset += @sizeOf(u32)) {
+        const action = std.mem.readInt(
+            u32,
+            bytes[offset..][0..@sizeOf(u32)],
+            @import("builtin").cpu.arch.endian(),
+        );
+        if (action == 0) return error.InvalidAction;
+        var prior: usize = 0;
+        while (prior < offset) : (prior += @sizeOf(u32)) {
+            if (action == std.mem.readInt(
+                u32,
+                bytes[prior..][0..@sizeOf(u32)],
+                @import("builtin").cpu.arch.endian(),
+            )) return error.InvalidAction;
+        }
+        submit = submit or action == 1;
+    }
+    return submit;
+}
+fn validPreeditHint(text: []const u8, hint: PreeditHint) bool {
+    return hint.start <= hint.end and hint.end <= text.len and
+        boundary(text, hint.start) and boundary(text, hint.end);
 }
 test "text input transactional bounded state" {
     const A = Adapter(@import("core_protocol"));
@@ -686,4 +821,75 @@ test "text input disconnect compacts copied event text" {
     try std.testing.expectEqualStrings("kept", adapter.peekEvent().?.surrounding);
     @memset(adapter.events[1].text, 0xaa);
     try std.testing.expectEqualStrings("kept", adapter.peekEvent().?.surrounding);
+}
+
+test "text input version two actions validate native arrays" {
+    var actions = [_]u32{ 9, 1, 12 };
+    try std.testing.expect(try parseAvailableActions(std.mem.asBytes(&actions)));
+    actions = .{ 9, 12, 13 };
+    try std.testing.expect(!try parseAvailableActions(std.mem.asBytes(&actions)));
+    actions = .{ 9, 0, 12 };
+    try std.testing.expectError(error.InvalidAction, parseAvailableActions(std.mem.asBytes(&actions)));
+    actions = .{ 9, 9, 12 };
+    try std.testing.expectError(error.InvalidAction, parseAvailableActions(std.mem.asBytes(&actions)));
+    try std.testing.expectError(error.InvalidAction, parseAvailableActions("x"));
+}
+
+test "text input version two stages language hints panel and submit" {
+    const A = Adapter(@import("core_protocol"));
+    const validator: SeatValidator = .{ .validateFn = struct {
+        fn validate(_: ?*anyopaque, _: wayring.io_uring.Peer, _: u32) bool {
+            return true;
+        }
+    }.validate };
+    var adapter = try A.init(std.testing.allocator, validator, .{
+        .device_capacity = 1,
+        .event_capacity = 1,
+        .manager_capacity = 1,
+        .outbound_capacity = 8,
+        .surrounding_bytes = 8,
+        .edit_string_bytes = 8,
+    });
+    defer adapter.deinit();
+    const device = try adapter.acquire();
+    device.peer = .{ .slot = 7, .generation = 3 };
+    device.version = 2;
+    device.focused = true;
+    device.current.enabled = true;
+    device.current.submit_available = true;
+    adapter.focus = .{ .peer = device.peer, .surface = 11 };
+
+    A.setInputPanelVisible(device, true);
+    try std.testing.expect((try adapter.state(adapter.id(device))).input_panel_visible);
+    A.setInputPanelVisible(device, false);
+    try adapter.setLanguage("en-US");
+    try adapter.queueEdit(adapter.id(device), .{
+        .preedit = "hé",
+        .hints = &.{
+            .{ .start = 1, .end = 3, .hint = .selection },
+            .{ .start = 2, .end = 3, .hint = .prediction },
+        },
+    });
+    try std.testing.expectError(error.InvalidSerial, adapter.queueSubmit(adapter.id(device), 0));
+    try adapter.queueSubmit(adapter.id(device), 42);
+
+    const expected = [_]A.OutKind{ .language, .preedit, .preedit_hint, .done, .action, .done };
+    for (expected) |kind| {
+        const out = adapter.oldest(device.peer).?;
+        try std.testing.expectEqual(kind, out.kind);
+        switch (kind) {
+            .language => try std.testing.expectEqualStrings("en-US", out.storage[0..out.text_len]),
+            .preedit_hint => {
+                try std.testing.expectEqual(@as(u32, 1), out.start);
+                try std.testing.expectEqual(@as(u32, 3), out.end);
+                try std.testing.expectEqual(@as(u32, @intFromEnum(PreeditHintKind.selection)), out.value);
+            },
+            .action => {
+                try std.testing.expectEqual(@as(u32, 1), out.value);
+                try std.testing.expectEqual(@as(u32, 42), out.serial);
+            },
+            else => {},
+        }
+        adapter.dropOut(out);
+    }
 }
