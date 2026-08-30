@@ -3659,6 +3659,13 @@ pub fn Coordinator(comptime protocol: type) type {
             return false;
         }
 
+        fn anyOutputInFlight(self: *const Self) bool {
+            for (self.physical_outputs[0..self.physical_output_count]) |physical|
+                if (physical.kms_output) |output|
+                    if (output.in_flight_frame != null) return true;
+            return false;
+        }
+
         fn connectedPhysicalOutputCount(self: *const Self) usize {
             var count: usize = 0;
             for (self.physical_outputs[0..self.physical_output_count]) |physical|
@@ -6378,10 +6385,10 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn applyReady(self: *Self) !void {
-            if (self.primaryKmsOutput()) |output| if (output.in_flight_frame != null) {
+            if (self.anyOutputInFlight()) {
                 try self.syncCommitTimer();
                 return;
-            };
+            }
             var remaining: usize = 0;
             for (0..self.pending_surface_len) |offset| {
                 const index = (self.pending_surface_head + offset) % self.pending_surfaces.len;
@@ -6394,7 +6401,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 const before_len = self.pending_surface_len;
                 const pending = self.pending_surfaces[self.pending_surface_head];
                 const applied = try self.applyPendingSurface(pending);
-                if (applied and self.primaryKmsOutput() == null)
+                if (applied and !self.anyKmsOutput())
                     self.adapter.clearFifoBarriers();
                 if (applied and !global_damage) {
                     // A layer-shell root is permanently assigned to one output.
@@ -6645,7 +6652,7 @@ pub fn Coordinator(comptime protocol: type) type {
                             .external => |external| external,
                             .shm, .single_pixel => unreachable,
                         };
-                        const output = self.primaryKmsOutput() orelse
+                        const output = (try self.outputForDestination(destination)) orelse
                             return try self.discardPendingCandidate(layer, pending.id);
                         imported_source = output.mapClientBuffer(.{
                             .context = external.context,
@@ -7635,8 +7642,17 @@ pub fn Coordinator(comptime protocol: type) type {
             buffer: *const protocol_linux_dmabuf.Buffer,
         ) !void {
             const self: *Self = @ptrCast(@alignCast(context));
-            const output = self.primaryKmsOutput() orelse return error.RendererUnavailable;
-            try output.validateClientBuffer(try dmabufImport(buffer));
+            const import = try dmabufImport(buffer);
+            var rejected: ?anyerror = null;
+            for (self.physical_outputs[0..self.physical_output_count]) |physical| {
+                const output = physical.kms_output orelse continue;
+                output.validateClientBuffer(import) catch |cause| {
+                    rejected = cause;
+                    continue;
+                };
+                return;
+            }
+            return rejected orelse error.RendererUnavailable;
         }
 
         fn dmabufLeaseToken(lease: protocol_linux_dmabuf.Lease) u64 {
@@ -8333,6 +8349,18 @@ pub fn Coordinator(comptime protocol: type) type {
             const physical = self.physicalOutputForProtocolId(id) orelse
                 return error.InvalidOutput;
             return self.outputBoundsFor(physical);
+        }
+
+        fn outputForDestination(
+            self: *const Self,
+            destination: render.Rect,
+        ) !?*output_api.Output {
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                const output = physical.kms_output orelse continue;
+                const bounds = try self.outputBoundsFor(physical);
+                if (try clipToOutput(destination, bounds) != null) return output;
+            }
+            return null;
         }
 
         fn globalOutputBounds(self: *const Self) !geometry.Rect {
@@ -9319,12 +9347,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.interaction.surfaceDestroyed(id);
                 for (self.app_layers) |*layer|
                     if (layer.id != null and std.meta.eql(layer.id.?, id) and
-                        (self.primaryKmsOutput() == null or
-                            self.primaryKmsOutput().?.in_flight_frame == null))
+                        !self.anyOutputInFlight())
                         self.discardUnpresentedLayer(layer);
                 if (self.cursor_layer.id != null and std.meta.eql(self.cursor_layer.id.?, id) and
-                    (self.primaryKmsOutput() == null or
-                        self.primaryKmsOutput().?.in_flight_frame == null))
+                    !self.anyOutputInFlight())
                     self.discardUnpresentedLayer(&self.cursor_layer);
             }
             _ = self.adapter.resourceRemoved(handle, object);
