@@ -4814,11 +4814,15 @@ pub fn Coordinator(comptime protocol: type) type {
             peer: wayring.io_uring.Peer,
             handle: wayring.objects.Handle,
             object: wayring.objects.Object,
-        ) bool {
-            const self: *Self = @ptrCast(@alignCast(context orelse return false));
-            const reference = self.output_adapter.reference(peer, handle, object) catch return false;
-            const physical = self.physicalOutputForProtocolId(reference.output) orelse return false;
-            return physical.kms_output != null;
+        ) ?protocol_wlr_screencopy.OutputMode {
+            const self: *Self = @ptrCast(@alignCast(context orelse return null));
+            const reference = self.output_adapter.reference(peer, handle, object) catch return null;
+            const physical = self.physicalOutputForProtocolId(reference.output) orelse return null;
+            const output = physical.kms_output orelse return null;
+            return .{
+                .width = output.planner.output.width,
+                .height = output.planner.output.height,
+            };
         }
 
         fn validateScreencopyBuffer(

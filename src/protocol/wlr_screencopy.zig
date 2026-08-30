@@ -29,8 +29,15 @@ pub const Config = struct {
 
 pub const OutputValidator = struct {
     context: ?*anyopaque = null,
-    validateFn: *const fn (?*anyopaque, wayring.io_uring.Peer, objects.Handle, objects.Object) bool,
+    validateFn: *const fn (
+        ?*anyopaque,
+        wayring.io_uring.Peer,
+        objects.Handle,
+        objects.Object,
+    ) ?OutputMode,
 };
+
+pub const OutputMode = struct { width: u32, height: u32 };
 
 pub const BufferValidator = struct {
     context: ?*anyopaque = null,
@@ -279,8 +286,18 @@ pub fn Adapter(comptime protocol: type) type {
                 return try self.invalidObject(actor, parent.id, "invalid output");
             const validator = self.output_validator orelse
                 return try self.invalidObject(actor, parent.id, "output unavailable");
-            if (!validator.validateFn(validator.context, peer, output_handle, output_object.*))
+            const mode = validator.validateFn(
+                validator.context,
+                peer,
+                output_handle,
+                output_object.*,
+            ) orelse
                 return try self.invalidObject(actor, parent.id, "foreign output");
+            if (mode.width == 0 or mode.height == 0 or mode.width > std.math.maxInt(i32) or
+                mode.height > std.math.maxInt(i32))
+                return try self.invalidObject(actor, parent.id, "output unavailable");
+            _ = std.math.mul(u32, mode.width, 4) catch
+                return try self.invalidObject(actor, parent.id, "output unavailable");
 
             const frame = self.acquireFrame() catch return try self.noMemory(actor);
             var frame_owned = true;
@@ -289,7 +306,7 @@ pub fn Adapter(comptime protocol: type) type {
             frame.output = output_handle;
             frame.overlay_cursor = value.overlay_cursor != 0;
             frame.region = if (requested) |region| clipped: {
-                const clipped = clipRegion(region, self.width, self.height) orelse
+                const clipped = clipRegion(region, mode.width, mode.height) orelse
                     break :clipped .{ .x = 0, .y = 0, .width = 0, .height = 0 };
                 break :clipped .{
                     .x = clipped.x,
@@ -297,8 +314,8 @@ pub fn Adapter(comptime protocol: type) type {
                     .width = clipped.width,
                     .height = clipped.height,
                 };
-            } else .{ .x = 0, .y = 0, .width = self.width, .height = self.height };
-            frame.failed_creation = !self.available or frame.region.width == 0 or frame.region.height == 0;
+            } else .{ .x = 0, .y = 0, .width = mode.width, .height = mode.height };
+            frame.failed_creation = frame.region.width == 0 or frame.region.height == 0;
 
             const event_count: usize = if (frame.failed_creation) 1 else 2;
             if (self.outbound.len - self.outbound_count < event_count)
