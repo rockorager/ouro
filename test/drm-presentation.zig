@@ -345,6 +345,7 @@ test "physical coordinator fails over from a disconnected primary output" {
         if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
     }
     const primary_protocol = coordinator.physical_outputs[0].protocol_output;
+    const primary_head = coordinator.physical_outputs[0].management_head;
     const secondary_protocol = coordinator.physical_outputs[1].protocol_output;
     const secondary_head = coordinator.physical_outputs[1].management_head;
 
@@ -352,24 +353,29 @@ test "physical coordinator fails over from a disconnected primary output" {
     try fixture.signalHotplug();
     for (0..512) |_| {
         _ = try loop.turn(coordinator);
-        if (!coordinator.topology_refresh_pending and
-            coordinator.physical_outputs[0].connector_id == 11 and
-            coordinator.physical_outputs[0].kms_output != null and
-            !coordinator.physical_outputs[1].connected and
-            !coordinator.physical_outputs[1].removing) break;
+        if (!coordinator.physical_outputs[0].connected and
+            !coordinator.physical_outputs[0].removing and
+            coordinator.physical_outputs[1].kms_output != null) break;
         if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
     }
-    try std.testing.expectEqual(@as(u32, 11), coordinator.physical_outputs[0].connector_id);
-    try std.testing.expect(coordinator.physical_outputs[0].kms_output != null);
-    try std.testing.expect(try coordinator.output_adapter.outputPublished(primary_protocol));
-    try std.testing.expect(!coordinator.physical_outputs[1].connected);
-    try std.testing.expect(!(try coordinator.output_adapter.outputPublished(secondary_protocol)));
+    try std.testing.expect(!coordinator.physical_outputs[0].connected);
+    try std.testing.expect(coordinator.physical_outputs[0].kms_output == null);
+    try std.testing.expect(!(try coordinator.output_adapter.outputPublished(primary_protocol)));
     try std.testing.expectError(
         error.InvalidHead,
-        coordinator.output_management_adapter.lifecycle.currentHead(secondary_head),
+        coordinator.output_management_adapter.lifecycle.currentHead(primary_head),
+    );
+    try std.testing.expect(coordinator.physical_outputs[1].connected);
+    try std.testing.expectEqual(@as(u32, 11), coordinator.physical_outputs[1].connector_id);
+    try std.testing.expect(coordinator.physical_outputs[1].kms_output != null);
+    try std.testing.expect(try coordinator.output_adapter.outputPublished(secondary_protocol));
+    try std.testing.expectEqual(secondary_protocol, coordinator.output_adapter.primaryOutput());
+    try std.testing.expectEqual(
+        secondary_head,
+        coordinator.output_management_adapter.lifecycle.primary,
     );
     try std.testing.expectEqual(@as(?i32, 3), (try coordinator.output_adapter.logicalSnapshot(
-        primary_protocol,
+        secondary_protocol,
     )).width);
 
     try coordinator.requestStop();

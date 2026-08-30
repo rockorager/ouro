@@ -96,7 +96,7 @@ pub fn Adapter(comptime protocol: type) type {
         const CHeadSlot = struct { header: slot_pool.Header = .{}, configuration: u32 = 0, peer: Peer = undefined, resource: ?objects.Handle = null, head: HeadId = undefined };
         const Kind = enum { make_head, head_name, head_description, physical_size, make_mode, mode_size, mode_refresh, mode_preferred, enabled, current_mode, position, transform, scale, make, model, adaptive_sync, done, head_finished, finished, succeeded, failed, cancelled };
         const Out = struct { kind: Kind, owner: u32, head: ?u32 = null, mode: ?u32 = null };
-        const InventoryHead = struct { id: HeadId, name: []u8, description: []u8, make: ?[]u8, model: ?[]u8, physical_width_mm: ?i32, physical_height_mm: ?i32, modes: []ModeState };
+        const InventoryHead = struct { id: HeadId, name: []u8, description: []u8, make: ?[]u8, model: ?[]u8, physical_width_mm: ?i32, physical_height_mm: ?i32, modes: []ModeState, modes_owned: bool = true };
         pub const WireCommand = struct { peer: Peer, configuration: ConfigurationId, wire_configuration: ?objects.Handle, operation: Operation, serial: u32, desired: HeadState, heads: []const DesiredHead };
 
         allocator: std.mem.Allocator,
@@ -145,7 +145,7 @@ pub fn Adapter(comptime protocol: type) type {
             var lifecycle = try Lifecycle.init(allocator, c.configuration_capacity, serial, state);
             errdefer lifecycle.deinit();
             var self: Self = .{ .allocator = allocator, .config = c, .mode_inventory = mode_inventory, .mode_count = 1, .managers = managers, .heads = heads, .modes = modes, .configurations = configurations, .config_heads = config_heads, .lifecycle = lifecycle };
-            try self.inventory.append(allocator, .{ .id = lifecycle.primary, .name = name, .description = description, .make = make, .model = model, .physical_width_mm = c.physical_width_mm, .physical_height_mm = c.physical_height_mm, .modes = mode_inventory[0..1] });
+            try self.inventory.append(allocator, .{ .id = lifecycle.primary, .name = name, .description = description, .make = make, .model = model, .physical_width_mm = c.physical_width_mm, .physical_height_mm = c.physical_height_mm, .modes = mode_inventory[0..1], .modes_owned = false });
             return self;
         }
         pub fn deinit(self: *Self) void {
@@ -156,7 +156,7 @@ pub fn Adapter(comptime protocol: type) type {
             self.heads.deinit();
             self.managers.deinit();
             for (self.inventory.items) |item| {
-                if (!std.meta.eql(item.id, self.lifecycle.primary)) self.allocator.free(item.modes);
+                if (item.modes_owned) self.allocator.free(item.modes);
                 if (item.model) |value| self.allocator.free(value);
                 if (item.make) |value| self.allocator.free(value);
                 self.allocator.free(item.description);
@@ -193,7 +193,10 @@ pub fn Adapter(comptime protocol: type) type {
                 return error.ModeInventoryInUse;
             @memcpy(self.mode_inventory[0..inventory.len], inventory);
             self.mode_count = inventory.len;
-            self.inventory.items[0].modes = self.mode_inventory[0..inventory.len];
+            const primary = self.findInventoryMutable(self.lifecycle.primary) orelse
+                return error.InvalidHead;
+            std.debug.assert(!primary.modes_owned);
+            primary.modes = self.mode_inventory[0..inventory.len];
         }
         fn bind(ctx: ?*anyopaque, binding: wayring.server.Binding) !?*anyopaque {
             const self: *Self = @ptrCast(@alignCast(ctx orelse return error.InvalidContext));
@@ -300,15 +303,31 @@ pub fn Adapter(comptime protocol: type) type {
                 }
                 self.outbound.appendAssumeCapacity(.{ .kind = .done, .owner = m.header.index });
             }
-            self.allocator.free(removed.modes);
+            if (removed.modes_owned) self.allocator.free(removed.modes);
             if (removed.model) |v| self.allocator.free(v);
             if (removed.make) |v| self.allocator.free(v);
             self.allocator.free(removed.description);
             self.allocator.free(removed.name);
         }
         pub fn promotePrimary(self: *Self, id: HeadId) !void {
-            _ = self.findInventory(id) orelse return error.InvalidHead;
+            if (std.meta.eql(id, self.lifecycle.primary)) return;
+            const previous_id = self.lifecycle.primary;
+            const previous = self.findInventoryMutable(previous_id) orelse
+                return error.InvalidHead;
+            const promoted = self.findInventoryMutable(id) orelse return error.InvalidHead;
+            if (promoted.modes.len > self.mode_inventory.len)
+                return error.InvalidModeInventory;
+            std.debug.assert(!previous.modes_owned and promoted.modes_owned);
+            const previous_modes = try self.allocator.dupe(ModeState, previous.modes);
+            errdefer self.allocator.free(previous_modes);
             try self.lifecycle.promotePrimary(id);
+            @memcpy(self.mode_inventory[0..promoted.modes.len], promoted.modes);
+            self.mode_count = promoted.modes.len;
+            self.allocator.free(promoted.modes);
+            previous.modes = previous_modes;
+            previous.modes_owned = true;
+            promoted.modes = self.mode_inventory[0..self.mode_count];
+            promoted.modes_owned = false;
         }
         pub fn publish(self: *Self, state: HeadState) !u32 {
             try self.ensureOutbound(self.synchronizeCount());
@@ -563,6 +582,10 @@ pub fn Adapter(comptime protocol: type) type {
             return null;
         }
         fn findInventory(self: *const Self, id: HeadId) ?*const InventoryHead {
+            const i = self.findInventoryIndex(id) orelse return null;
+            return &self.inventory.items[i];
+        }
+        fn findInventoryMutable(self: *Self, id: HeadId) ?*InventoryHead {
             const i = self.findInventoryIndex(id) orelse return null;
             return &self.inventory.items[i];
         }
@@ -1346,6 +1369,7 @@ test "output management binds two exact heads and targets synchronization" {
     const secondary_state: HeadState = .{ .width = 1024, .height = 768, .refresh_millihz = 75000, .x = 800 };
     var adapter = try A.init(std.testing.allocator, .{ .manager_capacity = 1, .mode_capacity = 2 }, 1, primary);
     defer adapter.deinit();
+    const primary_id = adapter.lifecycle.primary;
     const secondary = try adapter.addHead(.{ .name = "second", .description = "Second output" }, &.{.{ .width = 1024, .height = 768, .refresh_millihz = 75000, .preferred = true }}, secondary_state);
     _ = try A.bind(&adapter, .{ .peer = .{ .slot = 7, .generation = 2 }, .credentials = .{ .pid = 1, .uid = 2, .gid = 3 }, .global = .{ .id = 4, .generation = 1 }, .resource = .{ .id = 5, .generation = 2 }, .version = 4 });
 
@@ -1367,6 +1391,11 @@ test "output management binds two exact heads and targets synchronization" {
     var synchronized_done: usize = 0;
     for (adapter.outbound.items) |event| synchronized_done += @intFromBool(event.kind == .done);
     try std.testing.expectEqual(@as(usize, 1), synchronized_done);
+
+    try adapter.promotePrimary(secondary);
+    try std.testing.expectEqual(secondary, adapter.lifecycle.primary);
+    try adapter.promotePrimary(primary_id);
+    try std.testing.expectEqual(primary_id, adapter.lifecycle.primary);
 
     adapter.outbound.clearRetainingCapacity();
     const secondary_wire = adapter.findWireHead(0, secondary).?;
