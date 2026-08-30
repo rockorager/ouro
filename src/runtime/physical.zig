@@ -8377,13 +8377,18 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn recomputeSessionLockConfigures(self: *Self) !void {
-            const bounds = try self.outputBounds();
             const ids = try self.session_lock_adapter.surfaceIds(self.lock_surface_ids);
-            for (ids) |id| try self.session_lock_adapter.queueConfigure(
-                id,
-                @intCast(bounds.width),
-                @intCast(bounds.height),
-            );
+            for (ids) |id| {
+                const state = try self.session_lock_adapter.surfaceState(id);
+                const physical = self.physicalOutputForProtocolId(state.output_id) orelse
+                    return error.InvalidOutput;
+                const bounds = try self.outputBoundsFor(physical);
+                try self.session_lock_adapter.queueConfigure(
+                    id,
+                    @intCast(bounds.width),
+                    @intCast(bounds.height),
+                );
+            }
         }
 
         fn findAppLayer(self: *Self, id: Adapter.SurfaceId) ?*Layer {
