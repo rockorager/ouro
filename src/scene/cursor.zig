@@ -43,11 +43,11 @@ pub fn Cursor(comptime SurfaceId: type) type {
         pub fn composite(
             self: Self,
             source: Source,
-            output: render.Size,
+            output: geometry.Rect,
         ) !?render.SurfaceSample {
             const surface = self.surface orelse return null;
             if (!self.pointer_available or !std.meta.eql(surface, source.surface)) return null;
-            try render.validateOutput(output);
+            try output.validate();
             _ = try render.validateSample(source.sample);
 
             var sample = source.sample;
@@ -56,15 +56,15 @@ pub fn Cursor(comptime SurfaceId: type) type {
             sample.destination.y = std.math.sub(i32, self.position.y, self.hotspot.y) catch
                 return error.InvalidDestination;
             const right = @min(
-                @as(i64, output.width),
+                @as(i64, output.x) + output.width,
                 @as(i64, sample.destination.x) + sample.destination.width,
             );
             const bottom = @min(
-                @as(i64, output.height),
+                @as(i64, output.y) + output.height,
                 @as(i64, sample.destination.y) + sample.destination.height,
             );
-            const left = @max(@as(i64, 0), sample.destination.x);
-            const top = @max(@as(i64, 0), sample.destination.y);
+            const left = @max(@as(i64, output.x), sample.destination.x);
+            const top = @max(@as(i64, output.y), sample.destination.y);
             if (right <= left or bottom <= top) return null;
             sample.clip = .{
                 .x = @intCast(left),
@@ -103,10 +103,10 @@ test "interaction: composited cursor preserves exact committed identities" {
     cursor.request(id, .{ .x = 1, .y = 1 });
     cursor.move(.{ .x = 8, .y = 6 });
     const original = testSample();
-    const placed = (try cursor.composite(.{ .surface = id, .sample = original }, .{
-        .width = 20,
-        .height = 10,
-    })).?;
+    const placed = (try cursor.composite(
+        .{ .surface = id, .sample = original },
+        .{ .x = 0, .y = 0, .width = 20, .height = 10 },
+    )).?;
     try std.testing.expectEqual(original.sample, placed.sample);
     try std.testing.expectEqual(original.presentation, placed.presentation);
     try std.testing.expectEqual(render.Rect{ .x = 7, .y = 5, .width = 4, .height = 3 }, placed.destination);
@@ -118,15 +118,15 @@ test "interaction: cursor clips at output edges and rejects stale surfaces" {
     var cursor = TestCursor{ .pointer_available = true };
     cursor.request(id, .{ .x = 2, .y = 2 });
     cursor.move(.{ .x = 1, .y = 1 });
-    const placed = (try cursor.composite(.{ .surface = id, .sample = testSample() }, .{
-        .width = 10,
-        .height = 10,
-    })).?;
+    const placed = (try cursor.composite(
+        .{ .surface = id, .sample = testSample() },
+        .{ .x = 0, .y = 0, .width = 10, .height = 10 },
+    )).?;
     try std.testing.expectEqual(render.Rect{ .x = 0, .y = 0, .width = 3, .height = 2 }, placed.clip);
     try std.testing.expect((try cursor.composite(.{
         .surface = .{ .index = 2, .generation = 8 },
         .sample = testSample(),
-    }, .{ .width = 10, .height = 10 })) == null);
+    }, .{ .x = 0, .y = 0, .width = 10, .height = 10 })) == null);
     cursor.surfaceDestroyed(id);
     try std.testing.expect(cursor.surface == null);
 }
@@ -139,8 +139,24 @@ test "interaction: cursor rejects relocated destination overflow" {
     try std.testing.expectError(error.InvalidDestination, cursor.composite(.{
         .surface = id,
         .sample = testSample(),
-    }, .{
-        .width = std.math.maxInt(i32),
-        .height = 10,
-    }));
+    }, .{ .x = 0, .y = 0, .width = std.math.maxInt(i32), .height = 10 }));
+}
+
+test "interaction: composited cursor clips in global displaced output coordinates" {
+    const id: TestId = .{ .index = 2, .generation = 7 };
+    var cursor = TestCursor{ .pointer_available = true };
+    cursor.request(id, .{ .x = 1, .y = 1 });
+    cursor.move(.{ .x = 101, .y = -9 });
+    const placed = (try cursor.composite(
+        .{ .surface = id, .sample = testSample() },
+        .{ .x = 100, .y = -10, .width = 20, .height = 10 },
+    )).?;
+    try std.testing.expectEqual(
+        render.Rect{ .x = 100, .y = -10, .width = 4, .height = 3 },
+        placed.destination,
+    );
+    try std.testing.expectEqual(
+        render.Rect{ .x = 100, .y = -10, .width = 4, .height = 3 },
+        placed.clip,
+    );
 }

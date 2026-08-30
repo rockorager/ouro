@@ -6016,6 +6016,8 @@ test "shell-input: cursor composition retains source identities" {
     cursor.request(id, .{ .x = 0, .y = 0 });
     cursor.move(.{ .x = 2, .y = 1 });
     const placed = (try cursor.composite(.{ .surface = id, .sample = source }, .{
+        .x = 0,
+        .y = 0,
         .width = 3,
         .height = 2,
     })).?;

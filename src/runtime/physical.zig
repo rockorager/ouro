@@ -3852,6 +3852,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn physicalSceneRect(self: *const Self, rect: geometry.Rect) ?geometry.Rect {
+            const output_bounds = self.outputBounds() catch return null;
             const scale = geometry.OutputScale.init(
                 self.output_management_adapter.lifecycle.current.scale_120,
             ) catch return null;
@@ -3860,7 +3861,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .y = rect.y,
                 .width = std.math.cast(u32, rect.width) orelse return null,
                 .height = std.math.cast(u32, rect.height) orelse return null,
-            }, scale) catch return null;
+            }, output_bounds, scale) catch return null;
             return .{
                 .x = physical.x,
                 .y = physical.y,
@@ -5531,7 +5532,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn refreshRetainedLayersForOutput(self: *Self) bool {
-            const output_size = self.logicalOutputSize() catch return false;
+            const output_bounds = self.outputBounds() catch return false;
             var visibility_changed = false;
             for (self.app_layers) |*layer| if (layer.active) {
                 const id = layer.id orelse unreachable;
@@ -5581,16 +5582,16 @@ pub fn Coordinator(comptime protocol: type) type {
                             .y = scene.root.geometry.y,
                             .width = @intCast(@min(
                                 scene.root.geometry.width,
-                                @as(i32, @intCast(output_size.width)),
+                                output_bounds.width,
                             )),
                             .height = @intCast(@min(
                                 scene.root.geometry.height,
-                                @as(i32, @intCast(output_size.height)),
+                                output_bounds.height,
                             )),
                         };
                     }
                 }
-                sample.clip = clipToOutput(sample.destination, output_size) catch unreachable orelse {
+                sample.clip = clipToOutput(sample.destination, output_bounds) catch unreachable orelse {
                     self.retireLayer(layer);
                     visibility_changed = true;
                     continue;
@@ -5756,10 +5757,15 @@ pub fn Coordinator(comptime protocol: type) type {
             const destination_size = content.surface.size;
             if (destination_size.width == 0 or destination_size.height == 0)
                 return error.InvalidDestination;
-            const output_size: render.Size = if (self.output != null)
-                try self.logicalOutputSize()
+            const output_bounds: geometry.Rect = if (self.output != null)
+                try self.outputBounds()
             else
-                .{ .width = destination_size.width, .height = destination_size.height };
+                .{
+                    .x = 0,
+                    .y = 0,
+                    .width = @intCast(destination_size.width),
+                    .height = @intCast(destination_size.height),
+                };
             const has_window_geometry = if (surface_scene) |scene|
                 !scene.subsurface and scene.root.has_window_geometry
             else
@@ -5786,18 +5792,18 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (scene.subsurface)
                     destination_size.width
                 else
-                    @intCast(@min(scene.root.geometry.width, @as(i32, @intCast(output_size.width))))
+                    @intCast(@min(scene.root.geometry.width, output_bounds.width))
             else
-                @min(destination_size.width, output_size.width);
+                @min(destination_size.width, @as(u32, @intCast(output_bounds.width)));
             const rendered_height: u32 = if (has_window_geometry)
                 destination_size.height
             else if (surface_scene) |scene|
                 if (scene.subsurface)
                     destination_size.height
                 else
-                    @intCast(@min(scene.root.geometry.height, @as(i32, @intCast(output_size.height))))
+                    @intCast(@min(scene.root.geometry.height, output_bounds.height))
             else
-                @min(destination_size.height, output_size.height);
+                @min(destination_size.height, @as(u32, @intCast(output_bounds.height)));
             const destination: render.Rect = .{
                 .x = destination_x,
                 .y = destination_y,
@@ -5810,9 +5816,9 @@ pub fn Coordinator(comptime protocol: type) type {
                 borrowed_source.size.height,
             );
             const clip = if (surface_scene) |scene|
-                if (scene.root.visible) try clipToOutput(destination, output_size) else null
+                if (scene.root.visible) try clipToOutput(destination, output_bounds) else null
             else
-                try clipToOutput(destination, output_size);
+                try clipToOutput(destination, output_bounds);
             const visible_clip = clip orelse {
                 return try self.discardPendingCandidate(layer, pending.id);
             };
@@ -6101,24 +6107,24 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn renderFrame(self: *Self, frame: @import("../output/headless.zig").FrameId) !void {
             const output = self.output orelse return;
-            const logical_output = try self.logicalOutputSize();
+            const output_bounds = try self.outputBounds();
             var sample_count: usize = 0;
             if (self.sessionLockActive()) {
-                try self.appendSessionLock(&sample_count, logical_output);
+                try self.appendSessionLock(&sample_count, output_bounds);
                 self.session_lock_frame = frame;
             } else {
-                try self.appendLayerShell(.background, &sample_count, logical_output);
-                try self.appendLayerShell(.bottom, &sample_count, logical_output);
+                try self.appendLayerShell(.background, &sample_count, output_bounds);
+                try self.appendLayerShell(.bottom, &sample_count, output_bounds);
                 const windows = try self.desktop.sceneSnapshotGrowing(
                     self.allocator,
                     &self.scene_windows,
                 );
                 for (windows) |window| {
                     if (!window.visible) continue;
-                    try self.appendSceneRoot(window.surface, &sample_count, logical_output);
+                    try self.appendSceneRoot(window.surface, &sample_count, output_bounds);
                 }
-                try self.appendLayerShell(.top, &sample_count, logical_output);
-                try self.appendLayerShell(.overlay, &sample_count, logical_output);
+                try self.appendLayerShell(.top, &sample_count, output_bounds);
+                try self.appendLayerShell(.overlay, &sample_count, output_bounds);
             }
             var change_count = sample_count;
             const output_scale = try geometry.OutputScale.init(
@@ -6127,7 +6133,7 @@ pub fn Coordinator(comptime protocol: type) type {
             for (self.removed_layers[0..self.removed_layer_len]) |removed| {
                 try self.ensureFrameStorage(@max(sample_count, change_count) + 1);
                 self.frame_changes[change_count] = .{
-                    .previous = try scaleSurfaceState(removed.state, output_scale),
+                    .previous = try scaleSurfaceState(removed.state, output_bounds, output_scale),
                 };
                 change_count += 1;
             }
@@ -6138,9 +6144,13 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (try self.interaction.cursor.composite(.{
                     .surface = self.cursor_layer.id.?,
                     .sample = self.cursor_layer.sample.?,
-                }, logical_output)) |cursor_sample| {
+                }, output_bounds)) |cursor_sample| {
                     try self.ensureFrameStorage(@max(sample_count, change_count) + 1);
-                    self.frame_samples[sample_count] = try scaleSample(cursor_sample, output_scale);
+                    self.frame_samples[sample_count] = try scaleSample(
+                        cursor_sample,
+                        output_bounds,
+                        output_scale,
+                    );
                     self.frame_bindings[sample_count] = self.cursor_layer.binding.?;
                     var logical_change = self.cursor_layer.change.?;
                     logical_change.current = damage.SurfaceState.fromSample(cursor_sample, .{
@@ -6148,7 +6158,11 @@ pub fn Coordinator(comptime protocol: type) type {
                         .height = cursor_sample.destination.height,
                     });
                     logical_change.invalidate_bounds = true;
-                    self.frame_changes[change_count] = try scaleChange(logical_change, output_scale);
+                    self.frame_changes[change_count] = try scaleChange(
+                        logical_change,
+                        output_bounds,
+                        output_scale,
+                    );
                     self.cursor_layer.sample = cursor_sample;
                     self.cursor_layer.change = logical_change;
                     sample_count += 1;
@@ -6159,16 +6173,24 @@ pub fn Coordinator(comptime protocol: type) type {
             self.themed_cursor.setPointerAvailable(self.interaction.cursor.pointer_available);
             var next_themed_cursor_previous = self.themed_cursor_previous;
             if (self.themed_cursor.image != null) {
-                if (try self.themed_cursor.sample(logical_output)) |sample| {
+                if (try self.themed_cursor.sample(output_bounds)) |sample| {
                     try self.ensureFrameStorage(@max(sample_count, change_count) + 1);
-                    self.frame_samples[sample_count] = try scaleSample(sample, output_scale);
+                    self.frame_samples[sample_count] = try scaleSample(
+                        sample,
+                        output_bounds,
+                        output_scale,
+                    );
                     self.frame_bindings[sample_count] = self.themed_cursor.sampleBinding(output_api.SampleBinding);
                     var logical_change = try self.themed_cursor.damageChange(
                         self.themed_cursor_previous,
-                        logical_output,
+                        output_bounds,
                     );
                     logical_change.invalidate_bounds = true;
-                    self.frame_changes[change_count] = try scaleChange(logical_change, output_scale);
+                    self.frame_changes[change_count] = try scaleChange(
+                        logical_change,
+                        output_bounds,
+                        output_scale,
+                    );
                     next_themed_cursor_previous = logical_change.current;
                     sample_count += 1;
                     change_count += 1;
@@ -6176,6 +6198,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     try self.ensureFrameStorage(@max(sample_count, change_count) + 1);
                     self.frame_changes[change_count] = .{ .previous = try scaleSurfaceState(
                         self.themed_cursor_previous.?,
+                        output_bounds,
                         output_scale,
                     ) };
                     next_themed_cursor_previous = null;
@@ -6185,6 +6208,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.ensureFrameStorage(@max(sample_count, change_count) + 1);
                 self.frame_changes[change_count] = .{ .previous = try scaleSurfaceState(
                     self.themed_cursor_previous.?,
+                    output_bounds,
                     output_scale,
                 ) };
                 next_themed_cursor_previous = null;
@@ -6193,7 +6217,7 @@ pub fn Coordinator(comptime protocol: type) type {
             if (self.client_cursor_hidden_previous) |previous| {
                 try self.ensureFrameStorage(@max(sample_count, change_count) + 1);
                 self.frame_changes[change_count] = .{
-                    .previous = try scaleSurfaceState(previous, output_scale),
+                    .previous = try scaleSurfaceState(previous, output_bounds, output_scale),
                 };
                 change_count += 1;
             }
@@ -6306,33 +6330,35 @@ pub fn Coordinator(comptime protocol: type) type {
             self: *Self,
             selected: LayerShellAdapter.Layer,
             count: *usize,
-            output_size: render.Size,
+            output_bounds: geometry.Rect,
         ) !void {
             const ids = try self.layer_shell_adapter.ids(self.layer_surface_ids);
             for (ids) |id| {
                 const state = try self.layer_shell_adapter.state(id);
-                if (!state.mapped or state.layer != selected) continue;
-                try self.appendSceneRoot(state.surface, count, output_size);
+                if (!state.mapped or state.layer != selected or
+                    !std.meta.eql(state.output, self.protocol_output_id)) continue;
+                try self.appendSceneRoot(state.surface, count, output_bounds);
                 const popups = try self.desktop.externalPopupSnapshot(
                     state.surface,
                     self.popup_scene_windows,
                 );
                 for (popups) |popup| if (popup.visible)
-                    try self.appendSceneRoot(popup.surface, count, output_size);
+                    try self.appendSceneRoot(popup.surface, count, output_bounds);
             }
         }
 
         fn appendSessionLock(
             self: *Self,
             count: *usize,
-            output_size: render.Size,
+            output_bounds: geometry.Rect,
         ) !void {
             const active = self.session_lock_adapter.activeLock() orelse return;
             const ids = try self.session_lock_adapter.surfaceIds(self.lock_surface_ids);
             for (ids) |id| {
                 const state = try self.session_lock_adapter.surfaceState(id);
-                if (!state.mapped or !std.meta.eql(state.lock, active)) continue;
-                try self.appendSceneRoot(state.surface, count, output_size);
+                if (!state.mapped or !std.meta.eql(state.lock, active) or
+                    !std.meta.eql(state.output_id, self.protocol_output_id)) continue;
+                try self.appendSceneRoot(state.surface, count, output_bounds);
             }
         }
 
@@ -6340,20 +6366,28 @@ pub fn Coordinator(comptime protocol: type) type {
             self: *Self,
             root: Adapter.SurfaceId,
             count: *usize,
-            output_size: render.Size,
+            output_bounds: geometry.Rect,
         ) !void {
             const surfaces = try self.sceneOrder(root);
             for (surfaces) |surface| {
                 const layer = self.findAppLayer(surface) orelse continue;
                 if (!layer.active) continue;
-                if (!try self.refreshSubsurfaceLayer(layer, output_size)) continue;
+                if (!try self.refreshSubsurfaceLayer(layer, output_bounds)) continue;
                 try self.ensureFrameStorage(count.* + 1);
                 const output_scale = try geometry.OutputScale.init(
                     self.output_management_adapter.lifecycle.current.scale_120,
                 );
-                self.frame_samples[count.*] = try scaleSample(layer.sample.?, output_scale);
+                self.frame_samples[count.*] = try scaleSample(
+                    layer.sample.?,
+                    output_bounds,
+                    output_scale,
+                );
                 self.frame_bindings[count.*] = layer.binding.?;
-                self.frame_changes[count.*] = try scaleChange(layer.change.?, output_scale);
+                self.frame_changes[count.*] = try scaleChange(
+                    layer.change.?,
+                    output_bounds,
+                    output_scale,
+                );
                 count.* += 1;
             }
         }
@@ -6361,7 +6395,7 @@ pub fn Coordinator(comptime protocol: type) type {
         fn refreshSubsurfaceLayer(
             self: *Self,
             layer: *Layer,
-            output_size: render.Size,
+            output_bounds: geometry.Rect,
         ) !bool {
             const id = layer.id orelse return false;
             const scene = self.surfaceScene(id) orelse return false;
@@ -6383,7 +6417,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     scene.root.geometry.y,
                 scene.offset_y,
             );
-            sample.clip = try clipToOutput(sample.destination, output_size) orelse return false;
+            sample.clip = try clipToOutput(sample.destination, output_bounds) orelse return false;
             if (std.meta.eql(sample.destination, layer.sample.?.destination) and
                 std.meta.eql(sample.clip, layer.sample.?.clip)) return true;
             const natural_size = layer.change.?.current.?.surface_size;
@@ -7357,11 +7391,6 @@ pub fn Coordinator(comptime protocol: type) type {
             };
         }
 
-        fn logicalOutputSize(self: *const Self) !render.Size {
-            const bounds = try self.outputBounds();
-            return .{ .width = @intCast(bounds.width), .height = @intCast(bounds.height) };
-        }
-
         fn layerWorkArea(self: *Self, pending_surface: ?Adapter.SurfaceId) !geometry.Rect {
             var area = try self.outputBounds();
             const ids = try self.layer_shell_adapter.ids(self.layer_surface_ids);
@@ -8126,8 +8155,9 @@ test "physical: output replacement rolls back exactly once after activation fail
 
 test "physical: logical render rectangles scale adjacent edges without gaps" {
     const scale = try geometry.OutputScale.init(156);
-    const left = try scaleRenderRect(.{ .x = -1, .y = 2, .width = 3, .height = 5 }, scale);
-    const right = try scaleRenderRect(.{ .x = 2, .y = 2, .width = 4, .height = 5 }, scale);
+    const output: geometry.Rect = .{ .x = 0, .y = 0, .width = 10, .height = 10 };
+    const left = try scaleRenderRect(.{ .x = -1, .y = 2, .width = 3, .height = 5 }, output, scale);
+    const right = try scaleRenderRect(.{ .x = 2, .y = 2, .width = 4, .height = 5 }, output, scale);
     try std.testing.expectEqual(@as(i32, -1), left.x);
     try std.testing.expectEqual(@as(u32, 4), left.width);
     try std.testing.expectEqual(@as(i64, left.x) + left.width, right.x);
@@ -8135,8 +8165,28 @@ test "physical: logical render rectangles scale adjacent edges without gaps" {
     try std.testing.expectEqual(left.height, right.height);
     try std.testing.expectError(
         error.InvalidDestination,
-        scaleRenderRect(.{ .x = 0, .y = 0, .width = 1, .height = 1 }, try geometry.OutputScale.init(1)),
+        scaleRenderRect(
+            .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+            output,
+            try geometry.OutputScale.init(1),
+        ),
     );
+}
+
+test "physical: displaced output scene rectangles map to local physical pixels" {
+    const output: geometry.Rect = .{ .x = 1920, .y = -120, .width = 1280, .height = 960 };
+    const scale = try geometry.OutputScale.init(150);
+    const physical = try scaleRenderRect(
+        .{ .x = 2000, .y = -40, .width = 160, .height = 80 },
+        output,
+        scale,
+    );
+    try std.testing.expectEqual(render.Rect{
+        .x = 100,
+        .y = 100,
+        .width = 200,
+        .height = 100,
+    }, physical);
 }
 
 fn alphaMultiplier(multiplier: u32) u8 {
@@ -8334,17 +8384,19 @@ fn sourceCrop(update: anytype, width: u32, height: u32) !render.SourceRect {
     return render.SourceRect.pixels(0, 0, @intCast(width), @intCast(height));
 }
 
-fn clipToOutput(destination: render.Rect, output: render.Size) !?render.Rect {
-    try render.validateOutput(output);
+fn clipToOutput(destination: render.Rect, output: geometry.Rect) !?render.Rect {
+    try output.validate();
     if (destination.width == 0 or destination.height == 0) return null;
     const right = std.math.add(i64, destination.x, destination.width) catch
         return error.InvalidDestination;
     const bottom = std.math.add(i64, destination.y, destination.height) catch
         return error.InvalidDestination;
-    const left = @max(@as(i64, 0), destination.x);
-    const top = @max(@as(i64, 0), destination.y);
-    const clipped_right = @min(@as(i64, output.width), right);
-    const clipped_bottom = @min(@as(i64, output.height), bottom);
+    const output_right = @as(i64, output.x) + output.width;
+    const output_bottom = @as(i64, output.y) + output.height;
+    const left = @max(@as(i64, output.x), destination.x);
+    const top = @max(@as(i64, output.y), destination.y);
+    const clipped_right = @min(output_right, right);
+    const clipped_bottom = @min(output_bottom, bottom);
     if (clipped_right <= left or clipped_bottom <= top) return null;
     return .{
         .x = @intCast(left),
@@ -8354,15 +8406,28 @@ fn clipToOutput(destination: render.Rect, output: render.Size) !?render.Rect {
     };
 }
 
-fn scaleRenderRect(rect: render.Rect, scale: geometry.OutputScale) !render.Rect {
+fn scaleRenderRect(
+    rect: render.Rect,
+    output: geometry.Rect,
+    scale: geometry.OutputScale,
+) !render.Rect {
+    try output.validate();
     const logical_right = std.math.add(i64, rect.x, rect.width) catch
         return error.InvalidDestination;
     const logical_bottom = std.math.add(i64, rect.y, rect.height) catch
         return error.InvalidDestination;
-    const left = scale.physicalEdge(rect.x) catch return error.InvalidDestination;
-    const top = scale.physicalEdge(rect.y) catch return error.InvalidDestination;
-    const right = scale.physicalEdge(logical_right) catch return error.InvalidDestination;
-    const bottom = scale.physicalEdge(logical_bottom) catch return error.InvalidDestination;
+    const relative_left = std.math.sub(i64, rect.x, output.x) catch
+        return error.InvalidDestination;
+    const relative_top = std.math.sub(i64, rect.y, output.y) catch
+        return error.InvalidDestination;
+    const relative_right = std.math.sub(i64, logical_right, output.x) catch
+        return error.InvalidDestination;
+    const relative_bottom = std.math.sub(i64, logical_bottom, output.y) catch
+        return error.InvalidDestination;
+    const left = scale.physicalEdge(relative_left) catch return error.InvalidDestination;
+    const top = scale.physicalEdge(relative_top) catch return error.InvalidDestination;
+    const right = scale.physicalEdge(relative_right) catch return error.InvalidDestination;
+    const bottom = scale.physicalEdge(relative_bottom) catch return error.InvalidDestination;
     if (right <= left or bottom <= top) return error.InvalidDestination;
     return .{
         .x = std.math.cast(i32, left) orelse return error.InvalidDestination,
@@ -8372,24 +8437,36 @@ fn scaleRenderRect(rect: render.Rect, scale: geometry.OutputScale) !render.Rect 
     };
 }
 
-fn scaleSample(sample_value: render.SurfaceSample, scale: geometry.OutputScale) !render.SurfaceSample {
+fn scaleSample(
+    sample_value: render.SurfaceSample,
+    output: geometry.Rect,
+    scale: geometry.OutputScale,
+) !render.SurfaceSample {
     var result = sample_value;
-    result.destination = try scaleRenderRect(result.destination, scale);
-    result.clip = try scaleRenderRect(result.clip, scale);
+    result.destination = try scaleRenderRect(result.destination, output, scale);
+    result.clip = try scaleRenderRect(result.clip, output, scale);
     return result;
 }
 
-fn scaleSurfaceState(state: damage.SurfaceState, scale: geometry.OutputScale) !damage.SurfaceState {
+fn scaleSurfaceState(
+    state: damage.SurfaceState,
+    output: geometry.Rect,
+    scale: geometry.OutputScale,
+) !damage.SurfaceState {
     var result = state;
-    result.destination = try scaleRenderRect(result.destination, scale);
-    result.clip = try scaleRenderRect(result.clip, scale);
+    result.destination = try scaleRenderRect(result.destination, output, scale);
+    result.clip = try scaleRenderRect(result.clip, output, scale);
     return result;
 }
 
-fn scaleChange(change: damage.Change, scale: geometry.OutputScale) !damage.Change {
+fn scaleChange(
+    change: damage.Change,
+    output: geometry.Rect,
+    scale: geometry.OutputScale,
+) !damage.Change {
     var result = change;
-    result.previous = if (change.previous) |state| try scaleSurfaceState(state, scale) else null;
-    result.current = if (change.current) |state| try scaleSurfaceState(state, scale) else null;
+    result.previous = if (change.previous) |state| try scaleSurfaceState(state, output, scale) else null;
+    result.current = if (change.current) |state| try scaleSurfaceState(state, output, scale) else null;
     return result;
 }
 
@@ -8482,7 +8559,7 @@ test "seat: physical input batch retries only the failed suffix" {
 }
 
 test "physical: scene clip is the checked destination output intersection" {
-    const output: render.Size = .{ .width = 8, .height = 6 };
+    const output: geometry.Rect = .{ .x = 0, .y = 0, .width = 8, .height = 6 };
     try std.testing.expectEqual(
         render.Rect{ .x = 0, .y = 1, .width = 3, .height = 4 },
         (try clipToOutput(.{ .x = -2, .y = 1, .width = 5, .height = 4 }, output)).?,
@@ -8499,6 +8576,12 @@ test "physical: scene clip is the checked destination output intersection" {
         .{ .x = 9, .y = 0, .width = 2, .height = 2 },
         output,
     )) == null);
+
+    const displaced: geometry.Rect = .{ .x = 10, .y = -4, .width = 8, .height = 6 };
+    try std.testing.expectEqual(
+        render.Rect{ .x = 10, .y = -3, .width = 3, .height = 4 },
+        (try clipToOutput(.{ .x = 8, .y = -3, .width = 5, .height = 4 }, displaced)).?,
+    );
 }
 
 test "physical: capture readback copies full output without a clearing pass" {

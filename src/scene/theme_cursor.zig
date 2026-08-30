@@ -27,6 +27,8 @@ pub fn syntheticSurfaceId(comptime SurfaceId: type) SurfaceId {
 }
 
 pub const Cursor = struct {
+    pub const Error = render.ValidationError || error{InvalidGeometry};
+
     image: ?cursor_theme.Image = null,
     position: geometry.Point = .{ .x = 0, .y = 0 },
     pointer_available: bool = false,
@@ -65,10 +67,10 @@ pub const Cursor = struct {
         };
     }
 
-    pub fn sample(self: Cursor, output: render.Size) render.ValidationError!?render.SurfaceSample {
+    pub fn sample(self: Cursor, output: geometry.Rect) Error!?render.SurfaceSample {
         if (!self.pointer_available) return null;
         const image = self.image orelse return null;
-        try render.validateOutput(output);
+        try output.validate();
         if (image.width == 0 or image.height == 0 or
             image.width > std.math.maxInt(i32) / render.fixed_one or
             image.height > std.math.maxInt(i32) / render.fixed_one or
@@ -82,10 +84,10 @@ pub const Cursor = struct {
             return error.InvalidDestination;
         const y = std.math.sub(i32, self.position.y, @as(i32, @intCast(image.y_hotspot))) catch
             return error.InvalidDestination;
-        const right = @min(@as(i64, output.width), @as(i64, x) + image.width);
-        const bottom = @min(@as(i64, output.height), @as(i64, y) + image.height);
-        const left = @max(@as(i64, 0), x);
-        const top = @max(@as(i64, 0), y);
+        const right = @min(@as(i64, output.x) + output.width, @as(i64, x) + image.width);
+        const bottom = @min(@as(i64, output.y) + output.height, @as(i64, y) + image.height);
+        const left = @max(@as(i64, output.x), x);
+        const top = @max(@as(i64, output.y), y);
         if (right <= left or bottom <= top) return null;
 
         const result: render.SurfaceSample = .{
@@ -113,7 +115,7 @@ pub const Cursor = struct {
     /// Captures output-dependent geometry for scene damage before/after a
     /// cursor mutation. A caller captures `previous`, mutates, then calls
     /// `damageChange`; no client-content damage is attached.
-    pub fn damageState(self: Cursor, output: render.Size) render.ValidationError!?damage.SurfaceState {
+    pub fn damageState(self: Cursor, output: geometry.Rect) Error!?damage.SurfaceState {
         const value = try self.sample(output) orelse return null;
         return damage.SurfaceState.fromSample(value, value.source.size);
     }
@@ -121,8 +123,8 @@ pub const Cursor = struct {
     pub fn damageChange(
         self: Cursor,
         previous: ?damage.SurfaceState,
-        output: render.Size,
-    ) render.ValidationError!damage.Change {
+        output: geometry.Rect,
+    ) Error!damage.Change {
         return .{ .previous = previous, .current = try self.damageState(output) };
     }
 };
@@ -165,11 +167,11 @@ test "theme cursor: hotspot placement clipping and movement preserve identity" {
     cursor.setPointerAvailable(true);
     _ = cursor.setImage(testImage(&pixels_a));
     cursor.move(.{ .x = 1, .y = 1 });
-    const first = (try cursor.sample(.{ .width = 10, .height = 10 })).?;
+    const first = (try cursor.sample(.{ .x = 0, .y = 0, .width = 10, .height = 10 })).?;
     try std.testing.expectEqual(render.Rect{ .x = -1, .y = 0, .width = 4, .height = 3 }, first.destination);
     try std.testing.expectEqual(render.Rect{ .x = 0, .y = 0, .width = 3, .height = 3 }, first.clip);
     cursor.move(.{ .x = 8, .y = 8 });
-    const moved = (try cursor.sample(.{ .width = 10, .height = 10 })).?;
+    const moved = (try cursor.sample(.{ .x = 0, .y = 0, .width = 10, .height = 10 })).?;
     try std.testing.expectEqual(first.sample, moved.sample);
     try std.testing.expectEqual(first.presentation, moved.presentation);
     try std.testing.expect(!std.meta.eql(first.destination, moved.destination));
@@ -178,50 +180,50 @@ test "theme cursor: hotspot placement clipping and movement preserve identity" {
 test "theme cursor: image changes identity while identical image is a no-op" {
     var cursor = Cursor{ .pointer_available = true };
     try std.testing.expect(cursor.setImage(testImage(&pixels_a)));
-    const first = (try cursor.sample(.{ .width = 10, .height = 10 })).?.sample;
+    const first = (try cursor.sample(.{ .x = 0, .y = 0, .width = 10, .height = 10 })).?.sample;
     try std.testing.expect(!cursor.setImage(testImage(&pixels_a)));
-    try std.testing.expectEqual(first, (try cursor.sample(.{ .width = 10, .height = 10 })).?.sample);
+    try std.testing.expectEqual(first, (try cursor.sample(.{ .x = 0, .y = 0, .width = 10, .height = 10 })).?.sample);
     try std.testing.expect(cursor.setImage(testImage(&pixels_b)));
-    try std.testing.expect(first.commit_sequence != (try cursor.sample(.{ .width = 10, .height = 10 })).?.sample.commit_sequence);
+    try std.testing.expect(first.commit_sequence != (try cursor.sample(.{ .x = 0, .y = 0, .width = 10, .height = 10 })).?.sample.commit_sequence);
 }
 
 test "theme cursor: clear availability and clipping hide without stale image" {
     var cursor = Cursor{ .pointer_available = true };
     _ = cursor.setImage(testImage(&pixels_a));
     cursor.move(.{ .x = 20, .y = 20 });
-    try std.testing.expect((try cursor.sample(.{ .width = 10, .height = 10 })) == null);
+    try std.testing.expect((try cursor.sample(.{ .x = 0, .y = 0, .width = 10, .height = 10 })) == null);
     cursor.move(.{ .x = 2, .y = 1 });
     cursor.setPointerAvailable(false);
-    try std.testing.expect((try cursor.sample(.{ .width = 10, .height = 10 })) == null);
+    try std.testing.expect((try cursor.sample(.{ .x = 0, .y = 0, .width = 10, .height = 10 })) == null);
     cursor.setPointerAvailable(true);
     try std.testing.expect(cursor.setImage(null));
     try std.testing.expect(cursor.image == null);
-    try std.testing.expect((try cursor.sample(.{ .width = 10, .height = 10 })) == null);
+    try std.testing.expect((try cursor.sample(.{ .x = 0, .y = 0, .width = 10, .height = 10 })) == null);
 }
 
 test "theme cursor: invalid image and pointer arithmetic are rejected" {
     var cursor = Cursor{ .pointer_available = true };
     _ = cursor.setImage(.{ .width = 1, .height = 1, .x_hotspot = 0, .y_hotspot = 0, .delay = 0, .pixels = &.{ 0, 0, 0 } });
-    try std.testing.expectError(error.InvalidSource, cursor.sample(.{ .width = 10, .height = 10 }));
+    try std.testing.expectError(error.InvalidSource, cursor.sample(.{ .x = 0, .y = 0, .width = 10, .height = 10 }));
     _ = cursor.setImage(.{ .width = std.math.maxInt(u32), .height = 1, .x_hotspot = 0, .y_hotspot = 0, .delay = 0, .pixels = &.{} });
-    try std.testing.expectError(error.InvalidSource, cursor.sample(.{ .width = 10, .height = 10 }));
+    try std.testing.expectError(error.InvalidSource, cursor.sample(.{ .x = 0, .y = 0, .width = 10, .height = 10 }));
     _ = cursor.setImage(testImage(&pixels_a));
     cursor.position.x = std.math.minInt(i32);
-    try std.testing.expectError(error.InvalidDestination, cursor.sample(.{ .width = 10, .height = 10 }));
-    try std.testing.expectError(error.InvalidOutput, cursor.sample(.{ .width = 0, .height = 10 }));
+    try std.testing.expectError(error.InvalidDestination, cursor.sample(.{ .x = 0, .y = 0, .width = 10, .height = 10 }));
+    try std.testing.expectError(error.InvalidGeometry, cursor.sample(.{ .x = 0, .y = 0, .width = 0, .height = 10 }));
 }
 
 test "theme cursor: damage transition contains old and new geometry" {
     var cursor = Cursor{ .pointer_available = true };
     _ = cursor.setImage(testImage(&pixels_a));
     cursor.move(.{ .x = 4, .y = 4 });
-    const old = (try cursor.damageState(.{ .width = 20, .height = 20 })).?;
+    const old = (try cursor.damageState(.{ .x = 0, .y = 0, .width = 20, .height = 20 })).?;
     cursor.move(.{ .x = 9, .y = 7 });
-    const change = try cursor.damageChange(old, .{ .width = 20, .height = 20 });
+    const change = try cursor.damageChange(old, .{ .x = 0, .y = 0, .width = 20, .height = 20 });
     try std.testing.expectEqual(render.Rect{ .x = 2, .y = 3, .width = 4, .height = 3 }, change.previous.?.destination);
     try std.testing.expectEqual(render.Rect{ .x = 7, .y = 6, .width = 4, .height = 3 }, change.current.?.destination);
     try std.testing.expect(change.surface_damage == null and change.buffer_damage == null);
     _ = cursor.setImage(null);
-    const hidden = try cursor.damageChange(change.current, .{ .width = 20, .height = 20 });
+    const hidden = try cursor.damageChange(change.current, .{ .x = 0, .y = 0, .width = 20, .height = 20 });
     try std.testing.expect(hidden.previous != null and hidden.current == null);
 }
