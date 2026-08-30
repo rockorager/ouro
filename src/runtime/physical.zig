@@ -1558,12 +1558,12 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.syncCommitTimer();
             try self.syncXdgSessionStoreTimer();
             try self.prepareSecurityClosures();
-            try self.pauseOutput();
+            try self.pauseAllOutputs();
             try self.advanceDrain();
         }
 
         pub fn backendDrainComplete(self: *const Self) bool {
-            return self.stopping and self.primaryKmsOutput() == null and
+            return self.stopping and !self.anyKmsOutput() and
                 self.pending_screencopy == null and self.pending_image_copy == null and
                 (self.input == null or self.input.?.drainComplete()) and
                 self.session.drainComplete() and self.timers.idle() and
@@ -2592,7 +2592,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .quiesce_output => {
                     self.session_disable_pending = true;
                     if (self.input != null) try self.processInput();
-                    try self.pauseOutput();
+                    try self.pauseAllOutputs();
                 },
                 .none => switch (event) {
                     .failed => {
@@ -2602,10 +2602,10 @@ pub fn Coordinator(comptime protocol: type) type {
                         }
                         self.session_disable_pending = true;
                         if (self.input != null) try self.processInput();
-                        if (self.primaryKmsOutput()) |output| {
+                        for (self.physical_outputs[0..self.physical_output_count]) |*physical| if (physical.kms_output) |output| {
                             if (try output.terminalDeviceTeardown()) |action|
                                 try self.consumeRetireAction(action);
-                        }
+                        };
                     },
                     else => {},
                 },
@@ -3469,6 +3469,12 @@ pub fn Coordinator(comptime protocol: type) type {
 
         pub fn primaryKmsOutput(self: *const Self) ?*output_api.Output {
             return self.primaryPhysicalOutput().kms_output;
+        }
+
+        fn anyKmsOutput(self: *const Self) bool {
+            for (self.physical_outputs[0..self.physical_output_count]) |physical|
+                if (physical.kms_output != null) return true;
+            return false;
         }
 
         fn physicalOutputForProtocolId(
@@ -7774,13 +7780,20 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn pauseOutput(self: *Self) !void {
-            const output = self.primaryKmsOutput() orelse return;
-            if (!output.accepting_frames) return;
-            try self.output_adapter.setAvailable(
-                self.primaryPhysicalOutput().protocol_output,
-                false,
-            );
+            try self.pausePhysicalOutput(self.primaryPhysicalOutputMutable());
             self.screencopy_adapter.setAvailable(false);
+        }
+
+        fn pauseAllOutputs(self: *Self) !void {
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical|
+                try self.pausePhysicalOutput(physical);
+            self.screencopy_adapter.setAvailable(false);
+        }
+
+        fn pausePhysicalOutput(self: *Self, physical: *PhysicalOutput) !void {
+            const output = physical.kms_output orelse return;
+            if (!output.accepting_frames) return;
+            try self.output_adapter.setAvailable(physical.protocol_output, false);
             self.markProtocolAll(ProtocolReady.output);
             if (try output.requestPause()) |action| try self.consumeRetireAction(action);
             try self.processOutput();
@@ -7841,8 +7854,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 }
                 _ = input.quiesceComplete();
             }
-            if (self.primaryKmsOutput()) |output| {
-                const physical = self.primaryPhysicalOutputMutable();
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                const output = physical.kms_output orelse continue;
                 if (output.paused and !physical.drain_started) {
                     try output.beginDrain(&self.router, &self.root.ring);
                     physical.drain_started = true;
@@ -7857,7 +7870,8 @@ pub fn Coordinator(comptime protocol: type) type {
                     try output.destroy();
                     physical.kms_output = null;
                     self.stats.output_drains += 1;
-                    if (!self.stopping and self.output_power_transition != null) {
+                    const primary = std.meta.eql(physical.id, self.primaryPhysicalOutput().id);
+                    if (primary and !self.stopping and self.output_power_transition != null) {
                         const command = self.output_power_transition.?;
                         self.output_power_transition = null;
                         if (self.output_power_adapter.peekCommand()) |current| {
@@ -7874,31 +7888,36 @@ pub fn Coordinator(comptime protocol: type) type {
                             try self.gamma_control_adapter.outputRemoved(physical.id);
                             self.markProtocolAll(ProtocolReady.gamma_control);
                         }
-                        try self.retireGammaOwner();
-                        try self.drm_lease_adapter.deviceUnavailable(.physical);
-                        self.markProtocolAll(ProtocolReady.drm_lease);
-                        self.drm_lease_desired = false;
-                        self.drm_lease_topology_generation = null;
-                        self.drm_remove_pending = true;
-                        try self.advanceDrmLeaseGlobal();
                     }
                 }
             }
-            if (self.primaryKmsOutput() == null and self.drm_remove_pending) {
+            if (!self.anyKmsOutput() and !self.drm_remove_pending and
+                (self.stopping or self.session_disable_pending))
+            {
+                try self.retireGammaOwner();
+                try self.drm_lease_adapter.deviceUnavailable(.physical);
+                self.markProtocolAll(ProtocolReady.drm_lease);
+                self.drm_lease_desired = false;
+                self.drm_lease_topology_generation = null;
+                self.drm_remove_pending = true;
+                try self.advanceDrmLeaseGlobal();
+            }
+            if (!self.anyKmsOutput() and self.drm_remove_pending) {
                 try self.advanceDrmLeaseGlobal();
                 if (self.drm_lease_global_update == .none and
                     !self.drm_lease_adapter.installed() and
                     !self.drm_lease_adapter.retryRevocations())
                 {
                     try self.manager.remove();
-                    self.primaryPhysicalOutputMutable().claim = null;
+                    for (self.physical_outputs[0..self.physical_output_count]) |*physical|
+                        physical.claim = null;
                     self.drm_remove_pending = false;
                 }
             }
-            if (self.primaryKmsOutput() == null and self.stopping) self.abandonPending();
+            if (!self.anyKmsOutput() and self.stopping) self.abandonPending();
             const input_quiescent = self.input == null or
                 self.input.?.state == .suspended or self.input.?.state == .draining;
-            if (self.primaryKmsOutput() == null and input_quiescent and
+            if (!self.anyKmsOutput() and input_quiescent and
                 self.session_disable_pending)
             {
                 if (self.session.state == .disabling)
@@ -7906,7 +7925,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.session_disable_pending = false;
             }
             const input_drained = self.input == null or self.input.?.drainComplete();
-            if (self.primaryKmsOutput() == null and input_drained and self.stopping and
+            if (!self.anyKmsOutput() and input_drained and self.stopping and
                 self.session.state != .draining)
                 try self.session.beginDrain(&self.router, &self.root.ring);
         }
