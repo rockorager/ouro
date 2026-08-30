@@ -84,7 +84,7 @@ pub fn Adapter(comptime protocol: type) type {
         model: []u8,
         physical_width_mm: i32,
         physical_height_mm: i32,
-        scale: i32,
+        scale_120: u32,
         mode: ?Mode = null,
         available: bool = false,
         resources: []*Resource,
@@ -135,7 +135,7 @@ pub fn Adapter(comptime protocol: type) type {
                 .model = model,
                 .physical_width_mm = config.physical_width_mm,
                 .physical_height_mm = config.physical_height_mm,
-                .scale = config.scale,
+                .scale_120 = try std.math.mul(u32, @intCast(config.scale), 120),
                 .resources = resources,
                 .resource_free = 0,
                 .associations = associations,
@@ -219,6 +219,29 @@ pub fn Adapter(comptime protocol: type) type {
                 adapter.enqueue(id, .mode) catch unreachable;
                 if (resource.version >= 2) adapter.enqueue(id, .done) catch unreachable;
             };
+        }
+
+        /// Publishes the compositor-space scale in 1/120 increments. The
+        /// integer wl_output event rounds upward as required for clients that
+        /// do not bind fractional-scale-v1; xdg-output consumes the exact
+        /// logical dimensions from `logicalSnapshot`.
+        pub fn publishScale(adapter: *Self, scale_120: u32) !void {
+            if (scale_120 == 0 or
+                @divTrunc(@as(u64, scale_120) + 119, 120) > std.math.maxInt(i32))
+                return error.InvalidScale;
+            if (adapter.scale_120 == scale_120) return;
+            var event_count: usize = 0;
+            for (adapter.resources) |resource| {
+                if (resource.active and resource.version >= 2) event_count += 2;
+            }
+            try adapter.ensureOutbound(event_count);
+            adapter.scale_120 = scale_120;
+            for (adapter.resources, 0..) |resource, index| {
+                if (!resource.active or resource.version < 2) continue;
+                const id = adapter.idFor(@intCast(index));
+                adapter.enqueue(id, .scale) catch unreachable;
+                adapter.enqueue(id, .done) catch unreachable;
+            }
         }
 
         pub fn setAvailable(adapter: *Self, available: bool) void {
@@ -408,11 +431,14 @@ pub fn Adapter(comptime protocol: type) type {
 
         pub fn logicalSnapshot(adapter: *const Self) LogicalSnapshot {
             return .{
-                // Ouro's compositor space currently maps directly to the
-                // untransformed physical mode; wl_output.scale only describes
-                // the preferred client buffer scale.
-                .width = if (adapter.mode) |mode| mode.width else null,
-                .height = if (adapter.mode) |mode| mode.height else null,
+                .width = if (adapter.mode) |mode|
+                    @intCast(@divTrunc(@as(u64, @intCast(mode.width)) * 120, adapter.scale_120))
+                else
+                    null,
+                .height = if (adapter.mode) |mode|
+                    @intCast(@divTrunc(@as(u64, @intCast(mode.height)) * 120, adapter.scale_120))
+                else
+                    null,
                 .name = adapter.name,
                 .description = adapter.description,
             };
@@ -501,7 +527,9 @@ pub fn Adapter(comptime protocol: type) type {
                     .height = adapter.mode.?.height,
                     .refresh = adapter.mode.?.refresh_millihz,
                 } },
-                .scale => .{ .scale = .{ .factor = adapter.scale } },
+                .scale => .{ .scale = .{
+                    .factor = @intCast(@divTrunc(@as(u64, adapter.scale_120) + 119, 120)),
+                } },
                 .name => .{ .name = .{ .name = adapter.name } },
                 .description => .{ .description = .{ .description = adapter.description } },
                 .done => .{ .done = .{} },
@@ -784,4 +812,30 @@ test "output: storage grows beyond initial capacities" {
     try std.testing.expectEqual(first, reused);
     try std.testing.expect(old_id.generation != adapter.idFor(reused).generation);
     try std.testing.expectError(error.StaleResource, adapter.resolve(old_id));
+}
+
+test "output: fractional scale republishes integer fallback and logical size" {
+    const TestAdapter = Adapter(@import("core_protocol"));
+    var adapter = try TestAdapter.init(std.testing.allocator, .{
+        .resource_capacity = 1,
+        .association_capacity = 1,
+        .outbound_capacity = 1,
+    });
+    defer adapter.deinit();
+    try adapter.publishMode(1920, 1200, 60_000, 600, 340);
+    const resource_index = try adapter.acquireResource();
+    const resource = adapter.resources[resource_index];
+    resource.peer = .{ .slot = 1, .generation = 1 };
+    resource.version = 4;
+    resource.handle = .{ .id = 7, .generation = 1 };
+
+    try adapter.publishScale(156);
+    const snapshot = adapter.logicalSnapshot();
+    try std.testing.expectEqual(@as(?i32, 1476), snapshot.width);
+    try std.testing.expectEqual(@as(?i32, 923), snapshot.height);
+    try std.testing.expectEqual(@as(usize, 2), adapter.outbound_len);
+    try std.testing.expect(adapter.oldestOutbound(resource.peer).?.event == .scale);
+    try adapter.publishScale(156);
+    try std.testing.expectEqual(@as(usize, 2), adapter.outbound_len);
+    try std.testing.expectError(error.InvalidScale, adapter.publishScale(0));
 }

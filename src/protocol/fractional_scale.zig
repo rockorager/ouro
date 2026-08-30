@@ -173,6 +173,19 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             return false;
         }
 
+        /// Publishes a new preferred scale to every live surface binding.
+        /// Repeated publication is a no-op and requires no transport storage.
+        pub fn publishPreferredScale(adapter: *Self, preferred_scale: u32) !void {
+            if (preferred_scale == 0) return error.InvalidScale;
+            if (adapter.preferred_scale == preferred_scale) return;
+            adapter.preferred_scale = preferred_scale;
+            for (adapter.slots.entries.items) |slot| {
+                if (!slot.header.active or slot.event_pending) continue;
+                slot.event_pending = true;
+                adapter.event_pending_len += 1;
+            }
+        }
+
         pub fn resourceRemoved(adapter: *Self, handle: objects.Handle, object: objects.Object) bool {
             if (object.interface == &Scale.info) {
                 const slot = adapter.fromObject(&object) orelse return false;
@@ -244,4 +257,28 @@ test "fractional scale: initial reservation grows without moving contexts" {
     _ = try adapter.acquire();
     try std.testing.expectEqual(original, @intFromPtr(slot));
     adapter.release(slot);
+}
+
+test "fractional scale: changed preference republishes each live resource once" {
+    const FakeCore = struct {
+        pub const SurfaceId = struct { index: u32, generation: u32 };
+    };
+    const TestAdapter = Adapter(@import("core_protocol"), FakeCore);
+    var core: FakeCore = .{};
+    var adapter = try TestAdapter.init(std.testing.allocator, &core, .{});
+    defer adapter.deinit();
+    const first = try adapter.acquire();
+    const second = try adapter.acquire();
+    first.event_pending = false;
+    second.event_pending = false;
+    adapter.event_pending_len = 0;
+
+    try adapter.publishPreferredScale(180);
+    try std.testing.expectEqual(@as(u32, 180), adapter.preferred_scale);
+    try std.testing.expect(first.event_pending);
+    try std.testing.expect(second.event_pending);
+    try std.testing.expectEqual(@as(usize, 2), adapter.event_pending_len);
+    try adapter.publishPreferredScale(180);
+    try std.testing.expectEqual(@as(usize, 2), adapter.event_pending_len);
+    try std.testing.expectError(error.InvalidScale, adapter.publishPreferredScale(0));
 }
