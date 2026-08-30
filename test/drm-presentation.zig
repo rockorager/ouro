@@ -679,6 +679,7 @@ test "generated session lock publishes only after presentation and client loss s
     const allocator = std.testing.allocator;
     var fixture = try Fixture.init();
     defer fixture.deinit();
+    fixture.second_desktop = true;
     var path_storage: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-r15-session-lock-{d}.sock", .{linux.getpid()});
     wayring.unix_socket.unlink(path) catch {};
@@ -705,6 +706,7 @@ test "generated session lock publishes only after presentation and client loss s
         .objects = &client.objects,
         .queue = &actor.transmit,
         .registry = registry,
+        .minimum_outputs = 2,
     };
     try submitClient(&reactor, &driver, &handler);
 
@@ -723,6 +725,36 @@ test "generated session lock publishes only after presentation and client loss s
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
     try std.testing.expectEqual(@as(usize, 1), coordinator.stats.presented);
     try std.testing.expect(coordinator.session_lock_adapter.isFailClosed());
+    const lock_ids = try coordinator.session_lock_adapter.surfaceIds(coordinator.lock_surface_ids);
+    try std.testing.expectEqual(@as(usize, 1), lock_ids.len);
+    const lock_state = try coordinator.session_lock_adapter.surfaceState(lock_ids[0]);
+    try std.testing.expectEqual(
+        coordinator.physical_outputs[1].protocol_output,
+        lock_state.output_id,
+    );
+    var lock_destination: ?ouro.render.Rect = null;
+    for (coordinator.app_layers) |layer| {
+        if (layer.id) |id| if (std.meta.eql(id, lock_state.surface) and layer.sample != null) {
+            lock_destination = layer.sample.?.destination;
+            break;
+        };
+    }
+    try std.testing.expectEqual(
+        ouro.render.Rect{ .x = 3, .y = 0, .width = 3, .height = 2 },
+        lock_destination.?,
+    );
+    const lock_resource = try coordinator.adapter.surfaceResource(lock_state.surface);
+    var lock_associations: usize = 0;
+    for (coordinator.output_adapter.associations) |association| {
+        if (!association.active or !association.desired or
+            !std.meta.eql(association.surface, lock_resource)) continue;
+        try std.testing.expectEqual(
+            coordinator.physical_outputs[1].protocol_output,
+            association.output,
+        );
+        lock_associations += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), lock_associations);
 
     _ = try client.prepareClose();
     try submitClient(&reactor, &driver, &handler);
@@ -1746,6 +1778,8 @@ const SessionLockClientHandler = struct {
     surface: ?wayring.objects.Handle = null,
     buffer: ?wayring.objects.Handle = null,
     output_ready: bool = false,
+    output_count: usize = 0,
+    minimum_outputs: usize = 1,
     lock_requested: bool = false,
     configures: usize = 0,
     locked: usize = 0,
@@ -1764,8 +1798,10 @@ const SessionLockClientHandler = struct {
                         self.compositor = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wl_compositor.info, @min(global.version, 7), null);
                     if (std.mem.eql(u8, global.interface, protocol.wl_shm.info.name))
                         self.shm = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wl_shm.info, @min(global.version, 2), null);
-                    if (std.mem.eql(u8, global.interface, protocol.wl_output.info.name))
+                    if (std.mem.eql(u8, global.interface, protocol.wl_output.info.name)) {
                         self.output = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wl_output.info, @min(global.version, 4), null);
+                        self.output_count += 1;
+                    }
                     if (std.mem.eql(u8, global.interface, protocol.ext_session_lock_manager_v1.info.name))
                         self.manager = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.ext_session_lock_manager_v1.info, 1, null);
                 },
@@ -1777,7 +1813,8 @@ const SessionLockClientHandler = struct {
         } else if (target.object.interface == &protocol.wl_output.info) {
             switch (try protocol.wl_output.decodeEvent(message, fds)) {
                 .done => {
-                    self.output_ready = true;
+                    if (self.output != null and message.header.object_id == self.output.?.id)
+                        self.output_ready = true;
                     try self.maybeRequestLock();
                 },
                 else => {},
@@ -1806,7 +1843,8 @@ const SessionLockClientHandler = struct {
 
     fn maybeRequestLock(self: *SessionLockClientHandler) !void {
         if (self.lock_requested or !self.output_ready or self.compositor == null or
-            self.shm == null or self.output == null or self.manager == null) return;
+            self.shm == null or self.output == null or self.manager == null or
+            self.output_count < self.minimum_outputs) return;
         self.lock = (try protocol.ext_session_lock_manager_v1.construct_lock(
             self.objects,
             self.queue,
@@ -2452,7 +2490,9 @@ pub const Fixture = struct {
     framebuffer_removal_before_bo: bool = false,
     requests: [12]u8 = .{0} ** 12,
     request_count: usize = 0,
-    flip_userdata: ?*anyopaque = null,
+    flip_userdata: [4]?*anyopaque = .{null} ** 4,
+    flip_head: usize = 0,
+    flip_len: usize = 0,
     page_flips: usize = 0,
     device_closes: usize = 0,
     seat_closes: usize = 0,
@@ -2801,17 +2841,25 @@ pub const Fixture = struct {
     fn atomicCommit(context: *anyopaque, _: linux.fd_t, _: ouro.drm_atomic.Request, flags: ouro.drm_atomic.CommitFlags, userdata: ?*anyopaque) !void {
         const self: *Fixture = @ptrCast(@alignCast(context));
         if (flags.page_flip_event) {
-            self.flip_userdata = userdata;
+            if (self.flip_len == self.flip_userdata.len) return error.FlipQueueFull;
+            const index = (self.flip_head + self.flip_len) % self.flip_userdata.len;
+            self.flip_userdata[index] = userdata;
+            self.flip_len += 1;
             try signalFd(self.drm_fd);
         }
     }
     fn handleEvents(context: *anyopaque, _: linux.fd_t, callback: ouro.drm_atomic.FlipCallback) !void {
         const self: *Fixture = @ptrCast(@alignCast(context));
+        if (self.flip_len == 0) return;
         try consumeFd(self.drm_fd);
-        const userdata = self.flip_userdata orelse return error.MissingFlip;
-        self.flip_userdata = null;
-        self.page_flips += 1;
-        callback(userdata, 1, 2, 3000, 30);
+        while (self.flip_len != 0) {
+            const userdata = self.flip_userdata[self.flip_head] orelse return error.MissingFlip;
+            self.flip_userdata[self.flip_head] = null;
+            self.flip_head = (self.flip_head + 1) % self.flip_userdata.len;
+            self.flip_len -= 1;
+            self.page_flips += 1;
+            callback(userdata, 1, 2, 3000, 30);
+        }
     }
 };
 

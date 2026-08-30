@@ -7927,7 +7927,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 const state = self.session_lock_adapter.surfaceState(lock_surface) catch continue;
                 if (!state.mapped or !std.meta.eql(state.lock, active) or
                     !std.meta.eql(state.surface, id)) continue;
-                const rect = self.outputBounds() catch return null;
+                const physical = self.physicalOutputForProtocolId(state.output_id) orelse return null;
+                const rect = self.outputBoundsFor(physical) catch return null;
                 return .{
                     .id = .{
                         .index = id.index | (@as(u32, 1) << 30),
@@ -7944,6 +7945,13 @@ pub fn Coordinator(comptime protocol: type) type {
                 };
             }
             return null;
+        }
+
+        fn surfaceBelongsToSessionLock(self: *Self, id: Adapter.SurfaceId) bool {
+            if (self.session_lock_adapter.ownsSurface(id)) return true;
+            if (!(self.subcompositor_adapter.visible(id) catch return false)) return false;
+            const placement = self.subcompositor_adapter.placement(id) catch return false;
+            return self.session_lock_adapter.ownsSurface(placement.root);
         }
 
         fn sessionLockHit(
@@ -8292,11 +8300,14 @@ pub fn Coordinator(comptime protocol: type) type {
                         if (!layer.active or layer.peer == null or layer.sample == null or
                             !samePeer(layer.peer.?, client.peer) or
                             try clipToOutput(layer.sample.?.destination, bounds) == null) continue;
-                        self.association_surfaces[count] = layer.surface orelse
-                            return error.StaleSurface;
+                        const id = layer.id orelse return error.StaleSurface;
+                        const lock_surface = self.surfaceBelongsToSessionLock(id);
+                        if (lock_surface != self.sessionLockActive()) continue;
+                        self.association_surfaces[count] = layer.surface orelse return error.StaleSurface;
                         count += 1;
                     }
-                    if (self.cursor_layer.active and self.cursor_layer.peer != null and
+                    if (!self.sessionLockActive() and self.cursor_layer.active and
+                        self.cursor_layer.peer != null and
                         self.cursor_layer.sample != null and
                         samePeer(self.cursor_layer.peer.?, client.peer) and
                         try clipToOutput(self.cursor_layer.sample.?.destination, bounds) != null)
@@ -8328,6 +8339,7 @@ pub fn Coordinator(comptime protocol: type) type {
         ) !void {
             if (!layer.active or layer.peer == null or !samePeer(layer.peer.?, peer)) return;
             const surface = layer.id orelse return;
+            if (self.surfaceBelongsToSessionLock(surface) != self.sessionLockActive()) return;
             const sample = layer.sample orelse return;
             var preferred_scale: ?u32 = null;
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
