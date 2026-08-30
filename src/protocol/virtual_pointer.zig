@@ -24,7 +24,7 @@ pub const Config = struct {
 
 pub const Validator = struct {
     context: ?*anyopaque = null,
-    validateFn: *const fn (?*anyopaque, wayring.io_uring.Peer, u32) bool,
+    resolveFn: *const fn (?*anyopaque, wayring.io_uring.Peer, u32) ?u64,
 };
 
 pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
@@ -43,7 +43,7 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
             device_added: struct { seat: *Seat, device: input.DeviceId, info: platform.DeviceInfo },
             device_removed: struct { seat: *Seat, device: input.DeviceId },
             motion: struct { seat: *Seat, device: input.DeviceId, time: u32, dx: i32, dy: i32 },
-            motion_absolute: struct { seat: *Seat, device: input.DeviceId, time: u32, x: u32, y: u32, x_extent: u32, y_extent: u32, output_mapped: bool },
+            motion_absolute: struct { seat: *Seat, device: input.DeviceId, time: u32, x: u32, y: u32, x_extent: u32, y_extent: u32, output: ?u64 },
             button: struct { seat: *Seat, device: input.DeviceId, time: u32, button: u32, pressed: bool },
             axis: struct { seat: *Seat, device: input.DeviceId, time: u32, axis: u32, value: i32, source: platform.AxisSource },
             axis_stop: struct { seat: *Seat, device: input.DeviceId, time: u32, axis: u32, source: platform.AxisSource },
@@ -56,7 +56,7 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
             peer: wayring.io_uring.Peer = undefined,
             seat: ?*Seat = null,
-            output_mapped: bool = false,
+            output: ?u64 = null,
             axis_source: platform.AxisSource = .wheel,
             pressed: [button_words]u64 = [_]u64{0} ** button_words,
         };
@@ -169,7 +169,7 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
             switch (decoded.value) {
                 .destroy => {},
                 .motion => |p| self.push(.{ .motion = .{ .seat = d.seat.?, .device = id, .time = p.time, .dx = p.dx, .dy = p.dy } }) catch return try self.noMemory(actor),
-                .motion_absolute => |p| self.push(.{ .motion_absolute = .{ .seat = d.seat.?, .device = id, .time = p.time, .x = p.x, .y = p.y, .x_extent = p.x_extent, .y_extent = p.y_extent, .output_mapped = d.output_mapped } }) catch return try self.noMemory(actor),
+                .motion_absolute => |p| self.push(.{ .motion_absolute = .{ .seat = d.seat.?, .device = id, .time = p.time, .x = p.x, .y = p.y, .x_extent = p.x_extent, .y_extent = p.y_extent, .output = d.output } }) catch return try self.noMemory(actor),
                 .button => |p| {
                     if (p.state.value > 1) return try self.failure(actor, decoded.handle.id, error.InvalidButtonState);
                     if (p.button >= button_count) return try self.failure(actor, decoded.handle.id, error.InvalidButtonCode);
@@ -210,7 +210,13 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
             errdefer self.recycle(d);
             d.peer = peer;
             d.seat = self.seat_resolver.resolveFn(self.seat_resolver.context, peer, seat);
-            d.output_mapped = output != null and if (self.output_validator) |v| v.validateFn(v.context, peer, output.?) else false;
+            d.output = if (output) |value|
+                if (self.output_validator) |resolver|
+                    resolver.resolveFn(resolver.context, peer, value)
+                else
+                    null
+            else
+                null;
             if (d.seat != null and self.normal_count == self.normal_capacity)
                 return self.noMemoryVoid(actor);
             const admitted = if (with_output)
@@ -335,6 +341,40 @@ test "cleanup reserve delays generation reuse" {
     a.dropEvent();
     const replacement = try a.acquire();
     try std.testing.expect(replacement.header.generation != old.generation);
+}
+
+test "absolute motion preserves exact output identity" {
+    const TestSeat = struct {};
+    const Resolver = struct {
+        fn resolve(context: ?*anyopaque, _: wayring.io_uring.Peer, _: ?u32) ?*TestSeat {
+            return @ptrCast(@alignCast(context orelse return null));
+        }
+    };
+    const A = Adapter(@import("core_protocol"), TestSeat);
+    var seat: TestSeat = .{};
+    var adapter = try A.init(
+        std.testing.allocator,
+        .{ .context = &seat, .resolveFn = Resolver.resolve },
+        .{ .manager_capacity = 1, .device_capacity = 1, .event_capacity = 1 },
+    );
+    defer adapter.deinit();
+    const device = try adapter.acquire();
+    device.seat = &seat;
+    device.output = 0x0000_0007_0000_0003;
+    try adapter.push(.{ .motion_absolute = .{
+        .seat = &seat,
+        .device = adapter.inputId(device),
+        .time = 4,
+        .x = 5,
+        .y = 6,
+        .x_extent = 7,
+        .y_extent = 8,
+        .output = device.output,
+    } });
+    try std.testing.expectEqual(
+        device.output,
+        adapter.peekEvent().?.motion_absolute.output,
+    );
 }
 
 test "ownership growth preserves contexts and every removal beyond initial reserve" {

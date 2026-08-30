@@ -1194,7 +1194,7 @@ pub fn Coordinator(comptime protocol: type) type {
             errdefer self.virtual_pointer_adapter.deinit();
             self.virtual_pointer_adapter.setOutputValidator(.{
                 .context = self,
-                .validateFn = validateVirtualPointerOutput,
+                .resolveFn = resolveVirtualPointerOutput,
             });
             self.dmabuf_adapter = try DmabufAdapter.init(allocator, config.linux_dmabuf);
             errdefer self.dmabuf_adapter.deinit();
@@ -3195,7 +3195,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .touch_motion => |value| value,
                 else => return .{},
             };
-            const bounds = self.outputBounds() catch return .{};
+            const bounds = self.globalOutputBounds() catch return .{};
             const global_x = tabletCoordinate(position.x, bounds.x, bounds.width);
             const global_y = tabletCoordinate(position.y, bounds.y, bounds.height);
             const global_fixed: SeatAdapter.Point = .{
@@ -3292,7 +3292,7 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             const normalized_x = axes.x orelse return .{};
             const normalized_y = axes.y orelse return .{};
-            const bounds = self.outputBounds() catch return .{};
+            const bounds = self.globalOutputBounds() catch return .{};
             const global_x = tabletCoordinate(normalized_x, bounds.x, bounds.width);
             const global_y = tabletCoordinate(normalized_y, bounds.y, bounds.height);
             const whole: geometry.Point = .{
@@ -4962,17 +4962,18 @@ pub fn Coordinator(comptime protocol: type) type {
             });
         }
 
-        fn validateVirtualPointerOutput(
+        fn resolveVirtualPointerOutput(
             context: ?*anyopaque,
             peer: wayring.io_uring.Peer,
             output_object: u32,
-        ) bool {
-            const self: *Self = @ptrCast(@alignCast(context orelse return false));
-            const server_objects = self.root.runtime.clients.get(peer) catch return false;
-            const handle = server_objects.namespace.lookupHandle(output_object) orelse return false;
-            const object = server_objects.namespace.resolve(handle) orelse return false;
-            const reference = self.output_adapter.reference(peer, handle, object.*) catch return false;
-            return self.physicalOutputForProtocolId(reference.output) != null;
+        ) ?u64 {
+            const self: *Self = @ptrCast(@alignCast(context orelse return null));
+            const server_objects = self.root.runtime.clients.get(peer) catch return null;
+            const handle = server_objects.namespace.lookupHandle(output_object) orelse return null;
+            const object = server_objects.namespace.resolve(handle) orelse return null;
+            const reference = self.output_adapter.reference(peer, handle, object.*) catch return null;
+            if (self.physicalOutputForProtocolId(reference.output) == null) return null;
+            return @as(u64, reference.output.generation) << 32 | reference.output.index;
         }
 
         fn validateScreencopyOutput(
@@ -5358,7 +5359,8 @@ pub fn Coordinator(comptime protocol: type) type {
                     } }),
                     .motion_absolute => |value| absolute: {
                         if (value.x_extent == 0 or value.y_extent == 0) break :absolute true;
-                        const bounds = self.outputBounds() catch break :absolute true;
+                        const bounds = self.virtualPointerOutputBounds(value.output) catch
+                            break :absolute true;
                         if (bounds.width <= 0 or bounds.height <= 0) break :absolute true;
                         const x = @min(value.x, value.x_extent);
                         const y = @min(value.y, value.y_extent);
@@ -5431,7 +5433,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 } },
                 .motion_absolute => |value| absolute: {
                     if (value.x_extent == 0 or value.y_extent == 0) return true;
-                    const bounds = self.outputBounds() catch return true;
+                    const bounds = self.virtualPointerOutputBounds(value.output) catch return true;
                     if (bounds.width <= 0 or bounds.height <= 0) return true;
                     const x = @min(value.x, value.x_extent);
                     const y = @min(value.y, value.y_extent);
@@ -5468,7 +5470,11 @@ pub fn Coordinator(comptime protocol: type) type {
                 ),
             };
             if (normalized == .pointer_motion) {
-                const bounds = self.outputBounds() catch return true;
+                const bounds = switch (event) {
+                    .motion_absolute => |value| self.virtualPointerOutputBounds(value.output) catch
+                        return true,
+                    else => self.globalOutputBounds() catch return true,
+                };
                 var position = self.transient_seat_adapter.pointerPosition(seat) orelse return true;
                 position.x = clampFixedPosition(position.x, normalized.pointer_motion.dx, bounds.x, bounds.width);
                 position.y = clampFixedPosition(position.y, normalized.pointer_motion.dy, bounds.y, bounds.height);
@@ -8316,6 +8322,17 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn outputBounds(self: *const Self) !geometry.Rect {
             return self.outputBoundsFor(self.primaryPhysicalOutput());
+        }
+
+        fn virtualPointerOutputBounds(self: *const Self, output: ?u64) !geometry.Rect {
+            const value = output orelse return self.globalOutputBounds();
+            const id: OutputAdapter.OutputId = .{
+                .index = @truncate(value),
+                .generation = @truncate(value >> 32),
+            };
+            const physical = self.physicalOutputForProtocolId(id) orelse
+                return error.InvalidOutput;
+            return self.outputBoundsFor(physical);
         }
 
         fn globalOutputBounds(self: *const Self) !geometry.Rect {
