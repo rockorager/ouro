@@ -18,7 +18,7 @@ pub const Config = struct {
     mime_capacity: usize = 8,
     mime_bytes: usize = 128,
     outbound_capacity: usize = 64,
-    global_version: u32 = 3,
+    global_version: u32 = 4,
 
     fn validate(config: Config) !void {
         inline for (.{

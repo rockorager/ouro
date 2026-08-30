@@ -66,7 +66,7 @@ pub const Config = struct {
     keymap: []const u8,
     repeat_rate: i32 = 25,
     repeat_delay: i32 = 600,
-    global_version: u32 = 9,
+    global_version: u32 = 10,
     initial_serial: u32 = 1,
 
     fn validate(config: Config) !void {
