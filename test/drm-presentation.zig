@@ -264,6 +264,7 @@ test "physical coordinator retires a disconnected secondary output" {
     }
     const protocol_output = coordinator.physical_outputs[1].protocol_output;
     const management_head = coordinator.physical_outputs[1].management_head;
+    const physical_id = coordinator.physical_outputs[1].id;
     fixture.second_desktop = false;
     try fixture.signalHotplug();
     for (0..256) |_| {
@@ -286,6 +287,32 @@ test "physical coordinator retires a disconnected secondary output" {
     );
     try std.testing.expectEqual(@as(i32, 0), primary.x);
     try std.testing.expectEqual(@as(?i32, 3), primary.width);
+
+    fixture.second_desktop = true;
+    try fixture.signalHotplug();
+    for (0..512) |_| {
+        _ = try loop.turn(coordinator);
+        if (!coordinator.topology_refresh_pending and
+            coordinator.physical_outputs[1].connected and
+            coordinator.physical_outputs[1].kms_output != null and
+            coordinator.output_global_index == 2) break;
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+    }
+    try std.testing.expect(coordinator.physical_outputs[1].connected);
+    try std.testing.expect(coordinator.physical_outputs[1].kms_output != null);
+    try std.testing.expectEqual(physical_id.index, coordinator.physical_outputs[1].id.index);
+    try std.testing.expect(physical_id.generation != coordinator.physical_outputs[1].id.generation);
+    try std.testing.expect(!std.meta.eql(
+        protocol_output,
+        coordinator.physical_outputs[1].protocol_output,
+    ));
+    try std.testing.expect(!std.meta.eql(
+        management_head,
+        coordinator.physical_outputs[1].management_head,
+    ));
+    try std.testing.expect(try coordinator.output_adapter.outputPublished(
+        coordinator.physical_outputs[1].protocol_output,
+    ));
 
     try coordinator.requestStop();
     try drainServer(root, coordinator, &loop);
