@@ -7,7 +7,10 @@
 
 const std = @import("std");
 const wayring = @import("wayring");
-const libc = @cImport(@cInclude("time.h"));
+const libc = @cImport({
+    @cInclude("time.h");
+    @cInclude("sys/stat.h");
+});
 const completion = @import("completion.zig");
 const compositor_api = @import("compositor.zig");
 const loop_api = @import("loop.zig");
@@ -1442,9 +1445,6 @@ pub fn Coordinator(comptime protocol: type) type {
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
             _ = try self.virtual_pointer_adapter.install(&root.runtime);
-            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
-                return error.GlobalPublicationIncomplete;
-            _ = try self.dmabuf_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
             _ = try self.activation_adapter.install(&root.runtime);
@@ -5292,6 +5292,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 );
             if (self.render_device == null)
                 self.render_device = self.output.?.takeRenderDevice();
+            try self.ensureDmabuf(snapshot.handle);
             try self.ensureExplicitSync(snapshot.handle);
             try self.ensureDrmLeasing(snapshot);
             try self.ensureGammaOwner(snapshot);
@@ -5355,6 +5356,20 @@ pub fn Coordinator(comptime protocol: type) type {
                     return error.ActivatedOutputFailure) catch
                     return error.ActivatedOutputFailure;
             self.armTimer() catch return error.ActivatedOutputFailure;
+        }
+
+        /// Publish DMA-BUF only after renderer selection supplies the real DRM
+        /// device carried by version-4 default and per-surface feedback.
+        fn ensureDmabuf(self: *Self, handle: drm.Handle) !void {
+            if (self.dmabuf_adapter.global != null) return;
+            const fd = try kms.Device.fromManager(&self.manager).fd(handle);
+            var status: libc.struct_stat = undefined;
+            if (libc.fstat(fd, &status) != 0) return error.DrmDeviceUnavailable;
+            const device = std.math.cast(std.os.linux.dev_t, status.st_rdev) orelse
+                return error.DrmDeviceUnavailable;
+            _ = try self.dmabuf_adapter.install(&self.root.runtime, device);
+            if (try self.root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
         }
 
         /// The global is advertised only after the selected renderer/KMS DRM

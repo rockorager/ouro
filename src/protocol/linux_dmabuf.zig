@@ -1,10 +1,10 @@
 //! Bounded ownership and validation for zwp_linux_dmabuf_v1 parameters.
 //!
-//! This module deliberately does not install the protocol global yet. The
-//! compositor must not advertise DMA-BUF until these retained descriptors can
-//! traverse the renderer. It owns the difficult protocol lifetime boundary in
-//! isolation: request FDs move from one-shot params into persistent buffers,
-//! and are closed exactly once on every cancellation and failure path.
+//! The compositor must not advertise DMA-BUF until these retained descriptors
+//! can traverse the renderer and the renderer's DRM device is known. It owns
+//! the difficult protocol lifetime boundary in isolation: request FDs move
+//! from one-shot params into persistent buffers, and are closed exactly once
+//! on every cancellation and failure path.
 
 const std = @import("std");
 const wayring = @import("wayring");
@@ -34,10 +34,11 @@ pub const Error = error{
 };
 
 pub const Config = struct {
-    global_version: u32 = 3,
+    global_version: u32 = 4,
+    feedback_slots: u32 = 8,
 
     fn validate(config: Config) Error!void {
-        if (config.global_version == 0 or config.global_version > 3)
+        if (config.global_version == 0 or config.global_version > 4 or config.feedback_slots == 0)
             return error.InvalidConfig;
     }
 };
@@ -275,10 +276,7 @@ pub const Store = struct {
     }
 };
 
-/// Version-3 wire owner. Feedback support and production installation arrive
-/// with renderer capability discovery; until then this adapter is exercised as
-/// an isolated protocol owner and advertises only the two validated 32-bit
-/// formats with LINEAR and implicit modifiers.
+/// Bounded wire owner advertising only the formats accepted by Store.
 pub fn Adapter(comptime protocol: type) type {
     return struct {
         const Self = @This();
@@ -287,6 +285,7 @@ pub fn Adapter(comptime protocol: type) type {
         const Dmabuf = protocol.zwp_linux_dmabuf_v1;
         const Params = protocol.zwp_linux_buffer_params_v1;
         const WlBuffer = protocol.wl_buffer;
+        const Feedback = protocol.zwp_linux_dmabuf_feedback_v1;
 
         const Header = struct {
             active: bool = false,
@@ -316,6 +315,23 @@ pub fn Adapter(comptime protocol: type) type {
             header: Header = .{},
             state: Handle = undefined,
         };
+        const FeedbackResource = struct {
+            header: Header = .{},
+            peer: wayring.io_uring.Peer = undefined,
+            stage: u8 = 0,
+        };
+        const FormatEntry = extern struct {
+            format: u32,
+            padding: u32 = 0,
+            modifier: u64,
+        };
+        const format_entries = [_]FormatEntry{
+            .{ .format = drm_format_argb8888, .modifier = modifier_linear },
+            .{ .format = drm_format_argb8888, .modifier = modifier_invalid },
+            .{ .format = drm_format_xrgb8888, .modifier = modifier_linear },
+            .{ .format = drm_format_xrgb8888, .modifier = modifier_invalid },
+        };
+        const format_indices = std.mem.asBytes(&[_]u16{ 0, 1, 2, 3 }).*;
 
         allocator: std.mem.Allocator,
         runtime: ?*Runtime = null,
@@ -325,6 +341,10 @@ pub fn Adapter(comptime protocol: type) type {
         managers: slot_pool.Pool(ManagerSlot),
         params: slot_pool.Pool(ParamsResource),
         buffers: slot_pool.Pool(BufferResource),
+        feedback: slot_pool.Pool(FeedbackResource),
+        feedback_limit: u32,
+        format_table_fd: linux.fd_t,
+        device: [@sizeOf(linux.dev_t)]u8 = undefined,
         pending_len: usize = 0,
 
         pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
@@ -336,7 +356,12 @@ pub fn Adapter(comptime protocol: type) type {
             errdefer managers.deinit();
             var params = try slot_pool.Pool(ParamsResource).init(allocator, 8);
             errdefer params.deinit();
-            const buffers = try slot_pool.Pool(BufferResource).init(allocator, 16);
+            var buffers = try slot_pool.Pool(BufferResource).init(allocator, 16);
+            errdefer buffers.deinit();
+            var feedback = try slot_pool.Pool(FeedbackResource).init(allocator, config.feedback_slots);
+            errdefer feedback.deinit();
+            const table_fd = try createFormatTable();
+            errdefer _ = linux.close(table_fd);
             return .{
                 .allocator = allocator,
                 .global_version = config.global_version,
@@ -344,19 +369,25 @@ pub fn Adapter(comptime protocol: type) type {
                 .managers = managers,
                 .params = params,
                 .buffers = buffers,
+                .feedback = feedback,
+                .feedback_limit = config.feedback_slots,
+                .format_table_fd = table_fd,
             };
         }
 
         pub fn deinit(adapter: *Self) void {
+            _ = linux.close(adapter.format_table_fd);
             adapter.store.deinit();
+            adapter.feedback.deinit();
             adapter.buffers.deinit();
             adapter.params.deinit();
             adapter.managers.deinit();
             adapter.* = undefined;
         }
 
-        pub fn install(adapter: *Self, runtime: *Runtime) !objects.Handle {
+        pub fn install(adapter: *Self, runtime: *Runtime, device: linux.dev_t) !objects.Handle {
             if (adapter.runtime != null) return error.AlreadyInstalled;
+            @memcpy(&adapter.device, std.mem.asBytes(&device));
             adapter.runtime = runtime;
             errdefer adapter.runtime = null;
             const global = try runtime.addGlobalWithBinder(
@@ -387,6 +418,11 @@ pub fn Adapter(comptime protocol: type) type {
             message: wayring.wire.Message,
             fds: *wayring.ancillary.FdQueue,
         ) !?wayring.dispatch.Control {
+            if (target.object.interface != &Dmabuf.info and
+                target.object.interface != &Params.info and
+                target.object.interface != &WlBuffer.info and
+                target.object.interface != &Feedback.info)
+                return null;
             const runtime = adapter.runtime orelse return error.NotInstalled;
             const actor = try runtime.clients.reactor.getActor(peer);
             const server_objects = try runtime.clients.get(peer);
@@ -430,7 +466,32 @@ pub fn Adapter(comptime protocol: type) type {
                         };
                         slot.header.resource = admitted.params_id;
                     },
-                    .get_default_feedback, .get_surface_feedback => return try adapter.failure(actor, decoded.handle.id, error.UnsupportedVersion),
+                    .get_default_feedback => |payload| {
+                        const slot = adapter.acquireFeedback() catch return try adapter.noMemory(actor);
+                        slot.peer = manager.peer;
+                        const admitted = Dmabuf.admit_get_default_feedback(server_objects, decoded.handle, payload, .{ .id = slot }) catch |cause| {
+                            adapter.feedback.release(slot);
+                            return try adapter.failure(actor, decoded.handle.id, cause);
+                        };
+                        slot.header.resource = admitted.id;
+                        adapter.pending_len += 1;
+                    },
+                    .get_surface_feedback => |payload| {
+                        const surface_handle = server_objects.namespace.lookupHandle(payload.surface) orelse
+                            return try adapter.failure(actor, decoded.handle.id, error.InvalidSurface);
+                        const surface = server_objects.namespace.resolve(surface_handle) orelse
+                            return try adapter.failure(actor, decoded.handle.id, error.InvalidSurface);
+                        if (surface.interface != &protocol.wl_surface.info)
+                            return try adapter.failure(actor, decoded.handle.id, error.InvalidSurface);
+                        const slot = adapter.acquireFeedback() catch return try adapter.noMemory(actor);
+                        slot.peer = manager.peer;
+                        const admitted = Dmabuf.admit_get_surface_feedback(server_objects, decoded.handle, payload, .{ .id = slot }) catch |cause| {
+                            adapter.feedback.release(slot);
+                            return try adapter.failure(actor, decoded.handle.id, cause);
+                        };
+                        slot.header.resource = admitted.id;
+                        adapter.pending_len += 1;
+                    },
                 }
                 try decoded.finish(protocol, server_objects, &actor.transmit);
                 return .continue_dispatch;
@@ -449,6 +510,13 @@ pub fn Adapter(comptime protocol: type) type {
                 switch (decoded.value) {
                     .destroy => {},
                 }
+                try decoded.finish(protocol, server_objects, &actor.transmit);
+                return .continue_dispatch;
+            }
+            if (target.object.interface == &Feedback.info) {
+                const slot = adapter.feedback.fromContext(target.object.context) orelse return null;
+                if (!std.meta.eql(slot.header.resource, handle)) return null;
+                const decoded = try wayring.server.decodeRequest(Feedback, server_objects, message, fds);
                 try decoded.finish(protocol, server_objects, &actor.transmit);
                 return .continue_dispatch;
             }
@@ -622,6 +690,42 @@ pub fn Adapter(comptime protocol: type) type {
                     },
                 }
             }
+            for (adapter.feedback.entries.items) |slot| {
+                if (!slot.header.active or !samePeer(slot.peer, peer)) continue;
+                while (slot.stage < 7) {
+                    const event: Feedback.Event = switch (slot.stage) {
+                        0 => {
+                            const duplicated = linux.fcntl(adapter.format_table_fd, linux.F.DUPFD_CLOEXEC, 0);
+                            if (linux.errno(duplicated) != .SUCCESS) return error.SystemCallFailed;
+                            const fd: linux.fd_t = @intCast(duplicated);
+                            Feedback.encodeEvent(queue, slot.header.resource.id, .{ .format_table = .{ .fd = fd, .size = @sizeOf(@TypeOf(format_entries)) } }) catch |err| {
+                                _ = linux.close(fd);
+                                switch (err) {
+                                    error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return completed,
+                                    else => return err,
+                                }
+                            };
+                            slot.stage += 1;
+                            completed += 1;
+                            continue;
+                        },
+                        1 => .{ .main_device = .{ .device = &adapter.device } },
+                        2 => .{ .tranche_target_device = .{ .device = &adapter.device } },
+                        3 => .{ .tranche_flags = .{ .flags = .{ .value = 0 } } },
+                        4 => .{ .tranche_formats = .{ .indices = &format_indices } },
+                        5 => .{ .tranche_done = .{} },
+                        6 => .{ .done = .{} },
+                        else => unreachable,
+                    };
+                    Feedback.encodeEvent(queue, slot.header.resource.id, event) catch |err| switch (err) {
+                        error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return completed,
+                        else => return err,
+                    };
+                    slot.stage += 1;
+                    completed += 1;
+                }
+                adapter.pending_len -= 1;
+            }
             return completed;
         }
 
@@ -632,6 +736,9 @@ pub fn Adapter(comptime protocol: type) type {
                     return true;
             for (adapter.params.entries.items) |slot|
                 if (slot.header.active and samePeer(slot.peer, peer) and slot.pending != .none)
+                    return true;
+            for (adapter.feedback.entries.items) |slot|
+                if (slot.header.active and samePeer(slot.peer, peer) and slot.stage < 7)
                     return true;
             return false;
         }
@@ -731,6 +838,13 @@ pub fn Adapter(comptime protocol: type) type {
                 adapter.buffers.release(slot);
                 return true;
             }
+            if (object.interface == &Feedback.info) {
+                const slot = adapter.feedback.fromContext(object.context) orelse return false;
+                if (!std.meta.eql(slot.header.resource, handle)) return false;
+                if (slot.stage < 7) adapter.pending_len -= 1;
+                adapter.feedback.release(slot);
+                return true;
+            }
             return false;
         }
 
@@ -769,6 +883,43 @@ pub fn Adapter(comptime protocol: type) type {
             cause: anyerror,
         ) !wayring.dispatch.Control {
             return adapter.paramsError(actor, id, cause);
+        }
+
+        fn acquireFeedback(adapter: *Self) !*FeedbackResource {
+            if (adapter.feedback.free_head == slot_pool.none and
+                adapter.feedback.entries.items.len >= adapter.feedback_limit)
+                return error.OutOfMemory;
+            return adapter.feedback.acquire();
+        }
+
+        fn createFormatTable() !linux.fd_t {
+            const result = linux.memfd_create(
+                "ouro-dmabuf-formats",
+                linux.MFD.CLOEXEC | linux.MFD.ALLOW_SEALING,
+            );
+            if (linux.errno(result) != .SUCCESS) return error.SystemCallFailed;
+            const fd: linux.fd_t = @intCast(result);
+            errdefer _ = linux.close(fd);
+            const bytes = std.mem.asBytes(&format_entries);
+            var offset: usize = 0;
+            while (offset < bytes.len) {
+                const written = linux.write(fd, bytes.ptr + offset, bytes.len - offset);
+                switch (linux.errno(written)) {
+                    .SUCCESS => {
+                        if (written == 0) return error.SystemCallFailed;
+                        offset += written;
+                    },
+                    .INTR => continue,
+                    else => return error.SystemCallFailed,
+                }
+            }
+            const sealed = linux.fcntl(
+                fd,
+                linux.F.ADD_SEALS,
+                linux.F.SEAL_SHRINK | linux.F.SEAL_GROW | linux.F.SEAL_WRITE | linux.F.SEAL_SEAL,
+            );
+            if (linux.errno(sealed) != .SUCCESS) return error.SystemCallFailed;
+            return fd;
         }
     };
 }
@@ -945,6 +1096,96 @@ test "linux-dmabuf: legacy advertisements survive transmit backpressure" {
         bytes = bytes[message.header.size..];
     }
     try std.testing.expectEqual(@as(usize, 0), bytes.len);
+}
+
+test "linux-dmabuf: immutable feedback resumes with exact sequence and table" {
+    const protocol = @import("core_protocol");
+    const TestAdapter = Adapter(protocol);
+    var adapter = try TestAdapter.init(std.testing.allocator, .{ .feedback_slots = 1 });
+    defer adapter.deinit();
+    const device: linux.dev_t = 0x1234;
+    @memcpy(&adapter.device, std.mem.asBytes(&device));
+    var server_objects = try wayring.objects.ServerObjects.init(
+        std.testing.allocator,
+        8,
+        4,
+        &protocol.wl_display.info,
+        null,
+    );
+    defer server_objects.deinit(std.testing.allocator);
+    var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 128, 8);
+    defer blocks.deinit(std.testing.allocator);
+    var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 2);
+    defer descriptors.deinit(std.testing.allocator);
+    const peer: wayring.io_uring.Peer = .{ .slot = 9, .generation = 3 };
+    const feedback = try adapter.acquireFeedback();
+    feedback.peer = peer;
+    feedback.header.resource = try server_objects.insertClient(
+        7,
+        &protocol.zwp_linux_dmabuf_feedback_v1.info,
+        1,
+        feedback,
+    );
+    adapter.pending_len += 1;
+    try std.testing.expectError(error.OutOfMemory, adapter.acquireFeedback());
+
+    var blocked = wayring.tx.Queue.init(&blocks, 8, &descriptors, 0);
+    defer blocked.deinit();
+    try std.testing.expectEqual(@as(usize, 0), try adapter.flushOn(peer, &server_objects, &blocked));
+    try std.testing.expect(adapter.pendingOutbound(peer));
+    try std.testing.expectEqual(@as(u8, 0), feedback.stage);
+
+    var output = wayring.tx.Queue.init(&blocks, 512, &descriptors, 1);
+    defer output.deinit();
+    try std.testing.expectEqual(@as(usize, 7), try adapter.flushOn(peer, &server_objects, &output));
+    try std.testing.expect(!adapter.pendingOutbound(peer));
+    var descriptor_scratch: [2]linux.fd_t = undefined;
+    var control: [128]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+    const snapshot = try output.snapshot(&descriptor_scratch, &control);
+    var fds = wayring.ancillary.FdQueue.init(&descriptors, 1);
+    defer fds.deinit();
+    const duplicated = linux.fcntl(descriptor_scratch[0], linux.F.DUPFD_CLOEXEC, 0);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(duplicated));
+    try fds.append(@intCast(duplicated));
+    var bytes = snapshot.first;
+    const tags = [_]std.meta.Tag(protocol.zwp_linux_dmabuf_feedback_v1.Event){
+        .format_table,
+        .main_device,
+        .tranche_target_device,
+        .tranche_flags,
+        .tranche_formats,
+        .tranche_done,
+        .done,
+    };
+    for (tags, 0..) |tag, index| {
+        const message = (try wayring.wire.Message.decode(bytes)).?;
+        const event = try protocol.zwp_linux_dmabuf_feedback_v1.decodeEvent(message, &fds);
+        try std.testing.expectEqual(tag, std.meta.activeTag(event));
+        if (index == 0) {
+            try std.testing.expectEqual(@as(u32, 64), event.format_table.size);
+            var table: [64]u8 = undefined;
+            const read = linux.pread(event.format_table.fd, &table, table.len, 0);
+            try std.testing.expectEqual(table.len, read);
+            try std.testing.expectEqualSlices(u8, std.mem.asBytes(&TestAdapter.format_entries), &table);
+            _ = linux.close(event.format_table.fd);
+        } else if (index == 1) {
+            try std.testing.expectEqualSlices(u8, std.mem.asBytes(&device), event.main_device.device);
+        } else if (index == 2) {
+            try std.testing.expectEqualSlices(u8, std.mem.asBytes(&device), event.tranche_target_device.device);
+        } else if (index == 3) {
+            try std.testing.expectEqual(@as(u32, 0), event.tranche_flags.flags.value);
+        } else if (index == 4) {
+            try std.testing.expectEqualSlices(u8, &TestAdapter.format_indices, event.tranche_formats.indices);
+        }
+        bytes = bytes[message.header.size..];
+    }
+    try std.testing.expectEqual(@as(usize, 0), bytes.len);
+
+    const object = server_objects.namespace.resolve(feedback.header.resource).?.*;
+    try std.testing.expect(adapter.resourceRemoved(feedback.header.resource, object));
+    const reused = try adapter.acquireFeedback();
+    try std.testing.expect(reused == feedback);
+    adapter.feedback.release(reused);
 }
 
 test "linux-dmabuf: async created event retains buffer across params teardown" {
