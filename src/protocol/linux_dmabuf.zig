@@ -172,11 +172,14 @@ pub const Store = struct {
         const row_bytes = std.math.mul(u32, @intCast(width), 4) catch
             return error.OutOfBounds;
         if (plane.stride < row_bytes) return error.OutOfBounds;
-        const last_row = std.math.mul(u64, plane.stride, @as(u32, @intCast(height - 1))) catch
+        const plane_bytes = std.math.mul(u64, plane.stride, @as(u32, @intCast(height))) catch
             return error.OutOfBounds;
-        const end = std.math.add(u64, plane.offset, last_row) catch
+        const required_bytes = std.math.add(u64, plane.offset, plane_bytes) catch
             return error.OutOfBounds;
-        _ = std.math.add(u64, end, row_bytes) catch return error.OutOfBounds;
+        var descriptor = std.mem.zeroes(linux.Statx);
+        const status = linux.statx(plane.fd, "", linux.AT.EMPTY_PATH, .{ .SIZE = true }, &descriptor);
+        if (linux.errno(status) != .SUCCESS or !descriptor.mask.SIZE or required_bytes > descriptor.size)
+            return error.OutOfBounds;
         const slot = try acquireStoreSlot(BufferSlot, store.allocator, &store.buffers, &store.buffers_free);
         const index = slot.index;
         slot.* = .{
@@ -987,6 +990,16 @@ fn eventFd() !linux.fd_t {
     return @intCast(result);
 }
 
+fn sizedFd(size: usize) !linux.fd_t {
+    const result = linux.memfd_create("ouro-dmabuf-test", linux.MFD.CLOEXEC);
+    if (linux.errno(result) != .SUCCESS) return error.SystemCallFailed;
+    const fd: linux.fd_t = @intCast(result);
+    errdefer _ = linux.close(fd);
+    if (linux.errno(linux.ftruncate(fd, @intCast(size))) != .SUCCESS)
+        return error.SystemCallFailed;
+    return fd;
+}
+
 fn expectClosed(fd: linux.fd_t) !void {
     try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(fd, linux.F.GETFD, 0)));
 }
@@ -1013,7 +1026,7 @@ test "linux-dmabuf: resource and descriptor stores grow without moving live entr
     var buffers: [32]Handle = undefined;
     for (&params, &buffers) |*params_handle, *buffer_handle| {
         params_handle.* = try adapter.store.createParams();
-        const fd = try eventFd();
+        const fd = try sizedFd(4);
         try adapter.store.addPlane(params_handle.*, fd, 0, 0, 4, modifier_linear);
         buffer_handle.* = try adapter.store.createBuffer(
             params_handle.*,
@@ -1216,7 +1229,7 @@ test "linux-dmabuf: async created event retains buffer across params teardown" {
         3,
         params,
     );
-    const fd = try eventFd();
+    const fd = try sizedFd(4);
     try adapter.store.addPlane(params.state, fd, 0, 0, 4, modifier_linear);
     const state = try adapter.store.createBuffer(
         params.state,
@@ -1279,7 +1292,7 @@ test "linux-dmabuf: params transfer descriptor ownership to persistent buffer" {
     var store = try Store.init(std.testing.allocator, .{});
     defer store.deinit();
     const params = try store.createParams();
-    const fd = try eventFd();
+    const fd = try sizedFd(8192);
     try store.addPlane(params, fd, 0, 0, 256, modifier_linear);
     const created = try store.createBuffer(params, 64, 32, drm_format_xrgb8888, 0);
     try store.destroyParams(params);
@@ -1295,7 +1308,7 @@ test "linux-dmabuf: retained attachment outlives destroyed buffer resource" {
     var store = try Store.init(std.testing.allocator, .{});
     defer store.deinit();
     const params = try store.createParams();
-    const fd = try eventFd();
+    const fd = try sizedFd(4);
     try store.addPlane(params, fd, 0, 0, 4, modifier_linear);
     const created = try store.createBuffer(params, 1, 1, drm_format_argb8888, 0);
     const lease = try store.retainBuffer(created);
@@ -1352,4 +1365,27 @@ test "linux-dmabuf: one-shot validation is generation safe" {
     const second = try store.createParams();
     try std.testing.expectError(error.StaleHandle, store.destroyParams(first));
     try store.destroyParams(second);
+}
+
+test "linux-dmabuf: buffer extent includes offset and final row" {
+    var store = try Store.init(std.testing.allocator, .{});
+    defer store.deinit();
+
+    const truncated = try store.createParams();
+    const truncated_fd = try sizedFd(15);
+    try store.addPlane(truncated, truncated_fd, 0, 0, 8, modifier_linear);
+    try std.testing.expectError(
+        error.OutOfBounds,
+        store.createBuffer(truncated, 1, 2, drm_format_argb8888, 0),
+    );
+    try store.destroyParams(truncated);
+    try expectClosed(truncated_fd);
+
+    const exact = try store.createParams();
+    const exact_fd = try sizedFd(17);
+    try store.addPlane(exact, exact_fd, 0, 1, 8, modifier_linear);
+    const buffer = try store.createBuffer(exact, 1, 2, drm_format_argb8888, 0);
+    try store.destroyParams(exact);
+    try store.destroyBuffer(buffer);
+    try expectClosed(exact_fd);
 }
