@@ -272,6 +272,7 @@ pub const Renderer = struct {
         source_start: usize,
         source_end: usize,
     ) Error!void {
+        const prefer_direct_copy = directCopyPreferred(plan.render_full, plan.render_damage);
         for (plan.samples, 0..) |planned, index| {
             if (planned.source_index >= list.samples.len) return error.InvalidSourceIndex;
             if (planned.source_index < source_start or planned.source_index >= source_end) continue;
@@ -286,7 +287,10 @@ pub const Renderer = struct {
             sample.global_alpha = planned.global_alpha;
             _ = try render.validateSample(sample);
 
-            if (canCopyDirect(sample, list.output_format)) {
+            // Pixman's large SRC fast path batches scanlines more efficiently
+            // than one libc memcpy per row. Keep direct copies for bounded
+            // damage, where they avoid walking untouched pixels.
+            if (prefer_direct_copy and canCopyDirect(sample, list.output_format)) {
                 copyDirect(
                     destination_bytes,
                     destination_stride,
@@ -392,6 +396,26 @@ fn canCopyDirect(sample: render.SurfaceSample, output_format: render.PixelFormat
         @rem(sample.crop.y, render.fixed_one) == 0 and
         sample.crop.width == @as(i64, sample.destination.width) * render.fixed_one and
         sample.crop.height == @as(i64, sample.destination.height) * render.fixed_one;
+}
+
+fn directCopyPreferred(render_full: bool, render_damage: []const render.Rect) bool {
+    if (render_full) return false;
+    var pixels: u64 = 0;
+    for (render_damage) |rect| {
+        pixels +|= @as(u64, rect.width) * rect.height;
+    }
+    return pixels <= 256 * 256;
+}
+
+test "render-pixman: direct copies are limited to bounded damage" {
+    try std.testing.expect(directCopyPreferred(false, &.{
+        .{ .x = 0, .y = 0, .width = 64, .height = 64 },
+        .{ .x = 128, .y = 128, .width = 64, .height = 64 },
+    }));
+    try std.testing.expect(!directCopyPreferred(false, &.{
+        .{ .x = 0, .y = 0, .width = 960, .height = 720 },
+    }));
+    try std.testing.expect(!directCopyPreferred(true, &.{}));
 }
 
 fn copyDirect(
