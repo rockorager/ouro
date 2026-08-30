@@ -8833,12 +8833,26 @@ pub fn Coordinator(comptime protocol: type) type {
             for (self.physical_outputs[0..self.physical_output_count]) |*physical|
                 physical.claim = null;
             const primary = self.primaryPhysicalOutputMutable();
-            primary.claim = try self.manager.primaryClaim(handle);
-            const snapshot = try self.manager.claimSnapshot(primary.claim.?);
-            primary.connector_id = snapshot.selectedConnector().id;
+            var primary_claim = try self.manager.primaryClaim(handle);
+            var primary_snapshot = try self.manager.claimSnapshot(primary_claim);
+            if (primary_snapshot.selectedConnector().id != primary.connector_id) {
+                const topology = try self.manager.snapshot(handle);
+                for (try self.manager.scanoutCandidates(handle)) |candidate| {
+                    if (topology.connectors[candidate.connector_index].id != primary.connector_id)
+                        continue;
+                    const preferred_claim = try self.manager.claimScanout(handle, candidate);
+                    errdefer self.manager.releaseScanout(preferred_claim) catch {};
+                    try self.manager.releaseScanout(primary_claim);
+                    primary_claim = preferred_claim;
+                    primary_snapshot = try self.manager.claimSnapshot(primary_claim);
+                    break;
+                }
+            }
+            primary.claim = primary_claim;
+            primary.connector_id = primary_snapshot.selectedConnector().id;
             try self.activatePhysicalOutput(
                 primary,
-                snapshot,
+                primary_snapshot,
                 self.output_management_adapter.lifecycle.current.scale_120,
             );
             try self.activateAdditionalOutputs(handle);

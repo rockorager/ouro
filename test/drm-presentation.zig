@@ -378,6 +378,29 @@ test "physical coordinator fails over from a disconnected primary output" {
         secondary_protocol,
     )).width);
 
+    fixture.first_desktop = true;
+    try fixture.signalHotplug();
+    for (0..512) |_| {
+        _ = try loop.turn(coordinator);
+        if (!coordinator.topology_refresh_pending and
+            coordinator.physical_outputs[0].connected and
+            coordinator.physical_outputs[0].kms_output != null and
+            coordinator.physical_outputs[1].kms_output != null) break;
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+    }
+    try std.testing.expect(coordinator.physical_outputs[0].connected);
+    try std.testing.expectEqual(@as(u32, 10), coordinator.physical_outputs[0].connector_id);
+    try std.testing.expect(!std.meta.eql(
+        primary_protocol,
+        coordinator.physical_outputs[0].protocol_output,
+    ));
+    try std.testing.expectEqual(secondary_protocol, coordinator.physical_outputs[1].protocol_output);
+    try std.testing.expectEqual(secondary_protocol, coordinator.output_adapter.primaryOutput());
+    try std.testing.expectEqual(
+        secondary_head,
+        coordinator.output_management_adapter.lifecycle.primary,
+    );
+
     try coordinator.requestStop();
     try drainServer(root, coordinator, &loop);
     loop.deinit();
