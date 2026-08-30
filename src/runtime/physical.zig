@@ -6054,18 +6054,23 @@ pub fn Coordinator(comptime protocol: type) type {
             const logical_width = try output_scale.logicalDimension(mode.hdisplay);
             const logical_height = try output_scale.logicalDimension(mode.vdisplay);
             const refresh = try std.math.mul(u32, mode.vrefresh, 1000);
-            if (primary and publish_protocol) try self.output_management_adapter.setModes(
-                try collectOutputModes(
-                    self.output_management_modes,
-                    snapshot.modes[connector.mode_start..mode_end],
-                ),
-                .{
-                    .width = mode.hdisplay,
-                    .height = mode.vdisplay,
-                    .refresh_millihz = std.math.cast(i32, refresh) orelse
-                        return error.InvalidMode,
-                },
-            );
+            if (publish_protocol) {
+                var current = try self.output_management_adapter.lifecycle.currentHead(
+                    physical.management_head,
+                );
+                current.width = @intCast(mode.hdisplay);
+                current.height = @intCast(mode.vdisplay);
+                current.refresh_millihz = std.math.cast(i32, refresh) orelse
+                    return error.InvalidMode;
+                try self.output_management_adapter.setHeadModes(
+                    physical.management_head,
+                    try collectOutputModes(
+                        self.output_management_modes,
+                        snapshot.modes[connector.mode_start..mode_end],
+                    ),
+                    current,
+                );
+            }
             const generation = self.next_output_generation orelse
                 return error.GenerationExhausted;
             var output_config = self.output_config;

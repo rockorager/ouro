@@ -178,25 +178,30 @@ pub fn Adapter(comptime protocol: type) type {
         /// an identical inventory is allowed while bindings are live, which
         /// keeps output recreation independent from protocol object lifetime.
         pub fn setModes(self: *Self, inventory: []const ModeState, current: HeadState) !void {
-            if (inventory.len == 0 or inventory.len > self.mode_inventory.len)
+            return self.setHeadModes(self.lifecycle.primary, inventory, current);
+        }
+        pub fn setHeadModes(
+            self: *Self,
+            id: HeadId,
+            inventory: []const ModeState,
+            current: HeadState,
+        ) !void {
+            const head = self.findInventoryMutable(id) orelse return error.InvalidHead;
+            if (!head.modes_owned and inventory.len > self.mode_inventory.len)
                 return error.InvalidModeInventory;
-            var current_present = false;
-            for (inventory, 0..) |mode, index| {
-                try mode.validate();
-                current_present = current_present or mode.matches(current);
-                for (inventory[0..index]) |previous| if (previous.sameTiming(mode))
-                    return error.DuplicateMode;
-            }
-            if (!current_present) return error.CurrentModeMissing;
-            if (sameInventory(self.mode_inventory[0..self.mode_count], inventory)) return;
+            try validateModes(inventory, current);
+            if (sameInventory(head.modes, inventory)) return;
             for (self.managers.entries.items) |manager| if (manager.header.active)
                 return error.ModeInventoryInUse;
-            @memcpy(self.mode_inventory[0..inventory.len], inventory);
-            self.mode_count = inventory.len;
-            const primary = self.findInventoryMutable(self.lifecycle.primary) orelse
-                return error.InvalidHead;
-            std.debug.assert(!primary.modes_owned);
-            primary.modes = self.mode_inventory[0..inventory.len];
+            if (!head.modes_owned) {
+                @memcpy(self.mode_inventory[0..inventory.len], inventory);
+                self.mode_count = inventory.len;
+                head.modes = self.mode_inventory[0..inventory.len];
+                return;
+            }
+            const modes = try self.allocator.dupe(ModeState, inventory);
+            self.allocator.free(head.modes);
+            head.modes = modes;
         }
         fn bind(ctx: ?*anyopaque, binding: wayring.server.Binding) !?*anyopaque {
             const self: *Self = @ptrCast(@alignCast(ctx orelse return error.InvalidContext));
@@ -1322,6 +1327,42 @@ test "output management inventory retains every exact mode and current selection
         adapter.setModes(&.{modes[1]}, adapter.lifecycle.current),
     );
     adapter.releaseManager(manager);
+}
+
+test "output management refreshes an exact secondary mode inventory" {
+    const A = Adapter(@import("core_protocol"));
+    const primary: HeadState = .{ .width = 800, .height = 600, .refresh_millihz = 60000 };
+    var adapter = try A.init(
+        std.testing.allocator,
+        .{ .manager_capacity = 1, .mode_capacity = 2 },
+        1,
+        primary,
+    );
+    defer adapter.deinit();
+    const secondary = try adapter.addHead(
+        .{ .name = "second", .description = "Second output" },
+        &.{.{ .width = 1024, .height = 768, .refresh_millihz = 60000 }},
+        .{ .width = 1024, .height = 768, .refresh_millihz = 60000, .x = 800 },
+    );
+    const refreshed = [_]ModeState{
+        .{ .width = 1920, .height = 1080, .refresh_millihz = 60000, .preferred = true },
+        .{ .width = 1280, .height = 720, .refresh_millihz = 75000 },
+    };
+    const current: HeadState =
+        .{ .width = 1280, .height = 720, .refresh_millihz = 75000, .x = 800 };
+    try adapter.setHeadModes(secondary, &refreshed, current);
+    try std.testing.expect(A.sameInventory(
+        &refreshed,
+        adapter.findInventory(secondary).?.modes,
+    ));
+    try adapter.setHeadModes(secondary, &refreshed, current);
+
+    const manager = try adapter.managers.acquire();
+    defer adapter.releaseManager(manager);
+    try std.testing.expectError(
+        error.ModeInventoryInUse,
+        adapter.setHeadModes(secondary, &.{refreshed[1]}, current),
+    );
 }
 
 test "output management binding snapshots every mode in protocol order" {
