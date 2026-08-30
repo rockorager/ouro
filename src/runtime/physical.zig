@@ -263,6 +263,10 @@ pub fn Coordinator(comptime protocol: type) type {
         };
         const PhysicalOutput = struct {
             id: PhysicalOutputId,
+            connected: bool = true,
+            removing: bool = false,
+            removal_global_pending: bool = false,
+            removal_protocol_retired: bool = false,
             connector_id: u32 = 0,
             claim: ?drm.ClaimHandle = null,
             protocol_output: OutputAdapter.OutputId,
@@ -3486,12 +3490,20 @@ pub fn Coordinator(comptime protocol: type) type {
             return false;
         }
 
+        fn connectedPhysicalOutputCount(self: *const Self) usize {
+            var count: usize = 0;
+            for (self.physical_outputs[0..self.physical_output_count]) |physical|
+                count += @intFromBool(physical.connected);
+            return count;
+        }
+
         fn physicalOutputForProtocolId(
             self: *const Self,
             id: OutputAdapter.OutputId,
         ) ?*const PhysicalOutput {
             for (self.physical_outputs[0..self.physical_output_count]) |*physical|
-                if (std.meta.eql(physical.protocol_output, id)) return physical;
+                if (physical.connected and std.meta.eql(physical.protocol_output, id))
+                    return physical;
             return null;
         }
 
@@ -3500,7 +3512,8 @@ pub fn Coordinator(comptime protocol: type) type {
             id: protocol_output_management.HeadId,
         ) ?*const PhysicalOutput {
             for (self.physical_outputs[0..self.physical_output_count]) |*physical|
-                if (std.meta.eql(physical.management_head, id)) return physical;
+                if (physical.connected and std.meta.eql(physical.management_head, id))
+                    return physical;
             return null;
         }
 
@@ -3598,7 +3611,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self: *Self,
             desired: []const protocol_output_management.DesiredHead,
         ) bool {
-            if (desired.len != self.physical_output_count) return false;
+            if (desired.len != self.connectedPhysicalOutputCount()) return false;
             for (desired) |head| {
                 const physical = self.physicalOutputForManagementHead(head.id) orelse return false;
                 if (physical.kms_output == null or
@@ -3624,7 +3637,8 @@ pub fn Coordinator(comptime protocol: type) type {
             id: protocol_output_management.HeadId,
         ) ?*PhysicalOutput {
             for (self.physical_outputs[0..self.physical_output_count]) |*physical|
-                if (std.meta.eql(physical.management_head, id)) return physical;
+                if (physical.connected and std.meta.eql(physical.management_head, id))
+                    return physical;
             return null;
         }
 
@@ -4908,6 +4922,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn flushProtocol(self: *Self) !void {
+            try self.advancePhysicalOutputRemovals();
             try self.advanceOutputGlobals();
             try self.advanceDrmLeaseGlobal();
             while (try self.manager.pollRevokedLease()) |token| {
@@ -4938,6 +4953,10 @@ pub fn Coordinator(comptime protocol: type) type {
         fn advanceOutputGlobals(self: *Self) !void {
             while (self.output_global_index < self.physical_output_count) {
                 const physical = &self.physical_outputs[self.output_global_index];
+                if (!physical.connected) {
+                    self.output_global_index += 1;
+                    continue;
+                }
                 if (!try self.output_adapter.outputPublished(physical.protocol_output)) {
                     self.output_adapter.publishOutput(physical.protocol_output) catch |err| switch (err) {
                         error.GlobalUpdateActive => return,
@@ -4955,6 +4974,54 @@ pub fn Coordinator(comptime protocol: type) type {
                     .complete => break,
                 };
                 self.output_global_index += 1;
+            }
+        }
+
+        fn advancePhysicalOutputRemovals(self: *Self) !void {
+            for (self.physical_outputs[1..self.physical_output_count]) |*physical| {
+                if (!physical.removing or physical.kms_output != null) continue;
+                if (!physical.removal_global_pending) {
+                    self.output_adapter.retireOutput(physical.protocol_output) catch |err| switch (err) {
+                        error.GlobalUpdateActive => return,
+                        else => return err,
+                    };
+                    physical.removal_global_pending = true;
+                    self.xdg_output_adapter.outputRemoved(physical.protocol_output);
+                    self.markProtocolAll(ProtocolReady.output | ProtocolReady.xdg_output);
+                }
+                if (!physical.removal_protocol_retired) {
+                    try self.output_management_adapter.removeHead(physical.management_head);
+                    try self.output_power_adapter.outputRemoved(physical.id);
+                    try self.gamma_control_adapter.outputRemoved(physical.id);
+                    if (physical.claim) |claim| self.manager.releaseScanout(claim) catch |err| switch (err) {
+                        error.StaleClaim => {},
+                        else => return err,
+                    };
+                    physical.claim = null;
+                    physical.connected = false;
+                    physical.removal_protocol_retired = true;
+                    self.markProtocolAll(ProtocolReady.output_management |
+                        ProtocolReady.output_power | ProtocolReady.gamma_control);
+                    if (!self.stopping) {
+                        try self.publishOutputLayout();
+                        try self.consumeOutputManagementCommands();
+                    }
+                }
+                if (!try self.output_adapter.retirementReady(physical.protocol_output)) return;
+                while (true) switch (try self.root.runtime.publishNext()) {
+                    .sent => |peer| {
+                        if (self.loop) |loop| _ = try loop.driver.schedule(peer);
+                    },
+                    .blocked => |peer| {
+                        if (self.loop) |loop| _ = try loop.driver.schedule(peer);
+                        return;
+                    },
+                    .complete => break,
+                };
+                physical.removing = false;
+                physical.removal_global_pending = false;
+                physical.removal_protocol_retired = false;
+                return;
             }
         }
 
@@ -5512,7 +5579,7 @@ pub fn Coordinator(comptime protocol: type) type {
 
                 var existing: ?*PhysicalOutput = null;
                 for (self.physical_outputs[1..self.physical_output_count]) |*physical| {
-                    if (physical.connector_id == connector_id) {
+                    if (physical.connected and physical.connector_id == connector_id) {
                         existing = physical;
                         break;
                     }
@@ -5610,6 +5677,7 @@ pub fn Coordinator(comptime protocol: type) type {
         fn nextPhysicalOutputX(self: *Self) !i32 {
             var right: i64 = 0;
             for (self.physical_outputs[0..self.physical_output_count]) |physical| {
+                if (!physical.connected) continue;
                 const state = try self.output_management_adapter.lifecycle.currentHead(
                     physical.management_head,
                 );
@@ -8052,6 +8120,24 @@ pub fn Coordinator(comptime protocol: type) type {
             self.screencopy_adapter.setAvailable(false);
         }
 
+        /// Begins terminal removal of one non-primary desktop connector. A
+        /// future hotplug monitor calls this after comparing DRM inventories;
+        /// the drain and protocol mutation remain coordinator-owned.
+        pub fn requestConnectorRemoval(self: *Self, connector_id: u32) !void {
+            if (self.stopping or self.session_disable_pending or
+                self.output_reconfigure != null or self.output_power_transition != null)
+                return error.InvalidState;
+            for (self.physical_outputs[1..self.physical_output_count]) |*physical| {
+                if (!physical.connected or physical.connector_id != connector_id) continue;
+                if (physical.removing) return;
+                physical.removing = true;
+                errdefer physical.removing = false;
+                try self.pausePhysicalOutput(physical);
+                return;
+            }
+            return error.InvalidOutput;
+        }
+
         fn pausePhysicalOutput(self: *Self, physical: *PhysicalOutput) !void {
             const output = physical.kms_output orelse return;
             if (!output.accepting_frames) return;
@@ -8071,6 +8157,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 );
             for (self.clients.items) |*client| if (client.active) {
                 for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                    if (!physical.connected) continue;
                     const bounds = self.outputBoundsFor(physical) catch continue;
                     var count: usize = 0;
                     for (self.app_layers) |layer| {

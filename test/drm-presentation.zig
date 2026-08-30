@@ -239,6 +239,61 @@ test "physical coordinator activates and drains every desktop connector" {
     try root.deinit();
 }
 
+test "physical coordinator retires a disconnected secondary output" {
+    const allocator = std.testing.allocator;
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    fixture.second_desktop = true;
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-r15-output-remove-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), compositorConfig());
+    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), coordinatorConfig());
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
+    try coordinator.start(&loop);
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    for (0..128) |_| {
+        _ = try loop.turn(coordinator);
+        if (coordinator.physical_output_count == 2 and
+            coordinator.physical_outputs[1].kms_output != null and
+            coordinator.output_global_index == 2) break;
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+    }
+    const protocol_output = coordinator.physical_outputs[1].protocol_output;
+    const management_head = coordinator.physical_outputs[1].management_head;
+    fixture.second_desktop = false;
+    try coordinator.requestConnectorRemoval(11);
+    for (0..256) |_| {
+        _ = try loop.turn(coordinator);
+        if (!coordinator.physical_outputs[1].connected and
+            !coordinator.physical_outputs[1].removing) break;
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+    }
+    try std.testing.expect(!coordinator.physical_outputs[1].connected);
+    try std.testing.expect(!coordinator.physical_outputs[1].removing);
+    try std.testing.expect(coordinator.physical_outputs[1].kms_output == null);
+    try std.testing.expect(coordinator.physical_outputs[1].claim == null);
+    try std.testing.expect(!(try coordinator.output_adapter.outputPublished(protocol_output)));
+    try std.testing.expectError(
+        error.InvalidHead,
+        coordinator.output_management_adapter.lifecycle.currentHead(management_head),
+    );
+    const primary = try coordinator.output_adapter.logicalSnapshot(
+        coordinator.physical_outputs[0].protocol_output,
+    );
+    try std.testing.expectEqual(@as(i32, 0), primary.x);
+    try std.testing.expectEqual(@as(?i32, 3), primary.width);
+
+    try coordinator.requestStop();
+    try drainServer(root, coordinator, &loop);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
 test "generated output management applies two heads atomically" {
     try generatedMultiHeadApply(false);
 }

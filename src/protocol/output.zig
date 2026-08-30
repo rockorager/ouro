@@ -327,6 +327,16 @@ pub fn Adapter(comptime protocol: type) type {
             adapter.retireOutputState(id);
         }
 
+        pub fn retirementReady(adapter: *const Self, id: OutputId) !bool {
+            const output = try adapter.resolveOutputConst(id);
+            if (!output.retired) return false;
+            for (adapter.associations) |association| {
+                if (association.active and std.meta.eql(association.output, id) and
+                    association.entered.items.len != 0) return false;
+            }
+            return true;
+        }
+
         /// Discards an output which has never been globally published or bound.
         /// Published output removal is a separate backpressure-aware lifecycle.
         pub fn discardOutput(adapter: *Self, id: OutputId) !void {
@@ -1357,6 +1367,7 @@ test "output: retired globals leave surfaces and keep bound resources inert" {
     try std.testing.expectEqual(@as(usize, 0), adapter.outbound_len);
     try std.testing.expect(!association.desired);
     try std.testing.expect(adapter.associations_dirty);
+    try std.testing.expect(!(try adapter.retirementReady(output)));
     try std.testing.expectEqualStrings("secondary", (try adapter.logicalSnapshot(output)).name);
     const object: objects.Object = .{
         .interface = &protocol.wl_output.info,
@@ -1403,4 +1414,5 @@ test "output: retired globals leave surfaces and keep bound resources inert" {
         try protocol.wl_surface.decodeEvent(message, &queue.descriptors),
     );
     try std.testing.expect(!association.active);
+    try std.testing.expect(try adapter.retirementReady(output));
 }
