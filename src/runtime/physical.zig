@@ -698,6 +698,7 @@ pub fn Coordinator(comptime protocol: type) type {
         output_management_adapter: OutputManagementAdapter,
         physical_outputs: []PhysicalOutput,
         physical_output_count: usize,
+        hotplug_refresh_pending: bool = false,
         output_power_adapter: OutputPowerAdapter,
         gamma_control_adapter: GammaControlAdapter,
         output_management_modes: []protocol_output_management.ModeState,
@@ -2291,8 +2292,15 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn processHotplug(self: *Self) !void {
             const monitor = if (self.hotplug) |*value| value else return;
-            if (!monitor.takeChanged() or self.stopping or self.manager.currentHandle() == null)
+            if (monitor.takeChanged()) self.hotplug_refresh_pending = true;
+            if (!self.hotplug_refresh_pending) return;
+            if (self.stopping) {
+                self.hotplug_refresh_pending = false;
                 return;
+            }
+            if (self.manager.currentHandle() == null or self.session_disable_pending or
+                self.output_reconfigure != null or self.output_power_transition != null or
+                self.topology_refresh_pending) return;
             const connectors = try self.manager.probeDesktopConnectorIds(
                 self.hotplug_connector_ids,
             );
@@ -2319,6 +2327,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     try self.requestConnectorRemoval(physical.connector_id);
             }
             if (primary_missing or added) try self.requestTopologyRefresh();
+            self.hotplug_refresh_pending = false;
         }
 
         fn requestTopologyRefresh(self: *Self) !void {
@@ -2500,6 +2509,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 else => return err,
             };
             try self.processSeatEvents();
+            try self.processHotplug();
             try self.syncOutputAssociations();
             try self.advanceDrain();
             try self.syncForeignToplevelOutputChanges();
