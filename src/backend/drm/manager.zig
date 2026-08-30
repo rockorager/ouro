@@ -390,7 +390,7 @@ pub const Manager = struct {
     /// Returns every connected desktop connector with a deterministic complete
     /// connector/mode/CRTC/primary-plane tuple. The slice is borrowed from the
     /// active topology and becomes invalid with `handle` on rescan or removal.
-    /// The primary tuple used by `snapshot` is already claimed by Ouro.
+    /// The primary tuple used by `snapshot` is already claimed.
     pub fn scanoutCandidates(self: *const Manager, handle: Handle) ![]const ScanoutCandidate {
         if (!self.present or handle.generation != self.generation)
             return error.StaleSnapshot;
@@ -398,9 +398,24 @@ pub const Manager = struct {
         return storage.candidates[0..storage.candidate_count];
     }
 
+    /// Returns the exact claim reserved for the primary snapshot selection.
+    /// This gives compositor output records the same generation-safe ownership
+    /// handle used for additional scanout tuples.
+    pub fn primaryClaim(self: *const Manager, handle: Handle) !ClaimHandle {
+        _ = try self.snapshot(handle);
+        const claim = &self.claims[0];
+        if (!claim.active) return error.StaleClaim;
+        return .{
+            .topology_generation = self.generation,
+            .slot = 0,
+            .generation = claim.generation,
+        };
+    }
+
     /// Exclusively claims one exact candidate. Claims reserve the connector,
     /// CRTC, and primary plane together and remain valid only for this topology
-    /// generation. The compositor's primary candidate is reserved internally.
+    /// generation. The primary candidate returned by `primaryClaim` is already
+    /// reserved.
     pub fn claimScanout(
         self: *Manager,
         handle: Handle,
@@ -1027,6 +1042,8 @@ test "drm: scanout claims reserve complete tuples and recycle generation safely"
     const handle = (try manager.rescan()).?;
     const candidates = try manager.scanoutCandidates(handle);
     try std.testing.expectEqual(@as(usize, 2), candidates.len);
+    const primary = try manager.primaryClaim(handle);
+    try std.testing.expectEqual(@as(u32, 20), (try manager.claimSnapshot(primary)).selectedConnector().id);
     try std.testing.expectError(
         error.ConnectorClaimed,
         manager.claimScanout(handle, candidates[0]),
@@ -1050,6 +1067,26 @@ test "drm: scanout claims reserve complete tuples and recycle generation safely"
         manager.claimScanout(handle, invalid),
     );
     try manager.releaseScanout(replacement);
+}
+
+test "drm: primary claim is exact and generation safe" {
+    var seat = FakeSeat{};
+    const session = try seat.createSession();
+    defer destroyTestSession(session);
+    var platform = FakeDrm{ .multiple_outputs = true };
+    var manager = try Manager.init(std.testing.allocator, platform.platform(), session, "seat0", testConfig());
+    defer manager.deinit() catch unreachable;
+
+    const first = (try manager.rescan()).?;
+    const primary = try manager.primaryClaim(first);
+    const snapshot = try manager.claimSnapshot(primary);
+    try std.testing.expectEqual((try manager.snapshot(first)).selection, snapshot.selection);
+
+    const second = (try manager.rescan()).?;
+    try std.testing.expectError(error.StaleClaim, manager.claimSnapshot(primary));
+    try std.testing.expectError(error.StaleSnapshot, manager.primaryClaim(first));
+    const replacement = try manager.primaryClaim(second);
+    try std.testing.expect(replacement.generation != primary.generation);
 }
 
 test "drm: scanout claims reject shared CRTC and plane ownership" {
