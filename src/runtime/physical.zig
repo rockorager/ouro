@@ -5854,7 +5854,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn refreshRetainedLayersForOutput(self: *Self) bool {
-            const output_bounds = self.outputBounds() catch return false;
+            const output_bounds = self.globalOutputBounds() catch return false;
             var visibility_changed = false;
             for (self.app_layers) |*layer| if (layer.active) {
                 const id = layer.id orelse unreachable;
@@ -6080,8 +6080,8 @@ pub fn Coordinator(comptime protocol: type) type {
             const destination_size = content.surface.size;
             if (destination_size.width == 0 or destination_size.height == 0)
                 return error.InvalidDestination;
-            const output_bounds: geometry.Rect = if (self.primaryKmsOutput() != null)
-                try self.outputBounds()
+            const output_bounds: geometry.Rect = if (self.anyKmsOutput())
+                try self.globalOutputBounds()
             else
                 .{
                     .x = 0,
@@ -7728,6 +7728,37 @@ pub fn Coordinator(comptime protocol: type) type {
             return self.outputBoundsFor(self.primaryPhysicalOutput());
         }
 
+        fn globalOutputBounds(self: *const Self) !geometry.Rect {
+            var result: ?geometry.Rect = null;
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                if (physical.kms_output == null) continue;
+                const bounds = try self.outputBoundsFor(physical);
+                if (result == null) {
+                    result = bounds;
+                    continue;
+                }
+                const left = @min(result.?.x, bounds.x);
+                const top = @min(result.?.y, bounds.y);
+                const right = @max(
+                    @as(i64, result.?.x) + result.?.width,
+                    @as(i64, bounds.x) + bounds.width,
+                );
+                const bottom = @max(
+                    @as(i64, result.?.y) + result.?.height,
+                    @as(i64, bounds.y) + bounds.height,
+                );
+                result = .{
+                    .x = left,
+                    .y = top,
+                    .width = std.math.cast(i32, right - left) orelse
+                        return error.InvalidOutputLayout,
+                    .height = std.math.cast(i32, bottom - top) orelse
+                        return error.InvalidOutputLayout,
+                };
+            }
+            return result orelse error.NoOutput;
+        }
+
         fn outputBoundsFor(
             self: *const Self,
             physical: *const PhysicalOutput,
@@ -7954,26 +7985,32 @@ pub fn Coordinator(comptime protocol: type) type {
                     needed,
                 );
             for (self.clients.items) |*client| if (client.active) {
-                var count: usize = 0;
-                for (self.app_layers) |layer| {
-                    if (!layer.active or layer.peer == null or
-                        !samePeer(layer.peer.?, client.peer)) continue;
-                    self.association_surfaces[count] = layer.surface orelse
-                        return error.StaleSurface;
-                    count += 1;
+                for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                    const bounds = self.outputBoundsFor(physical) catch continue;
+                    var count: usize = 0;
+                    for (self.app_layers) |layer| {
+                        if (!layer.active or layer.peer == null or layer.sample == null or
+                            !samePeer(layer.peer.?, client.peer) or
+                            try clipToOutput(layer.sample.?.destination, bounds) == null) continue;
+                        self.association_surfaces[count] = layer.surface orelse
+                            return error.StaleSurface;
+                        count += 1;
+                    }
+                    if (self.cursor_layer.active and self.cursor_layer.peer != null and
+                        self.cursor_layer.sample != null and
+                        samePeer(self.cursor_layer.peer.?, client.peer) and
+                        try clipToOutput(self.cursor_layer.sample.?.destination, bounds) != null)
+                    {
+                        self.association_surfaces[count] = self.cursor_layer.surface orelse
+                            return error.StaleSurface;
+                        count += 1;
+                    }
+                    try self.output_adapter.reconcileSurfaces(
+                        physical.protocol_output,
+                        client.peer,
+                        self.association_surfaces[0..count],
+                    );
                 }
-                if (self.cursor_layer.active and self.cursor_layer.peer != null and
-                    samePeer(self.cursor_layer.peer.?, client.peer))
-                {
-                    self.association_surfaces[count] = self.cursor_layer.surface orelse
-                        return error.StaleSurface;
-                    count += 1;
-                }
-                try self.output_adapter.reconcileSurfaces(
-                    self.primaryPhysicalOutput().protocol_output,
-                    client.peer,
-                    self.association_surfaces[0..count],
-                );
                 if (self.output_adapter.pendingOutboundOn(client.peer))
                     client.protocol_ready |= ProtocolReady.output;
             };
