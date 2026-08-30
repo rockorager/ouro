@@ -5832,7 +5832,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn activateAdditionalOutputs(self: *Self, handle: drm.Handle) !void {
-            const scale_120 = self.output_management_adapter.lifecycle.current.scale_120;
+            const default_scale_120 = self.output_management_adapter.lifecycle.current.scale_120;
             for (try self.manager.scanoutCandidates(handle)) |candidate| {
                 const connector_id = (try self.manager.snapshot(handle)).connectors[candidate.connector_index].id;
                 if (connector_id == self.primaryPhysicalOutput().connector_id) continue;
@@ -5852,7 +5852,14 @@ pub fn Coordinator(comptime protocol: type) type {
                         physical.claim = null;
                         continue;
                     };
-                    self.activatePhysicalOutput(physical, snapshot, scale_120) catch {
+                    const state = self.output_management_adapter.lifecycle.currentHead(
+                        physical.management_head,
+                    ) catch {
+                        self.manager.releaseScanout(physical.claim.?) catch {};
+                        physical.claim = null;
+                        continue;
+                    };
+                    self.activatePhysicalOutput(physical, snapshot, state.scale_120) catch {
                         self.manager.releaseScanout(physical.claim.?) catch {};
                         physical.claim = null;
                     };
@@ -5864,7 +5871,13 @@ pub fn Coordinator(comptime protocol: type) type {
                 defer if (claim_owned) self.manager.releaseScanout(claim) catch {};
                 const snapshot = try self.manager.claimSnapshot(claim);
                 const x = try self.nextPhysicalOutputX();
-                _ = self.addPhysicalOutput(claim, snapshot, scale_120, x, false) catch continue;
+                _ = self.addPhysicalOutput(
+                    claim,
+                    snapshot,
+                    default_scale_120,
+                    x,
+                    false,
+                ) catch continue;
                 claim_owned = false;
             }
         }

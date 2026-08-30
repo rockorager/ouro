@@ -201,6 +201,18 @@ test "physical coordinator activates and drains every desktop connector" {
     try std.testing.expect((try coordinator.output_management_adapter.lifecycle.currentHead(
         coordinator.physical_outputs[1].management_head,
     )).enabled);
+    try coordinator.output_adapter.publishScale(
+        coordinator.physical_outputs[1].protocol_output,
+        240,
+    );
+    var secondary_head = try coordinator.output_management_adapter.lifecycle.currentHead(
+        coordinator.physical_outputs[1].management_head,
+    );
+    secondary_head.scale_120 = 240;
+    _ = try coordinator.output_management_adapter.publishHead(
+        coordinator.physical_outputs[1].management_head,
+        secondary_head,
+    );
     try std.testing.expectEqual(@as(usize, 0), (try coordinator.manager.leaseCandidates(
         coordinator.manager.currentHandle().?,
     )).len);
@@ -231,6 +243,18 @@ test "physical coordinator activates and drains every desktop connector" {
     try std.testing.expectEqual(@as(usize, 2), coordinator.physical_output_count);
     try std.testing.expect(coordinator.physical_outputs[0].kms_output != null);
     try std.testing.expect(coordinator.physical_outputs[1].kms_output != null);
+    try std.testing.expectEqual(
+        @as(u32, 240),
+        (try coordinator.output_management_adapter.lifecycle.currentHead(
+            coordinator.physical_outputs[1].management_head,
+        )).scale_120,
+    );
+    try std.testing.expectEqual(
+        @as(u32, 240),
+        coordinator.output_adapter.outputs[
+            coordinator.physical_outputs[1].protocol_output.index
+        ].scale_120,
+    );
 
     try coordinator.requestStop();
     try drainServer(root, coordinator, &loop);
