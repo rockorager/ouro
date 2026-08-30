@@ -8396,7 +8396,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.drm_lease_adapter.retryRevocations()) return;
 
             try self.retireGammaOwner();
-            const handle = (try self.manager.rescan()) orelse return error.DrmHardwareUnavailable;
+            const handle = (self.manager.rescan() catch |cause| switch (cause) {
+                error.NoConnectedOutput => return,
+                else => return cause,
+            }) orelse return error.DrmHardwareUnavailable;
             self.manager.clearEvents();
             for (self.physical_outputs[0..self.physical_output_count]) |*physical|
                 physical.claim = null;

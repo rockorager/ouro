@@ -416,7 +416,10 @@ pub const Manager = struct {
         const probe = &self.stores[self.active_store ^ 1];
         try self.platform.readTopology(fd, &probe.buffer);
         try validateCounts(&probe.buffer);
-        probe.candidate_count = try collectScanoutCandidates(&probe.buffer, probe.candidates);
+        probe.candidate_count = collectScanoutCandidates(&probe.buffer, probe.candidates) catch |cause| switch (cause) {
+            error.NoConnectedOutput => 0,
+            else => return cause,
+        };
         if (probe.candidate_count > output.len) return error.OutputTooSmall;
         for (probe.candidates[0..probe.candidate_count], 0..) |candidate, index|
             output[index] = probe.buffer.connectors[candidate.connector_index].id;
@@ -1203,6 +1206,25 @@ test "drm: scanout claims reserve complete tuples and recycle generation safely"
     try manager.releaseScanout(replacement);
 }
 
+test "drm: connector probe preserves active topology when no outputs remain" {
+    var seat = FakeSeat{};
+    const session = try seat.createSession();
+    defer destroyTestSession(session);
+    var platform = FakeDrm{};
+    var manager = try Manager.init(std.testing.allocator, platform.platform(), session, "seat0", testConfig());
+    defer manager.deinit() catch unreachable;
+
+    const handle = (try manager.rescan()).?;
+    const primary = try manager.primaryClaim(handle);
+    platform.primary_desktop = false;
+    var connector_ids: [2]u32 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), (try manager.probeDesktopConnectorIds(
+        &connector_ids,
+    )).len);
+    try std.testing.expectEqual(handle, manager.currentHandle().?);
+    try std.testing.expectEqual(@as(u32, 20), (try manager.claimSnapshot(primary)).selectedConnector().id);
+}
+
 test "drm: lease candidates exclude compositor-owned desktop connectors" {
     var seat = FakeSeat{};
     const session = try seat.createSession();
@@ -1530,6 +1552,7 @@ const FakeDrm = struct {
     fail_topology: bool = false,
     alternate_mode: bool = false,
     multiple_outputs: bool = false,
+    primary_desktop: bool = true,
     second_desktop: bool = true,
     shared_scanout: bool = false,
     lease_objects: [6]u32 = undefined,
@@ -1573,7 +1596,7 @@ const FakeDrm = struct {
         self.topology_after_caps = self.caps_enabled;
         if (self.fail_topology) return error.FakeTopology;
         buffer.reset();
-        buffer.connectors[0] = .{ .id = 20, .connector_type = 1, .connector_type_id = 1, .connected = true, .desktop = true, .width_mm = 500, .height_mm = 300, .encoder_id = 30, .mode_start = 0, .mode_count = if (self.alternate_mode) 2 else 1, .encoder_start = 0, .encoder_count = 1, .properties = .{ .crtc_id = 1 } };
+        buffer.connectors[0] = .{ .id = 20, .connector_type = 1, .connector_type_id = 1, .connected = true, .desktop = self.primary_desktop, .width_mm = 500, .height_mm = 300, .encoder_id = 30, .mode_start = 0, .mode_count = if (self.alternate_mode) 2 else 1, .encoder_start = 0, .encoder_count = 1, .properties = .{ .crtc_id = 1 } };
         buffer.modes[0] = testMode(1280, 720, 60);
         if (self.alternate_mode) buffer.modes[1] = testMode(1024, 768, 75);
         buffer.connector_encoders[0] = 30;

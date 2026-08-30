@@ -379,6 +379,62 @@ test "physical coordinator fails over from a disconnected primary output" {
     try root.deinit();
 }
 
+test "physical coordinator waits for the last output to reconnect" {
+    const allocator = std.testing.allocator;
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-r15-output-reconnect-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), compositorConfig());
+    const coordinator = try Coordinator.create(allocator, root, fixture.platformsWithHotplug(), coordinatorConfig());
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
+    try coordinator.start(&loop);
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    for (0..128) |_| {
+        _ = try loop.turn(coordinator);
+        if (coordinator.physical_outputs[0].kms_output != null) break;
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+    }
+
+    fixture.first_desktop = false;
+    try fixture.signalHotplug();
+    for (0..256) |_| {
+        _ = try loop.turn(coordinator);
+        if (coordinator.topology_refresh_pending and
+            coordinator.physical_outputs[0].kms_output == null) break;
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+    }
+    try std.testing.expect(coordinator.topology_refresh_pending);
+    try std.testing.expect(coordinator.physical_outputs[0].kms_output == null);
+    try std.testing.expect(!(try coordinator.output_management_adapter.lifecycle.currentHead(
+        coordinator.physical_outputs[0].management_head,
+    )).enabled);
+
+    fixture.first_desktop = true;
+    try fixture.signalHotplug();
+    for (0..256) |_| {
+        _ = try loop.turn(coordinator);
+        if (!coordinator.topology_refresh_pending and
+            coordinator.physical_outputs[0].kms_output != null) break;
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+    }
+    try std.testing.expect(!coordinator.topology_refresh_pending);
+    try std.testing.expect(coordinator.physical_outputs[0].kms_output != null);
+    try std.testing.expect((try coordinator.output_management_adapter.lifecycle.currentHead(
+        coordinator.physical_outputs[0].management_head,
+    )).enabled);
+
+    try coordinator.requestStop();
+    try drainServer(root, coordinator, &loop);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
 test "generated output management applies two heads atomically" {
     try generatedMultiHeadApply(false);
 }
