@@ -1,4 +1,4 @@
-//! Pixman CPU renderer for R10 linear scanout targets.
+//! Pixman CPU renderer for lifetime-mapped linear scanout targets.
 //!
 //! `render` accepts an acquired image, maps it, applies the R13 render-damage
 //! plan in protocol z-order, and unmaps it. Success leaves the image acquired
@@ -96,9 +96,9 @@ pub const Renderer = struct {
     }
 };
 
-/// CPU output startup always opts into R10's strict linear negotiation. A
-/// selected primary plane without XRGB/ARGB linear support fails with R10's
-/// clear `NoLinearRenderFormat` error rather than creating an unmappable pool.
+/// CPU output startup always opts into strict linear negotiation and
+/// lifetime-mapped DRM dumb targets. A selected primary plane without
+/// XRGB/ARGB linear support fails with `NoLinearRenderFormat`.
 pub fn initTargetPool(
     allocator: std.mem.Allocator,
     gbm_platform: gbm.Platform,
@@ -113,7 +113,7 @@ pub fn initTargetPool(
         drm_platform,
         fd,
         snapshot,
-        .{ .capacity = capacity, .linear_only = true },
+        .{ .capacity = capacity, .linear_only = true, .cpu_mapped = true },
     );
 }
 

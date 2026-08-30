@@ -188,7 +188,8 @@ zig build run -- --socket=/tmp/ouro.sock --renderer=auto
 Renderer selection is explicit:
 
 - `--renderer=auto` tries Vulkan and falls back to Pixman during startup;
-- `--renderer=pixman` requires the CPU renderer;
+- `--renderer=pixman` requires the CPU renderer and uses lifetime-mapped DRM
+  dumb buffers for software scanout targets;
 - `--renderer=vulkan` requires Vulkan and a primary KMS plane with
   `IN_FENCE_FD`. Vulkan exports a sync-file fence to KMS and never host-waits.
 
@@ -200,10 +201,10 @@ turn. `--output-icc=PATH` applies an ICC v2/v4 output profile, including VCGT
 calibration when present; it requires `--renderer=vulkan`. Auto and Pixman modes
 do not advertise color-management behavior they cannot guarantee.
 
-The physical path remains single-output and requires a usable `/dev/dri` device
-and libseat backend. `Loop.turn` is the sole io_uring submitter; protocol,
-backend, render, and presentation callbacks only retain bounded work for that
-turn. Real-hardware smoke is deliberately opt-in:
+The physical path activates every eligible desktop output and requires a usable
+`/dev/dri` device and libseat backend. `Loop.turn` is the sole io_uring
+submitter; protocol, backend, render, and presentation callbacks only retain
+bounded work for that turn. Real-hardware smoke is deliberately opt-in:
 
 ```sh
 zig build run-drm-smoke -- --renderer=pixman

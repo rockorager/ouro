@@ -13,6 +13,7 @@ drm_device=/dev/dri/card1
 output=eDP-1
 mode=1920x1200
 refresh=60
+outputs_spec=
 readiness_seconds=2
 frames_override=300
 perf_enabled=auto
@@ -28,7 +29,7 @@ usage: benchmark/run.sh [options]
 
   --suite NAME            quick, standard, all, shm, dmabuf, damage, viewport,
                           solid, scale, churn, mixed, color, alpha, composition, layers,
-                          dynamic, capacity, or capture (default: quick)
+                          dynamic, capacity, capture, or outputs (default: quick)
   --runs N                repetitions per compositor/workload (default: 3)
   --workload NAME         run one workload instead of a suite
   --frames N              frames per client (default: 300)
@@ -42,6 +43,7 @@ usage: benchmark/run.sh [options]
   --output NAME           connector name (default: eDP-1)
   --mode WIDTHxHEIGHT     output mode (default: 1920x1200)
   --refresh HZ            output refresh (default: 60)
+  --outputs LIST          comma-separated NAME:WIDTHxHEIGHT@HZ outputs in layout order
   --readiness SECONDS     fixed post-socket readiness delay (default: 2)
   --perf auto|on|off      perf stat policy (default: auto)
 EOF
@@ -63,6 +65,7 @@ while (($#)); do
         --output) output=$2; shift 2 ;;
         --mode) mode=$2; shift 2 ;;
         --refresh) refresh=$2; shift 2 ;;
+        --outputs) outputs_spec=$2; shift 2 ;;
         --readiness) readiness_seconds=$2; shift 2 ;;
         --perf) perf_enabled=$2; shift 2 ;;
         -h|--help) usage; exit 0 ;;
@@ -76,6 +79,10 @@ done
     exit 2
 }
 [[ $refresh =~ ^[1-9][0-9]*$ ]] || { echo "--refresh must be positive" >&2; exit 2; }
+[[ $mode =~ ^[1-9][0-9]*x[1-9][0-9]*$ ]] || {
+    echo "--mode must be WIDTHxHEIGHT" >&2
+    exit 2
+}
 [[ $duration_seconds =~ ^[1-9][0-9]*$ ]] || {
     echo "--duration must be positive" >&2
     exit 2
@@ -107,12 +114,53 @@ if [[ $renderer == pixman ]]; then
     }
     pacing=callback-only
 fi
+output_names=()
+output_modes=()
+output_refreshes=()
+output_widths=()
+output_heights=()
+if [[ -n $outputs_spec ]]; then
+    IFS=, read -r -a output_definitions <<<"$outputs_spec"
+    for definition in "${output_definitions[@]}"; do
+        if [[ ! $definition =~ ^([A-Za-z0-9_.-]+):([1-9][0-9]*)x([1-9][0-9]*)@([1-9][0-9]*)$ ]]; then
+            echo "invalid --outputs entry: $definition" >&2
+            exit 2
+        fi
+        output_names+=("${BASH_REMATCH[1]}")
+        output_widths+=("${BASH_REMATCH[2]}")
+        output_heights+=("${BASH_REMATCH[3]}")
+        output_modes+=("${BASH_REMATCH[2]}x${BASH_REMATCH[3]}")
+        output_refreshes+=("${BASH_REMATCH[4]}")
+    done
+else
+    [[ $output =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid --output name" >&2; exit 2; }
+    output_names+=("$output")
+    output_modes+=("$mode")
+    output_refreshes+=("$refresh")
+    output_widths+=("${mode%x*}")
+    output_heights+=("${mode#*x}")
+fi
+output_count=${#output_names[@]}
+((output_count <= 16)) || { echo "at most 16 outputs are supported" >&2; exit 2; }
+output=${output_names[0]}
+mode=${output_modes[0]}
+refresh=${output_refreshes[0]}
+output_specs=
+for ((index = 0; index < output_count; index++)); do
+    [[ -z $output_specs ]] || output_specs+=,
+    output_specs+="${output_names[index]}:${output_modes[index]}@${output_refreshes[index]}"
+done
+
 case "$selected_suite" in
-    quick|standard|all|shm|dmabuf|damage|viewport|solid|scale|churn|mixed|color|alpha|composition|layers|dynamic|capacity|native|sync|capture|visibility|cpu|lifecycle|scanout) ;;
+    quick|standard|all|shm|dmabuf|damage|viewport|solid|scale|churn|mixed|color|alpha|composition|layers|dynamic|capacity|native|sync|capture|outputs|visibility|cpu|lifecycle|scanout) ;;
     *) echo "unknown suite: $selected_suite" >&2; exit 2 ;;
 esac
 if [[ $selected_suite == scanout && $scanout != on ]]; then
     echo "the scanout suite requires --scanout on" >&2
+    exit 2
+fi
+if [[ $selected_suite == outputs && $output_count -lt 2 ]]; then
+    echo "the outputs suite requires at least two --outputs entries" >&2
     exit 2
 fi
 if [[ $selected_workload == direct-scanout-* && $scanout != on ]]; then
@@ -203,8 +251,9 @@ compositor_csv=$(IFS=,; printf '%s' "${compositors[*]}")
     printf 'gbm_version=%s\n' "$(pkg-config --modversion gbm)"
     printf 'libdrm_version=%s\n' "$(pkg-config --modversion libdrm)"
     printf 'kernel=%s\n' "$(uname -srmo)"
-    printf 'drm_device=%s\noutput=%s\nmode=%s\nrefresh=%s\n' \
-        "$drm_device" "$output" "$mode" "$refresh"
+    printf 'drm_device=%s\noutput=%s\nmode=%s\nrefresh=%s\noutputs=%s\noutput_count=%s\n' \
+        "$drm_device" "${output_names[0]}" "${output_modes[0]}" \
+        "${output_refreshes[0]}" "$output_specs" "$output_count"
     printf 'readiness_seconds=%s\nperf_policy=%s\npacing=%s\nsuite=%s\n' \
         "$readiness_seconds" "$perf_enabled" "$pacing" "$selected_suite"
     printf 'renderer=%s\nscanout=%s\ncompositors=%s\n' "$renderer" "$scanout" "$compositor_csv"
@@ -287,18 +336,26 @@ find_compositor_pid() {
 
 render_configs() {
     local directory=$1
-    sed -e "s|@OUTPUT@|$output|g" -e "s|@MODE@|$mode|g" \
-        -e "s|@MODE_REFRESH@|${mode}@${refresh}Hz|g" \
-        "$repo/benchmark/sway.conf.in" >"$directory/sway.conf"
-    sed -e "s|@OUTPUT@|$output|g" -e "s|@MODE@|$mode|g" \
-        -e "s|@MODE_REFRESH@|${mode}@${refresh}|g" \
-        -e "s|@DIRECT_SCANOUT@|$([[ $scanout == on ]] && printf 1 || printf 0)|g" \
-        "$repo/benchmark/hyprland.conf.in" >"$directory/hyprland.conf"
+    local x=0 index
+    : >"$directory/sway.conf"
+    : >"$directory/hyprland.conf"
+    for ((index = 0; index < output_count; index++)); do
+        printf 'output %s mode %s@%sHz position %d 0 scale 1\n' \
+            "${output_names[index]}" "${output_modes[index]}" \
+            "${output_refreshes[index]}" "$x" >>"$directory/sway.conf"
+        printf 'monitor = %s,%s@%s,%dx0,1\n' \
+            "${output_names[index]}" "${output_modes[index]}" \
+            "${output_refreshes[index]}" "$x" >>"$directory/hyprland.conf"
+        ((x += output_widths[index]))
+    done
+    cat "$repo/benchmark/sway.conf.in" >>"$directory/sway.conf"
+    sed -e "s|@DIRECT_SCANOUT@|$([[ $scanout == on ]] && printf 1 || printf 0)|g" \
+        "$repo/benchmark/hyprland.conf.in" >>"$directory/hyprland.conf"
 }
 
 run_case() {
     local workload_name=$1 client_modes=$2 clients=$3 width=$4 height=$5 frames=$6 warmup=$7
-    local compositor=$8 repetition=$9 kind=${10}
+    local compositor=$8 repetition=$9 kind=${10} placement=${11}
     local directory="$results/$workload_name/$compositor/run-$repetition"
     local runtime
     local expected_socket
@@ -315,14 +372,15 @@ run_case() {
     expected_socket="$runtime/wayland-0"
     chmod 700 "$runtime"
     render_configs "$directory"
-    printf 'workload=%s\nclient_modes=%s\nclients=%s\nwidth=%s\nheight=%s\nframes=%s\nwarmup=%s\nrefresh=%s\npacing=%s\nkind=%s\nduration_seconds=%s\n' \
-        "$workload_name" "$client_modes" "$clients" "$width" "$height" "$frames" "$warmup" "$refresh" "$pacing" "$kind" "$duration_seconds" \
+    printf 'workload=%s\nclient_modes=%s\nclients=%s\nwidth=%s\nheight=%s\nframes=%s\nwarmup=%s\nrefresh=%s\npacing=%s\nkind=%s\nplacement=%s\noutput_count=%s\nduration_seconds=%s\n' \
+        "$workload_name" "$client_modes" "$clients" "$width" "$height" "$frames" "$warmup" "${output_refreshes[0]}" "$pacing" "$kind" "$placement" "$output_count" "$duration_seconds" \
         >"$directory/case.env"
 
     case "$compositor" in
         ouro)
             seatd-launch -l error -- env XDG_RUNTIME_DIR="$runtime" LIBSEAT_BACKEND=seatd \
                 "$ouro_binary" --socket="$expected_socket" --renderer="$renderer" \
+                --drm-device="$drm_device" \
                 >"$directory/compositor.log" 2>&1 &
             launcher_pid=$!
             ;;
@@ -366,6 +424,7 @@ run_case() {
             anchor_log="$directory/anchor.log"
             mkfifo "$anchor_fifo"
             "$client_binary" "$socket" shm-hold 64 64 1 1 "$drm_device" "$pacing" \
+                - 1 1 1 1 \
                 <"$anchor_fifo" >"$anchor_log" 2>&1 &
             anchor_pid=$!
             client_pids=("$anchor_pid")
@@ -403,7 +462,7 @@ run_case() {
                 local log="$directory/churn-$iteration.log"
                 mkfifo "$fifo"
                 "$client_binary" "$socket" "$client_modes" "$width" "$height" 1 "$warmup" \
-                    "$drm_device" "$pacing" <"$fifo" >"$log" 2>&1 &
+                    "$drm_device" "$pacing" - 1 1 1 1 <"$fifo" >"$log" 2>&1 &
                 local client_pid=$!
                 local fd
                 exec {fd}>"$fifo"
@@ -468,9 +527,19 @@ run_case() {
         local log="$directory/client-$index.log"
         local client_mode=${modes[0]}
         if ((${#modes[@]} > 1)); then client_mode=${modes[index - 1]}; fi
+        local target_output=- expected_outputs=1 expected_width=1 expected_height=1
+        local expected_refresh=1
+        if [[ $placement == outputs ]]; then
+            target_output=$((index - 1))
+            expected_outputs=$output_count
+            expected_width=${output_widths[index - 1]}
+            expected_height=${output_heights[index - 1]}
+            expected_refresh=${output_refreshes[index - 1]}
+        fi
         mkfifo "$fifo"
         "$client_binary" "$socket" "$client_mode" "$width" "$height" "$frames" "$warmup" \
-            "$drm_device" "$pacing" \
+            "$drm_device" "$pacing" "$target_output" "$expected_outputs" \
+            "$expected_width" "$expected_height" "$expected_refresh" \
             <"$fifo" >"$log" 2>&1 &
         client_pids+=("$!")
         local fd
@@ -643,12 +712,31 @@ run_case() {
 
 matched=0
 for definition in "${benchmark_workloads[@]}"; do
-    read -r workload_name client_modes clients width height frames warmup kind <<<"$definition"
+    read -r workload_name client_modes clients width height frames warmup kind placement <<<"$definition"
     kind=${kind:-paced}
+    placement=${placement:-xdg}
     if [[ -n $selected_workload ]]; then
         [[ $selected_workload == "$workload_name" ]] || continue
     else
         benchmark_suite_contains "$selected_suite" "$workload_name" || continue
+    fi
+    if [[ $placement == outputs ]]; then
+        for output_refresh in "${output_refreshes[@]}"; do
+            [[ $output_refresh == "$refresh" ]] || {
+                echo "$workload_name requires equal refresh rates on every output" >&2
+                exit 2
+            }
+        done
+        if ((clients == 0)); then
+            ((output_count >= 2)) || {
+                echo "$workload_name requires at least two --outputs entries" >&2
+                exit 2
+            }
+            clients=$output_count
+        elif ((clients > output_count)); then
+            echo "$workload_name requires at least $clients --outputs entries" >&2
+            exit 2
+        fi
     fi
     matched=1
     frames=$frames_override
@@ -656,7 +744,7 @@ for definition in "${benchmark_workloads[@]}"; do
         for compositor in "${compositors[@]}"; do
             printf '==> %s run %d: %s\n' "$workload_name" "$repetition" "$compositor"
             if run_case "$workload_name" "$client_modes" "$clients" "$width" "$height" \
-                "$frames" "$warmup" "$compositor" "$repetition" "$kind"
+                "$frames" "$warmup" "$compositor" "$repetition" "$kind" "$placement"
             then
                 result=0
             else

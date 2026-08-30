@@ -29,10 +29,13 @@
 #include "presentation-time-client-protocol.h"
 #include "single-pixel-buffer-v1-client-protocol.h"
 #include "viewporter-client-protocol.h"
+#include "wlr-layer-shell-unstable-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 #include "color-management-v1-client-protocol.h"
 
 #define BUFFER_COUNT 3
+#define MAX_OUTPUTS 16
+#define OUTPUT_NAME_CAPACITY 128
 #define HALF_ALPHA_FACTOR UINT32_C(0x80808080)
 
 enum workload {
@@ -120,6 +123,19 @@ struct dmabuf_modifier {
     uint64_t modifier;
 };
 
+struct benchmark_output {
+    struct wl_output *proxy;
+    int32_t x;
+    int32_t y;
+    int32_t width;
+    int32_t height;
+    int32_t refresh_millihz;
+    int32_t scale;
+    char name[OUTPUT_NAME_CAPACITY];
+    bool current_mode;
+    bool done;
+};
+
 struct scene_layer {
     struct wl_surface *surface;
     struct wl_subsurface *subsurface;
@@ -155,9 +171,14 @@ struct client {
     struct wl_subcompositor *subcompositor;
     struct wl_shm *shm;
     struct wl_output *output;
+    struct benchmark_output outputs[MAX_OUTPUTS];
+    size_t output_count;
+    struct benchmark_output *selected_output;
     struct wp_single_pixel_buffer_manager_v1 *single_pixel_manager;
     struct wp_viewporter *viewporter;
     struct xdg_wm_base *wm_base;
+    struct zwlr_layer_shell_v1 *layer_shell;
+    struct zwlr_layer_surface_v1 *layer_surface;
     struct wp_presentation *presentation;
     struct zwp_linux_dmabuf_v1 *dmabuf;
     struct wp_linux_drm_syncobj_manager_v1 *syncobj_manager;
@@ -191,6 +212,11 @@ struct client {
     uint32_t *canonical_pixels;
     int32_t width;
     int32_t height;
+    int32_t target_output_index;
+    uint32_t expected_output_count;
+    int32_t expected_output_width;
+    int32_t expected_output_height;
+    int32_t expected_output_refresh;
     enum workload workload;
     enum backing backing;
     enum capture_backing capture_backing;
@@ -303,6 +329,18 @@ static uint64_t parse_positive(const char *text, const char *name) {
     return (uint64_t)value;
 }
 
+static int32_t parse_output_index(const char *text) {
+    if (strcmp(text, "-") == 0) return -1;
+    char *end = NULL;
+    errno = 0;
+    unsigned long value = strtoul(text, &end, 10);
+    if (errno != 0 || text[0] == '\0' || end[0] != '\0' || value > INT32_MAX) {
+        fprintf(stderr, "ouro-benchmark-client: invalid output index: %s\n", text);
+        exit(2);
+    }
+    return (int32_t)value;
+}
+
 static struct wl_display *connect_path(const char *path) {
     int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) fail("create socket");
@@ -401,6 +439,79 @@ static const struct wp_presentation_feedback_listener feedback_listener = {
     .discarded = feedback_discarded,
 };
 
+static void output_geometry(
+    void *data,
+    struct wl_output *output,
+    int32_t x,
+    int32_t y,
+    int32_t physical_width,
+    int32_t physical_height,
+    int32_t subpixel,
+    const char *make,
+    const char *model,
+    int32_t transform
+) {
+    (void)output;
+    (void)physical_width;
+    (void)physical_height;
+    (void)subpixel;
+    (void)make;
+    (void)model;
+    (void)transform;
+    struct benchmark_output *state = data;
+    state->x = x;
+    state->y = y;
+}
+
+static void output_mode(
+    void *data,
+    struct wl_output *output,
+    uint32_t flags,
+    int32_t width,
+    int32_t height,
+    int32_t refresh
+) {
+    (void)output;
+    if ((flags & WL_OUTPUT_MODE_CURRENT) == 0) return;
+    struct benchmark_output *state = data;
+    state->width = width;
+    state->height = height;
+    state->refresh_millihz = refresh;
+    state->current_mode = true;
+}
+
+static void output_done(void *data, struct wl_output *output) {
+    (void)output;
+    ((struct benchmark_output *)data)->done = true;
+}
+
+static void output_scale(void *data, struct wl_output *output, int32_t factor) {
+    (void)output;
+    ((struct benchmark_output *)data)->scale = factor;
+}
+
+static void output_name(void *data, struct wl_output *output, const char *name) {
+    (void)output;
+    struct benchmark_output *state = data;
+    if (strlen(name) >= sizeof(state->name)) protocol_fail("wl_output name is too long");
+    strcpy(state->name, name);
+}
+
+static void output_description(void *data, struct wl_output *output, const char *description) {
+    (void)data;
+    (void)output;
+    (void)description;
+}
+
+static const struct wl_output_listener output_listener = {
+    .geometry = output_geometry,
+    .mode = output_mode,
+    .done = output_done,
+    .scale = output_scale,
+    .name = output_name,
+    .description = output_description,
+};
+
 static void wm_base_ping(void *data, struct xdg_wm_base *wm_base, uint32_t serial) {
     (void)data;
     xdg_wm_base_pong(wm_base, serial);
@@ -419,6 +530,32 @@ static void xdg_surface_configure(void *data, struct xdg_surface *surface, uint3
 
 static const struct xdg_surface_listener xdg_surface_listener = {
     .configure = xdg_surface_configure,
+};
+
+static void layer_surface_configure(
+    void *data,
+    struct zwlr_layer_surface_v1 *surface,
+    uint32_t serial,
+    uint32_t width,
+    uint32_t height
+) {
+    (void)width;
+    (void)height;
+    struct client *client = data;
+    if (client->draining) return;
+    zwlr_layer_surface_v1_ack_configure(surface, serial);
+    client->configured = true;
+}
+
+static void layer_surface_closed(void *data, struct zwlr_layer_surface_v1 *surface) {
+    (void)data;
+    (void)surface;
+    protocol_fail("layer surface was closed");
+}
+
+static const struct zwlr_layer_surface_v1_listener layer_surface_listener = {
+    .configure = layer_surface_configure,
+    .closed = layer_surface_closed,
 };
 
 static void presentation_clock_id(void *data, struct wp_presentation *presentation, uint32_t clk_id) {
@@ -756,15 +893,28 @@ static void registry_global(
         );
     } else if (strcmp(interface, wl_shm_interface.name) == 0) {
         client->shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
-    } else if (strcmp(interface, wl_output_interface.name) == 0 && client->output == NULL) {
-        client->output = wl_registry_bind(
+    } else if (strcmp(interface, wl_output_interface.name) == 0) {
+        if (client->output_count == MAX_OUTPUTS) protocol_fail("too many wl_output globals");
+        struct benchmark_output *output = &client->outputs[client->output_count++];
+        output->scale = 1;
+        output->proxy = wl_registry_bind(
             registry,
             name,
             &wl_output_interface,
             version < 4 ? version : 4
         );
+        if (output->proxy == NULL ||
+            wl_output_add_listener(output->proxy, &output_listener, output) != 0)
+            protocol_fail("bind wl_output");
     } else if (strcmp(interface, xdg_wm_base_interface.name) == 0) {
         client->wm_base = wl_registry_bind(registry, name, &xdg_wm_base_interface, 1);
+    } else if (strcmp(interface, zwlr_layer_shell_v1_interface.name) == 0) {
+        client->layer_shell = wl_registry_bind(
+            registry,
+            name,
+            &zwlr_layer_shell_v1_interface,
+            version < 4 ? version : 4
+        );
     } else if (strcmp(interface, wp_presentation_interface.name) == 0) {
         client->presentation = wl_registry_bind(registry, name, &wp_presentation_interface, 1);
     } else if (strcmp(interface, zwp_linux_dmabuf_v1_interface.name) == 0) {
@@ -1507,6 +1657,53 @@ static void wait_for_capture(struct client *client) {
     client->capture_frame = NULL;
 }
 
+static int compare_outputs(
+    const struct benchmark_output *left,
+    const struct benchmark_output *right
+) {
+    if (left->x != right->x) return left->x < right->x ? -1 : 1;
+    if (left->y != right->y) return left->y < right->y ? -1 : 1;
+    return strcmp(left->name, right->name);
+}
+
+static struct benchmark_output *select_output(struct client *client, uint32_t index) {
+    for (size_t candidate = 0; candidate < client->output_count; candidate++) {
+        size_t rank = 0;
+        bool duplicate = false;
+        for (size_t other = 0; other < client->output_count; other++) {
+            if (other == candidate) continue;
+            const int ordering = compare_outputs(
+                &client->outputs[other],
+                &client->outputs[candidate]
+            );
+            if (ordering < 0) rank++;
+            if (ordering == 0) duplicate = true;
+        }
+        if (duplicate) protocol_fail("wl_output layout order is ambiguous");
+        if (rank == index) return &client->outputs[candidate];
+    }
+    return NULL;
+}
+
+static void select_benchmark_output(struct client *client) {
+    if (client->output_count == 0) protocol_fail("wl_output is required");
+    client->output = client->outputs[0].proxy;
+    if (client->target_output_index < 0) return;
+    if (client->output_count != client->expected_output_count)
+        protocol_fail("advertised output count does not match benchmark configuration");
+    client->selected_output = select_output(client, (uint32_t)client->target_output_index);
+    if (client->selected_output == NULL) protocol_fail("target output index is unavailable");
+    if (!client->selected_output->done || !client->selected_output->current_mode)
+        protocol_fail("target output did not publish complete current state");
+    if (client->selected_output->width != client->expected_output_width ||
+        client->selected_output->height != client->expected_output_height)
+        protocol_fail("target output mode does not match benchmark configuration");
+    const int32_t rounded_refresh = (client->selected_output->refresh_millihz + 500) / 1000;
+    if (rounded_refresh != client->expected_output_refresh)
+        protocol_fail("target output refresh does not match benchmark configuration");
+    client->output = client->selected_output->proxy;
+}
+
 static void setup(struct client *client, const char *socket_path, const char *drm_path) {
     client->display = connect_path(socket_path);
     struct wl_registry *registry = wl_display_get_registry(client->display);
@@ -1514,9 +1711,15 @@ static void setup(struct client *client, const char *socket_path, const char *dr
         wl_registry_add_listener(registry, &registry_listener, client) != 0 ||
         wl_display_roundtrip(client->display) < 0)
         fail("discover globals");
+    if (wl_display_roundtrip(client->display) < 0) fail("collect output state");
     wl_registry_destroy(registry);
-    if (client->compositor == NULL || client->wm_base == NULL || client->presentation == NULL)
-        protocol_fail("wl_compositor, xdg_wm_base, and wp_presentation are required");
+    if (client->compositor == NULL || client->presentation == NULL)
+        protocol_fail("wl_compositor and wp_presentation are required");
+    select_benchmark_output(client);
+    if (client->target_output_index < 0 && client->wm_base == NULL)
+        protocol_fail("xdg_wm_base is required");
+    if (client->target_output_index >= 0 && client->layer_shell == NULL)
+        unsupported("wlr-layer-shell-v1 output placement");
     if (client->backing == BACKING_SHM && client->shm == NULL)
         protocol_fail("wl_shm is required for SHM workloads");
     if (client->backing == BACKING_DMABUF) {
@@ -1529,17 +1732,35 @@ static void setup(struct client *client, const char *socket_path, const char *dr
         if (wl_display_roundtrip(client->display) < 0)
             fail("collect DMA-BUF modifier advertisements");
     }
-    if (xdg_wm_base_add_listener(client->wm_base, &wm_base_listener, client) != 0 ||
+    if ((client->wm_base != NULL &&
+            xdg_wm_base_add_listener(client->wm_base, &wm_base_listener, client) != 0) ||
         wp_presentation_add_listener(client->presentation, &presentation_listener, client) != 0)
         protocol_fail("install global listener");
     client->surface = wl_compositor_create_surface(client->compositor);
-    client->xdg_surface = xdg_wm_base_get_xdg_surface(client->wm_base, client->surface);
-    if (client->surface == NULL || client->xdg_surface == NULL ||
-        xdg_surface_add_listener(client->xdg_surface, &xdg_surface_listener, client) != 0)
-        protocol_fail("create xdg_surface");
-    client->toplevel = xdg_surface_get_toplevel(client->xdg_surface);
-    if (client->toplevel == NULL) protocol_fail("create xdg_toplevel");
-    xdg_toplevel_set_title(client->toplevel, "Ouro compositor benchmark");
+    if (client->surface == NULL) protocol_fail("create wl_surface");
+    if (client->target_output_index >= 0) {
+        client->layer_surface = zwlr_layer_shell_v1_get_layer_surface(
+            client->layer_shell,
+            client->surface,
+            client->output,
+            ZWLR_LAYER_SHELL_V1_LAYER_TOP,
+            "ouro-benchmark"
+        );
+        if (client->layer_surface == NULL || zwlr_layer_surface_v1_add_listener(
+            client->layer_surface,
+            &layer_surface_listener,
+            client
+        ) != 0) protocol_fail("create layer surface");
+        zwlr_layer_surface_v1_set_size(client->layer_surface, client->width, client->height);
+    } else {
+        client->xdg_surface = xdg_wm_base_get_xdg_surface(client->wm_base, client->surface);
+        if (client->xdg_surface == NULL ||
+            xdg_surface_add_listener(client->xdg_surface, &xdg_surface_listener, client) != 0)
+            protocol_fail("create xdg_surface");
+        client->toplevel = xdg_surface_get_toplevel(client->xdg_surface);
+        if (client->toplevel == NULL) protocol_fail("create xdg_toplevel");
+        xdg_toplevel_set_title(client->toplevel, "Ouro compositor benchmark");
+    }
     setup_explicit_sync(client);
     if (client->opaque_region) {
         struct wl_region *region = wl_compositor_create_region(client->compositor);
@@ -2046,6 +2267,8 @@ static void cleanup(struct client *client) {
         wp_linux_drm_syncobj_surface_v1_destroy(client->syncobj_surface);
     if (client->toplevel != NULL) xdg_toplevel_destroy(client->toplevel);
     if (client->xdg_surface != NULL) xdg_surface_destroy(client->xdg_surface);
+    if (client->layer_surface != NULL)
+        zwlr_layer_surface_v1_destroy(client->layer_surface);
     if (client->surface != NULL) wl_surface_destroy(client->surface);
     if (client->presentation != NULL) wp_presentation_destroy(client->presentation);
     if (client->alpha_modifier_manager != NULL)
@@ -2060,9 +2283,12 @@ static void cleanup(struct client *client) {
         wp_linux_drm_syncobj_timeline_v1_destroy(client->syncobj_timeline);
     if (client->syncobj_manager != NULL)
         wp_linux_drm_syncobj_manager_v1_destroy(client->syncobj_manager);
+    if (client->layer_shell != NULL) zwlr_layer_shell_v1_destroy(client->layer_shell);
     if (client->wm_base != NULL) xdg_wm_base_destroy(client->wm_base);
     if (client->shm != NULL) wl_shm_destroy(client->shm);
-    if (client->output != NULL) wl_output_destroy(client->output);
+    for (size_t index = 0; index < client->output_count; index++)
+        if (client->outputs[index].proxy != NULL)
+            wl_output_destroy(client->outputs[index].proxy);
     if (client->single_pixel_manager != NULL)
         wp_single_pixel_buffer_manager_v1_destroy(client->single_pixel_manager);
     if (client->viewporter != NULL) wp_viewporter_destroy(client->viewporter);
@@ -2318,10 +2544,11 @@ static enum pacing parse_pacing(const char *name) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 9) {
+    if (argc != 14) {
         fprintf(
             stderr,
-            "usage: %s SOCKET WORKLOAD WIDTH HEIGHT FRAMES WARMUP DRM_DEVICE PACING\n",
+            "usage: %s SOCKET WORKLOAD WIDTH HEIGHT FRAMES WARMUP DRM_DEVICE PACING "
+            "OUTPUT_INDEX OUTPUT_COUNT OUTPUT_WIDTH OUTPUT_HEIGHT OUTPUT_REFRESH\n",
             argv[0]
         );
         return 2;
@@ -2329,9 +2556,22 @@ int main(int argc, char **argv) {
     struct client client = {
         .width = (int32_t)parse_positive(argv[3], "width"),
         .height = (int32_t)parse_positive(argv[4], "height"),
+        .target_output_index = parse_output_index(argv[9]),
+        .expected_output_count = (uint32_t)parse_positive(argv[10], "output count"),
+        .expected_output_width = (int32_t)parse_positive(argv[11], "output width"),
+        .expected_output_height = (int32_t)parse_positive(argv[12], "output height"),
+        .expected_output_refresh = (int32_t)parse_positive(argv[13], "output refresh"),
         .drm_fd = -1,
         .capture_buffer = { .fd = -1, .drm_fd = -1 },
     };
+    if (client.target_output_index < 0) {
+        client.expected_output_count = 0;
+        client.expected_output_width = 0;
+        client.expected_output_height = 0;
+        client.expected_output_refresh = 0;
+    } else if ((uint32_t)client.target_output_index >= client.expected_output_count) {
+        protocol_fail("output index exceeds configured output count");
+    }
     parse_workload(&client, argv[2]);
     const enum pacing pacing = parse_pacing(argv[8]);
     const uint64_t frames = parse_positive(argv[5], "frames");
@@ -2360,11 +2600,13 @@ int main(int argc, char **argv) {
         if (read(STDIN_FILENO, &gate, 1) != 1) fail("read hold completion gate");
         printf(
             "{\"workload\":\"%s\",\"kind\":\"hold\",\"width\":%d,\"height\":%d,"
+            "\"output_index\":%d,"
             "\"hold_ns\":%" PRIu64 ",\"raw_callbacks\":%" PRIu64 ","
             "\"raw_releases\":%" PRIu64 ",\"raw_presented\":%" PRIu64 "}\n",
             argv[2],
             client.width,
             client.height,
+            client.target_output_index,
             monotonic_ns() - started_ns,
             client.callbacks,
             client.releases,
@@ -2406,6 +2648,7 @@ int main(int argc, char **argv) {
     const uint64_t gated_ns = monotonic_ns();
     printf(
         "{\"workload\":\"%s\",\"pacing\":\"%s\",\"width\":%d,\"height\":%d,"
+        "\"output_index\":%d,\"output_x\":%d,\"output_y\":%d,"
         "\"frames\":%" PRIu64 ",\"warmup\":%" PRIu64 ","
         "\"buffers_per_frame\":%zu,"
         "\"release_events_per_frame\":%zu,"
@@ -2428,6 +2671,9 @@ int main(int argc, char **argv) {
         argv[8],
         client.width,
         client.height,
+        client.target_output_index,
+        client.selected_output == NULL ? 0 : client.selected_output->x,
+        client.selected_output == NULL ? 0 : client.selected_output->y,
         frames,
         warmup,
         buffers_per_frame(&client),
