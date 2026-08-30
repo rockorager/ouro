@@ -148,7 +148,9 @@ fn realHandleEvents(context: *anyopaque, fd: std.posix.fd_t, callback: FlipCallb
     var event_context: c.drmEventContext = std.mem.zeroes(c.drmEventContext);
     event_context.version = 3;
     event_context.page_flip_handler2 = realPageFlip;
-    if (c.drmHandleEvent(fd, &event_context) != 0) return error.HandleDrmEventFailed;
+    const result = c.drmHandleEvent(fd, &event_context);
+    if (result != 0 and std.c.errno(result) != .AGAIN)
+        return error.HandleDrmEventFailed;
 }
 
 fn realPageFlip(
@@ -188,3 +190,21 @@ test "kms: atomic flag records remain deterministic and independent" {
     try std.testing.expect(test_flags.test_only and !test_flags.nonblock);
     try std.testing.expect(!real_flags.test_only and real_flags.page_flip_event);
 }
+
+test "kms: redundant shared-fd event dispatch tolerates an empty nonblocking queue" {
+    const linux = std.os.linux;
+    const result = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
+    if (linux.errno(result) != .SUCCESS) return error.EventFdFailed;
+    const fd: std.posix.fd_t = @intCast(result);
+    defer _ = linux.close(fd);
+
+    try real.handleEvents(fd, ignorePageFlip);
+}
+
+fn ignorePageFlip(
+    _: *anyopaque,
+    _: u32,
+    _: u32,
+    _: u32,
+    _: u32,
+) callconv(.c) void {}
