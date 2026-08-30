@@ -408,7 +408,7 @@ test "physical coordinator fails over from a disconnected primary output" {
     try root.deinit();
 }
 
-test "physical coordinator waits for the last output to reconnect" {
+test "physical coordinator replaces the last disconnected output exactly" {
     const allocator = std.testing.allocator;
     var fixture = try Fixture.init();
     defer fixture.deinit();
@@ -428,6 +428,8 @@ test "physical coordinator waits for the last output to reconnect" {
         if (coordinator.physical_outputs[0].kms_output != null) break;
         if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
     }
+    const disconnected_protocol = coordinator.physical_outputs[0].protocol_output;
+    const disconnected_head = coordinator.physical_outputs[0].management_head;
 
     fixture.first_desktop = false;
     try fixture.signalHotplug();
@@ -443,18 +445,37 @@ test "physical coordinator waits for the last output to reconnect" {
         coordinator.physical_outputs[0].management_head,
     )).enabled);
 
-    fixture.first_desktop = true;
+    fixture.second_desktop = true;
     try fixture.signalHotplug();
-    for (0..256) |_| {
+    for (0..512) |_| {
         _ = try loop.turn(coordinator);
         if (!coordinator.topology_refresh_pending and
-            coordinator.physical_outputs[0].kms_output != null) break;
+            !coordinator.physical_outputs[0].connected and
+            !coordinator.physical_outputs[0].removing and
+            coordinator.physical_outputs[1].kms_output != null) break;
         if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
     }
     try std.testing.expect(!coordinator.topology_refresh_pending);
-    try std.testing.expect(coordinator.physical_outputs[0].kms_output != null);
+    try std.testing.expect(!coordinator.physical_outputs[0].connected);
+    try std.testing.expect(!(try coordinator.output_adapter.outputPublished(
+        disconnected_protocol,
+    )));
+    try std.testing.expectError(
+        error.InvalidHead,
+        coordinator.output_management_adapter.lifecycle.currentHead(disconnected_head),
+    );
+    try std.testing.expectEqual(@as(u32, 11), coordinator.physical_outputs[1].connector_id);
+    try std.testing.expect(coordinator.physical_outputs[1].kms_output != null);
+    try std.testing.expect(!std.meta.eql(
+        disconnected_protocol,
+        coordinator.physical_outputs[1].protocol_output,
+    ));
+    try std.testing.expectEqual(
+        coordinator.physical_outputs[1].protocol_output,
+        coordinator.output_adapter.primaryOutput(),
+    );
     try std.testing.expect((try coordinator.output_management_adapter.lifecycle.currentHead(
-        coordinator.physical_outputs[0].management_head,
+        coordinator.physical_outputs[1].management_head,
     )).enabled);
 
     try coordinator.requestStop();

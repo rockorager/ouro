@@ -1331,7 +1331,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 },
             );
             errdefer self.output_management_adapter.deinit();
-            self.physical_outputs = try allocator.alloc(PhysicalOutput, config.drm.connector_capacity);
+            self.physical_outputs = try allocator.alloc(
+                PhysicalOutput,
+                try std.math.add(usize, config.drm.connector_capacity, 1),
+            );
             errdefer allocator.free(self.physical_outputs);
             self.physical_outputs[0] = .{
                 .id = .{ .index = 0, .generation = 1 },
@@ -5856,92 +5859,108 @@ pub fn Coordinator(comptime protocol: type) type {
                     continue;
                 }
 
-                var reusable: ?usize = null;
-                for (self.physical_outputs[0..self.physical_output_count], 0..) |physical, index| {
-                    if (!physical.connected and physical.id.generation != std.math.maxInt(u32)) {
-                        reusable = index;
-                        break;
-                    }
-                }
-                const appending = reusable == null;
-                if (appending and self.physical_output_count == self.physical_outputs.len) break;
                 const claim = self.manager.claimScanout(handle, candidate) catch continue;
                 var claim_owned = true;
                 defer if (claim_owned) self.manager.releaseScanout(claim) catch {};
                 const snapshot = try self.manager.claimSnapshot(claim);
-                const connector = snapshot.selectedConnector();
-                const mode = snapshot.selectedMode();
-                const refresh = try std.math.mul(u32, mode.vrefresh, 1000);
                 const x = try self.nextPhysicalOutputX();
-                var name_buffer: [64]u8 = undefined;
-                const name = try std.fmt.bufPrint(&name_buffer, "DRM-{d}", .{connector.id});
-                var description_buffer: [128]u8 = undefined;
-                const description = try std.fmt.bufPrint(
-                    &description_buffer,
-                    "DRM connector {d}",
-                    .{connector.id},
-                );
-                const protocol_output_id = self.output_adapter.addOutputUnpublished(.{
+                _ = self.addPhysicalOutput(claim, snapshot, scale_120, x, false) catch continue;
+                claim_owned = false;
+            }
+        }
+
+        fn addPhysicalOutput(
+            self: *Self,
+            claim: drm.ClaimHandle,
+            snapshot: drm.Snapshot,
+            scale_120: u32,
+            x: i32,
+            make_primary: bool,
+        ) !*PhysicalOutput {
+            var reusable: ?usize = null;
+            for (self.physical_outputs[0..self.physical_output_count], 0..) |physical, index| {
+                if (!physical.connected and physical.id.generation != std.math.maxInt(u32)) {
+                    reusable = index;
+                    break;
+                }
+            }
+            const appending = reusable == null;
+            if (appending and self.physical_output_count == self.physical_outputs.len)
+                return error.OutputCapacityExceeded;
+            const connector = snapshot.selectedConnector();
+            const mode = snapshot.selectedMode();
+            const refresh = try std.math.mul(u32, mode.vrefresh, 1000);
+            var name_buffer: [64]u8 = undefined;
+            const name = try std.fmt.bufPrint(&name_buffer, "DRM-{d}", .{connector.id});
+            var description_buffer: [128]u8 = undefined;
+            const description = try std.fmt.bufPrint(
+                &description_buffer,
+                "DRM connector {d}",
+                .{connector.id},
+            );
+            const protocol_output_id = try self.output_adapter.addOutputUnpublished(.{
+                .name = name,
+                .description = description,
+                .logical_x = x,
+                .physical_width_mm = std.math.cast(i32, connector.width_mm) orelse
+                    return error.InvalidPhysicalSize,
+                .physical_height_mm = std.math.cast(i32, connector.height_mm) orelse
+                    return error.InvalidPhysicalSize,
+                .scale_120 = scale_120,
+            });
+            errdefer self.output_adapter.discardOutput(protocol_output_id) catch {};
+            const mode_end = try std.math.add(usize, connector.mode_start, connector.mode_count);
+            if (mode_end > snapshot.modes.len) return error.InvalidModeInventory;
+            const modes = try collectOutputModes(
+                self.output_management_modes,
+                snapshot.modes[connector.mode_start..mode_end],
+            );
+            const management_head = try self.output_management_adapter.addHead(
+                .{
                     .name = name,
                     .description = description,
-                    .logical_x = x,
-                    .physical_width_mm = std.math.cast(i32, connector.width_mm) orelse continue,
-                    .physical_height_mm = std.math.cast(i32, connector.height_mm) orelse continue,
+                    .physical_width_mm = if (connector.width_mm == 0) null else std.math.cast(i32, connector.width_mm) orelse
+                        return error.InvalidPhysicalSize,
+                    .physical_height_mm = if (connector.height_mm == 0) null else std.math.cast(i32, connector.height_mm) orelse
+                        return error.InvalidPhysicalSize,
+                },
+                modes,
+                .{
+                    .enabled = false,
+                    .width = mode.hdisplay,
+                    .height = mode.vdisplay,
+                    .refresh_millihz = std.math.cast(i32, refresh) orelse
+                        return error.InvalidMode,
+                    .x = x,
                     .scale_120 = scale_120,
-                }) catch continue;
-                var protocol_output_owned = true;
-                defer if (protocol_output_owned)
-                    self.output_adapter.discardOutput(protocol_output_id) catch {};
-                const mode_end = std.math.add(usize, connector.mode_start, connector.mode_count) catch continue;
-                if (mode_end > snapshot.modes.len) continue;
-                const modes = collectOutputModes(
-                    self.output_management_modes,
-                    snapshot.modes[connector.mode_start..mode_end],
-                ) catch continue;
-                const management_head = self.output_management_adapter.addHead(
-                    .{
-                        .name = name,
-                        .description = description,
-                        .physical_width_mm = if (connector.width_mm == 0) null else std.math.cast(i32, connector.width_mm) orelse continue,
-                        .physical_height_mm = if (connector.height_mm == 0) null else std.math.cast(i32, connector.height_mm) orelse continue,
-                    },
-                    modes,
-                    .{
-                        .enabled = false,
-                        .width = mode.hdisplay,
-                        .height = mode.vdisplay,
-                        .refresh_millihz = std.math.cast(i32, refresh) orelse continue,
-                        .x = x,
-                        .scale_120 = scale_120,
-                    },
-                ) catch continue;
-                var management_head_owned = true;
-                defer if (management_head_owned)
-                    self.output_management_adapter.removeHead(management_head) catch {};
+                },
+            );
+            errdefer self.output_management_adapter.removeHead(management_head) catch {};
 
-                const index = reusable orelse self.physical_output_count;
-                const generation = if (appending)
-                    @as(u32, 1)
+            const index = reusable orelse self.physical_output_count;
+            const generation = if (appending)
+                @as(u32, 1)
+            else
+                self.physical_outputs[index].id.generation + 1;
+            self.physical_outputs[index] = .{
+                .id = .{ .index = @intCast(index), .generation = generation },
+                .connector_id = connector.id,
+                .claim = claim,
+                .protocol_output = protocol_output_id,
+                .management_head = management_head,
+            };
+            if (appending) self.physical_output_count += 1;
+            errdefer {
+                if (appending)
+                    self.physical_output_count -= 1
                 else
-                    self.physical_outputs[index].id.generation + 1;
-                self.physical_outputs[index] = .{
-                    .id = .{ .index = @intCast(index), .generation = generation },
-                    .connector_id = connector.id,
-                    .claim = claim,
-                    .protocol_output = protocol_output_id,
-                    .management_head = management_head,
-                };
-                if (appending) self.physical_output_count += 1;
-                const physical = &self.physical_outputs[index];
-                self.activatePhysicalOutput(physical, snapshot, scale_120) catch {
-                    if (appending) self.physical_output_count -= 1 else physical.connected = false;
-                    continue;
-                };
-                self.output_global_index = @min(self.output_global_index, index);
-                claim_owned = false;
-                protocol_output_owned = false;
-                management_head_owned = false;
+                    self.physical_outputs[index].connected = false;
             }
+            const physical = &self.physical_outputs[index];
+            if (make_primary) try self.promotePrimaryPhysicalOutput(physical);
+            try self.activatePhysicalOutput(physical, snapshot, scale_120);
+            self.output_global_index = @min(self.output_global_index, index);
+            return physical;
         }
 
         fn nextPhysicalOutputX(self: *Self) !i32 {
@@ -8833,6 +8852,9 @@ pub fn Coordinator(comptime protocol: type) type {
             for (self.physical_outputs[0..self.physical_output_count]) |*physical|
                 physical.claim = null;
             const primary = self.primaryPhysicalOutputMutable();
+            const primary_state = try self.output_management_adapter.lifecycle.currentHead(
+                primary.management_head,
+            );
             var primary_claim = try self.manager.primaryClaim(handle);
             var primary_snapshot = try self.manager.claimSnapshot(primary_claim);
             if (primary_snapshot.selectedConnector().id != primary.connector_id) {
@@ -8848,18 +8870,29 @@ pub fn Coordinator(comptime protocol: type) type {
                     break;
                 }
             }
-            primary.claim = primary_claim;
-            primary.connector_id = primary_snapshot.selectedConnector().id;
-            try self.activatePhysicalOutput(
-                primary,
-                primary_snapshot,
-                self.output_management_adapter.lifecycle.current.scale_120,
-            );
+            if (primary_snapshot.selectedConnector().id == primary.connector_id) {
+                primary.claim = primary_claim;
+                try self.activatePhysicalOutput(
+                    primary,
+                    primary_snapshot,
+                    primary_state.scale_120,
+                );
+            } else {
+                _ = try self.addPhysicalOutput(
+                    primary_claim,
+                    primary_snapshot,
+                    primary_state.scale_120,
+                    primary_state.x,
+                    true,
+                );
+                primary.removing = true;
+            }
             try self.activateAdditionalOutputs(handle);
             try self.advanceOutputGlobals();
             try self.publishOutputLayout();
             try self.consumeOutputManagementCommands();
             self.topology_refresh_pending = false;
+            try self.advancePhysicalOutputRemovals();
         }
 
         fn outputReconfigureReady(self: *Self) bool {
