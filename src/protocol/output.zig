@@ -91,6 +91,7 @@ pub fn Adapter(comptime protocol: type) type {
         };
         const OutputState = struct {
             active: bool = false,
+            retired: bool = false,
             generation: u32 = 1,
             next_free: u32 = none,
             adapter: ?*Self = null,
@@ -233,6 +234,7 @@ pub fn Adapter(comptime protocol: type) type {
 
         fn bind(context: ?*anyopaque, binding: wayring.server.Binding) !?*anyopaque {
             const output: *OutputState = @ptrCast(@alignCast(context orelse return error.InvalidContext));
+            if (output.retired) return error.InvalidOutput;
             const adapter = output.adapter orelse return error.InvalidContext;
             const output_id = adapter.outputIdFor(adapter.outputIndexFor(output));
             const index = adapter.acquireResource() catch return error.OutOfMemory;
@@ -312,11 +314,25 @@ pub fn Adapter(comptime protocol: type) type {
             return (try adapter.resolveOutputConst(id)).global != null;
         }
 
+        /// Removes a published secondary global while retaining bound
+        /// client-owned wl_output resources as inert objects. Surface leaves
+        /// are reconciled through the normal backpressure-aware flush path.
+        pub fn retireOutput(adapter: *Self, id: OutputId) !void {
+            if (std.meta.eql(id, adapter.primary_output)) return error.PrimaryOutput;
+            const output = try adapter.resolveOutput(id);
+            if (output.retired) return;
+            const global = output.global orelse return error.OutputUnpublished;
+            const runtime = adapter.runtime orelse return error.NotInstalled;
+            try runtime.removeGlobal(global);
+            adapter.retireOutputState(id);
+        }
+
         /// Discards an output which has never been globally published or bound.
         /// Published output removal is a separate backpressure-aware lifecycle.
         pub fn discardOutput(adapter: *Self, id: OutputId) !void {
             if (std.meta.eql(id, adapter.primary_output)) return error.PrimaryOutput;
             const output = try adapter.resolveOutput(id);
+            if (output.retired) return error.OutputRetired;
             if (output.global != null) return error.OutputPublished;
             for (adapter.resources) |resource|
                 if (resource.active and std.meta.eql(resource.output, id))
@@ -446,7 +462,7 @@ pub fn Adapter(comptime protocol: type) type {
             peer: wayring.io_uring.Peer,
             surfaces: []const objects.Handle,
         ) !void {
-            _ = try adapter.resolveOutput(output_id);
+            if ((try adapter.resolveOutput(output_id)).retired) return error.InvalidOutput;
             for (surfaces, 0..) |surface, index| {
                 if (surface.id == 0 or surface.generation == 0) return error.InvalidSurface;
                 for (surfaces[0..index]) |previous|
@@ -628,7 +644,7 @@ pub fn Adapter(comptime protocol: type) type {
             const resource = adapter.fromContext(object.context) orelse return error.ForeignResource;
             if (!resource.active or !samePeer(resource.peer, peer) or
                 !std.meta.eql(resource.handle, handle)) return error.ForeignResource;
-            _ = try adapter.resolveOutput(resource.output);
+            if ((try adapter.resolveOutput(resource.output)).retired) return error.InvalidOutput;
             return .{ .handle = resource.handle, .output = resource.output };
         }
 
@@ -920,6 +936,30 @@ pub fn Adapter(comptime protocol: type) type {
             adapter.allocator.free(output.make);
             adapter.allocator.free(output.description);
             adapter.allocator.free(output.name);
+        }
+
+        fn retireOutputState(adapter: *Self, id: OutputId) void {
+            const output = adapter.resolveOutput(id) catch unreachable;
+            output.global = null;
+            output.retired = true;
+            output.available = false;
+            for (adapter.resources, 0..) |resource, index| {
+                if (resource.active and std.meta.eql(resource.output, id))
+                    adapter.dropOutbound(adapter.idFor(@intCast(index)));
+            }
+            var associations_pending = false;
+            var index: usize = 0;
+            while (index < adapter.associations.len) : (index += 1) {
+                const association = &adapter.associations[index];
+                if (!association.active or !std.meta.eql(association.output, id)) continue;
+                association.desired = false;
+                if (association.entered.items.len == 0) {
+                    adapter.releaseAssociation(@intCast(index));
+                } else {
+                    associations_pending = true;
+                }
+            }
+            if (associations_pending) adapter.associations_dirty = true;
         }
 
         fn growOutputs(adapter: *Self) !void {
@@ -1277,4 +1317,90 @@ test "output: unpublished discard rejects primary and never aliases exhausted ge
     try std.testing.expect(replacement.index != terminal.index);
     try std.testing.expectError(error.StaleOutput, adapter.logicalSnapshot(terminal));
     try adapter.discardOutput(replacement);
+}
+
+test "output: retired globals leave surfaces and keep bound resources inert" {
+    const protocol = @import("core_protocol");
+    const TestAdapter = Adapter(protocol);
+    var adapter = try TestAdapter.init(std.testing.allocator, .{
+        .resource_capacity = 1,
+        .association_capacity = 1,
+        .outbound_capacity = 2,
+    });
+    defer adapter.deinit();
+    const output = try adapter.addOutputUnpublished(.{
+        .name = "secondary",
+        .description = "Secondary output",
+    });
+    adapter.outputs[output.index].global = .{ .id = 17, .generation = 1 };
+    adapter.outputs[output.index].available = true;
+    const peer: wayring.io_uring.Peer = .{ .slot = 3, .generation = 4 };
+    const resource_index = try adapter.acquireResource();
+    const resource = adapter.resources[resource_index];
+    resource.output = output;
+    resource.peer = peer;
+    resource.handle = .{ .id = 9, .generation = 2 };
+    try adapter.enqueue(adapter.idFor(resource_index), .geometry);
+    const surface: objects.Handle = .{ .id = 12, .generation = 5 };
+    const association = try adapter.acquireAssociation();
+    association.output = output;
+    association.peer = peer;
+    association.surface = surface;
+    association.desired = true;
+    try association.entered.append(std.testing.allocator, resource_index);
+    adapter.associations_dirty = false;
+
+    adapter.retireOutputState(output);
+    try std.testing.expect(adapter.outputs[output.index].retired);
+    try std.testing.expect(!adapter.outputs[output.index].available);
+    try std.testing.expect(adapter.outputs[output.index].global == null);
+    try std.testing.expectEqual(@as(usize, 0), adapter.outbound_len);
+    try std.testing.expect(!association.desired);
+    try std.testing.expect(adapter.associations_dirty);
+    try std.testing.expectEqualStrings("secondary", (try adapter.logicalSnapshot(output)).name);
+    const object: objects.Object = .{
+        .interface = &protocol.wl_output.info,
+        .version = 4,
+        .context = resource,
+    };
+    try std.testing.expectError(
+        error.InvalidOutput,
+        adapter.reference(peer, resource.handle, object),
+    );
+    try std.testing.expectError(
+        error.InvalidOutput,
+        adapter.reconcileSurfaces(output, peer, &.{surface}),
+    );
+    try std.testing.expectError(error.OutputRetired, adapter.discardOutput(output));
+
+    var server_objects = try objects.ServerObjects.init(
+        std.testing.allocator,
+        8,
+        2,
+        &protocol.wl_display.info,
+        null,
+    );
+    defer server_objects.deinit(std.testing.allocator);
+    association.surface = try server_objects.insertClient(
+        surface.id,
+        &protocol.wl_surface.info,
+        6,
+        null,
+    );
+    var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 128, 1);
+    defer blocks.deinit(std.testing.allocator);
+    var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 1);
+    defer descriptors.deinit(std.testing.allocator);
+    var queue = wayring.tx.Queue.init(&blocks, 128, &descriptors, 0);
+    defer queue.deinit();
+    try std.testing.expectEqual(@as(usize, 1), try adapter.flushOn(peer, &server_objects, &queue));
+    var descriptor_scratch: [1]std.os.linux.fd_t = undefined;
+    var control: [64]u8 align(@alignOf(std.os.linux.cmsghdr)) = undefined;
+    const queued = try queue.snapshot(&descriptor_scratch, &control);
+    const message = (try wayring.wire.Message.decode(queued.first)).?;
+    try std.testing.expectEqual(
+        protocol.wl_surface.Event{ .leave = .{ .output = resource.handle.id } },
+        try protocol.wl_surface.decodeEvent(message, &queue.descriptors),
+    );
+    try std.testing.expect(!association.active);
 }

@@ -301,6 +301,17 @@ pub fn Adapter(comptime protocol: type, comptime OutputAdapter: type) type {
             }
         }
 
+        /// Makes xdg-output resources for a removed wl_output inert. The
+        /// resources remain client-owned and can still be destroyed normally.
+        pub fn outputRemoved(adapter: *Self, output: OutputAdapter.OutputId) void {
+            for (adapter.slots.entries.items) |slot| {
+                if (!slot.header.active or !std.meta.eql(slot.output, output)) continue;
+                adapter.pending_len -= @intFromBool(pendingAny(slot.pending));
+                slot.pending = .{};
+                slot.output_resource = null;
+            }
+        }
+
         fn fromObject(adapter: *Self, object: objects.Object) ?*Slot {
             return adapter.slots.fromContext(object.context);
         }
@@ -476,4 +487,11 @@ test "xdg output: mode publication coalesces while retaining marker" {
     try std.testing.expect(slot.pending.size);
     try std.testing.expect(slot.pending.marker);
     try std.testing.expectEqual(@as(usize, 1), adapter.pending_len);
+
+    slot.output_resource = .{ .id = 8, .generation = 2 };
+    adapter.outputRemoved(output_id);
+    try std.testing.expect(slot.header.active);
+    try std.testing.expect(!pendingAny(slot.pending));
+    try std.testing.expect(slot.output_resource == null);
+    try std.testing.expectEqual(@as(usize, 0), adapter.pending_len);
 }
