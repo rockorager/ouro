@@ -6268,7 +6268,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 std.meta.eql(id, exact_surface_id)
             else
                 false;
-            var layer = if (surface_scene != null)
+            var layer = if (surface_scene != null or self.findAppLayer(exact_surface_id) != null)
                 try self.appLayerForSurface(exact_surface_id)
             else if (requested_cursor)
                 &self.cursor_layer
@@ -6280,12 +6280,13 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             if (layer.candidate == null) {
                 if (!try self.admitReadyBatch(exact_surface_id)) return false;
-                layer = if (surface_scene != null)
+                layer = if (surface_scene != null or self.findAppLayer(exact_surface_id) != null)
                     try self.appLayerForSurface(exact_surface_id)
                 else
                     &self.cursor_layer;
                 if (layer.candidate == null or
-                    !candidateMatches(layer.candidate.?, pending)) return false;
+                    !candidateMatches(layer.candidate.?, pending))
+                    return false;
             }
             const candidate = &layer.candidate.?;
             if (candidate.superseded) {
@@ -6297,15 +6298,20 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (layer.retains_source) try self.retireLayerSource(layer);
                 content.deinit();
                 layer.candidate = null;
-                if (layer.retired_source != null)
-                    self.abandonLayerKeepingRetired(layer)
-                else
+                if (layer.retired_source != null) {
+                    self.abandonLayerKeepingRetired(layer);
+                    _ = try self.retryRetiredSource(layer);
+                } else {
                     self.abandonLayer(layer);
+                }
                 self.finishPendingCandidate(pending.id);
                 return true;
             };
             if (attachment.buffer == null) {
-                if (layer.retains_source) try self.retireLayerSource(layer);
+                if (layer.retains_source) {
+                    try self.retireLayerSource(layer);
+                    _ = try self.retryRetiredSource(layer);
+                }
                 return self.discardPendingCandidate(layer, pending.id);
             }
             const lease = content.attachment_lease orelse return error.MissingLease;
@@ -6441,7 +6447,7 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             const render_device = self.render_device orelse return false;
             const upload_damage = renderUploadDamage(content.surface.upload_damage);
-            var retained_external = false;
+            var retained_source = false;
             const prepared = native: {
                 if (borrowed_source.external != null) {
                     if (render_device.content.prepareReplacingRetainedExternal(
@@ -6449,7 +6455,7 @@ pub fn Coordinator(comptime protocol: type) type {
                         sample_identity,
                         borrowed_source,
                     )) |direct_prepared| {
-                        retained_external = true;
+                        retained_source = true;
                         break :native direct_prepared;
                     } else |_| {}
                     if (render_device.content.prepareReplacingExternal(
@@ -6486,6 +6492,26 @@ pub fn Coordinator(comptime protocol: type) type {
                             .format = imported.format,
                             .bytes = imported.bytes,
                         };
+                    }
+                }
+                if (render_device.rendererKind() == .pixman and source == .shm) {
+                    const stable_bytes = self.adapter.shmBytes(lease) catch |err| switch (err) {
+                        error.UnsafeAccess => null,
+                        else => return err,
+                    };
+                    if (stable_bytes) |bytes| {
+                        borrowed_source.bytes = bytes;
+                        borrowed_source.retained_shm = true;
+                        const direct_prepared = render_device.content.prepareReplacingRetainedShm(
+                            layer.rendered,
+                            sample_identity,
+                            borrowed_source,
+                        ) catch |err| switch (err) {
+                            error.VersionCapacityExceeded, error.ByteCapacityExceeded => return false,
+                            else => return err,
+                        };
+                        retained_source = true;
+                        break :native direct_prepared;
                     }
                 }
                 break :native render_device.content.prepareReplacing(
@@ -6571,12 +6597,12 @@ pub fn Coordinator(comptime protocol: type) type {
             layer.id = published.id;
             layer.presentation = token;
             layer.source_release_pending = true;
-            layer.retains_source = retained_external;
+            layer.retains_source = retained_source;
             layer.sample = sample;
             layer.binding = binding;
             self.finishPendingCandidate(pending.id);
             self.stats.applied += 1;
-            if (!retained_external and render_device.content.ready(rendered))
+            if (!retained_source and render_device.content.ready(rendered))
                 _ = try self.retryLayerSourceRelease(layer);
             return true;
         }
@@ -6610,7 +6636,7 @@ pub fn Coordinator(comptime protocol: type) type {
                         &self.cursor_layer
                     else
                         return false
-                else if (self.surfaceScene(id) != null)
+                else if (self.surfaceScene(id) != null or self.findAppLayer(id) != null)
                     self.availableAppLayer(id, index) orelse return false
                 else
                     return false;
@@ -6719,6 +6745,7 @@ pub fn Coordinator(comptime protocol: type) type {
             layer.active = false;
             self.finishPendingCandidate(pending_id);
             _ = try self.retryLayerOutcome(layer);
+            _ = try self.retryRetiredSource(layer);
             return true;
         }
 
@@ -7879,11 +7906,19 @@ pub fn Coordinator(comptime protocol: type) type {
             return true;
         }
 
-        fn retireLayerSource(_: *Self, layer: *Layer) !void {
+        fn retireLayerSource(self: *Self, layer: *Layer) !void {
             if (layer.retired_source != null) return error.RetiredSourceOccupied;
+            const releasable = if (layer.rendered) |rendered|
+                if (self.render_device) |render_device|
+                    (render_device.content.resolve(rendered) catch return error.StaleContent).retained_shm
+                else
+                    false
+            else
+                false;
             layer.retired_source = .{
                 .peer = layer.peer orelse return error.ClientDisconnected,
                 .content = layer.content orelse return error.MissingContent,
+                .releasable = releasable,
             };
             layer.content = null;
             layer.source_release_pending = false;

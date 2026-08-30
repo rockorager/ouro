@@ -116,6 +116,9 @@ pub const Source = struct {
     stride: u32,
     format: PixelFormat,
     bytes: []const u8,
+    /// Bytes remain owned by a retained protocol SHM lease. The renderer may
+    /// borrow them synchronously, but the content store must not free them.
+    retained_shm: bool = false,
     upload: ?UploadBacking = null,
     native: ?NativeBacking = null,
     external: ?ExternalSource = null,
@@ -240,13 +243,15 @@ pub fn validateSample(sample: SurfaceSample) ValidationError!usize {
         return error.InvalidSource;
     if (sample.source.external != null) {
         const external = sample.source.external orelse return error.InvalidSource;
-        if (sample.source.bytes.len != 0 or external.token == 0 or
+        if (sample.source.retained_shm or sample.source.bytes.len != 0 or external.token == 0 or
             external.drm_format == 0 or external.plane_count == 0 or
             external.plane_count > 4)
             return error.InvalidSource;
         for (0..external.plane_count) |plane| if (external.fds[plane] < 0 or
             external.strides[plane] == 0) return error.InvalidSource;
-    } else if (sample.source.native != null or sample.source.bytes.len < length) {
+    } else if (sample.source.native != null or sample.source.bytes.len < length or
+        (sample.source.retained_shm and sample.source.upload != null))
+    {
         return error.InvalidSource;
     }
     if (sample.upload_damage.count > upload_damage_rect_capacity) return error.InvalidSource;

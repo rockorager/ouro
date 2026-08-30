@@ -319,6 +319,55 @@ pub const Store = struct {
         return .{ .index = @intCast(index), .generation = slot.generation };
     }
 
+    /// Retains stable SHM bytes as authoritative Pixman content. The caller
+    /// owns the matching protocol lease until this version is replaced or
+    /// detached; Store accounts the bytes but never copies or frees them.
+    pub fn prepareReplacingRetainedShm(
+        self: *Store,
+        previous: ?Handle,
+        identity: render.SampleIdentity,
+        source: render.Source,
+    ) !Prepared {
+        const logical_bytes = try validateRetainedShm(identity, source);
+
+        if (previous) |handle| reuse: {
+            if (handle.index >= self.slots.len) return error.StaleContent;
+            const slot = &self.slots[handle.index];
+            if (slot.state != .published or slot.generation != handle.generation or !slot.current)
+                return error.StaleContent;
+            if (slot.identity.surface != identity.surface or !slot.source.retained_shm or
+                slot.accounted_bytes != logical_bytes)
+                break :reuse;
+            if (identity.commit_sequence <= slot.identity.commit_sequence) return error.StaleCommit;
+            const next = std.math.add(u64, slot.identity.commit_sequence, 1) catch
+                return error.NonAdjacentCommit;
+            if (identity.commit_sequence != next) return error.NonAdjacentCommit;
+            slot.state = .replacing;
+            slot.replacement = .{ .identity = identity, .source = source, .damage = .{} };
+            return .{ .index = handle.index, .generation = handle.generation, .replaces = true };
+        }
+
+        const predecessor = self.currentSlot(identity.surface);
+        if (predecessor) |slot| {
+            if (identity.commit_sequence <= slot.identity.commit_sequence) return error.StaleCommit;
+            const next = std.math.add(u64, slot.identity.commit_sequence, 1) catch
+                return error.NonAdjacentCommit;
+            if (identity.commit_sequence != next) return error.NonAdjacentCommit;
+        }
+        if (logical_bytes > self.byte_capacity - self.used_bytes) return error.ByteCapacityExceeded;
+        const index = try self.claimSlot();
+        var slot = &self.slots[index];
+        slot.generation +%= 1;
+        if (slot.generation == 0) slot.generation = 1;
+        slot.state = .prepared;
+        slot.identity = identity;
+        slot.source = source;
+        slot.accounted_bytes = logical_bytes;
+        slot.current = false;
+        self.used_bytes += logical_bytes;
+        return .{ .index = @intCast(index), .generation = slot.generation };
+    }
+
     /// Prepares a normal immutable version, except when `previous` names the
     /// uniquely-owned compatible current version. That case reserves an
     /// allocation-free replacement whose borrowed source is consumed only by
@@ -408,6 +457,15 @@ pub const Store = struct {
                 return .{ .index = prepared.index, .generation = slot.generation };
             }
             if (slot.source.external != null) {
+                slot.generation +%= 1;
+                if (slot.generation == 0) slot.generation = 1;
+                slot.identity = replacement.identity;
+                slot.source = replacement.source;
+                slot.replacement = null;
+                slot.state = .published;
+                return .{ .index = prepared.index, .generation = slot.generation };
+            }
+            if (slot.source.retained_shm) {
                 slot.generation +%= 1;
                 if (slot.generation == 0) slot.generation = 1;
                 slot.identity = replacement.identity;
@@ -543,6 +601,7 @@ pub const Store = struct {
             return;
         };
         if (source.external != null) return;
+        if (source.retained_shm) return;
         if (source.upload) |upload| if (self.provider) |provider| {
             provider.release(upload.token);
             return;
@@ -561,6 +620,20 @@ fn validateExternal(identity: render.SampleIdentity, source: render.Source) !voi
         return error.InvalidSource;
     for (0..external.plane_count) |plane| if (external.fds[plane] < 0 or
         external.strides[plane] == 0) return error.InvalidSource;
+}
+
+fn validateRetainedShm(identity: render.SampleIdentity, source: render.Source) !usize {
+    if (identity.surface == 0 or identity.commit_sequence == 0 or
+        !source.retained_shm or source.native != null or source.upload != null or
+        source.external != null or source.size.width == 0 or source.size.height == 0)
+        return error.InvalidSource;
+    const row_bytes = std.math.mul(u32, source.size.width, 4) catch
+        return error.InvalidSource;
+    if (source.stride < row_bytes) return error.InvalidSource;
+    const logical_bytes = std.math.mul(usize, source.stride, source.size.height) catch
+        return error.InvalidSource;
+    if (source.bytes.len < logical_bytes) return error.InvalidSource;
+    return logical_bytes;
 }
 
 fn copyFull(destination: []u8, packed_stride: u32, source: render.Source) void {
@@ -1123,6 +1196,46 @@ test "render-content: retained external replacement is metadata-only and capabil
             externalSource(&backing, 303),
         ),
     );
+}
+
+test "render-content: retained SHM replacement borrows exact bytes without allocation" {
+    var store = try Store.init(
+        std.testing.allocator,
+        .{ .version_capacity = 2, .byte_capacity = 16 },
+    );
+    defer store.deinit();
+    const baseline = store.allocatedBytes();
+    const first_bytes = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    var first_source = testSource(&first_bytes, 2, 1, 8);
+    first_source.retained_shm = true;
+    const first = store.publish(try store.prepareReplacingRetainedShm(
+        null,
+        .{ .surface = 11, .commit_sequence = 1 },
+        first_source,
+    ));
+    try std.testing.expectEqual(baseline + 8, store.allocatedBytes());
+    try std.testing.expectEqual(@intFromPtr(&first_bytes), @intFromPtr((try store.resolve(first)).bytes.ptr));
+
+    const second_bytes = [_]u8{ 9, 10, 11, 12, 13, 14, 15, 16 };
+    var second_source = testSource(&second_bytes, 2, 1, 8);
+    second_source.retained_shm = true;
+    const prepared = try store.prepareReplacingRetainedShm(
+        first,
+        .{ .surface = 11, .commit_sequence = 2 },
+        second_source,
+    );
+    try std.testing.expect(prepared.replaces);
+    store.cancel(prepared);
+    try std.testing.expectEqual(@intFromPtr(&first_bytes), @intFromPtr((try store.resolve(first)).bytes.ptr));
+    const current = store.publish(try store.prepareReplacingRetainedShm(
+        first,
+        .{ .surface = 11, .commit_sequence = 2 },
+        second_source,
+    ));
+    try std.testing.expectError(error.StaleContent, store.resolve(first));
+    try std.testing.expectEqual(@intFromPtr(&second_bytes), @intFromPtr((try store.resolve(current)).bytes.ptr));
+    store.release(current);
+    try std.testing.expectEqual(baseline, store.allocatedBytes());
 }
 
 test "render-content: external adjacent replacement cancel reuse and pinned fallback" {
