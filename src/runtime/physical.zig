@@ -252,10 +252,14 @@ pub fn Coordinator(comptime protocol: type) type {
 
         const Imported = struct {};
         const OutputReconfigure = struct {
-            peer: wayring.io_uring.Peer,
-            configuration: protocol_output_management.ConfigurationId,
             previous: protocol_output_management.HeadState,
             desired: protocol_output_management.HeadState,
+        };
+        const OutputReconfigureTransaction = struct {
+            const Phase = enum { desired, rollback };
+            peer: wayring.io_uring.Peer,
+            configuration: protocol_output_management.ConfigurationId,
+            phase: Phase = .desired,
         };
         const PhysicalOutput = struct {
             id: PhysicalOutputId,
@@ -619,6 +623,7 @@ pub fn Coordinator(comptime protocol: type) type {
         drm_lease_topology_generation: ?u32 = null,
         drm_remove_pending: bool = false,
         output_global_index: usize = 1,
+        output_reconfigure: ?OutputReconfigureTransaction = null,
         gamma_platform: drm_gamma.Platform,
         shm: Shm,
         adapter: Adapter,
@@ -961,6 +966,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.drm_lease_topology_generation = null;
             self.drm_remove_pending = false;
             self.output_global_index = 1;
+            self.output_reconfigure = null;
             self.gamma_platform = platforms.gamma;
             self.shm = try Shm.init(allocator, config.shm);
             errdefer self.shm.deinit(allocator);
@@ -3552,21 +3558,34 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn consumeOutputManagementCommands(self: *Self) !void {
-            const physical = self.primaryPhysicalOutputMutable();
-            if (physical.reconfigure != null or self.output_power_transition != null) return;
+            if (self.output_reconfigure != null or self.output_power_transition != null) return;
             while (self.output_management_adapter.peekCommand()) |command| {
                 const supported = self.outputManagementCommandSupported(command.heads);
                 const unchanged = self.outputManagementCommandUnchanged(command.heads);
-                const primary_changed_only = self.outputManagementPrimaryChangedOnly(command.heads);
-                if (supported and command.operation == .apply and primary_changed_only) {
-                    physical.reconfigure = .{
+                if (supported and command.operation == .apply and !unchanged) {
+                    self.output_reconfigure = .{
                         .peer = command.peer,
                         .configuration = command.configuration,
-                        .previous = self.output_management_adapter.lifecycle.current,
-                        .desired = command.desired,
                     };
-                    errdefer physical.reconfigure = null;
-                    try self.pauseOutput();
+                    errdefer {
+                        self.output_reconfigure = null;
+                        for (self.physical_outputs[0..self.physical_output_count]) |*physical|
+                            physical.reconfigure = null;
+                    }
+                    for (command.heads) |head| {
+                        const current = try self.output_management_adapter.lifecycle.currentHead(
+                            head.id,
+                        );
+                        if (std.meta.eql(head.state, current)) continue;
+                        const physical = self.physicalOutputForManagementHeadMutable(head.id) orelse
+                            return error.InvalidOutput;
+                        physical.reconfigure = .{
+                            .previous = current,
+                            .desired = head.state,
+                        };
+                    }
+                    for (self.physical_outputs[0..self.physical_output_count]) |*physical|
+                        if (physical.reconfigure != null) try self.pausePhysicalOutput(physical);
                     return;
                 }
                 const accepted = supported and (command.operation == .@"test" or unchanged);
@@ -3600,21 +3619,13 @@ pub fn Coordinator(comptime protocol: type) type {
             return true;
         }
 
-        /// Until one drain transaction owns every changed KMS output, applying
-        /// more than the primary head would expose a partial configuration.
-        fn outputManagementPrimaryChangedOnly(
+        fn physicalOutputForManagementHeadMutable(
             self: *Self,
-            desired: []const protocol_output_management.DesiredHead,
-        ) bool {
-            var primary_changed = false;
-            for (desired) |head| {
-                const current = self.output_management_adapter.lifecycle.currentHead(head.id) catch
-                    return false;
-                if (std.meta.eql(head.state, current)) continue;
-                if (!std.meta.eql(head.id, self.primaryPhysicalOutput().management_head)) return false;
-                primary_changed = true;
-            }
-            return primary_changed;
+            id: protocol_output_management.HeadId,
+        ) ?*PhysicalOutput {
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical|
+                if (std.meta.eql(physical.management_head, id)) return physical;
+            return null;
         }
 
         pub fn resolveOutput(
@@ -3732,7 +3743,7 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn consumeOutputPowerCommands(self: *Self) !void {
             if (self.output_power_transition != null or
-                self.primaryPhysicalOutput().reconfigure != null) return;
+                self.output_reconfigure != null) return;
             while (self.output_power_adapter.peekCommand()) |command| {
                 const currently_on = self.primaryKmsOutput() != null;
                 if ((command.mode == .on) == currently_on) {
@@ -3780,8 +3791,7 @@ pub fn Coordinator(comptime protocol: type) type {
             physical: *const PhysicalOutput,
             desired: protocol_output_management.HeadState,
         ) bool {
-            if (!desired.enabled or desired.x != 0 or desired.y != 0 or
-                desired.transform != 0 or desired.adaptive_sync)
+            if (!desired.enabled or desired.transform != 0 or desired.adaptive_sync)
                 return false;
             if (desired.width <= 0 or desired.height <= 0 or desired.refresh_millihz <= 0)
                 return false;
@@ -5627,6 +5637,16 @@ pub fn Coordinator(comptime protocol: type) type {
             snapshot: drm.Snapshot,
             scale_120: u32,
         ) !void {
+            return self.activatePhysicalOutputStaged(physical, snapshot, scale_120, true);
+        }
+
+        fn activatePhysicalOutputStaged(
+            self: *Self,
+            physical: *PhysicalOutput,
+            snapshot: drm.Snapshot,
+            scale_120: u32,
+            publish_protocol: bool,
+        ) !void {
             if (physical.kms_output != null or self.stopping) return error.InvalidState;
             const primary = std.meta.eql(physical.id, self.primaryPhysicalOutput().id);
             const connector = snapshot.selectedConnector();
@@ -5637,7 +5657,7 @@ pub fn Coordinator(comptime protocol: type) type {
             const logical_width = try output_scale.logicalDimension(mode.hdisplay);
             const logical_height = try output_scale.logicalDimension(mode.vdisplay);
             const refresh = try std.math.mul(u32, mode.vrefresh, 1000);
-            if (primary) try self.output_management_adapter.setModes(
+            if (primary and publish_protocol) try self.output_management_adapter.setModes(
                 try collectOutputModes(
                     self.output_management_modes,
                     snapshot.modes[connector.mode_start..mode_end],
@@ -5682,38 +5702,41 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.ensureExplicitSync(snapshot.handle);
             try self.ensureDrmLeasing(snapshot);
             if (primary) try self.ensureGammaOwner(snapshot);
-            try self.output_adapter.publishMode(
-                physical.protocol_output,
-                output.planner.output.width,
-                output.planner.output.height,
-                try std.math.mul(u32, mode.vrefresh, 1000),
-                connector.width_mm,
-                connector.height_mm,
-            );
-            try self.output_adapter.publishScale(
-                physical.protocol_output,
-                scale_120,
-            );
-            if (primary) try self.fractional_scale_adapter.publishPreferredScale(scale_120);
-            try self.xdg_output_adapter.publishMode(physical.protocol_output);
             const work_area: geometry.Rect = .{
                 .x = 0,
                 .y = 0,
                 .width = logical_width,
                 .height = logical_height,
             };
-            if (primary) {
+            if (primary and publish_protocol) {
                 try self.desktop.validateWorkArea(work_area);
                 try self.interaction.validateBounds(work_area);
             }
             try output.prepareReadiness(&self.router, &self.root.ring);
-            if (primary) {
+            if (primary and publish_protocol) {
                 self.desktop.applyWorkArea(work_area);
                 self.interaction.applyBounds(work_area);
             }
-            const retained_visibility_changed = primary and self.refreshRetainedLayersForOutput();
+            const retained_visibility_changed = publish_protocol and primary and
+                self.refreshRetainedLayersForOutput();
             physical.drain_started = false;
-            if (primary) {
+            if (publish_protocol) {
+                try self.output_adapter.publishMode(
+                    physical.protocol_output,
+                    output.planner.output.width,
+                    output.planner.output.height,
+                    try std.math.mul(u32, mode.vrefresh, 1000),
+                    connector.width_mm,
+                    connector.height_mm,
+                );
+                try self.output_adapter.publishScale(
+                    physical.protocol_output,
+                    scale_120,
+                );
+                if (primary) try self.fractional_scale_adapter.publishPreferredScale(scale_120);
+                try self.xdg_output_adapter.publishMode(physical.protocol_output);
+            }
+            if (primary and publish_protocol) {
                 const screencopy_stride = try std.math.mul(
                     u32,
                     output.planner.output.width,
@@ -5733,23 +5756,25 @@ pub fn Coordinator(comptime protocol: type) type {
                     output.planner.output.height,
                 );
             }
-            var head_state = try self.output_management_adapter.lifecycle.currentHead(
-                physical.management_head,
-            );
-            head_state.enabled = true;
-            head_state.width = @intCast(output.planner.output.width);
-            head_state.height = @intCast(output.planner.output.height);
-            head_state.refresh_millihz = @intCast(try std.math.mul(u32, mode.vrefresh, 1000));
-            head_state.scale_120 = scale_120;
-            _ = try self.output_management_adapter.publishHead(
-                physical.management_head,
-                head_state,
-            );
-            try self.recomputeLayerConfigures();
-            try self.recomputeSessionLockConfigures();
-            self.markProtocolAll(ProtocolReady.output | ProtocolReady.xdg_output |
-                ProtocolReady.fractional_scale | ProtocolReady.output_management |
-                ProtocolReady.layer_shell | ProtocolReady.session_lock);
+            if (publish_protocol) {
+                var head_state = try self.output_management_adapter.lifecycle.currentHead(
+                    physical.management_head,
+                );
+                head_state.enabled = true;
+                head_state.width = @intCast(output.planner.output.width);
+                head_state.height = @intCast(output.planner.output.height);
+                head_state.refresh_millihz = @intCast(try std.math.mul(u32, mode.vrefresh, 1000));
+                head_state.scale_120 = scale_120;
+                _ = try self.output_management_adapter.publishHead(
+                    physical.management_head,
+                    head_state,
+                );
+                try self.recomputeLayerConfigures();
+                try self.recomputeSessionLockConfigures();
+                self.markProtocolAll(ProtocolReady.output | ProtocolReady.xdg_output |
+                    ProtocolReady.fractional_scale | ProtocolReady.output_management |
+                    ProtocolReady.layer_shell | ProtocolReady.session_lock);
+            }
             self.next_output_generation = if (generation == std.math.maxInt(u32))
                 null
             else
@@ -5762,6 +5787,66 @@ pub fn Coordinator(comptime protocol: type) type {
                     return error.ActivatedOutputFailure) catch
                     return error.ActivatedOutputFailure;
             self.armTimer() catch return error.ActivatedOutputFailure;
+        }
+
+        fn publishActivatedPhysicalOutput(
+            self: *Self,
+            physical: *PhysicalOutput,
+            snapshot: drm.Snapshot,
+            requested: protocol_output_management.HeadState,
+        ) !void {
+            const output = physical.kms_output orelse return error.OutputUnavailable;
+            const connector = snapshot.selectedConnector();
+            const mode = snapshot.selectedMode();
+            try self.output_adapter.publishMode(
+                physical.protocol_output,
+                output.planner.output.width,
+                output.planner.output.height,
+                try std.math.mul(u32, mode.vrefresh, 1000),
+                connector.width_mm,
+                connector.height_mm,
+            );
+            try self.output_adapter.publishScale(physical.protocol_output, requested.scale_120);
+            try self.output_adapter.publishPosition(
+                physical.protocol_output,
+                requested.x,
+                requested.y,
+            );
+            if (std.meta.eql(physical.id, self.primaryPhysicalOutput().id)) {
+                try self.fractional_scale_adapter.publishPreferredScale(requested.scale_120);
+                const stride = try std.math.mul(u32, output.planner.output.width, 4);
+                const bytes = try std.math.mul(usize, stride, output.planner.output.height);
+                self.screencopy_bytes = try self.allocator.realloc(self.screencopy_bytes, bytes);
+                try self.screencopy_adapter.publishMode(
+                    output.planner.output.width,
+                    output.planner.output.height,
+                );
+            }
+            try self.xdg_output_adapter.publishMode(physical.protocol_output);
+            var state = requested;
+            state.enabled = true;
+            state.width = @intCast(output.planner.output.width);
+            state.height = @intCast(output.planner.output.height);
+            state.refresh_millihz = @intCast(try std.math.mul(u32, mode.vrefresh, 1000));
+            _ = try self.output_management_adapter.publishHead(
+                physical.management_head,
+                state,
+            );
+        }
+
+        fn publishOutputLayout(self: *Self) !void {
+            const bounds = try self.globalOutputBounds();
+            try self.desktop.validateWorkArea(bounds);
+            try self.interaction.validateBounds(bounds);
+            self.desktop.applyWorkArea(bounds);
+            self.interaction.applyBounds(bounds);
+            _ = self.refreshRetainedLayersForOutput();
+            try self.recomputeLayerConfigures();
+            try self.recomputeSessionLockConfigures();
+            try self.syncOutputAssociations();
+            self.markProtocolAll(ProtocolReady.output | ProtocolReady.xdg_output |
+                ProtocolReady.fractional_scale | ProtocolReady.output_management |
+                ProtocolReady.layer_shell | ProtocolReady.session_lock);
         }
 
         /// Publish DMA-BUF only after renderer selection supplies the real DRM
@@ -8044,10 +8129,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     physical.drain_started = true;
                 }
                 if (physical.drain_started and output.drainComplete()) {
-                    if (!self.stopping and physical.reconfigure != null) {
-                        try self.finishOutputReconfigure(output);
-                        return;
-                    }
+                    if (!self.stopping and physical.reconfigure != null) continue;
                     if (self.stopping) self.abandonPending();
                     try self.invalidateCaptureSource(.{ .output = output.outputId() });
                     try output.destroy();
@@ -8082,6 +8164,10 @@ pub fn Coordinator(comptime protocol: type) type {
                         }
                     }
                 }
+            }
+            if (!self.stopping and self.outputReconfigureReady()) {
+                try self.finishOutputReconfigure();
+                return;
             }
             if (!self.anyKmsOutput() and !self.drm_remove_pending and
                 (self.stopping or self.session_disable_pending))
@@ -8122,47 +8208,131 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.session.beginDrain(&self.router, &self.root.ring);
         }
 
-        fn finishOutputReconfigure(self: *Self, old_output: *output_api.Output) !void {
-            const physical = self.primaryPhysicalOutputMutable();
-            const pending = physical.reconfigure orelse return error.InvalidState;
-            const handle = self.manager.currentHandle() orelse return error.StaleSnapshot;
-            const claim = physical.claim orelse return error.StaleClaim;
-            const previous = try self.manager.claimSnapshotMode(
-                claim,
-                @intCast(pending.previous.width),
-                @intCast(pending.previous.height),
-                @intCast(pending.previous.refresh_millihz),
-            );
-            const desired = try self.manager.claimSnapshotMode(
-                claim,
-                @intCast(pending.desired.width),
-                @intCast(pending.desired.height),
-                @intCast(pending.desired.refresh_millihz),
-            );
+        fn outputReconfigureReady(self: *Self) bool {
+            const transaction = self.output_reconfigure orelse return false;
+            for (self.physical_outputs[0..self.physical_output_count]) |physical| {
+                if (physical.reconfigure == null) continue;
+                const output = physical.kms_output orelse {
+                    if (transaction.phase == .rollback) continue;
+                    return false;
+                };
+                if (!physical.drain_started or !output.drainComplete()) return false;
+            }
+            return true;
+        }
 
-            try self.invalidateCaptureSource(.{ .output = old_output.outputId() });
-            try old_output.destroy();
-            physical.kms_output = null;
-            self.stats.output_drains += 1;
+        fn finishOutputReconfigure(self: *Self) !void {
+            const transaction = self.output_reconfigure orelse return error.InvalidState;
+            if (transaction.phase == .rollback)
+                return self.finishOutputReconfigureRollback(transaction);
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                if (physical.reconfigure == null) continue;
+                const output = physical.kms_output orelse return error.InvalidState;
+                try self.invalidateCaptureSource(.{ .output = output.outputId() });
+                try output.destroy();
+                physical.kms_output = null;
+                self.stats.output_drains += 1;
+            }
 
-            const result = try activateOutputWithRollback(
-                self,
-                desired,
-                previous,
-                pending.desired.scale_120,
-                pending.previous.scale_120,
-            );
-            if (result == .succeeded) try self.manager.commitMode(
-                handle,
-                @intCast(pending.desired.width),
-                @intCast(pending.desired.height),
-                @intCast(pending.desired.refresh_millihz),
-            );
-            physical.reconfigure = null;
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                const pending = physical.reconfigure orelse continue;
+                const claim = physical.claim orelse return error.StaleClaim;
+                const desired = try self.manager.claimSnapshotMode(
+                    claim,
+                    @intCast(pending.desired.width),
+                    @intCast(pending.desired.height),
+                    @intCast(pending.desired.refresh_millihz),
+                );
+                self.activatePhysicalOutputStaged(
+                    physical,
+                    desired,
+                    pending.desired.scale_120,
+                    false,
+                ) catch {
+                    self.output_reconfigure.?.phase = .rollback;
+                    for (self.physical_outputs[0..self.physical_output_count]) |*candidate|
+                        if (candidate.reconfigure != null and candidate.kms_output != null)
+                            try self.pausePhysicalOutput(candidate);
+                    if (self.outputReconfigureReady())
+                        try self.finishOutputReconfigure();
+                    return;
+                };
+            }
+
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                const pending = physical.reconfigure orelse continue;
+                const state = pending.desired;
+                const claim = physical.claim orelse return error.StaleClaim;
+                const snapshot = try self.manager.claimSnapshotMode(
+                    claim,
+                    @intCast(state.width),
+                    @intCast(state.height),
+                    @intCast(state.refresh_millihz),
+                );
+                try self.publishActivatedPhysicalOutput(physical, snapshot, state);
+                try self.manager.commitClaimMode(
+                    claim,
+                    @intCast(state.width),
+                    @intCast(state.height),
+                    @intCast(state.refresh_millihz),
+                );
+            }
+            try self.completeOutputReconfigure(transaction, .succeeded);
+        }
+
+        fn finishOutputReconfigureRollback(
+            self: *Self,
+            transaction: OutputReconfigureTransaction,
+        ) !void {
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                if (physical.reconfigure == null) continue;
+                if (physical.kms_output) |output| {
+                    try self.invalidateCaptureSource(.{ .output = output.outputId() });
+                    try output.destroy();
+                    physical.kms_output = null;
+                }
+                const pending = physical.reconfigure.?;
+                const claim = physical.claim orelse return error.StaleClaim;
+                const previous = try self.manager.claimSnapshotMode(
+                    claim,
+                    @intCast(pending.previous.width),
+                    @intCast(pending.previous.height),
+                    @intCast(pending.previous.refresh_millihz),
+                );
+                try self.activatePhysicalOutputStaged(
+                    physical,
+                    previous,
+                    pending.previous.scale_120,
+                    false,
+                );
+            }
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                const pending = physical.reconfigure orelse continue;
+                const claim = physical.claim orelse return error.StaleClaim;
+                const previous = try self.manager.claimSnapshotMode(
+                    claim,
+                    @intCast(pending.previous.width),
+                    @intCast(pending.previous.height),
+                    @intCast(pending.previous.refresh_millihz),
+                );
+                try self.publishActivatedPhysicalOutput(physical, previous, pending.previous);
+            }
+            try self.completeOutputReconfigure(transaction, .failed);
+        }
+
+        fn completeOutputReconfigure(
+            self: *Self,
+            transaction: OutputReconfigureTransaction,
+            result: protocol_output_management.Completion,
+        ) !void {
+            try self.publishOutputLayout();
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical|
+                physical.reconfigure = null;
+            self.output_reconfigure = null;
             if (self.output_management_adapter.peekCommand()) |command| {
-                if (std.meta.eql(command.configuration, pending.configuration)) {
+                if (std.meta.eql(command.configuration, transaction.configuration)) {
                     try self.output_management_adapter.completeCommand(result);
-                    self.markProtocol(pending.peer, ProtocolReady.output_management);
+                    self.markProtocol(transaction.peer, ProtocolReady.output_management);
                 }
             }
             try self.consumeOutputManagementCommands();

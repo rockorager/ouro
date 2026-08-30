@@ -239,6 +239,112 @@ test "physical coordinator activates and drains every desktop connector" {
     try root.deinit();
 }
 
+test "generated output management applies two heads atomically" {
+    try generatedMultiHeadApply(false);
+}
+
+test "generated output management rolls back every head" {
+    try generatedMultiHeadApply(true);
+}
+
+fn generatedMultiHeadApply(fail_second_activation: bool) !void {
+    const allocator = std.testing.allocator;
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    fixture.second_desktop = true;
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-r15-multi-head-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), compositorConfig());
+    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), coordinatorConfig());
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
+    try coordinator.start(&loop);
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    for (0..128) |_| {
+        _ = try loop.turn(coordinator);
+        if (coordinator.physical_output_count == 2 and
+            coordinator.physical_outputs[1].kms_output != null) break;
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+    }
+    const first_ids = .{
+        coordinator.physical_outputs[0].kms_output.?.outputId(),
+        coordinator.physical_outputs[1].kms_output.?.outputId(),
+    };
+    if (fail_second_activation)
+        fixture.fail_create_bo_at = fixture.bo_count + coordinatorConfig().output.image_count;
+
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(allocator, .{ .entries = 16, .flags = 0 }, clientReactorConfig());
+    var client = try ClientConnection.attach(
+        allocator,
+        &reactor,
+        try wayring.unix_socket.connect(path),
+        .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 },
+        .{ .max_objects = 32, .max_client_ids = 31 },
+    );
+    var driver = ClientDriver.init(&client);
+    const actor = try client.actor();
+    const registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null);
+    var handler: MultiOutputManagementClientHandler = .{
+        .objects = &client.objects,
+        .queue = &actor.transmit,
+        .registry = registry,
+    };
+    try submitClient(&reactor, &driver, &handler);
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        if (handler.apply_submitted and !handler.apply_flushed) {
+            try submitClient(&reactor, &driver, &handler);
+            handler.apply_flushed = true;
+        }
+        _ = try loop.turn(coordinator);
+        if (handler.succeeded == 1 or handler.failed == 1) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expectEqual(@as(usize, @intFromBool(!fail_second_activation)), handler.succeeded);
+    try std.testing.expectEqual(@as(usize, @intFromBool(fail_second_activation)), handler.failed);
+    try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+    try std.testing.expectEqual(@as(i32, if (fail_second_activation) 0 else 3), (try coordinator.output_management_adapter.lifecycle.currentHead(
+        coordinator.physical_outputs[0].management_head,
+    )).x);
+    try std.testing.expectEqual(@as(i32, if (fail_second_activation) 3 else 0), (try coordinator.output_management_adapter.lifecycle.currentHead(
+        coordinator.physical_outputs[1].management_head,
+    )).x);
+    try std.testing.expect(!std.meta.eql(
+        first_ids[0],
+        coordinator.physical_outputs[0].kms_output.?.outputId(),
+    ));
+    try std.testing.expect(!std.meta.eql(
+        first_ids[1],
+        coordinator.physical_outputs[1].kms_output.?.outputId(),
+    ));
+    try std.testing.expectEqual(@as(usize, 2), coordinator.stats.output_drains);
+
+    _ = try client.prepareClose();
+    try submitClient(&reactor, &driver, &handler);
+    try coordinator.requestStop();
+    var drained = false;
+    for (0..256) |_| {
+        const client_progress = try drainClient(&reactor, &driver, &handler);
+        const progress = try loop.turn(coordinator);
+        drained = progress.wayring.shutdown_complete and client_progress.quiescent and
+            coordinator.backendDrainComplete();
+        if (drained) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expect(drained);
+    try client.deinit(allocator);
+    reactor.deinit(allocator);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
 test "generated client leases, withdraws, and rediscovers a secondary connector" {
     const allocator = std.testing.allocator;
     var fixture = try Fixture.init();
@@ -1709,6 +1815,129 @@ const OutputManagementClientHandler = struct {
     }
 };
 
+const MultiOutputManagementClientHandler = struct {
+    objects: *wayring.objects.ClientObjects,
+    queue: *wayring.tx.Queue,
+    registry: wayring.objects.Handle,
+    manager: ?wayring.objects.Handle = null,
+    heads: [2]?wayring.objects.Handle = .{ null, null },
+    modes: [2]?wayring.objects.Handle = .{ null, null },
+    head_count: usize = 0,
+    serial: u32 = 0,
+    apply_submitted: bool = false,
+    apply_flushed: bool = false,
+    succeeded: usize = 0,
+    failed: usize = 0,
+    event_failures: usize = 0,
+
+    pub fn eventError(self: *MultiOutputManagementClientHandler, _: wayring.io_uring.Peer, _: ClientCore.EventFailure) void {
+        self.event_failures += 1;
+    }
+
+    pub fn event(self: *MultiOutputManagementClientHandler, target: wayring.objects.Dispatch, message: wayring.wire.Message, fds: *wayring.ancillary.FdQueue) !wayring.dispatch.Control {
+        if (target.object.interface == &ClientCore.Registry.info) {
+            switch (try ClientCore.decodeRegistryEvent(self.objects, self.registry, message, fds)) {
+                .global => |global| {
+                    if (std.mem.eql(u8, global.interface, protocol.zwlr_output_manager_v1.info.name)) self.manager = try ClientCore.bind(
+                        self.objects,
+                        self.queue,
+                        self.registry,
+                        global.name,
+                        &protocol.zwlr_output_manager_v1.info,
+                        @min(global.version, 4),
+                        null,
+                    );
+                },
+                .global_remove => {},
+            }
+        } else if (target.object.interface == &protocol.zwlr_output_manager_v1.info) {
+            switch (try protocol.zwlr_output_manager_v1.decodeEvent(message, fds)) {
+                .head => |value| {
+                    if (self.head_count >= self.heads.len) return error.TooManyHeads;
+                    self.heads[self.head_count] = (try protocol.zwlr_output_manager_v1.admit_event_head(
+                        self.objects,
+                        self.manager.?,
+                        value,
+                        .{},
+                    )).head;
+                    self.head_count += 1;
+                },
+                .done => |value| {
+                    self.serial = value.serial;
+                    if (!self.apply_submitted and self.head_count == self.heads.len and
+                        self.modes[0] != null and self.modes[1] != null) try self.submitApply();
+                },
+                .finished => {},
+            }
+        } else if (target.object.interface == &protocol.zwlr_output_head_v1.info) {
+            switch (try protocol.zwlr_output_head_v1.decodeEvent(message, fds)) {
+                .mode => |value| {
+                    const head = self.objects.namespace.lookupHandle(message.header.object_id) orelse
+                        return error.MissingHead;
+                    const index = self.headIndex(head) orelse return error.UnknownHead;
+                    self.modes[index] = (try protocol.zwlr_output_head_v1.admit_event_mode(
+                        self.objects,
+                        head,
+                        value,
+                        .{},
+                    )).mode;
+                },
+                else => {},
+            }
+        } else if (target.object.interface == &protocol.zwlr_output_mode_v1.info) {
+            _ = try protocol.zwlr_output_mode_v1.decodeEvent(message, fds);
+        } else if (target.object.interface == &protocol.zwlr_output_configuration_v1.info) {
+            switch (try protocol.zwlr_output_configuration_v1.decodeEvent(message, fds)) {
+                .succeeded => self.succeeded += 1,
+                .failed => self.failed += 1,
+                .cancelled => {},
+            }
+        } else if (target.object.interface == &ClientCore.Display.info) {
+            switch (try ClientCore.decodeDisplayEvent(self.objects, message, fds)) {
+                .delete_id => {},
+                .@"error" => return error.ServerProtocolError,
+            }
+        } else return error.UnexpectedEvent;
+        return .continue_dispatch;
+    }
+
+    fn headIndex(self: *const MultiOutputManagementClientHandler, head: wayring.objects.Handle) ?usize {
+        for (self.heads, 0..) |candidate, index| {
+            if (candidate != null and candidate.?.id == head.id) return index;
+        }
+        return null;
+    }
+
+    fn submitApply(self: *MultiOutputManagementClientHandler) !void {
+        const configuration = (try protocol.zwlr_output_manager_v1.construct_create_configuration(
+            self.objects,
+            self.queue,
+            self.manager.?,
+            .{ .serial = self.serial },
+        )).id;
+        for (self.heads, self.modes, 0..) |head, mode, index| {
+            const configuration_head = (try protocol.zwlr_output_configuration_v1.construct_enable_head(
+                self.objects,
+                self.queue,
+                configuration,
+                .{ .head = head.?.id },
+            )).id;
+            try protocol.zwlr_output_configuration_head_v1.encodeRequest(
+                self.queue,
+                configuration_head.id,
+                .{ .set_mode = .{ .mode = mode.?.id } },
+            );
+            try protocol.zwlr_output_configuration_head_v1.encodeRequest(
+                self.queue,
+                configuration_head.id,
+                .{ .set_position = .{ .x = if (index == 0) 3 else 0, .y = 0 } },
+            );
+        }
+        try protocol.zwlr_output_configuration_v1.encodeRequest(self.queue, configuration.id, .{ .apply = .{} });
+        self.apply_submitted = true;
+    }
+};
+
 const OutputPowerClientHandler = struct {
     objects: *wayring.objects.ClientObjects,
     queue: *wayring.tx.Queue,
@@ -2023,7 +2252,7 @@ pub const Fixture = struct {
     output_bo_destroyed: usize = 0,
     framebuffer_removed: usize = 0,
     framebuffer_removal_before_bo: bool = false,
-    requests: [8]u8 = .{0} ** 8,
+    requests: [12]u8 = .{0} ** 12,
     request_count: usize = 0,
     flip_userdata: ?*anyopaque = null,
     page_flips: usize = 0,
@@ -2047,6 +2276,7 @@ pub const Fixture = struct {
     gamma_current: [6]u16 = .{ 1, 2, 3, 4, 5, 6 },
     gamma_gets: usize = 0,
     gamma_sets: usize = 0,
+    fail_create_bo_at: ?usize = null,
 
     pub fn init() !Fixture {
         return .{ .session_fd = try eventFd(), .drm_fd = try eventFd() };
@@ -2260,6 +2490,11 @@ pub const Fixture = struct {
     }
     fn createBo(context: *anyopaque, _: ouro.gbm.Device, _: ouro.gbm.Allocation) !ouro.gbm.Bo {
         const self: *Fixture = @ptrCast(@alignCast(context));
+        if (self.fail_create_bo_at == self.bo_count) {
+            self.fail_create_bo_at = null;
+            self.bo_count += 1;
+            return error.CreateBoFailed;
+        }
         const bo = &self.bo_bytes[self.bo_count];
         self.bo_count += 1;
         return @ptrCast(bo);

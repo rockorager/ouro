@@ -685,6 +685,26 @@ pub const Manager = struct {
         self.stores[self.active_store].selection.mode_index = index;
     }
 
+    pub fn commitClaimMode(
+        self: *Manager,
+        claim_handle: ClaimHandle,
+        width: u32,
+        height: u32,
+        refresh_millihz: u32,
+    ) !void {
+        const claim = try self.getClaim(claim_handle);
+        const snapshot_value = try self.claimSnapshot(claim_handle);
+        const index = try exactModeIndex(
+            snapshot_value,
+            width,
+            height,
+            refresh_millihz,
+        );
+        claim.candidate.mode_index = index;
+        if (claim_handle.slot == 0)
+            self.stores[self.active_store].selection.mode_index = index;
+    }
+
     fn getClaim(self: anytype, claim_handle: ClaimHandle) !@TypeOf(&self.claims[0]) {
         if (!self.present or claim_handle.topology_generation != self.generation)
             return error.StaleClaim;
