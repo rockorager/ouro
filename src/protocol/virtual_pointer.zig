@@ -42,7 +42,7 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
         pub const Event = union(enum) {
             device_added: struct { seat: *Seat, device: input.DeviceId, info: platform.DeviceInfo },
             device_removed: struct { seat: *Seat, device: input.DeviceId },
-            motion: struct { seat: *Seat, device: input.DeviceId, time: u32, dx: i32, dy: i32 },
+            motion: struct { seat: *Seat, device: input.DeviceId, time: u32, dx: i32, dy: i32, output: ?u64 },
             motion_absolute: struct { seat: *Seat, device: input.DeviceId, time: u32, x: u32, y: u32, x_extent: u32, y_extent: u32, output: ?u64 },
             button: struct { seat: *Seat, device: input.DeviceId, time: u32, button: u32, pressed: bool },
             axis: struct { seat: *Seat, device: input.DeviceId, time: u32, axis: u32, value: i32, source: platform.AxisSource },
@@ -168,7 +168,7 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
             const id = self.inputId(d);
             switch (decoded.value) {
                 .destroy => {},
-                .motion => |p| self.push(.{ .motion = .{ .seat = d.seat.?, .device = id, .time = p.time, .dx = p.dx, .dy = p.dy } }) catch return try self.noMemory(actor),
+                .motion => |p| self.push(.{ .motion = .{ .seat = d.seat.?, .device = id, .time = p.time, .dx = p.dx, .dy = p.dy, .output = d.output } }) catch return try self.noMemory(actor),
                 .motion_absolute => |p| self.push(.{ .motion_absolute = .{ .seat = d.seat.?, .device = id, .time = p.time, .x = p.x, .y = p.y, .x_extent = p.x_extent, .y_extent = p.y_extent, .output = d.output } }) catch return try self.noMemory(actor),
                 .button => |p| {
                     if (p.state.value > 1) return try self.failure(actor, decoded.handle.id, error.InvalidButtonState);
@@ -343,7 +343,7 @@ test "cleanup reserve delays generation reuse" {
     try std.testing.expect(replacement.header.generation != old.generation);
 }
 
-test "absolute motion preserves exact output identity" {
+test "motion preserves exact output identity" {
     const TestSeat = struct {};
     const Resolver = struct {
         fn resolve(context: ?*anyopaque, _: wayring.io_uring.Peer, _: ?u32) ?*TestSeat {
@@ -374,6 +374,19 @@ test "absolute motion preserves exact output identity" {
     try std.testing.expectEqual(
         device.output,
         adapter.peekEvent().?.motion_absolute.output,
+    );
+    adapter.dropEvent();
+    try adapter.push(.{ .motion = .{
+        .seat = &seat,
+        .device = adapter.inputId(device),
+        .time = 9,
+        .dx = 10,
+        .dy = 11,
+        .output = device.output,
+    } });
+    try std.testing.expectEqual(
+        device.output,
+        adapter.peekEvent().?.motion.output,
     );
 }
 

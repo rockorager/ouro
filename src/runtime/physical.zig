@@ -5532,12 +5532,23 @@ pub fn Coordinator(comptime protocol: type) type {
                         .info = value.info,
                     } }),
                     .device_removed => |value| try self.acceptNormalizedInput(.{ .device_removed = value.device }),
-                    .motion => |value| try self.acceptNormalizedInput(.{ .pointer_motion = .{
-                        .device = value.device,
-                        .time_usec = @as(u64, value.time) * 1000,
-                        .dx = @as(f64, @floatFromInt(value.dx)) / 256.0,
-                        .dy = @as(f64, @floatFromInt(value.dy)) / 256.0,
-                    } }),
+                    .motion => |value| motion: {
+                        var delta: Interaction.MotionDelta = .{
+                            .dx = @as(f64, @floatFromInt(value.dx)) / 256.0,
+                            .dy = @as(f64, @floatFromInt(value.dy)) / 256.0,
+                        };
+                        if (value.output) |_| {
+                            const bounds = self.virtualPointerOutputBounds(value.output) catch
+                                break :motion true;
+                            delta = try self.interaction.confineMotion(delta.dx, delta.dy, bounds);
+                        }
+                        break :motion try self.acceptNormalizedInput(.{ .pointer_motion = .{
+                            .device = value.device,
+                            .time_usec = @as(u64, value.time) * 1000,
+                            .dx = delta.dx,
+                            .dy = delta.dy,
+                        } });
+                    },
                     .motion_absolute => |value| absolute: {
                         if (value.x_extent == 0 or value.y_extent == 0) break :absolute true;
                         const bounds = self.virtualPointerOutputBounds(value.output) catch
@@ -5551,12 +5562,15 @@ pub fn Coordinator(comptime protocol: type) type {
                         const target_y = @as(i64, bounds.y) + @as(i64, @intCast(
                             (@as(u64, y) * @as(u64, @intCast(bounds.height - 1))) / value.y_extent,
                         ));
-                        const current = self.interaction.pointerPosition();
+                        const delta = self.interaction.motionToPoint(.{
+                            .x = @intCast(target_x),
+                            .y = @intCast(target_y),
+                        });
                         break :absolute try self.acceptNormalizedInput(.{ .pointer_motion = .{
                             .device = value.device,
                             .time_usec = @as(u64, value.time) * 1000,
-                            .dx = @floatFromInt(target_x - current.x),
-                            .dy = @floatFromInt(target_y - current.y),
+                            .dx = delta.dx,
+                            .dy = delta.dy,
                         } });
                     },
                     .button => |value| try self.acceptNormalizedInput(.{ .pointer_button = .{
@@ -5653,6 +5667,8 @@ pub fn Coordinator(comptime protocol: type) type {
             if (normalized == .pointer_motion) {
                 const bounds = switch (event) {
                     .motion_absolute => |value| self.virtualPointerOutputBounds(value.output) catch
+                        return true,
+                    .motion => |value| self.virtualPointerOutputBounds(value.output) catch
                         return true,
                     else => self.globalOutputBounds() catch return true,
                 };

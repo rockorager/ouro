@@ -52,6 +52,7 @@ pub fn Interaction(comptime Desktop: type) type {
             point: FixedPoint,
         };
         pub const FixedPoint = struct { x: i32, y: i32 };
+        pub const MotionDelta = struct { dx: f64, dy: f64 };
         pub const Cancellation = packed struct {
             pointer_focus: bool = false,
             keyboard_focus: bool = false,
@@ -235,6 +236,30 @@ pub fn Interaction(comptime Desktop: type) type {
 
         pub fn pointerPosition(self: *const Self) geometry.Point {
             return .{ .x = fixedFloor(self.x_fixed), .y = fixedFloor(self.y_fixed) };
+        }
+
+        pub fn confineMotion(
+            self: *const Self,
+            dx: f64,
+            dy: f64,
+            bounds: geometry.Rect,
+        ) !MotionDelta {
+            if (!std.math.isFinite(dx) or !std.math.isFinite(dy)) return error.InvalidMotion;
+            try bounds.validate();
+            try validateFixedBounds(bounds);
+            const target_x = clampFixed(self.x_fixed +| fixedDelta(dx), bounds.x, bounds.width);
+            const target_y = clampFixed(self.y_fixed +| fixedDelta(dy), bounds.y, bounds.height);
+            return .{
+                .dx = @as(f64, @floatFromInt(target_x - self.x_fixed)) / 256.0,
+                .dy = @as(f64, @floatFromInt(target_y - self.y_fixed)) / 256.0,
+            };
+        }
+
+        pub fn motionToPoint(self: *const Self, point: geometry.Point) MotionDelta {
+            return .{
+                .dx = @as(f64, @floatFromInt(@as(i64, point.x) * 256 - self.x_fixed)) / 256.0,
+                .dy = @as(f64, @floatFromInt(@as(i64, point.y) * 256 - self.y_fixed)) / 256.0,
+            };
         }
 
         fn outputAreas(self: *const Self) []const geometry.Rect {
@@ -1715,6 +1740,30 @@ test "interaction: pointer cannot remain between disjoint outputs" {
     interaction.applyTopology(areas[0], &remaining);
     try std.testing.expectEqual(geometry.Point{ .x = 9, .y = 9 }, interaction.pointerPosition());
     try std.testing.expectEqual(interaction.pointerPosition(), interaction.cursor.position);
+}
+
+test "interaction: mapped motion retains exact fixed pointer state" {
+    var interaction = try initTestInteraction(2);
+    defer interaction.deinit();
+    var desktop = testDesktop();
+    var surfaces = TestSurfaces{};
+    try addPointer(&interaction, &desktop, &surfaces);
+    try interaction.consume(&desktop, &surfaces, .{ .pointer_motion = .{
+        .device = device_a,
+        .time_usec = 1,
+        .dx = 0.5,
+        .dy = 0.25,
+    } });
+    interaction.dropCommand();
+
+    const bounds: geometry.Rect = .{ .x = 0, .y = 0, .width = 2, .height = 2 };
+    const confined = try interaction.confineMotion(10, 10, bounds);
+    try std.testing.expectEqual(@as(f64, 127.0 / 256.0), confined.dx);
+    try std.testing.expectEqual(@as(f64, 191.0 / 256.0), confined.dy);
+
+    const absolute = interaction.motionToPoint(.{ .x = 1, .y = 1 });
+    try std.testing.expectEqual(@as(f64, -0.5), absolute.dx);
+    try std.testing.expectEqual(@as(f64, -0.25), absolute.dy);
 }
 
 test "interaction: popup grab retains outside delivery and dismisses on press" {
