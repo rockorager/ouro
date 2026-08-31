@@ -7847,6 +7847,8 @@ pub fn Coordinator(comptime protocol: type) type {
                     self.outputDamageRetired(physical, damage_generation);
                     try self.finishOutcome(rendered.retired.frame, false);
                 } else {
+                    if (output.rendererKind() == .pixman)
+                        try output.renderReady(frame, try monotonicNs());
                     self.outputDamageSubmitted(
                         physical,
                         damage_generation,
@@ -7881,6 +7883,8 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             switch (render_result) {
                 .submitted => {
+                    if (output.rendererKind() == .pixman)
+                        try output.renderReady(frame, try monotonicNs());
                     self.stats.submitted += 1;
                     self.markFrameChangesApplied(
                         @intCast(physical.id.index),
@@ -8155,12 +8159,12 @@ pub fn Coordinator(comptime protocol: type) type {
         fn processOutput(self: *Self) !void {
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
                 const output = physical.kms_output orelse continue;
-                try output.processKmsEvents(.{
+                try output.processKmsEventsOn(.{
                     .context = self,
                     .presented_fn = presented,
                     .retired_fn = retired,
                     .captured_fn = captured,
-                });
+                }, &self.root.ring);
             }
             try self.processScreencopyCaptures();
             try self.processImageCopyCaptures();
@@ -9608,10 +9612,14 @@ pub fn Coordinator(comptime protocol: type) type {
             return layer.id != null and std.meta.eql(id, layer.id.?);
         }
 
-        fn armTimer(self: *Self) !void {
+        fn armTimer(self: *Self) anyerror!void {
             const now = try monotonicNs();
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
                 const output = physical.kms_output orelse continue;
+                if (try output.beginImmediatePhysical(now)) |frame| {
+                    try self.renderFrame(frame);
+                    continue;
+                }
                 const request_value = (try output.timerRequest(now)) orelse continue;
                 const handle = try self.timers.arm(
                     &self.router,
@@ -10238,12 +10246,12 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (output.requestPause() catch unreachable) |action|
                     self.consumeRetireAction(action) catch unreachable;
             }
-            output.processKmsEvents(.{
+            output.processKmsEventsOn(.{
                 .context = self,
                 .presented_fn = presented,
                 .retired_fn = retired,
                 .captured_fn = captured,
-            }) catch unreachable;
+            }, &self.root.ring) catch unreachable;
             std.debug.assert(output.paused);
             output.beginDrain(&self.router, &self.root.ring) catch unreachable;
             std.debug.assert(output.drainComplete());

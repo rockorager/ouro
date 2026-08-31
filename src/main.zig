@@ -157,6 +157,8 @@ pub fn main(init: std.process.Init) !void {
             .scheduler = .{
                 .refresh_ns = 16_666_667,
                 .render_budget_ns = 7_000_000,
+                .adaptive_render_samples = 256,
+                .adaptive_render_margin_ns = 2 * std.time.ns_per_ms,
             },
             .renderer = options.renderer,
             .image_count = 3,

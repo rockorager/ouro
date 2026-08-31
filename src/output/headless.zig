@@ -64,14 +64,27 @@ pub const Config = struct {
     /// CLOCK_MONOTONIC phase of the modeled refresh clock.
     phase_ns: Timestamp = 0,
     refresh_ns: Timestamp,
+    /// Conservative ceiling used until adaptive physical timing is ready and
+    /// whenever adaptive timing is disabled.
     render_budget_ns: Timestamp,
+    /// Number of trustworthy physical render timings required before delaying
+    /// rendering toward vblank. Zero retains the fixed-budget behavior.
+    adaptive_render_samples: u16 = 0,
+    adaptive_render_margin_ns: Timestamp = 0,
+    adaptive_miss_tolerance_ns: Timestamp = std.time.ns_per_ms,
 
     pub fn validate(config: Config) Error!void {
         if (config.refresh_ns == 0 or config.render_budget_ns == 0 or
-            config.render_budget_ns >= config.refresh_ns)
+            config.render_budget_ns >= config.refresh_ns or
+            config.adaptive_render_samples > adaptive_render_sample_capacity or
+            (config.adaptive_render_samples != 0 and
+                (config.adaptive_render_margin_ns >= config.render_budget_ns or
+                    config.adaptive_miss_tolerance_ns == 0)))
             return error.InvalidConfig;
     }
 };
+
+const adaptive_render_sample_capacity = 256;
 
 pub const Error = std.mem.Allocator.Error || error{
     InvalidConfig,
@@ -96,6 +109,7 @@ pub const TimerRequest = struct {
     purpose: TimerPurpose,
     frame: FrameId,
     deadline: timer.Deadline,
+    render_budget_ns: Timestamp = 0,
 };
 
 pub const RenderRequest = struct {
@@ -174,6 +188,10 @@ pub fn Scheduler(comptime PresentationToken: type) type {
         retiring: bool = false,
         physical_submission: bool = false,
         physical_phase_ns: ?Timestamp = null,
+        render_durations: [adaptive_render_sample_capacity]Timestamp = undefined,
+        render_duration_count: u16 = 0,
+        render_duration_cursor: u16 = 0,
+        maximum_render_duration_ns: Timestamp = 0,
 
         pub fn init(
             allocator: std.mem.Allocator,
@@ -214,6 +232,37 @@ pub fn Scheduler(comptime PresentationToken: type) type {
             if (self.stage == .idle) self.stage = .requested;
         }
 
+        /// Starts a physical render without a timer while adaptive timing is
+        /// warming up. Once enough trustworthy samples exist, callers receive
+        /// null and should use `timerRequest` for deadline scheduling.
+        pub fn beginImmediatePhysical(
+            self: *Self,
+            now_ns: Timestamp,
+        ) Error!?RenderRequest {
+            if (self.stage != .requested or self.retiring or
+                self.config.adaptive_render_samples == 0 or self.adaptiveReady())
+                return null;
+            const id = try self.prospectiveFrameId();
+            const target = try self.nextTarget(now_ns);
+            self.frame = .{
+                .id = id,
+                .requests = self.pending,
+                .requested_ns = self.pending_since_ns,
+                .target_ns = target,
+                .render_deadline_ns = now_ns,
+                .render_started_ns = now_ns,
+            };
+            self.pending = .{};
+            self.samples_captured = false;
+            self.next_sequence += 1;
+            self.stage = .rendering;
+            return .{
+                .frame = id,
+                .requests = self.frame.?.requests,
+                .target_ns = target,
+            };
+        }
+
         /// Describes an absolute timer to prepare before the loop's sole
         /// submission. State changes only after `timerArmed`, so an SQE failure
         /// can be retried without losing or duplicating a frame request.
@@ -221,11 +270,13 @@ pub fn Scheduler(comptime PresentationToken: type) type {
             return switch (self.stage) {
                 .requested => blk: {
                     const id = try self.prospectiveFrameId();
-                    const target = try self.nextTarget(now_ns);
+                    const render_budget_ns = self.renderBudget();
+                    const target = try self.nextTargetWithBudget(now_ns, render_budget_ns);
                     break :blk .{
                         .purpose = .render_deadline,
                         .frame = id,
-                        .deadline = try deadlineFromNs(target - self.config.render_budget_ns),
+                        .deadline = try deadlineFromNs(target - render_budget_ns),
+                        .render_budget_ns = render_budget_ns,
                     };
                 },
                 .rendering => blk: {
@@ -251,20 +302,21 @@ pub fn Scheduler(comptime PresentationToken: type) type {
             switch (request_value.purpose) {
                 .render_deadline => {
                     if (self.stage != .requested or self.retiring or
+                        request_value.render_budget_ns == 0 or
                         !std.meta.eql(request_value.frame, try self.prospectiveFrameId()))
                         return error.StaleTimerRequest;
                     const deadline_ns = try nsFromDeadline(request_value.deadline);
                     const target = std.math.add(
                         Timestamp,
                         deadline_ns,
-                        self.config.render_budget_ns,
+                        request_value.render_budget_ns,
                     ) catch return error.TimestampOverflow;
                     self.frame = .{
                         .id = request_value.frame,
                         .requests = self.pending,
                         .requested_ns = self.pending_since_ns,
                         .target_ns = target,
-                        .render_deadline_ns = target - self.config.render_budget_ns,
+                        .render_deadline_ns = target - request_value.render_budget_ns,
                     };
                     self.pending = .{};
                     self.samples_captured = false;
@@ -395,9 +447,17 @@ pub fn Scheduler(comptime PresentationToken: type) type {
             self: *Self,
             frame_id: FrameId,
             actual_ns: Timestamp,
+            ready_ns: ?Timestamp,
         ) Error!Outcome {
             try self.requireFrame(frame_id, .submitted);
             if (!self.physical_submission) return error.InvalidStage;
+            const active = self.frame.?;
+            self.recordPhysicalTiming(
+                active.render_started_ns.?,
+                ready_ns,
+                active.target_ns,
+                actual_ns,
+            );
             // DRM flip timestamps share CLOCK_MONOTONIC with timer deadlines.
             // The observed flip is the authoritative physical refresh phase.
             self.physical_phase_ns = actual_ns;
@@ -466,7 +526,15 @@ pub fn Scheduler(comptime PresentationToken: type) type {
         }
 
         fn nextTarget(self: *const Self, now_ns: Timestamp) Error!Timestamp {
-            const threshold = std.math.add(Timestamp, now_ns, self.config.render_budget_ns) catch
+            return self.nextTargetWithBudget(now_ns, self.renderBudget());
+        }
+
+        fn nextTargetWithBudget(
+            self: *const Self,
+            now_ns: Timestamp,
+            render_budget_ns: Timestamp,
+        ) Error!Timestamp {
+            const threshold = std.math.add(Timestamp, now_ns, render_budget_ns) catch
                 return error.TimestampOverflow;
             const phase_ns = self.physical_phase_ns orelse self.config.phase_ns;
             if (phase_ns > threshold) return phase_ns;
@@ -476,6 +544,72 @@ pub fn Scheduler(comptime PresentationToken: type) type {
                 return error.TimestampOverflow;
             return std.math.add(Timestamp, phase_ns, advance) catch
                 return error.TimestampOverflow;
+        }
+
+        fn adaptiveReady(self: *const Self) bool {
+            return self.config.adaptive_render_samples != 0 and
+                self.render_duration_count == self.config.adaptive_render_samples;
+        }
+
+        fn renderBudget(self: *const Self) Timestamp {
+            if (!self.adaptiveReady()) return self.config.render_budget_ns;
+            const learned = std.math.add(
+                Timestamp,
+                self.maximum_render_duration_ns,
+                self.config.adaptive_render_margin_ns,
+            ) catch return self.config.render_budget_ns;
+            return @max(1, @min(learned, self.config.render_budget_ns));
+        }
+
+        fn recordPhysicalTiming(
+            self: *Self,
+            render_started_ns: Timestamp,
+            ready_ns: ?Timestamp,
+            target_ns: Timestamp,
+            actual_ns: Timestamp,
+        ) void {
+            if (self.config.adaptive_render_samples == 0) return;
+            const ready = ready_ns orelse {
+                self.resetAdaptiveTiming();
+                return;
+            };
+            const tolerated_target = std.math.add(
+                Timestamp,
+                target_ns,
+                self.config.adaptive_miss_tolerance_ns,
+            ) catch target_ns;
+            if (ready < render_started_ns or ready > actual_ns or actual_ns > tolerated_target) {
+                self.resetAdaptiveTiming();
+                return;
+            }
+            const duration = ready - render_started_ns;
+            const sample_count = self.config.adaptive_render_samples;
+            const cursor: usize = self.render_duration_cursor;
+            const replaced_maximum = self.render_duration_count == sample_count and
+                self.render_durations[cursor] == self.maximum_render_duration_ns;
+            self.render_durations[cursor] = duration;
+            self.render_duration_cursor = @intCast((cursor + 1) % sample_count);
+            if (self.render_duration_count < sample_count)
+                self.render_duration_count += 1;
+            if (replaced_maximum) {
+                self.maximum_render_duration_ns = 0;
+                for (self.render_durations[0..self.render_duration_count]) |sample|
+                    self.maximum_render_duration_ns = @max(
+                        self.maximum_render_duration_ns,
+                        sample,
+                    );
+            } else {
+                self.maximum_render_duration_ns = @max(
+                    self.maximum_render_duration_ns,
+                    duration,
+                );
+            }
+        }
+
+        fn resetAdaptiveTiming(self: *Self) void {
+            self.render_duration_count = 0;
+            self.render_duration_cursor = 0;
+            self.maximum_render_duration_ns = 0;
         }
 
         fn requireFrame(self: *const Self, frame_id: FrameId, stage: Stage) Error!void {
@@ -692,7 +826,7 @@ test "physical presentation anchors future refresh targets" {
     _ = try scheduler.renderComplete(first, 2);
     try scheduler.submitPhysical(first, 2);
     try std.testing.expectEqual(@as(Timestamp, 25), try scheduler.nextTarget(13));
-    _ = try scheduler.presentPhysical(first, 12);
+    _ = try scheduler.presentPhysical(first, 12, 2);
     try std.testing.expectEqual(@as(Timestamp, 22), try scheduler.nextTarget(13));
 
     try scheduler.request(.damage, 13);
@@ -702,6 +836,50 @@ test "physical presentation anchors future refresh targets" {
     try std.testing.expectEqual(@as(Timestamp, 22), scheduler.frame.?.target_ns);
     _ = try scheduler.remove();
     _ = try scheduler.timerEvent(fakeHandle(2), .canceled, 14);
+}
+
+test "physical timing warms adaptive render deadlines and resets after a miss" {
+    const config: Config = .{
+        .phase_ns = 0,
+        .refresh_ns = 10,
+        .render_budget_ns = 4,
+        .adaptive_render_samples = 3,
+        .adaptive_render_margin_ns = 1,
+        .adaptive_miss_tolerance_ns = 1,
+    };
+    var scheduler = try TestScheduler.init(std.testing.allocator, test_output, config, 1);
+    defer scheduler.deinit(std.testing.allocator);
+
+    const starts = [_]Timestamp{ 1, 11, 21 };
+    const ready = [_]Timestamp{ 2, 13, 22 };
+    const presented = [_]Timestamp{ 10, 20, 30 };
+    for (starts, ready, presented) |start_ns, ready_ns, actual_ns| {
+        try scheduler.request(.damage, start_ns);
+        const render = (try scheduler.beginImmediatePhysical(start_ns)).?;
+        try scheduler.captureSamples(render.frame, &.{});
+        _ = try scheduler.renderComplete(render.frame, ready_ns);
+        try scheduler.submitPhysical(render.frame, ready_ns);
+        _ = try scheduler.presentPhysical(render.frame, actual_ns, ready_ns);
+    }
+    try std.testing.expect(scheduler.adaptiveReady());
+    try std.testing.expectEqual(@as(Timestamp, 3), scheduler.renderBudget());
+
+    try scheduler.request(.damage, 31);
+    try std.testing.expect((try scheduler.beginImmediatePhysical(31)) == null);
+    const delayed = (try scheduler.timerRequest(31)).?;
+    try std.testing.expectEqual(@as(Timestamp, 37), try nsFromDeadline(delayed.deadline));
+    try scheduler.timerArmed(delayed, fakeHandle(1), 31);
+    const render = (try scheduler.timerEvent(fakeHandle(1), .fired, 37)).?.render;
+    try scheduler.captureSamples(render.frame, &.{});
+    _ = try scheduler.renderComplete(render.frame, 39);
+    try scheduler.submitPhysical(render.frame, 39);
+    _ = try scheduler.presentPhysical(render.frame, 50, 39);
+    try std.testing.expect(!scheduler.adaptiveReady());
+
+    try scheduler.request(.damage, 51);
+    const immediate = (try scheduler.beginImmediatePhysical(51)).?;
+    try scheduler.captureSamples(immediate.frame, &.{});
+    _ = try scheduler.failRender(immediate.frame);
 }
 
 test "stale frame timer and output generations cannot alias" {

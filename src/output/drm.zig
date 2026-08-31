@@ -22,6 +22,7 @@ const damage = @import("../scene/damage.zig");
 const scheduler_api = @import("headless.zig");
 const c = @cImport({
     @cInclude("linux/dma-buf.h");
+    @cInclude("linux/sync_file.h");
     @cInclude("sys/ioctl.h");
     @cInclude("sys/stat.h");
 });
@@ -713,6 +714,8 @@ pub const Output = struct {
     accepting_frames: bool = true,
     in_flight_frame: ?scheduler_api.FrameId = null,
     in_flight_handle: ?framebuffer.Handle = null,
+    in_flight_render_fence: ?std.posix.fd_t = null,
+    in_flight_ready_ns: ?u64 = null,
     pending_callback: ?FrameOutcome = null,
     pending_capture: ?CaptureRequest = null,
     pending_capture_target: ?vulkan_platform.CaptureTarget = null,
@@ -888,6 +891,8 @@ pub const Output = struct {
         self.accepting_frames = true;
         self.in_flight_frame = null;
         self.in_flight_handle = null;
+        self.in_flight_render_fence = null;
+        self.in_flight_ready_ns = null;
         self.pending_callback = null;
         self.pending_capture = null;
         self.pending_capture_target = null;
@@ -903,7 +908,8 @@ pub const Output = struct {
     /// removes framebuffers and BOs.
     pub fn destroy(self: *Output) !void {
         if (!self.drainComplete() or self.pending_callback != null or
-            self.pending_capture != null or self.pending_capture_target != null)
+            self.pending_capture != null or self.pending_capture_target != null or
+            self.in_flight_render_fence != null or self.in_flight_ready_ns != null)
             return error.DrainIncomplete;
         try self.kms_output.destroy();
         try self.scanout_images.deinit();
@@ -1084,6 +1090,12 @@ pub const Output = struct {
         return self.scheduler.timerRequest(now_ns);
     }
 
+    pub fn beginImmediatePhysical(self: *Output, now_ns: u64) !?scheduler_api.FrameId {
+        if (!self.accepting_frames) return null;
+        const request_value = try self.scheduler.beginImmediatePhysical(now_ns) orelse return null;
+        return request_value.frame;
+    }
+
     pub fn timerArmed(self: *Output, request_value: scheduler_api.TimerRequest, handle: timer.Handle, now_ns: u64) !void {
         try self.scheduler.timerArmed(request_value, handle, now_ns);
     }
@@ -1196,6 +1208,10 @@ pub const Output = struct {
         };
 
         var in_fence: ?std.posix.fd_t = null;
+        var retained_render_fence: ?std.posix.fd_t = null;
+        defer if (retained_render_fence) |fd| {
+            _ = linux.close(fd);
+        };
         var capture_target: ?vulkan_platform.CaptureTarget = null;
         const renderer = &(self.render_device.renderer orelse {
             return self.retireAndDiscard(frame_id, error.RendererUnavailable, handle);
@@ -1269,6 +1285,7 @@ pub const Output = struct {
                     }
                     return self.retireAndDiscard(frame_id, cause, handle);
                 };
+                if (in_fence) |fd| retained_render_fence = duplicateFence(fd);
             },
         }
         // Capture and renderer success prove this transition under the
@@ -1294,11 +1311,26 @@ pub const Output = struct {
         // cannot fail without violating single-thread ownership.
         self.in_flight_frame = frame_id;
         self.in_flight_handle = handle;
+        std.debug.assert(self.in_flight_render_fence == null);
+        std.debug.assert(self.in_flight_ready_ns == null);
+        self.in_flight_render_fence = retained_render_fence;
+        retained_render_fence = null;
         self.pending_capture = capture;
         self.pending_capture_target = capture_target;
         self.planner.publish() catch unreachable;
         self.scheduler.submitPhysical(frame_id, now_ns) catch unreachable;
         return .submitted;
+    }
+
+    /// Records synchronous Pixman completion after the caller captures a
+    /// post-render CLOCK_MONOTONIC timestamp. Vulkan completion is measured
+    /// from its retained sync_file at page flip instead.
+    pub fn renderReady(self: *Output, frame_id: scheduler_api.FrameId, now_ns: u64) !void {
+        if (self.in_flight_frame == null or
+            !std.meta.eql(self.in_flight_frame.?, frame_id) or
+            self.rendererKind() != .pixman or self.in_flight_ready_ns != null)
+            return error.InvalidState;
+        self.in_flight_ready_ns = now_ns;
     }
 
     /// Attempts the strict one-sample bypass while the scheduler still owns a
@@ -1343,20 +1375,40 @@ pub const Output = struct {
     /// Dispatches callbacks already recorded by R11. Callback backpressure is
     /// retryable: the exact scheduler outcome remains pinned until success.
     pub fn processKmsEvents(self: *Output, callbacks: WaylandCallbacks) !void {
+        return self.processKmsEventsInternal(callbacks, null);
+    }
+
+    pub fn processKmsEventsOn(
+        self: *Output,
+        callbacks: WaylandCallbacks,
+        ring: *linux.IoUring,
+    ) !void {
+        return self.processKmsEventsInternal(callbacks, ring);
+    }
+
+    fn processKmsEventsInternal(
+        self: *Output,
+        callbacks: WaylandCallbacks,
+        ring: ?*linux.IoUring,
+    ) !void {
         // Never ask R11 to publish deferred policy into an already-full queue.
         // This matters when callback delivery previously hit TX backpressure.
         if (self.kms_output.events().len == 0)
             try self.kms_output.processCallbacks();
-        try self.consumeKmsEvents(callbacks);
+        try self.consumeKmsEvents(callbacks, ring);
 
         // One page flip can defer exactly one disabling commit because its
         // `.presented` event occupied the final event slot. After consuming the
         // batch, give R11 one non-spinning policy pass and consume that result.
         try self.kms_output.processCallbacks();
-        try self.consumeKmsEvents(callbacks);
+        try self.consumeKmsEvents(callbacks, ring);
     }
 
-    fn consumeKmsEvents(self: *Output, callbacks: WaylandCallbacks) !void {
+    fn consumeKmsEvents(
+        self: *Output,
+        callbacks: WaylandCallbacks,
+        ring: ?*linux.IoUring,
+    ) !void {
         const events = self.kms_output.events();
         while (self.event_cursor < events.len) {
             switch (events[self.event_cursor]) {
@@ -1373,6 +1425,7 @@ pub const Output = struct {
                         self.pending_callback = try self.scheduler.presentPhysical(
                             frame_id,
                             timestamp_ns,
+                            self.takeRenderReadyTimestamp(ring),
                         );
                     }
                     const outcome = self.pending_callback.?;
@@ -1389,6 +1442,7 @@ pub const Output = struct {
                             self.pending_callback = try self.scheduler.retirePhysical(frame_id);
                         try callbacks.retired(self.pending_callback.?);
                         self.pending_callback = null;
+                        self.discardRenderTiming(ring);
                         self.in_flight_frame = null;
                         self.in_flight_handle = null;
                     }
@@ -1396,6 +1450,7 @@ pub const Output = struct {
                 },
                 .failed => {
                     try self.finishCapture(callbacks, false, 0);
+                    self.discardRenderTiming(ring);
                     return error.KmsFailed;
                 },
                 .drained => {},
@@ -1404,6 +1459,29 @@ pub const Output = struct {
         }
         self.kms_output.clearEvents();
         self.event_cursor = 0;
+    }
+
+    fn takeRenderReadyTimestamp(self: *Output, ring: ?*linux.IoUring) ?u64 {
+        const ready_ns = if (self.in_flight_render_fence) |fd|
+            syncFileSignalNanoseconds(fd)
+        else
+            self.in_flight_ready_ns;
+        self.discardRenderTiming(ring);
+        return ready_ns;
+    }
+
+    fn discardRenderTiming(self: *Output, ring: ?*linux.IoUring) void {
+        if (self.in_flight_render_fence) |fd| close: {
+            if (ring) |shared_ring| {
+                const sqe = shared_ring.close(completion.skipped_success_user_data, fd) catch
+                    break :close;
+                sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
+                self.in_flight_render_fence = null;
+            }
+        }
+        if (self.in_flight_render_fence) |fd| _ = linux.close(fd);
+        self.in_flight_render_fence = null;
+        self.in_flight_ready_ns = null;
     }
 
     fn finishCapture(
@@ -1731,6 +1809,37 @@ fn callbackData(timestamp_ns: u64) u32 {
     return @truncate(timestamp_ns / std.time.ns_per_ms);
 }
 
+fn duplicateFence(fd: std.posix.fd_t) ?std.posix.fd_t {
+    const result = linux.fcntl(fd, linux.F.DUPFD_CLOEXEC, 0);
+    if (linux.errno(result) != .SUCCESS) return null;
+    return @intCast(result);
+}
+
+fn syncFileSignalNanoseconds(fd: std.posix.fd_t) ?u64 {
+    var fences: [16]c.sync_fence_info = undefined;
+    var info: c.sync_file_info = std.mem.zeroes(c.sync_file_info);
+    info.num_fences = fences.len;
+    info.sync_fence_info = @intFromPtr(&fences);
+    if (!readSyncFileInfo(fd, &info) or info.status != 1 or
+        info.num_fences == 0 or info.num_fences > fences.len)
+        return null;
+
+    var signal_ns: u64 = 0;
+    for (fences[0..info.num_fences]) |fence| {
+        if (fence.status != 1 or fence.timestamp_ns == 0) return null;
+        signal_ns = @max(signal_ns, fence.timestamp_ns);
+    }
+    return signal_ns;
+}
+
+fn readSyncFileInfo(fd: std.posix.fd_t, info: *c.sync_file_info) bool {
+    while (true) {
+        const result = c.ioctl(fd, c.SYNC_IOC_FILE_INFO, info);
+        if (result == 0) return true;
+        if (std.posix.errno(result) != .INTR) return false;
+    }
+}
+
 test "drm-sim: exact sampled identities bind in presentation order" {
     const bytes = [_]u8{ 0, 0, 0, 255 };
     const binding = try appliedSampleBinding(
@@ -1825,7 +1934,7 @@ test "drm-sim: physical scheduler is page-flip paced and retires on failure" {
     _ = try scheduler.renderComplete(render_event.render.frame, 8);
     try scheduler.submitPhysical(render_event.render.frame, 8);
     try std.testing.expect((try scheduler.timerRequest(9)) == null);
-    const outcome = try scheduler.presentPhysical(render_event.render.frame, 12);
+    const outcome = try scheduler.presentPhysical(render_event.render.frame, 12, 3);
     try std.testing.expect(outcome.frame_callbacks_due);
     try std.testing.expectEqual(@as(?u64, 12), outcome.actual_ns);
     try std.testing.expectEqualSlices(scheduler_api.Sample(render.PresentationIdentity), &samples, outcome.sampled);
