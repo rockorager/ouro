@@ -5383,6 +5383,15 @@ pub fn Coordinator(comptime protocol: type) type {
                     self.markProtocolAll(ProtocolReady.output | ProtocolReady.xdg_output);
                 }
                 if (!physical.removal_protocol_retired) {
+                    const layer_ids = try self.layer_shell_adapter.ids(self.layer_surface_ids);
+                    for (layer_ids) |id| {
+                        const state = try self.layer_shell_adapter.state(id);
+                        if (!std.meta.eql(state.output, physical.protocol_output)) continue;
+                        self.queueLayerRemoval(state.surface);
+                        self.interaction.surfaceDestroyed(state.surface);
+                        self.desktop.removeExternalRoot(state.surface);
+                    }
+                    try self.layer_shell_adapter.outputRemoved(physical.protocol_output);
                     try self.output_management_adapter.removeHead(physical.management_head);
                     try self.output_power_adapter.outputRemoved(physical.id);
                     try self.gamma_control_adapter.outputRemoved(physical.id);
@@ -5395,7 +5404,8 @@ pub fn Coordinator(comptime protocol: type) type {
                     physical.connected = false;
                     physical.removal_protocol_retired = true;
                     self.markProtocolAll(ProtocolReady.output_management |
-                        ProtocolReady.output_power | ProtocolReady.gamma_control);
+                        ProtocolReady.output_power | ProtocolReady.gamma_control |
+                        ProtocolReady.layer_shell);
                     if (!self.stopping and !self.topology_refresh_pending) {
                         try self.publishOutputLayout();
                         try self.consumeOutputManagementCommands();
@@ -8547,6 +8557,7 @@ pub fn Coordinator(comptime protocol: type) type {
             const ids = try self.layer_shell_adapter.ids(self.layer_surface_ids);
             for (ids) |id| {
                 const state = try self.layer_shell_adapter.state(id);
+                if (state.closed) continue;
                 _ = try self.desktop.updateExternalRoot(
                     self.layerShellSceneState(state) orelse continue,
                 );
@@ -8923,6 +8934,7 @@ pub fn Coordinator(comptime protocol: type) type {
             const ids = try self.layer_shell_adapter.ids(self.layer_surface_ids);
             for (ids) |id| {
                 const state = try self.layer_shell_adapter.state(id);
+                if (state.closed) continue;
                 const size = try self.layerConfigureSize(state);
                 self.layer_shell_adapter.queueConfigure(id, size.width, size.height) catch |err| switch (err) {
                     error.NotConfigured => {},

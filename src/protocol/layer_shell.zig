@@ -75,6 +75,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
             margins: Margins,
             keyboard_interactivity: KeyboardInteractivity,
             mapped: bool,
+            closed: bool,
             namespace: []const u8,
             last_acknowledged_configure: u32,
         };
@@ -109,6 +110,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
             configure_width: u32 = 0,
             configure_height: u32 = 0,
             configure_pending: bool = false,
+            closed: bool = false,
+            closed_pending: bool = false,
         };
         const Outstanding = struct {
             active: bool = false,
@@ -291,6 +294,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
 
         pub fn validateSurfaceCommit(self: *Self, surface: SurfaceId) !void {
             const s = self.find(surface) orelse return error.StaleSurface;
+            if (s.closed) return error.Closed;
             try validatePending(s.pending);
             const core = try self.core.getSurfaceById(surface);
             if (core.hasPendingBufferAttachment() and s.last_ack == 0) return error.UnconfiguredBuffer;
@@ -331,6 +335,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
             height: u32,
         ) !void {
             const s = try self.resolve(id);
+            if (s.closed) return error.Closed;
             if (!s.initial_committed) return error.NotConfigured;
             try self.queueConfigureSlotSize(s, width, height);
         }
@@ -341,6 +346,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
             height: u32,
         ) !void {
             const s = self.find(surface) orelse return error.StaleSurface;
+            if (s.closed) return error.Closed;
             if (!s.initial_committed) return error.NotConfigured;
             try self.queueConfigureSlotSize(s, width, height);
         }
@@ -362,6 +368,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
             try self.queueConfigureSlotSize(s, width, height);
         }
         fn queueConfigureSlotSize(self: *Self, s: *Slot, width: u32, height: u32) !void {
+            if (s.closed) return error.Closed;
             if (!s.configure_pending and self.outbound_len == self.outbound_capacity) return error.Exhausted;
             if (!s.configure_pending) self.outbound_len += 1;
             s.configure_pending = true;
@@ -371,14 +378,26 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
         }
 
         pub fn pendingOutbound(self: *const Self, peer: wayring.io_uring.Peer) bool {
-            for (self.slots.entries.items) |s| if (s.header.active and s.configure_pending and samePeer(s.peer, peer)) return true;
+            for (self.slots.entries.items) |s| if (s.header.active and
+                (s.configure_pending or s.closed_pending) and samePeer(s.peer, peer)) return true;
             return false;
         }
         pub fn flushOn(self: *Self, peer: wayring.io_uring.Peer, server_objects: anytype, queue: *wayring.tx.Queue) !usize {
             var count: usize = 0;
             for (self.slots.entries.items) |s| {
-                if (!s.header.active or !s.configure_pending or !samePeer(s.peer, peer)) continue;
+                if (!s.header.active or (!s.configure_pending and !s.closed_pending) or
+                    !samePeer(s.peer, peer)) continue;
                 if (server_objects.namespace.resolve(s.resource) == null) continue;
+                if (s.closed_pending) {
+                    LayerSurface.encodeEvent(queue, s.resource.id, .{ .closed = .{} }) catch |err| switch (err) {
+                        error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return count,
+                        else => return err,
+                    };
+                    s.closed_pending = false;
+                    self.outbound_len -= 1;
+                    count += 1;
+                    continue;
+                }
                 const outstanding = self.acquireOutstanding() orelse return count;
                 LayerSurface.encodeEvent(queue, s.resource.id, .{ .configure = .{ .serial = s.configure_serial, .width = s.configure_width, .height = s.configure_height } }) catch |err| switch (err) {
                     error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => {
@@ -398,6 +417,23 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
                 count += 1;
             }
             return count;
+        }
+
+        pub fn outputRemoved(self: *Self, output: OutputAdapter.OutputId) !void {
+            for (self.slots.entries.items) |s| {
+                if (!s.header.active or s.closed or !std.meta.eql(s.output, output)) continue;
+                if (!s.configure_pending and self.outbound_len == self.outbound_capacity)
+                    return error.Exhausted;
+                if (s.configure_pending) {
+                    s.configure_pending = false;
+                } else {
+                    self.outbound_len += 1;
+                }
+                self.dropOutstanding(s);
+                s.closed = true;
+                s.closed_pending = true;
+                s.mapped = false;
+            }
         }
 
         pub fn resourceRemoved(self: *Self, handle: objects.Handle, object: objects.Object) bool {
@@ -455,7 +491,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
         fn release(self: *Self, i: u32) void {
             const s = self.slots.at(i) orelse return;
             if (!s.header.active) return;
-            if (s.configure_pending) self.outbound_len -= 1;
+            if (s.configure_pending or s.closed_pending) self.outbound_len -= 1;
             self.dropOutstanding(s);
             if (self.core.getSurfaceById(s.surface)) |core| core.role.deactivateObject(layer_role_id) catch {} else |_| {}
             self.allocator.free(s.namespace);
@@ -517,7 +553,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
             return stateValueWith(s, s.committed);
         }
         fn stateValueWith(s: *const Slot, value: Pending) State {
-            return .{ .surface = s.surface, .output = s.output, .layer = value.layer, .width = value.width, .height = value.height, .anchors = value.anchors, .exclusive_zone = value.exclusive_zone, .exclusive_edge = value.exclusive_edge, .margins = value.margins, .keyboard_interactivity = value.keyboard, .mapped = s.mapped, .namespace = s.namespace[0..s.namespace_len], .last_acknowledged_configure = s.last_ack };
+            return .{ .surface = s.surface, .output = s.output, .layer = value.layer, .width = value.width, .height = value.height, .anchors = value.anchors, .exclusive_zone = value.exclusive_zone, .exclusive_edge = value.exclusive_edge, .margins = value.margins, .keyboard_interactivity = value.keyboard, .mapped = s.mapped, .closed = s.closed, .namespace = s.namespace[0..s.namespace_len], .last_acknowledged_configure = s.last_ack };
         }
         fn parseLayer(v: u32) !Layer {
             return switch (v) {
@@ -771,7 +807,7 @@ test "layer shell: acknowledgements accept any sent outstanding configure once" 
     try std.testing.expectEqual(@as(u32, 18), slot.last_ack);
 }
 
-test "layer shell: configure survives transport backpressure" {
+test "layer shell: configure and output removal survive transport backpressure" {
     const test_protocol = @import("core_protocol");
     const FakeCore = struct {
         pub const SurfaceId = packed struct { index: u32, generation: u32 };
@@ -850,4 +886,21 @@ test "layer shell: configure survives transport backpressure" {
     const event = try test_protocol.zwlr_layer_surface_v1.decodeEvent(message, &queue.descriptors);
     try std.testing.expectEqual(@as(u32, 1920), event.configure.width);
     try std.testing.expectEqual(@as(u32, 30), event.configure.height);
+
+    try adapter.outputRemoved(slot.output);
+    try std.testing.expect(adapter.stateForSurface(slot.surface).?.closed);
+    try std.testing.expect(!adapter.stateForSurface(slot.surface).?.mapped);
+    var close_queue = wayring.tx.Queue.init(&blocks, 64, &descriptors, 0);
+    defer close_queue.deinit();
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try adapter.flushOn(slot.peer, &server_objects, &close_queue),
+    );
+    const close_snapshot = try close_queue.snapshot(&descriptor_scratch, &control);
+    const close_message = (try wayring.wire.Message.decode(close_snapshot.first)).?;
+    const close_event = try test_protocol.zwlr_layer_surface_v1.decodeEvent(
+        close_message,
+        &close_queue.descriptors,
+    );
+    try std.testing.expect(close_event == .closed);
 }

@@ -2466,7 +2466,7 @@ test "shell-input: two mapped toplevels sustain independent commit cycles" {
     try root.deinit();
 }
 
-test "shell-input: layer surface adopts and presents an xdg popup" {
+test "shell-input: secondary output removal closes its reactive layer popup root" {
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-layer-popup-{d}.sock", .{linux.getpid()});
@@ -2496,7 +2496,7 @@ test "shell-input: layer surface adopts and presents an xdg popup" {
     config.surface.copy_capacity = 2;
     config.output.max_samples = 3;
     config.output.max_source_bytes = pixels.len * 2;
-    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), config);
+    const coordinator = try Coordinator.create(allocator, root, fixture.platformsWithHotplug(), config);
     var loop = try Loop.init(
         allocator,
         root,
@@ -2528,6 +2528,7 @@ test "shell-input: layer surface adopts and presents an xdg popup" {
         .queue = &actor.transmit,
         .registry = registry,
         .minimum_outputs = 2,
+        .reactive = true,
     };
     try submitLayerPopupClient(&client_reactor, &driver, &handler);
 
@@ -2538,7 +2539,7 @@ test "shell-input: layer surface adopts and presents an xdg popup" {
     for (0..512) |_| {
         client_progress = try drainLayerPopupClient(&client_reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
-        if (!observed and handler.layer_mapped and handler.popup_mapped and
+        if (!observed and handler.layer_mapped and handler.popup_mapped and handler.releases == 2 and
             coordinator.stats.presented >= 1)
         {
             const layer_ids = try coordinator.layer_shell_adapter.ids(coordinator.layer_surface_ids);
@@ -2575,6 +2576,44 @@ test "shell-input: layer surface adopts and presents an xdg popup" {
     }
     try std.testing.expect(observed);
     try std.testing.expectEqual(@as(usize, 2), handler.releases);
+    try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+
+    const layer_ids = try coordinator.layer_shell_adapter.ids(coordinator.layer_surface_ids);
+    const layer_state = try coordinator.layer_shell_adapter.state(layer_ids[0]);
+    var popup_storage: [2]@TypeOf(coordinator.scene_windows[0]) = undefined;
+    var popups = try coordinator.desktop.externalPopupSnapshot(
+        layer_state.surface,
+        &popup_storage,
+    );
+    try std.testing.expectEqual(@as(usize, 1), popups.len);
+
+    handler.hold_popup_configures = true;
+    try handler.repositionPopup();
+    for (0..256) |_| {
+        client_progress = try drainLayerPopupClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.popup_configure_count >= 2) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(usize, 2), handler.popup_configure_count);
+    try std.testing.expect(handler.popup_configures[1] != handler.popup_configures[0]);
+
+    fixture.second_desktop = false;
+    try fixture.signalHotplug();
+    for (0..512) |_| {
+        client_progress = try drainLayerPopupClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.layer_closed == 1 and
+            !coordinator.physical_outputs[1].connected and
+            !coordinator.physical_outputs[1].removing) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(usize, 1), handler.layer_closed);
+    try std.testing.expect(!coordinator.physical_outputs[1].connected);
+    try std.testing.expectEqual(@as(usize, 2), handler.popup_configure_count);
+    popups = try coordinator.desktop.externalPopupSnapshot(layer_state.surface, &popup_storage);
+    try std.testing.expectEqual(@as(usize, 1), popups.len);
+    try std.testing.expect(!popups[0].visible);
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
 
     coordinator.disconnected(coordinator.peer.?);
@@ -4445,6 +4484,11 @@ const LayerPopupHandler = struct {
     created: bool = false,
     layer_mapped: bool = false,
     popup_mapped: bool = false,
+    reactive: bool = false,
+    hold_popup_configures: bool = false,
+    popup_configures: [4]u32 = undefined,
+    popup_configure_count: usize = 0,
+    layer_closed: usize = 0,
     releases: usize = 0,
     event_failures: usize = 0,
 
@@ -4488,18 +4532,18 @@ const LayerPopupHandler = struct {
                         self.layer_mapped = true;
                     }
                 },
-                .closed => return error.LayerClosed,
+                .closed => self.layer_closed += 1,
             }
         } else if (target.object.interface == &protocol.xdg_popup.info) {
             _ = try protocol.xdg_popup.decodeEvent(message, fds);
         } else if (target.object.interface == &protocol.xdg_surface.info) {
             switch (try protocol.xdg_surface.decodeEvent(message, fds)) {
                 .configure => |value| {
-                    try protocol.xdg_surface.encodeRequest(
-                        self.queue,
-                        self.popup_xdg_surface.?.id,
-                        .{ .ack_configure = .{ .serial = value.serial } },
-                    );
+                    self.popup_configures[self.popup_configure_count] = value.serial;
+                    self.popup_configure_count += 1;
+                    if (!self.popup_mapped or !self.hold_popup_configures) {
+                        try self.ackPopupConfigure(value.serial);
+                    }
                     if (!self.popup_mapped) {
                         try self.mapSurface(1, self.popup_surface.?);
                         self.popup_mapped = true;
@@ -4606,6 +4650,11 @@ const LayerPopupHandler = struct {
         try protocol.xdg_positioner.encodeRequest(self.queue, positioner.id.id, .{
             .set_anchor_rect = .{ .x = 1, .y = 0, .width = 1, .height = 1 },
         });
+        if (self.reactive) try protocol.xdg_positioner.encodeRequest(
+            self.queue,
+            positioner.id.id,
+            .{ .set_reactive = .{} },
+        );
         self.popup = (try protocol.xdg_surface.construct_get_popup(
             self.objects,
             self.queue,
@@ -4614,6 +4663,35 @@ const LayerPopupHandler = struct {
         )).id;
         try protocol.zwlr_layer_surface_v1.encodeRequest(self.queue, self.layer_surface.?.id, .{
             .get_popup = .{ .popup = self.popup.?.id },
+        });
+    }
+
+    fn ackPopupConfigure(self: *LayerPopupHandler, serial: u32) !void {
+        try protocol.xdg_surface.encodeRequest(
+            self.queue,
+            self.popup_xdg_surface.?.id,
+            .{ .ack_configure = .{ .serial = serial } },
+        );
+    }
+
+    fn repositionPopup(self: *LayerPopupHandler) !void {
+        const positioner = try protocol.xdg_wm_base.construct_create_positioner(
+            self.objects,
+            self.queue,
+            self.wm_base.?,
+            .{},
+        );
+        try protocol.xdg_positioner.encodeRequest(self.queue, positioner.id.id, .{
+            .set_size = .{ .width = 1, .height = 1 },
+        });
+        try protocol.xdg_positioner.encodeRequest(self.queue, positioner.id.id, .{
+            .set_anchor_rect = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+        });
+        try protocol.xdg_positioner.encodeRequest(self.queue, positioner.id.id, .{
+            .set_reactive = .{},
+        });
+        try protocol.xdg_popup.encodeRequest(self.queue, self.popup.?.id, .{
+            .reposition = .{ .positioner = positioner.id.id, .token = 1 },
         });
     }
 
