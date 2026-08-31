@@ -1595,7 +1595,7 @@ fn runVertical(trigger: TerminalTrigger, source: ClientSource) !void {
             _ = try loop.turn(coordinator);
         };
         const second_consumed = coordinator.stats.applied == 2 and
-            coordinator.cursor_layer.content != null;
+            coordinator.cursor_layer.content.owned;
         if (second_consumed and client_handler.surface_enters == 2) break;
         if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
             try waitForEither(&root.ring, client_reactor.ring);
@@ -1603,9 +1603,10 @@ fn runVertical(trigger: TerminalTrigger, source: ClientSource) !void {
     const abandoned_surface = coordinator.cursor_layer.surface.?;
     try std.testing.expectEqual(@as(usize, 2), coordinator.stats.applied);
     try std.testing.expect(!coordinator.cursor_layer.source_release_pending);
-    try std.testing.expect(coordinator.cursor_layer.content.?.attachment_lease == null);
-    try std.testing.expect(coordinator.cursor_layer.content.?.release_callbacks == null);
-    try std.testing.expect(coordinator.cursor_layer.content.?.surface.attachment.?.buffer == null);
+    try std.testing.expect(coordinator.cursor_layer.content.owned);
+    try std.testing.expect(coordinator.cursor_layer.content.value.attachment_lease == null);
+    try std.testing.expect(coordinator.cursor_layer.content.value.release_callbacks == null);
+    try std.testing.expect(coordinator.cursor_layer.content.value.surface.attachment.?.buffer == null);
     if (source == .dmabuf) {
         try std.testing.expectEqual(@as(usize, 4), fixture.import_attempts);
         try std.testing.expectEqual(@as(usize, 4), fixture.imported_bos);
@@ -1710,7 +1711,7 @@ fn runVertical(trigger: TerminalTrigger, source: ClientSource) !void {
     try std.testing.expect(wayring_drained);
     try std.testing.expect(client_progress.quiescent);
     try std.testing.expect(coordinator.backendDrainComplete());
-    try std.testing.expect(coordinator.cursor_layer.content == null);
+    try std.testing.expect(!coordinator.cursor_layer.content.owned);
     try std.testing.expectEqual(@as(usize, 1), coordinator.adapter.imports.available());
     try std.testing.expectEqual(@as(usize, 1), coordinator.adapter.frame_pool.available());
     try std.testing.expectEqual(@as(usize, 1), coordinator.adapter.release_pool.available());

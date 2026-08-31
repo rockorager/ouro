@@ -168,7 +168,7 @@ pub fn Loop(comptime protocol: type) type {
             };
         }
 
-        /// Performs one allocation-free turn and exactly one ring submission.
+        /// Performs one allocation-free turn without waiting for future CQEs.
         ///
         /// CQEs are clipped before consumption. Every live Ouro completion is
         /// classified before Wayring dispatch, so a full Wayring batch cannot
@@ -178,10 +178,10 @@ pub fn Loop(comptime protocol: type) type {
         /// Wayring then performs completion routing and bounded request
         /// dispatch. If declared, `prepare(*Handler) !void` runs afterward so
         /// the coordinator can consume events produced by that dispatch and
-        /// schedule their protocol output in the same submission. The sole
-        /// submission is deliberately last and includes initial accept, timer,
-        /// completion/dispatch/prepare-hook, shutdown, and Wayring SQEs. The completion
-        /// hook has this contract:
+        /// schedule their protocol output in the same submission.
+        /// The ring enter is deliberately last and includes initial accept,
+        /// timer, completion/dispatch/prepare-hook, shutdown, and Wayring SQEs.
+        /// The completion hook has this contract:
         ///
         /// `fn completions(*Handler, []const TimerOutcome,
         ///     []const OuroCompletion) !void`
@@ -189,6 +189,18 @@ pub fn Loop(comptime protocol: type) type {
         /// Returned slices borrow fixed loop storage and remain valid only until
         /// the next turn or `deinit`.
         pub fn turn(self: *Self, handler: anytype) !Progress {
+            return self.turnInternal(handler, false);
+        }
+
+        /// Performs a turn and combines its submission with the next wait when
+        /// no bounded work remains. Production uses this to avoid a separate
+        /// submit syscall before every blocking `io_uring_enter` while tests
+        /// and embedders can retain the nonblocking `turn` contract.
+        pub fn turnAndWait(self: *Self, handler: anytype) !Progress {
+            return self.turnInternal(handler, true);
+        }
+
+        fn turnInternal(self: *Self, handler: anytype, wait_on_idle: bool) !Progress {
             const ready = self.compositor.ring.cq_ready();
             const count = boundedCount(ready, self.cqes.len);
             const copied = if (count == 0)
@@ -278,7 +290,25 @@ pub fn Loop(comptime protocol: type) type {
                 wayring_progress.prepared += prepared.prepared;
                 wayring_progress.pending = prepared.pending;
             }
-            const submitted = try self.compositor.ring.submit();
+            const backend_drained = if (@hasDecl(@TypeOf(handler.*), "backendDrainComplete"))
+                handler.backendDrainComplete()
+            else
+                false;
+            const can_wait = wait_on_idle and self.compositor.ring.cq_ready() == 0 and
+                !wayring_progress.pending and !shutdown_requested and
+                !(wayring_progress.shutdown_complete and backend_drained);
+            const submitted = if (can_wait)
+                self.compositor.ring.submit_and_wait(1) catch |err| switch (err) {
+                    // TERM/INT and tracing can interrupt the wait after the
+                    // SQ tail has been published. Pending operations remain
+                    // owned by the ring and a later turn consumes their CQEs.
+                    error.SignalInterrupt => 0,
+                    else => return err,
+                }
+            else if (self.compositor.ring.sq_ready() != 0)
+                try self.compositor.ring.submit()
+            else
+                0;
             return .{
                 .reaped = copied,
                 .wayring_completions = wayring_count,

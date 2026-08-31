@@ -204,32 +204,20 @@ pub fn main(init: std.process.Init) !void {
         });
     var wayring_drained = false;
     var signal_stop_started = false;
-    var wait_for_completion = false;
     while (!wayring_drained or !coordinator.backendDrainComplete()) {
-        if (wait_for_completion) loop.waitForCompletion() catch |err| {
+        const progress = loop.turnAndWait(coordinator) catch |err| {
             if (run_error == null) run_error = err;
             coordinator.requestStop() catch |stop_err| {
                 if (run_error == null) run_error = stop_err;
             };
-            wait_for_completion = false;
-            continue;
-        };
-        const progress = loop.turn(coordinator) catch |err| {
-            if (run_error == null) run_error = err;
-            coordinator.requestStop() catch |stop_err| {
-                if (run_error == null) run_error = stop_err;
-            };
-            wait_for_completion = false;
             continue;
         };
         wayring_drained = progress.wayring.shutdown_complete;
-        wait_for_completion = !progress.needs_more_work;
         if (!signal_stop_started and progress.shutdown_requested) {
             signal_stop_started = true;
             coordinator.requestStop() catch |err| {
                 if (run_error == null) run_error = err;
             };
-            wait_for_completion = false;
         }
     }
     loop.deinit();

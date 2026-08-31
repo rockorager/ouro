@@ -101,6 +101,40 @@ const viewport = @import("../viewport.zig");
 const linux = std.os.linux;
 const drag_icon_role_id: surface_state.RoleId = 0x646e_645f_6963_6f6e;
 
+fn OwnedValue(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        owned: bool = false,
+        value: T = undefined,
+
+        fn get(self: *Self) ?*T {
+            return if (self.owned) &self.value else null;
+        }
+
+        fn getConst(self: *const Self) ?*const T {
+            return if (self.owned) &self.value else null;
+        }
+
+        fn set(self: *Self, value: T) void {
+            std.debug.assert(!self.owned);
+            self.value = value;
+            self.owned = true;
+        }
+
+        fn take(self: *Self) ?T {
+            if (!self.owned) return null;
+            self.owned = false;
+            return self.value;
+        }
+
+        fn clear(self: *Self) void {
+            std.debug.assert(self.owned);
+            self.owned = false;
+        }
+    };
+}
+
 fn copyCaptureRegion(
     destination: []u8,
     destination_stride: u32,
@@ -455,13 +489,13 @@ pub fn Coordinator(comptime protocol: type) type {
             peer: ?wayring.io_uring.Peer = null,
             surface: ?wayring.objects.Handle = null,
             id: ?Adapter.SurfaceId = null,
-            content: ?Adapter.Content = null,
+            content: OwnedValue(Adapter.Content) = .{},
             rendered: ?render_content.Handle = null,
             presentation: ?Presentations.Token = null,
             sample: ?render_list.AppliedSurface = null,
             binding: ?output_api.SampleBinding = null,
             change: ?damage.Change = null,
-            candidate: ?Candidate = null,
+            candidate: OwnedValue(Candidate) = .{},
             source_release_pending: bool = false,
             outcome_pending: bool = false,
             callback_data: ?u32 = null,
@@ -2779,9 +2813,9 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn candidatePending(self: *const Self, id: Adapter.SurfaceId) bool {
             for (self.app_layers[0..self.app_layer_count]) |layer|
-                if (layer.candidate) |candidate|
+                if (layer.candidate.getConst()) |candidate|
                     if (std.meta.eql(candidate.id, id)) return true;
-            if (self.cursor_layer.candidate) |candidate|
+            if (self.cursor_layer.candidate.getConst()) |candidate|
                 if (std.meta.eql(candidate.id, id)) return true;
             return false;
         }
@@ -5979,6 +6013,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn markInputMethodProtocol(self: *Self) void {
+            if (self.input_method_adapter.pendingOutbound() == 0) return;
             for (self.clients.items) |*client| {
                 if (client.active and self.input_method_adapter.pendingOutboundOn(client.peer))
                     client.protocol_ready |= ProtocolReady.input_method;
@@ -7023,20 +7058,20 @@ pub fn Coordinator(comptime protocol: type) type {
             else
                 return false;
             if (layer.presentation != null or self.appLayerOutputTrackingPending(layer)) return false;
-            if (layer.candidate) |candidate| {
+            if (layer.candidate.getConst()) |candidate| {
                 if (!candidateMatches(candidate, pending)) return false;
             }
-            if (layer.candidate == null) {
+            if (!layer.candidate.owned) {
                 if (!try self.admitReadyBatch(exact_surface_id)) return false;
                 layer = if (surface_scene != null or self.findAppLayer(exact_surface_id) != null)
                     try self.appLayerForSurface(exact_surface_id)
                 else
                     &self.cursor_layer;
-                if (layer.candidate == null or
-                    !candidateMatches(layer.candidate.?, pending))
+                if (!layer.candidate.owned or
+                    !candidateMatches(layer.candidate.value, pending))
                     return false;
             }
-            const candidate = &layer.candidate.?;
+            const candidate = layer.candidate.get().?;
             if (candidate.superseded) {
                 _ = try self.adapter.activateFrames(candidate.surface, &candidate.content);
                 return self.discardPendingCandidate(layer, pending.id);
@@ -7045,7 +7080,7 @@ pub fn Coordinator(comptime protocol: type) type {
             const attachment = content.surface.attachment orelse {
                 if (layer.retains_source) try self.retireLayerSource(layer);
                 content.deinit();
-                layer.candidate = null;
+                layer.candidate.clear();
                 if (layer.retired_source != null) {
                     self.abandonLayerKeepingRetired(layer);
                     _ = try self.retryRetiredSource(layer);
@@ -7282,7 +7317,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     try self.adapter.postInvalidShmBacking(actor, attachment.buffer.?.handle);
                     _ = try self.loop.?.driver.schedule(peer);
                     candidate.content.deinit();
-                    layer.candidate = null;
+                    layer.candidate.clear();
                     self.finishPendingCandidate(pending.id);
                     return true;
                 },
@@ -7331,7 +7366,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 sample.destination,
             );
             const previous = if (layer.change) |change| change.current else null;
-            layer.candidate = null;
+            layer.candidate.clear();
             if (!prepared.replaces) if (layer.rendered) |previous_handle|
                 render_device.content.release(previous_handle);
             layer.change = .{
@@ -7344,7 +7379,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .buffer_damage = published.content.surface.buffer_damage,
             };
             layer.active = true;
-            layer.content = published.content;
+            layer.content.set(published.content);
             layer.rendered = rendered;
             layer.peer = published.peer;
             layer.surface = published.surface;
@@ -7404,13 +7439,13 @@ pub fn Coordinator(comptime protocol: type) type {
             for (applied, 0..) |*update, index| {
                 const id = update.surface;
                 self.pendingCommitApplied(id);
-                self.applied_layers[index].candidate = .{
+                self.applied_layers[index].candidate.set(.{
                     .peer = try self.adapter.surfacePeer(id),
                     .surface = try self.adapter.surfaceResource(id),
                     .id = id,
                     .content = update.payload,
                     .superseded = !lastSurfaceOccurrence(ready, index),
-                };
+                });
             }
             return true;
         }
@@ -7440,7 +7475,7 @@ pub fn Coordinator(comptime protocol: type) type {
         fn ensureAvailableAppLayers(self: *Self, needed: usize) !void {
             var available = self.app_layers.len - self.app_layer_count;
             for (self.app_layers[0..self.app_layer_count]) |*layer|
-                available += @intFromBool(layer.presentation == null and layer.candidate == null and
+                available += @intFromBool(layer.presentation == null and !layer.candidate.owned and
                     !self.appLayerOutputTrackingPending(layer));
             if (available >= needed) return;
             const old_len = self.app_layers.len;
@@ -7510,7 +7545,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn layerAvailableForBatch(self: *Self, layer: *Layer, used: usize) bool {
-            if (layer.presentation != null or layer.candidate != null or
+            if (layer.presentation != null or layer.candidate.owned or
                 self.appLayerOutputTrackingPending(layer)) return false;
             for (self.applied_layers[0..used]) |assigned| if (assigned == layer) return false;
             return true;
@@ -7530,10 +7565,9 @@ pub fn Coordinator(comptime protocol: type) type {
                 error.Exhausted => return false,
                 else => return err,
             };
-            const candidate = layer.candidate orelse return error.MissingCandidate;
+            const candidate = layer.candidate.take() orelse return error.MissingCandidate;
             if (layer.active) if (layer.id) |id| self.queueLayerRemoval(id);
-            layer.candidate = null;
-            layer.content = candidate.content;
+            layer.content.set(candidate.content);
             layer.peer = candidate.peer;
             layer.surface = candidate.surface;
             layer.id = candidate.id;
@@ -8666,7 +8700,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 }
                 const binding = layer.binding orelse return error.SampleBindingMismatch;
                 if (!std.meta.eql(sampled.surface, binding.surface)) return error.SampleBindingMismatch;
-                const content = &(layer.content orelse return error.MissingContent);
+                const content = layer.content.get() orelse return error.MissingContent;
                 const owner_live = layer.peer != null and self.peerLive(layer.peer.?) and
                     self.layerSurfaceLive(layer);
                 if (!owner_live) {
@@ -8778,7 +8812,7 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn retryLayerOutcome(self: *Self, layer: *Layer) !bool {
             const token = layer.presentation orelse return error.MissingPresentation;
-            const content = &(layer.content orelse return error.MissingContent);
+            const content = layer.content.get() orelse return error.MissingContent;
             if (layer.source_release_pending and !layer.retains_source and
                 !try self.retryLayerSourceRelease(layer)) return false;
             if (!layer.retains_source) {
@@ -8839,7 +8873,7 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.presentations.finish(token);
             if (!layer.retains_source) {
                 content.deinit();
-                layer.content = null;
+                layer.content.clear();
             }
             layer.presentation = null;
             layer.outcome_pending = false;
@@ -8872,7 +8906,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 const render_device = self.render_device orelse return false;
                 if (!render_device.content.ready(rendered)) return false;
             }
-            const content = &(layer.content orelse return error.MissingContent);
+            const content = layer.content.get() orelse return error.MissingContent;
             const peer = layer.peer orelse return error.ClientDisconnected;
             if (!try self.releaseSource(peer, content)) return false;
             layer.source_release_pending = false;
@@ -8936,12 +8970,13 @@ pub fn Coordinator(comptime protocol: type) type {
                     false
             else
                 false;
+            const peer = layer.peer orelse return error.ClientDisconnected;
+            const content = layer.content.take() orelse return error.MissingContent;
             layer.retired_source = .{
-                .peer = layer.peer orelse return error.ClientDisconnected,
-                .content = layer.content orelse return error.MissingContent,
+                .peer = peer,
+                .content = content,
                 .releasable = releasable,
             };
-            layer.content = null;
             layer.source_release_pending = false;
             layer.retains_source = false;
         }
@@ -8979,7 +9014,8 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn appLayerForSurface(self: *Self, id: Adapter.SurfaceId) !*Layer {
             for (self.app_layers[0..self.app_layer_count]) |*layer|
-                if (layer.candidate) |candidate| if (std.meta.eql(candidate.id, id)) return layer;
+                if (layer.candidate.getConst()) |candidate|
+                    if (std.meta.eql(candidate.id, id)) return layer;
             for (self.app_layers[0..self.app_layer_count]) |*layer| {
                 if (layer.id) |current| if (std.meta.eql(current, id)) return layer;
             }
@@ -10079,7 +10115,7 @@ pub fn Coordinator(comptime protocol: type) type {
         /// Its presentation token and feedback remain owned until the
         /// discarded outcome (and any source release) can be delivered.
         fn discardUnpresentedLayer(self: *Self, layer: *Layer) void {
-            if (layer.presentation == null or layer.content == null)
+            if (layer.presentation == null or !layer.content.owned)
                 return self.abandonLayer(layer);
             if (layerHasOutputAssociation(layer)) self.output_associations_dirty = true;
             layer.active = false;
@@ -10092,8 +10128,8 @@ pub fn Coordinator(comptime protocol: type) type {
         fn abandonLayer(self: *Self, layer: *Layer) void {
             if (layerHasOutputAssociation(layer)) self.output_associations_dirty = true;
             if (layer.presentation) |token| self.presentations.discard(token) catch unreachable;
-            if (layer.content) |*content| content.deinit();
-            if (layer.candidate) |*candidate| candidate.content.deinit();
+            if (layer.content.get()) |content| content.deinit();
+            if (layer.candidate.get()) |candidate| candidate.content.deinit();
             if (layer.retired_source) |*source| source.content.deinit();
             if (layer.rendered) |rendered| if (self.render_device) |render_device|
                 render_device.content.release(rendered);
@@ -10343,21 +10379,21 @@ pub fn Coordinator(comptime protocol: type) type {
                     (@as(u64, id.generation) << 32) | id.index,
                 );
                 for (self.app_layers[0..self.app_layer_count]) |*layer| {
-                    if (layer.candidate) |*candidate| {
+                    if (layer.candidate.get()) |candidate| {
                         if (std.meta.eql(candidate.id, id) and
                             std.meta.eql(candidate.surface, handle))
                         {
                             candidate.content.deinit();
-                            layer.candidate = null;
+                            layer.candidate.clear();
                         }
                     }
                 }
-                if (self.cursor_layer.candidate) |*candidate| {
+                if (self.cursor_layer.candidate.get()) |candidate| {
                     if (std.meta.eql(candidate.id, id) and
                         std.meta.eql(candidate.surface, handle))
                     {
                         candidate.content.deinit();
-                        self.cursor_layer.candidate = null;
+                        self.cursor_layer.candidate.clear();
                     }
                 }
                 // Damage while the retained cursor layer is still visible. In
@@ -10665,9 +10701,9 @@ fn outputManagementLayoutSupported(
 
 fn layerVacant(layer: anytype) bool {
     return !layer.active and layer.peer == null and layer.surface == null and
-        layer.id == null and layer.content == null and layer.rendered == null and
+        layer.id == null and !layer.content.owned and layer.rendered == null and
         layer.presentation == null and layer.sample == null and layer.binding == null and
-        layer.change == null and layer.candidate == null and !layer.source_release_pending and
+        layer.change == null and !layer.candidate.owned and !layer.source_release_pending and
         !layer.outcome_pending and layer.callback_data == null and !layer.retire_after_outcome and
         !layer.retire_after_source_release and !layer.retains_source and
         layer.retired_source == null;
