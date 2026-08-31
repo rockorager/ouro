@@ -7326,6 +7326,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 };
                 if (rendered == .retired) {
                     if (capture_request != null) try self.finishActiveCapture(false, 0, null);
+                    self.outputDamageRetired(physical, damage_generation);
                     try self.finishOutcome(rendered.retired.frame, false);
                 } else {
                     self.outputDamageSubmitted(
@@ -7377,7 +7378,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 },
                 .retired => |failure| {
                     if (capture_request != null) try self.finishActiveCapture(false, 0, null);
-                    self.adapter.clearFifoBarriers();
+                    self.outputDamageRetired(physical, damage_generation);
                     try self.finishOutcome(failure.frame, false);
                 },
             }
@@ -7393,16 +7394,26 @@ pub fn Coordinator(comptime protocol: type) type {
             physical.damage_applied = damage_generation;
             physical.themed_cursor_previous = next_themed_cursor_previous;
             physical.client_cursor_previous = next_client_cursor_previous;
-            if (!self.allOutputDamageApplied()) return;
-            self.adapter.clearFifoBarriers();
+            self.clearFifoBarriersAfterOutputAttempts();
         }
 
-        fn allOutputDamageApplied(self: *const Self) bool {
-            for (self.physical_outputs[0..self.physical_output_count]) |physical| {
-                if (physical.kms_output == null) continue;
-                if (physical.damage_applied != physical.damage_requested) return false;
-            }
-            return true;
+        fn outputDamageRetired(
+            self: *Self,
+            physical: *PhysicalOutput,
+            damage_generation: u64,
+        ) void {
+            // A failed render does not apply scene or cursor state, but it is
+            // still this output's terminal latching attempt for FIFO. Wait for
+            // every other active output's matching attempt before unblocking.
+            physical.damage_applied = damage_generation;
+            self.clearFifoBarriersAfterOutputAttempts();
+        }
+
+        fn clearFifoBarriersAfterOutputAttempts(self: *Self) void {
+            if (!outputDamageAttemptsComplete(
+                self.physical_outputs[0..self.physical_output_count],
+            )) return;
+            self.adapter.clearFifoBarriers();
         }
 
         fn markFrameChangesApplied(
@@ -9218,6 +9229,8 @@ pub fn Coordinator(comptime protocol: type) type {
                     try self.invalidateCaptureSource(.{ .output = output.outputId() });
                     try output.destroy();
                     physical.kms_output = null;
+                    physical.damage_applied = physical.damage_requested;
+                    self.clearFifoBarriersAfterOutputAttempts();
                     self.foreign_toplevel_outputs_dirty = true;
                     self.retireOutputTracking(@intCast(physical.id.index));
                     _ = try self.retryRetainedOutcomes();
@@ -10294,6 +10307,32 @@ fn rectangleContains(outer: geometry.Rect, inner: geometry.Rect) bool {
     return inner.x >= outer.x and inner.y >= outer.y and
         @as(i64, inner.x) + inner.width <= @as(i64, outer.x) + outer.width and
         @as(i64, inner.y) + inner.height <= @as(i64, outer.y) + outer.height;
+}
+
+fn outputDamageAttemptsComplete(outputs: anytype) bool {
+    for (outputs) |output| {
+        if (output.kms_output == null) continue;
+        if (output.damage_applied != output.damage_requested) return false;
+    }
+    return true;
+}
+
+test "physical: FIFO damage attempts wait for every active output" {
+    const Output = struct {
+        kms_output: ?u8 = 0,
+        damage_requested: u64 = 1,
+        damage_applied: u64 = 0,
+    };
+    var outputs = [_]Output{ .{}, .{} };
+
+    outputs[0].damage_applied = 1;
+    try std.testing.expect(!outputDamageAttemptsComplete(&outputs));
+    outputs[1].damage_applied = 1;
+    try std.testing.expect(outputDamageAttemptsComplete(&outputs));
+
+    outputs[1].damage_applied = 0;
+    outputs[1].kms_output = null;
+    try std.testing.expect(outputDamageAttemptsComplete(&outputs));
 }
 
 const OutputPendingResult = enum {
