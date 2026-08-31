@@ -147,6 +147,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             seat_index: u32 = none,
             seat_generation: u32 = 0,
             client: ClientId = undefined,
+            capability_generation: u32 = 1,
             last_serial: u32 = 0,
             enter_serial: u32 = 0,
         };
@@ -156,6 +157,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             seat_index: u32 = none,
             seat_generation: u32 = 0,
             client: ClientId = undefined,
+            capability_generation: u32 = 1,
         };
         const TouchSlot = struct {
             header: slot_pool.Header = .{},
@@ -251,6 +253,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         pointer_devices: usize = 0,
         keyboard_devices: usize = 0,
         touch_devices: usize = 0,
+        pointer_capability_generation: u32 = 1,
+        keyboard_capability_generation: u32 = 1,
         touch_capability_generation: u32 = 1,
         next_touch_resource_generation: u64 = 1,
         pressed_keys: [state_words]u64 = [_]u64{0} ** state_words,
@@ -450,6 +454,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     slot.seat_index = adapter.seatIndex(seat);
                     slot.seat_generation = seat.header.generation;
                     slot.client = clientId(seat.peer);
+                    slot.capability_generation = adapter.pointer_capability_generation;
                     const focused = adapter.pointer_delivery != null and
                         sameClient(clientId(seat.peer), adapter.pointer_delivery.?.client);
                     if (focused) adapter.ensureOutbound(1) catch {
@@ -481,6 +486,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     slot.seat_index = adapter.seatIndex(seat);
                     slot.seat_generation = seat.header.generation;
                     slot.client = clientId(seat.peer);
+                    slot.capability_generation = adapter.keyboard_capability_generation;
                     const extra: usize = if (adapter.keyboard_focus != null) 4 else 2;
                     adapter.ensureOutbound(extra) catch {
                         adapter.keyboards.release(slot);
@@ -537,7 +543,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         fn pointerRequest(adapter: *Self, actor: *wayring.connection.Actor, server_objects: anytype, pointer: *PointerSlot, message: wayring.wire.Message, fds: *wayring.ancillary.FdQueue) !wayring.dispatch.Control {
             const decoded = try wayring.server.decodeRequest(Pointer, server_objects, message, fds);
             switch (decoded.value) {
-                .set_cursor => |payload| {
+                .set_cursor => |payload| set_cursor: {
+                    if (!adapter.pointerActive(pointer)) break :set_cursor;
                     const client = pointer.client;
                     if (payload.serial == 0 or payload.serial != pointer.last_serial or
                         adapter.pointer_delivery == null or
@@ -662,6 +669,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
 
         pub fn pointerFocused(adapter: *Self, id: PointerId) bool {
             const pointer = adapter.resolvePointer(id) catch return false;
+            if (!adapter.pointerActive(pointer)) return false;
             const focus = adapter.pointer_delivery orelse return false;
             return sameClient(pointer.client, focus.client);
         }
@@ -694,6 +702,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             if (serial == 0) return false;
             const id = adapter.pointerIdOn(server_objects, pointer_object) catch return false;
             const pointer = adapter.resolvePointer(id) catch return false;
+            if (!adapter.pointerActive(pointer)) return false;
             const delivery = adapter.deliveryTarget() orelse return false;
             return sameClient(pointer.client, clientId(peer)) and
                 pointer.enter_serial == serial and
@@ -1627,10 +1636,6 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             adapter.pointer_devices = pointer_devices;
             adapter.keyboard_devices = keyboard_devices;
             adapter.touch_devices = touch_devices;
-            if (slot.capabilities.touch and touch_devices == 0) {
-                adapter.touch_capability_generation +%= 1;
-                if (adapter.touch_capability_generation == 0) adapter.touch_capability_generation = 1;
-            }
             adapter.pressed_keys = keys_after;
             const modifiers_changed = !std.meta.eql(adapter.modifiers, next_modifiers);
             adapter.modifiers = next_modifiers;
@@ -1662,6 +1667,12 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 }
             }
             adapter.enqueueCapabilities(old, current) catch unreachable;
+            if (slot.capabilities.pointer and pointer_devices == 0)
+                advanceCapabilityGeneration(&adapter.pointer_capability_generation);
+            if (slot.capabilities.keyboard and keyboard_devices == 0)
+                advanceCapabilityGeneration(&adapter.keyboard_capability_generation);
+            if (slot.capabilities.touch and touch_devices == 0)
+                advanceCapabilityGeneration(&adapter.touch_capability_generation);
         }
 
         fn pointerButton(adapter: *Self, value: anytype) !void {
@@ -2017,7 +2028,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 adapter.next_serial +%= 1;
                 if (adapter.next_serial == 0) adapter.next_serial = 1;
                 var used = false;
-                for (adapter.pointers.entries.items) |pointer| if (pointer.header.active and
+                for (adapter.pointers.entries.items) |pointer| if (adapter.pointerActive(pointer) and
                     (pointer.last_serial == serial or pointer.enter_serial == serial))
                 {
                     used = true;
@@ -2029,21 +2040,21 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
 
         fn setLastPointerSerial(adapter: *Self, client: ClientId, serial: u32) void {
             for (adapter.pointers.entries.items) |pointer| {
-                if (pointer.header.active and sameClient(pointer.client, client))
+                if (adapter.pointerActive(pointer) and sameClient(pointer.client, client))
                     pointer.last_serial = serial;
             }
         }
 
         fn setPointerEnterSerial(adapter: *Self, client: ClientId, serial: u32) void {
             for (adapter.pointers.entries.items) |pointer| {
-                if (pointer.header.active and sameClient(pointer.client, client))
+                if (adapter.pointerActive(pointer) and sameClient(pointer.client, client))
                     pointer.enter_serial = serial;
             }
         }
 
         fn setImplicitGrabSerial(adapter: *Self, client: ClientId, serial: u32) void {
             for (adapter.pointers.entries.items) |pointer| {
-                if (!pointer.header.active or !sameClient(pointer.client, client)) continue;
+                if (!adapter.pointerActive(pointer) or !sameClient(pointer.client, client)) continue;
                 if (pointer.seat_index >= adapter.seats.entries.items.len) continue;
                 const seat = adapter.seats.entries.items[pointer.seat_index];
                 if (seat.header.active and seat.header.generation == pointer.seat_generation) {
@@ -2166,17 +2177,21 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         }
 
         fn pointerBelongs(adapter: *const Self, slot: *const PointerSlot, client: ClientId) bool {
-            _ = adapter;
-            if (!slot.header.active) return false;
+            if (!adapter.pointerActive(slot)) return false;
             return sameClient(slot.client, client);
         }
 
         fn keyboardBelongs(adapter: *const Self, slot: *const KeyboardSlot, client: ClientId) bool {
-            _ = adapter;
-            if (!slot.header.active) return false;
+            if (!adapter.keyboardActive(slot)) return false;
             return sameClient(slot.client, client);
         }
 
+        fn pointerActive(adapter: *const Self, slot: *const PointerSlot) bool {
+            return slot.header.active and slot.capability_generation == adapter.pointer_capability_generation;
+        }
+        fn keyboardActive(adapter: *const Self, slot: *const KeyboardSlot) bool {
+            return slot.header.active and slot.capability_generation == adapter.keyboard_capability_generation;
+        }
         fn touchActive(adapter: *const Self, slot: *const TouchSlot) bool {
             return slot.header.active and slot.capability_generation == adapter.touch_capability_generation;
         }
@@ -2386,6 +2401,10 @@ fn clientId(peer: wayring.io_uring.Peer) SeatClientId {
 
 fn sameClient(a: anytype, b: @TypeOf(a)) bool {
     return a.slot == b.slot and a.generation == b.generation;
+}
+fn advanceCapabilityGeneration(generation: *u32) void {
+    generation.* +%= 1;
+    if (generation.* == 0) generation.* = 1;
 }
 fn optionalTargetEqual(a: anytype, b: @TypeOf(a)) bool {
     if (a == null or b == null) return a == null and b == null;
@@ -3478,6 +3497,27 @@ test "seat: device removal reserves cancellation releases and capabilities atomi
     try std.testing.expectEqual(@as(usize, 1), countTestOutbound(&adapter, .seat_capabilities));
     _ = adapter.popEvent() orelse return error.MissingCancellation;
     try std.testing.expect(adapter.popEvent() == null);
+
+    const replacement: input.DeviceId = .{ .slot = 0, .generation = 6, .seat_generation = 7 };
+    clearTestOutbound(&adapter);
+    try adapter.consume(.{ .device_added = .{
+        .device = replacement,
+        .info = .{ .capabilities = .{ .pointer = true, .keyboard = true } },
+    } });
+    clearTestOutbound(&adapter);
+    try std.testing.expect(!adapter.pointerBelongs(pointer, client));
+    try std.testing.expect(!adapter.keyboardBelongs(keyboard, client));
+    try std.testing.expectEqual(@as(usize, 0), adapter.pointerResourceCount(client));
+    try std.testing.expectEqual(@as(usize, 0), adapter.keyboardResourceCount(target));
+
+    const fresh_pointer = try adapter.pointers.acquire();
+    fresh_pointer.client = client;
+    fresh_pointer.capability_generation = adapter.pointer_capability_generation;
+    const fresh_keyboard = try adapter.keyboards.acquire();
+    fresh_keyboard.client = client;
+    fresh_keyboard.capability_generation = adapter.keyboard_capability_generation;
+    try std.testing.expectEqual(@as(usize, 1), adapter.pointerResourceCount(client));
+    try std.testing.expectEqual(@as(usize, 1), adapter.keyboardResourceCount(target));
 }
 
 test "seat: removed grab surface completes cancellation once" {
