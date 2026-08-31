@@ -745,6 +745,7 @@ pub fn Coordinator(comptime protocol: type) type {
         output_tracking_capacity: usize,
         app_layer_change_outputs: []bool,
         app_layer_outcome_outputs: []bool,
+        app_layer_feedback_outputs: []bool,
         scene_windows: []Desktop.SceneWindow,
         popup_scene_windows: []Desktop.SceneWindow,
         frame_samples: []render_list.AppliedSurface,
@@ -876,6 +877,9 @@ pub fn Coordinator(comptime protocol: type) type {
             self.app_layer_outcome_outputs = try allocator.alloc(bool, app_layer_output_capacity);
             errdefer allocator.free(self.app_layer_outcome_outputs);
             @memset(self.app_layer_outcome_outputs, false);
+            self.app_layer_feedback_outputs = try allocator.alloc(bool, app_layer_output_capacity);
+            errdefer allocator.free(self.app_layer_feedback_outputs);
+            @memset(self.app_layer_feedback_outputs, false);
             const scene_capacity = try std.math.add(
                 usize,
                 config.desktop.toplevel_capacity,
@@ -1715,6 +1719,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.allocator.free(self.popup_scene_windows);
             self.allocator.free(self.scene_windows);
             self.allocator.free(self.foreign_toplevels);
+            self.allocator.free(self.app_layer_feedback_outputs);
             self.allocator.free(self.app_layer_outcome_outputs);
             self.allocator.free(self.app_layer_change_outputs);
             self.allocator.free(self.app_layers);
@@ -7198,12 +7203,21 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.app_layer_outcome_outputs,
             );
             @memset(outcome_outputs[self.app_layer_outcome_outputs.len..], false);
+            const feedback_outputs = try self.allocator.alloc(bool, output_capacity);
+            errdefer self.allocator.free(feedback_outputs);
+            @memcpy(
+                feedback_outputs[0..self.app_layer_feedback_outputs.len],
+                self.app_layer_feedback_outputs,
+            );
+            @memset(feedback_outputs[self.app_layer_feedback_outputs.len..], false);
+            self.allocator.free(self.app_layer_feedback_outputs);
             self.allocator.free(self.app_layer_outcome_outputs);
             self.allocator.free(self.app_layer_change_outputs);
             self.allocator.free(self.app_layers);
             self.app_layers = layers;
             self.app_layer_change_outputs = change_outputs;
             self.app_layer_outcome_outputs = outcome_outputs;
+            self.app_layer_feedback_outputs = feedback_outputs;
         }
 
         fn availableAppLayer(
@@ -8336,6 +8350,13 @@ pub fn Coordinator(comptime protocol: type) type {
                         .pending => output_pending = true,
                         .complete => {},
                     }
+                    if (was_presented) {
+                        const feedback_outputs = self.appLayerOutputRow(
+                            self.app_layer_feedback_outputs,
+                            layer,
+                        ) orelse unreachable;
+                        feedback_outputs[output_index] = true;
+                    }
                 }
                 const binding = layer.binding orelse return error.SampleBindingMismatch;
                 if (!std.meta.eql(sampled.surface, binding.surface)) return error.SampleBindingMismatch;
@@ -8465,10 +8486,23 @@ pub fn Coordinator(comptime protocol: type) type {
                 const objects = try self.root.runtime.clients.get(peer);
                 const actor = try self.root.runtime.clients.reactor.getActor(peer);
                 var output_storage: [64]u32 = undefined;
-                const output_resources = if (layer.feedback_output) |output|
-                    try self.output_adapter.resourceIds(output, peer, &output_storage)
-                else
-                    output_storage[0..0];
+                var output_resource_count: usize = 0;
+                if (self.appLayerOutputRow(self.app_layer_feedback_outputs, layer)) |outputs| {
+                    for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                        const output_index: usize = @intCast(physical.id.index);
+                        if (!outputs[output_index]) continue;
+                        const resources = try self.output_adapter.resourceIds(
+                            physical.protocol_output,
+                            peer,
+                            output_storage[output_resource_count..],
+                        );
+                        output_resource_count += resources.len;
+                    }
+                } else if (layer.feedback_output) |output| {
+                    const resources = try self.output_adapter.resourceIds(output, peer, &output_storage);
+                    output_resource_count = resources.len;
+                }
+                const output_resources = output_storage[0..output_resource_count];
                 _ = self.adapter.completePresentationFeedbackOn(
                     objects,
                     &actor.transmit,
@@ -8505,6 +8539,8 @@ pub fn Coordinator(comptime protocol: type) type {
             layer.outcome_pending = false;
             layer.feedback_outcome = null;
             layer.feedback_output = null;
+            if (self.appLayerOutputRow(self.app_layer_feedback_outputs, layer)) |outputs|
+                @memset(outputs, false);
             if (layer.retire_after_outcome) {
                 layer.retire_after_outcome = false;
                 if (layer.source_release_pending and
@@ -9149,6 +9185,8 @@ pub fn Coordinator(comptime protocol: type) type {
             if (self.appLayerOutputRow(self.app_layer_change_outputs, layer)) |outputs|
                 @memset(outputs, false);
             if (self.appLayerOutputRow(self.app_layer_outcome_outputs, layer)) |outputs|
+                @memset(outputs, false);
+            if (self.appLayerOutputRow(self.app_layer_feedback_outputs, layer)) |outputs|
                 @memset(outputs, false);
             layer.change_output_count = 0;
             layer.outcome_output_count = 0;
