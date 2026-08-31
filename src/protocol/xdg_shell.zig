@@ -254,6 +254,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             role: Role = .none,
             had_role: bool = false,
             last_acked_serial: u32 = 0,
+            committed_acked_serial: u32 = 0,
             window_geometry: ?WindowGeometry = null,
             pending_window_geometry: ?WindowGeometry = null,
         };
@@ -719,15 +720,22 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         pub fn publishSurfaceCommitted(adapter: *Self, id: SurfaceId) !void {
             for (adapter.surfaces) |slot| {
                 if (!slot.header.active or !std.meta.eql(slot.surface_id, id)) continue;
+                const previous_window_geometry = slot.window_geometry;
                 if (slot.pending_window_geometry) |geometry| {
                     slot.window_geometry = geometry;
                     slot.pending_window_geometry = null;
                 }
+                const geometry_changed = !std.meta.eql(
+                    previous_window_geometry,
+                    slot.window_geometry,
+                );
+                const serial_changed = slot.committed_acked_serial != slot.last_acked_serial;
                 switch (slot.role) {
                     .toplevel => |toplevel| {
                         const role = try adapter.resolveToplevel(toplevel);
                         const size = (try adapter.core.getSurfaceById(slot.surface_id)).committedSize();
                         const mapped = size.width != 0 and size.height != 0;
+                        const mapping_changed = role.mapped != mapped;
                         const unmapped = role.mapped and !mapped;
                         const initial_commit = !role.mapped and !role.initial_committed and !mapped;
                         var constraints_changed = false;
@@ -745,33 +753,39 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                             if (initial_commit) role.initial_committed = true;
                         }
                         role.mapped = mapped;
-                        adapter.publishReserved(.{ .commit_ready = .{
-                            .id = toplevel,
-                            .serial = slot.last_acked_serial,
-                            .has_window_geometry = slot.window_geometry != null,
-                            .surface_offset_x = if (slot.window_geometry) |geometry| geometry.x else 0,
-                            .surface_offset_y = if (slot.window_geometry) |geometry| geometry.y else 0,
-                            .unmapped = unmapped,
-                            .constraints_changed = constraints_changed,
-                            .initial_commit = initial_commit,
-                            .mapped = mapped,
-                        } });
+                        if (mapping_changed or initial_commit or constraints_changed or
+                            geometry_changed or serial_changed)
+                            adapter.publishReserved(.{ .commit_ready = .{
+                                .id = toplevel,
+                                .serial = slot.last_acked_serial,
+                                .has_window_geometry = slot.window_geometry != null,
+                                .surface_offset_x = if (slot.window_geometry) |geometry| geometry.x else 0,
+                                .surface_offset_y = if (slot.window_geometry) |geometry| geometry.y else 0,
+                                .unmapped = unmapped,
+                                .constraints_changed = constraints_changed,
+                                .initial_commit = initial_commit,
+                                .mapped = mapped,
+                            } });
                     },
                     .popup => |popup| {
                         const role = try adapter.resolvePopup(popup);
                         const size = (try adapter.core.getSurfaceById(slot.surface_id)).committedSize();
-                        role.mapped = size.width != 0 and size.height != 0;
+                        const mapped = size.width != 0 and size.height != 0;
+                        const mapping_changed = role.mapped != mapped;
+                        role.mapped = mapped;
                         role.initial_committed = true;
-                        adapter.publishReserved(.{ .popup_commit_ready = .{
-                            .id = popup,
-                            .serial = slot.last_acked_serial,
-                            .has_window_geometry = slot.window_geometry != null,
-                            .surface_offset_x = if (slot.window_geometry) |geometry| geometry.x else 0,
-                            .surface_offset_y = if (slot.window_geometry) |geometry| geometry.y else 0,
-                        } });
+                        if (mapping_changed or geometry_changed or serial_changed)
+                            adapter.publishReserved(.{ .popup_commit_ready = .{
+                                .id = popup,
+                                .serial = slot.last_acked_serial,
+                                .has_window_geometry = slot.window_geometry != null,
+                                .surface_offset_x = if (slot.window_geometry) |geometry| geometry.x else 0,
+                                .surface_offset_y = if (slot.window_geometry) |geometry| geometry.y else 0,
+                            } });
                     },
                     .none => {},
                 }
+                slot.committed_acked_serial = slot.last_acked_serial;
                 return;
             }
             return error.StaleSurface;
@@ -2731,10 +2745,7 @@ test "xdg-shell: toplevel size constraints publish only on surface commit" {
     try std.testing.expectEqual(@as(i32, 600), after.max_height);
 
     try context.adapter.surfaceCommitted(context.adapter.surfaces[0].surface_id);
-    try std.testing.expect(!(switch (context.adapter.popEvent() orelse return error.MissingEvent) {
-        .commit_ready => |value| value.constraints_changed,
-        else => return error.UnexpectedEvent,
-    }));
+    try std.testing.expect(context.adapter.popEvent() == null);
 }
 
 test "xdg-shell: contradictory pending size constraints are protocol errors" {
@@ -2930,6 +2941,11 @@ test "xdg-shell: unmap resets role state and requires a fresh initial commit" {
         else => return error.UnexpectedEvent,
     };
     try std.testing.expect(mapped.mapped);
+
+    try context.adapter.validateSurfaceCommit(surface_id);
+    _ = try context.core.state.commit();
+    try context.adapter.publishSurfaceCommitted(surface_id);
+    try std.testing.expect(context.adapter.popEvent() == null);
 
     @memcpy(role.title[0..5], "title");
     role.title_len = 5;

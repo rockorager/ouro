@@ -101,6 +101,7 @@ pub fn Adapter(comptime protocol: type) type {
         const Commit = surface_state.CommitState(SurfaceId);
 
         pub const Applied = Commit.Scheduler.Applied;
+        pub const Inspected = Commit.Scheduler.Inspected;
         pub const Content = Commit.Content;
         pub const UpdateToken = Commit.Scheduler.Token;
         pub const PresentationOutcome = union(enum) {
@@ -1149,6 +1150,41 @@ pub fn Adapter(comptime protocol: type) type {
             return applied;
         }
 
+        pub fn inspectReadyUpdatesAtId(
+            adapter: *Self,
+            id: SurfaceId,
+            output: []SurfaceId,
+            now_ns: u64,
+        ) !?Inspected {
+            const slot = try adapter.surfaceForId(id);
+            if (try adapter.fifoBlocked(slot)) return null;
+            return adapter.scheduler.inspectReadyWith(
+                &slot.updates,
+                output,
+                &now_ns,
+                commitReady,
+            );
+        }
+
+        pub fn applyInspectedUpdatesAtId(
+            adapter: *Self,
+            id: SurfaceId,
+            inspected: Inspected,
+            output: []Applied,
+        ) ![]Applied {
+            const slot = try adapter.surfaceForId(id);
+            const applied = try adapter.scheduler.applyInspected(
+                &slot.updates,
+                inspected,
+                output,
+            );
+            for (applied) |update| if (update.payload.surface.fifo_set) {
+                const applied_surface = try adapter.surfaceForId(update.surface);
+                applied_surface.fifo_barrier = true;
+            };
+            return applied;
+        }
+
         pub fn readyUpdateCount(adapter: *Self, handle: objects.Handle) !usize {
             return adapter.readyUpdateCountAt(handle, std.math.maxInt(u64));
         }
@@ -1221,6 +1257,10 @@ pub fn Adapter(comptime protocol: type) type {
                 );
             }
             return result;
+        }
+
+        pub fn pendingContentUpdates(adapter: *const Self) usize {
+            return adapter.scheduler.active_nodes;
         }
 
         /// Clears every active single-output FIFO condition after one physical
@@ -4307,6 +4347,7 @@ test "commit timing preserves exact ordered commits after timer destruction" {
     );
     _ = try context.dispatchCore();
 
+    try std.testing.expectEqual(@as(usize, 2), context.adapter.pendingContentUpdates());
     try std.testing.expectEqual(
         surface_state.CommitTimestamp{ .sec = 2, .nsec = 7 },
         (try context.adapter.nextCommitDeadline(std.time.ns_per_s)).?,
@@ -4326,6 +4367,7 @@ test "commit timing preserves exact ordered commits after timer destruction" {
         timed.surface.commit_timestamp.?,
     );
     timed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), context.adapter.pendingContentUpdates());
     var untimed = (try context.adapter.tryApplyAt(
         surface,
         &output,
@@ -4333,6 +4375,7 @@ test "commit timing preserves exact ordered commits after timer destruction" {
     ))[0].payload;
     try std.testing.expect(untimed.surface.commit_timestamp == null);
     untimed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.adapter.pendingContentUpdates());
 }
 
 test "commit timer slots grow beyond their initial reservation" {

@@ -405,6 +405,16 @@ pub fn Desktop(comptime Shell: type) type {
             return desktop.command_len + desktop.popup_command_len;
         }
 
+        pub fn maintenancePending(desktop: *const Self, shell: *const Shell) bool {
+            return desktop.destroyed != null or
+                desktop.destroyed_surface != null or
+                desktop.interactive_request != null or
+                desktop.peekEvent(shell) != null or
+                desktop.pendingCommands() != 0 or
+                desktop.scene_changed or
+                desktop.foreign_toplevel_changed;
+        }
+
         pub fn takeDestroyed(desktop: *Self) ?ToplevelId {
             const id = desktop.destroyed;
             desktop.destroyed = null;

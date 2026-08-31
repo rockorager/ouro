@@ -669,6 +669,7 @@ pub fn Coordinator(comptime protocol: type) type {
         input_touch_delivery: TouchDelivery = .{},
         input_method_key_owners: [0x300]?protocol_input_method.GrabId = [_]?protocol_input_method.GrabId{null} ** 0x300,
         processing_virtual_pointer: bool = false,
+        shell_maintenance_pending: bool = false,
         manager: drm.Manager,
         hotplug: ?drm_hotplug.Monitor = null,
         hotplug_connector_ids: []u32,
@@ -1892,6 +1893,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.syncIdleNotifications() catch {};
             self.shortcuts_inhibit_adapter.disconnected(peer);
             self.foreign_adapter.disconnected(peer);
+            self.shell_maintenance_pending = true;
             self.xdg_session_adapter.disconnected(peer);
             self.foreign_toplevel_list_adapter.disconnected(peer);
             self.workspace_adapter.disconnected(peer);
@@ -2001,7 +2003,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     self.surface = first;
                     self.surface_id = try self.adapter.surfaceId(first);
                 };
-                try self.advanceShell();
+                if (self.shellMaintenancePending()) try self.advanceShell();
                 if (self.adapter.pendingPresentationClock(peer) or
                     self.adapter.pendingDiscardedFeedback(peer))
                     self.markProtocol(peer, ProtocolReady.core);
@@ -2640,9 +2642,9 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.prepareSecurityClosures();
             try self.processSession();
             try self.processInput();
-            try self.advanceShell();
+            if (self.shellMaintenancePending()) try self.advanceShell();
             _ = try self.retryRetainedOutcomes();
-            try self.applyReady();
+            if (self.pending_surface_len != 0) try self.applyReady();
             self.applyInteractionCommands() catch |err| switch (err) {
                 error.Exhausted => {},
                 else => return err,
@@ -3455,8 +3457,12 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn advanceShell(self: *Self) !void {
+            self.shell_maintenance_pending = false;
+            errdefer self.shell_maintenance_pending = true;
             while (true) {
                 _ = try self.foreign_adapter.advanceRelations();
+                if (self.foreign_adapter.hasPendingRelations())
+                    self.shell_maintenance_pending = true;
                 if (self.desktop.takeDestroyed()) |id| {
                     self.interaction.toplevelDestroyed(id);
                     continue;
@@ -3467,7 +3473,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 }
                 if (self.desktop.peekInteractiveRequest()) |interactive_request| {
                     self.interaction.beginInteractive(&self.desktop, interactive_request) catch |err| switch (err) {
-                        error.Exhausted => break,
+                        error.Exhausted => {
+                            self.shell_maintenance_pending = true;
+                            break;
+                        },
                         error.StaleToplevel => {
                             self.desktop.dropInteractiveRequest();
                             continue;
@@ -3488,7 +3497,10 @@ pub fn Coordinator(comptime protocol: type) type {
                     else => null,
                 } else null;
                 const consumed = self.desktop.consume(&self.shell_adapter, 1) catch |err| switch (err) {
-                    error.Exhausted, error.Backpressure => break,
+                    error.Exhausted, error.Backpressure => consumed: {
+                        self.shell_maintenance_pending = true;
+                        break :consumed 0;
+                    },
                     else => return err,
                 };
                 if (consumed == 0) break;
@@ -3505,6 +3517,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     error.Exhausted => false,
                     else => return cause,
                 };
+                if (!synced) self.shell_maintenance_pending = true;
                 if (synced) {
                     self.desktop.markForeignToplevelSynced();
                     self.foreign_toplevel_outputs_dirty = false;
@@ -3530,6 +3543,14 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.syncToplevelDrag();
             if (self.shell_adapter.pendingOutbound() != 0)
                 self.markProtocolAll(ProtocolReady.shell);
+        }
+
+        fn shellMaintenancePending(self: *Self) bool {
+            return self.shell_maintenance_pending or
+                self.desktop.maintenancePending(&self.shell_adapter) or
+                self.foreign_adapter.hasPendingRelations() or
+                self.foreign_toplevel_list_adapter.pendingCommands() != 0 or
+                self.toplevel_drag_adapter.activeAttachment() != null;
         }
 
         fn applySessionRestore(self: *Self, shell_id: ShellAdapter.ToplevelId) !void {
@@ -4567,7 +4588,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn syncCommitTimer(self: *Self) !void {
-            const deadline = if (self.stopping)
+            const deadline = if (self.stopping or self.adapter.pendingContentUpdates() == 0)
                 null
             else
                 try self.adapter.nextCommitDeadline(try monotonicNs());
@@ -6006,6 +6027,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn markTextInputProtocol(self: *Self) void {
+            if (self.text_input_adapter.pendingOutbound() == 0) return;
             for (self.clients.items) |*client| {
                 if (client.active and self.text_input_adapter.pendingOutboundOn(client.peer))
                     client.protocol_ready |= ProtocolReady.text_input;
@@ -7399,22 +7421,17 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn admitReadyBatch(self: *Self, trigger: Adapter.SurfaceId) !bool {
             const now = try monotonicNs();
-            const ready_count = self.adapter.readyUpdateCountAtId(trigger, now) catch |err| switch (err) {
-                error.StaleSurface => return false,
-                else => return err,
-            };
-            if (ready_count == 0) return false;
-            try self.ensureUpdateBatchStorage(ready_count);
-            try self.ensureAvailableAppLayers(ready_count);
-            const ready = self.adapter.readyUpdateSurfaceIdsAt(
+            try self.ensureUpdateBatchStorage(self.adapter.pendingContentUpdates());
+            const inspected = self.adapter.inspectReadyUpdatesAtId(
                 trigger,
                 self.ready_update_ids,
                 now,
             ) catch |err| switch (err) {
                 error.StaleSurface => return false,
                 else => return err,
-            };
-            if (ready.len == 0) return false;
+            } orelse return false;
+            const ready = self.ready_update_ids[0..inspected.count];
+            try self.ensureAvailableAppLayers(ready.len);
             var superseded_count: usize = 0;
             for (ready, 0..) |id, index| {
                 const is_last = lastSurfaceOccurrence(ready, index);
@@ -7434,7 +7451,11 @@ pub fn Coordinator(comptime protocol: type) type {
                 superseded_count += @intFromBool(!is_last);
             }
             if (self.presentations.available() < superseded_count) return false;
-            const applied = try self.adapter.tryApplyAtId(trigger, self.applied_updates, now);
+            const applied = try self.adapter.applyInspectedUpdatesAtId(
+                trigger,
+                inspected,
+                self.applied_updates,
+            );
             std.debug.assert(applied.len == ready.len);
             for (applied, 0..) |*update, index| {
                 const id = update.surface;
@@ -10257,7 +10278,10 @@ pub fn Coordinator(comptime protocol: type) type {
             // expose outbound work in independent protocol adapters.
             if (object.interface != &protocol.wl_buffer.info and
                 object.interface != &protocol.wl_shm_pool.info)
+            {
+                self.shell_maintenance_pending = true;
                 self.markProtocolAll(ProtocolReady.all);
+            }
             const removed_surface_candidate: ?Adapter.SurfaceId = if (std.mem.eql(
                 u8,
                 object.interface.name,
