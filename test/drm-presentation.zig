@@ -267,6 +267,77 @@ test "physical coordinator activates and drains every desktop connector" {
     try root.deinit();
 }
 
+test "physical coordinator waits for peer output after a retired latching attempt" {
+    const allocator = std.testing.allocator;
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    fixture.second_desktop = true;
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-r15-output-fifo-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), compositorConfig());
+    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), coordinatorConfig());
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 1 });
+    try coordinator.start(&loop);
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    for (0..256) |_| {
+        _ = try loop.turn(coordinator);
+        if (coordinator.physical_output_count == 2 and
+            coordinator.physical_outputs[0].kms_output != null and
+            coordinator.physical_outputs[1].kms_output != null) break;
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+    }
+    const primary = &coordinator.physical_outputs[0];
+    const secondary = &coordinator.physical_outputs[1];
+    try std.testing.expect(primary.kms_output != null);
+    try std.testing.expect(secondary.kms_output != null);
+
+    fixture.fail_page_flip_crtc = 30;
+    try primary.kms_output.?.request(.damage, 1);
+    primary.damage_requested +%= 1;
+    try coordinator.completions(&.{}, &.{});
+    _ = try root.ring.submit();
+    try secondary.kms_output.?.request(.damage, 1);
+    secondary.damage_requested +%= 1;
+
+    while (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+    _ = try loop.turn(coordinator);
+    try std.testing.expectEqual(primary.damage_requested, primary.damage_applied);
+    try std.testing.expect(secondary.damage_applied != secondary.damage_requested);
+
+    for (0..64) |_| {
+        _ = try loop.turn(coordinator);
+        if (secondary.damage_applied == secondary.damage_requested) break;
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+    }
+    try std.testing.expectEqual(secondary.damage_requested, secondary.damage_applied);
+    for (0..64) |_| {
+        var in_flight = false;
+        for (coordinator.physical_outputs[0..coordinator.physical_output_count]) |physical|
+            in_flight = in_flight or (physical.kms_output != null and
+                physical.kms_output.?.in_flight_frame != null);
+        if (!in_flight) break;
+        _ = try loop.turn(coordinator);
+        _ = linux.sched_yield();
+    }
+
+    try coordinator.requestStop();
+    var drained = false;
+    for (0..512) |_| {
+        const progress = try loop.turn(coordinator);
+        drained = progress.wayring.shutdown_complete and coordinator.backendDrainComplete();
+        if (drained) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(drained);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
 test "physical coordinator retires a disconnected secondary output" {
     const allocator = std.testing.allocator;
     var fixture = try Fixture.init();
@@ -2727,6 +2798,7 @@ pub const Fixture = struct {
     device_closes: usize = 0,
     seat_closes: usize = 0,
     request_destroyed: usize = 0,
+    fail_page_flip_crtc: ?u32 = null,
     gbm_destroyed: usize = 0,
     imported_bos: usize = 0,
     import_attempts: usize = 0,
@@ -3108,10 +3180,14 @@ pub const Fixture = struct {
     fn atomicCommit(context: *anyopaque, _: linux.fd_t, request: ouro.drm_atomic.Request, flags: ouro.drm_atomic.CommitFlags, userdata: ?*anyopaque) !void {
         const self: *Fixture = @ptrCast(@alignCast(context));
         if (flags.page_flip_event) {
-            if (self.flip_len == self.pending_flips.len) return error.FlipQueueFull;
-            const index = (self.flip_head + self.flip_len) % self.pending_flips.len;
             const atomic_request: *AtomicRequest = @ptrCast(@alignCast(request));
             if (atomic_request.crtc == 0) return error.MissingCrtc;
+            if (self.fail_page_flip_crtc == atomic_request.crtc) {
+                self.fail_page_flip_crtc = null;
+                return error.AtomicCommitFailed;
+            }
+            if (self.flip_len == self.pending_flips.len) return error.FlipQueueFull;
+            const index = (self.flip_head + self.flip_len) % self.pending_flips.len;
             self.pending_flips[index] = .{
                 .userdata = userdata,
                 .crtc = atomic_request.crtc,
