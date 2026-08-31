@@ -3306,6 +3306,35 @@ test "shell-input: generated input-method client bridges focused text input" {
     try std.testing.expect(app_handler.mapped);
     try std.testing.expectEqual(@as(usize, 1), app_handler.text_input_enter);
     try std.testing.expect(method_handler.method != null);
+    try std.testing.expect(method_handler.popup_surface != null);
+    try std.testing.expect(method_handler.popup != null);
+    const method_server_objects = try root.runtime.clients.get(coordinator.clients.items[1].peer);
+    const popup_surface_handle = method_server_objects.namespace.lookupHandle(method_handler.popup_surface.?.id).?;
+    const popup_surface_object = method_server_objects.namespace.resolve(popup_surface_handle).?;
+    const popup_core_surface = try coordinator.adapter.getSurfaceObject(
+        popup_surface_handle,
+        popup_surface_object,
+    );
+    try std.testing.expect(popup_core_surface.role.id != 0);
+    const popup_role = popup_core_surface.role.id;
+    try std.testing.expect(popup_core_surface.role.object_active);
+    try wayring.client.sendRequest(
+        protocol.zwp_input_popup_surface_v2,
+        &method_client.objects,
+        &method_actor.transmit,
+        method_handler.popup.?,
+        .{ .destroy = .{} },
+    );
+    method_handler.popup = null;
+    try submitClient(&method_reactor, &method_driver, &method_handler);
+    for (0..64) |_| {
+        _ = try drainClient(&method_reactor, &method_driver, &method_handler);
+        _ = try loop.turn(coordinator);
+        if (!popup_core_surface.role.object_active) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(popup_role, popup_core_surface.role.id);
+    try std.testing.expect(!popup_core_surface.role.object_active);
     try std.testing.expectEqual(@as(usize, 1), method_handler.unavailable);
     try std.testing.expectEqual(@as(usize, 1), method_handler.grab_keymap);
     try std.testing.expectEqual(@as(usize, 1), method_handler.grab_repeat);
@@ -3860,6 +3889,7 @@ const InputMethodHandler = struct {
     objects: *wayring.objects.ClientObjects,
     queue: *wayring.tx.Queue,
     registry: wayring.objects.Handle,
+    compositor: ?wayring.objects.Handle = null,
     seat: ?wayring.objects.Handle = null,
     manager: ?wayring.objects.Handle = null,
     virtual_manager: ?wayring.objects.Handle = null,
@@ -3869,6 +3899,8 @@ const InputMethodHandler = struct {
     method: ?wayring.objects.Handle = null,
     rejected: ?wayring.objects.Handle = null,
     keyboard_grab: ?wayring.objects.Handle = null,
+    popup_surface: ?wayring.objects.Handle = null,
+    popup: ?wayring.objects.Handle = null,
     unavailable: usize = 0,
     activate: usize = 0,
     surrounding: usize = 0,
@@ -3892,6 +3924,7 @@ const InputMethodHandler = struct {
         if (target.object.interface == &ClientCore.Registry.info) {
             switch (try ClientCore.decodeRegistryEvent(self.objects, self.registry, message, fds)) {
                 .global => |v| {
+                    if (std.mem.eql(u8, v.interface, protocol.wl_compositor.info.name)) self.compositor = try ClientCore.bind(self.objects, self.queue, self.registry, v.name, &protocol.wl_compositor.info, @min(v.version, 7), null);
                     if (std.mem.eql(u8, v.interface, protocol.wl_seat.info.name)) self.seat = try ClientCore.bind(self.objects, self.queue, self.registry, v.name, &protocol.wl_seat.info, @min(v.version, 9), null);
                     if (std.mem.eql(u8, v.interface, protocol.zwp_input_method_manager_v2.info.name)) self.manager = try ClientCore.bind(self.objects, self.queue, self.registry, v.name, &protocol.zwp_input_method_manager_v2.info, 1, null);
                     if (std.mem.eql(u8, v.interface, protocol.zwp_virtual_keyboard_manager_v1.info.name)) self.virtual_manager = try ClientCore.bind(self.objects, self.queue, self.registry, v.name, &protocol.zwp_virtual_keyboard_manager_v1.info, 1, null);
@@ -3914,6 +3947,20 @@ const InputMethodHandler = struct {
                         self.method = (try protocol.zwp_input_method_manager_v2.construct_get_input_method(self.objects, self.queue, self.manager.?, .{ .seat = self.seat.?.id })).input_method;
                         self.rejected = (try protocol.zwp_input_method_manager_v2.construct_get_input_method(self.objects, self.queue, self.manager.?, .{ .seat = self.seat.?.id })).input_method;
                         self.keyboard_grab = (try protocol.zwp_input_method_v2.construct_grab_keyboard(self.objects, self.queue, self.method.?, .{})).keyboard;
+                    }
+                    if (self.popup == null and self.compositor != null and self.method != null) {
+                        self.popup_surface = (try protocol.wl_compositor.construct_create_surface(
+                            self.objects,
+                            self.queue,
+                            self.compositor.?,
+                            .{},
+                        )).id;
+                        self.popup = (try protocol.zwp_input_method_v2.construct_get_input_popup_surface(
+                            self.objects,
+                            self.queue,
+                            self.method.?,
+                            .{ .surface = self.popup_surface.?.id },
+                        )).id;
                     }
                 },
                 .global_remove => {},

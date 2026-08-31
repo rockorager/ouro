@@ -231,7 +231,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const SessionLockAdapter = protocol_session_lock.Adapter(protocol, Adapter, OutputAdapter);
         const CursorShapeAdapter = protocol_cursor_shape.Adapter(protocol);
         const TextInputAdapter = protocol_text_input.Adapter(protocol);
-        const InputMethodAdapter = protocol_input_method.Adapter(protocol, TextInputAdapter);
+        const InputMethodAdapter = protocol_input_method.Adapter(protocol, Adapter, TextInputAdapter);
         const VirtualKeyboardAdapter = protocol_virtual_keyboard.Adapter(protocol, SeatAdapter);
         const VirtualPointerAdapter = protocol_virtual_pointer.Adapter(protocol, SeatAdapter);
         const TransientSeatAdapter = protocol_transient_seat.Adapter(protocol, SeatAdapter);
@@ -1214,7 +1214,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .validateFn = validateTextInputSeat,
             }, config.text_input);
             errdefer self.text_input_adapter.deinit();
-            self.input_method_adapter = try InputMethodAdapter.init(allocator, &self.text_input_adapter, .{
+            self.input_method_adapter = try InputMethodAdapter.init(allocator, &self.adapter, &self.text_input_adapter, .{
                 .context = self,
                 .resolveFn = resolveInputMethodSeat,
             }, config.input_method);
@@ -10019,6 +10019,7 @@ pub fn Coordinator(comptime protocol: type) type {
             if (removed_surface_peer) |peer| self.data_device_adapter.surfaceRemoved(peer, handle.id);
             if (removed_surface_peer) |peer| self.output_adapter.surfaceRemoved(peer, handle);
             if (removed_surface) |id| {
+                self.input_method_adapter.surfaceRemoved(id);
                 self.pointer_constraints_adapter.surfaceRemoved(id);
                 self.color_management_adapter.surfaceRemoved(id);
                 self.color_representation_adapter.surfaceRemoved(id);

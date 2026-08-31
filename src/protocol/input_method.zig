@@ -4,7 +4,9 @@ const wayring = @import("wayring");
 const objects = wayring.objects;
 const linux = std.os.linux;
 const slot_pool = @import("slot_pool.zig");
+const surface_state = @import("../surface.zig");
 const none = std.math.maxInt(u32);
+const popup_role_id: surface_state.RoleId = 0x696d_5f70_6f70_7570;
 
 pub const GrabId = packed struct { index: u32, generation: u32 };
 pub const Modifiers = struct { serial: u32 = 0, depressed: u32 = 0, latched: u32 = 0, locked: u32 = 0, group: u32 = 0 };
@@ -91,7 +93,7 @@ pub const PendingEdit = struct {
     }
 };
 
-pub fn Adapter(comptime protocol: type, comptime TextInput: type) type {
+pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime TextInput: type) type {
     return struct {
         const Self = @This();
         const Runtime = wayring.server.Runtime(protocol);
@@ -103,11 +105,12 @@ pub fn Adapter(comptime protocol: type, comptime TextInput: type) type {
         const ManagerSlot = struct { header: slot_pool.Header = .{}, resource: objects.Handle = .{ .id = 0, .generation = 0 }, peer: wayring.io_uring.Peer = undefined };
         const MethodId = packed struct { index: u32, generation: u32 };
         const MethodSlot = struct { header: slot_pool.Header = .{}, resource: objects.Handle = .{ .id = 0, .generation = 0 }, peer: wayring.io_uring.Peer = undefined, seat_key: u32 = 0, available: bool = false, enabled: bool = false, target: ?TextInput.DeviceId = null, done_serial: u32 = 0, pending: PendingEdit = .{} };
-        const Child = struct { header: slot_pool.Header = .{}, resource: objects.Handle = .{ .id = 0, .generation = 0 }, peer: wayring.io_uring.Peer = undefined, parent: MethodId = undefined, order: u64 = 0, eligible: bool = true };
+        const Child = struct { header: slot_pool.Header = .{}, resource: objects.Handle = .{ .id = 0, .generation = 0 }, peer: wayring.io_uring.Peer = undefined, parent: MethodId = undefined, surface: ?CoreSurface.SurfaceId = null, order: u64 = 0, eligible: bool = true };
         const OutKind = enum { unavailable, activate, deactivate, surrounding, cause, content, done, grab_keymap, grab_repeat, grab_modifiers, grab_key };
         const Out = struct { active: bool = false, sequence: u64 = 0, peer: wayring.io_uring.Peer = undefined, method: MethodId = undefined, grab: GrabId = .{ .index = none, .generation = 0 }, kind: OutKind = .unavailable, text_len: usize = 0, cursor: u32 = 0, anchor: u32 = 0, cause: u32 = 0, hints: u32 = 0, purpose: u32 = 0, serial: u32 = 0, time: u32 = 0, key: u32 = 0, state: u32 = 0, modifiers: Modifiers = .{}, rate: i32 = 0, delay: i32 = 0, size: u32 = 0, storage: []u8 = &.{} };
 
         allocator: std.mem.Allocator,
+        core: *CoreSurface,
         validator: SeatValidator,
         text_input: *TextInput,
         managers: slot_pool.Pool(ManagerSlot),
@@ -126,7 +129,7 @@ pub fn Adapter(comptime protocol: type, comptime TextInput: type) type {
         runtime: ?*Runtime = null,
         global: ?objects.Handle = null,
 
-        pub fn init(a: std.mem.Allocator, ti: *TextInput, validator: SeatValidator, c: Config) !Self {
+        pub fn init(a: std.mem.Allocator, core: *CoreSurface, ti: *TextInput, validator: SeatValidator, c: Config) !Self {
             try c.validate();
             try Manager.info.validateVersion(1);
             var managers = try slot_pool.Pool(ManagerSlot).init(a, c.manager_capacity);
@@ -145,10 +148,11 @@ pub fn Adapter(comptime protocol: type, comptime TextInput: type) type {
                 o.* = .{};
                 o.storage = ot[i * c.string_bytes ..][0..c.string_bytes];
             }
-            return .{ .allocator = a, .validator = validator, .text_input = ti, .managers = managers, .methods = methods, .popups = popups, .grabs = grabs, .outbound = outbound, .out_text = ot, .string_bytes = c.string_bytes };
+            return .{ .allocator = a, .core = core, .validator = validator, .text_input = ti, .managers = managers, .methods = methods, .popups = popups, .grabs = grabs, .outbound = outbound, .out_text = ot, .string_bytes = c.string_bytes };
         }
         pub fn deinit(self: *Self) void {
             for (self.outbound) |*o| self.dropOut(o);
+            for (self.popups.entries.items) |popup| if (popup.header.active) self.releasePopup(popup);
             self.allocator.free(self.out_text);
             self.allocator.free(self.outbound);
             self.grabs.deinit();
@@ -236,10 +240,25 @@ pub fn Adapter(comptime protocol: type, comptime TextInput: type) type {
                     },
                     .commit => |q| self.commit(m, q.serial) catch return try self.noMemory(actor),
                     .get_input_popup_surface => |q| {
+                        const surface_handle = so.namespace.lookupHandle(q.surface) orelse
+                            return try self.protocolError(actor, d.handle.id, Method.@"error".role.value, "invalid wl_surface");
+                        const surface_object = so.namespace.resolve(surface_handle) orelse
+                            return try self.protocolError(actor, d.handle.id, Method.@"error".role.value, "invalid wl_surface");
+                        const surface = self.core.getSurfaceObject(surface_handle, surface_object) catch
+                            return try self.protocolError(actor, d.handle.id, Method.@"error".role.value, "foreign wl_surface");
+                        const surface_id = self.core.surfaceIdObject(surface_handle, surface_object) catch unreachable;
+                        if (!same(try self.core.surfacePeer(surface_id), peer) or surface.role.id != 0)
+                            return try self.protocolError(actor, d.handle.id, Method.@"error".role.value, "surface already has a role");
                         const c = self.popups.acquire() catch return try self.noMemory(actor);
                         c.peer = peer;
                         c.parent = self.methodId(m);
+                        c.surface = surface_id;
+                        surface.role.assign(popup_role_id, true) catch {
+                            self.popups.release(c);
+                            return try self.protocolError(actor, d.handle.id, Method.@"error".role.value, "surface role conflict");
+                        };
                         const admitted = Method.admit_get_input_popup_surface(so, d.handle, q, .{ .id = c }) catch |e| {
+                            surface.role.deactivateObject(popup_role_id) catch {};
                             self.popups.release(c);
                             return try self.failure(actor, d.handle.id, e);
                         };
@@ -522,7 +541,12 @@ pub fn Adapter(comptime protocol: type, comptime TextInput: type) type {
                 self.managers.release(m);
                 return true;
             }
-            if (o.interface == &Popup.info) return self.removeChild(&self.popups, h, o);
+            if (o.interface == &Popup.info) {
+                const popup = self.popups.fromContext(o.context) orelse return false;
+                if (!std.meta.eql(popup.resource, h)) return false;
+                self.releasePopup(popup);
+                return true;
+            }
             if (o.interface == &Grab.info) {
                 const c = self.grabs.fromContext(o.context) orelse return false;
                 if (!std.meta.eql(c.resource, h)) return false;
@@ -534,9 +558,17 @@ pub fn Adapter(comptime protocol: type, comptime TextInput: type) type {
         pub fn disconnected(self: *Self, peer: wayring.io_uring.Peer) void {
             for (self.methods.entries.items) |m| if (m.header.active and same(m.peer, peer)) self.releaseMethod(m);
             for (self.managers.entries.items) |m| if (m.header.active and same(m.peer, peer)) self.managers.release(m);
-            for (self.popups.entries.items) |c| if (c.header.active and same(c.peer, peer)) self.popups.release(c);
+            for (self.popups.entries.items) |c| if (c.header.active and same(c.peer, peer)) self.releasePopup(c);
             for (self.grabs.entries.items) |c| if (c.header.active and same(c.peer, peer)) self.releaseGrab(c);
             for (self.outbound) |*o| if (o.active and same(o.peer, peer)) self.dropOut(o);
+        }
+
+        pub fn surfaceRemoved(self: *Self, id: CoreSurface.SurfaceId) void {
+            for (self.popups.entries.items) |popup| {
+                if (popup.header.active and popup.surface != null and
+                    std.meta.eql(popup.surface.?, id))
+                    popup.surface = null;
+            }
         }
 
         fn acquireMethod(self: *Self) !*MethodSlot {
@@ -579,11 +611,12 @@ pub fn Adapter(comptime protocol: type, comptime TextInput: type) type {
             self.grabs.release(c);
             self.promoteGrab();
         }
-        fn removeChild(_: *Self, pool: *slot_pool.Pool(Child), h: objects.Handle, o: objects.Object) bool {
-            const c = pool.fromContext(o.context) orelse return false;
-            if (!std.meta.eql(c.resource, h)) return false;
-            pool.release(c);
-            return true;
+        fn releasePopup(self: *Self, popup: *Child) void {
+            if (!popup.header.active) return;
+            if (popup.surface) |surface_id| if (self.core.getSurfaceById(surface_id)) |surface|
+                surface.role.deactivateObject(popup_role_id) catch {}
+            else |_| {};
+            self.popups.release(popup);
         }
         fn findAvailable(self: *Self, seat_key: u32) ?*MethodSlot {
             for (self.methods.entries.items) |m| if (m.header.active and m.available and m.seat_key == seat_key) return m;
@@ -670,6 +703,12 @@ test "input method validates bounded UTF-8 and preedit cursors transactionally" 
 }
 
 test "input method arbitration state edits generation and disconnect" {
+    const S = struct {
+        pub const SurfaceId = packed struct { index: u32, generation: u32 };
+        pub fn getSurfaceById(_: *@This(), _: SurfaceId) error{StaleSurface}!*surface_state.Surface {
+            return error.StaleSurface;
+        }
+    };
     const T = struct {
         pub const DeviceId = packed struct { index: u32, generation: u32 };
         pub const Event = struct { device: DeviceId, peer: wayring.io_uring.Peer, seat: u32, state: struct { enabled: bool, has_surrounding: bool = false, cursor: i32 = 0, anchor: i32 = 0, cause: u32 = 0, has_content_type: bool = false, hints: u32 = 0, purpose: u32 = 0 }, surrounding: []const u8 = "", serial: u32 = 0 };
@@ -678,14 +717,15 @@ test "input method arbitration state edits generation and disconnect" {
             self.calls += 1;
         }
     };
-    const A = Adapter(@import("core_protocol"), T);
+    const A = Adapter(@import("core_protocol"), S, T);
+    var surfaces: S = .{};
     var ti: T = .{};
     const validator: SeatValidator = .{ .resolveFn = struct {
         fn f(_: ?*anyopaque, _: wayring.io_uring.Peer, _: u32) ?u32 {
             return 7;
         }
     }.f };
-    var a = try A.init(std.testing.allocator, &ti, validator, .{ .manager_capacity = 1, .method_capacity = 1, .popup_capacity = 1, .grab_capacity = 1, .outbound_capacity = 12, .string_bytes = 16 });
+    var a = try A.init(std.testing.allocator, &surfaces, &ti, validator, .{ .manager_capacity = 1, .method_capacity = 1, .popup_capacity = 1, .grab_capacity = 1, .outbound_capacity = 12, .string_bytes = 16 });
     defer a.deinit();
     const manager_one = try a.managers.acquire();
     const manager_two = try a.managers.acquire();
@@ -721,14 +761,21 @@ test "input method arbitration state edits generation and disconnect" {
 }
 
 test "input method keyboard grab orders sync, excludes stale generations, and promotes oldest waiter" {
+    const S = struct {
+        pub const SurfaceId = packed struct { index: u32, generation: u32 };
+        pub fn getSurfaceById(_: *@This(), _: SurfaceId) error{StaleSurface}!*surface_state.Surface {
+            return error.StaleSurface;
+        }
+    };
     const T = struct {
         pub const DeviceId = packed struct { index: u32, generation: u32 };
         pub const Event = struct { device: DeviceId, state: struct { enabled: bool }, surrounding: []const u8 = "" };
         pub fn queueEdit(_: *@This(), _: DeviceId, _: anytype) !void {}
     };
-    const A = Adapter(@import("core_protocol"), T);
+    const A = Adapter(@import("core_protocol"), S, T);
+    var surfaces: S = .{};
     var ti: T = .{};
-    var a = try A.init(std.testing.allocator, &ti, .{ .resolveFn = struct {
+    var a = try A.init(std.testing.allocator, &surfaces, &ti, .{ .resolveFn = struct {
         fn f(_: ?*anyopaque, _: wayring.io_uring.Peer, _: u32) ?u32 {
             return 9;
         }
