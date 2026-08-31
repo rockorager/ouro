@@ -52,6 +52,7 @@ pub fn Interaction(comptime Desktop: type) type {
             point: FixedPoint,
         };
         pub const FixedPoint = struct { x: i32, y: i32 };
+        pub const GlobalFixedPoint = struct { x: i64, y: i64 };
         pub const MotionDelta = struct { dx: f64, dy: f64 };
         pub const AbsolutePoint = struct { x: f64, y: f64 };
         pub const Cancellation = packed struct {
@@ -237,6 +238,10 @@ pub fn Interaction(comptime Desktop: type) type {
 
         pub fn pointerPosition(self: *const Self) geometry.Point {
             return .{ .x = fixedFloor(self.x_fixed), .y = fixedFloor(self.y_fixed) };
+        }
+
+        pub fn pointerPositionFixed(self: *const Self) GlobalFixedPoint {
+            return .{ .x = self.x_fixed, .y = self.y_fixed };
         }
 
         pub fn confineMotion(

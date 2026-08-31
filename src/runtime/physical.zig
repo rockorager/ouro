@@ -4626,14 +4626,22 @@ pub fn Coordinator(comptime protocol: type) type {
                             try self.seatTarget(value.surface)
                         else
                             null;
-                        const point: SeatAdapter.Point = if (target) |value|
+                        const focus_point: SeatAdapter.Point = if (target) |value|
                             .{ .x = value.point.x, .y = value.point.y }
                         else
                             .{ .x = 0, .y = 0 };
-                        try self.seat_adapter.setPointerFocus(seat_target, point);
+                        var delivery_point = focus_point;
+                        switch (self.seat_adapter.grabState()) {
+                            .active, .cancelled => |grab| delivery_point = self.pointerPointForSurface(
+                                grab.surface,
+                                self.interaction.pointerPositionFixed(),
+                            ) orelse self.seat_adapter.pointerState().point,
+                            .idle => {},
+                        }
+                        try self.seat_adapter.setPointerFocus(seat_target, delivery_point);
                         try self.pointer_constraints_adapter.updateFocus(
                             if (target) |value| value.surface else null,
-                            .{ .x = point.x, .y = point.y },
+                            .{ .x = focus_point.x, .y = focus_point.y },
                         );
                     },
                     .keyboard_focus => |target| {
@@ -8970,6 +8978,16 @@ pub fn Coordinator(comptime protocol: type) type {
             };
         }
 
+        fn pointerPointForSurface(
+            self: *Self,
+            id: Adapter.SurfaceId,
+            global: Interaction.GlobalFixedPoint,
+        ) ?SeatAdapter.Point {
+            const scene = self.surfaceScene(id) orelse return null;
+            const point = fixedPointForScene(scene, global) orelse return null;
+            return .{ .x = point.x, .y = point.y };
+        }
+
         fn layerShellScene(self: *Self, id: Adapter.SurfaceId) ?Desktop.SceneWindow {
             const state = self.layer_shell_adapter.stateForSurface(id) orelse return null;
             if (!state.mapped) return null;
@@ -10357,6 +10375,27 @@ fn longestCursorShapeName() usize {
     return longest;
 }
 
+fn fixedPointForScene(scene: anytype, global: anytype) ?geometry.Point {
+    const root_x: i64 = if (scene.subsurface and scene.root.has_window_geometry)
+        @as(i64, scene.root.geometry.x) - scene.root.surface_offset.x
+    else
+        scene.root.geometry.x;
+    const root_y: i64 = if (scene.subsurface and scene.root.has_window_geometry)
+        @as(i64, scene.root.geometry.y) - scene.root.surface_offset.y
+    else
+        scene.root.geometry.y;
+    const surface_x = root_x + scene.offset_x;
+    const surface_y = root_y + scene.offset_y;
+    const local_x = global.x - surface_x * 256 +
+        if (scene.subsurface) 0 else @as(i64, scene.root.surface_offset.x) * 256;
+    const local_y = global.y - surface_y * 256 +
+        if (scene.subsurface) 0 else @as(i64, scene.root.surface_offset.y) * 256;
+    return .{
+        .x = std.math.cast(i32, local_x) orelse return null,
+        .y = std.math.cast(i32, local_y) orelse return null,
+    };
+}
+
 fn activateOutputWithRollback(
     owner: anytype,
     desired: anytype,
@@ -10421,6 +10460,34 @@ test "physical: output mode inventory deduplicates timings and preserves preferr
     try std.testing.expectError(
         error.InvalidModeInventory,
         collectOutputModes(storage[0..1], modes[0..2]),
+    );
+}
+
+test "physical: implicit pointer grabs retain the origin surface coordinate space" {
+    const scene = .{
+        .root = .{
+            .geometry = geometry.Rect{ .x = 100, .y = 50, .width = 40, .height = 30 },
+            .has_window_geometry = true,
+            .surface_offset = geometry.Point{ .x = 5, .y = 7 },
+        },
+        .offset_x = @as(i32, 0),
+        .offset_y = @as(i32, 0),
+        .subsurface = false,
+    };
+    try std.testing.expectEqual(
+        @as(?geometry.Point, .{ .x = 15 * 256 + 128, .y = 17 * 256 + 64 }),
+        fixedPointForScene(scene, .{ .x = 110 * 256 + 128, .y = 60 * 256 + 64 }),
+    );
+
+    const child = .{
+        .root = scene.root,
+        .offset_x = @as(i32, 20),
+        .offset_y = @as(i32, 10),
+        .subsurface = true,
+    };
+    try std.testing.expectEqual(
+        @as(?geometry.Point, .{ .x = 5 * 256 + 128, .y = 7 * 256 + 64 }),
+        fixedPointForScene(child, .{ .x = 120 * 256 + 128, .y = 60 * 256 + 64 }),
     );
 }
 
