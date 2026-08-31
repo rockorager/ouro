@@ -5679,8 +5679,8 @@ pub fn Coordinator(comptime protocol: type) type {
                     break :absolute .{ .pointer_motion = .{
                         .device = value.device,
                         .time_usec = @as(u64, value.time) * 1000,
-                        .dx = @floatFromInt(target_x - @divFloor(current.x, 256)),
-                        .dy = @floatFromInt(target_y - @divFloor(current.y, 256)),
+                        .dx = fixedNormalizedDelta(target_x * 256 - current.x),
+                        .dy = fixedNormalizedDelta(target_y * 256 - current.y),
                     } };
                 },
                 .button => |value| .{ .pointer_button = .{
@@ -5712,6 +5712,19 @@ pub fn Coordinator(comptime protocol: type) type {
                 var position = self.transient_seat_adapter.pointerPosition(seat) orelse return true;
                 position.x = clampFixedPosition(position.x, normalized.pointer_motion.dx, bounds.x, bounds.width);
                 position.y = clampFixedPosition(position.y, normalized.pointer_motion.dy, bounds.y, bounds.height);
+                const mapped = switch (event) {
+                    .motion => |value| value.output != null,
+                    .motion_absolute => |value| value.output != null,
+                    else => false,
+                };
+                if (!mapped) {
+                    const projected = self.interaction.confinePoint(
+                        fixedNormalizedDelta(position.x),
+                        fixedNormalizedDelta(position.y),
+                    ) catch return true;
+                    position.x = gestureFixed(projected.x);
+                    position.y = gestureFixed(projected.y);
+                }
                 const whole: geometry.Point = .{ .x = @divFloor(position.x, 256), .y = @divFloor(position.y, 256) };
                 const windows = self.desktop.sceneSnapshot(self.scene_windows) catch return true;
                 var input_scene: InputScene = .{ .coordinator = self };
