@@ -717,6 +717,12 @@ fn generatedMultiHeadApply(
         try std.testing.expectEqual(@as(?i32, 2), logical.width);
         try std.testing.expectEqual(@as(?i32, 3), logical.height);
         try std.testing.expectEqual(@as(u3, 1), logical.transform);
+        const capture = coordinator.captureConstraints(.{ .source = .{
+            .output = first_output.outputId(),
+        } }).?;
+        try std.testing.expectEqual(@as(u32, 3), capture.width);
+        try std.testing.expectEqual(@as(u32, 2), capture.height);
+        try std.testing.expectEqual(@as(u3, 1), capture.transform);
     }
     if (disable_second and !reenable_second) {
         try std.testing.expectEqual(

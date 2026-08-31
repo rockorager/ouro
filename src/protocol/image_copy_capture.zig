@@ -45,6 +45,7 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
         pub const Constraints = struct {
             width: u32,
             height: u32,
+            transform: u3 = 0,
             dmabuf_device: ?u64 = null,
         };
         pub const Point = struct { x: i32, y: i32 };
@@ -124,7 +125,7 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
             dmabuf_xrgb,
             done,
             stopped,
-            transform,
+            transform: u3,
             damage: Constraints,
             presentation: u64,
             ready,
@@ -595,7 +596,7 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
             if (f.constraints_changed) return self.finishFailure(id, .buffer_constraints);
             if (self.outbound.len - self.outbound_count < 4) return error.Exhausted;
             const c = f.constraints orelse return self.finishFailure(id, .stopped);
-            try self.enqueue(.{ .frame = id }, .transform);
+            try self.enqueue(.{ .frame = id }, .{ .transform = c.transform });
             try self.enqueue(.{ .frame = id }, .{ .damage = c });
             try self.enqueue(.{ .frame = id }, .{ .presentation = timestamp_ns });
             try self.enqueue(.{ .frame = id }, .ready);
@@ -772,7 +773,9 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
                             continue;
                         }
                         const event: FrameProtocol.Event = switch (out.event) {
-                            .transform => .{ .transform = .{ .transform = protocol.wl_output.transform.normal } },
+                            .transform => |transform| .{ .transform = .{
+                                .transform = protocol.wl_output.transform.fromInt(transform),
+                            } },
                             .damage => |size| .{ .damage = .{
                                 .x = 0,
                                 .y = 0,
@@ -1082,7 +1085,7 @@ test "image copy capture: generated events flush in protocol order" {
         test_peer,
         session_resource,
         test_snapshot,
-        .{ .width = 64, .height = 32, .dmabuf_device = 0x1234 },
+        .{ .width = 64, .height = 32, .transform = 3, .dmabuf_device = 0x1234 },
         false,
     );
 
@@ -1154,6 +1157,10 @@ test "image copy capture: generated events flush in protocol order" {
         try std.testing.expectEqual(@as(u32, 11), message.header.object_id);
         const event = try protocol.ext_image_copy_capture_frame_v1.decodeEvent(message, &queue.descriptors);
         try std.testing.expectEqual(expected, std.meta.activeTag(event));
+        if (event == .transform) try std.testing.expectEqual(
+            protocol.wl_output.transform.@"270".value,
+            event.transform.transform.value,
+        );
         bytes = bytes[message.header.size..];
     }
     try std.testing.expectEqual(@as(usize, 0), bytes.len);

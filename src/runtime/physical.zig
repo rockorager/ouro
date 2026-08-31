@@ -4189,14 +4189,23 @@ pub fn Coordinator(comptime protocol: type) type {
             const maybe_constraints: ?ImageCopyCaptureAdapter.Constraints = switch (target) {
                 .source => |source| switch (source) {
                     .output => |id| if (self.physicalOutputForKmsId(id)) |physical| .{
-                        .width = physical.kms_output.?.planner.output.width,
-                        .height = physical.kms_output.?.planner.output.height,
+                        .width = physical.kms_output.?.planner.physical_output.width,
+                        .height = physical.kms_output.?.planner.physical_output.height,
+                        .transform = @intFromEnum(
+                            physical.kms_output.?.planner.output_transform,
+                        ),
                     } else null,
                     .toplevel => |id| if (self.desktop.scene(id)) |scene|
-                        if (self.physicalSceneRect(scene.geometry)) |physical| .{
-                            .width = @intCast(physical.width),
-                            .height = @intCast(physical.height),
-                        } else null
+                        if (self.physicalOutputContainingSceneRect(scene.geometry)) |output|
+                            if (output.kms_output.?.planner.output_transform == .normal)
+                                if (self.physicalSceneRectFor(scene.geometry, output)) |physical| .{
+                                    .width = @intCast(physical.width),
+                                    .height = @intCast(physical.height),
+                                } else null
+                            else
+                                null
+                        else
+                            null
                     else |_|
                         null,
                 },
@@ -4263,6 +4272,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .toplevel => |id| (self.desktop.scene(id) catch return null).geometry,
             };
             const output = self.captureKmsOutput(target) orelse return null;
+            if (output.planner.output_transform != .normal) return null;
             const physical = self.physicalOutputForKmsId(output.outputId()) orelse return null;
             const output_bounds = self.outputBoundsFor(physical) catch return null;
             const cursor_region: geometry.Rect = .{
@@ -5051,6 +5061,7 @@ pub fn Coordinator(comptime protocol: type) type {
             const reference = self.output_adapter.reference(peer, handle, object) catch return null;
             const physical = self.physicalOutputForProtocolId(reference.output) orelse return null;
             const output = physical.kms_output orelse return null;
+            if (output.planner.output_transform != .normal) return null;
             return .{
                 .width = output.planner.output.width,
                 .height = output.planner.output.height,
@@ -7770,7 +7781,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.failQueuedScreencopy(capture);
                 return;
             };
-            const full_stride = std.math.mul(u32, output.planner.output.width, 4) catch {
+            const full_stride = std.math.mul(u32, output.planner.physical_output.width, 4) catch {
                 self.shm.store.unpin(pin) catch unreachable;
                 try self.failQueuedScreencopy(capture);
                 return;
@@ -7919,7 +7930,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.failImageCopy(capture);
                 return;
             };
-            const full_stride = std.math.mul(u32, output.planner.output.width, 4) catch {
+            const full_stride = std.math.mul(u32, output.planner.physical_output.width, 4) catch {
                 try self.releaseImageCopyDestination(destination);
                 try self.failImageCopy(capture);
                 return;
@@ -7928,7 +7939,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 const capture_bytes = std.math.mul(
                     usize,
                     full_stride,
-                    output.planner.output.height,
+                    output.planner.physical_output.height,
                 ) catch {
                     try self.releaseImageCopyDestination(destination);
                     try self.failImageCopy(capture);
@@ -8124,7 +8135,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 pending.height,
                 pending.region,
                 readback,
-                output.planner.output,
+                output.planner.physical_output,
             );
             try access.end();
             ended = true;
