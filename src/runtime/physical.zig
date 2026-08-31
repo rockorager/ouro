@@ -463,6 +463,8 @@ pub fn Coordinator(comptime protocol: type) type {
             callback_data: ?u32 = null,
             feedback_outcome: ?Adapter.PresentationOutcome = null,
             feedback_output: ?OutputAdapter.OutputId = null,
+            change_output_count: usize = 0,
+            outcome_output_count: usize = 0,
             retire_after_outcome: bool = false,
             retire_after_source_release: bool = false,
             retains_source: bool = false,
@@ -738,12 +740,17 @@ pub fn Coordinator(comptime protocol: type) type {
         pending_surface_head: usize = 0,
         pending_surface_len: usize = 0,
         app_layers: []Layer,
+        output_tracking_capacity: usize,
+        app_layer_change_outputs: []bool,
+        app_layer_outcome_outputs: []bool,
         scene_windows: []Desktop.SceneWindow,
         popup_scene_windows: []Desktop.SceneWindow,
         frame_samples: []render_list.AppliedSurface,
         frame_bindings: []output_api.SampleBinding,
         frame_changes: []damage.Change,
+        frame_change_layers: []?*Layer,
         removed_layers: []RemovedLayer,
+        removed_layer_outputs: []bool,
         removed_layer_len: usize = 0,
         association_surfaces: []wayring.objects.Handle,
         output_associations_dirty: bool = true,
@@ -853,6 +860,18 @@ pub fn Coordinator(comptime protocol: type) type {
             self.app_layers = try allocator.alloc(Layer, app_layer_capacity);
             errdefer allocator.free(self.app_layers);
             @memset(self.app_layers, .{});
+            self.output_tracking_capacity = config.drm.connector_capacity;
+            const app_layer_output_capacity = try std.math.mul(
+                usize,
+                app_layer_capacity,
+                self.output_tracking_capacity,
+            );
+            self.app_layer_change_outputs = try allocator.alloc(bool, app_layer_output_capacity);
+            errdefer allocator.free(self.app_layer_change_outputs);
+            @memset(self.app_layer_change_outputs, false);
+            self.app_layer_outcome_outputs = try allocator.alloc(bool, app_layer_output_capacity);
+            errdefer allocator.free(self.app_layer_outcome_outputs);
+            @memset(self.app_layer_outcome_outputs, false);
             const scene_capacity = try std.math.add(
                 usize,
                 config.desktop.toplevel_capacity,
@@ -880,8 +899,20 @@ pub fn Coordinator(comptime protocol: type) type {
                 try std.math.add(usize, config.output.max_samples, config.surface.surface_capacity),
             );
             errdefer allocator.free(self.frame_changes);
+            self.frame_change_layers = try allocator.alloc(?*Layer, self.frame_changes.len);
+            errdefer allocator.free(self.frame_change_layers);
             self.removed_layers = try allocator.alloc(RemovedLayer, config.surface.surface_capacity);
             errdefer allocator.free(self.removed_layers);
+            self.removed_layer_outputs = try allocator.alloc(
+                bool,
+                try std.math.mul(
+                    usize,
+                    config.surface.surface_capacity,
+                    self.output_tracking_capacity,
+                ),
+            );
+            errdefer allocator.free(self.removed_layer_outputs);
+            @memset(self.removed_layer_outputs, false);
             self.removed_layer_len = 0;
             self.association_surfaces = try allocator.alloc(
                 wayring.objects.Handle,
@@ -1657,13 +1688,17 @@ pub fn Coordinator(comptime protocol: type) type {
             self.allocator.free(self.inhibitor_surface_ids);
             self.allocator.free(self.layer_surface_ids);
             self.allocator.free(self.association_surfaces);
+            self.allocator.free(self.frame_change_layers);
             self.allocator.free(self.frame_changes);
+            self.allocator.free(self.removed_layer_outputs);
             self.allocator.free(self.removed_layers);
             self.allocator.free(self.frame_bindings);
             self.allocator.free(self.frame_samples);
             self.allocator.free(self.popup_scene_windows);
             self.allocator.free(self.scene_windows);
             self.allocator.free(self.foreign_toplevels);
+            self.allocator.free(self.app_layer_outcome_outputs);
+            self.allocator.free(self.app_layer_change_outputs);
             self.allocator.free(self.app_layers);
             self.cursor_shape_adapter.deinit();
             self.cursor_cache.deinit();
@@ -5203,6 +5238,72 @@ pub fn Coordinator(comptime protocol: type) type {
             if (requested) try self.armTimer();
         }
 
+        fn layerShellOutput(self: *Self, layer: *const Layer) ?OutputAdapter.OutputId {
+            const id = layer.id orelse return null;
+            if (self.layer_shell_adapter.stateForSurface(id)) |state| return state.output;
+            const scene = self.surfaceScene(id) orelse return null;
+            return if (self.layer_shell_adapter.stateForSurface(scene.root.surface)) |state|
+                state.output
+            else
+                null;
+        }
+
+        fn surfaceStateTouchesOutput(
+            state: damage.SurfaceState,
+            bounds: geometry.Rect,
+        ) bool {
+            return (clipToOutput(state.destination, bounds) catch return true) != null;
+        }
+
+        fn requestLayerOutputDamage(
+            self: *Self,
+            layer: *Layer,
+            now: u64,
+        ) !bool {
+            const change = layer.change orelse return false;
+            const change_outputs = self.appLayerOutputRow(
+                self.app_layer_change_outputs,
+                layer,
+            ) orelse return false;
+            const outcome_outputs = self.appLayerOutputRow(
+                self.app_layer_outcome_outputs,
+                layer,
+            ) orelse return false;
+            for (change_outputs) |pending| std.debug.assert(!pending);
+            for (outcome_outputs) |pending| std.debug.assert(!pending);
+            std.debug.assert(layer.change_output_count == 0);
+            std.debug.assert(layer.outcome_output_count == 0);
+            const pinned_output = self.layerShellOutput(layer);
+            var requested = false;
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                if (!physical.connected or physical.kms_output == null) continue;
+                const bounds = try self.outputBoundsFor(physical);
+                const previous_visible = if (pinned_output) |id|
+                    change.previous != null and std.meta.eql(id, physical.protocol_output)
+                else if (change.previous) |state|
+                    surfaceStateTouchesOutput(state, bounds)
+                else
+                    false;
+                const current_visible = if (pinned_output) |id|
+                    change.current != null and std.meta.eql(id, physical.protocol_output)
+                else if (change.current) |state|
+                    surfaceStateTouchesOutput(state, bounds)
+                else
+                    false;
+                if (!previous_visible and !current_visible) continue;
+                if (!try requestPhysicalOutputDamage(physical, now)) continue;
+                const output_index: usize = @intCast(physical.id.index);
+                change_outputs[output_index] = true;
+                layer.change_output_count += 1;
+                if (current_visible and layer.presentation != null) {
+                    outcome_outputs[output_index] = true;
+                    layer.outcome_output_count += 1;
+                }
+                requested = true;
+            }
+            return requested;
+        }
+
         fn flushProtocol(self: *Self) !void {
             try self.advancePhysicalOutputRemovals();
             try self.advanceOutputGlobals();
@@ -6425,20 +6526,15 @@ pub fn Coordinator(comptime protocol: type) type {
                 const applied = try self.applyPendingSurface(pending);
                 if (applied and !self.anyKmsOutput())
                     self.adapter.clearFifoBarriers();
-                if (applied and !global_damage) {
-                    // A layer-shell root is permanently assigned to one output.
-                    // Other surface graphs may cross outputs, so keep their
-                    // damage request conservative until their bounds are known.
-                    if (self.layer_shell_adapter.stateForSurface(pending.id)) |state| {
-                        if (self.physicalOutputForProtocolIdMutable(state.output)) |physical| {
-                            const now = damage_requested_at orelse blk: {
-                                const value = try monotonicNs();
-                                damage_requested_at = value;
-                                break :blk value;
-                            };
-                            damage_requested = try requestPhysicalOutputDamage(physical, now) or
-                                damage_requested;
-                        }
+                if (applied) {
+                    if (self.findAppLayer(pending.id)) |layer| {
+                        const now = damage_requested_at orelse blk: {
+                            const value = try monotonicNs();
+                            damage_requested_at = value;
+                            break :blk value;
+                        };
+                        damage_requested = try self.requestLayerOutputDamage(layer, now) or
+                            damage_requested;
                     } else {
                         global_damage = true;
                     }
@@ -6478,7 +6574,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 &self.cursor_layer
             else
                 return false;
-            if (layer.presentation != null) return false;
+            if (layer.presentation != null or self.appLayerOutputTrackingPending(layer)) return false;
             if (layer.candidate) |candidate| {
                 if (!candidateMatches(candidate, pending)) return false;
             }
@@ -6896,15 +6992,48 @@ pub fn Coordinator(comptime protocol: type) type {
         fn ensureAvailableAppLayers(self: *Self, needed: usize) !void {
             var available: usize = 0;
             for (self.app_layers) |*layer|
-                available += @intFromBool(layer.presentation == null and layer.candidate == null);
+                available += @intFromBool(layer.presentation == null and layer.candidate == null and
+                    !self.appLayerOutputTrackingPending(layer));
             if (available >= needed) return;
             const old_len = self.app_layers.len;
             const minimum = try std.math.add(usize, old_len, needed - available);
             var capacity = old_len;
             while (capacity < minimum) capacity = std.math.mul(usize, capacity, 2) catch
                 return error.OutOfMemory;
-            self.app_layers = try self.allocator.realloc(self.app_layers, capacity);
-            @memset(self.app_layers[old_len..], .{});
+            try self.growAppLayers(capacity);
+        }
+
+        fn growAppLayers(self: *Self, capacity: usize) !void {
+            std.debug.assert(capacity > self.app_layers.len);
+            const layers = try self.allocator.alloc(Layer, capacity);
+            errdefer self.allocator.free(layers);
+            @memcpy(layers[0..self.app_layers.len], self.app_layers);
+            @memset(layers[self.app_layers.len..], .{});
+            const output_capacity = try std.math.mul(
+                usize,
+                capacity,
+                self.output_tracking_capacity,
+            );
+            const change_outputs = try self.allocator.alloc(bool, output_capacity);
+            errdefer self.allocator.free(change_outputs);
+            @memcpy(
+                change_outputs[0..self.app_layer_change_outputs.len],
+                self.app_layer_change_outputs,
+            );
+            @memset(change_outputs[self.app_layer_change_outputs.len..], false);
+            const outcome_outputs = try self.allocator.alloc(bool, output_capacity);
+            errdefer self.allocator.free(outcome_outputs);
+            @memcpy(
+                outcome_outputs[0..self.app_layer_outcome_outputs.len],
+                self.app_layer_outcome_outputs,
+            );
+            @memset(outcome_outputs[self.app_layer_outcome_outputs.len..], false);
+            self.allocator.free(self.app_layer_outcome_outputs);
+            self.allocator.free(self.app_layer_change_outputs);
+            self.allocator.free(self.app_layers);
+            self.app_layers = layers;
+            self.app_layer_change_outputs = change_outputs;
+            self.app_layer_outcome_outputs = outcome_outputs;
         }
 
         fn availableAppLayer(
@@ -6921,7 +7050,8 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn layerAvailableForBatch(self: *Self, layer: *Layer, used: usize) bool {
-            if (layer.presentation != null or layer.candidate != null) return false;
+            if (layer.presentation != null or layer.candidate != null or
+                self.appLayerOutputTrackingPending(layer)) return false;
             for (self.applied_layers[0..used]) |assigned| if (assigned == layer) return false;
             return true;
         }
@@ -6941,6 +7071,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 else => return err,
             };
             const candidate = layer.candidate orelse return error.MissingCandidate;
+            if (layer.active) if (layer.id) |id| self.queueLayerRemoval(id);
             layer.candidate = null;
             layer.content = candidate.content;
             layer.peer = candidate.peer;
@@ -6989,18 +7120,21 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.appendLayerShell(physical, .top, &sample_count, output_bounds);
                 try self.appendLayerShell(physical, .overlay, &sample_count, output_bounds);
             }
-            var change_count = sample_count;
+            var change_count: usize = 0;
             const head_state = try self.output_management_adapter.lifecycle.currentHead(
                 physical.management_head,
             );
             const output_scale = try geometry.OutputScale.init(
                 head_state.scale_120,
             );
-            for (self.removed_layers[0..self.removed_layer_len]) |removed| {
+            const output_index: usize = @intCast(physical.id.index);
+            for (self.removed_layers[0..self.removed_layer_len], 0..) |removed, index| {
+                if (!self.removedLayerOutputRow(index)[output_index]) continue;
                 try self.ensureFrameStorage(@max(sample_count, change_count) + 1);
                 self.frame_changes[change_count] = .{
                     .previous = try scaleSurfaceState(removed.state, output_bounds, output_scale),
                 };
+                self.frame_change_layers[change_count] = null;
                 change_count += 1;
             }
             const cursor_start = sample_count;
@@ -7034,6 +7168,7 @@ pub fn Coordinator(comptime protocol: type) type {
                         output_bounds,
                         output_scale,
                     );
+                    self.frame_change_layers[change_count] = null;
                     if (!std.meta.eql(
                         cursor_sample.destination,
                         self.cursor_layer.sample.?.destination,
@@ -7077,6 +7212,7 @@ pub fn Coordinator(comptime protocol: type) type {
                         output_bounds,
                         output_scale,
                     );
+                    self.frame_change_layers[change_count] = null;
                     next_themed_cursor_previous = logical_change.current;
                     sample_count += 1;
                     change_count += 1;
@@ -7087,6 +7223,7 @@ pub fn Coordinator(comptime protocol: type) type {
                         output_bounds,
                         output_scale,
                     ) };
+                    self.frame_change_layers[change_count] = null;
                     next_themed_cursor_previous = null;
                     change_count += 1;
                 }
@@ -7097,7 +7234,32 @@ pub fn Coordinator(comptime protocol: type) type {
                     output_bounds,
                     output_scale,
                 ) };
+                self.frame_change_layers[change_count] = null;
                 next_themed_cursor_previous = null;
+                change_count += 1;
+            }
+            for (self.app_layers) |*layer| {
+                const outputs = self.appLayerOutputRow(
+                    self.app_layer_change_outputs,
+                    layer,
+                ) orelse continue;
+                if (output_index >= outputs.len or !outputs[output_index]) continue;
+                try self.ensureFrameStorage(@max(sample_count, change_count) + 1);
+                var sampled = false;
+                if (layer.binding) |binding| for (self.frame_bindings[0..sample_count]) |frame_binding| {
+                    if (std.meta.eql(binding, frame_binding)) {
+                        sampled = true;
+                        break;
+                    }
+                };
+                var change = layer.change.?;
+                if (!sampled) change.current = null;
+                self.frame_changes[change_count] = try scaleChange(
+                    change,
+                    output_bounds,
+                    output_scale,
+                );
+                self.frame_change_layers[change_count] = layer;
                 change_count += 1;
             }
             const capture_request: ?output_api.CaptureRequest = if (self.pending_screencopy) |pending|
@@ -7186,6 +7348,12 @@ pub fn Coordinator(comptime protocol: type) type {
             switch (render_result) {
                 .submitted => {
                     self.stats.submitted += 1;
+                    self.markFrameChangesApplied(
+                        @intCast(physical.id.index),
+                        self.frame_change_layers[0..change_count],
+                        self.frame_bindings[0..sample_count],
+                    );
+                    self.markRemovedChangesApplied(@intCast(physical.id.index));
                     self.outputDamageSubmitted(
                         physical,
                         damage_generation,
@@ -7214,8 +7382,6 @@ pub fn Coordinator(comptime protocol: type) type {
             physical.client_cursor_previous = next_client_cursor_previous;
             if (!self.allOutputDamageApplied()) return;
             self.adapter.clearFifoBarriers();
-            self.markFrameChangesApplied();
-            self.removed_layer_len = 0;
         }
 
         fn allOutputDamageApplied(self: *const Self) bool {
@@ -7226,15 +7392,59 @@ pub fn Coordinator(comptime protocol: type) type {
             return true;
         }
 
-        fn markFrameChangesApplied(self: *Self) void {
-            for (self.app_layers) |*layer|
-                if (layer.active) markLayerChangeApplied(layer);
-            if (self.cursor_layer.active) markLayerChangeApplied(&self.cursor_layer);
+        fn markFrameChangesApplied(
+            self: *Self,
+            output_index: usize,
+            change_layers: []const ?*Layer,
+            bindings: []const output_api.SampleBinding,
+        ) void {
+            for (change_layers) |layer_optional| {
+                const layer = layer_optional orelse continue;
+                const outputs = self.appLayerOutputRow(
+                    self.app_layer_change_outputs,
+                    layer,
+                ) orelse continue;
+                if (clearOutputPending(
+                    outputs,
+                    output_index,
+                    &layer.change_output_count,
+                ) == .complete)
+                    markLayerChangeApplied(layer);
+            }
+            for (bindings) |binding| {
+                if (self.cursor_layer.active and self.cursor_layer.binding != null and
+                    std.meta.eql(self.cursor_layer.binding.?, binding))
+                    markLayerChangeApplied(&self.cursor_layer);
+            }
         }
 
         fn markLayerChangeApplied(layer: *Layer) void {
             const current = (layer.change orelse return).current orelse return;
             layer.change = .{ .previous = current, .current = current };
+        }
+
+        fn removedLayerOutputRow(self: *Self, index: usize) []bool {
+            const offset = index * self.output_tracking_capacity;
+            return self.removed_layer_outputs[offset..][0..self.output_tracking_capacity];
+        }
+
+        fn markRemovedChangesApplied(self: *Self, output_index: usize) void {
+            var retained: usize = 0;
+            for (0..self.removed_layer_len) |index| {
+                const outputs = self.removedLayerOutputRow(index);
+                if (output_index < outputs.len) outputs[output_index] = false;
+                var pending = false;
+                for (outputs) |value| pending = pending or value;
+                if (!pending) continue;
+                if (retained != index) {
+                    self.removed_layers[retained] = self.removed_layers[index];
+                    @memcpy(self.removedLayerOutputRow(retained), outputs);
+                }
+                retained += 1;
+            }
+            for (retained..self.removed_layer_len) |index|
+                @memset(self.removedLayerOutputRow(index), false);
+            self.removed_layer_len = retained;
         }
 
         fn appendLayerShell(
@@ -7300,11 +7510,6 @@ pub fn Coordinator(comptime protocol: type) type {
                     output_scale,
                 );
                 self.frame_bindings[count.*] = layer.binding.?;
-                self.frame_changes[count.*] = try scaleChange(
-                    layer.change.?,
-                    output_bounds,
-                    output_scale,
-                );
                 count.* += 1;
             }
         }
@@ -7358,6 +7563,10 @@ pub fn Coordinator(comptime protocol: type) type {
             self.frame_samples = try self.allocator.realloc(self.frame_samples, capacity);
             self.frame_bindings = try self.allocator.realloc(self.frame_bindings, capacity);
             self.frame_changes = try self.allocator.realloc(self.frame_changes, capacity);
+            self.frame_change_layers = try self.allocator.realloc(
+                self.frame_change_layers,
+                capacity,
+            );
         }
 
         fn sceneOrder(self: *Self, root: Adapter.SurfaceId) ![]Adapter.SurfaceId {
@@ -7933,33 +8142,50 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             for (outcome.sampled) |sampled| {
                 const layer = self.layerForPresentation(sampled.presentation) orelse continue;
+                var output_pending = false;
+                if (self.appLayerOutputRow(self.app_layer_outcome_outputs, layer)) |outputs| {
+                    const owner = physical orelse continue;
+                    const output_index: usize = @intCast(owner.id.index);
+                    switch (clearOutputPending(
+                        outputs,
+                        output_index,
+                        &layer.outcome_output_count,
+                    )) {
+                        .untracked => continue,
+                        .pending => output_pending = true,
+                        .complete => {},
+                    }
+                }
                 const binding = layer.binding orelse return error.SampleBindingMismatch;
                 if (!std.meta.eql(sampled.surface, binding.surface)) return error.SampleBindingMismatch;
                 const content = &(layer.content orelse return error.MissingContent);
                 const owner_live = layer.peer != null and self.peerLive(layer.peer.?) and
                     self.layerSurfaceLive(layer);
                 if (!owner_live) {
-                    self.abandonLayer(layer);
+                    if (!output_pending and !self.appLayerOutputTrackingPending(layer))
+                        self.abandonLayer(layer);
                     continue;
                 }
                 const surface = layer.surface.?;
-                if (was_presented and outcome.frame_callbacks_due) {
+                if (was_presented and outcome.frame_callbacks_due and layer.callback_data == null) {
                     _ = try self.adapter.activateFrames(surface, content);
                     layer.callback_data = callbackData(outcome.actual_ns.?);
                 }
-                layer.feedback_outcome = if (was_presented)
-                    .{ .presented = .{
+                if (was_presented) {
+                    layer.feedback_outcome = .{ .presented = .{
                         .actual_ns = outcome.actual_ns.?,
                         .refresh_ns = @intCast(self.output_config.scheduler.refresh_ns),
                         .flags = 1 | 2 | 4,
-                    } }
-                else
-                    .discarded;
-                layer.feedback_output = if (physical) |owner| owner.protocol_output else null;
-                layer.outcome_pending = true;
+                    } };
+                    layer.feedback_output = physical.?.protocol_output;
+                } else if (!was_presented and layer.feedback_outcome == null) {
+                    layer.feedback_outcome = .discarded;
+                }
+                if (!output_pending) layer.outcome_pending = true;
             }
             for (self.app_layers) |*layer|
-                if (layer.active and !self.layerSurfaceLive(layer)) self.abandonLayer(layer);
+                if (layer.active and !self.layerSurfaceLive(layer) and
+                    !self.appLayerOutputTrackingPending(layer)) self.abandonLayer(layer);
             if (self.cursor_layer.active and !self.layerSurfaceLive(&self.cursor_layer))
                 self.abandonLayer(&self.cursor_layer);
             if (physical) |owner| if (owner.session_lock_frame) |secure_frame| if (std.meta.eql(
@@ -8237,8 +8463,7 @@ pub fn Coordinator(comptime protocol: type) type {
             for (self.app_layers) |*layer| if (layerVacant(layer)) return layer;
             const old_len = self.app_layers.len;
             const capacity = std.math.mul(usize, old_len, 2) catch return error.OutOfMemory;
-            self.app_layers = try self.allocator.realloc(self.app_layers, capacity);
-            @memset(self.app_layers[old_len..], .{});
+            try self.growAppLayers(capacity);
             return &self.app_layers[old_len];
         }
 
@@ -8683,6 +8908,65 @@ pub fn Coordinator(comptime protocol: type) type {
             return null;
         }
 
+        fn appLayerIndex(self: *const Self, layer: *const Layer) ?usize {
+            for (self.app_layers, 0..) |*candidate, index|
+                if (candidate == layer) return index;
+            return null;
+        }
+
+        fn appLayerOutputRow(
+            self: *const Self,
+            storage: []bool,
+            layer: *const Layer,
+        ) ?[]bool {
+            const index = self.appLayerIndex(layer) orelse return null;
+            const offset = index * self.output_tracking_capacity;
+            return storage[offset..][0..self.output_tracking_capacity];
+        }
+
+        fn clearAppLayerOutputTracking(self: *Self, layer: *Layer) void {
+            if (self.appLayerOutputRow(self.app_layer_change_outputs, layer)) |outputs|
+                @memset(outputs, false);
+            if (self.appLayerOutputRow(self.app_layer_outcome_outputs, layer)) |outputs|
+                @memset(outputs, false);
+            layer.change_output_count = 0;
+            layer.outcome_output_count = 0;
+        }
+
+        fn appLayerOutputTrackingPending(self: *const Self, layer: *const Layer) bool {
+            _ = self;
+            return layer.change_output_count != 0 or layer.outcome_output_count != 0;
+        }
+
+        fn retireOutputTracking(self: *Self, output_index: usize) void {
+            for (self.app_layers) |*layer| {
+                if (self.appLayerOutputRow(self.app_layer_change_outputs, layer)) |outputs| {
+                    if (clearOutputPending(
+                        outputs,
+                        output_index,
+                        &layer.change_output_count,
+                    ) == .complete)
+                        markLayerChangeApplied(layer);
+                }
+                const outcomes = self.appLayerOutputRow(
+                    self.app_layer_outcome_outputs,
+                    layer,
+                ) orelse continue;
+                if (clearOutputPending(
+                    outcomes,
+                    output_index,
+                    &layer.outcome_output_count,
+                ) == .complete and
+                    layer.presentation != null)
+                {
+                    if (layer.feedback_outcome == null)
+                        layer.feedback_outcome = .discarded;
+                    layer.outcome_pending = true;
+                }
+            }
+            self.markRemovedChangesApplied(output_index);
+        }
+
         fn anyAppLayerActive(self: *const Self) bool {
             for (self.app_layers) |layer| if (layer.active) return true;
             return false;
@@ -8902,6 +9186,8 @@ pub fn Coordinator(comptime protocol: type) type {
                     try output.destroy();
                     physical.kms_output = null;
                     self.foreign_toplevel_outputs_dirty = true;
+                    self.retireOutputTracking(@intCast(physical.id.index));
+                    _ = try self.retryRetainedOutcomes();
                     self.stats.output_drains += 1;
                     var head_state = try self.output_management_adapter.lifecycle.currentHead(
                         physical.management_head,
@@ -9230,6 +9516,7 @@ pub fn Coordinator(comptime protocol: type) type {
             if (layer.retired_source) |*source| source.content.deinit();
             if (layer.rendered) |rendered| if (self.render_device) |render_device|
                 render_device.content.release(rendered);
+            self.clearAppLayerOutputTracking(layer);
             layer.* = .{};
         }
 
@@ -9260,14 +9547,47 @@ pub fn Coordinator(comptime protocol: type) type {
             const state = (layer.change orelse return).current orelse return;
             if (self.removed_layer_len == self.removed_layers.len) {
                 const capacity = std.math.mul(usize, self.removed_layers.len, 2) catch return;
-                self.removed_layers = self.allocator.realloc(
-                    self.removed_layers,
-                    capacity,
-                ) catch return;
+                const removed = self.allocator.alloc(RemovedLayer, capacity) catch return;
+                @memcpy(removed[0..self.removed_layers.len], self.removed_layers);
+                const outputs = self.allocator.alloc(
+                    bool,
+                    std.math.mul(usize, capacity, self.output_tracking_capacity) catch {
+                        self.allocator.free(removed);
+                        return;
+                    },
+                ) catch {
+                    self.allocator.free(removed);
+                    return;
+                };
+                @memcpy(outputs[0..self.removed_layer_outputs.len], self.removed_layer_outputs);
+                @memset(outputs[self.removed_layer_outputs.len..], false);
+                self.allocator.free(self.removed_layer_outputs);
+                self.allocator.free(self.removed_layers);
+                self.removed_layers = removed;
+                self.removed_layer_outputs = outputs;
             }
+            const outputs = self.removedLayerOutputRow(self.removed_layer_len);
+            @memset(outputs, false);
+            const pinned_output = self.layerShellOutput(layer);
+            const now = monotonicNs() catch return;
+            var requested = false;
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                if (!physical.connected or physical.kms_output == null) continue;
+                const visible = if (pinned_output) |output|
+                    std.meta.eql(output, physical.protocol_output)
+                else
+                    surfaceStateTouchesOutput(
+                        state,
+                        self.outputBoundsFor(physical) catch continue,
+                    );
+                if (!visible or !(requestPhysicalOutputDamage(physical, now) catch continue)) continue;
+                outputs[@intCast(physical.id.index)] = true;
+                requested = true;
+            }
+            if (!requested) return;
             self.removed_layers[self.removed_layer_len] = .{ .id = id, .state = state };
             self.removed_layer_len += 1;
-            self.requestOutputDamage() catch return;
+            self.armTimer() catch {};
         }
 
         fn cleanupUnstartedOutput(self: *Self, physical: *PhysicalOutput) void {
@@ -9465,6 +9785,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.interaction.surfaceDestroyed(id);
                 for (self.app_layers) |*layer|
                     if (layer.id != null and std.meta.eql(layer.id.?, id) and
+                        !self.appLayerOutputTrackingPending(layer) and
                         !self.anyOutputInFlight())
                         self.discardUnpresentedLayer(layer);
                 if (self.cursor_layer.id != null and std.meta.eql(self.cursor_layer.id.?, id) and
@@ -9940,6 +10261,52 @@ fn rectangleContains(outer: geometry.Rect, inner: geometry.Rect) bool {
     return inner.x >= outer.x and inner.y >= outer.y and
         @as(i64, inner.x) + inner.width <= @as(i64, outer.x) + outer.width and
         @as(i64, inner.y) + inner.height <= @as(i64, outer.y) + outer.height;
+}
+
+const OutputPendingResult = enum {
+    untracked,
+    pending,
+    complete,
+};
+
+fn clearOutputPending(
+    outputs: []bool,
+    output_index: usize,
+    pending_count: *usize,
+) OutputPendingResult {
+    if (output_index >= outputs.len or !outputs[output_index]) return .untracked;
+    std.debug.assert(pending_count.* != 0);
+    outputs[output_index] = false;
+    pending_count.* -= 1;
+    return if (pending_count.* == 0) .complete else .pending;
+}
+
+test "physical: output tracking completes only after every exact owner" {
+    var outputs = [_]bool{ true, false, true };
+    var pending_count: usize = 2;
+
+    try std.testing.expectEqual(
+        OutputPendingResult.untracked,
+        clearOutputPending(&outputs, 1, &pending_count),
+    );
+    try std.testing.expectEqualSlices(bool, &.{ true, false, true }, &outputs);
+    try std.testing.expectEqual(@as(usize, 2), pending_count);
+    try std.testing.expectEqual(
+        OutputPendingResult.pending,
+        clearOutputPending(&outputs, 0, &pending_count),
+    );
+    try std.testing.expectEqualSlices(bool, &.{ false, false, true }, &outputs);
+    try std.testing.expectEqual(@as(usize, 1), pending_count);
+    try std.testing.expectEqual(
+        OutputPendingResult.complete,
+        clearOutputPending(&outputs, 2, &pending_count),
+    );
+    try std.testing.expectEqualSlices(bool, &.{ false, false, false }, &outputs);
+    try std.testing.expectEqual(@as(usize, 0), pending_count);
+    try std.testing.expectEqual(
+        OutputPendingResult.untracked,
+        clearOutputPending(&outputs, 3, &pending_count),
+    );
 }
 
 fn fixed24ScaledTo16(value: i32, scale: i64) !i64 {
