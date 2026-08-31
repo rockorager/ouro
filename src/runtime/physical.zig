@@ -2593,8 +2593,9 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             try self.session_lock_adapter.validateSurfaceCommit(id);
             if (self.layer_shell_adapter.ownsSurface(id)) {
-                try self.desktop.validateWorkArea(try self.layerWorkArea(id));
-                try self.desktop.validateOutputAreas(try self.desktopOutputAreas(id));
+                const work_area = try self.layerWorkArea(id);
+                const output_areas = try self.desktopOutputAreas(id);
+                try self.desktop.validateTopology(work_area, output_areas);
             }
             const pointer = self.seat_adapter.pointerState();
             try self.pointer_constraints_adapter.validateSurfaceCommit(
@@ -2622,8 +2623,9 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             if (self.layer_shell_adapter.ownsSurface(id)) {
                 self.layer_shell_adapter.publishSurfaceCommitted(id) catch unreachable;
-                self.desktop.applyWorkArea(self.layerWorkArea(null) catch unreachable);
-                self.desktop.applyOutputAreas(self.desktopOutputAreas(null) catch unreachable);
+                const work_area = self.layerWorkArea(null) catch unreachable;
+                const output_areas = self.desktopOutputAreas(null) catch unreachable;
+                self.desktop.applyTopology(work_area, output_areas);
                 const layer_state = self.layer_shell_adapter.stateForSurface(id) orelse unreachable;
                 const configure_size = self.layerConfigureSize(layer_state) catch unreachable;
                 self.layer_shell_adapter.updatePendingConfigureSize(
@@ -6414,12 +6416,10 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn publishOutputLayout(self: *Self) !void {
             const bounds = try self.globalOutputBounds();
-            try self.desktop.validateWorkArea(bounds);
             const output_areas = try self.desktopOutputAreas(null);
-            try self.desktop.validateOutputAreas(output_areas);
+            try self.desktop.validateTopology(bounds, output_areas);
             try self.interaction.validateBounds(bounds);
-            self.desktop.applyWorkArea(bounds);
-            self.desktop.applyOutputAreas(output_areas);
+            self.desktop.applyTopology(bounds, output_areas);
             self.interaction.applyBounds(bounds);
             _ = self.refreshRetainedLayersForOutput();
             try self.recomputeLayerConfigures();
@@ -9874,8 +9874,10 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.text_input_adapter.resourceRemoved(handle, object);
             _ = self.subcompositor_adapter.resourceRemoved(handle, object);
             if (layer_shell_removed and self.primaryKmsOutput() != null) {
-                self.desktop.applyWorkArea(self.layerWorkArea(null) catch
-                    self.globalOutputBounds() catch unreachable);
+                const work_area = self.layerWorkArea(null) catch
+                    self.globalOutputBounds() catch unreachable;
+                const output_areas = self.desktopOutputAreas(null) catch unreachable;
+                self.desktop.applyTopology(work_area, output_areas);
                 self.syncLayerPopupRoots() catch {};
                 self.syncLayerKeyboardFocus() catch {};
                 self.requestOutputDamage() catch {};
