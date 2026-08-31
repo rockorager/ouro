@@ -39,6 +39,9 @@ pub fn Desktop(comptime Shell: type) type {
             generation: u32,
         };
 
+        pub const OutputId = packed struct { value: u64 };
+        pub const OutputArea = struct { id: OutputId, geometry: geometry.Rect };
+
         pub const workspace_id: WorkspaceId = .{ .index = 0, .generation = 1 };
 
         pub const Mode = enum { tiled, floating };
@@ -126,6 +129,7 @@ pub fn Desktop(comptime Shell: type) type {
             shell_id: Shell.ToplevelId = undefined,
             surface: Shell.SurfaceId = undefined,
             mode: Mode = .tiled,
+            output: ?OutputId = null,
             floating: geometry.Rect = undefined,
             scene: SceneWindow = undefined,
             target_scene: SceneWindow = undefined,
@@ -193,6 +197,7 @@ pub fn Desktop(comptime Shell: type) type {
         external_root_len: usize = 0,
         work_area: geometry.Rect,
         output_areas: []geometry.Rect,
+        output_ids: []OutputId,
         output_area_len: usize = 1,
         metadata_storage: []u8,
         metadata_bytes: usize,
@@ -233,6 +238,8 @@ pub fn Desktop(comptime Shell: type) type {
             errdefer allocator.free(external_roots);
             const output_areas = try allocator.alloc(geometry.Rect, config.output_capacity);
             errdefer allocator.free(output_areas);
+            const output_ids = try allocator.alloc(OutputId, config.output_capacity);
+            errdefer allocator.free(output_ids);
             const metadata_per_slot = try std.math.mul(usize, config.metadata_bytes, 2);
             const storage_len = try std.math.mul(
                 usize,
@@ -275,6 +282,7 @@ pub fn Desktop(comptime Shell: type) type {
             };
             @memset(desired, .{});
             output_areas[0] = work_area;
+            output_ids[0] = .{ .value = 0 };
             return .{
                 .allocator = allocator,
                 .slots = slots,
@@ -284,6 +292,7 @@ pub fn Desktop(comptime Shell: type) type {
                 .external_roots = external_roots,
                 .work_area = work_area,
                 .output_areas = output_areas,
+                .output_ids = output_ids,
                 .metadata_storage = metadata_storage,
                 .metadata_bytes = config.metadata_bytes,
                 .focus = focus,
@@ -305,6 +314,7 @@ pub fn Desktop(comptime Shell: type) type {
             desktop.allocator.free(desktop.tile_order);
             desktop.allocator.free(desktop.focus);
             desktop.allocator.free(desktop.metadata_storage);
+            desktop.allocator.free(desktop.output_ids);
             desktop.allocator.free(desktop.output_areas);
             desktop.allocator.free(desktop.popups);
             desktop.allocator.free(desktop.external_roots);
@@ -672,31 +682,49 @@ pub fn Desktop(comptime Shell: type) type {
 
         pub fn applyOutputAreas(desktop: *Self, areas: []const geometry.Rect) void {
             desktop.validateOutputAreas(areas) catch unreachable;
-            @memcpy(desktop.output_areas[0..areas.len], areas);
+            for (areas, 0..) |area, index| {
+                desktop.output_areas[index] = area;
+                desktop.output_ids[index] = .{ .value = index };
+            }
             desktop.output_area_len = areas.len;
             desktop.reflow() catch unreachable;
             desktop.reconfigureReactivePopups();
         }
 
+        pub fn validateOutputTopology(desktop: *Self, areas: []const OutputArea) !void {
+            if (areas.len == 0 or areas.len > desktop.output_areas.len) return error.Exhausted;
+            for (areas, 0..) |area, index| {
+                try area.geometry.validate();
+                for (areas[0..index]) |previous|
+                    if (std.meta.eql(previous.id, area.id)) return error.DuplicateOutput;
+            }
+            try desktop.validateLayout(desktop.layoutCount(), areas);
+            try desktop.requireCommandCapacity(desktop.live);
+            try desktop.requirePopupCommandCapacity(desktop.popup_live);
+        }
+
         pub fn validateTopology(
             desktop: *Self,
             work_area: geometry.Rect,
-            output_areas: []const geometry.Rect,
+            output_areas: []const OutputArea,
         ) !void {
             try work_area.validate();
-            try desktop.validateOutputAreas(output_areas);
+            try desktop.validateOutputTopology(output_areas);
         }
 
-        /// Publishes the global bounds and exact output work areas in one
-        /// reflow, so a topology turn cannot expose an intermediate layout.
+        /// Publishes global bounds and exact output work areas in one reflow,
+        /// so a topology turn cannot expose an intermediate layout.
         pub fn applyTopology(
             desktop: *Self,
             work_area: geometry.Rect,
-            output_areas: []const geometry.Rect,
+            output_areas: []const OutputArea,
         ) void {
             desktop.validateTopology(work_area, output_areas) catch unreachable;
             desktop.work_area = work_area;
-            @memcpy(desktop.output_areas[0..output_areas.len], output_areas);
+            for (output_areas, 0..) |area, index| {
+                desktop.output_areas[index] = area.geometry;
+                desktop.output_ids[index] = area.id;
+            }
             desktop.output_area_len = output_areas.len;
             desktop.reflow() catch unreachable;
             desktop.reconfigureReactivePopups();
@@ -989,6 +1017,7 @@ pub fn Desktop(comptime Shell: type) type {
             const slot = &desktop.slots[index];
             slot.shell_id = shell_id;
             slot.surface = surface;
+            slot.output = desktop.output_ids[0];
             slot.floating = desktop.defaultFloating();
             slot.scene = .{
                 .id = desktop.idFor(index),
@@ -1339,6 +1368,11 @@ pub fn Desktop(comptime Shell: type) type {
             }
             const placements = desktop.placements[0..placement_len];
             for (placements) |placement| {
+                const output_index = outputAreaIndexForRect(
+                    placement.rect,
+                    desktop.outputAreas(),
+                );
+                desktop.slots[placement.slot].output = desktop.output_ids[output_index];
                 desktop.desired[placement.slot] = .{
                     .active = true,
                     .rect = placement.rect,
@@ -1358,7 +1392,7 @@ pub fn Desktop(comptime Shell: type) type {
                 } else if (slot.fullscreen or slot.maximized) {
                     desktop.desired[index] = .{
                         .active = true,
-                        .rect = outputAreaForRect(slot.scene.geometry, desktop.outputAreas()),
+                        .rect = desktop.outputAreaForSlot(slot),
                         .visible = true,
                     };
                 }
@@ -1367,12 +1401,16 @@ pub fn Desktop(comptime Shell: type) type {
             }
             for (desktop.slots, 0..) |slot, index| {
                 if (!slot.header.active or slot.mode != .floating) continue;
+                const output_area = if (slot.fullscreen or slot.maximized)
+                    desktop.outputAreaForSlot(&desktop.slots[index])
+                else area: {
+                    const output_index = outputAreaIndexForRect(slot.floating, desktop.outputAreas());
+                    desktop.slots[index].output = desktop.output_ids[output_index];
+                    break :area slot.floating;
+                };
                 desktop.desired[index] = .{
                     .active = true,
-                    .rect = if (slot.fullscreen or slot.maximized)
-                        outputAreaForRect(slot.scene.geometry, desktop.outputAreas())
-                    else
-                        slot.floating,
+                    .rect = output_area,
                     .visible = !slot.minimized,
                     .stacking = stacking,
                 };
@@ -1584,6 +1622,16 @@ pub fn Desktop(comptime Shell: type) type {
             return desktop.output_areas[0..desktop.output_area_len];
         }
 
+        fn outputAreaForSlot(desktop: *Self, slot: *Slot) geometry.Rect {
+            if (slot.output) |id| {
+                for (desktop.output_ids[0..desktop.output_area_len], 0..) |candidate, index|
+                    if (std.meta.eql(candidate, id)) return desktop.output_areas[index];
+            }
+            const index = outputAreaIndexForRect(slot.scene.geometry, desktop.outputAreas());
+            slot.output = desktop.output_ids[index];
+            return desktop.output_areas[index];
+        }
+
         fn commandAvailable(desktop: *const Self) usize {
             return desktop.commands.len - desktop.command_len;
         }
@@ -1605,7 +1653,7 @@ pub fn Desktop(comptime Shell: type) type {
         fn validateLayout(
             desktop: *const Self,
             count: usize,
-            areas: []const geometry.Rect,
+            areas: anytype,
         ) !void {
             _ = desktop;
             var placed: usize = 0;
@@ -1613,7 +1661,7 @@ pub fn Desktop(comptime Shell: type) type {
             while (placed < count) : (area_index += 1) {
                 const remaining_areas = @min(areas.len - area_index, count - placed);
                 const area_count = outputItemCount(count - placed, remaining_areas);
-                const area = areas[area_index];
+                const area = outputAreaGeometry(areas[area_index]);
                 if (area_count > 1 and (area.width < 2 or area.height < area_count - 1))
                     return error.WorkAreaTooSmall;
                 placed += area_count;
@@ -1883,16 +1931,25 @@ pub fn Desktop(comptime Shell: type) type {
 
 const PopupGeometry = struct { x: i32, y: i32, width: i32, height: i32 };
 
+fn outputAreaGeometry(area: anytype) geometry.Rect {
+    if (@hasField(@TypeOf(area), "geometry")) return area.geometry;
+    return area;
+}
+
 fn outputItemCount(remaining_items: usize, remaining_areas: usize) usize {
     std.debug.assert(remaining_items != 0 and remaining_areas != 0);
     return (remaining_items - 1) / remaining_areas + 1;
 }
 
 fn outputAreaForRect(rect: geometry.Rect, areas: []const geometry.Rect) geometry.Rect {
+    return areas[outputAreaIndexForRect(rect, areas)];
+}
+
+fn outputAreaIndexForRect(rect: geometry.Rect, areas: []const geometry.Rect) usize {
     std.debug.assert(areas.len != 0);
-    var selected = areas[0];
+    var selected: usize = 0;
     var selected_intersection: i64 = 0;
-    for (areas) |area| {
+    for (areas, 0..) |area, index| {
         const left = @max(@as(i64, rect.x), area.x);
         const top = @max(@as(i64, rect.y), area.y);
         const right = @min(
@@ -1905,7 +1962,7 @@ fn outputAreaForRect(rect: geometry.Rect, areas: []const geometry.Rect) geometry
         );
         const intersection = @max(0, right - left) * @max(0, bottom - top);
         if (intersection <= selected_intersection) continue;
-        selected = area;
+        selected = index;
         selected_intersection = intersection;
     }
     return selected;
@@ -2320,9 +2377,13 @@ test "desktop: topology keeps tiled and fullscreen windows on exact outputs" {
         .{ .x = 200, .y = 20, .width = 80, .height = 40 },
     };
     const bounds: geometry.Rect = .{ .x = 0, .y = 0, .width = 280, .height = 60 };
-    const invalid_areas = [_]geometry.Rect{
-        .{ .x = 0, .y = 0, .width = 1, .height = 1 },
-        areas[1],
+    const topology = [_]TestDesktop.OutputArea{
+        .{ .id = .{ .value = 10 }, .geometry = areas[0] },
+        .{ .id = .{ .value = 20 }, .geometry = areas[1] },
+    };
+    const invalid_areas = [_]TestDesktop.OutputArea{
+        .{ .id = topology[0].id, .geometry = .{ .x = 0, .y = 0, .width = 1, .height = 1 } },
+        topology[1],
     };
     try std.testing.expectError(
         error.WorkAreaTooSmall,
@@ -2332,8 +2393,8 @@ test "desktop: topology keeps tiled and fullscreen windows on exact outputs" {
         geometry.Rect{ .x = 0, .y = 0, .width = 100, .height = 60 },
         desktop.workArea(),
     );
-    try desktop.validateTopology(bounds, &areas);
-    desktop.applyTopology(bounds, &areas);
+    try desktop.validateTopology(bounds, &topology);
+    desktop.applyTopology(bounds, &topology);
     try settleDesktop(&desktop, &shell);
 
     try std.testing.expectEqual(
@@ -2360,7 +2421,16 @@ test "desktop: topology keeps tiled and fullscreen windows on exact outputs" {
     try settleDesktop(&desktop, &shell);
     try std.testing.expectEqual(areas[1], (try desktop.scene(third)).geometry);
 
-    const remaining = [_]geometry.Rect{areas[0]};
+    const moved_secondary: geometry.Rect = .{ .x = 300, .y = 10, .width = 80, .height = 40 };
+    const moved = [_]TestDesktop.OutputArea{
+        topology[0],
+        .{ .id = topology[1].id, .geometry = moved_secondary },
+    };
+    desktop.applyTopology(.{ .x = 0, .y = 0, .width = 380, .height = 60 }, &moved);
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expectEqual(moved_secondary, (try desktop.scene(third)).geometry);
+
+    const remaining = [_]TestDesktop.OutputArea{topology[0]};
     desktop.applyTopology(areas[0], &remaining);
     try settleDesktop(&desktop, &shell);
     try std.testing.expectEqual(areas[0], (try desktop.scene(third)).geometry);
