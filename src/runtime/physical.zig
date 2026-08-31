@@ -3871,7 +3871,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (!self.outputManagementModeSupported(physical, head.state)) return false;
                 enabled += @intFromBool(head.state.enabled);
             }
-            return enabled != 0;
+            return enabled != 0 and outputManagementLayoutSupported(desired);
         }
 
         fn outputManagementCommandUnchanged(
@@ -10172,6 +10172,47 @@ fn tabletCoordinate(value: f64, origin: i32, extent: i32) f64 {
     );
 }
 
+fn outputManagementLayoutSupported(
+    desired: []const protocol_output_management.DesiredHead,
+) bool {
+    var left: i64 = 0;
+    var top: i64 = 0;
+    var right: i64 = 0;
+    var bottom: i64 = 0;
+    var initialized = false;
+    for (desired) |head| {
+        const state = head.state;
+        if (!state.enabled) continue;
+        if (state.width <= 0 or state.height <= 0 or state.transform < 0 or
+            state.transform > 7) return false;
+        const scale = geometry.OutputScale.init(state.scale_120) catch return false;
+        const quarter_turn = state.transform == 1 or state.transform == 3 or
+            state.transform == 5 or state.transform == 7;
+        const width = scale.logicalDimension(@intCast(
+            if (quarter_turn) state.height else state.width,
+        )) catch return false;
+        const height = scale.logicalDimension(@intCast(
+            if (quarter_turn) state.width else state.height,
+        )) catch return false;
+        const head_right = @as(i64, state.x) + width;
+        const head_bottom = @as(i64, state.y) + height;
+        if (!initialized) {
+            left = state.x;
+            top = state.y;
+            right = head_right;
+            bottom = head_bottom;
+            initialized = true;
+        } else {
+            left = @min(left, state.x);
+            top = @min(top, state.y);
+            right = @max(right, head_right);
+            bottom = @max(bottom, head_bottom);
+        }
+    }
+    return initialized and right - left <= std.math.maxInt(i32) and
+        bottom - top <= std.math.maxInt(i32);
+}
+
 fn layerVacant(layer: anytype) bool {
     return !layer.active and layer.peer == null and layer.surface == null and
         layer.id == null and layer.content == null and layer.rendered == null and
@@ -10724,4 +10765,32 @@ test "physical: capture rectangles require exact output containment" {
         secondary,
         .{ .x = 2, .y = 0, .width = 2, .height = 2 },
     ));
+}
+
+test "physical: output management rejects unrepresentable combined layout" {
+    const valid = [_]protocol_output_management.DesiredHead{
+        .{ .id = .{ .index = 0, .generation = 1 }, .state = .{
+            .width = 1920,
+            .height = 1080,
+            .refresh_millihz = 60_000,
+            .x = -2048,
+        } },
+        .{ .id = .{ .index = 1, .generation = 1 }, .state = .{
+            .width = 2560,
+            .height = 1440,
+            .refresh_millihz = 60_000,
+            .x = 1024,
+            .y = 512,
+            .transform = 1,
+        } },
+    };
+    try std.testing.expect(outputManagementLayoutSupported(&valid));
+
+    var invalid = valid;
+    invalid[0].state.x = std.math.minInt(i32);
+    invalid[1].state.x = std.math.maxInt(i32);
+    try std.testing.expect(!outputManagementLayoutSupported(&invalid));
+
+    invalid[1].state.enabled = false;
+    try std.testing.expect(outputManagementLayoutSupported(&invalid));
 }
