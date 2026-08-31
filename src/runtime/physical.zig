@@ -4913,6 +4913,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 !std.mem.eql(u8, name, "zwlr_output_power_manager_v1") and
                 !std.mem.eql(u8, name, "zwlr_gamma_control_manager_v1") and
                 !std.mem.eql(u8, name, "wp_drm_lease_device_v1") and
+                !std.mem.eql(u8, name, "zwlr_screencopy_manager_v1") and
                 !std.mem.eql(u8, name, "ext_output_image_capture_source_manager_v1") and
                 !std.mem.eql(u8, name, "ext_foreign_toplevel_image_capture_source_manager_v1") and
                 !std.mem.eql(u8, name, "ext_image_copy_capture_manager_v1");
