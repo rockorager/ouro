@@ -56,7 +56,7 @@ pub fn Adapter(comptime protocol: type) type {
         pub const DeviceId = packed struct { index: u32, generation: u32 };
         pub const Event = struct { device: DeviceId, peer: wayring.io_uring.Peer, seat: u32, state: State, surrounding: []const u8, serial: u32 };
         const ManagerSlot = struct { header: slot_pool.Header = .{}, resource: objects.Handle = .{ .id = 0, .generation = 0 }, peer: wayring.io_uring.Peer = undefined, version: u32 = 1 };
-        const Device = struct { header: slot_pool.Header = .{}, focused: bool = false, resource: objects.Handle = .{ .id = 0, .generation = 0 }, peer: wayring.io_uring.Peer = undefined, seat: u32 = 0, version: u32 = 1, pending: State = .{}, current: State = .{}, serial: u32 = 0, text: []u8 = &.{}, pending_text: []u8 = &.{} };
+        const Device = struct { header: slot_pool.Header = .{}, focused: bool = false, resource: objects.Handle = .{ .id = 0, .generation = 0 }, peer: wayring.io_uring.Peer = undefined, seat: u32 = 0, version: u32 = 1, pending: State = .{}, current: State = .{}, committed_rectangle: ?Rectangle = null, serial: u32 = 0, text: []u8 = &.{}, pending_text: []u8 = &.{} };
         const EventSlot = struct { event: Event = undefined, text: []u8 = &.{} };
         const OutKind = enum { enter, leave, preedit, preedit_hint, commit, delete, action, language, done };
         const Out = struct {
@@ -285,17 +285,58 @@ pub fn Adapter(comptime protocol: type) type {
                     }
                 }
             }
+            const current_has_rectangle = z.current.has_rectangle;
+            const current_rectangle = z.current.rectangle;
             z.current = z.pending;
+            if (z.version >= 2) {
+                if (z.pending.has_rectangle) z.committed_rectangle = z.pending.rectangle;
+                z.current.has_rectangle = current_has_rectangle;
+                z.current.rectangle = current_rectangle;
+                z.pending.has_rectangle = false;
+            }
             if (!z.current.enabled) {
                 z.current = .{};
                 z.pending = .{};
+                z.committed_rectangle = null;
             }
             @memcpy(z.text[0..z.current.surrounding_len], z.pending_text[0..z.current.surrounding_len]);
+            s.publishCurrent(z);
+            z.pending.cause = 0;
+        }
+        fn publishCurrent(s: *Self, z: *Device) void {
+            std.debug.assert(s.event_len < s.events.len);
             const e = &s.events[(s.event_head + s.event_len) % s.events.len];
             @memcpy(e.text[0..z.current.surrounding_len], z.text[0..z.current.surrounding_len]);
             e.event = .{ .device = s.id(z), .peer = z.peer, .seat = z.seat, .state = z.current, .surrounding = e.text[0..z.current.surrounding_len], .serial = z.serial };
             s.event_len += 1;
-            z.pending.cause = 0;
+        }
+        pub fn validateFocusedSurfaceCommit(s: *const Self, focus: Focus) !void {
+            if (s.rectanglePromotions(focus) > s.events.len - s.event_len)
+                return error.Exhausted;
+        }
+        pub fn focusedSurfaceCommitted(s: *Self, focus: Focus) !bool {
+            if (!focusEq(s.focus, focus)) return false;
+            const needed = s.rectanglePromotions(focus);
+            if (needed > s.events.len - s.event_len) return error.Exhausted;
+            for (s.devices.entries.items) |z| {
+                if (!z.header.active or !z.focused or !z.current.enabled or
+                    !same(z.peer, focus.peer) or z.committed_rectangle == null) continue;
+                z.current.has_rectangle = true;
+                z.current.rectangle = z.committed_rectangle.?;
+                z.committed_rectangle = null;
+                s.publishCurrent(z);
+            }
+            return needed != 0;
+        }
+        fn rectanglePromotions(s: *const Self, focus: Focus) usize {
+            if (!focusEq(s.focus, focus)) return 0;
+            var needed: usize = 0;
+            for (s.devices.entries.items) |z| {
+                if (z.header.active and z.focused and z.current.enabled and
+                    same(z.peer, focus.peer) and z.committed_rectangle != null)
+                    needed += 1;
+            }
+            return needed;
         }
         pub fn peekEvent(s: *const Self) ?*const Event {
             return if (s.event_len == 0) null else &s.events[s.event_head].event;
@@ -325,6 +366,7 @@ pub fn Adapter(comptime protocol: type) type {
                         z.focused = false;
                         z.pending = .{};
                         z.current = .{};
+                        z.committed_rectangle = null;
                     }
                 }
             }
@@ -336,6 +378,7 @@ pub fn Adapter(comptime protocol: type) type {
                         z.focused = true;
                         z.pending = .{};
                         z.current = .{};
+                        z.committed_rectangle = null;
                     }
                 }
             }
@@ -833,6 +876,44 @@ test "text input version two actions validate native arrays" {
     actions = .{ 9, 9, 12 };
     try std.testing.expectError(error.InvalidAction, parseAvailableActions(std.mem.asBytes(&actions)));
     try std.testing.expectError(error.InvalidAction, parseAvailableActions("x"));
+}
+
+test "text input version two promotes cursor rectangle on focused surface commit" {
+    const A = Adapter(@import("core_protocol"));
+    const validator: SeatValidator = .{ .validateFn = struct {
+        fn validate(_: ?*anyopaque, _: wayring.io_uring.Peer, _: u32) bool {
+            return true;
+        }
+    }.validate };
+    var adapter = try A.init(std.testing.allocator, validator, .{
+        .device_capacity = 1,
+        .event_capacity = 2,
+        .manager_capacity = 1,
+        .outbound_capacity = 2,
+        .surrounding_bytes = 8,
+        .edit_string_bytes = 8,
+    });
+    defer adapter.deinit();
+    const device = try adapter.acquire();
+    device.peer = .{ .slot = 7, .generation = 3 };
+    device.version = 2;
+    device.focused = true;
+    device.pending.enabled = true;
+    device.pending.has_rectangle = true;
+    device.pending.rectangle = .{ .x = 1, .y = 2, .width = 3, .height = 4 };
+    const focus: Focus = .{ .peer = device.peer, .surface = 11 };
+    adapter.focus = focus;
+
+    try adapter.commit(device);
+    try std.testing.expect(!adapter.peekEvent().?.state.has_rectangle);
+    adapter.dropEvent();
+    try std.testing.expect(try adapter.focusedSurfaceCommitted(focus));
+    const event = adapter.peekEvent().?;
+    try std.testing.expect(event.state.has_rectangle);
+    try std.testing.expectEqual(Rectangle{ .x = 1, .y = 2, .width = 3, .height = 4 }, event.state.rectangle);
+    adapter.dropEvent();
+    try std.testing.expect(!try adapter.focusedSurfaceCommitted(focus));
+    try std.testing.expect(adapter.peekEvent() == null);
 }
 
 test "text input version two stages language hints panel and submit" {

@@ -2621,6 +2621,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (pointer.focus) |focus| focus.surface else null,
                 .{ .x = pointer.point.x, .y = pointer.point.y },
             );
+            try self.text_input_adapter.validateFocusedSurfaceCommit(.{
+                .peer = try self.adapter.surfacePeer(id),
+                .surface = (try self.adapter.surfaceResource(id)).id,
+            });
             if (self.pending_surface_len == self.pending_surfaces.len and
                 !self.pendingSurfaceContains(id))
                 try self.growPendingSurfaces();
@@ -2628,6 +2632,11 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn surfaceCommitted(context: *anyopaque, id: Adapter.SurfaceId) !void {
             const self: *Self = @ptrCast(@alignCast(context));
+            if (try self.text_input_adapter.focusedSurfaceCommitted(.{
+                .peer = try self.adapter.surfacePeer(id),
+                .surface = (try self.adapter.surfaceResource(id)).id,
+            }))
+                self.markProtocolAll(ProtocolReady.text_input);
             self.pointer_constraints_adapter.surfaceCommitted(id);
             const pointer = self.seat_adapter.pointerState();
             try self.pointer_constraints_adapter.updateFocus(
