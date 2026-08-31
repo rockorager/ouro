@@ -787,6 +787,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 return error.InvalidConfig;
             if (config.workspace.output_capacity < config.drm.connector_capacity)
                 return error.InvalidConfig;
+            if (config.interaction.output_capacity < config.desktop.output_capacity)
+                return error.InvalidConfig;
             const self = try allocator.create(Self);
             errdefer allocator.destroy(self);
             self.allocator = allocator;
@@ -6416,11 +6418,12 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn publishOutputLayout(self: *Self) !void {
             const bounds = try self.globalOutputBounds();
+            const interaction_areas = try self.physicalOutputAreas();
+            try self.interaction.validateTopology(bounds, interaction_areas);
             const output_areas = try self.desktopOutputAreas(null);
             try self.desktop.validateTopology(bounds, output_areas);
-            try self.interaction.validateBounds(bounds);
             self.desktop.applyTopology(bounds, output_areas);
-            self.interaction.applyBounds(bounds);
+            self.interaction.applyTopology(bounds, try self.physicalOutputAreas());
             _ = self.refreshRetainedLayersForOutput();
             try self.recomputeLayerConfigures();
             try self.recomputeSessionLockConfigures();
@@ -8816,6 +8819,18 @@ pub fn Coordinator(comptime protocol: type) type {
                     physical.protocol_output,
                     pending_surface,
                 );
+                count += 1;
+            }
+            if (count == 0) return error.NoOutput;
+            return self.desktop_output_areas[0..count];
+        }
+
+        fn physicalOutputAreas(self: *Self) ![]const geometry.Rect {
+            var count: usize = 0;
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                if (physical.kms_output == null) continue;
+                if (count == self.desktop_output_areas.len) return error.Exhausted;
+                self.desktop_output_areas[count] = try self.outputBoundsFor(physical);
                 count += 1;
             }
             if (count == 0) return error.NoOutput;

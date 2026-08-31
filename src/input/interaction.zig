@@ -30,6 +30,7 @@ pub const Config = struct {
     window_capacity: usize,
     device_capacity: usize,
     command_capacity: usize,
+    output_capacity: usize = 8,
     bounds: geometry.Rect,
     initial_position: geometry.Point = .{ .x = 0, .y = 0 },
 };
@@ -89,6 +90,8 @@ pub fn Interaction(comptime Desktop: type) type {
 
         allocator: std.mem.Allocator,
         bounds: geometry.Rect,
+        output_areas: []geometry.Rect,
+        output_area_len: usize = 1,
         x_fixed: i64,
         y_fixed: i64,
         windows: []SceneWindow,
@@ -105,7 +108,7 @@ pub fn Interaction(comptime Desktop: type) type {
 
         pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
             if (config.window_capacity == 0 or config.device_capacity == 0 or
-                config.command_capacity == 0)
+                config.command_capacity == 0 or config.output_capacity == 0)
                 return error.InvalidConfig;
             const command_slots = std.math.add(usize, config.command_capacity, 1) catch
                 return error.InvalidConfig;
@@ -114,14 +117,18 @@ pub fn Interaction(comptime Desktop: type) type {
             try validateFixedBounds(config.bounds);
             const windows = try allocator.alloc(SceneWindow, config.window_capacity);
             errdefer allocator.free(windows);
+            const output_areas = try allocator.alloc(geometry.Rect, config.output_capacity);
+            errdefer allocator.free(output_areas);
             const devices = try allocator.alloc(Device, config.device_capacity);
             errdefer allocator.free(devices);
             // One extra slot is reserved for destruction/device-loss cancellation.
             const commands = try allocator.alloc(Command, command_slots);
             @memset(devices, .{});
+            output_areas[0] = config.bounds;
             return .{
                 .allocator = allocator,
                 .bounds = config.bounds,
+                .output_areas = output_areas,
                 .x_fixed = @as(i64, config.initial_position.x) * 256,
                 .y_fixed = @as(i64, config.initial_position.y) * 256,
                 .windows = windows,
@@ -134,6 +141,7 @@ pub fn Interaction(comptime Desktop: type) type {
         pub fn deinit(self: *Self) void {
             self.allocator.free(self.commands);
             self.allocator.free(self.devices);
+            self.allocator.free(self.output_areas);
             self.allocator.free(self.windows);
             self.* = undefined;
         }
@@ -229,14 +237,13 @@ pub fn Interaction(comptime Desktop: type) type {
             return .{ .x = fixedFloor(self.x_fixed), .y = fixedFloor(self.y_fixed) };
         }
 
+        fn outputAreas(self: *const Self) []const geometry.Rect {
+            return self.output_areas[0..self.output_area_len];
+        }
+
         /// Applies a validated surface-local warp without synthesizing input.
         pub fn warpPointer(self: *Self, target: Target, x_fixed: i64, y_fixed: i64) bool {
-            const minimum_x = @as(i64, self.bounds.x) * 256;
-            const minimum_y = @as(i64, self.bounds.y) * 256;
-            const maximum_x = (@as(i64, self.bounds.x) + self.bounds.width) * 256;
-            const maximum_y = (@as(i64, self.bounds.y) + self.bounds.height) * 256;
-            if (x_fixed < minimum_x or x_fixed >= maximum_x or
-                y_fixed < minimum_y or y_fixed >= maximum_y) return false;
+            if (!fixedPointInAreas(x_fixed, y_fixed, self.outputAreas())) return false;
             self.x_fixed = x_fixed;
             self.y_fixed = y_fixed;
             self.hover = target;
@@ -269,8 +276,39 @@ pub fn Interaction(comptime Desktop: type) type {
         pub fn applyBounds(self: *Self, bounds: geometry.Rect) void {
             self.validateBounds(bounds) catch unreachable;
             self.bounds = bounds;
-            self.x_fixed = clampFixed(self.x_fixed, bounds.x, bounds.width);
-            self.y_fixed = clampFixed(self.y_fixed, bounds.y, bounds.height);
+            if (self.output_area_len == 1) self.output_areas[0] = bounds;
+            const clamped = clampFixedToAreas(self.x_fixed, self.y_fixed, self.outputAreas());
+            self.x_fixed = clamped.x;
+            self.y_fixed = clamped.y;
+            self.cursor.move(self.pointerPosition());
+        }
+
+        pub fn validateTopology(
+            self: *const Self,
+            bounds: geometry.Rect,
+            output_areas: []const geometry.Rect,
+        ) !void {
+            try self.validateBounds(bounds);
+            if (output_areas.len == 0 or output_areas.len > self.output_areas.len)
+                return error.Exhausted;
+            for (output_areas) |area| {
+                try area.validate();
+                try validateFixedBounds(area);
+            }
+        }
+
+        pub fn applyTopology(
+            self: *Self,
+            bounds: geometry.Rect,
+            output_areas: []const geometry.Rect,
+        ) void {
+            self.validateTopology(bounds, output_areas) catch unreachable;
+            self.bounds = bounds;
+            @memcpy(self.output_areas[0..output_areas.len], output_areas);
+            self.output_area_len = output_areas.len;
+            const clamped = clampFixedToAreas(self.x_fixed, self.y_fixed, self.outputAreas());
+            self.x_fixed = clamped.x;
+            self.y_fixed = clamped.y;
             self.cursor.move(self.pointerPosition());
         }
 
@@ -371,8 +409,19 @@ pub fn Interaction(comptime Desktop: type) type {
         ) !void {
             try self.validatePointerMotion(device_id, dx, dy);
             try self.ensureCommandCapacity(1);
-            const next_x = clampFixed(self.x_fixed +| fixedDelta(dx), self.bounds.x, self.bounds.width);
-            const next_y = clampFixed(self.y_fixed +| fixedDelta(dy), self.bounds.y, self.bounds.height);
+            const requested_x = clampFixed(
+                self.x_fixed +| fixedDelta(dx),
+                self.bounds.x,
+                self.bounds.width,
+            );
+            const requested_y = clampFixed(
+                self.y_fixed +| fixedDelta(dy),
+                self.bounds.y,
+                self.bounds.height,
+            );
+            const clamped = clampFixedToAreas(requested_x, requested_y, self.outputAreas());
+            const next_x = clamped.x;
+            const next_y = clamped.y;
             const interactive_rect: ?geometry.Rect = if (self.mode == .interactive) rect: {
                 const operation = self.mode.interactive;
                 break :rect interactiveRect(
@@ -815,6 +864,39 @@ fn clampFixed(value: i64, origin: i32, extent: i32) i64 {
 
 fn fixedFloor(value: i64) i32 {
     return @intCast(@divFloor(value, 256));
+}
+
+const FixedPosition = struct { x: i64, y: i64 };
+
+fn fixedPointInAreas(x: i64, y: i64, areas: []const geometry.Rect) bool {
+    for (areas) |area| {
+        const candidate_x = clampFixed(x, area.x, area.width);
+        const candidate_y = clampFixed(y, area.y, area.height);
+        if (candidate_x == x and candidate_y == y) return true;
+    }
+    return false;
+}
+
+fn clampFixedToAreas(x: i64, y: i64, areas: []const geometry.Rect) FixedPosition {
+    std.debug.assert(areas.len != 0);
+    var nearest: FixedPosition = undefined;
+    var nearest_distance: ?u128 = null;
+    for (areas) |area| {
+        const candidate: FixedPosition = .{
+            .x = clampFixed(x, area.x, area.width),
+            .y = clampFixed(y, area.y, area.height),
+        };
+        const dx: i128 = @as(i128, x) - candidate.x;
+        const dy: i128 = @as(i128, y) - candidate.y;
+        const magnitude_x: u128 = @intCast(if (dx < 0) -dx else dx);
+        const magnitude_y: u128 = @intCast(if (dy < 0) -dy else dy);
+        const distance = magnitude_x * magnitude_x + magnitude_y * magnitude_y;
+        if (distance == 0) return candidate;
+        if (nearest_distance != null and distance >= nearest_distance.?) continue;
+        nearest = candidate;
+        nearest_distance = distance;
+    }
+    return nearest;
 }
 
 fn bitSet(words: *const [state_words]u64, code: u32) bool {
@@ -1590,6 +1672,49 @@ test "interaction: output replacement clamps retained pointer and cursor" {
     try std.testing.expectEqual(geometry.Point{ .x = 2, .y = 1 }, interaction.pointerPosition());
     try std.testing.expectEqual(interaction.pointerPosition(), interaction.cursor.position);
     try std.testing.expectEqual(replacement, interaction.bounds);
+}
+
+test "interaction: pointer cannot remain between disjoint outputs" {
+    var interaction = try initTestInteraction(4);
+    defer interaction.deinit();
+    var desktop = testDesktop();
+    var surfaces = TestSurfaces{};
+    try addPointer(&interaction, &desktop, &surfaces);
+    const areas = [_]geometry.Rect{
+        .{ .x = 0, .y = 0, .width = 10, .height = 10 },
+        .{ .x = 20, .y = 5, .width = 10, .height = 10 },
+    };
+    const bounds: geometry.Rect = .{ .x = 0, .y = 0, .width = 30, .height = 15 };
+    try interaction.validateTopology(bounds, &areas);
+    interaction.applyTopology(bounds, &areas);
+
+    try interaction.consume(&desktop, &surfaces, .{ .pointer_motion = .{
+        .device = device_a,
+        .time_usec = 1,
+        .dx = 10,
+        .dy = 10,
+    } });
+    interaction.dropCommand();
+    try std.testing.expectEqual(geometry.Point{ .x = 9, .y = 9 }, interaction.pointerPosition());
+    try std.testing.expect(!interaction.warpPointer(
+        targetFor(desktop.windows[0]),
+        15 * 256,
+        7 * 256,
+    ));
+
+    try interaction.consume(&desktop, &surfaces, .{ .pointer_motion = .{
+        .device = device_a,
+        .time_usec = 2,
+        .dx = 15,
+        .dy = 0,
+    } });
+    interaction.dropCommand();
+    try std.testing.expectEqual(geometry.Point{ .x = 24, .y = 9 }, interaction.pointerPosition());
+
+    const remaining = [_]geometry.Rect{areas[0]};
+    interaction.applyTopology(areas[0], &remaining);
+    try std.testing.expectEqual(geometry.Point{ .x = 9, .y = 9 }, interaction.pointerPosition());
+    try std.testing.expectEqual(interaction.pointerPosition(), interaction.cursor.position);
 }
 
 test "interaction: popup grab retains outside delivery and dismisses on press" {
