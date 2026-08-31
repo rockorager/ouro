@@ -75,6 +75,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             context: *anyopaque,
             validate: *const fn (*anyopaque, wayring.io_uring.Peer, u32, u32, SurfaceId) bool,
         };
+        pub const OutputResolver = struct {
+            context: *anyopaque,
+            resolve: *const fn (*anyopaque, wayring.io_uring.Peer, u32) ?u64,
+        };
 
         pub const ResizeEdge = enum { top, bottom, left, top_left, bottom_left, right, top_right, bottom_right };
 
@@ -135,6 +139,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 id: ToplevelId,
                 state: RequestedState,
                 enabled: bool,
+                output: ?u64 = null,
             },
             move_requested: ToplevelId,
             resize_requested: struct { id: ToplevelId, edge: ResizeEdge },
@@ -357,6 +362,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         outstanding: []Outstanding,
         grab_validator: ?GrabValidator = null,
         interactive_grab_validator: ?InteractiveGrabValidator = null,
+        output_resolver: ?OutputResolver = null,
 
         pub fn init(
             allocator: std.mem.Allocator,
@@ -459,6 +465,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
 
         pub fn setInteractiveGrabValidator(adapter: *Self, validator: InteractiveGrabValidator) void {
             adapter.interactive_grab_validator = validator;
+        }
+
+        pub fn setOutputResolver(adapter: *Self, resolver: OutputResolver) void {
+            adapter.output_resolver = resolver;
         }
 
         /// Completes the protocol-defined two-request construction of a popup
@@ -1397,8 +1407,11 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     return try adapter.noMemory(actor),
                 .unset_maximized => adapter.publishState(id, .maximized, false) catch
                     return try adapter.noMemory(actor),
-                .set_fullscreen => adapter.publishState(id, .fullscreen, true) catch
-                    return try adapter.noMemory(actor),
+                .set_fullscreen => |v| adapter.publishFullscreen(
+                    id,
+                    true,
+                    if (v.output) |output| adapter.resolveFullscreenOutput(slot, output) else null,
+                ) catch return try adapter.noMemory(actor),
                 .unset_fullscreen => adapter.publishState(id, .fullscreen, false) catch
                     return try adapter.noMemory(actor),
                 .set_minimized => adapter.publishState(id, .minimized, true) catch
@@ -1510,6 +1523,19 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             return validator.validate(validator.context, manager.peer, seat, serial, surface.surface_id);
         }
 
+        fn resolveFullscreenOutput(adapter: *Self, slot: *ToplevelSlot, object_id: u32) ?u64 {
+            const resolver = adapter.output_resolver orelse return null;
+            const surface = adapter.resolveRoleSurface(
+                slot.xdg_surface_index,
+                slot.xdg_surface_generation,
+            ) catch return null;
+            const manager = adapter.resolveManager(
+                surface.manager_index,
+                surface.manager_generation,
+            ) catch return null;
+            return resolver.resolve(resolver.context, manager.peer, object_id);
+        }
+
         fn popupPlacement(state: PositionerState) PopupPlacement {
             return .{
                 .width = state.width,
@@ -1537,6 +1563,15 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .id = id,
                 .state = state,
                 .enabled = enabled,
+            } });
+        }
+
+        fn publishFullscreen(adapter: *Self, id: ToplevelId, enabled: bool, output: ?u64) !void {
+            try adapter.publish(.{ .state_requested = .{
+                .id = id,
+                .state = .fullscreen,
+                .enabled = enabled,
+                .output = output,
             } });
         }
 
@@ -2498,6 +2533,37 @@ test "xdg-shell: serial ordering is wrap safe" {
     try std.testing.expect(serialAtOrBefore(10, 10));
     try std.testing.expect(serialAtOrBefore(std.math.maxInt(u32), 1));
     try std.testing.expect(!serialAtOrBefore(2, 1));
+}
+
+test "xdg-shell: fullscreen retains resolved output identity" {
+    const Resolver = struct {
+        fn resolve(_: *anyopaque, peer: wayring.io_uring.Peer, object_id: u32) ?u64 {
+            if (peer.slot != 0 or object_id != 20) return null;
+            return 0x0000_0007_0000_0003;
+        }
+    };
+    const context = try TestContext.init();
+    defer context.deinit();
+    const id = try context.createToplevel();
+    context.adapter.setOutputResolver(.{ .context = &context.core, .resolve = Resolver.resolve });
+    _ = try context.server_objects.insertClient(
+        20,
+        &test_protocol.wl_output.info,
+        4,
+        &context.core,
+    );
+    try test_protocol.xdg_toplevel.encodeRequest(&context.requests, 12, .{
+        .set_fullscreen = .{ .output = 20 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    const requested = switch (context.adapter.popEvent() orelse return error.MissingEvent) {
+        .state_requested => |event| event,
+        else => return error.UnexpectedEvent,
+    };
+    try std.testing.expectEqual(id, requested.id);
+    try std.testing.expectEqual(TestAdapter.RequestedState.fullscreen, requested.state);
+    try std.testing.expect(requested.enabled);
+    try std.testing.expectEqual(@as(?u64, 0x0000_0007_0000_0003), requested.output);
 }
 
 test "xdg-shell: state arrays contain native protocol uints" {

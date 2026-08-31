@@ -562,7 +562,16 @@ pub fn Desktop(comptime Shell: type) type {
                 .fullscreen => .fullscreen,
                 .maximized => .maximized,
                 .minimized => .minimized,
-            }, enabled);
+            }, enabled, null);
+        }
+
+        pub fn setToplevelFullscreen(
+            desktop: *Self,
+            id: ToplevelId,
+            enabled: bool,
+            output: ?OutputId,
+        ) !void {
+            try desktop.requestState(id, .fullscreen, enabled, output);
         }
 
         pub fn focusNext(desktop: *Self) !void {
@@ -604,13 +613,13 @@ pub fn Desktop(comptime Shell: type) type {
         pub fn toggleFocusedFullscreen(desktop: *Self) !void {
             const id = desktop.focused() orelse return;
             const index = try desktop.resolveIndex(id);
-            try desktop.requestState(id, .fullscreen, !desktop.slots[index].fullscreen);
+            try desktop.requestState(id, .fullscreen, !desktop.slots[index].fullscreen, null);
         }
 
         pub fn toggleFocusedMaximized(desktop: *Self) !void {
             const id = desktop.focused() orelse return;
             const index = try desktop.resolveIndex(id);
-            try desktop.requestState(id, .maximized, !desktop.slots[index].maximized);
+            try desktop.requestState(id, .maximized, !desktop.slots[index].maximized, null);
         }
 
         pub fn toggleFocusedFloating(desktop: *Self) !void {
@@ -961,6 +970,7 @@ pub fn Desktop(comptime Shell: type) type {
                     try desktop.idForShell(request.id),
                     request.state,
                     request.enabled,
+                    if (request.output) |value| .{ .value = value } else null,
                 ),
                 .move_requested => |shell_id| {
                     if (desktop.interactive_request != null) return error.Backpressure;
@@ -1309,11 +1319,24 @@ pub fn Desktop(comptime Shell: type) type {
             slot.modal = source.modal;
         }
 
-        fn requestState(desktop: *Self, id: ToplevelId, state: Shell.RequestedState, enabled: bool) !void {
+        fn requestState(
+            desktop: *Self,
+            id: ToplevelId,
+            state: Shell.RequestedState,
+            enabled: bool,
+            output: ?OutputId,
+        ) !void {
             const index = try desktop.resolveIndex(id);
             const slot = &desktop.slots[index];
+            const fullscreen_output: ?OutputId = if (state == .fullscreen and enabled and output != null) found: {
+                for (desktop.output_ids[0..desktop.output_area_len]) |candidate| {
+                    if (std.meta.eql(candidate, output.?)) break :found output;
+                }
+                break :found null;
+            } else null;
             const unchanged = switch (state) {
-                .fullscreen => slot.fullscreen == enabled,
+                .fullscreen => slot.fullscreen == enabled and
+                    (fullscreen_output == null or std.meta.eql(slot.output, fullscreen_output)),
                 .maximized => slot.maximized == enabled,
                 .minimized => slot.minimized == enabled,
             };
@@ -1330,7 +1353,10 @@ pub fn Desktop(comptime Shell: type) type {
             if (!was_eligible and will_be_eligible) next_layout_count += 1;
             try desktop.validateLayout(next_layout_count, desktop.outputAreas());
             switch (state) {
-                .fullscreen => slot.fullscreen = enabled,
+                .fullscreen => {
+                    slot.fullscreen = enabled;
+                    if (fullscreen_output != null) slot.output = fullscreen_output;
+                },
                 .maximized => slot.maximized = enabled,
                 .minimized => {
                     slot.minimized = enabled;
@@ -2139,7 +2165,7 @@ const TestShell = struct {
         popup_created: struct { id: PopupId, surface: SurfaceId, parent: SurfaceId, placement: PopupPlacement },
         metadata_changed: ToplevelId,
         parent_changed: struct { id: ToplevelId, parent: ?ToplevelId },
-        state_requested: struct { id: ToplevelId, state: RequestedState, enabled: bool },
+        state_requested: struct { id: ToplevelId, state: RequestedState, enabled: bool, output: ?u64 = null },
         move_requested: ToplevelId,
         resize_requested: struct { id: ToplevelId, edge: ResizeEdge },
         commit_ready: struct {
@@ -2416,6 +2442,17 @@ test "desktop: topology keeps tiled and fullscreen windows on exact outputs" {
         .id = .{ .index = 2, .generation = 1 },
         .state = .fullscreen,
         .enabled = true,
+        .output = topology[0].id.value,
+    } });
+    _ = try desktop.consume(&shell, 1);
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expectEqual(areas[0], (try desktop.scene(third)).geometry);
+
+    shell.push(.{ .state_requested = .{
+        .id = .{ .index = 2, .generation = 1 },
+        .state = .fullscreen,
+        .enabled = true,
+        .output = topology[1].id.value,
     } });
     _ = try desktop.consume(&shell, 1);
     try settleDesktop(&desktop, &shell);

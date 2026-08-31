@@ -1339,6 +1339,10 @@ pub fn Coordinator(comptime protocol: type) type {
             });
             self.output_adapter = try OutputAdapter.init(allocator, config.protocol_output);
             errdefer self.output_adapter.deinit();
+            self.shell_adapter.setOutputResolver(.{
+                .context = self,
+                .resolve = resolveXdgFullscreenOutput,
+            });
             self.foreign_toplevel_list_adapter.setOutputResolver(
                 self,
                 resolveForeignToplevelOutput,
@@ -3603,13 +3607,14 @@ pub fn Coordinator(comptime protocol: type) type {
                     .set_minimized => self.desktop.setToplevelState(entry.desktop, .minimized, true),
                     .unset_minimized => self.desktop.setToplevelState(entry.desktop, .minimized, false),
                     .set_fullscreen => |fullscreen_request| blk: {
+                        var output: ?Desktop.OutputId = null;
                         if (fullscreen_request.output) |output_object| {
                             const objects = self.root.runtime.clients.get(command.peer) catch
                                 break :blk error.StalePeer;
-                            _ = self.resolveCaptureOutput(command.peer, objects, output_object) orelse
+                            output = self.resolveDesktopOutput(command.peer, objects, output_object) orelse
                                 break :blk error.StaleOutput;
                         }
-                        break :blk self.desktop.setToplevelState(entry.desktop, .fullscreen, true);
+                        break :blk self.desktop.setToplevelFullscreen(entry.desktop, true, output);
                     },
                     .unset_fullscreen => self.desktop.setToplevelState(entry.desktop, .fullscreen, false),
                     .activate => |activation_request| blk: {
@@ -3673,6 +3678,16 @@ pub fn Coordinator(comptime protocol: type) type {
                 &resources,
             ) catch return null;
             return if (ids.len == 0) null else ids[0];
+        }
+
+        fn resolveXdgFullscreenOutput(
+            context: *anyopaque,
+            peer: wayring.io_uring.Peer,
+            object_id: u32,
+        ) ?u64 {
+            const self: *Self = @ptrCast(@alignCast(context));
+            const objects = self.root.runtime.clients.get(peer) catch return null;
+            return (self.resolveDesktopOutput(peer, objects, object_id) orelse return null).value;
         }
 
         fn foreignOutputId(id: OutputAdapter.OutputId) ForeignToplevelListAdapter.OutputId {
@@ -4158,6 +4173,20 @@ pub fn Coordinator(comptime protocol: type) type {
             const reference = self.output_adapter.reference(peer, handle, object.*) catch return null;
             const physical = self.physicalOutputForProtocolId(reference.output) orelse return null;
             return if (physical.kms_output) |output| output.outputId() else null;
+        }
+
+        fn resolveDesktopOutput(
+            self: *Self,
+            peer: wayring.io_uring.Peer,
+            server_objects: anytype,
+            object_id: u32,
+        ) ?Desktop.OutputId {
+            const handle = server_objects.namespace.lookupHandle(object_id) orelse return null;
+            const object = server_objects.namespace.resolve(handle) orelse return null;
+            const reference = self.output_adapter.reference(peer, handle, object.*) catch return null;
+            const physical = self.physicalOutputForProtocolId(reference.output) orelse return null;
+            if (physical.kms_output == null) return null;
+            return .{ .value = @as(u64, physical.id.generation) << 32 | physical.id.index };
         }
 
         fn invalidateCaptureSource(self: *Self, target: ImageCaptureSourceAdapter.Target) !void {
