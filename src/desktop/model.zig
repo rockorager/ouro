@@ -13,11 +13,12 @@ const none = std.math.maxInt(u32);
 pub const Config = struct {
     toplevel_capacity: usize,
     popup_capacity: usize = 8,
+    output_capacity: usize = 8,
     command_capacity: usize,
     metadata_bytes: usize,
 
     fn validate(config: Config) !void {
-        inline for (.{ config.toplevel_capacity, config.popup_capacity, config.command_capacity, config.metadata_bytes }) |value|
+        inline for (.{ config.toplevel_capacity, config.popup_capacity, config.output_capacity, config.command_capacity, config.metadata_bytes }) |value|
             if (value == 0 or value >= none) return error.InvalidConfig;
         _ = std.math.mul(usize, config.toplevel_capacity, config.metadata_bytes) catch
             return error.InvalidConfig;
@@ -191,6 +192,8 @@ pub fn Desktop(comptime Shell: type) type {
         external_roots: []SceneWindow,
         external_root_len: usize = 0,
         work_area: geometry.Rect,
+        output_areas: []geometry.Rect,
+        output_area_len: usize = 1,
         metadata_storage: []u8,
         metadata_bytes: usize,
         focus: []u32,
@@ -228,6 +231,8 @@ pub fn Desktop(comptime Shell: type) type {
             errdefer allocator.free(popups);
             const external_roots = try allocator.alloc(SceneWindow, config.popup_capacity);
             errdefer allocator.free(external_roots);
+            const output_areas = try allocator.alloc(geometry.Rect, config.output_capacity);
+            errdefer allocator.free(output_areas);
             const metadata_per_slot = try std.math.mul(usize, config.metadata_bytes, 2);
             const storage_len = try std.math.mul(
                 usize,
@@ -269,6 +274,7 @@ pub fn Desktop(comptime Shell: type) type {
                 .next_free = if (index + 1 < popups.len) @intCast(index + 1) else none,
             };
             @memset(desired, .{});
+            output_areas[0] = work_area;
             return .{
                 .allocator = allocator,
                 .slots = slots,
@@ -277,6 +283,7 @@ pub fn Desktop(comptime Shell: type) type {
                 .popup_free = 0,
                 .external_roots = external_roots,
                 .work_area = work_area,
+                .output_areas = output_areas,
                 .metadata_storage = metadata_storage,
                 .metadata_bytes = config.metadata_bytes,
                 .focus = focus,
@@ -298,6 +305,7 @@ pub fn Desktop(comptime Shell: type) type {
             desktop.allocator.free(desktop.tile_order);
             desktop.allocator.free(desktop.focus);
             desktop.allocator.free(desktop.metadata_storage);
+            desktop.allocator.free(desktop.output_areas);
             desktop.allocator.free(desktop.popups);
             desktop.allocator.free(desktop.external_roots);
             desktop.allocator.free(desktop.slots);
@@ -648,6 +656,17 @@ pub fn Desktop(comptime Shell: type) type {
             return desktop.work_area;
         }
 
+        pub fn validateOutputAreas(desktop: *const Self, areas: []const geometry.Rect) !void {
+            if (areas.len == 0 or areas.len > desktop.output_areas.len) return error.Exhausted;
+            for (areas) |area| try area.validate();
+        }
+
+        pub fn applyOutputAreas(desktop: *Self, areas: []const geometry.Rect) void {
+            desktop.validateOutputAreas(areas) catch unreachable;
+            @memcpy(desktop.output_areas[0..areas.len], areas);
+            desktop.output_area_len = areas.len;
+        }
+
         pub fn scene(desktop: *const Self, id: ToplevelId) !SceneWindow {
             return desktop.slots[try desktop.resolveIndex(id)].scene;
         }
@@ -956,7 +975,11 @@ pub fn Desktop(comptime Shell: type) type {
                 popup.root_surface
             else
                 value.parent;
-            const positioned = try placePopup(value.placement, parent.geometry, desktop.work_area);
+            const positioned = try placePopup(
+                value.placement,
+                parent.geometry,
+                popupOutputArea(parent.geometry, desktop.output_areas[0..desktop.output_area_len]),
+            );
             const configure: Shell.PopupConfigure = .{
                 .x = positioned.x,
                 .y = positioned.y,
@@ -1025,7 +1048,11 @@ pub fn Desktop(comptime Shell: type) type {
             try desktop.requirePopupCommandCapacity(1);
             const slot = try desktop.popupByShell(value.id);
             const parent = try desktop.sceneForSurface(slot.parent);
-            const positioned = try placePopup(value.placement, parent.geometry, desktop.work_area);
+            const positioned = try placePopup(
+                value.placement,
+                parent.geometry,
+                popupOutputArea(parent.geometry, desktop.output_areas[0..desktop.output_area_len]),
+            );
             const configure: Shell.PopupConfigure = .{
                 .x = positioned.x,
                 .y = positioned.y,
@@ -1731,6 +1758,29 @@ pub fn Desktop(comptime Shell: type) type {
 }
 
 const PopupGeometry = struct { x: i32, y: i32, width: i32, height: i32 };
+
+fn popupOutputArea(parent: geometry.Rect, areas: []const geometry.Rect) geometry.Rect {
+    std.debug.assert(areas.len != 0);
+    var selected = areas[0];
+    var selected_intersection: i64 = 0;
+    for (areas) |area| {
+        const left = @max(@as(i64, parent.x), area.x);
+        const top = @max(@as(i64, parent.y), area.y);
+        const right = @min(
+            @as(i64, parent.x) + parent.width,
+            @as(i64, area.x) + area.width,
+        );
+        const bottom = @min(
+            @as(i64, parent.y) + parent.height,
+            @as(i64, area.y) + area.height,
+        );
+        const intersection = @max(0, right - left) * @max(0, bottom - top);
+        if (intersection <= selected_intersection) continue;
+        selected = area;
+        selected_intersection = intersection;
+    }
+    return selected;
+}
 
 fn placePopup(placement: anytype, parent: geometry.Rect, bounds: geometry.Rect) !PopupGeometry {
     const width: i64 = placement.width;
@@ -2438,6 +2488,25 @@ test "desktop: popup placement flips before sliding or resizing" {
         .{ .x = 0, .y = 0, .width = 100, .height = 60 },
         .{ .x = 0, .y = 0, .width = 100, .height = 60 },
     ));
+}
+
+test "desktop: popup constraints select the largest parent output intersection" {
+    const areas = [_]geometry.Rect{
+        .{ .x = 0, .y = 0, .width = 100, .height = 60 },
+        .{ .x = 100, .y = 0, .width = 100, .height = 60 },
+    };
+    try std.testing.expectEqual(
+        areas[1],
+        popupOutputArea(.{ .x = 80, .y = 10, .width = 60, .height = 20 }, &areas),
+    );
+    try std.testing.expectEqual(
+        areas[0],
+        popupOutputArea(.{ .x = 75, .y = 10, .width = 50, .height = 20 }, &areas),
+    );
+    try std.testing.expectEqual(
+        areas[0],
+        popupOutputArea(.{ .x = 250, .y = 10, .width = 20, .height = 20 }, &areas),
+    );
 }
 
 test "desktop: scene transaction waits for every exact configure serial" {

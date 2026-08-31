@@ -652,6 +652,7 @@ pub fn Coordinator(comptime protocol: type) type {
         xdg_session_store: ?XdgSessionStore = null,
         xdg_session_store_failed: bool = false,
         desktop: Desktop,
+        desktop_output_areas: []geometry.Rect,
         interaction: Interaction,
         seat_adapter: SeatAdapter,
         transient_seat_adapter: TransientSeatAdapter,
@@ -1075,6 +1076,11 @@ pub fn Coordinator(comptime protocol: type) type {
             errdefer self.toplevel_icon_adapter.deinit();
             self.desktop = try Desktop.init(allocator, config.desktop, config.interaction.bounds);
             errdefer self.desktop.deinit();
+            self.desktop_output_areas = try allocator.alloc(
+                geometry.Rect,
+                config.desktop.output_capacity,
+            );
+            errdefer allocator.free(self.desktop_output_areas);
             self.foreign_toplevel_list_adapter = try ForeignToplevelListAdapter.init(
                 allocator,
                 config.foreign_toplevel_list,
@@ -1748,6 +1754,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.seat_adapter.deinit();
             self.subcompositor_adapter.deinit();
             self.interaction.deinit();
+            self.allocator.free(self.desktop_output_areas);
             self.desktop.deinit();
             self.foreign_toplevel_list_adapter.deinit();
             self.allocator.free(self.workspace_output_ids);
@@ -2585,8 +2592,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 else => return err,
             };
             try self.session_lock_adapter.validateSurfaceCommit(id);
-            if (self.layer_shell_adapter.ownsSurface(id))
+            if (self.layer_shell_adapter.ownsSurface(id)) {
                 try self.desktop.validateWorkArea(try self.layerWorkArea(id));
+                try self.desktop.validateOutputAreas(try self.desktopOutputAreas(id));
+            }
             const pointer = self.seat_adapter.pointerState();
             try self.pointer_constraints_adapter.validateSurfaceCommit(
                 id,
@@ -2614,6 +2623,7 @@ pub fn Coordinator(comptime protocol: type) type {
             if (self.layer_shell_adapter.ownsSurface(id)) {
                 self.layer_shell_adapter.publishSurfaceCommitted(id) catch unreachable;
                 self.desktop.applyWorkArea(self.layerWorkArea(null) catch unreachable);
+                self.desktop.applyOutputAreas(self.desktopOutputAreas(null) catch unreachable);
                 const layer_state = self.layer_shell_adapter.stateForSurface(id) orelse unreachable;
                 const configure_size = self.layerConfigureSize(layer_state) catch unreachable;
                 self.layer_shell_adapter.updatePendingConfigureSize(
@@ -6325,8 +6335,11 @@ pub fn Coordinator(comptime protocol: type) type {
         fn publishOutputLayout(self: *Self) !void {
             const bounds = try self.globalOutputBounds();
             try self.desktop.validateWorkArea(bounds);
+            const output_areas = try self.desktopOutputAreas(null);
+            try self.desktop.validateOutputAreas(output_areas);
             try self.interaction.validateBounds(bounds);
             self.desktop.applyWorkArea(bounds);
+            self.desktop.applyOutputAreas(output_areas);
             self.interaction.applyBounds(bounds);
             _ = self.refreshRetainedLayersForOutput();
             try self.recomputeLayerConfigures();
@@ -8695,6 +8708,24 @@ pub fn Coordinator(comptime protocol: type) type {
                 .width = snapshot.width orelse return error.NoOutput,
                 .height = snapshot.height orelse return error.NoOutput,
             };
+        }
+
+        fn desktopOutputAreas(
+            self: *Self,
+            pending_surface: ?Adapter.SurfaceId,
+        ) ![]const geometry.Rect {
+            var count: usize = 0;
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                if (physical.kms_output == null) continue;
+                if (count == self.desktop_output_areas.len) return error.Exhausted;
+                self.desktop_output_areas[count] = try self.layerWorkAreaFor(
+                    physical.protocol_output,
+                    pending_surface,
+                );
+                count += 1;
+            }
+            if (count == 0) return error.NoOutput;
+            return self.desktop_output_areas[0..count];
         }
 
         fn layerWorkArea(self: *Self, pending_surface: ?Adapter.SurfaceId) !geometry.Rect {
