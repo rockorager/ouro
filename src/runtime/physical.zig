@@ -5392,6 +5392,18 @@ pub fn Coordinator(comptime protocol: type) type {
                         self.desktop.removeExternalRoot(state.surface);
                     }
                     try self.layer_shell_adapter.outputRemoved(physical.protocol_output);
+                    const lock_ids = try self.session_lock_adapter.surfaceIds(
+                        self.lock_surface_ids,
+                    );
+                    for (lock_ids) |id| {
+                        const state = try self.session_lock_adapter.surfaceState(id);
+                        if (state.retired or
+                            !std.meta.eql(state.output_id, physical.protocol_output)) continue;
+                        self.queueLayerRemoval(state.surface);
+                        self.interaction.surfaceDestroyed(state.surface);
+                    }
+                    if (self.session_lock_adapter.outputRemoved(physical.protocol_output))
+                        try self.sessionLockChanged();
                     try self.output_management_adapter.removeHead(physical.management_head);
                     try self.output_power_adapter.outputRemoved(physical.id);
                     try self.gamma_control_adapter.outputRemoved(physical.id);
@@ -8947,6 +8959,7 @@ pub fn Coordinator(comptime protocol: type) type {
             const ids = try self.session_lock_adapter.surfaceIds(self.lock_surface_ids);
             for (ids) |id| {
                 const state = try self.session_lock_adapter.surfaceState(id);
+                if (state.retired) continue;
                 const physical = self.physicalOutputForProtocolId(state.output_id) orelse
                     return error.InvalidOutput;
                 const bounds = try self.outputBoundsFor(physical);

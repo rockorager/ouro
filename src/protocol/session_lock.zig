@@ -46,6 +46,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
             output: objects.Handle,
             output_id: OutputAdapter.OutputId,
             mapped: bool,
+            retired: bool,
         };
 
         const ManagerSlot = struct { header: slot_pool.Header = .{}, peer: wayring.io_uring.Peer = undefined, resource: objects.Handle = .{ .id = 0, .generation = 0 } };
@@ -74,6 +75,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
             ack_width: u32 = 0,
             ack_height: u32 = 0,
             mapped: bool = false,
+            retired: bool = false,
         };
         const Outstanding = struct { active: bool = false, surface: LockSurfaceId = undefined, serial: u32 = 0, width: u32 = 0, height: u32 = 0 };
 
@@ -158,7 +160,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
         }
         pub fn surfaceState(self: *const Self, id: LockSurfaceId) !SurfaceState {
             const s = try self.resolveSurface(id);
-            return .{ .lock = s.lock, .surface = s.surface, .output = s.output, .output_id = s.output_id, .mapped = s.mapped };
+            return .{ .lock = s.lock, .surface = s.surface, .output = s.output, .output_id = s.output_id, .mapped = s.mapped, .retired = s.retired };
         }
         pub fn ownsSurface(self: *const Self, surface: SurfaceId) bool {
             return self.findSurface(surface) != null;
@@ -178,6 +180,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
         pub fn queueConfigure(self: *Self, id: LockSurfaceId, width: u32, height: u32) !void {
             if (width == 0 or height == 0) return error.InvalidSize;
             const s = try self.resolveSurface(id);
+            if (s.retired) return error.Retired;
             if (!s.configure_pending and self.outbound_len == self.outbound_capacity) return error.Exhausted;
             if (!s.configure_pending) self.outbound_len += 1;
             s.configure_pending = true;
@@ -187,6 +190,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
         }
         pub fn validateSurfaceCommit(self: *Self, sid: SurfaceId) !void {
             const s = self.findSurface(sid) orelse return;
+            if (s.retired) return;
             if (!s.acked) return error.CommitBeforeFirstAck;
             const core = try self.core.getSurfaceById(sid);
             const prospective = try core.prospectiveContent();
@@ -195,7 +199,23 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
         }
         pub fn publishSurfaceCommitted(self: *Self, sid: SurfaceId) !void {
             const s = self.findSurface(sid) orelse return;
+            if (s.retired) return;
             s.mapped = true;
+        }
+
+        pub fn outputRemoved(self: *Self, output: OutputAdapter.OutputId) bool {
+            var changed = false;
+            for (self.surfaces.entries.items) |s| {
+                if (!s.header.active or s.retired or !std.meta.eql(s.output_id, output)) continue;
+                if (s.configure_pending) {
+                    s.configure_pending = false;
+                    self.outbound_len -= 1;
+                }
+                s.mapped = false;
+                s.retired = true;
+                changed = true;
+            }
+            return changed;
         }
 
         pub fn request(self: *Self, peer: wayring.io_uring.Peer, target: objects.Dispatch, message: wayring.wire.Message, fds: *wayring.ancillary.FdQueue) !?wayring.dispatch.Control {
@@ -645,4 +665,24 @@ test "session-lock: configure ack gates exact prospective commit dimensions" {
     try std.testing.expect(!adapter.outstanding[1].active);
     try std.testing.expectEqual(@as(u32, 1280), slot.ack_width);
     try std.testing.expectEqual(@as(u32, 720), slot.ack_height);
+
+    slot.output_id = .{ .index = 7, .generation = 8 };
+    try adapter.queueConfigure(id, 800, 600);
+    adapter.outstanding[0] = .{
+        .active = true,
+        .surface = id,
+        .serial = 13,
+        .width = 640,
+        .height = 480,
+    };
+    try std.testing.expect(adapter.outputRemoved(slot.output_id));
+    const retired = try adapter.surfaceState(id);
+    try std.testing.expect(retired.retired);
+    try std.testing.expect(!retired.mapped);
+    try std.testing.expect(!slot.configure_pending);
+    try std.testing.expectError(error.Retired, adapter.queueConfigure(id, 320, 200));
+    try adapter.ack(slot, 13);
+    try adapter.validateSurfaceCommit(slot.surface);
+    try adapter.publishSurfaceCommitted(slot.surface);
+    try std.testing.expect(!(try adapter.surfaceState(id)).mapped);
 }

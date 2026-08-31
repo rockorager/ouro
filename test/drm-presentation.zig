@@ -895,7 +895,12 @@ test "generated session lock publishes only after presentation and client loss s
     defer wayring.unix_socket.unlink(path) catch {};
 
     const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), compositorConfig());
-    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), coordinatorConfig());
+    const coordinator = try Coordinator.create(
+        allocator,
+        root,
+        fixture.platformsWithHotplug(),
+        coordinatorConfig(),
+    );
     var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
     try coordinator.start(&loop);
     _ = try loop.turn(coordinator);
@@ -983,6 +988,29 @@ test "generated session lock publishes only after presentation and client loss s
         lock_associations += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), lock_associations);
+
+    fixture.second_desktop = false;
+    try fixture.signalHotplug();
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (!coordinator.physical_outputs[1].connected and
+            !coordinator.physical_outputs[1].removing) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(!coordinator.physical_outputs[1].connected);
+    const retired_lock = try coordinator.session_lock_adapter.surfaceState(lock_ids[0]);
+    try std.testing.expect(retired_lock.retired);
+    try std.testing.expect(!retired_lock.mapped);
+    try std.testing.expect(coordinator.session_lock_adapter.activeLock() != null);
+    try std.testing.expect(coordinator.session_lock_adapter.isFailClosed());
+    try std.testing.expect(coordinator.physical_outputs[0].kms_output != null);
+    lock_associations = 0;
+    for (coordinator.output_adapter.associations) |association| {
+        if (association.active and association.desired and
+            std.meta.eql(association.surface, lock_resource)) lock_associations += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), lock_associations);
 
     _ = try client.prepareClose();
     try submitClient(&reactor, &driver, &handler);
