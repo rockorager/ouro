@@ -64,6 +64,7 @@ pub fn Adapter(comptime protocol: type, comptime SeatAdapter: type) type {
         init_context: ?*anyopaque,
         init_seat: InitSeatFn,
         mutation: ?Mutation = null,
+        pending_work: usize = 0,
         sequence: u64 = 1,
 
         pub fn init(allocator: std.mem.Allocator, config: Config, context: ?*anyopaque, init_seat: InitSeatFn) !Self {
@@ -121,7 +122,7 @@ pub fn Adapter(comptime protocol: type, comptime SeatAdapter: type) type {
                     error.GlobalUpdateActive => return null,
                     else => return err,
                 };
-                seat.state = .adding;
+                self.setState(seat, .adding);
                 self.mutation = .{ .add = id };
                 return self.mutation;
             };
@@ -131,7 +132,7 @@ pub fn Adapter(comptime protocol: type, comptime SeatAdapter: type) type {
                     error.GlobalUpdateActive => return null,
                     else => return err,
                 };
-                seat.state = .removing;
+                self.setState(seat, .removing);
                 self.mutation = .{ .remove = id };
                 return self.mutation;
             };
@@ -151,23 +152,23 @@ pub fn Adapter(comptime protocol: type, comptime SeatAdapter: type) type {
             const seat = self.validSeat(id) orelse return;
             switch (completed) {
                 .add => {
-                    if (seat.transient == null) seat.state = .remove_queued else {
-                        seat.state = .ready;
+                    if (seat.transient == null) self.setState(seat, .remove_queued) else {
+                        self.setState(seat, .ready);
                         const out = self.outForTransient(seat.transient.?) orelse return error.MissingReservation;
                         out.value.ready.name = seat.adapter.globalName() orelse return error.MissingGlobal;
                     }
                 },
-                .remove => seat.state = .retired,
+                .remove => self.setState(seat, .retired),
             }
             try self.advance();
         }
 
-        fn destroySeat(_: *Self, seat: *SeatSlot) void {
+        fn destroySeat(self: *Self, seat: *SeatSlot) void {
             seat.transient = null;
             switch (seat.state) {
-                .queued => seat.state = .retired,
+                .queued => self.setState(seat, .retired),
                 .adding => {}, // add completion observes the absent handle
-                .ready => seat.state = .remove_queued,
+                .ready => self.setState(seat, .remove_queued),
                 else => {},
             }
         }
@@ -187,8 +188,28 @@ pub fn Adapter(comptime protocol: type, comptime SeatAdapter: type) type {
                 if (seat.adapter.globalName() != null or seat.adapter.resourceCount() != 0 or seat.adapter.deviceCount() != 0) continue;
                 seat.adapter.deinit();
                 const generation = nextGeneration(seat.generation);
+                self.setState(seat, .free);
                 seat.* = .{ .generation = generation };
             };
+        }
+
+        pub fn hasPendingWork(self: *const Self) bool {
+            return self.mutation != null or self.pending_work != 0;
+        }
+
+        fn setState(self: *Self, seat: *SeatSlot, state: State) void {
+            const was_pending = stateNeedsWork(seat.state);
+            const is_pending = stateNeedsWork(state);
+            if (!was_pending and is_pending) self.pending_work += 1;
+            if (was_pending and !is_pending) {
+                std.debug.assert(self.pending_work != 0);
+                self.pending_work -= 1;
+            }
+            seat.state = state;
+        }
+
+        fn stateNeedsWork(state: State) bool {
+            return state == .queued or state == .remove_queued or state == .retired;
         }
 
         pub fn request(self: *Self, peer: wayring.io_uring.Peer, target: objects.Dispatch, message: wayring.wire.Message, fds: *wayring.ancillary.FdQueue) !?wayring.dispatch.Control {
@@ -223,7 +244,7 @@ pub fn Adapter(comptime protocol: type, comptime SeatAdapter: type) type {
                             errdefer out.active = false;
                             const admitted = try Manager.admit_create(server_objects, decoded.handle, value, .{ .seat = transient });
                             transient.* = .{ .active = true, .generation = id.generation, .peer = peer, .resource = admitted.seat, .seat = self.seatId(seat) };
-                            seat.state = .queued;
+                            self.setState(seat, .queued);
                             seat.peer = peer;
                             seat.transient = id;
                         } else {

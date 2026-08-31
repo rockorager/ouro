@@ -202,6 +202,10 @@ pub fn Loop(comptime protocol: type) type {
             var unrouted_count: usize = 0;
             var shutdown_requested = false;
             for (self.cqes[0..copied]) |cqe| {
+                if (cqe.user_data == completion.skipped_success_user_data) {
+                    if (cqe.res < 0) return error.SkippedOperationFailed;
+                    return error.UnexpectedSkippedCompletion;
+                }
                 if (self.router.route(cqe.user_data)) |token| {
                     if (token.kind == .shutdown) {
                         if (self.shutdown_token == null or

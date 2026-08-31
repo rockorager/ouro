@@ -107,6 +107,7 @@ pub fn Owner(comptime State: type, comptime ToplevelId: type) type {
         events: []Event,
         event_head: usize = 0,
         event_len: usize = 0,
+        tracked_toplevels: usize = 0,
         dirty: bool = false,
 
         pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
@@ -133,6 +134,7 @@ pub fn Owner(comptime State: type, comptime ToplevelId: type) type {
             @memset(self.handles, .{});
             self.event_head = 0;
             self.event_len = 0;
+            self.tracked_toplevels = 0;
             self.dirty = false;
             return self;
         }
@@ -288,6 +290,7 @@ pub fn Owner(comptime State: type, comptime ToplevelId: type) type {
         fn inertSession(self: *Self, index: usize) void {
             self.sessions[index].inert = true;
             for (self.handles) |*h| if (h.live and h.session_resource == index) {
+                self.stopTracking(h);
                 h.inert = true;
                 h.associated = false;
             };
@@ -358,6 +361,7 @@ pub fn Owner(comptime State: type, comptime ToplevelId: type) type {
             h.applied = false;
             const id: ToplevelSessionId = .{ .index = @intCast(handle_i), .generation = h.generation };
             try self.push(.{ .associated = .{ .handle = id, .toplevel = toplevel, .restoring = restoring } });
+            if (tracked(h)) self.tracked_toplevels += 1;
             return id;
         }
 
@@ -374,6 +378,7 @@ pub fn Owner(comptime State: type, comptime ToplevelId: type) type {
         }
         pub fn destroyToplevelSession(self: *Self, id: ToplevelSessionId) void {
             const h = self.handle(id) orelse return;
+            self.stopTracking(h);
             h.live = false;
             h.associated = false;
             h.generation +%= 1;
@@ -386,13 +391,17 @@ pub fn Owner(comptime State: type, comptime ToplevelId: type) type {
             self.records[ri].live = false;
             self.dirty = true;
             for (self.handles) |*h| if (h.live and h.record == ri) {
+                self.stopTracking(h);
                 h.inert = true;
                 h.associated = false;
             };
         }
         pub fn toplevelDestroyed(self: *Self, toplevel: ToplevelId) void {
             for (self.handles) |*h| {
-                if (h.live and h.associated and std.meta.eql(h.toplevel, toplevel)) h.associated = false;
+                if (h.live and h.associated and std.meta.eql(h.toplevel, toplevel)) {
+                    self.stopTracking(h);
+                    h.associated = false;
+                }
             }
         }
         pub fn updateState(self: *Self, toplevel: ToplevelId, state: State) void {
@@ -406,9 +415,18 @@ pub fn Owner(comptime State: type, comptime ToplevelId: type) type {
             };
         }
         pub fn tracksToplevels(self: *const Self) bool {
-            for (self.handles) |slot| if (slot.live and !slot.inert and
-                slot.associated and (!slot.restore_pending or slot.applied)) return true;
-            return false;
+            return self.tracked_toplevels != 0;
+        }
+
+        fn tracked(h: *const Handle) bool {
+            return h.live and !h.inert and h.associated and
+                (!h.restore_pending or h.applied);
+        }
+
+        fn stopTracking(self: *Self, h: *const Handle) void {
+            if (!tracked(h)) return;
+            std.debug.assert(self.tracked_toplevels != 0);
+            self.tracked_toplevels -= 1;
         }
         pub fn persistenceDirty(self: *const Self) bool {
             return self.dirty;
@@ -442,6 +460,7 @@ pub fn Owner(comptime State: type, comptime ToplevelId: type) type {
             if (!h.restore_pending or h.applied) return;
             try self.push(.{ .toplevel_restored = id });
             h.applied = true;
+            if (tracked(h)) self.tracked_toplevels += 1;
         }
         pub fn exportSession(self: *const Self, cursor: *usize) ?ExportSession {
             while (cursor.* < self.stored.len) : (cursor.* += 1) if (self.stored[cursor.*].live) {
@@ -501,6 +520,7 @@ pub fn Adapter(comptime protocol: type, comptime ShellAdapter: type, comptime St
         sessions: []SessionSlot,
         toplevels: []ToplevelSlot,
         outbound: []OutSlot,
+        pending_outbound: usize = 0,
         out_bytes: []u8,
         string_bytes: usize,
         sequence: u64 = 1,
@@ -644,8 +664,7 @@ pub fn Adapter(comptime protocol: type, comptime ShellAdapter: type, comptime St
             return false;
         }
         pub fn hasPendingOutbound(self: *const Self) bool {
-            for (self.outbound) |out| if (out.active) return true;
-            return false;
+            return self.pending_outbound != 0;
         }
         pub fn flushOn(self: *Self, peer: wayring.io_uring.Peer, server_objects: anytype, queue: *wayring.tx.Queue) !usize {
             var n: usize = 0;
@@ -657,6 +676,8 @@ pub fn Adapter(comptime protocol: type, comptime ShellAdapter: type, comptime St
                     .toplevel_restored => |id| if (self.toplevelSlot(id)) |t| try wayring.server.sendEvent(protocol, Toplevel, server_objects, queue, t.resource, .{ .restored = .{} }),
                 }
                 o.active = false;
+                std.debug.assert(self.pending_outbound > 0);
+                self.pending_outbound -= 1;
                 n += 1;
             }
             return n;
@@ -766,6 +787,7 @@ pub fn Adapter(comptime protocol: type, comptime ShellAdapter: type, comptime St
         fn reserve(self: *Self) ?*OutSlot {
             for (self.outbound) |*o| if (!o.active) {
                 o.active = true;
+                self.pending_outbound += 1;
                 o.sequence = self.sequence;
                 self.sequence +%= 1;
                 return o;
@@ -773,11 +795,7 @@ pub fn Adapter(comptime protocol: type, comptime ShellAdapter: type, comptime St
             return null;
         }
         fn freeOutCount(self: *const Self) usize {
-            var n: usize = 0;
-            for (self.outbound) |o| if (!o.active) {
-                n += 1;
-            };
-            return n;
+            return self.outbound.len - self.pending_outbound;
         }
         fn outIndex(self: *const Self, o: *const OutSlot) usize {
             return (@intFromPtr(o) - @intFromPtr(self.outbound.ptr)) / @sizeOf(OutSlot);
@@ -886,6 +904,7 @@ test "replacement, persistence, inertness, and generation reuse" {
     _ = owner.nextEvent();
     _ = owner.nextEvent();
     const h = try owner.addToplevel(second, 9, false, "main", false);
+    try std.testing.expect(owner.tracksToplevels());
     try std.testing.expect(owner.persistenceDirty());
     owner.persistenceSaved();
     owner.updateState(9, 42);
@@ -894,6 +913,7 @@ test "replacement, persistence, inertness, and generation reuse" {
     owner.updateState(9, 42);
     try std.testing.expect(!owner.persistenceDirty());
     owner.destroyToplevelSession(h);
+    try std.testing.expect(!owner.tracksToplevels());
     owner.destroySession(second, false);
     const third = try owner.getSession(2, 3, "s1", generator);
     try std.testing.expectEqual(second.index, third.index);
@@ -917,11 +937,13 @@ test "unknown restore is add; rename atomic; restore gate" {
     owner.destroySession(s, false);
     const restored = try owner.getSession(2, 1, "s1", generator);
     const rh = try owner.addToplevel(restored, 3, false, "a", true);
+    try std.testing.expect(!owner.tracksToplevels());
     const pending = owner.pendingRestore(3).?;
     try std.testing.expectEqual(rh, pending.handle);
     try std.testing.expectEqual(@as(?u32, 7), pending.state);
     try std.testing.expectEqual(@as(?u32, 7), owner.takeRestoreState(rh));
     try owner.markRestoreApplied(rh);
+    try std.testing.expect(owner.tracksToplevels());
     try std.testing.expect(owner.pendingRestore(3) == null);
     var found = false;
     while (owner.nextEvent()) |event| {

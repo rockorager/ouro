@@ -145,6 +145,7 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
         captures: []CaptureSlot,
         outbound: []Out,
         capture_count: usize = 0,
+        cursor_session_count: usize = 0,
         outbound_count: usize = 0,
         sequence: u64 = 1,
         runtime: ?*Runtime = null,
@@ -524,6 +525,7 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
                 .target = target,
                 .constraints = constraints,
             };
+            self.cursor_session_count += 1;
             return self.cursor_sessions.entries.items[index];
         }
 
@@ -564,6 +566,7 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
             }
         }
         pub fn refreshCursors(self: *Self, resolver: anytype) !usize {
+            if (self.cursor_session_count == 0) return 0;
             var changed: usize = 0;
             for (self.cursor_sessions.entries.items, 0..) |cursor, index| {
                 if (!cursor.active or cursor.target == null or cursor.source_target == null) continue;
@@ -904,6 +907,8 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
             const id = self.cursorSessionId(cursor);
             self.dropOwner(.{ .cursor = id });
             self.cursor_sessions.release(cursor);
+            std.debug.assert(self.cursor_session_count != 0);
+            self.cursor_session_count -= 1;
         }
         fn removeCaptures(self: *Self, id: FrameId) void {
             for (self.captures) |*slot| if (slot.active and std.meta.eql(slot.value.frame, id)) {

@@ -62,7 +62,6 @@ pub const ConnectorProperties = struct {
 pub const CrtcProperties = struct {
     active: u32,
     mode_id: u32,
-    out_fence_ptr: u32 = 0,
     vrr_enabled: u32 = 0,
 };
 pub const PlaneProperties = struct {
@@ -280,7 +279,6 @@ fn realReadTopology(_: *anyopaque, fd: std.posix.fd_t, out: *TopologyBuffer) !vo
             .properties = .{
                 .active = try requiredProperty(fd, props, "ACTIVE"),
                 .mode_id = try requiredProperty(fd, props, "MODE_ID"),
-                .out_fence_ptr = if (try optionalProperty(fd, props, "OUT_FENCE_PTR")) |value| value.id else 0,
                 .vrr_enabled = if (try optionalProperty(fd, props, "VRR_ENABLED")) |value| value.id else 0,
             },
         };

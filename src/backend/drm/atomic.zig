@@ -1,6 +1,7 @@
 //! Narrow, replaceable libdrm atomic-commit boundary. Requests and mode blobs
 //! are created outside Ouro's commit/completion turns and contain no borrowed
-//! libdrm pointers. Event dispatch is single-thread serialized.
+//! libdrm pointers. Event dispatch is single-thread serialized from bytes read
+//! by the runtime's shared io_uring.
 
 const std = @import("std");
 const drm = @import("manager.zig");
@@ -39,7 +40,7 @@ pub const Platform = struct {
         reset_request: *const fn (*anyopaque, Request) void,
         add_property: *const fn (*anyopaque, Request, u32, u32, u64) anyerror!void,
         commit: *const fn (*anyopaque, std.posix.fd_t, Request, CommitFlags, ?*anyopaque) anyerror!void,
-        handle_events: *const fn (*anyopaque, std.posix.fd_t, FlipCallback) anyerror!void,
+        handle_events: *const fn (*anyopaque, []const u8, FlipCallback) anyerror!void,
     };
 
     pub fn createBlob(self: Platform, fd: std.posix.fd_t, mode: drm.Mode) !u32 {
@@ -77,13 +78,12 @@ pub const Platform = struct {
         return self.vtable.commit(self.context, fd, request, flags, userdata);
     }
 
-    pub fn handleEvents(self: Platform, fd: std.posix.fd_t, callback: FlipCallback) !void {
-        return self.vtable.handle_events(self.context, fd, callback);
+    pub fn handleEvents(self: Platform, bytes: []const u8, callback: FlipCallback) !void {
+        return self.vtable.handle_events(self.context, bytes, callback);
     }
 };
 
-const RealContext = struct { callback: FlipCallback = undefined };
-var real_context: RealContext = .{};
+var real_context: u8 = 0;
 pub const real: Platform = .{ .context = &real_context, .vtable = &real_vtable };
 
 const real_vtable: Platform.VTable = .{
@@ -142,26 +142,30 @@ fn realCommit(
         return error.AtomicCommitFailed;
 }
 
-fn realHandleEvents(context: *anyopaque, fd: std.posix.fd_t, callback: FlipCallback) !void {
-    const self: *RealContext = @ptrCast(@alignCast(context));
-    self.callback = callback;
-    var event_context: c.drmEventContext = std.mem.zeroes(c.drmEventContext);
-    event_context.version = 3;
-    event_context.page_flip_handler2 = realPageFlip;
-    const result = c.drmHandleEvent(fd, &event_context);
-    if (result != 0 and std.c.errno(result) != .AGAIN)
-        return error.HandleDrmEventFailed;
-}
-
-fn realPageFlip(
-    _: c_int,
-    sequence: c_uint,
-    seconds: c_uint,
-    microseconds: c_uint,
-    crtc_id: c_uint,
-    userdata: ?*anyopaque,
-) callconv(.c) void {
-    real_context.callback(userdata orelse return, sequence, seconds, microseconds, crtc_id);
+fn realHandleEvents(_: *anyopaque, bytes: []const u8, callback: FlipCallback) !void {
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        if (bytes.len - offset < @sizeOf(c.struct_drm_event)) return error.TruncatedDrmEvent;
+        const header = std.mem.bytesToValue(
+            c.struct_drm_event,
+            bytes[offset..][0..@sizeOf(c.struct_drm_event)],
+        );
+        const length: usize = @intCast(header.length);
+        if (length < @sizeOf(c.struct_drm_event) or length > bytes.len - offset)
+            return error.InvalidDrmEvent;
+        if (header.type == c.DRM_EVENT_FLIP_COMPLETE) {
+            if (length < @sizeOf(c.struct_drm_event_vblank)) return error.InvalidDrmEvent;
+            const event = std.mem.bytesToValue(
+                c.struct_drm_event_vblank,
+                bytes[offset..][0..@sizeOf(c.struct_drm_event_vblank)],
+            );
+            if (event.user_data != 0) {
+                const userdata: *anyopaque = @ptrFromInt(event.user_data);
+                callback(userdata, event.sequence, event.tv_sec, event.tv_usec, event.crtc_id);
+            }
+        }
+        offset += length;
+    }
 }
 
 fn nativeMode(mode: drm.Mode) c.drmModeModeInfo {
@@ -191,20 +195,36 @@ test "kms: atomic flag records remain deterministic and independent" {
     try std.testing.expect(!real_flags.test_only and real_flags.page_flip_event);
 }
 
-test "kms: redundant shared-fd event dispatch tolerates an empty nonblocking queue" {
-    const linux = std.os.linux;
-    const result = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
-    if (linux.errno(result) != .SUCCESS) return error.EventFdFailed;
-    const fd: std.posix.fd_t = @intCast(result);
-    defer _ = linux.close(fd);
+test "kms: DRM event bytes dispatch exact page-flip facts" {
+    const Callback = struct {
+        var called = false;
+        var sequence: u32 = 0;
 
-    try real.handleEvents(fd, ignorePageFlip);
+        fn handle(
+            _: *anyopaque,
+            value: u32,
+            seconds: u32,
+            microseconds: u32,
+            crtc_id: u32,
+        ) callconv(.c) void {
+            called = seconds == 7 and microseconds == 11 and crtc_id == 13;
+            sequence = value;
+        }
+    };
+    Callback.called = false;
+    Callback.sequence = 0;
+    var userdata: u8 = 0;
+    var event: c.struct_drm_event_vblank = std.mem.zeroes(c.struct_drm_event_vblank);
+    event.base.type = c.DRM_EVENT_FLIP_COMPLETE;
+    event.base.length = @sizeOf(c.struct_drm_event_vblank);
+    event.user_data = @intFromPtr(&userdata);
+    event.tv_sec = 7;
+    event.tv_usec = 11;
+    event.sequence = 17;
+    event.crtc_id = 13;
+
+    try real.handleEvents(std.mem.asBytes(&event), Callback.handle);
+    try std.testing.expect(Callback.called);
+    try std.testing.expectEqual(@as(u32, 17), Callback.sequence);
+    try std.testing.expectError(error.TruncatedDrmEvent, real.handleEvents(&.{0}, Callback.handle));
 }
-
-fn ignorePageFlip(
-    _: *anyopaque,
-    _: u32,
-    _: u32,
-    _: u32,
-    _: u32,
-) callconv(.c) void {}

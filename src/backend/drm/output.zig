@@ -1,6 +1,6 @@
 //! Generation-safe atomic KMS output ownership. The owner is heap-stable
-//! because libdrm retains pointers to its preallocated commit records until a
-//! matching page-flip callback has been dispatched.
+//! because KMS retains pointers to its preallocated commit records until a
+//! matching page-flip event has been dispatched.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -37,7 +37,6 @@ pub const Event = union(enum) {
         sequence: u32,
         seconds: u32,
         microseconds: u32,
-        out_fence_fd: std.posix.fd_t,
     },
     paused,
     removed,
@@ -124,7 +123,6 @@ const CommitRecord = struct {
     image: framebuffer.Handle = undefined,
     callback_count: u32 = 0,
     fact: FlipFact = undefined,
-    out_fence_fd: std.posix.fd_t = -1,
 };
 
 const Queued = struct {
@@ -155,8 +153,9 @@ pub const Output = struct {
     in_flight_slot: ?u32 = null,
     output_generation: u32 = 1,
     modeset_tested: bool = false,
-    poll_token: ?completion.Token = null,
+    read_token: ?completion.Token = null,
     cancel_token: ?completion.Token = null,
+    drm_events: [1024]u8 = undefined,
     terminal_device_teardown: bool = false,
     adaptive_sync: bool = false,
 
@@ -235,29 +234,8 @@ pub const Output = struct {
         return self.events_buffer[0..self.event_count];
     }
 
-    /// Any presented OUT_FENCE_FD not taken by the coordinator is closed here.
     pub fn clearEvents(self: *Output) void {
-        for (self.events_buffer[0..self.event_count]) |*event| switch (event.*) {
-            .presented => |*presented| if (presented.out_fence_fd >= 0) {
-                _ = linux.close(presented.out_fence_fd);
-                presented.out_fence_fd = -1;
-            },
-            else => {},
-        };
         self.event_count = 0;
-    }
-
-    pub fn takeOutFence(self: *Output, event_index: usize) !std.posix.fd_t {
-        if (event_index >= self.event_count) return error.InvalidEvent;
-        switch (self.events_buffer[event_index]) {
-            .presented => |*presented| {
-                if (presented.out_fence_fd < 0) return error.NoOutFence;
-                const fd = presented.out_fence_fd;
-                presented.out_fence_fd = -1;
-                return fd;
-            },
-            else => return error.NoOutFence,
-        }
     }
 
     /// Takes ownership of an acquired R10 image and, when present, the input
@@ -304,6 +282,22 @@ pub const Output = struct {
     /// requests are built from preallocated records. R10 `submit` occurs only
     /// after the real ioctl succeeds; every earlier failure discards the image.
     pub fn commitQueued(self: *Output) !void {
+        return self.commitQueuedInternal(null);
+    }
+
+    /// Queues an accepted input fence's close on the shared ring without
+    /// submitting it. SQ exhaustion falls back to an immediate close.
+    pub fn commitQueuedOn(
+        self: *Output,
+        ring: *linux.IoUring,
+    ) !void {
+        return self.commitQueuedInternal(ring);
+    }
+
+    fn commitQueuedInternal(
+        self: *Output,
+        ring: ?*linux.IoUring,
+    ) !void {
         if (self.state != .queued) return error.InvalidState;
         const queued = self.queued.?;
         const fd = self.device.fd(self.snapshot_handle) catch |err| {
@@ -322,7 +316,7 @@ pub const Output = struct {
         const modeset = queued.previous_state == .initial or queued.previous_state == .paused;
 
         if ((modeset and !self.modeset_tested) or queued.test_before_commit) {
-            self.buildScanout(record, image.framebuffer_id, queued.in_fence_fd, modeset, false) catch |err| {
+            self.buildScanout(record, image.framebuffer_id, queued.in_fence_fd, modeset) catch |err| {
                 try self.rollbackRecordAndQueued(record);
                 return err;
             };
@@ -336,7 +330,7 @@ pub const Output = struct {
             if (modeset) self.modeset_tested = true;
             self.platform.resetRequest(record.request);
         }
-        self.buildScanout(record, image.framebuffer_id, queued.in_fence_fd, modeset, true) catch |err| {
+        self.buildScanout(record, image.framebuffer_id, queued.in_fence_fd, modeset) catch |err| {
             try self.rollbackRecordAndQueued(record);
             return err;
         };
@@ -345,7 +339,6 @@ pub const Output = struct {
         record.output_generation = self.output_generation;
         record.image = queued.image;
         record.callback_count = 0;
-        record.out_fence_fd = -1;
         const flags: atomic.CommitFlags = .{
             .allow_modeset = modeset,
             .nonblock = true,
@@ -356,16 +349,18 @@ pub const Output = struct {
             try self.rollbackRecordAndQueued(record);
             return err;
         };
-        self.closeQueuedInFence();
         // validateSubmit above makes this infallible under the single-thread
         // turn contract; a failure here means that contract was violated after
         // KMS accepted the image and therefore cannot be rolled back safely.
         self.images.submit_image(self.images.context, queued.image) catch {
+            self.closeQueuedInFence();
             self.state = .failed;
             self.queued = null;
             self.in_flight_slot = @intCast(slot);
             return error.ImageOwnershipViolation;
         };
+        if (ring) |value| self.queueInFenceClose(value);
+        self.closeQueuedInFence();
         self.queued = null;
         self.in_flight_slot = @intCast(slot);
         self.state = .in_flight;
@@ -440,10 +435,8 @@ pub const Output = struct {
             .sequence = record.fact.sequence,
             .seconds = record.fact.seconds,
             .microseconds = record.fact.microseconds,
-            .out_fence_fd = record.out_fence_fd,
         } };
         self.event_count += 1;
-        record.out_fence_fd = -1;
         retireRecord(self.platform, record);
         self.in_flight_slot = null;
         const should_disable = self.state == .disabling;
@@ -453,15 +446,15 @@ pub const Output = struct {
 
     /// Queues one-shot DRM-FD readiness on the shared ring. Never submits.
     pub fn prepareReadiness(self: *Output, router: *completion.Router, ring: *linux.IoUring) !void {
-        if (self.poll_token != null or self.cancel_token != null or
+        if (self.read_token != null or self.cancel_token != null or
             self.state == .failed or self.state == .draining or self.state == .drained or
             self.state == .removed)
             return error.InvalidState;
         const fd = try self.device.fd(self.snapshot_handle);
         const token = try router.acquire(.backend_ready);
         errdefer router.retire(token) catch unreachable;
-        _ = try ring.poll_add(token.encode(), fd, linux.POLL.IN | linux.POLL.ERR | linux.POLL.HUP | linux.POLL.NVAL);
-        self.poll_token = token;
+        _ = try ring.read(token.encode(), fd, .{ .buffer = &self.drm_events }, 0);
+        self.read_token = token;
     }
 
     pub fn completeReadiness(
@@ -471,42 +464,42 @@ pub const Output = struct {
         token: completion.Token,
         result: i32,
     ) !void {
-        if (self.poll_token) |poll| if (sameToken(poll, token)) {
+        if (self.read_token) |read| if (sameToken(read, token)) {
             try router.retire(token);
-            self.poll_token = null;
+            self.read_token = null;
             if (self.state == .draining) {
                 if (self.cancel_token == null) try self.finishDrain();
                 return;
             }
             if (self.state == .removed or self.state == .failed) return;
-            if (result < 0) return self.markFailed(.readiness);
-            const mask: u32 = @intCast(result);
-            if (mask & linux.POLL.IN == 0 or
-                mask & (linux.POLL.ERR | linux.POLL.HUP | linux.POLL.NVAL) != 0)
+            if (result <= 0 or result > self.drm_events.len)
                 return self.markFailed(.readiness);
-            const fd = self.device.fd(self.snapshot_handle) catch return self.markFailed(.readiness);
-            self.platform.handleEvents(fd, pageFlipCallback) catch return self.markFailed(.event_dispatch);
+            self.platform.handleEvents(
+                self.drm_events[0..@intCast(result)],
+                pageFlipCallback,
+            ) catch return self.markFailed(.event_dispatch);
             try self.prepareReadiness(router, ring);
             return;
         };
         if (self.cancel_token) |cancel| if (sameToken(cancel, token)) {
             try router.retire(token);
             self.cancel_token = null;
-            if (result != 0 and result != negativeErrno(.NOENT) and result != negativeErrno(.CANCELED))
+            if (result != 0 and result != negativeErrno(.NOENT) and
+                result != negativeErrno(.CANCELED) and result != negativeErrno(.ALREADY))
                 return error.UnexpectedCompletion;
-            if (self.poll_token == null and self.state == .draining) try self.finishDrain();
+            if (self.read_token == null and self.state == .draining) try self.finishDrain();
             return;
         };
         return error.UnknownToken;
     }
 
     pub fn ownsReadinessToken(self: *const Output, token: completion.Token) bool {
-        if (self.poll_token) |poll| if (sameToken(poll, token)) return true;
+        if (self.read_token) |read| if (sameToken(read, token)) return true;
         if (self.cancel_token) |cancel| if (sameToken(cancel, token)) return true;
         return false;
     }
 
-    /// Requires scanout quiescence first. Poll-remove and target CQEs may arrive
+    /// Requires scanout quiescence first. Cancel and target CQEs may arrive
     /// in either order; callback/request storage remains alive until both do.
     pub fn beginDrain(self: *Output, router: *completion.Router, ring: *linux.IoUring) !void {
         if (self.current != null or self.queued != null or self.in_flight_slot != null)
@@ -514,17 +507,17 @@ pub const Output = struct {
         if (self.state != .paused and self.state != .removed and self.state != .draining)
             return error.InvalidState;
         self.state = .draining;
-        if (self.poll_token) |poll| if (self.cancel_token == null) {
+        if (self.read_token) |read| if (self.cancel_token == null) {
             const token = try router.acquire(.backend_ready);
             errdefer router.retire(token) catch unreachable;
-            _ = try ring.poll_remove(token.encode(), poll.encode());
+            _ = try ring.cancel(token.encode(), read.encode(), 0);
             self.cancel_token = token;
         };
-        if (self.poll_token == null and self.cancel_token == null) try self.finishDrain();
+        if (self.read_token == null and self.cancel_token == null) try self.finishDrain();
     }
 
     pub fn drainComplete(self: *const Output) bool {
-        return self.state == .drained and self.poll_token == null and self.cancel_token == null and
+        return self.state == .drained and self.read_token == null and self.cancel_token == null and
             self.current == null and self.queued == null and self.in_flight_slot == null;
     }
 
@@ -534,7 +527,6 @@ pub const Output = struct {
         framebuffer_id: u32,
         in_fence_fd: ?std.posix.fd_t,
         modeset: bool,
-        include_out_fence: bool,
     ) !void {
         const request = record.request;
         if (modeset) {
@@ -561,8 +553,6 @@ pub const Output = struct {
         try self.platform.addProperty(request, self.plane.id, self.plane.properties.crtc_h, self.mode.vdisplay);
         if (in_fence_fd) |fence|
             try self.platform.addProperty(request, self.plane.id, self.plane.properties.in_fence_fd, @bitCast(@as(i64, fence)));
-        if (include_out_fence and self.crtc.properties.out_fence_ptr != 0)
-            try self.platform.addProperty(request, self.crtc.id, self.crtc.properties.out_fence_ptr, @intFromPtr(&record.out_fence_fd));
     }
 
     fn disableNow(self: *Output) !void {
@@ -618,8 +608,18 @@ pub const Output = struct {
         };
     }
 
+    fn queueInFenceClose(
+        self: *Output,
+        ring: *linux.IoUring,
+    ) void {
+        const queued = if (self.queued) |*value| value else return;
+        const fence = queued.in_fence_fd orelse return;
+        const sqe = ring.close(completion.skipped_success_user_data, fence) catch return;
+        sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
+        queued.in_fence_fd = null;
+    }
+
     fn rollbackRecordAndQueued(self: *Output, record: *CommitRecord) !void {
-        closeRecordFence(record);
         self.platform.resetRequest(record.request);
         record.state = .free;
         try self.rollbackQueued();
@@ -671,7 +671,6 @@ fn pageFlipCallback(
 }
 
 fn retireRecord(platform: atomic.Platform, record: *CommitRecord) void {
-    closeRecordFence(record);
     platform.resetRequest(record.request);
     record.callback_count = 0;
     if (record.generation == std.math.maxInt(u32)) {
@@ -679,13 +678,6 @@ fn retireRecord(platform: atomic.Platform, record: *CommitRecord) void {
     } else {
         record.generation += 1;
         record.state = .free;
-    }
-}
-
-fn closeRecordFence(record: *CommitRecord) void {
-    if (record.out_fence_fd >= 0) {
-        _ = linux.close(record.out_fence_fd);
-        record.out_fence_fd = -1;
     }
 }
 
@@ -735,7 +727,7 @@ test "kms: real commit failure rolls back and discards" {
     try fixture.destroy(output);
 }
 
-test "kms: scanout properties flags and optional fences match capabilities" {
+test "kms: scanout properties flags and input fences match capabilities" {
     var fixture = Fixture{};
     var output = try fixture.create(.{});
     const in_fence = try createTestFence();
@@ -751,7 +743,6 @@ test "kms: scanout properties flags and optional fences match capabilities" {
     try std.testing.expect(fixture.atomic_state.hasProperty(30, 36, @as(u64, 64) << 16));
     try std.testing.expect(fixture.atomic_state.hasProperty(30, 40, 64));
     try std.testing.expect(fixture.atomic_state.hasProperty(30, 42, @bitCast(@as(i64, in_fence))));
-    try std.testing.expect(fixture.atomic_state.hasProperty(20, 23, @intFromPtr(&output.records[0].out_fence_fd)));
     try output.terminalDeviceTeardown();
     try fixture.drainAndDestroy(output);
 
@@ -765,6 +756,31 @@ test "kms: scanout properties flags and optional fences match capabilities" {
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(rejected_fence, linux.F.GETFD, 0)));
     try FakeImages.discard(&fixture.images_state, image);
     try fixture.destroy(output);
+}
+
+test "kms: accepted input fence close completes through shared ring" {
+    var ring = linux.IoUring.init(4, 0) catch |err| switch (err) {
+        error.PermissionDenied, error.SystemOutdated => return error.SkipZigTest,
+        else => return err,
+    };
+    defer ring.deinit();
+    var fixture = Fixture{};
+    const output = try fixture.create(.{});
+    const fence = try createTestFence();
+    try output.queue(fixture.acquire(0), fence);
+    try output.commitQueuedOn(&ring);
+    try std.testing.expectEqual(@as(u32, 1), ring.sq_ready());
+
+    _ = try ring.submit();
+    for (0..100) |_| {
+        if (linux.errno(linux.fcntl(fence, linux.F.GETFD, 0)) == .BADF) break;
+        const delay: linux.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
+        _ = linux.nanosleep(&delay, null);
+    }
+    try expectClosed(fence);
+    try std.testing.expectEqual(@as(u32, 0), ring.cq_ready());
+    try output.terminalDeviceTeardown();
+    try fixture.drainAndDestroy(output);
 }
 
 test "kms: adaptive sync requires capability and programs exact CRTC property" {
@@ -927,43 +943,43 @@ test "kms: mode blob and request cleanup is reverse and generation exhaustion ne
     try std.testing.expectEqualSlices(usize, &.{1}, fixture.atomic_state.destroyed_requests[0..fixture.atomic_state.destroy_count]);
 }
 
-test "kms: poll cancellation CQEs drain in either order" {
+test "kms: read cancellation CQEs drain in either order" {
     var fixture = Fixture{};
     var output = try fixture.create(.{});
     output.state = .paused;
     var router = try completion.Router.init(std.testing.allocator, 4);
     defer router.deinit(std.testing.allocator);
-    const poll = try router.acquire(.backend_ready);
+    const read = try router.acquire(.backend_ready);
     const cancel = try router.acquire(.backend_ready);
-    output.poll_token = poll;
+    output.read_token = read;
     output.cancel_token = cancel;
     output.state = .draining;
     var ring: linux.IoUring = undefined;
-    try std.testing.expect(output.ownsReadinessToken(poll));
+    try std.testing.expect(output.ownsReadinessToken(read));
     try std.testing.expect(output.ownsReadinessToken(cancel));
     try output.completeReadiness(&router, &ring, cancel, 0);
     try std.testing.expect(!output.ownsReadinessToken(cancel));
-    try std.testing.expect(output.ownsReadinessToken(poll));
+    try std.testing.expect(output.ownsReadinessToken(read));
     try std.testing.expect(!output.drainComplete());
-    try output.completeReadiness(&router, &ring, poll, negativeErrno(.CANCELED));
-    try std.testing.expect(!output.ownsReadinessToken(poll));
+    try output.completeReadiness(&router, &ring, read, negativeErrno(.CANCELED));
+    try std.testing.expect(!output.ownsReadinessToken(read));
     try std.testing.expect(output.drainComplete());
     try output.destroy();
 
     fixture = .{};
     output = try fixture.create(.{});
-    const poll2 = try router.acquire(.backend_ready);
+    const read2 = try router.acquire(.backend_ready);
     const cancel2 = try router.acquire(.backend_ready);
-    output.poll_token = poll2;
+    output.read_token = read2;
     output.cancel_token = cancel2;
     output.state = .draining;
-    try output.completeReadiness(&router, &ring, poll2, negativeErrno(.CANCELED));
+    try output.completeReadiness(&router, &ring, read2, negativeErrno(.CANCELED));
     try output.completeReadiness(&router, &ring, cancel2, errorNoEntry());
     try std.testing.expect(output.drainComplete());
     try output.destroy();
 }
 
-test "kms: one-shot readiness rearms without submitting internally" {
+test "kms: one-shot event reads rearm without submitting internally" {
     var ring = linux.IoUring.init(8, 0) catch |err| switch (err) {
         error.PermissionDenied, error.SystemOutdated => return error.SkipZigTest,
         else => return err,
@@ -1107,7 +1123,7 @@ const FakeAtomic = struct {
         if (self.commit_count == self.fail_commit_at) return error.FakeCommit;
         if (userdata != null) self.callback_userdata = userdata;
     }
-    fn handleEvents(context: *anyopaque, _: std.posix.fd_t, _: atomic.FlipCallback) !void {
+    fn handleEvents(context: *anyopaque, _: []const u8, _: atomic.FlipCallback) !void {
         const self: *FakeAtomic = @ptrCast(@alignCast(context));
         self.handle_event_count += 1;
     }
@@ -1232,7 +1248,7 @@ const Fixture = struct {
     crtc: [1]drm.Crtc = .{.{
         .id = 20,
         .index = 0,
-        .properties = .{ .active = 21, .mode_id = 22, .out_fence_ptr = 23 },
+        .properties = .{ .active = 21, .mode_id = 22 },
     }},
     plane: [1]drm.Plane = .{.{
         .id = 30,

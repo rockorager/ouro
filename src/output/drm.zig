@@ -1108,7 +1108,19 @@ pub const Output = struct {
         bindings: []const SampleBinding,
         now_ns: u64,
     ) !RenderResult {
-        return self.renderFrameInternal(frame_id, applied, changes, bindings, now_ns, null);
+        return self.renderFrameInternal(frame_id, applied, changes, bindings, now_ns, null, null);
+    }
+
+    pub fn renderFrameOn(
+        self: *Output,
+        frame_id: scheduler_api.FrameId,
+        applied: []const render_list.AppliedSurface,
+        changes: []const damage.Change,
+        bindings: []const SampleBinding,
+        now_ns: u64,
+        ring: *linux.IoUring,
+    ) !RenderResult {
+        return self.renderFrameInternal(frame_id, applied, changes, bindings, now_ns, null, ring);
     }
 
     pub fn renderFrameCapture(
@@ -1120,7 +1132,20 @@ pub const Output = struct {
         now_ns: u64,
         capture: CaptureRequest,
     ) !RenderResult {
-        return self.renderFrameInternal(frame_id, applied, changes, bindings, now_ns, capture);
+        return self.renderFrameInternal(frame_id, applied, changes, bindings, now_ns, capture, null);
+    }
+
+    pub fn renderFrameCaptureOn(
+        self: *Output,
+        frame_id: scheduler_api.FrameId,
+        applied: []const render_list.AppliedSurface,
+        changes: []const damage.Change,
+        bindings: []const SampleBinding,
+        now_ns: u64,
+        capture: CaptureRequest,
+        ring: *linux.IoUring,
+    ) !RenderResult {
+        return self.renderFrameInternal(frame_id, applied, changes, bindings, now_ns, capture, ring);
     }
 
     fn renderFrameInternal(
@@ -1131,6 +1156,7 @@ pub const Output = struct {
         bindings: []const SampleBinding,
         now_ns: u64,
         capture: ?CaptureRequest,
+        ring: ?*linux.IoUring,
     ) !RenderResult {
         if (!self.accepting_frames or self.in_flight_frame != null or
             self.pending_callback != null or self.pending_capture != null)
@@ -1149,7 +1175,7 @@ pub const Output = struct {
         bindSamples(color_list, bindings, self.sample_storage) catch |cause|
             return self.retireUnstartedRender(frame_id, cause);
         try self.scheduler.captureSamples(frame_id, self.sample_storage[0..bindings.len]);
-        if (capture == null and try self.submitDirectScanout(frame_id, color_list, now_ns))
+        if (capture == null and try self.submitDirectScanout(frame_id, color_list, now_ns, ring))
             return .submitted;
         const handle = self.pool.acquire() catch |cause|
             return self.retireRender(frame_id, cause);
@@ -1253,7 +1279,11 @@ pub const Output = struct {
             if (in_fence) |fd| _ = linux.close(fd); // R11 rejected ownership.
             return self.retireAndDiscard(frame_id, cause, handle);
         };
-        self.kms_output.commitQueued() catch |cause| {
+        const commit_result = if (ring) |value|
+            self.kms_output.commitQueuedOn(value)
+        else
+            self.kms_output.commitQueued();
+        commit_result catch |cause| {
             // R11 now owns and closes the fence and terminally disposes the
             // acquired image on every commit rollback.
             self.planner.cancel() catch unreachable;
@@ -1281,6 +1311,7 @@ pub const Output = struct {
         frame_id: scheduler_api.FrameId,
         list: render.List,
         now_ns: u64,
+        ring: ?*linux.IoUring,
     ) !bool {
         if (self.planner.output_transform != .normal) return false;
         const source = directScanoutSource(list, self.output_color_description) orelse
@@ -1294,7 +1325,11 @@ pub const Output = struct {
         else
             self.kms_output.queue(handle, null) catch return false;
         acquired = false;
-        self.kms_output.commitQueued() catch return false;
+        const commit_result = if (ring) |value|
+            self.kms_output.commitQueuedOn(value)
+        else
+            self.kms_output.commitQueued();
+        commit_result catch return false;
         if (needs_test) self.scanout_images.markTested(handle);
         _ = self.scheduler.renderComplete(frame_id, now_ns) catch unreachable;
         self.in_flight_frame = frame_id;
@@ -1984,12 +2019,12 @@ test "drm-sim: physical Pixman owner starts and drains in strict order" {
     ));
     try std.testing.expectEqual(frame, output.in_flight_frame.?);
     try std.testing.expect((try output.requestPause()) == null);
-    const first_poll = output.kms_output.poll_token.?;
+    const first_read = output.kms_output.read_token.?;
     try output.completeReadiness(
         &fixture.router,
         &fixture.ring,
-        first_poll,
-        @intCast(linux.POLL.IN),
+        first_read,
+        1,
     );
     const callbacks: WaylandCallbacks = .{
         .context = &fixture,
@@ -2007,12 +2042,12 @@ test "drm-sim: physical Pixman owner starts and drains in strict order" {
     try std.testing.expectEqual(@as(usize, 1), fixture.presented_count);
     try std.testing.expect(output.paused);
     try output.beginDrain(&fixture.router, &fixture.ring);
-    const drain_poll = output.kms_output.poll_token.?;
+    const drain_read = output.kms_output.read_token.?;
     const drain_cancel = output.kms_output.cancel_token.?;
     try output.completeReadiness(
         &fixture.router,
         &fixture.ring,
-        drain_poll,
+        drain_read,
         -@as(i32, @intFromEnum(linux.E.CANCELED)),
     );
     try output.completeReadiness(&fixture.router, &fixture.ring, drain_cancel, 0);
@@ -2196,7 +2231,7 @@ const SimFixture = struct {
         const self: *SimFixture = @ptrCast(@alignCast(context));
         if (userdata) |value| self.flip_userdata = value;
     }
-    fn handleEvents(context: *anyopaque, _: std.posix.fd_t, callback: atomic.FlipCallback) !void {
+    fn handleEvents(context: *anyopaque, _: []const u8, callback: atomic.FlipCallback) !void {
         const self: *SimFixture = @ptrCast(@alignCast(context));
         const userdata = self.flip_userdata orelse return error.MissingFlip;
         self.flip_userdata = null;

@@ -6,6 +6,10 @@ const wayring_completion = @import("wayring").completion;
 const none = std.math.maxInt(u32);
 const max_slots = @as(usize, 1) << 24;
 
+/// Fire-and-forget operations use this outside both routed completion
+/// namespaces. They suppress successful CQEs; any CQE carrying it is a failure.
+pub const skipped_success_user_data = std.math.maxInt(u64);
+
 /// Ouro's low-byte tags. Wayring reserves the values recognized by
 /// `wayring.completion.Token.decode`, currently 1 through 5.
 pub const Kind = enum(u8) {

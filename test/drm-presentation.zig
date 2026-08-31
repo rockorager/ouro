@@ -3292,10 +3292,9 @@ pub const Fixture = struct {
             try signalFd(self.drm_fd);
         }
     }
-    fn handleEvents(context: *anyopaque, _: linux.fd_t, callback: ouro.drm_atomic.FlipCallback) !void {
+    fn handleEvents(context: *anyopaque, _: []const u8, callback: ouro.drm_atomic.FlipCallback) !void {
         const self: *Fixture = @ptrCast(@alignCast(context));
         if (self.flip_len == 0) return;
-        try consumeFd(self.drm_fd);
         while (self.flip_len != 0) {
             const flip = self.pending_flips[self.flip_head];
             const userdata = flip.userdata orelse return error.MissingFlip;

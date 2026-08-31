@@ -2565,6 +2565,11 @@ test "shell-input: secondary output removal closes its reactive layer popup root
                 return error.MissingLayerSurface;
             const popup = findLayer(coordinator.app_layers, popups[0].surface) orelse
                 return error.MissingPopupSurface;
+            if (!std.meta.eql(popup.binding.?.surface, submitted[1].surface)) {
+                const delay: linux.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
+                _ = linux.nanosleep(&delay, null);
+                continue;
+            }
             try std.testing.expectEqual(layer.binding.?.surface, submitted[0].surface);
             try std.testing.expectEqual(popup.binding.?.surface, submitted[1].surface);
             try std.testing.expectEqual(@as(i32, 3), layer.sample.?.destination.x);

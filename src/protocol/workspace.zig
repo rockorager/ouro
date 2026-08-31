@@ -54,6 +54,7 @@ pub fn Adapter(comptime protocol: type) type {
         workspace_name: []u8,
         string_capacity: usize,
         manager_free: u32 = 0,
+        manager_count: usize = 0,
         group_free: u32 = 0,
         workspace_free: u32 = 0,
         outbound_count: usize = 0,
@@ -192,8 +193,7 @@ pub fn Adapter(comptime protocol: type) type {
             return self.command_count;
         }
         pub fn hasManagers(self: *const Self) bool {
-            for (self.managers) |manager| if (manager.active) return true;
-            return false;
+            return self.manager_count != 0;
         }
         pub fn peekCommand(self: *const Self) ?Command {
             return if (self.command_count == 0) null else self.commands[self.command_head];
@@ -462,6 +462,7 @@ pub fn Adapter(comptime protocol: type) type {
             self.manager_free = self.managers[i].next_free;
             const g = self.managers[i].generation;
             self.managers[i] = .{ .active = true, .generation = g, .peer = b.peer, .resource = b.resource };
+            self.manager_count += 1;
             return i;
         }
         fn takeChild(self: *Self, slots: []Child, head: *u32, mi: u32, peer: wayring.io_uring.Peer) u32 {
@@ -492,6 +493,7 @@ pub fn Adapter(comptime protocol: type) type {
             head.* = i;
         }
         fn releaseManager(self: *Self, mi: u32) void {
+            std.debug.assert(self.managers[mi].active and self.manager_count != 0);
             const generation = self.managers[mi].generation;
             for (self.outbound) |*o| if (o.active and o.manager == mi and o.manager_generation == generation) self.dropOut(o);
             for (self.groups, 0..) |*h, i| if (h.active and h.manager == mi and h.manager_generation == generation) {
@@ -504,6 +506,7 @@ pub fn Adapter(comptime protocol: type) type {
             self.managers[mi] = .{ .generation = g, .next_free = self.manager_free };
             @memset(self.announcedFor(mi), .{});
             self.manager_free = mi;
+            self.manager_count -= 1;
         }
     };
 }
@@ -553,6 +556,7 @@ test "workspace output replacement snapshots leave enter and one done" {
     defer adapter.deinit();
     adapter.setOutputResolver(null, resolveTestOutput);
     adapter.managers[0].active = true;
+    adapter.manager_count = 1;
     adapter.announcedFor(0)[0] = .{ .active = true, .output = .{ .value = 4 }, .resource = .{ .id = 4, .generation = 1 } };
     adapter.manager_free = none;
     adapter.outputs[0] = .{ .value = 4 };
@@ -586,6 +590,7 @@ test "workspace plural output reconciliation retains shared membership" {
     defer adapter.deinit();
     adapter.setOutputResolver(null, resolveTestOutput);
     adapter.managers[0].active = true;
+    adapter.manager_count = 1;
     adapter.announcedFor(0)[0] = .{ .active = true, .output = .{ .value = 4 }, .resource = .{ .id = 4, .generation = 1 } };
     adapter.announcedFor(0)[1] = .{ .active = true, .output = .{ .value = 7 }, .resource = .{ .id = 7, .generation = 1 } };
     adapter.outputs[0] = .{ .value = 4 };
@@ -607,6 +612,7 @@ test "workspace null output transition queues leave and done" {
     defer adapter.deinit();
     adapter.setOutputResolver(null, resolveTestOutput);
     adapter.managers[0].active = true;
+    adapter.manager_count = 1;
     adapter.announcedFor(0)[0] = .{ .active = true, .output = .{ .value = 7 }, .resource = .{ .id = 7, .generation = 1 } };
     adapter.outputs[0] = .{ .value = 7 };
     adapter.output_count = 1;
@@ -621,6 +627,7 @@ test "workspace manager removal detaches live children and prevents generation a
     var adapter = try TestAdapter.init(std.testing.allocator, .{ .manager_capacity = 1, .group_handle_capacity = 2, .workspace_handle_capacity = 2 });
     defer adapter.deinit();
     adapter.managers[0].active = true;
+    adapter.manager_count = 1;
     adapter.groups[0] = .{ .active = true, .manager = 0, .manager_generation = 1, .resource = .{ .id = 10, .generation = 1 } };
     adapter.workspaces[0] = .{ .active = true, .manager = 0, .manager_generation = 1, .resource = .{ .id = 11, .generation = 1 } };
     adapter.releaseManager(0);
@@ -637,6 +644,7 @@ test "workspace unchanged synchronization does not queue done forever" {
     });
     defer adapter.deinit();
     adapter.managers[0].active = true;
+    adapter.manager_count = 1;
     try adapter.synchronize(&.{}, true);
     try std.testing.expectEqual(@as(usize, 0), adapter.outbound_count);
 }

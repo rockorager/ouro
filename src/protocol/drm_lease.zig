@@ -70,6 +70,9 @@ pub fn Adapter(comptime protocol: type, comptime DeviceId: type, comptime Connec
         connector_ids: []ConnectorId,
         outbound: []Out,
         outbound_len: usize = 0,
+        active_devices: usize = 0,
+        active_leases: usize = 0,
+        pending_revocations: usize = 0,
         names: []u8,
         descriptions: []u8,
         runtime: ?*Runtime = null,
@@ -403,6 +406,8 @@ pub fn Adapter(comptime protocol: type, comptime DeviceId: type, comptime Connec
         }
 
         pub fn pendingOutbound(self: *const Self, p: Peer) bool {
+            if (self.outbound_len == 0 and self.active_devices == 0 and
+                self.active_leases == 0) return false;
             for (self.outbound[0..self.outbound_len]) |o| if (samePeer(o.peer, p)) return true;
             for (self.devices) |d| if (d.h.active and d.dirty and samePeer(d.peer, p)) return true;
             for (self.leases) |l| if (l.h.active and l.finished and !l.finished_queued and samePeer(l.peer, p)) return true;
@@ -412,6 +417,7 @@ pub fn Adapter(comptime protocol: type, comptime DeviceId: type, comptime Connec
         /// Retries revocations which could not complete when their protocol
         /// resource disappeared. Returns true while backend ownership remains.
         pub fn retryRevocations(self: *Self) bool {
+            if (self.pending_revocations == 0) return false;
             var pending = false;
             for (self.leases) |*l| {
                 if (!l.h.active or !l.revocation_pending) continue;
@@ -468,7 +474,7 @@ pub fn Adapter(comptime protocol: type, comptime DeviceId: type, comptime Connec
             // An unsent lease descriptor is no longer useful after revocation.
             // Removing it also closes the adapter-owned descriptor exactly once.
             self.removeOutbound(.{ .lease = id }, null);
-            l.revocation_pending = revoke_backend;
+            self.setRevocationPending(l, revoke_backend);
             if (!self.revoke(l, revoke_backend)) return;
             l.finished = true;
             self.queueFinished(l);
@@ -479,7 +485,7 @@ pub fn Adapter(comptime protocol: type, comptime DeviceId: type, comptime Connec
                 if (revoke_backend and !self.resolver.revokeDrmLease(t)) return false;
                 l.token = null;
             }
-            l.revocation_pending = false;
+            self.setRevocationPending(l, false);
             for (self.selections) |*s| if (s.active and s.lease_owner and idEql(s.owner, lid)) {
                 if (self.inventorySlot(s.inventory)) |x| {
                     if (x.present) x.available = true;
@@ -494,9 +500,20 @@ pub fn Adapter(comptime protocol: type, comptime DeviceId: type, comptime Connec
             const id = self.idOf(Ls, self.leases, l);
             self.removeOutbound(.{ .lease = id }, null);
             l.resource = null;
-            l.revocation_pending = true;
+            self.setRevocationPending(l, true);
             if (!self.revoke(l, true)) return;
             self.retire(l);
+        }
+
+        fn setRevocationPending(self: *Self, l: *Ls, pending: bool) void {
+            if (l.revocation_pending == pending) return;
+            l.revocation_pending = pending;
+            if (pending) {
+                self.pending_revocations += 1;
+            } else {
+                std.debug.assert(self.pending_revocations != 0);
+                self.pending_revocations -= 1;
+            }
         }
 
         fn queueFinished(self: *Self, l: *Ls) void {
@@ -691,17 +708,28 @@ pub fn Adapter(comptime protocol: type, comptime DeviceId: type, comptime Connec
             self.outbound[self.outbound_len] = .{ .peer = p, .event = e };
             self.outbound_len += 1;
         }
-        fn acquire(_: *Self, comptime T: type, a: []T) ?*T {
+        fn acquire(self: *Self, comptime T: type, a: []T) ?*T {
             for (a) |*x| if (!x.h.active) {
                 const g = x.h.generation;
                 x.* = .{};
                 x.h = .{ .active = true, .generation = g };
+                if (T == Dev) self.active_devices += 1;
+                if (T == Ls) self.active_leases += 1;
                 return x;
             };
             return null;
         }
-        fn retire(_: *Self, x: anytype) void {
+        fn retire(self: *Self, x: anytype) void {
             if (!x.h.active) return;
+            const T = @TypeOf(x.*);
+            if (T == Dev) {
+                std.debug.assert(self.active_devices != 0);
+                self.active_devices -= 1;
+            }
+            if (T == Ls) {
+                std.debug.assert(self.active_leases != 0);
+                self.active_leases -= 1;
+            }
             x.h.active = false;
             x.h.generation +%= 1;
             if (x.h.generation == 0) x.h.generation = 1;

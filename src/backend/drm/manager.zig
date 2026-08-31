@@ -191,6 +191,7 @@ pub const Manager = struct {
     claims: []Claim,
     next_claim_generation: ?u64 = 1,
     leases: []Lease,
+    active_lease_count: usize = 0,
     next_lease_generation: ?u64 = 1,
     lease_objects: []u32,
     events_buffer: []Event,
@@ -637,6 +638,7 @@ pub const Manager = struct {
             .generation = lease_generation,
             .lessee_id = result.lessee_id,
         };
+        self.active_lease_count += 1;
         for (claim_handles) |claim_handle|
             (self.getClaim(claim_handle) catch unreachable).lease_slot = @intCast(slot);
         self.advanceLeaseGeneration();
@@ -757,11 +759,13 @@ pub const Manager = struct {
     }
 
     fn releaseLease(self: *Manager, slot: u32) void {
+        std.debug.assert(self.leases[slot].active and self.active_lease_count != 0);
         for (self.claims) |*claim| if (claim.active and claim.lease_slot == slot) {
             claim.active = false;
             claim.lease_slot = no_claim;
         };
         self.leases[slot].active = false;
+        self.active_lease_count -= 1;
     }
 
     fn revokeAllLeases(self: *Manager, terminal: bool) anyerror!void {
@@ -790,8 +794,7 @@ pub const Manager = struct {
     }
 
     fn hasActiveLease(self: *const Manager) bool {
-        for (self.leases) |lease| if (lease.active) return true;
-        return false;
+        return self.active_lease_count != 0;
     }
 
     fn invalidateClaims(self: *Manager) void {
