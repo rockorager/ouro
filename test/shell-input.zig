@@ -12,6 +12,7 @@ const ClientCore = wayring.client.Core(protocol);
 const Compositor = ouro.compositor.Compositor(protocol);
 const Coordinator = ouro.physical.Coordinator(protocol);
 const Loop = ouro.loop.Loop(protocol);
+const protocol_input_method = ouro.input_method;
 
 const pixels = [_]u8{
     0x10, 0x20, 0x30, 0xff, 0x40, 0x50, 0x60, 0xff, 0x70, 0x80, 0x90, 0xff, 0, 0, 0, 0,
@@ -3437,6 +3438,7 @@ test "shell-input: generated input-method client bridges focused text input" {
     try protocol.zwp_text_input_v3.encodeRequest(&app_actor.transmit, app_handler.text_input.?.id, .{ .set_surrounding_text = .{ .text = "hello world", .cursor = 5, .anchor = 3 } });
     try protocol.zwp_text_input_v3.encodeRequest(&app_actor.transmit, app_handler.text_input.?.id, .{ .set_text_change_cause = .{ .cause = .other } });
     try protocol.zwp_text_input_v3.encodeRequest(&app_actor.transmit, app_handler.text_input.?.id, .{ .set_content_type = .{ .hint = .completion, .purpose = .email } });
+    try protocol.zwp_text_input_v3.encodeRequest(&app_actor.transmit, app_handler.text_input.?.id, .{ .set_cursor_rectangle = .{ .x = 7, .y = 11, .width = 13, .height = 17 } });
     try protocol.zwp_text_input_v3.encodeRequest(&app_actor.transmit, app_handler.text_input.?.id, .{ .commit = .{} });
     try submitClient(&app_reactor, &app_driver, &app_handler);
     for (0..512) |_| {
@@ -3453,6 +3455,62 @@ test "shell-input: generated input-method client bridges focused text input" {
     try std.testing.expectEqual(@as(usize, 1), method_handler.cause);
     try std.testing.expectEqual(@as(usize, 1), method_handler.content);
     try std.testing.expectEqual(@as(usize, 1), method_handler.done);
+
+    method_handler.popup_surface = (try protocol.wl_compositor.construct_create_surface(
+        &method_client.objects,
+        &method_actor.transmit,
+        method_handler.compositor.?,
+        .{},
+    )).id;
+    method_handler.popup = (try protocol.zwp_input_method_v2.construct_get_input_popup_surface(
+        &method_client.objects,
+        &method_actor.transmit,
+        method_handler.method.?,
+        .{ .surface = method_handler.popup_surface.?.id },
+    )).id;
+    try submitClient(&method_reactor, &method_driver, &method_handler);
+    for (0..128) |_| {
+        _ = try drainClient(&method_reactor, &method_driver, &method_handler);
+        _ = try loop.turn(coordinator);
+        if (method_handler.popup_rectangles == 1) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(usize, 1), method_handler.popup_rectangles);
+    try std.testing.expectEqual(@as(i32, 13), method_handler.popup_rectangle.width);
+    try std.testing.expectEqual(@as(i32, 17), method_handler.popup_rectangle.height);
+    const active_popup_handle = method_server_objects.namespace.lookupHandle(method_handler.popup_surface.?.id).?;
+    const active_popup_object = method_server_objects.namespace.resolve(active_popup_handle).?;
+    const active_popup_surface = try coordinator.adapter.surfaceIdObject(
+        active_popup_handle,
+        active_popup_object,
+    );
+    const active_popup_scene = try coordinator.desktop.sceneForSurface(active_popup_surface);
+    try std.testing.expect(active_popup_scene.visible);
+    try std.testing.expectEqual(@as(usize, 1), coordinator.input_popup_scene_len);
+    try std.testing.expectEqual(
+        coordinator.physical_outputs[0].id,
+        coordinator.input_popup_scenes[0].output,
+    );
+    try wayring.client.sendRequest(
+        protocol.zwp_input_popup_surface_v2,
+        &method_client.objects,
+        &method_actor.transmit,
+        method_handler.popup.?,
+        .{ .destroy = .{} },
+    );
+    method_handler.popup = null;
+    try submitClient(&method_reactor, &method_driver, &method_handler);
+    for (0..64) |_| {
+        _ = try drainClient(&method_reactor, &method_driver, &method_handler);
+        _ = try loop.turn(coordinator);
+        if (coordinator.input_popup_scene_len == 0) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(usize, 0), coordinator.input_popup_scene_len);
+    try std.testing.expectError(
+        error.StaleSurface,
+        coordinator.desktop.sceneForSurface(active_popup_surface),
+    );
 
     const im = method_handler.method.?;
     try protocol.zwp_input_method_v2.encodeRequest(&method_actor.transmit, im.id, .{ .commit_string = .{ .text = "stale" } });
@@ -3901,6 +3959,8 @@ const InputMethodHandler = struct {
     keyboard_grab: ?wayring.objects.Handle = null,
     popup_surface: ?wayring.objects.Handle = null,
     popup: ?wayring.objects.Handle = null,
+    popup_rectangles: usize = 0,
+    popup_rectangle: protocol_input_method.PopupRectangle = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
     unavailable: usize = 0,
     activate: usize = 0,
     surrounding: usize = 0,
@@ -4030,6 +4090,18 @@ const InputMethodHandler = struct {
                         v.key != expected_keys[self.grab_keys] or
                         v.state.value != expected_states[self.grab_keys]) self.grab_keys_valid = false;
                     self.grab_keys += 1;
+                },
+            }
+        } else if (target.object.interface == &protocol.zwp_input_popup_surface_v2.info) {
+            switch (try protocol.zwp_input_popup_surface_v2.decodeEvent(message, fds)) {
+                .text_input_rectangle => |value| {
+                    self.popup_rectangles += 1;
+                    self.popup_rectangle = .{
+                        .x = value.x,
+                        .y = value.y,
+                        .width = value.width,
+                        .height = value.height,
+                    };
                 },
             }
         } else if (target.object.interface == &ClientCore.Display.info) switch (try ClientCore.decodeDisplayEvent(self.objects, message, fds)) {

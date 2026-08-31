@@ -42,6 +42,7 @@ pub const State = struct {
     submit_available: bool = false,
     input_panel_visible: bool = false,
 };
+pub const ActiveState = struct { focus: Focus, state: State };
 pub const PreeditHintKind = enum(u32) { whole = 1, selection, prediction, prefix, suffix, spelling_error, compose_error };
 pub const PreeditHint = struct { start: u32, end: u32, hint: PreeditHintKind };
 pub const Edit = struct { preedit: ?[]const u8 = null, cursor_begin: i32 = 0, cursor_end: i32 = 0, hints: []const PreeditHint = &.{}, commit: ?[]const u8 = null, delete_before: u32 = 0, delete_after: u32 = 0 };
@@ -340,6 +341,15 @@ pub fn Adapter(comptime protocol: type) type {
         }
         pub fn peekEvent(s: *const Self) ?*const Event {
             return if (s.event_len == 0) null else &s.events[s.event_head].event;
+        }
+        pub fn activeState(s: *const Self) ?ActiveState {
+            const focus = s.focus orelse return null;
+            for (s.devices.entries.items) |device| {
+                if (device.header.active and device.focused and device.current.enabled and
+                    same(device.peer, focus.peer))
+                    return .{ .focus = focus, .state = device.current };
+            }
+            return null;
         }
         pub fn dropEvent(s: *Self) void {
             if (s.event_len > 0) {

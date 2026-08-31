@@ -213,6 +213,10 @@ pub fn Coordinator(comptime protocol: type) type {
         const XdgOutputAdapter = protocol_xdg_output.Adapter(protocol, OutputAdapter);
         const OutputManagementAdapter = protocol_output_management.Adapter(protocol);
         const PhysicalOutputId = packed struct { index: u32, generation: u32 };
+        const InputPopupScene = struct {
+            surface: Adapter.SurfaceId,
+            output: PhysicalOutputId,
+        };
         const OutputPowerAdapter = protocol_output_power.Adapter(protocol, PhysicalOutputId, Self);
         const GammaControlAdapter = protocol_gamma_control.Adapter(protocol, PhysicalOutputId, Self);
         const DrmLeaseDeviceId = enum { physical };
@@ -748,6 +752,9 @@ pub fn Coordinator(comptime protocol: type) type {
         app_layer_feedback_outputs: []bool,
         scene_windows: []Desktop.SceneWindow,
         popup_scene_windows: []Desktop.SceneWindow,
+        input_popup_surfaces: []Adapter.SurfaceId,
+        input_popup_scenes: []InputPopupScene,
+        input_popup_scene_len: usize = 0,
         frame_samples: []render_list.AppliedSurface,
         frame_bindings: []output_api.SampleBinding,
         frame_changes: []damage.Change,
@@ -898,6 +905,17 @@ pub fn Coordinator(comptime protocol: type) type {
                 config.desktop.popup_capacity,
             );
             errdefer allocator.free(self.popup_scene_windows);
+            self.input_popup_surfaces = try allocator.alloc(
+                Adapter.SurfaceId,
+                config.input_method.popup_capacity,
+            );
+            errdefer allocator.free(self.input_popup_surfaces);
+            self.input_popup_scenes = try allocator.alloc(
+                InputPopupScene,
+                config.input_method.popup_capacity,
+            );
+            errdefer allocator.free(self.input_popup_scenes);
+            self.input_popup_scene_len = 0;
             self.frame_samples = try allocator.alloc(render_list.AppliedSurface, config.output.max_samples);
             errdefer allocator.free(self.frame_samples);
             self.frame_bindings = try allocator.alloc(output_api.SampleBinding, config.output.max_samples);
@@ -1716,6 +1734,8 @@ pub fn Coordinator(comptime protocol: type) type {
             self.allocator.free(self.removed_layers);
             self.allocator.free(self.frame_bindings);
             self.allocator.free(self.frame_samples);
+            self.allocator.free(self.input_popup_scenes);
+            self.allocator.free(self.input_popup_surfaces);
             self.allocator.free(self.popup_scene_windows);
             self.allocator.free(self.scene_windows);
             self.allocator.free(self.foreign_toplevels);
@@ -1851,6 +1871,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.screencopy_adapter.disconnected(peer);
             self.processVirtualPointerEvents() catch {};
             self.text_input_adapter.disconnected(peer);
+            self.syncInputMethodPopups() catch {};
             self.primary_selection_adapter.disconnected(peer);
             self.wlr_data_control_adapter.disconnected(peer);
             self.ext_data_control_adapter.disconnected(peer);
@@ -2026,6 +2047,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 return control;
             }
             if (try self.input_method_adapter.request(peer, target, message, fds)) |control| {
+                try self.syncInputMethodPopups();
                 if (self.input_method_adapter.pendingOutboundOn(peer))
                     self.markProtocol(peer, ProtocolReady.input_method);
                 self.markTextInputProtocol();
@@ -2637,6 +2659,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .surface = (try self.adapter.surfaceResource(id)).id,
             }))
                 self.markProtocolAll(ProtocolReady.text_input);
+            try self.syncInputMethodPopups();
             self.pointer_constraints_adapter.surfaceCommitted(id);
             const pointer = self.seat_adapter.pointerState();
             try self.pointer_constraints_adapter.updateFocus(
@@ -4774,6 +4797,7 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.data_device_adapter.setFocus(if (focus) |value| value.peer else null);
             try self.primary_selection_adapter.setFocus(if (focus) |value| value.peer else null);
             try self.text_input_adapter.setFocus(focus);
+            try self.syncInputMethodPopups();
             self.shortcuts_inhibit_adapter.setFocus(if (surface) |id| .{
                 .peer = focus.?.peer,
                 .surface = id,
@@ -5944,7 +5968,221 @@ pub fn Coordinator(comptime protocol: type) type {
                 };
                 self.text_input_adapter.dropEvent();
             }
+            try self.syncInputMethodPopups();
             self.markInputMethodProtocol();
+        }
+
+        fn syncInputMethodPopups(self: *Self) !void {
+            const active_surfaces = try self.input_method_adapter.activePopupSurfaces(
+                self.input_popup_surfaces,
+            );
+            var changed = false;
+            var index: usize = 0;
+            while (index < self.input_popup_scene_len) {
+                const mapped = self.input_popup_scenes[index];
+                var active = false;
+                for (active_surfaces) |surface| {
+                    if (std.meta.eql(surface, mapped.surface)) {
+                        active = true;
+                        break;
+                    }
+                }
+                if (active) {
+                    index += 1;
+                    continue;
+                }
+                self.unmapInputPopup(index);
+                changed = true;
+            }
+
+            const active = self.text_input_adapter.activeState();
+            const focused_surface = if (active) |state|
+                self.resolveTextInputSurface(state.focus)
+            else
+                null;
+            const focused_scene = if (focused_surface) |surface|
+                self.surfaceScene(surface)
+            else
+                null;
+            for (active_surfaces) |popup_surface| {
+                const state = active orelse {
+                    if (self.inputPopupSceneIndex(popup_surface)) |mapped_index| {
+                        self.unmapInputPopup(mapped_index);
+                        changed = true;
+                    }
+                    continue;
+                };
+                const scene = focused_scene orelse {
+                    if (self.inputPopupSceneIndex(popup_surface)) |mapped_index| {
+                        self.unmapInputPopup(mapped_index);
+                        changed = true;
+                    }
+                    continue;
+                };
+                const placement = self.inputPopupPlacement(popup_surface, scene, state.state) orelse {
+                    if (self.inputPopupSceneIndex(popup_surface)) |mapped_index| {
+                        self.unmapInputPopup(mapped_index);
+                        changed = true;
+                    }
+                    continue;
+                };
+                const previous = self.desktop.sceneForSurface(popup_surface) catch null;
+                const root: Desktop.SceneWindow = .{
+                    .id = .{
+                        .index = popup_surface.index | (@as(u32, 1) << 30),
+                        .generation = popup_surface.generation,
+                    },
+                    .surface = popup_surface,
+                    .managed = false,
+                    .keyboard_focusable = false,
+                    .geometry = placement.geometry,
+                    .visible = true,
+                    .stacking = std.math.maxInt(u32),
+                    .mode = .floating,
+                    .content_ready = placement.content_ready,
+                };
+                try self.desktop.setExternalRoot(root);
+                if (previous == null or !std.meta.eql(previous.?, root)) changed = true;
+                if (self.inputPopupSceneIndex(popup_surface)) |mapped_index| {
+                    if (!std.meta.eql(
+                        self.input_popup_scenes[mapped_index].output,
+                        placement.output.id,
+                    )) changed = true;
+                    self.input_popup_scenes[mapped_index].output = placement.output.id;
+                } else {
+                    if (self.input_popup_scene_len == self.input_popup_scenes.len)
+                        return error.Exhausted;
+                    self.input_popup_scenes[self.input_popup_scene_len] = .{
+                        .surface = popup_surface,
+                        .output = placement.output.id,
+                    };
+                    self.input_popup_scene_len += 1;
+                    changed = true;
+                }
+                _ = self.input_method_adapter.queuePopupRectangle(
+                    popup_surface,
+                    placement.rectangle,
+                ) catch 0;
+            }
+            if (changed) try self.requestOutputDamage();
+        }
+
+        fn resolveTextInputSurface(
+            self: *Self,
+            focus: protocol_text_input.Focus,
+        ) ?Adapter.SurfaceId {
+            const objects = self.root.runtime.clients.get(focus.peer) catch return null;
+            const handle = objects.namespace.lookupHandle(focus.surface) orelse return null;
+            const object = objects.namespace.resolve(handle) orelse return null;
+            return self.adapter.surfaceIdObject(handle, object) catch null;
+        }
+
+        const InputPopupPlacement = struct {
+            geometry: geometry.Rect,
+            rectangle: protocol_input_method.PopupRectangle,
+            output: *const PhysicalOutput,
+            content_ready: bool,
+        };
+
+        fn inputPopupPlacement(
+            self: *Self,
+            popup_surface: Adapter.SurfaceId,
+            focused_scene: SurfaceScene,
+            text_state: protocol_text_input.State,
+        ) ?InputPopupPlacement {
+            const focused_x = std.math.add(
+                i32,
+                if (focused_scene.root.has_window_geometry)
+                    alignedOrigin(
+                        focused_scene.root.geometry.x,
+                        focused_scene.root.surface_offset.x,
+                    )
+                else
+                    focused_scene.root.geometry.x,
+                focused_scene.offset_x,
+            ) catch return null;
+            const focused_y = std.math.add(
+                i32,
+                if (focused_scene.root.has_window_geometry)
+                    alignedOrigin(
+                        focused_scene.root.geometry.y,
+                        focused_scene.root.surface_offset.y,
+                    )
+                else
+                    focused_scene.root.geometry.y,
+                focused_scene.offset_y,
+            ) catch return null;
+            const rectangle = if (text_state.has_rectangle)
+                text_state.rectangle
+            else
+                protocol_text_input.Rectangle{};
+            const cursor_x = std.math.add(i32, focused_x, rectangle.x) catch return null;
+            const cursor_y = std.math.add(i32, focused_y, rectangle.y) catch return null;
+            const cursor_bounds: geometry.Rect = .{
+                .x = cursor_x,
+                .y = cursor_y,
+                .width = @max(rectangle.width, 1),
+                .height = @max(rectangle.height, 1),
+            };
+            const output = self.outputForInputPopup(cursor_bounds, focused_scene.root.geometry) orelse
+                return null;
+            const output_bounds = self.outputBoundsFor(output) catch return null;
+            const popup = self.adapter.getSurfaceById(popup_surface) catch return null;
+            const size = popup.committedSize();
+            const width = std.math.cast(i32, @max(size.width, 1)) orelse return null;
+            const height = std.math.cast(i32, @max(size.height, 1)) orelse return null;
+            const output_right = @as(i64, output_bounds.x) + output_bounds.width;
+            const output_bottom = @as(i64, output_bounds.y) + output_bounds.height;
+            const maximum_x = output_right - width;
+            const x: i32 = @intCast(@max(
+                @as(i64, output_bounds.x),
+                @min(@as(i64, cursor_x), maximum_x),
+            ));
+            const below = @as(i64, cursor_y) + @max(rectangle.height, 0);
+            const above = @as(i64, cursor_y) - height;
+            const y: i32 = @intCast(if (below + height <= output_bottom)
+                @max(@as(i64, output_bounds.y), below)
+            else
+                @max(@as(i64, output_bounds.y), above));
+            return .{
+                .geometry = .{ .x = x, .y = y, .width = width, .height = height },
+                .rectangle = .{
+                    .x = std.math.sub(i32, cursor_x, x) catch return null,
+                    .y = std.math.sub(i32, cursor_y, y) catch return null,
+                    .width = rectangle.width,
+                    .height = rectangle.height,
+                },
+                .output = output,
+                .content_ready = size.width != 0 and size.height != 0,
+            };
+        }
+
+        fn outputForInputPopup(
+            self: *const Self,
+            cursor: geometry.Rect,
+            focused: geometry.Rect,
+        ) ?*const PhysicalOutput {
+            if (self.physicalOutputContainingSceneRect(cursor)) |output| return output;
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                if (!physical.connected or physical.kms_output == null) continue;
+                const bounds = self.outputBoundsFor(physical) catch continue;
+                if (rectanglesIntersect(bounds, cursor)) return physical;
+            }
+            return self.physicalOutputContainingSceneRect(focused);
+        }
+
+        fn inputPopupSceneIndex(self: *const Self, surface: Adapter.SurfaceId) ?usize {
+            for (self.input_popup_scenes[0..self.input_popup_scene_len], 0..) |scene, index|
+                if (std.meta.eql(scene.surface, surface)) return index;
+            return null;
+        }
+
+        fn unmapInputPopup(self: *Self, index: usize) void {
+            const surface = self.input_popup_scenes[index].surface;
+            self.desktop.removeExternalRoot(surface);
+            self.queueLayerRemoval(surface);
+            self.input_popup_scene_len -= 1;
+            self.input_popup_scenes[index] = self.input_popup_scenes[self.input_popup_scene_len];
         }
 
         fn markShortcutsInhibitProtocol(self: *Self) void {
@@ -6515,6 +6753,7 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.refreshRetainedLayersForOutput();
             try self.recomputeLayerConfigures();
             try self.recomputeSessionLockConfigures();
+            try self.syncInputMethodPopups();
             self.output_associations_dirty = true;
             try self.syncOutputAssociations();
             self.foreign_toplevel_outputs_dirty = true;
@@ -7312,6 +7551,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 }
                 try self.appendLayerShell(physical, .top, &sample_count, output_bounds);
                 try self.appendLayerShell(physical, .overlay, &sample_count, output_bounds);
+                try self.appendInputMethodPopups(physical, &sample_count, output_bounds);
             }
             var change_count: usize = 0;
             const head_state = try self.output_management_adapter.lifecycle.currentHead(
@@ -7686,6 +7926,18 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (!state.mapped or !std.meta.eql(state.lock, active) or
                     !std.meta.eql(state.output_id, physical.protocol_output)) continue;
                 try self.appendSceneRoot(physical, state.surface, count, output_bounds);
+            }
+        }
+
+        fn appendInputMethodPopups(
+            self: *Self,
+            physical: *const PhysicalOutput,
+            count: *usize,
+            output_bounds: geometry.Rect,
+        ) !void {
+            for (self.input_popup_scenes[0..self.input_popup_scene_len]) |popup| {
+                if (!std.meta.eql(popup.output, physical.id)) continue;
+                try self.appendSceneRoot(physical, popup.surface, count, output_bounds);
             }
         }
 
@@ -10072,6 +10324,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     self.discardUnpresentedLayer(&self.cursor_layer);
             }
             _ = self.adapter.resourceRemoved(handle, object);
+            self.syncInputMethodPopups() catch {};
             self.syncCommitTimer() catch {};
             if (self.surface) |surface| {
                 if (std.meta.eql(surface, handle)) {

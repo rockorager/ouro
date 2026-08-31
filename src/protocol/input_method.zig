@@ -9,6 +9,8 @@ const none = std.math.maxInt(u32);
 const popup_role_id: surface_state.RoleId = 0x696d_5f70_6f70_7570;
 
 pub const GrabId = packed struct { index: u32, generation: u32 };
+pub const PopupId = packed struct { index: u32, generation: u32 };
+pub const PopupRectangle = struct { x: i32, y: i32, width: i32, height: i32 };
 pub const Modifiers = struct { serial: u32 = 0, depressed: u32 = 0, latched: u32 = 0, locked: u32 = 0, group: u32 = 0 };
 pub const KeyboardSnapshot = struct {
     keymap_size: u32,
@@ -106,8 +108,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Tex
         const MethodId = packed struct { index: u32, generation: u32 };
         const MethodSlot = struct { header: slot_pool.Header = .{}, resource: objects.Handle = .{ .id = 0, .generation = 0 }, peer: wayring.io_uring.Peer = undefined, seat_key: u32 = 0, available: bool = false, enabled: bool = false, target: ?TextInput.DeviceId = null, done_serial: u32 = 0, pending: PendingEdit = .{} };
         const Child = struct { header: slot_pool.Header = .{}, resource: objects.Handle = .{ .id = 0, .generation = 0 }, peer: wayring.io_uring.Peer = undefined, parent: MethodId = undefined, surface: ?CoreSurface.SurfaceId = null, order: u64 = 0, eligible: bool = true };
-        const OutKind = enum { unavailable, activate, deactivate, surrounding, cause, content, done, grab_keymap, grab_repeat, grab_modifiers, grab_key };
-        const Out = struct { active: bool = false, sequence: u64 = 0, peer: wayring.io_uring.Peer = undefined, method: MethodId = undefined, grab: GrabId = .{ .index = none, .generation = 0 }, kind: OutKind = .unavailable, text_len: usize = 0, cursor: u32 = 0, anchor: u32 = 0, cause: u32 = 0, hints: u32 = 0, purpose: u32 = 0, serial: u32 = 0, time: u32 = 0, key: u32 = 0, state: u32 = 0, modifiers: Modifiers = .{}, rate: i32 = 0, delay: i32 = 0, size: u32 = 0, storage: []u8 = &.{} };
+        const OutKind = enum { unavailable, activate, deactivate, surrounding, cause, content, done, popup_rectangle, grab_keymap, grab_repeat, grab_modifiers, grab_key };
+        const Out = struct { active: bool = false, sequence: u64 = 0, peer: wayring.io_uring.Peer = undefined, method: MethodId = undefined, popup: PopupId = .{ .index = none, .generation = 0 }, grab: GrabId = .{ .index = none, .generation = 0 }, kind: OutKind = .unavailable, text_len: usize = 0, cursor: u32 = 0, anchor: u32 = 0, cause: u32 = 0, hints: u32 = 0, purpose: u32 = 0, x: i32 = 0, y: i32 = 0, width: i32 = 0, height: i32 = 0, serial: u32 = 0, time: u32 = 0, key: u32 = 0, state: u32 = 0, modifiers: Modifiers = .{}, rate: i32 = 0, delay: i32 = 0, size: u32 = 0, storage: []u8 = &.{} };
 
         allocator: std.mem.Allocator,
         core: *CoreSurface,
@@ -457,6 +459,26 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Tex
         pub fn flushOn(self: *Self, peer: wayring.io_uring.Peer, so: anytype, queue: *wayring.tx.Queue) !usize {
             var count: usize = 0;
             while (self.oldest(peer)) |o| {
+                if (o.kind == .popup_rectangle) {
+                    const popup = self.resolvePopup(o.popup) orelse {
+                        self.dropOut(o);
+                        continue;
+                    };
+                    wayring.server.sendEvent(protocol, Popup, so, queue, popup.resource, .{
+                        .text_input_rectangle = .{
+                            .x = o.x,
+                            .y = o.y,
+                            .width = o.width,
+                            .height = o.height,
+                        },
+                    }) catch |err| switch (err) {
+                        error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return count,
+                        else => return err,
+                    };
+                    self.dropOut(o);
+                    count += 1;
+                    continue;
+                }
                 if (o.kind == .grab_keymap or o.kind == .grab_repeat or o.kind == .grab_modifiers or o.kind == .grab_key) {
                     const c = self.resolveGrab(o.grab) orelse {
                         self.dropOut(o);
@@ -523,6 +545,85 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Tex
         pub fn advance(self: *Self) void {
             self.promoteGrab();
         }
+        pub fn activePopupSurfaces(self: *Self, output: []CoreSurface.SurfaceId) ![]const CoreSurface.SurfaceId {
+            var len: usize = 0;
+            for (self.popups.entries.items) |popup| {
+                if (!popup.header.active or popup.surface == null) continue;
+                const method = self.resolveMethod(popup.parent) orelse continue;
+                if (!method.available or !method.enabled) continue;
+                if (len == output.len) return error.Exhausted;
+                output[len] = popup.surface.?;
+                len += 1;
+            }
+            return output[0..len];
+        }
+        pub fn queuePopupRectangle(self: *Self, surface: CoreSurface.SurfaceId, rectangle: PopupRectangle) !usize {
+            var needed: usize = 0;
+            for (self.popups.entries.items) |popup| {
+                if (!popup.header.active or popup.surface == null or
+                    !std.meta.eql(popup.surface.?, surface)) continue;
+                const method = self.resolveMethod(popup.parent) orelse continue;
+                if (!method.available or !method.enabled) continue;
+                const id = self.popupId(popup);
+                var pending = false;
+                for (self.outbound) |out| {
+                    if (out.active and out.kind == .popup_rectangle and
+                        std.meta.eql(out.popup, id))
+                    {
+                        pending = true;
+                        break;
+                    }
+                }
+                if (!pending) needed += 1;
+            }
+            if (!self.canEnqueue(needed)) return error.Exhausted;
+            self.normalizeSequence(needed);
+            for (self.popups.entries.items) |popup| {
+                if (!popup.header.active or popup.surface == null or
+                    !std.meta.eql(popup.surface.?, surface)) continue;
+                const method = self.resolveMethod(popup.parent) orelse continue;
+                if (!method.available or !method.enabled) continue;
+                const id = self.popupId(popup);
+                var pending: ?*Out = null;
+                for (self.outbound) |*out| {
+                    if (out.active and out.kind == .popup_rectangle and
+                        std.meta.eql(out.popup, id))
+                    {
+                        pending = out;
+                        break;
+                    }
+                }
+                if (pending) |out| {
+                    out.x = rectangle.x;
+                    out.y = rectangle.y;
+                    out.width = rectangle.width;
+                    out.height = rectangle.height;
+                    continue;
+                }
+                var out: *Out = undefined;
+                for (self.outbound) |*candidate| if (!candidate.active) {
+                    out = candidate;
+                    break;
+                };
+                const storage = out.storage;
+                out.* = .{
+                    .active = true,
+                    .sequence = self.next_sequence,
+                    .peer = popup.peer,
+                    .method = popup.parent,
+                    .popup = id,
+                    .kind = .popup_rectangle,
+                    .x = rectangle.x,
+                    .y = rectangle.y,
+                    .width = rectangle.width,
+                    .height = rectangle.height,
+                    .storage = storage,
+                };
+                self.next_sequence += 1;
+                self.out_len += 1;
+            }
+            return needed;
+        }
         pub fn pendingOutboundOn(self: *const Self, peer: wayring.io_uring.Peer) bool {
             for (self.outbound) |o| if (o.active and same(o.peer, peer)) return true;
             return false;
@@ -567,7 +668,12 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Tex
             for (self.popups.entries.items) |popup| {
                 if (popup.header.active and popup.surface != null and
                     std.meta.eql(popup.surface.?, id))
+                {
+                    const popup_id = self.popupId(popup);
+                    for (self.outbound) |*out| if (out.active and
+                        std.meta.eql(out.popup, popup_id)) self.dropOut(out);
                     popup.surface = null;
+                }
             }
         }
 
@@ -613,10 +719,20 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Tex
         }
         fn releasePopup(self: *Self, popup: *Child) void {
             if (!popup.header.active) return;
+            const id = self.popupId(popup);
+            for (self.outbound) |*out| if (out.active and std.meta.eql(out.popup, id)) self.dropOut(out);
             if (popup.surface) |surface_id| if (self.core.getSurfaceById(surface_id)) |surface|
                 surface.role.deactivateObject(popup_role_id) catch {}
             else |_| {};
             self.popups.release(popup);
+        }
+        fn popupId(_: *const Self, popup: *const Child) PopupId {
+            return .{ .index = popup.header.index, .generation = popup.header.generation };
+        }
+        fn resolvePopup(self: *Self, id: PopupId) ?*Child {
+            if (id.index >= self.popups.entries.items.len) return null;
+            const popup = self.popups.entries.items[id.index];
+            return if (popup.header.active and popup.header.generation == id.generation) popup else null;
         }
         fn findAvailable(self: *Self, seat_key: u32) ?*MethodSlot {
             for (self.methods.entries.items) |m| if (m.header.active and m.available and m.seat_key == seat_key) return m;
