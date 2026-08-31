@@ -598,27 +598,31 @@ test "physical coordinator replaces the last disconnected output exactly" {
 }
 
 test "generated output management applies two heads atomically" {
-    try generatedMultiHeadApply(false, false, false, false);
+    try generatedMultiHeadApply(false, false, false, false, false);
 }
 
 test "generated output management rolls back every head" {
-    try generatedMultiHeadApply(true, false, false, false);
+    try generatedMultiHeadApply(true, false, false, false, false);
 }
 
 test "generated output management disables a secondary head atomically" {
-    try generatedMultiHeadApply(false, true, false, false);
+    try generatedMultiHeadApply(false, true, false, false, false);
 }
 
 test "generated output management re-enables a secondary head atomically" {
-    try generatedMultiHeadApply(false, true, true, false);
+    try generatedMultiHeadApply(false, true, true, false, false);
 }
 
 test "generated output management rotates one physical head" {
-    try generatedMultiHeadApply(false, false, false, true);
+    try generatedMultiHeadApply(false, false, false, true, false);
 }
 
 test "generated output management rolls back a physical transform" {
-    try generatedMultiHeadApply(true, false, false, true);
+    try generatedMultiHeadApply(true, false, false, true, false);
+}
+
+test "generated output management enables adaptive sync on one head" {
+    try generatedMultiHeadApply(false, false, false, false, true);
 }
 
 fn generatedMultiHeadApply(
@@ -626,11 +630,13 @@ fn generatedMultiHeadApply(
     disable_second: bool,
     reenable_second: bool,
     rotate_first: bool,
+    adaptive_sync: bool,
 ) !void {
     const allocator = std.testing.allocator;
     var fixture = try Fixture.init();
     defer fixture.deinit();
     fixture.second_desktop = true;
+    fixture.vrr_supported = adaptive_sync;
     var path_storage: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-r15-multi-head-{d}.sock", .{linux.getpid()});
     wayring.unix_socket.unlink(path) catch {};
@@ -674,6 +680,7 @@ fn generatedMultiHeadApply(
         .disable_second = disable_second,
         .reenable_second = reenable_second,
         .rotate_first = rotate_first,
+        .adaptive_sync = adaptive_sync,
     };
     try submitClient(&reactor, &driver, &handler);
     for (0..512) |_| {
@@ -711,6 +718,10 @@ fn generatedMultiHeadApply(
         @as(i32, if (rotate_first and !fail_second_activation) 1 else 0),
         first_state.transform,
     );
+    try std.testing.expectEqual(adaptive_sync and !fail_second_activation, first_state.adaptive_sync);
+    if (adaptive_sync and !fail_second_activation) {
+        try std.testing.expect(coordinator.physical_outputs[0].kms_output.?.kms_output.adaptive_sync);
+    }
     if (rotate_first and !fail_second_activation) {
         const first_output = coordinator.physical_outputs[0].kms_output.?;
         try std.testing.expectEqual(ouro.render.Size{ .width = 2, .height = 3 }, first_output.planner.output);
@@ -2380,6 +2391,7 @@ const MultiOutputManagementClientHandler = struct {
     reenable_submitted: bool = false,
     reenable_flushed: bool = false,
     rotate_first: bool = false,
+    adaptive_sync: bool = false,
     succeeded: usize = 0,
     failed: usize = 0,
     event_failures: usize = 0,
@@ -2505,6 +2517,11 @@ const MultiOutputManagementClientHandler = struct {
                 self.queue,
                 configuration_head.id,
                 .{ .set_transform = .{ .transform = protocol.wl_output.transform.@"90" } },
+            );
+            if (self.adaptive_sync and index == 0) try protocol.zwlr_output_configuration_head_v1.encodeRequest(
+                self.queue,
+                configuration_head.id,
+                .{ .set_adaptive_sync = .{ .state = .enabled } },
             );
         }
         try protocol.zwlr_output_configuration_v1.encodeRequest(self.queue, configuration.id, .{ .apply = .{} });
@@ -2881,6 +2898,7 @@ pub const Fixture = struct {
     imported_bos: usize = 0,
     import_attempts: usize = 0,
     fail_imports: bool = false,
+    vrr_supported: bool = false,
     read_maps: usize = 0,
     unmaps: usize = 0,
     discover_cards: bool = true,
@@ -3107,18 +3125,18 @@ pub const Fixture = struct {
     fn topology(context: *anyopaque, _: linux.fd_t, out: *ouro.drm_platform.TopologyBuffer) !void {
         const self: *Fixture = @ptrCast(@alignCast(context));
         out.reset();
-        out.connectors[0] = .{ .id = 10, .connector_type = 1, .connector_type_id = 1, .connected = true, .desktop = self.first_desktop, .width_mm = 1, .height_mm = 1, .encoder_id = 20, .mode_start = 0, .mode_count = 1, .encoder_start = 0, .encoder_count = 1, .properties = .{ .crtc_id = 1 } };
+        out.connectors[0] = .{ .id = 10, .connector_type = 1, .connector_type_id = 1, .connected = true, .desktop = self.first_desktop, .width_mm = 1, .height_mm = 1, .encoder_id = 20, .mode_start = 0, .mode_count = 1, .encoder_start = 0, .encoder_count = 1, .properties = .{ .crtc_id = 1, .vrr_capable = self.vrr_supported } };
         out.modes[0] = .{ .clock = 1, .hdisplay = 3, .hsync_start = 3, .hsync_end = 3, .htotal = 3, .hskew = 0, .vdisplay = 2, .vsync_start = 2, .vsync_end = 2, .vtotal = 2, .vscan = 0, .vrefresh = 60, .flags = 0, .mode_type = 0 };
         out.connector_encoders[0] = 20;
         out.encoders[0] = .{ .id = 20, .crtc_id = 30, .possible_crtcs = 1 };
-        out.crtcs[0] = .{ .id = 30, .index = 0, .properties = .{ .active = 2, .mode_id = 3 } };
+        out.crtcs[0] = .{ .id = 30, .index = 0, .properties = .{ .active = 2, .mode_id = 3, .vrr_enabled = if (self.vrr_supported) 15 else 0 } };
         out.planes[0] = .{ .id = 40, .possible_crtcs = 1, .plane_type_value = 1, .format_start = 0, .format_count = 1, .properties = .{ .plane_type = 4, .fb_id = 5, .crtc_id = 6, .src_x = 7, .src_y = 8, .src_w = 9, .src_h = 10, .crtc_x = 11, .crtc_y = 12, .crtc_w = 13, .crtc_h = 14 } };
         out.formats[0] = .{ .fourcc = ouro.gbm.format_xrgb8888, .modifier = ouro.gbm.modifier_linear };
-        out.connectors[1] = .{ .id = 11, .connector_type = 1, .connector_type_id = 2, .connected = true, .desktop = self.second_desktop, .width_mm = 2, .height_mm = 2, .encoder_id = 21, .mode_start = 1, .mode_count = 1, .encoder_start = 1, .encoder_count = 1, .properties = .{ .crtc_id = 1 } };
+        out.connectors[1] = .{ .id = 11, .connector_type = 1, .connector_type_id = 2, .connected = true, .desktop = self.second_desktop, .width_mm = 2, .height_mm = 2, .encoder_id = 21, .mode_start = 1, .mode_count = 1, .encoder_start = 1, .encoder_count = 1, .properties = .{ .crtc_id = 1, .vrr_capable = self.vrr_supported } };
         out.modes[1] = out.modes[0];
         out.connector_encoders[1] = 21;
         out.encoders[1] = .{ .id = 21, .crtc_id = 31, .possible_crtcs = 2 };
-        out.crtcs[1] = .{ .id = 31, .index = 1, .properties = .{ .active = 2, .mode_id = 3 } };
+        out.crtcs[1] = .{ .id = 31, .index = 1, .properties = .{ .active = 2, .mode_id = 3, .vrr_enabled = if (self.vrr_supported) 16 else 0 } };
         out.planes[1] = .{ .id = 41, .possible_crtcs = 2, .plane_type_value = 1, .format_start = 1, .format_count = 1, .properties = .{ .plane_type = 4, .fb_id = 5, .crtc_id = 6, .src_x = 7, .src_y = 8, .src_w = 9, .src_h = 10, .crtc_x = 11, .crtc_y = 12, .crtc_w = 13, .crtc_h = 14 } };
         out.formats[1] = out.formats[0];
         out.connector_count = 2;

@@ -48,6 +48,7 @@ pub const Event = union(enum) {
 pub const Config = struct {
     commit_capacity: usize = 2,
     event_capacity: usize = 32,
+    adaptive_sync: bool = false,
 };
 
 /// Generation-checking adapter for R9's borrowed Session-owned DRM FD.
@@ -157,6 +158,7 @@ pub const Output = struct {
     poll_token: ?completion.Token = null,
     cancel_token: ?completion.Token = null,
     terminal_device_teardown: bool = false,
+    adaptive_sync: bool = false,
 
     pub fn create(
         allocator: std.mem.Allocator,
@@ -169,6 +171,9 @@ pub const Output = struct {
         if (config.commit_capacity == 0 or config.commit_capacity > std.math.maxInt(u32) or
             config.event_capacity == 0)
             return error.InvalidConfig;
+        if (config.adaptive_sync and (!snapshot.selectedConnector().properties.vrr_capable or
+            snapshot.selectedCrtc().properties.vrr_enabled == 0))
+            return error.AdaptiveSyncUnsupported;
         const fd = try device.fd(snapshot.handle);
         const records = try allocator.alloc(CommitRecord, config.commit_capacity);
         errdefer allocator.free(records);
@@ -198,6 +203,7 @@ pub const Output = struct {
             .mode_blob = blob,
             .records = records,
             .events_buffer = event_storage,
+            .adaptive_sync = config.adaptive_sync,
         };
         return self;
     }
@@ -535,6 +541,13 @@ pub const Output = struct {
             try self.platform.addProperty(request, self.connector.id, self.connector.properties.crtc_id, self.crtc.id);
             try self.platform.addProperty(request, self.crtc.id, self.crtc.properties.mode_id, self.mode_blob);
             try self.platform.addProperty(request, self.crtc.id, self.crtc.properties.active, 1);
+            if (self.crtc.properties.vrr_enabled != 0)
+                try self.platform.addProperty(
+                    request,
+                    self.crtc.id,
+                    self.crtc.properties.vrr_enabled,
+                    @intFromBool(self.adaptive_sync),
+                );
         }
         try self.platform.addProperty(request, self.plane.id, self.plane.properties.fb_id, framebuffer_id);
         try self.platform.addProperty(request, self.plane.id, self.plane.properties.crtc_id, self.crtc.id);
@@ -572,6 +585,8 @@ pub const Output = struct {
         try self.platform.addProperty(request, self.connector.id, self.connector.properties.crtc_id, 0);
         try self.platform.addProperty(request, self.crtc.id, self.crtc.properties.active, 0);
         try self.platform.addProperty(request, self.crtc.id, self.crtc.properties.mode_id, 0);
+        if (self.crtc.properties.vrr_enabled != 0)
+            try self.platform.addProperty(request, self.crtc.id, self.crtc.properties.vrr_enabled, 0);
         self.platform.commit(fd, request, .{ .allow_modeset = true }, null) catch |err| {
             self.platform.resetRequest(request);
             try self.markFailed(.disable_commit);
@@ -750,6 +765,23 @@ test "kms: scanout properties flags and optional fences match capabilities" {
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(rejected_fence, linux.F.GETFD, 0)));
     try FakeImages.discard(&fixture.images_state, image);
     try fixture.destroy(output);
+}
+
+test "kms: adaptive sync requires capability and programs exact CRTC property" {
+    var fixture = Fixture{};
+    try std.testing.expectError(
+        error.AdaptiveSyncUnsupported,
+        fixture.create(.{ .adaptive_sync = true }),
+    );
+
+    fixture.connector[0].properties.vrr_capable = true;
+    fixture.crtc[0].properties.vrr_enabled = 24;
+    const output = try fixture.create(.{ .adaptive_sync = true });
+    try output.queue(fixture.acquire(0), null);
+    try output.commitQueued();
+    try std.testing.expect(fixture.atomic_state.hasProperty(20, 24, 1));
+    try output.terminalDeviceTeardown();
+    try fixture.drainAndDestroy(output);
 }
 
 test "kms: direct candidates receive an active-state TEST_ONLY commit" {

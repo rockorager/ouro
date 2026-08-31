@@ -55,11 +55,15 @@ pub const Mode = struct {
     }
 };
 
-pub const ConnectorProperties = struct { crtc_id: u32 };
+pub const ConnectorProperties = struct {
+    crtc_id: u32,
+    vrr_capable: bool = false,
+};
 pub const CrtcProperties = struct {
     active: u32,
     mode_id: u32,
     out_fence_ptr: u32 = 0,
+    vrr_enabled: u32 = 0,
 };
 pub const PlaneProperties = struct {
     plane_type: u32,
@@ -277,6 +281,7 @@ fn realReadTopology(_: *anyopaque, fd: std.posix.fd_t, out: *TopologyBuffer) !vo
                 .active = try requiredProperty(fd, props, "ACTIVE"),
                 .mode_id = try requiredProperty(fd, props, "MODE_ID"),
                 .out_fence_ptr = if (try optionalProperty(fd, props, "OUT_FENCE_PTR")) |value| value.id else 0,
+                .vrr_enabled = if (try optionalProperty(fd, props, "VRR_ENABLED")) |value| value.id else 0,
             },
         };
         out.crtc_count += 1;
@@ -332,7 +337,13 @@ fn realReadTopology(_: *anyopaque, fd: std.posix.fd_t, out: *TopologyBuffer) !vo
             .mode_count = @intCast(out.mode_count - mode_start),
             .encoder_start = @intCast(encoder_start),
             .encoder_count = @intCast(out.connector_encoder_count - encoder_start),
-            .properties = .{ .crtc_id = try requiredProperty(fd, props, "CRTC_ID") },
+            .properties = .{
+                .crtc_id = try requiredProperty(fd, props, "CRTC_ID"),
+                .vrr_capable = if (try optionalProperty(fd, props, "vrr_capable")) |value|
+                    value.value != 0
+                else
+                    false,
+            },
         };
         out.connector_count += 1;
     }
