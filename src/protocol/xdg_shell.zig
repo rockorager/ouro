@@ -116,6 +116,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             constraint_adjustment: u32,
             offset_x: i32,
             offset_y: i32,
+            reactive: bool = false,
         };
 
         /// Shell-neutral events. Metadata bytes remain adapter-owned and are
@@ -1522,6 +1523,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .constraint_adjustment = state.constraint_adjustment,
                 .offset_x = state.offset_x,
                 .offset_y = state.offset_y,
+                .reactive = state.reactive,
             };
         }
 
@@ -3154,6 +3156,10 @@ test "xdg-shell: generated popup requests validate positioner and parent role" {
         .set_anchor_rect = .{ .x = 4, .y = 5, .width = 20, .height = 30 },
     });
     try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try test_protocol.xdg_positioner.encodeRequest(&context.requests, 15, .{
+        .set_reactive = .{},
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
     try test_protocol.xdg_surface.encodeRequest(&context.requests, 14, .{
         .get_popup = .{ .id = 16, .parent = 11, .positioner = 15 },
     });
@@ -3173,6 +3179,7 @@ test "xdg-shell: generated popup requests validate positioner and parent role" {
     try std.testing.expectEqual(@as(i32, 80), created.placement.height);
     try std.testing.expectEqual(@as(i32, 4), created.placement.anchor_x);
     try std.testing.expectEqual(@as(i32, 30), created.placement.anchor_height);
+    try std.testing.expect(created.placement.reactive);
     _ = try context.server_objects.insertClient(19, &test_protocol.wl_seat.info, 9, null);
     context.adapter.setGrabValidator(.{
         .context = &context.adapter,

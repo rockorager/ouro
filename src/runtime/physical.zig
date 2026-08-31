@@ -8536,7 +8536,9 @@ pub fn Coordinator(comptime protocol: type) type {
             const ids = try self.layer_shell_adapter.ids(self.layer_surface_ids);
             for (ids) |id| {
                 const state = try self.layer_shell_adapter.state(id);
-                _ = self.desktop.updateExternalRoot(self.layerShellSceneState(state) orelse continue);
+                _ = try self.desktop.updateExternalRoot(
+                    self.layerShellSceneState(state) orelse continue,
+                );
             }
         }
 

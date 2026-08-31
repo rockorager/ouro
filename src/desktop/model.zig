@@ -656,15 +656,17 @@ pub fn Desktop(comptime Shell: type) type {
             return desktop.work_area;
         }
 
-        pub fn validateOutputAreas(desktop: *const Self, areas: []const geometry.Rect) !void {
+        pub fn validateOutputAreas(desktop: *Self, areas: []const geometry.Rect) !void {
             if (areas.len == 0 or areas.len > desktop.output_areas.len) return error.Exhausted;
             for (areas) |area| try area.validate();
+            try desktop.requirePopupCommandCapacity(desktop.popup_live);
         }
 
         pub fn applyOutputAreas(desktop: *Self, areas: []const geometry.Rect) void {
             desktop.validateOutputAreas(areas) catch unreachable;
             @memcpy(desktop.output_areas[0..areas.len], areas);
             desktop.output_area_len = areas.len;
+            desktop.reconfigureReactivePopups();
         }
 
         pub fn scene(desktop: *const Self, id: ToplevelId) !SceneWindow {
@@ -684,19 +686,25 @@ pub fn Desktop(comptime Shell: type) type {
         }
 
         pub fn setExternalRoot(desktop: *Self, root: SceneWindow) !void {
-            if (desktop.updateExternalRoot(root)) return;
+            if (try desktop.updateExternalRoot(root)) return;
             if (desktop.external_root_len == desktop.external_roots.len) return error.Exhausted;
+            try desktop.requirePopupCommandCapacity(desktop.popup_live);
             desktop.external_roots[desktop.external_root_len] = root;
             desktop.external_root_len += 1;
             desktop.updatePopupScenes();
+            desktop.reconfigureReactivePopups();
         }
 
-        pub fn updateExternalRoot(desktop: *Self, root: SceneWindow) bool {
+        pub fn updateExternalRoot(desktop: *Self, root: SceneWindow) !bool {
             for (desktop.external_roots[0..desktop.external_root_len]) |*current| {
                 if (!std.meta.eql(current.surface, root.surface)) continue;
                 const changed = !std.meta.eql(current.*, root);
+                if (changed) try desktop.requirePopupCommandCapacity(desktop.popup_live);
                 current.* = root;
-                if (changed) desktop.updatePopupScenes();
+                if (changed) {
+                    desktop.updatePopupScenes();
+                    desktop.reconfigureReactivePopups();
+                }
                 return true;
             }
             return false;
@@ -1021,6 +1029,7 @@ pub fn Desktop(comptime Shell: type) type {
         fn commitPopup(desktop: *Self, value: anytype) !void {
             const slot = try desktop.popupByShell(value.id);
             if (slot.expected_serial != value.serial) return;
+            try desktop.requirePopupCommandCapacity(desktop.popup_live);
             const parent = desktop.sceneForSurface(slot.parent) catch return;
             const configure = slot.pending_configure orelse return;
             const next = SceneWindow{
@@ -1042,6 +1051,8 @@ pub fn Desktop(comptime Shell: type) type {
             slot.has_window_geometry = value.has_window_geometry;
             slot.surface_offset = next.surface_offset;
             slot.expected_serial = null;
+            desktop.updatePopupScenes();
+            desktop.reconfigureReactivePopups();
         }
 
         fn repositionPopup(desktop: *Self, value: anytype) !void {
@@ -1265,6 +1276,7 @@ pub fn Desktop(comptime Shell: type) type {
         }
 
         fn reflow(desktop: *Self) !void {
+            try desktop.requirePopupCommandCapacity(desktop.popup_live);
             @memset(desktop.desired, .{});
             var item_len: usize = 0;
             for (desktop.tile_order[0..desktop.tile_len]) |index| {
@@ -1434,6 +1446,7 @@ pub fn Desktop(comptime Shell: type) type {
                 changed = true;
             };
             desktop.updatePopupScenes();
+            desktop.reconfigureReactivePopups();
             desktop.scene_changed = changed or desktop.scene_changed;
         }
 
@@ -1453,6 +1466,52 @@ pub fn Desktop(comptime Shell: type) type {
                 popup.scene.visible = parent.visible;
             };
             desktop.scene_changed = changed or desktop.scene_changed;
+        }
+
+        fn reconfigureReactivePopups(desktop: *Self) void {
+            for (desktop.popups) |*popup| {
+                if (!popup.active or !popup.placement.reactive) continue;
+                const parent = desktop.sceneForSurface(popup.parent) catch continue;
+                const positioned = placePopup(
+                    popup.placement,
+                    parent.geometry,
+                    popupOutputArea(
+                        parent.geometry,
+                        desktop.output_areas[0..desktop.output_area_len],
+                    ),
+                ) catch unreachable;
+                const configure: Shell.PopupConfigure = .{
+                    .x = positioned.x,
+                    .y = positioned.y,
+                    .width = positioned.width,
+                    .height = positioned.height,
+                };
+                var latest = popup.pending_configure orelse popup.configure;
+                var latest_command: ?usize = null;
+                for (0..desktop.popup_command_len) |offset| {
+                    const index = (desktop.popup_command_head + offset) %
+                        desktop.popup_commands.len;
+                    const command = desktop.popup_commands[index];
+                    if (command.done or !std.meta.eql(command.id, popup.shell_id)) continue;
+                    latest = command.configure;
+                    latest_command = index;
+                }
+                if (std.meta.eql(latest, configure)) continue;
+                if (latest_command) |index| {
+                    if (desktop.popup_commands[index].reposition_token == null) {
+                        desktop.popup_commands[index].configure = configure;
+                        continue;
+                    }
+                }
+                std.debug.assert(desktop.popup_command_len != desktop.popup_commands.len);
+                const tail = (desktop.popup_command_head + desktop.popup_command_len) %
+                    desktop.popup_commands.len;
+                desktop.popup_commands[tail] = .{
+                    .id = popup.shell_id,
+                    .configure = configure,
+                };
+                desktop.popup_command_len += 1;
+            }
         }
 
         fn externalRootForSurface(desktop: *const Self, surface: Shell.SurfaceId) ?SceneWindow {
@@ -1917,6 +1976,7 @@ const TestShell = struct {
         constraint_adjustment: u32,
         offset_x: i32,
         offset_y: i32,
+        reactive: bool = false,
     };
     pub const RequestedState = enum { maximized, fullscreen, minimized };
     pub const StateSet = packed struct(u16) {
@@ -2462,6 +2522,68 @@ test "desktop: external-root popup stays out of the ordinary desktop scene" {
     );
     desktop.removeExternalRoot(root_surface);
     try std.testing.expect(!(try desktop.sceneForSurface(popup_surface)).visible);
+}
+
+test "desktop: reactive popup reconfigures when its root changes output" {
+    var desktop = try initTestDesktop(8);
+    defer desktop.deinit();
+    const areas = [_]geometry.Rect{
+        .{ .x = 0, .y = 0, .width = 100, .height = 60 },
+        .{ .x = 100, .y = 0, .width = 100, .height = 60 },
+    };
+    desktop.applyOutputAreas(&areas);
+    const root_surface: TestShell.SurfaceId = .{ .index = 10, .generation = 1 };
+    const popup_surface: TestShell.SurfaceId = .{ .index = 11, .generation = 1 };
+    const popup_id: TestShell.PopupId = .{ .index = 0, .generation = 1 };
+    var root: TestDesktop.SceneWindow = .{
+        .id = .{ .index = 99, .generation = 1 },
+        .surface = root_surface,
+        .geometry = .{ .x = 80, .y = 0, .width = 60, .height = 60 },
+        .visible = true,
+        .stacking = 1,
+        .mode = .floating,
+        .content_ready = true,
+    };
+    try desktop.setExternalRoot(root);
+    var shell = TestShell{};
+    shell.push(.{ .popup_created = .{
+        .id = popup_id,
+        .surface = popup_surface,
+        .parent = root_surface,
+        .placement = .{
+            .width = 30,
+            .height = 10,
+            .anchor_x = 50,
+            .anchor_y = 0,
+            .anchor_width = 10,
+            .anchor_height = 10,
+            .anchor = 8,
+            .gravity = 8,
+            .constraint_adjustment = 1,
+            .offset_x = 0,
+            .offset_y = 0,
+            .reactive = true,
+        },
+    } });
+    _ = try desktop.consume(&shell, 1);
+    const initial_serial = (try desktop.flushConfigure(&shell)).?;
+    try std.testing.expectEqual(@as(i32, 60), shell.popup_configured.?.x);
+    shell.push(.{ .popup_commit_ready = .{ .id = popup_id, .serial = initial_serial } });
+    _ = try desktop.consume(&shell, 1);
+    try std.testing.expectEqual(@as(i32, 140), (try desktop.sceneForSurface(popup_surface)).geometry.x);
+
+    root.geometry.x = 40;
+    try desktop.setExternalRoot(root);
+    try std.testing.expectEqual(@as(usize, 1), desktop.pendingCommands());
+    const moved_serial = (try desktop.flushConfigure(&shell)).?;
+    try std.testing.expectEqual(@as(i32, 30), shell.popup_configured.?.x);
+    try std.testing.expectEqual(@as(i32, 100), (try desktop.sceneForSurface(popup_surface)).geometry.x);
+    shell.push(.{ .popup_commit_ready = .{ .id = popup_id, .serial = initial_serial } });
+    _ = try desktop.consume(&shell, 1);
+    try std.testing.expectEqual(@as(i32, 100), (try desktop.sceneForSurface(popup_surface)).geometry.x);
+    shell.push(.{ .popup_commit_ready = .{ .id = popup_id, .serial = moved_serial } });
+    _ = try desktop.consume(&shell, 1);
+    try std.testing.expectEqual(@as(i32, 70), (try desktop.sceneForSurface(popup_surface)).geometry.x);
 }
 
 test "desktop: popup placement flips before sliding or resizing" {
