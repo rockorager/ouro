@@ -5434,7 +5434,7 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.advanceShell();
             try self.syncWorkspace();
             self.input_method_adapter.advance();
-            self.markInputMethodProtocol();
+            try self.reconcileInputMethod();
             if (self.image_copy_capture_adapter.refreshCursors(self)) |changed| {
                 if (changed != 0) self.markProtocolAll(ProtocolReady.image_copy_capture);
             } else |cause| switch (cause) {
@@ -5972,7 +5972,14 @@ pub fn Coordinator(comptime protocol: type) type {
             self.markInputMethodProtocol();
         }
 
+        fn reconcileInputMethod(self: *Self) !void {
+            if (self.text_input_adapter.activeState() == null)
+                _ = try self.input_method_adapter.deactivate(0);
+            self.markInputMethodProtocol();
+        }
+
         fn syncInputMethodPopups(self: *Self) !void {
+            try self.reconcileInputMethod();
             const active_surfaces = try self.input_method_adapter.activePopupSurfaces(
                 self.input_popup_surfaces,
             );

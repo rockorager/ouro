@@ -225,7 +225,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Tex
                 if (!std.meta.eql(m.resource, handle) or !same(m.peer, peer)) return null;
                 const d = try wayring.server.decodeRequest(Method, so, message, fds);
                 switch (d.value) {
-                    .destroy => {},
+                    .destroy => try self.destroyMethodChildren(m, so, &actor.transmit),
                     .commit_string => |q| if (m.available) {
                         if (q.text.len > self.string_bytes) return try self.protocolError(actor, d.handle.id, 0, "commit string too long");
                         m.pending.setCommit(q.text) catch return try self.protocolError(actor, d.handle.id, 0, "invalid commit string");
@@ -317,6 +317,32 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Tex
             };
             m.pending.reset();
         }
+        fn destroyMethodChildren(self: *Self, m: *MethodSlot, so: anytype, q: *wayring.tx.Queue) !void {
+            const parent = self.methodId(m);
+            var child_count: usize = 0;
+            for (self.popups.entries.items) |popup| {
+                if (popup.header.active and std.meta.eql(popup.parent, parent)) child_count += 1;
+            }
+            for (self.grabs.entries.items) |grab| {
+                if (grab.header.active and std.meta.eql(grab.parent, parent)) child_count += 1;
+            }
+            if (child_count == 0) return;
+
+            // Reserve every child delete_id plus the method's own delete_id,
+            // which DecodedRequest.finish queues after this returns.
+            const delete_size = try protocol.wl_display.eventSize(.{
+                .delete_id = .{ .id = m.resource.id },
+            });
+            try q.ensureCapacity(try std.math.mul(usize, child_count + 1, delete_size), 0);
+            for (self.popups.entries.items) |popup| {
+                if (popup.header.active and std.meta.eql(popup.parent, parent))
+                    _ = try Core.deleteClient(so, q, popup.resource);
+            }
+            for (self.grabs.entries.items) |grab| {
+                if (grab.header.active and std.meta.eql(grab.parent, parent))
+                    _ = try Core.deleteClient(so, q, grab.resource);
+            }
+        }
         pub fn synchronize(self: *Self, seat_key: u32, event: TextInput.Event) !void {
             const m = self.findAvailable(seat_key) orelse return;
             if (event.state.has_surrounding and
@@ -342,6 +368,17 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Tex
                 if (event.state.has_content_type) try self.enqueue(m, .content, .{ .hints = event.state.hints, .purpose = event.state.purpose });
             }
             try self.enqueue(m, .done, null);
+        }
+        pub fn deactivate(self: *Self, seat_key: u32) !bool {
+            const m = self.findAvailable(seat_key) orelse return false;
+            if (!m.enabled) return false;
+            if (!self.canEnqueue(2)) return error.Exhausted;
+            try self.enqueue(m, .deactivate, null);
+            m.enabled = false;
+            m.target = null;
+            m.pending.reset();
+            try self.enqueue(m, .done, null);
+            return true;
         }
         const Payload = struct { text: ?[]const u8 = null, cursor: u32 = 0, anchor: u32 = 0, cause: u32 = 0, hints: u32 = 0, purpose: u32 = 0 };
         fn enqueue(self: *Self, m: *MethodSlot, kind: OutKind, payload: ?Payload) !void {
@@ -870,6 +907,18 @@ test "input method arbitration state edits generation and disconnect" {
     try one.pending.setCommit("ok");
     try a.commit(one, 1);
     try std.testing.expectEqual(@as(usize, 1), ti.calls);
+    try std.testing.expect(try a.deactivate(7));
+    try std.testing.expect(!try a.deactivate(7));
+    try std.testing.expectEqual(@as(usize, 6), a.pendingOutbound());
+    var deactivates: usize = 0;
+    var done: usize = 0;
+    for (a.outbound) |out| if (out.active) switch (out.kind) {
+        .deactivate => deactivates += 1,
+        .done => done += 1,
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), deactivates);
+    try std.testing.expectEqual(@as(usize, 2), done);
     a.releaseMethod(one);
     const reused = try a.acquireMethod();
     try std.testing.expect(old.generation != a.methodId(reused).generation);

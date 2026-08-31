@@ -3560,8 +3560,66 @@ test "shell-input: generated input-method client bridges focused text input" {
     try std.testing.expectEqual(@as(usize, 0), app_handler.event_failures);
     try std.testing.expectEqual(@as(usize, 0), method_handler.event_failures);
 
-    try wayring.client.sendRequest(protocol.zwp_input_method_v2, &method_client.objects, &method_actor.transmit, im, .{ .destroy = .{} });
-    try wayring.client.sendRequest(protocol.zwp_text_input_v3, &app.objects, &app_actor.transmit, app_handler.text_input.?, .{ .destroy = .{} });
+    const retained_popup_surface = (try protocol.wl_compositor.construct_create_surface(
+        &method_client.objects,
+        &method_actor.transmit,
+        method_handler.compositor.?,
+        .{},
+    )).id;
+    const retained_popup = (try protocol.zwp_input_method_v2.construct_get_input_popup_surface(
+        &method_client.objects,
+        &method_actor.transmit,
+        im,
+        .{ .surface = retained_popup_surface.id },
+    )).id;
+    const retained_grab = method_handler.keyboard_grab.?;
+    const done_before_destroy = method_handler.done;
+    try wayring.client.sendRequest(
+        protocol.zwp_text_input_v3,
+        &app.objects,
+        &app_actor.transmit,
+        app_handler.text_input.?,
+        .{ .destroy = .{} },
+    );
+    app_handler.text_input = null;
+    try submitClient(&app_reactor, &app_driver, &app_handler);
+    for (0..512) |_| {
+        _ = try drainClient(&app_reactor, &app_driver, &app_handler);
+        _ = try drainClient(&method_reactor, &method_driver, &method_handler);
+        _ = try loop.turn(coordinator);
+        if (method_handler.deactivate == 1 and method_handler.done == done_before_destroy + 1) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(usize, 1), method_handler.deactivate);
+    try std.testing.expectEqual(done_before_destroy + 1, method_handler.done);
+
+    // The parent destructor implicitly retires these child proxies. Wayring's
+    // generic client does not yet encode that XML relationship, so mirror the
+    // generated-client lifecycle before waiting for the server delete_ids.
+    _ = try method_client.objects.retireLocal(retained_popup);
+    _ = try method_client.objects.retireLocal(retained_grab);
+    method_handler.destroyed_popup_id = retained_popup.id;
+    method_handler.destroyed_grab_id = retained_grab.id;
+    try wayring.client.sendRequest(
+        protocol.zwp_input_method_v2,
+        &method_client.objects,
+        &method_actor.transmit,
+        im,
+        .{ .destroy = .{} },
+    );
+    method_handler.method = null;
+    try submitClient(&method_reactor, &method_driver, &method_handler);
+    for (0..512) |_| {
+        _ = try drainClient(&method_reactor, &method_driver, &method_handler);
+        _ = try loop.turn(coordinator);
+        if (method_client.objects.namespace.lookupHandle(im.id) == null and
+            method_handler.destroyed_popup_deleted and
+            method_handler.destroyed_grab_deleted) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(method_client.objects.namespace.lookupHandle(im.id) == null);
+    try std.testing.expect(method_handler.destroyed_popup_deleted);
+    try std.testing.expect(method_handler.destroyed_grab_deleted);
     _ = try app.prepareClose();
     _ = try method_client.prepareClose();
     try submitClient(&app_reactor, &app_driver, &app_handler);
@@ -3963,6 +4021,7 @@ const InputMethodHandler = struct {
     popup_rectangle: protocol_input_method.PopupRectangle = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
     unavailable: usize = 0,
     activate: usize = 0,
+    deactivate: usize = 0,
     surrounding: usize = 0,
     cause: usize = 0,
     content: usize = 0,
@@ -3976,6 +4035,10 @@ const InputMethodHandler = struct {
     grab_keys: usize = 0,
     grab_initial_valid: bool = true,
     grab_keys_valid: bool = true,
+    destroyed_popup_id: u32 = 0,
+    destroyed_grab_id: u32 = 0,
+    destroyed_popup_deleted: bool = false,
+    destroyed_grab_deleted: bool = false,
 
     pub fn eventError(self: *@This(), _: wayring.io_uring.Peer, _: ClientCore.EventFailure) void {
         self.event_failures += 1;
@@ -4040,6 +4103,12 @@ const InputMethodHandler = struct {
                     self.order += 1;
                     try std.testing.expectEqual(@as(usize, 1), self.order);
                 },
+                .deactivate => {
+                    try std.testing.expect(!rejected);
+                    self.deactivate += 1;
+                    self.order += 1;
+                    self.state_valid = self.state_valid and self.order == 6;
+                },
                 .surrounding_text => |v| {
                     self.surrounding += 1;
                     self.order += 1;
@@ -4058,9 +4127,9 @@ const InputMethodHandler = struct {
                 .done => {
                     self.done += 1;
                     self.order += 1;
-                    self.state_valid = self.state_valid and self.order == 5;
+                    self.state_valid = self.state_valid and
+                        (self.order == 5 or (self.done == 2 and self.order == 7));
                 },
-                else => {},
             }
         } else if (target.object.interface == &protocol.zwp_input_method_keyboard_grab_v2.info) {
             switch (try protocol.zwp_input_method_keyboard_grab_v2.decodeEvent(message, fds)) {
@@ -4105,7 +4174,10 @@ const InputMethodHandler = struct {
                 },
             }
         } else if (target.object.interface == &ClientCore.Display.info) switch (try ClientCore.decodeDisplayEvent(self.objects, message, fds)) {
-            .delete_id => {},
+            .delete_id => |value| {
+                if (value.id == self.destroyed_popup_id) self.destroyed_popup_deleted = true;
+                if (value.id == self.destroyed_grab_id) self.destroyed_grab_deleted = true;
+            },
             .@"error" => return error.ServerProtocolError,
         } else return error.UnexpectedEvent;
         return .continue_dispatch;
