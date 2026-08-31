@@ -53,6 +53,7 @@ pub fn Interaction(comptime Desktop: type) type {
         };
         pub const FixedPoint = struct { x: i32, y: i32 };
         pub const MotionDelta = struct { dx: f64, dy: f64 };
+        pub const AbsolutePoint = struct { x: f64, y: f64 };
         pub const Cancellation = packed struct {
             pointer_focus: bool = false,
             keyboard_focus: bool = false,
@@ -259,6 +260,15 @@ pub fn Interaction(comptime Desktop: type) type {
             return .{
                 .dx = @as(f64, @floatFromInt(@as(i64, point.x) * 256 - self.x_fixed)) / 256.0,
                 .dy = @as(f64, @floatFromInt(@as(i64, point.y) * 256 - self.y_fixed)) / 256.0,
+            };
+        }
+
+        pub fn confinePoint(self: *const Self, x: f64, y: f64) !AbsolutePoint {
+            if (!std.math.isFinite(x) or !std.math.isFinite(y)) return error.InvalidMotion;
+            const clamped = clampFixedToAreas(fixedDelta(x), fixedDelta(y), self.outputAreas());
+            return .{
+                .x = @as(f64, @floatFromInt(clamped.x)) / 256.0,
+                .y = @as(f64, @floatFromInt(clamped.y)) / 256.0,
             };
         }
 
@@ -1726,6 +1736,12 @@ test "interaction: pointer cannot remain between disjoint outputs" {
         15 * 256,
         7 * 256,
     ));
+    const left = try interaction.confinePoint(14, 7);
+    try std.testing.expectEqual(@as(f64, 2559.0 / 256.0), left.x);
+    try std.testing.expectEqual(@as(f64, 7), left.y);
+    const right = try interaction.confinePoint(16, 7);
+    try std.testing.expectEqual(@as(f64, 20), right.x);
+    try std.testing.expectEqual(@as(f64, 7), right.y);
 
     try interaction.consume(&desktop, &surfaces, .{ .pointer_motion = .{
         .device = device_a,

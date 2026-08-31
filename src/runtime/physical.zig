@@ -3256,8 +3256,12 @@ pub fn Coordinator(comptime protocol: type) type {
                 else => return .{},
             };
             const bounds = self.globalOutputBounds() catch return .{};
-            const global_x = tabletCoordinate(position.x, bounds.x, bounds.width);
-            const global_y = tabletCoordinate(position.y, bounds.y, bounds.height);
+            const global = self.interaction.confinePoint(
+                tabletCoordinate(position.x, bounds.x, bounds.width),
+                tabletCoordinate(position.y, bounds.y, bounds.height),
+            ) catch return .{};
+            const global_x = global.x;
+            const global_y = global.y;
             const global_fixed: SeatAdapter.Point = .{
                 .x = gestureFixed(global_x),
                 .y = gestureFixed(global_y),
@@ -3353,8 +3357,12 @@ pub fn Coordinator(comptime protocol: type) type {
             const normalized_x = axes.x orelse return .{};
             const normalized_y = axes.y orelse return .{};
             const bounds = self.globalOutputBounds() catch return .{};
-            const global_x = tabletCoordinate(normalized_x, bounds.x, bounds.width);
-            const global_y = tabletCoordinate(normalized_y, bounds.y, bounds.height);
+            const global = self.interaction.confinePoint(
+                tabletCoordinate(normalized_x, bounds.x, bounds.width),
+                tabletCoordinate(normalized_y, bounds.y, bounds.height),
+            ) catch return .{};
+            const global_x = global.x;
+            const global_y = global.y;
             const whole: geometry.Point = .{
                 .x = @intFromFloat(@floor(global_x)),
                 .y = @intFromFloat(@floor(global_y)),
