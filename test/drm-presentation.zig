@@ -617,6 +617,10 @@ test "generated output management rotates one physical head" {
     try generatedMultiHeadApply(false, false, false, true);
 }
 
+test "generated output management rolls back a physical transform" {
+    try generatedMultiHeadApply(true, false, false, true);
+}
+
 fn generatedMultiHeadApply(
     fail_second_activation: bool,
     disable_second: bool,
@@ -723,6 +727,16 @@ fn generatedMultiHeadApply(
         try std.testing.expectEqual(@as(u32, 3), capture.width);
         try std.testing.expectEqual(@as(u32, 2), capture.height);
         try std.testing.expectEqual(@as(u3, 1), capture.transform);
+    } else if (rotate_first) {
+        const first_output = coordinator.physical_outputs[0].kms_output.?;
+        try std.testing.expectEqual(ouro.render.Size{ .width = 3, .height = 2 }, first_output.planner.output);
+        try std.testing.expectEqual(ouro.render.Transform.normal, first_output.planner.output_transform);
+        try std.testing.expectEqual(
+            @as(u3, 0),
+            (try coordinator.output_adapter.logicalSnapshot(
+                coordinator.physical_outputs[0].protocol_output,
+            )).transform,
+        );
     }
     if (disable_second and !reenable_second) {
         try std.testing.expectEqual(
