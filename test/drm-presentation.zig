@@ -598,25 +598,30 @@ test "physical coordinator replaces the last disconnected output exactly" {
 }
 
 test "generated output management applies two heads atomically" {
-    try generatedMultiHeadApply(false, false, false);
+    try generatedMultiHeadApply(false, false, false, false);
 }
 
 test "generated output management rolls back every head" {
-    try generatedMultiHeadApply(true, false, false);
+    try generatedMultiHeadApply(true, false, false, false);
 }
 
 test "generated output management disables a secondary head atomically" {
-    try generatedMultiHeadApply(false, true, false);
+    try generatedMultiHeadApply(false, true, false, false);
 }
 
 test "generated output management re-enables a secondary head atomically" {
-    try generatedMultiHeadApply(false, true, true);
+    try generatedMultiHeadApply(false, true, true, false);
+}
+
+test "generated output management rotates one physical head" {
+    try generatedMultiHeadApply(false, false, false, true);
 }
 
 fn generatedMultiHeadApply(
     fail_second_activation: bool,
     disable_second: bool,
     reenable_second: bool,
+    rotate_first: bool,
 ) !void {
     const allocator = std.testing.allocator;
     var fixture = try Fixture.init();
@@ -664,6 +669,7 @@ fn generatedMultiHeadApply(
         .registry = registry,
         .disable_second = disable_second,
         .reenable_second = reenable_second,
+        .rotate_first = rotate_first,
     };
     try submitClient(&reactor, &driver, &handler);
     for (0..512) |_| {
@@ -694,6 +700,24 @@ fn generatedMultiHeadApply(
     try std.testing.expectEqual(@as(i32, if (fail_second_activation or disable_second) 3 else 0), (try coordinator.output_management_adapter.lifecycle.currentHead(
         coordinator.physical_outputs[1].management_head,
     )).x);
+    const first_state = try coordinator.output_management_adapter.lifecycle.currentHead(
+        coordinator.physical_outputs[0].management_head,
+    );
+    try std.testing.expectEqual(
+        @as(i32, if (rotate_first and !fail_second_activation) 1 else 0),
+        first_state.transform,
+    );
+    if (rotate_first and !fail_second_activation) {
+        const first_output = coordinator.physical_outputs[0].kms_output.?;
+        try std.testing.expectEqual(ouro.render.Size{ .width = 2, .height = 3 }, first_output.planner.output);
+        try std.testing.expectEqual(ouro.render.Size{ .width = 3, .height = 2 }, first_output.planner.physical_output);
+        const logical = try coordinator.output_adapter.logicalSnapshot(
+            coordinator.physical_outputs[0].protocol_output,
+        );
+        try std.testing.expectEqual(@as(?i32, 2), logical.width);
+        try std.testing.expectEqual(@as(?i32, 3), logical.height);
+        try std.testing.expectEqual(@as(u3, 1), logical.transform);
+    }
     if (disable_second and !reenable_second) {
         try std.testing.expectEqual(
             first_ids[0],
@@ -2335,6 +2359,7 @@ const MultiOutputManagementClientHandler = struct {
     reenable_second: bool = false,
     reenable_submitted: bool = false,
     reenable_flushed: bool = false,
+    rotate_first: bool = false,
     succeeded: usize = 0,
     failed: usize = 0,
     event_failures: usize = 0,
@@ -2455,6 +2480,11 @@ const MultiOutputManagementClientHandler = struct {
                     .x = if (self.disable_second) 0 else if (index == 0) 3 else 0,
                     .y = 0,
                 } },
+            );
+            if (self.rotate_first and index == 0) try protocol.zwlr_output_configuration_head_v1.encodeRequest(
+                self.queue,
+                configuration_head.id,
+                .{ .set_transform = .{ .transform = protocol.wl_output.transform.@"90" } },
             );
         }
         try protocol.zwlr_output_configuration_v1.encodeRequest(self.queue, configuration.id, .{ .apply = .{} });

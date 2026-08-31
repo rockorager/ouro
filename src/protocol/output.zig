@@ -55,6 +55,7 @@ pub const OutputConfig = struct {
     model: []const u8 = "Unknown",
     logical_x: i32 = 0,
     logical_y: i32 = 0,
+    transform: u3 = 0,
     physical_width_mm: i32 = 0,
     physical_height_mm: i32 = 0,
     scale_120: u32 = 120,
@@ -86,6 +87,7 @@ pub fn Adapter(comptime protocol: type) type {
             y: i32,
             width: ?i32,
             height: ?i32,
+            transform: u3 = 0,
             name: []const u8,
             description: []const u8,
         };
@@ -102,6 +104,7 @@ pub fn Adapter(comptime protocol: type) type {
             model: []u8 = &.{},
             logical_x: i32 = 0,
             logical_y: i32 = 0,
+            transform: u3 = 0,
             physical_width_mm: i32 = 0,
             physical_height_mm: i32 = 0,
             scale_120: u32 = 120,
@@ -298,6 +301,7 @@ pub fn Adapter(comptime protocol: type) type {
                 .model = model,
                 .logical_x = config.logical_x,
                 .logical_y = config.logical_y,
+                .transform = config.transform,
                 .physical_width_mm = config.physical_width_mm,
                 .physical_height_mm = config.physical_height_mm,
                 .scale_120 = config.scale_120,
@@ -443,6 +447,27 @@ pub fn Adapter(comptime protocol: type) type {
                 const id = adapter.idFor(@intCast(index));
                 adapter.enqueue(id, .scale) catch unreachable;
                 adapter.enqueue(id, .done) catch unreachable;
+            }
+        }
+
+        /// Publishes the wl_output transform and updates the logical extent
+        /// consumed by xdg-output and compositor-space topology.
+        pub fn publishTransform(adapter: *Self, output_id: OutputId, transform: u3) !void {
+            const output = try adapter.resolveOutput(output_id);
+            if (output.transform == transform) return;
+            var event_count: usize = 0;
+            for (adapter.resources) |resource| {
+                if (resource.active and std.meta.eql(resource.output, output_id))
+                    event_count += if (resource.version >= 2) 2 else 1;
+            }
+            try adapter.ensureOutbound(event_count);
+            output.transform = transform;
+            adapter.associations_dirty = true;
+            for (adapter.resources, 0..) |resource, index| {
+                if (!resource.active or !std.meta.eql(resource.output, output_id)) continue;
+                const id = adapter.idFor(@intCast(index));
+                adapter.enqueue(id, .geometry) catch unreachable;
+                if (resource.version >= 2) adapter.enqueue(id, .done) catch unreachable;
             }
         }
 
@@ -669,17 +694,20 @@ pub fn Adapter(comptime protocol: type) type {
         pub fn logicalSnapshot(adapter: *const Self, output_id: OutputId) !LogicalSnapshot {
             const output = try adapter.resolveOutputConst(output_id);
             const scale = geometry.OutputScale.init(output.scale_120) catch unreachable;
+            const quarter_turn = output.transform == 1 or output.transform == 3 or
+                output.transform == 5 or output.transform == 7;
             return .{
                 .x = output.logical_x,
                 .y = output.logical_y,
                 .width = if (output.mode) |mode|
-                    scale.logicalDimension(@intCast(mode.width)) catch unreachable
+                    scale.logicalDimension(@intCast(if (quarter_turn) mode.height else mode.width)) catch unreachable
                 else
                     null,
                 .height = if (output.mode) |mode|
-                    scale.logicalDimension(@intCast(mode.height)) catch unreachable
+                    scale.logicalDimension(@intCast(if (quarter_turn) mode.width else mode.height)) catch unreachable
                 else
                     null,
+                .transform = output.transform,
                 .name = output.name,
                 .description = output.description,
             };
@@ -767,7 +795,7 @@ pub fn Adapter(comptime protocol: type) type {
                     .subpixel = Output.subpixel.unknown,
                     .make = output.make,
                     .model = output.model,
-                    .transform = Output.transform.normal,
+                    .transform = Output.transform.fromInt(output.transform),
                 } },
                 .mode => .{ .mode = .{
                     .flags = Output.mode.fromInt(Output.mode.current.value | Output.mode.preferred.value),
@@ -1166,6 +1194,34 @@ test "output: fractional scale republishes integer fallback and logical size" {
     try std.testing.expectError(error.InvalidScale, adapter.publishScale(output, 0));
     try std.testing.expectError(error.InvalidScale, adapter.publishScale(output, 230_401));
     try std.testing.expectEqual(@as(u32, 156), adapter.outputs[output.index].scale_120);
+}
+
+test "output: transform swaps logical dimensions and republishes geometry" {
+    const TestAdapter = Adapter(@import("core_protocol"));
+    var adapter = try TestAdapter.init(std.testing.allocator, .{
+        .resource_capacity = 1,
+        .association_capacity = 1,
+        .outbound_capacity = 1,
+    });
+    defer adapter.deinit();
+    const output = adapter.primaryOutput();
+    try adapter.publishMode(output, 1920, 1200, 60_000, 600, 340);
+    const resource_index = try adapter.acquireResource();
+    const resource = adapter.resources[resource_index];
+    resource.output = output;
+    resource.peer = .{ .slot = 1, .generation = 1 };
+    resource.version = 4;
+    resource.handle = .{ .id = 7, .generation = 1 };
+
+    try adapter.publishTransform(output, 1);
+    const snapshot = try adapter.logicalSnapshot(output);
+    try std.testing.expectEqual(@as(?i32, 1200), snapshot.width);
+    try std.testing.expectEqual(@as(?i32, 1920), snapshot.height);
+    try std.testing.expectEqual(@as(u3, 1), snapshot.transform);
+    try std.testing.expectEqual(@as(usize, 2), adapter.outbound_len);
+    try std.testing.expect(adapter.oldestOutbound(resource.peer).?.event == .geometry);
+    try adapter.publishTransform(output, 1);
+    try std.testing.expectEqual(@as(usize, 2), adapter.outbound_len);
 }
 
 test "output: identities isolate snapshots resources and surface associations" {

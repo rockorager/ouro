@@ -841,7 +841,13 @@ pub const Output = struct {
         self.owns_render_device = owns_render_device;
         self.vulkan_targets = path.vulkan_targets;
         const mode = snapshot.selectedMode();
-        const logical_output: render.Size = .{ .width = mode.hdisplay, .height = mode.vdisplay };
+        const logical_output: render.Size = switch (config.output_transform) {
+            .@"90", .@"270", .flipped_90, .flipped_270 => .{
+                .width = mode.vdisplay,
+                .height = mode.hdisplay,
+            },
+            else => .{ .width = mode.hdisplay, .height = mode.vdisplay },
+        };
         self.output_format = formatFromDrm(self.pool.allocation.format) orelse
             return error.UnsupportedOutputFormat;
         try config.output_color_description.validate();

@@ -4068,6 +4068,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     physical,
                     snapshot,
                     state.scale_120,
+                    state.transform,
                 ) catch {
                     try self.output_power_adapter.completeCommand(command, .failed);
                     self.markProtocol(command.peer, ProtocolReady.output_power);
@@ -4085,7 +4086,7 @@ pub fn Coordinator(comptime protocol: type) type {
             physical: *const PhysicalOutput,
             desired: protocol_output_management.HeadState,
         ) bool {
-            if (desired.transform != 0 or desired.adaptive_sync)
+            if (desired.transform < 0 or desired.transform > 7 or desired.adaptive_sync)
                 return false;
             if (!desired.enabled) return true;
             if (desired.width <= 0 or desired.height <= 0 or desired.refresh_millihz <= 0)
@@ -6021,7 +6022,12 @@ pub fn Coordinator(comptime protocol: type) type {
                         physical.claim = null;
                         continue;
                     };
-                    self.activatePhysicalOutput(physical, snapshot, state.scale_120) catch {
+                    self.activatePhysicalOutput(
+                        physical,
+                        snapshot,
+                        state.scale_120,
+                        state.transform,
+                    ) catch {
                         self.manager.releaseScanout(physical.claim.?) catch {};
                         physical.claim = null;
                     };
@@ -6133,7 +6139,7 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             const physical = &self.physical_outputs[index];
             if (make_primary) try self.promotePrimaryPhysicalOutput(physical);
-            try self.activatePhysicalOutput(physical, snapshot, scale_120);
+            try self.activatePhysicalOutput(physical, snapshot, scale_120, 0);
             self.output_global_index = @min(self.output_global_index, index);
             return physical;
         }
@@ -6146,7 +6152,11 @@ pub fn Coordinator(comptime protocol: type) type {
                     physical.management_head,
                 );
                 const scale = try geometry.OutputScale.init(state.scale_120);
-                const width = try scale.logicalDimension(@intCast(state.width));
+                const quarter_turn = state.transform == 1 or state.transform == 3 or
+                    state.transform == 5 or state.transform == 7;
+                const width = try scale.logicalDimension(@intCast(
+                    if (quarter_turn) state.height else state.width,
+                ));
                 right = @max(right, @as(i64, state.x) + width);
             }
             return std.math.cast(i32, right) orelse error.InvalidOutputLayout;
@@ -6156,10 +6166,12 @@ pub fn Coordinator(comptime protocol: type) type {
         /// topology ownership. Callers decide whether a failed activation is
         /// terminal or should be followed by an exact rollback snapshot.
         fn activateOutput(self: *Self, snapshot: drm.Snapshot, scale_120: u32) !void {
+            const transform = self.output_management_adapter.lifecycle.current.transform;
             return self.activatePhysicalOutput(
                 self.primaryPhysicalOutputMutable(),
                 snapshot,
                 scale_120,
+                transform,
             );
         }
 
@@ -6168,8 +6180,15 @@ pub fn Coordinator(comptime protocol: type) type {
             physical: *PhysicalOutput,
             snapshot: drm.Snapshot,
             scale_120: u32,
+            transform: i32,
         ) !void {
-            return self.activatePhysicalOutputStaged(physical, snapshot, scale_120, true);
+            return self.activatePhysicalOutputStaged(
+                physical,
+                snapshot,
+                scale_120,
+                transform,
+                true,
+            );
         }
 
         fn activatePhysicalOutputStaged(
@@ -6177,17 +6196,25 @@ pub fn Coordinator(comptime protocol: type) type {
             physical: *PhysicalOutput,
             snapshot: drm.Snapshot,
             scale_120: u32,
+            transform: i32,
             publish_protocol: bool,
         ) !void {
             if (physical.kms_output != null or self.stopping) return error.InvalidState;
+            if (transform < 0 or transform > 7) return error.InvalidTransform;
             const primary = std.meta.eql(physical.id, self.primaryPhysicalOutput().id);
             const connector = snapshot.selectedConnector();
             const mode_end = try std.math.add(usize, connector.mode_start, connector.mode_count);
             if (mode_end > snapshot.modes.len) return error.InvalidModeInventory;
             const mode = snapshot.selectedMode();
             const output_scale = try geometry.OutputScale.init(scale_120);
-            const logical_width = try output_scale.logicalDimension(mode.hdisplay);
-            const logical_height = try output_scale.logicalDimension(mode.vdisplay);
+            const quarter_turn = transform == 1 or transform == 3 or
+                transform == 5 or transform == 7;
+            const logical_width = try output_scale.logicalDimension(
+                if (quarter_turn) mode.vdisplay else mode.hdisplay,
+            );
+            const logical_height = try output_scale.logicalDimension(
+                if (quarter_turn) mode.hdisplay else mode.vdisplay,
+            );
             const refresh = try std.math.mul(u32, mode.vrefresh, 1000);
             if (publish_protocol) {
                 var current = try self.output_management_adapter.lifecycle.currentHead(
@@ -6211,6 +6238,7 @@ pub fn Coordinator(comptime protocol: type) type {
             var output_config = self.output_config;
             output_config.output_id.index = physical.id.index;
             output_config.output_id.generation = generation;
+            output_config.output_transform = @enumFromInt(transform);
             var output_committed = false;
             errdefer {
                 if (!output_committed) self.cleanupUnstartedOutput(physical);
@@ -6266,8 +6294,8 @@ pub fn Coordinator(comptime protocol: type) type {
             if (publish_protocol) {
                 try self.output_adapter.publishMode(
                     physical.protocol_output,
-                    output.planner.output.width,
-                    output.planner.output.height,
+                    mode.hdisplay,
+                    mode.vdisplay,
                     try std.math.mul(u32, mode.vrefresh, 1000),
                     connector.width_mm,
                     connector.height_mm,
@@ -6275,6 +6303,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.output_adapter.publishScale(
                     physical.protocol_output,
                     scale_120,
+                );
+                try self.output_adapter.publishTransform(
+                    physical.protocol_output,
+                    @intCast(transform),
                 );
                 if (primary) try self.fractional_scale_adapter.setDefaultPreferredScale(scale_120);
                 try self.xdg_output_adapter.publishMode(physical.protocol_output);
@@ -6284,10 +6316,11 @@ pub fn Coordinator(comptime protocol: type) type {
                     physical.management_head,
                 );
                 head_state.enabled = true;
-                head_state.width = @intCast(output.planner.output.width);
-                head_state.height = @intCast(output.planner.output.height);
+                head_state.width = @intCast(mode.hdisplay);
+                head_state.height = @intCast(mode.vdisplay);
                 head_state.refresh_millihz = @intCast(try std.math.mul(u32, mode.vrefresh, 1000));
                 head_state.scale_120 = scale_120;
+                head_state.transform = transform;
                 _ = try self.output_management_adapter.publishHead(
                     physical.management_head,
                     head_state,
@@ -6322,18 +6355,22 @@ pub fn Coordinator(comptime protocol: type) type {
             snapshot: drm.Snapshot,
             requested: protocol_output_management.HeadState,
         ) !void {
-            const output = physical.kms_output orelse return error.OutputUnavailable;
+            _ = physical.kms_output orelse return error.OutputUnavailable;
             const connector = snapshot.selectedConnector();
             const mode = snapshot.selectedMode();
             try self.output_adapter.publishMode(
                 physical.protocol_output,
-                output.planner.output.width,
-                output.planner.output.height,
+                mode.hdisplay,
+                mode.vdisplay,
                 try std.math.mul(u32, mode.vrefresh, 1000),
                 connector.width_mm,
                 connector.height_mm,
             );
             try self.output_adapter.publishScale(physical.protocol_output, requested.scale_120);
+            try self.output_adapter.publishTransform(
+                physical.protocol_output,
+                @intCast(requested.transform),
+            );
             try self.output_adapter.publishPosition(
                 physical.protocol_output,
                 requested.x,
@@ -6345,8 +6382,8 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.xdg_output_adapter.publishMode(physical.protocol_output);
             var state = requested;
             state.enabled = true;
-            state.width = @intCast(output.planner.output.width);
-            state.height = @intCast(output.planner.output.height);
+            state.width = @intCast(mode.hdisplay);
+            state.height = @intCast(mode.vdisplay);
             state.refresh_millihz = @intCast(try std.math.mul(u32, mode.vrefresh, 1000));
             _ = try self.output_management_adapter.publishHead(
                 physical.management_head,
@@ -9382,6 +9419,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     primary,
                     primary_snapshot,
                     primary_state.scale_120,
+                    primary_state.transform,
                 );
             } else {
                 _ = try self.addPhysicalOutput(
@@ -9444,6 +9482,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     physical,
                     desired,
                     pending.desired.scale_120,
+                    pending.desired.transform,
                     false,
                 ) catch {
                     self.output_reconfigure.?.phase = .rollback;
@@ -9511,6 +9550,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     physical,
                     previous,
                     pending.previous.scale_120,
+                    pending.previous.transform,
                     false,
                 );
             }
