@@ -396,6 +396,7 @@ test "physical coordinator retires a disconnected secondary output" {
     try std.testing.expectEqual(@as(?i32, 3), primary.width);
 
     fixture.second_desktop = true;
+    const serial_before_reconnect = coordinator.output_management_adapter.lifecycle.serial;
     try fixture.signalHotplug();
     for (0..512) |_| {
         _ = try loop.turn(coordinator);
@@ -420,6 +421,10 @@ test "physical coordinator retires a disconnected secondary output" {
     try std.testing.expect(try coordinator.output_adapter.outputPublished(
         coordinator.physical_outputs[1].protocol_output,
     ));
+    try std.testing.expectEqual(
+        serial_before_reconnect + 2,
+        coordinator.output_management_adapter.lifecycle.serial,
+    );
 
     try coordinator.requestStop();
     try drainServer(root, coordinator, &loop);

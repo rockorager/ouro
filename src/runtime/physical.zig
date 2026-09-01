@@ -693,6 +693,7 @@ pub fn Coordinator(comptime protocol: type) type {
         manager: drm.Manager,
         hotplug: ?drm_hotplug.Monitor = null,
         hotplug_connector_ids: []u32,
+        hotplug_connector_count: usize = 0,
         drm_lease_adapter: DrmLeaseAdapter,
         drm_lease_claims: []drm.ClaimHandle,
         drm_lease_desired: bool = false,
@@ -2568,6 +2569,7 @@ pub fn Coordinator(comptime protocol: type) type {
             const connectors = try self.manager.probeDesktopConnectorIds(
                 self.hotplug_connector_ids,
             );
+            self.hotplug_connector_count = connectors.len;
             const primary_missing = std.mem.indexOfScalar(
                 u32,
                 connectors,
@@ -10257,15 +10259,23 @@ pub fn Coordinator(comptime protocol: type) type {
                     self.retireOutputTracking(@intCast(physical.id.index));
                     _ = try self.retryRetainedOutcomes();
                     self.stats.output_drains += 1;
-                    var head_state = try self.output_management_adapter.lifecycle.currentHead(
-                        physical.management_head,
-                    );
-                    head_state.enabled = false;
-                    _ = try self.output_management_adapter.publishHead(
-                        physical.management_head,
-                        head_state,
-                    );
-                    self.markProtocolAll(ProtocolReady.output_management);
+                    const connector_survives_refresh = self.topology_refresh_pending and
+                        std.mem.indexOfScalar(
+                            u32,
+                            self.hotplug_connector_ids[0..self.hotplug_connector_count],
+                            physical.connector_id,
+                        ) != null;
+                    if (!connector_survives_refresh) {
+                        var head_state = try self.output_management_adapter.lifecycle.currentHead(
+                            physical.management_head,
+                        );
+                        head_state.enabled = false;
+                        _ = try self.output_management_adapter.publishHead(
+                            physical.management_head,
+                            head_state,
+                        );
+                        self.markProtocolAll(ProtocolReady.output_management);
+                    }
                     const power_transition = if (self.output_power_transition) |command|
                         std.meta.eql(command.output, physical.id)
                     else
