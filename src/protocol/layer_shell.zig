@@ -294,7 +294,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
 
         pub fn validateSurfaceCommit(self: *Self, surface: SurfaceId) !void {
             const s = self.find(surface) orelse return error.StaleSurface;
-            if (s.closed) return error.Closed;
+            if (s.closed) return;
             try validatePending(s.pending);
             const core = try self.core.getSurfaceById(surface);
             if (core.hasPendingBufferAttachment() and s.last_ack == 0) return error.UnconfiguredBuffer;
@@ -334,6 +334,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
 
         pub fn publishSurfaceCommitted(self: *Self, surface: SurfaceId) !void {
             const s = self.find(surface) orelse return error.StaleSurface;
+            if (s.closed) return;
             const core = try self.core.getSurfaceById(surface);
             s.committed = s.pending;
             const size = core.committedSize();
@@ -802,6 +803,14 @@ test "layer shell: commit lifecycle requires an acknowledged configure and reset
     slot.pending.width = 100;
     slot.pending.height = 20;
     try std.testing.expectError(error.UnconfiguredBuffer, adapter.validateSurfaceCommit(slot.surface));
+
+    try adapter.outputRemoved(slot.output);
+    const closed = slot.committed;
+    slot.pending = .{};
+    try adapter.validateSurfaceCommit(slot.surface);
+    try adapter.publishSurfaceCommitted(slot.surface);
+    try std.testing.expect(std.meta.eql(closed, slot.committed));
+    try std.testing.expect(!adapter.stateForSurface(slot.surface).?.mapped);
 }
 
 test "layer shell: acknowledgements accept any sent outstanding configure once" {
