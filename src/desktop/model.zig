@@ -783,6 +783,8 @@ pub fn Desktop(comptime Shell: type) type {
         pub fn removeExternalRoot(desktop: *Self, surface: Shell.SurfaceId) void {
             for (desktop.external_roots[0..desktop.external_root_len], 0..) |root, index| {
                 if (!std.meta.eql(root.surface, surface)) continue;
+                if (desktop.topmostPopupForRoot(surface)) |popup|
+                    desktop.enqueuePopupDone(popup.shell_id) catch unreachable;
                 desktop.external_root_len -= 1;
                 desktop.external_roots[index] = desktop.external_roots[desktop.external_root_len];
                 desktop.updatePopupScenes();
@@ -2935,6 +2937,9 @@ test "desktop: external-root popup stays out of the ordinary desktop scene" {
     );
     desktop.removeExternalRoot(root_surface);
     try std.testing.expect(!(try desktop.sceneForSurface(popup_surface)).visible);
+    try std.testing.expect(desktop.popups[0].dismissed);
+    try std.testing.expectEqual(@as(?u32, null), try desktop.flushConfigure(&shell));
+    try std.testing.expectEqual(@as(TestShell.PopupId, .{ .index = 0, .generation = 1 }), shell.popup_done.?);
 }
 
 test "desktop: reactive popup reconfigures when its root changes output" {
