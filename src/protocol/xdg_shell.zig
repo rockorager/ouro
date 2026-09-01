@@ -1311,7 +1311,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     const role = adapter.acquireToplevel() catch return try adapter.noMemory(actor);
                     surface.role.assign(toplevel_role_id, true) catch |cause| {
                         adapter.abandonToplevel(indexOf(ToplevelSlot, adapter.toplevels, role));
-                        return try adapter.roleFailure(actor, decoded.handle.id, cause);
+                        return try adapter.roleFailure(actor, slot, cause);
                     };
                     const admitted = XdgSurface.admit_get_toplevel(
                         server_objects,
@@ -1343,14 +1343,14 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                         return try adapter.invalidPositioner(actor, slot);
                     const parent: ?*SurfaceSlot = if (payload.parent) |parent_id|
                         adapter.xdgSurfaceByObject(server_objects, parent_id) catch
-                            return try adapter.protocolError(actor, decoded.handle.id, WmBase.@"error".invalid_popup_parent.value, "invalid popup parent")
+                            return try adapter.wmBaseError(actor, slot, WmBase.@"error".invalid_popup_parent.value, "invalid popup parent")
                     else
                         null;
                     if ((parent != null and parent.?.manager_index != slot.manager_index) or
                         positioner.manager_index != slot.manager_index)
-                        return try adapter.protocolError(actor, decoded.handle.id, WmBase.@"error".invalid_popup_parent.value, "cross-client popup objects");
+                        return try adapter.wmBaseError(actor, slot, WmBase.@"error".invalid_popup_parent.value, "cross-client popup objects");
                     if (parent != null and parent.?.role == .none)
-                        return try adapter.protocolError(actor, decoded.handle.id, WmBase.@"error".invalid_popup_parent.value, "popup parent has no role");
+                        return try adapter.wmBaseError(actor, slot, WmBase.@"error".invalid_popup_parent.value, "popup parent has no role");
                     if (adapter.topmostPopup(slot.manager_index, slot.manager_generation)) |topmost| {
                         const parent_is_topmost = if (parent) |parent_slot|
                             switch (parent_slot.role) {
@@ -1360,14 +1360,14 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                         else
                             false;
                         if (!parent_is_topmost)
-                            return try adapter.protocolError(actor, decoded.handle.id, WmBase.@"error".not_the_topmost_popup.value, "popup parent is not topmost");
+                            return try adapter.wmBaseError(actor, slot, WmBase.@"error".not_the_topmost_popup.value, "popup parent is not topmost");
                     }
                     const surface = adapter.core.getSurfaceById(slot.surface_id) catch
                         return try adapter.protocolError(actor, decoded.handle.id, XdgSurface.@"error".not_constructed.value, "wl_surface is gone");
                     const role = adapter.acquirePopup() catch return try adapter.noMemory(actor);
                     surface.role.assign(popup_role_id, true) catch |cause| {
                         adapter.abandonPopup(indexOf(PopupSlot, adapter.popups, role));
-                        return try adapter.roleFailure(actor, decoded.handle.id, cause);
+                        return try adapter.roleFailure(actor, slot, cause);
                     };
                     const admitted = XdgSurface.admit_get_popup(
                         server_objects,
@@ -1511,7 +1511,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             const decoded = try wayring.server.decodeRequest(Popup, server_objects, message, fds);
             switch (decoded.value) {
                 .destroy => if (adapter.popupHasChild(slot))
-                    return try adapter.protocolError(actor, decoded.handle.id, WmBase.@"error".not_the_topmost_popup.value, "popup has a live child"),
+                    return try adapter.popupWmBaseError(actor, slot, WmBase.@"error".not_the_topmost_popup.value, "popup has a live child"),
                 .grab => |v| {
                     if (slot.dismissed or slot.grabbed or slot.mapped or adapter.popupHasChild(slot))
                         return try adapter.protocolError(actor, decoded.handle.id, Popup.@"error".invalid_grab.value, "popup is not the topmost ungrabbed popup");
@@ -2173,8 +2173,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 else => adapter.protocolError(actor, id, 0, "invalid xdg-shell request"),
             };
         }
-        fn roleFailure(adapter: *Self, actor: *wayring.connection.Actor, id: u32, _: anyerror) !wayring.dispatch.Control {
-            return adapter.protocolError(actor, id, WmBase.@"error".role.value, "wl_surface has another role");
+        fn roleFailure(adapter: *Self, actor: *wayring.connection.Actor, surface: *SurfaceSlot, _: anyerror) !wayring.dispatch.Control {
+            return adapter.wmBaseError(actor, surface, WmBase.@"error".role.value, "wl_surface has another role");
         }
         fn metadataFailure(adapter: *Self, actor: *wayring.connection.Actor, id: u32, cause: anyerror) !wayring.dispatch.Control {
             return switch (cause) {
@@ -2187,11 +2187,21 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             return adapter.protocolError(actor, id, Positioner.@"error".invalid_input.value, "invalid xdg_positioner input");
         }
         fn invalidPositioner(adapter: *Self, actor: *wayring.connection.Actor, surface: *SurfaceSlot) !wayring.dispatch.Control {
+            return adapter.wmBaseError(actor, surface, WmBase.@"error".invalid_positioner.value, "incomplete xdg_positioner");
+        }
+        fn popupWmBaseError(adapter: *Self, actor: *wayring.connection.Actor, popup: *PopupSlot, code: u32, message: []const u8) !wayring.dispatch.Control {
+            const surface = adapter.resolveRoleSurface(
+                popup.xdg_surface_index,
+                popup.xdg_surface_generation,
+            ) catch unreachable;
+            return adapter.wmBaseError(actor, surface, code, message);
+        }
+        fn wmBaseError(adapter: *Self, actor: *wayring.connection.Actor, surface: *SurfaceSlot, code: u32, message: []const u8) !wayring.dispatch.Control {
             const manager = adapter.resolveManager(
                 surface.manager_index,
                 surface.manager_generation,
             ) catch unreachable;
-            return adapter.protocolError(actor, manager.header.resource.id, WmBase.@"error".invalid_positioner.value, "incomplete xdg_positioner");
+            return adapter.protocolError(actor, manager.header.resource.id, code, message);
         }
         fn invalidToplevelSize(adapter: *Self, actor: *wayring.connection.Actor, id: u32) !wayring.dispatch.Control {
             return adapter.protocolError(actor, id, Toplevel.@"error".invalid_size.value, "invalid toplevel size");
@@ -3438,6 +3448,40 @@ test "xdg-shell: zero anchor rect remains incomplete until popup use" {
         context,
         context.manager.id,
         test_protocol.xdg_wm_base.@"error".invalid_positioner.value,
+    );
+}
+
+test "xdg-shell: invalid popup parent error names the owning xdg_wm_base" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    try test_protocol.xdg_wm_base.encodeRequest(&context.requests, context.manager.id, .{
+        .get_xdg_surface = .{ .id = 11, .surface = context.core.handle.id },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try test_protocol.xdg_wm_base.encodeRequest(&context.requests, context.manager.id, .{
+        .get_xdg_surface = .{ .id = 14, .surface = context.core.second_handle.id },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try test_protocol.xdg_wm_base.encodeRequest(&context.requests, context.manager.id, .{
+        .create_positioner = .{ .id = 15 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try test_protocol.xdg_positioner.encodeRequest(&context.requests, 15, .{
+        .set_size = .{ .width = 20, .height = 10 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try test_protocol.xdg_positioner.encodeRequest(&context.requests, 15, .{
+        .set_anchor_rect = .{ .x = 0, .y = 0, .width = 10, .height = 10 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try test_protocol.xdg_surface.encodeRequest(&context.requests, 11, .{
+        .get_popup = .{ .id = 16, .parent = 14, .positioner = 15 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.stop, try context.dispatch());
+    try expectDisplayError(
+        context,
+        context.manager.id,
+        test_protocol.xdg_wm_base.@"error".invalid_popup_parent.value,
     );
 }
 
