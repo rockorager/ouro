@@ -1394,12 +1394,38 @@ test "generated gamma control applies exact ramps and restores on reuse" {
     }
     try std.testing.expectEqualSlices(u16, &GammaClientHandler.second_ramps, &fixture.gamma_current);
     try std.testing.expectEqual(@as(usize, 1), fixture.gamma_gets);
+
+    try fixture.signalSession(.disable);
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (coordinator.physical_outputs[0].kms_output == null and
+            coordinator.physical_outputs[1].kms_output == null and
+            coordinator.session.state == .disabled and fixture.gamma_sets == 4) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expectEqualSlices(u16, &fixture.gamma_original, &fixture.gamma_current);
+    try fixture.signalSession(.enable);
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (coordinator.physical_outputs[0].kms_output != null and
+            coordinator.physical_outputs[1].kms_output != null and
+            fixture.gamma_sets == 5) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expectEqualSlices(u16, &GammaClientHandler.second_ramps, &fixture.gamma_current);
+    try std.testing.expectEqual(@as(usize, 0), handler.failed);
+    try std.testing.expectEqual(@as(usize, 2), fixture.gamma_gets);
+
     try handler.destroyControl();
     try submitClient(&reactor, &driver, &handler);
     for (0..128) |_| {
         _ = try drainClient(&reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
-        if (fixture.gamma_sets == 4) break;
+        if (fixture.gamma_sets == 6) break;
         if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0) try waitForEither(&root.ring, reactor.ring);
     }
     try std.testing.expectEqualSlices(u16, &fixture.gamma_original, &fixture.gamma_current);

@@ -320,6 +320,7 @@ pub fn Coordinator(comptime protocol: type) type {
             management_head: protocol_output_management.HeadId,
             kms_output: ?*output_api.Output = null,
             gamma_owner: ?drm_gamma.Owner = null,
+            gamma_ramps: []u16 = &.{},
             session_lock_frame: ?output_scheduler.FrameId = null,
             drain_started: bool = false,
             reconfigure: ?OutputReconfigure = null,
@@ -1923,6 +1924,8 @@ pub fn Coordinator(comptime protocol: type) type {
             self.layer_shell_adapter.deinit();
             self.xdg_output_adapter.deinit();
             self.output_management_adapter.deinit();
+            for (self.physical_outputs[0..self.physical_output_count]) |physical|
+                self.allocator.free(physical.gamma_ramps);
             self.allocator.free(self.physical_outputs);
             self.output_power_adapter.deinit();
             self.gamma_control_adapter.deinit();
@@ -4373,14 +4376,21 @@ pub fn Coordinator(comptime protocol: type) type {
             const physical = self.physicalOutputForIdMutable(output) orelse
                 return error.InvalidOutput;
             const owner = if (physical.gamma_owner) |*value| value else return error.Unsupported;
+            const retained = try self.allocator.dupe(u16, ramps);
+            errdefer self.allocator.free(retained);
             try owner.apply(owner.generation, ramps);
+            self.allocator.free(physical.gamma_ramps);
+            physical.gamma_ramps = retained;
         }
 
         pub fn resetGamma(self: *Self, output: PhysicalOutputId) !void {
             const physical = self.physicalOutputForIdMutable(output) orelse
                 return error.InvalidOutput;
-            const owner = if (physical.gamma_owner) |*value| value else return error.Unsupported;
-            try owner.restore(owner.generation);
+            defer {
+                self.allocator.free(physical.gamma_ramps);
+                physical.gamma_ramps = &.{};
+            }
+            if (physical.gamma_owner) |*owner| try owner.restore(owner.generation);
         }
 
         pub fn allowDrmLease(self: *Self, binding: wayring.server.Binding) bool {
@@ -4449,6 +4459,11 @@ pub fn Coordinator(comptime protocol: type) type {
                 .crtc = crtc,
                 .generation = snapshot.handle.generation,
             };
+            if (physical.gamma_ramps.len != 0)
+                try physical.gamma_owner.?.apply(
+                    physical.gamma_owner.?.generation,
+                    physical.gamma_ramps,
+                );
         }
 
         fn retireGammaOwner(_: *Self, physical: *PhysicalOutput) !void {
