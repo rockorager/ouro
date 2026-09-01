@@ -169,6 +169,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 token: u32,
             },
             popup_grab_requested: PopupId,
+            popup_grab_denied: PopupId,
             toplevel_destroyed: ToplevelId,
             popup_destroyed: PopupId,
         };
@@ -1525,14 +1526,19 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                         surface.manager_index,
                         surface.manager_generation,
                     ) catch return try adapter.protocolError(actor, decoded.handle.id, Popup.@"error".invalid_grab.value, "popup client is stale");
-                    const validator = adapter.grab_validator orelse
-                        return try adapter.protocolError(actor, decoded.handle.id, Popup.@"error".invalid_grab.value, "popup grab validation unavailable");
-                    if (!validator.validate(validator.context, manager.peer, v.seat, v.serial))
-                        return try adapter.protocolError(actor, decoded.handle.id, Popup.@"error".invalid_grab.value, "invalid popup grab serial");
                     if (!adapter.canPublishWithLive(adapter.live_toplevels, adapter.live_popups))
                         return try adapter.noMemory(actor);
-                    slot.grabbed = true;
-                    adapter.publish(.{ .popup_grab_requested = adapter.popupId(slot) }) catch unreachable;
+                    const accepted = if (adapter.grab_validator) |validator|
+                        validator.validate(validator.context, manager.peer, v.seat, v.serial)
+                    else
+                        false;
+                    if (!accepted) {
+                        slot.dismissed = true;
+                        adapter.publish(.{ .popup_grab_denied = adapter.popupId(slot) }) catch unreachable;
+                    } else {
+                        slot.grabbed = true;
+                        adapter.publish(.{ .popup_grab_requested = adapter.popupId(slot) }) catch unreachable;
+                    }
                 },
                 .reposition => |v| {
                     const surface = adapter.resolveRoleSurface(
@@ -3707,6 +3713,50 @@ test "xdg-shell: generated popup requests validate positioner and parent role" {
         .popup_destroyed => |value| value,
         else => return error.UnexpectedEvent,
     });
+}
+
+test "xdg-shell: denied popup grab requests dismissal without an error" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    _ = try context.createToplevel();
+    try test_protocol.xdg_wm_base.encodeRequest(&context.requests, context.manager.id, .{
+        .get_xdg_surface = .{ .id = 14, .surface = context.core.second_handle.id },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try test_protocol.xdg_wm_base.encodeRequest(&context.requests, context.manager.id, .{
+        .create_positioner = .{ .id = 15 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try test_protocol.xdg_positioner.encodeRequest(&context.requests, 15, .{
+        .set_size = .{ .width = 20, .height = 10 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try test_protocol.xdg_positioner.encodeRequest(&context.requests, 15, .{
+        .set_anchor_rect = .{ .x = 0, .y = 0, .width = 10, .height = 10 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try test_protocol.xdg_surface.encodeRequest(&context.requests, 14, .{
+        .get_popup = .{ .id = 16, .parent = 11, .positioner = 15 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    const popup = context.adapter.popups[0];
+    const id = context.adapter.popupId(popup);
+    _ = context.adapter.popEvent() orelse return error.MissingEvent;
+    _ = try context.server_objects.insertClient(19, &test_protocol.wl_seat.info, 9, null);
+    context.adapter.setGrabValidator(.{
+        .context = &context.adapter,
+        .validate = validateTestGrab,
+    });
+    try test_protocol.xdg_popup.encodeRequest(&context.requests, 16, .{
+        .grab = .{ .seat = 19, .serial = 76 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try std.testing.expectEqual(id, switch (context.adapter.popEvent() orelse return error.MissingEvent) {
+        .popup_grab_denied => |value| value,
+        else => return error.UnexpectedEvent,
+    });
+    try std.testing.expect(popup.dismissed);
+    try std.testing.expectEqual(@as(usize, 0), context.actor.transmit.queuedBytes());
 }
 
 test "xdg-shell: null-parent popup requires layer adoption before initial commit" {

@@ -957,6 +957,7 @@ pub fn Desktop(comptime Shell: type) type {
                     slot.grabbed = true;
                     desktop.popup_grab = id;
                 },
+                .popup_grab_denied => |id| try desktop.enqueuePopupDone(id),
                 .popup_destroyed => |id| desktop.destroyPopup(id),
                 .metadata_changed => |shell_id| {
                     const id = try desktop.idForShell(shell_id);
@@ -2276,6 +2277,7 @@ const TestShell = struct {
         },
         popup_reposition_requested: struct { id: PopupId, placement: PopupPlacement, token: u32 },
         popup_grab_requested: PopupId,
+        popup_grab_denied: PopupId,
         toplevel_destroyed: ToplevelId,
         popup_destroyed: PopupId,
     };
@@ -2840,6 +2842,43 @@ test "desktop: popup configure maps above its owning toplevel" {
     _ = try desktop.consume(&shell, 1);
     try std.testing.expectError(error.StaleSurface, desktop.sceneForSurface(popup_surface));
     try std.testing.expect(desktop.takeSceneChanged());
+}
+
+test "desktop: denied popup grab queues immediate dismissal" {
+    var desktop = try initTestDesktop(8);
+    defer desktop.deinit();
+    var shell = TestShell{};
+    shell.push(created(0));
+    _ = try desktop.consume(&shell, 1);
+    try settleDesktop(&desktop, &shell);
+    const parent = (try desktop.scene(.{ .index = 0, .generation = 1 })).surface;
+    const popup_id: TestShell.PopupId = .{ .index = 0, .generation = 1 };
+    const popup_surface: TestShell.SurfaceId = .{ .index = 20, .generation = 2 };
+    shell.push(.{ .popup_created = .{
+        .id = popup_id,
+        .surface = popup_surface,
+        .parent = parent,
+        .placement = .{
+            .width = 20,
+            .height = 10,
+            .anchor_x = 0,
+            .anchor_y = 0,
+            .anchor_width = 10,
+            .anchor_height = 10,
+            .anchor = 8,
+            .gravity = 8,
+            .constraint_adjustment = 0,
+            .offset_x = 0,
+            .offset_y = 0,
+        },
+    } });
+    _ = try desktop.consume(&shell, 1);
+    shell.push(.{ .popup_grab_denied = popup_id });
+    _ = try desktop.consume(&shell, 1);
+    try std.testing.expect(desktop.popups[0].dismissed);
+    try std.testing.expect(!(try desktop.sceneForSurface(popup_surface)).visible);
+    try std.testing.expectEqual(@as(?u32, null), try desktop.flushConfigure(&shell));
+    try std.testing.expectEqual(popup_id, shell.popup_done.?);
 }
 
 test "desktop: toplevel unmap dismisses nested popups topmost first" {
