@@ -2094,9 +2094,9 @@ fn placePopup(placement: anytype, parent: geometry.Rect, bounds: geometry.Rect) 
         if (candidate >= top and candidate + height <= bottom) y = candidate;
     }
     if (placement.constraint_adjustment & 1 != 0)
-        x = std.math.clamp(x, left, @max(left, right - width));
+        x = slidePopup(x, width, left, right, placement.gravity, true);
     if (placement.constraint_adjustment & 2 != 0)
-        y = std.math.clamp(y, top, @max(top, bottom - height));
+        y = slidePopup(y, height, top, bottom, placement.gravity, false);
     if (placement.constraint_adjustment & 16 != 0) {
         const clipped_left = std.math.clamp(x, left, right - 1);
         const clipped_right = std.math.clamp(
@@ -2151,6 +2151,22 @@ fn popupOrigin(anchor: i64, size: i64, gravity: u32, horizontal: bool) i64 {
     if (toward_start) return anchor - size;
     if (toward_end) return anchor;
     return anchor - @divTrunc(size, 2);
+}
+
+fn slidePopup(
+    origin: i64,
+    size: i64,
+    start: i64,
+    end: i64,
+    gravity: u32,
+    horizontal: bool,
+) i64 {
+    if (size <= end - start) return std.math.clamp(origin, start, end - size);
+    const toward_start = if (horizontal)
+        gravity == 3 or gravity == 5 or gravity == 6
+    else
+        gravity == 1 or gravity == 5 or gravity == 7;
+    return if (toward_start) end - size else start;
 }
 
 fn flipDirection(direction: u32, horizontal: bool) u32 {
@@ -3098,6 +3114,32 @@ test "desktop: popup placement flips before sliding or resizing" {
         .y = 30,
         .width = 20,
         .height = 20,
+    }, try placePopup(
+        placement,
+        .{ .x = 0, .y = 0, .width = 100, .height = 60 },
+        .{ .x = 0, .y = 0, .width = 100, .height = 60 },
+    ));
+}
+
+test "desktop: oversized popup slides in its gravity direction first" {
+    const placement: TestShell.PopupPlacement = .{
+        .width = 120,
+        .height = 80,
+        .anchor_x = 110,
+        .anchor_y = 70,
+        .anchor_width = 10,
+        .anchor_height = 10,
+        .anchor = 5,
+        .gravity = 5,
+        .constraint_adjustment = 1 | 2,
+        .offset_x = 0,
+        .offset_y = 0,
+    };
+    try std.testing.expectEqual(PopupGeometry{
+        .x = -20,
+        .y = -20,
+        .width = 120,
+        .height = 80,
     }, try placePopup(
         placement,
         .{ .x = 0, .y = 0, .width = 100, .height = 60 },
