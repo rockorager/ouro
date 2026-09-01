@@ -164,6 +164,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             popup_commit_ready: struct {
                 id: PopupId,
                 serial: u32,
+                configure: ?PopupConfigure = null,
+                placement: ?PopupPlacement = null,
                 has_window_geometry: bool = false,
                 surface_offset_x: i32 = 0,
                 surface_offset_y: i32 = 0,
@@ -272,6 +274,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             requested_window_geometry: ?WindowGeometry = null,
             pending_window_geometry: ?WindowGeometry = null,
             acked_toplevel_configure: ?ToplevelConfigure = null,
+            acked_popup_configure: ?PopupConfigure = null,
+            acked_popup_placement: ?PopupPlacement = null,
         };
 
         const ToplevelSlot = struct {
@@ -350,6 +354,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             serial: u32 = 0,
             sent: bool = false,
             toplevel_configure: ?ToplevelConfigure = null,
+            popup_configure: ?PopupConfigure = null,
+            popup_placement: ?PopupPlacement = null,
         };
 
         allocator: std.mem.Allocator,
@@ -963,11 +969,15 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                         } else if (initial_commit) {
                             role.initial_committed = true;
                         }
+                        if (serial_changed and slot.acked_popup_placement != null)
+                            role.placement = slot.acked_popup_placement.?;
                         role.mapped = mapped;
                         if (mapping_changed or initial_commit or geometry_changed or serial_changed)
                             adapter.publishReserved(.{ .popup_commit_ready = .{
                                 .id = popup,
                                 .serial = slot.last_acked_serial,
+                                .configure = if (serial_changed) slot.acked_popup_configure else null,
+                                .placement = if (serial_changed) slot.acked_popup_placement else null,
                                 .has_window_geometry = hasEffectiveWindowGeometry(slot.window_geometry),
                                 .surface_offset_x = if (slot.window_geometry) |geometry| geometry.x else 0,
                                 .surface_offset_y = if (slot.window_geometry) |geometry| geometry.y else 0,
@@ -1058,22 +1068,25 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             id: PopupId,
             value: PopupConfigure,
         ) !u32 {
-            return adapter.queuePopupConfigureToken(id, value, null);
+            const role = try adapter.resolvePopup(id);
+            return adapter.queuePopupConfigureToken(id, value, role.placement, null);
         }
 
         pub fn queuePopupReposition(
             adapter: *Self,
             id: PopupId,
             value: PopupConfigure,
+            placement: PopupPlacement,
             token: u32,
         ) !u32 {
-            return adapter.queuePopupConfigureToken(id, value, token);
+            return adapter.queuePopupConfigureToken(id, value, placement, token);
         }
 
         fn queuePopupConfigureToken(
             adapter: *Self,
             id: PopupId,
             value: PopupConfigure,
+            placement: PopupPlacement,
             token: ?u32,
         ) !u32 {
             if (value.width <= 0 or value.height <= 0) return error.InvalidSize;
@@ -1087,6 +1100,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .surface_index = role.xdg_surface_index,
                 .surface_generation = surface.header.generation,
                 .serial = serial,
+                .popup_configure = value,
+                .popup_placement = placement,
             };
             adapter.enqueueOutbound(surface.manager_index, surface.manager_generation, .{ .popup_configure = .{
                 .id = id,
@@ -1713,10 +1728,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                         return try adapter.invalidPositioner(actor, surface);
                     if (!adapter.canPublishWithLive(adapter.live_toplevels, adapter.live_popups))
                         return try adapter.noMemory(actor);
-                    slot.placement = popupPlacement(positioner.state);
+                    const placement = popupPlacement(positioner.state);
                     adapter.publish(.{ .popup_reposition_requested = .{
                         .id = adapter.popupId(slot),
-                        .placement = slot.placement,
+                        .placement = placement,
                         .token = v.token,
                     } }) catch unreachable;
                 },
@@ -1828,6 +1843,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
 
         fn ackConfigure(adapter: *Self, surface: *SurfaceSlot, serial: u32) !void {
             var configure: ?ToplevelConfigure = null;
+            var popup_configure: ?PopupConfigure = null;
+            var popup_placement: ?PopupPlacement = null;
             var found = false;
             for (adapter.outstanding) |entry| {
                 if (entry.active and entry.surface_index == indexOf(SurfaceSlot, adapter.surfaces, surface) and
@@ -1835,6 +1852,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 {
                     found = true;
                     configure = entry.toplevel_configure;
+                    popup_configure = entry.popup_configure;
+                    popup_placement = entry.popup_placement;
                     break;
                 }
             }
@@ -1846,6 +1865,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             }
             surface.last_acked_serial = serial;
             surface.acked_toplevel_configure = configure;
+            surface.acked_popup_configure = popup_configure;
+            surface.acked_popup_placement = popup_placement;
         }
 
         fn issueSerial(adapter: *Self) u32 {
@@ -2135,6 +2156,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             slot.initial_committed = false;
             if (adapter.resolveRoleSurface(slot.xdg_surface_index, slot.xdg_surface_generation)) |surface| {
                 surface.last_acked_serial = 0;
+                surface.acked_popup_configure = null;
+                surface.acked_popup_placement = null;
             } else |_| {}
             adapter.dropOutstanding(slot.xdg_surface_index, slot.xdg_surface_generation);
         }
@@ -4028,6 +4051,11 @@ test "xdg-shell: generated popup requests validate positioner and parent role" {
     };
     try std.testing.expectEqual(id, committed.id);
     try std.testing.expectEqual(serial, committed.serial);
+    try std.testing.expectEqual(
+        TestAdapter.PopupConfigure{ .x = 4, .y = 5, .width = 120, .height = 80 },
+        committed.configure.?,
+    );
+    try std.testing.expectEqual(created.placement, committed.placement.?);
     try std.testing.expect(committed.has_window_geometry);
     try std.testing.expectEqual(@as(i32, 2), committed.surface_offset_x);
     try std.testing.expectEqual(@as(i32, 3), committed.surface_offset_y);
@@ -4097,7 +4125,7 @@ test "xdg-shell: generated popup requests validate positioner and parent role" {
         .y = 9,
         .width = 40,
         .height = 20,
-    }, reposition.token);
+    }, reposition.placement, reposition.token);
     var reposition_output = wayring.tx.Queue.init(&context.blocks, 64, &context.descriptors, 0);
     defer reposition_output.deinit();
     try std.testing.expectEqual(@as(usize, 1), try context.adapter.flushOn(

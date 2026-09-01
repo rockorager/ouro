@@ -2643,7 +2643,7 @@ test "shell-input: secondary output removal closes its reactive layer popup root
     try root.deinit();
 }
 
-test "shell-input: reactive toplevel popup replaces pending configure after output removal" {
+test "shell-input: popup applies each acknowledged configure after output removal" {
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-toplevel-popup-{d}.sock", .{linux.getpid()});
@@ -2798,15 +2798,16 @@ test "shell-input: reactive toplevel popup replaces pending configure after outp
         if (client_progress.quiescent and handler.queue.queuedBytes() == 0) break;
     }
     scene = try coordinator.desktop.sceneSnapshot(&scene_storage);
-    var stale_ignored = false;
+    var stale_applied = false;
     for (scene) |window| {
         const surface = try coordinator.adapter.surfaceHandle(window.surface);
         if (surface.id == handler.popup_surface.?.id) {
-            try std.testing.expectEqual(popup_before_stale.?, window.geometry);
-            stale_ignored = true;
+            try std.testing.expectEqual(@as(i32, 3), window.geometry.x);
+            try std.testing.expect(!std.meta.eql(popup_before_stale.?, window.geometry));
+            stale_applied = true;
         }
     }
-    try std.testing.expect(stale_ignored);
+    try std.testing.expect(stale_applied);
 
     try handler.ackPopupConfigure(current_serial);
     try handler.commitPopup();
