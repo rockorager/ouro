@@ -260,6 +260,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             committed_acked_serial: u32 = 0,
             window_geometry: ?WindowGeometry = null,
             pending_window_geometry: ?WindowGeometry = null,
+            acked_toplevel_configure: ?ToplevelConfigure = null,
         };
 
         const ToplevelSlot = struct {
@@ -337,6 +338,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             surface_generation: u32 = 0,
             serial: u32 = 0,
             sent: bool = false,
+            toplevel_configure: ?ToplevelConfigure = null,
         };
 
         allocator: std.mem.Allocator,
@@ -715,6 +717,26 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                         .none => {},
                     }
                 }
+                if (slot.role == .toplevel) {
+                    if (slot.acked_toplevel_configure) |configure| {
+                        if (configure.states.maximized) {
+                            const content = try surface.prospectiveContent();
+                            if (content.has_buffer) {
+                                const width: i64 = if (slot.pending_window_geometry orelse slot.window_geometry) |geometry|
+                                    geometry.width
+                                else
+                                    content.size.width;
+                                const height: i64 = if (slot.pending_window_geometry orelse slot.window_geometry) |geometry|
+                                    geometry.height
+                                else
+                                    content.size.height;
+                                if ((configure.width != 0 and width != configure.width) or
+                                    (configure.height != 0 and height != configure.height))
+                                    return error.InvalidSurfaceState;
+                            }
+                        }
+                    }
+                }
                 if (slot.role == .popup) {
                     const popup = try adapter.resolvePopup(slot.role.popup);
                     if (popup.parent == null) return error.PopupParentRequired;
@@ -756,6 +778,18 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                         manager.header.resource.id,
                         WmBase.@"error".invalid_popup_parent.value,
                         "xdg_popup has an invalid parent",
+                    );
+                },
+                error.InvalidSurfaceState => manager: {
+                    const manager = adapter.resolveManager(
+                        surface.manager_index,
+                        surface.manager_generation,
+                    ) catch return null;
+                    break :manager try adapter.protocolError(
+                        actor,
+                        manager.header.resource.id,
+                        WmBase.@"error".invalid_surface_state.value,
+                        "maximized window geometry does not match configure",
                     );
                 },
                 else => null,
@@ -902,6 +936,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .surface_index = role.xdg_surface_index,
                 .surface_generation = surface.header.generation,
                 .serial = serial,
+                .toplevel_configure = value,
             };
             adapter.enqueueOutbound(surface.manager_index, surface.manager_generation, .{ .toplevel_configure = .{
                 .id = id,
@@ -1674,12 +1709,14 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         }
 
         fn ackConfigure(adapter: *Self, surface: *SurfaceSlot, serial: u32) !void {
+            var configure: ?ToplevelConfigure = null;
             var found = false;
             for (adapter.outstanding) |entry| {
                 if (entry.active and entry.surface_index == indexOf(SurfaceSlot, adapter.surfaces, surface) and
                     entry.surface_generation == surface.header.generation and entry.serial == serial and entry.sent)
                 {
                     found = true;
+                    configure = entry.toplevel_configure;
                     break;
                 }
             }
@@ -1690,6 +1727,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     serialAtOrBefore(entry.serial, serial)) entry.* = .{};
             }
             surface.last_acked_serial = serial;
+            surface.acked_toplevel_configure = configure;
         }
 
         fn issueSerial(adapter: *Self) u32 {
@@ -1932,6 +1970,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             }
             if (adapter.resolveRoleSurface(slot.xdg_surface_index, slot.xdg_surface_generation)) |surface| {
                 surface.last_acked_serial = 0;
+                surface.acked_toplevel_configure = null;
             } else |_| {}
             adapter.dropOutstanding(slot.xdg_surface_index, slot.xdg_surface_generation);
             adapter.dropOutboundToplevel(id);
@@ -3206,6 +3245,76 @@ test "xdg-shell: unconfigured buffer error names the xdg_surface" {
         11,
         test_protocol.xdg_surface.@"error".unconfigured_buffer.value,
     );
+}
+
+test "xdg-shell: maximized commits obey the acknowledged window geometry" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const id = try context.createToplevel();
+    const surface = context.adapter.surfaces[0];
+    context.adapter.toplevels[id.index].initial_committed = true;
+
+    const serial = try context.adapter.queueToplevelConfigure(id, .{
+        .width = 800,
+        .height = 600,
+        .states = .{ .maximized = true },
+    });
+    context.adapter.markConfigureSent(serial);
+    try context.adapter.ackConfigure(surface, serial);
+    try context.core.state.attach(6, .{
+        .handle = .{ .id = 30, .generation = 1 },
+        .width = 800,
+        .height = 600,
+    }, 0, 0);
+    try context.adapter.validateSurfaceCommit(surface.surface_id);
+
+    surface.pending_window_geometry = .{ .x = 4, .y = 5, .width = 799, .height = 600 };
+    try std.testing.expectError(
+        error.InvalidSurfaceState,
+        context.adapter.validateSurfaceCommit(surface.surface_id),
+    );
+    try std.testing.expectEqual(
+        wayring.dispatch.Control.stop,
+        (try context.adapter.reportSurfaceCommitFailure(
+            &context.actor,
+            surface.surface_id,
+            error.InvalidSurfaceState,
+        )).?,
+    );
+    try expectDisplayError(
+        context,
+        context.manager.id,
+        test_protocol.xdg_wm_base.@"error".invalid_surface_state.value,
+    );
+}
+
+test "xdg-shell: newer unmaximized configure clears exact size requirement" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const id = try context.createToplevel();
+    const surface = context.adapter.surfaces[0];
+    context.adapter.toplevels[id.index].initial_committed = true;
+
+    const maximized = try context.adapter.queueToplevelConfigure(id, .{
+        .width = 800,
+        .height = 600,
+        .states = .{ .maximized = true },
+    });
+    context.adapter.markConfigureSent(maximized);
+    try context.adapter.ackConfigure(surface, maximized);
+    const restored = try context.adapter.queueToplevelConfigure(id, .{
+        .width = 640,
+        .height = 480,
+    });
+    context.adapter.markConfigureSent(restored);
+    try context.adapter.ackConfigure(surface, restored);
+
+    try context.core.state.attach(6, .{
+        .handle = .{ .id = 30, .generation = 1 },
+        .width = 700,
+        .height = 500,
+    }, 0, 0);
+    try context.adapter.validateSurfaceCommit(surface.surface_id);
 }
 
 test "xdg-shell: commit event storage grows before core mutation" {
