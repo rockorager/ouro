@@ -1229,30 +1229,34 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             switch (decoded.value) {
                 .destroy => {},
                 .set_size => |v| {
-                    if (v.width <= 0 or v.height <= 0) return try adapter.invalidPositioner(actor, decoded.handle.id);
+                    if (v.width <= 0 or v.height <= 0)
+                        return try adapter.invalidPositionerInput(actor, decoded.handle.id);
                     slot.state.width = v.width;
                     slot.state.height = v.height;
                     slot.state.configured_size = true;
                 },
                 .set_anchor_rect => |v| {
-                    if (v.width <= 0 or v.height <= 0) return try adapter.invalidPositioner(actor, decoded.handle.id);
+                    if (v.width < 0 or v.height < 0)
+                        return try adapter.invalidPositionerInput(actor, decoded.handle.id);
                     slot.state.anchor_x = v.x;
                     slot.state.anchor_y = v.y;
                     slot.state.anchor_width = v.width;
                     slot.state.anchor_height = v.height;
-                    slot.state.configured_anchor_rect = true;
+                    slot.state.configured_anchor_rect = v.width != 0 and v.height != 0;
                 },
                 .set_anchor => |v| {
-                    if (!validAxis(v.anchor.value)) return try adapter.invalidPositioner(actor, decoded.handle.id);
+                    if (!validAxis(v.anchor.value))
+                        return try adapter.invalidPositionerInput(actor, decoded.handle.id);
                     slot.state.anchor = v.anchor.value;
                 },
                 .set_gravity => |v| {
-                    if (!validAxis(v.gravity.value)) return try adapter.invalidPositioner(actor, decoded.handle.id);
+                    if (!validAxis(v.gravity.value))
+                        return try adapter.invalidPositionerInput(actor, decoded.handle.id);
                     slot.state.gravity = v.gravity.value;
                 },
                 .set_constraint_adjustment => |v| {
                     if (v.constraint_adjustment.value & ~@as(u32, 63) != 0)
-                        return try adapter.invalidPositioner(actor, decoded.handle.id);
+                        return try adapter.invalidPositionerInput(actor, decoded.handle.id);
                     slot.state.constraint_adjustment = v.constraint_adjustment.value;
                 },
                 .set_offset => |v| {
@@ -1262,7 +1266,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .set_reactive => slot.state.reactive = true,
                 .set_parent_size => |v| {
                     if (v.parent_width <= 0 or v.parent_height <= 0)
-                        return try adapter.invalidPositioner(actor, decoded.handle.id);
+                        return try adapter.invalidPositionerInput(actor, decoded.handle.id);
                     slot.state.parent_width = v.parent_width;
                     slot.state.parent_height = v.parent_height;
                 },
@@ -1320,9 +1324,9 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     if (!adapter.canPublishWithLive(adapter.live_toplevels, adapter.live_popups + 1))
                         return try adapter.noMemory(actor);
                     const positioner = adapter.positionerByObject(server_objects, payload.positioner) catch
-                        return try adapter.invalidPositioner(actor, decoded.handle.id);
+                        return try adapter.invalidPositioner(actor, slot);
                     if (!positioner.state.configured_size or !positioner.state.configured_anchor_rect)
-                        return try adapter.invalidPositioner(actor, decoded.handle.id);
+                        return try adapter.invalidPositioner(actor, slot);
                     const parent: ?*SurfaceSlot = if (payload.parent) |parent_id|
                         adapter.xdgSurfaceByObject(server_objects, parent_id) catch
                             return try adapter.protocolError(actor, decoded.handle.id, WmBase.@"error".invalid_popup_parent.value, "invalid popup parent")
@@ -1531,10 +1535,14 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     adapter.publish(.{ .popup_grab_requested = adapter.popupId(slot) }) catch unreachable;
                 },
                 .reposition => |v| {
+                    const surface = adapter.resolveRoleSurface(
+                        slot.xdg_surface_index,
+                        slot.xdg_surface_generation,
+                    ) catch return try adapter.failure(actor, decoded.handle.id, error.StaleSurface);
                     const positioner = adapter.positionerByObject(server_objects, v.positioner) catch
-                        return try adapter.invalidPositioner(actor, decoded.handle.id);
+                        return try adapter.invalidPositioner(actor, surface);
                     if (!positioner.state.configured_size or !positioner.state.configured_anchor_rect)
-                        return try adapter.invalidPositioner(actor, decoded.handle.id);
+                        return try adapter.invalidPositioner(actor, surface);
                     if (!adapter.canPublishWithLive(adapter.live_toplevels, adapter.live_popups))
                         return try adapter.noMemory(actor);
                     slot.placement = popupPlacement(positioner.state);
@@ -2156,8 +2164,15 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 else => cause,
             };
         }
-        fn invalidPositioner(adapter: *Self, actor: *wayring.connection.Actor, id: u32) !wayring.dispatch.Control {
-            return adapter.protocolError(actor, id, WmBase.@"error".invalid_positioner.value, "invalid xdg_positioner");
+        fn invalidPositionerInput(adapter: *Self, actor: *wayring.connection.Actor, id: u32) !wayring.dispatch.Control {
+            return adapter.protocolError(actor, id, Positioner.@"error".invalid_input.value, "invalid xdg_positioner input");
+        }
+        fn invalidPositioner(adapter: *Self, actor: *wayring.connection.Actor, surface: *SurfaceSlot) !wayring.dispatch.Control {
+            const manager = adapter.resolveManager(
+                surface.manager_index,
+                surface.manager_generation,
+            ) catch unreachable;
+            return adapter.protocolError(actor, manager.header.resource.id, WmBase.@"error".invalid_positioner.value, "incomplete xdg_positioner");
         }
         fn invalidToplevelSize(adapter: *Self, actor: *wayring.connection.Actor, id: u32) !wayring.dispatch.Control {
             return adapter.protocolError(actor, id, Toplevel.@"error".invalid_size.value, "invalid toplevel size");
@@ -3354,6 +3369,55 @@ test "xdg-shell: ping is outstanding until its emitted serial is ponged" {
     });
     try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
     try std.testing.expectEqual(@as(u32, 42), try context.adapter.queuePing(manager));
+}
+
+test "xdg-shell: invalid positioner input names the positioner" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    try test_protocol.xdg_wm_base.encodeRequest(&context.requests, context.manager.id, .{
+        .create_positioner = .{ .id = 15 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try test_protocol.xdg_positioner.encodeRequest(&context.requests, 15, .{
+        .set_size = .{ .width = 0, .height = 10 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.stop, try context.dispatch());
+    try expectDisplayError(
+        context,
+        15,
+        test_protocol.xdg_positioner.@"error".invalid_input.value,
+    );
+}
+
+test "xdg-shell: zero anchor rect remains incomplete until popup use" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    _ = try context.createToplevel();
+    try test_protocol.xdg_wm_base.encodeRequest(&context.requests, context.manager.id, .{
+        .get_xdg_surface = .{ .id = 14, .surface = context.core.second_handle.id },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try test_protocol.xdg_wm_base.encodeRequest(&context.requests, context.manager.id, .{
+        .create_positioner = .{ .id = 15 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try test_protocol.xdg_positioner.encodeRequest(&context.requests, 15, .{
+        .set_size = .{ .width = 20, .height = 10 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try test_protocol.xdg_positioner.encodeRequest(&context.requests, 15, .{
+        .set_anchor_rect = .{ .x = 0, .y = 0, .width = 0, .height = 10 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try test_protocol.xdg_surface.encodeRequest(&context.requests, 14, .{
+        .get_popup = .{ .id = 16, .parent = 11, .positioner = 15 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.stop, try context.dispatch());
+    try expectDisplayError(
+        context,
+        context.manager.id,
+        test_protocol.xdg_wm_base.@"error".invalid_positioner.value,
+    );
 }
 
 test "xdg-shell: generated popup requests validate positioner and parent role" {
