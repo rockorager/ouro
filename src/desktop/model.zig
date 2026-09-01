@@ -1228,6 +1228,8 @@ pub fn Desktop(comptime Shell: type) type {
             const reclaimable = desktop.commandCountFor(id);
             if (desktop.commandAvailable() + reclaimable < desktop.live - 1)
                 return error.Backpressure;
+            if (desktop.topmostPopupForRoot(desktop.slots[index].surface)) |popup|
+                try desktop.enqueuePopupDone(popup.shell_id);
             if (desktop.interactive_request) |request| {
                 if (std.meta.eql(request.id, id)) desktop.interactive_request = null;
             }
@@ -1814,6 +1816,9 @@ pub fn Desktop(comptime Shell: type) type {
             slot.content_ready = false;
             slot.grabbed = false;
             slot.dismissed = true;
+            if (desktop.popup_grab) |grab| {
+                if (std.meta.eql(grab, id)) desktop.popup_grab = null;
+            }
             slot.scene.content_ready = false;
             slot.scene.visible = false;
             desktop.scene_changed = true;
@@ -2849,6 +2854,8 @@ test "desktop: toplevel unmap dismisses nested popups topmost first" {
         .placement = placement,
     } });
     _ = try desktop.consume(&shell, 2);
+    desktop.popups[second_id.index].grabbed = true;
+    desktop.popup_grab = second_id;
 
     shell.push(.{ .commit_ready = .{
         .id = .{ .index = 0, .generation = 1 },
@@ -2856,6 +2863,7 @@ test "desktop: toplevel unmap dismisses nested popups topmost first" {
         .unmapped = true,
     } });
     _ = try desktop.consume(&shell, 1);
+    try std.testing.expect(desktop.popupGrabTarget() == null);
     try std.testing.expect(!desktop.popups[first_id.index].dismissed);
     try std.testing.expect(desktop.popups[second_id.index].dismissed);
     try std.testing.expectEqual(@as(?u32, null), try desktop.flushConfigure(&shell));
@@ -2867,6 +2875,42 @@ test "desktop: toplevel unmap dismisses nested popups topmost first" {
     try std.testing.expect(desktop.popups[first_id.index].dismissed);
     try std.testing.expectEqual(@as(?u32, null), try desktop.flushConfigure(&shell));
     try std.testing.expectEqual(first_id, shell.popup_done.?);
+}
+
+test "desktop: toplevel destruction dismisses its popup" {
+    var desktop = try initTestDesktop(8);
+    defer desktop.deinit();
+    var shell = TestShell{};
+    shell.push(created(0));
+    _ = try desktop.consume(&shell, 1);
+    try settleDesktop(&desktop, &shell);
+    const owner = try desktop.idForShell(.{ .index = 0, .generation = 1 });
+    const root = (try desktop.scene(owner)).surface;
+    const popup_id: TestShell.PopupId = .{ .index = 0, .generation = 1 };
+    shell.push(.{ .popup_created = .{
+        .id = popup_id,
+        .surface = .{ .index = 20, .generation = 1 },
+        .parent = root,
+        .placement = .{
+            .width = 10,
+            .height = 10,
+            .anchor_x = 0,
+            .anchor_y = 0,
+            .anchor_width = 1,
+            .anchor_height = 1,
+            .anchor = 8,
+            .gravity = 8,
+            .constraint_adjustment = 0,
+            .offset_x = 0,
+            .offset_y = 0,
+        },
+    } });
+    _ = try desktop.consume(&shell, 1);
+    shell.push(.{ .toplevel_destroyed = .{ .index = 0, .generation = 1 } });
+    _ = try desktop.consume(&shell, 1);
+    try std.testing.expect(desktop.popups[popup_id.index].dismissed);
+    try std.testing.expectEqual(@as(?u32, null), try desktop.flushConfigure(&shell));
+    try std.testing.expectEqual(popup_id, shell.popup_done.?);
 }
 
 test "desktop: external-root popup stays out of the ordinary desktop scene" {
