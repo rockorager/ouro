@@ -1090,12 +1090,6 @@ pub const Output = struct {
         return self.scheduler.timerRequest(now_ns);
     }
 
-    pub fn beginImmediatePhysical(self: *Output, now_ns: u64) !?scheduler_api.FrameId {
-        if (!self.accepting_frames) return null;
-        const request_value = try self.scheduler.beginImmediatePhysical(now_ns) orelse return null;
-        return request_value.frame;
-    }
-
     pub fn timerArmed(self: *Output, request_value: scheduler_api.TimerRequest, handle: timer.Handle, now_ns: u64) !void {
         try self.scheduler.timerArmed(request_value, handle, now_ns);
     }

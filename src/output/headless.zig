@@ -232,37 +232,6 @@ pub fn Scheduler(comptime PresentationToken: type) type {
             if (self.stage == .idle) self.stage = .requested;
         }
 
-        /// Starts a physical render without a timer while adaptive timing is
-        /// warming up. Once enough trustworthy samples exist, callers receive
-        /// null and should use `timerRequest` for deadline scheduling.
-        pub fn beginImmediatePhysical(
-            self: *Self,
-            now_ns: Timestamp,
-        ) Error!?RenderRequest {
-            if (self.stage != .requested or self.retiring or
-                self.config.adaptive_render_samples == 0 or self.adaptiveReady())
-                return null;
-            const id = try self.prospectiveFrameId();
-            const target = try self.nextTarget(now_ns);
-            self.frame = .{
-                .id = id,
-                .requests = self.pending,
-                .requested_ns = self.pending_since_ns,
-                .target_ns = target,
-                .render_deadline_ns = now_ns,
-                .render_started_ns = now_ns,
-            };
-            self.pending = .{};
-            self.samples_captured = false;
-            self.next_sequence += 1;
-            self.stage = .rendering;
-            return .{
-                .frame = id,
-                .requests = self.frame.?.requests,
-                .target_ns = target,
-            };
-        }
-
         /// Describes an absolute timer to prepare before the loop's sole
         /// submission. State changes only after `timerArmed`, so an SQE failure
         /// can be retried without losing or duplicating a frame request.
@@ -851,25 +820,27 @@ test "physical timing warms adaptive render deadlines and resets after a miss" {
     defer scheduler.deinit(std.testing.allocator);
 
     const starts = [_]Timestamp{ 1, 11, 21 };
-    const ready = [_]Timestamp{ 2, 13, 22 };
+    const deadlines = [_]Timestamp{ 6, 16, 26 };
+    const ready = [_]Timestamp{ 7, 18, 27 };
     const presented = [_]Timestamp{ 10, 20, 30 };
-    for (starts, ready, presented) |start_ns, ready_ns, actual_ns| {
+    for (starts, deadlines, ready, presented, 1..) |start_ns, deadline_ns, ready_ns, actual_ns, generation| {
         try scheduler.request(.damage, start_ns);
-        const render = (try scheduler.beginImmediatePhysical(start_ns)).?;
-        try scheduler.captureSamples(render.frame, &.{});
-        _ = try scheduler.renderComplete(render.frame, ready_ns);
-        try scheduler.submitPhysical(render.frame, ready_ns);
-        _ = try scheduler.presentPhysical(render.frame, actual_ns, ready_ns);
+        const handle = fakeHandle(@intCast(generation));
+        const frame = try armRender(&scheduler, start_ns, handle);
+        _ = try startRender(&scheduler, handle, deadline_ns);
+        try scheduler.captureSamples(frame, &.{});
+        _ = try scheduler.renderComplete(frame, ready_ns);
+        try scheduler.submitPhysical(frame, ready_ns);
+        _ = try scheduler.presentPhysical(frame, actual_ns, ready_ns);
     }
     try std.testing.expect(scheduler.adaptiveReady());
     try std.testing.expectEqual(@as(Timestamp, 3), scheduler.renderBudget());
 
     try scheduler.request(.damage, 31);
-    try std.testing.expect((try scheduler.beginImmediatePhysical(31)) == null);
     const delayed = (try scheduler.timerRequest(31)).?;
     try std.testing.expectEqual(@as(Timestamp, 37), try nsFromDeadline(delayed.deadline));
-    try scheduler.timerArmed(delayed, fakeHandle(1), 31);
-    const render = (try scheduler.timerEvent(fakeHandle(1), .fired, 37)).?.render;
+    try scheduler.timerArmed(delayed, fakeHandle(4), 31);
+    const render = (try scheduler.timerEvent(fakeHandle(4), .fired, 37)).?.render;
     try scheduler.captureSamples(render.frame, &.{});
     _ = try scheduler.renderComplete(render.frame, 39);
     try scheduler.submitPhysical(render.frame, 39);
@@ -877,9 +848,10 @@ test "physical timing warms adaptive render deadlines and resets after a miss" {
     try std.testing.expect(!scheduler.adaptiveReady());
 
     try scheduler.request(.damage, 51);
-    const immediate = (try scheduler.beginImmediatePhysical(51)).?;
-    try scheduler.captureSamples(immediate.frame, &.{});
-    _ = try scheduler.failRender(immediate.frame);
+    const frame = try armRender(&scheduler, 51, fakeHandle(5));
+    _ = try startRender(&scheduler, fakeHandle(5), 56);
+    try scheduler.captureSamples(frame, &.{});
+    _ = try scheduler.failRender(frame);
 }
 
 test "stale frame timer and output generations cannot alias" {

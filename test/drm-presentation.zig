@@ -298,7 +298,7 @@ test "physical coordinator waits for peer output after a retired latching attemp
     fixture.fail_page_flip_crtc = 30;
     try primary.kms_output.?.request(.damage, 1);
     primary.damage_requested +%= 1;
-    try coordinator.completions(&.{}, &.{});
+    try coordinator.prepare();
     _ = try root.ring.submit();
     try secondary.kms_output.?.request(.damage, 1);
     secondary.damage_requested +%= 1;

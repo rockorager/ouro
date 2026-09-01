@@ -2411,7 +2411,6 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.processSession();
             try self.processOutput();
             try self.prepareSecurityClosures();
-            try self.armTimer();
             try self.advanceDrain();
         }
 
@@ -2659,6 +2658,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.syncForeignToplevelOutputChanges();
                 try self.flushProtocol();
             }
+            // Arm frames only after the complete Wayland dispatch batch has
+            // converged. In particular, a surface commit and a following
+            // capture request from one client write must share the same frame.
+            try self.armTimer();
         }
 
         fn validateSurfaceCommit(context: *anyopaque, id: Adapter.SurfaceId) !void {
@@ -5405,11 +5408,9 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn requestOutputDamage(self: *Self) !void {
             const now = try monotonicNs();
-            var requested = false;
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
-                requested = try requestPhysicalOutputDamage(physical, now) or requested;
+                _ = try requestPhysicalOutputDamage(physical, now);
             }
-            if (requested) try self.armTimer();
         }
 
         fn layerShellOutput(self: *Self, layer: *const Layer) ?OutputAdapter.OutputId {
@@ -6779,7 +6780,6 @@ pub fn Coordinator(comptime protocol: type) type {
                     monotonicNs() catch return error.ActivatedOutputFailure,
                 ) catch return error.ActivatedOutputFailure))
                     return error.ActivatedOutputFailure;
-            self.armTimer() catch return error.ActivatedOutputFailure;
         }
 
         fn publishActivatedPhysicalOutput(
@@ -7023,7 +7023,6 @@ pub fn Coordinator(comptime protocol: type) type {
                 remaining += @max(1, self.pending_surfaces[index].commits);
             }
             var global_damage = false;
-            var damage_requested = false;
             var damage_requested_at: ?u64 = null;
             while (remaining != 0 and self.pending_surface_len != 0) : (remaining -= 1) {
                 const before_len = self.pending_surface_len;
@@ -7038,8 +7037,7 @@ pub fn Coordinator(comptime protocol: type) type {
                             damage_requested_at = value;
                             break :blk value;
                         };
-                        damage_requested = try self.requestLayerOutputDamage(layer, now) or
-                            damage_requested;
+                        _ = try self.requestLayerOutputDamage(layer, now);
                     } else {
                         global_damage = true;
                     }
@@ -7050,10 +7048,8 @@ pub fn Coordinator(comptime protocol: type) type {
             if (global_damage) {
                 const now = damage_requested_at orelse try monotonicNs();
                 for (self.physical_outputs[0..self.physical_output_count]) |*physical|
-                    damage_requested = try requestPhysicalOutputDamage(physical, now) or
-                        damage_requested;
+                    _ = try requestPhysicalOutputDamage(physical, now);
             }
-            if (damage_requested) try self.armTimer();
             try self.syncCommitTimer();
         }
 
@@ -8284,7 +8280,6 @@ pub fn Coordinator(comptime protocol: type) type {
                 return;
             }
             self.pending_screencopy.?.awaiting_output = true;
-            try self.armTimer();
         }
 
         fn processImageCopyCaptures(self: *Self) !void {
@@ -8439,7 +8434,6 @@ pub fn Coordinator(comptime protocol: type) type {
                 return;
             }
             self.pending_image_copy.?.awaiting_output = true;
-            try self.armTimer();
         }
 
         fn dmabufCaptureImport(buffer: *const protocol_linux_dmabuf.Buffer) !gbm.Import {
@@ -8769,7 +8763,6 @@ pub fn Coordinator(comptime protocol: type) type {
                                         owner,
                                         try monotonicNs(),
                                     ) catch false;
-                                    self.armTimer() catch {};
                                 }
                             },
                             error.StaleLock, error.InvalidPhase => {},
@@ -8783,7 +8776,6 @@ pub fn Coordinator(comptime protocol: type) type {
                             owner,
                             try monotonicNs(),
                         ) catch false;
-                        self.armTimer() catch {};
                     }
                 }
             };
@@ -9616,10 +9608,6 @@ pub fn Coordinator(comptime protocol: type) type {
             const now = try monotonicNs();
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
                 const output = physical.kms_output orelse continue;
-                if (try output.beginImmediatePhysical(now)) |frame| {
-                    try self.renderFrame(frame);
-                    continue;
-                }
                 const request_value = (try output.timerRequest(now)) orelse continue;
                 const handle = try self.timers.arm(
                     &self.router,
@@ -10233,7 +10221,6 @@ pub fn Coordinator(comptime protocol: type) type {
             if (!requested) return;
             self.removed_layers[self.removed_layer_len] = .{ .id = id, .state = state };
             self.removed_layer_len += 1;
-            self.armTimer() catch {};
         }
 
         fn cleanupUnstartedOutput(self: *Self, physical: *PhysicalOutput) void {
