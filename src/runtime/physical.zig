@@ -3970,6 +3970,7 @@ pub fn Coordinator(comptime protocol: type) type {
         fn resolveXdgWindowGeometryBounds(
             context: *anyopaque,
             root: Adapter.SurfaceId,
+            root_bounds: ?ShellAdapter.WindowGeometry,
         ) !ShellAdapter.WindowGeometry {
             const self: *Self = @ptrCast(@alignCast(context));
             const surfaces = try self.sceneOrder(root);
@@ -3979,7 +3980,17 @@ pub fn Coordinator(comptime protocol: type) type {
             var right: i64 = 0;
             var bottom: i64 = 0;
             for (surfaces) |surface_id| {
-                const size = (try self.adapter.getSurfaceById(surface_id)).committedSize();
+                const size = if (std.meta.eql(surface_id, root) and root_bounds != null)
+                    root_bounds.?
+                else size: {
+                    const committed = (try self.adapter.getSurfaceById(surface_id)).committedSize();
+                    break :size ShellAdapter.WindowGeometry{
+                        .x = 0,
+                        .y = 0,
+                        .width = @intCast(committed.width),
+                        .height = @intCast(committed.height),
+                    };
+                };
                 if (size.width == 0 or size.height == 0) continue;
                 const placement = if (std.meta.eql(surface_id, root))
                     null

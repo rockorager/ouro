@@ -91,7 +91,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
 
         pub const WindowGeometryResolver = struct {
             context: *anyopaque,
-            resolve: *const fn (*anyopaque, SurfaceId) anyerror!WindowGeometry,
+            resolve: *const fn (*anyopaque, SurfaceId, ?WindowGeometry) anyerror!WindowGeometry,
         };
 
         pub const StateSet = packed struct(u16) {
@@ -154,6 +154,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 has_window_geometry: bool = false,
                 surface_offset_x: i32 = 0,
                 surface_offset_y: i32 = 0,
+                window_width: i32 = 0,
+                window_height: i32 = 0,
                 unmapped: bool = false,
                 constraints_changed: bool = false,
                 initial_commit: bool = false,
@@ -165,6 +167,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 has_window_geometry: bool = false,
                 surface_offset_x: i32 = 0,
                 surface_offset_y: i32 = 0,
+                window_width: i32 = 0,
+                window_height: i32 = 0,
                 geometry_refresh: bool = false,
                 unmapped: bool = false,
                 initial_commit: bool = false,
@@ -712,7 +716,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
 
         pub fn validateWindowGeometryRefresh(adapter: *Self, id: SurfaceId) !void {
             const surface = adapter.findXdgSurface(id) orelse return;
-            if (surface.requested_window_geometry == null) return;
+            if (surface.requested_window_geometry != null) return;
             switch (surface.role) {
                 .toplevel => |role_id| if (!(try adapter.resolveToplevel(role_id)).mapped) return,
                 .popup => |role_id| {
@@ -723,12 +727,12 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             }
             if (!adapter.canPublishWithLive(adapter.live_toplevels, adapter.live_popups))
                 return error.Exhausted;
-            _ = try adapter.windowGeometryBounds(surface);
+            _ = try adapter.windowGeometryBounds(surface, null);
         }
 
         pub fn publishWindowGeometryRefresh(adapter: *Self, id: SurfaceId) !void {
             const surface = adapter.findXdgSurface(id) orelse return;
-            const requested = surface.requested_window_geometry orelse return;
+            if (surface.requested_window_geometry != null) return;
             switch (surface.role) {
                 .toplevel => |role_id| if (!(try adapter.resolveToplevel(role_id)).mapped) return,
                 .popup => |role_id| {
@@ -737,10 +741,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 },
                 .none => return,
             }
-            const geometry = effectiveWindowGeometry(
-                requested,
-                try adapter.windowGeometryBounds(surface),
-            );
+            const geometry = try adapter.windowGeometryBounds(surface, null);
             if (surface.window_geometry != null and
                 std.meta.eql(surface.window_geometry.?, geometry)) return;
             surface.window_geometry = geometry;
@@ -749,9 +750,11 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     adapter.publishReserved(.{ .commit_ready = .{
                         .id = role_id,
                         .serial = surface.last_acked_serial,
-                        .has_window_geometry = true,
+                        .has_window_geometry = geometry.width > 0 and geometry.height > 0,
                         .surface_offset_x = geometry.x,
                         .surface_offset_y = geometry.y,
+                        .window_width = geometry.width,
+                        .window_height = geometry.height,
                         .mapped = true,
                     } });
                 },
@@ -759,9 +762,11 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     adapter.publishReserved(.{ .popup_commit_ready = .{
                         .id = role_id,
                         .serial = surface.last_acked_serial,
-                        .has_window_geometry = true,
+                        .has_window_geometry = geometry.width > 0 and geometry.height > 0,
                         .surface_offset_x = geometry.x,
                         .surface_offset_y = geometry.y,
+                        .window_width = geometry.width,
+                        .window_height = geometry.height,
                         .geometry_refresh = true,
                     } });
                 },
@@ -795,11 +800,14 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                         {
                             const content = try surface.prospectiveContent();
                             if (content.has_buffer) {
+                                const root_bounds = windowGeometryBoundsFor(WindowGeometry, content.size);
                                 const geometry = if (slot.pending_window_geometry) |requested|
                                     effectiveWindowGeometry(
                                         requested,
-                                        windowGeometryBoundsFor(WindowGeometry, content.size),
+                                        try adapter.windowGeometryBounds(slot, root_bounds),
                                     )
+                                else if (slot.requested_window_geometry == null)
+                                    try adapter.windowGeometryBounds(slot, root_bounds)
                                 else
                                     slot.window_geometry;
                                 const width: i64 = if (geometry) |value|
@@ -891,11 +899,13 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 if (slot.pending_window_geometry) |geometry| {
                     slot.requested_window_geometry = geometry;
                     slot.pending_window_geometry = null;
+                    slot.window_geometry = effectiveWindowGeometry(
+                        geometry,
+                        try adapter.windowGeometryBounds(slot, null),
+                    );
+                } else if (slot.requested_window_geometry == null) {
+                    slot.window_geometry = try adapter.windowGeometryBounds(slot, null);
                 }
-                slot.window_geometry = if (slot.requested_window_geometry) |requested|
-                    effectiveWindowGeometry(requested, try adapter.windowGeometryBounds(slot))
-                else
-                    null;
                 const geometry_changed = !std.meta.eql(
                     previous_window_geometry,
                     slot.window_geometry,
@@ -929,9 +939,11 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                             adapter.publishReserved(.{ .commit_ready = .{
                                 .id = toplevel,
                                 .serial = slot.last_acked_serial,
-                                .has_window_geometry = slot.window_geometry != null,
+                                .has_window_geometry = hasEffectiveWindowGeometry(slot.window_geometry),
                                 .surface_offset_x = if (slot.window_geometry) |geometry| geometry.x else 0,
                                 .surface_offset_y = if (slot.window_geometry) |geometry| geometry.y else 0,
+                                .window_width = if (slot.window_geometry) |geometry| geometry.width else 0,
+                                .window_height = if (slot.window_geometry) |geometry| geometry.height else 0,
                                 .unmapped = unmapped,
                                 .constraints_changed = constraints_changed,
                                 .initial_commit = initial_commit,
@@ -956,9 +968,11 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                             adapter.publishReserved(.{ .popup_commit_ready = .{
                                 .id = popup,
                                 .serial = slot.last_acked_serial,
-                                .has_window_geometry = slot.window_geometry != null,
+                                .has_window_geometry = hasEffectiveWindowGeometry(slot.window_geometry),
                                 .surface_offset_x = if (slot.window_geometry) |geometry| geometry.x else 0,
                                 .surface_offset_y = if (slot.window_geometry) |geometry| geometry.y else 0,
+                                .window_width = if (slot.window_geometry) |geometry| geometry.width else 0,
+                                .window_height = if (slot.window_geometry) |geometry| geometry.height else 0,
                                 .unmapped = unmapped,
                                 .initial_commit = initial_commit,
                             } });
@@ -1789,9 +1803,14 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             } });
         }
 
-        fn windowGeometryBounds(adapter: *Self, slot: *SurfaceSlot) !WindowGeometry {
+        fn windowGeometryBounds(
+            adapter: *Self,
+            slot: *SurfaceSlot,
+            root_bounds: ?WindowGeometry,
+        ) !WindowGeometry {
             if (adapter.window_geometry_resolver) |resolver|
-                return resolver.resolve(resolver.context, slot.surface_id);
+                return resolver.resolve(resolver.context, slot.surface_id, root_bounds);
+            if (root_bounds) |bounds| return bounds;
             return windowGeometryBoundsFor(
                 WindowGeometry,
                 (try adapter.core.getSurfaceById(slot.surface_id)).committedSize(),
@@ -2455,6 +2474,11 @@ fn windowGeometryBoundsFor(comptime T: type, size: anytype) T {
     };
 }
 
+fn hasEffectiveWindowGeometry(value: anytype) bool {
+    const geometry = value orelse return false;
+    return geometry.width > 0 and geometry.height > 0;
+}
+
 fn effectiveWindowGeometry(requested: anytype, bounds: @TypeOf(requested)) @TypeOf(requested) {
     const left = @max(@as(i64, requested.x), bounds.x);
     const top = @max(@as(i64, requested.y), bounds.y);
@@ -2670,6 +2694,7 @@ fn validateTestInteractiveGrab(
 fn resolveTestWindowGeometry(
     context: *anyopaque,
     _: TestAdapter.SurfaceId,
+    _: ?TestAdapter.WindowGeometry,
 ) !TestAdapter.WindowGeometry {
     return @as(*TestAdapter.WindowGeometry, @ptrCast(@alignCast(context))).*;
 }
@@ -3291,16 +3316,27 @@ test "xdg-shell: explicit window geometry is clipped to surface-tree bounds" {
     );
     _ = context.adapter.popEvent();
 
-    try context.adapter.validateWindowGeometryRefresh(surface.surface_id);
+    const explicit_geometry = surface.window_geometry.?;
     tree_bounds = .{ .x = -10, .y = -5, .width = 140, .height = 90 };
+    try context.adapter.validateWindowGeometryRefresh(surface.surface_id);
+    try context.adapter.publishWindowGeometryRefresh(surface.surface_id);
+    try std.testing.expectEqual(explicit_geometry, surface.window_geometry.?);
+    try std.testing.expect(context.adapter.popEvent() == null);
+
+    surface.requested_window_geometry = null;
+    surface.window_geometry = tree_bounds;
+    tree_bounds = .{ .x = -5, .y = -2, .width = 130, .height = 85 };
+    try context.adapter.validateWindowGeometryRefresh(surface.surface_id);
     try context.adapter.publishWindowGeometryRefresh(surface.surface_id);
     const refreshed = switch (context.adapter.popEvent().?) {
         .commit_ready => |value| value,
         else => return error.UnexpectedEvent,
     };
     try std.testing.expect(refreshed.mapped);
-    try std.testing.expectEqual(@as(i32, -10), refreshed.surface_offset_x);
-    try std.testing.expectEqual(@as(i32, 0), refreshed.surface_offset_y);
+    try std.testing.expectEqual(@as(i32, -5), refreshed.surface_offset_x);
+    try std.testing.expectEqual(@as(i32, -2), refreshed.surface_offset_y);
+    try std.testing.expectEqual(@as(i32, 130), refreshed.window_width);
+    try std.testing.expectEqual(@as(i32, 85), refreshed.window_height);
     try context.adapter.publishWindowGeometryRefresh(surface.surface_id);
     try std.testing.expect(context.adapter.popEvent() == null);
 }
@@ -3595,6 +3631,9 @@ test "xdg-shell: commit event storage grows before core mutation" {
     try std.testing.expectEqual(id, ready.id);
     try std.testing.expectEqual(@as(u32, 1), ready.serial);
     try std.testing.expect(!ready.unmapped);
+    try std.testing.expect(ready.has_window_geometry);
+    try std.testing.expectEqual(@as(i32, 80), ready.window_width);
+    try std.testing.expectEqual(@as(i32, 60), ready.window_height);
     try std.testing.expect(context.adapter.toplevels[id.index].mapped);
 
     try context.core.state.attach(6, null, 0, 0);
@@ -4004,6 +4043,16 @@ test "xdg-shell: generated popup requests validate positioner and parent role" {
         .context = &popup_tree_bounds,
         .resolve = resolveTestWindowGeometry,
     });
+    const explicit_popup_geometry = context.adapter.surfaces[1].window_geometry.?;
+    try context.adapter.publishWindowGeometryRefresh(popup_surface);
+    try std.testing.expectEqual(
+        explicit_popup_geometry,
+        context.adapter.surfaces[1].window_geometry.?,
+    );
+    try std.testing.expect(context.adapter.popEvent() == null);
+
+    context.adapter.surfaces[1].requested_window_geometry = null;
+    context.adapter.surfaces[1].window_geometry = .{ .x = 0, .y = 0, .width = 120, .height = 80 };
     try context.adapter.validateWindowGeometryRefresh(popup_surface);
     try context.adapter.publishWindowGeometryRefresh(popup_surface);
     const geometry_refresh = switch (context.adapter.popEvent() orelse return error.MissingEvent) {
@@ -4014,6 +4063,8 @@ test "xdg-shell: generated popup requests validate positioner and parent role" {
     try std.testing.expectEqual(id, geometry_refresh.id);
     try std.testing.expectEqual(@as(i32, 10), geometry_refresh.surface_offset_x);
     try std.testing.expectEqual(@as(i32, 5), geometry_refresh.surface_offset_y);
+    try std.testing.expectEqual(@as(i32, 80), geometry_refresh.window_width);
+    try std.testing.expectEqual(@as(i32, 60), geometry_refresh.window_height);
     try context.adapter.publishWindowGeometryRefresh(popup_surface);
     try std.testing.expect(context.adapter.popEvent() == null);
 

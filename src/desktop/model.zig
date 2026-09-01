@@ -155,6 +155,8 @@ pub fn Desktop(comptime Shell: type) type {
             applied_configure: ?Shell.ToplevelConfigure = null,
             expected_serial: ?u32 = null,
             configure_ready: bool = false,
+            window_width: i32 = 0,
+            window_height: i32 = 0,
         };
 
         const Desired = struct {
@@ -184,6 +186,8 @@ pub fn Desktop(comptime Shell: type) type {
             dismissed: bool = false,
             has_window_geometry: bool = false,
             surface_offset: geometry.Point = .{ .x = 0, .y = 0 },
+            window_width: i32 = 0,
+            window_height: i32 = 0,
             scene: SceneWindow = undefined,
         };
 
@@ -1041,6 +1045,18 @@ pub fn Desktop(comptime Shell: type) type {
                         .x = commit.surface_offset_x,
                         .y = commit.surface_offset_y,
                     };
+                    if (commit.window_width > 0 and commit.window_height > 0) {
+                        desktop.slots[index].window_width = commit.window_width;
+                        desktop.slots[index].window_height = commit.window_height;
+                        desktop.slots[index].target_scene.geometry.width = commit.window_width;
+                        desktop.slots[index].target_scene.geometry.height = commit.window_height;
+                        if (desktop.slots[index].mode == .floating and
+                            !desktop.slots[index].fullscreen and !desktop.slots[index].maximized)
+                        {
+                            desktop.slots[index].floating.width = commit.window_width;
+                            desktop.slots[index].floating.height = commit.window_height;
+                        }
+                    }
                     if (commit.initial_commit) {
                         try desktop.beginInitialCommit(index);
                         return;
@@ -1148,6 +1164,12 @@ pub fn Desktop(comptime Shell: type) type {
                 slot.surface_offset = offset;
                 slot.scene.has_window_geometry = value.has_window_geometry;
                 slot.scene.surface_offset = offset;
+                if (value.window_width > 0 and value.window_height > 0) {
+                    slot.window_width = value.window_width;
+                    slot.window_height = value.window_height;
+                    slot.scene.geometry.width = value.window_width;
+                    slot.scene.geometry.height = value.window_height;
+                }
                 return;
             }
             if (value.unmapped) {
@@ -1155,6 +1177,8 @@ pub fn Desktop(comptime Shell: type) type {
                 slot.pending_configure = null;
                 slot.expected_serial = null;
                 slot.content_ready = false;
+                slot.window_width = 0;
+                slot.window_height = 0;
                 slot.scene.content_ready = false;
                 slot.scene.visible = false;
                 desktop.scene_changed = true;
@@ -1186,13 +1210,20 @@ pub fn Desktop(comptime Shell: type) type {
                 .mode = .floating,
                 .content_ready = true,
             };
-            desktop.scene_changed = !std.meta.eql(slot.scene, next) or desktop.scene_changed;
-            slot.scene = next;
+            var committed = next;
+            if (value.window_width > 0 and value.window_height > 0) {
+                committed.geometry.width = value.window_width;
+                committed.geometry.height = value.window_height;
+            }
+            desktop.scene_changed = !std.meta.eql(slot.scene, committed) or desktop.scene_changed;
+            slot.scene = committed;
             slot.configure = configure;
             slot.pending_configure = null;
             slot.content_ready = true;
             slot.has_window_geometry = value.has_window_geometry;
-            slot.surface_offset = next.surface_offset;
+            slot.surface_offset = committed.surface_offset;
+            slot.window_width = value.window_width;
+            slot.window_height = value.window_height;
             slot.expected_serial = null;
             desktop.updatePopupScenes();
             desktop.reconfigureReactivePopups();
@@ -1354,6 +1385,8 @@ pub fn Desktop(comptime Shell: type) type {
             slot.expected_serial = null;
             slot.configure_ready = false;
             slot.content_ready = false;
+            slot.window_width = 0;
+            slot.window_height = 0;
             slot.scene.content_ready = false;
             slot.target_scene.content_ready = false;
             slot.scene.visible = false;
@@ -1593,6 +1626,10 @@ pub fn Desktop(comptime Shell: type) type {
                     .mode = slot.mode,
                     .content_ready = slot.content_ready,
                 };
+                if (slot.content_ready and slot.window_width > 0 and slot.window_height > 0) {
+                    slot.target_scene.geometry.width = slot.window_width;
+                    slot.target_scene.geometry.height = slot.window_height;
+                }
             }
             desktop.publishReadyScene();
         }
@@ -1650,9 +1687,14 @@ pub fn Desktop(comptime Shell: type) type {
                     continue;
                 };
                 const next_geometry = popupAbsolute(popup.configure, parent.geometry);
-                changed = !std.meta.eql(popup.scene.geometry, next_geometry) or
+                var committed_geometry = next_geometry;
+                if (popup.window_width > 0 and popup.window_height > 0) {
+                    committed_geometry.width = popup.window_width;
+                    committed_geometry.height = popup.window_height;
+                }
+                changed = !std.meta.eql(popup.scene.geometry, committed_geometry) or
                     popup.scene.visible != parent.visible or changed;
-                popup.scene.geometry = next_geometry;
+                popup.scene.geometry = committed_geometry;
                 popup.scene.visible = parent.visible;
             };
             desktop.scene_changed = changed or desktop.scene_changed;
@@ -2322,6 +2364,8 @@ const TestShell = struct {
             has_window_geometry: bool = false,
             surface_offset_x: i32 = 0,
             surface_offset_y: i32 = 0,
+            window_width: i32 = 0,
+            window_height: i32 = 0,
             unmapped: bool = false,
             constraints_changed: bool = false,
             initial_commit: bool = false,
@@ -2333,6 +2377,8 @@ const TestShell = struct {
             has_window_geometry: bool = false,
             surface_offset_x: i32 = 0,
             surface_offset_y: i32 = 0,
+            window_width: i32 = 0,
+            window_height: i32 = 0,
             geometry_refresh: bool = false,
             unmapped: bool = false,
             initial_commit: bool = false,
@@ -2475,12 +2521,16 @@ test "desktop: steady commit refreshes effective window geometry" {
         .has_window_geometry = true,
         .surface_offset_x = -2,
         .surface_offset_y = 3,
+        .window_width = 45,
+        .window_height = 35,
         .mapped = true,
     } });
     _ = try desktop.consume(&shell, 1);
     const scene = try desktop.scene(id);
     try std.testing.expect(scene.has_window_geometry);
     try std.testing.expectEqual(geometry.Point{ .x = -2, .y = 3 }, scene.surface_offset);
+    try std.testing.expectEqual(@as(i32, 45), scene.geometry.width);
+    try std.testing.expectEqual(@as(i32, 35), scene.geometry.height);
     try std.testing.expect(desktop.takeSceneChanged());
 }
 
@@ -2887,11 +2937,16 @@ test "desktop: popup configure maps above its owning toplevel" {
         .has_window_geometry = true,
         .surface_offset_x = -3,
         .surface_offset_y = 2,
+        .window_width = 18,
+        .window_height = 9,
         .geometry_refresh = true,
     } });
     _ = try desktop.consume(&shell, 1);
     const refreshed = try desktop.sceneForSurface(popup_surface);
-    try std.testing.expectEqual(popup.geometry, refreshed.geometry);
+    try std.testing.expectEqual(popup.geometry.x, refreshed.geometry.x);
+    try std.testing.expectEqual(popup.geometry.y, refreshed.geometry.y);
+    try std.testing.expectEqual(@as(i32, 18), refreshed.geometry.width);
+    try std.testing.expectEqual(@as(i32, 9), refreshed.geometry.height);
     try std.testing.expect(refreshed.visible and refreshed.content_ready);
     try std.testing.expect(refreshed.has_window_geometry);
     try std.testing.expectEqual(geometry.Point{ .x = -3, .y = 2 }, refreshed.surface_offset);
@@ -2917,7 +2972,7 @@ test "desktop: popup configure maps above its owning toplevel" {
     _ = try desktop.consume(&shell, 1);
     const reposition_serial = (try desktop.flushConfigure(&shell)).?;
     try std.testing.expectEqual(
-        geometry.Rect{ .x = 30, .y = 20, .width = 20, .height = 10 },
+        geometry.Rect{ .x = 30, .y = 20, .width = 18, .height = 9 },
         (try desktop.sceneForSurface(popup_surface)).geometry,
     );
     shell.push(.{ .popup_commit_ready = .{ .id = popup_id, .serial = reposition_serial } });

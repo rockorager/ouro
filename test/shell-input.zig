@@ -2330,9 +2330,9 @@ test "shell-input: two mapped toplevels sustain independent commit cycles" {
             try std.testing.expect(first.change.?.surface_damage == null);
             try std.testing.expect(second.change.?.surface_damage == null);
             try std.testing.expectEqual(@as(i32, 0), first.sample.?.destination.x);
-            try std.testing.expectEqual(@as(u32, 2), first.sample.?.destination.width);
+            try std.testing.expectEqual(@as(u32, 3), first.sample.?.destination.width);
             try std.testing.expectEqual(@as(i32, 2), second.sample.?.destination.x);
-            try std.testing.expectEqual(@as(u32, 1), second.sample.?.destination.width);
+            try std.testing.expectEqual(@as(u32, 3), second.sample.?.destination.width);
             observed = true;
         }
         if (observed and coordinator.stats.presented == two_toplevel_cycle_count and
