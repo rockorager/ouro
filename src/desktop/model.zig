@@ -990,7 +990,7 @@ pub fn Desktop(comptime Shell: type) type {
                     slot.grabbed = true;
                     desktop.popup_grab = id;
                 },
-                .popup_grab_denied => |id| try desktop.enqueuePopupDone(id),
+                .popup_dismiss_requested => |id| try desktop.enqueuePopupDone(id),
                 .popup_destroyed => |id| desktop.destroyPopup(id),
                 .metadata_changed => |shell_id| {
                     const id = try desktop.idForShell(shell_id);
@@ -2322,7 +2322,7 @@ const TestShell = struct {
         },
         popup_reposition_requested: struct { id: PopupId, placement: PopupPlacement, token: u32 },
         popup_grab_requested: PopupId,
-        popup_grab_denied: PopupId,
+        popup_dismiss_requested: PopupId,
         toplevel_destroyed: ToplevelId,
         popup_destroyed: PopupId,
     };
@@ -2944,7 +2944,7 @@ test "desktop: denied popup grab queues immediate dismissal" {
         },
     } });
     _ = try desktop.consume(&shell, 1);
-    shell.push(.{ .popup_grab_denied = popup_id });
+    shell.push(.{ .popup_dismiss_requested = popup_id });
     _ = try desktop.consume(&shell, 1);
     try std.testing.expect(desktop.popups[0].dismissed);
     try std.testing.expect(!(try desktop.sceneForSurface(popup_surface)).visible);
