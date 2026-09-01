@@ -320,6 +320,10 @@ pub fn Adapter(comptime protocol: type, comptime Core: type) type {
             return self.graph.isVisible(child);
         }
 
+        pub fn effectivelySynchronized(self: *Self, surface: Core.SurfaceId) bool {
+            return self.graph.effectivelySynchronized(surface);
+        }
+
         fn acquire(self: *Self) !*Slot {
             if (self.free_head == none) try self.growSlots();
             const index = self.free_head;

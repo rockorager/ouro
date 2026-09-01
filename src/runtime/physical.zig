@@ -2803,10 +2803,15 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn validateSurfaceCommit(context: *anyopaque, id: Adapter.SurfaceId) !void {
             const self: *Self = @ptrCast(@alignCast(context));
+            var shell_owned = true;
             self.shell_adapter.validateSurfaceCommit(id) catch |err| switch (err) {
-                error.StaleSurface => {},
+                error.StaleSurface => shell_owned = false,
                 else => return err,
             };
+            if (!shell_owned) {
+                if (self.independentXdgGeometryRoot(id)) |root|
+                    try self.shell_adapter.validateWindowGeometryRefresh(root);
+            }
             self.layer_shell_adapter.validateSurfaceCommit(id) catch |err| switch (err) {
                 error.StaleSurface => {},
                 else => return err,
@@ -2864,6 +2869,8 @@ pub fn Coordinator(comptime protocol: type) type {
             if (self.shell_adapter.ownsSurface(id)) {
                 self.shell_adapter.publishSurfaceCommitted(id) catch unreachable;
                 self.toplevel_icon_adapter.surfaceCommitted(id) catch unreachable;
+            } else if (self.independentXdgGeometryRoot(id)) |root| {
+                try self.shell_adapter.publishWindowGeometryRefresh(root);
             }
             if (self.layer_shell_adapter.ownsSurface(id)) {
                 self.layer_shell_adapter.publishSurfaceCommitted(id) catch unreachable;
@@ -2894,6 +2901,13 @@ pub fn Coordinator(comptime protocol: type) type {
             self.surface_id = id;
             try self.enqueuePendingSurface(.{ .handle = self.surface.?, .id = id, .commits = 1 });
             self.syncIdleNotifications() catch {};
+        }
+
+        fn independentXdgGeometryRoot(self: *Self, id: Adapter.SurfaceId) ?Adapter.SurfaceId {
+            if (self.subcompositor_adapter.effectivelySynchronized(id)) return null;
+            if (!(self.subcompositor_adapter.visible(id) catch return null)) return null;
+            const root = (self.subcompositor_adapter.placement(id) catch return null).root;
+            return if (self.shell_adapter.ownsSurface(root)) root else null;
         }
 
         fn pendingSurfaceContains(self: *const Self, id: Adapter.SurfaceId) bool {

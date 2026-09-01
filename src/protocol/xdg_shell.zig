@@ -709,6 +709,37 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             return false;
         }
 
+        pub fn validateWindowGeometryRefresh(adapter: *Self, id: SurfaceId) !void {
+            const surface = adapter.findXdgSurface(id) orelse return;
+            if (surface.role != .toplevel or surface.requested_window_geometry == null)
+                return;
+            if (!adapter.canPublishWithLive(adapter.live_toplevels, adapter.live_popups))
+                return error.Exhausted;
+            _ = try adapter.windowGeometryBounds(surface);
+        }
+
+        pub fn publishWindowGeometryRefresh(adapter: *Self, id: SurfaceId) !void {
+            const surface = adapter.findXdgSurface(id) orelse return;
+            if (surface.role != .toplevel) return;
+            const requested = surface.requested_window_geometry orelse return;
+            const geometry = effectiveWindowGeometry(
+                requested,
+                try adapter.windowGeometryBounds(surface),
+            );
+            if (surface.window_geometry != null and
+                std.meta.eql(surface.window_geometry.?, geometry)) return;
+            surface.window_geometry = geometry;
+            const role = try adapter.resolveToplevel(surface.role.toplevel);
+            adapter.publishReserved(.{ .commit_ready = .{
+                .id = surface.role.toplevel,
+                .serial = surface.last_acked_serial,
+                .has_window_geometry = true,
+                .surface_offset_x = geometry.x,
+                .surface_offset_y = geometry.y,
+                .mapped = role.mapped,
+            } });
+        }
+
         /// Pre-commit half of the core transaction boundary. This rejects a
         /// mapped role until the exact initial configure has been acknowledged
         /// and preflights the one ordinary event produced by a toplevel commit.
@@ -3229,6 +3260,20 @@ test "xdg-shell: explicit window geometry is clipped to surface-tree bounds" {
         TestAdapter.WindowGeometry{ .x = -20, .y = 0, .width = 90, .height = 90 },
         surface.window_geometry.?,
     );
+    _ = context.adapter.popEvent();
+
+    try context.adapter.validateWindowGeometryRefresh(surface.surface_id);
+    tree_bounds = .{ .x = -10, .y = -5, .width = 140, .height = 90 };
+    try context.adapter.publishWindowGeometryRefresh(surface.surface_id);
+    const refreshed = switch (context.adapter.popEvent().?) {
+        .commit_ready => |value| value,
+        else => return error.UnexpectedEvent,
+    };
+    try std.testing.expect(refreshed.mapped);
+    try std.testing.expectEqual(@as(i32, -10), refreshed.surface_offset_x);
+    try std.testing.expectEqual(@as(i32, 0), refreshed.surface_offset_y);
+    try context.adapter.publishWindowGeometryRefresh(surface.surface_id);
+    try std.testing.expect(context.adapter.popEvent() == null);
 }
 
 test "xdg-shell: pre-v5 toplevel configure omits wm capabilities" {

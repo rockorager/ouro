@@ -2442,6 +2442,31 @@ fn settleDesktop(desktop: *TestDesktop, shell: *TestShell) !void {
     _ = try desktop.consume(shell, shell.len);
 }
 
+test "desktop: steady commit refreshes effective window geometry" {
+    var desktop = try initTestDesktop(4);
+    defer desktop.deinit();
+    var shell = TestShell{};
+    shell.push(created(0));
+    _ = try desktop.consume(&shell, 1);
+    try settleDesktop(&desktop, &shell);
+    _ = desktop.takeSceneChanged();
+
+    const id = try desktop.idForShell(.{ .index = 0, .generation = 1 });
+    shell.push(.{ .commit_ready = .{
+        .id = .{ .index = 0, .generation = 1 },
+        .serial = 0,
+        .has_window_geometry = true,
+        .surface_offset_x = -2,
+        .surface_offset_y = 3,
+        .mapped = true,
+    } });
+    _ = try desktop.consume(&shell, 1);
+    const scene = try desktop.scene(id);
+    try std.testing.expect(scene.has_window_geometry);
+    try std.testing.expectEqual(geometry.Point{ .x = -2, .y = 3 }, scene.surface_offset);
+    try std.testing.expect(desktop.takeSceneChanged());
+}
+
 test "desktop: foreign toplevel dirtiness excludes steady commits" {
     var desktop = try initTestDesktop(8);
     defer desktop.deinit();
