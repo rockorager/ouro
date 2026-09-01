@@ -1003,7 +1003,8 @@ test "generated session lock publishes only after presentation and client loss s
     for (0..512) |_| {
         _ = try drainClient(&reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
-        if (handler.locked == 1) break;
+        if (handler.locked == 1 and handler.surface_enters == 1 and
+            handler.preferred_scale == 240) break;
         if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
             try waitForEither(&root.ring, reactor.ring);
     }
@@ -1011,6 +1012,9 @@ test "generated session lock publishes only after presentation and client loss s
     try std.testing.expectEqual(@as(usize, 1), handler.locked);
     try std.testing.expectEqual(@as(usize, 0), handler.finished);
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+    try std.testing.expectEqual(@as(usize, 1), handler.surface_enters);
+    try std.testing.expectEqual(@as(usize, 0), handler.surface_leaves);
+    try std.testing.expectEqual(@as(u32, 240), handler.preferred_scale);
     try std.testing.expect(coordinator.stats.presented >= 1);
     try std.testing.expect(coordinator.session_lock_adapter.isFailClosed());
     const lock_ids = try coordinator.session_lock_adapter.surfaceIds(coordinator.lock_surface_ids);
@@ -1050,7 +1054,8 @@ test "generated session lock publishes only after presentation and client loss s
         _ = try drainClient(&reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
         if (!coordinator.physical_outputs[1].connected and
-            !coordinator.physical_outputs[1].removing) break;
+            !coordinator.physical_outputs[1].removing and
+            handler.surface_leaves == 1) break;
         _ = linux.sched_yield();
     }
     try std.testing.expect(!coordinator.physical_outputs[1].connected);
@@ -1066,6 +1071,7 @@ test "generated session lock publishes only after presentation and client loss s
             std.meta.eql(association.surface, lock_resource)) lock_associations += 1;
     }
     try std.testing.expectEqual(@as(usize, 0), lock_associations);
+    try std.testing.expectEqual(@as(usize, 1), handler.surface_leaves);
 
     _ = try client.prepareClose();
     try submitClient(&reactor, &driver, &handler);
@@ -2098,6 +2104,8 @@ const SessionLockClientHandler = struct {
     shm: ?wayring.objects.Handle = null,
     output: ?wayring.objects.Handle = null,
     manager: ?wayring.objects.Handle = null,
+    fractional_scale_manager: ?wayring.objects.Handle = null,
+    fractional_scale: ?wayring.objects.Handle = null,
     lock: ?wayring.objects.Handle = null,
     lock_surface: ?wayring.objects.Handle = null,
     surface: ?wayring.objects.Handle = null,
@@ -2112,6 +2120,9 @@ const SessionLockClientHandler = struct {
     locked: usize = 0,
     finished: usize = 0,
     event_failures: usize = 0,
+    surface_enters: usize = 0,
+    surface_leaves: usize = 0,
+    preferred_scale: u32 = 0,
 
     pub fn eventError(self: *SessionLockClientHandler, _: wayring.io_uring.Peer, _: ClientCore.EventFailure) void {
         self.event_failures += 1;
@@ -2131,6 +2142,8 @@ const SessionLockClientHandler = struct {
                     }
                     if (std.mem.eql(u8, global.interface, protocol.ext_session_lock_manager_v1.info.name))
                         self.manager = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.ext_session_lock_manager_v1.info, 1, null);
+                    if (std.mem.eql(u8, global.interface, protocol.wp_fractional_scale_manager_v1.info.name))
+                        self.fractional_scale_manager = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wp_fractional_scale_manager_v1.info, 1, null);
                 },
                 .global_remove => {},
             }
@@ -2156,7 +2169,21 @@ const SessionLockClientHandler = struct {
                 .configure => |value| try self.commitConfigured(value.serial, value.width, value.height),
             }
         } else if (target.object.interface == &protocol.wl_surface.info) {
-            _ = try protocol.wl_surface.decodeEvent(message, fds);
+            switch (try protocol.wl_surface.decodeEvent(message, fds)) {
+                .enter => |value| {
+                    try std.testing.expectEqual(self.output.?.id, value.output);
+                    self.surface_enters += 1;
+                },
+                .leave => |value| {
+                    try std.testing.expectEqual(self.output.?.id, value.output);
+                    self.surface_leaves += 1;
+                },
+                else => {},
+            }
+        } else if (target.object.interface == &protocol.wp_fractional_scale_v1.info) {
+            switch (try protocol.wp_fractional_scale_v1.decodeEvent(message, fds)) {
+                .preferred_scale => |value| self.preferred_scale = value.scale,
+            }
         } else if (target.object.interface == &protocol.wl_buffer.info) {
             _ = try protocol.wl_buffer.decodeEvent(message, fds);
         } else if (target.object.interface == &ClientCore.Display.info) {
@@ -2171,6 +2198,7 @@ const SessionLockClientHandler = struct {
     fn maybeRequestLock(self: *SessionLockClientHandler) !void {
         if (self.lock_requested or !self.output_ready or self.compositor == null or
             self.shm == null or self.output == null or self.manager == null or
+            self.fractional_scale_manager == null or
             self.output_count < self.minimum_outputs) return;
         self.lock = (try protocol.ext_session_lock_manager_v1.construct_lock(
             self.objects,
@@ -2183,6 +2211,12 @@ const SessionLockClientHandler = struct {
             self.queue,
             self.compositor.?,
             .{},
+        )).id;
+        self.fractional_scale = (try protocol.wp_fractional_scale_manager_v1.construct_get_fractional_scale(
+            self.objects,
+            self.queue,
+            self.fractional_scale_manager.?,
+            .{ .surface = self.surface.?.id },
         )).id;
         self.lock_surface = (try protocol.ext_session_lock_v1.construct_get_lock_surface(
             self.objects,
