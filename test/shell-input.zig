@@ -2583,6 +2583,8 @@ test "shell-input: secondary output removal closes its reactive layer popup root
     try std.testing.expect(observed);
     try std.testing.expectEqual(@as(usize, 2), handler.releases);
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+    try std.testing.expectEqual(@as(usize, 1), handler.layer_enters);
+    try std.testing.expectEqual(@as(usize, 0), handler.layer_leaves);
 
     const layer_ids = try coordinator.layer_shell_adapter.ids(coordinator.layer_surface_ids);
     const layer_state = try coordinator.layer_shell_adapter.state(layer_ids[0]);
@@ -2593,16 +2595,47 @@ test "shell-input: secondary output removal closes its reactive layer popup root
     );
     try std.testing.expectEqual(@as(usize, 1), popups.len);
 
+    try fixture.signalSession(.disable);
+    for (0..512) |_| {
+        client_progress = try drainLayerPopupClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (coordinator.physical_outputs[0].kms_output == null and
+            coordinator.physical_outputs[1].kms_output == null and
+            coordinator.session.state == .disabled and handler.layer_leaves == 1) break;
+        if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, client_reactor.ring);
+    }
+    try std.testing.expectEqual(@as(usize, 1), handler.layer_leaves);
+    try fixture.signalSession(.enable);
+    for (0..512) |_| {
+        client_progress = try drainLayerPopupClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (coordinator.physical_outputs[0].kms_output != null and
+            coordinator.physical_outputs[1].kms_output != null and
+            handler.layer_enters == 2) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(usize, 2), handler.layer_enters);
+    try std.testing.expectEqual(@as(usize, 0), handler.layer_closed);
+    popups = try coordinator.desktop.externalPopupSnapshot(layer_state.surface, &popup_storage);
+    try std.testing.expectEqual(@as(usize, 1), popups.len);
+    try std.testing.expect(popups[0].visible);
+
+    const popup_configures_before_reposition = handler.popup_configure_count;
     handler.hold_popup_configures = true;
     try handler.repositionPopup();
     for (0..256) |_| {
         client_progress = try drainLayerPopupClient(&client_reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
-        if (handler.popup_configure_count >= 2) break;
+        if (handler.popup_configure_count > popup_configures_before_reposition) break;
         _ = linux.sched_yield();
     }
-    try std.testing.expectEqual(@as(usize, 2), handler.popup_configure_count);
-    try std.testing.expect(handler.popup_configures[1] != handler.popup_configures[0]);
+    try std.testing.expectEqual(
+        popup_configures_before_reposition + 1,
+        handler.popup_configure_count,
+    );
+    try std.testing.expect(handler.popup_configures[handler.popup_configure_count - 1] !=
+        handler.popup_configures[handler.popup_configure_count - 2]);
 
     fixture.second_desktop = false;
     try fixture.signalHotplug();
@@ -2616,7 +2649,11 @@ test "shell-input: secondary output removal closes its reactive layer popup root
     }
     try std.testing.expectEqual(@as(usize, 1), handler.layer_closed);
     try std.testing.expect(!coordinator.physical_outputs[1].connected);
-    try std.testing.expectEqual(@as(usize, 2), handler.popup_configure_count);
+    try std.testing.expectEqual(
+        popup_configures_before_reposition + 1,
+        handler.popup_configure_count,
+    );
+    try std.testing.expectEqual(@as(usize, 2), handler.layer_leaves);
     popups = try coordinator.desktop.externalPopupSnapshot(layer_state.surface, &popup_storage);
     try std.testing.expectEqual(@as(usize, 1), popups.len);
     try std.testing.expect(!popups[0].visible);
@@ -4901,6 +4938,8 @@ const LayerPopupHandler = struct {
     popup_configures: [8]u32 = undefined,
     popup_configure_count: usize = 0,
     layer_closed: usize = 0,
+    layer_enters: usize = 0,
+    layer_leaves: usize = 0,
     releases: usize = 0,
     event_failures: usize = 0,
 
@@ -4929,7 +4968,21 @@ const LayerPopupHandler = struct {
         } else if (target.object.interface == &protocol.wl_output.info) {
             _ = try protocol.wl_output.decodeEvent(message, fds);
         } else if (target.object.interface == &protocol.wl_surface.info) {
-            _ = try protocol.wl_surface.decodeEvent(message, fds);
+            switch (try protocol.wl_surface.decodeEvent(message, fds)) {
+                .enter => |value| if (!self.toplevel_root and self.layer_wl_surface != null and
+                    message.header.object_id == self.layer_wl_surface.?.id)
+                {
+                    try std.testing.expectEqual(self.output.?.id, value.output);
+                    self.layer_enters += 1;
+                },
+                .leave => |value| if (!self.toplevel_root and self.layer_wl_surface != null and
+                    message.header.object_id == self.layer_wl_surface.?.id)
+                {
+                    try std.testing.expectEqual(self.output.?.id, value.output);
+                    self.layer_leaves += 1;
+                },
+                else => {},
+            }
         } else if (target.object.interface == &protocol.zwlr_layer_surface_v1.info) {
             switch (try protocol.zwlr_layer_surface_v1.decodeEvent(message, fds)) {
                 .configure => |value| {

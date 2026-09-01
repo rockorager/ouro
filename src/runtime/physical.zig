@@ -7360,6 +7360,10 @@ pub fn Coordinator(comptime protocol: type) type {
             var visibility_changed = false;
             for (self.app_layers[0..self.app_layer_count]) |*layer| if (layer.active) {
                 const id = layer.id orelse unreachable;
+                if (self.layer_shell_adapter.stateForSurface(id)) |state| {
+                    if (self.physicalOutputForProtocolId(state.output)) |physical|
+                        if (physical.kms_output == null) continue;
+                }
                 const scene = self.surfaceScene(id) orelse {
                     self.retireLayer(layer);
                     visibility_changed = true;
