@@ -1056,6 +1056,36 @@ test "generated session lock publishes only after presentation and client loss s
     }
     try std.testing.expectEqual(@as(usize, 1), lock_associations);
 
+    try fixture.signalSession(.disable);
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (coordinator.physical_outputs[0].kms_output == null and
+            coordinator.physical_outputs[1].kms_output == null and
+            coordinator.session.state == .disabled and
+            handler.surface_leaves == 1) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expect(coordinator.physical_outputs[0].kms_output == null);
+    try std.testing.expect(coordinator.physical_outputs[1].kms_output == null);
+    try std.testing.expectEqual(@as(usize, 1), handler.surface_leaves);
+
+    try fixture.signalSession(.enable);
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (coordinator.physical_outputs[0].kms_output != null and
+            coordinator.physical_outputs[1].kms_output != null and
+            handler.surface_enters == 2) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expect(coordinator.physical_outputs[0].kms_output != null);
+    try std.testing.expect(coordinator.physical_outputs[1].kms_output != null);
+    try std.testing.expectEqual(@as(usize, 2), handler.surface_enters);
+    try std.testing.expectEqual(@as(u32, 240), handler.preferred_scale);
+
     fixture.second_desktop = false;
     try fixture.signalHotplug();
     for (0..512) |_| {
@@ -1063,7 +1093,7 @@ test "generated session lock publishes only after presentation and client loss s
         _ = try loop.turn(coordinator);
         if (!coordinator.physical_outputs[1].connected and
             !coordinator.physical_outputs[1].removing and
-            handler.surface_leaves == 1) break;
+            handler.surface_leaves == 2) break;
         _ = linux.sched_yield();
     }
     try std.testing.expect(!coordinator.physical_outputs[1].connected);
@@ -1079,7 +1109,7 @@ test "generated session lock publishes only after presentation and client loss s
             std.meta.eql(association.surface, lock_resource)) lock_associations += 1;
     }
     try std.testing.expectEqual(@as(usize, 0), lock_associations);
-    try std.testing.expectEqual(@as(usize, 1), handler.surface_leaves);
+    try std.testing.expectEqual(@as(usize, 2), handler.surface_leaves);
 
     _ = try client.prepareClose();
     try submitClient(&reactor, &driver, &handler);

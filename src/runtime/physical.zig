@@ -9919,6 +9919,9 @@ pub fn Coordinator(comptime protocol: type) type {
             for (ids) |id| {
                 const state = try self.layer_shell_adapter.state(id);
                 if (state.closed) continue;
+                const physical = self.physicalOutputForProtocolId(state.output) orelse
+                    return error.InvalidOutput;
+                if (physical.kms_output == null) continue;
                 const size = try self.layerConfigureSize(state);
                 self.layer_shell_adapter.queueConfigure(id, size.width, size.height) catch |err| switch (err) {
                     error.NotConfigured => {},
@@ -9934,6 +9937,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (state.retired) continue;
                 const physical = self.physicalOutputForProtocolId(state.output_id) orelse
                     return error.InvalidOutput;
+                if (physical.kms_output == null) continue;
                 const bounds = try self.outputBoundsFor(physical);
                 try self.session_lock_adapter.queueConfigure(
                     id,
