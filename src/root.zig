@@ -18,6 +18,7 @@ pub const pointer_warp = @import("protocol/pointer_warp.zig");
 pub const security_context = @import("protocol/security_context.zig");
 pub const completion = @import("runtime/completion.zig");
 pub const compositor = @import("runtime/compositor.zig");
+pub const engine_settings = @import("runtime/settings.zig");
 pub const timer = @import("runtime/timer.zig");
 pub const loop = @import("runtime/loop.zig");
 pub const physical = @import("runtime/physical.zig");

@@ -6,7 +6,8 @@
 
 const std = @import("std");
 const geometry = @import("../scene/geometry.zig");
-const layout = @import("layout.zig");
+const desktop_policy = @import("policy.zig");
+pub const workspace = @import("workspace.zig");
 
 const none = std.math.maxInt(u32);
 
@@ -26,6 +27,12 @@ pub const Config = struct {
 };
 
 pub fn Desktop(comptime Shell: type) type {
+    return desktopWithPolicy(Shell, desktop_policy);
+}
+
+// Policy substitution remains private so transaction behavior can be tested
+// without making alternate compositor policies part of Ouro's API.
+fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
     return struct {
         const Self = @This();
 
@@ -34,17 +41,29 @@ pub fn Desktop(comptime Shell: type) type {
             generation: u32,
         };
 
-        pub const WorkspaceId = packed struct {
-            index: u32,
-            generation: u32,
-        };
-
         pub const OutputId = packed struct { value: u64 };
         pub const OutputArea = struct { id: OutputId, geometry: geometry.Rect };
 
-        pub const workspace_id: WorkspaceId = .{ .index = 0, .generation = 1 };
-
         pub const Mode = enum { tiled, floating };
+        pub const FocusSource = enum {
+            pointer_motion,
+            pointer_button,
+            activation,
+            foreign_toplevel,
+        };
+        const FocusDecision = struct {
+            accepted: bool,
+            changed: bool = false,
+        };
+        const Policy = PolicyFactory.Policy(
+            ToplevelId,
+            OutputId,
+            Mode,
+            FocusSource,
+            FocusDecision,
+        );
+        pub const PolicySnapshot = Policy.Snapshot;
+        pub const WorkspaceRevision = struct { policy: u64, outputs: u64 };
 
         pub const RequestedState = enum { fullscreen, maximized, minimized };
 
@@ -129,9 +148,6 @@ pub fn Desktop(comptime Shell: type) type {
             header: Header = .{},
             shell_id: Shell.ToplevelId = undefined,
             surface: Shell.SurfaceId = undefined,
-            mode: Mode = .tiled,
-            output: ?OutputId = null,
-            floating: geometry.Rect = undefined,
             scene: SceneWindow = undefined,
             target_scene: SceneWindow = undefined,
             title: []u8 = &.{},
@@ -146,10 +162,6 @@ pub fn Desktop(comptime Shell: type) type {
             modal: bool = false,
             parent: ?ToplevelId = null,
             initial_committed: bool = false,
-            fullscreen: bool = false,
-            maximized: bool = false,
-            minimized: bool = false,
-            resizing: bool = false,
             content_ready: bool = false,
             configured: bool = false,
             last_configure: Shell.ToplevelConfigure = .{ .width = 0, .height = 0 },
@@ -160,13 +172,178 @@ pub fn Desktop(comptime Shell: type) type {
             window_height: i32 = 0,
         };
 
-        const Desired = struct {
-            active: bool = false,
-            rect: geometry.Rect = undefined,
-            visible: bool = false,
-            stacking: u32 = 0,
-            configure: Shell.ToplevelConfigure = .{ .width = 0, .height = 0 },
+        const PolicyTarget = struct {
+            rect: geometry.Rect,
+            visible: bool,
+            stacking: u32,
+            output: ?OutputId = null,
+            mode: Mode,
+            maximized: bool = false,
+            fullscreen: bool = false,
+            activated: bool = false,
+            resizing: bool = false,
+            suspended: bool = false,
         };
+
+        const PolicyWindow = struct {
+            id: ToplevelId,
+            current_geometry: geometry.Rect,
+            parent: ?ToplevelId,
+        };
+
+        const PolicyView = struct {
+            context: *anyopaque,
+
+            pub const WindowIterator = struct {
+                view: PolicyView,
+                index: usize = 0,
+
+                pub fn next(iterator: *WindowIterator) ?PolicyWindow {
+                    const desktop = iterator.view.owner();
+                    while (iterator.index < desktop.slots.len) {
+                        const index = iterator.index;
+                        iterator.index += 1;
+                        if (desktop.slots[index].header.active)
+                            return desktop.policyWindow(@intCast(index));
+                    }
+                    return null;
+                }
+            };
+
+            fn owner(view: PolicyView) *Self {
+                return @ptrCast(@alignCast(view.context));
+            }
+
+            pub fn liveCount(view: PolicyView) usize {
+                return view.owner().live;
+            }
+
+            pub fn windows(view: PolicyView) WindowIterator {
+                return .{ .view = view };
+            }
+
+            pub fn windowFor(view: PolicyView, id: ToplevelId) PolicyWindow {
+                const desktop = view.owner();
+                return desktop.policyWindow(desktop.resolveIndex(id) catch unreachable);
+            }
+
+            pub fn outputCount(view: PolicyView) usize {
+                return view.owner().output_area_len;
+            }
+
+            pub fn output(view: PolicyView, index: usize) OutputArea {
+                const desktop = view.owner();
+                return .{
+                    .id = desktop.output_ids[index],
+                    .geometry = desktop.output_areas[index],
+                };
+            }
+
+            pub fn outputFor(
+                view: PolicyView,
+                selected: ?OutputId,
+                current_geometry: geometry.Rect,
+            ) OutputArea {
+                const desktop = view.owner();
+                if (selected) |id| {
+                    for (desktop.output_ids[0..desktop.output_area_len], 0..) |candidate, index|
+                        if (std.meta.eql(candidate, id)) return view.output(index);
+                }
+                return view.output(view.outputIndexForRect(current_geometry));
+            }
+
+            pub fn outputIndexForRect(view: PolicyView, rect: geometry.Rect) usize {
+                return outputAreaIndexForRect(rect, view.owner().outputAreas());
+            }
+        };
+
+        fn PolicyAreas(comptime Areas: type) type {
+            return struct {
+                areas: Areas,
+
+                pub fn outputCount(view: @This()) usize {
+                    return view.areas.len;
+                }
+
+                pub fn output(view: @This(), index: usize) struct { geometry: geometry.Rect } {
+                    return .{ .geometry = outputAreaGeometry(view.areas[index]) };
+                }
+            };
+        }
+
+        const PolicyTransaction = struct {
+            context: *anyopaque,
+
+            fn owner(transaction: PolicyTransaction) *Self {
+                return @ptrCast(@alignCast(transaction.context));
+            }
+
+            pub fn reset(transaction: PolicyTransaction) void {
+                const desktop = transaction.owner();
+                if (desktop.policy_epoch == std.math.maxInt(u32)) {
+                    @memset(desktop.desired_epochs, 0);
+                    desktop.policy_epoch = 1;
+                } else desktop.policy_epoch += 1;
+                desktop.policy_placed_committed = 0;
+            }
+
+            pub fn place(
+                transaction: PolicyTransaction,
+                id: ToplevelId,
+                value: anytype,
+            ) !void {
+                const desktop = transaction.owner();
+                const index = try desktop.resolveIndex(id);
+                if (desktop.desired_epochs[index] == desktop.policy_epoch)
+                    return error.DuplicatePolicyPlacement;
+                const target_value: PolicyTarget = .{
+                    .rect = value.rect,
+                    .visible = value.visible,
+                    .stacking = value.stacking,
+                    .output = value.output,
+                    .mode = value.mode,
+                    .maximized = value.maximized,
+                    .fullscreen = value.fullscreen,
+                    .activated = value.activated,
+                    .resizing = value.resizing,
+                    .suspended = value.suspended,
+                };
+                try target_value.rect.validate();
+                if (target_value.output) |output| try desktop.validatePolicyOutput(output);
+                desktop.desired[index] = target_value;
+                desktop.desired_epochs[index] = desktop.policy_epoch;
+                if (desktop.slots[index].initial_committed)
+                    desktop.policy_placed_committed += 1;
+            }
+
+            pub fn setStacking(
+                transaction: PolicyTransaction,
+                id: ToplevelId,
+                value: u32,
+            ) !void {
+                const desktop = transaction.owner();
+                const index = try desktop.resolveIndex(id);
+                if (desktop.desired_epochs[index] != desktop.policy_epoch)
+                    return error.MissingPolicyPlacement;
+                desktop.desired[index].stacking = value;
+            }
+
+            pub fn stacking(transaction: PolicyTransaction, id: ToplevelId) !u32 {
+                const desktop = transaction.owner();
+                const index = try desktop.resolveIndex(id);
+                if (desktop.desired_epochs[index] != desktop.policy_epoch)
+                    return error.MissingPolicyPlacement;
+                return desktop.desired[index].stacking;
+            }
+
+            pub fn finish(transaction: PolicyTransaction) !void {
+                const desktop = transaction.owner();
+                if (desktop.policy_placed_committed != desktop.committed_toplevels)
+                    return error.IncompletePolicyTransaction;
+            }
+        };
+
+        const Desired = PolicyTarget;
 
         const PopupSlot = struct {
             active: bool = false,
@@ -207,17 +384,15 @@ pub fn Desktop(comptime Shell: type) type {
         output_areas: []geometry.Rect,
         output_ids: []OutputId,
         output_area_len: usize = 1,
-        inner_gap: u32 = 0,
-        outer_gap: u32 = 0,
+        output_revision: u64 = 1,
         metadata_storage: []u8,
         metadata_bytes: usize,
-        focus: []u32,
-        focus_len: usize = 0,
-        tile_order: []u32,
-        tile_len: usize = 0,
-        layout_items: []layout.Item,
-        placements: []layout.Placement,
+        policy: Policy,
         desired: []Desired,
+        desired_epochs: []u32,
+        policy_epoch: u32 = 0,
+        policy_placed_committed: usize = 0,
+        committed_toplevels: usize = 0,
         commands: []Command,
         command_head: usize = 0,
         command_len: usize = 0,
@@ -257,16 +432,12 @@ pub fn Desktop(comptime Shell: type) type {
             );
             const metadata_storage = try allocator.alloc(u8, storage_len);
             errdefer allocator.free(metadata_storage);
-            const focus = try allocator.alloc(u32, config.toplevel_capacity);
-            errdefer allocator.free(focus);
-            const tile_order = try allocator.alloc(u32, config.toplevel_capacity);
-            errdefer allocator.free(tile_order);
-            const layout_items = try allocator.alloc(layout.Item, config.toplevel_capacity);
-            errdefer allocator.free(layout_items);
-            const placements = try allocator.alloc(layout.Placement, config.toplevel_capacity);
-            errdefer allocator.free(placements);
+            var policy = try Policy.init(allocator, config.toplevel_capacity);
+            errdefer policy.deinit();
             const desired = try allocator.alloc(Desired, config.toplevel_capacity);
             errdefer allocator.free(desired);
+            const desired_epochs = try allocator.alloc(u32, config.toplevel_capacity);
+            errdefer allocator.free(desired_epochs);
             const commands = try allocator.alloc(Command, config.command_capacity);
             errdefer allocator.free(commands);
             // One trailing slot is reserved for topmost-first popup dismissal,
@@ -289,7 +460,7 @@ pub fn Desktop(comptime Shell: type) type {
             for (popups, 0..) |*slot, index| slot.* = .{
                 .next_free = if (index + 1 < popups.len) @intCast(index + 1) else none,
             };
-            @memset(desired, .{});
+            @memset(desired_epochs, 0);
             output_areas[0] = work_area;
             output_ids[0] = .{ .value = 0 };
             return .{
@@ -304,11 +475,9 @@ pub fn Desktop(comptime Shell: type) type {
                 .output_ids = output_ids,
                 .metadata_storage = metadata_storage,
                 .metadata_bytes = config.metadata_bytes,
-                .focus = focus,
-                .tile_order = tile_order,
-                .layout_items = layout_items,
-                .placements = placements,
+                .policy = policy,
                 .desired = desired,
+                .desired_epochs = desired_epochs,
                 .commands = commands,
                 .popup_commands = popup_commands,
             };
@@ -317,11 +486,9 @@ pub fn Desktop(comptime Shell: type) type {
         pub fn deinit(desktop: *Self) void {
             desktop.allocator.free(desktop.popup_commands);
             desktop.allocator.free(desktop.commands);
+            desktop.allocator.free(desktop.desired_epochs);
             desktop.allocator.free(desktop.desired);
-            desktop.allocator.free(desktop.placements);
-            desktop.allocator.free(desktop.layout_items);
-            desktop.allocator.free(desktop.tile_order);
-            desktop.allocator.free(desktop.focus);
+            desktop.policy.deinit();
             desktop.allocator.free(desktop.metadata_storage);
             desktop.allocator.free(desktop.output_ids);
             desktop.allocator.free(desktop.output_areas);
@@ -453,18 +620,12 @@ pub fn Desktop(comptime Shell: type) type {
         pub fn beginInteractive(desktop: *Self, request: InteractiveRequest) !?InteractiveGeometry {
             const index = try desktop.resolveIndex(request.id);
             const slot = &desktop.slots[index];
-            if (slot.minimized or slot.fullscreen or slot.maximized) return null;
             try desktop.requireCommandCapacity(desktop.live);
-            if (slot.mode == .tiled) {
-                slot.floating = slot.scene.geometry;
-                slot.mode = .floating;
-                desktop.removeTile(index);
-            }
-            slot.resizing = request.kind == .resize;
-            desktop.promoteFocus(index);
+            if (!try desktop.policy.beginInteractive(request.id, request.kind, slot.scene.geometry))
+                return null;
             try desktop.reflow();
             return .{
-                .rect = slot.floating,
+                .rect = (try desktop.policy.windowState(request.id)).floating,
                 .min_width = @max(slot.min_width, 1),
                 .min_height = @max(slot.min_height, 1),
                 .max_width = slot.max_width,
@@ -473,7 +634,10 @@ pub fn Desktop(comptime Shell: type) type {
         }
 
         pub fn updateInteractive(desktop: *Self, id: ToplevelId, rect: geometry.Rect) !void {
-            try desktop.setFloatingGeometry(id, rect);
+            try rect.validate();
+            _ = try desktop.resolveIndex(id);
+            try desktop.requireCommandCapacity(1);
+            if (try desktop.policy.updateInteractive(id, rect)) try desktop.reflow();
         }
 
         pub fn updateToplevelDrag(
@@ -483,35 +647,21 @@ pub fn Desktop(comptime Shell: type) type {
             start: geometry.Point,
             current: geometry.Point,
         ) !void {
-            const min_x = @as(i64, desktop.work_area.x) - initial.width + 1;
-            const max_x = @as(i64, desktop.work_area.x) + desktop.work_area.width - 1;
-            const min_y = @as(i64, desktop.work_area.y) - initial.height + 1;
-            const max_y = @as(i64, desktop.work_area.y) + desktop.work_area.height - 1;
-            const x = std.math.clamp(
-                @as(i64, initial.x) + current.x - start.x,
-                min_x,
-                max_x,
-            );
-            const y = std.math.clamp(
-                @as(i64, initial.y) + current.y - start.y,
-                min_y,
-                max_y,
-            );
-            try desktop.setFloatingGeometry(id, .{
-                .x = std.math.cast(i32, x) orelse return error.InvalidGeometry,
-                .y = std.math.cast(i32, y) orelse return error.InvalidGeometry,
-                .width = initial.width,
-                .height = initial.height,
-            });
+            _ = try desktop.resolveIndex(id);
+            try desktop.requireCommandCapacity(1);
+            if (try desktop.policy.updateToplevelDrag(
+                id,
+                initial,
+                start,
+                current,
+                desktop.work_area,
+            )) try desktop.reflow();
         }
 
         pub fn endInteractive(desktop: *Self, id: ToplevelId) !void {
-            const index = desktop.resolveIndex(id) catch return;
-            const slot = &desktop.slots[index];
-            if (!slot.resizing) return;
+            _ = desktop.resolveIndex(id) catch return;
             try desktop.requireCommandCapacity(1);
-            slot.resizing = false;
-            try desktop.reflow();
+            if (try desktop.policy.endInteractive(id)) try desktop.reflow();
         }
 
         pub fn takeSceneChanged(desktop: *Self) bool {
@@ -544,12 +694,44 @@ pub fn Desktop(comptime Shell: type) type {
         }
 
         pub fn focused(desktop: *const Self) ?ToplevelId {
-            if (desktop.focus_len == 0) return null;
-            return desktop.idFor(desktop.focus[0]);
+            return desktop.policy.focusedToplevel();
         }
 
         pub fn focusedToplevel(desktop: *const Self) ?ToplevelId {
             return desktop.focused();
+        }
+
+        pub fn writeWorkspaceInventory(desktop: *const Self, writer: anytype) !void {
+            try desktop.policy.writeWorkspaceInventory(PolicyView{ .context = @constCast(desktop) }, writer);
+        }
+
+        pub fn workspaceRevision(desktop: *const Self) WorkspaceRevision {
+            return .{ .policy = desktop.policy.workspaceRevision(), .outputs = desktop.output_revision };
+        }
+
+        pub fn requestWorkspace(desktop: *Self, request: workspace.Request) !bool {
+            try desktop.requireCommandCapacity(desktop.live);
+            const changed = try desktop.policy.workspaceRequest(request);
+            if (changed) try desktop.reflow();
+            return changed;
+        }
+
+        fn mutatePolicy(desktop: *Self, context: anytype, comptime mutate: anytype) !void {
+            try desktop.requireCommandCapacity(desktop.live);
+            try desktop.requirePopupCommandCapacity(desktop.popup_live);
+            if (try mutate(&desktop.policy, PolicyView{ .context = desktop }, context))
+                try desktop.reflow();
+        }
+
+        pub fn validatePolicySnapshot(desktop: *Self, snapshot: *const PolicySnapshot) !void {
+            try desktop.requireCommandCapacity(desktop.live);
+            try desktop.requirePopupCommandCapacity(desktop.popup_live);
+            try desktop.policy.validateSnapshot(PolicyView{ .context = desktop }, snapshot);
+        }
+
+        pub fn installPolicySnapshot(desktop: *Self, snapshot: *PolicySnapshot) !void {
+            try desktop.validatePolicySnapshot(snapshot);
+            if (desktop.policy.installSnapshot(snapshot)) try desktop.reflow();
         }
 
         pub fn shellToplevel(desktop: *const Self, id: ToplevelId) !Shell.ToplevelId {
@@ -568,13 +750,19 @@ pub fn Desktop(comptime Shell: type) type {
             });
         }
 
-        pub fn focusToplevel(desktop: *Self, id: ToplevelId) !void {
-            const index = try desktop.resolveIndex(id);
-            if (desktop.slots[index].minimized) return error.NotVisible;
-            if (desktop.focus_len != 0 and desktop.focus[0] == index) return;
+        fn focusToplevel(desktop: *Self, id: ToplevelId) !void {
+            _ = try desktop.resolveIndex(id);
             try desktop.requireCommandCapacity(desktop.live);
-            desktop.promoteFocus(index);
+            if (!try desktop.policy.focus(id)) return;
             try desktop.reflow();
+        }
+
+        pub fn requestFocus(desktop: *Self, id: ToplevelId, source: FocusSource) !bool {
+            _ = try desktop.resolveIndex(id);
+            try desktop.requireCommandCapacity(desktop.live);
+            const decision = try desktop.policy.focusRequested(id, source);
+            if (decision.changed) try desktop.reflow();
+            return decision.accepted;
         }
 
         pub fn setToplevelState(
@@ -600,78 +788,55 @@ pub fn Desktop(comptime Shell: type) type {
         }
 
         pub fn focusNext(desktop: *Self) !void {
-            const current = desktop.focused() orelse return;
-            const current_index = try desktop.resolveIndex(current);
-            for (1..desktop.slots.len + 1) |offset| {
-                const index = (current_index + offset) % desktop.slots.len;
-                if (desktop.slots[index].header.active and !desktop.slots[index].minimized)
-                    return desktop.focusToplevel(desktop.idFor(@intCast(index)));
-            }
+            try desktop.requireCommandCapacity(desktop.live);
+            if (try desktop.policy.focusNext()) try desktop.reflow();
         }
 
         pub fn focusPrevious(desktop: *Self) !void {
-            const current = desktop.focused() orelse return;
-            const current_index = try desktop.resolveIndex(current);
-            for (1..desktop.slots.len + 1) |offset| {
-                const index = (current_index + desktop.slots.len - offset) % desktop.slots.len;
-                if (desktop.slots[index].header.active and !desktop.slots[index].minimized)
-                    return desktop.focusToplevel(desktop.idFor(@intCast(index)));
-            }
+            try desktop.requireCommandCapacity(desktop.live);
+            if (try desktop.policy.focusPrevious()) try desktop.reflow();
         }
 
         pub fn moveFocusedTile(desktop: *Self, direction: enum { next, previous }) !void {
-            const id = desktop.focused() orelse return;
-            const focused_index = try desktop.resolveIndex(id);
-            if (desktop.slots[focused_index].mode != .tiled or desktop.tile_len < 2) return;
-            var position: usize = 0;
-            while (position < desktop.tile_len and desktop.tile_order[position] != focused_index) : (position += 1) {}
-            if (position == desktop.tile_len) return error.InvalidTileOrder;
             try desktop.requireCommandCapacity(desktop.live);
-            const other = switch (direction) {
-                .next => (position + 1) % desktop.tile_len,
-                .previous => (position + desktop.tile_len - 1) % desktop.tile_len,
-            };
-            std.mem.swap(u32, &desktop.tile_order[position], &desktop.tile_order[other]);
-            try desktop.reflow();
+            if (try desktop.policy.moveFocusedTile(switch (direction) {
+                .next => .next,
+                .previous => .previous,
+            })) try desktop.reflow();
         }
 
         pub fn toggleFocusedFullscreen(desktop: *Self) !void {
             const id = desktop.focused() orelse return;
-            const index = try desktop.resolveIndex(id);
-            try desktop.requestState(id, .fullscreen, !desktop.slots[index].fullscreen, null);
+            try desktop.requestState(id, .fullscreen, !(try desktop.policy.windowState(id)).fullscreen, null);
         }
 
         pub fn toggleFocusedMaximized(desktop: *Self) !void {
             const id = desktop.focused() orelse return;
-            const index = try desktop.resolveIndex(id);
-            try desktop.requestState(id, .maximized, !desktop.slots[index].maximized, null);
+            try desktop.requestState(id, .maximized, !(try desktop.policy.windowState(id)).maximized, null);
         }
 
         pub fn toggleFocusedFloating(desktop: *Self) !void {
             const id = desktop.focused() orelse return;
-            const index = try desktop.resolveIndex(id);
-            try desktop.setFloating(id, desktop.slots[index].mode != .floating);
+            try desktop.setFloating(id, (try desktop.policy.windowState(id)).mode != .floating);
         }
 
         pub fn setFloating(desktop: *Self, id: ToplevelId, floating: bool) !void {
-            const index = try desktop.resolveIndex(id);
+            _ = try desktop.resolveIndex(id);
             const mode: Mode = if (floating) .floating else .tiled;
-            if (desktop.slots[index].mode == mode) return;
+            const state = try desktop.policy.windowState(id);
+            if (state.mode == mode) return;
             try desktop.requireCommandCapacity(desktop.live);
-            const slot = &desktop.slots[index];
-            if (!floating and !slot.minimized and !slot.fullscreen and !slot.maximized)
+            if (!floating and state.committed and !state.minimized and !state.fullscreen and !state.maximized)
                 try desktop.validateLayout(desktop.layoutCount() + 1, desktop.outputAreas());
-            slot.mode = mode;
-            if (floating) desktop.removeTile(index) else desktop.appendTile(index);
+            _ = try desktop.policy.setFloating(id, floating);
             try desktop.reflow();
         }
 
         pub fn setFloatingGeometry(desktop: *Self, id: ToplevelId, rect: geometry.Rect) !void {
             try rect.validate();
-            const index = try desktop.resolveIndex(id);
-            if (desktop.slots[index].mode != .floating) return error.NotFloating;
+            _ = try desktop.resolveIndex(id);
             try desktop.requireCommandCapacity(1);
-            desktop.slots[index].floating = rect;
+            if (!try desktop.policy.setFloatingGeometry(id, rect)) return;
             try desktop.reflow();
         }
 
@@ -706,27 +871,6 @@ pub fn Desktop(comptime Shell: type) type {
             return desktop.work_area;
         }
 
-        /// Changes tiling gaps atomically. All current output layouts and
-        /// configure capacity are checked before policy state is mutated.
-        pub fn validateGaps(desktop: *Self, inner: u32, outer: u32) !void {
-            if (desktop.inner_gap == inner and desktop.outer_gap == outer) return;
-            try desktop.validateLayoutWithGaps(
-                desktop.layoutCount(),
-                desktop.outputAreas(),
-                inner,
-                outer,
-            );
-            try desktop.requireCommandCapacity(desktop.live);
-        }
-
-        pub fn setGaps(desktop: *Self, inner: u32, outer: u32) !void {
-            if (desktop.inner_gap == inner and desktop.outer_gap == outer) return;
-            try desktop.validateGaps(inner, outer);
-            desktop.inner_gap = inner;
-            desktop.outer_gap = outer;
-            desktop.reflow() catch unreachable;
-        }
-
         pub fn validateOutputAreas(desktop: *Self, areas: []const geometry.Rect) !void {
             if (areas.len == 0 or areas.len > desktop.output_areas.len) return error.Exhausted;
             for (areas) |area| try area.validate();
@@ -742,6 +886,7 @@ pub fn Desktop(comptime Shell: type) type {
                 desktop.output_ids[index] = .{ .value = index };
             }
             desktop.output_area_len = areas.len;
+            desktop.output_revision +%= 1;
             desktop.reflow() catch unreachable;
             desktop.reconfigureReactivePopups();
         }
@@ -781,6 +926,7 @@ pub fn Desktop(comptime Shell: type) type {
                 desktop.output_ids[index] = area.id;
             }
             desktop.output_area_len = output_areas.len;
+            desktop.output_revision +%= 1;
             desktop.reflow() catch unreachable;
             desktop.reconfigureReactivePopups();
         }
@@ -948,22 +1094,27 @@ pub fn Desktop(comptime Shell: type) type {
         pub fn stateSnapshot(desktop: *const Self, id: ToplevelId) !StateSnapshot {
             const index = try desktop.resolveIndex(id);
             const slot = desktop.slots[index];
+            const state = try desktop.policy.windowState(id);
             return .{
-                .maximized = slot.maximized,
-                .minimized = slot.minimized,
-                .activated = desktop.focus_len != 0 and desktop.focus[0] == index,
-                .fullscreen = slot.fullscreen,
+                .maximized = state.maximized,
+                .minimized = state.minimized,
+                .activated = if (desktop.policy.focusedToplevel()) |focused_id|
+                    std.meta.eql(focused_id, id)
+                else
+                    false,
+                .fullscreen = state.fullscreen,
                 .parent = slot.parent,
             };
         }
 
         pub fn restorableState(desktop: *const Self, id: ToplevelId) !RestorableState {
-            const slot = desktop.slots[try desktop.resolveIndex(id)];
+            _ = try desktop.resolveIndex(id);
+            const state = try desktop.policy.windowState(id);
             return .{
-                .maximized = slot.maximized,
-                .fullscreen = slot.fullscreen,
-                .mode = slot.mode,
-                .floating_geometry = slot.floating,
+                .maximized = state.maximized,
+                .fullscreen = state.fullscreen,
+                .mode = state.mode,
+                .floating_geometry = state.floating,
             };
         }
 
@@ -978,10 +1129,7 @@ pub fn Desktop(comptime Shell: type) type {
             try state.floating_geometry.validate();
             const slot = &desktop.slots[try desktop.resolveIndex(id)];
             if (slot.initial_committed) return error.AlreadyMapped;
-            slot.maximized = state.maximized;
-            slot.fullscreen = state.fullscreen;
-            slot.mode = state.mode;
-            slot.floating = state.floating_geometry;
+            try desktop.policy.restore(id, state);
         }
 
         pub fn idForShell(desktop: *const Self, shell_id: Shell.ToplevelId) !ToplevelId {
@@ -1062,11 +1210,16 @@ pub fn Desktop(comptime Shell: type) type {
                         desktop.slots[index].window_height = commit.window_height;
                         desktop.slots[index].target_scene.geometry.width = commit.window_width;
                         desktop.slots[index].target_scene.geometry.height = commit.window_height;
-                        if (desktop.slots[index].mode == .floating and
-                            !desktop.slots[index].fullscreen and !desktop.slots[index].maximized)
+                        const state = try desktop.policy.windowState(id);
+                        if (state.mode == .floating and
+                            !state.fullscreen and !state.maximized)
                         {
-                            desktop.slots[index].floating.width = commit.window_width;
-                            desktop.slots[index].floating.height = commit.window_height;
+                            _ = try desktop.policy.setFloatingGeometry(id, .{
+                                .x = state.floating.x,
+                                .y = state.floating.y,
+                                .width = commit.window_width,
+                                .height = commit.window_height,
+                            });
                         }
                     }
                     if (commit.initial_commit) {
@@ -1087,13 +1240,20 @@ pub fn Desktop(comptime Shell: type) type {
             try desktop.validateLayout(desktop.layoutCount() + 1, desktop.outputAreas());
             try desktop.requireCommandCapacity(desktop.live + 1);
             const index = desktop.acquire();
+            const id = desktop.idFor(index);
+            desktop.policy.created(
+                id,
+                desktop.output_ids[0],
+                desktop.policy.initialGeometry(desktop.output_areas[0]),
+            ) catch |err| {
+                desktop.release(index);
+                return err;
+            };
             const slot = &desktop.slots[index];
             slot.shell_id = shell_id;
             slot.surface = surface;
-            slot.output = desktop.output_ids[0];
-            slot.floating = desktop.defaultFloating();
             slot.scene = .{
-                .id = desktop.idFor(index),
+                .id = id,
                 .surface = surface,
                 .geometry = desktop.output_areas[0],
                 .visible = false,
@@ -1363,9 +1523,9 @@ pub fn Desktop(comptime Shell: type) type {
                 if (std.meta.eql(request.id, id)) desktop.interactive_request = null;
             }
             desktop.removeCommandsFor(id);
-            desktop.removeFocus(index);
-            desktop.removeTile(index);
             desktop.unmapParenting(index);
+            desktop.policy.destroyed(id);
+            if (desktop.slots[index].initial_committed) desktop.committed_toplevels -= 1;
             desktop.release(index);
             desktop.live -= 1;
             try desktop.reflow();
@@ -1383,16 +1543,18 @@ pub fn Desktop(comptime Shell: type) type {
         fn beginInitialCommit(desktop: *Self, index: u32) !void {
             const slot = &desktop.slots[index];
             if (slot.initial_committed) return;
-            const adds_layout = slot.mode == .tiled and !slot.minimized and
-                !slot.fullscreen and !slot.maximized;
+            const id = desktop.idFor(index);
+            const state = try desktop.policy.windowState(id);
+            const adds_layout = state.mode == .tiled and !state.minimized and
+                !state.fullscreen and !state.maximized;
             try desktop.validateLayout(
                 desktop.layoutCount() + @intFromBool(adds_layout),
                 desktop.outputAreas(),
             );
             try desktop.requireCommandCapacity(desktop.live);
             slot.initial_committed = true;
-            if (slot.mode == .tiled) desktop.appendTile(index);
-            desktop.promoteFocus(index);
+            try desktop.policy.initialCommitted(id);
+            desktop.committed_toplevels += 1;
             try desktop.reflow();
             // An unmapped role has no pixels to expose, so its initial layout
             // is a safe scene baseline. A later reflow can then retain content
@@ -1411,19 +1573,10 @@ pub fn Desktop(comptime Shell: type) type {
                 if (std.meta.eql(request.id, id)) desktop.interactive_request = null;
             }
             desktop.removeCommandsFor(id);
-            desktop.removeFocus(index);
-            if (desktop.slots[index].mode == .tiled and desktop.slots[index].initial_committed)
-                desktop.removeTile(index);
             desktop.unmapParenting(index);
             const slot = &desktop.slots[index];
             desktop.foreign_toplevel_changed = slot.content_ready or
                 desktop.foreign_toplevel_changed;
-            slot.mode = .tiled;
-            slot.floating = desktop.defaultFloating();
-            slot.fullscreen = false;
-            slot.maximized = false;
-            slot.minimized = false;
-            slot.resizing = false;
             slot.initial_committed = false;
             slot.configured = false;
             slot.applied_configure = null;
@@ -1436,6 +1589,12 @@ pub fn Desktop(comptime Shell: type) type {
             slot.target_scene.content_ready = false;
             slot.scene.visible = false;
             slot.target_scene.visible = false;
+            try desktop.policy.reset(
+                id,
+                desktop.output_ids[0],
+                desktop.policy.initialGeometry(desktop.output_areas[0]),
+            );
+            desktop.committed_toplevels -= 1;
             try desktop.reflow();
         }
 
@@ -1477,185 +1636,74 @@ pub fn Desktop(comptime Shell: type) type {
             enabled: bool,
             output: ?OutputId,
         ) !void {
-            const index = try desktop.resolveIndex(id);
-            const slot = &desktop.slots[index];
+            _ = try desktop.resolveIndex(id);
             const fullscreen_output: ?OutputId = if (state == .fullscreen and enabled and output != null) found: {
                 for (desktop.output_ids[0..desktop.output_area_len]) |candidate| {
                     if (std.meta.eql(candidate, output.?)) break :found output;
                 }
                 break :found null;
             } else null;
-            const unchanged = switch (state) {
-                .fullscreen => slot.fullscreen == enabled and
-                    (fullscreen_output == null or std.meta.eql(slot.output, fullscreen_output)),
-                .maximized => slot.maximized == enabled,
-                .minimized => slot.minimized == enabled,
+            const requested: RequestedState = switch (state) {
+                .fullscreen => .fullscreen,
+                .maximized => .maximized,
+                .minimized => .minimized,
+            };
+            const current = try desktop.policy.windowState(id);
+            const unchanged = switch (requested) {
+                .fullscreen => current.fullscreen == enabled and
+                    (fullscreen_output == null or std.meta.eql(current.output, fullscreen_output)),
+                .maximized => current.maximized == enabled,
+                .minimized => current.minimized == enabled,
             };
             if (unchanged) return;
             try desktop.requireCommandCapacity(desktop.live);
             var next_layout_count = desktop.layoutCount();
-            const was_eligible = desktop.isLayoutEligible(index);
-            const next_fullscreen = if (state == .fullscreen) enabled else slot.fullscreen;
-            const next_maximized = if (state == .maximized) enabled else slot.maximized;
-            const next_minimized = if (state == .minimized) enabled else slot.minimized;
-            const will_be_eligible = slot.initial_committed and slot.mode == .tiled and !next_fullscreen and
-                !next_maximized and !next_minimized;
+            const was_eligible = current.committed and current.mode == .tiled and
+                !current.fullscreen and !current.maximized and !current.minimized;
+            const will_be_eligible = try desktop.policy.eligibleAfter(id, requested, enabled);
             if (was_eligible and !will_be_eligible) next_layout_count -= 1;
             if (!was_eligible and will_be_eligible) next_layout_count += 1;
             try desktop.validateLayout(next_layout_count, desktop.outputAreas());
-            switch (state) {
-                .fullscreen => {
-                    slot.fullscreen = enabled;
-                    if (fullscreen_output != null) slot.output = fullscreen_output;
-                },
-                .maximized => slot.maximized = enabled,
-                .minimized => {
-                    slot.minimized = enabled;
-                    if (enabled) desktop.removeFocus(index) else desktop.promoteFocus(index);
-                },
-            }
+            _ = try desktop.policy.setState(id, requested, enabled, fullscreen_output);
             try desktop.reflow();
         }
 
         fn reflow(desktop: *Self) !void {
             try desktop.requirePopupCommandCapacity(desktop.popup_live);
-            @memset(desktop.desired, .{});
-            var item_len: usize = 0;
-            for (desktop.tile_order[0..desktop.tile_len]) |index| {
-                const slot = &desktop.slots[index];
-                if (!slot.minimized and !slot.fullscreen and !slot.maximized) {
-                    desktop.layout_items[item_len] = .{ .slot = index };
-                    item_len += 1;
-                }
-            }
-            var placement_len: usize = 0;
-            var area_index: usize = 0;
-            while (placement_len < item_len) : (area_index += 1) {
-                const remaining_areas = @min(
-                    desktop.output_area_len - area_index,
-                    item_len - placement_len,
-                );
-                const area_item_len = outputItemCount(item_len - placement_len, remaining_areas);
-                _ = try layout.plan(
-                    desktop.layout_items[placement_len .. placement_len + area_item_len],
-                    desktop.output_areas[area_index],
-                    desktop.inner_gap,
-                    desktop.outer_gap,
-                    desktop.placements[placement_len .. placement_len + area_item_len],
-                );
-                placement_len += area_item_len;
-            }
-            const placements = desktop.placements[0..placement_len];
-            for (placements) |placement| {
-                const output_index = outputAreaIndexForRect(
-                    placement.rect,
-                    desktop.outputAreas(),
-                );
-                desktop.slots[placement.slot].output = desktop.output_ids[output_index];
-                desktop.desired[placement.slot] = .{
-                    .active = true,
-                    .rect = placement.rect,
-                    .visible = true,
-                };
-            }
-
-            var stacking: u32 = 0;
-            for (desktop.tile_order[0..desktop.tile_len]) |index| {
-                const slot = &desktop.slots[index];
-                if (slot.minimized) {
-                    desktop.desired[index] = .{
-                        .active = true,
-                        .rect = slot.scene.geometry,
-                        .visible = false,
-                    };
-                } else if (slot.fullscreen or slot.maximized) {
-                    desktop.desired[index] = .{
-                        .active = true,
-                        .rect = desktop.outputAreaForSlot(slot),
-                        .visible = true,
-                    };
-                }
-                desktop.desired[index].stacking = stacking;
-                stacking += 1;
-            }
-            for (desktop.slots, 0..) |slot, index| {
-                if (!slot.header.active or slot.mode != .floating) continue;
-                const output_area = if (slot.fullscreen or slot.maximized)
-                    desktop.outputAreaForSlot(&desktop.slots[index])
-                else area: {
-                    const output_index = outputAreaIndexForRect(slot.floating, desktop.outputAreas());
-                    desktop.slots[index].output = desktop.output_ids[output_index];
-                    break :area slot.floating;
-                };
-                desktop.desired[index] = .{
-                    .active = true,
-                    .rect = output_area,
-                    .visible = !slot.minimized,
-                    .stacking = stacking,
-                };
-                stacking += 1;
-            }
-            if (desktop.focus_len != 0) {
-                const focused_index = desktop.focus[0];
-                const focused_slot = &desktop.slots[focused_index];
-                if (focused_slot.mode == .floating or focused_slot.fullscreen or
-                    focused_slot.maximized)
-                {
-                    desktop.desired[focused_index].stacking = stacking;
-                }
-            }
-
-            // Preserve the policy order above while moving every child after
-            // its parent. Repeating the stable move handles complete ancestor
-            // chains without allocating another scene-order buffer.
-            for (0..desktop.live) |_| {
-                var moved = false;
-                for (desktop.slots, 0..) |slot, child_index| {
-                    if (!slot.header.active or slot.parent == null) continue;
-                    const parent_index = desktop.resolveIndex(slot.parent.?) catch continue;
-                    const child_stacking = desktop.desired[child_index].stacking;
-                    const parent_stacking = desktop.desired[parent_index].stacking;
-                    if (child_stacking > parent_stacking) continue;
-                    for (desktop.desired, desktop.slots) |*desired, candidate| {
-                        if (!candidate.header.active or desired.stacking <= child_stacking or
-                            desired.stacking > parent_stacking) continue;
-                        desired.stacking -= 1;
-                    }
-                    desktop.desired[child_index].stacking = parent_stacking;
-                    moved = true;
-                }
-                if (!moved) break;
-            }
+            try desktop.policy.arrange(
+                PolicyView{ .context = desktop },
+                PolicyTransaction{ .context = desktop },
+            );
+            try (PolicyTransaction{ .context = desktop }).finish();
 
             for (desktop.slots, 0..) |*slot, index| {
                 if (!slot.header.active or !slot.initial_committed) continue;
                 const desired = &desktop.desired[index];
-                std.debug.assert(desired.active);
                 const output_area = outputAreaForRect(desired.rect, desktop.outputAreas());
-                desired.configure = .{
+                const configure: Shell.ToplevelConfigure = .{
                     .width = desired.rect.width,
                     .height = desired.rect.height,
                     .states = .{
-                        .maximized = slot.maximized,
-                        .fullscreen = slot.fullscreen,
-                        .activated = desktop.focus_len != 0 and desktop.focus[0] == index,
-                        .resizing = slot.resizing,
-                        .tiled_left = slot.mode == .tiled and desired.rect.x == output_area.x,
-                        .tiled_right = slot.mode == .tiled and
+                        .maximized = desired.maximized,
+                        .fullscreen = desired.fullscreen,
+                        .activated = desired.activated,
+                        .resizing = desired.resizing,
+                        .tiled_left = desired.mode == .tiled and desired.rect.x == output_area.x,
+                        .tiled_right = desired.mode == .tiled and
                             desired.rect.x + desired.rect.width == output_area.x + output_area.width,
-                        .tiled_top = slot.mode == .tiled and desired.rect.y == output_area.y,
-                        .tiled_bottom = slot.mode == .tiled and
+                        .tiled_top = desired.mode == .tiled and desired.rect.y == output_area.y,
+                        .tiled_bottom = desired.mode == .tiled and
                             desired.rect.y + desired.rect.height == output_area.y + output_area.height,
-                        .suspended = slot.minimized,
+                        .suspended = desired.suspended,
                     },
                 };
-                if (!slot.configured or !std.meta.eql(slot.last_configure, desired.configure)) {
+                if (!slot.configured or !std.meta.eql(slot.last_configure, configure)) {
                     desktop.enqueue(.{
                         .id = desktop.idFor(@intCast(index)),
                         .shell_id = slot.shell_id,
-                        .configure = desired.configure,
+                        .configure = configure,
                     });
-                    slot.last_configure = desired.configure;
+                    slot.last_configure = configure;
                     slot.configured = true;
                     slot.expected_serial = null;
                     slot.configure_ready = false;
@@ -1668,7 +1716,7 @@ pub fn Desktop(comptime Shell: type) type {
                     .surface_offset = slot.target_scene.surface_offset,
                     .visible = desired.visible,
                     .stacking = desired.stacking,
-                    .mode = slot.mode,
+                    .mode = desired.mode,
                     .content_ready = slot.content_ready,
                 };
                 if (slot.content_ready and slot.window_width > 0 and slot.window_height > 0) {
@@ -1677,6 +1725,23 @@ pub fn Desktop(comptime Shell: type) type {
                 }
             }
             desktop.publishReadyScene();
+        }
+
+        fn validatePolicyOutput(desktop: *const Self, output: OutputId) !void {
+            for (desktop.output_ids[0..desktop.output_area_len]) |candidate| {
+                if (std.meta.eql(candidate, output)) return;
+            }
+            return error.StaleOutput;
+        }
+
+        fn policyWindow(desktop: *const Self, index: u32) PolicyWindow {
+            const slot = &desktop.slots[index];
+            std.debug.assert(slot.header.active);
+            return .{
+                .id = desktop.idFor(index),
+                .current_geometry = slot.scene.geometry,
+                .parent = slot.parent,
+            };
         }
 
         fn publishReadyScene(desktop: *Self) void {
@@ -1794,48 +1859,16 @@ pub fn Desktop(comptime Shell: type) type {
             return null;
         }
 
-        fn defaultFloating(desktop: *const Self) geometry.Rect {
-            const area = desktop.output_areas[0];
-            const width: i32 = @intCast(@max(1, @divTrunc(@as(i64, area.width) * 3, 4)));
-            const height: i32 = @intCast(@max(1, @divTrunc(@as(i64, area.height) * 3, 4)));
-            return .{
-                .x = area.x + @divTrunc(area.width - width, 2),
-                .y = area.y + @divTrunc(area.height - height, 2),
-                .width = width,
-                .height = height,
-            };
-        }
-
         fn outputAreas(desktop: *const Self) []const geometry.Rect {
             return desktop.output_areas[0..desktop.output_area_len];
-        }
-
-        fn outputAreaForSlot(desktop: *Self, slot: *Slot) geometry.Rect {
-            if (slot.output) |id| {
-                for (desktop.output_ids[0..desktop.output_area_len], 0..) |candidate, index|
-                    if (std.meta.eql(candidate, id)) return desktop.output_areas[index];
-            }
-            const index = outputAreaIndexForRect(slot.scene.geometry, desktop.outputAreas());
-            slot.output = desktop.output_ids[index];
-            return desktop.output_areas[index];
         }
 
         fn commandAvailable(desktop: *const Self) usize {
             return desktop.commands.len - desktop.command_len;
         }
 
-        fn isLayoutEligible(desktop: *const Self, index: u32) bool {
-            const slot = &desktop.slots[index];
-            return slot.initial_committed and slot.mode == .tiled and !slot.minimized and
-                !slot.fullscreen and !slot.maximized;
-        }
-
         fn layoutCount(desktop: *const Self) usize {
-            var count: usize = 0;
-            for (desktop.slots, 0..) |slot, index| {
-                if (slot.header.active and desktop.isLayoutEligible(@intCast(index))) count += 1;
-            }
-            return count;
+            return desktop.policy.layoutCount();
         }
 
         fn validateLayout(
@@ -1843,27 +1876,7 @@ pub fn Desktop(comptime Shell: type) type {
             count: usize,
             areas: anytype,
         ) !void {
-            return desktop.validateLayoutWithGaps(count, areas, desktop.inner_gap, desktop.outer_gap);
-        }
-
-        fn validateLayoutWithGaps(
-            desktop: *const Self,
-            count: usize,
-            areas: anytype,
-            inner: u32,
-            outer: u32,
-        ) !void {
-            _ = desktop;
-            var placed: usize = 0;
-            for (areas, 0..) |raw_area, area_index| {
-                var area_count: usize = 0;
-                if (placed < count) {
-                    const remaining_areas = @min(areas.len - area_index, count - placed);
-                    area_count = outputItemCount(count - placed, remaining_areas);
-                }
-                try layout.validate(area_count, outputAreaGeometry(raw_area), inner, outer);
-                placed += area_count;
-            }
+            return desktop.policy.validateLayout(count, PolicyAreas(@TypeOf(areas)){ .areas = areas });
         }
 
         fn requireCommandCapacity(desktop: *Self, count: usize) !void {
@@ -2023,16 +2036,11 @@ pub fn Desktop(comptime Shell: type) type {
                 return error.OutOfMemory;
             const storage = try desktop.allocator.alloc(u8, storage_len);
             errdefer desktop.allocator.free(storage);
-            const focus = try desktop.allocator.alloc(u32, new_len);
-            errdefer desktop.allocator.free(focus);
-            const tile_order = try desktop.allocator.alloc(u32, new_len);
-            errdefer desktop.allocator.free(tile_order);
-            const layout_items = try desktop.allocator.alloc(layout.Item, new_len);
-            errdefer desktop.allocator.free(layout_items);
-            const placements = try desktop.allocator.alloc(layout.Placement, new_len);
-            errdefer desktop.allocator.free(placements);
+            try desktop.policy.ensureCapacity(new_len);
             const desired = try desktop.allocator.alloc(Desired, new_len);
             errdefer desktop.allocator.free(desired);
+            const desired_epochs = try desktop.allocator.alloc(u32, new_len);
+            errdefer desktop.allocator.free(desired_epochs);
 
             for (slots, 0..) |*slot, index| {
                 const start = index * desktop.metadata_bytes * 2;
@@ -2046,25 +2054,18 @@ pub fn Desktop(comptime Shell: type) type {
                 slot.title = storage[start .. start + desktop.metadata_bytes];
                 slot.app_id = storage[start + desktop.metadata_bytes .. start + desktop.metadata_bytes * 2];
             }
-            @memcpy(focus[0..desktop.focus_len], desktop.focus[0..desktop.focus_len]);
-            @memcpy(tile_order[0..desktop.tile_len], desktop.tile_order[0..desktop.tile_len]);
             @memcpy(desired[0..old_len], desktop.desired);
-            @memset(desired[old_len..], .{});
+            @memcpy(desired_epochs[0..old_len], desktop.desired_epochs);
+            @memset(desired_epochs[old_len..], 0);
 
+            desktop.allocator.free(desktop.desired_epochs);
             desktop.allocator.free(desktop.desired);
-            desktop.allocator.free(desktop.placements);
-            desktop.allocator.free(desktop.layout_items);
-            desktop.allocator.free(desktop.tile_order);
-            desktop.allocator.free(desktop.focus);
             desktop.allocator.free(desktop.metadata_storage);
             desktop.allocator.free(desktop.slots);
             desktop.slots = slots;
             desktop.metadata_storage = storage;
-            desktop.focus = focus;
-            desktop.tile_order = tile_order;
-            desktop.layout_items = layout_items;
-            desktop.placements = placements;
             desktop.desired = desired;
+            desktop.desired_epochs = desired_epochs;
             desktop.free = @intCast(old_len);
         }
 
@@ -2129,44 +2130,6 @@ pub fn Desktop(comptime Shell: type) type {
 
         fn idFor(desktop: *const Self, index: u32) ToplevelId {
             return .{ .index = index, .generation = desktop.slots[index].header.generation };
-        }
-
-        fn promoteFocus(desktop: *Self, index: u32) void {
-            desktop.removeFocus(index);
-            std.mem.copyBackwards(u32, desktop.focus[1 .. desktop.focus_len + 1], desktop.focus[0..desktop.focus_len]);
-            desktop.focus[0] = index;
-            desktop.focus_len += 1;
-        }
-
-        fn removeFocus(desktop: *Self, index: u32) void {
-            for (desktop.focus[0..desktop.focus_len], 0..) |value, position| {
-                if (value != index) continue;
-                std.mem.copyForwards(
-                    u32,
-                    desktop.focus[position .. desktop.focus_len - 1],
-                    desktop.focus[position + 1 .. desktop.focus_len],
-                );
-                desktop.focus_len -= 1;
-                return;
-            }
-        }
-
-        fn appendTile(desktop: *Self, index: u32) void {
-            desktop.tile_order[desktop.tile_len] = index;
-            desktop.tile_len += 1;
-        }
-
-        fn removeTile(desktop: *Self, index: u32) void {
-            for (desktop.tile_order[0..desktop.tile_len], 0..) |value, position| {
-                if (value != index) continue;
-                std.mem.copyForwards(
-                    u32,
-                    desktop.tile_order[position .. desktop.tile_len - 1],
-                    desktop.tile_order[position + 1 .. desktop.tile_len],
-                );
-                desktop.tile_len -= 1;
-                return;
-            }
         }
     };
 }
@@ -2521,6 +2484,230 @@ const TestShell = struct {
 
 const TestDesktop = Desktop(TestShell);
 
+const KioskPolicyFactory = struct {
+    pub fn Policy(
+        comptime ToplevelId: type,
+        comptime OutputId: type,
+        comptime Mode: type,
+        comptime FocusSource: type,
+        comptime FocusDecision: type,
+    ) type {
+        return struct {
+            const Self = @This();
+            const Base = desktop_policy.Policy(
+                ToplevelId,
+                OutputId,
+                Mode,
+                FocusSource,
+                FocusDecision,
+            );
+            pub const Snapshot = Base.Snapshot;
+
+            base: Base,
+            show_oldest: bool = true,
+
+            pub fn init(allocator: std.mem.Allocator, capacity: usize) !Self {
+                return .{ .base = try Base.init(allocator, capacity) };
+            }
+
+            pub fn deinit(policy: *Self) void {
+                policy.base.deinit();
+            }
+
+            pub fn ensureCapacity(policy: *Self, capacity: usize) !void {
+                try policy.base.ensureCapacity(capacity);
+            }
+
+            pub fn layoutCount(policy: *const Self) usize {
+                return policy.base.layoutCount();
+            }
+
+            pub fn created(policy: *Self, id: ToplevelId, output: OutputId, rect: geometry.Rect) !void {
+                try policy.base.created(id, output, rect);
+            }
+
+            pub fn destroyed(policy: *Self, id: ToplevelId) void {
+                policy.base.destroyed(id);
+            }
+
+            pub fn initialCommitted(policy: *Self, id: ToplevelId) !void {
+                try policy.base.initialCommitted(id);
+            }
+
+            pub fn reset(policy: *Self, id: ToplevelId, output: OutputId, rect: geometry.Rect) !void {
+                try policy.base.reset(id, output, rect);
+            }
+
+            pub fn restore(policy: *Self, id: ToplevelId, value: anytype) !void {
+                try policy.base.restore(id, value);
+            }
+
+            pub fn windowState(policy: *const Self, id: ToplevelId) !Base.State {
+                return policy.base.windowState(id);
+            }
+
+            pub fn focusedToplevel(policy: *const Self) ?ToplevelId {
+                return policy.base.focusedToplevel();
+            }
+
+            pub fn writeWorkspaceInventory(policy: *const Self, view: anytype, writer: anytype) !void {
+                try policy.base.writeWorkspaceInventory(view, writer);
+            }
+
+            pub fn workspaceRevision(policy: *const Self) u64 {
+                return policy.base.workspaceRevision();
+            }
+
+            pub fn workspaceRequest(policy: *Self, request: workspace.Request) !bool {
+                return policy.base.workspaceRequest(request);
+            }
+
+            pub fn focusRequested(
+                policy: *Self,
+                id: ToplevelId,
+                source: FocusSource,
+            ) !FocusDecision {
+                return policy.base.focusRequested(id, source);
+            }
+
+            pub fn beginInteractive(
+                policy: *Self,
+                id: ToplevelId,
+                kind: anytype,
+                current_geometry: geometry.Rect,
+            ) !bool {
+                return policy.base.beginInteractive(id, kind, current_geometry);
+            }
+
+            pub fn updateInteractive(policy: *Self, id: ToplevelId, rect: geometry.Rect) !bool {
+                return policy.base.updateInteractive(id, rect);
+            }
+
+            pub fn updateToplevelDrag(
+                policy: *Self,
+                id: ToplevelId,
+                initial: geometry.Rect,
+                start: geometry.Point,
+                current: geometry.Point,
+                work_area: geometry.Rect,
+            ) !bool {
+                return policy.base.updateToplevelDrag(id, initial, start, current, work_area);
+            }
+
+            pub fn endInteractive(policy: *Self, id: ToplevelId) !bool {
+                return policy.base.endInteractive(id);
+            }
+
+            pub fn setFloatingGeometry(policy: *Self, id: ToplevelId, rect: geometry.Rect) !bool {
+                return policy.base.setFloatingGeometry(id, rect);
+            }
+
+            pub fn setState(
+                policy: *Self,
+                id: ToplevelId,
+                requested: anytype,
+                enabled: bool,
+                output: ?OutputId,
+            ) !bool {
+                return policy.base.setState(id, requested, enabled, output);
+            }
+
+            pub fn eligibleAfter(
+                policy: *const Self,
+                id: ToplevelId,
+                requested: anytype,
+                enabled: bool,
+            ) !bool {
+                return policy.base.eligibleAfter(id, requested, enabled);
+            }
+
+            pub fn validateSnapshot(policy: *const Self, view: anytype, snapshot: *const Snapshot) !void {
+                try policy.base.validateSnapshot(view, snapshot);
+            }
+
+            pub fn installSnapshot(policy: *Self, snapshot: *Snapshot) bool {
+                return policy.base.installSnapshot(snapshot);
+            }
+
+            pub fn validateLayout(policy: *const Self, count: usize, view: anytype) !void {
+                try policy.base.validateLayout(count, view);
+            }
+
+            pub fn initialGeometry(policy: *const Self, output: geometry.Rect) geometry.Rect {
+                return policy.base.initialGeometry(output);
+            }
+
+            pub fn arrange(policy: *Self, view: anytype, transaction: anytype) !void {
+                transaction.reset();
+                const output = view.output(0);
+                var stacking: u32 = 0;
+                var windows = view.windows();
+                while (windows.next()) |window| {
+                    try transaction.place(window.id, .{
+                        .rect = output.geometry,
+                        .visible = if (policy.show_oldest)
+                            stacking == 0
+                        else
+                            stacking + 1 == policy.base.layoutCount(),
+                        .stacking = stacking,
+                        .output = output.id,
+                        .mode = @as(Mode, .tiled),
+                        .maximized = false,
+                        .fullscreen = false,
+                        .activated = stacking == 0,
+                        .resizing = false,
+                        .suspended = false,
+                    });
+                    stacking += 1;
+                }
+            }
+        };
+    }
+};
+
+const KioskDesktop = desktopWithPolicy(TestShell, KioskPolicyFactory);
+
+test "desktop: internal policy seam accepts a replacement arrangement" {
+    var desktop = try KioskDesktop.init(std.testing.allocator, .{
+        .toplevel_capacity = 2,
+        .command_capacity = 4,
+        .metadata_bytes = 16,
+    }, .{ .x = 0, .y = 0, .width = 100, .height = 60 });
+    defer desktop.deinit();
+    var shell: TestShell = .{};
+    shell.push(created(0));
+    shell.push(created(1));
+    try std.testing.expectEqual(@as(usize, 2), try desktop.consume(&shell, 2));
+    shell.push(.{ .commit_ready = .{
+        .id = .{ .index = 0, .generation = 1 },
+        .serial = 0,
+        .initial_commit = true,
+        .mapped = false,
+    } });
+    shell.push(.{ .commit_ready = .{
+        .id = .{ .index = 1, .generation = 1 },
+        .serial = 0,
+        .initial_commit = true,
+        .mapped = false,
+    } });
+    try std.testing.expectEqual(@as(usize, 2), try desktop.consume(&shell, 2));
+    try std.testing.expect(desktop.desired[0].visible);
+    try std.testing.expect(!desktop.desired[1].visible);
+    try std.testing.expectEqual(
+        geometry.Rect{ .x = 0, .y = 0, .width = 100, .height = 60 },
+        desktop.desired[0].rect,
+    );
+
+    try desktop.mutatePolicy({}, struct {
+        fn update(policy: *KioskDesktop.Policy, _: KioskDesktop.PolicyView, _: void) !bool {
+            policy.show_oldest = false;
+            return true;
+        }
+    }.update);
+    try std.testing.expect(!desktop.desired[0].visible);
+    try std.testing.expect(desktop.desired[1].visible);
+}
+
 fn initTestDesktop(command_capacity: usize) !TestDesktop {
     return TestDesktop.init(std.testing.allocator, .{
         .toplevel_capacity = 3,
@@ -2683,16 +2870,18 @@ test "desktop: gaps reflow tiled windows transactionally" {
     const first = try desktop.idForShell(.{ .index = 0, .generation = 1 });
     const second = try desktop.idForShell(.{ .index = 1, .generation = 1 });
     const third = try desktop.idForShell(.{ .index = 2, .generation = 1 });
-    try desktop.setGaps(4, 5);
+    var gaps: TestDesktop.PolicySnapshot = .{ .inner_gap = 4, .outer_gap = 5 };
+    try desktop.installPolicySnapshot(&gaps);
     try settleDesktop(&desktop, &shell);
     try std.testing.expectEqual(geometry.Rect{ .x = 5, .y = 5, .width = 43, .height = 50 }, (try desktop.scene(first)).geometry);
     try std.testing.expectEqual(geometry.Rect{ .x = 52, .y = 5, .width = 43, .height = 23 }, (try desktop.scene(second)).geometry);
     try std.testing.expectEqual(geometry.Rect{ .x = 52, .y = 32, .width = 43, .height = 23 }, (try desktop.scene(third)).geometry);
 
     const before = (try desktop.scene(first)).geometry;
-    try std.testing.expectError(error.WorkAreaTooSmall, desktop.setGaps(100, 100));
-    try std.testing.expectEqual(@as(u32, 4), desktop.inner_gap);
-    try std.testing.expectEqual(@as(u32, 5), desktop.outer_gap);
+    var invalid: TestDesktop.PolicySnapshot = .{ .inner_gap = 100, .outer_gap = 100 };
+    try std.testing.expectError(error.WorkAreaTooSmall, desktop.installPolicySnapshot(&invalid));
+    try std.testing.expectEqual(@as(u32, 4), desktop.policy.inner_gap);
+    try std.testing.expectEqual(@as(u32, 5), desktop.policy.outer_gap);
     try std.testing.expectEqual(before, (try desktop.scene(first)).geometry);
 }
 
@@ -3603,10 +3792,10 @@ test "desktop: focus history and tiled-floating transitions are deterministic" {
     try desktop.toggleFocusedFullscreen();
     try desktop.toggleFocusedMaximized();
     try desktop.toggleFocusedFloating();
-    const second_index = try desktop.resolveIndex(second);
-    try std.testing.expect(desktop.slots[second_index].fullscreen);
-    try std.testing.expect(desktop.slots[second_index].maximized);
-    try std.testing.expectEqual(TestDesktop.Mode.floating, desktop.slots[second_index].mode);
+    const second_state = try desktop.policy.windowState(second);
+    try std.testing.expect(second_state.fullscreen);
+    try std.testing.expect(second_state.maximized);
+    try std.testing.expectEqual(TestDesktop.Mode.floating, second_state.mode);
     try desktop.focusToplevel(first);
 
     shell.push(.{ .toplevel_destroyed = .{ .index = 0, .generation = 1 } });
@@ -3633,10 +3822,10 @@ test "desktop: interactive resize preserves geometry and publishes resizing stat
     const interactive = (try desktop.beginInteractive(request)).?;
     desktop.dropInteractiveRequest();
     try std.testing.expectEqual(before, interactive.rect);
-    try std.testing.expect(desktop.slots[id.index].mode == .floating);
+    try std.testing.expect((try desktop.policy.windowState(id)).mode == .floating);
     try std.testing.expect(desktop.slots[id.index].last_configure.states.resizing);
     try desktop.updateInteractive(id, .{ .x = before.x, .y = before.y, .width = 80, .height = 40 });
-    try std.testing.expectEqual(@as(i32, 80), desktop.slots[id.index].floating.width);
+    try std.testing.expectEqual(@as(i32, 80), (try desktop.policy.windowState(id)).floating.width);
     try desktop.endInteractive(id);
     try std.testing.expect(!desktop.slots[id.index].last_configure.states.resizing);
 }
@@ -3658,10 +3847,14 @@ test "desktop: keyboard tile movement reorders layout transactionally" {
     while (desktop.peekCommand() != null) desktop.dropCommand();
 
     try desktop.moveFocusedTile(.previous);
-    try std.testing.expectEqualSlices(u32, &.{ 1, 0, 2 }, desktop.tile_order[0..3]);
+    try std.testing.expectEqual(@as(u32, 1), desktop.policy.tiles[0].index);
+    try std.testing.expectEqual(@as(u32, 0), desktop.policy.tiles[1].index);
+    try std.testing.expectEqual(@as(u32, 2), desktop.policy.tiles[2].index);
     while (desktop.peekCommand() != null) desktop.dropCommand();
     try desktop.moveFocusedTile(.next);
-    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2 }, desktop.tile_order[0..3]);
+    try std.testing.expectEqual(@as(u32, 0), desktop.policy.tiles[0].index);
+    try std.testing.expectEqual(@as(u32, 1), desktop.policy.tiles[1].index);
+    try std.testing.expectEqual(@as(u32, 2), desktop.policy.tiles[2].index);
 }
 
 test "desktop: queued destroys preserve exact generations in order" {

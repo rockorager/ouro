@@ -1,5 +1,7 @@
 const std = @import("std");
 const input = @import("backend/input/platform.zig");
+const binding_types = @import("input/binding.zig");
+const engine_settings = @import("runtime/settings.zig");
 const c = @cImport({
     @cInclude("xkbcommon/xkbcommon.h");
 });
@@ -16,17 +18,8 @@ const default_source =
     \\"super+return":["run","monstar"]}}
 ;
 
-pub const Modifiers = packed struct(u4) {
-    shift: bool = false,
-    control: bool = false,
-    alt: bool = false,
-    super: bool = false,
-};
-
-pub const Trigger = struct {
-    modifiers: Modifiers,
-    keysym: u32,
-};
+pub const Modifiers = binding_types.Modifiers;
+pub const Trigger = binding_types.Trigger;
 
 pub const Action = union(enum) {
     focus_next,
@@ -47,44 +40,23 @@ pub const Binding = struct {
     repeat: bool = false,
 };
 
-pub const General = struct { focus_follows_mouse: bool = false, inner_gap: u32 = 12, outer_gap: u32 = 12 };
-pub fn Setting(comptime T: type) type {
-    return union(enum) { use_default, value: T };
-}
-pub const InputType = enum { keyboard, pointer, touchpad, touch, tablet, tablet_pad };
-pub const InputMatch = struct { type: ?InputType = null, name: ?[]const u8 = null, vendor: ?u32 = null, product: ?u32 = null };
-pub const InputSettings = struct {
-    send_events: ?Setting(input.SendEvents) = null,
-    tap: ?Setting(input.Toggle) = null,
-    tap_button_map: ?Setting(input.TapButtonMap) = null,
-    drag: ?Setting(input.Toggle) = null,
-    drag_lock: ?Setting(input.DragLock) = null,
-    three_finger_drag: ?Setting(input.ThreeFingerDrag) = null,
-    accel_profile: ?Setting(input.AccelProfile) = null,
-    accel_speed: ?Setting(f64) = null,
-    natural_scroll: ?Setting(input.Toggle) = null,
-    left_handed: ?Setting(input.Toggle) = null,
-    click_method: ?Setting(input.ClickMethod) = null,
-    clickfinger_button_map: ?Setting(input.ClickfingerButtonMap) = null,
-    middle_emulation: ?Setting(input.Toggle) = null,
-    scroll_method: ?Setting(input.ScrollMethod) = null,
-    scroll_button: ?Setting(u32) = null,
-    scroll_button_lock: ?Setting(input.Toggle) = null,
-    disable_while_typing: ?Setting(input.Toggle) = null,
-    disable_while_trackpointing: ?Setting(input.Toggle) = null,
-    rotation: ?Setting(u32) = null,
-    scroll_factor: ?Setting(f64) = null,
-    repeat_rate: ?Setting(i32) = null,
-    repeat_delay: ?Setting(i32) = null,
+pub const General = struct {
+    focus_follows_mouse: bool = false,
+    inner_gap: u32 = 12,
+    outer_gap: u32 = 12,
 };
-pub const InputRule = struct { name: []const u8 = "", priority: i32 = 0, match: InputMatch = .{}, settings: InputSettings = .{} };
-pub const OutputMatch = struct { name: ?[]const u8 = null, connector_id: ?u32 = null, connector_type: ?u32 = null, connector_type_id: ?u32 = null, width_mm: ?u32 = null, height_mm: ?u32 = null };
-pub const OutputMode = struct { width: u32 = 0, height: u32 = 0, refresh_millihertz: ?u32 = null };
-pub const OutputPosition = struct { x: i32 = 0, y: i32 = 0 };
-pub const OutputSettings = struct { enabled: ?bool = null, mode: ?OutputMode = null, position: ?OutputPosition = null, scale_120: ?u32 = null };
-pub const OutputRule = struct { name: []const u8 = "", priority: i32 = 0, match: OutputMatch = .{}, settings: OutputSettings = .{} };
-pub const InputInfo = struct { type: InputType, name: []const u8, vendor: u32, product: u32 };
-pub const OutputInfo = struct { name: []const u8, connector_id: u32, connector_type: u32, connector_type_id: u32, width_mm: u32, height_mm: u32 };
+pub const Setting = engine_settings.Setting;
+pub const InputType = engine_settings.InputType;
+pub const InputMatch = engine_settings.InputMatch;
+pub const InputSettings = engine_settings.InputSettings;
+pub const InputRule = engine_settings.InputRule;
+pub const OutputMatch = engine_settings.OutputMatch;
+pub const OutputMode = engine_settings.OutputMode;
+pub const OutputPosition = engine_settings.OutputPosition;
+pub const OutputSettings = engine_settings.OutputSettings;
+pub const OutputRule = engine_settings.OutputRule;
+pub const InputInfo = engine_settings.InputInfo;
+pub const OutputInfo = engine_settings.OutputInfo;
 
 pub const Snapshot = struct {
     arena: std.heap.ArenaAllocator,
@@ -324,19 +296,10 @@ pub fn outputMatches(m: OutputMatch, info: OutputInfo) bool {
         (m.width_mm == null or m.width_mm.? == info.width_mm) and (m.height_mm == null or m.height_mm.? == info.height_mm);
 }
 pub fn resolveInput(rules: []const InputRule, info: InputInfo) InputSettings {
-    var result: InputSettings = .{};
-    for (rules) |rule| if (inputMatches(rule.match, info)) overlay(InputSettings, &result, rule.settings);
-    return result;
+    return engine_settings.resolveInput(rules, info);
 }
 pub fn resolveOutput(rules: []const OutputRule, info: OutputInfo) OutputSettings {
-    var result: OutputSettings = .{};
-    for (rules) |rule| if (outputMatches(rule.match, info)) overlay(OutputSettings, &result, rule.settings);
-    return result;
-}
-fn overlay(comptime T: type, target: *T, source: T) void {
-    inline for (@typeInfo(T).@"struct".fields) |f| {
-        if (@field(source, f.name) != null) @field(target, f.name) = @field(source, f.name);
-    }
+    return engine_settings.resolveOutput(rules, info);
 }
 
 fn parseValue(allocator: std.mem.Allocator, source: []const u8) !std.json.Value {

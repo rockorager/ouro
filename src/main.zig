@@ -9,8 +9,8 @@ const c = @cImport({
     @cInclude("sys/stat.h");
 });
 const Compositor = ouro.compositor.Compositor(protocol);
-const Loop = ouro.loop.Loop(protocol);
-const Coordinator = ouro.physical.Coordinator(protocol);
+const Runtime = ouro.physical.Coordinator(protocol);
+const Runner = ouro.physical.Runner(protocol);
 
 const shm_formats = [_]wayring.shm.Format{
     .{ .value = protocol.wl_shm.format.argb8888.value, .bytes_per_pixel = 4 },
@@ -40,9 +40,28 @@ pub fn main(init: std.process.Init) !void {
         .explicit_path = options.config,
     };
     var initial_config = try config_store.load();
-    var initial_config_owned = true;
-    defer if (initial_config_owned) initial_config.deinit();
-    var launcher: ouro.launcher.Systemd = .{
+    defer initial_config.deinit();
+    var initial_engine_settings = try Runtime.EngineSettings.init(
+        allocator,
+        initial_config.input_rules,
+        initial_config.output_rules,
+    );
+    var initial_engine_settings_owned = true;
+    defer if (initial_engine_settings_owned) initial_engine_settings.deinit();
+    var initial_key_consumer = try Runtime.Bindings.snapshotFromReferenceConfig(
+        allocator,
+        &initial_config,
+    );
+    var initial_key_consumer_owned = true;
+    defer if (initial_key_consumer_owned) initial_key_consumer.deinit();
+    var initial_policy: Runtime.PolicySnapshot = .{
+        .focus_follows_mouse = initial_config.general.focus_follows_mouse,
+        .inner_gap = initial_config.general.inner_gap,
+        .outer_gap = initial_config.general.outer_gap,
+    };
+    var initial_policy_owned = true;
+    defer if (initial_policy_owned) initial_policy.deinit();
+    const launcher: ouro.launcher.Systemd = .{
         .allocator = allocator,
         .io = init.io,
         .environ_map = init.environ_map,
@@ -85,7 +104,7 @@ pub fn main(init: std.process.Init) !void {
         try wayring.unix_socket.listen(options.socket, 128),
         compositorConfig(),
     );
-    const coordinator = Coordinator.create(allocator, root, .{
+    const coordinator = Runtime.create(allocator, root, .{
         .input = ouro.input_platform.real,
         .hotplug = ouro.drm_hotplug.real,
     }, .{
@@ -187,27 +206,26 @@ pub fn main(init: std.process.Init) !void {
             .enable_color_management = options.renderer == .vulkan,
             .output_color_description = output_description,
         },
-        .launcher = .{
-            .context = &launcher,
-            .launchFn = ouro.launcher.Systemd.launchOpaque,
-        },
     }) catch |err| {
         root.deinit() catch {};
         return err;
     };
-    coordinator.installConfig(&initial_config) catch |err| {
+    coordinator.installConfig(
+        &initial_engine_settings,
+        &initial_key_consumer,
+        &initial_policy,
+    ) catch |err| {
         coordinator.requestStop() catch unreachable;
         std.debug.assert(coordinator.backendDrainComplete());
         coordinator.destroy() catch {};
         root.deinit() catch {};
         return err;
     };
-    initial_config_owned = false;
-    var loop = Loop.init(
+    initial_engine_settings_owned = false;
+    initial_key_consumer_owned = false;
+    initial_policy_owned = false;
+    var runner = Runner.init(
         allocator,
-        root,
-        &coordinator.router,
-        &coordinator.timers,
         coordinator,
         .{ .completion_batch = 32 },
     ) catch |err| {
@@ -218,10 +236,10 @@ pub fn main(init: std.process.Init) !void {
         return err;
     };
     var run_error: ?anyerror = null;
-    loop.installShutdown(&shutdown_signals) catch |err| {
+    runner.installShutdown(&shutdown_signals) catch |err| {
         run_error = err;
     };
-    coordinator.start(&loop) catch |err| {
+    runner.start() catch |err| {
         if (run_error == null) run_error = err;
     };
     if (run_error != null) coordinator.requestStop() catch {};
@@ -234,13 +252,20 @@ pub fn main(init: std.process.Init) !void {
     var wayring_drained = false;
     var signal_stop_started = false;
     while (!wayring_drained or !coordinator.backendDrainComplete()) {
-        const progress = loop.turnAndWait(coordinator) catch |err| {
+        const progress = runner.turnAndWait() catch |err| {
             if (run_error == null) run_error = err;
             coordinator.requestStop() catch |stop_err| {
                 if (run_error == null) run_error = stop_err;
             };
             continue;
         };
+        const key_consumer = coordinator.bindingState();
+        while (key_consumer.peekAction()) |binding| {
+            applyBinding(coordinator, &launcher, binding) catch |err| {
+                std.log.err("binding action failed: {t}", .{err});
+            };
+            key_consumer.dropAction();
+        }
         wayring_drained = progress.wayring.shutdown_complete;
         if (!signal_stop_started and progress.shutdown_requested) {
             signal_stop_started = true;
@@ -253,20 +278,71 @@ pub fn main(init: std.process.Init) !void {
                 std.log.err("configuration reload failed; keeping active configuration: {t}", .{err});
                 continue;
             };
-            coordinator.installConfig(&candidate) catch |err| {
-                candidate.deinit();
+            defer candidate.deinit();
+            var engine_settings_candidate = Runtime.EngineSettings.init(
+                allocator,
+                candidate.input_rules,
+                candidate.output_rules,
+            ) catch |err| {
+                std.log.err("configuration reload failed; keeping active configuration: {t}", .{err});
+                continue;
+            };
+            var policy_candidate: Runtime.PolicySnapshot = .{
+                .focus_follows_mouse = candidate.general.focus_follows_mouse,
+                .inner_gap = candidate.general.inner_gap,
+                .outer_gap = candidate.general.outer_gap,
+            };
+            var key_consumer_candidate = Runtime.Bindings.snapshotFromReferenceConfig(
+                allocator,
+                &candidate,
+            ) catch |err| {
+                engine_settings_candidate.deinit();
+                std.log.err("configuration reload failed; keeping active configuration: {t}", .{err});
+                continue;
+            };
+            coordinator.installConfig(
+                &engine_settings_candidate,
+                &key_consumer_candidate,
+                &policy_candidate,
+            ) catch |err| {
+                engine_settings_candidate.deinit();
+                key_consumer_candidate.deinit();
+                policy_candidate.deinit();
                 std.log.err("configuration reload failed; keeping active configuration: {t}", .{err});
                 continue;
             };
             std.log.info("configuration reloaded", .{});
         }
     }
-    loop.deinit();
+    runner.deinit();
     const destroy_result = coordinator.destroy();
     const root_result = root.deinit();
     if (run_error) |err| return err;
     try destroy_result;
     try root_result;
+}
+
+fn applyBinding(
+    coordinator: *Runtime,
+    launcher: *const ouro.launcher.Systemd,
+    binding: ouro.config.Binding,
+) !void {
+    switch (binding.action) {
+        .focus_next => try coordinator.focusNext(),
+        .focus_previous => try coordinator.focusPrevious(),
+        .move_next => try coordinator.moveFocusedTile(.next),
+        .move_previous => try coordinator.moveFocusedTile(.previous),
+        .close => if (coordinator.focusedToplevel()) |id| try coordinator.requestClose(id),
+        .toggle_fullscreen => try coordinator.toggleFocusedFullscreen(),
+        .toggle_maximized => try coordinator.toggleFocusedMaximized(),
+        .toggle_floating => try coordinator.toggleFocusedFloating(),
+        .exit => try coordinator.requestStop(),
+        .run => |argv| {
+            launcher.launch(argv) catch |err| {
+                std.log.err("could not launch {s}: {t}", .{ argv[0], err });
+            };
+        },
+    }
 }
 
 fn parseOptions(args: std.process.Args) !Options {

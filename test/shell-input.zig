@@ -2775,12 +2775,10 @@ test "shell-input: popup applies each acknowledged configure after output remova
     try std.testing.expectEqual(@as(usize, 1), handler.popup_configure_count);
 
     try coordinator.desktop.setFloating(root_id.?, true);
-    try coordinator.desktop.setFloatingGeometry(root_id.?, .{
-        .x = 3,
-        .y = 0,
-        .width = 2,
-        .height = 2,
-    });
+    try coordinator.desktop.setFloatingGeometry(
+        root_id.?,
+        .{ .x = 3, .y = 0, .width = 2, .height = 2 },
+    );
     for (0..256) |_| {
         client_progress = try drainLayerPopupClient(&client_reactor, &driver, &handler);
         _ = try loop.turn(coordinator);

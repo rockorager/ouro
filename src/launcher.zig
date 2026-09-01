@@ -7,7 +7,7 @@ pub const Systemd = struct {
     io: std.Io,
     environ_map: *const std.process.Environ.Map,
 
-    pub fn launch(self: *Systemd, argv: []const []const u8) !void {
+    pub fn launch(self: *const Systemd, argv: []const []const u8) !void {
         try validateArgv(argv);
         const prefix = [_][]const u8{
             "systemd-run",

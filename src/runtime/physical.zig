@@ -19,7 +19,7 @@ const session_api = @import("../backend/session.zig");
 const session_platform = @import("../backend/platform.zig");
 const input_api = @import("../backend/input/backend.zig");
 const input_platform = @import("../backend/input/platform.zig");
-const user_config = @import("../config.zig");
+const engine_settings = @import("settings.zig");
 const drm = @import("../backend/drm/manager.zig");
 const drm_hotplug = @import("../backend/drm/hotplug.zig");
 const drm_gamma = @import("../backend/drm/gamma.zig");
@@ -196,6 +196,56 @@ fn copyCaptureRegion(
     }
 }
 
+/// Concrete event-loop owner for Ouro's compositor runtime. The compositor
+/// root and coordinator remain caller-owned and must outlive it.
+pub fn Runner(comptime protocol: type) type {
+    const Runtime = Coordinator(protocol);
+    const Loop = loop_api.Loop(protocol);
+    return struct {
+        runtime: *Runtime,
+        loop: Loop,
+
+        pub fn init(
+            allocator: std.mem.Allocator,
+            runtime: *Runtime,
+            config: loop_api.Config,
+        ) !@This() {
+            return .{
+                .runtime = runtime,
+                .loop = try Loop.init(
+                    allocator,
+                    runtime.root,
+                    &runtime.router,
+                    &runtime.timers,
+                    runtime,
+                    config,
+                ),
+            };
+        }
+
+        pub fn installShutdown(runner: *@This(), watcher: anytype) !void {
+            try runner.loop.installShutdown(watcher);
+        }
+
+        pub fn start(runner: *@This()) !void {
+            try runner.runtime.start(&runner.loop);
+        }
+
+        pub fn turn(runner: *@This()) !Loop.Progress {
+            return runner.loop.turn(runner.runtime);
+        }
+
+        pub fn turnAndWait(runner: *@This()) !Loop.Progress {
+            return runner.loop.turnAndWait(runner.runtime);
+        }
+
+        pub fn deinit(runner: *@This()) void {
+            runner.loop.deinit();
+            runner.* = undefined;
+        }
+    };
+}
+
 pub fn Coordinator(comptime protocol: type) type {
     return struct {
         const Self = @This();
@@ -207,14 +257,14 @@ pub fn Coordinator(comptime protocol: type) type {
         const Adapter = core_surface.Adapter(protocol);
         const SubcompositorAdapter = protocol_subcompositor.Adapter(protocol, Adapter);
         const ShellAdapter = xdg_shell.Adapter(protocol, Adapter);
-        const Desktop = desktop_model.Desktop(ShellAdapter);
+        pub const Desktop = desktop_model.Desktop(ShellAdapter);
         const XdgSessionAdapter = protocol_xdg_session_management.Adapter(
             protocol,
             ShellAdapter,
             Desktop.RestorableState,
         );
         const XdgSessionStore = session_persistence.Store(Desktop.RestorableState);
-        const Interaction = interaction_model.Interaction(Desktop);
+        pub const Interaction = interaction_model.Interaction(Desktop);
         const SeatAdapter = protocol_seat.Adapter(protocol, Adapter);
         const DataDeviceAdapter = protocol_data_device.Adapter(protocol);
         const PrimarySelectionAdapter = protocol_primary_selection.Adapter(protocol);
@@ -277,6 +327,57 @@ pub fn Coordinator(comptime protocol: type) type {
         const ScreencopyAdapter = protocol_wlr_screencopy.Adapter(protocol);
         const ForeignToplevelListAdapter = protocol_foreign_toplevel_list.Adapter(protocol);
         const WorkspaceAdapter = protocol_workspace.Adapter(protocol);
+        const WorkspaceWriter = struct {
+            coordinator: *Self,
+            groups: []WorkspaceAdapter.Group,
+            workspaces: []WorkspaceAdapter.Workspace,
+            outputs: []WorkspaceAdapter.OutputId,
+            revision: u64 = 0,
+            group_count: usize = 0,
+            workspace_count: usize = 0,
+            output_count: usize = 0,
+
+            pub fn begin(writer: *@This(), revision: u64) !void {
+                writer.revision = revision;
+                writer.group_count = 0;
+                writer.workspace_count = 0;
+                writer.output_count = 0;
+            }
+
+            pub fn addGroup(writer: *@This(), group: desktop_model.workspace.Group) !void {
+                if (writer.group_count == writer.groups.len) return error.Exhausted;
+                writer.groups[writer.group_count] = .{
+                    .id = .{ .value = group.id.value },
+                    .outputs = writer.outputs[writer.output_count..writer.output_count],
+                    .capabilities = @bitCast(group.capabilities),
+                };
+                writer.group_count += 1;
+            }
+
+            pub fn addOutput(writer: *@This(), group: desktop_model.workspace.GroupId, output: Desktop.OutputId) !void {
+                if (writer.group_count == 0 or writer.groups[writer.group_count - 1].id.value != group.value)
+                    return error.NonContiguousGroup;
+                if (writer.output_count == writer.outputs.len) return error.Exhausted;
+                writer.outputs[writer.output_count] = writer.coordinator.workspaceOutputForDesktopId(output) orelse return;
+                writer.output_count += 1;
+                const current = &writer.groups[writer.group_count - 1];
+                const byte_offset = @intFromPtr(current.outputs.ptr) - @intFromPtr(writer.outputs.ptr);
+                current.outputs = writer.outputs[byte_offset / @sizeOf(WorkspaceAdapter.OutputId) .. writer.output_count];
+            }
+
+            pub fn addWorkspace(writer: *@This(), workspace: desktop_model.workspace.Workspace) !void {
+                if (writer.workspace_count == writer.workspaces.len) return error.Exhausted;
+                writer.workspaces[writer.workspace_count] = .{
+                    .id = .{ .value = workspace.id.value },
+                    .group = .{ .value = workspace.group.value },
+                    .identifier = workspace.identifier,
+                    .name = workspace.name,
+                    .state = @bitCast(workspace.state),
+                    .capabilities = @bitCast(workspace.capabilities),
+                };
+                writer.workspace_count += 1;
+            }
+        };
         const ImageCaptureSourceAdapter = protocol_image_capture_source.Adapter(
             protocol,
             output_scheduler.OutputId,
@@ -302,7 +403,11 @@ pub fn Coordinator(comptime protocol: type) type {
                     peer: wayring.io_uring.Peer,
                     configuration: protocol_output_management.ConfigurationId,
                 },
-                config: user_config.Snapshot,
+                config: struct {
+                    engine: engine_settings.Snapshot,
+                    key_consumer: KeyConsumerSnapshot,
+                    policy: PolicySnapshot,
+                },
                 config_reconcile,
             };
             owner: Owner,
@@ -527,14 +632,13 @@ pub fn Coordinator(comptime protocol: type) type {
             output: output_api.Platforms = .{},
         };
 
-        pub const Launcher = struct {
-            context: *anyopaque,
-            launchFn: *const fn (context: *anyopaque, argv: []const []const u8) anyerror!void,
-
-            pub fn launch(self: Launcher, argv: []const []const u8) !void {
-                return self.launchFn(self.context, argv);
-            }
-        };
+        pub const Bindings = Interaction.KeyConsumer;
+        const KeyConsumerSnapshot = Bindings.Snapshot;
+        pub const PolicySnapshot = Desktop.PolicySnapshot;
+        pub const Workspace = desktop_model.workspace;
+        pub const EngineSettings = engine_settings.Snapshot;
+        pub const ToplevelId = Desktop.ToplevelId;
+        pub const OutputId = Desktop.OutputId;
 
         pub const Config = struct {
             router_capacity: usize,
@@ -641,7 +745,6 @@ pub fn Coordinator(comptime protocol: type) type {
             cursor_size: u32 = 24,
             drm: drm.Config,
             output: output_api.Config,
-            launcher: ?Launcher = null,
         };
 
         pub const Stats = struct {
@@ -667,7 +770,7 @@ pub fn Coordinator(comptime protocol: type) type {
         syncobj_config: protocol_linux_drm_syncobj.Config,
         input_config: input_api.Config,
         desktop_transaction_timeout_ns: u64,
-        launcher: ?Launcher,
+        settings: engine_settings.Snapshot,
         seat: [64]u8 = undefined,
         seat_len: u8,
         router: completion.Router,
@@ -732,6 +835,9 @@ pub fn Coordinator(comptime protocol: type) type {
         foreign_toplevel_list_adapter: ForeignToplevelListAdapter,
         workspace_adapter: WorkspaceAdapter,
         workspace_output_ids: []WorkspaceAdapter.OutputId,
+        workspace_groups: []WorkspaceAdapter.Group,
+        workspace_workspaces: []WorkspaceAdapter.Workspace,
+        workspace_revision: ?Desktop.WorkspaceRevision = null,
         image_capture_source_adapter: ImageCaptureSourceAdapter,
         image_copy_capture_adapter: ImageCopyCaptureAdapter,
         dmabuf_adapter: DmabufAdapter,
@@ -836,10 +942,9 @@ pub fn Coordinator(comptime protocol: type) type {
         commit_timer_deadline: ?surface_state.CommitTimestamp = null,
         xdg_session_store_timer: ?timer.Handle = null,
         xdg_session_store_timer_canceling: bool = false,
-        binding_repeat_timer: ?timer.Handle = null,
-        binding_repeat_timer_canceling: bool = false,
-        binding_repeat_delay_ns: ?u64 = null,
-        binding_repeat_interval_ns: u64 = 0,
+        consumer_timer: ?timer.Handle = null,
+        consumer_timer_canceling: bool = false,
+        consumer_timer_deadline_ns: ?u64 = null,
         cursor_layer: Layer,
         output_power_transition: ?OutputPowerAdapter.Command = null,
         stopping: bool = false,
@@ -856,7 +961,7 @@ pub fn Coordinator(comptime protocol: type) type {
         ) !*Self {
             if (config.foreign_toplevel_list.metadata_capacity < config.desktop.metadata_bytes)
                 return error.InvalidConfig;
-            if (config.workspace.output_capacity < config.drm.connector_capacity)
+            if (config.workspace.inventory_membership_capacity < config.desktop.output_capacity)
                 return error.InvalidConfig;
             if (config.interaction.output_capacity < config.desktop.output_capacity)
                 return error.InvalidConfig;
@@ -868,7 +973,6 @@ pub fn Coordinator(comptime protocol: type) type {
             self.output_config = config.output;
             self.syncobj_config = config.linux_drm_syncobj;
             self.desktop_transaction_timeout_ns = config.desktop_transaction_timeout_ns;
-            self.launcher = config.launcher;
             if (config.seat.len == 0 or config.seat.len > self.seat.len)
                 return error.InvalidSeat;
             self.input_config = config.input;
@@ -1038,10 +1142,9 @@ pub fn Coordinator(comptime protocol: type) type {
             self.commit_timer_deadline = null;
             self.xdg_session_store_timer = null;
             self.xdg_session_store_timer_canceling = false;
-            self.binding_repeat_timer = null;
-            self.binding_repeat_timer_canceling = false;
-            self.binding_repeat_delay_ns = null;
-            self.binding_repeat_interval_ns = 0;
+            self.consumer_timer = null;
+            self.consumer_timer_canceling = false;
+            self.consumer_timer_deadline_ns = null;
             self.cursor_layer = .{};
             const cursor_path_requirement = std.math.add(
                 usize,
@@ -1170,6 +1273,8 @@ pub fn Coordinator(comptime protocol: type) type {
             errdefer self.toplevel_icon_adapter.deinit();
             self.desktop = try Desktop.init(allocator, config.desktop, config.interaction.bounds);
             errdefer self.desktop.deinit();
+            self.settings = try engine_settings.Snapshot.defaults(allocator);
+            errdefer self.settings.deinit();
             self.physical_output_areas = try allocator.alloc(
                 geometry.Rect,
                 config.desktop.output_capacity,
@@ -1189,9 +1294,13 @@ pub fn Coordinator(comptime protocol: type) type {
             errdefer self.workspace_adapter.deinit();
             self.workspace_output_ids = try allocator.alloc(
                 WorkspaceAdapter.OutputId,
-                config.workspace.output_capacity,
+                config.workspace.inventory_membership_capacity,
             );
             errdefer allocator.free(self.workspace_output_ids);
+            self.workspace_groups = try allocator.alloc(WorkspaceAdapter.Group, config.workspace.inventory_group_capacity);
+            errdefer allocator.free(self.workspace_groups);
+            self.workspace_workspaces = try allocator.alloc(WorkspaceAdapter.Workspace, config.workspace.inventory_workspace_capacity);
+            errdefer allocator.free(self.workspace_workspaces);
             self.image_capture_source_adapter = try ImageCaptureSourceAdapter.init(
                 allocator,
                 config.image_capture_source,
@@ -1486,6 +1595,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .management_head = self.output_management_adapter.lifecycle.primary,
             };
             self.physical_output_count = 1;
+            try self.updateWorkspaceInventory();
             self.output_power_adapter = try OutputPowerAdapter.init(allocator, self, config.output_power);
             errdefer self.output_power_adapter.deinit();
             self.gamma_control_adapter = try GammaControlAdapter.init(allocator, self, config.gamma_control);
@@ -1729,39 +1839,97 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.processInput();
         }
 
-        pub fn installConfig(self: *Self, candidate: *user_config.Snapshot) !void {
-            try self.interaction.canInstallConfig();
-            try self.desktop.validateGaps(
-                candidate.general.inner_gap,
-                candidate.general.outer_gap,
-            );
+        /// Atomically installs engine, key-consumer, and desktop-policy state.
+        /// On success, ownership of all three snapshots transfers to the runtime.
+        pub fn installConfig(
+            self: *Self,
+            candidate: *engine_settings.Snapshot,
+            key_consumer: *KeyConsumerSnapshot,
+            policy: *PolicySnapshot,
+        ) !void {
+            try self.interaction.canInstallKeyConsumerSnapshot();
+            try self.desktop.validatePolicySnapshot(policy);
             if (self.output_reconfigure != null or self.output_power_transition != null)
                 return error.OutputTransactionPending;
             if (self.connectedPhysicalOutputCount() != 0) {
-                try self.beginConfigOutputReconfigure(candidate, true);
+                try self.beginConfigOutputReconfigure(candidate, key_consumer, policy, true);
                 return;
             }
-            try self.promoteConfig(candidate);
+            try self.promoteConfig(candidate, key_consumer, policy);
         }
 
-        fn promoteConfig(self: *Self, candidate: *user_config.Snapshot) !void {
+        fn promoteConfig(
+            self: *Self,
+            candidate: *engine_settings.Snapshot,
+            key_consumer: *KeyConsumerSnapshot,
+            policy: *PolicySnapshot,
+        ) !void {
             if (self.input) |input| {
                 try self.applyInputConfiguration(input, candidate);
             }
-            try self.desktop.setGaps(
-                candidate.general.inner_gap,
-                candidate.general.outer_gap,
-            );
-            self.binding_repeat_delay_ns = null;
-            try self.syncBindingRepeatTimer();
-            self.interaction.cancelRepeat();
-            try self.interaction.installConfig(candidate);
+            try self.desktop.installPolicySnapshot(policy);
+            try self.installKeyConsumerSnapshot(key_consumer);
+            self.settings.deinit();
+            self.settings = candidate.*;
+            candidate.* = undefined;
+        }
+
+        pub fn installKeyConsumerSnapshot(self: *Self, candidate: *KeyConsumerSnapshot) !void {
+            try self.interaction.canInstallKeyConsumerSnapshot();
+            try self.interaction.installKeyConsumerSnapshot(candidate);
+            try self.syncConsumerTimer();
+        }
+
+        /// Returns Ouro's binding state for draining actions at an event-loop
+        /// turn boundary.
+        pub fn bindingState(self: *Self) *Bindings {
+            return self.interaction.keyConsumer();
+        }
+
+        pub fn bindingsWorkPending(self: *const Self) bool {
+            return self.interaction.keyConsumerConst().workPending();
+        }
+
+        pub fn focusedToplevel(self: *const Self) ?ToplevelId {
+            return self.desktop.focusedToplevel();
+        }
+
+        pub fn focusNext(self: *Self) !void {
+            try self.desktop.focusNext();
+        }
+
+        pub fn focusPrevious(self: *Self) !void {
+            try self.desktop.focusPrevious();
+        }
+
+        pub fn moveFocusedTile(self: *Self, direction: enum { next, previous }) !void {
+            try self.desktop.moveFocusedTile(switch (direction) {
+                .next => .next,
+                .previous => .previous,
+            });
+        }
+
+        pub fn toggleFocusedFullscreen(self: *Self) !void {
+            try self.desktop.toggleFocusedFullscreen();
+        }
+
+        pub fn toggleFocusedMaximized(self: *Self) !void {
+            try self.desktop.toggleFocusedMaximized();
+        }
+
+        pub fn toggleFocusedFloating(self: *Self) !void {
+            try self.desktop.toggleFocusedFloating();
+        }
+
+        pub fn requestClose(self: *Self, id: ToplevelId) !void {
+            try self.shell_adapter.queueClose(try self.desktop.shellToplevel(id));
+            self.markProtocolAll(ProtocolReady.shell);
         }
 
         fn applyInputConfiguration(
             self: *Self,
             input: *input_api.Backend,
-            snapshot: *const user_config.Snapshot,
+            snapshot: *const engine_settings.Snapshot,
         ) !void {
             const ids = try self.allocator.alloc(input_api.DeviceId, input.deviceCount());
             defer self.allocator.free(ids);
@@ -1773,17 +1941,17 @@ pub fn Coordinator(comptime protocol: type) type {
             self: *Self,
             input: *input_api.Backend,
             id: input_api.DeviceId,
-            snapshot: *const user_config.Snapshot,
+            snapshot: *const engine_settings.Snapshot,
         ) !void {
             _ = self;
             const description = try input.describeDevice(id);
-            const info: user_config.InputInfo = .{
+            const info: engine_settings.InputInfo = .{
                 .type = inputDeviceType(description.info),
                 .name = description.name(),
                 .vendor = description.info.vendor,
                 .product = description.info.product,
             };
-            const settings = user_config.resolveInput(snapshot.input_rules, info);
+            const settings = engine_settings.resolveInput(snapshot.input_rules, info);
             const defaults = description.defaults;
             _ = try input.applyDeviceConfiguration(id, .{
                 .send_events = resolvedInputSetting(input_platform.SendEvents, settings.send_events, defaults.send_events),
@@ -1819,9 +1987,11 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.stopping = true;
                 if (self.output_reconfigure) |transaction| {
                     switch (transaction.owner) {
-                        .config => |snapshot_value| {
-                            var snapshot = snapshot_value;
-                            snapshot.deinit();
+                        .config => |config_value| {
+                            var config = config_value;
+                            config.engine.deinit();
+                            config.key_consumer.deinit();
+                            config.policy.deinit();
                         },
                         else => {},
                     }
@@ -1843,9 +2013,8 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.syncIdleTimer();
             try self.syncCommitTimer();
             try self.syncXdgSessionStoreTimer();
-            self.binding_repeat_delay_ns = null;
-            self.interaction.cancelRepeat();
-            try self.syncBindingRepeatTimer();
+            self.interaction.cancelKeyConsumerInput();
+            try self.syncConsumerTimer();
             try self.prepareSecurityClosures();
             if (self.hotplug) |*monitor| try monitor.beginDrain(&self.router, &self.root.ring);
             try self.pauseAllOutputs();
@@ -1967,10 +2136,13 @@ pub fn Coordinator(comptime protocol: type) type {
             self.seat_adapter.deinit();
             self.subcompositor_adapter.deinit();
             self.interaction.deinit();
+            self.settings.deinit();
             self.allocator.free(self.desktop_output_topology);
             self.allocator.free(self.physical_output_areas);
             self.desktop.deinit();
             self.foreign_toplevel_list_adapter.deinit();
+            self.allocator.free(self.workspace_workspaces);
+            self.allocator.free(self.workspace_groups);
             self.allocator.free(self.workspace_output_ids);
             self.workspace_adapter.deinit();
             self.image_copy_capture_adapter.deinit();
@@ -2535,8 +2707,8 @@ pub fn Coordinator(comptime protocol: type) type {
                     try self.desktopTimerEvent(outcome.event);
                     continue;
                 };
-                if (self.binding_repeat_timer) |handle| if (std.meta.eql(handle, outcome.handle)) {
-                    try self.bindingRepeatTimerEvent(outcome.event);
+                if (self.consumer_timer) |handle| if (std.meta.eql(handle, outcome.handle)) {
+                    try self.consumerTimerEvent(outcome.event);
                     continue;
                 };
                 for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
@@ -3087,12 +3259,22 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (event == .device_added) try self.applyInputDeviceConfiguration(
                     input,
                     event.device_added.device,
-                    self.interaction.currentConfig(),
+                    &self.settings,
                 );
                 if (!(try self.acceptNormalizedInput(event))) {
                     try self.scheduleClients();
                     return;
                 }
+                if (event == .device_added) {
+                    const description = try input.describeDevice(event.device_added.device);
+                    if (description.info.capabilities.keyboard)
+                        try self.interaction.setKeyRepeat(
+                            event.device_added.device,
+                            description.repeat_rate,
+                            description.repeat_delay,
+                        );
+                }
+                try self.syncConsumerTimer();
                 self.input_event_cursor += 1;
             }
             input.clearEvents();
@@ -3113,6 +3295,10 @@ pub fn Coordinator(comptime protocol: type) type {
         /// physical tests. A false result retains the event between owners;
         /// the caller must retry that exact value before offering another.
         pub fn acceptNormalizedInput(self: *Self, event: input_api.Event) !bool {
+            // A queued binding action is an exact turn boundary. Do not admit
+            // another event until main has handled it.
+            if (!self.input_interaction_accepted and self.bindingsWorkPending())
+                return false;
             if (self.sessionLockActive() and !self.session_lock_input_ready) {
                 try self.sessionLockChanged();
                 if (!self.session_lock_input_ready) return false;
@@ -3904,7 +4090,14 @@ pub fn Coordinator(comptime protocol: type) type {
                             break :blk error.StalePeer;
                         if (!self.seat_adapter.validateSeatOn(objects, command.peer, activation_request.seat))
                             break :blk error.StaleSeat;
-                        break :blk self.desktop.focusToplevel(entry.desktop);
+                        const scene = self.desktop.scene(entry.desktop) catch |cause|
+                            break :blk cause;
+                        break :blk self.interaction.activateToplevel(
+                            &self.desktop,
+                            scene.id,
+                            scene.surface,
+                            .foreign_toplevel,
+                        );
                     },
                     .close => blk: {
                         const shell_id = self.desktop.shellToplevel(entry.desktop) catch |cause|
@@ -4164,22 +4357,52 @@ pub fn Coordinator(comptime protocol: type) type {
             return null;
         }
 
+        fn workspaceOutputForDesktopId(self: *const Self, id: Desktop.OutputId) ?WorkspaceAdapter.OutputId {
+            for (self.physical_outputs[0..self.physical_output_count]) |physical| {
+                const desktop_id: Desktop.OutputId = .{
+                    .value = @as(u64, physical.id.generation) << 32 | physical.id.index,
+                };
+                if (physical.connected and std.meta.eql(desktop_id, id))
+                    return workspaceOutputId(physical.protocol_output);
+            }
+            return null;
+        }
+
+        fn updateWorkspaceInventory(self: *Self) !void {
+            const revision = self.desktop.workspaceRevision();
+            if (self.workspace_revision != null and std.meta.eql(self.workspace_revision.?, revision)) return;
+            var writer: WorkspaceWriter = .{
+                .coordinator = self,
+                .groups = self.workspace_groups,
+                .workspaces = self.workspace_workspaces,
+                .outputs = self.workspace_output_ids,
+            };
+            try self.desktop.writeWorkspaceInventory(&writer);
+            try self.workspace_adapter.inventory(
+                writer.revision,
+                writer.groups[0..writer.group_count],
+                writer.workspaces[0..writer.workspace_count],
+            );
+            self.workspace_revision = revision;
+        }
+
         fn syncWorkspace(self: *Self) !void {
             if (!self.workspace_adapter.hasManagers() and
                 self.workspace_adapter.pendingCommands() == 0) return;
-            var output_count: usize = 0;
-            for (self.physical_outputs[0..self.physical_output_count]) |physical| {
-                if (!physical.connected or
-                    !try self.output_adapter.outputPublished(physical.protocol_output)) continue;
-                self.workspace_output_ids[output_count] = workspaceOutputId(physical.protocol_output);
-                output_count += 1;
-            }
-            self.workspace_adapter.synchronize(self.workspace_output_ids[0..output_count], true) catch
+            self.updateWorkspaceInventory() catch
                 self.markProtocolAll(ProtocolReady.workspace);
             while (self.workspace_adapter.peekCommand()) |command| {
-                if (command.workspace_generation != 1) {
-                    self.workspace_adapter.dropCommand();
-                    continue;
+                if (self.workspace_adapter.commandCurrent(command)) {
+                    const kind: desktop_model.workspace.Request.Kind = switch (command.request) {
+                        .activate => .activate,
+                        .deactivate => .deactivate,
+                        .remove => .remove,
+                        .assign => |group| .{ .assign = .{ .value = group.value } },
+                    };
+                    _ = try self.desktop.requestWorkspace(.{
+                        .workspace = .{ .value = command.workspace.value },
+                        .kind = kind,
+                    });
                 }
                 self.workspace_adapter.dropCommand();
             }
@@ -4231,7 +4454,9 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn beginConfigOutputReconfigure(
             self: *Self,
-            candidate: *user_config.Snapshot,
+            candidate: *engine_settings.Snapshot,
+            key_consumer: ?*KeyConsumerSnapshot,
+            policy: ?*PolicySnapshot,
             take_ownership: bool,
         ) !void {
             const count = self.connectedPhysicalOutputCount();
@@ -4249,7 +4474,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 const connector = snapshot.selectedConnector();
                 var name_buffer: [64]u8 = undefined;
                 const name = try std.fmt.bufPrint(&name_buffer, "DRM-{d}", .{connector.id});
-                const settings = user_config.resolveOutput(candidate.output_rules, .{
+                const settings = engine_settings.resolveOutput(candidate.output_rules, .{
                     .name = name,
                     .connector_id = connector.id,
                     .connector_type = connector.connector_type,
@@ -4281,17 +4506,25 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             if (!self.outputManagementCommandSupported(desired)) return error.UnsupportedOutputConfiguration;
             if (!changed) {
-                if (take_ownership) try self.promoteConfig(candidate);
+                if (take_ownership) try self.promoteConfig(candidate, key_consumer.?, policy.?);
                 return;
             }
             self.output_reconfigure = .{ .owner = .config_reconcile };
             if (take_ownership) {
-                self.output_reconfigure.?.owner = .{ .config = candidate.* };
+                self.output_reconfigure.?.owner = .{ .config = .{
+                    .engine = candidate.*,
+                    .key_consumer = key_consumer.?.*,
+                    .policy = policy.?.*,
+                } };
                 candidate.* = undefined;
+                key_consumer.?.* = undefined;
+                policy.?.* = undefined;
             }
             errdefer {
                 if (self.output_reconfigure.?.owner == .config) {
-                    candidate.* = self.output_reconfigure.?.owner.config;
+                    candidate.* = self.output_reconfigure.?.owner.config.engine;
+                    key_consumer.?.* = self.output_reconfigure.?.owner.config.key_consumer;
+                    policy.?.* = self.output_reconfigure.?.owner.config.policy;
                 }
                 self.output_reconfigure = null;
                 for (self.physical_outputs[0..self.physical_output_count]) |*physical|
@@ -5002,46 +5235,38 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.syncDesktopTimer();
         }
 
-        fn syncBindingRepeatTimer(self: *Self) !void {
-            if (self.binding_repeat_delay_ns) |delay| {
-                if (self.binding_repeat_timer == null) {
-                    const deadline = std.math.add(u64, try monotonicNs(), delay) catch
-                        return error.InvalidDeadline;
-                    self.binding_repeat_timer = try self.timers.arm(
-                        &self.router,
-                        &self.root.ring,
-                        try deadlineFromNs(deadline),
-                    );
-                    self.binding_repeat_timer_canceling = false;
-                    self.binding_repeat_delay_ns = null;
-                } else if (!self.binding_repeat_timer_canceling) {
-                    try self.timers.cancel(
-                        &self.router,
-                        &self.root.ring,
-                        self.binding_repeat_timer.?,
-                    );
-                    self.binding_repeat_timer_canceling = true;
-                }
+        fn syncConsumerTimer(self: *Self) !void {
+            const target = if (self.stopping)
+                null
+            else
+                self.interaction.keyConsumerConst().nextDeadlineNs();
+            if (self.consumer_timer == null) {
+                const deadline = target orelse return;
+                self.consumer_timer = try self.timers.arm(
+                    &self.router,
+                    &self.root.ring,
+                    try deadlineFromNs(deadline),
+                );
+                self.consumer_timer_canceling = false;
+                self.consumer_timer_deadline_ns = deadline;
                 return;
             }
-            if (self.binding_repeat_timer) |handle| if (!self.binding_repeat_timer_canceling) {
-                try self.timers.cancel(&self.router, &self.root.ring, handle);
-                self.binding_repeat_timer_canceling = true;
-            };
+            if (self.consumer_timer_deadline_ns == target) return;
+            if (!self.consumer_timer_canceling) {
+                try self.timers.cancel(&self.router, &self.root.ring, self.consumer_timer.?);
+                self.consumer_timer_canceling = true;
+            }
         }
 
-        fn bindingRepeatTimerEvent(self: *Self, event: timer.Event) !void {
+        fn consumerTimerEvent(self: *Self, event: timer.Event) !void {
             if (event == .pending_cleanup or event == .cleanup_complete) return;
-            const was_canceling = self.binding_repeat_timer_canceling;
-            self.binding_repeat_timer = null;
-            self.binding_repeat_timer_canceling = false;
-            if (event == .fired and !was_canceling and
-                try self.interaction.repeatCurrentBinding(&self.desktop))
-            {
-                self.binding_repeat_delay_ns = self.binding_repeat_interval_ns;
-                try self.applyInteractionCommands();
-            }
-            try self.syncBindingRepeatTimer();
+            const was_canceling = self.consumer_timer_canceling;
+            self.consumer_timer = null;
+            self.consumer_timer_canceling = false;
+            self.consumer_timer_deadline_ns = null;
+            if (event == .fired and !was_canceling)
+                try self.interaction.keyConsumer().deadline(try monotonicNs());
+            try self.syncConsumerTimer();
         }
 
         fn desktopSceneChanged(self: *Self) !void {
@@ -5102,30 +5327,6 @@ pub fn Coordinator(comptime protocol: type) type {
                         if (cancel.pointer_grab) try self.seat_adapter.cancelPointerGrab();
                     },
                     .key_consumed => self.input_keyboard_consumed = true,
-                    .close => |id| try self.shell_adapter.queueClose(try self.desktop.shellToplevel(id)),
-                    .exit => try self.requestStop(),
-                    .run => |argv| if (self.launcher) |launcher| {
-                        launcher.launch(argv) catch |err|
-                            std.log.err("could not launch {s}: {t}", .{ argv[0], err });
-                    } else {
-                        std.log.err("could not launch {s}: no launcher configured", .{argv[0]});
-                    },
-                    .repeat_start => |value| {
-                        const input = self.input orelse return error.StaleDevice;
-                        const description = try input.describeDevice(value.device);
-                        if (description.repeat_rate > 0) {
-                            self.binding_repeat_interval_ns =
-                                (std.time.ns_per_s + @as(u64, @intCast(description.repeat_rate)) - 1) /
-                                @as(u64, @intCast(description.repeat_rate));
-                            self.binding_repeat_delay_ns = @as(u64, @intCast(description.repeat_delay)) *
-                                std.time.ns_per_ms;
-                        } else self.binding_repeat_delay_ns = null;
-                        try self.syncBindingRepeatTimer();
-                    },
-                    .repeat_stop => {
-                        self.binding_repeat_delay_ns = null;
-                        try self.syncBindingRepeatTimer();
-                    },
                 }
                 self.interaction.dropCommand();
                 self.stats.interaction_commands += 1;
@@ -5201,6 +5402,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 ProtocolReady.tablet);
             if (self.sessionLockActive()) {
                 self.session_lock_input_ready = false;
+                self.interaction.cancelKeyConsumerInput();
+                try self.syncConsumerTimer();
                 @memset(&self.input_method_key_owners, null);
                 self.interaction.suspendClientFocus();
                 var input_ready = true;
@@ -5737,6 +5940,7 @@ pub fn Coordinator(comptime protocol: type) type {
                         &self.desktop,
                         scene.id,
                         scene.surface,
+                        .activation,
                     ) catch |err| switch (err) {
                         error.NotVisible, error.StaleToplevel => continue,
                         else => return err,
@@ -6834,8 +7038,7 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn reconcileActiveOutputConfig(self: *Self) void {
             if (self.output_reconfigure != null or self.output_power_transition != null) return;
-            var active = self.interaction.currentConfig().*;
-            self.beginConfigOutputReconfigure(&active, false) catch |err| switch (err) {
+            self.beginConfigOutputReconfigure(&self.settings, null, null, false) catch |err| switch (err) {
                 // Topology replacement briefly publishes the protocol output
                 // before its new scanout claim is installed. The completed
                 // refresh reconciles again with the generation-safe claim.
@@ -10562,14 +10765,20 @@ pub fn Coordinator(comptime protocol: type) type {
                         self.markProtocol(owner.peer, ProtocolReady.output_management);
                     }
                 },
-                .config => |snapshot_value| {
-                    var snapshot = snapshot_value;
+                .config => |config_value| {
+                    var config = config_value;
                     if (result == .succeeded) {
-                        self.promoteConfig(&snapshot) catch |err| {
-                            snapshot.deinit();
+                        self.promoteConfig(&config.engine, &config.key_consumer, &config.policy) catch |err| {
+                            config.engine.deinit();
+                            config.key_consumer.deinit();
+                            config.policy.deinit();
                             std.log.err("output configuration succeeded but config promotion failed: {t}", .{err});
                         };
-                    } else snapshot.deinit();
+                    } else {
+                        config.engine.deinit();
+                        config.key_consumer.deinit();
+                        config.policy.deinit();
+                    }
                 },
                 .config_reconcile => {},
             }
@@ -10954,7 +11163,7 @@ fn activateOutputWithRollback(
 
 fn selectConfiguredMode(
     modes: []const drm.Mode,
-    requested: user_config.OutputMode,
+    requested: engine_settings.OutputMode,
 ) ?drm.Mode {
     var selected: ?drm.Mode = null;
     var selected_delta: u32 = std.math.maxInt(u32);
@@ -11598,7 +11807,7 @@ fn deadlineFromNs(ns: u64) !timer.Deadline {
     };
 }
 
-fn inputDeviceType(info: input_platform.DeviceInfo) user_config.InputType {
+fn inputDeviceType(info: input_platform.DeviceInfo) engine_settings.InputType {
     if (info.is_touchpad) return .touchpad;
     if (info.capabilities.touch) return .touch;
     if (info.capabilities.tablet_pad) return .tablet_pad;
@@ -11609,7 +11818,7 @@ fn inputDeviceType(info: input_platform.DeviceInfo) user_config.InputType {
 
 fn resolvedInputSetting(
     comptime T: type,
-    requested: ?user_config.Setting(T),
+    requested: ?engine_settings.Setting(T),
     defaults: input_platform.Setting(T),
 ) T {
     return if (requested) |setting| switch (setting) {
@@ -11620,7 +11829,7 @@ fn resolvedInputSetting(
 
 fn resolvedOptionalInputSetting(
     comptime T: type,
-    requested: ?user_config.Setting(T),
+    requested: ?engine_settings.Setting(T),
     defaults: ?input_platform.Setting(T),
 ) ?T {
     if (requested) |setting| return switch (setting) {
@@ -11632,7 +11841,7 @@ fn resolvedOptionalInputSetting(
 
 fn resolvedSoftwareInputSetting(
     comptime T: type,
-    requested: ?user_config.Setting(T),
+    requested: ?engine_settings.Setting(T),
     default: T,
 ) T {
     return if (requested) |setting| switch (setting) {

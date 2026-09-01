@@ -1,5 +1,5 @@
 const std = @import("std");
-const config = @import("../config.zig");
+const binding = @import("binding.zig");
 const c = @cImport({
     @cInclude("xkbcommon/xkbcommon.h");
 });
@@ -44,7 +44,7 @@ pub const State = struct {
     /// Returns the level-zero keysym in the active layout. Modifiers are
     /// represented separately, so Shift+1 remains Shift+1 rather than
     /// becoming the layout-specific symbol Shift+exclam.
-    pub fn trigger(self: *const State, evdev_code: u32) config.Trigger {
+    pub fn trigger(self: *const State, evdev_code: u32) binding.Trigger {
         const keycode = evdev_code + 8;
         const layout = c.xkb_state_key_get_layout(self.state, keycode);
         var syms: [*c]const c.xkb_keysym_t = null;

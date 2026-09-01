@@ -304,8 +304,13 @@ pub fn Loop(comptime protocol: type) type {
                 handler.backendDrainComplete()
             else
                 false;
+            const bindings_work_pending = if (@hasDecl(@TypeOf(handler.*), "bindingsWorkPending"))
+                handler.bindingsWorkPending()
+            else
+                false;
             const can_wait = wait_on_idle and self.compositor.ring.cq_ready() == 0 and
                 !wayring_progress.pending and !shutdown_requested and !reload_requested and
+                !bindings_work_pending and
                 !(wayring_progress.shutdown_complete and backend_drained);
             const submitted = if (can_wait)
                 self.compositor.ring.submit_and_wait(1) catch |err| switch (err) {
@@ -330,7 +335,7 @@ pub fn Loop(comptime protocol: type) type {
                 .shutdown_requested = shutdown_requested,
                 .reload_requested = reload_requested,
                 .needs_more_work = self.compositor.ring.cq_ready() != 0 or
-                    wayring_progress.pending,
+                    wayring_progress.pending or bindings_work_pending,
             };
         }
     };
