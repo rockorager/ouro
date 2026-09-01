@@ -2116,6 +2116,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 if (!child.header.active or child.parent == null or
                     !std.meta.eql(child.parent.?, id)) continue;
                 child.parent = replacement;
+                adapter.publishReserved(.{ .parent_changed = .{
+                    .id = adapter.toplevelId(child),
+                    .parent = replacement,
+                } });
             }
             if (adapter.resolveRoleSurface(slot.xdg_surface_index, slot.xdg_surface_generation)) |surface| {
                 surface.last_acked_serial = 0;
@@ -3088,6 +3092,12 @@ test "xdg-shell: toplevel parents are mapped, nullable, and cleared on retiremen
     try test_protocol.xdg_toplevel.encodeRequest(&context.requests, 12, .{ .destroy = .{} });
     try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
     try std.testing.expect(context.adapter.toplevels[child.index].parent == null);
+    const reparented = switch (context.adapter.popEvent() orelse return error.MissingEvent) {
+        .parent_changed => |value| value,
+        else => return error.UnexpectedEvent,
+    };
+    try std.testing.expectEqual(child, reparented.id);
+    try std.testing.expect(reparented.parent == null);
     try std.testing.expectEqual(parent, switch (context.adapter.popEvent() orelse return error.MissingEvent) {
         .toplevel_destroyed => |value| value,
         else => return error.UnexpectedEvent,
