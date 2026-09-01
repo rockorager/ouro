@@ -719,7 +719,9 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 }
                 if (slot.role == .toplevel) {
                     if (slot.acked_toplevel_configure) |configure| {
-                        if (configure.states.maximized) {
+                        if (configure.states.maximized or configure.states.fullscreen or
+                            configure.states.resizing)
+                        {
                             const content = try surface.prospectiveContent();
                             if (content.has_buffer) {
                                 const width: i64 = if (slot.pending_window_geometry orelse slot.window_geometry) |geometry|
@@ -730,8 +732,14 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                                     geometry.height
                                 else
                                     content.size.height;
-                                if ((configure.width != 0 and width != configure.width) or
-                                    (configure.height != 0 and height != configure.height))
+                                const exact = configure.states.maximized;
+                                const bounded = configure.states.fullscreen or configure.states.resizing;
+                                if ((configure.width != 0 and
+                                    ((exact and width != configure.width) or
+                                        (bounded and width > configure.width))) or
+                                    (configure.height != 0 and
+                                        ((exact and height != configure.height) or
+                                            (bounded and height > configure.height))))
                                     return error.InvalidSurfaceState;
                             }
                         }
@@ -789,7 +797,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                         actor,
                         manager.header.resource.id,
                         WmBase.@"error".invalid_surface_state.value,
-                        "maximized window geometry does not match configure",
+                        "window geometry violates configured state",
                     );
                 },
                 else => null,
@@ -3314,6 +3322,48 @@ test "xdg-shell: newer unmaximized configure clears exact size requirement" {
         .width = 700,
         .height = 500,
     }, 0, 0);
+    try context.adapter.validateSurfaceCommit(surface.surface_id);
+}
+
+test "xdg-shell: fullscreen and resizing configure dimensions are maxima" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const id = try context.createToplevel();
+    const surface = context.adapter.surfaces[0];
+    context.adapter.toplevels[id.index].initial_committed = true;
+
+    const fullscreen = try context.adapter.queueToplevelConfigure(id, .{
+        .width = 800,
+        .height = 600,
+        .states = .{ .fullscreen = true },
+    });
+    context.adapter.markConfigureSent(fullscreen);
+    try context.adapter.ackConfigure(surface, fullscreen);
+    try context.core.state.attach(6, .{
+        .handle = .{ .id = 30, .generation = 1 },
+        .width = 801,
+        .height = 500,
+    }, 0, 0);
+    try std.testing.expectError(
+        error.InvalidSurfaceState,
+        context.adapter.validateSurfaceCommit(surface.surface_id),
+    );
+    surface.pending_window_geometry = .{ .x = 0, .y = 0, .width = 700, .height = 500 };
+    try context.adapter.validateSurfaceCommit(surface.surface_id);
+
+    const resizing = try context.adapter.queueToplevelConfigure(id, .{
+        .width = 640,
+        .height = 480,
+        .states = .{ .resizing = true },
+    });
+    context.adapter.markConfigureSent(resizing);
+    try context.adapter.ackConfigure(surface, resizing);
+    surface.pending_window_geometry = .{ .x = 0, .y = 0, .width = 641, .height = 470 };
+    try std.testing.expectError(
+        error.InvalidSurfaceState,
+        context.adapter.validateSurfaceCommit(surface.surface_id),
+    );
+    surface.pending_window_geometry = .{ .x = 0, .y = 0, .width = 600, .height = 470 };
     try context.adapter.validateSurfaceCommit(surface.surface_id);
 }
 
