@@ -1432,6 +1432,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 .context = self,
                 .resolve = resolveXdgFullscreenOutput,
             });
+            self.shell_adapter.setWindowGeometryResolver(.{
+                .context = self,
+                .resolve = resolveXdgWindowGeometryBounds,
+            });
             self.foreign_toplevel_list_adapter.setOutputResolver(
                 self,
                 resolveForeignToplevelOutput,
@@ -3947,6 +3951,54 @@ pub fn Coordinator(comptime protocol: type) type {
             const self: *Self = @ptrCast(@alignCast(context));
             const objects = self.root.runtime.clients.get(peer) catch return null;
             return (self.resolveDesktopOutput(peer, objects, object_id) orelse return null).value;
+        }
+
+        fn resolveXdgWindowGeometryBounds(
+            context: *anyopaque,
+            root: Adapter.SurfaceId,
+        ) !ShellAdapter.WindowGeometry {
+            const self: *Self = @ptrCast(@alignCast(context));
+            const surfaces = try self.sceneOrder(root);
+            var has_content = false;
+            var left: i64 = 0;
+            var top: i64 = 0;
+            var right: i64 = 0;
+            var bottom: i64 = 0;
+            for (surfaces) |surface_id| {
+                const size = (try self.adapter.getSurfaceById(surface_id)).committedSize();
+                if (size.width == 0 or size.height == 0) continue;
+                const placement = if (std.meta.eql(surface_id, root))
+                    null
+                else
+                    try self.subcompositor_adapter.placement(surface_id);
+                const surface_left: i64 = if (placement) |value| value.offset.x else 0;
+                const surface_top: i64 = if (placement) |value| value.offset.y else 0;
+                const surface_right = surface_left + size.width;
+                const surface_bottom = surface_top + size.height;
+                if (!has_content) {
+                    left = surface_left;
+                    top = surface_top;
+                    right = surface_right;
+                    bottom = surface_bottom;
+                    has_content = true;
+                } else {
+                    left = @min(left, surface_left);
+                    top = @min(top, surface_top);
+                    right = @max(right, surface_right);
+                    bottom = @max(bottom, surface_bottom);
+                }
+            }
+            if (!has_content) return .{ .x = 0, .y = 0, .width = 0, .height = 0 };
+            if (left < std.math.minInt(i32) or top < std.math.minInt(i32) or
+                right > std.math.maxInt(i32) or bottom > std.math.maxInt(i32) or
+                right - left > std.math.maxInt(i32) or bottom - top > std.math.maxInt(i32))
+                return error.WindowGeometryOverflow;
+            return .{
+                .x = @intCast(left),
+                .y = @intCast(top),
+                .width = @intCast(right - left),
+                .height = @intCast(bottom - top),
+            };
         }
 
         fn foreignOutputId(id: OutputAdapter.OutputId) ForeignToplevelListAdapter.OutputId {

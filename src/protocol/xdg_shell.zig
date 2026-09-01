@@ -82,11 +82,16 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
 
         pub const ResizeEdge = enum { top, bottom, left, top_left, bottom_left, right, top_right, bottom_right };
 
-        const WindowGeometry = struct {
+        pub const WindowGeometry = struct {
             x: i32,
             y: i32,
             width: i32,
             height: i32,
+        };
+
+        pub const WindowGeometryResolver = struct {
+            context: *anyopaque,
+            resolve: *const fn (*anyopaque, SurfaceId) anyerror!WindowGeometry,
         };
 
         pub const StateSet = packed struct(u16) {
@@ -259,6 +264,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             last_acked_serial: u32 = 0,
             committed_acked_serial: u32 = 0,
             window_geometry: ?WindowGeometry = null,
+            requested_window_geometry: ?WindowGeometry = null,
             pending_window_geometry: ?WindowGeometry = null,
             acked_toplevel_configure: ?ToplevelConfigure = null,
         };
@@ -370,6 +376,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         grab_validator: ?GrabValidator = null,
         interactive_grab_validator: ?InteractiveGrabValidator = null,
         output_resolver: ?OutputResolver = null,
+        window_geometry_resolver: ?WindowGeometryResolver = null,
 
         pub fn init(
             allocator: std.mem.Allocator,
@@ -476,6 +483,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
 
         pub fn setOutputResolver(adapter: *Self, resolver: OutputResolver) void {
             adapter.output_resolver = resolver;
+        }
+
+        pub fn setWindowGeometryResolver(adapter: *Self, resolver: WindowGeometryResolver) void {
+            adapter.window_geometry_resolver = resolver;
         }
 
         /// Completes the protocol-defined two-request construction of a popup
@@ -724,12 +735,19 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                         {
                             const content = try surface.prospectiveContent();
                             if (content.has_buffer) {
-                                const width: i64 = if (slot.pending_window_geometry orelse slot.window_geometry) |geometry|
-                                    geometry.width
+                                const geometry = if (slot.pending_window_geometry) |requested|
+                                    effectiveWindowGeometry(
+                                        requested,
+                                        windowGeometryBoundsFor(WindowGeometry, content.size),
+                                    )
+                                else
+                                    slot.window_geometry;
+                                const width: i64 = if (geometry) |value|
+                                    value.width
                                 else
                                     content.size.width;
-                                const height: i64 = if (slot.pending_window_geometry orelse slot.window_geometry) |geometry|
-                                    geometry.height
+                                const height: i64 = if (geometry) |value|
+                                    value.height
                                 else
                                     content.size.height;
                                 const exact = configure.states.maximized;
@@ -811,9 +829,13 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 if (!slot.header.active or !std.meta.eql(slot.surface_id, id)) continue;
                 const previous_window_geometry = slot.window_geometry;
                 if (slot.pending_window_geometry) |geometry| {
-                    slot.window_geometry = geometry;
+                    slot.requested_window_geometry = geometry;
                     slot.pending_window_geometry = null;
                 }
+                slot.window_geometry = if (slot.requested_window_geometry) |requested|
+                    effectiveWindowGeometry(requested, try adapter.windowGeometryBounds(slot))
+                else
+                    null;
                 const geometry_changed = !std.meta.eql(
                     previous_window_geometry,
                     slot.window_geometry,
@@ -1707,6 +1729,15 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             } });
         }
 
+        fn windowGeometryBounds(adapter: *Self, slot: *SurfaceSlot) !WindowGeometry {
+            if (adapter.window_geometry_resolver) |resolver|
+                return resolver.resolve(resolver.context, slot.surface_id);
+            return windowGeometryBoundsFor(
+                WindowGeometry,
+                (try adapter.core.getSurfaceById(slot.surface_id)).committedSize(),
+            );
+        }
+
         fn publishFullscreen(adapter: *Self, id: ToplevelId, enabled: bool, output: ?u64) !void {
             try adapter.publish(.{ .state_requested = .{
                 .id = id,
@@ -2355,6 +2386,35 @@ fn validAxis(value: u32) bool {
     return value <= 8;
 }
 
+fn windowGeometryBoundsFor(comptime T: type, size: anytype) T {
+    return .{
+        .x = 0,
+        .y = 0,
+        .width = @intCast(size.width),
+        .height = @intCast(size.height),
+    };
+}
+
+fn effectiveWindowGeometry(requested: anytype, bounds: @TypeOf(requested)) @TypeOf(requested) {
+    const left = @max(@as(i64, requested.x), bounds.x);
+    const top = @max(@as(i64, requested.y), bounds.y);
+    const right = @min(
+        @as(i64, requested.x) + requested.width,
+        @as(i64, bounds.x) + bounds.width,
+    );
+    const bottom = @min(
+        @as(i64, requested.y) + requested.height,
+        @as(i64, bounds.y) + bounds.height,
+    );
+    if (left >= right or top >= bottom) return requested;
+    return .{
+        .x = @intCast(left),
+        .y = @intCast(top),
+        .width = @intCast(right - left),
+        .height = @intCast(bottom - top),
+    };
+}
+
 fn serialAtOrBefore(value: u32, limit: u32) bool {
     return @as(i32, @bitCast(limit -% value)) >= 0;
 }
@@ -2545,6 +2605,13 @@ fn validateTestInteractiveGrab(
     _: TestAdapter.SurfaceId,
 ) bool {
     return validateTestGrab(context, peer, seat_object, serial);
+}
+
+fn resolveTestWindowGeometry(
+    context: *anyopaque,
+    _: TestAdapter.SurfaceId,
+) !TestAdapter.WindowGeometry {
+    return @as(*TestAdapter.WindowGeometry, @ptrCast(@alignCast(context))).*;
 }
 
 const TestContext = struct {
@@ -3117,6 +3184,50 @@ test "xdg-shell: configure emission resumes between role and surface events" {
     try std.testing.expectEqual(
         TestAdapter.WindowGeometry{ .x = -12, .y = 7, .width = 780, .height = 560 },
         context.adapter.surfaces[0].window_geometry.?,
+    );
+}
+
+test "xdg-shell: explicit window geometry is clipped to surface-tree bounds" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const id = try context.createToplevel();
+    const surface = context.adapter.surfaces[0];
+    context.adapter.toplevels[id.index].initial_committed = true;
+    surface.last_acked_serial = 1;
+    try context.core.state.attach(6, .{
+        .handle = .{ .id = 30, .generation = 1 },
+        .width = 100,
+        .height = 80,
+    }, 0, 0);
+    _ = try context.core.state.commit();
+
+    surface.pending_window_geometry = .{ .x = -10, .y = 10, .width = 80, .height = 100 };
+    try context.adapter.publishSurfaceCommitted(surface.surface_id);
+    try std.testing.expectEqual(
+        TestAdapter.WindowGeometry{ .x = -10, .y = 10, .width = 80, .height = 100 },
+        surface.requested_window_geometry.?,
+    );
+    try std.testing.expectEqual(
+        TestAdapter.WindowGeometry{ .x = 0, .y = 10, .width = 70, .height = 70 },
+        surface.window_geometry.?,
+    );
+    _ = context.adapter.popEvent();
+
+    surface.pending_window_geometry = .{ .x = 200, .y = 200, .width = 20, .height = 10 };
+    try context.adapter.publishSurfaceCommitted(surface.surface_id);
+    try std.testing.expectEqual(surface.requested_window_geometry.?, surface.window_geometry.?);
+    _ = context.adapter.popEvent();
+
+    var tree_bounds = TestAdapter.WindowGeometry{ .x = -20, .y = -10, .width = 150, .height = 100 };
+    context.adapter.setWindowGeometryResolver(.{
+        .context = &tree_bounds,
+        .resolve = resolveTestWindowGeometry,
+    });
+    surface.pending_window_geometry = .{ .x = -30, .y = 0, .width = 100, .height = 100 };
+    try context.adapter.publishSurfaceCommitted(surface.surface_id);
+    try std.testing.expectEqual(
+        TestAdapter.WindowGeometry{ .x = -20, .y = 0, .width = 90, .height = 90 },
+        surface.window_geometry.?,
     );
 }
 
