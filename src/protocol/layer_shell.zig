@@ -302,6 +302,36 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
             if (!s.initial_committed and self.outbound_len == self.outbound_capacity) return error.Exhausted;
         }
 
+        pub fn reportSurfaceCommitFailure(
+            self: *Self,
+            actor: *wayring.connection.Actor,
+            surface: SurfaceId,
+            cause: anyerror,
+        ) !?wayring.dispatch.Control {
+            const s = self.find(surface) orelse return null;
+            return switch (cause) {
+                error.InvalidSize => try self.surfaceError(
+                    actor,
+                    s.resource.id,
+                    LayerSurface.@"error".invalid_size.value,
+                    "layer surface size is invalid",
+                ),
+                error.InvalidExclusiveEdge => try self.surfaceError(
+                    actor,
+                    s.resource.id,
+                    LayerSurface.@"error".invalid_exclusive_edge.value,
+                    "layer surface exclusive edge is invalid",
+                ),
+                error.UnconfiguredBuffer, error.InitialCommitMustBeEmpty => try self.surfaceError(
+                    actor,
+                    s.resource.id,
+                    LayerSurface.@"error".invalid_surface_state.value,
+                    "layer surface committed a buffer before configure",
+                ),
+                else => null,
+            };
+        }
+
         pub fn publishSurfaceCommitted(self: *Self, surface: SurfaceId) !void {
             const s = self.find(surface) orelse return error.StaleSurface;
             const core = try self.core.getSurfaceById(surface);
@@ -903,4 +933,60 @@ test "layer shell: configure and output removal survive transport backpressure" 
         &close_queue.descriptors,
     );
     try std.testing.expect(close_event == .closed);
+}
+
+test "layer shell: commit error names the layer surface" {
+    const test_protocol = @import("core_protocol");
+    const FakeCore = struct {
+        pub const SurfaceId = struct { index: u32, generation: u32 };
+    };
+    const FakeOutput = struct {
+        pub const OutputId = struct { index: u32, generation: u32 };
+    };
+    const TestAdapter = Adapter(test_protocol, FakeCore, FakeOutput);
+    var core: FakeCore = .{};
+    var output: FakeOutput = .{};
+    var adapter = try TestAdapter.init(std.testing.allocator, &core, &output, .{});
+    defer adapter.deinit();
+    const slot = try adapter.acquire();
+    slot.surface = .{ .index = 3, .generation = 4 };
+    slot.resource = .{ .id = 44, .generation = 5 };
+
+    var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 128, 1);
+    defer blocks.deinit(std.testing.allocator);
+    var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 1);
+    defer descriptors.deinit(std.testing.allocator);
+    var fragment_storage: [64]u8 = undefined;
+    var actor = wayring.connection.Actor.init(
+        0,
+        1,
+        &fragment_storage,
+        &descriptors,
+        0,
+        &blocks,
+        128,
+        0,
+    );
+    defer actor.deinit();
+    var received_fds = wayring.ancillary.FdQueue.init(&descriptors, 0);
+    defer received_fds.deinit();
+
+    try std.testing.expectEqual(
+        wayring.dispatch.Control.stop,
+        (try adapter.reportSurfaceCommitFailure(
+            &actor,
+            slot.surface,
+            error.InvalidExclusiveEdge,
+        )).?,
+    );
+    var descriptor_scratch: [1]std.os.linux.fd_t = undefined;
+    var control: [64]u8 align(@alignOf(std.os.linux.cmsghdr)) = undefined;
+    const snapshot = try actor.transmit.snapshot(&descriptor_scratch, &control);
+    const message = (try wayring.wire.Message.decode(snapshot.first)).?;
+    const event = try wayring.server.Core(test_protocol).Display.decodeEvent(message, &received_fds);
+    try std.testing.expectEqual(@as(?u32, 44), event.@"error".object_id);
+    try std.testing.expectEqual(
+        test_protocol.zwlr_layer_surface_v1.@"error".invalid_exclusive_edge.value,
+        event.@"error".code,
+    );
 }

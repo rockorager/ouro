@@ -197,6 +197,35 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
             if (!prospective.has_buffer) return error.NullBuffer;
             if (prospective.size.width != s.ack_width or prospective.size.height != s.ack_height) return error.DimensionsMismatch;
         }
+        pub fn reportSurfaceCommitFailure(
+            self: *Self,
+            actor: *wayring.connection.Actor,
+            sid: SurfaceId,
+            cause: anyerror,
+        ) !?wayring.dispatch.Control {
+            const s = self.findSurface(sid) orelse return null;
+            return switch (cause) {
+                error.CommitBeforeFirstAck => try self.protocolError(
+                    actor,
+                    s.resource.id,
+                    LockSurface.@"error".commit_before_first_ack.value,
+                    "lock surface committed before first configure ack",
+                ),
+                error.NullBuffer => try self.protocolError(
+                    actor,
+                    s.resource.id,
+                    LockSurface.@"error".null_buffer.value,
+                    "lock surface committed a null buffer",
+                ),
+                error.DimensionsMismatch => try self.protocolError(
+                    actor,
+                    s.resource.id,
+                    LockSurface.@"error".dimensions_mismatch.value,
+                    "lock surface dimensions do not match configure",
+                ),
+                else => null,
+            };
+        }
         pub fn publishSurfaceCommitted(self: *Self, sid: SurfaceId) !void {
             const s = self.findSurface(sid) orelse return;
             if (s.retired) return;
@@ -685,4 +714,60 @@ test "session-lock: configure ack gates exact prospective commit dimensions" {
     try adapter.validateSurfaceCommit(slot.surface);
     try adapter.publishSurfaceCommitted(slot.surface);
     try std.testing.expect(!(try adapter.surfaceState(id)).mapped);
+}
+
+test "session-lock: commit error names the lock surface" {
+    const test_protocol = @import("core_protocol");
+    const FakeCore = struct {
+        pub const SurfaceId = struct { index: u32, generation: u32 };
+    };
+    const FakeOutput = struct {
+        pub const OutputId = struct { index: u32, generation: u32 };
+    };
+    const TestAdapter = Adapter(test_protocol, FakeCore, FakeOutput);
+    var core: FakeCore = .{};
+    var output: FakeOutput = .{};
+    var adapter = try TestAdapter.init(std.testing.allocator, &core, &output, .{});
+    defer adapter.deinit();
+    const slot = try adapter.acquireSurface();
+    slot.surface = .{ .index = 5, .generation = 6 };
+    slot.resource = .{ .id = 45, .generation = 7 };
+
+    var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 128, 1);
+    defer blocks.deinit(std.testing.allocator);
+    var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 1);
+    defer descriptors.deinit(std.testing.allocator);
+    var fragment_storage: [64]u8 = undefined;
+    var actor = wayring.connection.Actor.init(
+        0,
+        1,
+        &fragment_storage,
+        &descriptors,
+        0,
+        &blocks,
+        128,
+        0,
+    );
+    defer actor.deinit();
+    var received_fds = wayring.ancillary.FdQueue.init(&descriptors, 0);
+    defer received_fds.deinit();
+
+    try std.testing.expectEqual(
+        wayring.dispatch.Control.stop,
+        (try adapter.reportSurfaceCommitFailure(
+            &actor,
+            slot.surface,
+            error.DimensionsMismatch,
+        )).?,
+    );
+    var descriptor_scratch: [1]std.os.linux.fd_t = undefined;
+    var control: [64]u8 align(@alignOf(std.os.linux.cmsghdr)) = undefined;
+    const snapshot = try actor.transmit.snapshot(&descriptor_scratch, &control);
+    const message = (try wayring.wire.Message.decode(snapshot.first)).?;
+    const event = try wayring.server.Core(test_protocol).Display.decodeEvent(message, &received_fds);
+    try std.testing.expectEqual(@as(?u32, 45), event.@"error".object_id);
+    try std.testing.expectEqual(
+        test_protocol.ext_session_lock_surface_v1.@"error".dimensions_mismatch.value,
+        event.@"error".code,
+    );
 }

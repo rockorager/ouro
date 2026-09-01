@@ -2660,7 +2660,11 @@ pub fn Coordinator(comptime protocol: type) type {
             cause: anyerror,
         ) !?wayring.dispatch.Control {
             const self: *Self = @ptrCast(@alignCast(context));
-            return self.shell_adapter.reportSurfaceCommitFailure(actor, id, cause);
+            if (try self.shell_adapter.reportSurfaceCommitFailure(actor, id, cause)) |control|
+                return control;
+            if (try self.layer_shell_adapter.reportSurfaceCommitFailure(actor, id, cause)) |control|
+                return control;
+            return self.session_lock_adapter.reportSurfaceCommitFailure(actor, id, cause);
         }
 
         fn surfaceCommitted(context: *anyopaque, id: Adapter.SurfaceId) !void {
