@@ -200,6 +200,8 @@ pub fn Desktop(comptime Shell: type) type {
         output_areas: []geometry.Rect,
         output_ids: []OutputId,
         output_area_len: usize = 1,
+        inner_gap: u32 = 0,
+        outer_gap: u32 = 0,
         metadata_storage: []u8,
         metadata_bytes: usize,
         focus: []u32,
@@ -403,6 +405,16 @@ pub fn Desktop(comptime Shell: type) type {
 
         pub fn pendingCommands(desktop: *const Self) usize {
             return desktop.command_len + desktop.popup_command_len;
+        }
+
+        pub fn maintenancePending(desktop: *const Self, shell: *const Shell) bool {
+            return desktop.destroyed != null or
+                desktop.destroyed_surface != null or
+                desktop.interactive_request != null or
+                desktop.peekEvent(shell) != null or
+                desktop.pendingCommands() != 0 or
+                desktop.scene_changed or
+                desktop.foreign_toplevel_changed;
         }
 
         pub fn takeDestroyed(desktop: *Self) ?ToplevelId {
@@ -679,6 +691,27 @@ pub fn Desktop(comptime Shell: type) type {
 
         pub fn workArea(desktop: *const Self) geometry.Rect {
             return desktop.work_area;
+        }
+
+        /// Changes tiling gaps atomically. All current output layouts and
+        /// configure capacity are checked before policy state is mutated.
+        pub fn validateGaps(desktop: *Self, inner: u32, outer: u32) !void {
+            if (desktop.inner_gap == inner and desktop.outer_gap == outer) return;
+            try desktop.validateLayoutWithGaps(
+                desktop.layoutCount(),
+                desktop.outputAreas(),
+                inner,
+                outer,
+            );
+            try desktop.requireCommandCapacity(desktop.live);
+        }
+
+        pub fn setGaps(desktop: *Self, inner: u32, outer: u32) !void {
+            if (desktop.inner_gap == inner and desktop.outer_gap == outer) return;
+            try desktop.validateGaps(inner, outer);
+            desktop.inner_gap = inner;
+            desktop.outer_gap = outer;
+            desktop.reflow() catch unreachable;
         }
 
         pub fn validateOutputAreas(desktop: *Self, areas: []const geometry.Rect) !void {
@@ -1412,6 +1445,8 @@ pub fn Desktop(comptime Shell: type) type {
                 _ = try layout.plan(
                     desktop.layout_items[placement_len .. placement_len + area_item_len],
                     desktop.output_areas[area_index],
+                    desktop.inner_gap,
+                    desktop.outer_gap,
                     desktop.placements[placement_len .. placement_len + area_item_len],
                 );
                 placement_len += area_item_len;
@@ -1705,15 +1740,25 @@ pub fn Desktop(comptime Shell: type) type {
             count: usize,
             areas: anytype,
         ) !void {
+            return desktop.validateLayoutWithGaps(count, areas, desktop.inner_gap, desktop.outer_gap);
+        }
+
+        fn validateLayoutWithGaps(
+            desktop: *const Self,
+            count: usize,
+            areas: anytype,
+            inner: u32,
+            outer: u32,
+        ) !void {
             _ = desktop;
             var placed: usize = 0;
-            var area_index: usize = 0;
-            while (placed < count) : (area_index += 1) {
-                const remaining_areas = @min(areas.len - area_index, count - placed);
-                const area_count = outputItemCount(count - placed, remaining_areas);
-                const area = outputAreaGeometry(areas[area_index]);
-                if (area_count > 1 and (area.width < 2 or area.height < area_count - 1))
-                    return error.WorkAreaTooSmall;
+            for (areas, 0..) |raw_area, area_index| {
+                var area_count: usize = 0;
+                if (placed < count) {
+                    const remaining_areas = @min(areas.len - area_index, count - placed);
+                    area_count = outputItemCount(count - placed, remaining_areas);
+                }
+                try layout.validate(area_count, outputAreaGeometry(raw_area), inner, outer);
                 placed += area_count;
             }
         }
@@ -2473,6 +2518,32 @@ test "desktop: shell events produce exact tiling, focus, metadata, and configure
     try std.testing.expectEqual(@as(usize, 2), try desktop.consume(&shell, 8));
     try std.testing.expectEqualStrings("terminal", (try desktop.metadata(first)).title);
     try std.testing.expect((try desktop.scene(first)).content_ready);
+}
+
+test "desktop: gaps reflow tiled windows transactionally" {
+    var desktop = try initTestDesktop(16);
+    defer desktop.deinit();
+    var shell = TestShell{};
+    shell.push(created(0));
+    shell.push(created(1));
+    shell.push(created(2));
+    _ = try desktop.consume(&shell, 3);
+    try settleDesktop(&desktop, &shell);
+
+    const first = try desktop.idForShell(.{ .index = 0, .generation = 1 });
+    const second = try desktop.idForShell(.{ .index = 1, .generation = 1 });
+    const third = try desktop.idForShell(.{ .index = 2, .generation = 1 });
+    try desktop.setGaps(4, 5);
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expectEqual(geometry.Rect{ .x = 5, .y = 5, .width = 43, .height = 50 }, (try desktop.scene(first)).geometry);
+    try std.testing.expectEqual(geometry.Rect{ .x = 52, .y = 5, .width = 43, .height = 23 }, (try desktop.scene(second)).geometry);
+    try std.testing.expectEqual(geometry.Rect{ .x = 52, .y = 32, .width = 43, .height = 23 }, (try desktop.scene(third)).geometry);
+
+    const before = (try desktop.scene(first)).geometry;
+    try std.testing.expectError(error.WorkAreaTooSmall, desktop.setGaps(100, 100));
+    try std.testing.expectEqual(@as(u32, 4), desktop.inner_gap);
+    try std.testing.expectEqual(@as(u32, 5), desktop.outer_gap);
+    try std.testing.expectEqual(before, (try desktop.scene(first)).geometry);
 }
 
 test "desktop: topology keeps tiled and fullscreen windows on exact outputs" {

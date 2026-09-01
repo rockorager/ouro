@@ -189,6 +189,12 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime She
             return completed;
         }
 
+        pub fn hasPendingRelations(self: *const Self) bool {
+            for (self.relations.entries.items) |relation|
+                if (relation.header.active and relation.clear_pending) return true;
+            return false;
+        }
+
         pub fn flushOn(self: *Self, peer: wayring.io_uring.Peer, _: anytype, queue: *wayring.tx.Queue) !usize {
             var completed: usize = 0;
             for (self.exports.entries.items) |slot| if (slot.header.active and slot.handle_pending and samePeer(slot.peer, peer)) {
@@ -430,7 +436,9 @@ test "xdg foreign: handles, invalidation, and relation cleanup are generational"
     try std.testing.expect(imported.export_id == null);
     try std.testing.expect(imported.destroyed_pending);
     try std.testing.expect(relation.clear_pending);
+    try std.testing.expect(adapter.hasPendingRelations());
     try std.testing.expectEqual(@as(usize, 1), try adapter.advanceRelations());
+    try std.testing.expect(!adapter.hasPendingRelations());
     try std.testing.expectEqual(@as(usize, 1), shell.cleared);
     try std.testing.expect(!relation.header.active);
 }

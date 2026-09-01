@@ -202,6 +202,10 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type) type {
             return null;
         }
 
+        pub fn hasPendingEvents(self: *const Self) bool {
+            return self.event_len != 0;
+        }
+
         pub fn dropEvent(self: *Self) void {
             std.debug.assert(self.event_len != 0);
             self.event_head = (self.event_head + 1) % self.events.len;

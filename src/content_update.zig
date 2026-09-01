@@ -31,6 +31,13 @@ pub fn Scheduler(comptime Key: type, comptime Payload: type) type {
             payload: Payload,
         };
 
+        /// A ready dependency graph inspected for immediate application.
+        /// Any scheduler mutation invalidates this value.
+        pub const Inspected = struct {
+            candidate: Token,
+            count: usize,
+        };
+
         pub const Pending = struct {
             kind: Kind,
             payload: *const Payload,
@@ -482,6 +489,56 @@ pub fn Scheduler(comptime Key: type, comptime Payload: type) type {
             return output[0..used];
         }
 
+        /// Inspects readiness and writes application-order surface keys in one
+        /// traversal. The returned token may be consumed by `applyInspected`
+        /// only before another scheduler operation mutates the graph.
+        pub fn inspectReadyWith(
+            scheduler: *Self,
+            queue: *Queue,
+            output: []Key,
+            context: ?*const anyopaque,
+            ready_fn: *const fn (?*const anyopaque, *const Payload) bool,
+        ) Error!?Inspected {
+            if (queue.scheduler != scheduler) return error.InvalidDependency;
+            if (queue.head == none or scheduler.nodes[queue.head].kind != .desync)
+                return null;
+            const candidate = scheduler.nodeToken(queue.head);
+            const epoch = scheduler.nextEpoch();
+            var used: usize = 0;
+            var blocked = false;
+            scheduler.inspectAndCollect(
+                candidate,
+                epoch,
+                output,
+                &used,
+                &blocked,
+                context,
+                ready_fn,
+            );
+            if (used > output.len) return error.OutputTooSmall;
+            if (blocked) return null;
+            return .{ .candidate = candidate, .count = used };
+        }
+
+        /// Consumes a graph returned by `inspectReadyWith` without repeating
+        /// its readiness traversal.
+        pub fn applyInspected(
+            scheduler: *Self,
+            queue: *Queue,
+            inspected: Inspected,
+            output: []Applied,
+        ) Error![]Applied {
+            if (queue.scheduler != scheduler) return error.InvalidDependency;
+            if (queue.head == none or
+                !std.meta.eql(scheduler.nodeToken(queue.head), inspected.candidate))
+                return error.InvalidToken;
+            if (output.len < inspected.count) return error.OutputTooSmall;
+            var used: usize = 0;
+            scheduler.apply(inspected.candidate, output, &used);
+            std.debug.assert(used == inspected.count);
+            return output[0..used];
+        }
+
         /// Visits the queue head and its complete dependency graph without
         /// mutating scheduler ownership. Both synchronized and desynchronized
         /// heads are accepted so owners can derive wake-up requirements.
@@ -633,6 +690,36 @@ pub fn Scheduler(comptime Key: type, comptime Payload: type) type {
                 );
         }
 
+        fn inspectAndCollect(
+            scheduler: *Self,
+            token: Token,
+            epoch: u32,
+            output: []Key,
+            used: *usize,
+            blocked: *bool,
+            context: ?*const anyopaque,
+            ready_fn: *const fn (?*const anyopaque, *const Payload) bool,
+        ) void {
+            const index = scheduler.validateToken(token) catch return;
+            const node = &scheduler.nodes[index];
+            if (node.visit_epoch == epoch) return;
+            node.visit_epoch = epoch;
+            if (node.constraint_count != 0 or !ready_fn(context, &node.payload)) blocked.* = true;
+            var edge_index = node.dependency_head;
+            while (edge_index != none) : (edge_index = scheduler.edges[edge_index].next)
+                scheduler.inspectAndCollect(
+                    scheduler.edges[edge_index].dependency,
+                    epoch,
+                    output,
+                    used,
+                    blocked,
+                    context,
+                    ready_fn,
+                );
+            if (used.* < output.len) output[used.*] = node.owner.key;
+            used.* += 1;
+        }
+
         fn alwaysReady(_: ?*const anyopaque, _: *const Payload) bool {
             return true;
         }
@@ -742,7 +829,20 @@ test "content updates apply complete dependency graphs atomically" {
     );
     try std.testing.expectError(error.OutputTooSmall, scheduler.tryApply(&parent, applied[0..2]));
     try std.testing.expectEqual(@as(usize, 3), try scheduler.readyCount(&parent));
-    const result = try scheduler.tryApply(&parent, &applied);
+    const Ready = struct {
+        fn check(_: ?*const anyopaque, _: *const u32) bool {
+            return true;
+        }
+    };
+    const inspected = (try scheduler.inspectReadyWith(
+        &parent,
+        &ready_surfaces,
+        null,
+        Ready.check,
+    )).?;
+    try std.testing.expectEqual(@as(usize, 3), inspected.count);
+    try std.testing.expectEqualSlices(u32, &.{ 2, 2, 1 }, &ready_surfaces);
+    const result = try scheduler.applyInspected(&parent, inspected, &applied);
     try std.testing.expectEqual(@as(usize, 3), result.len);
     try std.testing.expectEqual(@as(u32, 20), result[0].payload);
     try std.testing.expectEqual(@as(u32, 21), result[1].payload);

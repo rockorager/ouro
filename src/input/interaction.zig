@@ -8,9 +8,11 @@
 const std = @import("std");
 const input = @import("../backend/input/backend.zig");
 const input_platform = @import("../backend/input/platform.zig");
+const user_config = @import("../config.zig");
 const geometry = @import("../scene/geometry.zig");
 const hit_test = @import("../scene/hit_test.zig");
 const cursor_model = @import("../scene/cursor.zig");
+const keymap = @import("keymap.zig");
 
 const code_count = 0x300;
 const state_words = code_count / 64;
@@ -21,10 +23,9 @@ const key_m = 50;
 const key_space = 57;
 const key_j = 36;
 const key_k = 37;
+const key_x = 45;
 const key_left_shift = 42;
-const key_right_shift = 54;
 const key_left_meta = 125;
-const key_right_meta = 126;
 
 pub const Config = struct {
     window_capacity: usize,
@@ -67,6 +68,10 @@ pub fn Interaction(comptime Desktop: type) type {
             cancel: Cancellation,
             key_consumed,
             close: ToplevelId,
+            exit,
+            run: []const []const u8,
+            repeat_start: struct { device: input.DeviceId, key: u32 },
+            repeat_stop,
         };
         const InteractiveOperation = struct {
             target: Target,
@@ -108,6 +113,13 @@ pub fn Interaction(comptime Desktop: type) type {
         keyboard_focus: ?Target = null,
         mode: Mode = .default,
         cursor: Cursor = .{},
+        binding_config: user_config.Snapshot,
+        keymap_state: keymap.State,
+        repeat_binding: ?struct {
+            device: input.DeviceId,
+            key: u32,
+            binding: user_config.Binding,
+        } = null,
 
         pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
             if (config.window_capacity == 0 or config.device_capacity == 0 or
@@ -126,6 +138,11 @@ pub fn Interaction(comptime Desktop: type) type {
             errdefer allocator.free(devices);
             // One extra slot is reserved for destruction/device-loss cancellation.
             const commands = try allocator.alloc(Command, command_slots);
+            errdefer allocator.free(commands);
+            var binding_config = try user_config.defaultSnapshot(allocator);
+            errdefer binding_config.deinit();
+            var keymap_state = try keymap.State.init();
+            errdefer keymap_state.deinit();
             @memset(devices, .{});
             output_areas[0] = config.bounds;
             return .{
@@ -138,15 +155,51 @@ pub fn Interaction(comptime Desktop: type) type {
                 .devices = devices,
                 .commands = commands,
                 .cursor = .{ .position = config.initial_position },
+                .binding_config = binding_config,
+                .keymap_state = keymap_state,
             };
         }
 
         pub fn deinit(self: *Self) void {
+            self.keymap_state.deinit();
+            self.binding_config.deinit();
             self.allocator.free(self.commands);
             self.allocator.free(self.devices);
             self.allocator.free(self.output_areas);
             self.allocator.free(self.windows);
             self.* = undefined;
+        }
+
+        pub fn installConfig(self: *Self, candidate: *user_config.Snapshot) !void {
+            if (self.command_len != 0) return error.CommandsPending;
+            self.binding_config.deinit();
+            self.binding_config = candidate.*;
+            candidate.* = undefined;
+        }
+
+        pub fn canInstallConfig(self: *const Self) !void {
+            if (self.command_len != 0) return error.CommandsPending;
+        }
+
+        pub fn cancelRepeat(self: *Self) void {
+            self.repeat_binding = null;
+            self.removeRepeatCommands();
+        }
+
+        pub fn repeatCurrentBinding(self: *Self, desktop: *Desktop) !bool {
+            const repeating = self.repeat_binding orelse return false;
+            const device = self.findDevice(repeating.device) orelse return false;
+            if (!bitSet(&device.keys, repeating.key)) return false;
+            const close_target = try self.applyBindingDesktop(desktop, repeating.binding);
+            try self.ensureCommandCapacity(@as(usize, @intFromBool(close_target != null)) +
+                @as(usize, @intFromBool(repeating.binding.action == .exit or
+                    repeating.binding.action == .run)));
+            self.enqueueBindingCommands(repeating.binding, close_target);
+            return true;
+        }
+
+        pub fn currentConfig(self: *const Self) *const user_config.Snapshot {
+            return &self.binding_config;
         }
 
         /// Consumes one normalized input event transactionally. On ordinary
@@ -495,6 +548,13 @@ pub fn Interaction(comptime Desktop: type) type {
                     },
                 };
             } else null;
+            const follows_pointer = self.binding_config.general.focus_follows_mouse and
+                self.mode == .default and target != null and target.?.managed and
+                target.?.keyboard_focusable and
+                (self.keyboard_focus == null or
+                    !std.meta.eql(self.keyboard_focus.?.toplevel, target.?.toplevel) or
+                    !std.meta.eql(self.keyboard_focus.?.surface, target.?.surface));
+            if (follows_pointer) try self.ensureCommandCapacity(2);
             const inside = target != null;
             if (target == null) switch (self.mode) {
                 .popup_grab => |grab| for (windows) |window| {
@@ -516,6 +576,11 @@ pub fn Interaction(comptime Desktop: type) type {
             };
             if (interactive_rect) |rect|
                 try desktop.updateInteractive(self.mode.interactive.target.toplevel, rect);
+            if (follows_pointer) {
+                try desktop.focusToplevel(target.?.toplevel);
+                self.keyboard_focus = target.?;
+                self.enqueue(.{ .keyboard_focus = target.? });
+            }
             self.enqueue(.{ .pointer_focus = target });
             self.x_fixed = next_x;
             self.y_fixed = next_y;
@@ -600,36 +665,99 @@ pub fn Interaction(comptime Desktop: type) type {
             const was = bitSet(&device.keys, key);
             if (was == pressed) return;
             const release_binding = !pressed and bitSet(&device.swallowed_keys, key);
-            const meta = self.anyDeviceKey(key_left_meta) or self.anyDeviceKey(key_right_meta) or
-                (pressed and (key == key_left_meta or key == key_right_meta));
-            const shift = self.anyDeviceKey(key_left_shift) or self.anyDeviceKey(key_right_shift) or
-                (pressed and (key == key_left_shift or key == key_right_shift));
             const inhibit_bindings = if (self.keyboard_focus) |focus| inhibited: {
                 const scene = desktop.scene(focus.toplevel) catch break :inhibited false;
                 break :inhibited shortcuts_inhibited and scene.visible and scene.content_ready;
             } else false;
-            const binding = !inhibit_bindings and pressed and meta and isBindingKey(key);
-            const close_target = if (binding and key == key_q) desktop.focusedToplevel() else null;
-            if (binding or release_binding)
-                try self.ensureCommandCapacity(1 + @as(usize, @intFromBool(close_target != null)));
-            if (binding) switch (key) {
-                key_tab => try desktop.focusNext(),
-                key_q => {},
-                key_f => try desktop.toggleFocusedFullscreen(),
-                key_m => try desktop.toggleFocusedMaximized(),
-                key_space => try desktop.toggleFocusedFloating(),
-                key_j => if (shift) try desktop.moveFocusedTile(.next) else try desktop.focusNext(),
-                key_k => if (shift) try desktop.moveFocusedTile(.previous) else try desktop.focusPrevious(),
-                else => unreachable,
-            };
+            const binding = if (!inhibit_bindings and pressed)
+                self.findBinding(self.keymap_state.trigger(key))
+            else
+                null;
+            const close_target = if (binding) |value|
+                if (value.action == .close) desktop.focusedToplevel() else null
+            else
+                null;
+            const extra_command = if (binding) |value|
+                value.action == .run or value.action == .exit or close_target != null
+            else
+                false;
+            const stops_repeat = self.repeat_binding != null and
+                std.meta.eql(self.repeat_binding.?.device, device_id) and
+                self.repeat_binding.?.key == key and !pressed;
+            const starts_repeat = if (binding) |value| value.repeat else false;
+            if (binding != null or release_binding)
+                try self.ensureCommandCapacity(1 + @as(usize, @intFromBool(extra_command)) +
+                    @as(usize, @intFromBool(starts_repeat or stops_repeat)));
+            const applied_close_target = if (binding) |value|
+                try self.applyBindingDesktop(desktop, value)
+            else
+                null;
+            const aggregate_was = self.anyDeviceKey(key);
             writeBit(&device.keys, key, pressed);
-            writeBit(&device.swallowed_keys, key, binding);
-            if (binding or release_binding) self.enqueue(.key_consumed);
+            const aggregate_now = self.anyDeviceKey(key);
+            if (aggregate_was != aggregate_now) self.keymap_state.update(key, aggregate_now);
+            writeBit(&device.swallowed_keys, key, binding != null);
+            if (binding != null or release_binding) self.enqueue(.key_consumed);
+            if (binding) |value| self.enqueueBindingCommands(value, applied_close_target);
+            if (stops_repeat) {
+                self.repeat_binding = null;
+                self.enqueue(.repeat_stop);
+            }
+            if (binding) |value| if (value.repeat) {
+                self.repeat_binding = .{ .device = device_id, .key = key, .binding = value };
+                self.enqueue(.{ .repeat_start = .{ .device = device_id, .key = key } });
+            };
+        }
+
+        fn applyBindingDesktop(
+            self: *Self,
+            desktop: *Desktop,
+            binding: user_config.Binding,
+        ) !?ToplevelId {
+            _ = self;
+            const close_target = if (binding.action == .close) desktop.focusedToplevel() else null;
+            switch (binding.action) {
+                .focus_next => try desktop.focusNext(),
+                .focus_previous => try desktop.focusPrevious(),
+                .move_next => try desktop.moveFocusedTile(.next),
+                .move_previous => try desktop.moveFocusedTile(.previous),
+                .close, .exit, .run => {},
+                .toggle_fullscreen => try desktop.toggleFocusedFullscreen(),
+                .toggle_maximized => try desktop.toggleFocusedMaximized(),
+                .toggle_floating => try desktop.toggleFocusedFloating(),
+            }
+            return close_target;
+        }
+
+        fn enqueueBindingCommands(
+            self: *Self,
+            binding: user_config.Binding,
+            close_target: ?ToplevelId,
+        ) void {
             if (close_target) |id| self.enqueue(.{ .close = id });
+            switch (binding.action) {
+                .exit => self.enqueue(.exit),
+                .run => |argv| self.enqueue(.{ .run = argv }),
+                else => {},
+            }
+        }
+
+        fn findBinding(self: *const Self, trigger: user_config.Trigger) ?user_config.Binding {
+            for (self.binding_config.bindings) |binding| {
+                if (binding.trigger.keysym == trigger.keysym and
+                    @as(u4, @bitCast(binding.trigger.modifiers)) ==
+                        @as(u4, @bitCast(trigger.modifiers))) return binding;
+            }
+            return null;
         }
 
         fn removeDevice(self: *Self, desktop: *Desktop, id: input.DeviceId) !void {
             const device = self.findDevice(id) orelse return error.StaleDevice;
+            if (self.repeat_binding != null and std.meta.eql(self.repeat_binding.?.device, id)) {
+                try self.ensureCommandCapacity(1);
+                self.repeat_binding = null;
+                self.enqueue(.repeat_stop);
+            }
             const pointer = device.capabilities.pointer;
             var held_button = false;
             for (device.buttons) |word| held_button = held_button or word != 0;
@@ -637,7 +765,12 @@ pub fn Interaction(comptime Desktop: type) type {
                 (self.mode == .button_grab or self.mode == .interactive);
             if (cancel_grab and self.mode == .interactive)
                 try desktop.endInteractive(self.mode.interactive.target.toplevel);
+            const held_keys = device.keys;
             device.* = .{};
+            for (0..code_count) |key| {
+                if (bitSet(&held_keys, @intCast(key)) and !self.anyDeviceKey(@intCast(key)))
+                    self.keymap_state.update(@intCast(key), false);
+            }
             if (pointer) self.pointer_devices -= 1;
             const lost_pointer = pointer and self.pointer_devices == 0;
             if (lost_pointer) self.cursor.pointer_available = false;
@@ -761,6 +894,20 @@ pub fn Interaction(comptime Desktop: type) type {
             self.command_len = retained;
         }
 
+        fn removeRepeatCommands(self: *Self) void {
+            var retained: usize = 0;
+            for (0..self.command_len) |offset| {
+                const command = self.commands[(self.command_head + offset) % self.commands.len];
+                switch (command) {
+                    .repeat_start, .repeat_stop => continue,
+                    else => {},
+                }
+                self.commands[(self.command_head + retained) % self.commands.len] = command;
+                retained += 1;
+            }
+            self.command_len = retained;
+        }
+
         fn resolveDevice(self: *Self, id: input.DeviceId) !*Device {
             return self.findDevice(id) orelse error.StaleDevice;
         }
@@ -866,6 +1013,7 @@ pub fn Interaction(comptime Desktop: type) type {
                 .cancel => false,
                 .key_consumed => false,
                 .close => |id| toplevel != null and std.meta.eql(id, toplevel.?),
+                .exit, .run, .repeat_start, .repeat_stop => false,
             };
         }
 
@@ -946,11 +1094,6 @@ fn bitSet(words: *const [state_words]u64, code: u32) bool {
 fn writeBit(words: *[state_words]u64, code: u32, value: bool) void {
     const mask = @as(u64, 1) << @intCast(code % 64);
     if (value) words[code / 64] |= mask else words[code / 64] &= ~mask;
-}
-
-fn isBindingKey(key: u32) bool {
-    return key == key_tab or key == key_q or key == key_f or key == key_m or key == key_space or
-        key == key_j or key == key_k;
 }
 
 const TestId = packed struct { index: u32, generation: u32 };
@@ -1903,6 +2046,39 @@ test "interaction: compositor bindings consume exact press and release pairs" {
     }
     try std.testing.expectEqual(@as(usize, 1), desktop.move_next_count);
     try std.testing.expectEqual(@as(usize, 1), desktop.move_previous_count);
+}
+
+test "interaction: installed config emits an exact run argv" {
+    var interaction = try initTestInteraction(2);
+    defer interaction.deinit();
+    var candidate = try user_config.parseSource(std.testing.allocator,
+        \\{"bindings":{"super+x":["run","foot","--server"]}}
+    );
+    try interaction.installConfig(&candidate);
+    var desktop = testDesktop();
+    var surfaces = TestSurfaces{};
+    try interaction.consume(&desktop, &surfaces, .{ .device_added = .{
+        .device = device_a,
+        .info = .{ .capabilities = .{ .keyboard = true } },
+    } });
+    try interaction.consume(&desktop, &surfaces, .{ .keyboard_key = .{
+        .device = device_a,
+        .time_usec = 1,
+        .key = key_left_meta,
+        .pressed = true,
+    } });
+    try interaction.consume(&desktop, &surfaces, .{ .keyboard_key = .{
+        .device = device_a,
+        .time_usec = 2,
+        .key = key_x,
+        .pressed = true,
+    } });
+    try std.testing.expect(interaction.peekCommand().? == .key_consumed);
+    interaction.dropCommand();
+    const argv = interaction.peekCommand().?.run;
+    try std.testing.expectEqual(@as(usize, 2), argv.len);
+    try std.testing.expectEqualStrings("foot", argv[0]);
+    try std.testing.expectEqualStrings("--server", argv[1]);
 }
 
 test "interaction: shortcut inhibition forwards compositor binding pairs" {

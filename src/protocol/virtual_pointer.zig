@@ -111,6 +111,11 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
         pub fn peekEvent(self: *const Self) ?*const Event {
             return if (self.event_count == 0) null else &self.events[self.event_head];
         }
+
+        pub fn hasPendingEvents(self: *const Self) bool {
+            return self.event_count != 0;
+        }
+
         pub fn dropEvent(self: *Self) void {
             if (self.event_count == 0) return;
             const event = self.events[self.event_head];

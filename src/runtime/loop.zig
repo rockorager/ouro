@@ -47,6 +47,7 @@ pub fn Loop(comptime protocol: type) type {
         const Self = @This();
         const Compositor = compositor.Compositor(protocol);
         const Driver = wayring.server.Driver(protocol);
+        const WayringCompletion = Driver.RoutedCompletion;
 
         pub const Progress = struct {
             reaped: usize,
@@ -59,6 +60,7 @@ pub fn Loop(comptime protocol: type) type {
             wayring: Driver.Progress,
             submitted: u32,
             shutdown_requested: bool,
+            reload_requested: bool,
             /// More CQEs or deferred Wayring preparation remain for a future
             /// turn. The caller can use this to avoid blocking.
             needs_more_work: bool,
@@ -70,7 +72,7 @@ pub fn Loop(comptime protocol: type) type {
         timers: *timer.Timers,
         driver: Driver,
         cqes: []Cqe,
-        wayring_cqes: []Cqe,
+        wayring_cqes: []WayringCompletion,
         timer_outcomes: []TimerOutcome,
         ouro_completions: []OuroCompletion,
         unrouted_completions: []Cqe,
@@ -93,7 +95,7 @@ pub fn Loop(comptime protocol: type) type {
             errdefer driver.deinit(allocator);
             const cqes = try allocator.alloc(Cqe, config.completion_batch);
             errdefer allocator.free(cqes);
-            const wayring_cqes = try allocator.alloc(Cqe, config.completion_batch);
+            const wayring_cqes = try allocator.alloc(WayringCompletion, config.completion_batch);
             errdefer allocator.free(wayring_cqes);
             const timer_outcomes = try allocator.alloc(TimerOutcome, config.completion_batch);
             errdefer allocator.free(timer_outcomes);
@@ -135,14 +137,18 @@ pub fn Loop(comptime protocol: type) type {
         /// shutdown request makes the descriptor readable.
         pub fn installShutdown(self: *Self, watcher: *shutdown_signal.Watcher) !void {
             if (self.shutdown != null) return error.AlreadyInstalled;
+            self.shutdown = watcher;
+            try self.armSignalPoll();
+        }
+
+        fn armSignalPoll(self: *Self) !void {
             const token = try self.router.acquire(.shutdown);
             errdefer self.router.retire(token) catch unreachable;
             _ = try self.compositor.ring.poll_add(
                 token.encode(),
-                watcher.descriptor(),
+                self.shutdown.?.descriptor(),
                 linux.POLL.IN | linux.POLL.ERR | linux.POLL.HUP | linux.POLL.NVAL,
             );
-            self.shutdown = watcher;
             self.shutdown_token = token;
         }
 
@@ -168,20 +174,21 @@ pub fn Loop(comptime protocol: type) type {
             };
         }
 
-        /// Performs one allocation-free turn and exactly one ring submission.
+        /// Performs one allocation-free turn without waiting for future CQEs.
         ///
         /// CQEs are clipped before consumption. Every live Ouro completion is
         /// classified before Wayring dispatch, so a full Wayring batch cannot
         /// postpone a timer CQE already in that batch. If the handler declares
         /// `completions`, it receives both borrowed Ouro outcome slices as one
         /// batch and may update state or prepare SQEs before Wayring dispatch.
-        /// Wayring then performs completion routing and bounded request
-        /// dispatch. If declared, `prepare(*Handler) !void` runs afterward so
-        /// the coordinator can consume events produced by that dispatch and
-        /// schedule their protocol output in the same submission. The sole
-        /// submission is deliberately last and includes initial accept, timer,
-        /// completion/dispatch/prepare-hook, shutdown, and Wayring SQEs. The completion
-        /// hook has this contract:
+        /// Wayring completions retain their classification from the shared-ring
+        /// routing pass and then undergo bounded request dispatch. If declared,
+        /// `prepare(*Handler) !void` runs afterward so the coordinator can
+        /// consume events produced by that dispatch and schedule their protocol
+        /// output before Wayring's single preparation pass and submission.
+        /// The ring enter is deliberately last and includes initial accept,
+        /// timer, completion/dispatch/prepare-hook, shutdown, and Wayring SQEs.
+        /// The completion hook has this contract:
         ///
         /// `fn completions(*Handler, []const TimerOutcome,
         ///     []const OuroCompletion) !void`
@@ -189,6 +196,18 @@ pub fn Loop(comptime protocol: type) type {
         /// Returned slices borrow fixed loop storage and remain valid only until
         /// the next turn or `deinit`.
         pub fn turn(self: *Self, handler: anytype) !Progress {
+            return self.turnInternal(handler, false);
+        }
+
+        /// Performs a turn and combines its submission with the next wait when
+        /// no bounded work remains. Production uses this to avoid a separate
+        /// submit syscall before every blocking `io_uring_enter` while tests
+        /// and embedders can retain the nonblocking `turn` contract.
+        pub fn turnAndWait(self: *Self, handler: anytype) !Progress {
+            return self.turnInternal(handler, true);
+        }
+
+        fn turnInternal(self: *Self, handler: anytype, wait_on_idle: bool) !Progress {
             const ready = self.compositor.ring.cq_ready();
             const count = boundedCount(ready, self.cqes.len);
             const copied = if (count == 0)
@@ -201,7 +220,12 @@ pub fn Loop(comptime protocol: type) type {
             var ouro_count: usize = 0;
             var unrouted_count: usize = 0;
             var shutdown_requested = false;
+            var reload_requested = false;
             for (self.cqes[0..copied]) |cqe| {
+                if (cqe.user_data == completion.skipped_success_user_data) {
+                    if (cqe.res < 0) return error.SkippedOperationFailed;
+                    return error.UnexpectedSkippedCompletion;
+                }
                 if (self.router.route(cqe.user_data)) |token| {
                     if (token.kind == .shutdown) {
                         if (self.shutdown_token == null or
@@ -209,10 +233,13 @@ pub fn Loop(comptime protocol: type) type {
                             return error.UnexpectedShutdownCompletion;
                         if (cqe.res < 0 or @as(u32, @intCast(cqe.res)) & linux.POLL.IN == 0)
                             return error.ShutdownPollFailed;
-                        if (!(try self.shutdown.?.consume())) return error.MissingShutdownWakeup;
+                        const events = try self.shutdown.?.consume();
+                        if (!events.shutdown and !events.reload) return error.MissingShutdownWakeup;
                         try self.router.retire(token);
                         self.shutdown_token = null;
-                        shutdown_requested = true;
+                        shutdown_requested = events.shutdown;
+                        reload_requested = events.reload;
+                        if (!shutdown_requested) try self.armSignalPoll();
                         continue;
                     }
                     if (token.kind == .timer) {
@@ -241,15 +268,18 @@ pub fn Loop(comptime protocol: type) type {
                     unrouted_count += 1;
                     continue;
                 };
-                if (self.compositor.reactor.route(
+                const target = self.compositor.reactor.route(
                     &self.compositor.runtime.endpoint.listener,
                     cqe,
-                ) == null) {
+                ) orelse {
                     self.unrouted_completions[unrouted_count] = cqe;
                     unrouted_count += 1;
                     continue;
-                }
-                self.wayring_cqes[wayring_count] = cqe;
+                };
+                self.wayring_cqes[wayring_count] = .{
+                    .completion = cqe,
+                    .target = target,
+                };
                 wayring_count += 1;
             }
 
@@ -260,21 +290,35 @@ pub fn Loop(comptime protocol: type) type {
                     try handler.completions(completed_timers, completed_ouro);
             }
 
-            var wayring_progress = try self.driver.dispatch(
+            var wayring_progress = try self.driver.dispatchRouted(
                 self.wayring_cqes[0..wayring_count],
                 handler,
             );
-            if (@hasDecl(@TypeOf(handler.*), "prepare")) {
+            if (@hasDecl(@TypeOf(handler.*), "prepare"))
                 try handler.prepare();
-                // Dispatch prepares before invoking request handlers. The
-                // coordinator hook can schedule peers in response to the
-                // terminal request in that batch, so prepare those newly
-                // scheduled sends before this turn's sole submission.
-                const prepared = try self.driver.prepare(handler);
-                wayring_progress.prepared += prepared.prepared;
-                wayring_progress.pending = prepared.pending;
-            }
-            const submitted = try self.compositor.ring.submit();
+            // Dispatch and coordinator convergence can both schedule peers.
+            // Prepare their combined output once before this turn's sole
+            // submission.
+            wayring_progress.merge(try self.driver.prepare(handler));
+            const backend_drained = if (@hasDecl(@TypeOf(handler.*), "backendDrainComplete"))
+                handler.backendDrainComplete()
+            else
+                false;
+            const can_wait = wait_on_idle and self.compositor.ring.cq_ready() == 0 and
+                !wayring_progress.pending and !shutdown_requested and !reload_requested and
+                !(wayring_progress.shutdown_complete and backend_drained);
+            const submitted = if (can_wait)
+                self.compositor.ring.submit_and_wait(1) catch |err| switch (err) {
+                    // TERM/INT and tracing can interrupt the wait after the
+                    // SQ tail has been published. Pending operations remain
+                    // owned by the ring and a later turn consumes their CQEs.
+                    error.SignalInterrupt => 0,
+                    else => return err,
+                }
+            else if (self.compositor.ring.sq_ready() != 0)
+                try self.compositor.ring.submit()
+            else
+                0;
             return .{
                 .reaped = copied,
                 .wayring_completions = wayring_count,
@@ -284,6 +328,7 @@ pub fn Loop(comptime protocol: type) type {
                 .wayring = wayring_progress,
                 .submitted = submitted,
                 .shutdown_requested = shutdown_requested,
+                .reload_requested = reload_requested,
                 .needs_more_work = self.compositor.ring.cq_ready() != 0 or
                     wayring_progress.pending,
             };

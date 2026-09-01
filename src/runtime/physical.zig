@@ -19,6 +19,7 @@ const session_api = @import("../backend/session.zig");
 const session_platform = @import("../backend/platform.zig");
 const input_api = @import("../backend/input/backend.zig");
 const input_platform = @import("../backend/input/platform.zig");
+const user_config = @import("../config.zig");
 const drm = @import("../backend/drm/manager.zig");
 const drm_hotplug = @import("../backend/drm/hotplug.zig");
 const drm_gamma = @import("../backend/drm/gamma.zig");
@@ -100,6 +101,40 @@ const viewport = @import("../viewport.zig");
 
 const linux = std.os.linux;
 const drag_icon_role_id: surface_state.RoleId = 0x646e_645f_6963_6f6e;
+
+fn OwnedValue(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        owned: bool = false,
+        value: T = undefined,
+
+        fn get(self: *Self) ?*T {
+            return if (self.owned) &self.value else null;
+        }
+
+        fn getConst(self: *const Self) ?*const T {
+            return if (self.owned) &self.value else null;
+        }
+
+        fn set(self: *Self, value: T) void {
+            std.debug.assert(!self.owned);
+            self.value = value;
+            self.owned = true;
+        }
+
+        fn take(self: *Self) ?T {
+            if (!self.owned) return null;
+            self.owned = false;
+            return self.value;
+        }
+
+        fn clear(self: *Self) void {
+            std.debug.assert(self.owned);
+            self.owned = false;
+        }
+    };
+}
 
 fn copyCaptureRegion(
     destination: []u8,
@@ -262,8 +297,15 @@ pub fn Coordinator(comptime protocol: type) type {
         };
         const OutputReconfigureTransaction = struct {
             const Phase = enum { desired, rollback };
-            peer: wayring.io_uring.Peer,
-            configuration: protocol_output_management.ConfigurationId,
+            const Owner = union(enum) {
+                protocol: struct {
+                    peer: wayring.io_uring.Peer,
+                    configuration: protocol_output_management.ConfigurationId,
+                },
+                config: user_config.Snapshot,
+                config_reconcile,
+            };
+            owner: Owner,
             phase: Phase = .desired,
         };
         const PhysicalOutput = struct {
@@ -455,13 +497,13 @@ pub fn Coordinator(comptime protocol: type) type {
             peer: ?wayring.io_uring.Peer = null,
             surface: ?wayring.objects.Handle = null,
             id: ?Adapter.SurfaceId = null,
-            content: ?Adapter.Content = null,
+            content: OwnedValue(Adapter.Content) = .{},
             rendered: ?render_content.Handle = null,
             presentation: ?Presentations.Token = null,
             sample: ?render_list.AppliedSurface = null,
             binding: ?output_api.SampleBinding = null,
             change: ?damage.Change = null,
-            candidate: ?Candidate = null,
+            candidate: OwnedValue(Candidate) = .{},
             source_release_pending: bool = false,
             outcome_pending: bool = false,
             callback_data: ?u32 = null,
@@ -482,6 +524,15 @@ pub fn Coordinator(comptime protocol: type) type {
             drm: drm_platform.Platform = drm_platform.real,
             gamma: drm_gamma.Platform = drm_gamma.real,
             output: output_api.Platforms = .{},
+        };
+
+        pub const Launcher = struct {
+            context: *anyopaque,
+            launchFn: *const fn (context: *anyopaque, argv: []const []const u8) anyerror!void,
+
+            pub fn launch(self: Launcher, argv: []const []const u8) !void {
+                return self.launchFn(self.context, argv);
+            }
         };
 
         pub const Config = struct {
@@ -589,6 +640,7 @@ pub fn Coordinator(comptime protocol: type) type {
             cursor_size: u32 = 24,
             drm: drm.Config,
             output: output_api.Config,
+            launcher: ?Launcher = null,
         };
 
         pub const Stats = struct {
@@ -614,6 +666,7 @@ pub fn Coordinator(comptime protocol: type) type {
         syncobj_config: protocol_linux_drm_syncobj.Config,
         input_config: input_api.Config,
         desktop_transaction_timeout_ns: u64,
+        launcher: ?Launcher,
         seat: [64]u8 = undefined,
         seat_len: u8,
         router: completion.Router,
@@ -635,6 +688,7 @@ pub fn Coordinator(comptime protocol: type) type {
         input_touch_delivery: TouchDelivery = .{},
         input_method_key_owners: [0x300]?protocol_input_method.GrabId = [_]?protocol_input_method.GrabId{null} ** 0x300,
         processing_virtual_pointer: bool = false,
+        shell_maintenance_pending: bool = false,
         manager: drm.Manager,
         hotplug: ?drm_hotplug.Monitor = null,
         hotplug_connector_ids: []u32,
@@ -646,6 +700,7 @@ pub fn Coordinator(comptime protocol: type) type {
         drm_remove_pending: bool = false,
         topology_refresh_pending: bool = false,
         output_global_index: usize = 1,
+        pending_output_removals: usize = 0,
         output_reconfigure: ?OutputReconfigureTransaction = null,
         gamma_platform: drm_gamma.Platform,
         shm: Shm,
@@ -746,6 +801,7 @@ pub fn Coordinator(comptime protocol: type) type {
         pending_surface_head: usize = 0,
         pending_surface_len: usize = 0,
         app_layers: []Layer,
+        app_layer_count: usize,
         output_tracking_capacity: usize,
         app_layer_change_outputs: []bool,
         app_layer_outcome_outputs: []bool,
@@ -778,6 +834,10 @@ pub fn Coordinator(comptime protocol: type) type {
         commit_timer_deadline: ?surface_state.CommitTimestamp = null,
         xdg_session_store_timer: ?timer.Handle = null,
         xdg_session_store_timer_canceling: bool = false,
+        binding_repeat_timer: ?timer.Handle = null,
+        binding_repeat_timer_canceling: bool = false,
+        binding_repeat_delay_ns: ?u64 = null,
+        binding_repeat_interval_ns: u64 = 0,
         cursor_layer: Layer,
         output_power_transition: ?OutputPowerAdapter.Command = null,
         stopping: bool = false,
@@ -806,6 +866,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.output_config = config.output;
             self.syncobj_config = config.linux_drm_syncobj;
             self.desktop_transaction_timeout_ns = config.desktop_transaction_timeout_ns;
+            self.launcher = config.launcher;
             if (config.seat.len == 0 or config.seat.len > self.seat.len)
                 return error.InvalidSeat;
             self.input_config = config.input;
@@ -872,6 +933,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.app_layers = try allocator.alloc(Layer, app_layer_capacity);
             errdefer allocator.free(self.app_layers);
             @memset(self.app_layers, .{});
+            self.app_layer_count = 0;
             self.output_tracking_capacity = config.drm.connector_capacity;
             const app_layer_output_capacity = try std.math.mul(
                 usize,
@@ -974,6 +1036,10 @@ pub fn Coordinator(comptime protocol: type) type {
             self.commit_timer_deadline = null;
             self.xdg_session_store_timer = null;
             self.xdg_session_store_timer_canceling = false;
+            self.binding_repeat_timer = null;
+            self.binding_repeat_timer_canceling = false;
+            self.binding_repeat_delay_ns = null;
+            self.binding_repeat_interval_ns = 0;
             self.cursor_layer = .{};
             const cursor_path_requirement = std.math.add(
                 usize,
@@ -1049,6 +1115,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.drm_remove_pending = false;
             self.topology_refresh_pending = false;
             self.output_global_index = 1;
+            self.pending_output_removals = 0;
             self.output_reconfigure = null;
             self.gamma_platform = platforms.gamma;
             self.shm = try Shm.init(allocator, config.shm);
@@ -1656,9 +1723,106 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.processInput();
         }
 
+        pub fn installConfig(self: *Self, candidate: *user_config.Snapshot) !void {
+            try self.interaction.canInstallConfig();
+            try self.desktop.validateGaps(
+                candidate.general.inner_gap,
+                candidate.general.outer_gap,
+            );
+            if (self.output_reconfigure != null or self.output_power_transition != null)
+                return error.OutputTransactionPending;
+            if (self.connectedPhysicalOutputCount() != 0) {
+                try self.beginConfigOutputReconfigure(candidate, true);
+                return;
+            }
+            try self.promoteConfig(candidate);
+        }
+
+        fn promoteConfig(self: *Self, candidate: *user_config.Snapshot) !void {
+            if (self.input) |input| {
+                try self.applyInputConfiguration(input, candidate);
+            }
+            try self.desktop.setGaps(
+                candidate.general.inner_gap,
+                candidate.general.outer_gap,
+            );
+            self.binding_repeat_delay_ns = null;
+            try self.syncBindingRepeatTimer();
+            self.interaction.cancelRepeat();
+            try self.interaction.installConfig(candidate);
+        }
+
+        fn applyInputConfiguration(
+            self: *Self,
+            input: *input_api.Backend,
+            snapshot: *const user_config.Snapshot,
+        ) !void {
+            const ids = try self.allocator.alloc(input_api.DeviceId, input.deviceCount());
+            defer self.allocator.free(ids);
+            const count = input.enumerateDevices(ids);
+            for (ids[0..count]) |id| try self.applyInputDeviceConfiguration(input, id, snapshot);
+        }
+
+        fn applyInputDeviceConfiguration(
+            self: *Self,
+            input: *input_api.Backend,
+            id: input_api.DeviceId,
+            snapshot: *const user_config.Snapshot,
+        ) !void {
+            _ = self;
+            const description = try input.describeDevice(id);
+            const info: user_config.InputInfo = .{
+                .type = inputDeviceType(description.info),
+                .name = description.name(),
+                .vendor = description.info.vendor,
+                .product = description.info.product,
+            };
+            const settings = user_config.resolveInput(snapshot.input_rules, info);
+            const defaults = description.defaults;
+            _ = try input.applyDeviceConfiguration(id, .{
+                .send_events = resolvedInputSetting(input_platform.SendEvents, settings.send_events, defaults.send_events),
+                .tap = resolvedOptionalInputSetting(input_platform.Toggle, settings.tap, defaults.tap),
+                .tap_button_map = resolvedOptionalInputSetting(input_platform.TapButtonMap, settings.tap_button_map, defaults.tap_button_map),
+                .drag = resolvedOptionalInputSetting(input_platform.Toggle, settings.drag, defaults.drag),
+                .drag_lock = resolvedOptionalInputSetting(input_platform.DragLock, settings.drag_lock, defaults.drag_lock),
+                .three_finger_drag = resolvedOptionalInputSetting(input_platform.ThreeFingerDrag, settings.three_finger_drag, defaults.three_finger_drag),
+                .accel_profile = resolvedOptionalInputSetting(input_platform.AccelProfile, settings.accel_profile, defaults.accel_profile),
+                .accel_speed = resolvedOptionalInputSetting(f64, settings.accel_speed, defaults.accel_speed),
+                .natural_scroll = resolvedOptionalInputSetting(input_platform.Toggle, settings.natural_scroll, defaults.natural_scroll),
+                .left_handed = resolvedOptionalInputSetting(input_platform.Toggle, settings.left_handed, defaults.left_handed),
+                .click_method = resolvedOptionalInputSetting(input_platform.ClickMethod, settings.click_method, defaults.click_method),
+                .clickfinger_button_map = resolvedOptionalInputSetting(input_platform.ClickfingerButtonMap, settings.clickfinger_button_map, defaults.clickfinger_button_map),
+                .middle_emulation = resolvedOptionalInputSetting(input_platform.Toggle, settings.middle_emulation, defaults.middle_emulation),
+                .scroll_method = resolvedOptionalInputSetting(input_platform.ScrollMethod, settings.scroll_method, defaults.scroll_method),
+                .scroll_button = resolvedOptionalInputSetting(u32, settings.scroll_button, defaults.scroll_button),
+                .scroll_button_lock = resolvedOptionalInputSetting(input_platform.Toggle, settings.scroll_button_lock, defaults.scroll_button_lock),
+                .disable_while_typing = resolvedOptionalInputSetting(input_platform.Toggle, settings.disable_while_typing, defaults.disable_while_typing),
+                .disable_while_trackpointing = resolvedOptionalInputSetting(input_platform.Toggle, settings.disable_while_trackpointing, defaults.disable_while_trackpointing),
+                .rotation = resolvedOptionalInputSetting(u32, settings.rotation, defaults.rotation),
+            });
+            try input.applySoftwareConfiguration(
+                id,
+                resolvedSoftwareInputSetting(f64, settings.scroll_factor, 1),
+                resolvedSoftwareInputSetting(i32, settings.repeat_rate, 25),
+                resolvedSoftwareInputSetting(i32, settings.repeat_delay, 600),
+            );
+        }
+
         pub fn requestStop(self: *Self) !void {
             if (!self.stopping) {
                 self.stopping = true;
+                if (self.output_reconfigure) |transaction| {
+                    switch (transaction.owner) {
+                        .config => |snapshot_value| {
+                            var snapshot = snapshot_value;
+                            snapshot.deinit();
+                        },
+                        else => {},
+                    }
+                    self.output_reconfigure = null;
+                    for (self.physical_outputs[0..self.physical_output_count]) |*physical|
+                        physical.reconfigure = null;
+                }
                 if (self.loop) |value| try value.requestShutdown();
                 for (self.security_context_adapter.committedListeners()) |listener|
                     listener.closing = true;
@@ -1673,6 +1837,9 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.syncIdleTimer();
             try self.syncCommitTimer();
             try self.syncXdgSessionStoreTimer();
+            self.binding_repeat_delay_ns = null;
+            self.interaction.cancelRepeat();
+            try self.syncBindingRepeatTimer();
             try self.prepareSecurityClosures();
             if (self.hotplug) |*monitor| try monitor.beginDrain(&self.router, &self.root.ring);
             try self.pauseAllOutputs();
@@ -1855,6 +2022,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.syncIdleNotifications() catch {};
             self.shortcuts_inhibit_adapter.disconnected(peer);
             self.foreign_adapter.disconnected(peer);
+            self.shell_maintenance_pending = true;
             self.xdg_session_adapter.disconnected(peer);
             self.foreign_toplevel_list_adapter.disconnected(peer);
             self.workspace_adapter.disconnected(peer);
@@ -1964,7 +2132,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     self.surface = first;
                     self.surface_id = try self.adapter.surfaceId(first);
                 };
-                try self.advanceShell();
+                if (self.shellMaintenancePending()) try self.advanceShell();
                 if (self.adapter.pendingPresentationClock(peer) or
                     self.adapter.pendingDiscardedFeedback(peer))
                     self.markProtocol(peer, ProtocolReady.core);
@@ -2130,7 +2298,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 return control;
             }
             if (try self.decoration_adapter.request(peer, target, message, fds)) |control| {
-                try self.processDecorationEvents();
+                _ = try self.processDecorationEvents();
                 try self.advanceShell();
                 if (self.decoration_adapter.pendingOutbound(peer))
                     self.markProtocol(peer, ProtocolReady.decoration);
@@ -2359,6 +2527,10 @@ pub fn Coordinator(comptime protocol: type) type {
                     try self.desktopTimerEvent(outcome.event);
                     continue;
                 };
+                if (self.binding_repeat_timer) |handle| if (std.meta.eql(handle, outcome.handle)) {
+                    try self.bindingRepeatTimerEvent(outcome.event);
+                    continue;
+                };
                 for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
                     const output = physical.kms_output orelse continue;
                     const request_value = try output.timerEvent(
@@ -2372,7 +2544,6 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.processSession();
             try self.processOutput();
             try self.prepareSecurityClosures();
-            try self.armTimer();
             try self.advanceDrain();
         }
 
@@ -2603,9 +2774,9 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.prepareSecurityClosures();
             try self.processSession();
             try self.processInput();
-            try self.advanceShell();
+            if (self.shellMaintenancePending()) try self.advanceShell();
             _ = try self.retryRetainedOutcomes();
-            try self.applyReady();
+            if (self.pending_surface_len != 0) try self.applyReady();
             self.applyInteractionCommands() catch |err| switch (err) {
                 error.Exhausted => {},
                 else => return err,
@@ -2620,6 +2791,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.syncForeignToplevelOutputChanges();
                 try self.flushProtocol();
             }
+            // Arm frames only after the complete Wayland dispatch batch has
+            // converged. In particular, a surface commit and a following
+            // capture request from one client write must share the same frame.
+            try self.armTimer();
         }
 
         fn validateSurfaceCommit(context: *anyopaque, id: Adapter.SurfaceId) !void {
@@ -2789,10 +2964,10 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn candidatePending(self: *const Self, id: Adapter.SurfaceId) bool {
-            for (self.app_layers) |layer|
-                if (layer.candidate) |candidate|
+            for (self.app_layers[0..self.app_layer_count]) |layer|
+                if (layer.candidate.getConst()) |candidate|
                     if (std.meta.eql(candidate.id, id)) return true;
-            if (self.cursor_layer.candidate) |candidate|
+            if (self.cursor_layer.candidate.getConst()) |candidate|
                 if (std.meta.eql(candidate.id, id)) return true;
             return false;
         }
@@ -2886,6 +3061,11 @@ pub fn Coordinator(comptime protocol: type) type {
             if (self.input_event_cursor > events.len) return error.InputBatchChanged;
             while (self.input_event_cursor < events.len) {
                 const event = events[self.input_event_cursor];
+                if (event == .device_added) try self.applyInputDeviceConfiguration(
+                    input,
+                    event.device_added.device,
+                    self.interaction.currentConfig(),
+                );
                 if (!(try self.acceptNormalizedInput(event))) {
                     try self.scheduleClients();
                     return;
@@ -3432,8 +3612,12 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn advanceShell(self: *Self) !void {
+            self.shell_maintenance_pending = false;
+            errdefer self.shell_maintenance_pending = true;
             while (true) {
                 _ = try self.foreign_adapter.advanceRelations();
+                if (self.foreign_adapter.hasPendingRelations())
+                    self.shell_maintenance_pending = true;
                 if (self.desktop.takeDestroyed()) |id| {
                     self.interaction.toplevelDestroyed(id);
                     continue;
@@ -3444,7 +3628,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 }
                 if (self.desktop.peekInteractiveRequest()) |interactive_request| {
                     self.interaction.beginInteractive(&self.desktop, interactive_request) catch |err| switch (err) {
-                        error.Exhausted => break,
+                        error.Exhausted => {
+                            self.shell_maintenance_pending = true;
+                            break;
+                        },
                         error.StaleToplevel => {
                             self.desktop.dropInteractiveRequest();
                             continue;
@@ -3465,7 +3652,10 @@ pub fn Coordinator(comptime protocol: type) type {
                     else => null,
                 } else null;
                 const consumed = self.desktop.consume(&self.shell_adapter, 1) catch |err| switch (err) {
-                    error.Exhausted, error.Backpressure => break,
+                    error.Exhausted, error.Backpressure => consumed: {
+                        self.shell_maintenance_pending = true;
+                        break :consumed 0;
+                    },
                     else => return err,
                 };
                 if (consumed == 0) break;
@@ -3482,6 +3672,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     error.Exhausted => false,
                     else => return cause,
                 };
+                if (!synced) self.shell_maintenance_pending = true;
                 if (synced) {
                     self.desktop.markForeignToplevelSynced();
                     self.foreign_toplevel_outputs_dirty = false;
@@ -3507,6 +3698,14 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.syncToplevelDrag();
             if (self.shell_adapter.pendingOutbound() != 0)
                 self.markProtocolAll(ProtocolReady.shell);
+        }
+
+        fn shellMaintenancePending(self: *Self) bool {
+            return self.shell_maintenance_pending or
+                self.desktop.maintenancePending(&self.shell_adapter) or
+                self.foreign_adapter.hasPendingRelations() or
+                self.foreign_toplevel_list_adapter.pendingCommands() != 0 or
+                self.toplevel_drag_adapter.activeAttachment() != null;
         }
 
         fn applySessionRestore(self: *Self, shell_id: ShellAdapter.ToplevelId) !void {
@@ -3916,8 +4115,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 const unchanged = self.outputManagementCommandUnchanged(command.heads);
                 if (supported and command.operation == .apply and !unchanged) {
                     self.output_reconfigure = .{
-                        .peer = command.peer,
-                        .configuration = command.configuration,
+                        .owner = .{ .protocol = .{
+                            .peer = command.peer,
+                            .configuration = command.configuration,
+                        } },
                     };
                     errdefer {
                         self.output_reconfigure = null;
@@ -3944,6 +4145,87 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.output_management_adapter.completeCommand(if (accepted) .succeeded else .failed);
                 self.markProtocol(command.peer, ProtocolReady.output_management);
             }
+        }
+
+        fn beginConfigOutputReconfigure(
+            self: *Self,
+            candidate: *user_config.Snapshot,
+            take_ownership: bool,
+        ) !void {
+            const count = self.connectedPhysicalOutputCount();
+            const desired = try self.allocator.alloc(protocol_output_management.DesiredHead, count);
+            defer self.allocator.free(desired);
+            var index: usize = 0;
+            var changed = false;
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                if (!physical.connected) continue;
+                const current = try self.output_management_adapter.lifecycle.currentHead(
+                    physical.management_head,
+                );
+                const claim = physical.claim orelse return error.StaleClaim;
+                const snapshot = try self.manager.claimSnapshot(claim);
+                const connector = snapshot.selectedConnector();
+                var name_buffer: [64]u8 = undefined;
+                const name = try std.fmt.bufPrint(&name_buffer, "DRM-{d}", .{connector.id});
+                const settings = user_config.resolveOutput(candidate.output_rules, .{
+                    .name = name,
+                    .connector_id = connector.id,
+                    .connector_type = connector.connector_type,
+                    .connector_type_id = connector.connector_type_id,
+                    .width_mm = connector.width_mm,
+                    .height_mm = connector.height_mm,
+                });
+                var state = current;
+                if (settings.enabled) |enabled| state.enabled = enabled;
+                if (settings.position) |position| {
+                    state.x = position.x;
+                    state.y = position.y;
+                }
+                if (settings.scale_120) |scale| state.scale_120 = scale;
+                if (settings.mode) |requested| {
+                    const mode_end = try std.math.add(usize, connector.mode_start, connector.mode_count);
+                    if (mode_end > snapshot.modes.len) return error.InvalidModeInventory;
+                    const mode = selectConfiguredMode(
+                        snapshot.modes[connector.mode_start..mode_end],
+                        requested,
+                    ) orelse return error.UnsupportedOutputMode;
+                    state.width = @intCast(mode.hdisplay);
+                    state.height = @intCast(mode.vdisplay);
+                    state.refresh_millihz = @intCast(try std.math.mul(u32, mode.vrefresh, 1000));
+                }
+                desired[index] = .{ .id = physical.management_head, .state = state };
+                index += 1;
+                changed = changed or !std.meta.eql(current, state);
+            }
+            if (!self.outputManagementCommandSupported(desired)) return error.UnsupportedOutputConfiguration;
+            if (!changed) {
+                if (take_ownership) try self.promoteConfig(candidate);
+                return;
+            }
+            self.output_reconfigure = .{ .owner = .config_reconcile };
+            if (take_ownership) {
+                self.output_reconfigure.?.owner = .{ .config = candidate.* };
+                candidate.* = undefined;
+            }
+            errdefer {
+                if (self.output_reconfigure.?.owner == .config) {
+                    candidate.* = self.output_reconfigure.?.owner.config;
+                }
+                self.output_reconfigure = null;
+                for (self.physical_outputs[0..self.physical_output_count]) |*physical|
+                    physical.reconfigure = null;
+            }
+            for (desired) |head| {
+                const physical = self.physicalOutputForManagementHeadMutable(head.id) orelse
+                    return error.InvalidOutput;
+                const current = try self.output_management_adapter.lifecycle.currentHead(head.id);
+                if (!std.meta.eql(current, head.state)) physical.reconfigure = .{
+                    .previous = current,
+                    .desired = head.state,
+                };
+            }
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical|
+                if (physical.reconfigure != null) try self.pausePhysicalOutput(physical);
         }
 
         fn outputManagementCommandSupported(
@@ -4544,7 +4826,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn syncCommitTimer(self: *Self) !void {
-            const deadline = if (self.stopping)
+            const deadline = if (self.stopping or self.adapter.pendingContentUpdates() == 0)
                 null
             else
                 try self.adapter.nextCommitDeadline(try monotonicNs());
@@ -4626,13 +4908,55 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.syncDesktopTimer();
         }
 
+        fn syncBindingRepeatTimer(self: *Self) !void {
+            if (self.binding_repeat_delay_ns) |delay| {
+                if (self.binding_repeat_timer == null) {
+                    const deadline = std.math.add(u64, try monotonicNs(), delay) catch
+                        return error.InvalidDeadline;
+                    self.binding_repeat_timer = try self.timers.arm(
+                        &self.router,
+                        &self.root.ring,
+                        try deadlineFromNs(deadline),
+                    );
+                    self.binding_repeat_timer_canceling = false;
+                    self.binding_repeat_delay_ns = null;
+                } else if (!self.binding_repeat_timer_canceling) {
+                    try self.timers.cancel(
+                        &self.router,
+                        &self.root.ring,
+                        self.binding_repeat_timer.?,
+                    );
+                    self.binding_repeat_timer_canceling = true;
+                }
+                return;
+            }
+            if (self.binding_repeat_timer) |handle| if (!self.binding_repeat_timer_canceling) {
+                try self.timers.cancel(&self.router, &self.root.ring, handle);
+                self.binding_repeat_timer_canceling = true;
+            };
+        }
+
+        fn bindingRepeatTimerEvent(self: *Self, event: timer.Event) !void {
+            if (event == .pending_cleanup or event == .cleanup_complete) return;
+            const was_canceling = self.binding_repeat_timer_canceling;
+            self.binding_repeat_timer = null;
+            self.binding_repeat_timer_canceling = false;
+            if (event == .fired and !was_canceling and
+                try self.interaction.repeatCurrentBinding(&self.desktop))
+            {
+                self.binding_repeat_delay_ns = self.binding_repeat_interval_ns;
+                try self.applyInteractionCommands();
+            }
+            try self.syncBindingRepeatTimer();
+        }
+
         fn desktopSceneChanged(self: *Self) !void {
             try self.syncIdleNotifications();
             _ = self.refreshRetainedLayersForOutput();
             try self.requestOutputDamage();
         }
 
-        fn applyInteractionCommands(self: *Self) !void {
+        fn applyInteractionCommands(self: *Self) anyerror!void {
             var applied = false;
             while (self.interaction.peekCommand()) |command| {
                 switch (command) {
@@ -4685,6 +5009,29 @@ pub fn Coordinator(comptime protocol: type) type {
                     },
                     .key_consumed => self.input_keyboard_consumed = true,
                     .close => |id| try self.shell_adapter.queueClose(try self.desktop.shellToplevel(id)),
+                    .exit => try self.requestStop(),
+                    .run => |argv| if (self.launcher) |launcher| {
+                        launcher.launch(argv) catch |err|
+                            std.log.err("could not launch {s}: {t}", .{ argv[0], err });
+                    } else {
+                        std.log.err("could not launch {s}: no launcher configured", .{argv[0]});
+                    },
+                    .repeat_start => |value| {
+                        const input = self.input orelse return error.StaleDevice;
+                        const description = try input.describeDevice(value.device);
+                        if (description.repeat_rate > 0) {
+                            self.binding_repeat_interval_ns =
+                                (std.time.ns_per_s + @as(u64, @intCast(description.repeat_rate)) - 1) /
+                                @as(u64, @intCast(description.repeat_rate));
+                            self.binding_repeat_delay_ns = @as(u64, @intCast(description.repeat_delay)) *
+                                std.time.ns_per_ms;
+                        } else self.binding_repeat_delay_ns = null;
+                        try self.syncBindingRepeatTimer();
+                    },
+                    .repeat_stop => {
+                        self.binding_repeat_delay_ns = null;
+                        try self.syncBindingRepeatTimer();
+                    },
                 }
                 self.interaction.dropCommand();
                 self.stats.interaction_commands += 1;
@@ -5304,7 +5651,8 @@ pub fn Coordinator(comptime protocol: type) type {
             };
         }
 
-        fn processDecorationEvents(self: *Self) !void {
+        fn processDecorationEvents(self: *Self) !bool {
+            var changed = false;
             while (self.decoration_adapter.peekEvent()) |event| switch (event) {
                 .reconfigure => |toplevel| {
                     self.desktop.reconfigureShellToplevel(toplevel) catch |err| switch (err) {
@@ -5315,8 +5663,10 @@ pub fn Coordinator(comptime protocol: type) type {
                         else => return err,
                     };
                     self.decoration_adapter.dropEvent();
+                    changed = true;
                 },
             };
+            return changed;
         }
 
         fn processSeatEvents(self: *Self) !void {
@@ -5366,11 +5716,9 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn requestOutputDamage(self: *Self) !void {
             const now = try monotonicNs();
-            var requested = false;
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
-                requested = try requestPhysicalOutputDamage(physical, now) or requested;
+                _ = try requestPhysicalOutputDamage(physical, now);
             }
-            if (requested) try self.armTimer();
         }
 
         fn layerShellOutput(self: *Self, layer: *const Layer) ?OutputAdapter.OutputId {
@@ -5452,9 +5800,11 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.drm_lease_adapter.pendingOutbound(client.peer))
                 self.markProtocol(client.peer, ProtocolReady.drm_lease);
             try self.advanceTransientSeats();
-            if (!self.processing_virtual_pointer) try self.processVirtualPointerEvents();
-            try self.processDecorationEvents();
-            try self.advanceShell();
+            if (!self.processing_virtual_pointer and
+                self.virtual_pointer_adapter.hasPendingEvents())
+                try self.processVirtualPointerEvents();
+            if (self.decoration_adapter.hasPendingEvents() and
+                try self.processDecorationEvents()) try self.advanceShell();
             try self.syncWorkspace();
             self.input_method_adapter.advance();
             try self.reconcileInputMethod();
@@ -5496,6 +5846,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn advancePhysicalOutputRemovals(self: *Self) !void {
+            if (self.pending_output_removals == 0) return;
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
                 if (!physical.removing or physical.kms_output != null) continue;
                 if (!physical.removal_global_pending) {
@@ -5559,10 +5910,25 @@ pub fn Coordinator(comptime protocol: type) type {
                     },
                     .complete => break,
                 };
-                physical.removing = false;
+                self.setPhysicalOutputRemoving(physical, false);
                 physical.removal_global_pending = false;
                 physical.removal_protocol_retired = false;
                 return;
+            }
+        }
+
+        fn setPhysicalOutputRemoving(
+            self: *Self,
+            physical: *PhysicalOutput,
+            removing: bool,
+        ) void {
+            if (physical.removing == removing) return;
+            physical.removing = removing;
+            if (removing) {
+                self.pending_output_removals += 1;
+            } else {
+                std.debug.assert(self.pending_output_removals > 0);
+                self.pending_output_removals -= 1;
             }
         }
 
@@ -5599,6 +5965,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn advanceTransientSeats(self: *Self) !void {
+            if (!self.transient_seat_adapter.hasPendingWork()) return;
             try self.transient_seat_adapter.advance();
             while (true) {
                 const mutation = self.transient_seat_adapter.activeMutation() orelse
@@ -5970,6 +6337,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn markTextInputProtocol(self: *Self) void {
+            if (self.text_input_adapter.pendingOutbound() == 0) return;
             for (self.clients.items) |*client| {
                 if (client.active and self.text_input_adapter.pendingOutboundOn(client.peer))
                     client.protocol_ready |= ProtocolReady.text_input;
@@ -5977,6 +6345,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn markInputMethodProtocol(self: *Self) void {
+            if (self.input_method_adapter.pendingOutbound() == 0) return;
             for (self.clients.items) |*client| {
                 if (client.active and self.input_method_adapter.pendingOutboundOn(client.peer))
                     client.protocol_ready |= ProtocolReady.input_method;
@@ -6366,6 +6735,19 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.activateAdditionalOutputs(handle);
             try self.advanceOutputGlobals();
             try self.publishOutputLayout();
+            self.reconcileActiveOutputConfig();
+        }
+
+        fn reconcileActiveOutputConfig(self: *Self) void {
+            if (self.output_reconfigure != null or self.output_power_transition != null) return;
+            var active = self.interaction.currentConfig().*;
+            self.beginConfigOutputReconfigure(&active, false) catch |err| switch (err) {
+                // Topology replacement briefly publishes the protocol output
+                // before its new scanout claim is installed. The completed
+                // refresh reconciles again with the generation-safe claim.
+                error.StaleClaim => {},
+                else => std.log.err("could not reconcile output configuration: {t}", .{err}),
+            };
         }
 
         fn activateAdditionalOutputs(self: *Self, handle: drm.Handle) !void {
@@ -6727,7 +7109,6 @@ pub fn Coordinator(comptime protocol: type) type {
                     monotonicNs() catch return error.ActivatedOutputFailure,
                 ) catch return error.ActivatedOutputFailure))
                     return error.ActivatedOutputFailure;
-            self.armTimer() catch return error.ActivatedOutputFailure;
         }
 
         fn publishActivatedPhysicalOutput(
@@ -6884,7 +7265,7 @@ pub fn Coordinator(comptime protocol: type) type {
         fn refreshRetainedLayersForOutput(self: *Self) bool {
             const output_bounds = self.globalOutputBounds() catch return false;
             var visibility_changed = false;
-            for (self.app_layers) |*layer| if (layer.active) {
+            for (self.app_layers[0..self.app_layer_count]) |*layer| if (layer.active) {
                 const id = layer.id orelse unreachable;
                 const scene = self.surfaceScene(id) orelse {
                     self.retireLayer(layer);
@@ -6971,7 +7352,6 @@ pub fn Coordinator(comptime protocol: type) type {
                 remaining += @max(1, self.pending_surfaces[index].commits);
             }
             var global_damage = false;
-            var damage_requested = false;
             var damage_requested_at: ?u64 = null;
             while (remaining != 0 and self.pending_surface_len != 0) : (remaining -= 1) {
                 const before_len = self.pending_surface_len;
@@ -6986,8 +7366,7 @@ pub fn Coordinator(comptime protocol: type) type {
                             damage_requested_at = value;
                             break :blk value;
                         };
-                        damage_requested = try self.requestLayerOutputDamage(layer, now) or
-                            damage_requested;
+                        _ = try self.requestLayerOutputDamage(layer, now);
                     } else {
                         global_damage = true;
                     }
@@ -6998,10 +7377,8 @@ pub fn Coordinator(comptime protocol: type) type {
             if (global_damage) {
                 const now = damage_requested_at orelse try monotonicNs();
                 for (self.physical_outputs[0..self.physical_output_count]) |*physical|
-                    damage_requested = try requestPhysicalOutputDamage(physical, now) or
-                        damage_requested;
+                    _ = try requestPhysicalOutputDamage(physical, now);
             }
-            if (damage_requested) try self.armTimer();
             try self.syncCommitTimer();
         }
 
@@ -7028,20 +7405,20 @@ pub fn Coordinator(comptime protocol: type) type {
             else
                 return false;
             if (layer.presentation != null or self.appLayerOutputTrackingPending(layer)) return false;
-            if (layer.candidate) |candidate| {
+            if (layer.candidate.getConst()) |candidate| {
                 if (!candidateMatches(candidate, pending)) return false;
             }
-            if (layer.candidate == null) {
+            if (!layer.candidate.owned) {
                 if (!try self.admitReadyBatch(exact_surface_id)) return false;
                 layer = if (surface_scene != null or self.findAppLayer(exact_surface_id) != null)
                     try self.appLayerForSurface(exact_surface_id)
                 else
                     &self.cursor_layer;
-                if (layer.candidate == null or
-                    !candidateMatches(layer.candidate.?, pending))
+                if (!layer.candidate.owned or
+                    !candidateMatches(layer.candidate.value, pending))
                     return false;
             }
-            const candidate = &layer.candidate.?;
+            const candidate = layer.candidate.get().?;
             if (candidate.superseded) {
                 _ = try self.adapter.activateFrames(candidate.surface, &candidate.content);
                 return self.discardPendingCandidate(layer, pending.id);
@@ -7050,7 +7427,7 @@ pub fn Coordinator(comptime protocol: type) type {
             const attachment = content.surface.attachment orelse {
                 if (layer.retains_source) try self.retireLayerSource(layer);
                 content.deinit();
-                layer.candidate = null;
+                layer.candidate.clear();
                 if (layer.retired_source != null) {
                     self.abandonLayerKeepingRetired(layer);
                     _ = try self.retryRetiredSource(layer);
@@ -7287,7 +7664,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     try self.adapter.postInvalidShmBacking(actor, attachment.buffer.?.handle);
                     _ = try self.loop.?.driver.schedule(peer);
                     candidate.content.deinit();
-                    layer.candidate = null;
+                    layer.candidate.clear();
                     self.finishPendingCandidate(pending.id);
                     return true;
                 },
@@ -7336,7 +7713,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 sample.destination,
             );
             const previous = if (layer.change) |change| change.current else null;
-            layer.candidate = null;
+            layer.candidate.clear();
             if (!prepared.replaces) if (layer.rendered) |previous_handle|
                 render_device.content.release(previous_handle);
             layer.change = .{
@@ -7349,7 +7726,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .buffer_damage = published.content.surface.buffer_damage,
             };
             layer.active = true;
-            layer.content = published.content;
+            layer.content.set(published.content);
             layer.rendered = rendered;
             layer.peer = published.peer;
             layer.surface = published.surface;
@@ -7369,22 +7746,17 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn admitReadyBatch(self: *Self, trigger: Adapter.SurfaceId) !bool {
             const now = try monotonicNs();
-            const ready_count = self.adapter.readyUpdateCountAtId(trigger, now) catch |err| switch (err) {
-                error.StaleSurface => return false,
-                else => return err,
-            };
-            if (ready_count == 0) return false;
-            try self.ensureUpdateBatchStorage(ready_count);
-            try self.ensureAvailableAppLayers(ready_count);
-            const ready = self.adapter.readyUpdateSurfaceIdsAt(
+            try self.ensureUpdateBatchStorage(self.adapter.pendingContentUpdates());
+            const inspected = self.adapter.inspectReadyUpdatesAtId(
                 trigger,
                 self.ready_update_ids,
                 now,
             ) catch |err| switch (err) {
                 error.StaleSurface => return false,
                 else => return err,
-            };
-            if (ready.len == 0) return false;
+            } orelse return false;
+            const ready = self.ready_update_ids[0..inspected.count];
+            try self.ensureAvailableAppLayers(ready.len);
             var superseded_count: usize = 0;
             for (ready, 0..) |id, index| {
                 const is_last = lastSurfaceOccurrence(ready, index);
@@ -7404,18 +7776,22 @@ pub fn Coordinator(comptime protocol: type) type {
                 superseded_count += @intFromBool(!is_last);
             }
             if (self.presentations.available() < superseded_count) return false;
-            const applied = try self.adapter.tryApplyAtId(trigger, self.applied_updates, now);
+            const applied = try self.adapter.applyInspectedUpdatesAtId(
+                trigger,
+                inspected,
+                self.applied_updates,
+            );
             std.debug.assert(applied.len == ready.len);
             for (applied, 0..) |*update, index| {
                 const id = update.surface;
                 self.pendingCommitApplied(id);
-                self.applied_layers[index].candidate = .{
+                self.applied_layers[index].candidate.set(.{
                     .peer = try self.adapter.surfacePeer(id),
                     .surface = try self.adapter.surfaceResource(id),
                     .id = id,
                     .content = update.payload,
                     .superseded = !lastSurfaceOccurrence(ready, index),
-                };
+                });
             }
             return true;
         }
@@ -7443,9 +7819,9 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn ensureAvailableAppLayers(self: *Self, needed: usize) !void {
-            var available: usize = 0;
-            for (self.app_layers) |*layer|
-                available += @intFromBool(layer.presentation == null and layer.candidate == null and
+            var available = self.app_layers.len - self.app_layer_count;
+            for (self.app_layers[0..self.app_layer_count]) |*layer|
+                available += @intFromBool(layer.presentation == null and !layer.candidate.owned and
                     !self.appLayerOutputTrackingPending(layer));
             if (available >= needed) return;
             const old_len = self.app_layers.len;
@@ -7503,16 +7879,19 @@ pub fn Coordinator(comptime protocol: type) type {
             preferred: ?Adapter.SurfaceId,
             used: usize,
         ) ?*Layer {
-            if (preferred) |id| for (self.app_layers) |*layer|
+            if (preferred) |id| for (self.app_layers[0..self.app_layer_count]) |*layer|
                 if (layer.id != null and std.meta.eql(layer.id.?, id) and
                     self.layerAvailableForBatch(layer, used)) return layer;
-            for (self.app_layers) |*layer|
+            for (self.app_layers[0..self.app_layer_count]) |*layer|
                 if (layerVacant(layer) and self.layerAvailableForBatch(layer, used)) return layer;
-            return null;
+            if (self.app_layer_count == self.app_layers.len) return null;
+            const layer = &self.app_layers[self.app_layer_count];
+            self.app_layer_count += 1;
+            return layer;
         }
 
         fn layerAvailableForBatch(self: *Self, layer: *Layer, used: usize) bool {
-            if (layer.presentation != null or layer.candidate != null or
+            if (layer.presentation != null or layer.candidate.owned or
                 self.appLayerOutputTrackingPending(layer)) return false;
             for (self.applied_layers[0..used]) |assigned| if (assigned == layer) return false;
             return true;
@@ -7532,10 +7911,9 @@ pub fn Coordinator(comptime protocol: type) type {
                 error.Exhausted => return false,
                 else => return err,
             };
-            const candidate = layer.candidate orelse return error.MissingCandidate;
+            const candidate = layer.candidate.take() orelse return error.MissingCandidate;
             if (layer.active) if (layer.id) |id| self.queueLayerRemoval(id);
-            layer.candidate = null;
-            layer.content = candidate.content;
+            layer.content.set(candidate.content);
             layer.peer = candidate.peer;
             layer.surface = candidate.surface;
             layer.id = candidate.id;
@@ -7701,7 +8079,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 next_themed_cursor_previous = null;
                 change_count += 1;
             }
-            for (self.app_layers) |*layer| {
+            for (self.app_layers[0..self.app_layer_count]) |*layer| {
                 const outputs = self.appLayerOutputRow(
                     self.app_layer_change_outputs,
                     layer,
@@ -7767,9 +8145,24 @@ pub fn Coordinator(comptime protocol: type) type {
                 null;
             if (sample_count == 0 and change_count == 0) {
                 const result = if (capture_request) |capture|
-                    output.renderFrameCapture(frame, &.{}, &.{}, &.{}, try monotonicNs(), capture)
+                    output.renderFrameCaptureOn(
+                        frame,
+                        &.{},
+                        &.{},
+                        &.{},
+                        try monotonicNs(),
+                        capture,
+                        &self.root.ring,
+                    )
                 else
-                    output.renderFrame(frame, &.{}, &.{}, &.{}, try monotonicNs());
+                    output.renderFrameOn(
+                        frame,
+                        &.{},
+                        &.{},
+                        &.{},
+                        try monotonicNs(),
+                        &self.root.ring,
+                    );
                 const rendered = result catch |cause| {
                     if (capture_request != null) try self.finishActiveCapture(false, 0, null);
                     return cause;
@@ -7779,6 +8172,8 @@ pub fn Coordinator(comptime protocol: type) type {
                     self.outputDamageRetired(physical, damage_generation);
                     try self.finishOutcome(rendered.retired.frame, false);
                 } else {
+                    if (output.rendererKind() == .pixman)
+                        try output.renderReady(frame, try monotonicNs());
                     self.outputDamageSubmitted(
                         physical,
                         damage_generation,
@@ -7789,21 +8184,23 @@ pub fn Coordinator(comptime protocol: type) type {
                 return;
             }
             const result = if (capture_request) |capture|
-                output.renderFrameCapture(
+                output.renderFrameCaptureOn(
                     frame,
                     self.frame_samples[0..sample_count],
                     self.frame_changes[0..change_count],
                     self.frame_bindings[0..sample_count],
                     try monotonicNs(),
                     capture,
+                    &self.root.ring,
                 )
             else
-                output.renderFrame(
+                output.renderFrameOn(
                     frame,
                     self.frame_samples[0..sample_count],
                     self.frame_changes[0..change_count],
                     self.frame_bindings[0..sample_count],
                     try monotonicNs(),
+                    &self.root.ring,
                 );
             const render_result = result catch |cause| {
                 if (capture_request != null) try self.finishActiveCapture(false, 0, null);
@@ -7811,6 +8208,8 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             switch (render_result) {
                 .submitted => {
+                    if (output.rendererKind() == .pixman)
+                        try output.renderReady(frame, try monotonicNs());
                     self.stats.submitted += 1;
                     self.markFrameChangesApplied(
                         @intCast(physical.id.index),
@@ -8085,12 +8484,12 @@ pub fn Coordinator(comptime protocol: type) type {
         fn processOutput(self: *Self) !void {
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
                 const output = physical.kms_output orelse continue;
-                try output.processKmsEvents(.{
+                try output.processKmsEventsOn(.{
                     .context = self,
                     .presented_fn = presented,
                     .retired_fn = retired,
                     .captured_fn = captured,
-                });
+                }, &self.root.ring);
             }
             try self.processScreencopyCaptures();
             try self.processImageCopyCaptures();
@@ -8210,7 +8609,6 @@ pub fn Coordinator(comptime protocol: type) type {
                 return;
             }
             self.pending_screencopy.?.awaiting_output = true;
-            try self.armTimer();
         }
 
         fn processImageCopyCaptures(self: *Self) !void {
@@ -8365,7 +8763,6 @@ pub fn Coordinator(comptime protocol: type) type {
                 return;
             }
             self.pending_image_copy.?.awaiting_output = true;
-            try self.armTimer();
         }
 
         fn dmabufCaptureImport(buffer: *const protocol_linux_dmabuf.Buffer) !gbm.Import {
@@ -8621,7 +9018,7 @@ pub fn Coordinator(comptime protocol: type) type {
         fn finishOutcome(self: *Self, outcome: output_api.FrameOutcome, was_presented: bool) !void {
             const physical = self.physicalOutputForKmsIdMutable(outcome.frame.output);
             if (was_presented) {
-                for (self.app_layers) |*layer| {
+                for (self.app_layers[0..self.app_layer_count]) |*layer| {
                     if (layer.retired_source) |*source| source.releasable = true;
                 }
                 if (self.cursor_layer.retired_source) |*source| source.releasable = true;
@@ -8651,7 +9048,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 }
                 const binding = layer.binding orelse return error.SampleBindingMismatch;
                 if (!std.meta.eql(sampled.surface, binding.surface)) return error.SampleBindingMismatch;
-                const content = &(layer.content orelse return error.MissingContent);
+                const content = layer.content.get() orelse return error.MissingContent;
                 const owner_live = layer.peer != null and self.peerLive(layer.peer.?) and
                     self.layerSurfaceLive(layer);
                 if (!owner_live) {
@@ -8676,7 +9073,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 }
                 if (!output_pending) layer.outcome_pending = true;
             }
-            for (self.app_layers) |*layer|
+            for (self.app_layers[0..self.app_layer_count]) |*layer|
                 if (layer.active and !self.layerSurfaceLive(layer) and
                     !self.appLayerOutputTrackingPending(layer)) self.abandonLayer(layer);
             if (self.cursor_layer.active and !self.layerSurfaceLive(&self.cursor_layer))
@@ -8695,7 +9092,6 @@ pub fn Coordinator(comptime protocol: type) type {
                                         owner,
                                         try monotonicNs(),
                                     ) catch false;
-                                    self.armTimer() catch {};
                                 }
                             },
                             error.StaleLock, error.InvalidPhase => {},
@@ -8709,7 +9105,6 @@ pub fn Coordinator(comptime protocol: type) type {
                             owner,
                             try monotonicNs(),
                         ) catch false;
-                        self.armTimer() catch {};
                     }
                 }
             };
@@ -8720,7 +9115,7 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn retryRetainedOutcomes(self: *Self) !bool {
             var changed = false;
-            for (self.app_layers) |*layer| {
+            for (self.app_layers[0..self.app_layer_count]) |*layer| {
                 _ = try self.retryRetiredSource(layer);
                 if (layer.retire_after_source_release) {
                     if (layer.source_release_pending and
@@ -8763,7 +9158,7 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn retryLayerOutcome(self: *Self, layer: *Layer) !bool {
             const token = layer.presentation orelse return error.MissingPresentation;
-            const content = &(layer.content orelse return error.MissingContent);
+            const content = layer.content.get() orelse return error.MissingContent;
             if (layer.source_release_pending and !layer.retains_source and
                 !try self.retryLayerSourceRelease(layer)) return false;
             if (!layer.retains_source) {
@@ -8824,7 +9219,7 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.presentations.finish(token);
             if (!layer.retains_source) {
                 content.deinit();
-                layer.content = null;
+                layer.content.clear();
             }
             layer.presentation = null;
             layer.outcome_pending = false;
@@ -8857,7 +9252,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 const render_device = self.render_device orelse return false;
                 if (!render_device.content.ready(rendered)) return false;
             }
-            const content = &(layer.content orelse return error.MissingContent);
+            const content = layer.content.get() orelse return error.MissingContent;
             const peer = layer.peer orelse return error.ClientDisconnected;
             if (!try self.releaseSource(peer, content)) return false;
             layer.source_release_pending = false;
@@ -8921,12 +9316,13 @@ pub fn Coordinator(comptime protocol: type) type {
                     false
             else
                 false;
+            const peer = layer.peer orelse return error.ClientDisconnected;
+            const content = layer.content.take() orelse return error.MissingContent;
             layer.retired_source = .{
-                .peer = layer.peer orelse return error.ClientDisconnected,
-                .content = layer.content orelse return error.MissingContent,
+                .peer = peer,
+                .content = content,
                 .releasable = releasable,
             };
-            layer.content = null;
             layer.source_release_pending = false;
             layer.retains_source = false;
         }
@@ -8954,7 +9350,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self: *Self,
             identity: render.PresentationIdentity,
         ) ?*Layer {
-            for (self.app_layers) |*layer| if (layer.presentation) |token|
+            for (self.app_layers[0..self.app_layer_count]) |*layer| if (layer.presentation) |token|
                 if (std.meta.eql(output_api.presentationIdentity(token), identity)) return layer;
             if (self.cursor_layer.presentation) |token|
                 if (std.meta.eql(output_api.presentationIdentity(token), identity))
@@ -8963,16 +9359,25 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn appLayerForSurface(self: *Self, id: Adapter.SurfaceId) !*Layer {
-            for (self.app_layers) |*layer|
-                if (layer.candidate) |candidate| if (std.meta.eql(candidate.id, id)) return layer;
-            for (self.app_layers) |*layer| {
+            for (self.app_layers[0..self.app_layer_count]) |*layer|
+                if (layer.candidate.getConst()) |candidate|
+                    if (std.meta.eql(candidate.id, id)) return layer;
+            for (self.app_layers[0..self.app_layer_count]) |*layer| {
                 if (layer.id) |current| if (std.meta.eql(current, id)) return layer;
             }
-            for (self.app_layers) |*layer| if (layerVacant(layer)) return layer;
-            const old_len = self.app_layers.len;
-            const capacity = std.math.mul(usize, old_len, 2) catch return error.OutOfMemory;
-            try self.growAppLayers(capacity);
-            return &self.app_layers[old_len];
+            for (self.app_layers[0..self.app_layer_count]) |*layer|
+                if (layerVacant(layer)) return layer;
+            if (self.app_layer_count == self.app_layers.len) {
+                const capacity = std.math.mul(
+                    usize,
+                    self.app_layers.len,
+                    2,
+                ) catch return error.OutOfMemory;
+                try self.growAppLayers(capacity);
+            }
+            const layer = &self.app_layers[self.app_layer_count];
+            self.app_layer_count += 1;
+            return layer;
         }
 
         fn surfaceScene(self: *Self, id: Adapter.SurfaceId) ?SurfaceScene {
@@ -9461,13 +9866,13 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn findAppLayer(self: *Self, id: Adapter.SurfaceId) ?*Layer {
-            for (self.app_layers) |*layer|
+            for (self.app_layers[0..self.app_layer_count]) |*layer|
                 if (layer.id) |current| if (std.meta.eql(current, id)) return layer;
             return null;
         }
 
         fn appLayerIndex(self: *const Self, layer: *const Layer) ?usize {
-            for (self.app_layers, 0..) |*candidate, index|
+            for (self.app_layers[0..self.app_layer_count], 0..) |*candidate, index|
                 if (candidate == layer) return index;
             return null;
         }
@@ -9499,7 +9904,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn retireOutputTracking(self: *Self, output_index: usize) void {
-            for (self.app_layers) |*layer| {
+            for (self.app_layers[0..self.app_layer_count]) |*layer| {
                 if (self.appLayerOutputRow(self.app_layer_change_outputs, layer)) |outputs| {
                     if (clearOutputPending(
                         outputs,
@@ -9528,7 +9933,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn anyAppLayerActive(self: *const Self) bool {
-            for (self.app_layers) |layer| if (layer.active) return true;
+            for (self.app_layers[0..self.app_layer_count]) |layer| if (layer.active) return true;
             return false;
         }
 
@@ -9538,7 +9943,7 @@ pub fn Coordinator(comptime protocol: type) type {
             return layer.id != null and std.meta.eql(id, layer.id.?);
         }
 
-        fn armTimer(self: *Self) !void {
+        fn armTimer(self: *Self) anyerror!void {
             const now = try monotonicNs();
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
                 const output = physical.kms_output orelse continue;
@@ -9574,8 +9979,8 @@ pub fn Coordinator(comptime protocol: type) type {
                     self.output_adapter.primaryOutput(),
                 )) return error.PrimaryOutput;
                 if (physical.removing) return;
-                physical.removing = true;
-                errdefer physical.removing = false;
+                self.setPhysicalOutputRemoving(physical, true);
+                errdefer self.setPhysicalOutputRemoving(physical, false);
                 try self.pausePhysicalOutput(physical);
                 // An output without the shared DRM readiness poll may pause
                 // and drain synchronously, leaving no completion to drive the
@@ -9610,7 +10015,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     if (!physical.connected) continue;
                     const bounds = self.outputBoundsFor(physical) catch continue;
                     var count: usize = 0;
-                    for (self.app_layers) |layer| {
+                    for (self.app_layers[0..self.app_layer_count]) |layer| {
                         if (!layer.active or layer.peer == null or layer.sample == null or
                             !samePeer(layer.peer.?, client.peer) or
                             try clipToOutput(layer.sample.?.destination, bounds) == null) continue;
@@ -9636,7 +10041,7 @@ pub fn Coordinator(comptime protocol: type) type {
                         self.association_surfaces[0..count],
                     );
                 }
-                for (self.app_layers) |*layer|
+                for (self.app_layers[0..self.app_layer_count]) |*layer|
                     try self.publishLayerPreferredScale(layer, client.peer);
                 try self.publishLayerPreferredScale(&self.cursor_layer, client.peer);
                 if (self.output_adapter.pendingOutboundOn(client.peer))
@@ -9884,11 +10289,12 @@ pub fn Coordinator(comptime protocol: type) type {
                     primary_state.x,
                     true,
                 );
-                primary.removing = true;
+                self.setPhysicalOutputRemoving(primary, true);
             }
             try self.activateAdditionalOutputs(handle);
             try self.advanceOutputGlobals();
             try self.publishOutputLayout();
+            self.reconcileActiveOutputConfig();
             try self.consumeOutputManagementCommands();
             self.topology_refresh_pending = false;
             try self.advancePhysicalOutputRemovals();
@@ -10045,11 +10451,23 @@ pub fn Coordinator(comptime protocol: type) type {
                 physical.reconfigure = null;
             self.output_reconfigure = null;
             self.markProtocolAll(ProtocolReady.output_power);
-            if (self.output_management_adapter.peekCommand()) |command| {
-                if (std.meta.eql(command.configuration, transaction.configuration)) {
-                    try self.output_management_adapter.completeCommand(result);
-                    self.markProtocol(transaction.peer, ProtocolReady.output_management);
-                }
+            switch (transaction.owner) {
+                .protocol => |owner| if (self.output_management_adapter.peekCommand()) |command| {
+                    if (std.meta.eql(command.configuration, owner.configuration)) {
+                        try self.output_management_adapter.completeCommand(result);
+                        self.markProtocol(owner.peer, ProtocolReady.output_management);
+                    }
+                },
+                .config => |snapshot_value| {
+                    var snapshot = snapshot_value;
+                    if (result == .succeeded) {
+                        self.promoteConfig(&snapshot) catch |err| {
+                            snapshot.deinit();
+                            std.log.err("output configuration succeeded but config promotion failed: {t}", .{err});
+                        };
+                    } else snapshot.deinit();
+                },
+                .config_reconcile => {},
             }
             try self.consumeOutputManagementCommands();
             try self.consumeOutputPowerCommands();
@@ -10059,14 +10477,14 @@ pub fn Coordinator(comptime protocol: type) type {
         /// has reached a state where no physical outcome can still reference it.
         fn abandonPending(self: *Self) void {
             self.abandonLayer(&self.cursor_layer);
-            for (self.app_layers) |*layer| self.abandonLayer(layer);
+            for (self.app_layers[0..self.app_layer_count]) |*layer| self.abandonLayer(layer);
         }
 
         /// Terminates an applied layer which can no longer reach an output.
         /// Its presentation token and feedback remain owned until the
         /// discarded outcome (and any source release) can be delivered.
         fn discardUnpresentedLayer(self: *Self, layer: *Layer) void {
-            if (layer.presentation == null or layer.content == null)
+            if (layer.presentation == null or !layer.content.owned)
                 return self.abandonLayer(layer);
             if (layerHasOutputAssociation(layer)) self.output_associations_dirty = true;
             layer.active = false;
@@ -10079,8 +10497,8 @@ pub fn Coordinator(comptime protocol: type) type {
         fn abandonLayer(self: *Self, layer: *Layer) void {
             if (layerHasOutputAssociation(layer)) self.output_associations_dirty = true;
             if (layer.presentation) |token| self.presentations.discard(token) catch unreachable;
-            if (layer.content) |*content| content.deinit();
-            if (layer.candidate) |*candidate| candidate.content.deinit();
+            if (layer.content.get()) |content| content.deinit();
+            if (layer.candidate.get()) |candidate| candidate.content.deinit();
             if (layer.retired_source) |*source| source.content.deinit();
             if (layer.rendered) |rendered| if (self.render_device) |render_device|
                 render_device.content.release(rendered);
@@ -10155,7 +10573,6 @@ pub fn Coordinator(comptime protocol: type) type {
             if (!requested) return;
             self.removed_layers[self.removed_layer_len] = .{ .id = id, .state = state };
             self.removed_layer_len += 1;
-            self.armTimer() catch {};
         }
 
         fn cleanupUnstartedOutput(self: *Self, physical: *PhysicalOutput) void {
@@ -10168,12 +10585,12 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (output.requestPause() catch unreachable) |action|
                     self.consumeRetireAction(action) catch unreachable;
             }
-            output.processKmsEvents(.{
+            output.processKmsEventsOn(.{
                 .context = self,
                 .presented_fn = presented,
                 .retired_fn = retired,
                 .captured_fn = captured,
-            }) catch unreachable;
+            }, &self.root.ring) catch unreachable;
             std.debug.assert(output.paused);
             output.beginDrain(&self.router, &self.root.ring) catch unreachable;
             std.debug.assert(output.drainComplete());
@@ -10208,7 +10625,10 @@ pub fn Coordinator(comptime protocol: type) type {
             // expose outbound work in independent protocol adapters.
             if (object.interface != &protocol.wl_buffer.info and
                 object.interface != &protocol.wl_shm_pool.info)
+            {
+                self.shell_maintenance_pending = true;
                 self.markProtocolAll(ProtocolReady.all);
+            }
             const removed_surface_candidate: ?Adapter.SurfaceId = if (std.mem.eql(
                 u8,
                 object.interface.name,
@@ -10329,22 +10749,22 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (self.render_device) |render_device| render_device.content.destroySurface(
                     (@as(u64, id.generation) << 32) | id.index,
                 );
-                for (self.app_layers) |*layer| {
-                    if (layer.candidate) |*candidate| {
+                for (self.app_layers[0..self.app_layer_count]) |*layer| {
+                    if (layer.candidate.get()) |candidate| {
                         if (std.meta.eql(candidate.id, id) and
                             std.meta.eql(candidate.surface, handle))
                         {
                             candidate.content.deinit();
-                            layer.candidate = null;
+                            layer.candidate.clear();
                         }
                     }
                 }
-                if (self.cursor_layer.candidate) |*candidate| {
+                if (self.cursor_layer.candidate.get()) |candidate| {
                     if (std.meta.eql(candidate.id, id) and
                         std.meta.eql(candidate.surface, handle))
                     {
                         candidate.content.deinit();
-                        self.cursor_layer.candidate = null;
+                        self.cursor_layer.candidate.clear();
                     }
                 }
                 // Damage while the retained cursor layer is still visible. In
@@ -10354,7 +10774,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     std.meta.eql(self.cursor_layer.id.?, id))
                     self.requestCursorRedraw() catch {};
                 self.interaction.surfaceDestroyed(id);
-                for (self.app_layers) |*layer|
+                for (self.app_layers[0..self.app_layer_count]) |*layer|
                     if (layer.id != null and std.meta.eql(layer.id.?, id) and
                         !self.appLayerOutputTrackingPending(layer) and
                         !self.anyOutputInFlight())
@@ -10428,6 +10848,28 @@ fn activateOutputWithRollback(
     return .succeeded;
 }
 
+fn selectConfiguredMode(
+    modes: []const drm.Mode,
+    requested: user_config.OutputMode,
+) ?drm.Mode {
+    var selected: ?drm.Mode = null;
+    var selected_delta: u32 = std.math.maxInt(u32);
+    for (modes) |mode| {
+        if (mode.hdisplay != requested.width or mode.vdisplay != requested.height) continue;
+        if (requested.refresh_millihertz) |refresh| {
+            const actual = std.math.mul(u32, mode.vrefresh, 1000) catch continue;
+            const delta = if (actual > refresh) actual - refresh else refresh - actual;
+            if (selected == null or delta < selected_delta) {
+                selected = mode;
+                selected_delta = delta;
+            }
+        } else if (selected == null or (!selected.?.preferred() and mode.preferred())) {
+            selected = mode;
+        }
+    }
+    return selected;
+}
+
 fn collectOutputModes(
     destination: []protocol_output_management.ModeState,
     modes: []const drm.Mode,
@@ -10459,6 +10901,24 @@ fn collectOutputModes(
     }
     if (count == 0) return error.InvalidModeInventory;
     return destination[0..count];
+}
+
+test "physical: configured mode selection prefers preferred and closest refresh" {
+    const modes = [_]drm.Mode{
+        .{ .clock = 1, .hdisplay = 1920, .hsync_start = 1920, .hsync_end = 1920, .htotal = 1920, .hskew = 0, .vdisplay = 1080, .vsync_start = 1080, .vsync_end = 1080, .vtotal = 1080, .vscan = 0, .vrefresh = 60, .flags = 0, .mode_type = 0 },
+        .{ .clock = 2, .hdisplay = 1920, .hsync_start = 1920, .hsync_end = 1920, .htotal = 1920, .hskew = 0, .vdisplay = 1080, .vsync_start = 1080, .vsync_end = 1080, .vtotal = 1080, .vscan = 0, .vrefresh = 75, .flags = 0, .mode_type = 1 << 3 },
+        .{ .clock = 3, .hdisplay = 1280, .hsync_start = 1280, .hsync_end = 1280, .htotal = 1280, .hskew = 0, .vdisplay = 720, .vsync_start = 720, .vsync_end = 720, .vtotal = 720, .vscan = 0, .vrefresh = 60, .flags = 0, .mode_type = 0 },
+    };
+    try std.testing.expectEqual(@as(u32, 75), selectConfiguredMode(&modes, .{
+        .width = 1920,
+        .height = 1080,
+    }).?.vrefresh);
+    try std.testing.expectEqual(@as(u32, 60), selectConfiguredMode(&modes, .{
+        .width = 1920,
+        .height = 1080,
+        .refresh_millihertz = 61_000,
+    }).?.vrefresh);
+    try std.testing.expect(selectConfiguredMode(&modes, .{ .width = 800, .height = 600 }) == null);
 }
 
 test "physical: output mode inventory deduplicates timings and preserves preferred" {
@@ -10701,9 +11161,9 @@ fn outputManagementLayoutSupported(
 
 fn layerVacant(layer: anytype) bool {
     return !layer.active and layer.peer == null and layer.surface == null and
-        layer.id == null and layer.content == null and layer.rendered == null and
+        layer.id == null and !layer.content.owned and layer.rendered == null and
         layer.presentation == null and layer.sample == null and layer.binding == null and
-        layer.change == null and layer.candidate == null and !layer.source_release_pending and
+        layer.change == null and !layer.candidate.owned and !layer.source_release_pending and
         !layer.outcome_pending and layer.callback_data == null and !layer.retire_after_outcome and
         !layer.retire_after_source_release and !layer.retains_source and
         layer.retired_source == null;
@@ -11032,6 +11492,49 @@ fn deadlineFromNs(ns: u64) !timer.Deadline {
         .sec = @intCast(seconds),
         .nsec = @intCast(ns % std.time.ns_per_s),
     };
+}
+
+fn inputDeviceType(info: input_platform.DeviceInfo) user_config.InputType {
+    if (info.is_touchpad) return .touchpad;
+    if (info.capabilities.touch) return .touch;
+    if (info.capabilities.tablet_pad) return .tablet_pad;
+    if (info.capabilities.tablet_tool) return .tablet;
+    if (info.capabilities.keyboard) return .keyboard;
+    return .pointer;
+}
+
+fn resolvedInputSetting(
+    comptime T: type,
+    requested: ?user_config.Setting(T),
+    defaults: input_platform.Setting(T),
+) T {
+    return if (requested) |setting| switch (setting) {
+        .use_default => defaults.default,
+        .value => |value| value,
+    } else defaults.default;
+}
+
+fn resolvedOptionalInputSetting(
+    comptime T: type,
+    requested: ?user_config.Setting(T),
+    defaults: ?input_platform.Setting(T),
+) ?T {
+    if (requested) |setting| return switch (setting) {
+        .use_default => if (defaults) |value| value.default else null,
+        .value => |value| value,
+    };
+    return if (defaults) |value| value.default else null;
+}
+
+fn resolvedSoftwareInputSetting(
+    comptime T: type,
+    requested: ?user_config.Setting(T),
+    default: T,
+) T {
+    return if (requested) |setting| switch (setting) {
+        .use_default => default,
+        .value => |value| value,
+    } else default;
 }
 
 test "seat: physical input batch retries only the failed suffix" {

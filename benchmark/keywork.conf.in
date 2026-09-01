@@ -1,0 +1,10 @@
+[general]
+focus-follows-mouse=disabled
+inner-gap=0
+outer-gap=0
+corner-radius=0
+shadow=disabled
+unfocused-border-width=0
+focused-border-width=0
+
+[bindings]

@@ -547,6 +547,9 @@ pub fn Adapter(comptime protocol: type) type {
             }
             return n;
         }
+        pub fn pendingOutbound(s: *const Self) usize {
+            return s.out_len;
+        }
         pub fn pendingOutboundOn(s: *const Self, p: wayring.io_uring.Peer) bool {
             for (s.outbound) |o| if (o.active and same(o.peer, p)) return true;
             return false;
@@ -736,8 +739,10 @@ test "text input focus edits and stale generation" {
     try a.setFocus(.{ .peer = z.peer, .surface = 9 });
     z.current.enabled = true;
     try a.queueEdit(id, .{ .commit = "x" });
+    try std.testing.expect(a.pendingOutbound() != 0);
     try std.testing.expect(a.pendingOutboundOn(z.peer));
     a.release(z);
+    try std.testing.expectEqual(@as(usize, 0), a.pendingOutbound());
     try std.testing.expect(!a.pendingOutboundOn(z.peer));
     const n = try a.acquire();
     try std.testing.expect(id.generation != a.id(n).generation);

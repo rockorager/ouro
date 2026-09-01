@@ -2565,6 +2565,11 @@ test "shell-input: secondary output removal closes its reactive layer popup root
                 return error.MissingLayerSurface;
             const popup = findLayer(coordinator.app_layers, popups[0].surface) orelse
                 return error.MissingPopupSurface;
+            if (!std.meta.eql(popup.binding.?.surface, submitted[1].surface)) {
+                const delay: linux.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
+                _ = linux.nanosleep(&delay, null);
+                continue;
+            }
             try std.testing.expectEqual(layer.binding.?.surface, submitted[0].surface);
             try std.testing.expectEqual(popup.binding.?.surface, submitted[1].surface);
             try std.testing.expectEqual(@as(i32, 3), layer.sample.?.destination.x);
@@ -3854,6 +3859,8 @@ const FakeInput = struct {
         .next_event = nextEvent,
         .suspend_context = suspendContext,
         .resume_context = resumeContext,
+        .device_configuration = deviceConfiguration,
+        .apply_configuration = applyConfiguration,
     };
 
     fn create(context: *anyopaque, _: *ouro.input_platform.Restricted, _: [:0]const u8) !*anyopaque {
@@ -3882,6 +3889,12 @@ const FakeInput = struct {
     }
     fn suspendContext(_: *anyopaque, _: *anyopaque) !void {}
     fn resumeContext(_: *anyopaque, _: *anyopaque) !void {}
+    fn deviceConfiguration(_: *anyopaque, _: ouro.input_platform.DeviceRef) !ouro.input_platform.DeviceConfiguration {
+        return .{ .send_events = .{ .default = .{}, .current = .{} } };
+    }
+    fn applyConfiguration(_: *anyopaque, _: ouro.input_platform.DeviceRef, _: ouro.input_platform.Configuration) !ouro.input_platform.ApplyResult {
+        return .{};
+    }
 };
 
 const TabletHandler = struct {

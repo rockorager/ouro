@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_COMPOSITORS = ("ouro", "sway", "hyprland")
+DEFAULT_COMPOSITORS = ("ouro", "keywork", "sway", "hyprland")
 
 
 def parse_env(path: Path) -> dict[str, str]:

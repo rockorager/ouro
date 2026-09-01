@@ -494,6 +494,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Tex
             self.active_grab = id;
         }
         pub fn flushOn(self: *Self, peer: wayring.io_uring.Peer, so: anytype, queue: *wayring.tx.Queue) !usize {
+            // Flushing is the only asynchronous transition which can make
+            // room for a previously blocked keyboard-grab promotion. All
+            // other promotion producers retry synchronously at mutation time.
+            defer self.promoteGrab();
             var count: usize = 0;
             while (self.oldest(peer)) |o| {
                 if (o.kind == .popup_rectangle) {
