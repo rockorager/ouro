@@ -716,6 +716,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 if (slot.role == .popup) {
                     const popup = try adapter.resolvePopup(slot.role.popup);
                     if (popup.parent == null) return error.PopupParentRequired;
+                    if (surface.hasPendingBufferAttachment() and !adapter.popupParentMapped(popup))
+                        return error.InvalidPopupParent;
                 }
                 if ((slot.role == .toplevel or slot.role == .popup) and
                     !adapter.canPublishWithLive(adapter.live_toplevels, adapter.live_popups))
@@ -2049,6 +2051,19 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             return false;
         }
 
+        fn popupParentMapped(adapter: *Self, popup: *const PopupSlot) bool {
+            if (popup.external_parent) return true;
+            const parent = adapter.xdgSurfaceById(popup.parent orelse return false) orelse return false;
+            return switch (parent.role) {
+                .toplevel => |id| (adapter.resolveToplevel(id) catch return false).mapped,
+                .popup => |id| blk: {
+                    const role = adapter.resolvePopup(id) catch return false;
+                    break :blk role.mapped and !role.dismissed;
+                },
+                .none => false,
+            };
+        }
+
         fn xdgSurfaceById(adapter: *Self, id: SurfaceId) ?*SurfaceSlot {
             for (adapter.surfaces) |surface|
                 if (surface.header.active and std.meta.eql(surface.surface_id, id)) return surface;
@@ -3267,7 +3282,7 @@ test "xdg-shell: ping is outstanding until its emitted serial is ponged" {
 test "xdg-shell: generated popup requests validate positioner and parent role" {
     const context = try TestContext.init();
     defer context.deinit();
-    _ = try context.createToplevel();
+    const parent = try context.createToplevel();
 
     try test_protocol.xdg_wm_base.encodeRequest(&context.requests, context.manager.id, .{
         .get_xdg_surface = .{ .id = 14, .surface = context.core.second_handle.id },
@@ -3377,6 +3392,11 @@ test "xdg-shell: generated popup requests validate positioner and parent role" {
         .width = 120,
         .height = 80,
     }, 0, 0);
+    try std.testing.expectError(
+        error.InvalidPopupParent,
+        context.adapter.validateSurfaceCommit(popup_surface),
+    );
+    context.adapter.toplevels[parent.index].mapped = true;
     try context.adapter.validateSurfaceCommit(popup_surface);
     _ = try context.core.second_state.commit();
     try context.adapter.publishSurfaceCommitted(popup_surface);
