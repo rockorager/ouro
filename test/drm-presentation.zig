@@ -1282,6 +1282,30 @@ test "generated output power client drains and recreates the physical output" {
         coordinator.stats.selected_outputs,
     );
     try std.testing.expectEqual(@as(usize, 1), coordinator.stats.output_drains);
+    const power = handler.power.?;
+
+    try fixture.signalSession(.disable);
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (coordinator.physical_outputs[0].kms_output == null and
+            coordinator.physical_outputs[1].kms_output == null and
+            coordinator.session.state == .disabled) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
+    }
+    try fixture.signalSession(.enable);
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (coordinator.physical_outputs[0].kms_output != null and
+            coordinator.physical_outputs[1].kms_output != null) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expectEqual(power, handler.power.?);
+    try std.testing.expectEqual(@as(usize, 0), handler.failed);
+    try std.testing.expectEqual(@as(usize, 3), handler.mode_count);
 
     _ = try client.prepareClose();
     try submitClient(&reactor, &driver, &handler);
