@@ -177,6 +177,14 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(executable);
+    b.installFile(
+        "resources/ouro.desktop",
+        "share/wayland-sessions/ouro.desktop",
+    );
+    b.installFile(
+        "resources/ouro-session.target",
+        "share/systemd/user/ouro-session.target",
+    );
     const run_executable = b.addRunArtifact(executable);
     if (b.args) |args| run_executable.addArgs(args);
     const run_step = b.step("run", "Run the physical-display compositor");

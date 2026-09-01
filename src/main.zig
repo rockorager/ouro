@@ -11,6 +11,7 @@ const c = @cImport({
 const Compositor = ouro.compositor.Compositor(protocol);
 const Runtime = ouro.physical.Coordinator(protocol);
 const Runner = ouro.physical.Runner(protocol);
+const SystemdSession = @import("systemd_session.zig");
 
 const shm_formats = [_]wayring.shm.Format{
     .{ .value = protocol.wl_shm.format.argb8888.value, .bytes_per_pixel = 4 },
@@ -18,11 +19,12 @@ const shm_formats = [_]wayring.shm.Format{
 };
 
 const Options = struct {
-    socket: []const u8 = "/tmp/ouro.sock",
+    socket: ?[]const u8 = null,
     renderer: ouro.real_output.RendererPreference = .vulkan_then_pixman,
     drm_device: ?[]const u8 = null,
     output_icc: ?[]const u8 = null,
     config: ?[]const u8 = null,
+    managed_session: bool = false,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -33,6 +35,34 @@ pub fn main(init: std.process.Init) !void {
     };
     if (options.output_icc != null and options.renderer != .vulkan)
         return error.OutputIccRequiresVulkan;
+    const managed_socket = if (options.socket == null and options.managed_session)
+        try std.fmt.allocPrint(
+            allocator,
+            "{s}/ouro.sock",
+            .{init.environ_map.get("XDG_RUNTIME_DIR") orelse return error.MissingRuntimeDirectory},
+        )
+    else
+        null;
+    defer if (managed_socket) |value| allocator.free(value);
+    const socket = options.socket orelse managed_socket orelse "/tmp/ouro.sock";
+    const wayland_display = if (managed_socket != null) "ouro.sock" else socket;
+    var systemd_session = SystemdSession.init(
+        init.io,
+        init.environ_map,
+        options.managed_session,
+    );
+    if (options.managed_session) {
+        _ = init.environ_map.swapRemove("DISPLAY");
+        _ = init.environ_map.swapRemove("WAYLAND_DISPLAY");
+        try init.environ_map.put("WAYLAND_DISPLAY", wayland_display);
+        try init.environ_map.put("XDG_CURRENT_DESKTOP", "ouro");
+        try init.environ_map.put("XDG_SESSION_DESKTOP", "ouro");
+        try init.environ_map.put("XDG_SESSION_TYPE", "wayland");
+    }
+    try systemd_session.prepare();
+    defer systemd_session.shutdown() catch |err| {
+        std.log.warn("could not shut down the managed graphical session: {t}", .{err});
+    };
     const config_store: ouro.config.Store = .{
         .allocator = allocator,
         .io = init.io,
@@ -95,13 +125,13 @@ pub fn main(init: std.process.Init) !void {
     var shutdown_signals = try ouro.shutdown_signal.Watcher.install();
     defer shutdown_signals.deinit();
 
-    wayring.unix_socket.unlink(options.socket) catch {};
-    defer wayring.unix_socket.unlink(options.socket) catch {};
-    const session_state_path = try std.fmt.allocPrint(allocator, "{s}.sessions-v1", .{options.socket});
+    wayring.unix_socket.unlink(socket) catch {};
+    defer wayring.unix_socket.unlink(socket) catch {};
+    const session_state_path = try std.fmt.allocPrint(allocator, "{s}.sessions-v1", .{socket});
     defer allocator.free(session_state_path);
     const root = try Compositor.create(
         allocator,
-        try wayring.unix_socket.listen(options.socket, 128),
+        try wayring.unix_socket.listen(socket, 128),
         compositorConfig(),
     );
     const coordinator = Runtime.create(allocator, root, .{
@@ -242,11 +272,14 @@ pub fn main(init: std.process.Init) !void {
     runner.start() catch |err| {
         if (run_error == null) run_error = err;
     };
+    if (run_error == null) systemd_session.ready(wayland_display) catch |err| {
+        run_error = err;
+    };
     if (run_error != null) coordinator.requestStop() catch {};
 
     if (run_error == null)
         std.log.info("Ouro listening on {s}; renderer policy={s}", .{
-            options.socket,
+            socket,
             @tagName(options.renderer),
         });
     var wayring_drained = false;
@@ -361,7 +394,7 @@ fn parseOptions(args: std.process.Args) !Options {
             options.renderer = .vulkan_then_pixman;
         } else if (std.mem.startsWith(u8, argument, "--socket=")) {
             options.socket = argument["--socket=".len..];
-            if (options.socket.len == 0) return error.InvalidSocket;
+            if (options.socket.?.len == 0) return error.InvalidSocket;
         } else if (std.mem.startsWith(u8, argument, "--drm-device=")) {
             options.drm_device = argument["--drm-device=".len..];
             if (options.drm_device.?.len == 0) return error.InvalidDrmDevice;
@@ -371,6 +404,8 @@ fn parseOptions(args: std.process.Args) !Options {
         } else if (std.mem.startsWith(u8, argument, "--config=")) {
             options.config = argument["--config=".len..];
             if (options.config.?.len == 0) return error.InvalidConfigPath;
+        } else if (std.mem.eql(u8, argument, "--managed-session")) {
+            options.managed_session = true;
         } else return error.UnknownArgument;
     }
     return options;
@@ -378,7 +413,7 @@ fn parseOptions(args: std.process.Args) !Options {
 
 fn usage() void {
     std.debug.print(
-        \\usage: ouro [--socket=PATH] [--renderer=auto|pixman|vulkan] [--drm-device=PATH] [--output-icc=PATH] [--config=PATH]
+        \\usage: ouro [--socket=PATH] [--renderer=auto|pixman|vulkan] [--drm-device=PATH] [--output-icc=PATH] [--config=PATH] [--managed-session]
         \\
         \\  auto    try Vulkan, then fall back to Pixman at startup
         \\  pixman  require the CPU Pixman renderer
@@ -386,6 +421,7 @@ fn usage() void {
         \\  --drm-device  require this DRM card instead of automatic selection
         \\  --output-icc  apply an ICC v2/v4 output profile and VCGT (Vulkan only)
         \\  --config      load this JSON file before sibling config.d/*.json fragments
+        \\  --managed-session  publish and bind the systemd graphical session lifecycle
         \\  SIGHUP        reload configuration; invalid replacements are rejected
         \\
     , .{});

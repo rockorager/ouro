@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=Ouro
+Comment=Ouro Wayland compositor
+Exec=ouro --managed-session
+TryExec=ouro
+Type=Application

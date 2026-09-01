@@ -194,6 +194,17 @@ not physical evdev positions. Actions are exact JSON arrays: `focus-next`,
 `run` never invokes a shell and delegates process ownership to
 `systemd-run --user`; Ouro does not supervise applications.
 
+## Display-manager session
+
+`zig build install` installs `ouro.desktop` under `share/wayland-sessions` and
+`ouro-session.target` under `share/systemd/user`. Install with a system prefix
+such as `/usr` for display managers to discover the session. The desktop entry
+starts Ouro with `--managed-session`, which publishes its Wayland and desktop
+environment to the systemd user manager and D-Bus activation environment,
+starts `ouro-session.target` bound to `graphical-session.target`, and clears
+that environment and stops both targets when Ouro exits. Direct launches stay
+standalone and do not alter the user's graphical-session targets.
+
 A binding may use an object when compositor-side repetition is desired:
 
 ```json
