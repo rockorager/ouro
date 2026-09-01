@@ -22,6 +22,7 @@ const Options = struct {
     renderer: ouro.real_output.RendererPreference = .vulkan_then_pixman,
     drm_device: ?[]const u8 = null,
     output_icc: ?[]const u8 = null,
+    config: ?[]const u8 = null,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -32,6 +33,20 @@ pub fn main(init: std.process.Init) !void {
     };
     if (options.output_icc != null and options.renderer != .vulkan)
         return error.OutputIccRequiresVulkan;
+    const config_store: ouro.config.Store = .{
+        .allocator = allocator,
+        .io = init.io,
+        .environ_map = init.environ_map,
+        .explicit_path = options.config,
+    };
+    var initial_config = try config_store.load();
+    var initial_config_owned = true;
+    defer if (initial_config_owned) initial_config.deinit();
+    var launcher: ouro.launcher.Systemd = .{
+        .allocator = allocator,
+        .io = init.io,
+        .environ_map = init.environ_map,
+    };
     var output_profile_fd: linux.fd_t = -1;
     defer if (output_profile_fd >= 0) {
         _ = linux.close(output_profile_fd);
@@ -172,10 +187,22 @@ pub fn main(init: std.process.Init) !void {
             .enable_color_management = options.renderer == .vulkan,
             .output_color_description = output_description,
         },
+        .launcher = .{
+            .context = &launcher,
+            .launchFn = ouro.launcher.Systemd.launchOpaque,
+        },
     }) catch |err| {
         root.deinit() catch {};
         return err;
     };
+    coordinator.installConfig(&initial_config) catch |err| {
+        coordinator.requestStop() catch unreachable;
+        std.debug.assert(coordinator.backendDrainComplete());
+        coordinator.destroy() catch {};
+        root.deinit() catch {};
+        return err;
+    };
+    initial_config_owned = false;
     var loop = Loop.init(
         allocator,
         root,
@@ -221,6 +248,18 @@ pub fn main(init: std.process.Init) !void {
                 if (run_error == null) run_error = err;
             };
         }
+        if (!signal_stop_started and progress.reload_requested) {
+            var candidate = config_store.load() catch |err| {
+                std.log.err("configuration reload failed; keeping active configuration: {t}", .{err});
+                continue;
+            };
+            coordinator.installConfig(&candidate) catch |err| {
+                candidate.deinit();
+                std.log.err("configuration reload failed; keeping active configuration: {t}", .{err});
+                continue;
+            };
+            std.log.info("configuration reloaded", .{});
+        }
     }
     loop.deinit();
     const destroy_result = coordinator.destroy();
@@ -253,6 +292,9 @@ fn parseOptions(args: std.process.Args) !Options {
         } else if (std.mem.startsWith(u8, argument, "--output-icc=")) {
             options.output_icc = argument["--output-icc=".len..];
             if (options.output_icc.?.len == 0) return error.InvalidOutputIcc;
+        } else if (std.mem.startsWith(u8, argument, "--config=")) {
+            options.config = argument["--config=".len..];
+            if (options.config.?.len == 0) return error.InvalidConfigPath;
         } else return error.UnknownArgument;
     }
     return options;
@@ -260,13 +302,15 @@ fn parseOptions(args: std.process.Args) !Options {
 
 fn usage() void {
     std.debug.print(
-        \\usage: ouro [--socket=PATH] [--renderer=auto|pixman|vulkan] [--drm-device=PATH] [--output-icc=PATH]
+        \\usage: ouro [--socket=PATH] [--renderer=auto|pixman|vulkan] [--drm-device=PATH] [--output-icc=PATH] [--config=PATH]
         \\
         \\  auto    try Vulkan, then fall back to Pixman at startup
         \\  pixman  require the CPU Pixman renderer
         \\  vulkan  require Vulkan and KMS IN_FENCE_FD (no host wait)
         \\  --drm-device  require this DRM card instead of automatic selection
         \\  --output-icc  apply an ICC v2/v4 output profile and VCGT (Vulkan only)
+        \\  --config      load this JSON file before sibling config.d/*.json fragments
+        \\  SIGHUP        reload configuration; invalid replacements are rejected
         \\
     , .{});
 }

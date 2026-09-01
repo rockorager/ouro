@@ -160,6 +160,7 @@ pub fn build(b: *std.Build) void {
     ouro.linkSystemLibrary("pixman-1", .{});
     ouro.linkSystemLibrary("vulkan", .{});
     ouro.linkSystemLibrary("lcms2", .{});
+    ouro.linkSystemLibrary("xkbcommon", .{});
 
     const executable = b.addExecutable(.{
         .name = "ouro",

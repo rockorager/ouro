@@ -60,6 +60,7 @@ pub fn Loop(comptime protocol: type) type {
             wayring: Driver.Progress,
             submitted: u32,
             shutdown_requested: bool,
+            reload_requested: bool,
             /// More CQEs or deferred Wayring preparation remain for a future
             /// turn. The caller can use this to avoid blocking.
             needs_more_work: bool,
@@ -136,14 +137,18 @@ pub fn Loop(comptime protocol: type) type {
         /// shutdown request makes the descriptor readable.
         pub fn installShutdown(self: *Self, watcher: *shutdown_signal.Watcher) !void {
             if (self.shutdown != null) return error.AlreadyInstalled;
+            self.shutdown = watcher;
+            try self.armSignalPoll();
+        }
+
+        fn armSignalPoll(self: *Self) !void {
             const token = try self.router.acquire(.shutdown);
             errdefer self.router.retire(token) catch unreachable;
             _ = try self.compositor.ring.poll_add(
                 token.encode(),
-                watcher.descriptor(),
+                self.shutdown.?.descriptor(),
                 linux.POLL.IN | linux.POLL.ERR | linux.POLL.HUP | linux.POLL.NVAL,
             );
-            self.shutdown = watcher;
             self.shutdown_token = token;
         }
 
@@ -215,6 +220,7 @@ pub fn Loop(comptime protocol: type) type {
             var ouro_count: usize = 0;
             var unrouted_count: usize = 0;
             var shutdown_requested = false;
+            var reload_requested = false;
             for (self.cqes[0..copied]) |cqe| {
                 if (cqe.user_data == completion.skipped_success_user_data) {
                     if (cqe.res < 0) return error.SkippedOperationFailed;
@@ -227,10 +233,13 @@ pub fn Loop(comptime protocol: type) type {
                             return error.UnexpectedShutdownCompletion;
                         if (cqe.res < 0 or @as(u32, @intCast(cqe.res)) & linux.POLL.IN == 0)
                             return error.ShutdownPollFailed;
-                        if (!(try self.shutdown.?.consume())) return error.MissingShutdownWakeup;
+                        const events = try self.shutdown.?.consume();
+                        if (!events.shutdown and !events.reload) return error.MissingShutdownWakeup;
                         try self.router.retire(token);
                         self.shutdown_token = null;
-                        shutdown_requested = true;
+                        shutdown_requested = events.shutdown;
+                        reload_requested = events.reload;
+                        if (!shutdown_requested) try self.armSignalPoll();
                         continue;
                     }
                     if (token.kind == .timer) {
@@ -296,7 +305,7 @@ pub fn Loop(comptime protocol: type) type {
             else
                 false;
             const can_wait = wait_on_idle and self.compositor.ring.cq_ready() == 0 and
-                !wayring_progress.pending and !shutdown_requested and
+                !wayring_progress.pending and !shutdown_requested and !reload_requested and
                 !(wayring_progress.shutdown_complete and backend_drained);
             const submitted = if (can_wait)
                 self.compositor.ring.submit_and_wait(1) catch |err| switch (err) {
@@ -319,6 +328,7 @@ pub fn Loop(comptime protocol: type) type {
                 .wayring = wayring_progress,
                 .submitted = submitted,
                 .shutdown_requested = shutdown_requested,
+                .reload_requested = reload_requested,
                 .needs_more_work = self.compositor.ring.cq_ready() != 0 or
                     wayring_progress.pending,
             };

@@ -8,6 +8,7 @@ const linux = std.os.linux;
 const completion = @import("../../runtime/completion.zig");
 const session_api = @import("../session.zig");
 const platform_api = @import("platform.zig");
+const log = std.log.scoped(.input_backend);
 
 const none = std.math.maxInt(u32);
 const code_count = 0x300;
@@ -19,6 +20,20 @@ pub const DeviceId = struct {
     slot: u32,
     generation: u32,
     seat_generation: u32,
+};
+
+pub const DeviceDescription = struct {
+    id: DeviceId,
+    info: platform_api.DeviceInfo,
+    defaults: platform_api.DeviceConfiguration,
+    current: platform_api.DeviceConfiguration,
+    scroll_factor: f64,
+    repeat_rate: i32,
+    repeat_delay: i32,
+
+    pub fn name(self: *const DeviceDescription) []const u8 {
+        return self.info.deviceName();
+    }
 };
 
 pub const GestureBegin = struct { device: DeviceId, time_usec: u64, fingers: u32 };
@@ -142,6 +157,11 @@ const DeviceSlot = struct {
     seat_generation: u32 = 0,
     reference: platform_api.DeviceRef = 0,
     info: platform_api.DeviceInfo = .{ .capabilities = .{} },
+    defaults: platform_api.DeviceConfiguration = undefined,
+    current: platform_api.DeviceConfiguration = undefined,
+    scroll_factor: f64 = 1,
+    repeat_rate: i32 = 25,
+    repeat_delay: i32 = 600,
     pressed: [state_words]u64 = [_]u64{0} ** state_words,
 };
 
@@ -246,6 +266,66 @@ pub const Backend = struct {
 
     pub fn deviceCount(self: *const Backend) usize {
         return self.active_devices;
+    }
+
+    /// Copies active generation-bearing IDs into `output` and returns the
+    /// number written. Enumeration performs no allocation.
+    pub fn enumerateDevices(self: *const Backend, output: []DeviceId) usize {
+        var count: usize = 0;
+        for (self.devices, 0..) |slot, index| if (slot.active and count < output.len) {
+            output[count] = self.idFor(@intCast(index));
+            count += 1;
+        };
+        return count;
+    }
+
+    pub fn describeDevice(self: *const Backend, id: DeviceId) !DeviceDescription {
+        const slot = try self.getDevice(id);
+        return .{
+            .id = id,
+            .info = slot.info,
+            .defaults = slot.defaults,
+            .current = slot.current,
+            .scroll_factor = slot.scroll_factor,
+            .repeat_rate = slot.repeat_rate,
+            .repeat_delay = slot.repeat_delay,
+        };
+    }
+
+    pub fn applySoftwareConfiguration(
+        self: *Backend,
+        id: DeviceId,
+        scroll_factor: f64,
+        repeat_rate: i32,
+        repeat_delay: i32,
+    ) !void {
+        if (!std.math.isFinite(scroll_factor) or scroll_factor < 0 or
+            repeat_rate < 0 or repeat_delay < 0) return error.InvalidConfiguration;
+        const slot: *DeviceSlot = @constCast(try self.getDevice(id));
+        slot.scroll_factor = scroll_factor;
+        slot.repeat_rate = repeat_rate;
+        slot.repeat_delay = repeat_delay;
+    }
+
+    pub fn applyDeviceConfiguration(self: *Backend, id: DeviceId, value: platform_api.Configuration) !platform_api.ApplyResult {
+        const slot: *DeviceSlot = @constCast(try self.getDevice(id));
+        const result = try self.platform.applyConfiguration(slot.reference, value);
+        // Re-read native state so rejected fields cannot corrupt the snapshot.
+        slot.current = try self.platform.deviceConfiguration(slot.reference);
+        if (result.unsupported != 0 or result.invalid != 0)
+            log.warn("device configuration partially rejected: unsupported=0x{x} invalid=0x{x}", .{ result.unsupported, result.invalid });
+        return result;
+    }
+
+    pub fn applyConfigurationToAll(self: *Backend, value: platform_api.Configuration) !platform_api.ApplyResult {
+        var total: platform_api.ApplyResult = .{};
+        for (self.devices, 0..) |slot, index| if (slot.active) {
+            const result = try self.applyDeviceConfiguration(self.idFor(@intCast(index)), value);
+            total.applied |= result.applied;
+            total.unsupported |= result.unsupported;
+            total.invalid |= result.invalid;
+        };
+        return total;
     }
 
     pub fn isPressed(self: *const Backend, device: DeviceId, code: u32) !bool {
@@ -422,11 +502,17 @@ pub const Backend = struct {
                 if (self.free_head == none) return error.DeviceCapacityExhausted;
                 const index = self.free_head;
                 const slot = &self.devices[index];
+                const captured = try self.platform.deviceConfiguration(value.device);
                 self.free_head = slot.next_free;
                 slot.active = true;
                 slot.seat_generation = self.seat_generation;
                 slot.reference = value.device;
                 slot.info = value.info;
+                slot.defaults = captured;
+                slot.current = captured;
+                slot.scroll_factor = 1;
+                slot.repeat_rate = 25;
+                slot.repeat_delay = 600;
                 @memset(&slot.pressed, 0);
                 self.active_devices += 1;
                 self.push(.{ .device_added = .{
@@ -464,12 +550,23 @@ pub const Backend = struct {
                         (present.value120 != null and !std.math.isFinite(present.value120.?)))
                         return error.InvalidAxis;
                 };
+                const index = self.findReference(value.device) orelse return error.UnknownDevice;
+                const factor = self.devices[index].scroll_factor;
+                var vertical = value.vertical;
+                var horizontal = value.horizontal;
+                inline for (.{ &vertical, &horizontal }) |axis| if (axis.*) |*present| {
+                    present.value *= factor;
+                    if (present.value120) |value120| present.value120 = value120 * factor;
+                    if (!std.math.isFinite(present.value) or
+                        (present.value120 != null and !std.math.isFinite(present.value120.?)))
+                        return error.InvalidAxis;
+                };
                 self.push(.{ .pointer_axis = .{
-                    .device = try self.idForReference(value.device),
+                    .device = self.idFor(index),
                     .time_usec = value.time_usec,
                     .source = value.source,
-                    .vertical = value.vertical,
-                    .horizontal = value.horizontal,
+                    .vertical = vertical,
+                    .horizontal = horizontal,
                 } });
             },
             .swipe_begin => |value| self.push(.{ .swipe_begin = try self.gestureBegin(value) }),
@@ -876,6 +973,12 @@ const FakeInput = struct {
     next: usize = 0,
     count: usize = 0,
     destroys: usize = 0,
+    configuration: platform_api.DeviceConfiguration = .{
+        .send_events = .{ .default = .{}, .current = .{} },
+        .tap = .{ .default = .disabled, .current = .disabled },
+        .accel_speed = .{ .default = 0, .current = 0 },
+    },
+    apply_count: usize = 0,
 
     const vtable: platform_api.Platform.VTable = .{
         .create = createContext,
@@ -885,6 +988,8 @@ const FakeInput = struct {
         .next_event = nextEvent,
         .suspend_context = suspendContext,
         .resume_context = resumeContext,
+        .device_configuration = deviceConfiguration,
+        .apply_configuration = applyConfiguration,
     };
 
     fn platform(self: *FakeInput) platform_api.Platform {
@@ -940,6 +1045,29 @@ const FakeInput = struct {
             self.restricted.?.userdata,
             "/dev/input/fake",
         );
+    }
+
+    fn deviceConfiguration(context: *anyopaque, _: platform_api.DeviceRef) !platform_api.DeviceConfiguration {
+        const self: *FakeInput = @ptrCast(@alignCast(context));
+        return self.configuration;
+    }
+
+    fn applyConfiguration(context: *anyopaque, _: platform_api.DeviceRef, value: platform_api.Configuration) !platform_api.ApplyResult {
+        const self: *FakeInput = @ptrCast(@alignCast(context));
+        self.apply_count += 1;
+        var result: platform_api.ApplyResult = .{};
+        if (value.tap) |tap| {
+            self.configuration.tap.?.current = tap;
+            result.applied |= 1 << 1;
+        }
+        if (value.accel_speed) |speed| if (std.math.isFinite(speed) and speed >= -1 and speed <= 1) {
+            self.configuration.accel_speed.?.current = speed;
+            result.applied |= 1 << 7;
+        } else {
+            result.invalid |= 1 << 7;
+        };
+        if (value.rotation != null) result.unsupported |= 1 << 18;
+        return result;
     }
 };
 
@@ -1488,4 +1616,52 @@ test "input: readiness and removal join the shared ring without internal submit"
     session.clearEvents();
     session.state = .draining;
     try session.destroy();
+}
+
+test "input: configuration snapshots survive hotplug and stale IDs" {
+    var seat_fake: FakeSeat = .{};
+    var input_fake: FakeInput = .{};
+    const backend = try testBackend(&seat_fake, &input_fake, 8);
+    defer destroyTestBackend(backend) catch unreachable;
+
+    var info: platform_api.DeviceInfo = .{
+        .capabilities = .{ .pointer = true, .touch = true },
+        .is_touchpad = true,
+    };
+    @memcpy(info.name[0..8], "Touchpad");
+    info.name_len = 8;
+    input_fake.append(.{ .device_added = .{ .device = 41, .info = info } });
+    try backend.drainEvents();
+
+    var ids: [2]DeviceId = undefined;
+    try std.testing.expectEqual(@as(usize, 1), backend.enumerateDevices(&ids));
+    const initial = try backend.describeDevice(ids[0]);
+    try std.testing.expectEqualStrings("Touchpad", initial.name());
+    try std.testing.expect(initial.info.is_touchpad);
+    try std.testing.expectEqual(platform_api.Toggle.disabled, initial.defaults.tap.?.default);
+
+    const first = try backend.applyDeviceConfiguration(ids[0], .{
+        .tap = .enabled,
+        .accel_speed = 0.5,
+        .rotation = 90,
+    });
+    try std.testing.expect(first.applied & (1 << 1) != 0);
+    try std.testing.expect(first.unsupported & (1 << 18) != 0);
+    const configured = try backend.describeDevice(ids[0]);
+    try std.testing.expectEqual(platform_api.Toggle.enabled, configured.current.tap.?.current);
+    try std.testing.expectEqual(@as(f64, 0.5), configured.current.accel_speed.?.current);
+    try std.testing.expectEqual(platform_api.Toggle.disabled, configured.defaults.tap.?.default);
+
+    // Reload-style aggregate application reaches existing and later hotplugged
+    // devices, while removed generations remain unusable.
+    _ = try backend.applyConfigurationToAll(.{ .tap = .disabled });
+    input_fake.append(.{ .device_removed = 41 });
+    try backend.drainEvents();
+    try std.testing.expectError(error.StaleDevice, backend.describeDevice(ids[0]));
+    input_fake.append(.{ .device_added = .{ .device = 42, .info = info } });
+    try backend.drainEvents();
+    try std.testing.expectEqual(@as(usize, 1), backend.enumerateDevices(&ids));
+    _ = try backend.applyConfigurationToAll(.{ .tap = .enabled });
+    try std.testing.expectEqual(platform_api.Toggle.enabled, (try backend.describeDevice(ids[0])).current.tap.?.current);
+    try std.testing.expectEqual(@as(usize, 3), input_fake.apply_count);
 }

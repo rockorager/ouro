@@ -35,6 +35,7 @@ const mod_num: u32 = 1 << 4;
 const mod_meta: u32 = 1 << 6;
 const mod_alt_gr: u32 = 1 << 7;
 const cursor_role_id: surface_state.RoleId = 0x6375_7273_6f72_5f5f;
+const input_keymap = @import("../input/keymap.zig");
 
 pub const SeatClientId = packed struct {
     slot: u32,
@@ -43,15 +44,7 @@ pub const SeatClientId = packed struct {
 
 /// XKB text intentionally owns no layout policy beyond the conventional evdev
 /// rules. R20 may replace it from compositor configuration at startup.
-pub const default_keymap =
-    \\xkb_keymap {
-    \\ xkb_keycodes { include "evdev+aliases(qwerty)" };
-    \\ xkb_types { include "complete" };
-    \\ xkb_compatibility { include "complete" };
-    \\ xkb_symbols { include "pc+us+inet(evdev)" };
-    \\ xkb_geometry { include "pc(pc105)" };
-    \\};
-;
+pub const default_keymap = input_keymap.default_text;
 
 pub const Config = struct {
     seat_capacity: usize,

@@ -3801,6 +3801,8 @@ const FakeInput = struct {
         .next_event = nextEvent,
         .suspend_context = suspendContext,
         .resume_context = resumeContext,
+        .device_configuration = deviceConfiguration,
+        .apply_configuration = applyConfiguration,
     };
 
     fn create(context: *anyopaque, _: *ouro.input_platform.Restricted, _: [:0]const u8) !*anyopaque {
@@ -3829,6 +3831,12 @@ const FakeInput = struct {
     }
     fn suspendContext(_: *anyopaque, _: *anyopaque) !void {}
     fn resumeContext(_: *anyopaque, _: *anyopaque) !void {}
+    fn deviceConfiguration(_: *anyopaque, _: ouro.input_platform.DeviceRef) !ouro.input_platform.DeviceConfiguration {
+        return .{ .send_events = .{ .default = .{}, .current = .{} } };
+    }
+    fn applyConfiguration(_: *anyopaque, _: ouro.input_platform.DeviceRef, _: ouro.input_platform.Configuration) !ouro.input_platform.ApplyResult {
+        return .{};
+    }
 };
 
 const TabletHandler = struct {

@@ -15,6 +15,74 @@ pub const ToolRef = usize;
 pub const DeviceGroupRef = usize;
 pub const max_tablet_pad_groups = 8;
 pub const max_tablet_pad_controls = 64;
+pub const max_device_name = 255;
+
+pub const Toggle = enum(u1) { disabled, enabled };
+pub const TapButtonMap = enum(u1) { lrm, lmr };
+pub const DragLock = enum(u2) { disabled, timeout, sticky };
+pub const ThreeFingerDrag = enum(u2) { disabled, three_fingers, four_fingers };
+pub const AccelProfile = enum(u3) { none = 0, flat = 1, adaptive = 2, custom = 4 };
+pub const ClickMethod = enum(u2) { none = 0, button_areas = 1, clickfinger = 2 };
+pub const ClickfingerButtonMap = enum(u1) { lrm, lmr };
+pub const ScrollMethod = enum(u3) { none = 0, two_finger = 1, edge = 2, on_button_down = 4 };
+pub const SendEvents = packed struct(u32) {
+    disabled: bool = false,
+    disabled_on_external_mouse: bool = false,
+    _padding: u30 = 0,
+};
+
+pub fn Setting(comptime T: type) type {
+    return struct { default: T, current: T };
+}
+
+/// Null fields are unsupported by this device. Values contain both the
+/// libinput default captured at discovery and the current native value.
+pub const DeviceConfiguration = struct {
+    send_events: Setting(SendEvents),
+    tap: ?Setting(Toggle) = null,
+    tap_button_map: ?Setting(TapButtonMap) = null,
+    drag: ?Setting(Toggle) = null,
+    drag_lock: ?Setting(DragLock) = null,
+    three_finger_drag: ?Setting(ThreeFingerDrag) = null,
+    accel_profile: ?Setting(AccelProfile) = null,
+    accel_speed: ?Setting(f64) = null,
+    natural_scroll: ?Setting(Toggle) = null,
+    left_handed: ?Setting(Toggle) = null,
+    click_method: ?Setting(ClickMethod) = null,
+    clickfinger_button_map: ?Setting(ClickfingerButtonMap) = null,
+    middle_emulation: ?Setting(Toggle) = null,
+    scroll_method: ?Setting(ScrollMethod) = null,
+    scroll_button: ?Setting(u32) = null,
+    scroll_button_lock: ?Setting(Toggle) = null,
+    disable_while_typing: ?Setting(Toggle) = null,
+    disable_while_trackpointing: ?Setting(Toggle) = null,
+    rotation: ?Setting(u32) = null,
+};
+
+/// Null means leave the native value unchanged.
+pub const Configuration = struct {
+    send_events: ?SendEvents = null,
+    tap: ?Toggle = null,
+    tap_button_map: ?TapButtonMap = null,
+    drag: ?Toggle = null,
+    drag_lock: ?DragLock = null,
+    three_finger_drag: ?ThreeFingerDrag = null,
+    accel_profile: ?AccelProfile = null,
+    accel_speed: ?f64 = null,
+    natural_scroll: ?Toggle = null,
+    left_handed: ?Toggle = null,
+    click_method: ?ClickMethod = null,
+    clickfinger_button_map: ?ClickfingerButtonMap = null,
+    middle_emulation: ?Toggle = null,
+    scroll_method: ?ScrollMethod = null,
+    scroll_button: ?u32 = null,
+    scroll_button_lock: ?Toggle = null,
+    disable_while_typing: ?Toggle = null,
+    disable_while_trackpointing: ?Toggle = null,
+    rotation: ?u32 = null,
+};
+
+pub const ApplyResult = struct { applied: u32 = 0, unsupported: u32 = 0, invalid: u32 = 0 };
 
 pub const Capabilities = packed struct {
     pointer: bool = false,
@@ -27,6 +95,9 @@ pub const Capabilities = packed struct {
 
 pub const DeviceInfo = struct {
     capabilities: Capabilities,
+    name: [max_device_name]u8 = [_]u8{0} ** max_device_name,
+    name_len: u8 = 0,
+    is_touchpad: bool = false,
     vendor: u32 = 0,
     product: u32 = 0,
     group: DeviceGroupRef = 0,
@@ -36,6 +107,10 @@ pub const DeviceInfo = struct {
     pad_mode_groups: u32 = 0,
     pad_groups: [max_tablet_pad_groups]TabletPadGroupInfo =
         [_]TabletPadGroupInfo{.{}} ** max_tablet_pad_groups,
+
+    pub fn deviceName(self: *const DeviceInfo) []const u8 {
+        return self.name[0..self.name_len];
+    }
 };
 
 pub const TabletPadGroupInfo = struct {
@@ -211,6 +286,8 @@ pub const Platform = struct {
         next_event: *const fn (*anyopaque, *anyopaque) anyerror!?RawEvent,
         suspend_context: *const fn (*anyopaque, *anyopaque) anyerror!void,
         resume_context: *const fn (*anyopaque, *anyopaque) anyerror!void,
+        device_configuration: *const fn (*anyopaque, DeviceRef) anyerror!DeviceConfiguration,
+        apply_configuration: *const fn (*anyopaque, DeviceRef, Configuration) anyerror!ApplyResult,
     };
 
     pub fn createContext(self: Platform, restricted: *Restricted, seat: [:0]const u8) !*anyopaque {
@@ -240,6 +317,14 @@ pub const Platform = struct {
     pub fn resumeContext(self: Platform, value: *anyopaque) !void {
         return self.vtable.resume_context(self.context, value);
     }
+
+    pub fn deviceConfiguration(self: Platform, device: DeviceRef) !DeviceConfiguration {
+        return self.vtable.device_configuration(self.context, device);
+    }
+
+    pub fn applyConfiguration(self: Platform, device: DeviceRef, value: Configuration) !ApplyResult {
+        return self.vtable.apply_configuration(self.context, device, value);
+    }
 };
 
 const RealContext = struct {
@@ -259,6 +344,8 @@ const real_vtable: Platform.VTable = .{
     .next_event = realNextEvent,
     .suspend_context = realSuspend,
     .resume_context = realResume,
+    .device_configuration = realDeviceConfiguration,
+    .apply_configuration = realApplyConfiguration,
 };
 
 const interface: c.struct_libinput_interface = .{
@@ -577,6 +664,15 @@ fn deviceInfo(device: *c.struct_libinput_device) DeviceInfo {
         .pad_strips = if (capabilities.tablet_pad) @intCast(c.libinput_device_tablet_pad_get_num_strips(device)) else 0,
         .pad_mode_groups = if (capabilities.tablet_pad) @intCast(c.libinput_device_tablet_pad_get_num_mode_groups(device)) else 0,
     };
+    const native_name = std.mem.span(c.libinput_device_get_name(device));
+    const name_len = @min(native_name.len, max_device_name);
+    @memcpy(info.name[0..name_len], native_name[0..name_len]);
+    info.name_len = @intCast(name_len);
+    if (c.libinput_device_get_udev_device(device)) |udev_device| {
+        defer _ = c.udev_device_unref(udev_device);
+        if (c.udev_device_get_property_value(udev_device, "ID_INPUT_TOUCHPAD")) |value|
+            info.is_touchpad = std.mem.eql(u8, std.mem.span(value), "1");
+    }
     if (capabilities.tablet_pad and !tabletPadTopology(device, &info)) {
         capabilities.tablet_pad = false;
         info.capabilities.tablet_pad = false;
@@ -717,4 +813,82 @@ fn realSuspend(_: *anyopaque, value: *anyopaque) !void {
 fn realResume(_: *anyopaque, value: *anyopaque) !void {
     const owner: *RealContext = @ptrCast(@alignCast(value));
     if (c.libinput_resume(owner.input) != 0) return error.ResumeFailed;
+}
+
+fn nativeDevice(reference: DeviceRef) *c.struct_libinput_device {
+    return @ptrFromInt(reference);
+}
+
+fn enumSetting(comptime T: type, default: anytype, current: anytype) Setting(T) {
+    return .{ .default = @enumFromInt(default), .current = @enumFromInt(current) };
+}
+
+fn boolSetting(default: anytype, current: anytype) Setting(Toggle) {
+    return .{
+        .default = if (default != 0) .enabled else .disabled,
+        .current = if (current != 0) .enabled else .disabled,
+    };
+}
+
+fn realDeviceConfiguration(_: *anyopaque, reference: DeviceRef) !DeviceConfiguration {
+    const d = nativeDevice(reference);
+    const tap_count = c.libinput_device_config_tap_get_finger_count(d);
+    const drag_count = c.libinput_device_config_3fg_drag_get_finger_count(d);
+    const click_methods = c.libinput_device_config_click_get_methods(d);
+    const scroll_methods = c.libinput_device_config_scroll_get_methods(d);
+    const accel = c.libinput_device_config_accel_is_available(d) != 0;
+    return .{
+        .send_events = .{
+            .default = @bitCast(c.libinput_device_config_send_events_get_default_mode(d)),
+            .current = @bitCast(c.libinput_device_config_send_events_get_mode(d)),
+        },
+        .tap = if (tap_count > 0) enumSetting(Toggle, c.libinput_device_config_tap_get_default_enabled(d), c.libinput_device_config_tap_get_enabled(d)) else null,
+        .tap_button_map = if (tap_count > 0) enumSetting(TapButtonMap, c.libinput_device_config_tap_get_default_button_map(d), c.libinput_device_config_tap_get_button_map(d)) else null,
+        .drag = if (tap_count > 0) enumSetting(Toggle, c.libinput_device_config_tap_get_default_drag_enabled(d), c.libinput_device_config_tap_get_drag_enabled(d)) else null,
+        .drag_lock = if (tap_count > 0) enumSetting(DragLock, c.libinput_device_config_tap_get_default_drag_lock_enabled(d), c.libinput_device_config_tap_get_drag_lock_enabled(d)) else null,
+        .three_finger_drag = if (drag_count >= 3) enumSetting(ThreeFingerDrag, c.libinput_device_config_3fg_drag_get_default_enabled(d), c.libinput_device_config_3fg_drag_get_enabled(d)) else null,
+        .accel_profile = if (accel) enumSetting(AccelProfile, c.libinput_device_config_accel_get_default_profile(d), c.libinput_device_config_accel_get_profile(d)) else null,
+        .accel_speed = if (accel) .{ .default = c.libinput_device_config_accel_get_default_speed(d), .current = c.libinput_device_config_accel_get_speed(d) } else null,
+        .natural_scroll = if (c.libinput_device_config_scroll_has_natural_scroll(d) != 0) boolSetting(c.libinput_device_config_scroll_get_default_natural_scroll_enabled(d), c.libinput_device_config_scroll_get_natural_scroll_enabled(d)) else null,
+        .left_handed = if (c.libinput_device_config_left_handed_is_available(d) != 0) boolSetting(c.libinput_device_config_left_handed_get_default(d), c.libinput_device_config_left_handed_get(d)) else null,
+        .click_method = if (click_methods != 0) enumSetting(ClickMethod, c.libinput_device_config_click_get_default_method(d), c.libinput_device_config_click_get_method(d)) else null,
+        .clickfinger_button_map = if (click_methods & c.LIBINPUT_CONFIG_CLICK_METHOD_CLICKFINGER != 0) enumSetting(ClickfingerButtonMap, c.libinput_device_config_click_get_default_clickfinger_button_map(d), c.libinput_device_config_click_get_clickfinger_button_map(d)) else null,
+        .middle_emulation = if (c.libinput_device_config_middle_emulation_is_available(d) != 0) enumSetting(Toggle, c.libinput_device_config_middle_emulation_get_default_enabled(d), c.libinput_device_config_middle_emulation_get_enabled(d)) else null,
+        .scroll_method = if (scroll_methods != 0) enumSetting(ScrollMethod, c.libinput_device_config_scroll_get_default_method(d), c.libinput_device_config_scroll_get_method(d)) else null,
+        .scroll_button = if (scroll_methods & c.LIBINPUT_CONFIG_SCROLL_ON_BUTTON_DOWN != 0) .{ .default = c.libinput_device_config_scroll_get_default_button(d), .current = c.libinput_device_config_scroll_get_button(d) } else null,
+        .scroll_button_lock = if (scroll_methods & c.LIBINPUT_CONFIG_SCROLL_ON_BUTTON_DOWN != 0) enumSetting(Toggle, c.libinput_device_config_scroll_get_default_button_lock(d), c.libinput_device_config_scroll_get_button_lock(d)) else null,
+        .disable_while_typing = if (c.libinput_device_config_dwt_is_available(d) != 0) enumSetting(Toggle, c.libinput_device_config_dwt_get_default_enabled(d), c.libinput_device_config_dwt_get_enabled(d)) else null,
+        .disable_while_trackpointing = if (c.libinput_device_config_dwtp_is_available(d) != 0) enumSetting(Toggle, c.libinput_device_config_dwtp_get_default_enabled(d), c.libinput_device_config_dwtp_get_enabled(d)) else null,
+        .rotation = if (c.libinput_device_config_rotation_is_available(d) != 0) .{ .default = c.libinput_device_config_rotation_get_default_angle(d), .current = c.libinput_device_config_rotation_get_angle(d) } else null,
+    };
+}
+
+fn record(result: *ApplyResult, bit: u5, status: c_uint) void {
+    const mask = @as(u32, 1) << bit;
+    if (status == c.LIBINPUT_CONFIG_STATUS_SUCCESS) result.applied |= mask else if (status == c.LIBINPUT_CONFIG_STATUS_UNSUPPORTED) result.unsupported |= mask else result.invalid |= mask;
+}
+
+fn realApplyConfiguration(_: *anyopaque, reference: DeviceRef, value: Configuration) !ApplyResult {
+    const d = nativeDevice(reference);
+    var result: ApplyResult = .{};
+    if (value.send_events) |v| record(&result, 0, c.libinput_device_config_send_events_set_mode(d, @bitCast(v)));
+    if (value.tap) |v| record(&result, 1, c.libinput_device_config_tap_set_enabled(d, @intFromEnum(v)));
+    if (value.tap_button_map) |v| record(&result, 2, c.libinput_device_config_tap_set_button_map(d, @intFromEnum(v)));
+    if (value.drag) |v| record(&result, 3, c.libinput_device_config_tap_set_drag_enabled(d, @intFromEnum(v)));
+    if (value.drag_lock) |v| record(&result, 4, c.libinput_device_config_tap_set_drag_lock_enabled(d, @intFromEnum(v)));
+    if (value.three_finger_drag) |v| record(&result, 5, c.libinput_device_config_3fg_drag_set_enabled(d, @intFromEnum(v)));
+    if (value.accel_profile) |v| record(&result, 6, c.libinput_device_config_accel_set_profile(d, @intFromEnum(v)));
+    if (value.accel_speed) |v| record(&result, 7, if (std.math.isFinite(v) and v >= -1 and v <= 1) c.libinput_device_config_accel_set_speed(d, v) else c.LIBINPUT_CONFIG_STATUS_INVALID);
+    if (value.natural_scroll) |v| record(&result, 8, c.libinput_device_config_scroll_set_natural_scroll_enabled(d, @intFromEnum(v)));
+    if (value.left_handed) |v| record(&result, 9, c.libinput_device_config_left_handed_set(d, @intFromEnum(v)));
+    if (value.click_method) |v| record(&result, 10, c.libinput_device_config_click_set_method(d, @intFromEnum(v)));
+    if (value.clickfinger_button_map) |v| record(&result, 11, c.libinput_device_config_click_set_clickfinger_button_map(d, @intFromEnum(v)));
+    if (value.middle_emulation) |v| record(&result, 12, c.libinput_device_config_middle_emulation_set_enabled(d, @intFromEnum(v)));
+    if (value.scroll_method) |v| record(&result, 13, c.libinput_device_config_scroll_set_method(d, @intFromEnum(v)));
+    if (value.scroll_button) |v| record(&result, 14, c.libinput_device_config_scroll_set_button(d, v));
+    if (value.scroll_button_lock) |v| record(&result, 15, c.libinput_device_config_scroll_set_button_lock(d, @intFromEnum(v)));
+    if (value.disable_while_typing) |v| record(&result, 16, c.libinput_device_config_dwt_set_enabled(d, @intFromEnum(v)));
+    if (value.disable_while_trackpointing) |v| record(&result, 17, c.libinput_device_config_dwtp_set_enabled(d, @intFromEnum(v)));
+    if (value.rotation) |v| record(&result, 18, if (v < 360) c.libinput_device_config_rotation_set_angle(d, v) else c.LIBINPUT_CONFIG_STATUS_INVALID);
+    return result;
 }

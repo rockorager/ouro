@@ -19,6 +19,7 @@ const session_api = @import("../backend/session.zig");
 const session_platform = @import("../backend/platform.zig");
 const input_api = @import("../backend/input/backend.zig");
 const input_platform = @import("../backend/input/platform.zig");
+const user_config = @import("../config.zig");
 const drm = @import("../backend/drm/manager.zig");
 const drm_hotplug = @import("../backend/drm/hotplug.zig");
 const drm_gamma = @import("../backend/drm/gamma.zig");
@@ -296,8 +297,15 @@ pub fn Coordinator(comptime protocol: type) type {
         };
         const OutputReconfigureTransaction = struct {
             const Phase = enum { desired, rollback };
-            peer: wayring.io_uring.Peer,
-            configuration: protocol_output_management.ConfigurationId,
+            const Owner = union(enum) {
+                protocol: struct {
+                    peer: wayring.io_uring.Peer,
+                    configuration: protocol_output_management.ConfigurationId,
+                },
+                config: user_config.Snapshot,
+                config_reconcile,
+            };
+            owner: Owner,
             phase: Phase = .desired,
         };
         const PhysicalOutput = struct {
@@ -518,6 +526,15 @@ pub fn Coordinator(comptime protocol: type) type {
             output: output_api.Platforms = .{},
         };
 
+        pub const Launcher = struct {
+            context: *anyopaque,
+            launchFn: *const fn (context: *anyopaque, argv: []const []const u8) anyerror!void,
+
+            pub fn launch(self: Launcher, argv: []const []const u8) !void {
+                return self.launchFn(self.context, argv);
+            }
+        };
+
         pub const Config = struct {
             router_capacity: usize,
             timer_capacity: usize,
@@ -623,6 +640,7 @@ pub fn Coordinator(comptime protocol: type) type {
             cursor_size: u32 = 24,
             drm: drm.Config,
             output: output_api.Config,
+            launcher: ?Launcher = null,
         };
 
         pub const Stats = struct {
@@ -648,6 +666,7 @@ pub fn Coordinator(comptime protocol: type) type {
         syncobj_config: protocol_linux_drm_syncobj.Config,
         input_config: input_api.Config,
         desktop_transaction_timeout_ns: u64,
+        launcher: ?Launcher,
         seat: [64]u8 = undefined,
         seat_len: u8,
         router: completion.Router,
@@ -815,6 +834,10 @@ pub fn Coordinator(comptime protocol: type) type {
         commit_timer_deadline: ?surface_state.CommitTimestamp = null,
         xdg_session_store_timer: ?timer.Handle = null,
         xdg_session_store_timer_canceling: bool = false,
+        binding_repeat_timer: ?timer.Handle = null,
+        binding_repeat_timer_canceling: bool = false,
+        binding_repeat_delay_ns: ?u64 = null,
+        binding_repeat_interval_ns: u64 = 0,
         cursor_layer: Layer,
         output_power_transition: ?OutputPowerAdapter.Command = null,
         stopping: bool = false,
@@ -843,6 +866,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.output_config = config.output;
             self.syncobj_config = config.linux_drm_syncobj;
             self.desktop_transaction_timeout_ns = config.desktop_transaction_timeout_ns;
+            self.launcher = config.launcher;
             if (config.seat.len == 0 or config.seat.len > self.seat.len)
                 return error.InvalidSeat;
             self.input_config = config.input;
@@ -1012,6 +1036,10 @@ pub fn Coordinator(comptime protocol: type) type {
             self.commit_timer_deadline = null;
             self.xdg_session_store_timer = null;
             self.xdg_session_store_timer_canceling = false;
+            self.binding_repeat_timer = null;
+            self.binding_repeat_timer_canceling = false;
+            self.binding_repeat_delay_ns = null;
+            self.binding_repeat_interval_ns = 0;
             self.cursor_layer = .{};
             const cursor_path_requirement = std.math.add(
                 usize,
@@ -1694,9 +1722,106 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.processInput();
         }
 
+        pub fn installConfig(self: *Self, candidate: *user_config.Snapshot) !void {
+            try self.interaction.canInstallConfig();
+            try self.desktop.validateGaps(
+                candidate.general.inner_gap,
+                candidate.general.outer_gap,
+            );
+            if (self.output_reconfigure != null or self.output_power_transition != null)
+                return error.OutputTransactionPending;
+            if (self.connectedPhysicalOutputCount() != 0) {
+                try self.beginConfigOutputReconfigure(candidate, true);
+                return;
+            }
+            try self.promoteConfig(candidate);
+        }
+
+        fn promoteConfig(self: *Self, candidate: *user_config.Snapshot) !void {
+            if (self.input) |input| {
+                try self.applyInputConfiguration(input, candidate);
+            }
+            try self.desktop.setGaps(
+                candidate.general.inner_gap,
+                candidate.general.outer_gap,
+            );
+            self.binding_repeat_delay_ns = null;
+            try self.syncBindingRepeatTimer();
+            self.interaction.cancelRepeat();
+            try self.interaction.installConfig(candidate);
+        }
+
+        fn applyInputConfiguration(
+            self: *Self,
+            input: *input_api.Backend,
+            snapshot: *const user_config.Snapshot,
+        ) !void {
+            const ids = try self.allocator.alloc(input_api.DeviceId, input.deviceCount());
+            defer self.allocator.free(ids);
+            const count = input.enumerateDevices(ids);
+            for (ids[0..count]) |id| try self.applyInputDeviceConfiguration(input, id, snapshot);
+        }
+
+        fn applyInputDeviceConfiguration(
+            self: *Self,
+            input: *input_api.Backend,
+            id: input_api.DeviceId,
+            snapshot: *const user_config.Snapshot,
+        ) !void {
+            _ = self;
+            const description = try input.describeDevice(id);
+            const info: user_config.InputInfo = .{
+                .type = inputDeviceType(description.info),
+                .name = description.name(),
+                .vendor = description.info.vendor,
+                .product = description.info.product,
+            };
+            const settings = user_config.resolveInput(snapshot.input_rules, info);
+            const defaults = description.defaults;
+            _ = try input.applyDeviceConfiguration(id, .{
+                .send_events = resolvedInputSetting(input_platform.SendEvents, settings.send_events, defaults.send_events),
+                .tap = resolvedOptionalInputSetting(input_platform.Toggle, settings.tap, defaults.tap),
+                .tap_button_map = resolvedOptionalInputSetting(input_platform.TapButtonMap, settings.tap_button_map, defaults.tap_button_map),
+                .drag = resolvedOptionalInputSetting(input_platform.Toggle, settings.drag, defaults.drag),
+                .drag_lock = resolvedOptionalInputSetting(input_platform.DragLock, settings.drag_lock, defaults.drag_lock),
+                .three_finger_drag = resolvedOptionalInputSetting(input_platform.ThreeFingerDrag, settings.three_finger_drag, defaults.three_finger_drag),
+                .accel_profile = resolvedOptionalInputSetting(input_platform.AccelProfile, settings.accel_profile, defaults.accel_profile),
+                .accel_speed = resolvedOptionalInputSetting(f64, settings.accel_speed, defaults.accel_speed),
+                .natural_scroll = resolvedOptionalInputSetting(input_platform.Toggle, settings.natural_scroll, defaults.natural_scroll),
+                .left_handed = resolvedOptionalInputSetting(input_platform.Toggle, settings.left_handed, defaults.left_handed),
+                .click_method = resolvedOptionalInputSetting(input_platform.ClickMethod, settings.click_method, defaults.click_method),
+                .clickfinger_button_map = resolvedOptionalInputSetting(input_platform.ClickfingerButtonMap, settings.clickfinger_button_map, defaults.clickfinger_button_map),
+                .middle_emulation = resolvedOptionalInputSetting(input_platform.Toggle, settings.middle_emulation, defaults.middle_emulation),
+                .scroll_method = resolvedOptionalInputSetting(input_platform.ScrollMethod, settings.scroll_method, defaults.scroll_method),
+                .scroll_button = resolvedOptionalInputSetting(u32, settings.scroll_button, defaults.scroll_button),
+                .scroll_button_lock = resolvedOptionalInputSetting(input_platform.Toggle, settings.scroll_button_lock, defaults.scroll_button_lock),
+                .disable_while_typing = resolvedOptionalInputSetting(input_platform.Toggle, settings.disable_while_typing, defaults.disable_while_typing),
+                .disable_while_trackpointing = resolvedOptionalInputSetting(input_platform.Toggle, settings.disable_while_trackpointing, defaults.disable_while_trackpointing),
+                .rotation = resolvedOptionalInputSetting(u32, settings.rotation, defaults.rotation),
+            });
+            try input.applySoftwareConfiguration(
+                id,
+                resolvedSoftwareInputSetting(f64, settings.scroll_factor, 1),
+                resolvedSoftwareInputSetting(i32, settings.repeat_rate, 25),
+                resolvedSoftwareInputSetting(i32, settings.repeat_delay, 600),
+            );
+        }
+
         pub fn requestStop(self: *Self) !void {
             if (!self.stopping) {
                 self.stopping = true;
+                if (self.output_reconfigure) |transaction| {
+                    switch (transaction.owner) {
+                        .config => |snapshot_value| {
+                            var snapshot = snapshot_value;
+                            snapshot.deinit();
+                        },
+                        else => {},
+                    }
+                    self.output_reconfigure = null;
+                    for (self.physical_outputs[0..self.physical_output_count]) |*physical|
+                        physical.reconfigure = null;
+                }
                 if (self.loop) |value| try value.requestShutdown();
                 for (self.security_context_adapter.committedListeners()) |listener|
                     listener.closing = true;
@@ -1711,6 +1836,9 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.syncIdleTimer();
             try self.syncCommitTimer();
             try self.syncXdgSessionStoreTimer();
+            self.binding_repeat_delay_ns = null;
+            self.interaction.cancelRepeat();
+            try self.syncBindingRepeatTimer();
             try self.prepareSecurityClosures();
             if (self.hotplug) |*monitor| try monitor.beginDrain(&self.router, &self.root.ring);
             try self.pauseAllOutputs();
@@ -2398,6 +2526,10 @@ pub fn Coordinator(comptime protocol: type) type {
                     try self.desktopTimerEvent(outcome.event);
                     continue;
                 };
+                if (self.binding_repeat_timer) |handle| if (std.meta.eql(handle, outcome.handle)) {
+                    try self.bindingRepeatTimerEvent(outcome.event);
+                    continue;
+                };
                 for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
                     const output = physical.kms_output orelse continue;
                     const request_value = try output.timerEvent(
@@ -2914,6 +3046,11 @@ pub fn Coordinator(comptime protocol: type) type {
             if (self.input_event_cursor > events.len) return error.InputBatchChanged;
             while (self.input_event_cursor < events.len) {
                 const event = events[self.input_event_cursor];
+                if (event == .device_added) try self.applyInputDeviceConfiguration(
+                    input,
+                    event.device_added.device,
+                    self.interaction.currentConfig(),
+                );
                 if (!(try self.acceptNormalizedInput(event))) {
                     try self.scheduleClients();
                     return;
@@ -3963,8 +4100,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 const unchanged = self.outputManagementCommandUnchanged(command.heads);
                 if (supported and command.operation == .apply and !unchanged) {
                     self.output_reconfigure = .{
-                        .peer = command.peer,
-                        .configuration = command.configuration,
+                        .owner = .{ .protocol = .{
+                            .peer = command.peer,
+                            .configuration = command.configuration,
+                        } },
                     };
                     errdefer {
                         self.output_reconfigure = null;
@@ -3991,6 +4130,87 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.output_management_adapter.completeCommand(if (accepted) .succeeded else .failed);
                 self.markProtocol(command.peer, ProtocolReady.output_management);
             }
+        }
+
+        fn beginConfigOutputReconfigure(
+            self: *Self,
+            candidate: *user_config.Snapshot,
+            take_ownership: bool,
+        ) !void {
+            const count = self.connectedPhysicalOutputCount();
+            const desired = try self.allocator.alloc(protocol_output_management.DesiredHead, count);
+            defer self.allocator.free(desired);
+            var index: usize = 0;
+            var changed = false;
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                if (!physical.connected) continue;
+                const current = try self.output_management_adapter.lifecycle.currentHead(
+                    physical.management_head,
+                );
+                const claim = physical.claim orelse return error.StaleClaim;
+                const snapshot = try self.manager.claimSnapshot(claim);
+                const connector = snapshot.selectedConnector();
+                var name_buffer: [64]u8 = undefined;
+                const name = try std.fmt.bufPrint(&name_buffer, "DRM-{d}", .{connector.id});
+                const settings = user_config.resolveOutput(candidate.output_rules, .{
+                    .name = name,
+                    .connector_id = connector.id,
+                    .connector_type = connector.connector_type,
+                    .connector_type_id = connector.connector_type_id,
+                    .width_mm = connector.width_mm,
+                    .height_mm = connector.height_mm,
+                });
+                var state = current;
+                if (settings.enabled) |enabled| state.enabled = enabled;
+                if (settings.position) |position| {
+                    state.x = position.x;
+                    state.y = position.y;
+                }
+                if (settings.scale_120) |scale| state.scale_120 = scale;
+                if (settings.mode) |requested| {
+                    const mode_end = try std.math.add(usize, connector.mode_start, connector.mode_count);
+                    if (mode_end > snapshot.modes.len) return error.InvalidModeInventory;
+                    const mode = selectConfiguredMode(
+                        snapshot.modes[connector.mode_start..mode_end],
+                        requested,
+                    ) orelse return error.UnsupportedOutputMode;
+                    state.width = @intCast(mode.hdisplay);
+                    state.height = @intCast(mode.vdisplay);
+                    state.refresh_millihz = @intCast(try std.math.mul(u32, mode.vrefresh, 1000));
+                }
+                desired[index] = .{ .id = physical.management_head, .state = state };
+                index += 1;
+                changed = changed or !std.meta.eql(current, state);
+            }
+            if (!self.outputManagementCommandSupported(desired)) return error.UnsupportedOutputConfiguration;
+            if (!changed) {
+                if (take_ownership) try self.promoteConfig(candidate);
+                return;
+            }
+            self.output_reconfigure = .{ .owner = .config_reconcile };
+            if (take_ownership) {
+                self.output_reconfigure.?.owner = .{ .config = candidate.* };
+                candidate.* = undefined;
+            }
+            errdefer {
+                if (self.output_reconfigure.?.owner == .config) {
+                    candidate.* = self.output_reconfigure.?.owner.config;
+                }
+                self.output_reconfigure = null;
+                for (self.physical_outputs[0..self.physical_output_count]) |*physical|
+                    physical.reconfigure = null;
+            }
+            for (desired) |head| {
+                const physical = self.physicalOutputForManagementHeadMutable(head.id) orelse
+                    return error.InvalidOutput;
+                const current = try self.output_management_adapter.lifecycle.currentHead(head.id);
+                if (!std.meta.eql(current, head.state)) physical.reconfigure = .{
+                    .previous = current,
+                    .desired = head.state,
+                };
+            }
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical|
+                if (physical.reconfigure != null) try self.pausePhysicalOutput(physical);
         }
 
         fn outputManagementCommandSupported(
@@ -4673,13 +4893,55 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.syncDesktopTimer();
         }
 
+        fn syncBindingRepeatTimer(self: *Self) !void {
+            if (self.binding_repeat_delay_ns) |delay| {
+                if (self.binding_repeat_timer == null) {
+                    const deadline = std.math.add(u64, try monotonicNs(), delay) catch
+                        return error.InvalidDeadline;
+                    self.binding_repeat_timer = try self.timers.arm(
+                        &self.router,
+                        &self.root.ring,
+                        try deadlineFromNs(deadline),
+                    );
+                    self.binding_repeat_timer_canceling = false;
+                    self.binding_repeat_delay_ns = null;
+                } else if (!self.binding_repeat_timer_canceling) {
+                    try self.timers.cancel(
+                        &self.router,
+                        &self.root.ring,
+                        self.binding_repeat_timer.?,
+                    );
+                    self.binding_repeat_timer_canceling = true;
+                }
+                return;
+            }
+            if (self.binding_repeat_timer) |handle| if (!self.binding_repeat_timer_canceling) {
+                try self.timers.cancel(&self.router, &self.root.ring, handle);
+                self.binding_repeat_timer_canceling = true;
+            };
+        }
+
+        fn bindingRepeatTimerEvent(self: *Self, event: timer.Event) !void {
+            if (event == .pending_cleanup or event == .cleanup_complete) return;
+            const was_canceling = self.binding_repeat_timer_canceling;
+            self.binding_repeat_timer = null;
+            self.binding_repeat_timer_canceling = false;
+            if (event == .fired and !was_canceling and
+                try self.interaction.repeatCurrentBinding(&self.desktop))
+            {
+                self.binding_repeat_delay_ns = self.binding_repeat_interval_ns;
+                try self.applyInteractionCommands();
+            }
+            try self.syncBindingRepeatTimer();
+        }
+
         fn desktopSceneChanged(self: *Self) !void {
             try self.syncIdleNotifications();
             _ = self.refreshRetainedLayersForOutput();
             try self.requestOutputDamage();
         }
 
-        fn applyInteractionCommands(self: *Self) !void {
+        fn applyInteractionCommands(self: *Self) anyerror!void {
             var applied = false;
             while (self.interaction.peekCommand()) |command| {
                 switch (command) {
@@ -4724,6 +4986,29 @@ pub fn Coordinator(comptime protocol: type) type {
                     },
                     .key_consumed => self.input_keyboard_consumed = true,
                     .close => |id| try self.shell_adapter.queueClose(try self.desktop.shellToplevel(id)),
+                    .exit => try self.requestStop(),
+                    .run => |argv| if (self.launcher) |launcher| {
+                        launcher.launch(argv) catch |err|
+                            std.log.err("could not launch {s}: {t}", .{ argv[0], err });
+                    } else {
+                        std.log.err("could not launch {s}: no launcher configured", .{argv[0]});
+                    },
+                    .repeat_start => |value| {
+                        const input = self.input orelse return error.StaleDevice;
+                        const description = try input.describeDevice(value.device);
+                        if (description.repeat_rate > 0) {
+                            self.binding_repeat_interval_ns =
+                                (std.time.ns_per_s + @as(u64, @intCast(description.repeat_rate)) - 1) /
+                                @as(u64, @intCast(description.repeat_rate));
+                            self.binding_repeat_delay_ns = @as(u64, @intCast(description.repeat_delay)) *
+                                std.time.ns_per_ms;
+                        } else self.binding_repeat_delay_ns = null;
+                        try self.syncBindingRepeatTimer();
+                    },
+                    .repeat_stop => {
+                        self.binding_repeat_delay_ns = null;
+                        try self.syncBindingRepeatTimer();
+                    },
                 }
                 self.interaction.dropCommand();
                 self.stats.interaction_commands += 1;
@@ -6419,6 +6704,19 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.activateAdditionalOutputs(handle);
             try self.advanceOutputGlobals();
             try self.publishOutputLayout();
+            self.reconcileActiveOutputConfig();
+        }
+
+        fn reconcileActiveOutputConfig(self: *Self) void {
+            if (self.output_reconfigure != null or self.output_power_transition != null) return;
+            var active = self.interaction.currentConfig().*;
+            self.beginConfigOutputReconfigure(&active, false) catch |err| switch (err) {
+                // Topology replacement briefly publishes the protocol output
+                // before its new scanout claim is installed. The completed
+                // refresh reconciles again with the generation-safe claim.
+                error.StaleClaim => {},
+                else => std.log.err("could not reconcile output configuration: {t}", .{err}),
+            };
         }
 
         fn activateAdditionalOutputs(self: *Self, handle: drm.Handle) !void {
@@ -9955,6 +10253,7 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.activateAdditionalOutputs(handle);
             try self.advanceOutputGlobals();
             try self.publishOutputLayout();
+            self.reconcileActiveOutputConfig();
             try self.consumeOutputManagementCommands();
             self.topology_refresh_pending = false;
             try self.advancePhysicalOutputRemovals();
@@ -10111,11 +10410,23 @@ pub fn Coordinator(comptime protocol: type) type {
                 physical.reconfigure = null;
             self.output_reconfigure = null;
             self.markProtocolAll(ProtocolReady.output_power);
-            if (self.output_management_adapter.peekCommand()) |command| {
-                if (std.meta.eql(command.configuration, transaction.configuration)) {
-                    try self.output_management_adapter.completeCommand(result);
-                    self.markProtocol(transaction.peer, ProtocolReady.output_management);
-                }
+            switch (transaction.owner) {
+                .protocol => |owner| if (self.output_management_adapter.peekCommand()) |command| {
+                    if (std.meta.eql(command.configuration, owner.configuration)) {
+                        try self.output_management_adapter.completeCommand(result);
+                        self.markProtocol(owner.peer, ProtocolReady.output_management);
+                    }
+                },
+                .config => |snapshot_value| {
+                    var snapshot = snapshot_value;
+                    if (result == .succeeded) {
+                        self.promoteConfig(&snapshot) catch |err| {
+                            snapshot.deinit();
+                            std.log.err("output configuration succeeded but config promotion failed: {t}", .{err});
+                        };
+                    } else snapshot.deinit();
+                },
+                .config_reconcile => {},
             }
             try self.consumeOutputManagementCommands();
             try self.consumeOutputPowerCommands();
@@ -10475,6 +10786,28 @@ fn activateOutputWithRollback(
     return .succeeded;
 }
 
+fn selectConfiguredMode(
+    modes: []const drm.Mode,
+    requested: user_config.OutputMode,
+) ?drm.Mode {
+    var selected: ?drm.Mode = null;
+    var selected_delta: u32 = std.math.maxInt(u32);
+    for (modes) |mode| {
+        if (mode.hdisplay != requested.width or mode.vdisplay != requested.height) continue;
+        if (requested.refresh_millihertz) |refresh| {
+            const actual = std.math.mul(u32, mode.vrefresh, 1000) catch continue;
+            const delta = if (actual > refresh) actual - refresh else refresh - actual;
+            if (selected == null or delta < selected_delta) {
+                selected = mode;
+                selected_delta = delta;
+            }
+        } else if (selected == null or (!selected.?.preferred() and mode.preferred())) {
+            selected = mode;
+        }
+    }
+    return selected;
+}
+
 fn collectOutputModes(
     destination: []protocol_output_management.ModeState,
     modes: []const drm.Mode,
@@ -10506,6 +10839,24 @@ fn collectOutputModes(
     }
     if (count == 0) return error.InvalidModeInventory;
     return destination[0..count];
+}
+
+test "physical: configured mode selection prefers preferred and closest refresh" {
+    const modes = [_]drm.Mode{
+        .{ .clock = 1, .hdisplay = 1920, .hsync_start = 1920, .hsync_end = 1920, .htotal = 1920, .hskew = 0, .vdisplay = 1080, .vsync_start = 1080, .vsync_end = 1080, .vtotal = 1080, .vscan = 0, .vrefresh = 60, .flags = 0, .mode_type = 0 },
+        .{ .clock = 2, .hdisplay = 1920, .hsync_start = 1920, .hsync_end = 1920, .htotal = 1920, .hskew = 0, .vdisplay = 1080, .vsync_start = 1080, .vsync_end = 1080, .vtotal = 1080, .vscan = 0, .vrefresh = 75, .flags = 0, .mode_type = 1 << 3 },
+        .{ .clock = 3, .hdisplay = 1280, .hsync_start = 1280, .hsync_end = 1280, .htotal = 1280, .hskew = 0, .vdisplay = 720, .vsync_start = 720, .vsync_end = 720, .vtotal = 720, .vscan = 0, .vrefresh = 60, .flags = 0, .mode_type = 0 },
+    };
+    try std.testing.expectEqual(@as(u32, 75), selectConfiguredMode(&modes, .{
+        .width = 1920,
+        .height = 1080,
+    }).?.vrefresh);
+    try std.testing.expectEqual(@as(u32, 60), selectConfiguredMode(&modes, .{
+        .width = 1920,
+        .height = 1080,
+        .refresh_millihertz = 61_000,
+    }).?.vrefresh);
+    try std.testing.expect(selectConfiguredMode(&modes, .{ .width = 800, .height = 600 }) == null);
 }
 
 test "physical: output mode inventory deduplicates timings and preserves preferred" {
@@ -11051,6 +11402,49 @@ fn deadlineFromNs(ns: u64) !timer.Deadline {
         .sec = @intCast(seconds),
         .nsec = @intCast(ns % std.time.ns_per_s),
     };
+}
+
+fn inputDeviceType(info: input_platform.DeviceInfo) user_config.InputType {
+    if (info.is_touchpad) return .touchpad;
+    if (info.capabilities.touch) return .touch;
+    if (info.capabilities.tablet_pad) return .tablet_pad;
+    if (info.capabilities.tablet_tool) return .tablet;
+    if (info.capabilities.keyboard) return .keyboard;
+    return .pointer;
+}
+
+fn resolvedInputSetting(
+    comptime T: type,
+    requested: ?user_config.Setting(T),
+    defaults: input_platform.Setting(T),
+) T {
+    return if (requested) |setting| switch (setting) {
+        .use_default => defaults.default,
+        .value => |value| value,
+    } else defaults.default;
+}
+
+fn resolvedOptionalInputSetting(
+    comptime T: type,
+    requested: ?user_config.Setting(T),
+    defaults: ?input_platform.Setting(T),
+) ?T {
+    if (requested) |setting| return switch (setting) {
+        .use_default => if (defaults) |value| value.default else null,
+        .value => |value| value,
+    };
+    return if (defaults) |value| value.default else null;
+}
+
+fn resolvedSoftwareInputSetting(
+    comptime T: type,
+    requested: ?user_config.Setting(T),
+    default: T,
+) T {
+    return if (requested) |setting| switch (setting) {
+        .use_default => default,
+        .value => |value| value,
+    } else default;
 }
 
 test "seat: physical input batch retries only the failed suffix" {

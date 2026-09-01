@@ -151,12 +151,128 @@ responsibilities:
   resizing floating windows, dismisses popup stacks topmost-first on outside
   presses, and places a composited cursor without replacing render generations.
 
-Initial compositor keybindings use the Logo key: `Logo+Tab` focuses the next
+Built-in compositor keybindings use the Logo key: `Logo+Tab` focuses the next
 window, `Logo+Q` requests that the focused client close, `Logo+F` toggles
 fullscreen, `Logo+M` toggles maximized state, and `Logo+Space` toggles floating
 layout. `Logo+J/K` focuses forward/backward; adding Shift moves the focused
-tiled window in that direction. Matched key press/release pairs are consumed
-before client seat delivery.
+tiled window in that direction. `Logo+Shift+E` exits Ouro and `Logo+Return`
+starts Monstar through a transient systemd user service. Matched key
+press/release pairs are consumed before client seat delivery.
+
+## Configuration
+
+Ouro loads strict JSON from `$XDG_CONFIG_HOME/ouro/config.json` (or
+`$HOME/.config/ouro/config.json`) and then applies lexically sorted
+`config.d/*.json` fragments. System locations from `XDG_CONFIG_DIRS` are
+applied first at lower precedence. `--config=PATH` instead selects one base
+file and a `config.d` directory beside it. Missing files retain the built-in
+defaults; malformed JSON, duplicate object keys, unknown fields, invalid
+keysyms, and invalid actions reject the complete candidate. `SIGHUP` reloads
+the same sources atomically and preserves the active snapshot on failure.
+
+Every source after the built-in defaults is an
+[RFC 7396 JSON Merge Patch](https://www.rfc-editor.org/rfc/rfc7396). Objects
+merge, arrays and scalar values replace, and `null` removes a value. Thus a
+binding can be replaced or removed without copying the whole map, while
+`"bindings": null` clears the complete binding class:
+
+```json
+{
+  "bindings": {
+    "super+q": null,
+    "super+return": ["run", "foot", "--server"],
+    "super+x": ["exit"]
+  }
+}
+```
+
+Triggers are case-insensitive XKB keysym names plus any of `shift`, `control`
+(`ctrl`), `alt`, and `super` (`logo` or `mod4`). They follow the active layout,
+not physical evdev positions. Actions are exact JSON arrays: `focus-next`,
+`focus-previous`, `move-next`, `move-previous`, `close`, `toggle-fullscreen`,
+`toggle-maximized`, `toggle-floating`, `exit`, or `run` followed by an argv.
+`run` never invokes a shell and delegates process ownership to
+`systemd-run --user`; Ouro does not supervise applications.
+
+A binding may use an object when compositor-side repetition is desired:
+
+```json
+{
+  "bindings": {
+    "super+j": { "action": ["focus-next"], "repeat": true }
+  }
+}
+```
+
+General policy and named device rules are mergeable in the same way. Rules are
+applied by increasing `priority`, then by rule name; later matching values win.
+The string `"default"` restores the libinput value captured when the device was
+discovered. Software scrolling and keyboard repeat default to a factor of 1,
+25 keys per second, and a 600 ms delay.
+
+```json
+{
+  "general": {
+    "focus_follows_mouse": true,
+    "inner_gap": 8,
+    "outer_gap": 12
+  },
+  "input_rules": {
+    "all-touchpads": {
+      "priority": 10,
+      "match": { "type": "touchpad", "name": "Synaptics*" },
+      "settings": {
+        "tap": true,
+        "natural_scroll": true,
+        "accel_profile": "adaptive",
+        "accel_speed": 0.25,
+        "scroll_factor": 0.8
+      }
+    },
+    "keyboard-repeat": {
+      "match": { "type": "keyboard" },
+      "settings": { "repeat_rate": 30, "repeat_delay": 350 }
+    }
+  }
+}
+```
+
+Input matches accept `type`, `name` (a `*`/`?` glob), `vendor`, and `product`.
+Native settings include send-events, tapping and drag behavior, acceleration,
+natural scrolling, handedness, click and scroll methods, middle emulation,
+disable-while-typing/trackpointing, and rotation. Unsupported libinput settings
+are logged and leave that device unchanged rather than rejecting unrelated
+settings.
+
+Output rules match the stable `DRM-<connector-id>` name, connector ID/type/type
+ID, or physical dimensions. They use the same priority and merge semantics.
+Mode, position, scale, and enablement changes run through Ouro's atomic KMS
+reconfiguration path and retain the previous configuration if activation or
+rollback validation fails.
+
+```json
+{
+  "output_rules": {
+    "primary": {
+      "match": { "connector_id": 42 },
+      "settings": {
+        "enabled": true,
+        "mode": {
+          "width": 2560,
+          "height": 1440,
+          "refresh_millihertz": 144000
+        },
+        "position": { "x": 0, "y": 0 },
+        "scale": 1.25
+      }
+    }
+  }
+}
+```
+
+If a mode omits `refresh_millihertz`, Ouro selects the preferred matching
+resolution and then the first advertised match. With a refresh, it selects the
+closest advertised timing. A configuration may not disable every output.
 
 [Transactional commit composition](src/surface.zig) ties surface, region,
 viewport, frame/release callback, and content-update state together so all
