@@ -299,6 +299,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             grabbed: bool = false,
             mapped: bool = false,
             initial_committed: bool = false,
+            dismissed: bool = false,
         };
 
         const Outbound = union(enum) {
@@ -770,9 +771,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     .popup => |popup| {
                         const role = try adapter.resolvePopup(popup);
                         const size = (try adapter.core.getSurfaceById(slot.surface_id)).committedSize();
-                        const mapped = size.width != 0 and size.height != 0;
+                        const mapped = !role.dismissed and size.width != 0 and size.height != 0;
                         const unmapped = role.mapped and !mapped;
-                        const initial_commit = !role.mapped and !role.initial_committed and !mapped;
+                        const initial_commit = !role.dismissed and !role.mapped and
+                            !role.initial_committed and !mapped;
                         if (unmapped) {
                             adapter.unmapPopup(popup);
                         } else if (initial_commit) {
@@ -888,6 +890,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         ) !u32 {
             if (value.width <= 0 or value.height <= 0) return error.InvalidSize;
             const role = try adapter.resolvePopup(id);
+            if (role.dismissed) return error.StalePopup;
             const surface = try adapter.resolveRoleSurface(role.xdg_surface_index, role.xdg_surface_generation);
             const outstanding = try adapter.acquireOutstanding();
             const serial = adapter.issueSerial();
@@ -927,6 +930,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 surface.manager_generation,
                 .{ .popup_done = id },
             );
+            adapter.resetPopupMapping(id);
+            role.grabbed = false;
+            role.dismissed = true;
+            adapter.dropOutboundPopupConfigures(id);
         }
 
         pub fn managerIdOn(
@@ -1453,7 +1460,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .destroy => if (adapter.popupHasChild(slot))
                     return try adapter.protocolError(actor, decoded.handle.id, WmBase.@"error".not_the_topmost_popup.value, "popup has a live child"),
                 .grab => |v| {
-                    if (slot.grabbed or slot.mapped or adapter.popupHasChild(slot))
+                    if (slot.dismissed or slot.grabbed or slot.mapped or adapter.popupHasChild(slot))
                         return try adapter.protocolError(actor, decoded.handle.id, Popup.@"error".invalid_grab.value, "popup is not the topmost ungrabbed popup");
                     const parent_id = slot.parent orelse
                         return try adapter.protocolError(actor, decoded.handle.id, Popup.@"error".invalid_grab.value, "popup parent is unset");
@@ -1889,6 +1896,11 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         }
 
         fn unmapPopup(adapter: *Self, id: PopupId) void {
+            adapter.resetPopupMapping(id);
+            adapter.dropOutboundPopup(id);
+        }
+
+        fn resetPopupMapping(adapter: *Self, id: PopupId) void {
             const slot = adapter.resolvePopup(id) catch return;
             slot.mapped = false;
             slot.initial_committed = false;
@@ -1896,7 +1908,6 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 surface.last_acked_serial = 0;
             } else |_| {}
             adapter.dropOutstanding(slot.xdg_surface_index, slot.xdg_surface_generation);
-            adapter.dropOutboundPopup(id);
         }
 
         fn abandonPopup(adapter: *Self, index: u32) void {
@@ -1944,6 +1955,19 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 else => {},
             };
         }
+
+        fn dropOutboundPopupConfigures(adapter: *Self, id: PopupId) void {
+            for (adapter.outbound) |*slot| if (slot.active) switch (slot.value) {
+                .popup_configure => |value| {
+                    if (std.meta.eql(value.id, id)) {
+                        slot.active = false;
+                        adapter.outbound_len -= 1;
+                    }
+                },
+                else => {},
+            };
+        }
+
         fn dropOutboundManager(adapter: *Self, index: u32, generation: u32) void {
             for (adapter.outbound) |*slot| {
                 if (slot.active and slot.manager_index == index and
@@ -3483,6 +3507,38 @@ test "xdg-shell: generated popup requests validate positioner and parent role" {
     };
     try std.testing.expectEqual(remap_serial, remapped.serial);
     try std.testing.expect(context.adapter.popups[id.index].mapped);
+
+    _ = try context.adapter.queuePopupConfigure(id, .{
+        .x = 6,
+        .y = 7,
+        .width = 90,
+        .height = 60,
+    });
+    try context.adapter.queuePopupDone(id);
+    try std.testing.expectEqual(@as(usize, 1), context.adapter.pendingOutbound());
+    try std.testing.expect(!context.adapter.popups[id.index].mapped);
+    try std.testing.expect(!context.adapter.popups[id.index].initial_committed);
+    try std.testing.expect(!context.adapter.popups[id.index].grabbed);
+    try std.testing.expect(context.adapter.popups[id.index].dismissed);
+    try std.testing.expectEqual(@as(u32, 0), context.adapter.surfaces[1].last_acked_serial);
+
+    var done_output = wayring.tx.Queue.init(&context.blocks, 16, &context.descriptors, 0);
+    defer done_output.deinit();
+    try std.testing.expectEqual(@as(usize, 1), try context.adapter.flushOn(
+        &context.server_objects,
+        &done_output,
+    ));
+    const done_snapshot = try done_output.snapshot(&descriptor_scratch, &control);
+    const done_message = (try wayring.wire.Message.decode(done_snapshot.first)).?;
+    switch (try test_protocol.xdg_popup.decodeEvent(done_message, &context.received_fds)) {
+        .popup_done => {},
+        else => return error.UnexpectedEvent,
+    }
+    try context.adapter.validateSurfaceCommit(popup_surface);
+    _ = try context.core.second_state.commit();
+    try context.adapter.publishSurfaceCommitted(popup_surface);
+    _ = context.adapter.popEvent() orelse return error.MissingEvent;
+    try std.testing.expect(!context.adapter.popups[id.index].mapped);
 
     try test_protocol.xdg_popup.encodeRequest(&context.requests, 16, .{ .destroy = .{} });
     try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());

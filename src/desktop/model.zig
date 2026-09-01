@@ -181,6 +181,7 @@ pub fn Desktop(comptime Shell: type) type {
             expected_serial: ?u32 = null,
             content_ready: bool = false,
             grabbed: bool = false,
+            dismissed: bool = false,
             has_window_geometry: bool = false,
             surface_offset: geometry.Point = .{ .x = 0, .y = 0 },
             scene: SceneWindow = undefined,
@@ -1095,6 +1096,7 @@ pub fn Desktop(comptime Shell: type) type {
 
         fn commitPopup(desktop: *Self, value: anytype) !void {
             const slot = try desktop.popupByShell(value.id);
+            if (slot.dismissed) return;
             if (value.unmapped) {
                 desktop.removePopupCommand(value.id);
                 slot.pending_configure = null;
@@ -1144,8 +1146,9 @@ pub fn Desktop(comptime Shell: type) type {
         }
 
         fn repositionPopup(desktop: *Self, value: anytype) !void {
-            try desktop.requirePopupCommandCapacity(1);
             const slot = try desktop.popupByShell(value.id);
+            if (slot.dismissed) return;
+            try desktop.requirePopupCommandCapacity(1);
             const parent = try desktop.sceneForSurface(slot.parent);
             const positioned = try placePopup(
                 value.placement,
@@ -1797,7 +1800,24 @@ pub fn Desktop(comptime Shell: type) type {
         }
 
         fn enqueuePopupDone(desktop: *Self, id: Shell.PopupId) !void {
-            if (desktop.popup_command_len == desktop.popup_commands.len) return error.Exhausted;
+            const slot = try desktop.popupByShell(id);
+            var reclaimable: usize = 0;
+            for (0..desktop.popup_command_len) |offset| {
+                const index = (desktop.popup_command_head + offset) % desktop.popup_commands.len;
+                if (std.meta.eql(desktop.popup_commands[index].id, id)) reclaimable += 1;
+            }
+            if (desktop.popup_command_len - reclaimable == desktop.popup_commands.len)
+                return error.Exhausted;
+            desktop.removePopupCommand(id);
+            slot.pending_configure = null;
+            slot.expected_serial = null;
+            slot.content_ready = false;
+            slot.grabbed = false;
+            slot.dismissed = true;
+            slot.scene.content_ready = false;
+            slot.scene.visible = false;
+            desktop.scene_changed = true;
+            desktop.updatePopupScenes();
             const tail = (desktop.popup_command_head + desktop.popup_command_len) %
                 desktop.popup_commands.len;
             desktop.popup_commands[tail] = .{ .id = id, .done = true };
@@ -2763,8 +2783,16 @@ test "desktop: popup configure maps above its owning toplevel" {
     try std.testing.expectEqual(popup_surface, grab.surface);
     try std.testing.expect(try desktop.dismissPopupGrab());
     try std.testing.expect(desktop.popupGrabTarget() == null);
+    try std.testing.expect(!(try desktop.sceneForSurface(popup_surface)).visible);
+    try std.testing.expect(!(try desktop.sceneForSurface(popup_surface)).content_ready);
+    try std.testing.expect(!desktop.popups[0].grabbed);
+    try std.testing.expect(desktop.popups[0].dismissed);
+    try std.testing.expect(desktop.takeSceneChanged());
     try std.testing.expectEqual(@as(?u32, null), try desktop.flushConfigure(&shell));
     try std.testing.expectEqual(popup_id, shell.popup_done.?);
+    shell.push(.{ .popup_commit_ready = .{ .id = popup_id, .serial = remap_serial } });
+    _ = try desktop.consume(&shell, 1);
+    try std.testing.expect(!(try desktop.sceneForSurface(popup_surface)).visible);
 
     shell.push(.{ .popup_destroyed = popup_id });
     _ = try desktop.consume(&shell, 1);
