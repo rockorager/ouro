@@ -7130,6 +7130,7 @@ pub fn Coordinator(comptime protocol: type) type {
             const retained_visibility_changed = publish_protocol and primary and
                 self.refreshRetainedLayersForOutput();
             physical.drain_started = false;
+            try self.output_adapter.setAvailable(physical.protocol_output, true);
             if (publish_protocol) {
                 try self.output_adapter.publishMode(
                     physical.protocol_output,
@@ -10256,13 +10257,6 @@ pub fn Coordinator(comptime protocol: type) type {
                             }
                         }
                         try self.consumeOutputPowerCommands();
-                    } else {
-                        if (!self.stopping) {
-                            try self.output_power_adapter.outputRemoved(physical.id);
-                            self.markProtocolAll(ProtocolReady.output_power);
-                            try self.gamma_control_adapter.outputRemoved(physical.id);
-                            self.markProtocolAll(ProtocolReady.gamma_control);
-                        }
                     }
                 }
             }

@@ -232,10 +232,14 @@ test "physical coordinator activates and drains every desktop connector" {
     }
     for (coordinator.physical_outputs[0..coordinator.physical_output_count]) |physical|
         try std.testing.expect(physical.kms_output == null);
-    for (coordinator.physical_outputs[0..coordinator.physical_output_count]) |physical|
+    for (coordinator.physical_outputs[0..coordinator.physical_output_count]) |physical| {
         try std.testing.expect(!(try coordinator.output_management_adapter.lifecycle.currentHead(
             physical.management_head,
         )).enabled);
+        try std.testing.expect(!coordinator.output_adapter.outputs[
+            physical.protocol_output.index
+        ].available);
+    }
 
     try fixture.signalSession(.enable);
     for (0..128) |_| {
@@ -247,6 +251,10 @@ test "physical coordinator activates and drains every desktop connector" {
     try std.testing.expectEqual(@as(usize, 2), coordinator.physical_output_count);
     try std.testing.expect(coordinator.physical_outputs[0].kms_output != null);
     try std.testing.expect(coordinator.physical_outputs[1].kms_output != null);
+    for (coordinator.physical_outputs[0..coordinator.physical_output_count]) |physical|
+        try std.testing.expect(coordinator.output_adapter.outputs[
+            physical.protocol_output.index
+        ].available);
     try std.testing.expectEqual(
         @as(u32, 240),
         (try coordinator.output_management_adapter.lifecycle.currentHead(
