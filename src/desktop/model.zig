@@ -1044,7 +1044,6 @@ pub fn Desktop(comptime Shell: type) type {
 
         fn createPopup(desktop: *Self, value: anytype) !void {
             if (desktop.popup_free == none) try desktop.growPopups();
-            try desktop.requirePopupCommandCapacity(1);
             const parent = try desktop.sceneForSurface(value.parent);
             const parent_popup = desktop.popupBySurface(value.parent);
             const external_root = if (parent_popup) |popup|
@@ -1092,14 +1091,31 @@ pub fn Desktop(comptime Shell: type) type {
                 },
             };
             desktop.popup_live += 1;
-            const tail = (desktop.popup_command_head + desktop.popup_command_len) %
-                desktop.popup_commands.len;
-            desktop.popup_commands[tail] = .{ .id = value.id, .configure = configure };
-            desktop.popup_command_len += 1;
         }
 
         fn commitPopup(desktop: *Self, value: anytype) !void {
             const slot = try desktop.popupByShell(value.id);
+            if (value.unmapped) {
+                desktop.removePopupCommand(value.id);
+                slot.pending_configure = null;
+                slot.expected_serial = null;
+                slot.content_ready = false;
+                slot.scene.content_ready = false;
+                slot.scene.visible = false;
+                desktop.scene_changed = true;
+                desktop.updatePopupScenes();
+                return;
+            }
+            if (value.initial_commit and slot.expected_serial == null and
+                slot.pending_configure == null and !desktop.hasPopupCommand(value.id))
+            {
+                try desktop.requirePopupCommandCapacity(1);
+                const tail = (desktop.popup_command_head + desktop.popup_command_len) %
+                    desktop.popup_commands.len;
+                desktop.popup_commands[tail] = .{ .id = value.id, .configure = slot.configure };
+                desktop.popup_command_len += 1;
+                return;
+            }
             if (slot.expected_serial != value.serial) return;
             try desktop.requirePopupCommandCapacity(desktop.popup_live);
             const parent = desktop.sceneForSurface(slot.parent) catch return;
@@ -1772,6 +1788,14 @@ pub fn Desktop(comptime Shell: type) type {
             desktop.popup_command_len = retained;
         }
 
+        fn hasPopupCommand(desktop: *const Self, id: Shell.PopupId) bool {
+            for (0..desktop.popup_command_len) |offset| {
+                const index = (desktop.popup_command_head + offset) % desktop.popup_commands.len;
+                if (std.meta.eql(desktop.popup_commands[index].id, id)) return true;
+            }
+            return false;
+        }
+
         fn enqueuePopupDone(desktop: *Self, id: Shell.PopupId) !void {
             if (desktop.popup_command_len == desktop.popup_commands.len) return error.Exhausted;
             const tail = (desktop.popup_command_head + desktop.popup_command_len) %
@@ -2185,6 +2209,8 @@ const TestShell = struct {
             has_window_geometry: bool = false,
             surface_offset_x: i32 = 0,
             surface_offset_y: i32 = 0,
+            unmapped: bool = false,
+            initial_commit: bool = false,
         },
         popup_reposition_requested: struct { id: PopupId, placement: PopupPlacement, token: u32 },
         popup_grab_requested: PopupId,
@@ -2649,6 +2675,13 @@ test "desktop: popup configure maps above its owning toplevel" {
         },
     } });
     _ = try desktop.consume(&shell, 1);
+    try std.testing.expectEqual(@as(usize, 0), desktop.pendingCommands());
+    shell.push(.{ .popup_commit_ready = .{
+        .id = popup_id,
+        .serial = 0,
+        .initial_commit = true,
+    } });
+    _ = try desktop.consume(&shell, 1);
     const serial = (try desktop.flushConfigure(&shell)).?;
     try std.testing.expectEqual(TestShell.PopupConfigure{
         .x = 30,
@@ -2700,6 +2733,29 @@ test "desktop: popup configure maps above its owning toplevel" {
         (try desktop.sceneForSurface(popup_surface)).geometry,
     );
 
+    shell.push(.{ .popup_commit_ready = .{
+        .id = popup_id,
+        .serial = reposition_serial,
+        .unmapped = true,
+    } });
+    _ = try desktop.consume(&shell, 1);
+    try std.testing.expect(!(try desktop.sceneForSurface(popup_surface)).visible);
+    try std.testing.expect(!(try desktop.sceneForSurface(popup_surface)).content_ready);
+    try std.testing.expectEqual(@as(usize, 0), desktop.pendingCommands());
+
+    shell.push(.{ .popup_commit_ready = .{
+        .id = popup_id,
+        .serial = 0,
+        .initial_commit = true,
+    } });
+    _ = try desktop.consume(&shell, 1);
+    try std.testing.expectEqual(@as(usize, 1), desktop.pendingCommands());
+    const remap_serial = (try desktop.flushConfigure(&shell)).?;
+    shell.push(.{ .popup_commit_ready = .{ .id = popup_id, .serial = remap_serial } });
+    _ = try desktop.consume(&shell, 1);
+    try std.testing.expect((try desktop.sceneForSurface(popup_surface)).visible);
+    try std.testing.expect((try desktop.sceneForSurface(popup_surface)).content_ready);
+
     shell.push(.{ .popup_grab_requested = popup_id });
     _ = try desktop.consume(&shell, 1);
     const grab = desktop.popupGrabTarget() orelse return error.MissingPopupGrab;
@@ -2750,6 +2806,12 @@ test "desktop: external-root popup stays out of the ordinary desktop scene" {
             .offset_x = 0,
             .offset_y = 0,
         },
+    } });
+    _ = try desktop.consume(&shell, 1);
+    shell.push(.{ .popup_commit_ready = .{
+        .id = .{ .index = 0, .generation = 1 },
+        .serial = 0,
+        .initial_commit = true,
     } });
     _ = try desktop.consume(&shell, 1);
     const serial = (try desktop.flushConfigure(&shell)).?;
@@ -2820,6 +2882,12 @@ test "desktop: reactive popup reconfigures when its root changes output" {
             .offset_y = 0,
             .reactive = true,
         },
+    } });
+    _ = try desktop.consume(&shell, 1);
+    shell.push(.{ .popup_commit_ready = .{
+        .id = popup_id,
+        .serial = 0,
+        .initial_commit = true,
     } });
     _ = try desktop.consume(&shell, 1);
     const initial_serial = (try desktop.flushConfigure(&shell)).?;

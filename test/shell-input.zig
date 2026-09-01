@@ -5114,6 +5114,11 @@ const LayerPopupHandler = struct {
             self.layer_surface.?.id,
             .{ .get_popup = .{ .popup = self.popup.?.id } },
         );
+        try protocol.wl_surface.encodeRequest(
+            self.queue,
+            self.popup_surface.?.id,
+            .{ .commit = .{} },
+        );
     }
 
     fn ackPopupConfigure(self: *LayerPopupHandler, serial: u32) !void {

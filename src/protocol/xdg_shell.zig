@@ -160,6 +160,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 has_window_geometry: bool = false,
                 surface_offset_x: i32 = 0,
                 surface_offset_y: i32 = 0,
+                unmapped: bool = false,
+                initial_commit: bool = false,
             },
             popup_reposition_requested: struct {
                 id: PopupId,
@@ -700,8 +702,16 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             for (adapter.surfaces) |slot| {
                 if (!slot.header.active or !std.meta.eql(slot.surface_id, id)) continue;
                 const surface = try adapter.core.getSurfaceById(slot.surface_id);
-                if (surface.hasPendingBufferAttachment() and slot.last_acked_serial == 0)
-                    return error.UnconfiguredBuffer;
+                if (surface.hasPendingBufferAttachment()) {
+                    if (slot.last_acked_serial == 0) return error.UnconfiguredBuffer;
+                    switch (slot.role) {
+                        .toplevel => |toplevel| if (!(try adapter.resolveToplevel(toplevel)).initial_committed)
+                            return error.InitialCommitMustBeEmpty,
+                        .popup => |popup| if (!(try adapter.resolvePopup(popup)).initial_committed)
+                            return error.InitialCommitMustBeEmpty,
+                        .none => {},
+                    }
+                }
                 if (slot.role == .popup) {
                     const popup = try adapter.resolvePopup(slot.role.popup);
                     if (popup.parent == null) return error.PopupParentRequired;
@@ -760,14 +770,23 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     .popup => |popup| {
                         const role = try adapter.resolvePopup(popup);
                         const size = (try adapter.core.getSurfaceById(slot.surface_id)).committedSize();
-                        role.mapped = size.width != 0 and size.height != 0;
-                        role.initial_committed = true;
+                        const mapped = size.width != 0 and size.height != 0;
+                        const unmapped = role.mapped and !mapped;
+                        const initial_commit = !role.mapped and !role.initial_committed and !mapped;
+                        if (unmapped) {
+                            adapter.unmapPopup(popup);
+                        } else if (initial_commit) {
+                            role.initial_committed = true;
+                        }
+                        role.mapped = mapped;
                         adapter.publishReserved(.{ .popup_commit_ready = .{
                             .id = popup,
                             .serial = slot.last_acked_serial,
                             .has_window_geometry = slot.window_geometry != null,
                             .surface_offset_x = if (slot.window_geometry) |geometry| geometry.x else 0,
                             .surface_offset_y = if (slot.window_geometry) |geometry| geometry.y else 0,
+                            .unmapped = unmapped,
+                            .initial_commit = initial_commit,
                         } });
                     },
                     .none => {},
@@ -1868,6 +1887,18 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             adapter.publishTerminal(.{ .popup_destroyed = id });
             adapter.abandonPopup(index);
         }
+
+        fn unmapPopup(adapter: *Self, id: PopupId) void {
+            const slot = adapter.resolvePopup(id) catch return;
+            slot.mapped = false;
+            slot.initial_committed = false;
+            if (adapter.resolveRoleSurface(slot.xdg_surface_index, slot.xdg_surface_generation)) |surface| {
+                surface.last_acked_serial = 0;
+            } else |_| {}
+            adapter.dropOutstanding(slot.xdg_surface_index, slot.xdg_surface_generation);
+            adapter.dropOutboundPopup(id);
+        }
+
         fn abandonPopup(adapter: *Self, index: u32) void {
             release(PopupSlot, adapter.popups, &adapter.popup_free, index);
         }
@@ -2786,6 +2817,13 @@ test "xdg-shell: configure emission resumes between role and surface events" {
     });
     try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
     try std.testing.expect(context.adapter.surfaces[0].window_geometry == null);
+    try context.core.state.attach(6, null, 0, 0);
+    try context.adapter.surfaceCommitted(context.adapter.surfaces[0].surface_id);
+    const initial = switch (context.adapter.popEvent().?) {
+        .commit_ready => |value| value,
+        else => return error.UnexpectedEvent,
+    };
+    try std.testing.expect(initial.initial_commit);
     const serial = try context.adapter.queueToplevelConfigure(id, .{
         .width = 800,
         .height = 600,
@@ -2981,6 +3019,7 @@ test "xdg-shell: commit event storage grows before core mutation" {
     const id = try context.createToplevel();
     const surface_id = context.adapter.surfaces[0].surface_id;
     context.adapter.surfaces[0].last_acked_serial = 1;
+    context.adapter.toplevels[id.index].initial_committed = true;
     try context.core.state.attach(6, .{
         .handle = .{ .id = 30, .generation = 1 },
         .width = 80,
@@ -3259,6 +3298,28 @@ test "xdg-shell: generated popup requests validate positioner and parent role" {
         .popup_grab_requested => |value| value,
         else => return error.UnexpectedEvent,
     });
+    const popup_surface = try context.core.surfaceId(context.core.second_handle);
+    context.adapter.surfaces[1].last_acked_serial = 1;
+    try context.core.second_state.attach(6, .{
+        .handle = .{ .id = 31, .generation = 1 },
+        .width = 120,
+        .height = 80,
+    }, 0, 0);
+    try std.testing.expectError(
+        error.InitialCommitMustBeEmpty,
+        context.adapter.validateSurfaceCommit(popup_surface),
+    );
+    try context.core.second_state.attach(6, null, 0, 0);
+    context.adapter.surfaces[1].last_acked_serial = 0;
+    try context.adapter.validateSurfaceCommit(popup_surface);
+    _ = try context.core.second_state.commit();
+    try context.adapter.publishSurfaceCommitted(popup_surface);
+    const initial = switch (context.adapter.popEvent() orelse return error.MissingEvent) {
+        .popup_commit_ready => |value| value,
+        else => return error.UnexpectedEvent,
+    };
+    try std.testing.expect(initial.initial_commit);
+
     const serial = try context.adapter.queuePopupConfigure(id, .{
         .x = 4,
         .y = 5,
@@ -3292,7 +3353,6 @@ test "xdg-shell: generated popup requests validate positioner and parent role" {
         .width = 120,
         .height = 80,
     }, 0, 0);
-    const popup_surface = try context.core.surfaceId(context.core.second_handle);
     try context.adapter.validateSurfaceCommit(popup_surface);
     _ = try context.core.second_state.commit();
     try context.adapter.publishSurfaceCommitted(popup_surface);
@@ -3350,6 +3410,79 @@ test "xdg-shell: generated popup requests validate positioner and parent role" {
         &context.received_fds,
     );
     try std.testing.expectEqual(@as(u32, 99), repositioned.repositioned.token);
+
+    _ = try context.adapter.queuePopupConfigure(id, .{
+        .x = 10,
+        .y = 11,
+        .width = 30,
+        .height = 20,
+    });
+    try std.testing.expectEqual(@as(usize, 1), context.adapter.pendingOutbound());
+    try context.core.second_state.attach(6, null, 0, 0);
+    try context.adapter.validateSurfaceCommit(popup_surface);
+    _ = try context.core.second_state.commit();
+    try context.adapter.publishSurfaceCommitted(popup_surface);
+    const unmapped = switch (context.adapter.popEvent() orelse return error.MissingEvent) {
+        .popup_commit_ready => |value| value,
+        else => return error.UnexpectedEvent,
+    };
+    try std.testing.expect(unmapped.unmapped);
+    try std.testing.expect(!unmapped.initial_commit);
+    try std.testing.expect(!context.adapter.popups[id.index].mapped);
+    try std.testing.expect(!context.adapter.popups[id.index].initial_committed);
+    try std.testing.expectEqual(@as(u32, 0), context.adapter.surfaces[1].last_acked_serial);
+    try std.testing.expectEqual(@as(usize, 0), context.adapter.pendingOutbound());
+
+    try context.core.second_state.attach(6, .{
+        .handle = .{ .id = 31, .generation = 1 },
+        .width = 120,
+        .height = 80,
+    }, 0, 0);
+    try std.testing.expectError(
+        error.UnconfiguredBuffer,
+        context.adapter.validateSurfaceCommit(popup_surface),
+    );
+    try context.core.second_state.attach(6, null, 0, 0);
+    try context.adapter.validateSurfaceCommit(popup_surface);
+    _ = try context.core.second_state.commit();
+    try context.adapter.publishSurfaceCommitted(popup_surface);
+    const remap_initial = switch (context.adapter.popEvent() orelse return error.MissingEvent) {
+        .popup_commit_ready => |value| value,
+        else => return error.UnexpectedEvent,
+    };
+    try std.testing.expect(remap_initial.initial_commit);
+    try std.testing.expect(!remap_initial.unmapped);
+
+    const remap_serial = try context.adapter.queuePopupConfigure(id, .{
+        .x = 4,
+        .y = 5,
+        .width = 120,
+        .height = 80,
+    });
+    var remap_output = wayring.tx.Queue.init(&context.blocks, 64, &context.descriptors, 0);
+    defer remap_output.deinit();
+    try std.testing.expectEqual(@as(usize, 1), try context.adapter.flushOn(
+        &context.server_objects,
+        &remap_output,
+    ));
+    try test_protocol.xdg_surface.encodeRequest(&context.requests, 14, .{
+        .ack_configure = .{ .serial = remap_serial },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try context.core.second_state.attach(6, .{
+        .handle = .{ .id = 31, .generation = 1 },
+        .width = 120,
+        .height = 80,
+    }, 0, 0);
+    try context.adapter.validateSurfaceCommit(popup_surface);
+    _ = try context.core.second_state.commit();
+    try context.adapter.publishSurfaceCommitted(popup_surface);
+    const remapped = switch (context.adapter.popEvent() orelse return error.MissingEvent) {
+        .popup_commit_ready => |value| value,
+        else => return error.UnexpectedEvent,
+    };
+    try std.testing.expectEqual(remap_serial, remapped.serial);
+    try std.testing.expect(context.adapter.popups[id.index].mapped);
 
     try test_protocol.xdg_popup.encodeRequest(&context.requests, 16, .{ .destroy = .{} });
     try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
