@@ -186,6 +186,7 @@ pub fn Desktop(comptime Shell: type) type {
             content_ready: bool = false,
             grabbed: bool = false,
             dismissed: bool = false,
+            dismiss_parent: bool = false,
             has_window_geometry: bool = false,
             surface_offset: geometry.Point = .{ .x = 0, .y = 0 },
             window_width: i32 = 0,
@@ -829,7 +830,7 @@ pub fn Desktop(comptime Shell: type) type {
             for (desktop.external_roots[0..desktop.external_root_len], 0..) |root, index| {
                 if (!std.meta.eql(root.surface, surface)) continue;
                 if (desktop.topmostPopupForRoot(surface)) |popup|
-                    desktop.enqueuePopupDone(popup.shell_id) catch unreachable;
+                    desktop.enqueuePopupDone(popup.shell_id, true) catch unreachable;
                 desktop.external_root_len -= 1;
                 desktop.external_roots[index] = desktop.external_roots[desktop.external_root_len];
                 desktop.updatePopupScenes();
@@ -880,7 +881,7 @@ pub fn Desktop(comptime Shell: type) type {
         /// destroyed, preserving xdg-shell's stack discipline.
         pub fn dismissPopupGrab(desktop: *Self) !bool {
             const id = desktop.popup_grab orelse return false;
-            try desktop.enqueuePopupDone(id);
+            try desktop.enqueuePopupDone(id, true);
             desktop.popup_grab = null;
             return true;
         }
@@ -1002,7 +1003,10 @@ pub fn Desktop(comptime Shell: type) type {
                     slot.grabbed = true;
                     desktop.popup_grab = id;
                 },
-                .popup_dismiss_requested => |id| try desktop.enqueuePopupDone(id),
+                .popup_dismiss_requested => |value| try desktop.enqueuePopupDone(
+                    value.id,
+                    value.cascade,
+                ),
                 .popup_destroyed => |id| desktop.destroyPopup(id),
                 .metadata_changed => |shell_id| {
                     const id = try desktop.idForShell(shell_id);
@@ -1152,7 +1156,7 @@ pub fn Desktop(comptime Shell: type) type {
                 },
             };
             desktop.popup_live += 1;
-            if (parent_dismissed) try desktop.enqueuePopupDone(value.id);
+            if (parent_dismissed) try desktop.enqueuePopupDone(value.id, true);
         }
 
         fn commitPopup(desktop: *Self, value: anytype) !void {
@@ -1305,6 +1309,7 @@ pub fn Desktop(comptime Shell: type) type {
             const root_surface = slot.root_surface;
             const was_grab = if (desktop.popup_grab) |grab| std.meta.eql(grab, id) else false;
             const was_dismissed = slot.dismissed;
+            const dismiss_parent = slot.dismiss_parent;
             const index: u32 = @intCast((@intFromPtr(slot) - @intFromPtr(desktop.popups.ptr)) /
                 @sizeOf(PopupSlot));
             desktop.removePopupCommand(id);
@@ -1334,9 +1339,9 @@ pub fn Desktop(comptime Shell: type) type {
                 if (!root_in_use) desktop.removeExternalRoot(root_surface);
             }
             const parent_popup = desktop.popupBySurface(parent);
-            if (was_dismissed) {
+            if (was_dismissed and dismiss_parent) {
                 if (parent_popup) |popup| {
-                    desktop.enqueuePopupDone(popup.shell_id) catch unreachable;
+                    desktop.enqueuePopupDone(popup.shell_id, true) catch unreachable;
                 }
             } else if (was_grab) {
                 desktop.popup_grab = if (parent_popup) |popup|
@@ -1353,7 +1358,7 @@ pub fn Desktop(comptime Shell: type) type {
             if (desktop.commandAvailable() + reclaimable < desktop.live - 1)
                 return error.Backpressure;
             if (desktop.topmostPopupForRoot(desktop.slots[index].surface)) |popup|
-                try desktop.enqueuePopupDone(popup.shell_id);
+                try desktop.enqueuePopupDone(popup.shell_id, true);
             if (desktop.interactive_request) |request| {
                 if (std.meta.eql(request.id, id)) desktop.interactive_request = null;
             }
@@ -1401,7 +1406,7 @@ pub fn Desktop(comptime Shell: type) type {
             if (desktop.commandAvailable() + reclaimable < desktop.live - 1)
                 return error.Backpressure;
             if (desktop.topmostPopupForRoot(desktop.slots[index].surface)) |popup|
-                try desktop.enqueuePopupDone(popup.shell_id);
+                try desktop.enqueuePopupDone(popup.shell_id, true);
             if (desktop.interactive_request) |request| {
                 if (std.meta.eql(request.id, id)) desktop.interactive_request = null;
             }
@@ -1947,9 +1952,12 @@ pub fn Desktop(comptime Shell: type) type {
             return false;
         }
 
-        fn enqueuePopupDone(desktop: *Self, id: Shell.PopupId) !void {
+        fn enqueuePopupDone(desktop: *Self, id: Shell.PopupId, dismiss_parent: bool) !void {
             const slot = try desktop.popupByShell(id);
-            if (slot.dismissed) return;
+            if (slot.dismissed) {
+                slot.dismiss_parent = slot.dismiss_parent or dismiss_parent;
+                return;
+            }
             var reclaimable: usize = 0;
             for (0..desktop.popup_command_len) |offset| {
                 const index = (desktop.popup_command_head + offset) % desktop.popup_commands.len;
@@ -1964,6 +1972,7 @@ pub fn Desktop(comptime Shell: type) type {
             slot.content_ready = false;
             slot.grabbed = false;
             slot.dismissed = true;
+            slot.dismiss_parent = dismiss_parent;
             if (desktop.popup_grab) |grab| {
                 if (std.meta.eql(grab, id)) desktop.popup_grab = null;
             }
@@ -2428,7 +2437,7 @@ const TestShell = struct {
         },
         popup_reposition_requested: struct { id: PopupId, placement: PopupPlacement, token: u32 },
         popup_grab_requested: PopupId,
-        popup_dismiss_requested: PopupId,
+        popup_dismiss_requested: struct { id: PopupId, cascade: bool },
         toplevel_destroyed: ToplevelId,
         popup_destroyed: PopupId,
     };
@@ -3107,12 +3116,26 @@ test "desktop: denied popup grab queues immediate dismissal" {
         },
     } });
     _ = try desktop.consume(&shell, 1);
-    shell.push(.{ .popup_dismiss_requested = popup_id });
+    const child_id: TestShell.PopupId = .{ .index = 1, .generation = 1 };
+    const child_surface: TestShell.SurfaceId = .{ .index = 21, .generation = 2 };
+    shell.push(.{ .popup_created = .{
+        .id = child_id,
+        .surface = child_surface,
+        .parent = popup_surface,
+        .placement = desktop.popups[popup_id.index].placement,
+    } });
     _ = try desktop.consume(&shell, 1);
-    try std.testing.expect(desktop.popups[0].dismissed);
-    try std.testing.expect(!(try desktop.sceneForSurface(popup_surface)).visible);
+    shell.push(.{ .popup_dismiss_requested = .{ .id = child_id, .cascade = false } });
+    _ = try desktop.consume(&shell, 1);
+    try std.testing.expect(!desktop.popups[popup_id.index].dismissed);
+    try std.testing.expect(desktop.popups[child_id.index].dismissed);
+    try std.testing.expect(!(try desktop.sceneForSurface(child_surface)).visible);
     try std.testing.expectEqual(@as(?u32, null), try desktop.flushConfigure(&shell));
-    try std.testing.expectEqual(popup_id, shell.popup_done.?);
+    try std.testing.expectEqual(child_id, shell.popup_done.?);
+    shell.push(.{ .popup_destroyed = child_id });
+    _ = try desktop.consume(&shell, 1);
+    try std.testing.expect(!desktop.popups[popup_id.index].dismissed);
+    try std.testing.expectEqual(@as(usize, 0), desktop.pendingCommands());
 }
 
 test "desktop: toplevel unmap dismisses nested popups topmost first" {

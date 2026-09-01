@@ -181,7 +181,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 token: u32,
             },
             popup_grab_requested: PopupId,
-            popup_dismiss_requested: PopupId,
+            popup_dismiss_requested: struct { id: PopupId, cascade: bool },
             toplevel_destroyed: ToplevelId,
             popup_destroyed: PopupId,
         };
@@ -1569,7 +1569,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                         .placement = role.placement,
                     } }) catch unreachable;
                     if (parent_dismissed)
-                        adapter.publish(.{ .popup_dismiss_requested = adapter.popupId(role) }) catch unreachable;
+                        adapter.publish(.{ .popup_dismiss_requested = .{
+                            .id = adapter.popupId(role),
+                            .cascade = true,
+                        } }) catch unreachable;
                 },
                 .set_window_geometry => |v| {
                     if (slot.role == .none)
@@ -1721,7 +1724,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                         false;
                     if (!accepted) {
                         slot.dismissed = true;
-                        adapter.publish(.{ .popup_dismiss_requested = adapter.popupId(slot) }) catch unreachable;
+                        adapter.publish(.{ .popup_dismiss_requested = .{
+                            .id = adapter.popupId(slot),
+                            .cascade = false,
+                        } }) catch unreachable;
                     } else {
                         slot.grabbed = true;
                         adapter.publish(.{ .popup_grab_requested = adapter.popupId(slot) }) catch unreachable;
@@ -4344,10 +4350,12 @@ test "xdg-shell: denied popup grab requests dismissal without an error" {
         .grab = .{ .seat = 19, .serial = 76 },
     });
     try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
-    try std.testing.expectEqual(id, switch (context.adapter.popEvent() orelse return error.MissingEvent) {
+    const dismissal = switch (context.adapter.popEvent() orelse return error.MissingEvent) {
         .popup_dismiss_requested => |value| value,
         else => return error.UnexpectedEvent,
-    });
+    };
+    try std.testing.expectEqual(id, dismissal.id);
+    try std.testing.expect(!dismissal.cascade);
     try std.testing.expect(popup.dismissed);
     try std.testing.expectEqual(@as(usize, 0), context.actor.transmit.queuedBytes());
 }
@@ -4407,10 +4415,12 @@ test "xdg-shell: child of dismissed popup requests immediate dismissal" {
         .popup_created => |value| value.id,
         else => return error.UnexpectedEvent,
     });
-    try std.testing.expectEqual(child_id, switch (context.adapter.popEvent() orelse return error.MissingEvent) {
+    const dismissal = switch (context.adapter.popEvent() orelse return error.MissingEvent) {
         .popup_dismiss_requested => |value| value,
         else => return error.UnexpectedEvent,
-    });
+    };
+    try std.testing.expectEqual(child_id, dismissal.id);
+    try std.testing.expect(dismissal.cascade);
     try std.testing.expect(child.dismissed);
 }
 
