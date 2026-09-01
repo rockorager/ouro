@@ -727,6 +727,39 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             return error.StaleSurface;
         }
 
+        /// Reports role-specific commit validation failures on the protocol
+        /// object that defines the violated rule. Unrecognized failures remain
+        /// available to the core surface owner for its generic fallback.
+        pub fn reportSurfaceCommitFailure(
+            adapter: *Self,
+            actor: *wayring.connection.Actor,
+            id: SurfaceId,
+            cause: anyerror,
+        ) !?wayring.dispatch.Control {
+            const surface = adapter.findXdgSurface(id) orelse return null;
+            return switch (cause) {
+                error.UnconfiguredBuffer, error.InitialCommitMustBeEmpty => try adapter.protocolError(
+                    actor,
+                    surface.header.resource.id,
+                    XdgSurface.@"error".unconfigured_buffer.value,
+                    "xdg_surface committed a buffer before configure",
+                ),
+                error.PopupParentRequired, error.InvalidPopupParent => manager: {
+                    const manager = adapter.resolveManager(
+                        surface.manager_index,
+                        surface.manager_generation,
+                    ) catch return null;
+                    break :manager try adapter.protocolError(
+                        actor,
+                        manager.header.resource.id,
+                        WmBase.@"error".invalid_popup_parent.value,
+                        "xdg_popup has an invalid parent",
+                    );
+                },
+                else => null,
+            };
+        }
+
         /// Post-commit half of the core transaction boundary. Publication is
         /// deferred until core state and attachment ownership are committed.
         pub fn publishSurfaceCommitted(adapter: *Self, id: SurfaceId) !void {
@@ -2551,6 +2584,21 @@ const TestContext = struct {
     }
 };
 
+fn expectDisplayError(context: *TestContext, object_id: u32, code: u32) !void {
+    var descriptor_scratch: [1]std.os.linux.fd_t = undefined;
+    var control: [64]u8 align(@alignOf(std.os.linux.cmsghdr)) = undefined;
+    const snapshot = try context.actor.transmit.snapshot(&descriptor_scratch, &control);
+    const message = (try wayring.wire.Message.decode(snapshot.first)) orelse
+        return error.IncompleteMessage;
+    const event = try TestCore.Display.decodeEvent(message, &context.received_fds);
+    const protocol_error = switch (event) {
+        .@"error" => |value| value,
+        else => return error.UnexpectedEvent,
+    };
+    try std.testing.expectEqual(@as(?u32, object_id), protocol_error.object_id);
+    try std.testing.expectEqual(code, protocol_error.code);
+}
+
 fn testResourceRemoved(context: ?*anyopaque, handle: objects.Handle, object: objects.Object) void {
     const adapter: *TestAdapter = @ptrCast(@alignCast(context orelse return));
     _ = adapter.resourceRemoved(handle, object);
@@ -3050,6 +3098,35 @@ test "xdg-shell: unmap resets role state and requires a fresh initial commit" {
     };
     try std.testing.expect(remap_initial.initial_commit);
     try std.testing.expect(!remap_initial.mapped);
+}
+
+test "xdg-shell: unconfigured buffer error names the xdg_surface" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    _ = try context.createToplevel();
+    const surface_id = try context.core.surfaceId(context.core.handle);
+    try context.core.state.attach(6, .{
+        .handle = .{ .id = 30, .generation = 1 },
+        .width = 80,
+        .height = 60,
+    }, 0, 0);
+    try std.testing.expectError(
+        error.UnconfiguredBuffer,
+        context.adapter.validateSurfaceCommit(surface_id),
+    );
+    try std.testing.expectEqual(
+        wayring.dispatch.Control.stop,
+        (try context.adapter.reportSurfaceCommitFailure(
+            &context.actor,
+            surface_id,
+            error.UnconfiguredBuffer,
+        )).?,
+    );
+    try expectDisplayError(
+        context,
+        11,
+        test_protocol.xdg_surface.@"error".unconfigured_buffer.value,
+    );
 }
 
 test "xdg-shell: commit event storage grows before core mutation" {
@@ -3629,6 +3706,51 @@ test "xdg-shell: null-parent popup requires layer adoption before initial commit
         layer_parent,
     ));
     try context.adapter.validateSurfaceCommit(popup_surface);
+}
+
+test "xdg-shell: invalid popup parent error names the xdg_wm_base" {
+    const context = try TestContext.init();
+    defer context.deinit();
+
+    try test_protocol.xdg_wm_base.encodeRequest(&context.requests, context.manager.id, .{
+        .get_xdg_surface = .{ .id = 14, .surface = context.core.second_handle.id },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try test_protocol.xdg_wm_base.encodeRequest(&context.requests, context.manager.id, .{
+        .create_positioner = .{ .id = 15 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try test_protocol.xdg_positioner.encodeRequest(&context.requests, 15, .{
+        .set_size = .{ .width = 120, .height = 80 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try test_protocol.xdg_positioner.encodeRequest(&context.requests, 15, .{
+        .set_anchor_rect = .{ .x = 4, .y = 5, .width = 20, .height = 30 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try test_protocol.xdg_surface.encodeRequest(&context.requests, 14, .{
+        .get_popup = .{ .id = 16, .parent = null, .positioner = 15 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+
+    const surface_id = try context.core.surfaceId(context.core.second_handle);
+    try std.testing.expectError(
+        error.PopupParentRequired,
+        context.adapter.validateSurfaceCommit(surface_id),
+    );
+    try std.testing.expectEqual(
+        wayring.dispatch.Control.stop,
+        (try context.adapter.reportSurfaceCommitFailure(
+            &context.actor,
+            surface_id,
+            error.PopupParentRequired,
+        )).?,
+    );
+    try expectDisplayError(
+        context,
+        context.manager.id,
+        test_protocol.xdg_wm_base.@"error".invalid_popup_parent.value,
+    );
 }
 
 test "xdg-shell: stale generations cannot address reused toplevel slots" {

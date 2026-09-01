@@ -1640,6 +1640,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .context = self,
                 .validate_fn = validateSurfaceCommit,
                 .committed_fn = surfaceCommitted,
+                .failure_fn = surfaceCommitFailure,
             });
             return self;
         }
@@ -2650,6 +2651,16 @@ pub fn Coordinator(comptime protocol: type) type {
             if (self.pending_surface_len == self.pending_surfaces.len and
                 !self.pendingSurfaceContains(id))
                 try self.growPendingSurfaces();
+        }
+
+        fn surfaceCommitFailure(
+            context: *anyopaque,
+            actor: *wayring.connection.Actor,
+            id: Adapter.SurfaceId,
+            cause: anyerror,
+        ) !?wayring.dispatch.Control {
+            const self: *Self = @ptrCast(@alignCast(context));
+            return self.shell_adapter.reportSurfaceCommitFailure(actor, id, cause);
         }
 
         fn surfaceCommitted(context: *anyopaque, id: Adapter.SurfaceId) !void {

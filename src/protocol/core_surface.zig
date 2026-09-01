@@ -117,6 +117,12 @@ pub fn Adapter(comptime protocol: type) type {
             context: *anyopaque,
             validate_fn: *const fn (*anyopaque, SurfaceId) anyerror!void,
             committed_fn: *const fn (*anyopaque, SurfaceId) anyerror!void,
+            failure_fn: ?*const fn (
+                *anyopaque,
+                *wayring.connection.Actor,
+                SurfaceId,
+                anyerror,
+            ) anyerror!?wayring.dispatch.Control = null,
         };
 
         pub const ContentCommitPlan = struct {
@@ -1640,8 +1646,12 @@ pub fn Adapter(comptime protocol: type) type {
                         .generation = resource.generation,
                     };
                     if (adapter.commit_hook) |hook|
-                        hook.validate_fn(hook.context, surface_id) catch |cause|
+                        hook.validate_fn(hook.context, surface_id) catch |cause| {
+                            if (hook.failure_fn) |report|
+                                if (try report(hook.context, actor, surface_id, cause)) |control|
+                                    return control;
                             return try adapter.surfaceCommitFailure(actor, slot, cause);
+                        };
                     const content_plan = if (adapter.content_commit_hook) |hook| plan: {
                         adapter.ensureCommitDependencies(adapter.surfaces.len) catch |cause|
                             return try adapter.surfaceFailure(actor, resource.id, cause);
@@ -5373,6 +5383,7 @@ test "commit-hook admission failure precedes ordinary core surface mutation" {
     const Hook = struct {
         validated: usize = 0,
         committed_count: usize = 0,
+        failure_count: usize = 0,
 
         fn validate(pointer: *anyopaque, _: TestAdapter.SurfaceId) !void {
             const hook: *@This() = @ptrCast(@alignCast(pointer));
@@ -5384,6 +5395,18 @@ test "commit-hook admission failure precedes ordinary core surface mutation" {
             const hook: *@This() = @ptrCast(@alignCast(pointer));
             hook.committed_count += 1;
         }
+
+        fn failure(
+            pointer: *anyopaque,
+            _: *wayring.connection.Actor,
+            _: TestAdapter.SurfaceId,
+            cause: anyerror,
+        ) !?wayring.dispatch.Control {
+            const hook: *@This() = @ptrCast(@alignCast(pointer));
+            try std.testing.expectEqual(error.Exhausted, cause);
+            hook.failure_count += 1;
+            return .stop;
+        }
     };
     const context = try TestContext.init();
     defer context.deinit();
@@ -5393,6 +5416,7 @@ test "commit-hook admission failure precedes ordinary core surface mutation" {
         .context = &hook,
         .validate_fn = Hook.validate,
         .committed_fn = Hook.committed,
+        .failure_fn = Hook.failure,
     });
 
     try test_protocol.wl_surface.encodeRequest(
@@ -5403,6 +5427,7 @@ test "commit-hook admission failure precedes ordinary core surface mutation" {
     try std.testing.expectEqual(wayring.dispatch.Control.stop, try context.dispatchCore());
     try std.testing.expectEqual(@as(usize, 1), hook.validated);
     try std.testing.expectEqual(@as(usize, 0), hook.committed_count);
+    try std.testing.expectEqual(@as(usize, 1), hook.failure_count);
     try std.testing.expectEqual(@as(u64, 0), (try context.adapter.getSurface(surface)).sequence);
 }
 
