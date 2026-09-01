@@ -1134,6 +1134,22 @@ pub fn Desktop(comptime Shell: type) type {
         fn commitPopup(desktop: *Self, value: anytype) !void {
             const slot = try desktop.popupByShell(value.id);
             if (slot.dismissed) return;
+            if (value.geometry_refresh) {
+                if (!slot.content_ready) return;
+                const offset = geometry.Point{
+                    .x = value.surface_offset_x,
+                    .y = value.surface_offset_y,
+                };
+                desktop.scene_changed = slot.scene.has_window_geometry !=
+                    value.has_window_geometry or
+                    !std.meta.eql(slot.scene.surface_offset, offset) or
+                    desktop.scene_changed;
+                slot.has_window_geometry = value.has_window_geometry;
+                slot.surface_offset = offset;
+                slot.scene.has_window_geometry = value.has_window_geometry;
+                slot.scene.surface_offset = offset;
+                return;
+            }
             if (value.unmapped) {
                 desktop.removePopupCommand(value.id);
                 slot.pending_configure = null;
@@ -2317,6 +2333,7 @@ const TestShell = struct {
             has_window_geometry: bool = false,
             surface_offset_x: i32 = 0,
             surface_offset_y: i32 = 0,
+            geometry_refresh: bool = false,
             unmapped: bool = false,
             initial_commit: bool = false,
         },
@@ -2862,6 +2879,23 @@ test "desktop: popup configure maps above its owning toplevel" {
     try std.testing.expectEqual(@as(usize, 2), snapshot.len);
     try std.testing.expect(snapshot[0].stacking < snapshot[1].stacking);
     try std.testing.expectEqual(popup_surface, snapshot[1].surface);
+
+    _ = desktop.takeSceneChanged();
+    shell.push(.{ .popup_commit_ready = .{
+        .id = popup_id,
+        .serial = serial + 100,
+        .has_window_geometry = true,
+        .surface_offset_x = -3,
+        .surface_offset_y = 2,
+        .geometry_refresh = true,
+    } });
+    _ = try desktop.consume(&shell, 1);
+    const refreshed = try desktop.sceneForSurface(popup_surface);
+    try std.testing.expectEqual(popup.geometry, refreshed.geometry);
+    try std.testing.expect(refreshed.visible and refreshed.content_ready);
+    try std.testing.expect(refreshed.has_window_geometry);
+    try std.testing.expectEqual(geometry.Point{ .x = -3, .y = 2 }, refreshed.surface_offset);
+    try std.testing.expect(desktop.takeSceneChanged());
 
     shell.push(.{ .popup_reposition_requested = .{
         .id = popup_id,

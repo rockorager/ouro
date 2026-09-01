@@ -165,6 +165,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 has_window_geometry: bool = false,
                 surface_offset_x: i32 = 0,
                 surface_offset_y: i32 = 0,
+                geometry_refresh: bool = false,
                 unmapped: bool = false,
                 initial_commit: bool = false,
             },
@@ -711,8 +712,15 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
 
         pub fn validateWindowGeometryRefresh(adapter: *Self, id: SurfaceId) !void {
             const surface = adapter.findXdgSurface(id) orelse return;
-            if (surface.role != .toplevel or surface.requested_window_geometry == null)
-                return;
+            if (surface.requested_window_geometry == null) return;
+            switch (surface.role) {
+                .toplevel => |role_id| if (!(try adapter.resolveToplevel(role_id)).mapped) return,
+                .popup => |role_id| {
+                    const role = try adapter.resolvePopup(role_id);
+                    if (!role.mapped or role.dismissed) return;
+                },
+                .none => return,
+            }
             if (!adapter.canPublishWithLive(adapter.live_toplevels, adapter.live_popups))
                 return error.Exhausted;
             _ = try adapter.windowGeometryBounds(surface);
@@ -720,8 +728,15 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
 
         pub fn publishWindowGeometryRefresh(adapter: *Self, id: SurfaceId) !void {
             const surface = adapter.findXdgSurface(id) orelse return;
-            if (surface.role != .toplevel) return;
             const requested = surface.requested_window_geometry orelse return;
+            switch (surface.role) {
+                .toplevel => |role_id| if (!(try adapter.resolveToplevel(role_id)).mapped) return,
+                .popup => |role_id| {
+                    const role = try adapter.resolvePopup(role_id);
+                    if (!role.mapped or role.dismissed) return;
+                },
+                .none => return,
+            }
             const geometry = effectiveWindowGeometry(
                 requested,
                 try adapter.windowGeometryBounds(surface),
@@ -729,15 +744,29 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             if (surface.window_geometry != null and
                 std.meta.eql(surface.window_geometry.?, geometry)) return;
             surface.window_geometry = geometry;
-            const role = try adapter.resolveToplevel(surface.role.toplevel);
-            adapter.publishReserved(.{ .commit_ready = .{
-                .id = surface.role.toplevel,
-                .serial = surface.last_acked_serial,
-                .has_window_geometry = true,
-                .surface_offset_x = geometry.x,
-                .surface_offset_y = geometry.y,
-                .mapped = role.mapped,
-            } });
+            switch (surface.role) {
+                .toplevel => |role_id| {
+                    adapter.publishReserved(.{ .commit_ready = .{
+                        .id = role_id,
+                        .serial = surface.last_acked_serial,
+                        .has_window_geometry = true,
+                        .surface_offset_x = geometry.x,
+                        .surface_offset_y = geometry.y,
+                        .mapped = true,
+                    } });
+                },
+                .popup => |role_id| {
+                    adapter.publishReserved(.{ .popup_commit_ready = .{
+                        .id = role_id,
+                        .serial = surface.last_acked_serial,
+                        .has_window_geometry = true,
+                        .surface_offset_x = geometry.x,
+                        .surface_offset_y = geometry.y,
+                        .geometry_refresh = true,
+                    } });
+                },
+                .none => return,
+            }
         }
 
         /// Pre-commit half of the core transaction boundary. This rejects a
@@ -3964,6 +3993,29 @@ test "xdg-shell: generated popup requests validate positioner and parent role" {
     try std.testing.expectEqual(@as(i32, 2), committed.surface_offset_x);
     try std.testing.expectEqual(@as(i32, 3), committed.surface_offset_y);
     try std.testing.expect(context.adapter.popups[id.index].mapped);
+
+    var popup_tree_bounds = TestAdapter.WindowGeometry{
+        .x = 10,
+        .y = 5,
+        .width = 80,
+        .height = 60,
+    };
+    context.adapter.setWindowGeometryResolver(.{
+        .context = &popup_tree_bounds,
+        .resolve = resolveTestWindowGeometry,
+    });
+    try context.adapter.validateWindowGeometryRefresh(popup_surface);
+    try context.adapter.publishWindowGeometryRefresh(popup_surface);
+    const geometry_refresh = switch (context.adapter.popEvent() orelse return error.MissingEvent) {
+        .popup_commit_ready => |value| value,
+        else => return error.UnexpectedEvent,
+    };
+    try std.testing.expect(geometry_refresh.geometry_refresh);
+    try std.testing.expectEqual(id, geometry_refresh.id);
+    try std.testing.expectEqual(@as(i32, 10), geometry_refresh.surface_offset_x);
+    try std.testing.expectEqual(@as(i32, 5), geometry_refresh.surface_offset_y);
+    try context.adapter.publishWindowGeometryRefresh(popup_surface);
+    try std.testing.expect(context.adapter.popEvent() == null);
 
     try test_protocol.xdg_wm_base.encodeRequest(&context.requests, context.manager.id, .{
         .create_positioner = .{ .id = 17 },
