@@ -800,6 +800,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     }
                 }
                 if (slot.role == .toplevel) {
+                    const toplevel = try adapter.resolveToplevel(slot.role.toplevel);
+                    if (!validSizeConstraints(toplevel)) return error.InvalidToplevelSize;
                     if (slot.acked_toplevel_configure) |configure| {
                         if (configure.states.maximized or configure.states.fullscreen or
                             configure.states.resizing)
@@ -890,6 +892,18 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                         manager.header.resource.id,
                         WmBase.@"error".invalid_surface_state.value,
                         "window geometry violates configured state",
+                    );
+                },
+                error.InvalidToplevelSize => toplevel: {
+                    const role = switch (surface.role) {
+                        .toplevel => |role_id| adapter.resolveToplevel(role_id) catch return null,
+                        else => return null,
+                    };
+                    break :toplevel try adapter.protocolError(
+                        actor,
+                        role.header.resource.id,
+                        Toplevel.@"error".invalid_size.value,
+                        "minimum size exceeds maximum size",
                     );
                 },
                 else => null,
@@ -1630,17 +1644,13 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .set_app_id => |v| adapter.setMetadata(slot, false, v.app_id) catch |cause|
                     return try adapter.metadataFailure(actor, decoded.handle.id, cause),
                 .set_max_size => |v| {
-                    if (v.width < 0 or v.height < 0 or
-                        (v.width != 0 and slot.pending_min_width != 0 and v.width < slot.pending_min_width) or
-                        (v.height != 0 and slot.pending_min_height != 0 and v.height < slot.pending_min_height))
+                    if (v.width < 0 or v.height < 0)
                         return try adapter.invalidToplevelSize(actor, decoded.handle.id);
                     slot.pending_max_width = v.width;
                     slot.pending_max_height = v.height;
                 },
                 .set_min_size => |v| {
-                    if (v.width < 0 or v.height < 0 or
-                        (v.width != 0 and slot.pending_max_width != 0 and v.width > slot.pending_max_width) or
-                        (v.height != 0 and slot.pending_max_height != 0 and v.height > slot.pending_max_height))
+                    if (v.width < 0 or v.height < 0)
                         return try adapter.invalidToplevelSize(actor, decoded.handle.id);
                     slot.pending_min_width = v.width;
                     slot.pending_min_height = v.height;
@@ -2502,6 +2512,13 @@ fn hasEffectiveWindowGeometry(value: anytype) bool {
     return geometry.width > 0 and geometry.height > 0;
 }
 
+fn validSizeConstraints(toplevel: anytype) bool {
+    return (toplevel.pending_max_width == 0 or toplevel.pending_min_width == 0 or
+        toplevel.pending_min_width <= toplevel.pending_max_width) and
+        (toplevel.pending_max_height == 0 or toplevel.pending_min_height == 0 or
+            toplevel.pending_min_height <= toplevel.pending_max_height);
+}
+
 fn effectiveWindowGeometry(requested: anytype, bounds: @TypeOf(requested)) @TypeOf(requested) {
     const left = @max(@as(i64, requested.x), bounds.x);
     const top = @max(@as(i64, requested.y), bounds.y);
@@ -3163,8 +3180,25 @@ test "xdg-shell: contradictory pending size constraints are protocol errors" {
         try test_protocol.xdg_toplevel.encodeRequest(&context.requests, 12, .{
             .set_min_size = .{ .width = 101, .height = 100 },
         });
-        try std.testing.expectEqual(wayring.dispatch.Control.stop, try context.dispatch());
-        try std.testing.expectEqual(@as(i32, 0), context.adapter.toplevels[0].pending_min_width);
+        try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+        const surface = context.adapter.surfaces[0].surface_id;
+        try std.testing.expectError(
+            error.InvalidToplevelSize,
+            context.adapter.validateSurfaceCommit(surface),
+        );
+        try std.testing.expectEqual(
+            wayring.dispatch.Control.stop,
+            (try context.adapter.reportSurfaceCommitFailure(
+                &context.actor,
+                surface,
+                error.InvalidToplevelSize,
+            )).?,
+        );
+        try expectDisplayError(
+            context,
+            12,
+            test_protocol.xdg_toplevel.@"error".invalid_size.value,
+        );
     }
     {
         const context = try TestContext.init();
@@ -3177,8 +3211,19 @@ test "xdg-shell: contradictory pending size constraints are protocol errors" {
         try test_protocol.xdg_toplevel.encodeRequest(&context.requests, 12, .{
             .set_max_size = .{ .width = 100, .height = 99 },
         });
-        try std.testing.expectEqual(wayring.dispatch.Control.stop, try context.dispatch());
-        try std.testing.expectEqual(@as(i32, 0), context.adapter.toplevels[0].pending_max_height);
+        try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+        try std.testing.expectError(
+            error.InvalidToplevelSize,
+            context.adapter.validateSurfaceCommit(context.adapter.surfaces[0].surface_id),
+        );
+
+        try test_protocol.xdg_toplevel.encodeRequest(&context.requests, 12, .{
+            .set_min_size = .{ .width = 100, .height = 99 },
+        });
+        try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+        try context.adapter.surfaceCommitted(context.adapter.surfaces[0].surface_id);
+        try std.testing.expectEqual(@as(i32, 99), context.adapter.toplevels[0].min_height);
+        try std.testing.expectEqual(@as(i32, 99), context.adapter.toplevels[0].max_height);
     }
 }
 
