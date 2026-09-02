@@ -588,6 +588,73 @@ test "physical coordinator rebuilds an output when its modes change" {
     try root.deinit();
 }
 
+test "physical coordinator preserves outputs while changing and adding connectors" {
+    const allocator = std.testing.allocator;
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    fixture.second_desktop = true;
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-r15-output-change-add-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), compositorConfig());
+    const coordinator = try Coordinator.create(allocator, root, fixture.platformsWithHotplug(), coordinatorConfig());
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
+    try coordinator.start(&loop);
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    for (0..128) |_| {
+        _ = try loop.turn(coordinator);
+        if (coordinator.physical_output_count == 2 and
+            coordinator.physical_outputs[1].kms_output != null and
+            coordinator.output_global_index == 2) break;
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+    }
+
+    const changed_id = coordinator.physical_outputs[0].id;
+    const changed_output = coordinator.physical_outputs[0].protocol_output;
+    const changed_head = coordinator.physical_outputs[0].management_head;
+    const unchanged_kms = coordinator.physical_outputs[1].kms_output.?;
+    const unchanged_id = coordinator.physical_outputs[1].id;
+    const unchanged_output = coordinator.physical_outputs[1].protocol_output;
+    const unchanged_head = coordinator.physical_outputs[1].management_head;
+    const drains_before = coordinator.stats.output_drains;
+    fixture.first_mode_width = 4;
+    fixture.third_connector = true;
+    fixture.third_desktop = true;
+    try fixture.signalHotplug();
+    for (0..768) |_| {
+        _ = try loop.turn(coordinator);
+        if (!coordinator.topology_refresh_pending and
+            coordinator.physical_output_count == 3 and
+            coordinator.physical_outputs[2].kms_output != null and
+            coordinator.output_global_index == 3) break;
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), coordinator.physical_output_count);
+    try std.testing.expectEqual(@as(?i32, 4), (try coordinator.output_adapter.logicalSnapshot(changed_output)).width);
+    try std.testing.expect(std.meta.eql(changed_id, coordinator.physical_outputs[0].id));
+    try std.testing.expect(std.meta.eql(changed_output, coordinator.physical_outputs[0].protocol_output));
+    try std.testing.expect(!std.meta.eql(changed_head, coordinator.physical_outputs[0].management_head));
+    try std.testing.expect(coordinator.physical_outputs[1].kms_output.? == unchanged_kms);
+    try std.testing.expect(std.meta.eql(unchanged_id, coordinator.physical_outputs[1].id));
+    try std.testing.expect(std.meta.eql(unchanged_output, coordinator.physical_outputs[1].protocol_output));
+    try std.testing.expect(std.meta.eql(unchanged_head, coordinator.physical_outputs[1].management_head));
+    try std.testing.expectEqual(@as(u32, 12), coordinator.physical_outputs[2].connector_id);
+    try std.testing.expect(try coordinator.output_adapter.outputPublished(
+        coordinator.physical_outputs[2].protocol_output,
+    ));
+    try std.testing.expectEqual(drains_before + 1, coordinator.stats.output_drains);
+
+    try coordinator.requestStop();
+    try drainServer(root, coordinator, &loop);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
 test "physical coordinator falls back when topology changes during targeted refresh" {
     const allocator = std.testing.allocator;
     var fixture = try Fixture.init();
@@ -3508,6 +3575,7 @@ pub const Fixture = struct {
     second_mode_width: u16 = 3,
     change_second_mode_after_read: bool = false,
     third_connector: bool = false,
+    third_desktop: bool = false,
     lease_objects: [6]u32 = undefined,
     lease_object_count: usize = 0,
     lease_create_count: usize = 0,
@@ -3748,7 +3816,7 @@ pub const Fixture = struct {
         out.planes[1] = .{ .id = 41, .possible_crtcs = 2, .plane_type_value = 1, .format_start = 1, .format_count = 1, .properties = .{ .plane_type = 4, .fb_id = 5, .crtc_id = 6, .src_x = 7, .src_y = 8, .src_w = 9, .src_h = 10, .crtc_x = 11, .crtc_y = 12, .crtc_w = 13, .crtc_h = 14 } };
         out.formats[1] = out.formats[0];
         if (self.third_connector) {
-            out.connectors[2] = .{ .id = 12, .connector_type = 1, .connector_type_id = 3, .connected = true, .desktop = false, .width_mm = 3, .height_mm = 3, .encoder_id = 22, .mode_start = 2, .mode_count = 1, .encoder_start = 2, .encoder_count = 1, .properties = .{ .crtc_id = 1 } };
+            out.connectors[2] = .{ .id = 12, .connector_type = 1, .connector_type_id = 3, .connected = true, .desktop = self.third_desktop, .width_mm = 3, .height_mm = 3, .encoder_id = 22, .mode_start = 2, .mode_count = 1, .encoder_start = 2, .encoder_count = 1, .properties = .{ .crtc_id = 1 } };
             out.modes[2] = out.modes[0];
             out.connector_encoders[2] = 22;
             out.encoders[2] = .{ .id = 22, .crtc_id = 32, .possible_crtcs = 4 };
@@ -3938,7 +4006,7 @@ pub fn coordinatorConfig() Coordinator.Config {
     return .{ .router_capacity = 12, .timer_capacity = 6, .device_capacity = 1, .shm = .{ .limits = .{ .max_pool_bytes = 4096 }, .pool_capacity = 1, .buffer_capacity = 1, .formats = &shm_formats }, .surface = .{ .surface_capacity = 1, .region_capacity = 1, .viewport_capacity = 1, .presentation_resource_capacity = 1, .presentation_feedback_capacity = 2, .region_operation_capacity = 1, .frame_callback_capacity = 1, .release_callback_capacity = 1, .content_update_capacity = 1, .dependency_capacity = 1, .attachment_capacity = 1, .copy_capacity = 1, .max_copy_bytes = pixels.len }, .drm = .{ .card_capacity = 1, .connector_capacity = 3, .mode_capacity = 3, .connector_encoder_capacity = 3, .encoder_capacity = 3, .crtc_capacity = 3, .plane_capacity = 3, .format_capacity = 3, .event_capacity = 4 }, .output = .{ .output_id = .{ .index = 0, .generation = 1 }, .scheduler = .{ .refresh_ns = 4 * std.time.ns_per_ms, .render_budget_ns = std.time.ns_per_ms }, .renderer = .pixman, .image_count = 2, .max_samples = 2, .max_source_bytes = pixels.len, .max_source_width = 3, .max_source_height = 2, .kms = .{ .event_capacity = 2 } } };
 }
 pub fn compositorConfig() Compositor.Config {
-    return .{ .ring = .{ .entries = 32, .flags = 0 }, .reactor = clientReactorConfig(), .runtime = .{ .actor = .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 }, .object_capacity = 32, .object_quota = 32, .buckets_per_client = 32, .max_globals = 62, .registry_capacity = 1 } };
+    return .{ .ring = .{ .entries = 32, .flags = 0 }, .reactor = clientReactorConfig(), .runtime = .{ .actor = .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 }, .object_capacity = 32, .object_quota = 32, .buckets_per_client = 32, .max_globals = 63, .registry_capacity = 1 } };
 }
 pub fn clientReactorConfig() wayring.io_uring.Config {
     return .{ .receive_buffer_size = 4096, .receive_buffer_count = 4, .receive_control_capacity = 256, .fragment_block_size = 256, .fragment_block_count = 4, .transmit_block_size = 512, .transmit_block_count = 8, .descriptor_count = 4, .send_descriptor_capacity = 2 };
