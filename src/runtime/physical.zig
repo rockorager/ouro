@@ -246,6 +246,90 @@ pub fn Runner(comptime protocol: type) type {
     };
 }
 
+fn transformedCaptureSize(output: render.Size, transform: render.Transform) render.Size {
+    return switch (transform) {
+        .@"90", .@"270", .flipped_90, .flipped_270 => .{ .width = output.height, .height = output.width },
+        else => output,
+    };
+}
+
+fn transformedCapturePixel(
+    x: u32,
+    y: u32,
+    output: render.Size,
+    transform: render.Transform,
+) [2]u32 {
+    return switch (transform) {
+        .normal => .{ x, y },
+        .@"90" => .{ y, output.width - 1 - x },
+        .@"180" => .{ output.width - 1 - x, output.height - 1 - y },
+        .@"270" => .{ output.height - 1 - y, x },
+        .flipped => .{ output.width - 1 - x, y },
+        .flipped_90 => .{ y, x },
+        .flipped_180 => .{ x, output.height - 1 - y },
+        .flipped_270 => .{ output.height - 1 - y, output.width - 1 - x },
+    };
+}
+
+fn copyTransformedCaptureRegion(
+    destination: []u8,
+    destination_stride: u32,
+    destination_width: u32,
+    destination_height: u32,
+    region: geometry.Rect,
+    source: output_api.CaptureReadback,
+    output: render.Size,
+    transform: render.Transform,
+) !void {
+    if (transform == .normal) return copyCaptureRegion(
+        destination,
+        destination_stride,
+        destination_width,
+        destination_height,
+        region,
+        source,
+        output,
+    );
+    const destination_row_bytes = try std.math.mul(usize, destination_width, 4);
+    const destination_required = try std.math.mul(usize, destination_stride, destination_height);
+    const physical = transformedCaptureSize(output, transform);
+    const source_row_bytes = try std.math.mul(usize, physical.width, 4);
+    const source_required = try std.math.mul(usize, source.stride, physical.height);
+    if (destination_stride < destination_row_bytes or destination.len < destination_required or
+        source.stride < source_row_bytes or source.bytes.len < source_required)
+        return error.CaptureCapacityExceeded;
+
+    for (0..destination_height) |destination_y| {
+        const destination_start = try std.math.mul(usize, destination_y, destination_stride);
+        const destination_row = destination[destination_start..][0..destination_row_bytes];
+        const logical_y = @as(i64, region.y) + @as(i64, @intCast(destination_y));
+        for (0..destination_width) |destination_x| {
+            const destination_pixel = destination_row[destination_x * 4 ..][0..4];
+            const logical_x = @as(i64, region.x) + @as(i64, @intCast(destination_x));
+            if (logical_x < 0 or logical_y < 0 or
+                logical_x >= output.width or logical_y >= output.height)
+            {
+                @memset(destination_pixel, 0);
+                continue;
+            }
+            const source_pixel = transformedCapturePixel(
+                @intCast(logical_x),
+                @intCast(logical_y),
+                output,
+                transform,
+            );
+            const source_start = try std.math.add(
+                usize,
+                try std.math.mul(usize, source_pixel[1], source.stride),
+                @as(usize, source_pixel[0]) * 4,
+            );
+            if (source_start + 4 > source.bytes.len)
+                return error.CaptureCapacityExceeded;
+            @memcpy(destination_pixel, source.bytes[source_start..][0..4]);
+        }
+    }
+}
+
 pub fn Coordinator(comptime protocol: type) type {
     return struct {
         const Self = @This();
@@ -5818,7 +5902,6 @@ pub fn Coordinator(comptime protocol: type) type {
             const reference = self.output_adapter.reference(peer, handle, object) catch return null;
             const physical = self.physicalOutputForProtocolId(reference.output) orelse return null;
             const output = physical.kms_output orelse return null;
-            if (output.planner.output_transform != .normal) return null;
             return .{
                 .width = output.planner.output.width,
                 .height = output.planner.output.height,
@@ -8882,7 +8965,7 @@ pub fn Coordinator(comptime protocol: type) type {
             const capture_bytes = std.math.mul(
                 usize,
                 full_stride,
-                output.planner.output.height,
+                output.planner.physical_output.height,
             ) catch {
                 self.shm.store.unpin(pin) catch unreachable;
                 try self.failQueuedScreencopy(capture);
@@ -9291,7 +9374,7 @@ pub fn Coordinator(comptime protocol: type) type {
             const physical = self.physicalOutputForKmsId(pending.output) orelse
                 return error.OutputUnavailable;
             const output = physical.kms_output orelse return error.OutputUnavailable;
-            try copyCaptureRegion(
+            try copyTransformedCaptureRegion(
                 access.bytes[0..required],
                 @intCast(row_bytes),
                 pending.region.width,
@@ -9304,6 +9387,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 },
                 readback,
                 output.planner.output,
+                output.planner.output_transform,
             );
             try access.end();
             ended = true;
@@ -11958,6 +12042,42 @@ test "physical: capture readback clears only out-of-output destination pixels" {
         .{ .width = 2, .height = 2 },
     );
     try std.testing.expectEqualSlices(u8, &expected, &destination);
+}
+
+test "physical: screencopy inverse maps every output transform" {
+    const logical: render.Size = .{ .width = 2, .height = 3 };
+    const expected = [_]u32{ 1, 2, 3, 4, 5, 6 };
+    const cases = [_]struct {
+        transform: render.Transform,
+        source: [6]u32,
+    }{
+        .{ .transform = .normal, .source = .{ 1, 2, 3, 4, 5, 6 } },
+        .{ .transform = .@"90", .source = .{ 2, 4, 6, 1, 3, 5 } },
+        .{ .transform = .@"180", .source = .{ 6, 5, 4, 3, 2, 1 } },
+        .{ .transform = .@"270", .source = .{ 5, 3, 1, 6, 4, 2 } },
+        .{ .transform = .flipped, .source = .{ 2, 1, 4, 3, 6, 5 } },
+        .{ .transform = .flipped_90, .source = .{ 1, 3, 5, 2, 4, 6 } },
+        .{ .transform = .flipped_180, .source = .{ 5, 6, 3, 4, 1, 2 } },
+        .{ .transform = .flipped_270, .source = .{ 6, 4, 2, 5, 3, 1 } },
+    };
+    for (cases) |case| {
+        const physical = transformedCaptureSize(logical, case.transform);
+        var destination = [_]u32{0} ** expected.len;
+        try copyTransformedCaptureRegion(
+            std.mem.sliceAsBytes(&destination),
+            logical.width * 4,
+            logical.width,
+            logical.height,
+            .{ .x = 0, .y = 0, .width = 2, .height = 3 },
+            .{
+                .bytes = std.mem.sliceAsBytes(&case.source),
+                .stride = physical.width * 4,
+            },
+            logical,
+            case.transform,
+        );
+        try std.testing.expectEqualSlices(u32, &expected, &destination);
+    }
 }
 
 test "physical: window geometry origin alignment clamps hostile offsets" {

@@ -2912,6 +2912,12 @@ test "shell-input: screencopy captures clipped output into writable SHM" {
         .{ .completion_batch = 16 },
     );
     try coordinator.start(&loop);
+    var rotated = coordinator.output_management_adapter.lifecycle.current;
+    rotated.transform = 1;
+    _ = try coordinator.output_management_adapter.publishHead(
+        coordinator.output_management_adapter.lifecycle.primary,
+        rotated,
+    );
 
     var client_reactor: wayring.io_uring.Reactor = undefined;
     try client_reactor.initOwned(
@@ -2950,6 +2956,10 @@ test "shell-input: screencopy captures clipped output into writable SHM" {
             try waitForEither(&root.ring, client_reactor.ring);
     }
     try std.testing.expect(handler.ready);
+    try std.testing.expectEqual(
+        .@"90",
+        coordinator.primaryKmsOutput().?.planner.output_transform,
+    );
     try std.testing.expect(!handler.failed);
     try std.testing.expectEqual(@as(usize, 1), handler.buffer_events);
     try std.testing.expectEqual(@as(usize, 1), handler.buffer_done_events);
