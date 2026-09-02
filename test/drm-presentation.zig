@@ -611,39 +611,43 @@ test "physical coordinator replaces the last disconnected output exactly" {
 }
 
 test "generated output management applies two heads atomically" {
-    try generatedMultiHeadApply(false, false, false, false, false, false, false);
+    try generatedMultiHeadApply(false, false, false, false, false, false, false, false);
 }
 
 test "generated output management rolls back every head" {
-    try generatedMultiHeadApply(true, false, false, false, false, false, false);
+    try generatedMultiHeadApply(true, false, false, false, false, false, false, false);
 }
 
 test "generated output management disables a secondary head atomically" {
-    try generatedMultiHeadApply(false, true, false, false, false, false, false);
+    try generatedMultiHeadApply(false, true, false, false, false, false, false, false);
 }
 
 test "generated output management re-enables a secondary head atomically" {
-    try generatedMultiHeadApply(false, true, true, false, false, false, false);
+    try generatedMultiHeadApply(false, true, true, false, false, false, false, false);
 }
 
 test "generated output management promotes an enabled head after disabling the primary" {
-    try generatedMultiHeadApply(false, false, false, false, false, true, false);
+    try generatedMultiHeadApply(false, false, false, false, false, true, false, false);
 }
 
 test "generated output management retries hotplug deferred during reconfiguration" {
-    try generatedMultiHeadApply(false, false, false, false, false, false, true);
+    try generatedMultiHeadApply(false, false, false, false, false, false, true, false);
+}
+
+test "generated output management resumes session disable deferred during reconfiguration" {
+    try generatedMultiHeadApply(false, false, false, false, false, false, false, true);
 }
 
 test "generated output management rotates one physical head" {
-    try generatedMultiHeadApply(false, false, false, true, false, false, false);
+    try generatedMultiHeadApply(false, false, false, true, false, false, false, false);
 }
 
 test "generated output management rolls back a physical transform" {
-    try generatedMultiHeadApply(true, false, false, true, false, false, false);
+    try generatedMultiHeadApply(true, false, false, true, false, false, false, false);
 }
 
 test "generated output management enables adaptive sync on one head" {
-    try generatedMultiHeadApply(false, false, false, false, true, false, false);
+    try generatedMultiHeadApply(false, false, false, false, true, false, false, false);
 }
 
 fn generatedMultiHeadApply(
@@ -654,6 +658,7 @@ fn generatedMultiHeadApply(
     adaptive_sync: bool,
     disable_first: bool,
     hotplug_during_apply: bool,
+    session_disable_during_apply: bool,
 ) !void {
     const allocator = std.testing.allocator;
     var fixture = try Fixture.init();
@@ -712,6 +717,7 @@ fn generatedMultiHeadApply(
     };
     try submitClient(&reactor, &driver, &handler);
     var hotplug_signaled = false;
+    var session_disable_signaled = false;
     for (0..512) |_| {
         _ = try drainClient(&reactor, &driver, &handler);
         if (handler.apply_submitted and !handler.apply_flushed) {
@@ -730,11 +736,22 @@ fn generatedMultiHeadApply(
             try fixture.signalHotplug();
             hotplug_signaled = true;
         }
+        if (session_disable_during_apply and !session_disable_signaled and
+            coordinator.output_reconfigure != null)
+        {
+            try fixture.signalSession(.disable);
+            session_disable_signaled = true;
+        }
         const transaction_complete = handler.succeeded == @as(usize, 1) + @intFromBool(reenable_second) or
             handler.failed == 1;
         const hotplug_complete = !hotplug_during_apply or (hotplug_signaled and
             !coordinator.physical_outputs[1].connected and !coordinator.hotplug_refresh_pending);
-        if (transaction_complete and hotplug_complete) break;
+        var outputs_inactive = true;
+        for (coordinator.physical_outputs[0..coordinator.physical_output_count]) |physical|
+            outputs_inactive = outputs_inactive and physical.kms_output == null;
+        const session_disable_complete = !session_disable_during_apply or
+            (session_disable_signaled and outputs_inactive and coordinator.session.state == .disabled);
+        if (transaction_complete and hotplug_complete and session_disable_complete) break;
         if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0) {
             try waitForEither(&root.ring, reactor.ring);
         }
@@ -746,6 +763,7 @@ fn generatedMultiHeadApply(
     try std.testing.expectEqual(@as(usize, @intFromBool(fail_second_activation)), handler.failed);
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
     try std.testing.expectEqual(hotplug_during_apply, hotplug_signaled);
+    try std.testing.expectEqual(session_disable_during_apply, session_disable_signaled);
     if (hotplug_during_apply) {
         try std.testing.expect(coordinator.physical_outputs[0].connected);
         try std.testing.expect(coordinator.physical_outputs[0].kms_output != null);
@@ -755,6 +773,10 @@ fn generatedMultiHeadApply(
             coordinator.physical_outputs[0].protocol_output,
             coordinator.output_adapter.primaryOutput(),
         );
+    } else if (session_disable_during_apply) {
+        try std.testing.expectEqual(.disabled, coordinator.session.state);
+        for (coordinator.physical_outputs[0..coordinator.physical_output_count]) |physical|
+            try std.testing.expect(physical.kms_output == null);
     } else {
         try std.testing.expectEqual(@as(i32, if (fail_second_activation or disable_second or disable_first) 0 else 3), (try coordinator.output_management_adapter.lifecycle.currentHead(
             coordinator.physical_outputs[0].management_head,

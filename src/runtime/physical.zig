@@ -10890,7 +10890,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self: *Self,
             transaction: OutputReconfigureTransaction,
             result: protocol_output_management.Completion,
-        ) !void {
+        ) anyerror!void {
             try self.publishOutputLayout();
             for (self.physical_outputs[0..self.physical_output_count]) |*physical|
                 physical.reconfigure = null;
@@ -10923,6 +10923,10 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.processHotplug();
             try self.consumeOutputManagementCommands();
             try self.consumeOutputPowerCommands();
+            if (self.session_disable_pending) try self.pauseAllOutputs();
+            if (self.output_reconfigure != null or self.output_power_transition != null or
+                self.topology_refresh_pending or self.session_disable_pending)
+                try self.advanceDrain();
         }
 
         /// Drops applied protocol/presentation ownership only after the output
