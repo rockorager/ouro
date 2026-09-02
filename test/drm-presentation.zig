@@ -611,35 +611,39 @@ test "physical coordinator replaces the last disconnected output exactly" {
 }
 
 test "generated output management applies two heads atomically" {
-    try generatedMultiHeadApply(false, false, false, false, false, false);
+    try generatedMultiHeadApply(false, false, false, false, false, false, false);
 }
 
 test "generated output management rolls back every head" {
-    try generatedMultiHeadApply(true, false, false, false, false, false);
+    try generatedMultiHeadApply(true, false, false, false, false, false, false);
 }
 
 test "generated output management disables a secondary head atomically" {
-    try generatedMultiHeadApply(false, true, false, false, false, false);
+    try generatedMultiHeadApply(false, true, false, false, false, false, false);
 }
 
 test "generated output management re-enables a secondary head atomically" {
-    try generatedMultiHeadApply(false, true, true, false, false, false);
+    try generatedMultiHeadApply(false, true, true, false, false, false, false);
 }
 
 test "generated output management promotes an enabled head after disabling the primary" {
-    try generatedMultiHeadApply(false, false, false, false, false, true);
+    try generatedMultiHeadApply(false, false, false, false, false, true, false);
+}
+
+test "generated output management retries hotplug deferred during reconfiguration" {
+    try generatedMultiHeadApply(false, false, false, false, false, false, true);
 }
 
 test "generated output management rotates one physical head" {
-    try generatedMultiHeadApply(false, false, false, true, false, false);
+    try generatedMultiHeadApply(false, false, false, true, false, false, false);
 }
 
 test "generated output management rolls back a physical transform" {
-    try generatedMultiHeadApply(true, false, false, true, false, false);
+    try generatedMultiHeadApply(true, false, false, true, false, false, false);
 }
 
 test "generated output management enables adaptive sync on one head" {
-    try generatedMultiHeadApply(false, false, false, false, true, false);
+    try generatedMultiHeadApply(false, false, false, false, true, false, false);
 }
 
 fn generatedMultiHeadApply(
@@ -649,6 +653,7 @@ fn generatedMultiHeadApply(
     rotate_first: bool,
     adaptive_sync: bool,
     disable_first: bool,
+    hotplug_during_apply: bool,
 ) !void {
     const allocator = std.testing.allocator;
     var fixture = try Fixture.init();
@@ -661,7 +666,11 @@ fn generatedMultiHeadApply(
     defer wayring.unix_socket.unlink(path) catch {};
 
     const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), compositorConfig());
-    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), coordinatorConfig());
+    const platforms = if (hotplug_during_apply)
+        fixture.platformsWithHotplug()
+    else
+        fixture.platforms();
+    const coordinator = try Coordinator.create(allocator, root, platforms, coordinatorConfig());
     var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
     try coordinator.start(&loop);
     _ = try loop.turn(coordinator);
@@ -702,6 +711,7 @@ fn generatedMultiHeadApply(
         .disable_first = disable_first,
     };
     try submitClient(&reactor, &driver, &handler);
+    var hotplug_signaled = false;
     for (0..512) |_| {
         _ = try drainClient(&reactor, &driver, &handler);
         if (handler.apply_submitted and !handler.apply_flushed) {
@@ -713,10 +723,21 @@ fn generatedMultiHeadApply(
             handler.reenable_flushed = true;
         }
         _ = try loop.turn(coordinator);
-        if (handler.succeeded == @as(usize, 1) + @intFromBool(reenable_second) or
-            handler.failed == 1) break;
-        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+        if (hotplug_during_apply and !hotplug_signaled and
+            coordinator.output_reconfigure != null)
+        {
+            fixture.second_desktop = false;
+            try fixture.signalHotplug();
+            hotplug_signaled = true;
+        }
+        const transaction_complete = handler.succeeded == @as(usize, 1) + @intFromBool(reenable_second) or
+            handler.failed == 1;
+        const hotplug_complete = !hotplug_during_apply or (hotplug_signaled and
+            !coordinator.physical_outputs[1].connected and !coordinator.hotplug_refresh_pending);
+        if (transaction_complete and hotplug_complete) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0) {
             try waitForEither(&root.ring, reactor.ring);
+        }
     }
     try std.testing.expectEqual(
         if (fail_second_activation) 0 else @as(usize, 1) + @intFromBool(reenable_second),
@@ -724,102 +745,114 @@ fn generatedMultiHeadApply(
     );
     try std.testing.expectEqual(@as(usize, @intFromBool(fail_second_activation)), handler.failed);
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
-    try std.testing.expectEqual(@as(i32, if (fail_second_activation or disable_second or disable_first) 0 else 3), (try coordinator.output_management_adapter.lifecycle.currentHead(
-        coordinator.physical_outputs[0].management_head,
-    )).x);
-    try std.testing.expectEqual(@as(i32, if (fail_second_activation or disable_second) 3 else 0), (try coordinator.output_management_adapter.lifecycle.currentHead(
-        coordinator.physical_outputs[1].management_head,
-    )).x);
-    const first_state = try coordinator.output_management_adapter.lifecycle.currentHead(
-        coordinator.physical_outputs[0].management_head,
-    );
-    try std.testing.expectEqual(
-        @as(i32, if (rotate_first and !fail_second_activation) 1 else 0),
-        first_state.transform,
-    );
-    try std.testing.expectEqual(adaptive_sync and !fail_second_activation, first_state.adaptive_sync);
-    if (disable_first) {
-        try std.testing.expect(!first_state.enabled);
-        try std.testing.expect(coordinator.physical_outputs[0].kms_output == null);
-        try std.testing.expect(coordinator.physical_outputs[1].kms_output != null);
+    try std.testing.expectEqual(hotplug_during_apply, hotplug_signaled);
+    if (hotplug_during_apply) {
+        try std.testing.expect(coordinator.physical_outputs[0].connected);
+        try std.testing.expect(coordinator.physical_outputs[0].kms_output != null);
+        try std.testing.expect(!coordinator.physical_outputs[1].connected);
+        try std.testing.expect(coordinator.physical_outputs[1].kms_output == null);
         try std.testing.expectEqual(
-            coordinator.physical_outputs[1].protocol_output,
+            coordinator.physical_outputs[0].protocol_output,
             coordinator.output_adapter.primaryOutput(),
         );
-        try std.testing.expectEqual(
-            coordinator.physical_outputs[1].management_head,
-            coordinator.output_management_adapter.lifecycle.primary,
-        );
-    }
-    if (adaptive_sync and !fail_second_activation) {
-        try std.testing.expect(coordinator.physical_outputs[0].kms_output.?.kms_output.adaptive_sync);
-    }
-    if (rotate_first and !fail_second_activation) {
-        const first_output = coordinator.physical_outputs[0].kms_output.?;
-        try std.testing.expectEqual(ouro.render.Size{ .width = 2, .height = 3 }, first_output.planner.output);
-        try std.testing.expectEqual(ouro.render.Size{ .width = 3, .height = 2 }, first_output.planner.physical_output);
-        const logical = try coordinator.output_adapter.logicalSnapshot(
-            coordinator.physical_outputs[0].protocol_output,
-        );
-        try std.testing.expectEqual(@as(?i32, 2), logical.width);
-        try std.testing.expectEqual(@as(?i32, 3), logical.height);
-        try std.testing.expectEqual(@as(u3, 1), logical.transform);
-        const capture = coordinator.captureConstraints(.{ .source = .{
-            .output = first_output.outputId(),
-        } }).?;
-        try std.testing.expectEqual(@as(u32, 3), capture.width);
-        try std.testing.expectEqual(@as(u32, 2), capture.height);
-        try std.testing.expectEqual(@as(u3, 1), capture.transform);
-    } else if (rotate_first) {
-        const first_output = coordinator.physical_outputs[0].kms_output.?;
-        try std.testing.expectEqual(ouro.render.Size{ .width = 3, .height = 2 }, first_output.planner.output);
-        try std.testing.expectEqual(ouro.render.Transform.normal, first_output.planner.output_transform);
-        try std.testing.expectEqual(
-            @as(u3, 0),
-            (try coordinator.output_adapter.logicalSnapshot(
-                coordinator.physical_outputs[0].protocol_output,
-            )).transform,
-        );
-    }
-    if (disable_first) {
-        try std.testing.expect(!std.meta.eql(
-            first_ids[1],
-            coordinator.physical_outputs[1].kms_output.?.outputId(),
-        ));
-        try std.testing.expectEqual(@as(usize, 2), coordinator.stats.output_drains);
-    } else if (disable_second and !reenable_second) {
-        try std.testing.expectEqual(
-            first_ids[0],
-            coordinator.physical_outputs[0].kms_output.?.outputId(),
-        );
-        try std.testing.expect(coordinator.physical_outputs[1].kms_output == null);
-        try std.testing.expect(!(try coordinator.output_management_adapter.lifecycle.currentHead(
-            coordinator.physical_outputs[1].management_head,
-        )).enabled);
-        try std.testing.expectEqual(@as(usize, 1), coordinator.stats.output_drains);
-    } else if (!reenable_second) {
-        try std.testing.expect(!std.meta.eql(
-            first_ids[0],
-            coordinator.physical_outputs[0].kms_output.?.outputId(),
-        ));
-        try std.testing.expect(!std.meta.eql(
-            first_ids[1],
-            coordinator.physical_outputs[1].kms_output.?.outputId(),
-        ));
-        try std.testing.expectEqual(@as(usize, 2), coordinator.stats.output_drains);
     } else {
-        try std.testing.expectEqual(
-            first_ids[0],
-            coordinator.physical_outputs[0].kms_output.?.outputId(),
-        );
-        try std.testing.expect(!std.meta.eql(
-            first_ids[1],
-            coordinator.physical_outputs[1].kms_output.?.outputId(),
-        ));
-        try std.testing.expect((try coordinator.output_management_adapter.lifecycle.currentHead(
+        try std.testing.expectEqual(@as(i32, if (fail_second_activation or disable_second or disable_first) 0 else 3), (try coordinator.output_management_adapter.lifecycle.currentHead(
+            coordinator.physical_outputs[0].management_head,
+        )).x);
+        try std.testing.expectEqual(@as(i32, if (fail_second_activation or disable_second) 3 else 0), (try coordinator.output_management_adapter.lifecycle.currentHead(
             coordinator.physical_outputs[1].management_head,
-        )).enabled);
-        try std.testing.expectEqual(@as(usize, 1), coordinator.stats.output_drains);
+        )).x);
+        const first_state = try coordinator.output_management_adapter.lifecycle.currentHead(
+            coordinator.physical_outputs[0].management_head,
+        );
+        try std.testing.expectEqual(
+            @as(i32, if (rotate_first and !fail_second_activation) 1 else 0),
+            first_state.transform,
+        );
+        try std.testing.expectEqual(adaptive_sync and !fail_second_activation, first_state.adaptive_sync);
+        if (disable_first) {
+            try std.testing.expect(!first_state.enabled);
+            try std.testing.expect(coordinator.physical_outputs[0].kms_output == null);
+            try std.testing.expect(coordinator.physical_outputs[1].kms_output != null);
+            try std.testing.expectEqual(
+                coordinator.physical_outputs[1].protocol_output,
+                coordinator.output_adapter.primaryOutput(),
+            );
+            try std.testing.expectEqual(
+                coordinator.physical_outputs[1].management_head,
+                coordinator.output_management_adapter.lifecycle.primary,
+            );
+        }
+        if (adaptive_sync and !fail_second_activation) {
+            try std.testing.expect(coordinator.physical_outputs[0].kms_output.?.kms_output.adaptive_sync);
+        }
+        if (rotate_first and !fail_second_activation) {
+            const first_output = coordinator.physical_outputs[0].kms_output.?;
+            try std.testing.expectEqual(ouro.render.Size{ .width = 2, .height = 3 }, first_output.planner.output);
+            try std.testing.expectEqual(ouro.render.Size{ .width = 3, .height = 2 }, first_output.planner.physical_output);
+            const logical = try coordinator.output_adapter.logicalSnapshot(
+                coordinator.physical_outputs[0].protocol_output,
+            );
+            try std.testing.expectEqual(@as(?i32, 2), logical.width);
+            try std.testing.expectEqual(@as(?i32, 3), logical.height);
+            try std.testing.expectEqual(@as(u3, 1), logical.transform);
+            const capture = coordinator.captureConstraints(.{ .source = .{
+                .output = first_output.outputId(),
+            } }).?;
+            try std.testing.expectEqual(@as(u32, 3), capture.width);
+            try std.testing.expectEqual(@as(u32, 2), capture.height);
+            try std.testing.expectEqual(@as(u3, 1), capture.transform);
+        } else if (rotate_first) {
+            const first_output = coordinator.physical_outputs[0].kms_output.?;
+            try std.testing.expectEqual(ouro.render.Size{ .width = 3, .height = 2 }, first_output.planner.output);
+            try std.testing.expectEqual(ouro.render.Transform.normal, first_output.planner.output_transform);
+            try std.testing.expectEqual(
+                @as(u3, 0),
+                (try coordinator.output_adapter.logicalSnapshot(
+                    coordinator.physical_outputs[0].protocol_output,
+                )).transform,
+            );
+        }
+        if (disable_first) {
+            try std.testing.expect(!std.meta.eql(
+                first_ids[1],
+                coordinator.physical_outputs[1].kms_output.?.outputId(),
+            ));
+            try std.testing.expectEqual(@as(usize, 2), coordinator.stats.output_drains);
+        } else if (disable_second and !reenable_second) {
+            try std.testing.expectEqual(
+                first_ids[0],
+                coordinator.physical_outputs[0].kms_output.?.outputId(),
+            );
+            try std.testing.expect(coordinator.physical_outputs[1].kms_output == null);
+            try std.testing.expect(!(try coordinator.output_management_adapter.lifecycle.currentHead(
+                coordinator.physical_outputs[1].management_head,
+            )).enabled);
+            try std.testing.expectEqual(@as(usize, 1), coordinator.stats.output_drains);
+        } else if (!reenable_second) {
+            try std.testing.expect(!std.meta.eql(
+                first_ids[0],
+                coordinator.physical_outputs[0].kms_output.?.outputId(),
+            ));
+            try std.testing.expect(!std.meta.eql(
+                first_ids[1],
+                coordinator.physical_outputs[1].kms_output.?.outputId(),
+            ));
+            try std.testing.expectEqual(@as(usize, 2), coordinator.stats.output_drains);
+        } else {
+            try std.testing.expectEqual(
+                first_ids[0],
+                coordinator.physical_outputs[0].kms_output.?.outputId(),
+            );
+            try std.testing.expect(!std.meta.eql(
+                first_ids[1],
+                coordinator.physical_outputs[1].kms_output.?.outputId(),
+            ));
+            try std.testing.expect((try coordinator.output_management_adapter.lifecycle.currentHead(
+                coordinator.physical_outputs[1].management_head,
+            )).enabled);
+            try std.testing.expectEqual(@as(usize, 1), coordinator.stats.output_drains);
+        }
     }
 
     _ = try client.prepareClose();

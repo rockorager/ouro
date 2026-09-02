@@ -2812,7 +2812,7 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.advanceDrain();
         }
 
-        fn processHotplug(self: *Self) !void {
+        fn processHotplug(self: *Self) anyerror!void {
             const monitor = if (self.hotplug) |*value| value else return;
             if (monitor.takeChanged()) self.hotplug_refresh_pending = true;
             if (!self.hotplug_refresh_pending) return;
@@ -10920,6 +10920,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 },
                 .config_reconcile => {},
             }
+            try self.processHotplug();
             try self.consumeOutputManagementCommands();
             try self.consumeOutputPowerCommands();
         }
