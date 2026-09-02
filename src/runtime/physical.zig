@@ -4994,13 +4994,10 @@ pub fn Coordinator(comptime protocol: type) type {
                     } else null,
                     .toplevel => |id| if (self.desktop.scene(id)) |scene|
                         if (self.physicalOutputContainingSceneRect(scene.geometry)) |output|
-                            if (output.kms_output.?.planner.output_transform == .normal)
-                                if (self.physicalSceneRectFor(scene.geometry, output)) |physical| .{
-                                    .width = @intCast(physical.width),
-                                    .height = @intCast(physical.height),
-                                } else null
-                            else
-                                null
+                            if (self.physicalSceneRectFor(scene.geometry, output)) |physical| .{
+                                .width = @intCast(physical.width),
+                                .height = @intCast(physical.height),
+                            } else null
                         else
                             null
                     else |_|
@@ -5010,8 +5007,7 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             var constraints = maybe_constraints orelse return null;
             constraints.dmabuf_device = if (self.captureKmsOutput(target)) |output| capture: {
-                if (std.meta.activeTag(target) == .cursor and
-                    output.planner.output_transform != .normal) break :capture null;
+                if (captureTransformToUpright(target, output)) break :capture null;
                 break :capture output.captureDmabufDevice(.{
                     .width = constraints.width,
                     .height = constraints.height,
@@ -5033,6 +5029,20 @@ pub fn Coordinator(comptime protocol: type) type {
                 .toplevel => |id| (self.physicalOutputContainingSceneRect(
                     (self.desktop.scene(id) catch return null).geometry,
                 ) orelse return null).kms_output,
+            };
+        }
+
+        fn captureTransformToUpright(
+            target: ImageCopyCaptureAdapter.Target,
+            output: *const output_api.Output,
+        ) bool {
+            if (output.planner.output_transform == .normal) return false;
+            return switch (target) {
+                .cursor => true,
+                .source => |source| switch (source) {
+                    .toplevel => true,
+                    .output => false,
+                },
             };
         }
 
@@ -9056,8 +9066,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     return;
                 },
             };
-            const transform_to_upright = std.meta.activeTag(capture.target) == .cursor and
-                output.planner.output_transform != .normal;
+            const transform_to_upright = captureTransformToUpright(capture.target, output);
             const destination: ImageCopyDestination = if (self.shm.bufferToken(object)) |token| shm: {
                 const info = self.shm.store.bufferInfo(token) catch {
                     try self.failImageCopy(capture);
