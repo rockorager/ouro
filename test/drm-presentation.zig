@@ -898,17 +898,23 @@ fn generatedMultiHeadApply(
     try root.deinit();
 }
 
-test "generated client leases, withdraws, and rediscovers a secondary connector" {
+test "generated client leases and hotplugs two non-desktop connectors" {
     const allocator = std.testing.allocator;
     var fixture = try Fixture.init();
     defer fixture.deinit();
+    fixture.third_connector = true;
     var path_storage: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-r15-lease-client-{d}.sock", .{linux.getpid()});
     wayring.unix_socket.unlink(path) catch {};
     defer wayring.unix_socket.unlink(path) catch {};
 
     const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), compositorConfig());
-    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), coordinatorConfig());
+    const coordinator = try Coordinator.create(
+        allocator,
+        root,
+        fixture.platformsWithHotplug(),
+        coordinatorConfig(),
+    );
     var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
     try coordinator.start(&loop);
 
@@ -964,16 +970,63 @@ test "generated client leases, withdraws, and rediscovers a secondary connector"
     try std.testing.expectEqual(@as(usize, 1), handler.finished);
     try std.testing.expectEqual(@as(usize, 1), fixture.lease_create_count);
     try std.testing.expectEqual(@as(usize, 0), fixture.lease_revoke_count);
-    try std.testing.expectEqualSlices(u32, &.{ 11, 31, 41 }, fixture.lease_objects[0..fixture.lease_object_count]);
+    try std.testing.expectEqualSlices(
+        u32,
+        &.{ 11, 31, 41, 12, 32, 42 },
+        fixture.lease_objects[0..fixture.lease_object_count],
+    );
 
     for (0..256) |_| {
         _ = try drainClient(&reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
-        if (handler.connector_done_count == 2) break;
+        if (handler.connector_done_count == 4) break;
         if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
             try waitForEither(&root.ring, reactor.ring);
     }
-    try std.testing.expectEqual(@as(usize, 2), handler.connector_done_count);
+    try std.testing.expectEqual(@as(usize, 4), handler.connector_done_count);
+
+    fixture.third_connector = false;
+    try fixture.signalHotplug();
+    for (0..256) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        if (handler.release_requested and !handler.release_flushed) {
+            try submitClient(&reactor, &driver, &handler);
+            handler.release_flushed = true;
+        } else if (handler.device != null and !handler.bind_flushed) {
+            try submitClient(&reactor, &driver, &handler);
+            handler.bind_flushed = true;
+        }
+        _ = try loop.turn(coordinator);
+        if (handler.withdrawn == 4 and handler.connector_done_count == 5 and
+            handler.globals == 2 and handler.global_removes == 1 and handler.released == 1) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expectEqual(@as(usize, 4), handler.withdrawn);
+    try std.testing.expectEqual(@as(usize, 5), handler.connector_done_count);
+    try std.testing.expectEqual(@as(usize, 1), handler.global_removes);
+    try std.testing.expect(coordinator.primaryKmsOutput() != null);
+
+    fixture.third_connector = true;
+    try fixture.signalHotplug();
+    for (0..256) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        if (handler.release_requested and !handler.release_flushed) {
+            try submitClient(&reactor, &driver, &handler);
+            handler.release_flushed = true;
+        } else if (handler.device != null and !handler.bind_flushed) {
+            try submitClient(&reactor, &driver, &handler);
+            handler.bind_flushed = true;
+        }
+        _ = try loop.turn(coordinator);
+        if (handler.withdrawn == 5 and handler.connector_done_count == 7 and
+            handler.globals == 3 and handler.global_removes == 2 and handler.released == 2) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expectEqual(@as(usize, 5), handler.withdrawn);
+    try std.testing.expectEqual(@as(usize, 7), handler.connector_done_count);
+    try std.testing.expectEqual(@as(usize, 2), handler.global_removes);
 
     try fixture.signalSession(.disable);
     for (0..256) |_| {
@@ -983,14 +1036,14 @@ test "generated client leases, withdraws, and rediscovers a secondary connector"
             handler.release_flushed = true;
         }
         _ = try loop.turn(coordinator);
-        if (coordinator.primaryKmsOutput() == null and handler.withdrawn == 2 and
-            handler.released == 1 and handler.global_removes == 1) break;
+        if (coordinator.primaryKmsOutput() == null and handler.withdrawn == 7 and
+            handler.released == 3 and handler.global_removes == 3) break;
         if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
             try waitForEither(&root.ring, reactor.ring);
     }
-    try std.testing.expectEqual(@as(usize, 2), handler.withdrawn);
-    try std.testing.expectEqual(@as(usize, 1), handler.released);
-    try std.testing.expectEqual(@as(usize, 1), handler.global_removes);
+    try std.testing.expectEqual(@as(usize, 7), handler.withdrawn);
+    try std.testing.expectEqual(@as(usize, 3), handler.released);
+    try std.testing.expectEqual(@as(usize, 3), handler.global_removes);
     try std.testing.expectEqual(ouro.session.State.disabled, coordinator.session.state);
 
     try fixture.signalSession(.enable);
@@ -1001,12 +1054,12 @@ test "generated client leases, withdraws, and rediscovers a secondary connector"
             handler.bind_flushed = true;
         }
         _ = try loop.turn(coordinator);
-        if (handler.globals == 2 and handler.connector_done_count == 3) break;
+        if (handler.globals == 4 and handler.connector_done_count == 9) break;
         if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
             try waitForEither(&root.ring, reactor.ring);
     }
-    try std.testing.expectEqual(@as(usize, 2), handler.globals);
-    try std.testing.expectEqual(@as(usize, 3), handler.connector_done_count);
+    try std.testing.expectEqual(@as(usize, 4), handler.globals);
+    try std.testing.expectEqual(@as(usize, 9), handler.connector_done_count);
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
     try std.testing.expect(coordinator.primaryKmsOutput() != null);
 
@@ -3002,13 +3055,12 @@ const LeaseClientHandler = struct {
     queue: *wayring.tx.Queue,
     registry: wayring.objects.Handle,
     device: ?wayring.objects.Handle = null,
-    connector: ?wayring.objects.Handle = null,
+    connectors: [2]?wayring.objects.Handle = .{ null, null },
     lease: ?wayring.objects.Handle = null,
     discovery_fd_received: bool = false,
-    connector_name: bool = false,
-    connector_description: bool = false,
-    connector_id: bool = false,
-    connector_done: bool = false,
+    connector_names: usize = 0,
+    connector_descriptions: usize = 0,
+    connector_ids: usize = 0,
     bind_flushed: bool = false,
     submitted: bool = false,
     lease_request_flushed: bool = false,
@@ -3056,6 +3108,7 @@ const LeaseClientHandler = struct {
                             .{ .release = .{} },
                         );
                         self.release_requested = true;
+                        self.release_flushed = false;
                     }
                 },
             }
@@ -3065,27 +3118,40 @@ const LeaseClientHandler = struct {
                     _ = linux.close(value.fd);
                     self.discovery_fd_received = true;
                 },
-                .connector => |value| self.connector = (try protocol.wp_drm_lease_device_v1.admit_event_connector(
-                    self.objects,
-                    self.device.?,
-                    value,
-                    .{},
-                )).id,
+                .connector => |value| {
+                    const connector = (try protocol.wp_drm_lease_device_v1.admit_event_connector(
+                        self.objects,
+                        self.device.?,
+                        value,
+                        .{},
+                    )).id;
+                    var stored = false;
+                    for (&self.connectors) |*slot| {
+                        if (slot.* != null) continue;
+                        slot.* = connector;
+                        stored = true;
+                        break;
+                    }
+                    if (!stored) return error.UnexpectedConnector;
+                },
                 .done => if (!self.submitted) {
-                    try std.testing.expect(self.discovery_fd_received and self.connector_name and
-                        self.connector_description and self.connector_id and self.connector_done);
+                    try std.testing.expect(self.discovery_fd_received);
+                    try std.testing.expectEqual(@as(usize, 2), self.connector_names);
+                    try std.testing.expectEqual(@as(usize, 2), self.connector_descriptions);
+                    try std.testing.expectEqual(@as(usize, 2), self.connector_ids);
+                    try std.testing.expectEqual(@as(usize, 2), self.connector_done_count);
                     const request = (try protocol.wp_drm_lease_device_v1.construct_create_lease_request(
                         self.objects,
                         self.queue,
                         self.device.?,
                         .{},
                     )).id;
-                    try wayring.client.sendRequest(
+                    for (self.connectors) |connector| try wayring.client.sendRequest(
                         protocol.wp_drm_lease_request_v1,
                         self.objects,
                         self.queue,
                         request,
-                        .{ .request_connector = .{ .connector = self.connector.?.id } },
+                        .{ .request_connector = .{ .connector = connector.?.id } },
                     );
                     self.lease = (try protocol.wp_drm_lease_request_v1.construct_submit(
                         self.objects,
@@ -3096,37 +3162,41 @@ const LeaseClientHandler = struct {
                     self.submitted = true;
                 },
                 .released => {
-                    _ = try self.objects.retireLocal(self.device.?);
-                    self.device = null;
+                    const released = self.objects.namespace.lookupHandle(message.header.object_id) orelse
+                        return error.MissingLeaseDevice;
+                    _ = try self.objects.retireLocal(released);
+                    if (self.device != null and self.device.?.id == released.id)
+                        self.device = null;
                     self.released += 1;
                 },
             }
         } else if (target.object.interface == &protocol.wp_drm_lease_connector_v1.info) {
             switch (try protocol.wp_drm_lease_connector_v1.decodeEvent(message, fds)) {
                 .name => |value| {
-                    try std.testing.expectEqualStrings("DRM-11", value.name);
-                    self.connector_name = true;
+                    try std.testing.expect(std.mem.eql(u8, value.name, "DRM-11") or
+                        std.mem.eql(u8, value.name, "DRM-12"));
+                    self.connector_names += 1;
                 },
                 .description => |value| {
-                    try std.testing.expect(std.mem.indexOf(u8, value.description, "connector 11") != null);
-                    self.connector_description = true;
+                    try std.testing.expect(std.mem.indexOf(u8, value.description, "connector 11") != null or
+                        std.mem.indexOf(u8, value.description, "connector 12") != null);
+                    self.connector_descriptions += 1;
                 },
                 .connector_id => |value| {
-                    try std.testing.expectEqual(@as(u32, 11), value.connector_id);
-                    self.connector_id = true;
+                    try std.testing.expect(value.connector_id == 11 or value.connector_id == 12);
+                    self.connector_ids += 1;
                 },
-                .done => {
-                    self.connector_done = true;
-                    self.connector_done_count += 1;
-                },
+                .done => self.connector_done_count += 1,
                 .withdrawn => {
                     self.withdrawn += 1;
                     const connector = self.objects.namespace.lookupHandle(message.header.object_id) orelse
                         return error.MissingConnector;
                     // The device release below retires its server-owned children.
                     _ = try self.objects.removePeer(connector);
-                    if (self.connector != null and self.connector.?.id == connector.id)
-                        self.connector = null;
+                    for (&self.connectors) |*stored| {
+                        if (stored.* != null and (stored.*).?.id == connector.id)
+                            stored.* = null;
+                    }
                 },
             }
         } else if (target.object.interface == &protocol.wp_drm_lease_v1.info) {
@@ -3188,6 +3258,7 @@ pub const Fixture = struct {
     discover_cards: bool = true,
     first_desktop: bool = true,
     second_desktop: bool = false,
+    third_connector: bool = false,
     lease_objects: [6]u32 = undefined,
     lease_object_count: usize = 0,
     lease_create_count: usize = 0,
@@ -3423,13 +3494,23 @@ pub const Fixture = struct {
         out.crtcs[1] = .{ .id = 31, .index = 1, .properties = .{ .active = 2, .mode_id = 3, .vrr_enabled = if (self.vrr_supported) 16 else 0 } };
         out.planes[1] = .{ .id = 41, .possible_crtcs = 2, .plane_type_value = 1, .format_start = 1, .format_count = 1, .properties = .{ .plane_type = 4, .fb_id = 5, .crtc_id = 6, .src_x = 7, .src_y = 8, .src_w = 9, .src_h = 10, .crtc_x = 11, .crtc_y = 12, .crtc_w = 13, .crtc_h = 14 } };
         out.formats[1] = out.formats[0];
-        out.connector_count = 2;
-        out.mode_count = 2;
-        out.connector_encoder_count = 2;
-        out.encoder_count = 2;
-        out.crtc_count = 2;
-        out.plane_count = 2;
-        out.format_count = 2;
+        if (self.third_connector) {
+            out.connectors[2] = .{ .id = 12, .connector_type = 1, .connector_type_id = 3, .connected = true, .desktop = false, .width_mm = 3, .height_mm = 3, .encoder_id = 22, .mode_start = 2, .mode_count = 1, .encoder_start = 2, .encoder_count = 1, .properties = .{ .crtc_id = 1 } };
+            out.modes[2] = out.modes[0];
+            out.connector_encoders[2] = 22;
+            out.encoders[2] = .{ .id = 22, .crtc_id = 32, .possible_crtcs = 4 };
+            out.crtcs[2] = .{ .id = 32, .index = 2, .properties = .{ .active = 2, .mode_id = 3 } };
+            out.planes[2] = .{ .id = 42, .possible_crtcs = 4, .plane_type_value = 1, .format_start = 2, .format_count = 1, .properties = .{ .plane_type = 4, .fb_id = 5, .crtc_id = 6, .src_x = 7, .src_y = 8, .src_w = 9, .src_h = 10, .crtc_x = 11, .crtc_y = 12, .crtc_w = 13, .crtc_h = 14 } };
+            out.formats[2] = out.formats[0];
+        }
+        const topology_count: usize = if (self.third_connector) 3 else 2;
+        out.connector_count = topology_count;
+        out.mode_count = topology_count;
+        out.connector_encoder_count = topology_count;
+        out.encoder_count = topology_count;
+        out.crtc_count = topology_count;
+        out.plane_count = topology_count;
+        out.format_count = topology_count;
     }
 
     fn createGbm(context: *anyopaque, _: linux.fd_t) !ouro.gbm.Device {
@@ -3593,7 +3674,7 @@ pub const Fixture = struct {
 };
 
 pub fn coordinatorConfig() Coordinator.Config {
-    return .{ .router_capacity = 12, .timer_capacity = 6, .device_capacity = 1, .shm = .{ .limits = .{ .max_pool_bytes = 4096 }, .pool_capacity = 1, .buffer_capacity = 1, .formats = &shm_formats }, .surface = .{ .surface_capacity = 1, .region_capacity = 1, .viewport_capacity = 1, .presentation_resource_capacity = 1, .presentation_feedback_capacity = 2, .region_operation_capacity = 1, .frame_callback_capacity = 1, .release_callback_capacity = 1, .content_update_capacity = 1, .dependency_capacity = 1, .attachment_capacity = 1, .copy_capacity = 1, .max_copy_bytes = pixels.len }, .drm = .{ .card_capacity = 1, .connector_capacity = 2, .mode_capacity = 2, .connector_encoder_capacity = 2, .encoder_capacity = 2, .crtc_capacity = 2, .plane_capacity = 2, .format_capacity = 2, .event_capacity = 4 }, .output = .{ .output_id = .{ .index = 0, .generation = 1 }, .scheduler = .{ .refresh_ns = 4 * std.time.ns_per_ms, .render_budget_ns = std.time.ns_per_ms }, .renderer = .pixman, .image_count = 2, .max_samples = 2, .max_source_bytes = pixels.len, .max_source_width = 3, .max_source_height = 2, .kms = .{ .event_capacity = 2 } } };
+    return .{ .router_capacity = 12, .timer_capacity = 6, .device_capacity = 1, .shm = .{ .limits = .{ .max_pool_bytes = 4096 }, .pool_capacity = 1, .buffer_capacity = 1, .formats = &shm_formats }, .surface = .{ .surface_capacity = 1, .region_capacity = 1, .viewport_capacity = 1, .presentation_resource_capacity = 1, .presentation_feedback_capacity = 2, .region_operation_capacity = 1, .frame_callback_capacity = 1, .release_callback_capacity = 1, .content_update_capacity = 1, .dependency_capacity = 1, .attachment_capacity = 1, .copy_capacity = 1, .max_copy_bytes = pixels.len }, .drm = .{ .card_capacity = 1, .connector_capacity = 3, .mode_capacity = 3, .connector_encoder_capacity = 3, .encoder_capacity = 3, .crtc_capacity = 3, .plane_capacity = 3, .format_capacity = 3, .event_capacity = 4 }, .output = .{ .output_id = .{ .index = 0, .generation = 1 }, .scheduler = .{ .refresh_ns = 4 * std.time.ns_per_ms, .render_budget_ns = std.time.ns_per_ms }, .renderer = .pixman, .image_count = 2, .max_samples = 2, .max_source_bytes = pixels.len, .max_source_width = 3, .max_source_height = 2, .kms = .{ .event_capacity = 2 } } };
 }
 pub fn compositorConfig() Compositor.Config {
     return .{ .ring = .{ .entries = 32, .flags = 0 }, .reactor = clientReactorConfig(), .runtime = .{ .actor = .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 }, .object_capacity = 32, .object_quota = 32, .buckets_per_client = 32, .max_globals = 62, .registry_capacity = 1 } };

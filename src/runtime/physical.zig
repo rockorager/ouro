@@ -2832,9 +2832,12 @@ pub fn Coordinator(comptime protocol: type) type {
             if (self.manager.currentHandle() == null or self.session_disable_pending or
                 self.output_reconfigure != null or self.output_power_transition != null or
                 self.topology_refresh_pending) return;
-            const connectors = try self.manager.probeDesktopConnectorIds(
+            const handle = self.manager.currentHandle() orelse return;
+            const probe = try self.manager.probeConnectorChanges(
+                handle,
                 self.hotplug_connector_ids,
             );
+            const connectors = probe.desktop;
             self.hotplug_connector_count = connectors.len;
             const primary_missing = std.mem.indexOfScalar(
                 u32,
@@ -2863,6 +2866,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 }
                 if (!known) added = true;
             }
+            var removal_requested = false;
             for (self.physical_outputs[0..self.physical_output_count]) |physical| {
                 if (!physical.connected or physical.removing) continue;
                 if (std.mem.indexOfScalar(u32, connectors, physical.connector_id) == null) {
@@ -2871,9 +2875,11 @@ pub fn Coordinator(comptime protocol: type) type {
                         self.output_adapter.primaryOutput(),
                     )) continue;
                     try self.requestConnectorRemoval(physical.connector_id);
+                    removal_requested = true;
                 }
             }
-            if ((primary_missing and !primary_promoted) or added)
+            if ((primary_missing and !primary_promoted) or added or
+                (probe.lease_changed and !removal_requested))
                 try self.requestTopologyRefresh();
             self.hotplug_refresh_pending = false;
         }

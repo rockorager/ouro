@@ -440,6 +440,58 @@ pub const Manager = struct {
         return output[0..probe.candidate_count];
     }
 
+    /// Reads desktop and lease connector identity from one kernel topology so
+    /// hotplug classification cannot mix two different probe generations.
+    pub fn probeConnectorChanges(
+        self: *Manager,
+        handle: Handle,
+        desktop_output: []u32,
+    ) !struct { desktop: []const u32, lease_changed: bool } {
+        if (!self.present or handle.generation != self.generation)
+            return error.StaleSnapshot;
+        const fd = try self.session.deviceFd(self.device orelse return error.StaleSnapshot);
+        const probe = &self.stores[self.active_store ^ 1];
+        try self.platform.readTopology(fd, &probe.buffer);
+        try validateCounts(&probe.buffer);
+        probe.candidate_count = collectScanoutCandidates(&probe.buffer, probe.candidates) catch |cause| switch (cause) {
+            error.NoConnectedOutput => 0,
+            else => return cause,
+        };
+        probe.lease_candidate_count = try collectLeaseCandidates(
+            &probe.buffer,
+            probe.lease_candidates,
+        );
+        if (probe.candidate_count > desktop_output.len) return error.OutputTooSmall;
+        for (probe.candidates[0..probe.candidate_count], 0..) |candidate, index|
+            desktop_output[index] = probe.buffer.connectors[candidate.connector_index].id;
+
+        const current = &self.stores[self.active_store];
+        var lease_changed = probe.lease_candidate_count != current.lease_candidate_count;
+        if (!lease_changed) for (current.lease_candidates[0..current.lease_candidate_count]) |candidate| {
+            const connector_id = current.buffer.connectors[candidate.connector_index].id;
+            const crtc_id = current.buffer.crtcs[candidate.crtc_index].id;
+            const plane_id = current.buffer.planes[candidate.plane_index].id;
+            var found = false;
+            for (probe.lease_candidates[0..probe.lease_candidate_count]) |probed| {
+                if (probe.buffer.connectors[probed.connector_index].id == connector_id and
+                    probe.buffer.crtcs[probed.crtc_index].id == crtc_id and
+                    probe.buffer.planes[probed.plane_index].id == plane_id)
+                {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                lease_changed = true;
+                break;
+            }
+        };
+        return .{
+            .desktop = desktop_output[0..probe.candidate_count],
+            .lease_changed = lease_changed,
+        };
+    }
+
     /// Returns connected non-desktop connectors with complete scanout tuples.
     /// These are kept separate from compositor-owned desktop outputs so a
     /// connector cannot be both globally displayed and advertised for lease.
