@@ -1521,7 +1521,11 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                         .popup => |id| (adapter.resolvePopup(id) catch unreachable).dismissed,
                         else => false,
                     } else false;
-                    if (adapter.topmostPopup(slot.manager_index, slot.manager_generation)) |topmost| {
+                    if (if (parent) |parent_slot|
+                        adapter.topmostPopupForParent(parent_slot)
+                    else
+                        null) |topmost|
+                    {
                         const parent_is_topmost = if (parent) |parent_slot|
                             switch (parent_slot.role) {
                                 .popup => |id| std.meta.eql(id, adapter.popupId(topmost)),
@@ -2340,15 +2344,31 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             return null;
         }
 
-        fn topmostPopup(adapter: *Self, manager_index: u32, manager_generation: u32) ?*PopupSlot {
+        fn popupTreeRoot(adapter: *Self, popup: *const PopupSlot) ?SurfaceId {
+            var current = popup;
+            var remaining = adapter.popups.len;
+            while (remaining != 0) : (remaining -= 1) {
+                const parent_id = current.parent orelse return null;
+                if (current.external_parent) return parent_id;
+                const parent = adapter.xdgSurfaceById(parent_id) orelse return parent_id;
+                switch (parent.role) {
+                    .popup => |id| current = adapter.resolvePopup(id) catch return null,
+                    else => return parent.surface_id,
+                }
+            }
+            return null;
+        }
+
+        fn topmostPopupForParent(adapter: *Self, parent: *const SurfaceSlot) ?*PopupSlot {
+            const root = switch (parent.role) {
+                .popup => |id| adapter.popupTreeRoot(adapter.resolvePopup(id) catch return null) orelse
+                    return null,
+                else => parent.surface_id,
+            };
             for (adapter.popups) |popup| {
                 if (!popup.header.active or adapter.popupHasChild(popup)) continue;
-                const surface = adapter.resolveRoleSurface(
-                    popup.xdg_surface_index,
-                    popup.xdg_surface_generation,
-                ) catch continue;
-                if (surface.manager_index == manager_index and
-                    surface.manager_generation == manager_generation) return popup;
+                const popup_root = adapter.popupTreeRoot(popup) orelse continue;
+                if (std.meta.eql(popup_root, root)) return popup;
             }
             return null;
         }
@@ -2673,6 +2693,53 @@ const FakeCore = struct {
 
 const TestAdapter = Adapter(test_protocol, FakeCore);
 const TestCore = wayring.server.Core(test_protocol);
+
+test "xdg-shell: topmost popup validation is scoped to one popup tree" {
+    var core: FakeCore = .{};
+    var adapter = try TestAdapter.init(std.testing.allocator, &core, .{
+        .manager_capacity = 1,
+        .positioner_capacity = 1,
+        .surface_capacity = 3,
+        .toplevel_capacity = 2,
+        .popup_capacity = 1,
+        .event_capacity = 1,
+        .outbound_capacity = 1,
+        .outstanding_configure_capacity = 1,
+        .metadata_bytes = 8,
+    });
+    defer adapter.deinit();
+
+    const root_a: FakeCore.SurfaceId = .{ .index = 0, .generation = 1 };
+    const popup_surface: FakeCore.SurfaceId = .{ .index = 1, .generation = 1 };
+    const root_b: FakeCore.SurfaceId = .{ .index = 2, .generation = 1 };
+    adapter.surfaces[0].* = .{
+        .header = .{ .active = true },
+        .surface_id = root_a,
+        .role = .{ .toplevel = .{ .index = 0, .generation = 1 } },
+    };
+    adapter.surfaces[1].* = .{
+        .header = .{ .active = true },
+        .surface_id = popup_surface,
+        .role = .{ .popup = .{ .index = 0, .generation = 1 } },
+    };
+    adapter.surfaces[2].* = .{
+        .header = .{ .active = true },
+        .surface_id = root_b,
+        .role = .{ .toplevel = .{ .index = 1, .generation = 1 } },
+    };
+    adapter.popups[0].* = .{
+        .header = .{ .active = true },
+        .xdg_surface_index = 1,
+        .xdg_surface_generation = 1,
+        .parent = root_a,
+    };
+
+    try std.testing.expectEqual(
+        adapter.popups[0],
+        adapter.topmostPopupForParent(adapter.surfaces[0]),
+    );
+    try std.testing.expect(adapter.topmostPopupForParent(adapter.surfaces[2]) == null);
+}
 
 test "xdg-shell: stores grow beyond their initial capacities with stable object pointers" {
     var core: FakeCore = undefined;

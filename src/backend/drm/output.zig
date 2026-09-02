@@ -141,6 +141,7 @@ pub const Output = struct {
     connector: drm.Connector,
     crtc: drm.Crtc,
     plane: drm.Plane,
+    inherited_planes: []drm.Plane,
     mode: drm.Mode,
     fd: std.posix.fd_t,
     mode_blob: u32,
@@ -187,6 +188,21 @@ pub const Output = struct {
         errdefer platform.destroyBlob(fd, blob) catch {};
         const event_storage = try allocator.alloc(Event, config.event_capacity);
         errdefer allocator.free(event_storage);
+        var inherited_plane_count: usize = 0;
+        for (snapshot.planes) |plane| {
+            if (plane.id != snapshot.selectedPlane().id and
+                plane.current_crtc_id == snapshot.selectedCrtc().id)
+                inherited_plane_count += 1;
+        }
+        const inherited_planes = try allocator.alloc(drm.Plane, inherited_plane_count);
+        errdefer allocator.free(inherited_planes);
+        var inherited_plane_index: usize = 0;
+        for (snapshot.planes) |plane| {
+            if (plane.id == snapshot.selectedPlane().id or
+                plane.current_crtc_id != snapshot.selectedCrtc().id) continue;
+            inherited_planes[inherited_plane_index] = plane;
+            inherited_plane_index += 1;
+        }
         const self = try allocator.create(Output);
         self.* = .{
             .allocator = allocator,
@@ -197,6 +213,7 @@ pub const Output = struct {
             .connector = snapshot.selectedConnector(),
             .crtc = snapshot.selectedCrtc(),
             .plane = snapshot.selectedPlane(),
+            .inherited_planes = inherited_planes,
             .mode = snapshot.selectedMode(),
             .fd = fd,
             .mode_blob = blob,
@@ -226,6 +243,7 @@ pub const Output = struct {
         const allocator = self.allocator;
         allocator.free(self.events_buffer);
         allocator.free(self.records);
+        allocator.free(self.inherited_planes);
         allocator.destroy(self);
         if (first_error) |err| return err;
     }
@@ -541,6 +559,14 @@ pub const Output = struct {
     ) !void {
         const request = record.request;
         if (modeset) {
+            // A previous DRM master may leave cursor or overlay planes bound
+            // to this CRTC. Ouro composites the complete scene into its
+            // primary plane, so inherited planes must be detached atomically
+            // with the takeover instead of remaining visible above it.
+            for (self.inherited_planes) |plane| {
+                try self.platform.addProperty(request, plane.id, plane.properties.fb_id, 0);
+                try self.platform.addProperty(request, plane.id, plane.properties.crtc_id, 0);
+            }
             try self.platform.addProperty(request, self.connector.id, self.connector.properties.crtc_id, self.crtc.id);
             try self.platform.addProperty(request, self.crtc.id, self.crtc.properties.mode_id, self.mode_blob);
             try self.platform.addProperty(request, self.crtc.id, self.crtc.properties.active, 1);
@@ -767,6 +793,72 @@ test "kms: scanout properties flags and input fences match capabilities" {
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(rejected_fence, linux.F.GETFD, 0)));
     try FakeImages.discard(&fixture.images_state, image);
     try fixture.destroy(output);
+}
+
+test "kms: initial modeset clears planes inherited on the selected CRTC" {
+    var fixture = Fixture{};
+    var planes = [_]drm.Plane{
+        fixture.plane[0],
+        .{
+            .id = 31,
+            .possible_crtcs = 1,
+            .current_crtc_id = 20,
+            .plane_type_value = 2,
+            .format_start = 0,
+            .format_count = 1,
+            .properties = .{
+                .plane_type = 51,
+                .fb_id = 52,
+                .crtc_id = 53,
+                .src_x = 54,
+                .src_y = 55,
+                .src_w = 56,
+                .src_h = 57,
+                .crtc_x = 58,
+                .crtc_y = 59,
+                .crtc_w = 60,
+                .crtc_h = 61,
+            },
+        },
+        .{
+            .id = 32,
+            .possible_crtcs = 2,
+            .current_crtc_id = 99,
+            .plane_type_value = 2,
+            .format_start = 0,
+            .format_count = 1,
+            .properties = .{
+                .plane_type = 71,
+                .fb_id = 72,
+                .crtc_id = 73,
+                .src_x = 74,
+                .src_y = 75,
+                .src_w = 76,
+                .src_h = 77,
+                .crtc_x = 78,
+                .crtc_y = 79,
+                .crtc_w = 80,
+                .crtc_h = 81,
+            },
+        },
+    };
+    var snapshot = fixture.snapshot();
+    snapshot.planes = &planes;
+    const output = try Output.create(
+        std.testing.allocator,
+        fixture.atomic_state.platform(),
+        .{ .context = &fixture, .get_fd = Fixture.deviceFd },
+        fixture.images_state.images(),
+        snapshot,
+        .{},
+    );
+    try output.queue(fixture.acquire(0), null);
+    try output.commitQueued();
+    try std.testing.expect(fixture.atomic_state.hasProperty(31, 52, 0));
+    try std.testing.expect(fixture.atomic_state.hasProperty(31, 53, 0));
+    try std.testing.expect(!fixture.atomic_state.hasProperty(32, 72, 0));
+    try output.terminalDeviceTeardown();
+    try fixture.drainAndDestroy(output);
 }
 
 test "kms: accepted input fence close completes through shared ring" {

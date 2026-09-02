@@ -21,6 +21,50 @@ const shm_formats = [_]wayring.shm.Format{
     .{ .value = protocol.wl_shm.format.xrgb8888.value, .bytes_per_pixel = 4 },
 };
 
+test "configuration installs before physical startup claims an output" {
+    const allocator = std.testing.allocator;
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(
+        &path_storage,
+        "/tmp/ouro-config-before-start-{d}.sock",
+        .{linux.getpid()},
+    );
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+
+    const root = try Compositor.create(
+        allocator,
+        try wayring.unix_socket.listen(path, 1),
+        compositorConfig(),
+    );
+    const coordinator = try Coordinator.create(
+        allocator,
+        root,
+        fixture.platforms(),
+        coordinatorConfig(),
+    );
+    var reference = try ouro.config.defaultSnapshot(allocator);
+    defer reference.deinit();
+    var engine = try Coordinator.EngineSettings.init(
+        allocator,
+        reference.input_rules,
+        reference.output_rules,
+    );
+    var bindings = try Coordinator.Bindings.snapshotFromReferenceConfig(
+        allocator,
+        &reference,
+    );
+    var policy: Coordinator.PolicySnapshot = .{};
+
+    try coordinator.installConfig(&engine, &bindings, &policy);
+    try coordinator.requestStop();
+    try std.testing.expect(coordinator.backendDrainComplete());
+    try coordinator.destroy();
+    try root.deinit();
+}
+
 test "generated ordinary SHM traverses the physical coordinator exactly once and drains" {
     try runVertical(.session_disable, .shm);
 }
@@ -302,6 +346,17 @@ test "physical coordinator waits for peer output after a retired latching attemp
     const secondary = &coordinator.physical_outputs[1];
     try std.testing.expect(primary.kms_output != null);
     try std.testing.expect(secondary.kms_output != null);
+
+    // Secondary outputs schedule an initial blank scanout so a connector with
+    // no mapped clients becomes visibly active. Let that startup transaction
+    // settle before testing the independent latching failure below.
+    for (0..64) |_| {
+        if (physicalOutputsSettled(coordinator)) break;
+        _ = try loop.turn(coordinator);
+        if (physicalOutputsSettled(coordinator)) break;
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+    }
+    try std.testing.expectEqual(secondary.damage_requested, secondary.damage_applied);
 
     fixture.fail_page_flip_crtc = 30;
     try primary.kms_output.?.request(.damage, 1);
@@ -617,6 +672,12 @@ test "physical coordinator fails over from a disconnected primary output" {
             coordinator.output_global_index == 2) break;
         if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
     }
+    for (0..64) |_| {
+        if (physicalOutputsSettled(coordinator)) break;
+        _ = try loop.turn(coordinator);
+        if (physicalOutputsSettled(coordinator)) break;
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+    }
     const primary_protocol = coordinator.physical_outputs[0].protocol_output;
     const primary_head = coordinator.physical_outputs[0].management_head;
     const secondary_protocol = coordinator.physical_outputs[1].protocol_output;
@@ -845,6 +906,12 @@ fn generatedMultiHeadApply(
         _ = try loop.turn(coordinator);
         if (coordinator.physical_output_count == 2 and
             coordinator.physical_outputs[1].kms_output != null) break;
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+    }
+    for (0..64) |_| {
+        if (physicalOutputsSettled(coordinator)) break;
+        _ = try loop.turn(coordinator);
+        if (physicalOutputsSettled(coordinator)) break;
         if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
     }
     const first_ids = .{
@@ -3893,6 +3960,13 @@ pub fn drainServer(root: *Compositor, coordinator: *Coordinator, loop: *Loop) !v
         if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
     }
     return error.DrainTimeout;
+}
+fn physicalOutputsSettled(coordinator: *Coordinator) bool {
+    for (coordinator.physical_outputs[0..coordinator.physical_output_count]) |physical|
+        if (physical.damage_applied != physical.damage_requested or
+            (physical.kms_output != null and physical.kms_output.?.in_flight_frame != null))
+            return false;
+    return true;
 }
 fn waitForEither(server: *linux.IoUring, client: *linux.IoUring) !void {
     for (0..1_000_000) |_| {

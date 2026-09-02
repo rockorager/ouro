@@ -499,7 +499,7 @@ pub const Backend = struct {
         switch (raw) {
             .device_added => |value| {
                 if (self.findReference(value.device) != null) return error.DuplicateDevice;
-                if (self.free_head == none) return error.DeviceCapacityExhausted;
+                if (self.free_head == none) try self.growDevices();
                 const index = self.free_head;
                 const slot = &self.devices[index];
                 const captured = try self.platform.deviceConfiguration(value.device);
@@ -827,6 +827,17 @@ pub const Backend = struct {
             slot.next_free = self.free_head;
             self.free_head = index;
         } else slot.next_free = none;
+    }
+
+    fn growDevices(self: *Backend) !void {
+        const old_len = self.devices.len;
+        if (old_len >= none) return error.OutOfMemory;
+        const new_len = @min(@as(usize, none), old_len + @max(old_len, 1));
+        self.devices = try self.allocator.realloc(self.devices, new_len);
+        for (self.devices[old_len..], old_len..) |*slot, index| slot.* = .{
+            .next_free = if (index + 1 < new_len) @intCast(index + 1) else none,
+        };
+        self.free_head = @intCast(old_len);
     }
 
     fn checkCallback(self: *Backend) !void {
@@ -1230,6 +1241,22 @@ test "input: physical state remains distinct and device reuse advances generatio
     try std.testing.expectEqual(first.slot, replacement.slot);
     try std.testing.expect(first.generation != replacement.generation);
     try std.testing.expectError(error.StaleDevice, backend.isPressed(first, 30));
+}
+
+test "input: device storage grows beyond its initial reservation" {
+    var seat_fake: FakeSeat = .{};
+    var input_fake: FakeInput = .{};
+    const backend = try testBackend(&seat_fake, &input_fake, 4);
+    defer destroyTestBackend(backend) catch unreachable;
+
+    for (1..4) |reference| try backend.consume(.{ .device_added = .{
+        .device = reference,
+        .info = .{ .capabilities = .{ .keyboard = true } },
+    } });
+
+    try std.testing.expectEqual(@as(usize, 3), backend.deviceCount());
+    try std.testing.expectEqual(@as(usize, 4), backend.devices.len);
+    try std.testing.expectEqual(@as(usize, 3), backend.events().len);
 }
 
 test "input: pointer button motion and keyboard events retain generation identity" {

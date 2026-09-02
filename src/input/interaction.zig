@@ -509,6 +509,57 @@ fn interactionWithKeyConsumer(comptime Desktop: type, comptime KeyConsumerFactor
             self.enqueueCancellation(cancellation);
         }
 
+        /// Re-hit-tests a stationary pointer after the published scene changes.
+        /// Active grabs retain their original target until their normal end.
+        pub fn reconcilePointer(self: *Self, desktop: *Desktop, surfaces: anytype) !void {
+            if (self.mode != .default) return;
+            const target = try self.targetAtPointer(desktop, surfaces, self.x_fixed, self.y_fixed);
+            const focus_candidate = target != null and target.?.managed and
+                target.?.keyboard_focusable and
+                (self.keyboard_focus == null or
+                    !std.meta.eql(self.keyboard_focus.?.toplevel, target.?.toplevel) or
+                    !std.meta.eql(self.keyboard_focus.?.surface, target.?.surface));
+            if (focus_candidate) try self.ensureCommandCapacity(2) else try self.ensureCommandCapacity(1);
+            if (focus_candidate and try desktop.requestFocus(target.?.toplevel, .pointer_motion)) {
+                self.keyboard_focus = target.?;
+                self.enqueue(.{ .keyboard_focus = target.? });
+            }
+            if (!std.meta.eql(self.hover, target)) self.enqueue(.{ .pointer_focus = target });
+            self.hover = target;
+            self.pointer_inside = target != null;
+        }
+
+        fn targetAtPointer(
+            self: *Self,
+            desktop: *Desktop,
+            surfaces: anytype,
+            x_fixed: i64,
+            y_fixed: i64,
+        ) !?Target {
+            const point: geometry.Point = .{ .x = fixedFloor(x_fixed), .y = fixedFloor(y_fixed) };
+            const windows = while (true) {
+                break desktop.sceneSnapshot(self.windows) catch {
+                    const capacity = std.math.mul(usize, self.windows.len, 2) catch
+                        return error.OutOfMemory;
+                    self.windows = try self.allocator.realloc(self.windows, capacity);
+                    continue;
+                };
+            };
+            const hit = surfaces.topmost(SceneWindow, windows, point) orelse return null;
+            const local_x = x_fixed - @as(i64, point.x - hit.local.x) * 256;
+            const local_y = y_fixed - @as(i64, point.y - hit.local.y) * 256;
+            return .{
+                .toplevel = hit.toplevel,
+                .surface = hit.surface,
+                .managed = hit.managed,
+                .keyboard_focusable = hit.keyboard_focusable,
+                .point = .{
+                    .x = std.math.cast(i32, local_x) orelse return error.InvalidGeometry,
+                    .y = std.math.cast(i32, local_y) orelse return error.InvalidGeometry,
+                },
+            };
+        }
+
         fn pointerMotion(
             self: *Self,
             desktop: *Desktop,
@@ -542,29 +593,7 @@ fn interactionWithKeyConsumer(comptime Desktop: type, comptime KeyConsumerFactor
                 ) catch return error.InvalidGeometry;
             } else null;
             const point: geometry.Point = .{ .x = fixedFloor(next_x), .y = fixedFloor(next_y) };
-            const windows = while (true) {
-                break desktop.sceneSnapshot(self.windows) catch {
-                    const capacity = std.math.mul(usize, self.windows.len, 2) catch
-                        return error.OutOfMemory;
-                    self.windows = try self.allocator.realloc(self.windows, capacity);
-                    continue;
-                };
-            };
-            const hit = surfaces.topmost(SceneWindow, windows, point);
-            var target: ?Target = if (hit) |value| target: {
-                const local_x = next_x - @as(i64, point.x - value.local.x) * 256;
-                const local_y = next_y - @as(i64, point.y - value.local.y) * 256;
-                break :target .{
-                    .toplevel = value.toplevel,
-                    .surface = value.surface,
-                    .managed = value.managed,
-                    .keyboard_focusable = value.keyboard_focusable,
-                    .point = .{
-                        .x = std.math.cast(i32, local_x) orelse return error.InvalidGeometry,
-                        .y = std.math.cast(i32, local_y) orelse return error.InvalidGeometry,
-                    },
-                };
-            } else null;
+            var target = try self.targetAtPointer(desktop, surfaces, next_x, next_y);
             const focus_candidate = self.mode == .default and target != null and target.?.managed and
                 target.?.keyboard_focusable and
                 (self.keyboard_focus == null or
@@ -573,7 +602,7 @@ fn interactionWithKeyConsumer(comptime Desktop: type, comptime KeyConsumerFactor
             if (focus_candidate) try self.ensureCommandCapacity(2);
             const inside = target != null;
             if (target == null) switch (self.mode) {
-                .popup_grab => |grab| for (windows) |window| {
+                .popup_grab => |grab| for (desktop.sceneSnapshot(self.windows) catch unreachable) |window| {
                     if (!window.visible or !window.content_ready or
                         !std.meta.eql(window.surface, grab.surface)) continue;
                     target = .{
@@ -663,7 +692,15 @@ fn interactionWithKeyConsumer(comptime Desktop: type, comptime KeyConsumerFactor
                 available = device;
                 break;
             };
-            const device = available orelse return error.DeviceCapacityExhausted;
+            if (available == null) {
+                const old_len = self.devices.len;
+                const new_len = std.math.mul(usize, old_len, 2) catch
+                    return error.OutOfMemory;
+                self.devices = try self.allocator.realloc(self.devices, new_len);
+                @memset(self.devices[old_len..], .{});
+                available = &self.devices[old_len];
+            }
+            const device = available.?;
             device.* = .{ .active = true, .id = id, .capabilities = capabilities };
             if (capabilities.pointer) {
                 self.pointer_devices += 1;
@@ -1311,6 +1348,25 @@ test "interaction: invalid command capacity overflow is rejected before allocati
     ));
 }
 
+test "interaction: device storage grows beyond its initial reservation" {
+    var interaction = try initTestInteraction(2);
+    defer interaction.deinit();
+    var desktop = testDesktop();
+    var surfaces = TestSurfaces{};
+
+    for (0..3) |slot| try interaction.consume(&desktop, &surfaces, .{ .device_added = .{
+        .device = .{ .slot = @intCast(slot), .generation = 1, .seat_generation = 1 },
+        .info = .{ .capabilities = .{} },
+    } });
+
+    try std.testing.expectEqual(@as(usize, 4), interaction.devices.len);
+    try std.testing.expect(interaction.findDevice(.{
+        .slot = 2,
+        .generation = 1,
+        .seat_generation = 1,
+    }) != null);
+}
+
 test "interaction: pointer motion selects exact topmost input surface" {
     var interaction = try initTestInteraction(4);
     defer interaction.deinit();
@@ -1424,6 +1480,30 @@ test "interaction: pointer motion asks desktop policy before changing keyboard f
     try std.testing.expectEqual(desktop.windows[1].surface, interaction.peekCommand().?.keyboard_focus.surface);
     interaction.dropCommand();
     try std.testing.expectEqual(desktop.windows[1].surface, interaction.peekCommand().?.pointer_focus.?.surface);
+}
+
+test "interaction: stationary pointer reconciles focus after scene reflow" {
+    var interaction = try initTestInteraction(3);
+    defer interaction.deinit();
+    var desktop = testDesktop();
+    desktop.focus_follows_mouse = true;
+    var surfaces = TestSurfaces{};
+    try addPointer(&interaction, &desktop, &surfaces);
+    try interaction.consume(&desktop, &surfaces, .{ .pointer_motion = .{
+        .device = device_a,
+        .time_usec = 1,
+        .dx = 12,
+        .dy = 7,
+    } });
+    while (interaction.pendingCommands() != 0) interaction.dropCommand();
+
+    desktop.len = 1;
+    try interaction.reconcilePointer(&desktop, &surfaces);
+
+    try std.testing.expectEqual(desktop.windows[0].id, desktop.focused.?);
+    try std.testing.expectEqual(desktop.windows[0].surface, interaction.peekCommand().?.keyboard_focus.surface);
+    interaction.dropCommand();
+    try std.testing.expectEqual(desktop.windows[0].surface, interaction.peekCommand().?.pointer_focus.?.surface);
 }
 
 test "interaction: default press updates desktop and enters exact button grab" {

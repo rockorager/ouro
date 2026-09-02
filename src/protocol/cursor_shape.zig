@@ -272,7 +272,13 @@ pub fn Adapter(comptime protocol: type) type {
             self.devices.release(slot);
         }
         fn publishShape(self: *Self, slot: *DeviceSlot, serial: u32, shape: Shape) !void {
-            if (!self.validator.validate(slot.peer, slot.pointer, serial)) return;
+            if (!self.validator.validate(slot.peer, slot.pointer, serial)) {
+                std.log.warn(
+                    "ignored cursor shape {s} with stale pointer serial {d}",
+                    .{ shape.name(), serial },
+                );
+                return;
+            }
             if (self.event_len == self.events.len) return error.Exhausted;
             self.events[(self.event_head + self.event_len) % self.events.len] = .{
                 .device = self.deviceId(slot),

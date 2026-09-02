@@ -1120,14 +1120,8 @@ fn requireExternalSampling(
 ) !void {
     if (source.plane_count != 1 or source.fds[0] < 0 or source.strides[0] == 0)
         return error.UnsupportedExternalSource;
-    const vk_format: c.VkFormat = switch (format) {
-        .xrgb8888, .argb8888_premultiplied => c.VK_FORMAT_B8G8R8A8_UNORM,
-    };
-    const expected_drm: u32 = switch (format) {
-        .xrgb8888 => c.DRM_FORMAT_XRGB8888,
-        .argb8888_premultiplied => c.DRM_FORMAT_ARGB8888,
-    };
-    if (source.drm_format != expected_drm) return error.UnsupportedExternalFormat;
+    const vk_format = externalVkFormat(source.drm_format, format) orelse
+        return error.UnsupportedExternalFormat;
     var modifier_query: c.VkPhysicalDeviceImageDrmFormatModifierInfoEXT = .{
         .sType = c.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT,
         .pNext = null,
@@ -1176,9 +1170,7 @@ fn requireExternalSampling(
 
 fn importedImage(self: *RealRenderer, source: render.ExternalSource, size: render.Size, format: render.PixelFormat) !u64 {
     try requireExternalSampling(self, source, size, format);
-    const vk_format: c.VkFormat = switch (format) {
-        .xrgb8888, .argb8888_premultiplied => c.VK_FORMAT_B8G8R8A8_UNORM,
-    };
+    const vk_format = externalVkFormat(source.drm_format, format) orelse unreachable;
     for (self.imported_images, 0..) |*entry, index| if (entry.occupied and
         entry.source.context == source.context and entry.source.token == source.token)
     {
@@ -1334,9 +1326,47 @@ fn importedFromToken(self: *RealRenderer, token: u64) ?*ImportedImage {
 }
 
 fn inferExternalFormat(drm_format: u32) ?render.PixelFormat {
-    if (drm_format == c.DRM_FORMAT_XRGB8888) return .xrgb8888;
-    if (drm_format == c.DRM_FORMAT_ARGB8888) return .argb8888_premultiplied;
+    if (drm_format == c.DRM_FORMAT_XRGB8888 or drm_format == c.DRM_FORMAT_XBGR8888)
+        return .xrgb8888;
+    if (drm_format == c.DRM_FORMAT_ARGB8888 or drm_format == c.DRM_FORMAT_ABGR8888)
+        return .argb8888_premultiplied;
     return null;
+}
+
+fn externalVkFormat(drm_format: u32, format: render.PixelFormat) ?c.VkFormat {
+    return switch (format) {
+        .xrgb8888 => if (drm_format == c.DRM_FORMAT_XRGB8888)
+            c.VK_FORMAT_B8G8R8A8_UNORM
+        else if (drm_format == c.DRM_FORMAT_XBGR8888)
+            c.VK_FORMAT_R8G8B8A8_UNORM
+        else
+            null,
+        .argb8888_premultiplied => if (drm_format == c.DRM_FORMAT_ARGB8888)
+            c.VK_FORMAT_B8G8R8A8_UNORM
+        else if (drm_format == c.DRM_FORMAT_ABGR8888)
+            c.VK_FORMAT_R8G8B8A8_UNORM
+        else
+            null,
+    };
+}
+
+test "external DMA-BUF channel order selects the matching Vulkan format" {
+    try std.testing.expect(externalVkFormat(
+        c.DRM_FORMAT_ARGB8888,
+        .argb8888_premultiplied,
+    ) == c.VK_FORMAT_B8G8R8A8_UNORM);
+    try std.testing.expect(externalVkFormat(
+        c.DRM_FORMAT_ABGR8888,
+        .argb8888_premultiplied,
+    ) == c.VK_FORMAT_R8G8B8A8_UNORM);
+    try std.testing.expect(externalVkFormat(
+        c.DRM_FORMAT_XBGR8888,
+        .xrgb8888,
+    ) == c.VK_FORMAT_R8G8B8A8_UNORM);
+    try std.testing.expect(externalVkFormat(
+        c.DRM_FORMAT_ABGR8888,
+        .xrgb8888,
+    ) == null);
 }
 
 fn pendingAcquire(
@@ -1632,6 +1662,7 @@ fn realImportTarget(_: *anyopaque, renderer: Renderer, metadata: gbm.Metadata, d
     target.descriptor_sets = &.{};
     target.batch_capacity = 0;
     target.sample_buffer_size = 0;
+    target.state = .ready;
     try createHostBuffer(self, self.staging_buffer_size, &target.source_buffer, &target.source_memory, &target.source_map);
     target.source_buffer_size = self.staging_buffer_size;
     errdefer destroyBuffer(self, target.source_buffer, target.source_memory);
@@ -1660,7 +1691,6 @@ fn realImportTarget(_: *anyopaque, renderer: Renderer, metadata: gbm.Metadata, d
     }
     target.width = metadata.width;
     target.height = metadata.height;
-    target.state = .ready;
     target.fence_needs_reset = false;
     target.initialized_layout = false;
     return @ptrCast(target);

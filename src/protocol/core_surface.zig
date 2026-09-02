@@ -1782,26 +1782,28 @@ pub fn Adapter(comptime protocol: type) type {
             );
             switch (decoded.value) {
                 .destroy => {},
-                .add => |value| slot.region.add(.{
-                    .x = value.x,
-                    .y = value.y,
-                    .width = value.width,
-                    .height = value.height,
-                }) catch |cause| return try adapter.regionFailure(
-                    actor,
-                    decoded.handle.id,
-                    cause,
-                ),
-                .subtract => |value| slot.region.subtract(.{
-                    .x = value.x,
-                    .y = value.y,
-                    .width = value.width,
-                    .height = value.height,
-                }) catch |cause| return try adapter.regionFailure(
-                    actor,
-                    decoded.handle.id,
-                    cause,
-                ),
+                .add => |value| if (value.width != 0 and value.height != 0)
+                    slot.region.add(.{
+                        .x = value.x,
+                        .y = value.y,
+                        .width = value.width,
+                        .height = value.height,
+                    }) catch |cause| return try adapter.regionFailure(
+                        actor,
+                        decoded.handle.id,
+                        cause,
+                    ),
+                .subtract => |value| if (value.width != 0 and value.height != 0)
+                    slot.region.subtract(.{
+                        .x = value.x,
+                        .y = value.y,
+                        .width = value.width,
+                        .height = value.height,
+                    }) catch |cause| return try adapter.regionFailure(
+                        actor,
+                        decoded.handle.id,
+                        cause,
+                    ),
             }
             try decoded.finish(protocol, server_objects, &actor.transmit);
             return .continue_dispatch;
@@ -5299,6 +5301,24 @@ test "surface copies region request data before the region is destroyed" {
     var content = (try context.adapter.tryApply(surface, &output))[0].payload;
     defer content.deinit();
     try std.testing.expect(content.regions.opaque_changed);
+}
+
+test "core region accepts zero-sized compatibility rectangles as no-ops" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const region = try context.createRegion(11);
+
+    try test_protocol.wl_region.encodeRequest(&context.requests, region.id, .{
+        .add = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatchCore());
+    try test_protocol.wl_region.encodeRequest(&context.requests, region.id, .{
+        .subtract = .{ .x = 0, .y = 0, .width = 1, .height = 0 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatchCore());
+
+    const slot = context.adapter.regionFromObject(context.server_objects.namespace.resolve(region).?).?;
+    try std.testing.expectEqual(@as(usize, 0), slot.region.count);
 }
 
 test "interaction: core hit query uses exact committed region and surface generation" {

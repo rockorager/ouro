@@ -64,7 +64,9 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
         };
         pub const Margins = struct { top: i32 = 0, right: i32 = 0, bottom: i32 = 0, left: i32 = 0 };
         pub const State = struct {
+            peer: wayring.io_uring.Peer,
             surface: SurfaceId,
+            wl_surface: objects.Handle,
             output: OutputAdapter.OutputId,
             layer: Layer,
             width: u32,
@@ -74,6 +76,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
             exclusive_edge: ?Anchor,
             margins: Margins,
             keyboard_interactivity: KeyboardInteractivity,
+            configured: bool,
             mapped: bool,
             closed: bool,
             namespace: []const u8,
@@ -336,10 +339,11 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
             const s = self.find(surface) orelse return error.StaleSurface;
             if (s.closed) return;
             const core = try self.core.getSurfaceById(surface);
+            const configuration_changed = !std.meta.eql(s.pending, s.committed);
             s.committed = s.pending;
             const size = core.committedSize();
             const mapped = size.width != 0 and size.height != 0;
-            if (!s.initial_committed) {
+            if (!s.initial_committed or configuration_changed) {
                 s.initial_committed = true;
                 try self.queueConfigureSlot(s);
             }
@@ -400,6 +404,12 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
         }
         fn queueConfigureSlotSize(self: *Self, s: *Slot, width: u32, height: u32) !void {
             if (s.closed) return error.Closed;
+            // State changes such as keyboard interactivity and layer do not
+            // require a configure when the compositor's effective size is
+            // unchanged. Repeating the old dimensions can overwrite a
+            // client's in-progress content-size negotiation.
+            if (s.configure_serial != 0 and s.configure_width == width and
+                s.configure_height == height) return;
             if (!s.configure_pending and self.outbound_len == self.outbound_capacity) return error.Exhausted;
             if (!s.configure_pending) self.outbound_len += 1;
             s.configure_pending = true;
@@ -443,6 +453,17 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
                     .slot_generation = s.header.generation,
                     .serial = s.configure_serial,
                 };
+                std.log.info(
+                    "configured layer surface {d} ({s}) at {d}x{d}, layer={s}, keyboard={s}",
+                    .{
+                        s.resource.id,
+                        s.namespace[0..s.namespace_len],
+                        s.configure_width,
+                        s.configure_height,
+                        @tagName(s.committed.layer),
+                        @tagName(s.committed.keyboard),
+                    },
+                );
                 s.configure_pending = false;
                 self.outbound_len -= 1;
                 count += 1;
@@ -584,7 +605,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
             return stateValueWith(s, s.committed);
         }
         fn stateValueWith(s: *const Slot, value: Pending) State {
-            return .{ .surface = s.surface, .output = s.output, .layer = value.layer, .width = value.width, .height = value.height, .anchors = value.anchors, .exclusive_zone = value.exclusive_zone, .exclusive_edge = value.exclusive_edge, .margins = value.margins, .keyboard_interactivity = value.keyboard, .mapped = s.mapped, .closed = s.closed, .namespace = s.namespace[0..s.namespace_len], .last_acknowledged_configure = s.last_ack };
+            return .{ .peer = s.peer, .surface = s.surface, .wl_surface = s.wl_surface, .output = s.output, .layer = value.layer, .width = value.width, .height = value.height, .anchors = value.anchors, .exclusive_zone = value.exclusive_zone, .exclusive_edge = value.exclusive_edge, .margins = value.margins, .keyboard_interactivity = value.keyboard, .configured = s.initial_committed, .mapped = s.mapped, .closed = s.closed, .namespace = s.namespace[0..s.namespace_len], .last_acknowledged_configure = s.last_ack };
         }
         fn parseLayer(v: u32) !Layer {
             return switch (v) {
@@ -773,6 +794,8 @@ test "layer shell: commit lifecycle requires an acknowledged configure and reset
         .serial = slot.configure_serial,
     };
     try adapter.ackConfigure(slot, slot.configure_serial);
+    slot.configure_pending = false;
+    adapter.outbound_len = 0;
     try adapter.validateSurfaceCommit(slot.surface);
 
     slot.pending.width = 120;
@@ -785,8 +808,16 @@ test "layer shell: commit lifecycle requires an acknowledged configure and reset
     core.surface.width = 120;
     core.surface.height = 20;
     try adapter.publishSurfaceCommitted(slot.surface);
+    try std.testing.expect(slot.configure_pending);
     try std.testing.expect(adapter.stateForSurface(slot.surface).?.mapped);
     try std.testing.expectEqual(@as(u32, 120), adapter.stateForSurface(slot.surface).?.width);
+
+    slot.configure_pending = false;
+    adapter.outbound_len = 0;
+    slot.pending.keyboard = .exclusive;
+    try adapter.publishSurfaceCommitted(slot.surface);
+    try std.testing.expect(!slot.configure_pending);
+    try std.testing.expectEqual(TestAdapter.KeyboardInteractivity.exclusive, adapter.stateForSurface(slot.surface).?.keyboard_interactivity);
 
     core.surface.current_buffer = null;
     core.surface.width = 0;

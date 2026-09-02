@@ -64,6 +64,7 @@ const Replacement = struct {
     identity: render.SampleIdentity,
     source: render.Source,
     damage: render.UploadDamage,
+    retain_pixels: bool = false,
 };
 
 const Slot = struct {
@@ -422,9 +423,45 @@ pub const Store = struct {
         };
     }
 
+    /// Advances one surface's content identity while retaining its exact
+    /// renderer-owned pixels. This represents a wl_surface commit without an
+    /// attach request: metadata and callbacks change, but the current buffer
+    /// contents do not.
+    pub fn prepareRetaining(
+        self: *Store,
+        previous: Handle,
+        identity: render.SampleIdentity,
+    ) !Prepared {
+        if (previous.index >= self.slots.len) return error.StaleContent;
+        const slot = &self.slots[previous.index];
+        if (slot.state != .published or slot.generation != previous.generation or
+            !slot.current)
+            return error.StaleContent;
+        if (identity.surface == 0 or slot.identity.surface != identity.surface)
+            return error.InvalidIdentity;
+        if (identity.commit_sequence <= slot.identity.commit_sequence)
+            return error.StaleCommit;
+        const next = std.math.add(u64, slot.identity.commit_sequence, 1) catch
+            return error.NonAdjacentCommit;
+        if (identity.commit_sequence != next) return error.NonAdjacentCommit;
+        slot.state = .replacing;
+        slot.replacement = .{
+            .identity = identity,
+            .source = slot.source,
+            .damage = .{},
+            .retain_pixels = true,
+        };
+        return .{
+            .index = previous.index,
+            .generation = previous.generation,
+            .replaces = true,
+        };
+    }
+
     pub fn cancel(self: *Store, prepared: Prepared) void {
         const slot = self.preparedSlot(prepared) orelse return;
-        if (slot.source.native) |native| if (self.provider) |provider|
+        const retains_pixels = prepared.replaces and slot.replacement.?.retain_pixels;
+        if (!retains_pixels) if (slot.source.native) |native| if (self.provider) |provider|
             if (provider.cancel_native_fn) |cancel_fn| {
                 const identity = if (prepared.replaces)
                     slot.replacement.?.identity
@@ -447,6 +484,14 @@ pub const Store = struct {
         const slot = self.preparedSlot(prepared) orelse unreachable;
         if (prepared.replaces) {
             const replacement = slot.replacement orelse unreachable;
+            if (replacement.retain_pixels) {
+                slot.generation +%= 1;
+                if (slot.generation == 0) slot.generation = 1;
+                slot.identity = replacement.identity;
+                slot.replacement = null;
+                slot.state = .published;
+                return .{ .index = prepared.index, .generation = slot.generation };
+            }
             if (slot.source.native != null) {
                 slot.generation +%= 1;
                 if (slot.generation == 0) slot.generation = 1;
@@ -1046,6 +1091,34 @@ test "render-content: unique replacement is transactional and allocation-free" {
         1, 1, 1, 1, 8, 8, 8, 8,
         3, 3, 3, 3, 4, 4, 4, 4,
     }, (try store.resolve(current)).bytes);
+    store.release(current);
+}
+
+test "render-content: retained commit advances identity without changing pixels" {
+    var store = try Store.init(std.testing.allocator, .{ .version_capacity = 1, .byte_capacity = 16 });
+    defer store.deinit();
+    const bytes = [_]u8{ 1, 2, 3, 4 };
+    const old = store.publish(try store.prepare(
+        .{ .surface = 1, .commit_sequence = 1 },
+        testSource(&bytes, 1, 1, 4),
+        .{},
+    ));
+    const allocated = store.allocatedBytes();
+
+    const cancelled = try store.prepareRetaining(
+        old,
+        .{ .surface = 1, .commit_sequence = 2 },
+    );
+    store.cancel(cancelled);
+    try std.testing.expectEqualSlices(u8, &bytes, (try store.resolve(old)).bytes);
+
+    const current = store.publish(try store.prepareRetaining(
+        old,
+        .{ .surface = 1, .commit_sequence = 2 },
+    ));
+    try std.testing.expectEqual(allocated, store.allocatedBytes());
+    try std.testing.expectError(error.StaleContent, store.resolve(old));
+    try std.testing.expectEqualSlices(u8, &bytes, (try store.resolve(current)).bytes);
     store.release(current);
 }
 

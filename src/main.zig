@@ -53,6 +53,10 @@ pub fn main(init: std.process.Init) !void {
         try init.environ_map.put("XDG_SESSION_DESKTOP", "ouro");
         try init.environ_map.put("XDG_SESSION_TYPE", "wayland");
     }
+    // Install before any subsystem can create a worker. All threads must
+    // inherit the blocked mask so TERM/INT/HUP are delivered through signalfd.
+    var shutdown_signals = try ouro.shutdown_signal.Watcher.install();
+    defer shutdown_signals.deinit();
     try systemd_session.prepare();
     defer systemd_session.shutdown() catch |err| {
         std.log.warn("could not shut down the managed graphical session: {t}", .{err});
@@ -96,8 +100,6 @@ pub fn main(init: std.process.Init) !void {
         return error.DrmHardwareUnavailable;
     }
     _ = linux.close(@intCast(dri_result));
-    var shutdown_signals = try ouro.shutdown_signal.Watcher.install();
-    defer shutdown_signals.deinit();
 
     wayring.unix_socket.unlink(socket) catch {};
     defer wayring.unix_socket.unlink(socket) catch {};
@@ -121,7 +123,7 @@ pub fn main(init: std.process.Init) !void {
             .restricted_capacity = 32,
         },
         .shm = .{
-            .limits = .{ .max_pool_bytes = 16 * 1024 * 1024 },
+            .limits = .{ .max_pool_bytes = 128 * 1024 * 1024 },
             .pool_capacity = 64,
             .buffer_capacity = 64,
             .formats = &shm_formats,
@@ -199,7 +201,8 @@ pub fn main(init: std.process.Init) !void {
             .image_count = 3,
             .max_samples = 17,
             .max_source_bytes = 32 * 1024 * 1024,
-            .max_surface_bytes = 16 * 1024 * 1024,
+            .max_surface_bytes = 128 * 1024 * 1024,
+            .max_content_bytes = 512 * 1024 * 1024,
             .max_source_width = 8192,
             .max_source_height = 8192,
             // Client descriptions and profile changes share a bounded cache.
@@ -236,13 +239,13 @@ pub fn main(init: std.process.Init) !void {
         return err;
     };
     var run_error: ?anyerror = null;
-    runner.installShutdown(&shutdown_signals) catch |err| {
-        run_error = err;
-    };
     runner.start() catch |err| {
         if (run_error == null) run_error = err;
     };
     if (run_error == null) systemd_session.ready(wayland_display) catch |err| {
+        run_error = err;
+    };
+    if (run_error == null) runner.installShutdown(&shutdown_signals) catch |err| {
         run_error = err;
     };
     if (run_error != null) coordinator.requestStop() catch {};
@@ -272,6 +275,12 @@ pub fn main(init: std.process.Init) !void {
         wayring_drained = progress.wayring.shutdown_complete;
         if (!signal_stop_started and progress.shutdown_requested) {
             signal_stop_started = true;
+            // Stop managed clients before draining their Wayland connections.
+            // Waiting until the compositor defer runs creates a cycle: Ouro
+            // waits for clients which systemd keeps alive until Ouro exits.
+            systemd_session.shutdown() catch |err| {
+                if (run_error == null) run_error = err;
+            };
             coordinator.requestStop() catch |err| {
                 if (run_error == null) run_error = err;
             };
@@ -409,7 +418,7 @@ fn compositorConfig() Compositor.Config {
         },
         .runtime = .{
             .actor = .{
-                .received_fd_budget = 2,
+                .received_fd_budget = 16,
                 .transmit_byte_budget = 8192,
                 .transmit_fd_budget = 2,
             },

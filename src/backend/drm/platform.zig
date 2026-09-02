@@ -120,6 +120,7 @@ pub const LeaseResult = struct {
 pub const Plane = struct {
     id: u32,
     possible_crtcs: u32,
+    current_crtc_id: u32 = 0,
     plane_type_value: u64,
     format_start: u32,
     format_count: u32,
@@ -368,6 +369,7 @@ fn realReadTopology(_: *anyopaque, fd: std.posix.fd_t, out: *TopologyBuffer) !vo
         out.planes[out.plane_count] = .{
             .id = plane.*.plane_id,
             .possible_crtcs = plane.*.possible_crtcs,
+            .current_crtc_id = plane.*.crtc_id,
             .plane_type_value = plane_type.value,
             .format_start = @intCast(format_start),
             .format_count = @intCast(out.format_count - format_start),

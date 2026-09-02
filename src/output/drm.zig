@@ -46,6 +46,9 @@ pub const Config = struct {
     /// Maximum bytes retained for one surface version. Defaults to the frame
     /// capacity for compatibility with single-surface configurations.
     max_surface_bytes: ?usize = null,
+    /// Aggregate logical bytes retained across current and pending surface
+    /// versions. Defaults to one maximum-sized version per initial slot.
+    max_content_bytes: ?usize = null,
     max_source_width: u32,
     max_source_height: u32,
     max_client_damage: usize = 32,
@@ -148,19 +151,32 @@ const Renderer = union(RendererKind) {
     }
 };
 
-fn surfaceByteCapacity(config: Config) usize {
+pub fn surfaceByteCapacity(config: Config) usize {
     return config.max_surface_bytes orelse config.max_source_bytes;
+}
+
+fn contentVersionCapacity(config: Config) !usize {
+    return std.math.add(usize, config.max_samples, 1) catch error.InvalidConfig;
+}
+
+fn contentByteCapacity(config: Config) !usize {
+    return config.max_content_bytes orelse std.math.mul(
+        usize,
+        surfaceByteCapacity(config),
+        try contentVersionCapacity(config),
+    ) catch return error.InvalidConfig;
 }
 
 fn validateConfig(config: Config) !void {
     const surface_bytes = surfaceByteCapacity(config);
+    const content_bytes = try contentByteCapacity(config);
     if (config.image_count == 0 or config.max_render_targets < config.image_count or
         config.max_samples == 0 or config.max_source_bytes == 0 or surface_bytes == 0 or
-        surface_bytes > config.max_source_bytes)
+        content_bytes < surface_bytes)
         return error.InvalidConfig;
 }
 
-test "drm-output: retained surface capacity fits aggregate frame capacity" {
+test "drm-output: surface, retained content, and fallback frame capacities are independent" {
     const base: Config = .{
         .output_id = .{ .index = 0, .generation = 1 },
         .scheduler = .{ .refresh_ns = 10, .render_budget_ns = 3 },
@@ -172,8 +188,12 @@ test "drm-output: retained surface capacity fits aggregate frame capacity" {
         .max_source_height = 1,
     };
     try validateConfig(base);
-    var invalid = base;
-    invalid.max_surface_bytes = 9;
+    var large_surface = base;
+    large_surface.max_surface_bytes = 16;
+    large_surface.max_content_bytes = 32;
+    try validateConfig(large_surface);
+    var invalid = large_surface;
+    invalid.max_content_bytes = 15;
     try std.testing.expectError(error.InvalidConfig, validateConfig(invalid));
 }
 
@@ -759,22 +779,14 @@ pub const Output = struct {
         const render_device = try allocator.create(RenderDevice);
         var render_device_owned = true;
         errdefer if (render_device_owned) allocator.destroy(render_device);
-        const content_version_capacity = std.math.add(
-            usize,
-            config.max_samples,
-            1,
-        ) catch return error.InvalidConfig;
+        const content_version_capacity = try contentVersionCapacity(config);
         const content_provider = switch (path.renderer) {
             .pixman => null,
             .vulkan => |*renderer| renderer.contentProvider(),
         };
         var content = try render_content.Store.initWithProvider(allocator, .{
             .version_capacity = content_version_capacity,
-            .byte_capacity = std.math.mul(
-                usize,
-                surfaceByteCapacity(config),
-                content_version_capacity,
-            ) catch return error.InvalidConfig,
+            .byte_capacity = try contentByteCapacity(config),
         }, content_provider);
         var content_owned = true;
         errdefer if (content_owned) content.deinit();
@@ -1482,24 +1494,30 @@ pub const Output = struct {
                             timestamp_ns,
                             self.takeRenderReadyTimestamp(ring),
                         );
+                        // The page flip is physically complete before the
+                        // coordinator callback runs. Publish that boundary so
+                        // callback work can apply commits and queue the next
+                        // frame instead of observing stale in-flight state.
+                        self.in_flight_frame = null;
+                        self.in_flight_handle = null;
                     }
                     const outcome = self.pending_callback.?;
                     try callbacks.presented(outcome, callbackData(outcome.actual_ns.?));
                     self.pending_callback = null;
-                    self.in_flight_frame = null;
-                    self.in_flight_handle = null;
                 },
                 .paused => self.paused = true,
                 .removed => {
-                    if (self.in_flight_frame) |frame_id| {
+                    if (self.in_flight_frame != null or self.pending_callback != null) {
                         try self.finishCapture(callbacks, false, 0);
-                        if (self.pending_callback == null)
+                        if (self.pending_callback == null) {
+                            const frame_id = self.in_flight_frame.?;
                             self.pending_callback = try self.scheduler.retirePhysical(frame_id);
+                            self.in_flight_frame = null;
+                            self.in_flight_handle = null;
+                        }
                         try callbacks.retired(self.pending_callback.?);
                         self.pending_callback = null;
                         self.discardRenderTiming(ring);
-                        self.in_flight_frame = null;
-                        self.in_flight_handle = null;
                     }
                     self.paused = true;
                 },
@@ -1759,13 +1777,8 @@ fn initVulkan(allocator: std.mem.Allocator, platforms: Platforms, fd: std.posix.
         return error.InFenceUnsupported;
     var pool = try vulkan.initTargetPool(allocator, platforms.gbm, platforms.framebuffer, fd, snapshot, config.image_count);
     errdefer pool.deinit() catch {};
-    const content_version_capacity = std.math.add(usize, config.max_samples, 1) catch
-        return error.InvalidConfig;
-    const content_store_bytes = std.math.mul(
-        usize,
-        surfaceByteCapacity(config),
-        content_version_capacity,
-    ) catch return error.InvalidConfig;
+    const content_version_capacity = try contentVersionCapacity(config);
+    const content_store_bytes = try contentByteCapacity(config);
     const retained_upload_bytes = std.math.mul(
         usize,
         config.max_source_bytes,
@@ -1820,8 +1833,9 @@ fn bindSamples(list: render.List, bindings: []const SampleBinding, output: []sch
 }
 
 pub fn formatFromDrm(value: u32) ?render.PixelFormat {
-    if (value == gbm.format_xrgb8888) return .xrgb8888;
-    if (value == gbm.format_argb8888) return .argb8888_premultiplied;
+    if (value == gbm.format_xrgb8888 or value == gbm.format_xbgr8888) return .xrgb8888;
+    if (value == gbm.format_argb8888 or value == gbm.format_abgr8888)
+        return .argb8888_premultiplied;
     return null;
 }
 
@@ -2160,6 +2174,7 @@ test "drm-sim: physical Pixman owner starts and drains in strict order" {
             .kms = .{ .event_capacity = 1 },
         },
     );
+    fixture.output_under_callback = output;
     try std.testing.expectEqual(RendererKind.pixman, output.rendererKind().?);
     try output.prepareReadiness(&fixture.router, &fixture.ring);
     try output.request(.damage, 1);
@@ -2240,6 +2255,7 @@ const SimFixture = struct {
     captured_count: usize = 0,
     capture_backpressure: bool = false,
     last_map_access: ?gbm.MapAccess = null,
+    output_under_callback: ?*Output = null,
     router: completion.Router = undefined,
     ring: linux.IoUring = undefined,
 
@@ -2403,6 +2419,10 @@ const SimFixture = struct {
     }
     fn presented(context: *anyopaque, outcome: FrameOutcome, callback_data: u32) !void {
         const self: *SimFixture = @ptrCast(@alignCast(context));
+        if (self.output_under_callback) |output| {
+            try std.testing.expect(output.in_flight_frame == null);
+            try std.testing.expect(output.in_flight_handle == null);
+        }
         try std.testing.expect(outcome.frame_callbacks_due);
         try std.testing.expect(outcome.output_removed);
         try std.testing.expectEqual(@as(usize, 0), outcome.sampled.len);

@@ -609,7 +609,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                         self.remove(r);
                         return count + 1;
                     }
-                    while (r.pending < 6) {
+                    while (r.pending < 5) {
                         const primaries = infoPrimaries(r.description.primaries);
                         const event: Info.Event = switch (r.pending) {
                             0 => .{ .primaries = primaries },
@@ -627,7 +627,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                                 .min_lum = @intFromFloat(r.description.min_luminance * 10_000),
                                 .max_lum = @intFromFloat(r.description.max_luminance),
                             } },
-                            else => .{ .done = .{} },
+                            else => unreachable,
                         };
                         wayring.server.sendEvent(protocol, Info, server_objects, queue, r.handle, event) catch |err| switch (err) {
                             error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return count,
@@ -635,11 +635,16 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                         };
                         r.pending += 1;
                         count += 1;
-                        if (r.pending == 6) {
-                            self.remove(r);
-                            return count;
-                        }
                     }
+                    // `done` is a destructor event. sendEvent synchronously
+                    // invokes resourceRemoved, which frees r, so it must be the
+                    // final operation that accesses this resource.
+                    wayring.server.sendEvent(protocol, Info, server_objects, queue, r.handle, .{ .done = .{} }) catch |err| switch (err) {
+                        error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return count,
+                        else => return err,
+                    };
+                    self.remove(r);
+                    return count + 1;
                 }
             }
             return count;
@@ -927,4 +932,53 @@ fn failureMessage(failure: icc_worker.Failure) []const u8 {
         .transform_creation_failed => "failed to create ICC transform",
         .invalid_transform_output => "ICC transform produced invalid output",
     };
+}
+
+test "image description info completion does not access destroyed resource" {
+    const protocol = @import("core_protocol");
+    const FakeCore = struct {};
+    const TestAdapter = Adapter(protocol, FakeCore);
+    const peer: wayring.io_uring.Peer = .{ .slot = 0, .generation = 1 };
+
+    var core: FakeCore = .{};
+    var adapter = try TestAdapter.init(std.testing.allocator, &core, .{
+        .resource_capacity = 2,
+        .async_jobs = 1,
+        .queued_profile_bytes = 1024,
+        .retained_luts = 1,
+    });
+    defer adapter.deinit();
+
+    var server_objects = try objects.ServerObjects.init(
+        std.testing.allocator,
+        8,
+        2,
+        &protocol.wl_display.info,
+        null,
+    );
+    defer server_objects.deinit(std.testing.allocator);
+    server_objects.setRemovalHook(.{
+        .context = &adapter,
+        .notify = struct {
+            fn removed(context: ?*anyopaque, handle: objects.Handle, object: objects.Object) void {
+                const target: *TestAdapter = @ptrCast(@alignCast(context.?));
+                _ = target.resourceRemoved(handle, object);
+            }
+        }.removed,
+    });
+
+    const info = try adapter.create(.info, undefined, peer, null, 2);
+    info.handle = try server_objects.insertClient(2, &protocol.wp_image_description_info_v1.info, 2, info);
+    const info_handle = info.handle;
+
+    var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 256, 2);
+    defer blocks.deinit(std.testing.allocator);
+    var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 1);
+    defer descriptors.deinit(std.testing.allocator);
+    var queue = wayring.tx.Queue.init(&blocks, 256, &descriptors, 0);
+    defer queue.deinit();
+
+    try std.testing.expectEqual(@as(usize, 6), try adapter.flushOn(peer, &server_objects, &queue));
+    try std.testing.expect(server_objects.namespace.resolve(info_handle) == null);
+    try std.testing.expect(!adapter.pendingOutbound(peer));
 }

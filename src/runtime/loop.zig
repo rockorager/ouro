@@ -78,6 +78,7 @@ pub fn Loop(comptime protocol: type) type {
         unrouted_completions: []Cqe,
         shutdown: ?*shutdown_signal.Watcher = null,
         shutdown_token: ?completion.Token = null,
+        shutdown_seen: bool = false,
 
         /// Allocates all turn storage and queues the initial listener accept.
         /// Nothing is submitted until the first call to `turn`.
@@ -132,9 +133,8 @@ pub fn Loop(comptime protocol: type) type {
             self.* = undefined;
         }
 
-        /// Queues the process-shutdown eventfd poll for the first turn's sole
-        /// submission. The poll remains owned until TERM/INT or an internal
-        /// shutdown request makes the descriptor readable.
+        /// Queues the process signal descriptor poll for the first turn's sole
+        /// submission. The poll remains owned until a watched signal arrives.
         pub fn installShutdown(self: *Self, watcher: *shutdown_signal.Watcher) !void {
             if (self.shutdown != null) return error.AlreadyInstalled;
             self.shutdown = watcher;
@@ -166,9 +166,6 @@ pub fn Loop(comptime protocol: type) type {
         pub fn waitForCompletion(self: *Self) !void {
             if (self.compositor.ring.cq_ready() != 0) return;
             _ = self.compositor.ring.enter(0, 1, linux.IORING_ENTER_GETEVENTS) catch |err| switch (err) {
-                // TERM/INT can interrupt the wait before the eventfd poll CQE
-                // is visible. The handler has made that descriptor readable,
-                // so the following ordinary turn or wait will consume it.
                 error.SignalInterrupt => return,
                 else => return err,
             };
@@ -234,12 +231,16 @@ pub fn Loop(comptime protocol: type) type {
                         if (cqe.res < 0 or @as(u32, @intCast(cqe.res)) & linux.POLL.IN == 0)
                             return error.ShutdownPollFailed;
                         const events = try self.shutdown.?.consume();
-                        if (!events.shutdown and !events.reload) return error.MissingShutdownWakeup;
+                        std.log.info(
+                            "received process signal: shutdown={}, reload={}, sender_pid={d}, sender_uid={d}",
+                            .{ events.shutdown, events.reload, events.sender_pid, events.sender_uid },
+                        );
                         try self.router.retire(token);
                         self.shutdown_token = null;
-                        shutdown_requested = events.shutdown;
-                        reload_requested = events.reload;
-                        if (!shutdown_requested) try self.armSignalPoll();
+                        shutdown_requested = shutdown_requested or events.shutdown;
+                        reload_requested = reload_requested or events.reload;
+                        self.shutdown_seen = self.shutdown_seen or events.shutdown;
+                        if (!self.shutdown_seen) try self.armSignalPoll();
                         continue;
                     }
                     if (token.kind == .timer) {

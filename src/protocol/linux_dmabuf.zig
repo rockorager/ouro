@@ -17,6 +17,8 @@ pub const max_planes = 4;
 
 pub const drm_format_argb8888: u32 = fourcc('A', 'R', '2', '4');
 pub const drm_format_xrgb8888: u32 = fourcc('X', 'R', '2', '4');
+pub const drm_format_abgr8888: u32 = fourcc('A', 'B', '2', '4');
+pub const drm_format_xbgr8888: u32 = fourcc('X', 'B', '2', '4');
 pub const modifier_linear: u64 = 0;
 pub const modifier_invalid: u64 = (@as(u64, 1) << 56) - 1;
 
@@ -172,16 +174,34 @@ pub const Store = struct {
         if (params.used) return error.AlreadyUsed;
         params.used = true;
         if (width <= 0 or height <= 0) return error.InvalidDimensions;
-        if (format != drm_format_argb8888 and format != drm_format_xrgb8888)
+        if (format != drm_format_argb8888 and format != drm_format_xrgb8888 and
+            format != drm_format_abgr8888 and format != drm_format_xbgr8888)
+        {
+            std.log.warn(
+                "rejecting DMA-BUF format {x:0>8} ({c}{c}{c}{c}), size {d}x{d}, flags {x}",
+                .{ format, @as(u8, @truncate(format)), @as(u8, @truncate(format >> 8)), @as(u8, @truncate(format >> 16)), @as(u8, @truncate(format >> 24)), width, height, flags },
+            );
             return error.InvalidFormat;
+        }
         // Ouro does not yet deinterlace or invert imported content. These
         // layouts must not be accepted until the renderer models them.
-        if (flags != 0) return error.InvalidFormat;
+        if (flags != 0) {
+            std.log.warn(
+                "rejecting DMA-BUF flags {x} for format {x:0>8}, size {d}x{d}",
+                .{ flags, format, width, height },
+            );
+            return error.InvalidFormat;
+        }
         const plane = params.planes[0] orelse return error.Incomplete;
         for (params.planes[1..]) |candidate| if (candidate != null)
             return error.Incomplete;
-        if (plane.modifier != modifier_linear and plane.modifier != modifier_invalid)
+        if (plane.modifier != modifier_linear and plane.modifier != modifier_invalid) {
+            std.log.warn(
+                "rejecting DMA-BUF modifier {x:0>16} for format {x:0>8}, size {d}x{d}",
+                .{ plane.modifier, format, width, height },
+            );
             return error.InvalidFormat;
+        }
         const row_bytes = std.math.mul(u32, @intCast(width), 4) catch
             return error.OutOfBounds;
         if (plane.stride < row_bytes) return error.OutOfBounds;
@@ -348,8 +368,12 @@ pub fn Adapter(comptime protocol: type) type {
             .{ .format = drm_format_argb8888, .modifier = modifier_invalid },
             .{ .format = drm_format_xrgb8888, .modifier = modifier_linear },
             .{ .format = drm_format_xrgb8888, .modifier = modifier_invalid },
+            .{ .format = drm_format_abgr8888, .modifier = modifier_linear },
+            .{ .format = drm_format_abgr8888, .modifier = modifier_invalid },
+            .{ .format = drm_format_xbgr8888, .modifier = modifier_linear },
+            .{ .format = drm_format_xbgr8888, .modifier = modifier_invalid },
         };
-        const format_indices = std.mem.asBytes(&[_]u16{ 0, 1, 2, 3 }).*;
+        const format_indices = std.mem.asBytes(&[_]u16{ 0, 1, 2, 3, 4, 5, 6, 7 }).*;
 
         allocator: std.mem.Allocator,
         runtime: ?*Runtime = null,
@@ -430,8 +454,8 @@ pub fn Adapter(comptime protocol: type) type {
             slot.header.resource = binding.resource;
             slot.peer = binding.peer;
             slot.version = binding.version;
-            slot.advertisement = if (binding.version >= 4) 4 else 0;
-            if (slot.advertisement < 4) adapter.pending_len += 1;
+            slot.advertisement = if (binding.version >= 4) @intCast(format_entries.len) else 0;
+            if (slot.advertisement < format_entries.len) adapter.pending_len += 1;
             return slot;
         }
 
@@ -670,16 +694,11 @@ pub fn Adapter(comptime protocol: type) type {
             if (adapter.pending_len == 0) return completed;
             for (adapter.managers.entries.items) |manager| {
                 if (!manager.header.active or !samePeer(manager.peer, peer)) continue;
-                if (manager.advertisement >= 4) continue;
-                while (manager.advertisement < 4) {
-                    const format = if (manager.advertisement / 2 == 0)
-                        drm_format_argb8888
-                    else
-                        drm_format_xrgb8888;
-                    const modifier = if (manager.advertisement % 2 == 0)
-                        modifier_linear
-                    else
-                        modifier_invalid;
+                if (manager.advertisement >= format_entries.len) continue;
+                while (manager.advertisement < format_entries.len) {
+                    const entry = format_entries[manager.advertisement];
+                    const format = entry.format;
+                    const modifier = entry.modifier;
                     var emitted = true;
                     if (manager.version >= 3) {
                         Dmabuf.encodeEvent(queue, manager.header.resource.id, .{ .modifier = .{
@@ -747,6 +766,7 @@ pub fn Adapter(comptime protocol: type) type {
             for (adapter.feedback.entries.items) |slot| {
                 if (!slot.header.active or !samePeer(slot.peer, peer)) continue;
                 const stage_count = feedbackStageCount(slot.version);
+                if (slot.stage >= stage_count) continue;
                 while (slot.stage < stage_count) {
                     const event: Feedback.Event = if (slot.version >= 6) switch (slot.stage) {
                         0 => {
@@ -809,7 +829,8 @@ pub fn Adapter(comptime protocol: type) type {
         pub fn pendingOutbound(adapter: *const Self, peer: wayring.io_uring.Peer) bool {
             if (adapter.pending_len == 0) return false;
             for (adapter.managers.entries.items) |slot|
-                if (slot.header.active and samePeer(slot.peer, peer) and slot.advertisement < 4)
+                if (slot.header.active and samePeer(slot.peer, peer) and
+                    slot.advertisement < format_entries.len)
                     return true;
             for (adapter.params.entries.items) |slot|
                 if (slot.header.active and samePeer(slot.peer, peer) and slot.pending != .none)
@@ -891,7 +912,7 @@ pub fn Adapter(comptime protocol: type) type {
             if (object.interface == &Dmabuf.info) {
                 const slot = adapter.managers.fromContext(object.context) orelse return false;
                 if (!std.meta.eql(slot.header.resource, handle)) return false;
-                if (slot.advertisement < 4) adapter.pending_len -= 1;
+                if (slot.advertisement < format_entries.len) adapter.pending_len -= 1;
                 adapter.managers.release(slot);
                 return true;
             }
@@ -1176,7 +1197,7 @@ test "linux-dmabuf: legacy advertisements survive transmit backpressure" {
         null,
     );
     defer server_objects.deinit(std.testing.allocator);
-    var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 128, 8);
+    var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 256, 8);
     defer blocks.deinit(std.testing.allocator);
     var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 1);
     defer descriptors.deinit(std.testing.allocator);
@@ -1203,7 +1224,7 @@ test "linux-dmabuf: legacy advertisements survive transmit backpressure" {
     var output = wayring.tx.Queue.init(&blocks, 512, &descriptors, 0);
     defer output.deinit();
     try std.testing.expectEqual(
-        @as(usize, 4),
+        TestAdapter.format_entries.len,
         try adapter.flushOn(peer, &server_objects, &output),
     );
     try std.testing.expect(!adapter.pendingOutbound(peer));
@@ -1218,6 +1239,10 @@ test "linux-dmabuf: legacy advertisements survive transmit backpressure" {
         .{ .format = drm_format_argb8888, .modifier = modifier_invalid },
         .{ .format = drm_format_xrgb8888, .modifier = modifier_linear },
         .{ .format = drm_format_xrgb8888, .modifier = modifier_invalid },
+        .{ .format = drm_format_abgr8888, .modifier = modifier_linear },
+        .{ .format = drm_format_abgr8888, .modifier = modifier_invalid },
+        .{ .format = drm_format_xbgr8888, .modifier = modifier_linear },
+        .{ .format = drm_format_xbgr8888, .modifier = modifier_invalid },
     };
     for (expected) |pair| {
         const message = (try wayring.wire.Message.decode(bytes)).?;
@@ -1296,8 +1321,11 @@ test "linux-dmabuf: version 6 feedback resumes with sampling tranche and no main
         const event = try protocol.zwp_linux_dmabuf_feedback_v1.decodeEvent(message, &fds);
         try std.testing.expectEqual(tag, std.meta.activeTag(event));
         if (index == 0) {
-            try std.testing.expectEqual(@as(u32, 64), event.format_table.size);
-            var table: [64]u8 = undefined;
+            try std.testing.expectEqual(
+                @as(u32, @sizeOf(@TypeOf(TestAdapter.format_entries))),
+                event.format_table.size,
+            );
+            var table: [@sizeOf(@TypeOf(TestAdapter.format_entries))]u8 = undefined;
             const read = linux.pread(event.format_table.fd, &table, table.len, 0);
             try std.testing.expectEqual(table.len, read);
             try std.testing.expectEqualSlices(u8, std.mem.asBytes(&TestAdapter.format_entries), &table);
@@ -1316,8 +1344,25 @@ test "linux-dmabuf: version 6 feedback resumes with sampling tranche and no main
     }
     try std.testing.expectEqual(@as(usize, 0), bytes.len);
 
+    const manager = try adapter.managers.acquire();
+    manager.peer = peer;
+    manager.version = 3;
+    manager.header.resource = try server_objects.insertClient(
+        6,
+        &protocol.zwp_linux_dmabuf_v1.info,
+        3,
+        manager,
+    );
+    adapter.pending_len += 1;
+    var later_output = wayring.tx.Queue.init(&blocks, 512, &descriptors, 0);
+    defer later_output.deinit();
+    try std.testing.expectEqual(@as(usize, 8), try adapter.flushOn(peer, &server_objects, &later_output));
+    try std.testing.expectEqual(@as(usize, 0), adapter.pending_len);
+
     const object = server_objects.namespace.resolve(feedback.header.resource).?.*;
     try std.testing.expect(adapter.resourceRemoved(feedback.header.resource, object));
+    const manager_object = server_objects.namespace.resolve(manager.header.resource).?.*;
+    try std.testing.expect(adapter.resourceRemoved(manager.header.resource, manager_object));
     const reused = try adapter.acquireFeedback();
     try std.testing.expect(reused == feedback);
     adapter.feedback.release(reused);

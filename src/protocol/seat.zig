@@ -539,7 +539,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .set_cursor => |payload| set_cursor: {
                     if (!adapter.pointerActive(pointer)) break :set_cursor;
                     const client = pointer.client;
-                    if (payload.serial == 0 or payload.serial != pointer.last_serial or
+                    if (payload.serial == 0 or payload.serial != pointer.enter_serial or
                         adapter.pointer_delivery == null or
                         !sameClient(client, adapter.pointer_delivery.?.client))
                         return try adapter.protocolError(actor, decoded.handle.id, 0, "invalid pointer serial");
@@ -681,7 +681,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             const id = adapter.pointerIdOn(server_objects, pointer_object) catch return false;
             const pointer = adapter.resolvePointer(id) catch return false;
             return sameClient(pointer.client, clientId(peer)) and
-                pointer.last_serial == serial and adapter.pointerFocused(id);
+                pointer.enter_serial == serial and adapter.pointerFocused(id);
         }
 
         pub fn validatePointerWarpOn(
@@ -1373,7 +1373,9 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 },
                 .seat_name => |id| {
                     const slot = adapter.resolveSeat(id.index, id.generation) catch return true;
-                    try Seat.encodeEvent(queue, slot.resource.id, .{ .name = .{ .name = adapter.name } });
+                    const object = server_objects.namespace.resolve(slot.resource) orelse return true;
+                    if (object.version >= 2)
+                        try Seat.encodeEvent(queue, slot.resource.id, .{ .name = .{ .name = adapter.name } });
                 },
                 .pointer_enter => |v| {
                     const slot = adapter.resolvePointer(v.pointer) catch return true;
@@ -1569,7 +1571,16 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 available = slot;
                 break;
             };
-            const slot = available orelse return error.DeviceCapacityExhausted;
+            if (available == null) {
+                const old_len = adapter.devices.len;
+                const new_len = std.math.mul(usize, old_len, 2) catch
+                    return error.OutOfMemory;
+                if (new_len >= none) return error.OutOfMemory;
+                adapter.devices = try adapter.allocator.realloc(adapter.devices, new_len);
+                @memset(adapter.devices[old_len..], .{});
+                available = &adapter.devices[old_len];
+            }
+            const slot = available.?;
             const old = adapter.capabilityBits();
             const pointer_devices = adapter.pointer_devices + @intFromBool(capabilities.pointer);
             const keyboard_devices = adapter.keyboard_devices + @intFromBool(capabilities.keyboard);
@@ -2785,7 +2796,8 @@ test "seat: relative pointer lookup retains exact resource generation and focus"
     try std.testing.expect(adapter.pointerFocused(id));
     pointer.last_serial = 45;
     pointer.enter_serial = 44;
-    try std.testing.expect(adapter.validateCursorShapeOn(&server_objects, peer, 2, 45));
+    try std.testing.expect(adapter.validateCursorShapeOn(&server_objects, peer, 2, 44));
+    try std.testing.expect(!adapter.validateCursorShapeOn(&server_objects, peer, 2, 45));
     try std.testing.expect(!adapter.validateCursorShapeOn(&server_objects, peer, 2, 43));
     try std.testing.expect(adapter.validatePointerWarpOn(
         &server_objects,
@@ -3253,6 +3265,35 @@ test "seat: stale surface generation cannot become focus" {
     try std.testing.expectError(error.StaleSurface, adapter.setPointerFocus(stale, .{ .x = 0, .y = 0 }));
 }
 
+test "seat: version one resource does not receive seat name" {
+    var core: FakeCore = .{};
+    var adapter = try testAdapter(&core);
+    defer adapter.deinit();
+    var server_objects = try wayring.objects.ServerObjects.init(
+        std.testing.allocator,
+        8,
+        4,
+        &TestCore.Display.info,
+        null,
+    );
+    defer server_objects.deinit(std.testing.allocator);
+    const seat = try adapter.seats.acquire();
+    seat.peer = .{ .slot = 0, .generation = 1 };
+    seat.resource = try server_objects.insertClient(2, &test_protocol.wl_seat.info, 1, seat);
+    try adapter.enqueue(clientId(seat.peer), .{ .seat_name = adapter.seatId(seat) });
+
+    var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 64, 1);
+    defer blocks.deinit(std.testing.allocator);
+    var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 1);
+    defer descriptors.deinit(std.testing.allocator);
+    var output = wayring.tx.Queue.init(&blocks, 64, &descriptors, 0);
+    defer output.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), try adapter.flushOn(&server_objects, &output));
+    try std.testing.expectEqual(@as(usize, 0), output.queuedBytes());
+    try std.testing.expectEqual(@as(usize, 0), adapter.pendingOutbound());
+}
+
 test "seat: keymap FD delivery retains ownership across TX backpressure" {
     var core: FakeCore = .{};
     var adapter = try testAdapter(&core);
@@ -3426,6 +3467,24 @@ test "seat: device add backpressure preserves identity for exact retry" {
     try std.testing.expect(adapter.findDevice(device) != null);
     try std.testing.expectEqual(@as(usize, 1), adapter.pointer_devices);
     try std.testing.expectEqual(@as(usize, 1), adapter.pendingOutbound());
+}
+
+test "seat: device storage grows beyond its initial reservation" {
+    var core: FakeCore = .{};
+    var adapter = try testAdapter(&core);
+    defer adapter.deinit();
+
+    for (0..3) |slot| try adapter.consume(.{ .device_added = .{
+        .device = .{ .slot = @intCast(slot), .generation = 1, .seat_generation = 1 },
+        .info = .{ .capabilities = .{} },
+    } });
+
+    try std.testing.expectEqual(@as(usize, 4), adapter.devices.len);
+    try std.testing.expect(adapter.findDevice(.{
+        .slot = 2,
+        .generation = 1,
+        .seat_generation = 1,
+    }) != null);
 }
 
 test "seat: device removal reserves cancellation releases and capabilities atomically" {

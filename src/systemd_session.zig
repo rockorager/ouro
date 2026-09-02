@@ -6,18 +6,20 @@ const std = @import("std");
 
 const log = std.log.scoped(.systemd_session);
 
-const maximum_assignments = 4;
+const maximum_assignments = 5;
 const environment_names = [_][]const u8{
     "WAYLAND_DISPLAY",
     "DISPLAY",
     "XDG_CURRENT_DESKTOP",
     "XDG_SESSION_DESKTOP",
     "XDG_SESSION_TYPE",
+    "XCURSOR_SIZE",
 };
 
 io: std.Io,
 environ_map: *const std.process.Environ.Map,
 enabled: bool,
+shutdown_started: bool = false,
 
 pub fn init(
     io: std.Io,
@@ -54,6 +56,7 @@ pub fn ready(self: *const Self, wayland_display: []const u8) !void {
         "XDG_CURRENT_DESKTOP=ouro",
         "XDG_SESSION_DESKTOP=ouro",
         "XDG_SESSION_TYPE=wayland",
+        "XCURSOR_SIZE=24",
     });
     if (!try self.run(&.{
         "systemctl",
@@ -64,16 +67,20 @@ pub fn ready(self: *const Self, wayland_display: []const u8) !void {
     })) return error.SessionTargetStartFailed;
 }
 
-pub fn shutdown(self: *const Self) !void {
-    if (!self.enabled) return;
-    self.clearActivationEnvironment();
+pub fn shutdown(self: *Self) !void {
+    if (!self.enabled or self.shutdown_started) return;
+    self.shutdown_started = true;
     if (!try self.run(&.{
         "systemctl",
         "--user",
+        "--no-block",
         "stop",
         "ouro-session.target",
         "graphical-session.target",
     })) return error.SessionTargetStopFailed;
+    // Session exit must not depend on synchronous activation-bus updates.
+    // The next managed session's prepare phase clears both environments
+    // before publishing its own values.
 }
 
 fn clearActivationEnvironment(self: *const Self) void {
@@ -94,6 +101,7 @@ fn clearActivationEnvironment(self: *const Self) void {
         "XDG_CURRENT_DESKTOP=",
         "XDG_SESSION_DESKTOP=",
         "XDG_SESSION_TYPE=",
+        "XCURSOR_SIZE=",
     };
     var dbus_argv: [1 + empty_assignments.len][]const u8 = undefined;
     dbus_argv[0] = "dbus-update-activation-environment";

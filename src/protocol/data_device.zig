@@ -386,7 +386,7 @@ pub fn Adapter(comptime protocol: type) type {
                 .offer => |payload| {
                     if (source.used) return try self.protocolError(actor, decoded.handle.id, Source.@"error".invalid_source.value, "selection source is already in use");
                     self.addMime(source, payload.mime_type) catch |err| switch (err) {
-                        error.Exhausted => return try self.noMemory(actor),
+                        error.OutOfMemory => return try self.noMemory(actor),
                         else => return try self.protocolError(actor, decoded.handle.id, Source.@"error".invalid_source.value, @errorName(err)),
                     };
                 },
@@ -1053,11 +1053,24 @@ pub fn Adapter(comptime protocol: type) type {
             if (value.len > self.mime_bytes or value.len > std.math.maxInt(u16))
                 return error.InvalidMime;
             if (self.findMime(source, value) != null) return;
-            if (source.mime_count == self.mime_capacity) return error.Exhausted;
+            if (source.mime_count == source.mime_lengths.len)
+                try self.growMimeStorage(source);
             const index = source.mime_count;
             @memcpy(source.mime_storage[index * self.mime_bytes ..][0..value.len], value);
             source.mime_lengths[index] = @intCast(value.len);
             source.mime_count += 1;
+        }
+
+        fn growMimeStorage(self: *Self, source: *SourceSlot) !void {
+            const old_capacity = source.mime_lengths.len;
+            const capacity = std.math.mul(usize, old_capacity, 2) catch
+                return error.OutOfMemory;
+            source.mime_storage = try self.allocator.realloc(
+                source.mime_storage,
+                try std.math.mul(usize, capacity, self.mime_bytes),
+            );
+            source.mime_lengths = try self.allocator.realloc(source.mime_lengths, capacity);
+            @memset(source.mime_lengths[old_capacity..], 0);
         }
 
         fn findMime(self: *const Self, source: *const SourceSlot, value: []const u8) ?usize {
@@ -1415,6 +1428,21 @@ test "data device ownership capacities are initial reservations" {
     try std.testing.expect(fromContext(TestAdapter.SourceSlot, adapter.sources.items, source) == source);
     try std.testing.expect(fromContext(TestAdapter.DeviceSlot, adapter.devices.items, device) == device);
     try std.testing.expect(fromContext(TestAdapter.OfferSlot, adapter.offers.items, offer) == offer);
+}
+
+test "data device MIME capacity is an initial reservation" {
+    var adapter = try testAdapter(.{ .mime_capacity = 1, .mime_bytes = 32 });
+    defer adapter.deinit();
+    const source = try adapter.acquireSource();
+
+    try adapter.addMime(source, "text/plain");
+    try adapter.addMime(source, "image/png");
+    try adapter.addMime(source, "image/webp");
+
+    try std.testing.expectEqual(@as(usize, 3), source.mime_count);
+    try std.testing.expectEqualStrings("text/plain", adapter.mime(source, 0));
+    try std.testing.expectEqualStrings("image/png", adapter.mime(source, 1));
+    try std.testing.expectEqualStrings("image/webp", adapter.mime(source, 2));
 }
 
 fn optionalDragTargetIdentityEqual(a: anytype, b: @TypeOf(a)) bool {

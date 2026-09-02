@@ -515,10 +515,16 @@ pub fn Adapter(comptime protocol: type) type {
                             continue;
                         };
                         if (o.kind == .output_enter) {
-                            try wayring.server.sendEvent(protocol, ProtoGroup, server_objects, queue, g.?.resource.?, .{ .output_enter = .{ .output = output.id } });
+                            wayring.server.sendEvent(protocol, ProtoGroup, server_objects, queue, g.?.resource.?, .{ .output_enter = .{ .output = output.id } }) catch |e| {
+                                if (backpressure(e)) return count;
+                                return e;
+                            };
                             self.announceOutput(mi, o.group, o.target_generation, o.output, output);
                         } else {
-                            try wayring.server.sendEvent(protocol, ProtoGroup, server_objects, queue, g.?.resource.?, .{ .output_leave = .{ .output = output.id } });
+                            wayring.server.sendEvent(protocol, ProtoGroup, server_objects, queue, g.?.resource.?, .{ .output_leave = .{ .output = output.id } }) catch |e| {
+                                if (backpressure(e)) return count;
+                                return e;
+                            };
                             self.withdrawOutput(mi, o.group, o.target_generation, o.output);
                         }
                     },
@@ -810,6 +816,53 @@ fn activateDefaultTestProjection(adapter: *TestAdapter) void {
     adapter.groups[0] = .{ .active = true, .present = true, .manager = 0, .manager_generation = 1, .semantic = 1, .inventory_generation = adapter.inventory_generation };
     adapter.workspace_free = adapter.workspaces[0].next_free;
     adapter.workspaces[0] = .{ .active = true, .present = true, .manager = 0, .manager_generation = 1, .semantic = 1, .inventory_generation = adapter.inventory_generation };
+}
+
+test "workspace output membership retries transmit backpressure" {
+    const protocol = @import("core_protocol");
+    const peer: wayring.io_uring.Peer = .{ .slot = 0, .generation = 1 };
+    var adapter = try TestAdapter.init(std.testing.allocator, .{
+        .manager_capacity = 1,
+        .group_handle_capacity = 1,
+        .workspace_handle_capacity = 1,
+        .outbound_capacity = 1,
+    });
+    defer adapter.deinit();
+    activateDefaultTestProjection(&adapter);
+    adapter.managers[0].peer = peer;
+
+    var server_objects = try objects.ServerObjects.init(
+        std.testing.allocator,
+        8,
+        4,
+        &protocol.wl_display.info,
+        null,
+    );
+    defer server_objects.deinit(std.testing.allocator);
+    adapter.groups[0].resource = try server_objects.insertClient(
+        2,
+        &protocol.ext_workspace_group_handle_v1.info,
+        1,
+        &adapter.groups[0],
+    );
+    const output = try server_objects.insertClient(3, &protocol.wl_output.info, 4, null);
+    try adapter.enqueueTarget(0, .output_enter, 1, 0, 0, "", .{ .value = 3 }, output, 0);
+
+    var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 64, 2);
+    defer blocks.deinit(std.testing.allocator);
+    var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 1);
+    defer descriptors.deinit(std.testing.allocator);
+    var blocked = wayring.tx.Queue.init(&blocks, 8, &descriptors, 1);
+    defer blocked.deinit();
+    try std.testing.expectEqual(@as(usize, 0), try adapter.flushOn(peer, &server_objects, &blocked));
+    try std.testing.expectEqual(@as(usize, 1), adapter.outbound_count);
+    try std.testing.expect(!adapter.announcedFor(0)[0].active);
+
+    var accepting = wayring.tx.Queue.init(&blocks, 64, &descriptors, 1);
+    defer accepting.deinit();
+    try std.testing.expectEqual(@as(usize, 1), try adapter.flushOn(peer, &server_objects, &accepting));
+    try std.testing.expectEqual(@as(usize, 0), adapter.outbound_count);
+    try std.testing.expect(adapter.announcedFor(0)[0].active);
 }
 
 test "workspace output replacement snapshots leave enter and one done" {

@@ -1160,7 +1160,7 @@ fn chooseOutput(buffer: *const api.TopologyBuffer) !Selection {
     for (buffer.connectors[0..buffer.connector_count], 0..) |connector, index| {
         if (!connector.connected or !connector.desktop or connector.mode_count == 0) continue;
         saw_connector = true;
-        const candidate = connectorCandidate(buffer, index, &saw_crtc) orelse continue;
+        const candidate = connectorCandidate(buffer, index, &saw_crtc, &.{}) orelse continue;
         if (selected == null or connector.id <
             buffer.connectors[selected.?.connector_index].id)
             selected = candidate;
@@ -1178,10 +1178,17 @@ fn collectScanoutCandidates(
     var count: usize = 0;
     var saw_connector = false;
     var saw_crtc = false;
-    for (buffer.connectors[0..buffer.connector_count], 0..) |connector, index| {
-        if (!connector.connected or !connector.desktop or connector.mode_count == 0) continue;
+    var after_id: ?u32 = null;
+    while (nextConnectorById(buffer, true, after_id)) |index| {
+        const connector = buffer.connectors[index];
+        after_id = connector.id;
         saw_connector = true;
-        const candidate = connectorCandidate(buffer, index, &saw_crtc) orelse continue;
+        const candidate = connectorCandidate(
+            buffer,
+            index,
+            &saw_crtc,
+            candidates[0..count],
+        ) orelse continue;
         if (count == candidates.len) return error.InvalidPlatformResult;
         candidates[count] = candidate;
         count += 1;
@@ -1198,9 +1205,15 @@ fn collectLeaseCandidates(
 ) !usize {
     var count: usize = 0;
     var saw_crtc = false;
-    for (buffer.connectors[0..buffer.connector_count], 0..) |connector, index| {
-        if (!connector.connected or connector.desktop or connector.mode_count == 0) continue;
-        const candidate = connectorCandidate(buffer, index, &saw_crtc) orelse continue;
+    var after_id: ?u32 = null;
+    while (nextConnectorById(buffer, false, after_id)) |index| {
+        after_id = buffer.connectors[index].id;
+        const candidate = connectorCandidate(
+            buffer,
+            index,
+            &saw_crtc,
+            candidates[0..count],
+        ) orelse continue;
         if (count == candidates.len) return error.InvalidPlatformResult;
         candidates[count] = candidate;
         count += 1;
@@ -1212,6 +1225,7 @@ fn connectorCandidate(
     buffer: *const api.TopologyBuffer,
     connector_index: usize,
     saw_crtc: *bool,
+    assigned: []const ScanoutCandidate,
 ) ?ScanoutCandidate {
     const connector = buffer.connectors[connector_index];
     var mode_index: usize = connector.mode_start;
@@ -1227,11 +1241,23 @@ fn connectorCandidate(
     for (buffer.crtcs[0..buffer.crtc_count], 0..) |crtc, candidate_index| {
         if (!connectorSupportsCrtc(buffer, connector, crtc.index)) continue;
         saw_crtc.* = true;
+        var crtc_assigned = false;
+        for (assigned) |existing| if (existing.crtc_index == candidate_index) {
+            crtc_assigned = true;
+            break;
+        };
+        if (crtc_assigned) continue;
         var candidate_plane: ?usize = null;
         for (buffer.planes[0..buffer.plane_count], 0..) |plane, candidate_plane_index| {
             if (plane.plane_type_value != primary_plane_type or plane.format_count == 0 or
                 plane.possible_crtcs & (@as(u32, 1) << @intCast(crtc.index)) == 0)
                 continue;
+            var plane_assigned = false;
+            for (assigned) |existing| if (existing.plane_index == candidate_plane_index) {
+                plane_assigned = true;
+                break;
+            };
+            if (plane_assigned) continue;
             if (candidate_plane == null or plane.id < buffer.planes[candidate_plane.?].id)
                 candidate_plane = candidate_plane_index;
         }
@@ -1247,6 +1273,21 @@ fn connectorCandidate(
         .crtc_index = @intCast(crtc_index orelse return null),
         .plane_index = @intCast(plane_index.?),
     };
+}
+
+fn nextConnectorById(
+    buffer: *const api.TopologyBuffer,
+    desktop: bool,
+    after_id: ?u32,
+) ?usize {
+    var selected: ?usize = null;
+    for (buffer.connectors[0..buffer.connector_count], 0..) |connector, index| {
+        if (!connector.connected or connector.desktop != desktop or connector.mode_count == 0 or
+            (after_id != null and connector.id <= after_id.?)) continue;
+        if (selected == null or connector.id < buffer.connectors[selected.?].id)
+            selected = index;
+    }
+    return selected;
 }
 
 fn choosePrimaryCandidate(
@@ -1671,7 +1712,7 @@ test "drm: primary claim is exact and generation safe" {
     try std.testing.expect(replacement.generation != primary.generation);
 }
 
-test "drm: scanout claims reject shared CRTC and plane ownership" {
+test "drm: scanout candidates exclude connectors without independent resources" {
     var seat = FakeSeat{};
     const session = try seat.createSession();
     defer destroyTestSession(session);
@@ -1681,11 +1722,8 @@ test "drm: scanout claims reject shared CRTC and plane ownership" {
 
     const handle = (try manager.rescan()).?;
     const candidates = try manager.scanoutCandidates(handle);
-    try std.testing.expectEqual(@as(usize, 2), candidates.len);
-    try std.testing.expectError(
-        error.ScanoutConflict,
-        manager.claimScanout(handle, candidates[1]),
-    );
+    try std.testing.expectEqual(@as(usize, 1), candidates.len);
+    try std.testing.expectEqual(@as(u32, 20), (try manager.snapshot(handle)).selectedConnector().id);
 }
 
 test "drm: failed rescan preserves claims and successful rescan invalidates them" {

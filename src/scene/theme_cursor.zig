@@ -89,6 +89,14 @@ pub const Cursor = struct {
         const left = @max(@as(i64, output.x), x);
         const top = @max(@as(i64, output.y), y);
         if (right <= left or bottom <= top) return null;
+        var upload_damage: render.UploadDamage = .{};
+        upload_damage.rects[0] = .{
+            .min_x = 0,
+            .min_y = 0,
+            .max_x = image.width,
+            .max_y = image.height,
+        };
+        upload_damage.count = 1;
 
         const result: render.SurfaceSample = .{
             .sample = self.sampleIdentity(),
@@ -99,6 +107,11 @@ pub const Cursor = struct {
                 .format = .argb8888_premultiplied,
                 .bytes = image.pixels,
             },
+            // Cursor images use adjacent synthetic commit identities. Mark
+            // the whole replacement dirty so a same-sized shape refreshes
+            // the renderer's persistent texture rather than only its scene
+            // geometry.
+            .upload_damage = upload_damage,
             .crop = render.SourceRect.pixels(0, 0, @intCast(image.width), @intCast(image.height)),
             .destination = .{ .x = x, .y = y, .width = image.width, .height = image.height },
             .clip = .{
@@ -170,6 +183,13 @@ test "theme cursor: hotspot placement clipping and movement preserve identity" {
     const first = (try cursor.sample(.{ .x = 0, .y = 0, .width = 10, .height = 10 })).?;
     try std.testing.expectEqual(render.Rect{ .x = -1, .y = 0, .width = 4, .height = 3 }, first.destination);
     try std.testing.expectEqual(render.Rect{ .x = 0, .y = 0, .width = 3, .height = 3 }, first.clip);
+    try std.testing.expectEqual(@as(u8, 1), first.upload_damage.count);
+    try std.testing.expectEqual(render.UploadRect{
+        .min_x = 0,
+        .min_y = 0,
+        .max_x = 4,
+        .max_y = 3,
+    }, first.upload_damage.rects[0]);
     cursor.move(.{ .x = 8, .y = 8 });
     const moved = (try cursor.sample(.{ .x = 0, .y = 0, .width = 10, .height = 10 })).?;
     try std.testing.expectEqual(first.sample, moved.sample);

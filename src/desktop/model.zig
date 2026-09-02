@@ -1294,6 +1294,24 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
             const slot = &desktop.popups[index];
             desktop.popup_free = slot.next_free;
             const generation = slot.generation;
+            std.log.info(
+                "created popup {d}:{d} for root {d}:{d}: parent=({d},{d}) {d}x{d}, configure=({d},{d}) {d}x{d}, external={}",
+                .{
+                    value.surface.index,
+                    value.surface.generation,
+                    root_surface.index,
+                    root_surface.generation,
+                    parent.geometry.x,
+                    parent.geometry.y,
+                    parent.geometry.width,
+                    parent.geometry.height,
+                    configure.x,
+                    configure.y,
+                    configure.width,
+                    configure.height,
+                    external_root,
+                },
+            );
             slot.* = .{
                 .active = true,
                 .generation = generation,
@@ -1429,6 +1447,19 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
             slot.surface_offset = committed.surface_offset;
             slot.window_width = value.window_width;
             slot.window_height = value.window_height;
+            if (slot.scene.visible) std.log.info(
+                "mapped popup {d}:{d} at ({d},{d}) {d}x{d} for root {d}:{d}",
+                .{
+                    slot.surface.index,
+                    slot.surface.generation,
+                    slot.scene.geometry.x,
+                    slot.scene.geometry.y,
+                    slot.scene.geometry.width,
+                    slot.scene.geometry.height,
+                    slot.root_surface.index,
+                    slot.root_surface.generation,
+                },
+            );
             desktop.updatePopupScenes();
             desktop.reconfigureReactivePopups();
         }
