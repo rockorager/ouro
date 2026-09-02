@@ -297,13 +297,46 @@ pub const Manager = struct {
     /// smallest udev syspath. The syspath fallback is stable across enumeration
     /// ordering and card-node renumbering when udev exposes stable ancestry.
     pub fn rescan(self: *Manager) !?Handle {
+        return self.rescanImpl(null, null);
+    }
+
+    /// Rescans one unchanged DRM device while preserving every active scanout
+    /// claim by exact connector, CRTC, plane, and mode identity. Replacement
+    /// handles are written in input order only after the complete topology can
+    /// be rebound atomically; otherwise the current generation stays valid.
+    pub fn rescanPreservingClaims(
+        self: *Manager,
+        handles: []const ClaimHandle,
+        refreshed: []ClaimHandle,
+    ) !?Handle {
+        if (refreshed.len < handles.len) return error.OutputTooSmall;
+        var active_count: usize = 0;
+        for (self.claims) |claim| active_count += @intFromBool(claim.active);
+        if (handles.len != active_count) return error.IncompleteClaims;
+        for (handles, 0..) |handle, index| {
+            _ = try self.getClaim(handle);
+            for (handles[0..index]) |earlier|
+                if (std.meta.eql(earlier, handle)) return error.DuplicateClaim;
+        }
+        return self.rescanImpl(handles, refreshed);
+    }
+
+    fn rescanImpl(
+        self: *Manager,
+        preserved_handles: ?[]const ClaimHandle,
+        refreshed_handles: ?[]ClaimHandle,
+    ) !?Handle {
         if (self.hasActiveLease()) return error.LeasesActive;
+        const preserved = preserved_handles orelse &.{};
+        const rebound = try self.allocator.alloc(ScanoutCandidate, preserved.len);
+        defer self.allocator.free(rebound);
         const card_count = try self.platform.discover(self.cards, self.seat[0..self.seat_len]);
         if (card_count > self.cards.len) return error.InvalidPlatformResult;
         const selected_card = selectCard(
             self.cards[0..card_count],
             self.device_path[0..self.device_path_len],
         ) orelse {
+            if (preserved.len != 0) return error.ClaimsChanged;
             try self.remove();
             return null;
         };
@@ -311,6 +344,7 @@ pub const Manager = struct {
 
         const same_device = self.device != null and
             std.mem.eql(u8, self.card.stablePath(), selected_card.stablePath());
+        if (preserved.len != 0 and !same_device) return error.ClaimsChanged;
         const candidate = if (same_device)
             self.device.?
         else
@@ -333,8 +367,17 @@ pub const Manager = struct {
             &storage.buffer,
             storage.candidates[0..storage.candidate_count],
         ).selection();
+        for (preserved, 0..) |claim_handle, index| {
+            const claim = try self.getClaim(claim_handle);
+            rebound[index] = rebindCandidate(
+                &self.stores[self.active_store],
+                storage,
+                claim.candidate,
+            ) orelse return error.ClaimsChanged;
+        }
         if (self.generation == std.math.maxInt(u32)) return error.GenerationExhausted;
-        if (self.next_claim_generation == null) return error.GenerationExhausted;
+        if (preserved.len == 0 and self.next_claim_generation == null)
+            return error.GenerationExhausted;
 
         if (!same_device) {
             if (self.device) |old| {
@@ -354,14 +397,28 @@ pub const Manager = struct {
             self.card = selected_card.*;
         }
         self.active_store = next_store;
-        self.invalidateClaims();
         self.generation += 1;
         self.present = true;
-        self.claims[0] = .{
-            .active = true,
-            .generation = self.takeClaimGeneration(),
-            .candidate = candidateFromSelection(storage.selection),
-        };
+        if (preserved.len == 0) {
+            self.invalidateClaims();
+            self.claims[0] = .{
+                .active = true,
+                .generation = self.takeClaimGeneration(),
+                .candidate = candidateFromSelection(storage.selection),
+            };
+        } else {
+            for (preserved, rebound, 0..) |claim_handle, rebound_candidate, index| {
+                const claim = &self.claims[claim_handle.slot];
+                claim.candidate = rebound_candidate;
+                refreshed_handles.?[index] = .{
+                    .topology_generation = self.generation,
+                    .slot = claim_handle.slot,
+                    .generation = claim_handle.generation,
+                };
+            }
+            if (self.claims[0].active)
+                storage.selection = self.claims[0].candidate.selection();
+        }
         const handle: Handle = .{ .generation = self.generation };
         self.events_buffer[self.event_count] = .{ .snapshot = handle };
         self.event_count += 1;
@@ -876,6 +933,54 @@ pub const Manager = struct {
     }
 };
 
+fn rebindCandidate(
+    previous: *const Storage,
+    next: *const Storage,
+    candidate: ScanoutCandidate,
+) ?ScanoutCandidate {
+    const previous_connector = previous.buffer.connectors[candidate.connector_index];
+    const previous_crtc = previous.buffer.crtcs[candidate.crtc_index];
+    const previous_plane = previous.buffer.planes[candidate.plane_index];
+    const previous_mode = previous.buffer.modes[candidate.mode_index];
+    const candidates = if (candidateTuplePresent(
+        previous.candidates[0..previous.candidate_count],
+        candidate,
+    ))
+        next.candidates[0..next.candidate_count]
+    else if (candidateTuplePresent(
+        previous.lease_candidates[0..previous.lease_candidate_count],
+        candidate,
+    ))
+        next.lease_candidates[0..next.lease_candidate_count]
+    else
+        return null;
+    for (candidates) |next_candidate| {
+        const connector = next.buffer.connectors[next_candidate.connector_index];
+        if (connector.id != previous_connector.id or
+            next.buffer.crtcs[next_candidate.crtc_index].id != previous_crtc.id or
+            next.buffer.planes[next_candidate.plane_index].id != previous_plane.id) continue;
+        const mode_end = std.math.add(usize, connector.mode_start, connector.mode_count) catch
+            return null;
+        for (next.buffer.modes[connector.mode_start..mode_end], connector.mode_start..) |mode, mode_index| {
+            if (!std.meta.eql(mode, previous_mode)) continue;
+            var rebound = next_candidate;
+            rebound.mode_index = @intCast(mode_index);
+            return rebound;
+        }
+    }
+    return null;
+}
+
+fn candidateTuplePresent(
+    candidates: []const ScanoutCandidate,
+    target: ScanoutCandidate,
+) bool {
+    for (candidates) |candidate| if (candidate.connector_index == target.connector_index and
+        candidate.crtc_index == target.crtc_index and
+        candidate.plane_index == target.plane_index) return true;
+    return false;
+}
+
 fn exactModeIndex(
     snapshot_value: Snapshot,
     width: u32,
@@ -1283,6 +1388,57 @@ test "drm: scanout claims reserve complete tuples and recycle generation safely"
         manager.claimScanout(handle, invalid),
     );
     try manager.releaseScanout(replacement);
+}
+
+test "drm: same-device rescan preserves exact claims while adding outputs" {
+    var seat = FakeSeat{};
+    const session = try seat.createSession();
+    defer destroyTestSession(session);
+    var platform = FakeDrm{};
+    var manager = try Manager.init(std.testing.allocator, platform.platform(), session, "seat0", testConfig());
+    defer manager.deinit() catch unreachable;
+
+    const first = (try manager.rescan()).?;
+    const primary = try manager.primaryClaim(first);
+    platform.multiple_outputs = true;
+    var refreshed: [1]ClaimHandle = undefined;
+    const second = (try manager.rescanPreservingClaims(&.{primary}, &refreshed)).?;
+    try std.testing.expectError(error.StaleClaim, manager.claimSnapshot(primary));
+    try std.testing.expectEqual(primary.slot, refreshed[0].slot);
+    try std.testing.expectEqual(primary.generation, refreshed[0].generation);
+    try std.testing.expectEqual(second.generation, refreshed[0].topology_generation);
+    try std.testing.expectEqual(@as(u32, 20), (try manager.claimSnapshot(refreshed[0])).selectedConnector().id);
+    const candidates = try manager.scanoutCandidates(second);
+    try std.testing.expectEqual(@as(usize, 2), candidates.len);
+    const added = try manager.claimScanout(second, candidates[1]);
+    try std.testing.expectEqual(@as(u32, 21), (try manager.claimSnapshot(added)).selectedConnector().id);
+}
+
+test "drm: changed claim identity rejects refresh without mutation" {
+    var seat = FakeSeat{};
+    const session = try seat.createSession();
+    defer destroyTestSession(session);
+    var platform = FakeDrm{ .multiple_outputs = true };
+    var manager = try Manager.init(std.testing.allocator, platform.platform(), session, "seat0", testConfig());
+    defer manager.deinit() catch unreachable;
+
+    const handle = (try manager.rescan()).?;
+    const primary = try manager.primaryClaim(handle);
+    const secondary = try manager.claimScanout(handle, (try manager.scanoutCandidates(handle))[1]);
+    var refreshed: [2]ClaimHandle = undefined;
+    try std.testing.expectError(
+        error.IncompleteClaims,
+        manager.rescanPreservingClaims(&.{primary}, &refreshed),
+    );
+    platform.second_desktop = false;
+    try std.testing.expectError(
+        error.ClaimsChanged,
+        manager.rescanPreservingClaims(&.{ primary, secondary }, &refreshed),
+    );
+    try std.testing.expectEqual(handle, manager.currentHandle().?);
+    try std.testing.expectEqual(@as(u32, 20), (try manager.claimSnapshot(primary)).selectedConnector().id);
+    try std.testing.expectEqual(@as(u32, 21), (try manager.claimSnapshot(secondary)).selectedConnector().id);
+    try std.testing.expectEqualSlices(Event, &.{.{ .snapshot = handle }}, manager.events());
 }
 
 test "drm: connector probe preserves active topology when no outputs remain" {
