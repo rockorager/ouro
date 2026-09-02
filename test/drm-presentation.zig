@@ -1090,6 +1090,7 @@ test "generated session lock publishes only after presentation and client loss s
     var fixture = try Fixture.init();
     defer fixture.deinit();
     fixture.second_desktop = true;
+    fixture.flip_batch_limit = 1;
     var path_storage: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-r15-session-lock-{d}.sock", .{linux.getpid()});
     wayring.unix_socket.unlink(path) catch {};
@@ -1146,15 +1147,28 @@ test "generated session lock publishes only after presentation and client loss s
     };
     try submitClient(&reactor, &driver, &handler);
 
+    var observed_partial_secure_presentation = false;
     for (0..512) |_| {
         _ = try drainClient(&reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
+        if (coordinator.session_lock_adapter.pendingLock() != null) {
+            var presented_outputs: usize = 0;
+            for (coordinator.physical_outputs[0..coordinator.physical_output_count]) |physical| {
+                if (physical.kms_output != null and physical.session_lock_presented)
+                    presented_outputs += 1;
+            }
+            if (presented_outputs == 1) {
+                try std.testing.expectEqual(@as(usize, 0), handler.locked);
+                observed_partial_secure_presentation = true;
+            }
+        }
         if (handler.locked == 1 and handler.surface_enters == 1 and
             handler.preferred_scale == 240) break;
         if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
             try waitForEither(&root.ring, reactor.ring);
     }
     try std.testing.expectEqual(@as(usize, 1), handler.configures);
+    try std.testing.expect(observed_partial_secure_presentation);
     try std.testing.expectEqual(@as(usize, 1), handler.locked);
     try std.testing.expectEqual(@as(usize, 0), handler.finished);
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
@@ -3243,6 +3257,7 @@ pub const Fixture = struct {
     pending_flips: [4]PendingFlip = .{PendingFlip{}} ** 4,
     flip_head: usize = 0,
     flip_len: usize = 0,
+    flip_batch_limit: ?usize = null,
     page_flips: usize = 0,
     device_closes: usize = 0,
     seat_closes: usize = 0,
@@ -3660,6 +3675,7 @@ pub const Fixture = struct {
     fn handleEvents(context: *anyopaque, _: []const u8, callback: ouro.drm_atomic.FlipCallback) !void {
         const self: *Fixture = @ptrCast(@alignCast(context));
         if (self.flip_len == 0) return;
+        var handled: usize = 0;
         while (self.flip_len != 0) {
             const flip = self.pending_flips[self.flip_head];
             const userdata = flip.userdata orelse return error.MissingFlip;
@@ -3669,7 +3685,10 @@ pub const Fixture = struct {
             self.flip_len -= 1;
             self.page_flips += 1;
             callback(userdata, 1, 2, 3000, flip.crtc);
+            handled += 1;
+            if (self.flip_batch_limit) |limit| if (handled == limit) break;
         }
+        if (self.flip_len != 0) try signalFd(self.drm_fd);
     }
 };
 

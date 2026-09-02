@@ -512,6 +512,7 @@ pub fn Coordinator(comptime protocol: type) type {
             gamma_owner: ?drm_gamma.Owner = null,
             gamma_ramps: []u16 = &.{},
             session_lock_frame: ?output_scheduler.FrameId = null,
+            session_lock_presented: bool = false,
             drain_started: bool = false,
             reconfigure: ?OutputReconfigure = null,
             damage_requested: u64 = 0,
@@ -5603,6 +5604,12 @@ pub fn Coordinator(comptime protocol: type) type {
                 ProtocolReady.primary_selection | ProtocolReady.text_input |
                 ProtocolReady.tablet);
             if (self.sessionLockActive()) {
+                if (self.session_lock_adapter.pendingLock() != null) {
+                    for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                        physical.session_lock_frame = null;
+                        physical.session_lock_presented = false;
+                    }
+                }
                 self.session_lock_input_ready = false;
                 self.interaction.cancelKeyConsumerInput();
                 try self.syncConsumerTimer();
@@ -5640,8 +5647,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 };
                 self.session_lock_input_ready = input_ready;
             } else if (unlocked) {
-                for (self.physical_outputs[0..self.physical_output_count]) |*physical|
+                for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
                     physical.session_lock_frame = null;
+                    physical.session_lock_presented = false;
+                }
                 self.session_lock_input_ready = false;
                 try self.input_method_adapter.setGrabInhibited(false);
                 try self.virtual_keyboard_adapter.setInhibited(&self.seat_adapter, false);
@@ -6313,6 +6322,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 error.Exhausted => self.markProtocolAll(ProtocolReady.image_copy_capture),
                 else => return cause,
             }
+            try self.publishPresentedSessionLock();
             for (self.clients.items) |client| if (client.active and client.protocol_ready != 0)
                 try self.flushProtocolOn(client.peer);
         }
@@ -7536,6 +7546,8 @@ pub fn Coordinator(comptime protocol: type) type {
                     snapshot,
                     output_config,
                 );
+            physical.session_lock_frame = null;
+            physical.session_lock_presented = false;
             physical.kms_output = output;
             if (self.render_device == null)
                 self.render_device = output.takeRenderDevice();
@@ -9567,6 +9579,20 @@ pub fn Coordinator(comptime protocol: type) type {
             return (@as(u64, frame.generation) << 32) | frame.index;
         }
 
+        fn publishPresentedSessionLock(self: *Self) !void {
+            const lock = self.session_lock_adapter.pendingLock() orelse return;
+            for (self.physical_outputs[0..self.physical_output_count]) |physical| {
+                if (!physical.connected or physical.kms_output == null) continue;
+                if (!physical.session_lock_presented) return;
+            }
+            self.session_lock_adapter.publishLocked(lock) catch |err| switch (err) {
+                error.Exhausted => return,
+                error.StaleLock, error.InvalidPhase => return,
+            };
+            const peer = self.session_lock_adapter.lockPeer(lock) catch return;
+            self.markProtocol(peer, ProtocolReady.session_lock);
+        }
+
         fn finishOutcome(self: *Self, outcome: output_api.FrameOutcome, was_presented: bool) !void {
             const physical = self.physicalOutputForKmsIdMutable(outcome.frame.output);
             if (was_presented) {
@@ -9636,21 +9662,8 @@ pub fn Coordinator(comptime protocol: type) type {
             )) {
                 self.physical_outputs[owner.id.index].session_lock_frame = null;
                 if (was_presented) {
-                    if (self.session_lock_adapter.pendingLock()) |lock| {
-                        self.session_lock_adapter.publishLocked(lock) catch |err| switch (err) {
-                            error.Exhausted => {
-                                if (owner.kms_output != null) {
-                                    _ = requestPhysicalOutputDamage(
-                                        owner,
-                                        try monotonicNs(),
-                                    ) catch false;
-                                }
-                            },
-                            error.StaleLock, error.InvalidPhase => {},
-                        };
-                        const peer = self.session_lock_adapter.lockPeer(lock) catch null;
-                        if (peer) |value| self.markProtocol(value, ProtocolReady.session_lock);
-                    }
+                    self.physical_outputs[owner.id.index].session_lock_presented = true;
+                    try self.publishPresentedSessionLock();
                 } else if (self.sessionLockActive()) {
                     if (owner.kms_output != null) {
                         _ = requestPhysicalOutputDamage(
