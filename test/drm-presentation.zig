@@ -655,6 +655,74 @@ test "physical coordinator preserves outputs while changing and adding connector
     try root.deinit();
 }
 
+test "physical coordinator rebuilds multiple changed outputs together" {
+    const allocator = std.testing.allocator;
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    fixture.second_desktop = true;
+    fixture.third_connector = true;
+    fixture.third_desktop = true;
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-r15-output-multiple-change-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), compositorConfig());
+    const coordinator = try Coordinator.create(allocator, root, fixture.platformsWithHotplug(), coordinatorConfig());
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
+    try coordinator.start(&loop);
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    for (0..256) |_| {
+        _ = try loop.turn(coordinator);
+        if (coordinator.physical_output_count == 3 and
+            coordinator.physical_outputs[2].kms_output != null and
+            coordinator.output_global_index == 3) break;
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+    }
+
+    const first_head = coordinator.physical_outputs[0].management_head;
+    const second_head = coordinator.physical_outputs[1].management_head;
+    const unchanged_kms = coordinator.physical_outputs[2].kms_output.?;
+    const unchanged_id = coordinator.physical_outputs[2].id;
+    const unchanged_output = coordinator.physical_outputs[2].protocol_output;
+    const unchanged_head = coordinator.physical_outputs[2].management_head;
+    const drains_before = coordinator.stats.output_drains;
+    fixture.first_mode_width = 4;
+    fixture.second_mode_width = 4;
+    try fixture.signalHotplug();
+    for (0..768) |_| {
+        _ = try loop.turn(coordinator);
+        if (!coordinator.topology_refresh_pending and
+            coordinator.physical_outputs[0].kms_output != null and
+            coordinator.physical_outputs[1].kms_output != null)
+        {
+            const first = coordinator.output_adapter.logicalSnapshot(
+                coordinator.physical_outputs[0].protocol_output,
+            ) catch continue;
+            const second = coordinator.output_adapter.logicalSnapshot(
+                coordinator.physical_outputs[1].protocol_output,
+            ) catch continue;
+            if (first.width == 4 and second.width == 4) break;
+        }
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+    }
+
+    try std.testing.expect(!std.meta.eql(first_head, coordinator.physical_outputs[0].management_head));
+    try std.testing.expect(!std.meta.eql(second_head, coordinator.physical_outputs[1].management_head));
+    try std.testing.expect(coordinator.physical_outputs[2].kms_output.? == unchanged_kms);
+    try std.testing.expect(std.meta.eql(unchanged_id, coordinator.physical_outputs[2].id));
+    try std.testing.expect(std.meta.eql(unchanged_output, coordinator.physical_outputs[2].protocol_output));
+    try std.testing.expect(std.meta.eql(unchanged_head, coordinator.physical_outputs[2].management_head));
+    try std.testing.expectEqual(drains_before + 2, coordinator.stats.output_drains);
+
+    try coordinator.requestStop();
+    try drainServer(root, coordinator, &loop);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
 test "physical coordinator falls back when topology changes during targeted refresh" {
     const allocator = std.testing.allocator;
     var fixture = try Fixture.init();
@@ -3576,6 +3644,7 @@ pub const Fixture = struct {
     change_second_mode_after_read: bool = false,
     third_connector: bool = false,
     third_desktop: bool = false,
+    third_mode_width: u16 = 3,
     lease_objects: [6]u32 = undefined,
     lease_object_count: usize = 0,
     lease_create_count: usize = 0,
@@ -3818,6 +3887,10 @@ pub const Fixture = struct {
         if (self.third_connector) {
             out.connectors[2] = .{ .id = 12, .connector_type = 1, .connector_type_id = 3, .connected = true, .desktop = self.third_desktop, .width_mm = 3, .height_mm = 3, .encoder_id = 22, .mode_start = 2, .mode_count = 1, .encoder_start = 2, .encoder_count = 1, .properties = .{ .crtc_id = 1 } };
             out.modes[2] = out.modes[0];
+            out.modes[2].hdisplay = self.third_mode_width;
+            out.modes[2].hsync_start = self.third_mode_width;
+            out.modes[2].hsync_end = self.third_mode_width;
+            out.modes[2].htotal = self.third_mode_width;
             out.connector_encoders[2] = 22;
             out.encoders[2] = .{ .id = 22, .crtc_id = 32, .possible_crtcs = 4 };
             out.crtcs[2] = .{ .id = 32, .index = 2, .properties = .{ .active = 2, .mode_id = 3 } };
