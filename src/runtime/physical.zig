@@ -9239,6 +9239,18 @@ pub fn Coordinator(comptime protocol: type) type {
             self.markProtocol(capture.peer, ProtocolReady.image_copy_capture);
         }
 
+        fn failCapturesForOutput(
+            self: *Self,
+            output: output_scheduler.OutputId,
+        ) !void {
+            if (self.pending_screencopy) |pending|
+                if (std.meta.eql(pending.output, output))
+                    try self.finishScreencopy(false, 0, null);
+            if (self.pending_image_copy) |pending|
+                if (std.meta.eql(pending.output, output))
+                    try self.finishImageCopy(false, 0, null);
+        }
+
         fn finishActiveCapture(
             self: *Self,
             success: bool,
@@ -10560,12 +10572,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (physical.drain_started and output.drainComplete()) {
                     if (!self.stopping and physical.reconfigure != null) continue;
                     if (self.stopping) self.abandonPending();
-                    if (self.pending_screencopy) |pending|
-                        if (std.meta.eql(pending.output, output.outputId()))
-                            try self.finishScreencopy(false, 0, null);
-                    if (self.pending_image_copy) |pending|
-                        if (std.meta.eql(pending.output, output.outputId()))
-                            try self.finishImageCopy(false, 0, null);
+                    try self.failCapturesForOutput(output.outputId());
                     try self.invalidateCaptureSource(.{ .output = output.outputId() });
                     try output.destroy();
                     physical.kms_output = null;
@@ -10743,6 +10750,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     if (!pending.previous.enabled) continue;
                     return error.InvalidState;
                 };
+                try self.failCapturesForOutput(output.outputId());
                 try self.invalidateCaptureSource(.{ .output = output.outputId() });
                 try output.destroy();
                 physical.kms_output = null;
@@ -10815,6 +10823,7 @@ pub fn Coordinator(comptime protocol: type) type {
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
                 if (physical.reconfigure == null) continue;
                 if (physical.kms_output) |output| {
+                    try self.failCapturesForOutput(output.outputId());
                     try self.invalidateCaptureSource(.{ .output = output.outputId() });
                     try output.destroy();
                     physical.kms_output = null;
