@@ -514,6 +514,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const PhysicalOutput = struct {
             id: PhysicalOutputId,
             connected: bool = true,
+            desired_enabled: bool = true,
             removing: bool = false,
             removal_global_pending: bool = false,
             removal_protocol_retired: bool = false,
@@ -5060,6 +5061,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     self.markProtocol(command.peer, ProtocolReady.output_power);
                     continue;
                 };
+                physical.desired_enabled = true;
                 try self.syncOutputAssociations();
                 try self.output_power_adapter.completeCommand(command, .succeeded);
                 self.markProtocol(command.peer, ProtocolReady.output_power);
@@ -7504,6 +7506,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     };
                     if (replace_management_heads)
                         try self.replaceManagementHead(physical, snapshot, state);
+                    if (!physical.desired_enabled) continue;
                     self.activatePhysicalOutput(
                         physical,
                         snapshot,
@@ -11743,6 +11746,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     if (!self.stopping and power_transition) {
                         const command = self.output_power_transition.?;
                         self.output_power_transition = null;
+                        physical.desired_enabled = false;
                         if (self.output_power_adapter.peekCommand()) |current| {
                             if (std.meta.eql(current, command)) {
                                 try self.output_power_adapter.completeCommand(command, .succeeded);
@@ -11891,13 +11895,18 @@ pub fn Coordinator(comptime protocol: type) type {
                 return error.DrmHardwareUnavailable;
             var claim_count: usize = 0;
             for (self.physical_outputs[0..self.physical_output_count]) |physical| {
-                const output = physical.kms_output orelse continue;
-                if (!std.meta.eql(output.topologyHandle(), previous))
-                    return error.StaleSnapshot;
+                if (std.mem.indexOfScalar(
+                    u32,
+                    self.hotplug_updated_connector_ids[0..self.hotplug_updated_connector_count],
+                    physical.connector_id,
+                ) != null) continue;
+                const claim = physical.claim orelse continue;
+                if (physical.kms_output) |output|
+                    if (!std.meta.eql(output.topologyHandle(), previous))
+                        return error.StaleSnapshot;
                 if (claim_count == self.topology_claims.len)
                     return error.ClaimCapacityExceeded;
-                self.topology_claims[claim_count] = physical.claim orelse
-                    return error.StaleClaim;
+                self.topology_claims[claim_count] = claim;
                 claim_count += 1;
             }
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
@@ -11933,8 +11942,13 @@ pub fn Coordinator(comptime protocol: type) type {
 
             claim_count = 0;
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
-                const output = physical.kms_output orelse continue;
-                try output.rebindTopology(previous, handle);
+                if (std.mem.indexOfScalar(
+                    u32,
+                    self.hotplug_updated_connector_ids[0..self.hotplug_updated_connector_count],
+                    physical.connector_id,
+                ) != null or physical.claim == null) continue;
+                if (physical.kms_output) |output|
+                    try output.rebindTopology(previous, handle);
                 physical.claim = self.topology_refreshed_claims[claim_count];
                 claim_count += 1;
             }
@@ -11959,13 +11973,14 @@ pub fn Coordinator(comptime protocol: type) type {
                     );
                     physical.claim = claim;
                     try self.replaceManagementHead(physical, snapshot, state);
-                    try self.activatePhysicalOutput(
-                        physical,
-                        snapshot,
-                        state.scale_120,
-                        state.transform,
-                        state.adaptive_sync,
-                    );
+                    if (physical.desired_enabled)
+                        try self.activatePhysicalOutput(
+                            physical,
+                            snapshot,
+                            state.scale_120,
+                            state.transform,
+                            state.adaptive_sync,
+                        );
                     break;
                 }
                 if (physical.claim == null) return error.NoConnectedOutput;
@@ -11987,13 +12002,13 @@ pub fn Coordinator(comptime protocol: type) type {
                 return error.DrmHardwareUnavailable;
             var claim_count: usize = 0;
             for (self.physical_outputs[0..self.physical_output_count]) |physical| {
-                const output = physical.kms_output orelse continue;
-                if (!std.meta.eql(output.topologyHandle(), previous))
-                    return error.StaleSnapshot;
+                const claim = physical.claim orelse continue;
+                if (physical.kms_output) |output|
+                    if (!std.meta.eql(output.topologyHandle(), previous))
+                        return error.StaleSnapshot;
                 if (claim_count == self.topology_claims.len)
                     return error.ClaimCapacityExceeded;
-                self.topology_claims[claim_count] = physical.claim orelse
-                    return error.StaleClaim;
+                self.topology_claims[claim_count] = claim;
                 claim_count += 1;
             }
             const handle = self.manager.rescanPreservingClaims(
@@ -12016,8 +12031,9 @@ pub fn Coordinator(comptime protocol: type) type {
 
             claim_count = 0;
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
-                const output = physical.kms_output orelse continue;
-                try output.rebindTopology(previous, handle);
+                if (physical.claim == null) continue;
+                if (physical.kms_output) |output|
+                    try output.rebindTopology(previous, handle);
                 physical.claim = self.topology_refreshed_claims[claim_count];
                 claim_count += 1;
             }
@@ -12094,6 +12110,7 @@ pub fn Coordinator(comptime protocol: type) type {
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
                 const pending = physical.reconfigure orelse continue;
                 const state = pending.desired;
+                physical.desired_enabled = state.enabled;
                 if (!state.enabled) {
                     _ = try self.output_management_adapter.publishHead(
                         physical.management_head,
@@ -12155,6 +12172,7 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
                 const pending = physical.reconfigure orelse continue;
+                physical.desired_enabled = pending.previous.enabled;
                 if (!pending.previous.enabled) {
                     _ = try self.output_management_adapter.publishHead(
                         physical.management_head,

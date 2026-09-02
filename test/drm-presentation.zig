@@ -986,43 +986,47 @@ test "physical coordinator replaces the last disconnected output exactly" {
 }
 
 test "generated output management applies two heads atomically" {
-    try generatedMultiHeadApply(false, false, false, false, false, false, false, false);
+    try generatedMultiHeadApply(false, false, false, false, false, false, false, false, false);
 }
 
 test "generated output management rolls back every head" {
-    try generatedMultiHeadApply(true, false, false, false, false, false, false, false);
+    try generatedMultiHeadApply(true, false, false, false, false, false, false, false, false);
 }
 
 test "generated output management disables a secondary head atomically" {
-    try generatedMultiHeadApply(false, true, false, false, false, false, false, false);
+    try generatedMultiHeadApply(false, true, false, false, false, false, false, false, false);
 }
 
 test "generated output management re-enables a secondary head atomically" {
-    try generatedMultiHeadApply(false, true, true, false, false, false, false, false);
+    try generatedMultiHeadApply(false, true, true, false, false, false, false, false, false);
+}
+
+test "generated output management preserves a disabled head across topology refresh" {
+    try generatedMultiHeadApply(false, true, false, false, false, false, false, false, true);
 }
 
 test "generated output management promotes an enabled head after disabling the primary" {
-    try generatedMultiHeadApply(false, false, false, false, false, true, false, false);
+    try generatedMultiHeadApply(false, false, false, false, false, true, false, false, false);
 }
 
 test "generated output management retries hotplug deferred during reconfiguration" {
-    try generatedMultiHeadApply(false, false, false, false, false, false, true, false);
+    try generatedMultiHeadApply(false, false, false, false, false, false, true, false, false);
 }
 
 test "generated output management resumes session disable deferred during reconfiguration" {
-    try generatedMultiHeadApply(false, false, false, false, false, false, false, true);
+    try generatedMultiHeadApply(false, false, false, false, false, false, false, true, false);
 }
 
 test "generated output management rotates one physical head" {
-    try generatedMultiHeadApply(false, false, false, true, false, false, false, false);
+    try generatedMultiHeadApply(false, false, false, true, false, false, false, false, false);
 }
 
 test "generated output management rolls back a physical transform" {
-    try generatedMultiHeadApply(true, false, false, true, false, false, false, false);
+    try generatedMultiHeadApply(true, false, false, true, false, false, false, false, false);
 }
 
 test "generated output management enables adaptive sync on one head" {
-    try generatedMultiHeadApply(false, false, false, false, true, false, false, false);
+    try generatedMultiHeadApply(false, false, false, false, true, false, false, false, false);
 }
 
 fn generatedMultiHeadApply(
@@ -1034,6 +1038,7 @@ fn generatedMultiHeadApply(
     disable_first: bool,
     hotplug_during_apply: bool,
     session_disable_during_apply: bool,
+    refresh_after_disable: bool,
 ) !void {
     const allocator = std.testing.allocator;
     var fixture = try Fixture.init();
@@ -1046,7 +1051,7 @@ fn generatedMultiHeadApply(
     defer wayring.unix_socket.unlink(path) catch {};
 
     const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), compositorConfig());
-    const platforms = if (hotplug_during_apply)
+    const platforms = if (hotplug_during_apply or refresh_after_disable)
         fixture.platformsWithHotplug()
     else
         fixture.platforms();
@@ -1136,6 +1141,20 @@ fn generatedMultiHeadApply(
         if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0) {
             try waitForEither(&root.ring, reactor.ring);
         }
+    }
+    if (refresh_after_disable) {
+        fixture.third_connector = true;
+        try fixture.signalHotplug();
+        for (0..512) |_| {
+            _ = try drainClient(&reactor, &driver, &handler);
+            _ = try loop.turn(coordinator);
+            if (!fixture.hotplug_pending and
+                !coordinator.topology_refresh_pending and
+                !coordinator.hotplug_refresh_pending) break;
+            if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+                try waitForEither(&root.ring, reactor.ring);
+        }
+        try std.testing.expect(!coordinator.topology_refresh_pending);
     }
     try std.testing.expectEqual(
         if (fail_second_activation) 0 else @as(usize, 1) + @intFromBool(reenable_second),
