@@ -4339,6 +4339,21 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.fractional_scale_adapter.setDefaultPreferredScale(state.scale_120);
         }
 
+        fn promoteEnabledPhysicalOutput(self: *Self) !void {
+            const primary = self.primaryPhysicalOutput();
+            if ((try self.output_management_adapter.lifecycle.currentHead(
+                primary.management_head,
+            )).enabled) return;
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                if (!physical.connected or physical.removing or physical.kms_output == null) continue;
+                if (!(try self.output_management_adapter.lifecycle.currentHead(
+                    physical.management_head,
+                )).enabled) continue;
+                try self.promotePrimaryPhysicalOutput(physical);
+                return;
+            }
+        }
+
         pub fn primaryKmsOutput(self: *const Self) ?*output_api.Output {
             return self.primaryPhysicalOutput().kms_output;
         }
@@ -10813,6 +10828,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     @intCast(state.refresh_millihz),
                 );
             }
+            try self.promoteEnabledPhysicalOutput();
             try self.completeOutputReconfigure(transaction, .succeeded);
         }
 

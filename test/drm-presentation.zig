@@ -611,31 +611,35 @@ test "physical coordinator replaces the last disconnected output exactly" {
 }
 
 test "generated output management applies two heads atomically" {
-    try generatedMultiHeadApply(false, false, false, false, false);
+    try generatedMultiHeadApply(false, false, false, false, false, false);
 }
 
 test "generated output management rolls back every head" {
-    try generatedMultiHeadApply(true, false, false, false, false);
+    try generatedMultiHeadApply(true, false, false, false, false, false);
 }
 
 test "generated output management disables a secondary head atomically" {
-    try generatedMultiHeadApply(false, true, false, false, false);
+    try generatedMultiHeadApply(false, true, false, false, false, false);
 }
 
 test "generated output management re-enables a secondary head atomically" {
-    try generatedMultiHeadApply(false, true, true, false, false);
+    try generatedMultiHeadApply(false, true, true, false, false, false);
+}
+
+test "generated output management promotes an enabled head after disabling the primary" {
+    try generatedMultiHeadApply(false, false, false, false, false, true);
 }
 
 test "generated output management rotates one physical head" {
-    try generatedMultiHeadApply(false, false, false, true, false);
+    try generatedMultiHeadApply(false, false, false, true, false, false);
 }
 
 test "generated output management rolls back a physical transform" {
-    try generatedMultiHeadApply(true, false, false, true, false);
+    try generatedMultiHeadApply(true, false, false, true, false, false);
 }
 
 test "generated output management enables adaptive sync on one head" {
-    try generatedMultiHeadApply(false, false, false, false, true);
+    try generatedMultiHeadApply(false, false, false, false, true, false);
 }
 
 fn generatedMultiHeadApply(
@@ -644,6 +648,7 @@ fn generatedMultiHeadApply(
     reenable_second: bool,
     rotate_first: bool,
     adaptive_sync: bool,
+    disable_first: bool,
 ) !void {
     const allocator = std.testing.allocator;
     var fixture = try Fixture.init();
@@ -694,6 +699,7 @@ fn generatedMultiHeadApply(
         .reenable_second = reenable_second,
         .rotate_first = rotate_first,
         .adaptive_sync = adaptive_sync,
+        .disable_first = disable_first,
     };
     try submitClient(&reactor, &driver, &handler);
     for (0..512) |_| {
@@ -718,7 +724,7 @@ fn generatedMultiHeadApply(
     );
     try std.testing.expectEqual(@as(usize, @intFromBool(fail_second_activation)), handler.failed);
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
-    try std.testing.expectEqual(@as(i32, if (fail_second_activation or disable_second) 0 else 3), (try coordinator.output_management_adapter.lifecycle.currentHead(
+    try std.testing.expectEqual(@as(i32, if (fail_second_activation or disable_second or disable_first) 0 else 3), (try coordinator.output_management_adapter.lifecycle.currentHead(
         coordinator.physical_outputs[0].management_head,
     )).x);
     try std.testing.expectEqual(@as(i32, if (fail_second_activation or disable_second) 3 else 0), (try coordinator.output_management_adapter.lifecycle.currentHead(
@@ -732,6 +738,19 @@ fn generatedMultiHeadApply(
         first_state.transform,
     );
     try std.testing.expectEqual(adaptive_sync and !fail_second_activation, first_state.adaptive_sync);
+    if (disable_first) {
+        try std.testing.expect(!first_state.enabled);
+        try std.testing.expect(coordinator.physical_outputs[0].kms_output == null);
+        try std.testing.expect(coordinator.physical_outputs[1].kms_output != null);
+        try std.testing.expectEqual(
+            coordinator.physical_outputs[1].protocol_output,
+            coordinator.output_adapter.primaryOutput(),
+        );
+        try std.testing.expectEqual(
+            coordinator.physical_outputs[1].management_head,
+            coordinator.output_management_adapter.lifecycle.primary,
+        );
+    }
     if (adaptive_sync and !fail_second_activation) {
         try std.testing.expect(coordinator.physical_outputs[0].kms_output.?.kms_output.adaptive_sync);
     }
@@ -762,7 +781,13 @@ fn generatedMultiHeadApply(
             )).transform,
         );
     }
-    if (disable_second and !reenable_second) {
+    if (disable_first) {
+        try std.testing.expect(!std.meta.eql(
+            first_ids[1],
+            coordinator.physical_outputs[1].kms_output.?.outputId(),
+        ));
+        try std.testing.expectEqual(@as(usize, 2), coordinator.stats.output_drains);
+    } else if (disable_second and !reenable_second) {
         try std.testing.expectEqual(
             first_ids[0],
             coordinator.physical_outputs[0].kms_output.?.outputId(),
@@ -2520,6 +2545,7 @@ const MultiOutputManagementClientHandler = struct {
     reenable_flushed: bool = false,
     rotate_first: bool = false,
     adaptive_sync: bool = false,
+    disable_first: bool = false,
     succeeded: usize = 0,
     failed: usize = 0,
     event_failures: usize = 0,
@@ -2614,7 +2640,7 @@ const MultiOutputManagementClientHandler = struct {
             .{ .serial = self.serial },
         )).id;
         for (self.heads, self.modes, 0..) |head, mode, index| {
-            if (self.disable_second and index == 1) {
+            if ((self.disable_second and index == 1) or (self.disable_first and index == 0)) {
                 try protocol.zwlr_output_configuration_v1.encodeRequest(
                     self.queue,
                     configuration.id,
@@ -2637,7 +2663,7 @@ const MultiOutputManagementClientHandler = struct {
                 self.queue,
                 configuration_head.id,
                 .{ .set_position = .{
-                    .x = if (self.disable_second) 0 else if (index == 0) 3 else 0,
+                    .x = if (self.disable_second or self.disable_first) 0 else if (index == 0) 3 else 0,
                     .y = 0,
                 } },
             );
