@@ -12736,6 +12736,16 @@ test "physical: capture rectangles require exact output containment" {
     ));
 }
 
+test "physical: toplevel capture bounds include every tree extension" {
+    var bounds: geometry.Rect = .{ .x = 0, .y = 0, .width = 3, .height = 2 };
+    bounds = try rectangleUnion(bounds, .{ .x = -2, .y = -1, .width = 2, .height = 2 });
+    bounds = try rectangleUnion(bounds, .{ .x = 3, .y = 1, .width = 4, .height = 3 });
+    try std.testing.expectEqual(
+        geometry.Rect{ .x = -2, .y = -1, .width = 9, .height = 5 },
+        bounds,
+    );
+}
+
 test "physical: output management rejects unrepresentable combined layout" {
     const valid = [_]protocol_output_management.DesiredHead{
         .{ .id = .{ .index = 0, .generation = 1 }, .state = .{
