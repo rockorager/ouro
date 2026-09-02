@@ -1404,6 +1404,60 @@ test "output management binding snapshots every mode in protocol order" {
     try std.testing.expect(adapter.currentMode(0) == adapter.modes.entries.items[1]);
 }
 
+test "output management snapshots the full production topology" {
+    const A = Adapter(@import("core_protocol"));
+    const modes = [_]ModeState{
+        .{ .width = 800, .height = 600, .refresh_millihz = 60000, .preferred = true },
+        .{ .width = 1024, .height = 768, .refresh_millihz = 60000 },
+        .{ .width = 1280, .height = 720, .refresh_millihz = 60000 },
+        .{ .width = 1920, .height = 1080, .refresh_millihz = 60000 },
+    };
+    const primary: HeadState = .{
+        .width = modes[0].width,
+        .height = modes[0].height,
+        .refresh_millihz = modes[0].refresh_millihz,
+    };
+    var adapter = try A.init(
+        std.testing.allocator,
+        .{
+            .manager_capacity = 8,
+            .mode_capacity = 128,
+            .outbound_capacity = 8192,
+        },
+        1,
+        primary,
+    );
+    defer adapter.deinit();
+    try adapter.setModes(&modes, primary);
+    for (1..32) |index| {
+        var name_storage: [16]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_storage, "output-{d}", .{index});
+        _ = try adapter.addHead(
+            .{ .name = name, .description = "Production capacity output" },
+            &modes,
+            .{
+                .width = modes[0].width,
+                .height = modes[0].height,
+                .refresh_millihz = modes[0].refresh_millihz,
+                .x = @intCast(index * modes[0].width),
+            },
+        );
+    }
+    try std.testing.expectEqual(@as(usize, 32), adapter.inventory.items.len);
+
+    for (0..8) |index| _ = try A.bind(&adapter, .{
+        .peer = .{ .slot = @intCast(index + 1), .generation = 1 },
+        .credentials = .{ .pid = 1, .uid = 2, .gid = 3 },
+        .global = .{ .id = 4, .generation = 1 },
+        .resource = .{ .id = @intCast(index + 5), .generation = 1 },
+        .version = 4,
+    });
+
+    try std.testing.expectEqual(@as(usize, 8 * 705), adapter.outbound.items.len);
+    try std.testing.expectEqual(@as(usize, 8 * 32), adapter.heads.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 8 * 128), adapter.modes.entries.items.len);
+}
+
 test "output management binds two exact heads and targets synchronization" {
     const A = Adapter(@import("core_protocol"));
     const primary: HeadState = .{ .width = 800, .height = 600, .refresh_millihz = 60000 };
