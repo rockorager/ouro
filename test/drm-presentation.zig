@@ -1421,6 +1421,14 @@ test "generated output power client drains and recreates the physical output" {
 }
 
 test "generated gamma control applies exact ramps and restores on reuse" {
+    try generatedGammaControl(1);
+}
+
+test "generated gamma control routes the primary output exactly" {
+    try generatedGammaControl(0);
+}
+
+fn generatedGammaControl(output_index: usize) !void {
     const allocator = std.testing.allocator;
     var fixture = try Fixture.init();
     defer fixture.deinit();
@@ -1456,7 +1464,12 @@ test "generated gamma control applies exact ramps and restores on reuse" {
     var driver = ClientDriver.init(&client);
     const actor = try client.actor();
     const registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null);
-    var handler: GammaClientHandler = .{ .objects = &client.objects, .queue = &actor.transmit, .registry = registry };
+    var handler: GammaClientHandler = .{
+        .objects = &client.objects,
+        .queue = &actor.transmit,
+        .registry = registry,
+        .desired_output_index = output_index,
+    };
     try submitClient(&reactor, &driver, &handler);
     for (0..512) |_| {
         _ = try drainClient(&reactor, &driver, &handler);
@@ -1465,7 +1478,7 @@ test "generated gamma control applies exact ramps and restores on reuse" {
         if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0) try waitForEither(&root.ring, reactor.ring);
     }
     try std.testing.expectEqualSlices(u16, &GammaClientHandler.first_ramps, &fixture.gamma_current);
-    try std.testing.expectEqual(@as(u32, 31), fixture.gamma_crtc);
+    try std.testing.expectEqual(@as(u32, if (output_index == 0) 30 else 31), fixture.gamma_crtc);
     try std.testing.expectEqual(@as(usize, 1), fixture.gamma_gets);
 
     try handler.destroyControl();
@@ -2913,6 +2926,8 @@ const GammaClientHandler = struct {
     registry: wayring.objects.Handle,
     manager: ?wayring.objects.Handle = null,
     output: ?wayring.objects.Handle = null,
+    desired_output_index: usize,
+    output_count: usize = 0,
     control: ?wayring.objects.Handle = null,
     output_ready: bool = false,
     gamma_sizes: usize = 0,
@@ -2926,8 +2941,11 @@ const GammaClientHandler = struct {
         if (target.object.interface == &ClientCore.Registry.info) {
             switch (try ClientCore.decodeRegistryEvent(self.objects, self.registry, message, fds)) {
                 .global => |global| {
-                    if (std.mem.eql(u8, global.interface, protocol.wl_output.info.name))
-                        self.output = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wl_output.info, @min(global.version, 4), null);
+                    if (std.mem.eql(u8, global.interface, protocol.wl_output.info.name)) {
+                        if (self.output_count == self.desired_output_index)
+                            self.output = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wl_output.info, @min(global.version, 4), null);
+                        self.output_count += 1;
+                    }
                     if (std.mem.eql(u8, global.interface, protocol.zwlr_gamma_control_manager_v1.info.name))
                         self.manager = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.zwlr_gamma_control_manager_v1.info, 1, null);
                 },
