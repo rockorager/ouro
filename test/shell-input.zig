@@ -2884,6 +2884,14 @@ test "shell-input: popup applies each acknowledged configure after output remova
 }
 
 test "shell-input: screencopy captures clipped output into writable SHM" {
+    try runScreencopyCapture(false);
+}
+
+test "shell-input: session disable fails pending screencopy" {
+    try runScreencopyCapture(true);
+}
+
+fn runScreencopyCapture(interrupt: bool) !void {
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-screencopy-{d}.sock", .{linux.getpid()});
@@ -2948,29 +2956,42 @@ test "shell-input: screencopy captures clipped output into writable SHM" {
     _ = try loop.turn(coordinator);
     try fixture.signalSession(.enable);
     var client_progress: ClientDriver.Progress = .{};
+    var disable_sent = false;
     for (0..512) |_| {
         client_progress = try drainClient(&client_reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
-        if (handler.ready) break;
+        if (interrupt and !disable_sent and coordinator.pending_screencopy != null) {
+            try fixture.signalSession(.disable);
+            disable_sent = true;
+        }
+        if ((!interrupt and handler.ready) or
+            (interrupt and handler.failed and coordinator.pending_screencopy == null and
+                coordinator.session.state == .disabled)) break;
         if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
             try waitForEither(&root.ring, client_reactor.ring);
     }
-    try std.testing.expect(handler.ready);
-    try std.testing.expectEqual(
-        .@"90",
-        coordinator.primaryKmsOutput().?.planner.output_transform,
-    );
-    try std.testing.expect(!handler.failed);
+    try std.testing.expectEqual(interrupt, disable_sent);
+    try std.testing.expectEqual(!interrupt, handler.ready);
+    try std.testing.expectEqual(interrupt, handler.failed);
     try std.testing.expectEqual(@as(usize, 1), handler.buffer_events);
     try std.testing.expectEqual(@as(usize, 1), handler.buffer_done_events);
-    try std.testing.expectEqual(@as(usize, 1), handler.flags_events);
-    try std.testing.expectEqual(@as(usize, 1), handler.damage_events);
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
-    var captured: [4]u8 = undefined;
-    const read = linux.pread(handler.read_fd, &captured, captured.len, 0);
-    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(read));
-    try std.testing.expectEqual(@as(usize, captured.len), read);
-    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0xff }, &captured);
+    if (interrupt) {
+        try std.testing.expect(coordinator.pending_screencopy == null);
+        try std.testing.expectEqual(.disabled, coordinator.session.state);
+    } else {
+        try std.testing.expectEqual(
+            .@"90",
+            coordinator.primaryKmsOutput().?.planner.output_transform,
+        );
+        try std.testing.expectEqual(@as(usize, 1), handler.flags_events);
+        try std.testing.expectEqual(@as(usize, 1), handler.damage_events);
+        var captured: [4]u8 = undefined;
+        const read = linux.pread(handler.read_fd, &captured, captured.len, 0);
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(read));
+        try std.testing.expectEqual(@as(usize, captured.len), read);
+        try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0xff }, &captured);
+    }
 
     coordinator.disconnected(coordinator.peer.?);
     _ = try client.prepareClose();
@@ -2994,6 +3015,14 @@ test "shell-input: screencopy captures clipped output into writable SHM" {
 }
 
 test "shell-input: image copy capture publishes constraints and writes output SHM" {
+    try runImageCopyCapture(false);
+}
+
+test "shell-input: session disable fails image copy frame and stops session" {
+    try runImageCopyCapture(true);
+}
+
+fn runImageCopyCapture(interrupt: bool) !void {
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-image-copy-{d}.sock", .{linux.getpid()});
@@ -3058,30 +3087,44 @@ test "shell-input: image copy capture publishes constraints and writes output SH
     _ = try loop.turn(coordinator);
     try fixture.signalSession(.enable);
     var client_progress: ClientDriver.Progress = .{};
+    var disable_sent = false;
     for (0..512) |_| {
         client_progress = try drainClient(&client_reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
-        if (handler.ready) break;
+        if (interrupt and !disable_sent and coordinator.pending_image_copy != null) {
+            try fixture.signalSession(.disable);
+            disable_sent = true;
+        }
+        if ((!interrupt and handler.ready) or
+            (interrupt and handler.failed and handler.stopped and
+                coordinator.pending_image_copy == null and
+                coordinator.session.state == .disabled)) break;
         if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
             try waitForEither(&root.ring, client_reactor.ring);
     }
-    try std.testing.expect(handler.ready);
-    try std.testing.expect(!handler.failed);
-    try std.testing.expect(!handler.stopped);
+    try std.testing.expectEqual(interrupt, disable_sent);
+    try std.testing.expectEqual(!interrupt, handler.ready);
+    try std.testing.expectEqual(interrupt, handler.failed);
+    try std.testing.expectEqual(interrupt, handler.stopped);
     try std.testing.expectEqual(@as(usize, 1), handler.buffer_size_events);
     try std.testing.expectEqual(@as(usize, 2), handler.shm_format_events);
     try std.testing.expectEqual(@as(usize, 1), handler.constraints_done_events);
-    try std.testing.expectEqual(@as(usize, 1), handler.transform_events);
-    try std.testing.expectEqual(@as(usize, 1), handler.damage_events);
-    try std.testing.expectEqual(@as(usize, 1), handler.presentation_events);
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
-    var captured: [24]u8 = undefined;
-    const read = linux.pread(handler.read_fd, &captured, captured.len, 0);
-    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(read));
-    try std.testing.expectEqual(@as(usize, captured.len), read);
-    const black_pixel = [_]u8{ 0, 0, 0, 0xff };
-    for (0..6) |pixel|
-        try std.testing.expectEqualSlices(u8, &black_pixel, captured[pixel * 4 ..][0..4]);
+    if (interrupt) {
+        try std.testing.expect(coordinator.pending_image_copy == null);
+        try std.testing.expectEqual(.disabled, coordinator.session.state);
+    } else {
+        try std.testing.expectEqual(@as(usize, 1), handler.transform_events);
+        try std.testing.expectEqual(@as(usize, 1), handler.damage_events);
+        try std.testing.expectEqual(@as(usize, 1), handler.presentation_events);
+        var captured: [24]u8 = undefined;
+        const read = linux.pread(handler.read_fd, &captured, captured.len, 0);
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(read));
+        try std.testing.expectEqual(@as(usize, captured.len), read);
+        const black_pixel = [_]u8{ 0, 0, 0, 0xff };
+        for (0..6) |pixel|
+            try std.testing.expectEqualSlices(u8, &black_pixel, captured[pixel * 4 ..][0..4]);
+    }
 
     coordinator.disconnected(coordinator.peer.?);
     _ = try client.prepareClose();
