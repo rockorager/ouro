@@ -1486,9 +1486,9 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     var input = try FakeInput.init();
     defer input.deinit();
     var root_config = physical_fixture.compositorConfig();
-    root_config.runtime.object_capacity = 64;
-    root_config.runtime.object_quota = 64;
-    root_config.runtime.buckets_per_client = 64;
+    root_config.runtime.object_capacity = 128;
+    root_config.runtime.object_quota = 128;
+    root_config.runtime.buckets_per_client = 128;
     const root = try Compositor.create(
         allocator,
         try wayring.unix_socket.listen(path, 1),
@@ -1501,8 +1501,8 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     // platform batch after the accepted prefix has been cleared.
     config.input.device_capacity = 1;
     config.input.event_capacity = 2;
-    config.shm.pool_capacity = 2;
-    config.shm.buffer_capacity = 2;
+    config.shm.pool_capacity = 3;
+    config.shm.buffer_capacity = 3;
     config.surface.surface_capacity = 2;
     config.surface.content_update_capacity = 2;
     config.surface.dependency_capacity = 2;
@@ -1538,7 +1538,7 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
         &client_reactor,
         try wayring.unix_socket.connect(path),
         .{ .received_fd_budget = 2, .transmit_byte_budget = 4096, .transmit_fd_budget = 2 },
-        .{ .max_objects = 64, .max_client_ids = 63 },
+        .{ .max_objects = 128, .max_client_ids = 127 },
     );
     const actor = try client.actor();
     var driver = ClientDriver.init(&client);
@@ -1554,6 +1554,10 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
         .test_image_capture_sources = true,
         .test_toplevel_drag = true,
     };
+    defer {
+        if (handler.image_capture_read_fd >= 0)
+            _ = linux.close(handler.image_capture_read_fd);
+    }
     try submitClient(&client_reactor, &driver, &handler);
 
     _ = try loop.turn(coordinator);
@@ -1782,6 +1786,30 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     ).?.target != null);
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
 
+    try handler.queueToplevelCapture();
+    try submitClient(&client_reactor, &driver, &handler);
+    for (0..128) |_| {
+        client_progress = try drainClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.image_capture_ready) break;
+        if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, client_reactor.ring);
+    }
+    try std.testing.expect(handler.image_capture_ready);
+    try std.testing.expectEqual(@as(u32, 3), handler.image_capture_width);
+    try std.testing.expectEqual(@as(u32, 2), handler.image_capture_height);
+    var toplevel_pixels: [24]u8 = undefined;
+    const capture_read = linux.pread(
+        handler.image_capture_read_fd,
+        &toplevel_pixels,
+        toplevel_pixels.len,
+        0,
+    );
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(capture_read));
+    try std.testing.expectEqual(@as(usize, toplevel_pixels.len), capture_read);
+    try std.testing.expectEqualSlices(u8, pixels[0..12], toplevel_pixels[0..12]);
+    try std.testing.expectEqualSlices(u8, pixels[16..28], toplevel_pixels[12..24]);
+
     const motion_before_warp = handler.pointer_motion;
     try handler.queuePointerWarp();
     try submitClient(&client_reactor, &driver, &handler);
@@ -1875,7 +1903,7 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     for (0..64) |_| {
         client_progress = try drainClient(&client_reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
-        if (handler.buffer_release == 1 and !coordinator.app_layers[0].active) break;
+        if (handler.buffer_release >= 1 and !coordinator.app_layers[0].active) break;
         if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
             try waitForEither(&root.ring, client_reactor.ring);
     }
@@ -5614,6 +5642,13 @@ const Handler = struct {
     image_output_source: ?wayring.objects.Handle = null,
     image_toplevel_source: ?wayring.objects.Handle = null,
     image_cursor_session: ?wayring.objects.Handle = null,
+    image_capture_session: ?wayring.objects.Handle = null,
+    image_capture_frame: ?wayring.objects.Handle = null,
+    image_capture_buffer: ?wayring.objects.Handle = null,
+    image_capture_read_fd: linux.fd_t = -1,
+    image_capture_width: u32 = 0,
+    image_capture_height: u32 = 0,
+    image_capture_ready: bool = false,
     test_image_capture_sources: bool = false,
     image_output_global_seen: bool = false,
     image_toplevel_global_seen: bool = false,
@@ -5858,6 +5893,36 @@ const Handler = struct {
                     try std.testing.expectEqual(self.output.?.id, value.output);
                     self.wlr_foreign_toplevel_output_leave += 1;
                 },
+            }
+        } else if (target.object.interface == &protocol.ext_image_copy_capture_session_v1.info) {
+            switch (try protocol.ext_image_copy_capture_session_v1.decodeEvent(message, fds)) {
+                .buffer_size => |value| {
+                    self.image_capture_width = value.width;
+                    self.image_capture_height = value.height;
+                },
+                .shm_format => {},
+                .done => try self.queueToplevelCaptureFrame(),
+                .stopped => return error.UnexpectedCaptureStop,
+                .dmabuf_device, .dmabuf_format => return error.UnexpectedDmabufCapture,
+            }
+        } else if (target.object.interface == &protocol.ext_image_copy_capture_frame_v1.info) {
+            switch (try protocol.ext_image_copy_capture_frame_v1.decodeEvent(message, fds)) {
+                .transform => |value| try std.testing.expectEqual(
+                    protocol.wl_output.transform.normal,
+                    value.transform,
+                ),
+                .damage => |value| {
+                    try std.testing.expectEqual(@as(i32, 0), value.x);
+                    try std.testing.expectEqual(@as(i32, 0), value.y);
+                    try std.testing.expectEqual(@as(i32, 3), value.width);
+                    try std.testing.expectEqual(@as(i32, 2), value.height);
+                },
+                .presentation_time => {},
+                .ready => {
+                    self.image_capture_ready = true;
+                    try self.destroyToplevelCapture();
+                },
+                .failed => return error.UnexpectedCaptureFailure,
             }
         } else if (target.object.interface == &protocol.ext_image_copy_capture_cursor_session_v1.info) {
             switch (try protocol.ext_image_copy_capture_cursor_session_v1.decodeEvent(message, fds)) {
@@ -6317,6 +6382,98 @@ const Handler = struct {
                     .pointer = self.pointer.?.id,
                 },
             )).session;
+    }
+
+    fn queueToplevelCapture(self: *Handler) !void {
+        if (self.image_capture_session != null or self.image_copy_manager == null or
+            self.image_toplevel_source == null) return error.CaptureUnavailable;
+        self.image_capture_session = (try protocol.ext_image_copy_capture_manager_v1.construct_create_session(
+            self.objects,
+            self.queue,
+            self.image_copy_manager.?,
+            .{
+                .source = self.image_toplevel_source.?.id,
+                .options = protocol.ext_image_copy_capture_manager_v1.options.fromInt(0),
+            },
+        )).session;
+    }
+
+    fn queueToplevelCaptureFrame(self: *Handler) !void {
+        if (self.image_capture_frame != null) return;
+        try std.testing.expectEqual(@as(u32, 3), self.image_capture_width);
+        try std.testing.expectEqual(@as(u32, 2), self.image_capture_height);
+        const descriptor = try ordinaryMemfd(24, 0, &([_]u8{0x55} ** 24));
+        const retained = linux.fcntl(descriptor, linux.F.DUPFD_CLOEXEC, 0);
+        if (linux.errno(retained) != .SUCCESS) return error.DuplicateFailed;
+        self.image_capture_read_fd = @intCast(retained);
+        const pool = try protocol.wl_shm.construct_create_pool(
+            self.objects,
+            self.queue,
+            self.shm.?,
+            .{ .fd = descriptor, .size = 24 },
+        );
+        self.image_capture_buffer = (try protocol.wl_shm_pool.construct_create_buffer(
+            self.objects,
+            self.queue,
+            pool.id,
+            .{
+                .offset = 0,
+                .width = 3,
+                .height = 2,
+                .stride = 12,
+                .format = .argb8888,
+            },
+        )).id;
+        try wayring.client.sendRequest(
+            protocol.wl_shm_pool,
+            self.objects,
+            self.queue,
+            pool.id,
+            .{ .destroy = .{} },
+        );
+        self.image_capture_frame = (try protocol.ext_image_copy_capture_session_v1.construct_create_frame(
+            self.objects,
+            self.queue,
+            self.image_capture_session.?,
+            .{},
+        )).frame;
+        try protocol.ext_image_copy_capture_frame_v1.encodeRequest(
+            self.queue,
+            self.image_capture_frame.?.id,
+            .{ .attach_buffer = .{ .buffer = self.image_capture_buffer.?.id } },
+        );
+        try protocol.ext_image_copy_capture_frame_v1.encodeRequest(
+            self.queue,
+            self.image_capture_frame.?.id,
+            .{ .capture = .{} },
+        );
+    }
+
+    fn destroyToplevelCapture(self: *Handler) !void {
+        try wayring.client.sendRequest(
+            protocol.ext_image_copy_capture_frame_v1,
+            self.objects,
+            self.queue,
+            self.image_capture_frame.?,
+            .{ .destroy = .{} },
+        );
+        self.image_capture_frame = null;
+        try wayring.client.sendRequest(
+            protocol.ext_image_copy_capture_session_v1,
+            self.objects,
+            self.queue,
+            self.image_capture_session.?,
+            .{ .destroy = .{} },
+        );
+        self.image_capture_session = null;
+        try wayring.client.sendRequest(
+            protocol.wl_buffer,
+            self.objects,
+            self.queue,
+            self.image_capture_buffer.?,
+            .{ .destroy = .{} },
+        );
+        self.image_capture_buffer = null;
     }
 
     fn maybeCreateDataDevice(self: *Handler) !void {

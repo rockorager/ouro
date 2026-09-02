@@ -30,6 +30,7 @@ const output_api = @import("../output/drm.zig");
 const output_scheduler = @import("../output/headless.zig");
 const render = @import("../render/types.zig");
 const render_content = @import("../render/content.zig");
+const render_pixman = @import("../render/pixman.zig");
 const render_list = @import("../scene/render_list.zig");
 const damage = @import("../scene/damage.zig");
 const geometry = @import("../scene/geometry.zig");
@@ -1007,6 +1008,9 @@ pub fn Coordinator(comptime protocol: type) type {
         input_popup_scenes: []InputPopupScene,
         input_popup_scene_len: usize = 0,
         frame_samples: []render_list.AppliedSurface,
+        capture_samples: []render.PlannedSample,
+        capture_imports: []?output_api.ImportedSource,
+        capture_renderer: render_pixman.Renderer,
         frame_bindings: []output_api.SampleBinding,
         frame_changes: []damage.Change,
         frame_change_layers: []?*Layer,
@@ -1173,6 +1177,17 @@ pub fn Coordinator(comptime protocol: type) type {
             self.input_popup_scene_len = 0;
             self.frame_samples = try allocator.alloc(render_list.AppliedSurface, config.output.max_samples);
             errdefer allocator.free(self.frame_samples);
+            self.capture_samples = try allocator.alloc(render.PlannedSample, config.output.max_samples);
+            errdefer allocator.free(self.capture_samples);
+            self.capture_imports = try allocator.alloc(?output_api.ImportedSource, config.output.max_samples);
+            errdefer allocator.free(self.capture_imports);
+            @memset(self.capture_imports, null);
+            self.capture_renderer = try render_pixman.Renderer.init(allocator, .{
+                .max_samples = config.output.max_samples,
+                .max_source_width = config.output.max_source_width,
+                .max_source_height = config.output.max_source_height,
+            });
+            errdefer self.capture_renderer.deinit();
             self.frame_bindings = try allocator.alloc(output_api.SampleBinding, config.output.max_samples);
             errdefer allocator.free(self.frame_bindings);
             self.frame_changes = try allocator.alloc(
@@ -2169,6 +2184,9 @@ pub fn Coordinator(comptime protocol: type) type {
             self.allocator.free(self.removed_layer_outputs);
             self.allocator.free(self.removed_layers);
             self.allocator.free(self.frame_bindings);
+            self.capture_renderer.deinit();
+            self.allocator.free(self.capture_imports);
+            self.allocator.free(self.capture_samples);
             self.allocator.free(self.frame_samples);
             self.allocator.free(self.input_popup_scenes);
             self.allocator.free(self.input_popup_surfaces);
@@ -5097,16 +5115,10 @@ pub fn Coordinator(comptime protocol: type) type {
                             physical.kms_output.?.planner.output_transform,
                         ),
                     } else null,
-                    .toplevel => |id| if (self.desktop.scene(id)) |scene|
-                        if (self.physicalOutputContainingSceneRect(scene.geometry)) |output|
-                            if (self.physicalSceneRectFor(scene.geometry, output)) |physical| .{
-                                .width = @intCast(physical.width),
-                                .height = @intCast(physical.height),
-                            } else null
-                        else
-                            null
-                    else |_|
-                        null,
+                    .toplevel => |id| if (self.captureToplevelBounds(id)) |bounds| .{
+                        .width = @intCast(bounds.width),
+                        .height = @intCast(bounds.height),
+                    } else null,
                 },
                 .cursor => if (self.cursorCaptureState(target)) |state| state.constraints else null,
             };
@@ -5121,6 +5133,56 @@ pub fn Coordinator(comptime protocol: type) type {
             return constraints;
         }
 
+        fn captureToplevelBounds(self: *Self, id: Desktop.ToplevelId) ?geometry.Rect {
+            const scene = self.desktop.scene(id) catch return null;
+            const surfaces = self.sceneOrder(scene.surface) catch return null;
+            var bounds: ?geometry.Rect = null;
+            for (surfaces) |surface| {
+                const layer = self.findAppLayer(surface) orelse continue;
+                if (!layer.active) continue;
+                const sample = self.logicalCaptureSample(layer) catch return null;
+                bounds = if (bounds) |current|
+                    rectangleUnion(current, sample.destination) catch return null
+                else
+                    .{
+                        .x = sample.destination.x,
+                        .y = sample.destination.y,
+                        .width = @intCast(sample.destination.width),
+                        .height = @intCast(sample.destination.height),
+                    };
+            }
+            return bounds;
+        }
+
+        fn logicalCaptureSample(
+            self: *Self,
+            layer: *const Layer,
+        ) !render.SurfaceSample {
+            const id = layer.id orelse return error.MissingSurface;
+            const scene = self.surfaceScene(id) orelse return error.MissingScene;
+            var sample = layer.sample orelse return error.MissingSample;
+            if (scene.subsurface) {
+                sample.destination.x = try std.math.add(
+                    i32,
+                    if (scene.root.has_window_geometry)
+                        alignedOrigin(scene.root.geometry.x, scene.root.surface_offset.x)
+                    else
+                        scene.root.geometry.x,
+                    scene.offset_x,
+                );
+                sample.destination.y = try std.math.add(
+                    i32,
+                    if (scene.root.has_window_geometry)
+                        alignedOrigin(scene.root.geometry.y, scene.root.surface_offset.y)
+                    else
+                        scene.root.geometry.y,
+                    scene.offset_y,
+                );
+            }
+            sample.clip = sample.destination;
+            return sample;
+        }
+
         fn captureKmsOutput(
             self: *const Self,
             target: ImageCopyCaptureAdapter.Target,
@@ -5131,10 +5193,19 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             return switch (source) {
                 .output => |id| (self.physicalOutputForKmsId(id) orelse return null).kms_output,
-                .toplevel => |id| (self.physicalOutputContainingSceneRect(
-                    (self.desktop.scene(id) catch return null).geometry,
-                ) orelse return null).kms_output,
+                .toplevel => |id| if (std.meta.activeTag(target) == .source)
+                    self.firstCaptureOutput()
+                else
+                    (self.physicalOutputContainingSceneRect(
+                        (self.desktop.scene(id) catch return null).geometry,
+                    ) orelse return null).kms_output,
             };
+        }
+
+        fn firstCaptureOutput(self: *const Self) ?*output_api.Output {
+            for (self.physical_outputs[0..self.physical_output_count]) |physical|
+                if (physical.connected) if (physical.kms_output) |output| return output;
+            return null;
         }
 
         fn captureTransformToUpright(
@@ -8978,10 +9049,14 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn ensureFrameStorage(self: *Self, needed: usize) !void {
             if (self.frame_samples.len >= needed) return;
-            var capacity = self.frame_samples.len;
+            const old_capacity = self.frame_samples.len;
+            var capacity = old_capacity;
             while (capacity < needed) capacity = std.math.mul(usize, capacity, 2) catch
                 return error.OutOfMemory;
             self.frame_samples = try self.allocator.realloc(self.frame_samples, capacity);
+            self.capture_samples = try self.allocator.realloc(self.capture_samples, capacity);
+            self.capture_imports = try self.allocator.realloc(self.capture_imports, capacity);
+            @memset(self.capture_imports[old_capacity..capacity], null);
             self.frame_bindings = try self.allocator.realloc(self.frame_bindings, capacity);
             self.frame_changes = try self.allocator.realloc(self.frame_changes, capacity);
             self.frame_change_layers = try self.allocator.realloc(
@@ -9154,6 +9229,13 @@ pub fn Coordinator(comptime protocol: type) type {
                 return;
             }
             const capture = self.image_copy_capture_adapter.takeCapture() orelse return;
+            if (capture.target == .source) switch (capture.target.source) {
+                .toplevel => |id| {
+                    try self.processToplevelImageCopy(capture, id);
+                    return;
+                },
+                .output => {},
+            };
             const output = self.captureKmsOutput(capture.target) orelse {
                 try self.failImageCopy(capture);
                 return;
@@ -9301,6 +9383,276 @@ pub fn Coordinator(comptime protocol: type) type {
                 return;
             }
             self.pending_image_copy.?.awaiting_output = true;
+        }
+
+        fn processToplevelImageCopy(
+            self: *Self,
+            capture: ImageCopyCaptureAdapter.Capture,
+            id: Desktop.ToplevelId,
+        ) !void {
+            const bounds = self.captureToplevelBounds(id) orelse {
+                try self.failImageCopy(capture);
+                return;
+            };
+            if (bounds.width <= 0 or bounds.height <= 0 or
+                capture.width != @as(u32, @intCast(bounds.width)) or
+                capture.height != @as(u32, @intCast(bounds.height)))
+            {
+                try self.image_copy_capture_adapter.fail(capture.frame, .buffer_constraints);
+                self.markProtocol(capture.peer, ProtocolReady.image_copy_capture);
+                return;
+            }
+            const output = self.firstCaptureOutput() orelse {
+                try self.failImageCopy(capture);
+                return;
+            };
+            const scene = self.desktop.scene(id) catch {
+                try self.failImageCopy(capture);
+                return;
+            };
+            const surfaces = self.sceneOrder(scene.surface) catch {
+                try self.failImageCopy(capture);
+                return;
+            };
+            var sample_count: usize = 0;
+            for (surfaces) |surface| {
+                const layer = self.findAppLayer(surface) orelse continue;
+                if (!layer.active) continue;
+                try self.ensureFrameStorage(sample_count + 1);
+                self.frame_samples[sample_count] = self.logicalCaptureSample(layer) catch {
+                    try self.failImageCopy(capture);
+                    return;
+                };
+                sample_count += 1;
+            }
+            if (capture.paint_cursors and !self.sessionLockActive()) {
+                if (self.themed_cursor.image) |_| {
+                    self.themed_cursor.move(self.interaction.cursor.position);
+                    self.themed_cursor.setPointerAvailable(
+                        self.interaction.cursor.pointer_available,
+                    );
+                    if (try self.themed_cursor.sample(bounds)) |sample| {
+                        try self.ensureFrameStorage(sample_count + 1);
+                        self.frame_samples[sample_count] = sample;
+                        sample_count += 1;
+                    }
+                } else if (self.cursor_layer.active) {
+                    if (try self.interaction.cursor.composite(.{
+                        .surface = self.cursor_layer.id.?,
+                        .sample = self.cursor_layer.sample.?,
+                    }, bounds)) |sample| {
+                        try self.ensureFrameStorage(sample_count + 1);
+                        self.frame_samples[sample_count] = sample;
+                        sample_count += 1;
+                    }
+                }
+            }
+            if (sample_count == 0) {
+                try self.failImageCopy(capture);
+                return;
+            }
+
+            var imported_count: usize = 0;
+            defer for (self.capture_imports[0..imported_count]) |*imported| {
+                if (imported.*) |*source| source.deinit();
+                imported.* = null;
+            };
+            for (self.frame_samples[0..sample_count], 0..) |*sample, index| {
+                sample.destination.x = std.math.sub(i32, sample.destination.x, bounds.x) catch {
+                    try self.failImageCopy(capture);
+                    return;
+                };
+                sample.destination.y = std.math.sub(i32, sample.destination.y, bounds.y) catch {
+                    try self.failImageCopy(capture);
+                    return;
+                };
+                sample.clip.x = std.math.sub(i32, sample.clip.x, bounds.x) catch {
+                    try self.failImageCopy(capture);
+                    return;
+                };
+                sample.clip.y = std.math.sub(i32, sample.clip.y, bounds.y) catch {
+                    try self.failImageCopy(capture);
+                    return;
+                };
+                if (sample.source.external != null) {
+                    const imported = output.mapExternalSource(sample.source) catch {
+                        try self.failImageCopy(capture);
+                        return;
+                    };
+                    self.capture_imports[imported_count] = imported;
+                    imported_count += 1;
+                    sample.source = .{
+                        .size = .{ .width = imported.width, .height = imported.height },
+                        .stride = imported.stride,
+                        .format = imported.format,
+                        .bytes = imported.bytes,
+                    };
+                }
+                self.capture_samples[index] = .{
+                    .source_index = @intCast(index),
+                    .sample = sample.sample,
+                    .presentation = sample.presentation,
+                    .crop = sample.crop,
+                    .destination = .{
+                        .x = sample.destination.x,
+                        .y = sample.destination.y,
+                        .width = sample.destination.width,
+                        .height = sample.destination.height,
+                    },
+                    .clip = .{
+                        .x = sample.clip.x,
+                        .y = sample.clip.y,
+                        .width = sample.clip.width,
+                        .height = sample.clip.height,
+                    },
+                    .transform = sample.transform,
+                    .global_alpha = sample.global_alpha,
+                };
+            }
+
+            const output_size: render.Size = .{
+                .width = capture.width,
+                .height = capture.height,
+            };
+            const full_damage = [_]render.Rect{.{
+                .x = 0,
+                .y = 0,
+                .width = capture.width,
+                .height = capture.height,
+            }};
+            const plan: render.DamagePlan = .{
+                .output = output_size,
+                .samples = self.capture_samples[0..sample_count],
+                .client_damage = &full_damage,
+                .scene_damage = &.{},
+                .repair_damage = &.{},
+                .render_damage = &full_damage,
+                .client_full = true,
+                .scene_full = false,
+                .repair_full = false,
+                .render_full = true,
+            };
+            const server_objects = self.root.runtime.clients.get(capture.peer) catch {
+                try self.failImageCopy(capture);
+                return;
+            };
+            const object = server_objects.namespace.resolve(capture.buffer) orelse {
+                try self.failImageCopy(capture);
+                return;
+            };
+            var rendered = false;
+            if (self.shm.bufferToken(object)) |token| {
+                const info = self.shm.store.bufferInfo(token) catch {
+                    try self.failImageCopy(capture);
+                    return;
+                };
+                const format: render.PixelFormat = if (info.format.value == protocol.wl_shm.format.argb8888.value)
+                    .argb8888_premultiplied
+                else if (info.format.value == protocol.wl_shm.format.xrgb8888.value)
+                    .xrgb8888
+                else {
+                    try self.image_copy_capture_adapter.fail(capture.frame, .buffer_constraints);
+                    self.markProtocol(capture.peer, ProtocolReady.image_copy_capture);
+                    return;
+                };
+                const stride = std.math.mul(u32, capture.width, 4) catch {
+                    try self.failImageCopy(capture);
+                    return;
+                };
+                if (info.width != capture.width or info.height != capture.height or
+                    info.stride != stride)
+                {
+                    try self.image_copy_capture_adapter.fail(capture.frame, .buffer_constraints);
+                    self.markProtocol(capture.peer, ProtocolReady.image_copy_capture);
+                    return;
+                }
+                const pin = self.shm.store.pin(token) catch {
+                    try self.failImageCopy(capture);
+                    return;
+                };
+                defer self.shm.store.unpin(pin) catch {};
+                var access = self.shm.store.writeAccess(pin) catch {
+                    try self.failImageCopy(capture);
+                    return;
+                };
+                var access_open = true;
+                defer if (access_open) access.end() catch {};
+                const list: render.List = .{
+                    .output = output_size,
+                    .output_format = format,
+                    .clear = .{ .a = 0, .r = 0, .g = 0, .b = 0 },
+                    .samples = self.frame_samples[0..sample_count],
+                };
+                self.capture_renderer.draw(
+                    list,
+                    plan,
+                    access.bytes,
+                    @intCast(info.stride),
+                ) catch {
+                    try self.failImageCopy(capture);
+                    return;
+                };
+                try access.end();
+                access_open = false;
+                rendered = true;
+            } else if (self.dmabuf_adapter.bufferFromObject(object)) |handle| {
+                const lease = self.dmabuf_adapter.retainBuffer(handle) catch {
+                    try self.failImageCopy(capture);
+                    return;
+                };
+                defer self.dmabuf_adapter.releaseLease(lease) catch {};
+                const buffer = self.dmabuf_adapter.leasedBuffer(lease) catch {
+                    try self.failImageCopy(capture);
+                    return;
+                };
+                const import = dmabufCaptureImport(buffer) catch {
+                    try self.image_copy_capture_adapter.fail(capture.frame, .buffer_constraints);
+                    self.markProtocol(capture.peer, ProtocolReady.image_copy_capture);
+                    return;
+                };
+                if (import.width != capture.width or import.height != capture.height) {
+                    try self.image_copy_capture_adapter.fail(capture.frame, .buffer_constraints);
+                    self.markProtocol(capture.peer, ProtocolReady.image_copy_capture);
+                    return;
+                }
+                var destination = output.mapCaptureDestination(import) catch {
+                    try self.failImageCopy(capture);
+                    return;
+                };
+                defer destination.deinit();
+                const format: render.PixelFormat = if (import.format == gbm.format_argb8888)
+                    .argb8888_premultiplied
+                else
+                    .xrgb8888;
+                const list: render.List = .{
+                    .output = output_size,
+                    .output_format = format,
+                    .clear = .{ .a = 0, .r = 0, .g = 0, .b = 0 },
+                    .samples = self.frame_samples[0..sample_count],
+                };
+                self.capture_renderer.draw(
+                    list,
+                    plan,
+                    destination.bytes,
+                    destination.stride,
+                ) catch {
+                    try self.failImageCopy(capture);
+                    return;
+                };
+                rendered = true;
+            }
+            if (!rendered) {
+                try self.failImageCopy(capture);
+                return;
+            }
+            self.image_copy_capture_adapter.complete(
+                capture.frame,
+                try monotonicNs(),
+            ) catch |cause| switch (cause) {
+                error.StaleFrame, error.InvalidCompletion => return,
+                else => return cause,
+            };
+            self.markProtocol(capture.peer, ProtocolReady.image_copy_capture);
         }
 
         fn dmabufCaptureImport(buffer: *const protocol_linux_dmabuf.Buffer) !gbm.Import {
@@ -11956,6 +12308,19 @@ fn rectanglesIntersect(a: geometry.Rect, b: geometry.Rect) bool {
         @as(i64, b.x) < @as(i64, a.x) + a.width and
         @as(i64, a.y) < @as(i64, b.y) + b.height and
         @as(i64, b.y) < @as(i64, a.y) + a.height;
+}
+
+fn rectangleUnion(a: geometry.Rect, b: render.Rect) !geometry.Rect {
+    const left = @min(@as(i64, a.x), b.x);
+    const top = @min(@as(i64, a.y), b.y);
+    const right = @max(@as(i64, a.x) + a.width, @as(i64, b.x) + b.width);
+    const bottom = @max(@as(i64, a.y) + a.height, @as(i64, b.y) + b.height);
+    return .{
+        .x = std.math.cast(i32, left) orelse return error.GeometryOverflow,
+        .y = std.math.cast(i32, top) orelse return error.GeometryOverflow,
+        .width = std.math.cast(i32, right - left) orelse return error.GeometryOverflow,
+        .height = std.math.cast(i32, bottom - top) orelse return error.GeometryOverflow,
+    };
 }
 
 fn rectangleContains(outer: geometry.Rect, inner: geometry.Rect) bool {

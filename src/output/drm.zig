@@ -240,6 +240,20 @@ pub const ImportedSource = struct {
     }
 };
 
+pub const MappedCaptureDestination = struct {
+    platform: gbm.Platform,
+    bo: gbm.Bo,
+    mapping: gbm.Mapping,
+    bytes: []u8,
+    stride: u32,
+
+    pub fn deinit(destination: *MappedCaptureDestination) void {
+        destination.platform.unmap(destination.bo, destination.mapping.token);
+        destination.platform.destroyBo(destination.bo);
+        destination.* = undefined;
+    }
+};
+
 const ImportIdentity = struct {
     context: *anyopaque,
     token: u64,
@@ -1041,6 +1055,45 @@ pub const Output = struct {
             .backing = .{ .gbm = bo },
         };
         return mapped;
+    }
+
+    pub fn mapExternalSource(self: *Output, source: render.Source) !ImportedSource {
+        const external = source.external orelse return error.MissingExternalSource;
+        return mapImportedSource(
+            self.pool.gbm_platform,
+            self.pool.device,
+            externalImport(source.size, external),
+        );
+    }
+
+    pub fn mapCaptureDestination(
+        self: *Output,
+        import: gbm.Import,
+    ) !MappedCaptureDestination {
+        if (import.width == 0 or import.height == 0 or import.plane_count != 1 or
+            import.modifier != gbm.modifier_linear)
+            return error.UnsupportedCaptureTarget;
+        _ = formatFromDrm(import.format) orelse return error.UnsupportedFormat;
+        const bo = try self.pool.gbm_platform.importBo(
+            self.pool.device,
+            import,
+            .rendering,
+        );
+        errdefer self.pool.gbm_platform.destroyBo(bo);
+        const mapping = try self.pool.gbm_platform.map(bo, .write);
+        errdefer self.pool.gbm_platform.unmap(bo, mapping.token);
+        const row_bytes = std.math.mul(u32, import.width, 4) catch
+            return error.InvalidTarget;
+        if (mapping.stride < row_bytes) return error.InvalidTarget;
+        const length = std.math.mul(usize, mapping.stride, import.height) catch
+            return error.InvalidTarget;
+        return .{
+            .platform = self.pool.gbm_platform,
+            .bo = bo,
+            .mapping = mapping,
+            .bytes = mapping.data[0..length],
+            .stride = mapping.stride,
+        };
     }
 
     fn importCacheDestination(self: *Output) *CachedImport {
