@@ -1345,29 +1345,37 @@ test "generated output power client drains and recreates the physical output" {
     for (0..512) |_| {
         _ = try drainClient(&reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
-        if (handler.mode_count == handler.modes.len) break;
+        if (handler.mode_counts[0] == handler.modes[0].len and
+            handler.mode_counts[1] == handler.modes[1].len) break;
         if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
             try waitForEither(&root.ring, reactor.ring);
     }
-    try std.testing.expectEqualSlices(u32, &.{
+    for (handler.modes) |modes| try std.testing.expectEqualSlices(u32, &.{
         protocol.zwlr_output_power_v1.mode.on.value,
         protocol.zwlr_output_power_v1.mode.off.value,
         protocol.zwlr_output_power_v1.mode.on.value,
-    }, &handler.modes);
+    }, &modes);
     try std.testing.expectEqual(@as(usize, 0), handler.failed);
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
     try std.testing.expect(coordinator.primaryKmsOutput() != null);
-    try std.testing.expectEqual(initial_primary, coordinator.primaryKmsOutput().?.outputId());
+    try std.testing.expect(!std.meta.eql(
+        initial_primary,
+        coordinator.physical_outputs[0].kms_output.?.outputId(),
+    ));
     try std.testing.expect(!std.meta.eql(
         initial_secondary,
         coordinator.physical_outputs[1].kms_output.?.outputId(),
     ));
     try std.testing.expectEqual(
-        @as(usize, 3),
+        coordinator.physical_outputs[0].kms_output.?.outputId(),
+        coordinator.primaryKmsOutput().?.outputId(),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 4),
         coordinator.stats.selected_outputs,
     );
-    try std.testing.expectEqual(@as(usize, 1), coordinator.stats.output_drains);
-    const power = handler.power.?;
+    try std.testing.expectEqual(@as(usize, 2), coordinator.stats.output_drains);
+    const powers = handler.powers;
 
     try fixture.signalSession(.disable);
     for (0..512) |_| {
@@ -1388,9 +1396,9 @@ test "generated output power client drains and recreates the physical output" {
         if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
             try waitForEither(&root.ring, reactor.ring);
     }
-    try std.testing.expectEqual(power, handler.power.?);
+    try std.testing.expectEqual(powers, handler.powers);
     try std.testing.expectEqual(@as(usize, 0), handler.failed);
-    try std.testing.expectEqual(@as(usize, 3), handler.mode_count);
+    try std.testing.expectEqual([2]usize{ 3, 3 }, handler.mode_counts);
 
     _ = try client.prepareClose();
     try submitClient(&reactor, &driver, &handler);
@@ -2776,11 +2784,16 @@ const OutputPowerClientHandler = struct {
     queue: *wayring.tx.Queue,
     registry: wayring.objects.Handle,
     manager: ?wayring.objects.Handle = null,
-    output: ?wayring.objects.Handle = null,
-    power: ?wayring.objects.Handle = null,
-    output_ready: bool = false,
-    modes: [3]u32 = undefined,
-    mode_count: usize = 0,
+    outputs: [2]?wayring.objects.Handle = .{ null, null },
+    output_count: usize = 0,
+    powers: [2]?wayring.objects.Handle = .{ null, null },
+    output_ready: [2]bool = .{ false, false },
+    modes: [2][3]u32 = undefined,
+    mode_counts: [2]usize = .{ 0, 0 },
+    primary_off_requested: bool = false,
+    primary_on_requested: bool = false,
+    secondary_off_requested: bool = false,
+    secondary_on_requested: bool = false,
     failed: usize = 0,
     event_failures: usize = 0,
 
@@ -2792,30 +2805,38 @@ const OutputPowerClientHandler = struct {
         if (target.object.interface == &ClientCore.Registry.info) {
             switch (try ClientCore.decodeRegistryEvent(self.objects, self.registry, message, fds)) {
                 .global => |global| {
-                    if (std.mem.eql(u8, global.interface, protocol.wl_output.info.name))
-                        self.output = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wl_output.info, @min(global.version, 4), null);
+                    if (std.mem.eql(u8, global.interface, protocol.wl_output.info.name)) {
+                        if (self.output_count >= self.outputs.len) return error.UnexpectedOutput;
+                        self.outputs[self.output_count] = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wl_output.info, @min(global.version, 4), null);
+                        self.output_count += 1;
+                    }
                     if (std.mem.eql(u8, global.interface, protocol.zwlr_output_power_manager_v1.info.name))
                         self.manager = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.zwlr_output_power_manager_v1.info, 1, null);
                 },
                 .global_remove => {},
             }
-            try self.maybeCreatePower();
+            try self.maybeCreatePowers();
         } else if (target.object.interface == &protocol.wl_output.info) {
             switch (try protocol.wl_output.decodeEvent(message, fds)) {
                 .done => {
-                    self.output_ready = true;
-                    try self.maybeCreatePower();
+                    self.output_ready[
+                        self.outputIndex(target.object) orelse
+                            return error.UnexpectedOutput
+                    ] = true;
+                    try self.maybeCreatePowers();
                 },
                 else => {},
             }
         } else if (target.object.interface == &protocol.zwlr_output_power_v1.info) {
             switch (try protocol.zwlr_output_power_v1.decodeEvent(message, fds)) {
                 .mode => |value| {
-                    if (self.mode_count >= self.modes.len) return error.UnexpectedPowerMode;
-                    self.modes[self.mode_count] = value.mode.value;
-                    self.mode_count += 1;
-                    if (self.mode_count == 1) try self.setMode(.off);
-                    if (self.mode_count == 2) try self.setMode(.on);
+                    const index = self.powerIndex(target.object) orelse
+                        return error.UnexpectedOutputPower;
+                    if (self.mode_counts[index] >= self.modes[index].len)
+                        return error.UnexpectedPowerMode;
+                    self.modes[index][self.mode_counts[index]] = value.mode.value;
+                    self.mode_counts[index] += 1;
+                    try self.advancePowerCycles();
                 },
                 .failed => self.failed += 1,
             }
@@ -2828,22 +2849,58 @@ const OutputPowerClientHandler = struct {
         return .continue_dispatch;
     }
 
-    fn maybeCreatePower(self: *OutputPowerClientHandler) !void {
-        if (self.power != null or !self.output_ready or self.output == null or self.manager == null) return;
-        self.power = (try protocol.zwlr_output_power_manager_v1.construct_get_output_power(
-            self.objects,
-            self.queue,
-            self.manager.?,
-            .{ .output = self.output.?.id },
-        )).id;
+    fn maybeCreatePowers(self: *OutputPowerClientHandler) !void {
+        const manager = self.manager orelse return;
+        for (&self.powers, self.outputs, self.output_ready) |*power, output, ready| {
+            if (power.* != null or !ready or output == null) continue;
+            power.* = (try protocol.zwlr_output_power_manager_v1.construct_get_output_power(
+                self.objects,
+                self.queue,
+                manager,
+                .{ .output = output.?.id },
+            )).id;
+        }
     }
 
-    fn setMode(self: *OutputPowerClientHandler, mode: protocol.zwlr_output_power_v1.mode) !void {
+    fn advancePowerCycles(self: *OutputPowerClientHandler) !void {
+        if (self.mode_counts[0] == 1 and !self.primary_off_requested) {
+            try self.setMode(0, .off);
+            self.primary_off_requested = true;
+        }
+        if (self.mode_counts[0] == 2 and !self.primary_on_requested) {
+            try self.setMode(0, .on);
+            self.primary_on_requested = true;
+        }
+        if (self.mode_counts[0] == 3 and self.mode_counts[1] == 1 and
+            !self.secondary_off_requested)
+        {
+            try self.setMode(1, .off);
+            self.secondary_off_requested = true;
+        }
+        if (self.mode_counts[1] == 2 and !self.secondary_on_requested) {
+            try self.setMode(1, .on);
+            self.secondary_on_requested = true;
+        }
+    }
+
+    fn setMode(self: *OutputPowerClientHandler, index: usize, mode: protocol.zwlr_output_power_v1.mode) !void {
         try protocol.zwlr_output_power_v1.encodeRequest(
             self.queue,
-            self.power.?.id,
+            self.powers[index].?.id,
             .{ .set_mode = .{ .mode = mode } },
         );
+    }
+
+    fn outputIndex(self: *const OutputPowerClientHandler, target: *wayring.objects.Object) ?usize {
+        for (self.outputs, 0..) |output, index|
+            if (output != null and self.objects.namespace.resolve(output.?) == target) return index;
+        return null;
+    }
+
+    fn powerIndex(self: *const OutputPowerClientHandler, target: *wayring.objects.Object) ?usize {
+        for (self.powers, 0..) |power, index|
+            if (power != null and self.objects.namespace.resolve(power.?) == target) return index;
+        return null;
     }
 };
 
