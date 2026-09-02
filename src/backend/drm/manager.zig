@@ -297,7 +297,7 @@ pub const Manager = struct {
     /// smallest udev syspath. The syspath fallback is stable across enumeration
     /// ordering and card-node renumbering when udev exposes stable ancestry.
     pub fn rescan(self: *Manager) !?Handle {
-        return self.rescanImpl(null, null);
+        return self.rescanImpl(null, null, false);
     }
 
     /// Rescans one unchanged DRM device while preserving every active scanout
@@ -318,13 +318,31 @@ pub const Manager = struct {
             for (handles[0..index]) |earlier|
                 if (std.meta.eql(earlier, handle)) return error.DuplicateClaim;
         }
-        return self.rescanImpl(handles, refreshed);
+        return self.rescanImpl(handles, refreshed, false);
+    }
+
+    /// Rescans while preserving only the supplied active claims. Claims not
+    /// supplied are invalidated atomically with the topology generation so a
+    /// coordinator can rebuild changed outputs without draining unchanged ones.
+    pub fn rescanReplacingClaims(
+        self: *Manager,
+        preserved: []const ClaimHandle,
+        refreshed: []ClaimHandle,
+    ) !?Handle {
+        if (refreshed.len < preserved.len) return error.OutputTooSmall;
+        for (preserved, 0..) |handle, index| {
+            _ = try self.getClaim(handle);
+            for (preserved[0..index]) |earlier|
+                if (std.meta.eql(earlier, handle)) return error.DuplicateClaim;
+        }
+        return self.rescanImpl(preserved, refreshed, true);
     }
 
     fn rescanImpl(
         self: *Manager,
         preserved_handles: ?[]const ClaimHandle,
         refreshed_handles: ?[]ClaimHandle,
+        invalidate_unpreserved: bool,
     ) !?Handle {
         if (self.hasActiveLease()) return error.LeasesActive;
         const preserved = preserved_handles orelse &.{};
@@ -407,6 +425,15 @@ pub const Manager = struct {
                 .candidate = candidateFromSelection(storage.selection),
             };
         } else {
+            if (invalidate_unpreserved) for (self.claims, 0..) |*claim, slot| {
+                if (!claim.active) continue;
+                var keep = false;
+                for (preserved) |handle| if (handle.slot == slot) {
+                    keep = true;
+                    break;
+                };
+                if (!keep) claim.active = false;
+            };
             for (preserved, rebound, 0..) |claim_handle, rebound_candidate, index| {
                 const claim = &self.claims[claim_handle.slot];
                 claim.candidate = rebound_candidate;
@@ -503,7 +530,8 @@ pub const Manager = struct {
         self: *Manager,
         handle: Handle,
         desktop_output: []u32,
-    ) !struct { desktop: []const u32, desktop_updated: bool, lease_changed: bool } {
+        updated_output: []u32,
+    ) !struct { desktop: []const u32, desktop_updated: []const u32, lease_changed: bool } {
         if (!self.present or handle.generation != self.generation)
             return error.StaleSnapshot;
         const fd = try self.session.deviceFd(self.device orelse return error.StaleSnapshot);
@@ -523,20 +551,24 @@ pub const Manager = struct {
             desktop_output[index] = probe.buffer.connectors[candidate.connector_index].id;
 
         const current = &self.stores[self.active_store];
-        var desktop_updated = false;
+        var desktop_updated_count: usize = 0;
         for (current.candidates[0..current.candidate_count]) |candidate| {
             const connector_id = current.buffer.connectors[candidate.connector_index].id;
             for (probe.candidates[0..probe.candidate_count]) |probed| {
                 if (probe.buffer.connectors[probed.connector_index].id != connector_id) continue;
-                desktop_updated = !candidateConfigurationEqual(
+                if (!candidateConfigurationEqual(
                     current,
                     candidate,
                     probe,
                     probed,
-                );
+                )) {
+                    if (desktop_updated_count == updated_output.len)
+                        return error.OutputTooSmall;
+                    updated_output[desktop_updated_count] = connector_id;
+                    desktop_updated_count += 1;
+                }
                 break;
             }
-            if (desktop_updated) break;
         }
         var lease_changed = probe.lease_candidate_count != current.lease_candidate_count;
         if (!lease_changed) for (current.lease_candidates[0..current.lease_candidate_count]) |candidate| {
@@ -560,7 +592,7 @@ pub const Manager = struct {
         };
         return .{
             .desktop = desktop_output[0..probe.candidate_count],
-            .desktop_updated = desktop_updated,
+            .desktop_updated = updated_output[0..desktop_updated_count],
             .lease_changed = lease_changed,
         };
     }
@@ -1419,21 +1451,22 @@ test "drm: connector probe distinguishes additions from updates" {
 
     const handle = (try manager.rescan()).?;
     var connector_ids: [2]u32 = undefined;
-    const unchanged = try manager.probeConnectorChanges(handle, &connector_ids);
+    var updated_ids: [2]u32 = undefined;
+    const unchanged = try manager.probeConnectorChanges(handle, &connector_ids, &updated_ids);
     try std.testing.expectEqualSlices(u32, &.{20}, unchanged.desktop);
-    try std.testing.expect(!unchanged.desktop_updated);
+    try std.testing.expectEqual(@as(usize, 0), unchanged.desktop_updated.len);
     try std.testing.expect(!unchanged.lease_changed);
 
     platform.multiple_outputs = true;
-    const added = try manager.probeConnectorChanges(handle, &connector_ids);
+    const added = try manager.probeConnectorChanges(handle, &connector_ids, &updated_ids);
     try std.testing.expectEqualSlices(u32, &.{ 20, 21 }, added.desktop);
-    try std.testing.expect(!added.desktop_updated);
+    try std.testing.expectEqual(@as(usize, 0), added.desktop_updated.len);
     try std.testing.expect(!added.lease_changed);
 
     platform.alternate_mode = true;
-    const updated = try manager.probeConnectorChanges(handle, &connector_ids);
+    const updated = try manager.probeConnectorChanges(handle, &connector_ids, &updated_ids);
     try std.testing.expectEqualSlices(u32, &.{ 20, 21 }, updated.desktop);
-    try std.testing.expect(updated.desktop_updated);
+    try std.testing.expectEqualSlices(u32, &.{20}, updated.desktop_updated);
     try std.testing.expect(!updated.lease_changed);
     try std.testing.expectEqual(handle, manager.currentHandle().?);
 }
@@ -1517,6 +1550,33 @@ test "drm: same-device rescan preserves exact claims while adding outputs" {
     try std.testing.expectEqual(@as(usize, 2), candidates.len);
     const added = try manager.claimScanout(second, candidates[1]);
     try std.testing.expectEqual(@as(u32, 21), (try manager.claimSnapshot(added)).selectedConnector().id);
+}
+
+test "drm: same-device rescan replaces changed claims atomically" {
+    var seat = FakeSeat{};
+    const session = try seat.createSession();
+    defer destroyTestSession(session);
+    var platform = FakeDrm{ .multiple_outputs = true };
+    var manager = try Manager.init(std.testing.allocator, platform.platform(), session, "seat0", testConfig());
+    defer manager.deinit() catch unreachable;
+
+    const first = (try manager.rescan()).?;
+    const primary = try manager.primaryClaim(first);
+    const secondary = try manager.claimScanout(first, (try manager.scanoutCandidates(first))[1]);
+    platform.alternate_mode = true;
+    var refreshed: [1]ClaimHandle = undefined;
+    const second = (try manager.rescanReplacingClaims(&.{secondary}, &refreshed)).?;
+
+    try std.testing.expectError(error.StaleClaim, manager.claimSnapshot(primary));
+    try std.testing.expectError(error.StaleClaim, manager.claimSnapshot(secondary));
+    try std.testing.expectEqual(secondary.slot, refreshed[0].slot);
+    try std.testing.expectEqual(secondary.generation, refreshed[0].generation);
+    try std.testing.expectEqual(second.generation, refreshed[0].topology_generation);
+    try std.testing.expectEqual(@as(u32, 21), (try manager.claimSnapshot(refreshed[0])).selectedConnector().id);
+    const replacement = try manager.claimScanout(second, (try manager.scanoutCandidates(second))[0]);
+    const replacement_snapshot = try manager.claimSnapshot(replacement);
+    try std.testing.expectEqual(@as(u32, 20), replacement_snapshot.selectedConnector().id);
+    try std.testing.expectEqual(@as(usize, 2), replacement_snapshot.selectedConnector().mode_count);
 }
 
 test "drm: changed claim identity rejects refresh without mutation" {

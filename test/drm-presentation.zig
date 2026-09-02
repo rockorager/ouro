@@ -453,6 +453,7 @@ test "physical coordinator rebuilds an output when its modes change" {
     const allocator = std.testing.allocator;
     var fixture = try Fixture.init();
     defer fixture.deinit();
+    fixture.second_desktop = true;
     var path_storage: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-r15-output-mode-hotplug-{d}.sock", .{linux.getpid()});
     wayring.unix_socket.unlink(path) catch {};
@@ -466,13 +467,19 @@ test "physical coordinator rebuilds an output when its modes change" {
     try fixture.signalSession(.enable);
     for (0..128) |_| {
         _ = try loop.turn(coordinator);
-        if (coordinator.primaryKmsOutput() != null and coordinator.output_global_index == 1) break;
+        if (coordinator.physical_output_count == 2 and
+            coordinator.physical_outputs[1].kms_output != null and
+            coordinator.output_global_index == 2) break;
         if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
     }
 
     const physical_id = coordinator.physical_outputs[0].id;
     const protocol_output = coordinator.physical_outputs[0].protocol_output;
     const management_head = coordinator.physical_outputs[0].management_head;
+    const unchanged_kms = coordinator.physical_outputs[1].kms_output.?;
+    const unchanged_physical_id = coordinator.physical_outputs[1].id;
+    const unchanged_protocol_output = coordinator.physical_outputs[1].protocol_output;
+    const unchanged_management_head = coordinator.physical_outputs[1].management_head;
     const drains_before = coordinator.stats.output_drains;
     fixture.first_mode_width = 4;
     try fixture.signalHotplug();
@@ -501,7 +508,20 @@ test "physical coordinator rebuilds an output when its modes change" {
         management_head,
         coordinator.physical_outputs[0].management_head,
     ));
-    try std.testing.expect(coordinator.stats.output_drains > drains_before);
+    try std.testing.expect(coordinator.physical_outputs[1].kms_output.? == unchanged_kms);
+    try std.testing.expect(std.meta.eql(
+        unchanged_physical_id,
+        coordinator.physical_outputs[1].id,
+    ));
+    try std.testing.expect(std.meta.eql(
+        unchanged_protocol_output,
+        coordinator.physical_outputs[1].protocol_output,
+    ));
+    try std.testing.expect(std.meta.eql(
+        unchanged_management_head,
+        coordinator.physical_outputs[1].management_head,
+    ));
+    try std.testing.expectEqual(drains_before + 1, coordinator.stats.output_drains);
 
     try coordinator.requestStop();
     try drainServer(root, coordinator, &loop);
@@ -3581,6 +3601,10 @@ pub const Fixture = struct {
         out.formats[0] = .{ .fourcc = ouro.gbm.format_xrgb8888, .modifier = ouro.gbm.modifier_linear };
         out.connectors[1] = .{ .id = 11, .connector_type = 1, .connector_type_id = 2, .connected = true, .desktop = self.second_desktop, .width_mm = 2, .height_mm = 2, .encoder_id = 21, .mode_start = 1, .mode_count = 1, .encoder_start = 1, .encoder_count = 1, .properties = .{ .crtc_id = 1, .vrr_capable = self.vrr_supported } };
         out.modes[1] = out.modes[0];
+        out.modes[1].hdisplay = 3;
+        out.modes[1].hsync_start = 3;
+        out.modes[1].hsync_end = 3;
+        out.modes[1].htotal = 3;
         out.connector_encoders[1] = 21;
         out.encoders[1] = .{ .id = 21, .crtc_id = 31, .possible_crtcs = 2 };
         out.crtcs[1] = .{ .id = 31, .index = 1, .properties = .{ .active = 2, .mode_id = 3, .vrr_enabled = if (self.vrr_supported) 16 else 0 } };

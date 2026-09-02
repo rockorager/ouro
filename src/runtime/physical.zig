@@ -885,6 +885,8 @@ pub fn Coordinator(comptime protocol: type) type {
         hotplug: ?drm_hotplug.Monitor = null,
         hotplug_connector_ids: []u32,
         hotplug_connector_count: usize = 0,
+        hotplug_updated_connector_ids: []u32,
+        hotplug_updated_connector_count: usize = 0,
         drm_lease_adapter: DrmLeaseAdapter,
         drm_lease_claims: []drm.ClaimHandle,
         topology_claims: []drm.ClaimHandle,
@@ -1312,6 +1314,11 @@ pub fn Coordinator(comptime protocol: type) type {
             errdefer if (self.hotplug) |*monitor| monitor.deinit();
             self.hotplug_connector_ids = try allocator.alloc(u32, config.drm.connector_capacity);
             errdefer allocator.free(self.hotplug_connector_ids);
+            self.hotplug_updated_connector_ids = try allocator.alloc(
+                u32,
+                config.drm.connector_capacity,
+            );
+            errdefer allocator.free(self.hotplug_updated_connector_ids);
             self.drm_lease_adapter = try DrmLeaseAdapter.init(allocator, self, config.drm_lease);
             errdefer self.drm_lease_adapter.deinit();
             self.drm_lease_claims = try allocator.alloc(
@@ -2170,6 +2177,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 first_error = err;
             };
             if (self.hotplug) |*monitor| monitor.deinit();
+            self.allocator.free(self.hotplug_updated_connector_ids);
             self.allocator.free(self.hotplug_connector_ids);
             self.retireGammaOwners() catch |err| {
                 if (first_error == null) first_error = err;
@@ -2871,9 +2879,11 @@ pub fn Coordinator(comptime protocol: type) type {
             const probe = try self.manager.probeConnectorChanges(
                 handle,
                 self.hotplug_connector_ids,
+                self.hotplug_updated_connector_ids,
             );
             const connectors = probe.desktop;
             self.hotplug_connector_count = connectors.len;
+            self.hotplug_updated_connector_count = probe.desktop_updated.len;
             const primary_missing = std.mem.indexOfScalar(
                 u32,
                 connectors,
@@ -2913,19 +2923,19 @@ pub fn Coordinator(comptime protocol: type) type {
                     removal_requested = true;
                 }
             }
-            if ((primary_missing and !primary_promoted) or added or probe.desktop_updated or
+            if ((primary_missing and !primary_promoted) or added or probe.desktop_updated.len != 0 or
                 (probe.lease_changed and !removal_requested))
                 try self.requestTopologyRefresh(probe.desktop_updated);
             self.hotplug_refresh_pending = false;
         }
 
-        fn requestTopologyRefresh(self: *Self, force_drain: bool) !void {
+        fn requestTopologyRefresh(self: *Self, updated_connectors: []const u32) !void {
             if (self.topology_refresh_pending) return;
             if (self.stopping or self.session_disable_pending or
                 self.output_reconfigure != null or self.output_power_transition != null)
                 return error.InvalidState;
             self.topology_refresh_pending = true;
-            self.topology_refresh_draining = force_drain;
+            self.topology_refresh_draining = updated_connectors.len != 0;
             errdefer {
                 self.topology_refresh_pending = false;
                 self.topology_refresh_draining = false;
@@ -2934,7 +2944,11 @@ pub fn Coordinator(comptime protocol: type) type {
             self.markProtocolAll(ProtocolReady.drm_lease);
             self.drm_lease_desired = false;
             self.drm_lease_topology_generation = null;
-            if (force_drain) try self.pauseAllOutputs();
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                if (std.mem.indexOfScalar(u32, updated_connectors, physical.connector_id) == null)
+                    continue;
+                try self.pausePhysicalOutput(physical);
+            }
         }
 
         fn armIccPoll(self: *Self) !void {
@@ -11269,8 +11283,20 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.drm_lease_adapter.installed() or
                 self.drm_lease_adapter.retryRevocations()) return;
             if (self.anyKmsOutput()) {
-                if (!self.topology_refresh_draining)
+                if (self.topology_refresh_draining and
+                    self.hotplug_updated_connector_count != 0)
+                {
+                    for (self.physical_outputs[0..self.physical_output_count]) |physical| {
+                        if (std.mem.indexOfScalar(
+                            u32,
+                            self.hotplug_updated_connector_ids[0..self.hotplug_updated_connector_count],
+                            physical.connector_id,
+                        ) != null and physical.kms_output != null) return;
+                    }
+                    try self.refreshChangedTopology();
+                } else if (!self.topology_refresh_draining) {
                     try self.refreshActiveTopology();
+                }
                 return;
             }
 
@@ -11330,6 +11356,103 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.consumeOutputManagementCommands();
             self.topology_refresh_pending = false;
             self.topology_refresh_draining = false;
+            self.hotplug_updated_connector_count = 0;
+            try self.advancePhysicalOutputRemovals();
+        }
+
+        fn refreshChangedTopology(self: *Self) !void {
+            const previous = self.manager.currentHandle() orelse
+                return error.DrmHardwareUnavailable;
+            var claim_count: usize = 0;
+            for (self.physical_outputs[0..self.physical_output_count]) |physical| {
+                const output = physical.kms_output orelse continue;
+                if (!std.meta.eql(output.topologyHandle(), previous))
+                    return error.StaleSnapshot;
+                if (claim_count == self.topology_claims.len)
+                    return error.ClaimCapacityExceeded;
+                self.topology_claims[claim_count] = physical.claim orelse
+                    return error.StaleClaim;
+                claim_count += 1;
+            }
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                if (physical.kms_output != null) continue;
+                if (std.mem.indexOfScalar(
+                    u32,
+                    self.hotplug_updated_connector_ids[0..self.hotplug_updated_connector_count],
+                    physical.connector_id,
+                ) == null) continue;
+                try self.retireGammaOwner(physical);
+            }
+
+            const handle = self.manager.rescanReplacingClaims(
+                self.topology_claims[0..claim_count],
+                self.topology_refreshed_claims[0..claim_count],
+            ) catch |cause| switch (cause) {
+                error.ClaimsChanged,
+                error.NoConnectedOutput,
+                error.NoCompatibleCrtc,
+                error.NoPrimaryPlane,
+                => {
+                    self.hotplug_updated_connector_count = 0;
+                    try self.pauseAllOutputs();
+                    return;
+                },
+                else => return cause,
+            } orelse {
+                self.hotplug_updated_connector_count = 0;
+                try self.pauseAllOutputs();
+                return;
+            };
+            self.manager.clearEvents();
+
+            claim_count = 0;
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                const output = physical.kms_output orelse continue;
+                try output.rebindTopology(previous, handle);
+                physical.claim = self.topology_refreshed_claims[claim_count];
+                claim_count += 1;
+            }
+
+            const topology = try self.manager.snapshot(handle);
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                if (physical.kms_output != null) continue;
+                if (std.mem.indexOfScalar(
+                    u32,
+                    self.hotplug_updated_connector_ids[0..self.hotplug_updated_connector_count],
+                    physical.connector_id,
+                ) == null) continue;
+                physical.claim = null;
+                for (try self.manager.scanoutCandidates(handle)) |candidate| {
+                    if (topology.connectors[candidate.connector_index].id != physical.connector_id)
+                        continue;
+                    const claim = try self.manager.claimScanout(handle, candidate);
+                    errdefer self.manager.releaseScanout(claim) catch {};
+                    const snapshot = try self.manager.claimSnapshot(claim);
+                    const state = try self.output_management_adapter.lifecycle.currentHead(
+                        physical.management_head,
+                    );
+                    physical.claim = claim;
+                    try self.replaceManagementHead(physical, snapshot, state);
+                    try self.activatePhysicalOutput(
+                        physical,
+                        snapshot,
+                        state.scale_120,
+                        state.transform,
+                        state.adaptive_sync,
+                    );
+                    break;
+                }
+                if (physical.claim == null) return error.NoConnectedOutput;
+            }
+            try self.activateAdditionalOutputs(handle, false);
+            try self.ensureDrmLeasing(topology);
+            try self.advanceOutputGlobals();
+            try self.publishOutputLayout();
+            self.reconcileActiveOutputConfig();
+            try self.consumeOutputManagementCommands();
+            self.topology_refresh_pending = false;
+            self.topology_refresh_draining = false;
+            self.hotplug_updated_connector_count = 0;
             try self.advancePhysicalOutputRemovals();
         }
 
@@ -11380,6 +11503,7 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.consumeOutputManagementCommands();
             self.topology_refresh_pending = false;
             self.topology_refresh_draining = false;
+            self.hotplug_updated_connector_count = 0;
             try self.advancePhysicalOutputRemovals();
         }
 
