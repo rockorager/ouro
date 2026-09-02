@@ -550,6 +550,7 @@ pub fn Coordinator(comptime protocol: type) type {
             height: u32,
             full_stride: u32,
             overlay_cursor: bool,
+            transform_to_upright: bool,
             awaiting_output: bool = false,
             copied: bool = false,
             success: bool = false,
@@ -5008,10 +5009,14 @@ pub fn Coordinator(comptime protocol: type) type {
                 .cursor => if (self.cursorCaptureState(target)) |state| state.constraints else null,
             };
             var constraints = maybe_constraints orelse return null;
-            constraints.dmabuf_device = if (self.captureKmsOutput(target)) |output|
-                output.captureDmabufDevice(.{ .width = constraints.width, .height = constraints.height })
-            else
-                null;
+            constraints.dmabuf_device = if (self.captureKmsOutput(target)) |output| capture: {
+                if (std.meta.activeTag(target) == .cursor and
+                    output.planner.output_transform != .normal) break :capture null;
+                break :capture output.captureDmabufDevice(.{
+                    .width = constraints.width,
+                    .height = constraints.height,
+                });
+            } else null;
             return constraints;
         }
 
@@ -5068,7 +5073,6 @@ pub fn Coordinator(comptime protocol: type) type {
                 .toplevel => |id| (self.desktop.scene(id) catch return null).geometry,
             };
             const output = self.captureKmsOutput(target) orelse return null;
-            if (output.planner.output_transform != .normal) return null;
             const physical = self.physicalOutputForKmsId(output.outputId()) orelse return null;
             const output_bounds = self.outputBoundsFor(physical) catch return null;
             const cursor_region: geometry.Rect = .{
@@ -9052,6 +9056,8 @@ pub fn Coordinator(comptime protocol: type) type {
                     return;
                 },
             };
+            const transform_to_upright = std.meta.activeTag(capture.target) == .cursor and
+                output.planner.output_transform != .normal;
             const destination: ImageCopyDestination = if (self.shm.bufferToken(object)) |token| shm: {
                 const info = self.shm.store.bufferInfo(token) catch {
                     try self.failImageCopy(capture);
@@ -9074,7 +9080,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     return;
                 } };
             } else if (self.dmabuf_adapter.bufferFromObject(object)) |handle| dmabuf: {
-                if (output.rendererKind() != .vulkan) {
+                if (transform_to_upright or output.rendererKind() != .vulkan) {
                     try self.image_copy_capture_adapter.fail(capture.frame, .buffer_constraints);
                     self.markProtocol(capture.peer, ProtocolReady.image_copy_capture);
                     return;
@@ -9142,6 +9148,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     .cursor => true,
                     .source => false,
                 },
+                .transform_to_upright = transform_to_upright,
             };
             if (!(requestPhysicalOutputDamage(physical, try monotonicNs()) catch false)) {
                 try self.finishImageCopy(false, 0, null);
@@ -9302,15 +9309,28 @@ pub fn Coordinator(comptime protocol: type) type {
             const physical = self.physicalOutputForKmsId(pending.output) orelse
                 return error.OutputUnavailable;
             const output = physical.kms_output orelse return error.OutputUnavailable;
-            try copyCaptureRegion(
-                access.bytes[0..required],
-                @intCast(destination_stride),
-                pending.width,
-                pending.height,
-                pending.region,
-                readback,
-                output.planner.physical_output,
-            );
+            if (pending.transform_to_upright) {
+                try copyTransformedCaptureRegion(
+                    access.bytes[0..required],
+                    @intCast(destination_stride),
+                    pending.width,
+                    pending.height,
+                    pending.region,
+                    readback,
+                    output.planner.output,
+                    output.planner.output_transform,
+                );
+            } else {
+                try copyCaptureRegion(
+                    access.bytes[0..required],
+                    @intCast(destination_stride),
+                    pending.width,
+                    pending.height,
+                    pending.region,
+                    readback,
+                    output.planner.physical_output,
+                );
+            }
             try access.end();
             ended = true;
         }

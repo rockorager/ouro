@@ -3022,6 +3022,12 @@ test "shell-input: image copy capture publishes constraints and writes output SH
         .{ .completion_batch = 16 },
     );
     try coordinator.start(&loop);
+    var rotated = coordinator.output_management_adapter.lifecycle.current;
+    rotated.transform = 1;
+    _ = try coordinator.output_management_adapter.publishHead(
+        coordinator.output_management_adapter.lifecycle.primary,
+        rotated,
+    );
 
     var client_reactor: wayring.io_uring.Reactor = undefined;
     try client_reactor.initOwned(
@@ -4801,7 +4807,7 @@ const ImageCopyHandler = struct {
         } else if (target.object.interface == &protocol.ext_image_copy_capture_frame_v1.info) {
             switch (try protocol.ext_image_copy_capture_frame_v1.decodeEvent(message, fds)) {
                 .transform => |value| {
-                    try std.testing.expectEqual(protocol.wl_output.transform.normal, value.transform);
+                    try std.testing.expectEqual(protocol.wl_output.transform.@"90", value.transform);
                     self.transform_events += 1;
                 },
                 .damage => |value| {
