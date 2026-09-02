@@ -2,6 +2,7 @@
 //! session; device discovery and policy deliberately do not live here.
 
 const std = @import("std");
+const linux = std.os.linux;
 
 const c = @cImport({
     @cInclude("libseat.h");
@@ -79,6 +80,14 @@ pub const real: Platform = .{
     .vtable = &real_vtable,
 };
 
+/// Direct device access for an explicitly selected virtual DRM device. This
+/// deliberately does not acquire a seat, so it must never be used for a real
+/// display or input device.
+pub const headless: Platform = .{
+    .context = &real_context,
+    .vtable = &headless_vtable,
+};
+
 const real_vtable: Platform.VTable = .{
     .open_seat = realOpenSeat,
     .close_seat = realCloseSeat,
@@ -87,6 +96,22 @@ const real_vtable: Platform.VTable = .{
     .disable_seat = realDisableSeat,
     .open_device = realOpenDevice,
     .close_device = realCloseDevice,
+    .close_fd = realCloseFd,
+};
+
+const HeadlessSeat = struct {
+    fd: linux.fd_t,
+    callback: *CallbackContext,
+};
+
+const headless_vtable: Platform.VTable = .{
+    .open_seat = headlessOpenSeat,
+    .close_seat = headlessCloseSeat,
+    .get_fd = headlessGetFd,
+    .dispatch = headlessDispatch,
+    .disable_seat = headlessDisableSeat,
+    .open_device = headlessOpenDevice,
+    .close_device = headlessCloseDevice,
     .close_fd = realCloseFd,
 };
 
@@ -149,5 +174,52 @@ fn realCloseDevice(_: *anyopaque, seat: *anyopaque, id: i32) !void {
 }
 
 fn realCloseFd(_: *anyopaque, fd: std.posix.fd_t) !void {
-    _ = std.os.linux.close(fd);
+    _ = linux.close(fd);
 }
+
+fn headlessOpenSeat(_: *anyopaque, callback: *CallbackContext) !*anyopaque {
+    const result = linux.eventfd(1, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
+    if (linux.errno(result) != .SUCCESS) return error.OpenSeatFailed;
+    const seat = std.heap.page_allocator.create(HeadlessSeat) catch {
+        _ = linux.close(@intCast(result));
+        return error.OutOfMemory;
+    };
+    seat.* = .{ .fd = @intCast(result), .callback = callback };
+    return seat;
+}
+
+fn headlessCloseSeat(_: *anyopaque, seat_ptr: *anyopaque) !void {
+    const seat: *HeadlessSeat = @ptrCast(@alignCast(seat_ptr));
+    _ = linux.close(seat.fd);
+    std.heap.page_allocator.destroy(seat);
+}
+
+fn headlessGetFd(_: *anyopaque, seat_ptr: *anyopaque) !linux.fd_t {
+    const seat: *HeadlessSeat = @ptrCast(@alignCast(seat_ptr));
+    return seat.fd;
+}
+
+fn headlessDispatch(_: *anyopaque, seat_ptr: *anyopaque) !void {
+    const seat: *HeadlessSeat = @ptrCast(@alignCast(seat_ptr));
+    var value: u64 = 0;
+    const result = linux.read(seat.fd, @ptrCast(&value), @sizeOf(u64));
+    if (linux.errno(result) == .AGAIN) return;
+    if (linux.errno(result) != .SUCCESS or result != @sizeOf(u64))
+        return error.DispatchFailed;
+    seat.callback.listener.enable(seat.callback.userdata);
+}
+
+fn headlessDisableSeat(_: *anyopaque, _: *anyopaque) !void {}
+
+fn headlessOpenDevice(_: *anyopaque, _: *anyopaque, path: [:0]const u8) !OpenedDevice {
+    const result = linux.open(path, .{
+        .ACCMODE = .RDWR,
+        .CLOEXEC = true,
+        .NONBLOCK = true,
+    }, 0);
+    if (linux.errno(result) != .SUCCESS) return error.OpenDeviceFailed;
+    const fd: linux.fd_t = @intCast(result);
+    return .{ .id = fd, .fd = fd };
+}
+
+fn headlessCloseDevice(_: *anyopaque, _: *anyopaque, _: i32) !void {}

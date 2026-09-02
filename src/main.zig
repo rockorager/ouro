@@ -21,6 +21,7 @@ const Options = struct {
     drm_device: ?[]const u8 = null,
     config: ?[]const u8 = null,
     managed_session: bool = false,
+    headless: bool = false,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -29,6 +30,10 @@ pub fn main(init: std.process.Init) !void {
         usage();
         return err;
     };
+    if (options.headless and (options.drm_device == null or options.managed_session)) {
+        usage();
+        return error.InvalidHeadlessOptions;
+    }
     const managed_socket = if (options.socket == null and options.managed_session)
         try std.fmt.allocPrint(
             allocator,
@@ -111,8 +116,9 @@ pub fn main(init: std.process.Init) !void {
         compositorConfig(),
     );
     const coordinator = Runtime.create(allocator, root, .{
-        .input = ouro.input_platform.real,
-        .hotplug = ouro.drm_hotplug.real,
+        .session = if (options.headless) ouro.backend_platform.headless else ouro.backend_platform.real,
+        .input = if (options.headless) null else ouro.input_platform.real,
+        .hotplug = if (options.headless) null else ouro.drm_hotplug.real,
     }, .{
         .router_capacity = 17,
         .timer_capacity = 6,
@@ -123,7 +129,9 @@ pub fn main(init: std.process.Init) !void {
             .restricted_capacity = 32,
         },
         .shm = .{
-            .limits = .{ .max_pool_bytes = 128 * 1024 * 1024 },
+            // Clients commonly reserve large sparse pools (foot uses 512 MiB)
+            // while committing only output-sized buffers from them.
+            .limits = .{ .max_pool_bytes = 1024 * 1024 * 1024 },
             .pool_capacity = 64,
             .buffer_capacity = 64,
             .formats = &shm_formats,
@@ -382,6 +390,8 @@ fn parseOptions(args: std.process.Args) !Options {
             if (options.config.?.len == 0) return error.InvalidConfigPath;
         } else if (std.mem.eql(u8, argument, "--managed-session")) {
             options.managed_session = true;
+        } else if (std.mem.eql(u8, argument, "--headless")) {
+            options.headless = true;
         } else return error.UnknownArgument;
     }
     return options;
@@ -389,7 +399,7 @@ fn parseOptions(args: std.process.Args) !Options {
 
 fn usage() void {
     std.debug.print(
-        \\usage: ouro [--socket=PATH] [--renderer=auto|pixman|vulkan] [--drm-device=PATH] [--config=PATH] [--managed-session]
+        \\usage: ouro [--socket=PATH] [--renderer=auto|pixman|vulkan] [--drm-device=PATH] [--config=PATH] [--managed-session] [--headless]
         \\
         \\  auto    try Vulkan, then fall back to Pixman at startup
         \\  pixman  require the CPU Pixman renderer
@@ -397,6 +407,7 @@ fn usage() void {
         \\  --drm-device  require this DRM card instead of automatic selection
         \\  --config      load JSON output rules, including per-output ICC profiles
         \\  --managed-session  publish and bind the systemd graphical session lifecycle
+        \\  --headless     bypass libseat and input for an explicitly selected virtual DRM device
         \\  SIGHUP        reload configuration; invalid replacements are rejected
         \\
     , .{});
