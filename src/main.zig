@@ -186,6 +186,13 @@ pub fn main(init: std.process.Init) !void {
             .retained_luts = 32,
         },
         .protocol_output = .{ .association_capacity = 17 },
+        .output_management = .{
+            // One connector may consume the complete DRM mode inventory. A
+            // bound manager snapshots every head and mode, and all eight
+            // manager slots may have snapshots queued concurrently.
+            .mode_capacity = 128,
+            .outbound_capacity = 8192,
+        },
         .drm = .{
             .card_capacity = 8,
             .connector_capacity = 32,
@@ -440,9 +447,9 @@ fn compositorConfig() Compositor.Config {
             .object_capacity = 128,
             .object_quota = 1024,
             .buckets_per_client = 128,
-            // Vulkan may publish wp_linux_drm_syncobj_manager_v1 only after
-            // output discovery proves DRM syncobj support.
-            .max_globals = 68,
+            // Leave room for all 32 wl_output globals plus the optional
+            // wp_linux_drm_syncobj_manager_v1 discovered after startup.
+            .max_globals = 128,
             .registry_capacity = 4,
         },
     };
