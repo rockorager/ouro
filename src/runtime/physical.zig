@@ -2913,24 +2913,28 @@ pub fn Coordinator(comptime protocol: type) type {
                     removal_requested = true;
                 }
             }
-            if ((primary_missing and !primary_promoted) or added or
+            if ((primary_missing and !primary_promoted) or added or probe.desktop_updated or
                 (probe.lease_changed and !removal_requested))
-                try self.requestTopologyRefresh();
+                try self.requestTopologyRefresh(probe.desktop_updated);
             self.hotplug_refresh_pending = false;
         }
 
-        fn requestTopologyRefresh(self: *Self) !void {
+        fn requestTopologyRefresh(self: *Self, force_drain: bool) !void {
             if (self.topology_refresh_pending) return;
             if (self.stopping or self.session_disable_pending or
                 self.output_reconfigure != null or self.output_power_transition != null)
                 return error.InvalidState;
             self.topology_refresh_pending = true;
-            self.topology_refresh_draining = false;
-            errdefer self.topology_refresh_pending = false;
+            self.topology_refresh_draining = force_drain;
+            errdefer {
+                self.topology_refresh_pending = false;
+                self.topology_refresh_draining = false;
+            }
             try self.drm_lease_adapter.deviceUnavailable(.physical);
             self.markProtocolAll(ProtocolReady.drm_lease);
             self.drm_lease_desired = false;
             self.drm_lease_topology_generation = null;
+            if (force_drain) try self.pauseAllOutputs();
         }
 
         fn armIccPoll(self: *Self) !void {
@@ -7341,7 +7345,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 snapshot,
                 self.output_management_adapter.lifecycle.current.scale_120,
             );
-            try self.activateAdditionalOutputs(handle);
+            try self.activateAdditionalOutputs(handle, false);
             try self.advanceOutputGlobals();
             try self.publishOutputLayout();
             self.reconcileActiveOutputConfig();
@@ -7358,7 +7362,11 @@ pub fn Coordinator(comptime protocol: type) type {
             };
         }
 
-        fn activateAdditionalOutputs(self: *Self, handle: drm.Handle) !void {
+        fn activateAdditionalOutputs(
+            self: *Self,
+            handle: drm.Handle,
+            replace_management_heads: bool,
+        ) !void {
             const default_scale_120 = self.output_management_adapter.lifecycle.current.scale_120;
             for (try self.manager.scanoutCandidates(handle)) |candidate| {
                 const connector_id = (try self.manager.snapshot(handle)).connectors[candidate.connector_index].id;
@@ -7386,6 +7394,8 @@ pub fn Coordinator(comptime protocol: type) type {
                         physical.claim = null;
                         continue;
                     };
+                    if (replace_management_heads)
+                        try self.replaceManagementHead(physical, snapshot, state);
                     self.activatePhysicalOutput(
                         physical,
                         snapshot,
@@ -7413,6 +7423,54 @@ pub fn Coordinator(comptime protocol: type) type {
                 ) catch continue;
                 claim_owned = false;
             }
+        }
+
+        fn replaceManagementHead(
+            self: *Self,
+            physical: *PhysicalOutput,
+            snapshot: drm.Snapshot,
+            previous_state: protocol_output_management.HeadState,
+        ) !void {
+            const connector = snapshot.selectedConnector();
+            const mode = snapshot.selectedMode();
+            const mode_end = try std.math.add(usize, connector.mode_start, connector.mode_count);
+            if (mode_end > snapshot.modes.len) return error.InvalidModeInventory;
+            const refresh = try std.math.mul(u32, mode.vrefresh, 1000);
+            var name_buffer: [64]u8 = undefined;
+            const name = try std.fmt.bufPrint(&name_buffer, "DRM-{d}", .{connector.id});
+            var description_buffer: [128]u8 = undefined;
+            const description = try std.fmt.bufPrint(
+                &description_buffer,
+                "DRM connector {d}",
+                .{connector.id},
+            );
+            var state = previous_state;
+            state.enabled = false;
+            state.width = @intCast(mode.hdisplay);
+            state.height = @intCast(mode.vdisplay);
+            state.refresh_millihz = std.math.cast(i32, refresh) orelse
+                return error.InvalidMode;
+            const previous = physical.management_head;
+            const replacement = try self.output_management_adapter.addHead(
+                .{
+                    .name = name,
+                    .description = description,
+                    .physical_width_mm = if (connector.width_mm == 0) null else std.math.cast(i32, connector.width_mm) orelse
+                        return error.InvalidPhysicalSize,
+                    .physical_height_mm = if (connector.height_mm == 0) null else std.math.cast(i32, connector.height_mm) orelse
+                        return error.InvalidPhysicalSize,
+                },
+                try collectOutputModes(
+                    self.output_management_modes,
+                    snapshot.modes[connector.mode_start..mode_end],
+                ),
+                state,
+            );
+            errdefer self.output_management_adapter.removeHead(replacement) catch {};
+            if (std.meta.eql(previous, self.output_management_adapter.lifecycle.primary))
+                try self.output_management_adapter.promotePrimary(replacement);
+            try self.output_management_adapter.removeHead(previous);
+            physical.management_head = replacement;
         }
 
         fn addPhysicalOutput(
@@ -11224,6 +11282,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.manager.clearEvents();
             for (self.physical_outputs[0..self.physical_output_count]) |*physical|
                 physical.claim = null;
+            const replace_management_heads = self.topology_refresh_draining;
             const primary = self.primaryPhysicalOutputMutable();
             const primary_state = try self.output_management_adapter.lifecycle.currentHead(
                 primary.management_head,
@@ -11245,6 +11304,8 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             if (primary_snapshot.selectedConnector().id == primary.connector_id) {
                 primary.claim = primary_claim;
+                if (replace_management_heads)
+                    try self.replaceManagementHead(primary, primary_snapshot, primary_state);
                 try self.activatePhysicalOutput(
                     primary,
                     primary_snapshot,
@@ -11262,7 +11323,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 );
                 self.setPhysicalOutputRemoving(primary, true);
             }
-            try self.activateAdditionalOutputs(handle);
+            try self.activateAdditionalOutputs(handle, replace_management_heads);
             try self.advanceOutputGlobals();
             try self.publishOutputLayout();
             self.reconcileActiveOutputConfig();
@@ -11311,7 +11372,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 physical.claim = self.topology_refreshed_claims[claim_count];
                 claim_count += 1;
             }
-            try self.activateAdditionalOutputs(handle);
+            try self.activateAdditionalOutputs(handle, false);
             try self.ensureDrmLeasing(try self.manager.snapshot(handle));
             try self.advanceOutputGlobals();
             try self.publishOutputLayout();

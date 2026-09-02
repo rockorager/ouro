@@ -503,7 +503,7 @@ pub const Manager = struct {
         self: *Manager,
         handle: Handle,
         desktop_output: []u32,
-    ) !struct { desktop: []const u32, lease_changed: bool } {
+    ) !struct { desktop: []const u32, desktop_updated: bool, lease_changed: bool } {
         if (!self.present or handle.generation != self.generation)
             return error.StaleSnapshot;
         const fd = try self.session.deviceFd(self.device orelse return error.StaleSnapshot);
@@ -523,6 +523,21 @@ pub const Manager = struct {
             desktop_output[index] = probe.buffer.connectors[candidate.connector_index].id;
 
         const current = &self.stores[self.active_store];
+        var desktop_updated = false;
+        for (current.candidates[0..current.candidate_count]) |candidate| {
+            const connector_id = current.buffer.connectors[candidate.connector_index].id;
+            for (probe.candidates[0..probe.candidate_count]) |probed| {
+                if (probe.buffer.connectors[probed.connector_index].id != connector_id) continue;
+                desktop_updated = !candidateConfigurationEqual(
+                    current,
+                    candidate,
+                    probe,
+                    probed,
+                );
+                break;
+            }
+            if (desktop_updated) break;
+        }
         var lease_changed = probe.lease_candidate_count != current.lease_candidate_count;
         if (!lease_changed) for (current.lease_candidates[0..current.lease_candidate_count]) |candidate| {
             const connector_id = current.buffer.connectors[candidate.connector_index].id;
@@ -545,6 +560,7 @@ pub const Manager = struct {
         };
         return .{
             .desktop = desktop_output[0..probe.candidate_count],
+            .desktop_updated = desktop_updated,
             .lease_changed = lease_changed,
         };
     }
@@ -971,6 +987,66 @@ fn rebindCandidate(
     return null;
 }
 
+fn candidateConfigurationEqual(
+    left: *const Storage,
+    left_candidate: ScanoutCandidate,
+    right: *const Storage,
+    right_candidate: ScanoutCandidate,
+) bool {
+    const left_connector = left.buffer.connectors[left_candidate.connector_index];
+    const right_connector = right.buffer.connectors[right_candidate.connector_index];
+    if (left_connector.id != right_connector.id or
+        left_connector.connector_type != right_connector.connector_type or
+        left_connector.connector_type_id != right_connector.connector_type_id or
+        left_connector.width_mm != right_connector.width_mm or
+        left_connector.height_mm != right_connector.height_mm or
+        left_connector.encoder_id != right_connector.encoder_id or
+        left_connector.mode_count != right_connector.mode_count or
+        left_connector.encoder_count != right_connector.encoder_count or
+        !std.meta.eql(left_connector.properties, right_connector.properties)) return false;
+
+    const left_mode_end = @as(usize, left_connector.mode_start) + left_connector.mode_count;
+    const right_mode_end = @as(usize, right_connector.mode_start) + right_connector.mode_count;
+    if (!recordsEqual(
+        Mode,
+        left.buffer.modes[left_connector.mode_start..left_mode_end],
+        right.buffer.modes[right_connector.mode_start..right_mode_end],
+    )) return false;
+    const left_encoder_end = @as(usize, left_connector.encoder_start) +
+        left_connector.encoder_count;
+    const right_encoder_end = @as(usize, right_connector.encoder_start) +
+        right_connector.encoder_count;
+    if (!std.mem.eql(
+        u32,
+        left.buffer.connector_encoders[left_connector.encoder_start..left_encoder_end],
+        right.buffer.connector_encoders[right_connector.encoder_start..right_encoder_end],
+    )) return false;
+
+    const left_crtc = left.buffer.crtcs[left_candidate.crtc_index];
+    const right_crtc = right.buffer.crtcs[right_candidate.crtc_index];
+    if (!std.meta.eql(left_crtc, right_crtc)) return false;
+    const left_plane = left.buffer.planes[left_candidate.plane_index];
+    const right_plane = right.buffer.planes[right_candidate.plane_index];
+    if (left_plane.id != right_plane.id or
+        left_plane.possible_crtcs != right_plane.possible_crtcs or
+        left_plane.plane_type_value != right_plane.plane_type_value or
+        left_plane.format_count != right_plane.format_count or
+        !std.meta.eql(left_plane.properties, right_plane.properties)) return false;
+    const left_format_end = @as(usize, left_plane.format_start) + left_plane.format_count;
+    const right_format_end = @as(usize, right_plane.format_start) + right_plane.format_count;
+    return recordsEqual(
+        api.Format,
+        left.buffer.formats[left_plane.format_start..left_format_end],
+        right.buffer.formats[right_plane.format_start..right_format_end],
+    );
+}
+
+fn recordsEqual(comptime T: type, left: []const T, right: []const T) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |a, b| if (!std.meta.eql(a, b)) return false;
+    return true;
+}
+
 fn candidateTuplePresent(
     candidates: []const ScanoutCandidate,
     target: ScanoutCandidate,
@@ -1331,6 +1407,35 @@ test "drm: committed mode selection is generation-safe and preserves topology ow
     const next = (try manager.rescan()).?;
     try std.testing.expectError(error.StaleSnapshot, manager.commitMode(handle, 1280, 720, 60000));
     try manager.commitMode(next, 1280, 720, 60000);
+}
+
+test "drm: connector probe distinguishes additions from updates" {
+    var seat = FakeSeat{};
+    const session = try seat.createSession();
+    defer destroyTestSession(session);
+    var platform = FakeDrm{};
+    var manager = try Manager.init(std.testing.allocator, platform.platform(), session, "seat0", testConfig());
+    defer manager.deinit() catch unreachable;
+
+    const handle = (try manager.rescan()).?;
+    var connector_ids: [2]u32 = undefined;
+    const unchanged = try manager.probeConnectorChanges(handle, &connector_ids);
+    try std.testing.expectEqualSlices(u32, &.{20}, unchanged.desktop);
+    try std.testing.expect(!unchanged.desktop_updated);
+    try std.testing.expect(!unchanged.lease_changed);
+
+    platform.multiple_outputs = true;
+    const added = try manager.probeConnectorChanges(handle, &connector_ids);
+    try std.testing.expectEqualSlices(u32, &.{ 20, 21 }, added.desktop);
+    try std.testing.expect(!added.desktop_updated);
+    try std.testing.expect(!added.lease_changed);
+
+    platform.alternate_mode = true;
+    const updated = try manager.probeConnectorChanges(handle, &connector_ids);
+    try std.testing.expectEqualSlices(u32, &.{ 20, 21 }, updated.desktop);
+    try std.testing.expect(updated.desktop_updated);
+    try std.testing.expect(!updated.lease_changed);
+    try std.testing.expectEqual(handle, manager.currentHandle().?);
 }
 
 test "drm: scanout claims reserve complete tuples and recycle generation safely" {

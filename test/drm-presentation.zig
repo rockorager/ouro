@@ -449,6 +449,67 @@ test "physical coordinator retires a disconnected secondary output" {
     try root.deinit();
 }
 
+test "physical coordinator rebuilds an output when its modes change" {
+    const allocator = std.testing.allocator;
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-r15-output-mode-hotplug-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), compositorConfig());
+    const coordinator = try Coordinator.create(allocator, root, fixture.platformsWithHotplug(), coordinatorConfig());
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
+    try coordinator.start(&loop);
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    for (0..128) |_| {
+        _ = try loop.turn(coordinator);
+        if (coordinator.primaryKmsOutput() != null and coordinator.output_global_index == 1) break;
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+    }
+
+    const physical_id = coordinator.physical_outputs[0].id;
+    const protocol_output = coordinator.physical_outputs[0].protocol_output;
+    const management_head = coordinator.physical_outputs[0].management_head;
+    const drains_before = coordinator.stats.output_drains;
+    fixture.first_mode_width = 4;
+    try fixture.signalHotplug();
+    for (0..512) |_| {
+        _ = try loop.turn(coordinator);
+        if (!coordinator.topology_refresh_pending and
+            coordinator.physical_outputs[0].kms_output != null)
+        {
+            const snapshot = coordinator.output_adapter.logicalSnapshot(
+                coordinator.physical_outputs[0].protocol_output,
+            ) catch continue;
+            if (snapshot.width == 4) break;
+        }
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+    }
+    const snapshot = try coordinator.output_adapter.logicalSnapshot(
+        coordinator.physical_outputs[0].protocol_output,
+    );
+    try std.testing.expectEqual(@as(?i32, 4), snapshot.width);
+    try std.testing.expect(std.meta.eql(physical_id, coordinator.physical_outputs[0].id));
+    try std.testing.expect(std.meta.eql(
+        protocol_output,
+        coordinator.physical_outputs[0].protocol_output,
+    ));
+    try std.testing.expect(!std.meta.eql(
+        management_head,
+        coordinator.physical_outputs[0].management_head,
+    ));
+    try std.testing.expect(coordinator.stats.output_drains > drains_before);
+
+    try coordinator.requestStop();
+    try drainServer(root, coordinator, &loop);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
 test "physical coordinator fails over from a disconnected primary output" {
     const allocator = std.testing.allocator;
     var fixture = try Fixture.init();
@@ -3287,6 +3348,7 @@ pub const Fixture = struct {
     unmaps: usize = 0,
     discover_cards: bool = true,
     first_desktop: bool = true,
+    first_mode_width: u16 = 3,
     second_desktop: bool = false,
     third_connector: bool = false,
     lease_objects: [6]u32 = undefined,
@@ -3511,7 +3573,7 @@ pub const Fixture = struct {
         const self: *Fixture = @ptrCast(@alignCast(context));
         out.reset();
         out.connectors[0] = .{ .id = 10, .connector_type = 1, .connector_type_id = 1, .connected = true, .desktop = self.first_desktop, .width_mm = 1, .height_mm = 1, .encoder_id = 20, .mode_start = 0, .mode_count = 1, .encoder_start = 0, .encoder_count = 1, .properties = .{ .crtc_id = 1, .vrr_capable = self.vrr_supported } };
-        out.modes[0] = .{ .clock = 1, .hdisplay = 3, .hsync_start = 3, .hsync_end = 3, .htotal = 3, .hskew = 0, .vdisplay = 2, .vsync_start = 2, .vsync_end = 2, .vtotal = 2, .vscan = 0, .vrefresh = 60, .flags = 0, .mode_type = 0 };
+        out.modes[0] = .{ .clock = 1, .hdisplay = self.first_mode_width, .hsync_start = self.first_mode_width, .hsync_end = self.first_mode_width, .htotal = self.first_mode_width, .hskew = 0, .vdisplay = 2, .vsync_start = 2, .vsync_end = 2, .vtotal = 2, .vscan = 0, .vrefresh = 60, .flags = 0, .mode_type = 0 };
         out.connector_encoders[0] = 20;
         out.encoders[0] = .{ .id = 20, .crtc_id = 30, .possible_crtcs = 1 };
         out.crtcs[0] = .{ .id = 30, .index = 0, .properties = .{ .active = 2, .mode_id = 3, .vrr_enabled = if (self.vrr_supported) 15 else 0 } };
