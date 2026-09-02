@@ -4492,6 +4492,15 @@ pub fn Coordinator(comptime protocol: type) type {
             return false;
         }
 
+        fn ensureDrmReadiness(self: *Self) !void {
+            for (self.physical_outputs[0..self.physical_output_count]) |physical|
+                if (physical.kms_output) |output|
+                    if (output.readinessPrepared()) return;
+            const primary = self.primaryKmsOutput() orelse return;
+            if (primary.canPrepareReadiness())
+                try primary.prepareReadiness(&self.router, &self.root.ring);
+        }
+
         fn anyOutputInFlight(self: *const Self) bool {
             for (self.physical_outputs[0..self.physical_output_count]) |physical|
                 if (physical.kms_output) |output|
@@ -11744,6 +11753,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     }
                 }
             }
+            try self.ensureDrmReadiness();
             if (!self.stopping and self.outputReconfigureReady()) {
                 try self.finishOutputReconfigure();
                 return;

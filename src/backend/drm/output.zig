@@ -528,6 +528,15 @@ pub const Output = struct {
         return false;
     }
 
+    pub fn readinessPrepared(self: *const Output) bool {
+        return self.read_token != null or self.cancel_token != null;
+    }
+
+    pub fn canPrepareReadiness(self: *const Output) bool {
+        return !self.readinessPrepared() and self.state != .failed and
+            self.state != .draining and self.state != .drained and self.state != .removed;
+    }
+
     /// Requires scanout quiescence first. Cancel and target CQEs may arrive
     /// in either order; callback/request storage remains alive until both do.
     pub fn beginDrain(self: *Output, router: *completion.Router, ring: *linux.IoUring) !void {

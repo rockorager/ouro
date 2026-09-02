@@ -1635,6 +1635,14 @@ pub const Output = struct {
         return self.kms_output.ownsReadinessToken(token);
     }
 
+    pub fn readinessPrepared(self: *const Output) bool {
+        return self.kms_output.readinessPrepared();
+    }
+
+    pub fn canPrepareReadiness(self: *const Output) bool {
+        return self.kms_output.canPrepareReadiness();
+    }
+
     pub fn beginDrain(self: *Output, router: *completion.Router, ring: *linux.IoUring) !void {
         if (!self.paused) return error.ScanoutNotQuiescent;
         try self.kms_output.beginDrain(router, ring);

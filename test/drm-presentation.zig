@@ -863,6 +863,21 @@ test "physical coordinator fails over from a disconnected primary output" {
         secondary_protocol,
     )).width);
 
+    const flips_before_failover = fixture.page_flips;
+    const promoted = coordinator.physical_outputs[1].kms_output.?;
+    try promoted.request(.damage, 1);
+    coordinator.physical_outputs[1].damage_requested +%= 1;
+    for (0..128) |_| {
+        _ = try loop.turn(coordinator);
+        if (fixture.page_flips != flips_before_failover) break;
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+    }
+    try std.testing.expectEqual(flips_before_failover + 1, fixture.page_flips);
+    try std.testing.expectEqual(
+        coordinator.physical_outputs[1].damage_requested,
+        coordinator.physical_outputs[1].damage_applied,
+    );
+
     fixture.first_desktop = true;
     try fixture.signalHotplug();
     for (0..512) |_| {
