@@ -8218,7 +8218,10 @@ pub fn Coordinator(comptime protocol: type) type {
                             .external => |external| external,
                             .shm, .single_pixel => unreachable,
                         };
-                        const output = (try self.outputForDestination(destination)) orelse
+                        const output = (try self.outputForLayerDestination(
+                            layer,
+                            destination,
+                        )) orelse
                             return try self.discardPendingCandidate(layer, pending.id);
                         imported_source = output.mapClientBuffer(.{
                             .context = external.context,
@@ -10502,6 +10505,19 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (try clipToOutput(destination, bounds) != null) return output;
             }
             return null;
+        }
+
+        fn outputForLayerDestination(
+            self: *Self,
+            layer: *const Layer,
+            destination: render.Rect,
+        ) !?*output_api.Output {
+            if (self.boundLayerOutput(layer)) |output_id| {
+                const physical = self.physicalOutputForProtocolId(output_id) orelse return null;
+                if (!physical.connected) return null;
+                return physical.kms_output;
+            }
+            return self.outputForDestination(destination);
         }
 
         fn globalOutputBounds(self: *const Self) !geometry.Rect {
