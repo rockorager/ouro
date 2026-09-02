@@ -508,6 +508,7 @@ pub fn Coordinator(comptime protocol: type) type {
             protocol_output: OutputAdapter.OutputId,
             management_head: protocol_output_management.HeadId,
             kms_output: ?*output_api.Output = null,
+            output_profile: ?*engine_settings.OutputProfile = null,
             gamma_owner: ?drm_gamma.Owner = null,
             gamma_ramps: []u16 = &.{},
             session_lock_frame: ?output_scheduler.FrameId = null,
@@ -1624,6 +1625,10 @@ pub fn Coordinator(comptime protocol: type) type {
             });
             self.output_adapter = try OutputAdapter.init(allocator, config.protocol_output);
             errdefer self.output_adapter.deinit();
+            self.color_management_adapter.setOutputResolver(.{
+                .context = self,
+                .resolve = resolveColorManagedOutput,
+            });
             self.shell_adapter.setOutputResolver(.{
                 .context = self,
                 .resolve = resolveXdgFullscreenOutput,
@@ -1934,6 +1939,8 @@ pub fn Coordinator(comptime protocol: type) type {
         ) !void {
             try self.interaction.canInstallKeyConsumerSnapshot();
             try self.desktop.validatePolicySnapshot(policy);
+            if (candidate.profiles.len != 0 and self.output_config.renderer != .vulkan)
+                return error.OutputIccRequiresVulkan;
             if (self.output_reconfigure != null or self.output_power_transition != null)
                 return error.OutputTransactionPending;
             if (self.connectedPhysicalOutputCount() != 0) {
@@ -2179,8 +2186,10 @@ pub fn Coordinator(comptime protocol: type) type {
             self.layer_shell_adapter.deinit();
             self.xdg_output_adapter.deinit();
             self.output_management_adapter.deinit();
-            for (self.physical_outputs[0..self.physical_output_count]) |physical|
+            for (self.physical_outputs[0..self.physical_output_count]) |physical| {
                 self.allocator.free(physical.gamma_ramps);
+                if (physical.output_profile) |profile| profile.release();
+            }
             self.allocator.free(self.physical_outputs);
             self.output_power_adapter.deinit();
             self.gamma_control_adapter.deinit();
@@ -4329,6 +4338,37 @@ pub fn Coordinator(comptime protocol: type) type {
             unreachable;
         }
 
+        fn resolveColorManagedOutput(
+            context: ?*anyopaque,
+            peer: wayring.io_uring.Peer,
+            handle: ?wayring.objects.Handle,
+        ) ?protocol_color_management.ResolvedOutput {
+            const self: *Self = @ptrCast(@alignCast(context orelse return null));
+            const physical = if (handle) |resource| blk: {
+                const output_id = self.output_adapter.outputForResource(peer, resource) orelse
+                    return null;
+                break :blk self.physicalOutputForProtocolId(output_id) orelse return null;
+            } else self.primaryPhysicalOutput();
+            const profile = physical.output_profile orelse return .{
+                .description = .srgb,
+            };
+            _ = profile.retain();
+            var description = render.color.Description.srgb;
+            description.lut = &profile.source_lut;
+            return .{
+                .description = description,
+                .icc_fd = profile.fd,
+                .icc_size = profile.size,
+                .retained_context = profile,
+                .release = releaseColorManagedOutput,
+            };
+        }
+
+        fn releaseColorManagedOutput(context: ?*anyopaque) void {
+            const profile: *engine_settings.OutputProfile = @ptrCast(@alignCast(context.?));
+            profile.release();
+        }
+
         fn promotePrimaryPhysicalOutput(self: *Self, physical: *PhysicalOutput) !void {
             _ = try self.output_adapter.logicalSnapshot(physical.protocol_output);
             const state = try self.output_management_adapter.lifecycle.currentHead(
@@ -4552,6 +4592,36 @@ pub fn Coordinator(comptime protocol: type) type {
             }
         }
 
+        fn configuredOutputProfile(
+            settings: *const engine_settings.Snapshot,
+            snapshot: drm.Snapshot,
+        ) !?*engine_settings.OutputProfile {
+            const connector = snapshot.selectedConnector();
+            var name_buffer: [64]u8 = undefined;
+            const name = try std.fmt.bufPrint(&name_buffer, "DRM-{d}", .{connector.id});
+            const configured = engine_settings.resolveOutput(settings.output_rules, .{
+                .name = name,
+                .connector_id = connector.id,
+                .connector_type = connector.connector_type,
+                .connector_type_id = connector.connector_type_id,
+                .width_mm = connector.width_mm,
+                .height_mm = connector.height_mm,
+            });
+            return settings.outputProfile(configured.icc_profile);
+        }
+
+        fn sameOutputProfile(
+            lhs: ?*engine_settings.OutputProfile,
+            rhs: ?*engine_settings.OutputProfile,
+        ) bool {
+            if (lhs == null or rhs == null) return lhs == null and rhs == null;
+            return std.mem.eql(
+                u8,
+                &lhs.?.output_lut.profile_hash,
+                &rhs.?.output_lut.profile_hash,
+            );
+        }
+
         fn beginConfigOutputReconfigure(
             self: *Self,
             candidate: *engine_settings.Snapshot,
@@ -4582,6 +4652,10 @@ pub fn Coordinator(comptime protocol: type) type {
                     .width_mm = connector.width_mm,
                     .height_mm = connector.height_mm,
                 });
+                const profile_changed = !sameOutputProfile(
+                    physical.output_profile,
+                    candidate.outputProfile(settings.icc_profile),
+                );
                 var state = current;
                 if (settings.enabled) |enabled| state.enabled = enabled;
                 if (settings.position) |position| {
@@ -4602,7 +4676,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 }
                 desired[index] = .{ .id = physical.management_head, .state = state };
                 index += 1;
-                changed = changed or !std.meta.eql(current, state);
+                changed = changed or !std.meta.eql(current, state) or
+                    (current.enabled and profile_changed);
             }
             if (!self.outputManagementCommandSupported(desired)) return error.UnsupportedOutputConfiguration;
             if (!changed) {
@@ -4634,7 +4709,15 @@ pub fn Coordinator(comptime protocol: type) type {
                 const physical = self.physicalOutputForManagementHeadMutable(head.id) orelse
                     return error.InvalidOutput;
                 const current = try self.output_management_adapter.lifecycle.currentHead(head.id);
-                if (!std.meta.eql(current, head.state)) physical.reconfigure = .{
+                const claim = physical.claim orelse return error.StaleClaim;
+                const snapshot = try self.manager.claimSnapshot(claim);
+                const desired_profile = try configuredOutputProfile(candidate, snapshot);
+                const profile_changed = !sameOutputProfile(
+                    physical.output_profile,
+                    desired_profile,
+                );
+                if (!std.meta.eql(current, head.state) or
+                    (current.enabled and profile_changed)) physical.reconfigure = .{
                     .previous = current,
                     .desired = head.state,
                 };
@@ -6299,6 +6382,8 @@ pub fn Coordinator(comptime protocol: type) type {
                         else => return err,
                     };
                     physical.claim = null;
+                    if (physical.output_profile) |profile| profile.release();
+                    physical.output_profile = null;
                     physical.connected = false;
                     physical.removal_protocol_retired = true;
                     self.markProtocolAll(ProtocolReady.output_management |
@@ -7360,6 +7445,14 @@ pub fn Coordinator(comptime protocol: type) type {
             );
         }
 
+        fn outputSettingsForActivation(self: *Self) *const engine_settings.Snapshot {
+            if (self.output_reconfigure) |transaction| {
+                if (transaction.phase == .desired and transaction.owner == .config)
+                    return &self.output_reconfigure.?.owner.config.engine;
+            }
+            return &self.settings;
+        }
+
         fn activatePhysicalOutputStaged(
             self: *Self,
             physical: *PhysicalOutput,
@@ -7410,6 +7503,12 @@ pub fn Coordinator(comptime protocol: type) type {
             output_config.output_id.generation = generation;
             output_config.output_transform = @enumFromInt(transform);
             output_config.kms.adaptive_sync = adaptive_sync;
+            const selected_profile = try configuredOutputProfile(
+                self.outputSettingsForActivation(),
+                snapshot,
+            );
+            if (selected_profile) |profile|
+                output_config.output_color_description.lut = &profile.output_lut;
             var output_committed = false;
             errdefer {
                 if (!output_committed) self.cleanupUnstartedOutput(physical);
@@ -7511,6 +7610,11 @@ pub fn Coordinator(comptime protocol: type) type {
                 generation + 1;
             self.stats.selected_outputs += 1;
             self.foreign_toplevel_outputs_dirty = true;
+            if (selected_profile != physical.output_profile) {
+                if (selected_profile) |profile| _ = profile.retain();
+                if (physical.output_profile) |profile| profile.release();
+                physical.output_profile = selected_profile;
+            }
             output_committed = true;
             if (self.anyAppLayerActive() or self.cursor_layer.active or
                 retained_visibility_changed or self.sessionLockActive())

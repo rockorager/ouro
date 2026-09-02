@@ -230,7 +230,11 @@ test "color: rejects degenerate descriptions" {
 
 test "color: ICC selects linear sRGB working-space transform" {
     var texel = [_][4]f16{.{ 0, 0, 0, 1 }};
-    var lut: icc.Lut = .{ .profile_hash = .{0} ** 32, .rgba = &texel };
+    var lut: icc.Lut = .{
+        .profile_hash = .{0} ** 32,
+        .lut_hash = .{1} ** 32,
+        .rgba = &texel,
+    };
     var source = Description.srgb;
     source.transfer = .gamma28;
     source.lut = &lut;

@@ -252,6 +252,8 @@ fn validateRule(rule: anytype) !void {
         if (rule.settings.scale_120) |scale| if (scale == 0) return error.InvalidRange;
         if (rule.settings.mode) |mode| if (mode.width == 0 or mode.height == 0)
             return error.InvalidRange;
+        if (rule.settings.icc_profile) |path| if (!std.fs.path.isAbsolute(path))
+            return error.OutputIccPathNotAbsolute;
     }
 }
 
@@ -718,13 +720,17 @@ test "machine policy rules repeat sorting matching and defaults" {
         \\{"general":{"focus_follows_mouse":false,"inner_gap":4,"outer_gap":8},
         \\"bindings":{"super+x":{"action":["exit"],"repeat":true}},
         \\"input_rules":{"z":{"priority":2,"match":{"type":"touchpad","name":"Syn*"},"settings":{"tap":true,"accel_speed":0.5}},"a":{"priority":2,"settings":{"tap":"default"}}},
-        \\"output_rules":{"main":{"match":{"name":"DP-?"},"settings":{"enabled":true,"mode":{"width":1920,"height":1080},"position":{"x":-10,"y":0},"scale":1.25}}}}
+        \\"output_rules":{"main":{"match":{"name":"DP-?"},"settings":{"enabled":true,"mode":{"width":1920,"height":1080},"position":{"x":-10,"y":0},"scale":1.25,"icc_profile":"/usr/share/color/icc/main.icc"}}}}
     );
     defer snapshot.deinit();
     try std.testing.expect(!snapshot.general.focus_follows_mouse and snapshot.bindings[0].repeat);
     try std.testing.expectEqualStrings("a", snapshot.input_rules[0].name);
     try std.testing.expect(inputMatches(snapshot.input_rules[1].match, .{ .type = .touchpad, .name = "Synaptics", .vendor = 0, .product = 0 }));
     try std.testing.expectEqual(@as(?u32, 150), snapshot.output_rules[0].settings.scale_120);
+    try std.testing.expectEqualStrings(
+        "/usr/share/color/icc/main.icc",
+        snapshot.output_rules[0].settings.icc_profile.?,
+    );
     const resolved = resolveInput(snapshot.input_rules, .{ .type = .touchpad, .name = "Synaptics", .vendor = 0, .product = 0 });
     try std.testing.expect(resolved.tap.? == .value);
 }
@@ -732,6 +738,7 @@ test "machine policy rules repeat sorting matching and defaults" {
 test "rule ranges strict fields and partial merge removals" {
     try std.testing.expectError(error.InvalidRange, parseSource(std.testing.allocator, "{\"input_rules\":{\"x\":{\"settings\":{\"rotation\":360}}}}"));
     try std.testing.expectError(error.UnknownField, parseSource(std.testing.allocator, "{\"output_rules\":{\"x\":{\"match\":{\"icc\":\"x\"}}}}"));
+    try std.testing.expectError(error.OutputIccPathNotAbsolute, parseSource(std.testing.allocator, "{\"output_rules\":{\"x\":{\"settings\":{\"icc_profile\":\"relative.icc\"}}}}"));
     var snapshot = try mergeSources(std.testing.allocator, &.{
         "{\"input_rules\":{\"mouse\":{\"match\":{\"name\":\"M*\"}}}}",
         "{\"input_rules\":{\"mouse\":{\"settings\":{\"natural_scroll\":true}}}}",

@@ -641,16 +641,21 @@ test "render-vulkan: LUT slot is packed without changing Sample ABI" {
     try std.testing.expectEqual(@as(usize, 160), @sizeOf(vk.Sample));
 }
 
-test "render-vulkan: profile hash cache hit does not upload twice" {
+test "render-vulkan: LUT hash cache hit does not upload twice" {
     var fake = FakePlatform{};
     const lut: @import("icc.zig").Lut = .{
         .profile_hash = .{7} ** 32,
+        .lut_hash = .{8} ** 32,
         .rgba = &.{},
     };
     const platform = fake.platform();
     try std.testing.expectEqual(@as(u32, 0), try platform.cacheLut(@ptrCast(&fake), &lut));
     try std.testing.expectEqual(@as(u32, 0), try platform.cacheLut(@ptrCast(&fake), &lut));
     try std.testing.expectEqual(@as(usize, 1), fake.lut_upload_count);
+    var inverse = lut;
+    inverse.lut_hash = .{9} ** 32;
+    try std.testing.expectEqual(@as(u32, 1), try platform.cacheLut(@ptrCast(&fake), &inverse));
+    try std.testing.expectEqual(@as(usize, 2), fake.lut_upload_count);
 }
 
 test "render-vulkan: fixed target cache retains source bytes and cleans up exactly once" {
@@ -1225,10 +1230,10 @@ const FakePlatform = struct {
     fn cacheLut(context: *anyopaque, _: vk.Renderer, lut: *const @import("icc.zig").Lut) !u32 {
         const self: *FakePlatform = @ptrCast(@alignCast(context));
         for (self.lut_hashes[0..self.lut_count], 0..) |hash, slot|
-            if (std.mem.eql(u8, &hash, &lut.profile_hash)) return @intCast(slot);
+            if (std.mem.eql(u8, &hash, &lut.lut_hash)) return @intCast(slot);
         if (self.lut_count == self.lut_hashes.len) return error.ColorLutCapacityExceeded;
         const slot = self.lut_count;
-        self.lut_hashes[slot] = lut.profile_hash;
+        self.lut_hashes[slot] = lut.lut_hash;
         self.lut_count += 1;
         self.lut_upload_count += 1;
         return @intCast(slot);

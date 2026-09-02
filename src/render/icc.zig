@@ -15,6 +15,9 @@ pub const texel_count: usize = edge_length * edge_length * edge_length;
 pub const Lut = struct {
     /// SHA-256 of the exact bytes supplied to `compile`.
     profile_hash: [32]u8,
+    /// SHA-256 of the compiled transform texels. Unlike `profile_hash`, this
+    /// distinguishes source and output transforms from the same ICC file.
+    lut_hash: [32]u8,
     /// R varies fastest, followed by G and B. Alpha is always one.
     rgba: []const [4]f16,
 
@@ -105,8 +108,11 @@ fn compileDirection(allocator: std.mem.Allocator, profile_bytes: []const u8, dir
 
     var profile_hash: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(profile_bytes, &profile_hash, .{});
+    var lut_hash: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(rgba), &lut_hash, .{});
     return .{
         .profile_hash = profile_hash,
+        .lut_hash = lut_hash,
         .rgba = rgba,
     };
 }
@@ -155,6 +161,7 @@ test "icc: lcms in-memory sRGB profile compiles deterministic bounded LUT" {
     defer second.deinit(allocator);
     try std.testing.expectEqual(texel_count, first.rgba.len);
     try std.testing.expectEqualSlices(u8, &first.profile_hash, &second.profile_hash);
+    try std.testing.expectEqualSlices(u8, &first.lut_hash, &second.lut_hash);
     try std.testing.expectEqualSlices([4]f16, first.rgba, second.rgba);
     for (first.rgba) |texel| for (texel) |component| {
         try std.testing.expect(std.math.isFinite(component));
@@ -171,6 +178,18 @@ test "icc: output profile compiles a bounded working-to-device LUT" {
     try std.testing.expectEqual(texel_count, lut.rgba.len);
     try std.testing.expectApproxEqAbs(@as(f16, 0), lut.rgba[0][0], 0.001);
     try std.testing.expectApproxEqAbs(@as(f16, 1), lut.rgba[lut.rgba.len - 1][0], 0.01);
+}
+
+test "icc: source and output transforms have distinct cache identities" {
+    const allocator = std.testing.allocator;
+    const bytes = try testSrgbBytes(allocator);
+    defer allocator.free(bytes);
+    var source = try compile(allocator, bytes);
+    defer source.deinit(allocator);
+    var output = try compileOutput(allocator, bytes);
+    defer output.deinit(allocator);
+    try std.testing.expectEqualSlices(u8, &source.profile_hash, &output.profile_hash);
+    try std.testing.expect(!std.mem.eql(u8, &source.lut_hash, &output.lut_hash));
 }
 
 test "icc: malformed input is rejected" {

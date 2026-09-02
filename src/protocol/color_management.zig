@@ -17,11 +17,23 @@ pub const Config = struct {
     async_jobs: usize = 2,
     queued_profile_bytes: usize = 32 * 1024 * 1024,
     retained_luts: usize = 16,
-    output_description: color.Description = .srgb,
-    /// Borrowed seekable descriptor retained by the executable for the
-    /// adapter lifetime. -1 means the output description is parametric.
-    output_icc_fd: linux.fd_t = -1,
-    output_icc_size: u32 = 0,
+};
+
+pub const ResolvedOutput = struct {
+    description: color.Description,
+    /// Borrowed for the duration of the resolve call; the adapter duplicates
+    /// it before retaining the description.
+    icc_fd: linux.fd_t = -1,
+    icc_size: u32 = 0,
+    retained_context: ?*anyopaque = null,
+    release: ?*const fn (?*anyopaque) void = null,
+};
+
+pub const OutputResolver = struct {
+    context: ?*anyopaque,
+    /// A null handle requests the preferred description for feedback. The
+    /// resolver transfers one retained reference in a successful result.
+    resolve: *const fn (?*anyopaque, wayring.io_uring.Peer, ?objects.Handle) ?ResolvedOutput,
 };
 
 pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
@@ -72,37 +84,36 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         worker: *icc_worker.Worker,
         jobs: std.ArrayListUnmanaged(Job) = .empty,
         retained: std.ArrayListUnmanaged(*icc.Lut) = .empty,
-        output_description: color.Description,
-        output_icc_fd: linux.fd_t,
-        output_icc_size: u32,
+        retained_outputs: std.ArrayListUnmanaged(ResolvedOutput) = .empty,
+        output_resolver: ?OutputResolver = null,
 
         pub fn init(allocator: std.mem.Allocator, core: *CoreSurface, config: Config) !Self {
             if (config.resource_capacity == 0) return error.InvalidConfig;
             if (config.async_jobs == 0 or config.queued_profile_bytes == 0 or config.queued_profile_bytes > icc.max_profile_bytes or config.retained_luts == 0)
                 return error.InvalidConfig;
-            try config.output_description.validate();
-            if ((config.output_icc_fd < 0) != (config.output_icc_size == 0)) return error.InvalidConfig;
             const worker = try icc_worker.Worker.init(allocator, .{ .job_capacity = config.async_jobs, .profile_byte_budget = config.queued_profile_bytes });
             errdefer worker.deinit();
             var self: Self = .{
                 .allocator = allocator,
                 .core = core,
                 .worker = worker,
-                .output_description = config.output_description,
-                .output_icc_fd = config.output_icc_fd,
-                .output_icc_size = config.output_icc_size,
             };
             try self.resources.ensureTotalCapacity(allocator, config.resource_capacity);
             try self.jobs.ensureTotalCapacity(allocator, config.async_jobs);
             try self.retained.ensureTotalCapacity(allocator, config.retained_luts);
+            try self.retained_outputs.ensureTotalCapacity(allocator, config.retained_luts);
             return self;
         }
         pub fn deinit(self: *Self) void {
             self.worker.deinit();
             for (self.resources.items) |r| {
                 if (r.icc_fd >= 0) _ = linux.close(r.icc_fd);
+                if (r.info_icc_fd >= 0) _ = linux.close(r.info_icc_fd);
                 self.allocator.destroy(r);
             }
+            for (self.retained_outputs.items) |resolved|
+                if (resolved.release) |release| release(resolved.retained_context);
+            self.retained_outputs.deinit(self.allocator);
             for (self.retained.items) |lut| {
                 lut.deinit(self.allocator);
                 self.allocator.destroy(lut);
@@ -111,6 +122,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             self.jobs.deinit(self.allocator);
             self.resources.deinit(self.allocator);
             self.* = undefined;
+        }
+
+        pub fn setOutputResolver(self: *Self, resolver: OutputResolver) void {
+            self.output_resolver = resolver;
         }
         pub fn install(self: *Self, runtime: *Runtime) !objects.Handle {
             if (self.runtime != null) return error.AlreadyInstalled;
@@ -156,7 +171,14 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                         const info = self.create(.info, undefined, resource.peer, null, resource.version) catch
                             return try self.noMemory(actor);
                         info.description = resource.description;
-                        info.info_icc_fd = resource.info_icc_fd;
+                        if (resource.info_icc_fd >= 0) {
+                            const duplicated = linux.dup(resource.info_icc_fd);
+                            if (linux.errno(duplicated) != .SUCCESS) {
+                                self.remove(info);
+                                return try self.noMemory(actor);
+                            }
+                            info.info_icc_fd = @intCast(duplicated);
+                        }
                         info.info_icc_size = resource.info_icc_size;
                         const admitted = Image.admit_get_information(
                             server_objects,
@@ -263,11 +285,9 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .get_image_description => |value| {
                     const image = self.create(.image, undefined, resource.peer, null, resource.version) catch
                         return try self.noMemory(actor);
-                    image.description = self.output_description;
-                    image.information_allowed = true;
-                    image.info_icc_fd = self.output_icc_fd;
-                    image.info_icc_size = self.output_icc_size;
-                    if (resource.output == null) {
+                    if (resource.output == null or
+                        !self.resolveOutput(image, resource.peer, resource.output))
+                    {
                         image.image_state = .failed;
                         image.no_output = true;
                     }
@@ -298,10 +318,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .get_preferred => |value| {
                     const image = self.create(.image, undefined, resource.peer, null, resource.version) catch
                         return try self.noMemory(actor);
-                    image.description = self.output_description;
-                    image.information_allowed = true;
-                    image.info_icc_fd = self.output_icc_fd;
-                    image.info_icc_size = self.output_icc_size;
+                    if (!self.resolveOutput(image, resource.peer, null)) {
+                        image.image_state = .failed;
+                        image.no_output = true;
+                    }
                     const admitted = Feedback.admit_get_preferred(
                         server_objects,
                         decoded.handle,
@@ -665,6 +685,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                         if (job.image == r) job.image = null;
                     }
                     if (r.icc_fd >= 0) _ = linux.close(r.icc_fd);
+                    if (r.info_icc_fd >= 0) _ = linux.close(r.info_icc_fd);
                     self.allocator.destroy(r);
                     return;
                 }
@@ -678,6 +699,60 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             const p = o.context orelse return null;
             for (self.resources.items) |r| if (@intFromPtr(r) == @intFromPtr(p)) return r;
             return null;
+        }
+
+        fn resolveOutput(
+            self: *Self,
+            image: *Resource,
+            peer: wayring.io_uring.Peer,
+            handle: ?objects.Handle,
+        ) bool {
+            const resolver = self.output_resolver orelse {
+                image.description = .srgb;
+                image.information_allowed = true;
+                return true;
+            };
+            var resolved = resolver.resolve(resolver.context, peer, handle) orelse return false;
+            resolved.description.validate() catch {
+                releaseResolvedOutput(resolved);
+                return false;
+            };
+            if ((resolved.icc_fd < 0) != (resolved.icc_size == 0)) {
+                releaseResolvedOutput(resolved);
+                return false;
+            }
+            if (resolved.description.lut) |lut| {
+                if (resolved.release == null) return false;
+                var already_retained = false;
+                for (self.retained_outputs.items) |retained| {
+                    const existing = retained.description.lut orelse continue;
+                    if (!std.mem.eql(u8, &existing.lut_hash, &lut.lut_hash)) continue;
+                    releaseResolvedOutput(resolved);
+                    resolved = retained;
+                    already_retained = true;
+                    break;
+                }
+                if (!already_retained) {
+                    if (self.retained_outputs.items.len == self.retained_outputs.capacity) {
+                        releaseResolvedOutput(resolved);
+                        return false;
+                    }
+                    self.retained_outputs.appendAssumeCapacity(resolved);
+                }
+            }
+            const info_icc_fd: linux.fd_t = if (resolved.icc_fd >= 0) blk: {
+                const duplicated = linux.dup(resolved.icc_fd);
+                if (linux.errno(duplicated) != .SUCCESS) {
+                    return false;
+                }
+                break :blk @intCast(duplicated);
+            } else -1;
+            image.description = resolved.description;
+            image.info_icc_fd = info_icc_fd;
+            image.info_icc_size = resolved.icc_size;
+            image.information_allowed = true;
+            if (resolved.description.lut == null) releaseResolvedOutput(resolved);
+            return true;
         }
         fn unsupported(self: *Self, a: *wayring.connection.Actor, id: u32, m: []const u8) !wayring.dispatch.Control {
             return self.managerError(a, id, Manager.@"error".unsupported_feature.value, m);
@@ -821,6 +896,10 @@ fn descriptionIdentity(description: color.Description) u64 {
     var identity = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(&values));
     if (description.lut) |lut| identity = std.hash.Wyhash.hash(identity, &lut.profile_hash);
     return if (identity == 0) 1 else identity;
+}
+
+fn releaseResolvedOutput(resolved: ResolvedOutput) void {
+    if (resolved.release) |release| release(resolved.retained_context);
 }
 
 fn samePeer(a: wayring.io_uring.Peer, b: wayring.io_uring.Peer) bool {

@@ -691,6 +691,22 @@ pub fn Adapter(comptime protocol: type) type {
             return .{ .handle = resource.handle, .output = resource.output };
         }
 
+        /// Resolves a client wl_output resource to the compositor's stable
+        /// output identity. Peer plus handle generation prevents either a
+        /// different namespace or stale resource from aliasing a replacement.
+        pub fn outputForResource(
+            adapter: *const Self,
+            peer: wayring.io_uring.Peer,
+            handle: objects.Handle,
+        ) ?OutputId {
+            for (adapter.resources) |resource| {
+                if (resource.active and samePeer(resource.peer, peer) and
+                    std.meta.eql(resource.handle, handle))
+                    return resource.output;
+            }
+            return null;
+        }
+
         pub fn logicalSnapshot(adapter: *const Self, output_id: OutputId) !LogicalSnapshot {
             const output = try adapter.resolveOutputConst(output_id);
             const scale = geometry.OutputScale.init(output.scale_120) catch unreachable;

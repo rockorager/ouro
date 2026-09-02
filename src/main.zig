@@ -5,9 +5,6 @@ const ouro = @import("ouro");
 const protocol = @import("xdg_protocol");
 
 const linux = std.os.linux;
-const c = @cImport({
-    @cInclude("sys/stat.h");
-});
 const Compositor = ouro.compositor.Compositor(protocol);
 const Runtime = ouro.physical.Coordinator(protocol);
 const Runner = ouro.physical.Runner(protocol);
@@ -22,7 +19,6 @@ const Options = struct {
     socket: ?[]const u8 = null,
     renderer: ouro.real_output.RendererPreference = .vulkan_then_pixman,
     drm_device: ?[]const u8 = null,
-    output_icc: ?[]const u8 = null,
     config: ?[]const u8 = null,
     managed_session: bool = false,
 };
@@ -33,8 +29,6 @@ pub fn main(init: std.process.Init) !void {
         usage();
         return err;
     };
-    if (options.output_icc != null and options.renderer != .vulkan)
-        return error.OutputIccRequiresVulkan;
     const managed_socket = if (options.socket == null and options.managed_session)
         try std.fmt.allocPrint(
             allocator,
@@ -96,26 +90,6 @@ pub fn main(init: std.process.Init) !void {
         .io = init.io,
         .environ_map = init.environ_map,
     };
-    var output_profile_fd: linux.fd_t = -1;
-    defer if (output_profile_fd >= 0) {
-        _ = linux.close(output_profile_fd);
-    };
-    var output_lut: ouro.icc.Lut = undefined;
-    var output_lut_valid = false;
-    defer if (output_lut_valid) {
-        output_lut.deinit(allocator);
-    };
-    var output_description = ouro.render.color.Description.srgb;
-    var output_profile_size: u32 = 0;
-    if (options.output_icc) |path| {
-        const loaded = try loadOutputProfile(allocator, path);
-        output_profile_fd = loaded.fd;
-        output_profile_size = @intCast(loaded.bytes.len);
-        defer allocator.free(loaded.bytes);
-        output_lut = try ouro.icc.compileOutput(allocator, loaded.bytes);
-        output_lut_valid = true;
-        output_description.lut = &output_lut;
-    }
     const dri_result = linux.open("/dev/dri", .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
     if (linux.errno(dri_result) != .SUCCESS) {
         std.log.err("DRM smoke unavailable: /dev/dri is absent or inaccessible", .{});
@@ -194,14 +168,11 @@ pub fn main(init: std.process.Init) !void {
         .linux_dmabuf = .{},
         .enable_color_protocols = options.renderer == .vulkan,
         .color_management = .{
-            // Compilation remains single-worker and byte-bounded, while the
-            // queue can admit every retained client ICC description.
+            // Compilation remains single-worker and byte-bounded. Up to 32
+            // client and 32 output transforms fit the 64-slot renderer cache.
             .async_jobs = 16,
             .queued_profile_bytes = 32 * 1024 * 1024,
-            .retained_luts = 16,
-            .output_description = output_description,
-            .output_icc_fd = output_profile_fd,
-            .output_icc_size = output_profile_size,
+            .retained_luts = 32,
         },
         .protocol_output = .{ .association_capacity = 17 },
         .drm = .{
@@ -231,10 +202,9 @@ pub fn main(init: std.process.Init) !void {
             .max_surface_bytes = 16 * 1024 * 1024,
             .max_source_width = 8192,
             .max_source_height = 8192,
-            // Sixteen client ICC descriptions plus a distinct output profile.
-            .max_color_luts = 17,
+            // Client descriptions and profile changes share a bounded cache.
+            .max_color_luts = 64,
             .enable_color_management = options.renderer == .vulkan,
-            .output_color_description = output_description,
         },
     }) catch |err| {
         root.deinit() catch {};
@@ -398,9 +368,6 @@ fn parseOptions(args: std.process.Args) !Options {
         } else if (std.mem.startsWith(u8, argument, "--drm-device=")) {
             options.drm_device = argument["--drm-device=".len..];
             if (options.drm_device.?.len == 0) return error.InvalidDrmDevice;
-        } else if (std.mem.startsWith(u8, argument, "--output-icc=")) {
-            options.output_icc = argument["--output-icc=".len..];
-            if (options.output_icc.?.len == 0) return error.InvalidOutputIcc;
         } else if (std.mem.startsWith(u8, argument, "--config=")) {
             options.config = argument["--config=".len..];
             if (options.config.?.len == 0) return error.InvalidConfigPath;
@@ -413,39 +380,17 @@ fn parseOptions(args: std.process.Args) !Options {
 
 fn usage() void {
     std.debug.print(
-        \\usage: ouro [--socket=PATH] [--renderer=auto|pixman|vulkan] [--drm-device=PATH] [--output-icc=PATH] [--config=PATH] [--managed-session]
+        \\usage: ouro [--socket=PATH] [--renderer=auto|pixman|vulkan] [--drm-device=PATH] [--config=PATH] [--managed-session]
         \\
         \\  auto    try Vulkan, then fall back to Pixman at startup
         \\  pixman  require the CPU Pixman renderer
         \\  vulkan  require Vulkan and KMS IN_FENCE_FD (no host wait)
         \\  --drm-device  require this DRM card instead of automatic selection
-        \\  --output-icc  apply an ICC v2/v4 output profile and VCGT (Vulkan only)
-        \\  --config      load this JSON file before sibling config.d/*.json fragments
+        \\  --config      load JSON output rules, including per-output ICC profiles
         \\  --managed-session  publish and bind the systemd graphical session lifecycle
         \\  SIGHUP        reload configuration; invalid replacements are rejected
         \\
     , .{});
-}
-
-fn loadOutputProfile(allocator: std.mem.Allocator, path: []const u8) !struct { fd: linux.fd_t, bytes: []u8 } {
-    const terminated = try allocator.dupeZ(u8, path);
-    defer allocator.free(terminated);
-    const raw = linux.open(terminated, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-    if (linux.errno(raw) != .SUCCESS) return error.OpenOutputIccFailed;
-    const fd: linux.fd_t = @intCast(raw);
-    errdefer _ = linux.close(fd);
-    var stat: c.struct_stat = undefined;
-    if (c.fstat(fd, &stat) != 0 or stat.st_size <= 0 or stat.st_size > ouro.icc.max_profile_bytes)
-        return error.InvalidOutputIcc;
-    const bytes = try allocator.alloc(u8, @intCast(stat.st_size));
-    errdefer allocator.free(bytes);
-    var offset: usize = 0;
-    while (offset < bytes.len) {
-        const read = linux.pread(fd, bytes[offset..].ptr, bytes.len - offset, @intCast(offset));
-        if (linux.errno(read) != .SUCCESS or read == 0) return error.ReadOutputIccFailed;
-        offset += read;
-    }
-    return .{ .fd = fd, .bytes = bytes };
 }
 
 fn compositorConfig() Compositor.Config {

@@ -901,13 +901,13 @@ fn realCacheLut(_: *anyopaque, renderer: Renderer, lut: *const icc.Lut) !u32 {
     const self: *RealRenderer = @ptrCast(@alignCast(renderer));
     if (lut.rgba.len != icc.texel_count) return error.InvalidColorLut;
     for (self.lut_hashes[0..self.lut_count], 0..) |hash, slot|
-        if (std.mem.eql(u8, &hash, &lut.profile_hash)) return @intCast(slot);
+        if (std.mem.eql(u8, &hash, &lut.lut_hash)) return @intCast(slot);
     if (self.lut_count == self.lut_hashes.len) return error.ColorLutCapacityExceeded;
     const slot = self.lut_count;
     const output = @as([*][4]f32, @ptrCast(@alignCast(self.lut_map)))[slot * icc.texel_count .. (slot + 1) * icc.texel_count];
     for (lut.rgba, output) |source, *destination|
         destination.* = .{ source[0], source[1], source[2], source[3] };
-    self.lut_hashes[slot] = lut.profile_hash;
+    self.lut_hashes[slot] = lut.lut_hash;
     self.lut_count += 1;
     return @intCast(slot);
 }

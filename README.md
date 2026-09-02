@@ -257,9 +257,11 @@ settings.
 
 Output rules match the stable `DRM-<connector-id>` name, connector ID/type/type
 ID, or physical dimensions. They use the same priority and merge semantics.
-Mode, position, scale, and enablement changes run through Ouro's atomic KMS
-reconfiguration path and retain the previous configuration if activation or
-rollback validation fails.
+Mode, position, scale, enablement, and ICC profile changes run through Ouro's
+atomic KMS reconfiguration path and retain the previous configuration if
+activation or rollback validation fails. `icc_profile` must be an absolute
+path to an ICC v2/v4 RGB Display or ColorSpace profile and requires strict
+Vulkan mode.
 
 ```json
 {
@@ -274,7 +276,8 @@ rollback validation fails.
           "refresh_millihertz": 144000
         },
         "position": { "x": 0, "y": 0 },
-        "scale": 1.25
+        "scale": 1.25,
+        "icc_profile": "/usr/share/color/icc/display.icc"
       }
     }
   }
@@ -324,9 +327,11 @@ Strict Vulkan mode also publishes `color-management-v1` and
 `color-representation-v1`. Client parametric descriptions and ICC v2/v4 RGB
 Display or ColorSpace profiles are transformed in linear light. ICC parsing and
 33³ LUT generation run on a bounded worker rather than the compositor or render
-turn. `--output-icc=PATH` applies an ICC v2/v4 output profile, including VCGT
-calibration when present; it requires `--renderer=vulkan`. Auto and Pixman modes
-do not advertise color-management behavior they cannot guarantee.
+turn for client-provided profiles. Configured output profiles are validated and
+compiled before an atomic configuration replacement begins; their VCGT
+calibration is included when present. Auto and Pixman modes reject configured
+output profiles and do not advertise color-management behavior they cannot
+guarantee.
 
 The physical path activates every eligible desktop output and requires a usable
 `/dev/dri` device and libseat backend. `Loop.turn` is the sole io_uring
