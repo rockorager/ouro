@@ -887,11 +887,14 @@ pub fn Coordinator(comptime protocol: type) type {
         hotplug_connector_count: usize = 0,
         drm_lease_adapter: DrmLeaseAdapter,
         drm_lease_claims: []drm.ClaimHandle,
+        topology_claims: []drm.ClaimHandle,
+        topology_refreshed_claims: []drm.ClaimHandle,
         drm_lease_desired: bool = false,
         drm_lease_global_update: enum { none, adding, removing } = .none,
         drm_lease_topology_generation: ?u32 = null,
         drm_remove_pending: bool = false,
         topology_refresh_pending: bool = false,
+        topology_refresh_draining: bool = false,
         output_global_index: usize = 1,
         pending_output_removals: usize = 0,
         output_reconfigure: ?OutputReconfigureTransaction = null,
@@ -1316,11 +1319,22 @@ pub fn Coordinator(comptime protocol: type) type {
                 config.drm_lease.selection_capacity,
             );
             errdefer allocator.free(self.drm_lease_claims);
+            self.topology_claims = try allocator.alloc(
+                drm.ClaimHandle,
+                config.drm.connector_capacity,
+            );
+            errdefer allocator.free(self.topology_claims);
+            self.topology_refreshed_claims = try allocator.alloc(
+                drm.ClaimHandle,
+                config.drm.connector_capacity,
+            );
+            errdefer allocator.free(self.topology_refreshed_claims);
             self.drm_lease_desired = false;
             self.drm_lease_global_update = .none;
             self.drm_lease_topology_generation = null;
             self.drm_remove_pending = false;
             self.topology_refresh_pending = false;
+            self.topology_refresh_draining = false;
             self.output_global_index = 1;
             self.pending_output_removals = 0;
             self.output_reconfigure = null;
@@ -2162,6 +2176,8 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             self.drm_lease_adapter.deinit();
             self.allocator.free(self.drm_lease_claims);
+            self.allocator.free(self.topology_refreshed_claims);
+            self.allocator.free(self.topology_claims);
             self.manager.deinit() catch |err| {
                 if (first_error == null) first_error = err;
             };
@@ -2909,12 +2925,12 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.output_reconfigure != null or self.output_power_transition != null)
                 return error.InvalidState;
             self.topology_refresh_pending = true;
+            self.topology_refresh_draining = false;
             errdefer self.topology_refresh_pending = false;
             try self.drm_lease_adapter.deviceUnavailable(.physical);
             self.markProtocolAll(ProtocolReady.drm_lease);
             self.drm_lease_desired = false;
             self.drm_lease_topology_generation = null;
-            try self.pauseAllOutputs();
         }
 
         fn armIccPoll(self: *Self) !void {
@@ -11188,13 +11204,17 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn advanceTopologyRefresh(self: *Self) !void {
-            if (self.anyKmsOutput()) return;
             for (self.physical_outputs[0..self.physical_output_count]) |physical|
                 if (physical.removing) return;
             try self.advanceDrmLeaseGlobal();
             if (self.drm_lease_global_update != .none or
                 self.drm_lease_adapter.installed() or
                 self.drm_lease_adapter.retryRevocations()) return;
+            if (self.anyKmsOutput()) {
+                if (!self.topology_refresh_draining)
+                    try self.refreshActiveTopology();
+                return;
+            }
 
             try self.retireGammaOwners();
             const handle = (self.manager.rescan() catch |cause| switch (cause) {
@@ -11248,6 +11268,57 @@ pub fn Coordinator(comptime protocol: type) type {
             self.reconcileActiveOutputConfig();
             try self.consumeOutputManagementCommands();
             self.topology_refresh_pending = false;
+            self.topology_refresh_draining = false;
+            try self.advancePhysicalOutputRemovals();
+        }
+
+        fn refreshActiveTopology(self: *Self) !void {
+            const previous = self.manager.currentHandle() orelse
+                return error.DrmHardwareUnavailable;
+            var claim_count: usize = 0;
+            for (self.physical_outputs[0..self.physical_output_count]) |physical| {
+                const output = physical.kms_output orelse continue;
+                if (!std.meta.eql(output.topologyHandle(), previous))
+                    return error.StaleSnapshot;
+                if (claim_count == self.topology_claims.len)
+                    return error.ClaimCapacityExceeded;
+                self.topology_claims[claim_count] = physical.claim orelse
+                    return error.StaleClaim;
+                claim_count += 1;
+            }
+            const handle = self.manager.rescanPreservingClaims(
+                self.topology_claims[0..claim_count],
+                self.topology_refreshed_claims[0..claim_count],
+            ) catch |cause| switch (cause) {
+                error.ClaimsChanged,
+                error.IncompleteClaims,
+                error.NoConnectedOutput,
+                error.NoCompatibleCrtc,
+                error.NoPrimaryPlane,
+                => {
+                    self.topology_refresh_draining = true;
+                    try self.pauseAllOutputs();
+                    return;
+                },
+                else => return cause,
+            } orelse return error.DrmHardwareUnavailable;
+            self.manager.clearEvents();
+
+            claim_count = 0;
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                const output = physical.kms_output orelse continue;
+                try output.rebindTopology(previous, handle);
+                physical.claim = self.topology_refreshed_claims[claim_count];
+                claim_count += 1;
+            }
+            try self.activateAdditionalOutputs(handle);
+            try self.ensureDrmLeasing(try self.manager.snapshot(handle));
+            try self.advanceOutputGlobals();
+            try self.publishOutputLayout();
+            self.reconcileActiveOutputConfig();
+            try self.consumeOutputManagementCommands();
+            self.topology_refresh_pending = false;
+            self.topology_refresh_draining = false;
             try self.advancePhysicalOutputRemovals();
         }
 

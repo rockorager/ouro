@@ -996,6 +996,14 @@ pub const Output = struct {
         return self.render_device.rendererKind();
     }
 
+    pub fn topologyHandle(self: *const Output) drm.Handle {
+        return self.kms_output.snapshotHandle();
+    }
+
+    pub fn rebindTopology(self: *Output, previous: drm.Handle, current: drm.Handle) !void {
+        try self.kms_output.rebindSnapshot(previous, current);
+    }
+
     pub fn validateClientBuffer(self: *Output, import: gbm.Import) !void {
         const format = formatFromDrm(import.format) orelse return error.UnsupportedFormat;
         const renderer = &(self.render_device.renderer orelse return error.RendererUnavailable);

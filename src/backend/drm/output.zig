@@ -238,6 +238,17 @@ pub const Output = struct {
         self.event_count = 0;
     }
 
+    pub fn snapshotHandle(self: *const Output) drm.Handle {
+        return self.snapshot_handle;
+    }
+
+    /// Rebinds an unchanged KMS tuple after the manager atomically refreshes
+    /// the same DRM device and invalidates only its topology generation.
+    pub fn rebindSnapshot(self: *Output, previous: drm.Handle, current: drm.Handle) !void {
+        if (!std.meta.eql(self.snapshot_handle, previous)) return error.StaleSnapshot;
+        self.snapshot_handle = current;
+    }
+
     /// Takes ownership of an acquired R10 image and, when present, the input
     /// fence only after all validation succeeds. The fence is closed after the
     /// real atomic ioctl attempt or on any earlier rollback.
