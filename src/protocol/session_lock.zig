@@ -165,6 +165,12 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
         pub fn ownsSurface(self: *const Self, surface: SurfaceId) bool {
             return self.findSurface(surface) != null;
         }
+        pub fn outputForSurface(
+            self: *const Self,
+            surface: SurfaceId,
+        ) ?OutputAdapter.OutputId {
+            return (self.findSurface(surface) orelse return null).output_id;
+        }
         pub fn lockPeer(self: *const Self, id: LockId) !wayring.io_uring.Peer {
             return (try self.resolveLock(id)).peer;
         }
@@ -670,7 +676,10 @@ test "session-lock: configure ack gates exact prospective commit dimensions" {
     defer adapter.deinit();
     const slot = try adapter.acquireSurface();
     slot.surface = .{ .index = 5, .generation = 6 };
+    slot.output_id = .{ .index = 7, .generation = 8 };
     const id = adapter.surfaceId(slot);
+    try std.testing.expectEqual(slot.output_id, adapter.outputForSurface(slot.surface).?);
+    try std.testing.expect(adapter.outputForSurface(.{ .index = 6, .generation = 6 }) == null);
 
     try std.testing.expectError(error.CommitBeforeFirstAck, adapter.validateSurfaceCommit(slot.surface));
     adapter.outstanding[0] = .{ .active = true, .surface = id, .serial = 11, .width = 1920, .height = 1200 };
@@ -695,7 +704,6 @@ test "session-lock: configure ack gates exact prospective commit dimensions" {
     try std.testing.expectEqual(@as(u32, 1280), slot.ack_width);
     try std.testing.expectEqual(@as(u32, 720), slot.ack_height);
 
-    slot.output_id = .{ .index = 7, .generation = 8 };
     try adapter.queueConfigure(id, 800, 600);
     adapter.outstanding[0] = .{
         .active = true,
