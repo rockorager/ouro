@@ -176,6 +176,7 @@ pub fn main(init: std.process.Init) !void {
             .bounds = .{ .x = 0, .y = 0, .width = 8192, .height = 8192 },
         },
         .linux_dmabuf = .{},
+        .virtual_keyboard_reconciles_focus = options.headless,
         .enable_color_protocols = options.renderer == .vulkan,
         .color_management = .{
             // Compilation remains single-worker and byte-bounded. Up to 32

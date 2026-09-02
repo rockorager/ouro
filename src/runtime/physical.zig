@@ -783,6 +783,7 @@ pub fn Coordinator(comptime protocol: type) type {
             text_input: protocol_text_input.Config = .{},
             input_method: protocol_input_method.Config = .{},
             virtual_keyboard: protocol_virtual_keyboard.Config = .{},
+            virtual_keyboard_reconciles_focus: bool = false,
             virtual_pointer: protocol_virtual_pointer.Config = .{},
             wlr_screencopy: protocol_wlr_screencopy.Config = .{},
             foreign_toplevel_list: protocol_foreign_toplevel_list.Config = .{},
@@ -879,6 +880,7 @@ pub fn Coordinator(comptime protocol: type) type {
         input_delivery_event: ?input_api.Event = null,
         input_touch_delivery: TouchDelivery = .{},
         input_method_key_owners: [0x300]?protocol_input_method.GrabId = [_]?protocol_input_method.GrabId{null} ** 0x300,
+        virtual_keyboard_reconciles_focus: bool,
         processing_virtual_pointer: bool = false,
         shell_maintenance_pending: bool = false,
         pointer_reconcile_pending: bool = false,
@@ -1070,6 +1072,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.output_config = config.output;
             self.syncobj_config = config.linux_drm_syncobj;
             self.desktop_transaction_timeout_ns = config.desktop_transaction_timeout_ns;
+            self.virtual_keyboard_reconciles_focus = config.virtual_keyboard_reconciles_focus;
             if (config.seat.len == 0 or config.seat.len > self.seat.len)
                 return error.InvalidSeat;
             self.input_config = config.input;
@@ -6103,6 +6106,8 @@ pub fn Coordinator(comptime protocol: type) type {
             const self: *Self = @ptrCast(@alignCast(context orelse return));
             if (seat != &self.seat_adapter) return;
             self.input_method_adapter.keymapUpdated() catch unreachable;
+            if (self.virtual_keyboard_reconciles_focus)
+                self.syncLayerKeyboardFocus() catch unreachable;
             self.markInputMethodProtocol();
         }
 

@@ -3380,6 +3380,7 @@ test "shell-input: generated input-method client bridges focused text input" {
     const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 2), root_config);
     var config = physical_fixture.coordinatorConfig();
     config.router_capacity = 32;
+    config.virtual_keyboard_reconciles_focus = true;
     var platforms = fixture.platforms();
     platforms.input = input.platform();
     const coordinator = try Coordinator.create(allocator, root, platforms, config);
@@ -3491,6 +3492,10 @@ test "shell-input: generated input-method client bridges focused text input" {
     try std.testing.expectEqual(@as(usize, 3), method_handler.grab_modifiers);
     try std.testing.expect(method_handler.grab_keys_valid);
 
+    // Model a headless seat which selected its desktop window before any
+    // keyboard existed. Installing the virtual keymap must reconcile that
+    // selected window before the immediately following key events.
+    try coordinator.seat_adapter.setKeyboardFocus(null);
     const virtual_keyboard = method_handler.virtual_keyboard.?;
     const keymap = coordinator.seat_adapter.keyboardSnapshot();
     const keymap_fd = try coordinator.seat_adapter.duplicateKeymap();
