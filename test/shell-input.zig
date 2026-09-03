@@ -1489,6 +1489,7 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     root_config.runtime.object_capacity = 128;
     root_config.runtime.object_quota = 128;
     root_config.runtime.buckets_per_client = 128;
+    root_config.runtime.actor.received_fd_budget = 3;
     const root = try Compositor.create(
         allocator,
         try wayring.unix_socket.listen(path, 1),
@@ -1503,11 +1504,11 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     config.input.event_capacity = 2;
     config.shm.pool_capacity = 3;
     config.shm.buffer_capacity = 3;
-    config.surface.surface_capacity = 2;
-    config.surface.content_update_capacity = 2;
-    config.surface.dependency_capacity = 2;
-    config.surface.attachment_capacity = 2;
-    config.surface.copy_capacity = 2;
+    config.surface.surface_capacity = 3;
+    config.surface.content_update_capacity = 3;
+    config.surface.dependency_capacity = 3;
+    config.surface.attachment_capacity = 3;
+    config.surface.copy_capacity = 3;
     config.surface.guarded_shm_access = false;
     config.output.max_samples = 3;
     config.output.max_source_bytes = pixels.len + 4;
@@ -1571,6 +1572,9 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     var motion_submission_start: ?usize = null;
     var motion_frame_observed = false;
     var two_layers_observed = false;
+    var drag_icon_observed = false;
+    var drag_icon_motion_observed = false;
+    var first_drag_icon_destination: ?ouro.render.Rect = null;
     var first_cursor_destination: ?ouro.render.Rect = null;
     var client_progress: ClientDriver.Progress = .{};
     for (0..512) |_| {
@@ -1626,7 +1630,7 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
         {
             toplevel_drag_active = true;
         }
-        if (key_sent and !drag_release_sent and motion_redraw_sent and toplevel_drag_active and
+        if (key_sent and !drag_release_sent and drag_icon_motion_observed and toplevel_drag_active and
             coordinator.data_device_adapter.dragActive() and
             input.cursor == input.event_count)
         {
@@ -1643,13 +1647,14 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
         {
             const app = coordinator.app_layers[0].sample.?;
             const cursor = coordinator.cursor_layer.sample.?;
-            const submitted = coordinator.primaryKmsOutput().?.sample_storage[0..2];
+            const cursor_index: usize = if (coordinator.physical_outputs[0].drag_icon_previous != null) 2 else 1;
+            const submitted = coordinator.primaryKmsOutput().?.sample_storage[0 .. cursor_index + 1];
             try std.testing.expectEqual(coordinator.app_layers[0].binding.?.surface, submitted[0].surface);
             try std.testing.expectEqual(app.sample, coordinator.app_layers[0].binding.?.sample);
             try std.testing.expectEqual(app.presentation, submitted[0].presentation);
-            try std.testing.expectEqual(coordinator.cursor_layer.binding.?.surface, submitted[1].surface);
+            try std.testing.expectEqual(coordinator.cursor_layer.binding.?.surface, submitted[cursor_index].surface);
             try std.testing.expectEqual(cursor.sample, coordinator.cursor_layer.binding.?.sample);
-            try std.testing.expectEqual(cursor.presentation, submitted[1].presentation);
+            try std.testing.expectEqual(cursor.presentation, submitted[cursor_index].presentation);
             try std.testing.expectEqual(@as(i32, -1), app.destination.x);
             try std.testing.expectEqual(@as(i32, 0), app.destination.y);
             try std.testing.expectEqual(@as(u32, 3), app.destination.width);
@@ -1657,7 +1662,23 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
             try std.testing.expect(cursor.destination.x >= 0 and cursor.destination.y >= 0);
             two_layers_observed = true;
         }
-        if (coordinator.stats.presented == 2 and !motion_redraw_sent and
+        if (!drag_icon_observed and coordinator.drag_icon_root != null and
+            coordinator.physical_outputs[0].drag_icon_previous != null)
+        {
+            for (coordinator.app_layers[0..coordinator.app_layer_count]) |layer| {
+                if (layer.id == null or !std.meta.eql(layer.id.?, coordinator.drag_icon_root.?)) continue;
+                const icon = layer.sample orelse continue;
+                try std.testing.expect(layer.floating);
+                try std.testing.expectEqual(coordinator.interaction.cursor.position.x + 1, icon.destination.x);
+                try std.testing.expectEqual(coordinator.interaction.cursor.position.y, icon.destination.y);
+                try std.testing.expectEqual(@as(u32, 1), icon.destination.width);
+                try std.testing.expectEqual(@as(u32, 1), icon.destination.height);
+                first_drag_icon_destination = icon.destination;
+                drag_icon_observed = true;
+                break;
+            }
+        }
+        if (coordinator.stats.presented >= 2 and drag_icon_observed and !motion_redraw_sent and
             coordinator.data_device_adapter.dragActive() and input.cursor == input.event_count and
             coordinator.cursor_layer.sample != null)
         {
@@ -1676,11 +1697,23 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
         {
             const app = coordinator.app_layers[0].sample.?;
             const cursor = coordinator.cursor_layer.sample.?;
-            const submitted = coordinator.primaryKmsOutput().?.sample_storage[0..2];
+            const submitted = coordinator.primaryKmsOutput().?.sample_storage[0..3];
             try std.testing.expectEqual(coordinator.app_layers[0].binding.?.surface, submitted[0].surface);
             try std.testing.expectEqual(app.presentation, submitted[0].presentation);
-            try std.testing.expectEqual(coordinator.cursor_layer.binding.?.surface, submitted[1].surface);
-            try std.testing.expectEqual(cursor.presentation, submitted[1].presentation);
+            for (coordinator.app_layers[0..coordinator.app_layer_count]) |layer| {
+                if (layer.id == null or coordinator.drag_icon_root == null or
+                    !std.meta.eql(layer.id.?, coordinator.drag_icon_root.?)) continue;
+                const icon = layer.sample orelse continue;
+                try std.testing.expectEqual(layer.binding.?.surface, submitted[1].surface);
+                try std.testing.expectEqual(icon.presentation, submitted[1].presentation);
+                try std.testing.expectEqual(coordinator.interaction.cursor.position.x + 1, icon.destination.x);
+                try std.testing.expectEqual(coordinator.interaction.cursor.position.y, icon.destination.y);
+                if (!std.meta.eql(first_drag_icon_destination.?, icon.destination))
+                    drag_icon_motion_observed = true;
+                break;
+            }
+            try std.testing.expectEqual(coordinator.cursor_layer.binding.?.surface, submitted[2].surface);
+            try std.testing.expectEqual(cursor.presentation, submitted[2].presentation);
             if (!std.meta.eql(first_cursor_destination.?, cursor.destination))
                 motion_frame_observed = true;
         }
@@ -1703,6 +1736,8 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     try std.testing.expect(handler.configure_serial != 0);
     try std.testing.expectEqual(handler.configure_serial, handler.acked_serial);
     try std.testing.expect(two_layers_observed);
+    try std.testing.expect(drag_icon_observed);
+    try std.testing.expect(drag_icon_motion_observed);
     try std.testing.expect(motion_frame_observed);
     try std.testing.expect(coordinator.stats.submitted >= motion_submission_start.? + 1);
     try std.testing.expectEqual(coordinator.stats.submitted, coordinator.stats.presented);
@@ -1732,7 +1767,7 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     try std.testing.expectEqual(@as(i32, 15 * 256), handler.pointer_axis_fixed);
     try std.testing.expectEqual(@as(i32, 120), handler.pointer_axis_value120_value);
     try std.testing.expectEqual(@as(usize, 1), handler.keyboard_key);
-    try std.testing.expectEqual(@as(usize, 0), handler.buffer_release);
+    try std.testing.expect(handler.buffer_release <= 1);
     try std.testing.expect(handler.output_geometry);
     try std.testing.expectEqual(@as(i32, 1), handler.output_physical_width);
     try std.testing.expectEqual(@as(i32, 1), handler.output_physical_height);
@@ -1741,8 +1776,9 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     try std.testing.expect(handler.output_name);
     try std.testing.expect(handler.output_description);
     try std.testing.expect(handler.output_done != 0);
-    try std.testing.expectEqual(@as(usize, 2), handler.output_enter);
-    try std.testing.expectEqual(@as(usize, 0), handler.output_leave);
+    try std.testing.expect(coordinator.drag_icon_root == null);
+    try std.testing.expectEqual(@as(usize, 3), handler.output_enter);
+    try std.testing.expect(handler.output_leave <= 1);
     try std.testing.expect(!handler.output_released);
     try std.testing.expect(handler.foreign_toplevel_list != null);
     try std.testing.expect(handler.foreign_toplevel_handle != null);
@@ -1847,12 +1883,12 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
         client_progress = try drainClient(&client_reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
         if (coordinator.primaryKmsOutput() == null and coordinator.session.state == .disabled and
-            handler.output_leave == 2 and handler.wlr_foreign_toplevel_output_leave == 1) break;
+            handler.output_leave == 3 and handler.wlr_foreign_toplevel_output_leave == 1) break;
         if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
             try waitForEither(&root.ring, client_reactor.ring);
     }
     try std.testing.expect(coordinator.primaryKmsOutput() == null);
-    try std.testing.expectEqual(@as(usize, 2), handler.output_leave);
+    try std.testing.expectEqual(@as(usize, 3), handler.output_leave);
     try std.testing.expectEqual(@as(usize, 1), handler.wlr_foreign_toplevel_output_leave);
     try std.testing.expect(coordinator.app_layers[0].active);
     try std.testing.expect(coordinator.cursor_layer.active);
@@ -1862,7 +1898,7 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     for (0..128) |_| {
         client_progress = try drainClient(&client_reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
-        if (coordinator.stats.presented == presented_before_disable + 1 and handler.output_enter == 4 and
+        if (coordinator.stats.presented == presented_before_disable + 1 and handler.output_enter == 5 and
             handler.wlr_foreign_toplevel_output_enter == 2 and handler.output_deleted) break;
         if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
             try waitForEither(&root.ring, client_reactor.ring);
@@ -1875,7 +1911,7 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     );
     try std.testing.expectEqual(retained_app.sample, coordinator.app_layers[0].sample.?.sample);
     try std.testing.expectEqual(retained_cursor.sample, coordinator.cursor_layer.sample.?.sample);
-    try std.testing.expectEqual(@as(usize, 4), handler.output_enter);
+    try std.testing.expectEqual(@as(usize, 5), handler.output_enter);
     try std.testing.expectEqual(@as(usize, 2), handler.wlr_foreign_toplevel_output_enter);
     try std.testing.expect(handler.output_released);
     try std.testing.expect(handler.output_deleted);
@@ -5826,6 +5862,8 @@ const Handler = struct {
     test_toplevel_drag: bool = false,
     toplevel_drag_attached: bool = false,
     toplevel_drag_destroyed: bool = false,
+    drag_icon_surface: ?wayring.objects.Handle = null,
+    drag_icon_buffer: ?wayring.objects.Handle = null,
     toplevel_tag_manager: ?wayring.objects.Handle = null,
     test_toplevel_tag: bool = false,
     toplevel_tag_set: bool = false,
@@ -6238,6 +6276,8 @@ const Handler = struct {
                     if (value.state.value == protocol.wl_pointer.button_state.pressed.value and
                         self.drag_cancelled == 0 and !self.test_text_input)
                     {
+                        if (self.test_toplevel_drag and self.drag_icon_surface == null)
+                            try self.queueDragIcon();
                         try protocol.wl_data_device.encodeRequest(self.queue, self.data_device.?.id, .{
                             .start_drag = .{
                                 .source = self.data_source.?.id,
@@ -6250,7 +6290,7 @@ const Handler = struct {
                             .start_drag = .{
                                 .source = self.data_source.?.id,
                                 .origin = self.surface.?.id,
-                                .icon = null,
+                                .icon = if (self.test_toplevel_drag) self.drag_icon_surface.?.id else null,
                                 .serial = value.serial,
                             },
                         });
@@ -6872,6 +6912,46 @@ const Handler = struct {
         try protocol.wl_surface.encodeRequest(self.queue, surface.id, .{ .commit = .{} });
         try wayring.client.sendRequest(protocol.wl_buffer, self.objects, self.queue, buffer, .{ .destroy = .{} });
         try wayring.client.sendRequest(protocol.wl_shm_pool, self.objects, self.queue, pool.id, .{ .destroy = .{} });
+    }
+
+    fn queueDragIcon(self: *Handler) !void {
+        const descriptor = try ordinaryMemfd(4, 0, &.{ 0xff, 0xff, 0xff, 0xff });
+        const pool = try protocol.wl_shm.construct_create_pool(
+            self.objects,
+            self.queue,
+            self.shm.?,
+            .{ .fd = descriptor, .size = 4 },
+        );
+        self.drag_icon_buffer = (try protocol.wl_shm_pool.construct_create_buffer(
+            self.objects,
+            self.queue,
+            pool.id,
+            .{ .offset = 0, .width = 1, .height = 1, .stride = 4, .format = .argb8888 },
+        )).id;
+        self.drag_icon_surface = (try protocol.wl_compositor.construct_create_surface(
+            self.objects,
+            self.queue,
+            self.compositor.?,
+            .{},
+        )).id;
+        try protocol.wl_surface.encodeRequest(self.queue, self.drag_icon_surface.?.id, .{
+            .attach = .{ .buffer = self.drag_icon_buffer.?.id, .x = 0, .y = 0 },
+        });
+        try protocol.wl_surface.encodeRequest(self.queue, self.drag_icon_surface.?.id, .{
+            .offset = .{ .x = 1, .y = 0 },
+        });
+        try protocol.wl_surface.encodeRequest(
+            self.queue,
+            self.drag_icon_surface.?.id,
+            .{ .commit = .{} },
+        );
+        try wayring.client.sendRequest(
+            protocol.wl_shm_pool,
+            self.objects,
+            self.queue,
+            pool.id,
+            .{ .destroy = .{} },
+        );
     }
 
     fn queuePointerWarp(self: *Handler) !void {

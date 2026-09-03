@@ -163,6 +163,11 @@ pub fn Adapter(comptime protocol: type) type {
             y: i32,
         };
 
+        pub const DragIcon = struct {
+            peer: wayring.io_uring.Peer,
+            surface_object: u32,
+        };
+
         allocator: std.mem.Allocator,
         runtime: ?*Runtime = null,
         global: ?objects.Handle = null,
@@ -598,6 +603,14 @@ pub fn Adapter(comptime protocol: type) type {
 
         pub fn dragActive(self: *const Self) bool {
             return self.drag != null;
+        }
+
+        pub fn dragIcon(self: *const Self) ?DragIcon {
+            const drag = self.drag orelse return null;
+            return .{
+                .peer = drag.peer,
+                .surface_object = drag.icon_object orelse return null,
+            };
         }
 
         pub fn surfaceRemoved(self: *Self, peer: wayring.io_uring.Peer, object_id: u32) void {

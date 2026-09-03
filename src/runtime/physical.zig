@@ -534,6 +534,7 @@ pub fn Coordinator(comptime protocol: type) type {
             damage_requested: u64 = 0,
             damage_applied: u64 = 0,
             screencopy_generation: u64 = 1,
+            drag_icon_previous: ?damage.SurfaceState = null,
             themed_cursor_previous: ?damage.SurfaceState = null,
             client_cursor_previous: ?damage.SurfaceState = null,
         };
@@ -726,6 +727,7 @@ pub fn Coordinator(comptime protocol: type) type {
             retire_after_outcome: bool = false,
             retire_after_source_release: bool = false,
             retains_source: bool = false,
+            floating: bool = false,
             retired_source: ?RetiredSource = null,
         };
 
@@ -1063,6 +1065,7 @@ pub fn Coordinator(comptime protocol: type) type {
         consumer_timer_canceling: bool = false,
         consumer_timer_deadline_ns: ?u64 = null,
         cursor_layer: Layer,
+        drag_icon_root: ?Adapter.SurfaceId = null,
         output_power_transition: ?OutputPowerAdapter.Command = null,
         stopping: bool = false,
         session_disable_pending: bool = false,
@@ -3146,6 +3149,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 else => return err,
             };
             try self.processSeatEvents();
+            try self.syncDragIcon();
             try self.processHotplug();
             try self.syncOutputAssociations();
             try self.advanceDrain();
@@ -3782,6 +3786,37 @@ pub fn Coordinator(comptime protocol: type) type {
                 @truncate(time_usec / 1000),
                 emit_motion,
             );
+        }
+
+        fn currentDragIconRoot(self: *Self) ?Adapter.SurfaceId {
+            const icon = self.data_device_adapter.dragIcon() orelse return null;
+            const server_objects = self.root.runtime.clients.get(icon.peer) catch return null;
+            const handle = server_objects.namespace.lookupHandle(icon.surface_object) orelse return null;
+            const object = server_objects.namespace.resolve(handle) orelse return null;
+            return self.adapter.surfaceIdObject(handle, object) catch null;
+        }
+
+        fn syncDragIcon(self: *Self) !void {
+            const next = self.currentDragIconRoot();
+            if ((self.drag_icon_root == null and next == null) or
+                (self.drag_icon_root != null and next != null and
+                    std.meta.eql(self.drag_icon_root.?, next.?))) return;
+            if (self.drag_icon_root) |old| {
+                for (self.app_layers[0..self.app_layer_count]) |*layer| {
+                    const id = layer.id orelse continue;
+                    if (!std.meta.eql(id, old)) {
+                        if (!(self.subcompositor_adapter.visible(id) catch false)) continue;
+                        const placement = self.subcompositor_adapter.placement(id) catch continue;
+                        if (!std.meta.eql(placement.root, old)) continue;
+                    }
+                    self.queueLayerRemoval(id);
+                    self.retireLayer(layer);
+                }
+            }
+            self.drag_icon_root = next;
+            self.output_associations_dirty = true;
+            try self.requestOutputDamage();
+            if (next != null and self.pending_surface_len != 0) try self.applyReady();
         }
 
         fn syncToplevelDrag(self: *Self) !void {
@@ -6411,13 +6446,14 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn requestCursorRedraw(self: *Self) !void {
             if (!self.cursor_layer.active and self.themed_cursor.image == null and
-                !self.anyCursorPrevious()) return;
+                self.drag_icon_root == null and !self.anyCursorPrevious()) return;
             try self.requestOutputDamage();
         }
 
         fn anyCursorPrevious(self: *const Self) bool {
             for (self.physical_outputs[0..self.physical_output_count]) |physical|
-                if (physical.themed_cursor_previous != null or
+                if (physical.drag_icon_previous != null or
+                    physical.themed_cursor_previous != null or
                     physical.client_cursor_previous != null) return true;
             return false;
         }
@@ -8285,7 +8321,9 @@ pub fn Coordinator(comptime protocol: type) type {
             const exact_surface_id = pending.id;
             const surface_scene = self.surfaceScene(exact_surface_id);
             const cursor_surface = self.cursorTreeContains(exact_surface_id);
-            var layer = if (surface_scene != null or self.findAppLayer(exact_surface_id) != null)
+            const drag_icon_surface = self.dragIconTreeContains(exact_surface_id);
+            var layer = if (surface_scene != null or self.findAppLayer(exact_surface_id) != null or
+                drag_icon_surface)
                 try self.appLayerForSurface(exact_surface_id)
             else if (cursor_surface and std.meta.eql(
                 self.interaction.cursor.surface.?,
@@ -8302,7 +8340,8 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             if (!layer.candidate.owned) {
                 if (!try self.admitReadyBatch(exact_surface_id)) return false;
-                layer = if (surface_scene != null or self.findAppLayer(exact_surface_id) != null)
+                layer = if (surface_scene != null or self.findAppLayer(exact_surface_id) != null or
+                    drag_icon_surface)
                     try self.appLayerForSurface(exact_surface_id)
                 else if (std.meta.eql(self.interaction.cursor.surface.?, exact_surface_id))
                     &self.cursor_layer
@@ -8892,11 +8931,12 @@ pub fn Coordinator(comptime protocol: type) type {
                     else
                         return false
                 else if (self.surfaceScene(id) != null or self.findAppLayer(id) != null or
-                    self.cursorTreeContains(id))
+                    self.cursorTreeContains(id) or self.dragIconTreeContains(id))
                     self.availableAppLayer(id, index) orelse return false
                 else
                     return false;
                 self.applied_layers[index] = layer;
+                layer.floating = self.cursorTreeContains(id) or self.dragIconTreeContains(id);
                 superseded_count += @intFromBool(!is_last);
             }
             if (self.presentations.available() < superseded_count) return false;
@@ -9103,6 +9143,13 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.frame_change_layers[change_count] = null;
                 change_count += 1;
             }
+            const next_drag_icon_previous = try self.appendDragIcon(
+                physical,
+                &sample_count,
+                &change_count,
+                output_bounds,
+                output_scale,
+            );
             const cursor_start = sample_count;
             var next_client_cursor_previous: ?damage.SurfaceState = null;
             var client_cursor_visible = false;
@@ -9293,7 +9340,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 change_count += 1;
             }
             for (self.app_layers[0..self.app_layer_count]) |*layer| {
-                if (layer.id != null and self.cursorTreeContains(layer.id.?)) continue;
+                if (layer.floating) continue;
                 const outputs = self.appLayerOutputRow(
                     self.app_layer_change_outputs,
                     layer,
@@ -9392,6 +9439,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     self.outputDamageSubmitted(
                         physical,
                         damage_generation,
+                        next_drag_icon_previous,
                         next_themed_cursor_previous,
                         next_client_cursor_previous,
                     );
@@ -9436,6 +9484,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     self.outputDamageSubmitted(
                         physical,
                         damage_generation,
+                        next_drag_icon_previous,
                         next_themed_cursor_previous,
                         next_client_cursor_previous,
                     );
@@ -9473,10 +9522,12 @@ pub fn Coordinator(comptime protocol: type) type {
             self: *Self,
             physical: *PhysicalOutput,
             damage_generation: u64,
+            next_drag_icon_previous: ?damage.SurfaceState,
             next_themed_cursor_previous: ?damage.SurfaceState,
             next_client_cursor_previous: ?damage.SurfaceState,
         ) void {
             physical.damage_applied = damage_generation;
+            physical.drag_icon_previous = next_drag_icon_previous;
             physical.themed_cursor_previous = next_themed_cursor_previous;
             physical.client_cursor_previous = next_client_cursor_previous;
             self.clearFifoBarriersAfterOutputAttempts();
@@ -9519,8 +9570,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     &layer.change_output_count,
                 );
                 if (cleared == .complete or
-                    (cleared == .untracked and layer.id != null and
-                        self.cursorTreeContains(layer.id.?)))
+                    (cleared == .untracked and layer.floating))
                     markLayerChangeApplied(layer);
             }
             for (bindings) |binding| {
@@ -9607,6 +9657,101 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (!std.meta.eql(popup.output, physical.id)) continue;
                 try self.appendSceneRoot(physical, popup.surface, count, output_bounds);
             }
+        }
+
+        fn appendDragIcon(
+            self: *Self,
+            physical: *const PhysicalOutput,
+            sample_count: *usize,
+            change_count: *usize,
+            output_bounds: geometry.Rect,
+            output_scale: geometry.OutputScale,
+        ) !?damage.SurfaceState {
+            const root = self.drag_icon_root orelse {
+                if (physical.drag_icon_previous) |previous| {
+                    try self.ensureFrameStorage(@max(sample_count.*, change_count.*) + 1);
+                    self.frame_changes[change_count.*] = .{ .previous = try scaleSurfaceState(
+                        previous,
+                        output_bounds,
+                        output_scale,
+                    ) };
+                    self.frame_change_layers[change_count.*] = null;
+                    change_count.* += 1;
+                }
+                return null;
+            };
+            const pointer = self.interaction.cursor.position;
+            var combined: ?damage.SurfaceState = null;
+            const surfaces = try self.sceneOrder(root);
+            for (surfaces) |surface| {
+                const layer = self.findAppLayer(surface) orelse continue;
+                if (!layer.active or layer.sample == null or layer.binding == null or
+                    layer.change == null) continue;
+                const placement_offset: geometry.Point = if (std.meta.eql(surface, root))
+                    .{ .x = 0, .y = 0 }
+                else blk: {
+                    const placement = self.subcompositor_adapter.placement(surface) catch continue;
+                    break :blk .{ .x = placement.offset.x, .y = placement.offset.y };
+                };
+                var sample = layer.sample.?;
+                sample.destination.x = try std.math.add(
+                    i32,
+                    pointer.x,
+                    translatedCoordinate(placement_offset.x, layer.content_origin.x),
+                );
+                sample.destination.y = try std.math.add(
+                    i32,
+                    pointer.y,
+                    translatedCoordinate(placement_offset.y, layer.content_origin.y),
+                );
+                sample.clip = try clipToOutput(sample.destination, output_bounds) orelse continue;
+                if (!std.meta.eql(sample.destination, layer.sample.?.destination) or
+                    !std.meta.eql(sample.clip, layer.sample.?.clip))
+                {
+                    const previous = layer.change.?.current;
+                    const natural_size = (previous orelse layer.change.?.previous.?).surface_size;
+                    layer.sample = sample;
+                    layer.change = .{
+                        .previous = previous,
+                        .current = damage.SurfaceState.fromSample(sample, natural_size),
+                        .invalidate_bounds = true,
+                    };
+                    self.output_associations_dirty = true;
+                }
+                try self.ensureFrameStorage(@max(sample_count.*, change_count.*) + 1);
+                self.frame_samples[sample_count.*] = try scaleSample(
+                    sample,
+                    output_bounds,
+                    output_scale,
+                );
+                self.frame_bindings[sample_count.*] = layer.binding.?;
+                self.frame_changes[change_count.*] = try scaleChange(
+                    layer.change.?,
+                    output_bounds,
+                    output_scale,
+                );
+                self.frame_change_layers[change_count.*] = layer;
+                try includeSurfaceBounds(
+                    &combined,
+                    damage.SurfaceState.fromSample(
+                        sample,
+                        (layer.change.?.current orelse layer.change.?.previous.?).surface_size,
+                    ),
+                );
+                sample_count.* += 1;
+                change_count.* += 1;
+            }
+            if (combined == null) if (physical.drag_icon_previous) |previous| {
+                try self.ensureFrameStorage(@max(sample_count.*, change_count.*) + 1);
+                self.frame_changes[change_count.*] = .{ .previous = try scaleSurfaceState(
+                    previous,
+                    output_bounds,
+                    output_scale,
+                ) };
+                self.frame_change_layers[change_count.*] = null;
+                change_count.* += 1;
+            };
+            return combined;
         }
 
         fn appendSceneRoot(
@@ -10629,7 +10774,7 @@ pub fn Coordinator(comptime protocol: type) type {
                         output_index,
                         &layer.outcome_output_count,
                     )) {
-                        .untracked => continue,
+                        .untracked => if (!layer.floating) continue,
                         .pending => output_pending = true,
                         .complete => {},
                     }
@@ -10982,6 +11127,14 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn cursorTreeContains(self: *Self, id: Adapter.SurfaceId) bool {
             const root = self.interaction.cursor.surface orelse return false;
+            if (std.meta.eql(root, id)) return true;
+            if (!(self.subcompositor_adapter.visible(id) catch return false)) return false;
+            const placement = self.subcompositor_adapter.placement(id) catch return false;
+            return std.meta.eql(placement.root, root);
+        }
+
+        fn dragIconTreeContains(self: *Self, id: Adapter.SurfaceId) bool {
+            const root = self.drag_icon_root orelse return false;
             if (std.meta.eql(root, id)) return true;
             if (!(self.subcompositor_adapter.visible(id) catch return false)) return false;
             const placement = self.subcompositor_adapter.placement(id) catch return false;
