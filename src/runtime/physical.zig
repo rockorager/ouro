@@ -4474,14 +4474,20 @@ pub fn Coordinator(comptime protocol: type) type {
         fn resolveColorManagedOutput(
             context: ?*anyopaque,
             peer: wayring.io_uring.Peer,
-            handle: ?wayring.objects.Handle,
+            output: ?wayring.objects.Handle,
+            surface: ?wayring.objects.Handle,
         ) ?protocol_color_management.ResolvedOutput {
             const self: *Self = @ptrCast(@alignCast(context orelse return null));
-            const physical = if (handle) |resource| blk: {
+            const physical = if (output) |resource| blk: {
                 const output_id = self.output_adapter.outputForResource(peer, resource) orelse
                     return null;
                 break :blk self.physicalOutputForProtocolId(output_id) orelse return null;
-            } else self.primaryPhysicalOutput();
+            } else if (surface) |resource| blk: {
+                const output_id = self.output_adapter.firstOutputForSurface(peer, resource) orelse
+                    return .{ .description = .srgb };
+                break :blk self.physicalOutputForProtocolId(output_id) orelse
+                    return .{ .description = .srgb };
+            } else return null;
             const profile = physical.output_profile orelse return .{
                 .description = .srgb,
             };

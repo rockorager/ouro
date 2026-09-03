@@ -555,6 +555,24 @@ pub fn Adapter(comptime protocol: type) type {
             if (changed) adapter.associations_dirty = true;
         }
 
+        pub fn firstOutputForSurface(
+            adapter: *const Self,
+            peer: wayring.io_uring.Peer,
+            surface: objects.Handle,
+        ) ?OutputId {
+            for (adapter.outputs, 0..) |output, index| {
+                if (!output.active or output.retired or !output.available) continue;
+                const id: OutputId = .{ .index = @intCast(index), .generation = output.generation };
+                for (adapter.associations) |association| {
+                    if (association.active and association.desired and
+                        std.meta.eql(association.output, id) and
+                        samePeer(association.peer, peer) and
+                        std.meta.eql(association.surface, surface)) return id;
+                }
+            }
+            return null;
+        }
+
         pub fn request(
             adapter: *Self,
             peer: wayring.io_uring.Peer,
@@ -1351,6 +1369,12 @@ test "output: identities isolate snapshots resources and surface associations" {
     try std.testing.expect(adapter.findAssociation(primary, peer, surface_b) == null);
     try std.testing.expect(adapter.findAssociation(secondary, peer, surface_a) == null);
     try std.testing.expect(adapter.findAssociation(secondary, peer, surface_b) != null);
+    try std.testing.expectEqual(primary, adapter.firstOutputForSurface(peer, surface_a).?);
+    try std.testing.expectEqual(secondary, adapter.firstOutputForSurface(peer, surface_b).?);
+    try std.testing.expect(adapter.firstOutputForSurface(
+        .{ .slot = peer.slot, .generation = peer.generation + 1 },
+        surface_a,
+    ) == null);
 
     const protocol = @import("core_protocol");
     var server_objects = try objects.ServerObjects.init(

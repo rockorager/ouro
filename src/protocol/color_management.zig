@@ -31,9 +31,10 @@ pub const ResolvedOutput = struct {
 
 pub const OutputResolver = struct {
     context: ?*anyopaque,
-    /// A null handle requests the preferred description for feedback. The
-    /// resolver transfers one retained reference in a successful result.
-    resolve: *const fn (?*anyopaque, wayring.io_uring.Peer, ?objects.Handle) ?ResolvedOutput,
+    /// Exactly one handle is non-null: an output requests its own description,
+    /// while surface feedback requests the preferred description for a surface.
+    /// The resolver transfers one retained reference in a successful result.
+    resolve: *const fn (?*anyopaque, wayring.io_uring.Peer, ?objects.Handle, ?objects.Handle) ?ResolvedOutput,
 };
 
 pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
@@ -286,7 +287,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     const image = self.create(.image, undefined, resource.peer, null, resource.version) catch
                         return try self.noMemory(actor);
                     if (resource.output == null or
-                        !self.resolveOutput(image, resource.peer, resource.output))
+                        !self.resolveOutput(image, resource.peer, resource.output, null))
                     {
                         image.image_state = .failed;
                         image.no_output = true;
@@ -318,7 +319,9 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .get_preferred => |value| {
                     const image = self.create(.image, undefined, resource.peer, null, resource.version) catch
                         return try self.noMemory(actor);
-                    if (!self.resolveOutput(image, resource.peer, null)) {
+                    const surface_resource = self.core.surfaceResource(surface) catch
+                        return try self.feedbackError(actor, decoded.handle.id, "inert surface feedback");
+                    if (!self.resolveOutput(image, resource.peer, null, surface_resource)) {
                         image.image_state = .failed;
                         image.no_output = true;
                     }
@@ -710,14 +713,15 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             self: *Self,
             image: *Resource,
             peer: wayring.io_uring.Peer,
-            handle: ?objects.Handle,
+            output: ?objects.Handle,
+            surface: ?objects.Handle,
         ) bool {
             const resolver = self.output_resolver orelse {
                 image.description = .srgb;
                 image.information_allowed = true;
                 return true;
             };
-            var resolved = resolver.resolve(resolver.context, peer, handle) orelse return false;
+            var resolved = resolver.resolve(resolver.context, peer, output, surface) orelse return false;
             resolved.description.validate() catch {
                 releaseResolvedOutput(resolved);
                 return false;
