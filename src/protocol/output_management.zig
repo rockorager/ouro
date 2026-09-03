@@ -90,7 +90,7 @@ pub fn Adapter(comptime protocol: type) type {
         const ConfigurationHead = protocol.zwlr_output_configuration_head_v1;
         const Peer = wayring.io_uring.Peer;
 
-        const ManagerSlot = struct { header: slot_pool.Header = .{}, peer: Peer = undefined, resource: objects.Handle = .{ .id = 0, .generation = 0 }, version: u32 = 1, stopped: bool = false };
+        const ManagerSlot = struct { header: slot_pool.Header = .{}, peer: Peer = undefined, resource: ?objects.Handle = null, version: u32 = 1, stopped: bool = false };
         const Child = struct { header: slot_pool.Header = .{}, manager: u32 = 0, peer: Peer = undefined, resource: ?objects.Handle = null, head: HeadId = undefined, mode: ModeState = undefined, retired: bool = false };
         const ConfigSlot = struct { header: slot_pool.Header = .{}, manager: u32 = 0, peer: Peer = undefined, resource: ?objects.Handle = null, lifecycle: ConfigurationId = undefined, destroyed: bool = false };
         const CHeadSlot = struct { header: slot_pool.Header = .{}, configuration: u32 = 0, peer: Peer = undefined, resource: ?objects.Handle = null, head: HeadId = undefined };
@@ -298,7 +298,11 @@ pub fn Adapter(comptime protocol: type) type {
                 const h = self.findWireHead(m.header.index, id) orelse continue;
                 self.removeQueuedHeadEvents(m.header.index, h.header.index);
                 if (m.stopped) {
-                    if (h.resource == null) self.retireWireHead(h);
+                    if (h.resource == null) {
+                        self.retireWireHead(h);
+                    } else {
+                        self.markWireHeadFinished(h);
+                    }
                     continue;
                 }
                 if (h.resource != null) {
@@ -420,7 +424,7 @@ pub fn Adapter(comptime protocol: type) type {
             const rh = server_objects.namespace.lookupHandle(message.header.object_id) orelse return null;
             if (target.object.interface == &Manager.info) {
                 const m = self.managers.fromContext(target.object.context) orelse return null;
-                if (!samePeer(m.peer, peer) or !std.meta.eql(m.resource, rh)) return null;
+                if (!samePeer(m.peer, peer) or m.resource == null or !std.meta.eql(m.resource.?, rh)) return null;
                 const d = try wayring.server.decodeRequest(Manager, server_objects, message, fds);
                 switch (d.value) {
                     .create_configuration => |v| {
@@ -610,8 +614,10 @@ pub fn Adapter(comptime protocol: type) type {
             return null;
         }
         fn retireWireHead(self: *Self, h: *Child) void {
+            const manager = h.manager;
             for (self.modes.entries.items) |m| if (m.header.active and m.manager == h.manager and std.meta.eql(m.head, h.head)) self.modes.release(m);
             self.heads.release(h);
+            self.retireManagerIfUnusedIndex(manager);
         }
         fn markWireHeadFinished(self: *Self, h: *Child) void {
             h.retired = true;
@@ -690,8 +696,22 @@ pub fn Adapter(comptime protocol: type) type {
                 });
             }
             const m = self.managers.at(o.owner) orelse return;
-            if (o.kind == .finished) return Manager.encodeEvent(q, m.resource.id, .{ .finished = .{} });
-            if (o.kind == .done) return Manager.encodeEvent(q, m.resource.id, .{ .done = .{ .serial = self.lifecycle.serial } });
+            const manager_resource = m.resource orelse return;
+            if (o.kind == .finished) {
+                const manager_index = m.header.index;
+                const manager_generation = m.header.generation;
+                try wayring.server.sendEvent(protocol, Manager, so, q, manager_resource, .{ .finished = .{} });
+                if (self.managers.at(manager_index)) |live| {
+                    if (live.header.generation == manager_generation and live.resource != null and
+                        std.meta.eql(live.resource.?, manager_resource))
+                    {
+                        live.resource = null;
+                        self.retireManagerIfUnused(live);
+                    }
+                }
+                return;
+            }
+            if (o.kind == .done) return Manager.encodeEvent(q, manager_resource.id, .{ .done = .{ .serial = self.lifecycle.serial } });
             const h = self.headChild(o) orelse return;
             const item = self.findInventory(h.head);
             if (o.kind == .head_finished) {
@@ -703,7 +723,7 @@ pub fn Adapter(comptime protocol: type) type {
             const s = self.lifecycle.currentHead(h.head) catch return;
             switch (o.kind) {
                 .make_head => {
-                    const made = try Manager.construct_event_head(protocol, so, q, m.resource, .{ .head = .{ .context = h } });
+                    const made = try Manager.construct_event_head(protocol, so, q, manager_resource, .{ .head = .{ .context = h } });
                     h.resource = made.head;
                 },
                 .head_name => try Head.encodeEvent(q, h.resource.?.id, .{ .name = .{ .name = metadata.name } }),
@@ -757,14 +777,17 @@ pub fn Adapter(comptime protocol: type) type {
                 const pool = if (object.interface == &Head.info) &self.heads else &self.modes;
                 if (pool.fromContext(object.context)) |c| {
                     if (c.resource != null and std.meta.eql(c.resource.?, handle)) {
+                        const manager = c.manager;
                         pool.release(c);
+                        self.retireManagerIfUnusedIndex(manager);
                         return true;
                     }
                 }
             }
             if (object.interface == &Manager.info) if (self.managers.fromContext(object.context)) |m| {
-                if (std.meta.eql(m.resource, handle)) {
-                    self.releaseManager(m);
+                if (m.resource != null and std.meta.eql(m.resource.?, handle)) {
+                    m.resource = null;
+                    self.retireManagerIfUnused(m);
                     return true;
                 }
             };
@@ -819,8 +842,10 @@ pub fn Adapter(comptime protocol: type) type {
             self.destroyConfig(c);
         }
         fn retireConfig(self: *Self, c: *ConfigSlot) void {
+            const manager = c.manager;
             for (self.config_heads.entries.items) |h| if (h.header.active and h.configuration == c.header.index) self.config_heads.release(h);
             self.configurations.release(c);
+            self.retireManagerIfUnusedIndex(manager);
         }
         fn findConfigHead(self: *Self, configuration: u32) ?*CHeadSlot {
             for (self.config_heads.entries.items) |h|
@@ -830,6 +855,17 @@ pub fn Adapter(comptime protocol: type) type {
         fn releaseManager(self: *Self, m: *ManagerSlot) void {
             for (self.heads.entries.items) |h| if (h.header.active and h.manager == m.header.index) self.heads.release(h);
             for (self.modes.entries.items) |x| if (x.header.active and x.manager == m.header.index) self.modes.release(x);
+            self.managers.release(m);
+        }
+        fn retireManagerIfUnusedIndex(self: *Self, index: u32) void {
+            const manager = self.managers.at(index) orelse return;
+            self.retireManagerIfUnused(manager);
+        }
+        fn retireManagerIfUnused(self: *Self, m: *ManagerSlot) void {
+            if (m.resource != null) return;
+            for (self.heads.entries.items) |h| if (h.header.active and h.manager == m.header.index) return;
+            for (self.modes.entries.items) |mode| if (mode.header.active and mode.manager == m.header.index) return;
+            for (self.configurations.entries.items) |c| if (c.header.active and c.manager == m.header.index) return;
             self.managers.release(m);
         }
         fn headChild(self: *Self, out: Out) ?*Child {
@@ -1368,6 +1404,87 @@ test "positive fixed output scales remain valid after scale-120 conversion" {
     try std.testing.expectEqual(@as(u32, 1), A.scale120FromFixed(1));
     try std.testing.expectEqual(@as(u32, 120), A.scale120FromFixed(256));
     try std.testing.expectEqual(@as(u32, 150), A.scale120FromFixed(320));
+}
+
+test "finished output manager retains children until their release" {
+    const protocol = @import("core_protocol");
+    const A = Adapter(protocol);
+    var adapter = try A.init(
+        std.testing.allocator,
+        .{ .manager_capacity = 1 },
+        1,
+        .{ .width = 800, .height = 600, .refresh_millihz = 60_000 },
+    );
+    defer adapter.deinit();
+    var server_objects = try wayring.objects.ServerObjects.init(
+        std.testing.allocator,
+        8,
+        4,
+        &protocol.wl_display.info,
+        null,
+    );
+    defer server_objects.deinit(std.testing.allocator);
+    var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 64, 2);
+    defer blocks.deinit(std.testing.allocator);
+    var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 1);
+    defer descriptors.deinit(std.testing.allocator);
+    var queue = wayring.tx.Queue.init(&blocks, 64, &descriptors, 0);
+    defer queue.deinit();
+
+    const peer: wayring.io_uring.Peer = .{ .slot = 1, .generation = 1 };
+    const manager = try adapter.managers.acquire();
+    manager.peer = peer;
+    manager.stopped = true;
+    manager.resource = try server_objects.insertClient(
+        2,
+        &protocol.zwlr_output_manager_v1.info,
+        4,
+        manager,
+    );
+    const manager_index = manager.header.index;
+    const manager_resource = manager.resource.?;
+    const head = try adapter.heads.acquire();
+    head.manager = manager_index;
+    head.peer = peer;
+    head.head = adapter.lifecycle.primary;
+    head.resource = try server_objects.createLocal(
+        &protocol.zwlr_output_head_v1.info,
+        4,
+        head,
+    );
+    const head_resource = head.resource.?;
+    const mode = try adapter.modes.acquire();
+    mode.manager = manager_index;
+    mode.peer = peer;
+    mode.head = adapter.lifecycle.primary;
+    mode.resource = try server_objects.createLocal(
+        &protocol.zwlr_output_mode_v1.info,
+        3,
+        mode,
+    );
+    const mode_resource = mode.resource.?;
+    try adapter.outbound.append(std.testing.allocator, .{
+        .kind = .finished,
+        .owner = manager_index,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), try adapter.flushOn(
+        peer,
+        &server_objects,
+        &queue,
+    ));
+    try std.testing.expect(server_objects.namespace.resolve(manager_resource) == null);
+    try std.testing.expect(server_objects.namespace.resolve(head_resource) != null);
+    try std.testing.expect(server_objects.namespace.resolve(mode_resource) != null);
+    try std.testing.expect(adapter.managers.at(manager_index) != null);
+    try std.testing.expect(adapter.managers.at(manager_index).?.resource == null);
+
+    const head_object = try server_objects.removeLocal(head_resource);
+    try std.testing.expect(adapter.resourceRemoved(head_resource, head_object));
+    try std.testing.expect(adapter.managers.at(manager_index) != null);
+    const mode_object = try server_objects.removeLocal(mode_resource);
+    try std.testing.expect(adapter.resourceRemoved(mode_resource, mode_object));
+    try std.testing.expect(adapter.managers.at(manager_index) == null);
 }
 
 test "destroying a pending wire configuration removes every configuration head" {
