@@ -67,6 +67,7 @@ pub const Error = viewport.Error || error{
 /// the absence of a role; compositors may use enum integer values or hashes of
 /// static role names.
 pub const RoleId = u64;
+pub const cursor_role_id: RoleId = 0x6375_7273_6f72_5f5f;
 
 pub const Role = struct {
     id: RoleId = 0,
@@ -439,9 +440,15 @@ pub const Surface = struct {
         };
         const scale: u32 = @intCast(surface.current_scale);
         const content_size: SurfaceSize = if (swaps_axes)
-            .{ .width = buffer.height / scale, .height = buffer.width / scale }
+            .{
+                .width = surface.scaledDimension(buffer.height, scale),
+                .height = surface.scaledDimension(buffer.width, scale),
+            }
         else
-            .{ .width = buffer.width / scale, .height = buffer.height / scale };
+            .{
+                .width = surface.scaledDimension(buffer.width, scale),
+                .height = surface.scaledDimension(buffer.height, scale),
+            };
         return surface.viewport.current.surfaceSize(content_size);
     }
 
@@ -464,10 +471,13 @@ pub const Surface = struct {
             surface.current_buffer;
         if (buffer) |value| {
             const scale: u32 = @intCast(surface.pending_scale);
-            if (value.width % scale != 0 or value.height % scale != 0)
+            if (!surface.allowsNonDivisibleScale() and
+                (value.width % scale != 0 or value.height % scale != 0))
                 return error.InvalidSize;
         }
         try surface.viewport.validateCommit(surface.contentSize(buffer));
+        if (buffer != null and surface.allowsNonDivisibleScale())
+            try surface.validateExactViewportSource(buffer.?);
         try surface.validateExplicitSync();
     }
 
@@ -500,6 +510,7 @@ pub const Surface = struct {
             surface.current_transform,
             surface.current_scale,
             viewport_state,
+            surface.allowsNonDivisibleScale(),
         );
         const explicit_sync: ?drm_syncobj.Commit = if (surface.pending_acquire_point) |acquire| .{
             .acquire = acquire,
@@ -577,7 +588,31 @@ pub const Surface = struct {
         const width = if (swaps_axes) value.height else value.width;
         const height = if (swaps_axes) value.width else value.height;
         const scale: u32 = @intCast(surface.pending_scale);
-        return .{ .width = width / scale, .height = height / scale };
+        return .{
+            .width = surface.scaledDimension(width, scale),
+            .height = surface.scaledDimension(height, scale),
+        };
+    }
+
+    fn allowsNonDivisibleScale(surface: Surface) bool {
+        return surface.role.id == cursor_role_id;
+    }
+
+    fn scaledDimension(surface: Surface, extent: u32, scale: u32) u32 {
+        return extent / scale + @intFromBool(surface.allowsNonDivisibleScale() and extent % scale != 0);
+    }
+
+    fn validateExactViewportSource(surface: Surface, buffer: Buffer) Error!void {
+        const source = surface.viewport.pending.source() orelse return;
+        const swaps_axes = transformSwapsAxes(surface.pending_transform);
+        const width = if (swaps_axes) buffer.height else buffer.width;
+        const height = if (swaps_axes) buffer.width else buffer.height;
+        const right = @as(i128, source.x) + source.width;
+        const bottom = @as(i128, source.y) + source.height;
+        const scale: i128 = surface.pending_scale;
+        if (right * scale > @as(i128, width) * viewport.fixed_one or
+            bottom * scale > @as(i128, height) * viewport.fixed_one)
+            return error.OutOfBuffer;
     }
 
     pub fn validateDestroy(surface: Surface) Error!void {
@@ -596,6 +631,7 @@ fn canonicalBufferDamage(
     transform: Transform,
     scale_value: i32,
     viewport_state: ViewportState,
+    allow_nondivisible_scale: bool,
 ) UploadDamage {
     const value = buffer orelse return .{};
     var result: UploadDamage = .{};
@@ -607,6 +643,7 @@ fn canonicalBufferDamage(
         transform,
         @intCast(scale_value),
         viewport_state,
+        allow_nondivisible_scale,
     ));
     return result;
 }
@@ -617,22 +654,29 @@ fn mapSurfaceDamage(
     transform: Transform,
     scale: u32,
     viewport_state: ViewportState,
+    allow_nondivisible_scale: bool,
 ) Damage {
     if (damage.empty) return .{};
     const swaps_axes = transformSwapsAxes(transform);
     const transformed_width: u32 = if (swaps_axes) buffer.height else buffer.width;
     const transformed_height: u32 = if (swaps_axes) buffer.width else buffer.height;
-    const content_width = transformed_width / scale;
-    const content_height = transformed_height / scale;
+    const content_width = transformed_width / scale +
+        @intFromBool(allow_nondivisible_scale and transformed_width % scale != 0);
+    const content_height = transformed_height / scale +
+        @intFromBool(allow_nondivisible_scale and transformed_height % scale != 0);
     const configured_source = viewport_state.source();
     const source_start_x: i128 = if (configured_source) |source| source.x else 0;
     const source_start_y: i128 = if (configured_source) |source| source.y else 0;
     const source_width: i128 = if (configured_source) |source|
         source.width
+    else if (allow_nondivisible_scale)
+        @divFloor(@as(i128, transformed_width) * viewport.fixed_one, scale)
     else
         @as(i128, content_width) * viewport.fixed_one;
     const source_height: i128 = if (configured_source) |source|
         source.height
+    else if (allow_nondivisible_scale)
+        @divFloor(@as(i128, transformed_height) * viewport.fixed_one, scale)
     else
         @as(i128, content_height) * viewport.fixed_one;
     const destination = viewport_state.destination() orelse if (configured_source) |source|
@@ -1522,6 +1566,34 @@ test "surface rejects buffer dimensions not divisible by scale transactionally" 
     const update = try surface.commit();
     try std.testing.expectEqual(second, update.attachment.?.buffer.?);
     try std.testing.expectEqual(@as(i32, 4), surface.current_scale);
+}
+
+test "cursor surfaces cover non-divisible scaled buffers within exact source bounds" {
+    var surface: Surface = .{};
+    try surface.role.assign(cursor_role_id, false);
+    try surface.attach(7, .{
+        .handle = .{ .id = 2, .generation = 1 },
+        .width = 31,
+        .height = 17,
+    }, 0, 0);
+    try surface.setScale(2);
+    surface.damage(0, 0, 16, 9);
+    const first = try surface.commit();
+    try std.testing.expectEqual(SurfaceSize{ .width = 16, .height = 9 }, first.size);
+    try std.testing.expectEqual(first.size, surface.committedSize());
+    try expectUploadDamage(&.{damageRect(0, 0, 31, 17)}, first.upload_damage);
+
+    try surface.viewport.setSource(0, 0, 31 * 128, 17 * 128);
+    try surface.viewport.setDestination(16, 9);
+    _ = try surface.commit();
+    try surface.viewport.setSource(0, 0, 16 * viewport.fixed_one, 17 * 128);
+    try std.testing.expectError(error.OutOfBuffer, surface.commit());
+
+    surface.viewport.clear();
+    try surface.setTransform(1);
+    const transformed = try surface.commit();
+    try std.testing.expectEqual(SurfaceSize{ .width = 9, .height = 16 }, transformed.size);
+    try std.testing.expectEqual(transformed.size, surface.committedSize());
 }
 
 test "commit timestamps are validated, one-shot, and committed exactly" {
