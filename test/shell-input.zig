@@ -1306,6 +1306,7 @@ test "shell-input: security context filters nested manager before registry disco
             parent_handler.foreign_toplevel_global_seen and
             parent_handler.workspace_global_seen and
             parent_handler.output_management_global_seen and
+            parent_handler.session_lock_global_seen and
             parent_handler.image_output_global_seen and
             parent_handler.image_toplevel_global_seen and
             parent_handler.image_copy_global_seen) break;
@@ -1320,6 +1321,7 @@ test "shell-input: security context filters nested manager before registry disco
     try std.testing.expect(parent_handler.foreign_toplevel_global_seen);
     try std.testing.expect(parent_handler.workspace_global_seen);
     try std.testing.expect(parent_handler.output_management_global_seen);
+    try std.testing.expect(parent_handler.session_lock_global_seen);
     try std.testing.expect(parent_handler.image_output_global_seen);
     try std.testing.expect(parent_handler.image_toplevel_global_seen);
     try std.testing.expect(parent_handler.image_copy_global_seen);
@@ -1421,6 +1423,7 @@ test "shell-input: security context filters nested manager before registry disco
     try std.testing.expect(!child_handler.foreign_toplevel_global_seen);
     try std.testing.expect(!child_handler.workspace_global_seen);
     try std.testing.expect(!child_handler.output_management_global_seen);
+    try std.testing.expect(!child_handler.session_lock_global_seen);
     try std.testing.expect(!child_handler.image_output_global_seen);
     try std.testing.expect(!child_handler.image_toplevel_global_seen);
     try std.testing.expect(!child_handler.image_copy_global_seen);
@@ -5896,6 +5899,7 @@ const Handler = struct {
     foreign_toplevel_global_seen: bool = false,
     workspace_global_seen: bool = false,
     output_management_global_seen: bool = false,
+    session_lock_global_seen: bool = false,
     wlr_foreign_toplevel_manager: ?wayring.objects.Handle = null,
     wlr_foreign_toplevel_handle: ?wayring.objects.Handle = null,
     test_wlr_foreign_toplevel: bool = false,
@@ -6535,6 +6539,8 @@ const Handler = struct {
                 self.workspace_global_seen = true;
             if (std.mem.eql(u8, value.interface, protocol.zwlr_output_manager_v1.info.name))
                 self.output_management_global_seen = true;
+            if (std.mem.eql(u8, value.interface, protocol.ext_session_lock_manager_v1.info.name))
+                self.session_lock_global_seen = true;
             if (std.mem.eql(u8, value.interface, protocol.ext_output_image_capture_source_manager_v1.info.name))
                 self.image_output_global_seen = true;
             if (std.mem.eql(u8, value.interface, protocol.ext_foreign_toplevel_image_capture_source_manager_v1.info.name))
