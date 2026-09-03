@@ -363,17 +363,16 @@ pub fn Adapter(comptime protocol: type) type {
             padding: u32 = 0,
             modifier: u64,
         };
+        // Keep the legacy events and v4 feedback table aligned with the
+        // renderer import contract. Implicit modifiers are accepted for
+        // validation but are not advertised until a renderer can import them.
         const format_entries = [_]FormatEntry{
             .{ .format = drm_format_argb8888, .modifier = modifier_linear },
-            .{ .format = drm_format_argb8888, .modifier = modifier_invalid },
             .{ .format = drm_format_xrgb8888, .modifier = modifier_linear },
-            .{ .format = drm_format_xrgb8888, .modifier = modifier_invalid },
             .{ .format = drm_format_abgr8888, .modifier = modifier_linear },
-            .{ .format = drm_format_abgr8888, .modifier = modifier_invalid },
             .{ .format = drm_format_xbgr8888, .modifier = modifier_linear },
-            .{ .format = drm_format_xbgr8888, .modifier = modifier_invalid },
         };
-        const format_indices = std.mem.asBytes(&[_]u16{ 0, 1, 2, 3, 4, 5, 6, 7 }).*;
+        const format_indices = std.mem.asBytes(&[_]u16{ 0, 1, 2, 3 }).*;
 
         allocator: std.mem.Allocator,
         runtime: ?*Runtime = null,
@@ -1236,13 +1235,9 @@ test "linux-dmabuf: legacy advertisements survive transmit backpressure" {
     var bytes = snapshot.first;
     const expected = [_]struct { format: u32, modifier: u64 }{
         .{ .format = drm_format_argb8888, .modifier = modifier_linear },
-        .{ .format = drm_format_argb8888, .modifier = modifier_invalid },
         .{ .format = drm_format_xrgb8888, .modifier = modifier_linear },
-        .{ .format = drm_format_xrgb8888, .modifier = modifier_invalid },
         .{ .format = drm_format_abgr8888, .modifier = modifier_linear },
-        .{ .format = drm_format_abgr8888, .modifier = modifier_invalid },
         .{ .format = drm_format_xbgr8888, .modifier = modifier_linear },
-        .{ .format = drm_format_xbgr8888, .modifier = modifier_invalid },
     };
     for (expected) |pair| {
         const message = (try wayring.wire.Message.decode(bytes)).?;
@@ -1356,7 +1351,10 @@ test "linux-dmabuf: version 6 feedback resumes with sampling tranche and no main
     adapter.pending_len += 1;
     var later_output = wayring.tx.Queue.init(&blocks, 512, &descriptors, 0);
     defer later_output.deinit();
-    try std.testing.expectEqual(@as(usize, 8), try adapter.flushOn(peer, &server_objects, &later_output));
+    try std.testing.expectEqual(
+        TestAdapter.format_entries.len,
+        try adapter.flushOn(peer, &server_objects, &later_output),
+    );
     try std.testing.expectEqual(@as(usize, 0), adapter.pending_len);
 
     const object = server_objects.namespace.resolve(feedback.header.resource).?.*;
