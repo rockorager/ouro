@@ -2918,14 +2918,18 @@ test "shell-input: popup applies each acknowledged configure after output remova
 }
 
 test "shell-input: screencopy captures clipped output into writable SHM" {
-    try runScreencopyCapture(false);
+    try runScreencopyCapture(false, false);
+}
+
+test "shell-input: copy with damage waits for a newer output frame" {
+    try runScreencopyCapture(false, true);
 }
 
 test "shell-input: session disable fails pending screencopy" {
-    try runScreencopyCapture(true);
+    try runScreencopyCapture(true, false);
 }
 
-fn runScreencopyCapture(interrupt: bool) !void {
+fn runScreencopyCapture(interrupt: bool, repeat_with_damage: bool) !void {
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-screencopy-{d}.sock", .{linux.getpid()});
@@ -2981,6 +2985,7 @@ fn runScreencopyCapture(interrupt: bool) !void {
         .objects = &client.objects,
         .queue = &actor.transmit,
         .registry = registry,
+        .capture_goal = if (repeat_with_damage) 2 else 1,
     };
     defer {
         if (handler.read_fd >= 0) _ = linux.close(handler.read_fd);
@@ -2991,12 +2996,25 @@ fn runScreencopyCapture(interrupt: bool) !void {
     try fixture.signalSession(.enable);
     var client_progress: ClientDriver.Progress = .{};
     var disable_sent = false;
+    var damage_sent = false;
     for (0..512) |_| {
         client_progress = try drainClient(&client_reactor, &driver, &handler);
+        if (repeat_with_damage and handler.ready_events == 1 and !handler.capture_requested) {
+            try handler.maybeCapture();
+            try submitClient(&client_reactor, &driver, &handler);
+        }
         _ = try loop.turn(coordinator);
         if (interrupt and !disable_sent and coordinator.pending_screencopy != null) {
             try fixture.signalSession(.disable);
             disable_sent = true;
+        }
+        if (repeat_with_damage and !damage_sent and handler.ready_events == 1 and
+            coordinator.screencopy_adapter.capture_count == 1 and
+            coordinator.pending_screencopy == null)
+        {
+            try coordinator.primaryKmsOutput().?.request(.damage, 1);
+            damage_sent = true;
+            _ = try loop.turn(coordinator);
         }
         if ((!interrupt and handler.ready) or
             (interrupt and handler.failed and coordinator.pending_screencopy == null and
@@ -3007,8 +3025,10 @@ fn runScreencopyCapture(interrupt: bool) !void {
     try std.testing.expectEqual(interrupt, disable_sent);
     try std.testing.expectEqual(!interrupt, handler.ready);
     try std.testing.expectEqual(interrupt, handler.failed);
-    try std.testing.expectEqual(@as(usize, 1), handler.buffer_events);
-    try std.testing.expectEqual(@as(usize, 1), handler.buffer_done_events);
+    try std.testing.expectEqual(repeat_with_damage, damage_sent);
+    const completed: usize = if (repeat_with_damage) 2 else 1;
+    try std.testing.expectEqual(completed, handler.buffer_events);
+    try std.testing.expectEqual(completed, handler.buffer_done_events);
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
     if (interrupt) {
         try std.testing.expect(coordinator.pending_screencopy == null);
@@ -3018,8 +3038,8 @@ fn runScreencopyCapture(interrupt: bool) !void {
             .@"90",
             coordinator.primaryKmsOutput().?.planner.output_transform,
         );
-        try std.testing.expectEqual(@as(usize, 1), handler.flags_events);
-        try std.testing.expectEqual(@as(usize, 1), handler.damage_events);
+        try std.testing.expectEqual(completed, handler.flags_events);
+        try std.testing.expectEqual(completed, handler.damage_events);
         var captured: [4]u8 = undefined;
         const read = linux.pread(handler.read_fd, &captured, captured.len, 0);
         try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(read));
@@ -4822,6 +4842,8 @@ const ScreencopyHandler = struct {
     buffer: ?wayring.objects.Handle = null,
     read_fd: linux.fd_t = -1,
     output_ready: bool = false,
+    capture_goal: usize = 1,
+    ready_events: usize = 0,
     capture_requested: bool = false,
     copy_requested: bool = false,
     ready: bool = false,
@@ -4886,7 +4908,19 @@ const ScreencopyHandler = struct {
                     try std.testing.expectEqual(@as(u32, 1), value.height);
                     self.damage_events += 1;
                 },
-                .ready => self.ready = true,
+                .ready => {
+                    self.ready_events += 1;
+                    if (self.ready_events == self.capture_goal) {
+                        self.ready = true;
+                    } else {
+                        self.frame = null;
+                        self.buffer = null;
+                        self.capture_requested = false;
+                        self.copy_requested = false;
+                        if (self.read_fd >= 0) _ = linux.close(self.read_fd);
+                        self.read_fd = -1;
+                    }
+                },
                 .failed => self.failed = true,
                 .linux_dmabuf => return error.UnexpectedDmabufCapture,
             }

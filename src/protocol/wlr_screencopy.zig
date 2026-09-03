@@ -37,7 +37,12 @@ pub const OutputValidator = struct {
     ) ?OutputMode,
 };
 
-pub const OutputMode = struct { width: u32, height: u32 };
+pub const OutputMode = struct {
+    width: u32,
+    height: u32,
+    identity: u64,
+    generation: u64,
+};
 
 pub const BufferValidator = struct {
     context: ?*anyopaque = null,
@@ -78,19 +83,34 @@ pub fn Adapter(comptime protocol: type) type {
             region: Region,
             overlay_cursor: bool,
             with_damage: bool,
+            wait_generation: ?u64,
         };
+
+        pub const Candidate = struct {
+            sequence: u64,
+            capture: Capture,
+        };
+
+        const ManagerId = struct { index: u32, generation: u32 };
+        const Baseline = struct { output: u64, generation: u64 };
+        const max_manager_outputs = 64;
 
         const ManagerSlot = struct {
             header: slot_pool.Header = .{},
             peer: wayring.io_uring.Peer = undefined,
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
+            baselines: [max_manager_outputs]Baseline = undefined,
+            baseline_count: usize = 0,
         };
         const Phase = enum { advertised, queued, capturing, finished };
         const Frame = struct {
             header: slot_pool.Header = .{},
             peer: wayring.io_uring.Peer = undefined,
+            manager: ManagerId = undefined,
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
             output: objects.Handle = .{ .id = 0, .generation = 0 },
+            output_identity: u64 = 0,
+            output_generation: u64 = 0,
             region: Region = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
             overlay_cursor: bool = false,
             used_damage: bool = false,
@@ -219,7 +239,7 @@ pub fn Adapter(comptime protocol: type) type {
                 switch (decoded.value) {
                     .destroy => {},
                     .capture_output => |value| {
-                        if (try self.createFrame(actor, server_objects, peer, decoded.handle, value, null, false)) |control|
+                        if (try self.createFrame(actor, server_objects, manager, peer, decoded.handle, value, null, false)) |control|
                             return control;
                     },
                     .capture_output_region => |value| {
@@ -229,7 +249,7 @@ pub fn Adapter(comptime protocol: type) type {
                             .width = value.width,
                             .height = value.height,
                         };
-                        if (try self.createFrame(actor, server_objects, peer, decoded.handle, value, requested, true)) |control|
+                        if (try self.createFrame(actor, server_objects, manager, peer, decoded.handle, value, requested, true)) |control|
                             return control;
                     },
                 }
@@ -257,6 +277,7 @@ pub fn Adapter(comptime protocol: type) type {
             self: *Self,
             actor: *wayring.connection.Actor,
             server_objects: anytype,
+            manager: *ManagerSlot,
             peer: wayring.io_uring.Peer,
             parent: objects.Handle,
             value: anytype,
@@ -286,7 +307,10 @@ pub fn Adapter(comptime protocol: type) type {
             var frame_owned = true;
             defer if (frame_owned) self.releaseFrame(self.frameIndex(frame));
             frame.peer = peer;
+            frame.manager = self.managerId(manager);
             frame.output = output_handle;
+            frame.output_identity = mode.identity;
+            frame.output_generation = mode.generation;
             frame.overlay_cursor = value.overlay_cursor != 0;
             frame.region = if (requested) |region| clipped: {
                 const clipped = clipRegion(region, mode.width, mode.height) orelse
@@ -361,6 +385,11 @@ pub fn Adapter(comptime protocol: type) type {
                         .region = frame.region,
                         .overlay_cursor = frame.overlay_cursor,
                         .with_damage = with_damage,
+                        .wait_generation = captureWaitGeneration(
+                            with_damage,
+                            self.managerBaseline(frame.manager, frame.output_identity),
+                            frame.output_generation,
+                        ),
                     },
                 };
                 self.next_sequence +%= 1;
@@ -372,9 +401,15 @@ pub fn Adapter(comptime protocol: type) type {
             unreachable;
         }
 
-        pub fn peekCapture(self: *Self) ?*const Capture {
+        pub fn nextCapture(self: *Self, after: ?u64) ?Candidate {
             if (self.capture_count == 0) return null;
-            while (self.oldestCapture()) |slot| {
+            while (true) {
+                var oldest: ?*CaptureSlot = null;
+                for (self.captures) |*slot| {
+                    if (!slot.active or (after != null and slot.sequence <= after.?)) continue;
+                    if (oldest == null or slot.sequence < oldest.?.sequence) oldest = slot;
+                }
+                const slot = oldest orelse return null;
                 const frame = self.resolve(slot.capture.frame) catch {
                     slot.active = false;
                     self.capture_count -= 1;
@@ -385,20 +420,23 @@ pub fn Adapter(comptime protocol: type) type {
                     self.capture_count -= 1;
                     continue;
                 }
-                return &slot.capture;
+                return .{ .sequence = slot.sequence, .capture = slot.capture };
             }
-            return null;
         }
 
-        /// Marks the oldest capture as accepted by the coordinator. The
+        /// Marks an exact capture as accepted by the coordinator. The
         /// coordinator must retain `Capture.frame` until `complete` succeeds.
-        pub fn dropCapture(self: *Self) void {
-            const slot = self.oldestCapture() orelse return;
-            if (self.resolve(slot.capture.frame)) |frame| {
-                if (frame.phase == .queued) frame.phase = .capturing;
-            } else |_| {}
-            slot.active = false;
-            self.capture_count -= 1;
+        pub fn acceptCapture(self: *Self, id: FrameId) !void {
+            const frame = try self.resolve(id);
+            if (frame.phase != .queued) return error.InvalidCompletion;
+            for (self.captures) |*slot| {
+                if (!slot.active or !std.meta.eql(slot.capture.frame, id)) continue;
+                frame.phase = .capturing;
+                slot.active = false;
+                self.capture_count -= 1;
+                return;
+            }
+            return error.InvalidCompletion;
         }
 
         pub fn failCapture(self: *Self, id: FrameId) !void {
@@ -419,7 +457,12 @@ pub fn Adapter(comptime protocol: type) type {
             self.capture_count -= 1;
         }
 
-        pub fn complete(self: *Self, id: FrameId, timestamp_ns: ?u64) !void {
+        pub fn complete(
+            self: *Self,
+            id: FrameId,
+            timestamp_ns: ?u64,
+            output_generation: u64,
+        ) !void {
             const frame = try self.resolve(id);
             if (frame.phase != .capturing) return error.InvalidCompletion;
             const needed: usize = if (timestamp_ns != null)
@@ -429,6 +472,11 @@ pub fn Adapter(comptime protocol: type) type {
             if (self.outbound.len - self.outbound_count < needed)
                 return error.Exhausted;
             if (timestamp_ns) |timestamp| {
+                try self.setManagerBaseline(
+                    frame.manager,
+                    frame.output_identity,
+                    output_generation,
+                );
                 self.enqueue(id, .flags) catch unreachable;
                 if (frame.used_damage) self.enqueue(id, .damage) catch unreachable;
                 self.enqueue(id, .{ .ready = timestamp }) catch unreachable;
@@ -445,6 +493,21 @@ pub fn Adapter(comptime protocol: type) type {
                 if (samePeer(frame.peer, peer)) return true;
             }
             return false;
+        }
+
+        pub fn outputRemoved(self: *Self, output: u64) void {
+            for (self.managers.entries.items) |manager| {
+                if (!manager.header.active) continue;
+                var index: usize = 0;
+                while (index < manager.baseline_count) {
+                    if (manager.baselines[index].output != output) {
+                        index += 1;
+                        continue;
+                    }
+                    manager.baseline_count -= 1;
+                    manager.baselines[index] = manager.baselines[manager.baseline_count];
+                }
+            }
         }
 
         pub fn flushOn(
@@ -544,15 +607,6 @@ pub fn Adapter(comptime protocol: type) type {
             unreachable;
         }
 
-        fn oldestCapture(self: *Self) ?*CaptureSlot {
-            var oldest: ?*CaptureSlot = null;
-            for (self.captures) |*slot| {
-                if (slot.active and
-                    (oldest == null or slot.sequence < oldest.?.sequence)) oldest = slot;
-            }
-            return oldest;
-        }
-
         fn oldestOutbound(self: *Self, peer: wayring.io_uring.Peer) ?*Outbound {
             var oldest: ?*Outbound = null;
             for (self.outbound) |*slot| {
@@ -571,6 +625,46 @@ pub fn Adapter(comptime protocol: type) type {
                 .tv_sec_lo = @truncate(seconds),
                 .tv_nsec = @intCast(timestamp_ns % std.time.ns_per_s),
             } };
+        }
+
+        fn managerId(_: *const Self, manager: *const ManagerSlot) ManagerId {
+            return .{
+                .index = manager.header.index,
+                .generation = manager.header.generation,
+            };
+        }
+
+        fn resolveManager(self: *Self, id: ManagerId) ?*ManagerSlot {
+            const manager = self.managers.at(id.index) orelse return null;
+            return if (manager.header.generation == id.generation) manager else null;
+        }
+
+        fn managerBaseline(self: *Self, id: ManagerId, output: u64) ?u64 {
+            const manager = self.resolveManager(id) orelse return null;
+            for (manager.baselines[0..manager.baseline_count]) |baseline|
+                if (baseline.output == output) return baseline.generation;
+            return null;
+        }
+
+        fn setManagerBaseline(
+            self: *Self,
+            id: ManagerId,
+            output: u64,
+            generation: u64,
+        ) !void {
+            const manager = self.resolveManager(id) orelse return;
+            for (manager.baselines[0..manager.baseline_count]) |*baseline| {
+                if (baseline.output != output) continue;
+                baseline.generation = generation;
+                return;
+            }
+            if (manager.baseline_count == manager.baselines.len)
+                return error.OutputCapacityExceeded;
+            manager.baselines[manager.baseline_count] = .{
+                .output = output,
+                .generation = generation,
+            };
+            manager.baseline_count += 1;
         }
 
         fn frameId(self: *const Self, frame: *const Frame) FrameId {
@@ -613,6 +707,14 @@ pub fn Adapter(comptime protocol: type) type {
             return .stop;
         }
     };
+}
+
+fn captureWaitGeneration(
+    with_damage: bool,
+    baseline: ?u64,
+    current: u64,
+) ?u64 {
+    return if (with_damage and baseline == current) current else null;
 }
 
 const ClippedRegion = struct { x: u32, y: u32, width: u32, height: u32 };
@@ -671,6 +773,13 @@ test "screencopy: regions are clipped to output extents" {
     try std.testing.expect(clipRegion(.{ .x = 0, .y = 0, .width = 0, .height = 10 }, 50, 60) == null);
 }
 
+test "screencopy: damage waits only on a manager's current baseline" {
+    try std.testing.expectEqual(@as(?u64, null), captureWaitGeneration(false, 7, 7));
+    try std.testing.expectEqual(@as(?u64, null), captureWaitGeneration(true, null, 7));
+    try std.testing.expectEqual(@as(?u64, null), captureWaitGeneration(true, 6, 7));
+    try std.testing.expectEqual(@as(?u64, 7), captureWaitGeneration(true, 7, 7));
+}
+
 test "screencopy: frame ownership grows without moving existing contexts" {
     const A = Adapter(@import("core_protocol"));
     var adapter = try A.init(std.testing.allocator, .{ .manager_capacity = 1, .frame_capacity = 1, .capture_capacity = 1, .outbound_capacity = 4 });
@@ -696,11 +805,11 @@ test "screencopy: frame generations reject stale completion and cleanup retained
     frame.region = .{ .x = 0, .y = 0, .width = 64, .height = 32 };
     frame.phase = .capturing;
     const old = adapter.frameId(frame);
-    try adapter.complete(old, null);
+    try adapter.complete(old, null, 0);
     try std.testing.expectEqual(@as(usize, 1), adapter.outbound_count);
     adapter.releaseFrame(old.index);
     try std.testing.expectEqual(@as(usize, 0), adapter.outbound_count);
-    try std.testing.expectError(error.StaleFrame, adapter.complete(old, null));
+    try std.testing.expectError(error.StaleFrame, adapter.complete(old, null, 0));
     const replacement = try adapter.acquireFrame();
     try std.testing.expect(replacement.header.generation != old.generation);
 }
@@ -714,14 +823,17 @@ test "screencopy: completion retains ordered success events" {
         .outbound_capacity = 4,
     });
     defer adapter.deinit();
+    const manager = try adapter.managers.acquire();
     const frame = try adapter.acquireFrame();
     frame.peer = .{ .slot = 1, .generation = 9 };
+    frame.manager = adapter.managerId(manager);
     frame.resource = .{ .id = 12, .generation = 2 };
+    frame.output_identity = 3;
     frame.region = .{ .x = 0, .y = 0, .width = 100, .height = 40 };
     frame.phase = .capturing;
     frame.used_damage = true;
     const id = adapter.frameId(frame);
-    try adapter.complete(id, 5 * std.time.ns_per_s + 17);
+    try adapter.complete(id, 5 * std.time.ns_per_s + 17, 4);
     try std.testing.expectEqual(@as(usize, 3), adapter.outbound_count);
     const first = adapter.oldestOutbound(frame.peer).?;
     try std.testing.expect(first.event == .flags);
@@ -733,4 +845,51 @@ test "screencopy: completion retains ordered success events" {
     adapter.outbound_count -= 1;
     const third = adapter.oldestOutbound(frame.peer).?;
     try std.testing.expectEqual(@as(u64, 5 * std.time.ns_per_s + 17), third.event.ready);
+    try std.testing.expectEqual(@as(?u64, 4), adapter.managerBaseline(frame.manager, 3));
+    adapter.outputRemoved(3);
+    try std.testing.expectEqual(@as(?u64, null), adapter.managerBaseline(frame.manager, 3));
+}
+
+test "screencopy: waiting capture does not block a later ready capture" {
+    const A = Adapter(@import("core_protocol"));
+    var adapter = try A.init(std.testing.allocator, .{
+        .manager_capacity = 1,
+        .frame_capacity = 2,
+        .capture_capacity = 2,
+        .outbound_capacity = 4,
+    });
+    defer adapter.deinit();
+    const manager = try adapter.managers.acquire();
+    const first = try adapter.acquireFrame();
+    first.manager = adapter.managerId(manager);
+    first.phase = .queued;
+    const second = try adapter.acquireFrame();
+    second.manager = adapter.managerId(manager);
+    second.phase = .queued;
+    adapter.captures[0] = .{
+        .active = true,
+        .sequence = 1,
+        .capture = .{
+            .frame = adapter.frameId(first),
+            .peer = .{ .slot = 1, .generation = 1 },
+            .buffer = .{ .id = 1, .generation = 1 },
+            .output = .{ .id = 2, .generation = 1 },
+            .region = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+            .overlay_cursor = false,
+            .with_damage = true,
+            .wait_generation = 7,
+        },
+    };
+    adapter.captures[1] = adapter.captures[0];
+    adapter.captures[1].sequence = 2;
+    adapter.captures[1].capture.frame = adapter.frameId(second);
+    adapter.captures[1].capture.wait_generation = null;
+    adapter.capture_count = 2;
+
+    const waiting = adapter.nextCapture(null).?;
+    try std.testing.expectEqual(@as(?u64, 7), waiting.capture.wait_generation);
+    const ready = adapter.nextCapture(waiting.sequence).?;
+    try std.testing.expectEqual(adapter.frameId(second), ready.capture.frame);
+    try adapter.acceptCapture(ready.capture.frame);
+    try std.testing.expectEqual(adapter.frameId(first), adapter.nextCapture(null).?.capture.frame);
 }

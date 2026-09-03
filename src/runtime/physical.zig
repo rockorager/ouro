@@ -533,6 +533,7 @@ pub fn Coordinator(comptime protocol: type) type {
             reconfigure: ?OutputReconfigure = null,
             damage_requested: u64 = 0,
             damage_applied: u64 = 0,
+            screencopy_generation: u64 = 1,
             themed_cursor_previous: ?damage.SurfaceState = null,
             client_cursor_previous: ?damage.SurfaceState = null,
         };
@@ -550,6 +551,7 @@ pub fn Coordinator(comptime protocol: type) type {
             region: ScreencopyAdapter.Region,
             full_stride: u32,
             overlay_cursor: bool,
+            output_generation: u64 = 0,
             awaiting_output: bool = false,
             copied: bool = false,
             success: bool = false,
@@ -6238,6 +6240,9 @@ pub fn Coordinator(comptime protocol: type) type {
             return .{
                 .width = output.planner.output.width,
                 .height = output.planner.output.height,
+                .identity = (@as(u64, reference.output.generation) << 32) |
+                    reference.output.index,
+                .generation = physical.screencopy_generation,
             };
         }
 
@@ -6620,6 +6625,10 @@ pub fn Coordinator(comptime protocol: type) type {
                     physical.claim = null;
                     if (physical.output_profile) |profile| profile.release();
                     physical.output_profile = null;
+                    self.screencopy_adapter.outputRemoved(
+                        (@as(u64, physical.protocol_output.generation) << 32) |
+                            physical.protocol_output.index,
+                    );
                     physical.connected = false;
                     physical.removal_protocol_retired = true;
                     self.markProtocolAll(ProtocolReady.output_management |
@@ -9377,6 +9386,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     self.outputDamageRetired(physical, damage_generation);
                     try self.finishOutcome(rendered.retired.frame, false);
                 } else {
+                    self.advanceScreencopyGeneration(physical, frame.output);
                     if (output.rendererKind() == .pixman)
                         try output.renderReady(frame, try monotonicNs());
                     self.outputDamageSubmitted(
@@ -9413,6 +9423,7 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             switch (render_result) {
                 .submitted => {
+                    self.advanceScreencopyGeneration(physical, frame.output);
                     if (output.rendererKind() == .pixman)
                         try output.renderReady(frame, try monotonicNs());
                     self.stats.submitted += 1;
@@ -9435,6 +9446,26 @@ pub fn Coordinator(comptime protocol: type) type {
                     self.outputDamageRetired(physical, damage_generation);
                     try self.finishOutcome(failure.frame, false);
                 },
+            }
+        }
+
+        fn advanceScreencopyGeneration(
+            self: *Self,
+            physical: *PhysicalOutput,
+            output: output_scheduler.OutputId,
+        ) void {
+            physical.screencopy_generation +%= 1;
+            if (physical.screencopy_generation == 0) {
+                physical.screencopy_generation = 1;
+                self.screencopy_adapter.outputRemoved(
+                    (@as(u64, physical.protocol_output.generation) << 32) |
+                        physical.protocol_output.index,
+                );
+            }
+            if (self.pending_screencopy) |*pending| {
+                if (std.meta.eql(pending.output, output)) {
+                    pending.output_generation = physical.screencopy_generation;
+                }
             }
         }
 
@@ -9746,8 +9777,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (!pending.awaiting_output) try self.finishScreencopy(false, 0, null);
                 return;
             }
-            const pending_capture = self.screencopy_adapter.peekCapture() orelse return;
-            const capture = pending_capture.*;
+            const capture = (try self.nextReadyScreencopyCapture()) orelse return;
             const server_objects = self.root.runtime.clients.get(capture.peer) catch {
                 try self.failQueuedScreencopy(capture);
                 return;
@@ -9815,12 +9845,44 @@ pub fn Coordinator(comptime protocol: type) type {
                 .full_stride = full_stride,
                 .overlay_cursor = capture.overlay_cursor,
             };
-            self.screencopy_adapter.dropCapture();
+            try self.screencopy_adapter.acceptCapture(capture.frame);
             if (!(requestPhysicalOutputDamage(physical, try monotonicNs()) catch false)) {
                 try self.finishScreencopy(false, 0, null);
                 return;
             }
             self.pending_screencopy.?.awaiting_output = true;
+        }
+
+        fn nextReadyScreencopyCapture(self: *Self) !?ScreencopyAdapter.Capture {
+            var after: ?u64 = null;
+            while (self.screencopy_adapter.nextCapture(after)) |candidate| {
+                after = candidate.sequence;
+                const capture = candidate.capture;
+                const server_objects = self.root.runtime.clients.get(capture.peer) catch {
+                    try self.failQueuedScreencopy(capture);
+                    return null;
+                };
+                const output_object = server_objects.namespace.resolve(capture.output) orelse {
+                    try self.failQueuedScreencopy(capture);
+                    return null;
+                };
+                const reference = self.output_adapter.reference(
+                    capture.peer,
+                    capture.output,
+                    output_object.*,
+                ) catch {
+                    try self.failQueuedScreencopy(capture);
+                    return null;
+                };
+                const physical = self.physicalOutputForProtocolId(reference.output) orelse {
+                    try self.failQueuedScreencopy(capture);
+                    return null;
+                };
+                if (capture.wait_generation) |generation|
+                    if (generation == physical.screencopy_generation) continue;
+                return capture;
+            }
+            return null;
         }
 
         fn processImageCopyCaptures(self: *Self) !void {
@@ -10482,6 +10544,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.screencopy_adapter.complete(
                 pending.frame,
                 if (pending.success) timestamp_ns else null,
+                pending.output_generation,
             ) catch |cause| switch (cause) {
                 error.StaleFrame, error.InvalidCompletion => {
                     self.pending_screencopy = null;
