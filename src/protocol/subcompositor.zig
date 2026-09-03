@@ -238,7 +238,7 @@ pub fn Adapter(comptime protocol: type, comptime Core: type) type {
         ) !Core.ContentCommitPlan {
             const self: *Self = @ptrCast(@alignCast(context));
             try self.ensureSurfaceScratch();
-            const children = try self.graph.directChildren(surface, self.surface_scratch);
+            const children = try self.graph.synchronizedDescendants(surface, self.surface_scratch);
             var count: usize = 0;
             for (children) |child| if (try self.core.newestSynchronizedUpdate(child)) |update| {
                 if (count == dependencies.len) return error.OutputTooSmall;
@@ -419,7 +419,7 @@ fn samePeer(a: wayring.io_uring.Peer, b: wayring.io_uring.Peer) bool {
     return a.slot == b.slot and a.generation == b.generation;
 }
 
-test "subcompositor: synchronized child is claimed by parent and desync transitions queue" {
+test "subcompositor: synchronized subtree is claimed by parent and desync transitions queue" {
     const protocol = @import("core_protocol");
     const FakeCore = struct {
         pub const SurfaceId = struct { index: u32, generation: u32 };
@@ -436,6 +436,7 @@ test "subcompositor: synchronized child is claimed by parent and desync transiti
 
         hook: ?ContentCommitHook = null,
         child_update: ?UpdateToken = null,
+        grandchild_update: ?UpdateToken = null,
         transitioned: usize = 0,
 
         pub fn setContentCommitHook(core: *@This(), hook: ContentCommitHook) !void {
@@ -444,7 +445,11 @@ test "subcompositor: synchronized child is claimed by parent and desync transiti
         }
 
         pub fn newestSynchronizedUpdate(core: *@This(), id: SurfaceId) !?UpdateToken {
-            return if (id.index == 1) core.child_update else null;
+            return switch (id.index) {
+                1 => core.child_update,
+                2 => core.grandchild_update,
+                else => null,
+            };
         }
 
         pub fn transitionSurfaceDesync(core: *@This(), _: SurfaceId) !usize {
@@ -463,16 +468,21 @@ test "subcompositor: synchronized child is claimed by parent and desync transiti
 
     const parent: FakeCore.SurfaceId = .{ .index = 0, .generation = 1 };
     const child: FakeCore.SurfaceId = .{ .index = 1, .generation = 1 };
+    const grandchild: FakeCore.SurfaceId = .{ .index = 2, .generation = 1 };
     try adapter.graph.add(child, parent);
+    try adapter.graph.add(grandchild, child);
     try adapter.graph.setPosition(child, 7, -3);
     core.child_update = .{ .index = 4, .generation = 2 };
 
     var dependencies: [2]FakeCore.UpdateToken = undefined;
     const child_plan = try core.hook.?.plan_fn(core.hook.?.context, child, &dependencies);
     try std.testing.expectEqual(@import("../content_update.zig").Kind.sync, child_plan.kind);
+    try std.testing.expectEqual(@as(usize, 0), child_plan.dependency_count);
+    core.grandchild_update = .{ .index = 5, .generation = 3 };
     const parent_plan = try core.hook.?.plan_fn(core.hook.?.context, parent, &dependencies);
-    try std.testing.expectEqual(@as(usize, 1), parent_plan.dependency_count);
+    try std.testing.expectEqual(@as(usize, 2), parent_plan.dependency_count);
     try std.testing.expectEqual(core.child_update.?, dependencies[0]);
+    try std.testing.expectEqual(core.grandchild_update.?, dependencies[1]);
 
     core.hook.?.committed_fn(core.hook.?.context, parent);
     try std.testing.expect(try adapter.visible(child));

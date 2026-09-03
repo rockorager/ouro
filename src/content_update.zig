@@ -303,8 +303,8 @@ pub fn Scheduler(comptime Key: type, comptime Payload: type) type {
         }
 
         /// Appends one content update. The queue predecessor is always a
-        /// dependency. Eligible child SCUs are claimed exactly once, matching
-        /// wl_surface.commit's direct-child dependency rule.
+        /// dependency. Eligible synchronized descendant updates supplied by
+        /// the relationship owner are claimed exactly once.
         pub fn commit(
             scheduler: *Self,
             queue: *Queue,

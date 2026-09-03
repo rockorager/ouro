@@ -263,7 +263,6 @@ pub fn Graph(comptime Key: type, comptime Payload: type) type {
 
         /// Returns every directly associated child, including a newly added
         /// child whose relationship visibility awaits this parent's commit.
-        /// This is the dependency set used when constructing a parent CU.
         pub fn directChildren(
             graph: Self,
             parent: Key,
@@ -279,6 +278,33 @@ pub fn Graph(comptime Key: type, comptime Payload: type) type {
             while (child != none) : (child = graph.surfaces[child].next_sibling) {
                 output[used] = graph.surfaces[child].surface;
                 used += 1;
+            }
+            return output[0..used];
+        }
+
+        /// Returns every descendant whose cached state is applied by this
+        /// parent's commit. An effectively synchronized parent carries its
+        /// whole subtree; a desynchronized parent carries only subtrees rooted
+        /// at explicitly synchronized children.
+        pub fn synchronizedDescendants(
+            graph: Self,
+            parent: Key,
+            output: []Key,
+        ) Error![]Key {
+            const parent_index = graph.find(parent) orelse return output[0..0];
+            const parent_synchronized = graph.effectivelySynchronizedIndex(parent_index);
+            var required: usize = 0;
+            var child = graph.surfaces[parent_index].first_child;
+            while (child != none) : (child = graph.surfaces[child].next_sibling) {
+                if (parent_synchronized or graph.surfaces[child].sync)
+                    required += graph.subtreeSurfaceCount(child);
+            }
+            if (output.len < required) return error.OutputTooSmall;
+            var used: usize = 0;
+            child = graph.surfaces[parent_index].first_child;
+            while (child != none) : (child = graph.surfaces[child].next_sibling) {
+                if (parent_synchronized or graph.surfaces[child].sync)
+                    graph.appendSubtreeSurfaces(child, output, &used);
             }
             return output[0..used];
         }
@@ -571,6 +597,22 @@ pub fn Graph(comptime Key: type, comptime Payload: type) type {
             while (child != none) : (child = graph.surfaces[child].next_sibling)
                 count += graph.countSubtreeCommits(child);
             return count;
+        }
+
+        fn subtreeSurfaceCount(graph: Self, index: u32) usize {
+            var count: usize = 1;
+            var child = graph.surfaces[index].first_child;
+            while (child != none) : (child = graph.surfaces[child].next_sibling)
+                count += graph.subtreeSurfaceCount(child);
+            return count;
+        }
+
+        fn appendSubtreeSurfaces(graph: Self, index: u32, output: []Key, used: *usize) void {
+            output[used.*] = graph.surfaces[index].surface;
+            used.* += 1;
+            var child = graph.surfaces[index].first_child;
+            while (child != none) : (child = graph.surfaces[child].next_sibling)
+                graph.appendSubtreeSurfaces(child, output, used);
         }
 
         fn countTransitionCommits(graph: Self, index: u32) usize {
@@ -880,6 +922,31 @@ test "relationship graph supplies scheduler commit inputs" {
     try std.testing.expectEqual(first, direct[1]);
     try std.testing.expectError(error.OutputTooSmall, graph.directChildren(root, children[0..1]));
     try std.testing.expectEqual(@as(usize, 0), (try graph.directChildren(handle(9), &children)).len);
+}
+
+test "synchronized descendants preserve desynchronized subtree barriers" {
+    var graph = try TestGraph.init(std.testing.allocator, 4, 1);
+    defer graph.deinit(std.testing.allocator);
+    const root = handle(1);
+    const parent = handle(2);
+    const child = handle(3);
+    try graph.add(parent, root);
+    try graph.add(child, parent);
+    var changed: [2]objects.Handle = undefined;
+    _ = try graph.transitionDesync(child, &changed);
+
+    var descendants: [2]objects.Handle = undefined;
+    const root_transaction = try graph.synchronizedDescendants(root, &descendants);
+    try std.testing.expectEqualSlices(objects.Handle, &.{ parent, child }, root_transaction);
+
+    try graph.setSync(child);
+    _ = try graph.transitionDesync(parent, &changed);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        (try graph.synchronizedDescendants(root, &descendants)).len,
+    );
+    const parent_transaction = try graph.synchronizedDescendants(parent, &descendants);
+    try std.testing.expectEqualSlices(objects.Handle, &.{child}, parent_transaction);
 }
 
 test "ancestor lifetime controls recursive relationship visibility" {
