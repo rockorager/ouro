@@ -1807,7 +1807,32 @@ test "generated output power client drains and recreates the physical output" {
         .objects = &client.objects,
         .queue = &actor.transmit,
         .registry = registry,
+        .hold_primary_off = true,
     };
+    try submitClient(&reactor, &driver, &handler);
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.mode_counts[0] == 2) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expect(coordinator.physical_outputs[0].kms_output == null);
+    try std.testing.expectEqual(
+        coordinator.physical_outputs[1].protocol_output,
+        coordinator.output_adapter.primaryOutput(),
+    );
+    const flips_while_primary_off = fixture.page_flips;
+    try coordinator.physical_outputs[1].kms_output.?.request(.damage, 1);
+    coordinator.physical_outputs[1].damage_requested +%= 1;
+    for (0..128) |_| {
+        _ = try loop.turn(coordinator);
+        if (fixture.page_flips != flips_while_primary_off) break;
+        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+    }
+    try std.testing.expectEqual(flips_while_primary_off + 1, fixture.page_flips);
+    handler.hold_primary_off = false;
+    try handler.advancePowerCycles();
     try submitClient(&reactor, &driver, &handler);
     for (0..512) |_| {
         _ = try drainClient(&reactor, &driver, &handler);
@@ -3274,6 +3299,7 @@ const OutputPowerClientHandler = struct {
     primary_on_requested: bool = false,
     secondary_off_requested: bool = false,
     secondary_on_requested: bool = false,
+    hold_primary_off: bool = false,
     failed: usize = 0,
     event_failures: usize = 0,
 
@@ -3347,7 +3373,9 @@ const OutputPowerClientHandler = struct {
             try self.setMode(0, .off);
             self.primary_off_requested = true;
         }
-        if (self.mode_counts[0] == 2 and !self.primary_on_requested) {
+        if (self.mode_counts[0] == 2 and !self.primary_on_requested and
+            !self.hold_primary_off)
+        {
             try self.setMode(0, .on);
             self.primary_on_requested = true;
         }

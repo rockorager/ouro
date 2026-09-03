@@ -11747,6 +11747,7 @@ pub fn Coordinator(comptime protocol: type) type {
                         const command = self.output_power_transition.?;
                         self.output_power_transition = null;
                         physical.desired_enabled = false;
+                        try self.promoteEnabledPhysicalOutput();
                         if (self.output_power_adapter.peekCommand()) |current| {
                             if (std.meta.eql(current, command)) {
                                 try self.output_power_adapter.completeCommand(command, .succeeded);
