@@ -246,6 +246,9 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         pointer_devices: usize = 0,
         keyboard_devices: usize = 0,
         touch_devices: usize = 0,
+        pointer_ever_available: bool = false,
+        keyboard_ever_available: bool = false,
+        touch_ever_available: bool = false,
         pointer_capability_generation: u32 = 1,
         keyboard_capability_generation: u32 = 1,
         touch_capability_generation: u32 = 1,
@@ -440,7 +443,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             const decoded = try wayring.server.decodeRequest(Seat, server_objects, message, fds);
             switch (decoded.value) {
                 .get_pointer => |payload| {
-                    if (adapter.pointer_devices == 0)
+                    if (!adapter.pointer_ever_available)
                         return try adapter.protocolError(actor, decoded.handle.id, Seat.@"error".missing_capability.value, "pointer capability unavailable");
                     const slot = adapter.pointers.acquire() catch
                         return try adapter.noMemory(actor);
@@ -472,7 +475,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     };
                 },
                 .get_keyboard => |payload| {
-                    if (adapter.keyboard_devices == 0)
+                    if (!adapter.keyboard_ever_available)
                         return try adapter.protocolError(actor, decoded.handle.id, Seat.@"error".missing_capability.value, "keyboard capability unavailable");
                     const slot = adapter.keyboards.acquire() catch
                         return try adapter.noMemory(actor);
@@ -510,7 +513,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     };
                 },
                 .get_touch => |payload| {
-                    if (adapter.touch_devices == 0)
+                    if (!adapter.touch_ever_available)
                         return try adapter.protocolError(actor, decoded.handle.id, Seat.@"error".missing_capability.value, "touch capability unavailable");
                     const slot = adapter.touches.acquire() catch return try adapter.noMemory(actor);
                     slot.seat_index = adapter.seatIndex(seat);
@@ -1591,6 +1594,9 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             adapter.pointer_devices = pointer_devices;
             adapter.keyboard_devices = keyboard_devices;
             adapter.touch_devices = touch_devices;
+            adapter.pointer_ever_available = adapter.pointer_ever_available or capabilities.pointer;
+            adapter.keyboard_ever_available = adapter.keyboard_ever_available or capabilities.keyboard;
+            adapter.touch_ever_available = adapter.touch_ever_available or capabilities.touch;
             adapter.enqueueCapabilities(old, current) catch unreachable;
         }
 
@@ -2511,10 +2517,19 @@ const test_protocol = @import("core_protocol");
 const FakeCore = struct {
     pub const SurfaceId = struct { index: u32, generation: u32 };
     generation: u32 = 1,
-    state: u8 = 0,
+    state: surface_state.Surface = .{},
 
-    pub fn getSurfaceById(core: *FakeCore, id: SurfaceId) !*u8 {
+    pub fn getSurfaceById(core: *FakeCore, id: SurfaceId) !*surface_state.Surface {
         if (id.index != 0 or id.generation != core.generation) return error.StaleSurface;
+        return &core.state;
+    }
+
+    pub fn getSurfaceObject(
+        core: *FakeCore,
+        handle: objects.Handle,
+        _: *const objects.Object,
+    ) !*surface_state.Surface {
+        if (handle.id != 10 or handle.generation != core.generation) return error.StaleSurface;
         return &core.state;
     }
 
@@ -2570,6 +2585,34 @@ fn countTestOutbound(adapter: *const TestAdapter, tag: std.meta.Tag(TestAdapter.
         count += 1;
     };
     return count;
+}
+
+fn dispatchTestRequest(
+    adapter: *TestAdapter,
+    actor: *wayring.connection.Actor,
+    server_objects: *wayring.objects.ServerObjects,
+    received_fds: *wayring.ancillary.FdQueue,
+    requests: *wayring.tx.Queue,
+) !wayring.dispatch.Control {
+    var descriptor_scratch: [1]linux.fd_t = undefined;
+    var control: [64]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+    const snapshot = try requests.snapshot(&descriptor_scratch, &control);
+    const message = (try wayring.wire.Message.decode(snapshot.first)) orelse
+        return error.IncompleteMessage;
+    const target = try server_objects.namespace.request(
+        message.header.object_id,
+        message.header.opcode,
+    );
+    const result = (try adapter.requestOn(
+        actor,
+        server_objects,
+        target,
+        message,
+        received_fds,
+    )).?;
+    try requests.begin(snapshot);
+    try requests.complete(snapshot.byteCount());
+    return result;
 }
 
 test "seat: ownership reservations grow without invalidating contexts" {
@@ -3502,6 +3545,79 @@ test "seat: device storage grows beyond its initial reservation" {
         .generation = 1,
         .seat_generation = 1,
     }) != null);
+}
+
+test "seat: child resources can be created after capabilities disappear" {
+    var core: FakeCore = .{};
+    var adapter = try testAdapter(&core);
+    defer adapter.deinit();
+    var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 128, 8);
+    defer blocks.deinit(std.testing.allocator);
+    var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 1);
+    defer descriptors.deinit(std.testing.allocator);
+    var requests = wayring.tx.Queue.init(&blocks, 512, &descriptors, 1);
+    defer requests.deinit();
+    var fragment_storage: [64]u8 = undefined;
+    var actor = wayring.connection.Actor.init(
+        0,
+        1,
+        &fragment_storage,
+        &descriptors,
+        1,
+        &blocks,
+        512,
+        0,
+    );
+    defer actor.deinit();
+    var server_objects = try wayring.objects.ServerObjects.init(
+        std.testing.allocator,
+        8,
+        4,
+        &TestCore.Display.info,
+        null,
+    );
+    defer server_objects.deinit(std.testing.allocator);
+    var received_fds = wayring.ancillary.FdQueue.init(&descriptors, 1);
+    defer received_fds.deinit();
+
+    const device: input.DeviceId = .{ .slot = 0, .generation = 1, .seat_generation = 1 };
+    try adapter.consume(.{ .device_added = .{
+        .device = device,
+        .info = .{ .capabilities = .{ .pointer = true, .keyboard = true, .touch = true } },
+    } });
+    clearTestOutbound(&adapter);
+    try adapter.consume(.{ .device_removed = device });
+    clearTestOutbound(&adapter);
+    try std.testing.expectEqual(@as(u32, 0), adapter.capabilityBits());
+
+    const seat = try adapter.seats.acquire();
+    seat.peer = .{ .slot = 0, .generation = 1 };
+    seat.resource = try server_objects.insertClient(2, &test_protocol.wl_seat.info, 9, seat);
+    try test_protocol.wl_seat.encodeRequest(&requests, seat.resource.id, .{
+        .get_pointer = .{ .id = 3 },
+    });
+    try std.testing.expectEqual(
+        wayring.dispatch.Control.continue_dispatch,
+        try dispatchTestRequest(&adapter, &actor, &server_objects, &received_fds, &requests),
+    );
+    try test_protocol.wl_seat.encodeRequest(&requests, seat.resource.id, .{
+        .get_keyboard = .{ .id = 4 },
+    });
+    try std.testing.expectEqual(
+        wayring.dispatch.Control.continue_dispatch,
+        try dispatchTestRequest(&adapter, &actor, &server_objects, &received_fds, &requests),
+    );
+    try test_protocol.wl_seat.encodeRequest(&requests, seat.resource.id, .{
+        .get_touch = .{ .id = 5 },
+    });
+    try std.testing.expectEqual(
+        wayring.dispatch.Control.continue_dispatch,
+        try dispatchTestRequest(&adapter, &actor, &server_objects, &received_fds, &requests),
+    );
+    try std.testing.expect(server_objects.namespace.lookupHandle(3) != null);
+    try std.testing.expect(server_objects.namespace.lookupHandle(4) != null);
+    try std.testing.expect(server_objects.namespace.lookupHandle(5) != null);
+    try std.testing.expectEqual(@as(usize, 4), adapter.resourceCount());
 }
 
 test "seat: device removal reserves cancellation releases and capabilities atomically" {
