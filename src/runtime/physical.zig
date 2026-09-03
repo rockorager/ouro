@@ -8056,6 +8056,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.fractional_scale_adapter.setDefaultPreferredScale(requested.scale_120);
             }
             try self.xdg_output_adapter.publishMode(physical.protocol_output);
+            try self.xdg_output_adapter.publishPosition(physical.protocol_output);
             var state = requested;
             state.enabled = true;
             state.width = @intCast(mode.hdisplay);

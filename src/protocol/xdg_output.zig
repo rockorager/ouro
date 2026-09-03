@@ -454,7 +454,7 @@ test "xdg output: snapshot terminator follows negotiated version" {
     }
 }
 
-test "xdg output: mode publication coalesces while retaining marker" {
+test "xdg output: topology publication coalesces while retaining marker" {
     const protocol = @import("core_protocol");
     const FakeOutput = struct {
         pub const OutputId = struct { index: u32, generation: u32 };
@@ -484,6 +484,9 @@ test "xdg output: mode publication coalesces while retaining marker" {
     slot.output = output_id;
     try adapter.publishMode(output_id);
     try adapter.publishMode(output_id);
+    try adapter.publishPosition(output_id);
+    try adapter.publishPosition(output_id);
+    try std.testing.expect(slot.pending.position);
     try std.testing.expect(slot.pending.size);
     try std.testing.expect(slot.pending.marker);
     try std.testing.expectEqual(@as(usize, 1), adapter.pending_len);
