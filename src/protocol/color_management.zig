@@ -65,6 +65,9 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             tf_set: bool = false,
             primaries_set: bool = false,
             luminances_set: bool = false,
+            luminance_min: u32 = 0,
+            luminance_max: u32 = 0,
+            luminance_reference: u32 = 0,
             pending: u8 = 0,
             version: u32 = 1,
             information_allowed: bool = false,
@@ -396,7 +399,15 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                             creator.description.reference_luminance = 203;
                         },
                         else => {},
-                    };
+                    } else {
+                        const luminances = primaryLuminances(
+                            creator.luminance_min,
+                            creator.luminance_max,
+                            creator.luminance_reference,
+                            creator.description.transfer,
+                        ) catch return try self.creatorError(actor, decoded.handle.id, Creator.@"error".invalid_luminance.value, "invalid luminance range");
+                        applyPrimaryLuminances(&creator.description, luminances);
+                    }
                     creator.tf_set = true;
                 },
                 .set_primaries_named => |v| {
@@ -411,12 +422,16 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 },
                 .set_luminances => |v| {
                     if (creator.luminances_set) return try self.creatorError(actor, decoded.handle.id, Creator.@"error".already_set.value, "luminances already set");
-                    creator.description.min_luminance = @as(f32, @floatFromInt(v.min_lum)) / 10000;
-                    creator.description.max_luminance = if (creator.description.transfer == .st2084_pq)
-                        creator.description.min_luminance + 10_000
-                    else
-                        @floatFromInt(v.max_lum);
-                    creator.description.reference_luminance = @floatFromInt(v.reference_lum);
+                    const luminances = primaryLuminances(
+                        v.min_lum,
+                        v.max_lum,
+                        v.reference_lum,
+                        if (creator.tf_set) creator.description.transfer else null,
+                    ) catch return try self.creatorError(actor, decoded.handle.id, Creator.@"error".invalid_luminance.value, "invalid luminance range");
+                    creator.luminance_min = v.min_lum;
+                    creator.luminance_max = v.max_lum;
+                    creator.luminance_reference = v.reference_lum;
+                    applyPrimaryLuminances(&creator.description, luminances);
                     creator.luminances_set = true;
                 },
                 .set_max_cll => |v| {
@@ -447,7 +462,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     creator.description.mastering_min_luminance = @as(f32, @floatFromInt(v.min_lum)) / 10_000;
                     creator.description.mastering_max_luminance = @floatFromInt(v.max_lum);
                 },
-                .set_tf_power => return try self.creatorError(actor, decoded.handle.id, Creator.@"error".unsupported_feature.value, "unsupported feature"),
+                .set_tf_power => {
+                    if (creator.tf_set) return try self.creatorError(actor, decoded.handle.id, Creator.@"error".already_set.value, "transfer function already set");
+                    return try self.creatorError(actor, decoded.handle.id, Creator.@"error".unsupported_feature.value, "unsupported feature");
+                },
                 .create => |v| {
                     if (!creator.tf_set or !creator.primaries_set) return try self.creatorError(actor, decoded.handle.id, Creator.@"error".incomplete_set.value, "incomplete image description");
                     if (creator.version == 1 and !versionOneTargetLuminanceValid(creator.description))
@@ -906,6 +924,31 @@ fn encodeChromaticity(value: f32) i32 {
 fn point(x: i32, y: i32) color.Chromaticity {
     return .{ .x = @as(f32, @floatFromInt(x)) / 1_000_000, .y = @as(f32, @floatFromInt(y)) / 1_000_000 };
 }
+
+const PrimaryLuminances = struct {
+    min: f32,
+    max: f32,
+    reference: f32,
+};
+
+fn primaryLuminances(min: u32, max: u32, reference: u32, tf: ?color.TransferFunction) !PrimaryLuminances {
+    if (@as(u64, reference) * 10_000 <= min) return error.InvalidLuminance;
+    if (tf != null and tf.? != .st2084_pq and @as(u64, max) * 10_000 <= min)
+        return error.InvalidLuminance;
+    const min_luminance = @as(f32, @floatFromInt(min)) / 10_000;
+    return .{
+        .min = min_luminance,
+        .max = if (tf == .st2084_pq) min_luminance + 10_000 else @floatFromInt(max),
+        .reference = @floatFromInt(reference),
+    };
+}
+
+fn applyPrimaryLuminances(description: *color.Description, luminances: PrimaryLuminances) void {
+    description.min_luminance = luminances.min;
+    description.max_luminance = luminances.max;
+    description.reference_luminance = luminances.reference;
+}
+
 fn transfer(v: u32) ?color.TransferFunction {
     return switch (v) {
         2 => .gamma22,
@@ -1097,4 +1140,15 @@ test "mastering display metadata validation and identity are exact" {
     description.target_max_cll = null;
     description.mastering_max_luminance = 0.005;
     try std.testing.expectError(error.InvalidColorDescription, description.validate());
+}
+
+test "primary luminance interpretation is transfer-order independent" {
+    const deferred = try primaryLuminances(50, 0, 203, null);
+    try std.testing.expectEqual(@as(f32, 0), deferred.max);
+
+    const pq = try primaryLuminances(50, 0, 203, .st2084_pq);
+    try std.testing.expectEqual(@as(f32, 0.005), pq.min);
+    try std.testing.expectEqual(@as(f32, 10_000.005), pq.max);
+    try std.testing.expectError(error.InvalidLuminance, primaryLuminances(50, 0, 203, .srgb));
+    try std.testing.expectError(error.InvalidLuminance, primaryLuminances(50, 80, 0, null));
 }
