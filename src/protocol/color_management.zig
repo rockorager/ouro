@@ -70,6 +70,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             luminance_reference: u32 = 0,
             preferred_identity: u64 = 0,
             preferred_pending: bool = false,
+            output_identity: u64 = 0,
+            output_pending: bool = false,
             pending: u8 = 0,
             version: u32 = 1,
             information_allowed: bool = false,
@@ -228,6 +230,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     };
                     child.handle = admitted.id;
                     child.output = output_handle;
+                    child.output_identity = self.outputIdentity(child.peer, output_handle);
                 },
                 .get_surface => |value| {
                     const wl_handle = server_objects.namespace.lookupHandle(value.surface) orelse return try self.invalidObject(actor, "invalid surface");
@@ -722,13 +725,33 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     };
                     r.preferred_pending = false;
                     count += 1;
+                } else if (r.kind == .output and r.output_pending) {
+                    wayring.server.sendEvent(protocol, Output, server_objects, queue, r.handle, .{ .image_description_changed = .{} }) catch |err| switch (err) {
+                        error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return count,
+                        else => return err,
+                    };
+                    r.output_pending = false;
+                    count += 1;
                 }
             }
             return count;
         }
         pub fn pendingOutbound(self: *const Self, peer: wayring.io_uring.Peer) bool {
-            for (self.resources.items) |r| if (samePeer(r.peer, peer) and ((r.kind == .manager and r.pending < capabilities.len) or (r.kind == .image and r.pending == 0 and r.image_state != .compiling) or (r.kind == .info and r.pending < 8) or (r.kind == .feedback and r.preferred_pending))) return true;
+            for (self.resources.items) |r| if (samePeer(r.peer, peer) and ((r.kind == .manager and r.pending < capabilities.len) or (r.kind == .image and r.pending == 0 and r.image_state != .compiling) or (r.kind == .info and r.pending < 8) or (r.kind == .feedback and r.preferred_pending) or (r.kind == .output and r.output_pending))) return true;
             return false;
+        }
+
+        pub fn refreshOutputs(self: *Self) bool {
+            var changed = false;
+            for (self.resources.items) |r| {
+                if (r.kind != .output or r.output == null) continue;
+                const identity = self.outputIdentity(r.peer, r.output.?);
+                if (identity == r.output_identity) continue;
+                r.output_identity = identity;
+                r.output_pending = true;
+                changed = true;
+            }
+            return changed;
         }
 
         pub fn refreshPreferred(self: *Self) bool {
@@ -748,6 +771,14 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             const resolver = self.output_resolver orelse return descriptionIdentity(.srgb);
             const resource = self.core.surfaceResource(surface) catch return descriptionIdentity(.srgb);
             const resolved = resolver.resolve(resolver.context, peer, null, resource) orelse
+                return descriptionIdentity(.srgb);
+            defer releaseResolvedOutput(resolved);
+            return descriptionIdentity(resolved.description);
+        }
+
+        fn outputIdentity(self: *Self, peer: wayring.io_uring.Peer, output: objects.Handle) u64 {
+            const resolver = self.output_resolver orelse return descriptionIdentity(.srgb);
+            const resolved = resolver.resolve(resolver.context, peer, output, null) orelse
                 return descriptionIdentity(.srgb);
             defer releaseResolvedOutput(resolved);
             return descriptionIdentity(resolved.description);
@@ -1193,7 +1224,7 @@ test "primary luminance interpretation is transfer-order independent" {
     try std.testing.expectError(error.InvalidLuminance, primaryLuminances(50, 80, 0, null));
 }
 
-test "surface feedback queues only changed preferred identities" {
+test "output and surface feedback queue only changed identities" {
     const protocol = @import("core_protocol");
     const FakeCore = struct {
         pub const SurfaceId = u64;
@@ -1224,7 +1255,7 @@ test "surface feedback queues only changed preferred identities" {
 
     var core: FakeCore = .{ .resource = .{ .id = 3, .generation = 1 } };
     var adapter = try TestAdapter.init(std.testing.allocator, &core, .{
-        .resource_capacity = 1,
+        .resource_capacity = 2,
         .async_jobs = 1,
         .queued_profile_bytes = 1024,
         .retained_luts = 1,
@@ -1235,11 +1266,19 @@ test "surface feedback queues only changed preferred identities" {
 
     const feedback = try adapter.create(.feedback, .{ .id = 4, .generation = 1 }, peer, 7, 2);
     feedback.preferred_identity = adapter.preferredIdentity(peer, 7);
+    const output = try adapter.create(.output, .{ .id = 5, .generation = 1 }, peer, null, 2);
+    output.output = core.resource;
+    output.output_identity = adapter.outputIdentity(peer, core.resource);
     try std.testing.expect(!adapter.refreshPreferred());
+    try std.testing.expect(!adapter.refreshOutputs());
     try std.testing.expect(!adapter.pendingOutbound(peer));
 
     resolver_state.wide_gamut = true;
     try std.testing.expect(adapter.refreshPreferred());
+    try std.testing.expect(adapter.refreshOutputs());
     try std.testing.expect(adapter.pendingOutbound(peer));
+    try std.testing.expect(feedback.preferred_pending);
+    try std.testing.expect(output.output_pending);
     try std.testing.expect(!adapter.refreshPreferred());
+    try std.testing.expect(!adapter.refreshOutputs());
 }

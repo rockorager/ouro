@@ -496,6 +496,23 @@ pub fn Adapter(comptime protocol: type) type {
             output.available = available;
         }
 
+        /// Queues the synchronization marker shared by output extensions after
+        /// an extension-only state change.
+        pub fn publishDone(adapter: *Self, output_id: OutputId) !void {
+            _ = try adapter.resolveOutput(output_id);
+            var count: usize = 0;
+            for (adapter.resources) |resource| {
+                if (resource.active and resource.version >= 2 and
+                    std.meta.eql(resource.output, output_id)) count += 1;
+            }
+            try adapter.ensureOutbound(count);
+            for (adapter.resources, 0..) |resource, index| {
+                if (!resource.active or resource.version < 2 or
+                    !std.meta.eql(resource.output, output_id)) continue;
+                adapter.enqueue(adapter.idFor(@intCast(index)), .done) catch unreachable;
+            }
+        }
+
         /// Reconciles the mapped surface set without directly writing the
         /// transport. `flushOn` retains each enter/leave transition until its
         /// generated event is accepted.
@@ -1222,6 +1239,29 @@ test "output: storage grows beyond initial capacities" {
     try std.testing.expectEqual(first, reused);
     try std.testing.expect(old_id.generation != adapter.idFor(reused).generation);
     try std.testing.expectError(error.StaleResource, adapter.resolve(old_id));
+}
+
+test "output: extension change queues done for supported resources" {
+    const TestAdapter = Adapter(@import("core_protocol"));
+    var adapter = try TestAdapter.init(std.testing.allocator, .{
+        .resource_capacity = 2,
+        .association_capacity = 1,
+        .outbound_capacity = 1,
+    });
+    defer adapter.deinit();
+    const output = adapter.primaryOutput();
+    const peer: wayring.io_uring.Peer = .{ .slot = 1, .generation = 1 };
+
+    for (1..3) |version| {
+        const index = try adapter.acquireResource();
+        adapter.resources[index].output = output;
+        adapter.resources[index].peer = peer;
+        adapter.resources[index].version = @intCast(version);
+        adapter.resources[index].handle = .{ .id = @intCast(10 + version), .generation = 1 };
+    }
+    try adapter.publishDone(output);
+    try std.testing.expectEqual(@as(usize, 1), adapter.outbound_len);
+    try std.testing.expect(adapter.oldestOutbound(peer).?.event == .done);
 }
 
 test "output: fractional scale republishes integer fallback and logical size" {

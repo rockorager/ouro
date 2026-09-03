@@ -8088,9 +8088,15 @@ pub fn Coordinator(comptime protocol: type) type {
             self.stats.selected_outputs += 1;
             self.foreign_toplevel_outputs_dirty = true;
             if (selected_profile != physical.output_profile) {
+                try self.output_adapter.publishDone(physical.protocol_output);
                 if (selected_profile) |profile| _ = profile.retain();
                 if (physical.output_profile) |profile| profile.release();
                 physical.output_profile = selected_profile;
+                _ = self.color_management_adapter.refreshOutputs();
+                _ = self.color_management_adapter.refreshPreferred();
+                self.markProtocolAll(
+                    ProtocolReady.color_management | ProtocolReady.output,
+                );
             }
             output_committed = true;
             _ = retained_visibility_changed;
