@@ -5268,7 +5268,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn captureKmsOutput(
-            self: *const Self,
+            self: *Self,
             target: ImageCopyCaptureAdapter.Target,
         ) ?*output_api.Output {
             const source = switch (target) {
@@ -5278,7 +5278,9 @@ pub fn Coordinator(comptime protocol: type) type {
             return switch (source) {
                 .output => |id| (self.physicalOutputForKmsId(id) orelse return null).kms_output,
                 .toplevel => |id| if (std.meta.activeTag(target) == .source)
-                    self.firstCaptureOutput()
+                    self.captureOutputForToplevelBounds(
+                        self.captureToplevelBounds(id) orelse return null,
+                    )
                 else
                     (self.physicalOutputContainingSceneRect(
                         (self.desktop.scene(id) catch return null).geometry,
@@ -5290,6 +5292,15 @@ pub fn Coordinator(comptime protocol: type) type {
             for (self.physical_outputs[0..self.physical_output_count]) |physical|
                 if (physical.connected) if (physical.kms_output) |output| return output;
             return null;
+        }
+
+        fn captureOutputForToplevelBounds(
+            self: *const Self,
+            bounds: geometry.Rect,
+        ) ?*output_api.Output {
+            if (self.physicalOutputContainingSceneRect(bounds)) |physical|
+                return physical.kms_output;
+            return self.firstCaptureOutput();
         }
 
         fn captureTransformToUpright(
@@ -9964,7 +9975,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.markProtocol(capture.peer, ProtocolReady.image_copy_capture);
                 return;
             }
-            const output = self.firstCaptureOutput() orelse {
+            const output = self.captureOutputForToplevelBounds(bounds) orelse {
                 try self.failImageCopy(capture);
                 return;
             };
