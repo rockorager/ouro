@@ -9165,6 +9165,7 @@ pub fn Coordinator(comptime protocol: type) type {
             if (!self.sessionLockActive() and self.cursor_layer.active and
                 self.themed_cursor.image == null)
             {
+                const global_bounds = try self.globalOutputBounds();
                 const root = self.cursor_layer.id.?;
                 const surfaces = try self.sceneOrder(root);
                 for (surfaces) |surface| {
@@ -9181,7 +9182,17 @@ pub fn Coordinator(comptime protocol: type) type {
                         if (try cursor.composite(.{
                             .surface = root,
                             .sample = self.cursor_layer.sample.?,
-                        }, output_bounds)) |cursor_sample| {
+                        }, global_bounds)) |global_sample| {
+                            if (!std.meta.eql(
+                                global_sample.destination,
+                                self.cursor_layer.sample.?.destination,
+                            )) self.output_associations_dirty = true;
+                            self.cursor_layer.sample = global_sample;
+                            var cursor_sample = global_sample;
+                            cursor_sample.clip = try clipToOutput(
+                                cursor_sample.destination,
+                                output_bounds,
+                            ) orelse continue;
                             try self.ensureFrameStorage(@max(sample_count, change_count) + 1);
                             self.frame_samples[sample_count] = try scaleSample(
                                 cursor_sample,
@@ -9204,11 +9215,6 @@ pub fn Coordinator(comptime protocol: type) type {
                                 output_scale,
                             );
                             self.frame_change_layers[change_count] = null;
-                            if (!std.meta.eql(
-                                cursor_sample.destination,
-                                self.cursor_layer.sample.?.destination,
-                            )) self.output_associations_dirty = true;
-                            self.cursor_layer.sample = cursor_sample;
                             try includeSurfaceBounds(&next_client_cursor_previous, current);
                             client_cursor_visible = true;
                             sample_count += 1;
@@ -9236,21 +9242,13 @@ pub fn Coordinator(comptime protocol: type) type {
                         ),
                         translatedCoordinate(placement.offset.y, layer.content_origin.y),
                     );
-                    const visible_clip = try clipToOutput(sample.destination, output_bounds) orelse {
+                    const visible_clip = try clipToOutput(sample.destination, global_bounds) orelse {
                         if (layer.change.?.current != null) {
                             const previous = layer.change.?.current.?;
                             layer.change = .{
                                 .previous = previous,
                                 .invalidate_bounds = true,
                             };
-                            try self.ensureFrameStorage(change_count + 1);
-                            self.frame_changes[change_count] = try scaleChange(
-                                layer.change.?,
-                                output_bounds,
-                                output_scale,
-                            );
-                            self.frame_change_layers[change_count] = layer;
-                            change_count += 1;
                         }
                         continue;
                     };
@@ -9267,9 +9265,12 @@ pub fn Coordinator(comptime protocol: type) type {
                             .invalidate_bounds = true,
                         };
                     }
+                    var output_sample = sample;
+                    output_sample.clip = try clipToOutput(sample.destination, output_bounds) orelse
+                        continue;
                     try self.ensureFrameStorage(@max(sample_count, change_count) + 1);
                     self.frame_samples[sample_count] = try scaleSample(
-                        sample,
+                        output_sample,
                         output_bounds,
                         output_scale,
                     );
@@ -9281,7 +9282,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     );
                     self.frame_change_layers[change_count] = layer;
                     const child_state = damage.SurfaceState.fromSample(
-                        sample,
+                        output_sample,
                         (layer.change.?.current orelse layer.change.?.previous.?).surface_size,
                     );
                     try includeSurfaceBounds(&next_client_cursor_previous, child_state);
@@ -9690,6 +9691,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 return null;
             };
             const pointer = self.interaction.cursor.position;
+            const global_bounds = try self.globalOutputBounds();
             var combined: ?damage.SurfaceState = null;
             const surfaces = try self.sceneOrder(root);
             for (surfaces) |surface| {
@@ -9713,7 +9715,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     pointer.y,
                     translatedCoordinate(placement_offset.y, layer.content_origin.y),
                 );
-                sample.clip = try clipToOutput(sample.destination, output_bounds) orelse continue;
+                sample.clip = try clipToOutput(sample.destination, global_bounds) orelse continue;
                 if (!std.meta.eql(sample.destination, layer.sample.?.destination) or
                     !std.meta.eql(sample.clip, layer.sample.?.clip))
                 {
@@ -9727,9 +9729,12 @@ pub fn Coordinator(comptime protocol: type) type {
                     };
                     self.output_associations_dirty = true;
                 }
+                var output_sample = sample;
+                output_sample.clip = try clipToOutput(sample.destination, output_bounds) orelse
+                    continue;
                 try self.ensureFrameStorage(@max(sample_count.*, change_count.*) + 1);
                 self.frame_samples[sample_count.*] = try scaleSample(
-                    sample,
+                    output_sample,
                     output_bounds,
                     output_scale,
                 );
@@ -9743,7 +9748,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 try includeSurfaceBounds(
                     &combined,
                     damage.SurfaceState.fromSample(
-                        sample,
+                        output_sample,
                         (layer.change.?.current orelse layer.change.?.previous.?).surface_size,
                     ),
                 );
