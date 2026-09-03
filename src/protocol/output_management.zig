@@ -494,7 +494,7 @@ pub fn Adapter(comptime protocol: type) type {
                 const d = try wayring.server.decodeRequest(ConfigurationHead, server_objects, message, fds);
                 switch (d.value) {
                     .set_mode => |v| if (self.validMode(c, ch.head, server_objects, v.mode)) |mode| try self.lifecycle.setHeadMode(c.lifecycle, ch.head, mode.mode.width, mode.mode.height, mode.mode.refresh_millihz) else return try self.protocolError(actor, d.handle.id, 2, "invalid mode"),
-                    .set_custom_mode => |v| self.lifecycle.setHeadMode(c.lifecycle, ch.head, v.width, v.height, v.refresh) catch |e| return try self.headError(actor, d.handle.id, e),
+                    .set_custom_mode => |v| self.lifecycle.setHeadCustomMode(c.lifecycle, ch.head, v.width, v.height, v.refresh) catch |e| return try self.headError(actor, d.handle.id, e),
                     .set_position => |v| try self.lifecycle.setHeadPosition(c.lifecycle, ch.head, v.x, v.y),
                     .set_transform => |v| self.lifecycle.setHeadTransform(c.lifecycle, ch.head, @intCast(v.transform.value)) catch |e| return try self.headError(actor, d.handle.id, e),
                     .set_scale => |v| self.lifecycle.setHeadScale120(c.lifecycle, ch.head, if (v.scale > 0) @intCast(@divTrunc(@as(i64, v.scale) * 120, 256)) else 0) catch |e| return try self.headError(actor, d.handle.id, e),
@@ -1030,6 +1030,17 @@ pub const Lifecycle = struct {
         h.desired.refresh_millihz = refresh;
         self.updatePrimaryDesired(c, head, h.desired);
     }
+    pub fn setHeadCustomMode(self: *Lifecycle, id: ConfigurationId, head: HeadId, width: i32, height: i32, refresh: i32) !void {
+        const c = try self.get(id);
+        const h = try self.mutableHead(c, head);
+        if (h.mode_set) return error.AlreadySet;
+        if (width <= 0 or height <= 0 or refresh < 0) return error.InvalidMode;
+        h.mode_set = true;
+        h.desired.width = width;
+        h.desired.height = height;
+        if (refresh != 0) h.desired.refresh_millihz = refresh;
+        self.updatePrimaryDesired(c, head, h.desired);
+    }
     pub fn setPosition(self: *Lifecycle, id: ConfigurationId, x: i32, y: i32) !void {
         return self.setHeadPosition(id, self.primary, x, y);
     }
@@ -1185,6 +1196,35 @@ test "configuration coverage stale cancellation one shot and FIFO completion" {
     l.disconnect();
     try std.testing.expect(l.peek() == null);
     try std.testing.expectError(error.InvalidConfiguration, l.enable(reused));
+}
+
+test "custom mode accepts an unspecified refresh without weakening exact modes" {
+    var lifecycle = try Lifecycle.init(
+        std.testing.allocator,
+        1,
+        7,
+        .{ .width = 1920, .height = 1080, .refresh_millihz = 60_000 },
+    );
+    defer lifecycle.deinit();
+
+    const custom = try lifecycle.create(7);
+    try lifecycle.enable(custom);
+    try lifecycle.setHeadCustomMode(custom, lifecycle.primary, 1280, 720, 0);
+    const desired = (try lifecycle.get(custom)).desired;
+    try std.testing.expectEqual(@as(i32, 1280), desired.width);
+    try std.testing.expectEqual(@as(i32, 720), desired.height);
+    try std.testing.expectEqual(@as(i32, 60_000), desired.refresh_millihz);
+
+    const exact = try lifecycle.create(7);
+    try lifecycle.enable(exact);
+    try std.testing.expectError(
+        error.InvalidMode,
+        lifecycle.setHeadMode(exact, lifecycle.primary, 1280, 720, 0),
+    );
+    try std.testing.expectError(
+        error.InvalidMode,
+        lifecycle.setHeadCustomMode(exact, lifecycle.primary, 1280, 720, -1),
+    );
 }
 
 test "configuration covers and atomically applies every exact head" {
