@@ -267,7 +267,6 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             wl_surface: objects.Handle = .{ .id = 0, .generation = 0 },
             surface_id: SurfaceId = undefined,
             role: Role = .none,
-            had_role: bool = false,
             last_acked_serial: u32 = 0,
             committed_acked_serial: u32 = 0,
             window_geometry: ?WindowGeometry = null,
@@ -1480,7 +1479,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .destroy => if (slot.role != .none)
                     return try adapter.protocolError(actor, decoded.handle.id, XdgSurface.@"error".defunct_role_object.value, "xdg role object still exists"),
                 .get_toplevel => |payload| {
-                    if (slot.had_role) return try adapter.protocolError(actor, decoded.handle.id, XdgSurface.@"error".already_constructed.value, "xdg role already constructed");
+                    if (slot.role != .none) return try adapter.protocolError(actor, decoded.handle.id, XdgSurface.@"error".already_constructed.value, "xdg role already constructed");
                     if (!adapter.canPublishWithLive(adapter.live_toplevels + 1, adapter.live_popups))
                         return try adapter.noMemory(actor);
                     const surface = adapter.core.getSurfaceById(slot.surface_id) catch
@@ -1506,12 +1505,11 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     role.xdg_surface_generation = slot.header.generation;
                     const id = adapter.toplevelId(role);
                     slot.role = .{ .toplevel = id };
-                    slot.had_role = true;
                     adapter.live_toplevels += 1;
                     adapter.publish(.{ .toplevel_created = .{ .id = id, .surface = slot.surface_id } }) catch unreachable;
                 },
                 .get_popup => |payload| {
-                    if (slot.had_role) return try adapter.protocolError(actor, decoded.handle.id, XdgSurface.@"error".already_constructed.value, "xdg role already constructed");
+                    if (slot.role != .none) return try adapter.protocolError(actor, decoded.handle.id, XdgSurface.@"error".already_constructed.value, "xdg role already constructed");
                     const positioner = adapter.positionerByObject(server_objects, payload.positioner) catch
                         return try adapter.invalidPositioner(actor, slot);
                     if (!positioner.state.configured_size or !positioner.state.configured_anchor_rect)
@@ -1573,7 +1571,6 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     role.placement = popupPlacement(positioner.state);
                     role.dismissed = parent_dismissed;
                     slot.role = .{ .popup = adapter.popupId(role) };
-                    slot.had_role = true;
                     adapter.live_popups += 1;
                     if (parent) |parent_slot| adapter.publish(.{ .popup_created = .{
                         .id = adapter.popupId(role),
@@ -1771,6 +1768,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
 
         fn setMetadata(adapter: *Self, slot: *ToplevelSlot, title: bool, bytes: []const u8) !void {
             if (bytes.len > adapter.metadata_bytes) return error.MetadataTooLong;
+            if (!std.unicode.utf8ValidateSlice(bytes)) return error.InvalidUtf8;
             if (!adapter.canPublishWithLive(adapter.live_toplevels, adapter.live_popups)) return error.Exhausted;
             const destination = if (title) slot.title else slot.app_id;
             @memcpy(destination[0..bytes.len], bytes);
@@ -2419,6 +2417,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             return switch (cause) {
                 error.Exhausted => adapter.noMemory(actor),
                 error.MetadataTooLong => adapter.protocolError(actor, id, 0, "metadata exceeds configured bound"),
+                error.InvalidUtf8 => adapter.protocolError(actor, id, 0, "metadata is not valid UTF-8"),
                 else => cause,
             };
         }
@@ -3132,6 +3131,45 @@ test "xdg-shell: generated requests publish owned generational toplevel state" {
         else => return error.UnexpectedEvent,
     });
     try std.testing.expectError(error.StaleToplevel, context.adapter.metadata(id));
+}
+
+test "xdg-shell: destroyed role object can be recreated with the permanent role" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const first = try context.createToplevel();
+
+    try test_protocol.xdg_toplevel.encodeRequest(&context.requests, 12, .{ .destroy = .{} });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try std.testing.expectEqual(first, switch (context.adapter.popEvent().?) {
+        .toplevel_destroyed => |destroyed| destroyed,
+        else => return error.UnexpectedEvent,
+    });
+
+    try test_protocol.xdg_surface.encodeRequest(&context.requests, 11, .{
+        .get_toplevel = .{ .id = 16 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    const second = switch (context.adapter.popEvent() orelse return error.MissingEvent) {
+        .toplevel_created => |event| event.id,
+        else => return error.UnexpectedEvent,
+    };
+    try std.testing.expect(!std.meta.eql(first, second));
+    try std.testing.expectEqual(toplevel_role_id, context.core.state.role.id);
+    try std.testing.expect(context.core.state.role.object_active);
+}
+
+test "xdg-shell: toplevel metadata rejects invalid UTF-8" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const id = try context.createToplevel();
+
+    try test_protocol.xdg_toplevel.encodeRequest(&context.requests, 12, .{
+        .set_title = .{ .title = "\xff" },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.stop, try context.dispatch());
+    try expectDisplayError(context, 12, 0);
+    try std.testing.expectEqualStrings("", (try context.adapter.metadata(id)).title);
+    try std.testing.expect(context.adapter.popEvent() == null);
 }
 
 test "xdg-shell: toplevel parents are mapped, nullable, and cleared on retirement" {

@@ -254,6 +254,19 @@ fn transformedCaptureSize(output: render.Size, transform: render.Transform) rend
     };
 }
 
+fn inverseSurfaceTransform(transform: surface_state.Transform) render.Transform {
+    return switch (transform) {
+        .normal => .normal,
+        .@"90" => .@"270",
+        .@"180" => .@"180",
+        .@"270" => .@"90",
+        .flipped => .flipped,
+        .flipped_90 => .flipped_90,
+        .flipped_180 => .flipped_180,
+        .flipped_270 => .flipped_270,
+    };
+}
+
 fn transformedCapturePixel(
     x: u32,
     y: u32,
@@ -1093,6 +1106,9 @@ pub fn Coordinator(comptime protocol: type) type {
             self.input_delivery_event = null;
             self.input_touch_delivery = .{};
             @memset(&self.input_method_key_owners, null);
+            self.processing_virtual_pointer = false;
+            self.shell_maintenance_pending = false;
+            self.pointer_reconcile_pending = false;
             self.render_device = null;
             self.syncobj_device = null;
             self.syncobj_adapter = null;
@@ -8207,14 +8223,16 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             const exact_surface_id = pending.id;
             const surface_scene = self.surfaceScene(exact_surface_id);
-            const requested_cursor = if (self.interaction.cursor.surface) |id|
-                std.meta.eql(id, exact_surface_id)
-            else
-                false;
+            const cursor_surface = self.cursorTreeContains(exact_surface_id);
             var layer = if (surface_scene != null or self.findAppLayer(exact_surface_id) != null)
                 try self.appLayerForSurface(exact_surface_id)
-            else if (requested_cursor)
+            else if (cursor_surface and std.meta.eql(
+                self.interaction.cursor.surface.?,
+                exact_surface_id,
+            ))
                 &self.cursor_layer
+            else if (cursor_surface)
+                try self.appLayerForSurface(exact_surface_id)
             else
                 return false;
             if (layer.presentation != null or self.appLayerOutputTrackingPending(layer)) return false;
@@ -8225,8 +8243,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (!try self.admitReadyBatch(exact_surface_id)) return false;
                 layer = if (surface_scene != null or self.findAppLayer(exact_surface_id) != null)
                     try self.appLayerForSurface(exact_surface_id)
+                else if (std.meta.eql(self.interaction.cursor.surface.?, exact_surface_id))
+                    &self.cursor_layer
                 else
-                    &self.cursor_layer;
+                    try self.appLayerForSurface(exact_surface_id);
                 if (!layer.candidate.owned or
                     !candidateMatches(layer.candidate.value, pending))
                     return false;
@@ -8531,7 +8551,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .crop = crop,
                 .destination = destination,
                 .clip = visible_clip,
-                .transform = @enumFromInt(@intFromEnum(content.surface.transform)),
+                .transform = inverseSurfaceTransform(content.surface.transform),
                 .color_description = content.surface.color_description,
                 .color_representation = content.surface.color_representation,
                 .global_alpha = alphaMultiplier(content.surface.alpha_multiplier),
@@ -8700,7 +8720,7 @@ pub fn Coordinator(comptime protocol: type) type {
             );
             sample.destination = destination;
             sample.clip = visible_clip;
-            sample.transform = @enumFromInt(@intFromEnum(content.surface.transform));
+            sample.transform = inverseSurfaceTransform(content.surface.transform);
             sample.color_description = content.surface.color_description;
             sample.color_representation = content.surface.color_representation;
             sample.global_alpha = alphaMultiplier(content.surface.alpha_multiplier);
@@ -8810,7 +8830,8 @@ pub fn Coordinator(comptime protocol: type) type {
                         &self.cursor_layer
                     else
                         return false
-                else if (self.surfaceScene(id) != null or self.findAppLayer(id) != null)
+                else if (self.surfaceScene(id) != null or self.findAppLayer(id) != null or
+                    self.cursorTreeContains(id))
                     self.availableAppLayer(id, index) orelse return false
                 else
                     return false;
@@ -9022,52 +9043,131 @@ pub fn Coordinator(comptime protocol: type) type {
                 change_count += 1;
             }
             const cursor_start = sample_count;
-            var next_client_cursor_previous = physical.client_cursor_previous;
+            var next_client_cursor_previous: ?damage.SurfaceState = null;
             var client_cursor_visible = false;
             if (!self.sessionLockActive() and self.cursor_layer.active and
                 self.themed_cursor.image == null)
             {
-                var cursor = self.interaction.cursor;
-                cursor.hotspot.x = translatedCoordinate(
-                    cursor.hotspot.x,
-                    -@as(i64, self.cursor_layer.content_origin.x),
-                );
-                cursor.hotspot.y = translatedCoordinate(
-                    cursor.hotspot.y,
-                    -@as(i64, self.cursor_layer.content_origin.y),
-                );
-                if (try cursor.composite(.{
-                    .surface = self.cursor_layer.id.?,
-                    .sample = self.cursor_layer.sample.?,
-                }, output_bounds)) |cursor_sample| {
+                const root = self.cursor_layer.id.?;
+                const surfaces = try self.sceneOrder(root);
+                for (surfaces) |surface| {
+                    if (std.meta.eql(surface, root)) {
+                        var cursor = self.interaction.cursor;
+                        cursor.hotspot.x = translatedCoordinate(
+                            cursor.hotspot.x,
+                            -@as(i64, self.cursor_layer.content_origin.x),
+                        );
+                        cursor.hotspot.y = translatedCoordinate(
+                            cursor.hotspot.y,
+                            -@as(i64, self.cursor_layer.content_origin.y),
+                        );
+                        if (try cursor.composite(.{
+                            .surface = root,
+                            .sample = self.cursor_layer.sample.?,
+                        }, output_bounds)) |cursor_sample| {
+                            try self.ensureFrameStorage(@max(sample_count, change_count) + 1);
+                            self.frame_samples[sample_count] = try scaleSample(
+                                cursor_sample,
+                                output_bounds,
+                                output_scale,
+                            );
+                            self.frame_bindings[sample_count] = self.cursor_layer.binding.?;
+                            const current = damage.SurfaceState.fromSample(cursor_sample, .{
+                                .width = cursor_sample.destination.width,
+                                .height = cursor_sample.destination.height,
+                            });
+                            const logical_change: damage.Change = .{
+                                .previous = physical.client_cursor_previous,
+                                .current = current,
+                                .invalidate_bounds = true,
+                            };
+                            self.frame_changes[change_count] = try scaleChange(
+                                logical_change,
+                                output_bounds,
+                                output_scale,
+                            );
+                            self.frame_change_layers[change_count] = null;
+                            if (!std.meta.eql(
+                                cursor_sample.destination,
+                                self.cursor_layer.sample.?.destination,
+                            )) self.output_associations_dirty = true;
+                            self.cursor_layer.sample = cursor_sample;
+                            try includeSurfaceBounds(&next_client_cursor_previous, current);
+                            client_cursor_visible = true;
+                            sample_count += 1;
+                            change_count += 1;
+                        }
+                        continue;
+                    }
+                    const layer = self.findAppLayer(surface) orelse continue;
+                    if (!layer.active) continue;
+                    const placement = self.subcompositor_adapter.placement(surface) catch continue;
+                    var sample = layer.sample orelse continue;
+                    sample.destination.x = try std.math.add(
+                        i32,
+                        translatedCoordinate(
+                            self.interaction.cursor.position.x,
+                            -@as(i64, self.interaction.cursor.hotspot.x),
+                        ),
+                        translatedCoordinate(placement.offset.x, layer.content_origin.x),
+                    );
+                    sample.destination.y = try std.math.add(
+                        i32,
+                        translatedCoordinate(
+                            self.interaction.cursor.position.y,
+                            -@as(i64, self.interaction.cursor.hotspot.y),
+                        ),
+                        translatedCoordinate(placement.offset.y, layer.content_origin.y),
+                    );
+                    const visible_clip = try clipToOutput(sample.destination, output_bounds) orelse {
+                        if (layer.change.?.current != null) {
+                            const previous = layer.change.?.current.?;
+                            layer.change = .{
+                                .previous = previous,
+                                .invalidate_bounds = true,
+                            };
+                            try self.ensureFrameStorage(change_count + 1);
+                            self.frame_changes[change_count] = try scaleChange(
+                                layer.change.?,
+                                output_bounds,
+                                output_scale,
+                            );
+                            self.frame_change_layers[change_count] = layer;
+                            change_count += 1;
+                        }
+                        continue;
+                    };
+                    sample.clip = visible_clip;
+                    if (!std.meta.eql(sample.destination, layer.sample.?.destination) or
+                        !std.meta.eql(sample.clip, layer.sample.?.clip))
+                    {
+                        const previous = layer.change.?.current;
+                        const natural_size = (previous orelse layer.change.?.previous.?).surface_size;
+                        layer.sample = sample;
+                        layer.change = .{
+                            .previous = previous,
+                            .current = damage.SurfaceState.fromSample(sample, natural_size),
+                            .invalidate_bounds = true,
+                        };
+                    }
                     try self.ensureFrameStorage(@max(sample_count, change_count) + 1);
                     self.frame_samples[sample_count] = try scaleSample(
-                        cursor_sample,
+                        sample,
                         output_bounds,
                         output_scale,
                     );
-                    self.frame_bindings[sample_count] = self.cursor_layer.binding.?;
-                    const current = damage.SurfaceState.fromSample(cursor_sample, .{
-                        .width = cursor_sample.destination.width,
-                        .height = cursor_sample.destination.height,
-                    });
-                    const logical_change: damage.Change = .{
-                        .previous = physical.client_cursor_previous,
-                        .current = current,
-                        .invalidate_bounds = true,
-                    };
+                    self.frame_bindings[sample_count] = layer.binding.?;
                     self.frame_changes[change_count] = try scaleChange(
-                        logical_change,
+                        layer.change.?,
                         output_bounds,
                         output_scale,
                     );
-                    self.frame_change_layers[change_count] = null;
-                    if (!std.meta.eql(
-                        cursor_sample.destination,
-                        self.cursor_layer.sample.?.destination,
-                    )) self.output_associations_dirty = true;
-                    self.cursor_layer.sample = cursor_sample;
-                    next_client_cursor_previous = current;
+                    self.frame_change_layers[change_count] = layer;
+                    const child_state = damage.SurfaceState.fromSample(
+                        sample,
+                        (layer.change.?.current orelse layer.change.?.previous.?).surface_size,
+                    );
+                    try includeSurfaceBounds(&next_client_cursor_previous, child_state);
                     client_cursor_visible = true;
                     sample_count += 1;
                     change_count += 1;
@@ -9132,6 +9232,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 change_count += 1;
             }
             for (self.app_layers[0..self.app_layer_count]) |*layer| {
+                if (layer.id != null and self.cursorTreeContains(layer.id.?)) continue;
                 const outputs = self.appLayerOutputRow(
                     self.app_layer_change_outputs,
                     layer,
@@ -9329,11 +9430,14 @@ pub fn Coordinator(comptime protocol: type) type {
                     self.app_layer_change_outputs,
                     layer,
                 ) orelse continue;
-                if (clearOutputPending(
+                const cleared = clearOutputPending(
                     outputs,
                     output_index,
                     &layer.change_output_count,
-                ) == .complete)
+                );
+                if (cleared == .complete or
+                    (cleared == .untracked and layer.id != null and
+                        self.cursorTreeContains(layer.id.?)))
                     markLayerChangeApplied(layer);
             }
             for (bindings) |binding| {
@@ -10759,6 +10863,14 @@ pub fn Coordinator(comptime protocol: type) type {
                 .offset_y = placement.offset.y,
                 .subsurface = true,
             };
+        }
+
+        fn cursorTreeContains(self: *Self, id: Adapter.SurfaceId) bool {
+            const root = self.interaction.cursor.surface orelse return false;
+            if (std.meta.eql(root, id)) return true;
+            if (!(self.subcompositor_adapter.visible(id) catch return false)) return false;
+            const placement = self.subcompositor_adapter.placement(id) catch return false;
+            return std.meta.eql(placement.root, root);
         }
 
         fn pointerPointForSurface(
@@ -13104,6 +13216,37 @@ fn rectangleUnion(a: geometry.Rect, b: render.Rect) !geometry.Rect {
     };
 }
 
+fn includeSurfaceBounds(bounds: *?damage.SurfaceState, surface: damage.SurfaceState) !void {
+    const current = bounds.* orelse {
+        bounds.* = surface;
+        return;
+    };
+    const destination = try rectangleUnion(.{
+        .x = current.destination.x,
+        .y = current.destination.y,
+        .width = @intCast(current.destination.width),
+        .height = @intCast(current.destination.height),
+    }, surface.destination);
+    const clip = try rectangleUnion(.{
+        .x = current.clip.x,
+        .y = current.clip.y,
+        .width = @intCast(current.clip.width),
+        .height = @intCast(current.clip.height),
+    }, surface.clip);
+    bounds.*.?.destination = .{
+        .x = destination.x,
+        .y = destination.y,
+        .width = @intCast(destination.width),
+        .height = @intCast(destination.height),
+    };
+    bounds.*.?.clip = .{
+        .x = clip.x,
+        .y = clip.y,
+        .width = @intCast(clip.width),
+        .height = @intCast(clip.height),
+    };
+}
+
 fn rectangleContains(outer: geometry.Rect, inner: geometry.Rect) bool {
     return inner.x >= outer.x and inner.y >= outer.y and
         @as(i64, inner.x) + inner.width <= @as(i64, outer.x) + outer.width and
@@ -13450,6 +13593,40 @@ test "physical: surface content origin accumulates commit deltas safely" {
         std.math.minInt(i32),
         -1,
     ));
+}
+
+test "physical: renderer samples invert the client buffer transform" {
+    const expected = [_]render.Transform{
+        .normal,
+        .@"270",
+        .@"180",
+        .@"90",
+        .flipped,
+        .flipped_90,
+        .flipped_180,
+        .flipped_270,
+    };
+    for (expected, 0..) |transform, value|
+        try std.testing.expectEqual(transform, inverseSurfaceTransform(@enumFromInt(value)));
+}
+
+test "physical: cursor damage bounds include surfaces in either scene order" {
+    var root: damage.SurfaceState = undefined;
+    root.destination = .{ .x = 20, .y = 20, .width = 40, .height = 40 };
+    root.clip = root.destination;
+    var child: damage.SurfaceState = undefined;
+    child.destination = .{ .x = 10, .y = 30, .width = 20, .height = 50 };
+    child.clip = child.destination;
+
+    var below: ?damage.SurfaceState = null;
+    try includeSurfaceBounds(&below, child);
+    try includeSurfaceBounds(&below, root);
+    try std.testing.expectEqual(render.Rect{ .x = 10, .y = 20, .width = 50, .height = 60 }, below.?.destination);
+
+    var above: ?damage.SurfaceState = null;
+    try includeSurfaceBounds(&above, root);
+    try includeSurfaceBounds(&above, child);
+    try std.testing.expectEqual(below.?.destination, above.?.destination);
 }
 
 test "physical: output association surfaces form a set" {

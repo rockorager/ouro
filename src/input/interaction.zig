@@ -594,6 +594,9 @@ fn interactionWithKeyConsumer(comptime Desktop: type, comptime KeyConsumerFactor
             } else null;
             const point: geometry.Point = .{ .x = fixedFloor(next_x), .y = fixedFloor(next_y) };
             var target = try self.targetAtPointer(desktop, surfaces, next_x, next_y);
+            if (self.mode == .popup_grab and target != null and
+                !std.meta.eql(target.?.toplevel, self.mode.popup_grab.toplevel))
+                target = null;
             const focus_candidate = self.mode == .default and target != null and target.?.managed and
                 target.?.keyboard_focusable and
                 (self.keyboard_focus == null or
@@ -2051,7 +2054,7 @@ test "interaction: popup grab retains outside delivery and dismisses on press" {
     var interaction = try initTestInteraction(3);
     defer interaction.deinit();
     var desktop = testDesktop();
-    var surfaces = TestSurfaces{ .hole_surface = desktop.windows[0].surface };
+    var surfaces = TestSurfaces{};
     try addPointer(&interaction, &desktop, &surfaces);
     interaction.setPopupGrab(@as(?struct { toplevel: TestId, surface: TestId }, .{
         .toplevel = desktop.windows[1].id,
