@@ -4567,9 +4567,12 @@ pub fn Coordinator(comptime protocol: type) type {
             for (self.physical_outputs[0..self.physical_output_count]) |physical|
                 if (physical.kms_output) |output|
                     if (output.readinessPrepared()) return;
-            const primary = self.primaryKmsOutput() orelse return;
-            if (primary.canPrepareReadiness())
-                try primary.prepareReadiness(&self.router, &self.root.ring);
+            for (self.physical_outputs[0..self.physical_output_count]) |physical| {
+                const output = physical.kms_output orelse continue;
+                if (!output.canPrepareReadiness()) continue;
+                try output.prepareReadiness(&self.router, &self.root.ring);
+                return;
+            }
         }
 
         fn anyOutputInFlight(self: *const Self) bool {
@@ -12842,7 +12845,7 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.image_capture_source_adapter.resourceRemoved(handle, object);
             _ = self.text_input_adapter.resourceRemoved(handle, object);
             _ = self.subcompositor_adapter.resourceRemoved(handle, object);
-            if (layer_shell_removed and self.primaryKmsOutput() != null) {
+            if (layer_shell_removed and self.anyKmsOutput()) {
                 const work_area = self.layerWorkArea(null) catch
                     self.globalOutputBounds() catch unreachable;
                 const output_areas = self.desktopOutputAreas(null) catch unreachable;
