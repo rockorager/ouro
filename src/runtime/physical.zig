@@ -5298,7 +5298,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self: *const Self,
             bounds: geometry.Rect,
         ) ?*output_api.Output {
-            if (self.physicalOutputContainingSceneRect(bounds)) |physical|
+            if (self.physicalOutputBestForSceneRect(bounds)) |physical|
                 return physical.kms_output;
             return self.firstCaptureOutput();
         }
@@ -5419,6 +5419,25 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (rectangleContains(bounds, rect)) return physical;
             }
             return null;
+        }
+
+        fn physicalOutputBestForSceneRect(
+            self: *const Self,
+            rect: geometry.Rect,
+        ) ?*const PhysicalOutput {
+            var best: ?*const PhysicalOutput = null;
+            var best_area: u64 = 0;
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                if (!physical.connected or physical.kms_output == null) continue;
+                const bounds = self.outputBoundsFor(physical) catch continue;
+                if (rectangleContains(bounds, rect)) return physical;
+                const area = rectangleIntersectionArea(bounds, rect);
+                if (area > best_area) {
+                    best = physical;
+                    best_area = area;
+                }
+            }
+            return best;
         }
 
         fn physicalSceneRectFor(
@@ -13244,6 +13263,18 @@ fn rectanglesIntersect(a: geometry.Rect, b: geometry.Rect) bool {
         @as(i64, b.y) < @as(i64, a.y) + a.height;
 }
 
+fn rectangleIntersectionArea(a: geometry.Rect, b: geometry.Rect) u64 {
+    const width = @max(
+        @as(i64, 0),
+        @min(@as(i64, a.x) + a.width, @as(i64, b.x) + b.width) - @max(a.x, b.x),
+    );
+    const height = @max(
+        @as(i64, 0),
+        @min(@as(i64, a.y) + a.height, @as(i64, b.y) + b.height) - @max(a.y, b.y),
+    );
+    return @intCast(width * height);
+}
+
 fn rectangleUnion(a: geometry.Rect, b: render.Rect) !geometry.Rect {
     const left = @min(@as(i64, a.x), b.x);
     const top = @min(@as(i64, a.y), b.y);
@@ -13843,6 +13874,16 @@ test "physical: capture rectangles require exact output containment" {
         secondary,
         .{ .x = 2, .y = 0, .width = 2, .height = 2 },
     ));
+    const spanning: geometry.Rect = .{ .x = 2, .y = 0, .width = 4, .height = 2 };
+    try std.testing.expectEqual(
+        @as(u64, 2),
+        rectangleIntersectionArea(.{ .x = 0, .y = 0, .width = 3, .height = 2 }, spanning),
+    );
+    try std.testing.expectEqual(@as(u64, 6), rectangleIntersectionArea(secondary, spanning));
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        rectangleIntersectionArea(secondary, .{ .x = -3, .y = 0, .width = 3, .height = 2 }),
+    );
 }
 
 test "physical: toplevel capture bounds include every tree extension" {
