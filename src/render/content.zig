@@ -334,10 +334,10 @@ pub const Store = struct {
         const logical_bytes = try validateRetainedShm(identity, source);
 
         if (previous) |handle| reuse: {
-            if (handle.index >= self.slots.len) return error.StaleContent;
+            if (handle.index >= self.slots.len) break :reuse;
             const slot = &self.slots[handle.index];
             if (slot.state != .published or slot.generation != handle.generation or !slot.current)
-                return error.StaleContent;
+                break :reuse;
             if (slot.identity.surface != identity.surface or !slot.source.retained_shm or
                 slot.accounted_bytes != logical_bytes)
                 break :reuse;
@@ -1362,6 +1362,51 @@ test "render-content: retained SHM replacement borrows exact bytes without alloc
     try std.testing.expectEqual(@intFromPtr(&second_bytes), @intFromPtr((try store.resolve(current)).bytes.ptr));
     store.release(current);
     try std.testing.expectEqual(baseline, store.allocatedBytes());
+}
+
+test "render-content: stale retained SHM hint preserves the zero-copy path" {
+    var store = try Store.init(
+        std.testing.allocator,
+        .{ .version_capacity = 3, .byte_capacity = 24 },
+    );
+    defer store.deinit();
+    const first_bytes = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    var first_source = testSource(&first_bytes, 2, 1, 8);
+    first_source.retained_shm = true;
+    const first = store.publish(try store.prepareReplacingRetainedShm(
+        null,
+        .{ .surface = 11, .commit_sequence = 1 },
+        first_source,
+    ));
+
+    const second_bytes = [_]u8{ 9, 10, 11, 12, 13, 14, 15, 16 };
+    var second_source = testSource(&second_bytes, 2, 1, 8);
+    second_source.retained_shm = true;
+    const second = store.publish(try store.prepareReplacingRetainedShm(
+        null,
+        .{ .surface = 11, .commit_sequence = 2 },
+        second_source,
+    ));
+
+    const third_bytes = [_]u8{ 17, 18, 19, 20, 21, 22, 23, 24 };
+    var third_source = testSource(&third_bytes, 2, 1, 8);
+    third_source.retained_shm = true;
+    const prepared = try store.prepareReplacingRetainedShm(
+        first,
+        .{ .surface = 11, .commit_sequence = 3 },
+        third_source,
+    );
+    try std.testing.expect(!prepared.replaces);
+    const third = store.publish(prepared);
+    try std.testing.expectEqual(
+        @intFromPtr(&third_bytes),
+        @intFromPtr((try store.resolve(third)).bytes.ptr),
+    );
+    try std.testing.expect((try store.resolve(third)).retained_shm);
+
+    store.release(first);
+    store.release(second);
+    store.release(third);
 }
 
 test "render-content: external adjacent replacement cancel reuse and pinned fallback" {
