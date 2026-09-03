@@ -240,6 +240,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
             const slot = self.slots.fromContext(target.object.context) orelse return null;
             if (!std.meta.eql(slot.resource, handle) or !samePeer(slot.peer, peer)) return null;
             const decoded = try wayring.server.decodeRequest(LayerSurface, server_objects, message, fds);
+            if (closedRequestIgnored(slot.closed, decoded.value)) {
+                try decoded.finish(protocol, server_objects, &actor.transmit);
+                return .continue_dispatch;
+            }
             switch (decoded.value) {
                 .set_size => |v| {
                     slot.pending.width = v.width;
@@ -665,6 +669,9 @@ fn validatePending(p: anytype) !void {
         if (@popCount(bits) != 1 or bits & a.bits() == 0) return error.InvalidExclusiveEdge;
     }
 }
+fn closedRequestIgnored(closed: bool, request: anytype) bool {
+    return closed and std.meta.activeTag(request) != .destroy;
+}
 fn samePeer(a: wayring.io_uring.Peer, b: wayring.io_uring.Peer) bool {
     return a.slot == b.slot and a.generation == b.generation;
 }
@@ -720,6 +727,17 @@ test "layer shell: layer is immutable after the initial commit" {
     const A = Adapter(@import("core_protocol"), struct {}, struct {});
     try std.testing.expectEqual(A.Layer.top, try A.parseLayerRequest(false, 2));
     try std.testing.expectError(error.InvalidSurfaceState, A.parseLayerRequest(true, 2));
+}
+
+test "layer shell: closed surfaces ignore every request except destroy" {
+    const LayerSurface = @import("core_protocol").zwlr_layer_surface_v1;
+    try std.testing.expect(closedRequestIgnored(true, LayerSurface.Request{
+        .set_size = .{ .width = 80, .height = 60 },
+    }));
+    try std.testing.expect(!closedRequestIgnored(true, LayerSurface.Request{ .destroy = .{} }));
+    try std.testing.expect(!closedRequestIgnored(false, LayerSurface.Request{
+        .set_size = .{ .width = 80, .height = 60 },
+    }));
 }
 
 test "layer shell: ownership grows past initial reservation without moving contexts" {
