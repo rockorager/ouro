@@ -1549,6 +1549,7 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
         .queue = &actor.transmit,
         .registry = registry,
         .test_pointer_warp = true,
+        .test_pointer_constraints = true,
         .test_foreign_toplevel = true,
         .test_wlr_foreign_toplevel = true,
         .test_toplevel_tag = true,
@@ -1745,6 +1746,7 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     try std.testing.expectEqual(@as(usize, 5), input.dispatch_count);
     try std.testing.expectEqual(@as(usize, 12), input.next_count);
     try std.testing.expect(handler.pointer_enter != 0);
+    try std.testing.expectEqual(@as(usize, 1), handler.pointer_confined);
     try std.testing.expect(handler.keyboard_enter != 0);
     try std.testing.expect(handler.pointer_motion != 0);
     try std.testing.expect(handler.pointer_button != 0);
@@ -5939,6 +5941,10 @@ const Handler = struct {
     idle_standard: ?wayring.objects.Handle = null,
     idle_input: ?wayring.objects.Handle = null,
     idle_inhibitor: ?wayring.objects.Handle = null,
+    pointer_constraints_manager: ?wayring.objects.Handle = null,
+    confined_pointer: ?wayring.objects.Handle = null,
+    test_pointer_constraints: bool = false,
+    pointer_confined: usize = 0,
     surface: ?wayring.objects.Handle = null,
     xdg_surface: ?wayring.objects.Handle = null,
     toplevel: ?wayring.objects.Handle = null,
@@ -6262,6 +6268,19 @@ const Handler = struct {
                 .enter => |value| {
                     self.pointer_enter += 1;
                     self.pointer_enter_serial = value.serial;
+                    if (self.test_pointer_constraints and self.confined_pointer == null) {
+                        self.confined_pointer = (try protocol.zwp_pointer_constraints_v1.construct_confine_pointer(
+                            self.objects,
+                            self.queue,
+                            self.pointer_constraints_manager.?,
+                            .{
+                                .surface = self.surface.?.id,
+                                .pointer = self.pointer.?.id,
+                                .region = null,
+                                .lifetime = .persistent,
+                            },
+                        )).id;
+                    }
                 },
                 .motion => self.pointer_motion += 1,
                 .button => |value| {
@@ -6313,6 +6332,20 @@ const Handler = struct {
                 },
                 .frame => self.pointer_frame += 1,
                 else => {},
+            }
+        } else if (target.object.interface == &protocol.zwp_confined_pointer_v1.info) {
+            switch (try protocol.zwp_confined_pointer_v1.decodeEvent(message, fds)) {
+                .confined => {
+                    self.pointer_confined += 1;
+                    try wayring.client.sendRequest(
+                        protocol.zwp_confined_pointer_v1,
+                        self.objects,
+                        self.queue,
+                        self.confined_pointer.?,
+                        .{ .destroy = .{} },
+                    );
+                },
+                .unconfined => {},
             }
         } else if (target.object.interface == &protocol.wl_keyboard.info) {
             switch (try protocol.wl_keyboard.decodeEvent(message, fds)) {
@@ -6537,6 +6570,19 @@ const Handler = struct {
             self.idle_inhibit_manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.zwp_idle_inhibit_manager_v1.info, @min(value.version, 1), null);
         if (self.test_pointer_warp and std.mem.eql(u8, value.interface, protocol.wp_pointer_warp_v1.info.name))
             self.pointer_warp_manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wp_pointer_warp_v1.info, @min(value.version, 1), null);
+        if (self.test_pointer_constraints and std.mem.eql(
+            u8,
+            value.interface,
+            protocol.zwp_pointer_constraints_v1.info.name,
+        )) self.pointer_constraints_manager = try ClientCore.bind(
+            self.objects,
+            self.queue,
+            self.registry,
+            value.name,
+            &protocol.zwp_pointer_constraints_v1.info,
+            1,
+            null,
+        );
         if (std.mem.eql(u8, value.interface, protocol.wp_security_context_manager_v1.info.name)) {
             self.security_global_seen = true;
             if (self.test_security_context)

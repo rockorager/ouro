@@ -2754,6 +2754,11 @@ pub fn Coordinator(comptime protocol: type) type {
                 return control;
             }
             if (try self.pointer_constraints_adapter.request(peer, target, message, fds)) |control| {
+                const pointer = self.seat_adapter.pointerState();
+                try self.pointer_constraints_adapter.updateFocus(
+                    if (pointer.focus) |focus| focus.surface else null,
+                    .{ .x = pointer.point.x, .y = pointer.point.y },
+                );
                 if (self.pointer_constraints_adapter.pendingOutbound(peer))
                     self.markProtocol(peer, ProtocolReady.pointer_constraints);
                 try self.flushProtocol();
