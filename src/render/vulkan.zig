@@ -153,6 +153,13 @@ pub const Renderer = struct {
         try self.platform.validateExternal(self.implementation, source, size, format);
     }
 
+    pub fn sampledDmabufFormats(
+        self: *Renderer,
+        output: []gbm.FormatModifier,
+    ) ![]const gbm.FormatModifier {
+        return self.platform.sampledDmabufFormats(self.implementation, output);
+    }
+
     /// Requires every target to be out of KMS ownership. Platform destruction
     /// performs the terminal fence wait before releasing imported BO state.
     pub fn destroyTargets(self: *Renderer, targets: *Targets) void {
@@ -625,6 +632,21 @@ test "render-vulkan: packed ABI preserves order geometry transform alpha and ret
     try std.testing.expectEqual([4]i32{ -5, 6, 7, 8 }, gpu_sample.destination);
     try std.testing.expectEqual([4]u32{ 0, 7, 13, 0 }, gpu_sample.attributes);
     try std.testing.expectEqual(@as(usize, 160), @sizeOf(vk.Sample));
+}
+
+test "render-vulkan: sampled DMA-BUF capabilities cross the platform boundary" {
+    var fake = FakePlatform{};
+    var renderer = try Renderer.init(std.testing.allocator, fake.platform(), 41, .{
+        .max_samples = 1,
+        .max_source_bytes = 4,
+        .max_targets = 1,
+    });
+    defer renderer.deinit();
+    var storage: [2]gbm.FormatModifier = undefined;
+    try std.testing.expectEqualSlices(gbm.FormatModifier, &.{
+        .{ .fourcc = gbm.format_argb8888, .modifier = gbm.modifier_linear },
+        .{ .fourcc = gbm.format_xrgb8888, .modifier = 7 },
+    }, try renderer.sampledDmabufFormats(&storage));
 }
 
 test "render-vulkan: LUT slot is packed without changing Sample ABI" {
@@ -1201,6 +1223,7 @@ const FakePlatform = struct {
         .readback = readback,
         .content_provider = contentProvider,
         .validate_external = validateExternal,
+        .sampled_dmabuf_formats = sampledDmabufFormats,
         .packs_sources = packsSources,
         .cache_lut = cacheLut,
     };
@@ -1223,6 +1246,16 @@ const FakePlatform = struct {
         _: render_types.Size,
         _: render_types.PixelFormat,
     ) !void {}
+    fn sampledDmabufFormats(
+        _: *anyopaque,
+        _: vk.Renderer,
+        output: []gbm.FormatModifier,
+    ) !usize {
+        if (output.len < 2) return error.OutputTooSmall;
+        output[0] = .{ .fourcc = gbm.format_argb8888, .modifier = gbm.modifier_linear };
+        output[1] = .{ .fourcc = gbm.format_xrgb8888, .modifier = 7 };
+        return 2;
+    }
     fn packsSources(context: *anyopaque, _: vk.Renderer) bool {
         const self: *FakePlatform = @ptrCast(@alignCast(context));
         return self.pack_sources;

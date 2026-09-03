@@ -8038,6 +8038,14 @@ pub fn Coordinator(comptime protocol: type) type {
         /// device carried by version-4 default and per-surface feedback.
         fn ensureDmabuf(self: *Self, handle: drm.Handle) !void {
             if (self.dmabuf_adapter.global != null) return;
+            const render_device = self.render_device orelse return error.RendererUnavailable;
+            var renderer_formats: [256]gbm.FormatModifier = undefined;
+            const supported = try render_device.sampledDmabufFormats(&renderer_formats);
+            if (supported.len == 0) return;
+            var protocol_formats: [renderer_formats.len]protocol_linux_dmabuf.Format = undefined;
+            for (supported, protocol_formats[0..supported.len]) |format, *entry|
+                entry.* = .{ .fourcc = format.fourcc, .modifier = format.modifier };
+            try self.dmabuf_adapter.setFormats(protocol_formats[0..supported.len]);
             const fd = try kms.Device.fromManager(&self.manager).fd(handle);
             var status: libc.struct_stat = undefined;
             if (libc.fstat(fd, &status) != 0) return error.DrmDeviceUnavailable;

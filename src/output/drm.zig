@@ -218,6 +218,28 @@ pub const RenderDevice = struct {
         return @intCast(status.st_rdev);
     }
 
+    pub fn sampledDmabufFormats(
+        self: *RenderDevice,
+        output: []gbm.FormatModifier,
+    ) ![]const gbm.FormatModifier {
+        const renderer = &(self.renderer orelse return error.RendererUnavailable);
+        return switch (renderer.*) {
+            .vulkan => |*value| value.sampledDmabufFormats(output),
+            .pixman => {
+                const formats = [_]u32{
+                    gbm.format_argb8888,
+                    gbm.format_xrgb8888,
+                    gbm.format_abgr8888,
+                    gbm.format_xbgr8888,
+                };
+                if (output.len < formats.len) return error.OutputTooSmall;
+                for (formats, output[0..formats.len]) |format, *entry|
+                    entry.* = .{ .fourcc = format, .modifier = gbm.modifier_linear };
+                return output[0..formats.len];
+            },
+        };
+    }
+
     pub fn matches(self: *const RenderDevice, card: *const drm.Card) bool {
         return std.mem.eql(u8, self.card.stablePath(), card.stablePath());
     }

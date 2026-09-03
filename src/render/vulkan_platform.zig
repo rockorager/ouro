@@ -96,6 +96,7 @@ pub const Platform = struct {
         readback: *const fn (*anyopaque, Renderer, Target, CapturePhase) anyerror!Readback,
         content_provider: *const fn (*anyopaque, Renderer) ?render_content.Provider,
         validate_external: *const fn (*anyopaque, Renderer, render.ExternalSource, render.Size, render.PixelFormat) anyerror!void,
+        sampled_dmabuf_formats: *const fn (*anyopaque, Renderer, []gbm.FormatModifier) anyerror!usize,
         packs_sources: *const fn (*anyopaque, Renderer) bool,
         cache_lut: *const fn (*anyopaque, Renderer, *const icc.Lut) anyerror!u32,
     };
@@ -144,6 +145,19 @@ pub const Platform = struct {
     ) !void {
         try self.vtable.validate_external(self.context, renderer, source, size, format);
     }
+    pub fn sampledDmabufFormats(
+        self: Platform,
+        renderer: Renderer,
+        output: []gbm.FormatModifier,
+    ) ![]const gbm.FormatModifier {
+        const count = try self.vtable.sampled_dmabuf_formats(
+            self.context,
+            renderer,
+            output,
+        );
+        if (count > output.len) return error.InvalidPlatformResult;
+        return output[0..count];
+    }
     pub fn packsSources(self: Platform, renderer: Renderer) bool {
         return self.vtable.packs_sources(self.context, renderer);
     }
@@ -168,6 +182,7 @@ const real_vtable: Platform.VTable = .{
     .readback = realReadback,
     .content_provider = realContentProvider,
     .validate_external = realValidateExternal,
+    .sampled_dmabuf_formats = realSampledDmabufFormats,
     .packs_sources = realPacksSources,
     .cache_lut = realCacheLut,
 };
@@ -1106,6 +1121,66 @@ fn realValidateExternal(
     const token = try importedImage(self, candidate, size, format);
     const entry = importedFromToken(self, token) orelse unreachable;
     destroyImportedImage(self, entry);
+}
+
+fn realSampledDmabufFormats(
+    _: *anyopaque,
+    renderer: Renderer,
+    output: []gbm.FormatModifier,
+) !usize {
+    const self: *RealRenderer = @ptrCast(@alignCast(renderer));
+    const candidates = [_]struct {
+        fourcc: u32,
+        format: render.PixelFormat,
+        vk_format: c.VkFormat,
+    }{
+        .{ .fourcc = c.DRM_FORMAT_ARGB8888, .format = .argb8888_premultiplied, .vk_format = c.VK_FORMAT_B8G8R8A8_UNORM },
+        .{ .fourcc = c.DRM_FORMAT_XRGB8888, .format = .xrgb8888, .vk_format = c.VK_FORMAT_B8G8R8A8_UNORM },
+        .{ .fourcc = c.DRM_FORMAT_ABGR8888, .format = .argb8888_premultiplied, .vk_format = c.VK_FORMAT_R8G8B8A8_UNORM },
+        .{ .fourcc = c.DRM_FORMAT_XBGR8888, .format = .xrgb8888, .vk_format = c.VK_FORMAT_R8G8B8A8_UNORM },
+    };
+    var count: usize = 0;
+    for (candidates) |candidate| {
+        var modifier_list: c.VkDrmFormatModifierPropertiesListEXT = .{
+            .sType = c.VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT,
+            .pNext = null,
+            .drmFormatModifierCount = 0,
+            .pDrmFormatModifierProperties = null,
+        };
+        var properties: c.VkFormatProperties2 = .{
+            .sType = c.VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
+            .pNext = &modifier_list,
+            .formatProperties = undefined,
+        };
+        c.vkGetPhysicalDeviceFormatProperties2(self.physical_device, candidate.vk_format, &properties);
+        if (modifier_list.drmFormatModifierCount == 0 or
+            modifier_list.drmFormatModifierCount > 64) continue;
+        var modifiers: [64]c.VkDrmFormatModifierPropertiesEXT = undefined;
+        modifier_list.pDrmFormatModifierProperties = &modifiers;
+        c.vkGetPhysicalDeviceFormatProperties2(self.physical_device, candidate.vk_format, &properties);
+        for (modifiers[0..modifier_list.drmFormatModifierCount]) |modifier| {
+            if (modifier.drmFormatModifierPlaneCount != 1 or
+                modifier.drmFormatModifierTilingFeatures & c.VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT == 0)
+                continue;
+            const source: render.ExternalSource = .{
+                .context = self,
+                .token = 0,
+                .alive_fn = validationSourceAlive,
+                .drm_format = candidate.fourcc,
+                .modifier = modifier.drmFormatModifier,
+                .plane_count = 1,
+                .fds = .{ 0, -1, -1, -1 },
+                .strides = .{ 4, 0, 0, 0 },
+                .offsets = .{ 0, 0, 0, 0 },
+            };
+            requireExternalSampling(self, source, .{ .width = 1, .height = 1 }, candidate.format) catch
+                continue;
+            if (count == output.len) return error.OutputTooSmall;
+            output[count] = .{ .fourcc = candidate.fourcc, .modifier = modifier.drmFormatModifier };
+            count += 1;
+        }
+    }
+    return count;
 }
 
 fn validationSourceAlive(_: *anyopaque, _: u64) bool {

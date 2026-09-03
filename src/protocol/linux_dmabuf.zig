@@ -22,6 +22,18 @@ pub const drm_format_xbgr8888: u32 = fourcc('X', 'B', '2', '4');
 pub const modifier_linear: u64 = 0;
 pub const modifier_invalid: u64 = (@as(u64, 1) << 56) - 1;
 
+pub const Format = struct {
+    fourcc: u32,
+    modifier: u64,
+};
+
+pub const default_formats = [_]Format{
+    .{ .fourcc = drm_format_argb8888, .modifier = modifier_linear },
+    .{ .fourcc = drm_format_xrgb8888, .modifier = modifier_linear },
+    .{ .fourcc = drm_format_abgr8888, .modifier = modifier_linear },
+    .{ .fourcc = drm_format_xbgr8888, .modifier = modifier_linear },
+};
+
 pub const Error = error{
     InvalidConfig,
     Exhausted,
@@ -38,9 +50,12 @@ pub const Error = error{
 pub const Config = struct {
     global_version: u32 = 6,
     feedback_slots: u32 = 8,
+    formats: []const Format = &default_formats,
 
     fn validate(config: Config) Error!void {
-        if (config.global_version == 0 or config.global_version > 6 or config.feedback_slots == 0)
+        if (config.global_version == 0 or config.global_version > 6 or
+            config.feedback_slots == 0 or config.formats.len == 0 or
+            config.formats.len > std.math.maxInt(u16))
             return error.InvalidConfig;
     }
 };
@@ -195,24 +210,22 @@ pub const Store = struct {
         const plane = params.planes[0] orelse return error.Incomplete;
         for (params.planes[1..]) |candidate| if (candidate != null)
             return error.Incomplete;
-        if (plane.modifier != modifier_linear and plane.modifier != modifier_invalid) {
-            std.log.warn(
-                "rejecting DMA-BUF modifier {x:0>16} for format {x:0>8}, size {d}x{d}",
-                .{ plane.modifier, format, width, height },
-            );
-            return error.InvalidFormat;
+        // Linear layout has a portable byte-bound check. Modifier-specific
+        // layouts are admitted to the renderer validator, which queries the
+        // exact Vulkan import contract before the wl_buffer becomes usable.
+        if (plane.modifier == modifier_linear or plane.modifier == modifier_invalid) {
+            const row_bytes = std.math.mul(u32, @intCast(width), 4) catch
+                return error.OutOfBounds;
+            if (plane.stride < row_bytes) return error.OutOfBounds;
+            const plane_bytes = std.math.mul(u64, plane.stride, @as(u32, @intCast(height))) catch
+                return error.OutOfBounds;
+            const required_bytes = std.math.add(u64, plane.offset, plane_bytes) catch
+                return error.OutOfBounds;
+            var descriptor = std.mem.zeroes(linux.Statx);
+            const status = linux.statx(plane.fd, "", linux.AT.EMPTY_PATH, .{ .SIZE = true }, &descriptor);
+            if (linux.errno(status) != .SUCCESS or !descriptor.mask.SIZE or required_bytes > descriptor.size)
+                return error.OutOfBounds;
         }
-        const row_bytes = std.math.mul(u32, @intCast(width), 4) catch
-            return error.OutOfBounds;
-        if (plane.stride < row_bytes) return error.OutOfBounds;
-        const plane_bytes = std.math.mul(u64, plane.stride, @as(u32, @intCast(height))) catch
-            return error.OutOfBounds;
-        const required_bytes = std.math.add(u64, plane.offset, plane_bytes) catch
-            return error.OutOfBounds;
-        var descriptor = std.mem.zeroes(linux.Statx);
-        const status = linux.statx(plane.fd, "", linux.AT.EMPTY_PATH, .{ .SIZE = true }, &descriptor);
-        if (linux.errno(status) != .SUCCESS or !descriptor.mask.SIZE or required_bytes > descriptor.size)
-            return error.OutOfBounds;
         const slot = try acquireStoreSlot(BufferSlot, store.allocator, &store.buffers, &store.buffers_free);
         const index = slot.index;
         slot.* = .{
@@ -363,17 +376,6 @@ pub fn Adapter(comptime protocol: type) type {
             padding: u32 = 0,
             modifier: u64,
         };
-        // Keep the legacy events and v4 feedback table aligned with the
-        // renderer import contract. Implicit modifiers are accepted for
-        // validation but are not advertised until a renderer can import them.
-        const format_entries = [_]FormatEntry{
-            .{ .format = drm_format_argb8888, .modifier = modifier_linear },
-            .{ .format = drm_format_xrgb8888, .modifier = modifier_linear },
-            .{ .format = drm_format_abgr8888, .modifier = modifier_linear },
-            .{ .format = drm_format_xbgr8888, .modifier = modifier_linear },
-        };
-        const format_indices = std.mem.asBytes(&[_]u16{ 0, 1, 2, 3 }).*;
-
         allocator: std.mem.Allocator,
         runtime: ?*Runtime = null,
         global: ?objects.Handle = null,
@@ -384,6 +386,8 @@ pub fn Adapter(comptime protocol: type) type {
         buffers: slot_pool.Pool(BufferResource),
         feedback: slot_pool.Pool(FeedbackResource),
         feedback_limit: u32,
+        format_entries: []FormatEntry,
+        format_indices: []u16,
         format_table_fd: linux.fd_t,
         device: [@sizeOf(linux.dev_t)]u8 = undefined,
         import_validator: ?ImportValidator = null,
@@ -402,7 +406,15 @@ pub fn Adapter(comptime protocol: type) type {
             errdefer buffers.deinit();
             var feedback = try slot_pool.Pool(FeedbackResource).init(allocator, config.feedback_slots);
             errdefer feedback.deinit();
-            const table_fd = try createFormatTable();
+            const format_entries = try allocator.alloc(FormatEntry, config.formats.len);
+            errdefer allocator.free(format_entries);
+            const format_indices = try allocator.alloc(u16, config.formats.len);
+            errdefer allocator.free(format_indices);
+            for (config.formats, format_entries, format_indices, 0..) |format, *entry, *index, i| {
+                entry.* = .{ .format = format.fourcc, .modifier = format.modifier };
+                index.* = @intCast(i);
+            }
+            const table_fd = try createFormatTable(format_entries);
             errdefer _ = linux.close(table_fd);
             return .{
                 .allocator = allocator,
@@ -413,12 +425,16 @@ pub fn Adapter(comptime protocol: type) type {
                 .buffers = buffers,
                 .feedback = feedback,
                 .feedback_limit = config.feedback_slots,
+                .format_entries = format_entries,
+                .format_indices = format_indices,
                 .format_table_fd = table_fd,
             };
         }
 
         pub fn deinit(adapter: *Self) void {
             _ = linux.close(adapter.format_table_fd);
+            adapter.allocator.free(adapter.format_indices);
+            adapter.allocator.free(adapter.format_entries);
             adapter.store.deinit();
             adapter.feedback.deinit();
             adapter.buffers.deinit();
@@ -442,6 +458,30 @@ pub fn Adapter(comptime protocol: type) type {
             return global;
         }
 
+        /// Replaces the immutable advertisement snapshot before the global is
+        /// visible. Existing feedback tables must never change underneath
+        /// clients, so renderer capability discovery has one pre-install hook.
+        pub fn setFormats(adapter: *Self, formats: []const Format) !void {
+            if (adapter.runtime != null) return error.AlreadyInstalled;
+            if (formats.len == 0 or formats.len > std.math.maxInt(u16))
+                return error.InvalidConfig;
+            const entries = try adapter.allocator.alloc(FormatEntry, formats.len);
+            errdefer adapter.allocator.free(entries);
+            const indices = try adapter.allocator.alloc(u16, formats.len);
+            errdefer adapter.allocator.free(indices);
+            for (formats, entries, indices, 0..) |format, *entry, *index, i| {
+                entry.* = .{ .format = format.fourcc, .modifier = format.modifier };
+                index.* = @intCast(i);
+            }
+            const table_fd = try createFormatTable(entries);
+            _ = linux.close(adapter.format_table_fd);
+            adapter.allocator.free(adapter.format_indices);
+            adapter.allocator.free(adapter.format_entries);
+            adapter.format_entries = entries;
+            adapter.format_indices = indices;
+            adapter.format_table_fd = table_fd;
+        }
+
         pub fn setImportValidator(adapter: *Self, validator: ?ImportValidator) void {
             adapter.import_validator = validator;
         }
@@ -453,8 +493,8 @@ pub fn Adapter(comptime protocol: type) type {
             slot.header.resource = binding.resource;
             slot.peer = binding.peer;
             slot.version = binding.version;
-            slot.advertisement = if (binding.version >= 4) @intCast(format_entries.len) else 0;
-            if (slot.advertisement < format_entries.len) adapter.pending_len += 1;
+            slot.advertisement = if (binding.version >= 4) @intCast(adapter.format_entries.len) else 0;
+            if (slot.advertisement < adapter.format_entries.len) adapter.pending_len += 1;
             return slot;
         }
 
@@ -693,9 +733,9 @@ pub fn Adapter(comptime protocol: type) type {
             if (adapter.pending_len == 0) return completed;
             for (adapter.managers.entries.items) |manager| {
                 if (!manager.header.active or !samePeer(manager.peer, peer)) continue;
-                if (manager.advertisement >= format_entries.len) continue;
-                while (manager.advertisement < format_entries.len) {
-                    const entry = format_entries[manager.advertisement];
+                if (manager.advertisement >= adapter.format_entries.len) continue;
+                while (manager.advertisement < adapter.format_entries.len) {
+                    const entry = adapter.format_entries[manager.advertisement];
                     const format = entry.format;
                     const modifier = entry.modifier;
                     var emitted = true;
@@ -708,7 +748,10 @@ pub fn Adapter(comptime protocol: type) type {
                             error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return completed,
                             else => return err,
                         };
-                    } else if (manager.advertisement % 2 == 0) {
+                    } else if (firstFormatOccurrence(
+                        adapter.format_entries,
+                        manager.advertisement,
+                    )) {
                         Dmabuf.encodeEvent(queue, manager.header.resource.id, .{ .format = .{
                             .format = format,
                         } }) catch |err| switch (err) {
@@ -772,7 +815,7 @@ pub fn Adapter(comptime protocol: type) type {
                             const duplicated = linux.fcntl(adapter.format_table_fd, linux.F.DUPFD_CLOEXEC, 0);
                             if (linux.errno(duplicated) != .SUCCESS) return error.SystemCallFailed;
                             const fd: linux.fd_t = @intCast(duplicated);
-                            Feedback.encodeEvent(queue, slot.header.resource.id, .{ .format_table = .{ .fd = fd, .size = @sizeOf(@TypeOf(format_entries)) } }) catch |err| {
+                            Feedback.encodeEvent(queue, slot.header.resource.id, .{ .format_table = .{ .fd = fd, .size = @intCast(std.mem.sliceAsBytes(adapter.format_entries).len) } }) catch |err| {
                                 _ = linux.close(fd);
                                 switch (err) {
                                     error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return completed,
@@ -785,7 +828,7 @@ pub fn Adapter(comptime protocol: type) type {
                         },
                         1 => .{ .tranche_target_device = .{ .device = &adapter.device } },
                         2 => .{ .tranche_flags = .{ .flags = Feedback.tranche_flags.sampling } },
-                        3 => .{ .tranche_formats = .{ .indices = &format_indices } },
+                        3 => .{ .tranche_formats = .{ .indices = std.mem.sliceAsBytes(adapter.format_indices) } },
                         4 => .{ .tranche_done = .{} },
                         5 => .{ .done = .{} },
                         else => unreachable,
@@ -794,7 +837,7 @@ pub fn Adapter(comptime protocol: type) type {
                             const duplicated = linux.fcntl(adapter.format_table_fd, linux.F.DUPFD_CLOEXEC, 0);
                             if (linux.errno(duplicated) != .SUCCESS) return error.SystemCallFailed;
                             const fd: linux.fd_t = @intCast(duplicated);
-                            Feedback.encodeEvent(queue, slot.header.resource.id, .{ .format_table = .{ .fd = fd, .size = @sizeOf(@TypeOf(format_entries)) } }) catch |err| {
+                            Feedback.encodeEvent(queue, slot.header.resource.id, .{ .format_table = .{ .fd = fd, .size = @intCast(std.mem.sliceAsBytes(adapter.format_entries).len) } }) catch |err| {
                                 _ = linux.close(fd);
                                 switch (err) {
                                     error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return completed,
@@ -808,7 +851,7 @@ pub fn Adapter(comptime protocol: type) type {
                         1 => .{ .main_device = .{ .device = &adapter.device } },
                         2 => .{ .tranche_target_device = .{ .device = &adapter.device } },
                         3 => .{ .tranche_flags = .{ .flags = .{ .value = 0 } } },
-                        4 => .{ .tranche_formats = .{ .indices = &format_indices } },
+                        4 => .{ .tranche_formats = .{ .indices = std.mem.sliceAsBytes(adapter.format_indices) } },
                         5 => .{ .tranche_done = .{} },
                         6 => .{ .done = .{} },
                         else => unreachable,
@@ -825,11 +868,17 @@ pub fn Adapter(comptime protocol: type) type {
             return completed;
         }
 
+        fn firstFormatOccurrence(entries: []const FormatEntry, index: usize) bool {
+            for (entries[0..index]) |entry|
+                if (entry.format == entries[index].format) return false;
+            return true;
+        }
+
         pub fn pendingOutbound(adapter: *const Self, peer: wayring.io_uring.Peer) bool {
             if (adapter.pending_len == 0) return false;
             for (adapter.managers.entries.items) |slot|
                 if (slot.header.active and samePeer(slot.peer, peer) and
-                    slot.advertisement < format_entries.len)
+                    slot.advertisement < adapter.format_entries.len)
                     return true;
             for (adapter.params.entries.items) |slot|
                 if (slot.header.active and samePeer(slot.peer, peer) and slot.pending != .none)
@@ -911,7 +960,7 @@ pub fn Adapter(comptime protocol: type) type {
             if (object.interface == &Dmabuf.info) {
                 const slot = adapter.managers.fromContext(object.context) orelse return false;
                 if (!std.meta.eql(slot.header.resource, handle)) return false;
-                if (slot.advertisement < format_entries.len) adapter.pending_len -= 1;
+                if (slot.advertisement < adapter.format_entries.len) adapter.pending_len -= 1;
                 adapter.managers.release(slot);
                 return true;
             }
@@ -996,7 +1045,7 @@ pub fn Adapter(comptime protocol: type) type {
             return if (version >= 6) 6 else 7;
         }
 
-        fn createFormatTable() !linux.fd_t {
+        fn createFormatTable(format_entries: []const FormatEntry) !linux.fd_t {
             const result = linux.memfd_create(
                 "ouro-dmabuf-formats",
                 linux.MFD.CLOEXEC | linux.MFD.ALLOW_SEALING,
@@ -1004,7 +1053,7 @@ pub fn Adapter(comptime protocol: type) type {
             if (linux.errno(result) != .SUCCESS) return error.SystemCallFailed;
             const fd: linux.fd_t = @intCast(result);
             errdefer _ = linux.close(fd);
-            const bytes = std.mem.asBytes(&format_entries);
+            const bytes = std.mem.sliceAsBytes(format_entries);
             var offset: usize = 0;
             while (offset < bytes.len) {
                 const written = linux.write(fd, bytes.ptr + offset, bytes.len - offset);
@@ -1110,6 +1159,18 @@ test "linux-dmabuf: generated wire adapter is complete" {
     std.testing.refAllDecls(TestAdapter);
     var adapter = try TestAdapter.init(std.testing.allocator, .{});
     adapter.deinit();
+}
+
+test "linux-dmabuf: legacy advertisement deduplicates dynamic modifiers" {
+    const TestAdapter = Adapter(@import("core_protocol"));
+    const entries = [_]TestAdapter.FormatEntry{
+        .{ .format = drm_format_argb8888, .modifier = modifier_linear },
+        .{ .format = drm_format_argb8888, .modifier = 7 },
+        .{ .format = drm_format_xrgb8888, .modifier = 9 },
+    };
+    try std.testing.expect(TestAdapter.firstFormatOccurrence(&entries, 0));
+    try std.testing.expect(!TestAdapter.firstFormatOccurrence(&entries, 1));
+    try std.testing.expect(TestAdapter.firstFormatOccurrence(&entries, 2));
 }
 
 test "linux-dmabuf: sampling device gates renderer import" {
@@ -1223,7 +1284,7 @@ test "linux-dmabuf: legacy advertisements survive transmit backpressure" {
     var output = wayring.tx.Queue.init(&blocks, 512, &descriptors, 0);
     defer output.deinit();
     try std.testing.expectEqual(
-        TestAdapter.format_entries.len,
+        adapter.format_entries.len,
         try adapter.flushOn(peer, &server_objects, &output),
     );
     try std.testing.expect(!adapter.pendingOutbound(peer));
@@ -1255,8 +1316,14 @@ test "linux-dmabuf: legacy advertisements survive transmit backpressure" {
 test "linux-dmabuf: version 6 feedback resumes with sampling tranche and no main device" {
     const protocol = @import("core_protocol");
     const TestAdapter = Adapter(protocol);
+    const formats = [_]Format{
+        .{ .fourcc = drm_format_argb8888, .modifier = modifier_linear },
+        .{ .fourcc = drm_format_argb8888, .modifier = 7 },
+        .{ .fourcc = drm_format_xrgb8888, .modifier = 9 },
+    };
     var adapter = try TestAdapter.init(std.testing.allocator, .{ .feedback_slots = 1 });
     defer adapter.deinit();
+    try adapter.setFormats(&formats);
     const device: linux.dev_t = 0x1234;
     @memcpy(&adapter.device, std.mem.asBytes(&device));
     var server_objects = try wayring.objects.ServerObjects.init(
@@ -1316,14 +1383,16 @@ test "linux-dmabuf: version 6 feedback resumes with sampling tranche and no main
         const event = try protocol.zwp_linux_dmabuf_feedback_v1.decodeEvent(message, &fds);
         try std.testing.expectEqual(tag, std.meta.activeTag(event));
         if (index == 0) {
+            const table_bytes = std.mem.sliceAsBytes(adapter.format_entries);
             try std.testing.expectEqual(
-                @as(u32, @sizeOf(@TypeOf(TestAdapter.format_entries))),
+                @as(u32, @intCast(table_bytes.len)),
                 event.format_table.size,
             );
-            var table: [@sizeOf(@TypeOf(TestAdapter.format_entries))]u8 = undefined;
-            const read = linux.pread(event.format_table.fd, &table, table.len, 0);
+            const table = try std.testing.allocator.alloc(u8, table_bytes.len);
+            defer std.testing.allocator.free(table);
+            const read = linux.pread(event.format_table.fd, table.ptr, table.len, 0);
             try std.testing.expectEqual(table.len, read);
-            try std.testing.expectEqualSlices(u8, std.mem.asBytes(&TestAdapter.format_entries), &table);
+            try std.testing.expectEqualSlices(u8, table_bytes, table);
             _ = linux.close(event.format_table.fd);
         } else if (index == 1) {
             try std.testing.expectEqualSlices(u8, std.mem.asBytes(&device), event.tranche_target_device.device);
@@ -1333,7 +1402,11 @@ test "linux-dmabuf: version 6 feedback resumes with sampling tranche and no main
                 event.tranche_flags.flags.value,
             );
         } else if (index == 3) {
-            try std.testing.expectEqualSlices(u8, &TestAdapter.format_indices, event.tranche_formats.indices);
+            try std.testing.expectEqualSlices(
+                u8,
+                std.mem.sliceAsBytes(adapter.format_indices),
+                event.tranche_formats.indices,
+            );
         }
         bytes = bytes[message.header.size..];
     }
@@ -1352,7 +1425,7 @@ test "linux-dmabuf: version 6 feedback resumes with sampling tranche and no main
     var later_output = wayring.tx.Queue.init(&blocks, 512, &descriptors, 0);
     defer later_output.deinit();
     try std.testing.expectEqual(
-        TestAdapter.format_entries.len,
+        adapter.format_entries.len,
         try adapter.flushOn(peer, &server_objects, &later_output),
     );
     try std.testing.expectEqual(@as(usize, 0), adapter.pending_len);
@@ -1553,4 +1626,17 @@ test "linux-dmabuf: buffer extent includes offset and final row" {
     try store.destroyParams(exact);
     try store.destroyBuffer(buffer);
     try expectClosed(exact_fd);
+}
+
+test "linux-dmabuf: modifier-specific layout validation is renderer-owned" {
+    var store = try Store.init(std.testing.allocator, .{});
+    defer store.deinit();
+    const params = try store.createParams();
+    const fd = try sizedFd(1);
+    try store.addPlane(params, fd, 0, 0, 1, 7);
+    const buffer = try store.createBuffer(params, 64, 32, drm_format_xrgb8888, 0);
+    try std.testing.expectEqual(@as(u64, 7), (try store.buffer(buffer)).planes[0].?.modifier);
+    try store.destroyParams(params);
+    try store.destroyBuffer(buffer);
+    try expectClosed(fd);
 }

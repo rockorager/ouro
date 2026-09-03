@@ -17,6 +17,11 @@ pub const format_argb8888: u32 = fourcc('A', 'R', '2', '4');
 pub const format_xbgr8888: u32 = fourcc('X', 'B', '2', '4');
 pub const format_abgr8888: u32 = fourcc('A', 'B', '2', '4');
 
+pub const FormatModifier = struct {
+    fourcc: u32,
+    modifier: u64,
+};
+
 fn fourcc(a: u8, b: u8, value_c: u8, d: u8) u32 {
     return @as(u32, a) | (@as(u32, b) << 8) | (@as(u32, value_c) << 16) |
         (@as(u32, d) << 24);
