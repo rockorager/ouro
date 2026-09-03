@@ -36,6 +36,9 @@ pub const Description = struct {
     reference_luminance: f32 = 80,
     min_luminance: f32 = 0.2,
     max_luminance: f32 = 80,
+    mastering_primaries: ?Primaries = null,
+    mastering_min_luminance: ?f32 = null,
+    mastering_max_luminance: ?f32 = null,
     target_max_cll: ?u32 = null,
     target_max_fall: ?u32 = null,
     /// Optional compositor-owned ICC transform. The immutable LUT and its
@@ -52,17 +55,21 @@ pub const Description = struct {
         .transfer = .srgb,
     };
 
+    pub fn targetPrimaries(value: Description) Primaries {
+        return value.mastering_primaries orelse value.primaries;
+    }
+
+    pub fn targetMinLuminance(value: Description) f32 {
+        return value.mastering_min_luminance orelse value.min_luminance;
+    }
+
+    pub fn targetMaxLuminance(value: Description) f32 {
+        return value.mastering_max_luminance orelse value.max_luminance;
+    }
+
     pub fn validate(value: Description) !void {
-        inline for (.{
-            value.primaries.red,
-            value.primaries.green,
-            value.primaries.blue,
-            value.primaries.white,
-        }) |point| {
-            if (!std.math.isFinite(point.x) or !std.math.isFinite(point.y) or
-                point.x <= 0 or point.y <= 0 or point.x + point.y > 1)
-                return error.InvalidColorDescription;
-        }
+        try validatePrimaries(value.primaries);
+        if (value.mastering_primaries) |primaries| try validatePrimaries(primaries);
         if (!std.math.isFinite(value.reference_luminance) or
             !std.math.isFinite(value.min_luminance) or
             !std.math.isFinite(value.max_luminance) or
@@ -70,10 +77,26 @@ pub const Description = struct {
             value.max_luminance < value.reference_luminance or
             value.min_luminance >= value.max_luminance)
             return error.InvalidColorDescription;
+        if ((value.mastering_min_luminance == null) != (value.mastering_max_luminance == null))
+            return error.InvalidColorDescription;
+        if (value.mastering_min_luminance) |min_luminance| {
+            const max_luminance = value.mastering_max_luminance.?;
+            if (!std.math.isFinite(min_luminance) or !std.math.isFinite(max_luminance) or
+                min_luminance < 0 or min_luminance >= max_luminance)
+                return error.InvalidColorDescription;
+        }
         if (value.target_max_cll != null and value.target_max_fall != null and
             value.target_max_fall.? > value.target_max_cll.?)
             return error.InvalidColorDescription;
-        _ = try rgbToXyz(value.primaries);
+    }
+
+    fn validatePrimaries(primaries: Primaries) !void {
+        inline for (.{ primaries.red, primaries.green, primaries.blue, primaries.white }) |point| {
+            if (!std.math.isFinite(point.x) or !std.math.isFinite(point.y) or
+                point.x <= 0 or point.y <= 0 or point.x + point.y > 1)
+                return error.InvalidColorDescription;
+        }
+        _ = try rgbToXyz(primaries);
     }
 };
 

@@ -429,7 +429,25 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                         return try self.creatorError(actor, decoded.handle.id, Creator.@"error".already_set.value, "max_fall already set");
                     creator.description.target_max_fall = v.max_fall;
                 },
-                .set_tf_power, .set_mastering_display_primaries, .set_mastering_luminance => return try self.creatorError(actor, decoded.handle.id, Creator.@"error".unsupported_feature.value, "unsupported feature"),
+                .set_mastering_display_primaries => |v| {
+                    if (creator.description.mastering_primaries != null)
+                        return try self.creatorError(actor, decoded.handle.id, Creator.@"error".already_set.value, "mastering primaries already set");
+                    creator.description.mastering_primaries = .{
+                        .red = point(v.r_x, v.r_y),
+                        .green = point(v.g_x, v.g_y),
+                        .blue = point(v.b_x, v.b_y),
+                        .white = point(v.w_x, v.w_y),
+                    };
+                },
+                .set_mastering_luminance => |v| {
+                    if (creator.description.mastering_min_luminance != null)
+                        return try self.creatorError(actor, decoded.handle.id, Creator.@"error".already_set.value, "mastering luminance already set");
+                    if (@as(u64, v.max_lum) * 10_000 <= v.min_lum)
+                        return try self.creatorError(actor, decoded.handle.id, Creator.@"error".invalid_luminance.value, "invalid mastering luminance range");
+                    creator.description.mastering_min_luminance = @as(f32, @floatFromInt(v.min_lum)) / 10_000;
+                    creator.description.mastering_max_luminance = @floatFromInt(v.max_lum);
+                },
+                .set_tf_power => return try self.creatorError(actor, decoded.handle.id, Creator.@"error".unsupported_feature.value, "unsupported feature"),
                 .create => |v| {
                     if (!creator.tf_set or !creator.primaries_set) return try self.creatorError(actor, decoded.handle.id, Creator.@"error".incomplete_set.value, "incomplete image description");
                     if (creator.version == 1 and !versionOneTargetLuminanceValid(creator.description))
@@ -637,10 +655,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                                 .max_lum = @intFromFloat(r.description.max_luminance),
                                 .reference_lum = @intFromFloat(r.description.reference_luminance),
                             } },
-                            3 => .{ .target_primaries = infoTargetPrimaries(r.description.primaries) },
+                            3 => .{ .target_primaries = infoTargetPrimaries(r.description.targetPrimaries()) },
                             4 => .{ .target_luminance = .{
-                                .min_lum = @intFromFloat(r.description.min_luminance * 10_000),
-                                .max_lum = @intFromFloat(r.description.max_luminance),
+                                .min_lum = @intFromFloat(r.description.targetMinLuminance() * 10_000),
+                                .max_lum = @intFromFloat(r.description.targetMaxLuminance()),
                             } },
                             5 => if (r.description.target_max_cll) |value|
                                 .{ .target_max_cll = .{ .max_cll = value } }
@@ -817,6 +835,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             .{ .supported_feature = .{ .feature = Manager.feature.parametric } },
             .{ .supported_feature = .{ .feature = Manager.feature.set_primaries } },
             .{ .supported_feature = .{ .feature = Manager.feature.set_luminances } },
+            .{ .supported_feature = .{ .feature = Manager.feature.set_mastering_display_primaries } },
             .{ .supported_feature = .{ .feature = Manager.feature.icc_v2_v4 } },
             .{ .supported_primaries_named = .{ .primaries = Manager.primaries.srgb } },
             .{ .supported_primaries_named = .{ .primaries = Manager.primaries.display_p3 } },
@@ -831,7 +850,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         };
 
         fn capability(version: u32, index: usize) Manager.Event {
-            if (index == 8) return .{ .supported_tf_named = .{ .tf = if (version >= 2)
+            if (index == 9) return .{ .supported_tf_named = .{ .tf = if (version >= 2)
                 Manager.transfer_function.compound_power_2_4
             else
                 Manager.transfer_function.srgb } };
@@ -922,10 +941,22 @@ fn descriptionIdentity(description: color.Description) u64 {
         @bitCast(description.reference_luminance),
         @bitCast(description.min_luminance),
         @bitCast(description.max_luminance),
+        @bitCast(if (description.mastering_primaries) |p| p.red.x else @as(f32, 0)),
+        @bitCast(if (description.mastering_primaries) |p| p.red.y else @as(f32, 0)),
+        @bitCast(if (description.mastering_primaries) |p| p.green.x else @as(f32, 0)),
+        @bitCast(if (description.mastering_primaries) |p| p.green.y else @as(f32, 0)),
+        @bitCast(if (description.mastering_primaries) |p| p.blue.x else @as(f32, 0)),
+        @bitCast(if (description.mastering_primaries) |p| p.blue.y else @as(f32, 0)),
+        @bitCast(if (description.mastering_primaries) |p| p.white.x else @as(f32, 0)),
+        @bitCast(if (description.mastering_primaries) |p| p.white.y else @as(f32, 0)),
+        @bitCast(description.mastering_min_luminance orelse 0),
+        @bitCast(description.mastering_max_luminance orelse 0),
         description.target_max_cll orelse 0,
         description.target_max_fall orelse 0,
-        @intFromBool(description.target_max_cll != null) |
-            (@as(u32, @intFromBool(description.target_max_fall != null)) << 1),
+        @intFromBool(description.mastering_primaries != null) |
+            (@as(u32, @intFromBool(description.mastering_min_luminance != null)) << 1) |
+            (@as(u32, @intFromBool(description.target_max_cll != null)) << 2) |
+            (@as(u32, @intFromBool(description.target_max_fall != null)) << 3),
     };
     var identity = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(&values));
     if (description.lut) |lut| identity = std.hash.Wyhash.hash(identity, &lut.profile_hash);
@@ -933,11 +964,12 @@ fn descriptionIdentity(description: color.Description) u64 {
 }
 
 fn versionOneTargetLuminanceValid(description: color.Description) bool {
+    const min_luminance = description.targetMinLuminance();
+    const max_luminance = description.targetMaxLuminance();
     inline for (.{ description.target_max_cll, description.target_max_fall }) |level| {
         if (level) |value| {
             const luminance: f32 = @floatFromInt(value);
-            if (luminance <= description.min_luminance or
-                luminance > description.max_luminance) return false;
+            if (luminance <= min_luminance or luminance > max_luminance) return false;
         }
     }
     return true;
@@ -1046,4 +1078,23 @@ test "content light metadata validation and identity are exact" {
     try std.testing.expect(
         descriptionIdentity(description) != descriptionIdentity(color.Description.srgb),
     );
+}
+
+test "mastering display metadata validation and identity are exact" {
+    var description = color.Description.srgb;
+    description.mastering_primaries = namedPrimaries(6).?;
+    description.mastering_min_luminance = 0.005;
+    description.mastering_max_luminance = 1_000;
+    description.target_max_cll = 1_000;
+    try description.validate();
+    try std.testing.expect(versionOneTargetLuminanceValid(description));
+    try std.testing.expectEqual(@as(f32, 0.005), description.targetMinLuminance());
+    try std.testing.expectEqual(@as(f32, 1_000), description.targetMaxLuminance());
+    try std.testing.expect(descriptionIdentity(description) != descriptionIdentity(color.Description.srgb));
+
+    description.target_max_cll = 1_001;
+    try std.testing.expect(!versionOneTargetLuminanceValid(description));
+    description.target_max_cll = null;
+    description.mastering_max_luminance = 0.005;
+    try std.testing.expectError(error.InvalidColorDescription, description.validate());
 }
