@@ -1909,6 +1909,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         }
 
         fn surfaceRemoved(adapter: *Self, id: SurfaceId) void {
+            adapter.discardCursorEvents(id);
             if (adapter.pointer_focus) |v| {
                 if (std.meta.eql(v.surface, id)) adapter.pointer_focus = null;
             }
@@ -1932,6 +1933,22 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     adapter.outbound_len -= 1;
                 }
             }
+        }
+
+        fn discardCursorEvents(adapter: *Self, surface: SurfaceId) void {
+            var retained: usize = 0;
+            for (0..adapter.event_len) |offset| {
+                const event = adapter.events[(adapter.event_head + offset) % adapter.events.len];
+                const removed = switch (event) {
+                    .cursor_requested => |request_value| request_value.surface != null and
+                        std.meta.eql(request_value.surface.?, surface),
+                    .pointer_grab_cancelled => false,
+                };
+                if (removed) continue;
+                adapter.events[(adapter.event_head + retained) % adapter.events.len] = event;
+                retained += 1;
+            }
+            adapter.event_len = retained;
         }
 
         fn capabilityPublicationCount(adapter: *const Self, old: u32, current: u32) usize {
@@ -3596,6 +3613,12 @@ test "seat: removed grab surface completes cancellation once" {
     } });
     clearTestOutbound(&adapter);
 
+    try adapter.publish(.{ .cursor_requested = .{
+        .client = client,
+        .serial = 17,
+        .surface = target.surface,
+        .hotspot = .{ .x = 2, .y = 3 },
+    } });
     adapter.surfaceRemoved(target.surface);
     try std.testing.expect(adapter.pointer_focus == null);
     try std.testing.expect(adapter.pointer_delivery == null);
