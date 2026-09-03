@@ -2129,7 +2129,7 @@ test "interaction: compositor bindings consume exact press and release pairs" {
     try std.testing.expectEqual(@as(usize, 0), desktop.maximized_count);
     try std.testing.expectEqual(@as(usize, 0), desktop.floating_count);
 
-    inline for (.{ .{ key_j, .focus_next }, .{ key_k, .focus_previous } }) |case| {
+    inline for (.{ .{ key_j, .focus_down }, .{ key_k, .focus_up } }) |case| {
         try interaction.consume(&desktop, &surfaces, .{ .keyboard_key = .{
             .device = device_a,
             .time_usec = 4,
@@ -2158,7 +2158,7 @@ test "interaction: compositor bindings consume exact press and release pairs" {
         .key = key_left_shift,
         .pressed = true,
     } });
-    inline for (.{ .{ key_j, .move_next }, .{ key_k, .move_previous } }) |case| {
+    inline for (.{ .{ key_j, .move_down }, .{ key_k, .move_up } }) |case| {
         try interaction.consume(&desktop, &surfaces, .{ .keyboard_key = .{
             .device = device_a,
             .time_usec = 7,

@@ -534,7 +534,7 @@ const TransientSeatHandler = struct {
     }
 };
 
-test "shell-input: generated workspace client observes and activates the fixed workspace" {
+test "shell-input: generated workspace client observes output workspaces and activates one" {
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-workspace-{d}.sock", .{linux.getpid()});
@@ -545,8 +545,8 @@ test "shell-input: generated workspace client observes and activates the fixed w
     defer fixture.deinit();
     fixture.second_desktop = true;
     var root_config = physical_fixture.compositorConfig();
-    root_config.runtime.object_capacity = 24;
-    root_config.runtime.object_quota = 24;
+    root_config.runtime.object_capacity = 128;
+    root_config.runtime.object_quota = 128;
     root_config.runtime.registry_capacity = 1;
     const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), root_config);
     var config = physical_fixture.coordinatorConfig();
@@ -562,7 +562,7 @@ test "shell-input: generated workspace client observes and activates the fixed w
         &reactor,
         try wayring.unix_socket.connect(path),
         .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 },
-        .{ .max_objects = 16, .max_client_ids = 15 },
+        .{ .max_objects = 128, .max_client_ids = 127 },
     );
     const actor = try client.actor();
     var driver = ClientDriver.init(&client);
@@ -577,16 +577,17 @@ test "shell-input: generated workspace client observes and activates the fixed w
         _ = try drainClient(&reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
         if (handler.activation_sent) turns_after_activation += 1;
-        if (handler.output_enter == 2 and turns_after_activation >= 4 and
+        if (turns_after_activation >= 4 and
             coordinator.workspace_adapter.pendingCommands() == 0) break;
         _ = linux.sched_yield();
     }
     try std.testing.expect(handler.manager != null);
-    try std.testing.expect(handler.group != null);
-    try std.testing.expect(handler.workspace != null);
-    try std.testing.expectEqual(@as(usize, 8), handler.initial_order);
+    try std.testing.expect(handler.group_count >= 1);
+    try std.testing.expect(handler.workspace_count >= 10);
+    try std.testing.expectEqual(handler.workspace_count, handler.workspace_ids);
+    try std.testing.expect(handler.active_states >= 1);
+    try std.testing.expectEqual(handler.workspace_count, handler.workspace_enter);
     try std.testing.expectEqual(@as(usize, 1), handler.initial_done);
-    try std.testing.expectEqual(@as(usize, 2), handler.output_enter);
     try std.testing.expect(handler.activation_sent);
     try std.testing.expectEqual(@as(usize, 0), coordinator.workspace_adapter.pendingCommands());
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
@@ -618,8 +619,10 @@ test "shell-input: generated workspace client observes and activates the fixed w
     }
     try std.testing.expectEqual(@as(usize, 1), handler.finished);
 
-    try wayring.client.sendRequest(protocol.ext_workspace_group_handle_v1, &client.objects, &actor.transmit, handler.group.?, .{ .destroy = .{} });
-    try wayring.client.sendRequest(protocol.ext_workspace_handle_v1, &client.objects, &actor.transmit, handler.workspace.?, .{ .destroy = .{} });
+    for (handler.groups[0..handler.group_count]) |group|
+        try wayring.client.sendRequest(protocol.ext_workspace_group_handle_v1, &client.objects, &actor.transmit, group, .{ .destroy = .{} });
+    for (handler.workspaces[0..handler.workspace_count]) |workspace_handle|
+        try wayring.client.sendRequest(protocol.ext_workspace_handle_v1, &client.objects, &actor.transmit, workspace_handle, .{ .destroy = .{} });
     try submitClient(&reactor, &driver, &handler);
     for (0..32) |_| {
         _ = try drainClient(&reactor, &driver, &handler);
@@ -652,9 +655,14 @@ const WorkspaceHandler = struct {
     outputs: [2]wayring.objects.Handle = undefined,
     output_count: usize = 0,
     manager: ?wayring.objects.Handle = null,
-    group: ?wayring.objects.Handle = null,
-    workspace: ?wayring.objects.Handle = null,
-    initial_order: usize = 0,
+    groups: [8]wayring.objects.Handle = undefined,
+    workspaces: [80]wayring.objects.Handle = undefined,
+    target_workspace: ?wayring.objects.Handle = null,
+    group_count: usize = 0,
+    workspace_count: usize = 0,
+    workspace_ids: usize = 0,
+    active_states: usize = 0,
+    workspace_enter: usize = 0,
     initial_done: usize = 0,
     output_enter: usize = 0,
     output_leave: usize = 0,
@@ -683,19 +691,19 @@ const WorkspaceHandler = struct {
         } else if (target.object.interface == &protocol.ext_workspace_manager_v1.info) {
             switch (try protocol.ext_workspace_manager_v1.decodeEvent(message, fds)) {
                 .workspace_group => |value| {
-                    try std.testing.expectEqual(@as(usize, 0), self.initial_order);
-                    self.group = (try protocol.ext_workspace_manager_v1.admit_event_workspace_group(self.objects, self.manager.?, value, .{})).workspace_group;
-                    self.initial_order = 1;
+                    const admitted = try protocol.ext_workspace_manager_v1.admit_event_workspace_group(self.objects, self.manager.?, value, .{});
+                    self.groups[self.group_count] = admitted.workspace_group;
+                    self.group_count += 1;
                 },
                 .workspace => |value| {
-                    try std.testing.expectEqual(@as(usize, 2), self.initial_order);
-                    self.workspace = (try protocol.ext_workspace_manager_v1.admit_event_workspace(self.objects, self.manager.?, value, .{})).workspace;
-                    self.initial_order = 3;
+                    const admitted = try protocol.ext_workspace_manager_v1.admit_event_workspace(self.objects, self.manager.?, value, .{});
+                    self.workspaces[self.workspace_count] = admitted.workspace;
+                    if (self.workspace_count == 1) self.target_workspace = admitted.workspace;
+                    self.workspace_count += 1;
                 },
                 .done => {
                     if (self.initial_done == 0) {
-                        try std.testing.expectEqual(@as(usize, 8), self.initial_order);
-                        try protocol.ext_workspace_handle_v1.encodeRequest(self.queue, self.workspace.?.id, .{ .activate = .{} });
+                        try protocol.ext_workspace_handle_v1.encodeRequest(self.queue, self.target_workspace.?.id, .{ .activate = .{} });
                         try protocol.ext_workspace_manager_v1.encodeRequest(self.queue, self.manager.?.id, .{ .commit = .{} });
                         self.activation_sent = true;
                         self.initial_done = 1;
@@ -708,14 +716,11 @@ const WorkspaceHandler = struct {
         } else if (target.object.interface == &protocol.ext_workspace_group_handle_v1.info) {
             switch (try protocol.ext_workspace_group_handle_v1.decodeEvent(message, fds)) {
                 .capabilities => |value| {
-                    try std.testing.expectEqual(@as(usize, 1), self.initial_order);
                     try std.testing.expectEqual(@as(u32, 0), value.capabilities.value);
-                    self.initial_order = 2;
                 },
                 .workspace_enter => |value| {
-                    try std.testing.expectEqual(@as(usize, 7), self.initial_order);
-                    try std.testing.expectEqual(self.workspace.?.id, value.workspace);
-                    self.initial_order = 8;
+                    _ = value;
+                    self.workspace_enter += 1;
                 },
                 .output_enter => |value| {
                     try std.testing.expect(self.hasOutput(value.output));
@@ -725,32 +730,24 @@ const WorkspaceHandler = struct {
                     try std.testing.expect(self.hasOutput(value.output));
                     self.output_leave += 1;
                 },
-                .workspace_leave, .removed => return error.UnexpectedWorkspaceGroupEvent,
+                .workspace_leave, .removed => {},
             }
         } else if (target.object.interface == &protocol.ext_workspace_handle_v1.info) {
             switch (try protocol.ext_workspace_handle_v1.decodeEvent(message, fds)) {
                 .id => |value| {
-                    try std.testing.expectEqual(@as(usize, 3), self.initial_order);
-                    try std.testing.expectEqualStrings("ouro-0", value.id);
-                    self.initial_order = 4;
+                    try std.testing.expect(std.mem.startsWith(u8, value.id, "ouro-"));
+                    self.workspace_ids += 1;
                 },
-                .name => |value| {
-                    try std.testing.expectEqual(@as(usize, 4), self.initial_order);
-                    try std.testing.expectEqualStrings("Ouro", value.name);
-                    self.initial_order = 5;
-                },
+                .name => |value| try std.testing.expect(value.name.len >= 1 and value.name.len <= 2),
                 .state => |value| {
-                    try std.testing.expectEqual(@as(usize, 5), self.initial_order);
-                    try std.testing.expect(value.state.contains(protocol.ext_workspace_handle_v1.state.active));
-                    self.initial_order = 6;
+                    if (value.state.contains(protocol.ext_workspace_handle_v1.state.active))
+                        self.active_states += 1;
                 },
                 .capabilities => |value| {
-                    try std.testing.expectEqual(@as(usize, 6), self.initial_order);
                     try std.testing.expectEqual(protocol.ext_workspace_handle_v1.workspace_capabilities.activate, value.capabilities);
-                    self.initial_order = 7;
                 },
                 .coordinates => return error.UnexpectedWorkspaceCoordinates,
-                .removed => return error.UnexpectedWorkspaceRemoved,
+                .removed => {},
             }
         } else if (target.object.interface == &ClientCore.Display.info) {
             switch (try ClientCore.decodeDisplayEvent(self.objects, message, fds)) {

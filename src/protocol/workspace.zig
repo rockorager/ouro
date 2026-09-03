@@ -8,12 +8,12 @@ const none = std.math.maxInt(u32);
 pub const Config = struct {
     manager_capacity: usize = 8,
     group_handle_capacity: usize = 128,
-    workspace_handle_capacity: usize = 512,
+    workspace_handle_capacity: usize = 640,
     outbound_capacity: usize = 4096,
     command_capacity: usize = 16,
     string_capacity: usize = 256,
     inventory_group_capacity: usize = 8,
-    inventory_workspace_capacity: usize = 32,
+    inventory_workspace_capacity: usize = 80,
     inventory_membership_capacity: usize = 64,
     inventory_string_capacity: usize = 2048,
 

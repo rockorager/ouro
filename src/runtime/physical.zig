@@ -1086,6 +1086,9 @@ pub fn Coordinator(comptime protocol: type) type {
                 return error.InvalidConfig;
             if (config.workspace.inventory_membership_capacity < config.desktop.output_capacity)
                 return error.InvalidConfig;
+            if (config.workspace.inventory_group_capacity < config.desktop.output_capacity or
+                config.desktop.output_capacity > config.workspace.inventory_workspace_capacity / 10)
+                return error.InvalidConfig;
             if (config.interaction.output_capacity < config.desktop.output_capacity)
                 return error.InvalidConfig;
             const self = try allocator.create(Self);
@@ -2063,6 +2066,37 @@ pub fn Coordinator(comptime protocol: type) type {
                 .next => .next,
                 .previous => .previous,
             });
+        }
+
+        pub fn focusDirection(self: *Self, direction: enum { left, right, up, down }) !void {
+            try self.desktop.focusDirection(switch (direction) {
+                .left => .left,
+                .right => .right,
+                .up => .up,
+                .down => .down,
+            });
+        }
+
+        pub fn moveFocusedDirection(self: *Self, direction: enum { left, right, up, down }) !void {
+            try self.desktop.moveFocusedDirection(switch (direction) {
+                .left => .left,
+                .right => .right,
+                .up => .up,
+                .down => .down,
+            });
+        }
+
+        pub fn moveFocusedToOutput(self: *Self, reverse: bool) !void {
+            try self.desktop.moveFocusedToOutput(reverse);
+        }
+
+        pub fn switchWorkspace(self: *Self, number: u8) !void {
+            const output = self.pointerOutput() orelse return;
+            try self.desktop.switchWorkspace(output, number);
+        }
+
+        pub fn moveFocusedToWorkspace(self: *Self, number: u8) !void {
+            try self.desktop.moveFocusedToWorkspace(number);
         }
 
         pub fn toggleFocusedFullscreen(self: *Self) !void {
@@ -4089,6 +4123,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (pending_shell) |event| switch (event) {
                     .commit_ready => |commit| if (commit.initial_commit)
                         try self.applySessionRestore(commit.id),
+                    .toplevel_created => self.selectPointerSpawnOutput(),
                     else => {},
                 };
                 const destroyed_shell = if (pending_shell) |event| switch (event) {
@@ -4142,6 +4177,26 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.syncToplevelDrag();
             if (self.shell_adapter.pendingOutbound() != 0)
                 self.markProtocolAll(ProtocolReady.shell);
+        }
+
+        fn selectPointerSpawnOutput(self: *Self) void {
+            if (self.pointerOutput()) |output| self.desktop.setNextSpawnOutput(output);
+        }
+
+        fn pointerOutput(self: *Self) ?OutputId {
+            const pointer = self.interaction.pointerPosition();
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                if (!physical.connected or physical.kms_output == null) continue;
+                const bounds = self.outputBoundsFor(physical) catch continue;
+                const right = @as(i64, bounds.x) + bounds.width;
+                const bottom = @as(i64, bounds.y) + bounds.height;
+                if (pointer.x < bounds.x or pointer.y < bounds.y or
+                    pointer.x >= right or pointer.y >= bottom) continue;
+                return .{
+                    .value = @as(u64, physical.id.generation) << 32 | physical.id.index,
+                };
+            }
+            return null;
         }
 
         fn shellMaintenancePending(self: *Self) bool {
@@ -4704,7 +4759,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 writer.groups[0..writer.group_count],
                 writer.workspaces[0..writer.workspace_count],
             );
-            self.workspace_revision = revision;
+            self.workspace_revision = self.desktop.workspaceRevision();
         }
 
         fn syncWorkspace(self: *Self) !void {
@@ -11472,6 +11527,7 @@ pub fn Coordinator(comptime protocol: type) type {
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
                 if (physical.kms_output == null) continue;
                 if (count == self.desktop_output_topology.len) return error.Exhausted;
+                const bounds = try self.outputBoundsFor(physical);
                 self.desktop_output_topology[count] = .{
                     .id = .{
                         .value = @as(u64, physical.id.generation) << 32 | physical.id.index,
@@ -11480,6 +11536,7 @@ pub fn Coordinator(comptime protocol: type) type {
                         physical.protocol_output,
                         pending_surface,
                     ),
+                    .primary_area = @as(i64, bounds.width) * bounds.height,
                 };
                 count += 1;
             }

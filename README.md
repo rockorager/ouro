@@ -154,9 +154,17 @@ responsibilities:
 Built-in compositor keybindings use the Logo key: `Logo+Tab` focuses the next
 window, `Logo+Q` requests that the focused client close, `Logo+F` toggles
 fullscreen, `Logo+M` toggles maximized state, and `Logo+Space` toggles floating
-layout. `Logo+J/K` focuses forward/backward; adding Shift moves the focused
-tiled window in that direction. `Logo+Shift+E` exits Ouro and `Logo+Return`
-starts Monstar through a transient systemd user service. Matched key
+layout. `Logo+H/J/K/L` focuses left/down/up/right; adding Shift moves the
+focused tiled window in that direction. `Logo+Control+Shift+H/L` moves it to
+the previous/next output. Each output has ten independent workspaces;
+`Logo+1` through `Logo+0` select them on the output under the pointer, and
+adding Shift moves the focused window to that numbered workspace.
+`Logo+Shift+E` exits Ouro and `Logo+Return` starts
+Monstar through a transient systemd user service. New windows open on the
+output containing the pointer. The output with the largest logical area is
+primary (ties retain the current primary). If primary changes, windows from
+the former primary follow it without changing workspace number; windows from
+any disconnected secondary output also move to primary. Matched key
 press/release pairs are consumed before client seat delivery.
 
 ## Configuration
@@ -189,7 +197,11 @@ binding can be replaced or removed without copying the whole map, while
 Triggers are case-insensitive XKB keysym names plus any of `shift`, `control`
 (`ctrl`), `alt`, and `super` (`logo` or `mod4`). They follow the active layout,
 not physical evdev positions. Actions are exact JSON arrays: `focus-next`,
-`focus-previous`, `move-next`, `move-previous`, `close`, `toggle-fullscreen`,
+`focus-previous`, `focus-left`, `focus-right`, `focus-up`, `focus-down`,
+`move-next`, `move-previous`, `move-left`, `move-right`, `move-up`, `move-down`,
+`move-output-next`, `move-output-previous`, `switch-workspace` followed by a
+number from 1 through 10, `move-focused-to-workspace` followed by the same,
+`close`, `toggle-fullscreen`,
 `toggle-maximized`, `toggle-floating`, `exit`, or `run` followed by an argv.
 `run` never invokes a shell and delegates process ownership to
 `systemd-run --user`; Ouro does not supervise applications.
@@ -305,7 +317,7 @@ zig build test
 M3 composes the bounded shell, desktop, normalized input, seat, interaction,
 scene, and physical-output owners in one Coordinator event turn. An ordinary
 XDG client discovers the published globals, acknowledges its exact initial
-configure, maps unsealed SHM, enters the one-workspace tiled desktop, and
+configure, maps unsealed SHM, enters the tiled desktop, and
 receives generation-safe pointer motion, buttons, scrolling, and keyboard
 delivery. XDG popup surfaces are positioned and composed above their parent;
 explicit grabs retain pointer delivery outside client surfaces and publish

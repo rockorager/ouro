@@ -1,4 +1,4 @@
-//! Dynamically sized owner for one-workspace desktop policy.
+//! Dynamically sized owner for desktop policy.
 //!
 //! The shell adapter owns protocol resources and transmission. This owner
 //! stores only copied value IDs, consumes shell-neutral events, and retains configure
@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const geometry = @import("../scene/geometry.zig");
+const desktop_layout = @import("layout.zig");
 const desktop_policy = @import("policy.zig");
 pub const workspace = @import("workspace.zig");
 
@@ -42,7 +43,11 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
         };
 
         pub const OutputId = packed struct { value: u64 };
-        pub const OutputArea = struct { id: OutputId, geometry: geometry.Rect };
+        pub const OutputArea = struct {
+            id: OutputId,
+            geometry: geometry.Rect,
+            primary_area: i64 = 0,
+        };
 
         pub const Mode = enum { tiled, floating };
         pub const FocusSource = enum {
@@ -236,6 +241,7 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
                 return .{
                     .id = desktop.output_ids[index],
                     .geometry = desktop.output_areas[index],
+                    .primary_area = desktop.output_primary_areas[index],
                 };
             }
 
@@ -383,7 +389,9 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
         work_area: geometry.Rect,
         output_areas: []geometry.Rect,
         output_ids: []OutputId,
+        output_primary_areas: []i64,
         output_area_len: usize = 1,
+        spawn_output: ?OutputId = null,
         output_revision: u64 = 1,
         metadata_storage: []u8,
         metadata_bytes: usize,
@@ -424,6 +432,8 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
             errdefer allocator.free(output_areas);
             const output_ids = try allocator.alloc(OutputId, config.output_capacity);
             errdefer allocator.free(output_ids);
+            const output_primary_areas = try allocator.alloc(i64, config.output_capacity);
+            errdefer allocator.free(output_primary_areas);
             const metadata_per_slot = try std.math.mul(usize, config.metadata_bytes, 2);
             const storage_len = try std.math.mul(
                 usize,
@@ -432,7 +442,7 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
             );
             const metadata_storage = try allocator.alloc(u8, storage_len);
             errdefer allocator.free(metadata_storage);
-            var policy = try Policy.init(allocator, config.toplevel_capacity);
+            var policy = try Policy.init(allocator, config.toplevel_capacity, config.output_capacity);
             errdefer policy.deinit();
             const desired = try allocator.alloc(Desired, config.toplevel_capacity);
             errdefer allocator.free(desired);
@@ -463,6 +473,7 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
             @memset(desired_epochs, 0);
             output_areas[0] = work_area;
             output_ids[0] = .{ .value = 0 };
+            output_primary_areas[0] = @as(i64, work_area.width) * work_area.height;
             return .{
                 .allocator = allocator,
                 .slots = slots,
@@ -473,6 +484,7 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
                 .work_area = work_area,
                 .output_areas = output_areas,
                 .output_ids = output_ids,
+                .output_primary_areas = output_primary_areas,
                 .metadata_storage = metadata_storage,
                 .metadata_bytes = config.metadata_bytes,
                 .policy = policy,
@@ -490,6 +502,7 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
             desktop.allocator.free(desktop.desired);
             desktop.policy.deinit();
             desktop.allocator.free(desktop.metadata_storage);
+            desktop.allocator.free(desktop.output_primary_areas);
             desktop.allocator.free(desktop.output_ids);
             desktop.allocator.free(desktop.output_areas);
             desktop.allocator.free(desktop.popups);
@@ -620,12 +633,14 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
         pub fn beginInteractive(desktop: *Self, request: InteractiveRequest) !?InteractiveGeometry {
             const index = try desktop.resolveIndex(request.id);
             const slot = &desktop.slots[index];
+            const current_geometry = slot.scene.geometry;
             try desktop.requireCommandCapacity(desktop.live);
-            if (!try desktop.policy.beginInteractive(request.id, request.kind, slot.scene.geometry))
+            if (!try desktop.policy.beginInteractive(request.id, request.kind, current_geometry))
                 return null;
             try desktop.reflow();
+            const state = try desktop.policy.windowState(request.id);
             return .{
-                .rect = (try desktop.policy.windowState(request.id)).floating,
+                .rect = if (state.mode == .tiled) current_geometry else state.floating,
                 .min_width = @max(slot.min_width, 1),
                 .min_height = @max(slot.min_height, 1),
                 .max_width = slot.max_width,
@@ -701,8 +716,13 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
             return desktop.focused();
         }
 
-        pub fn writeWorkspaceInventory(desktop: *const Self, writer: anytype) !void {
-            try desktop.policy.writeWorkspaceInventory(PolicyView{ .context = @constCast(desktop) }, writer);
+        /// Selects the output used by the next toplevel-created event.
+        pub fn setNextSpawnOutput(desktop: *Self, output: OutputId) void {
+            desktop.spawn_output = output;
+        }
+
+        pub fn writeWorkspaceInventory(desktop: *Self, writer: anytype) !void {
+            try desktop.policy.writeWorkspaceInventory(PolicyView{ .context = desktop }, writer);
         }
 
         pub fn workspaceRevision(desktop: *const Self) WorkspaceRevision {
@@ -714,6 +734,16 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
             const changed = try desktop.policy.workspaceRequest(request);
             if (changed) try desktop.reflow();
             return changed;
+        }
+
+        pub fn switchWorkspace(desktop: *Self, output: OutputId, number: u8) !void {
+            try desktop.requireCommandCapacity(desktop.live);
+            if (desktop.policy.switchWorkspace(output, number)) try desktop.reflow();
+        }
+
+        pub fn moveFocusedToWorkspace(desktop: *Self, number: u8) !void {
+            try desktop.requireCommandCapacity(desktop.live);
+            if (try desktop.policy.moveFocusedToWorkspace(number)) try desktop.reflow();
         }
 
         fn mutatePolicy(desktop: *Self, context: anytype, comptime mutate: anytype) !void {
@@ -805,6 +835,22 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
             })) try desktop.reflow();
         }
 
+        pub fn focusDirection(desktop: *Self, direction: desktop_layout.Direction) !void {
+            try desktop.requireCommandCapacity(desktop.live);
+            if (try desktop.policy.focusDirection(direction)) try desktop.reflow();
+        }
+
+        pub fn moveFocusedDirection(desktop: *Self, direction: desktop_layout.Direction) !void {
+            try desktop.requireCommandCapacity(desktop.live);
+            if (try desktop.policy.moveFocusedDirection(direction)) try desktop.reflow();
+        }
+
+        pub fn moveFocusedToOutput(desktop: *Self, reverse: bool) !void {
+            try desktop.requireCommandCapacity(desktop.live);
+            if (try desktop.policy.moveFocusedToOutput(reverse, PolicyView{ .context = desktop }))
+                try desktop.reflow();
+        }
+
         pub fn toggleFocusedFullscreen(desktop: *Self) !void {
             const id = desktop.focused() orelse return;
             try desktop.requestState(id, .fullscreen, !(try desktop.policy.windowState(id)).fullscreen, null);
@@ -863,7 +909,10 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
         pub fn applyWorkArea(desktop: *Self, rect: geometry.Rect) void {
             desktop.validateWorkArea(rect) catch unreachable;
             desktop.work_area = rect;
-            if (desktop.output_area_len == 1) desktop.output_areas[0] = rect;
+            if (desktop.output_area_len == 1) {
+                desktop.output_areas[0] = rect;
+                desktop.output_primary_areas[0] = @as(i64, rect.width) * rect.height;
+            }
             desktop.reflow() catch unreachable;
         }
 
@@ -884,6 +933,7 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
             for (areas, 0..) |area, index| {
                 desktop.output_areas[index] = area;
                 desktop.output_ids[index] = .{ .value = index };
+                desktop.output_primary_areas[index] = @as(i64, area.width) * area.height;
             }
             desktop.output_area_len = areas.len;
             desktop.output_revision +%= 1;
@@ -924,6 +974,10 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
             for (output_areas, 0..) |area, index| {
                 desktop.output_areas[index] = area.geometry;
                 desktop.output_ids[index] = area.id;
+                desktop.output_primary_areas[index] = if (area.primary_area > 0)
+                    area.primary_area
+                else
+                    @as(i64, area.geometry.width) * area.geometry.height;
             }
             desktop.output_area_len = output_areas.len;
             desktop.output_revision +%= 1;
@@ -1241,10 +1295,20 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
             try desktop.requireCommandCapacity(desktop.live + 1);
             const index = desktop.acquire();
             const id = desktop.idFor(index);
+            const requested_output = desktop.spawn_output;
+            desktop.spawn_output = null;
+            var output_index: usize = 0;
+            if (requested_output) |requested| {
+                for (desktop.output_ids[0..desktop.output_area_len], 0..) |candidate, candidate_index|
+                    if (std.meta.eql(candidate, requested)) {
+                        output_index = candidate_index;
+                        break;
+                    };
+            }
             desktop.policy.created(
                 id,
-                desktop.output_ids[0],
-                desktop.policy.initialGeometry(desktop.output_areas[0]),
+                desktop.output_ids[output_index],
+                desktop.policy.initialGeometry(desktop.output_areas[output_index]),
             ) catch |err| {
                 desktop.release(index);
                 return err;
@@ -1255,7 +1319,7 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
             slot.scene = .{
                 .id = id,
                 .surface = surface,
-                .geometry = desktop.output_areas[0],
+                .geometry = desktop.output_areas[output_index],
                 .visible = false,
                 .stacking = 0,
                 .mode = .tiled,
@@ -2515,6 +2579,32 @@ const TestShell = struct {
 
 const TestDesktop = Desktop(TestShell);
 
+const TestWorkspaceWriter = struct {
+    groups: usize = 0,
+    outputs: usize = 0,
+    workspaces: usize = 0,
+    active: usize = 0,
+    second_workspace: ?workspace.WorkspaceId = null,
+    second_active: bool = false,
+
+    pub fn begin(_: *@This(), _: u64) !void {}
+    pub fn addGroup(writer: *@This(), _: workspace.Group) !void {
+        writer.groups += 1;
+    }
+    pub fn addOutput(writer: *@This(), _: workspace.GroupId, _: TestDesktop.OutputId) !void {
+        writer.outputs += 1;
+    }
+    pub fn addWorkspace(writer: *@This(), value: workspace.Workspace) !void {
+        writer.workspaces += 1;
+        if (value.state.active) writer.active += 1;
+        if (std.mem.eql(u8, value.identifier, "ouro-1") and writer.second_workspace == null)
+            writer.second_workspace = value.id;
+        if (writer.second_workspace) |id| {
+            if (std.meta.eql(id, value.id)) writer.second_active = value.state.active;
+        }
+    }
+};
+
 const KioskPolicyFactory = struct {
     pub fn Policy(
         comptime ToplevelId: type,
@@ -2537,8 +2627,8 @@ const KioskPolicyFactory = struct {
             base: Base,
             show_oldest: bool = true,
 
-            pub fn init(allocator: std.mem.Allocator, capacity: usize) !Self {
-                return .{ .base = try Base.init(allocator, capacity) };
+            pub fn init(allocator: std.mem.Allocator, capacity: usize, output_capacity: usize) !Self {
+                return .{ .base = try Base.init(allocator, capacity, output_capacity) };
             }
 
             pub fn deinit(policy: *Self) void {
@@ -2581,7 +2671,7 @@ const KioskPolicyFactory = struct {
                 return policy.base.focusedToplevel();
             }
 
-            pub fn writeWorkspaceInventory(policy: *const Self, view: anytype, writer: anytype) !void {
+            pub fn writeWorkspaceInventory(policy: *Self, view: anytype, writer: anytype) !void {
                 try policy.base.writeWorkspaceInventory(view, writer);
             }
 
@@ -2591,6 +2681,14 @@ const KioskPolicyFactory = struct {
 
             pub fn workspaceRequest(policy: *Self, request: workspace.Request) !bool {
                 return policy.base.workspaceRequest(request);
+            }
+
+            pub fn switchWorkspace(policy: *Self, output: OutputId, number: u8) bool {
+                return policy.base.switchWorkspace(output, number);
+            }
+
+            pub fn moveFocusedToWorkspace(policy: *Self, number: u8) !bool {
+                return policy.base.moveFocusedToWorkspace(number);
             }
 
             pub fn focusRequested(
@@ -2959,9 +3057,16 @@ test "desktop: topology keeps tiled and fullscreen windows on exact outputs" {
         (try desktop.scene(first)).geometry,
     );
     try std.testing.expectEqual(
-        geometry.Rect{ .x = 50, .y = 0, .width = 50, .height = 60 },
+        geometry.Rect{ .x = 50, .y = 0, .width = 25, .height = 60 },
         (try desktop.scene(second)).geometry,
     );
+    try std.testing.expectEqual(
+        geometry.Rect{ .x = 75, .y = 0, .width = 25, .height = 60 },
+        (try desktop.scene(third)).geometry,
+    );
+    try desktop.focusToplevel(third);
+    try desktop.moveFocusedToOutput(false);
+    try settleDesktop(&desktop, &shell);
     try std.testing.expectEqual(areas[1], (try desktop.scene(third)).geometry);
     const third_states = desktop.slots[third.index].last_configure.states;
     try std.testing.expect(third_states.tiled_left);
@@ -3017,6 +3122,226 @@ test "desktop: topology keeps tiled and fullscreen windows on exact outputs" {
         try std.testing.expect(rect.x + rect.width <= areas[0].x + areas[0].width);
         try std.testing.expect(rect.y + rect.height <= areas[0].y + areas[0].height);
     }
+}
+
+test "desktop: outputs select independent workspaces and restore workspace focus" {
+    var desktop = try initTestDesktop(16);
+    defer desktop.deinit();
+    var shell = TestShell{};
+    const first_output: TestDesktop.OutputId = .{ .value = 10 };
+    const second_output: TestDesktop.OutputId = .{ .value = 20 };
+    const topology = [_]TestDesktop.OutputArea{
+        .{ .id = first_output, .geometry = .{ .x = 0, .y = 0, .width = 100, .height = 60 } },
+        .{ .id = second_output, .geometry = .{ .x = 100, .y = 0, .width = 100, .height = 60 } },
+    };
+    try desktop.validateTopology(.{ .x = 0, .y = 0, .width = 200, .height = 60 }, &topology);
+    desktop.applyTopology(.{ .x = 0, .y = 0, .width = 200, .height = 60 }, &topology);
+
+    desktop.setNextSpawnOutput(first_output);
+    shell.push(created(0));
+    _ = try desktop.consume(&shell, 1);
+    try settleDesktop(&desktop, &shell);
+    const first = try desktop.idForShell(.{ .index = 0, .generation = 1 });
+
+    desktop.setNextSpawnOutput(second_output);
+    shell.push(created(1));
+    _ = try desktop.consume(&shell, 1);
+    try settleDesktop(&desktop, &shell);
+    const second = try desktop.idForShell(.{ .index = 1, .generation = 1 });
+
+    try desktop.switchWorkspace(first_output, 2);
+    try std.testing.expect(!desktop.desired[first.index].visible);
+    try std.testing.expect(desktop.desired[second.index].visible);
+    try std.testing.expectEqual(second, desktop.focused().?);
+
+    try desktop.switchWorkspace(second_output, 3);
+    try std.testing.expect(desktop.focused() == null);
+    try desktop.switchWorkspace(first_output, 1);
+    try std.testing.expectEqual(first, desktop.focused().?);
+
+    try desktop.toggleFocusedFullscreen();
+    try desktop.switchWorkspace(first_output, 2);
+    try std.testing.expect(!desktop.desired[first.index].visible);
+    try desktop.switchWorkspace(first_output, 1);
+    try std.testing.expect(desktop.desired[first.index].visible);
+    try desktop.toggleFocusedFullscreen();
+
+    try desktop.moveFocusedToWorkspace(2);
+    try std.testing.expect(!desktop.desired[first.index].visible);
+    try desktop.switchWorkspace(first_output, 2);
+    try std.testing.expect(desktop.desired[first.index].visible);
+    try std.testing.expectEqual(first_output, (try desktop.policy.windowState(first)).output.?);
+    try std.testing.expectEqual(@as(u8, 2), (try desktop.policy.windowState(first)).workspace);
+
+    try desktop.toggleFocusedFloating();
+    try desktop.moveFocusedToWorkspace(4);
+    try std.testing.expect(!desktop.desired[first.index].visible);
+    try desktop.switchWorkspace(first_output, 4);
+    try std.testing.expect(desktop.desired[first.index].visible);
+    try std.testing.expectEqual(first_output, (try desktop.policy.windowState(first)).output.?);
+    try std.testing.expectEqual(@as(u8, 4), (try desktop.policy.windowState(first)).workspace);
+
+    try desktop.switchWorkspace(second_output, 1);
+    try std.testing.expect(desktop.desired[first.index].visible);
+    try std.testing.expect(desktop.desired[second.index].visible);
+    try std.testing.expectEqual(second, desktop.focused().?);
+
+    try desktop.focusToplevel(first);
+    try desktop.moveFocusedToOutput(false);
+    try std.testing.expectEqual(second_output, (try desktop.policy.windowState(first)).output.?);
+    try std.testing.expectEqual(@as(u8, 1), (try desktop.policy.windowState(first)).workspace);
+    try std.testing.expect(desktop.desired[first.index].visible);
+
+    try desktop.switchWorkspace(first_output, 5);
+    desktop.setNextSpawnOutput(first_output);
+    shell.push(created(2));
+    _ = try desktop.consume(&shell, 1);
+    try settleDesktop(&desktop, &shell);
+    const third = try desktop.idForShell(.{ .index = 2, .generation = 1 });
+    try std.testing.expectEqual(@as(u8, 5), (try desktop.policy.windowState(third)).workspace);
+    try std.testing.expect(desktop.desired[third.index].visible);
+}
+
+test "desktop: workspace inventory publishes ten workspaces per output" {
+    var desktop = try initTestDesktop(4);
+    defer desktop.deinit();
+    const topology = [_]TestDesktop.OutputArea{
+        .{ .id = .{ .value = 10 }, .geometry = .{ .x = 0, .y = 0, .width = 100, .height = 60 } },
+        .{ .id = .{ .value = 20 }, .geometry = .{ .x = 100, .y = 0, .width = 100, .height = 60 } },
+    };
+    try desktop.validateTopology(.{ .x = 0, .y = 0, .width = 200, .height = 60 }, &topology);
+    desktop.applyTopology(.{ .x = 0, .y = 0, .width = 200, .height = 60 }, &topology);
+
+    var initial: TestWorkspaceWriter = .{};
+    try desktop.writeWorkspaceInventory(&initial);
+    try std.testing.expectEqual(@as(usize, 2), initial.groups);
+    try std.testing.expectEqual(@as(usize, 2), initial.outputs);
+    try std.testing.expectEqual(@as(usize, 20), initial.workspaces);
+    try std.testing.expectEqual(@as(usize, 2), initial.active);
+    try std.testing.expect(!initial.second_active);
+
+    try std.testing.expect(try desktop.requestWorkspace(.{
+        .workspace = initial.second_workspace.?,
+        .kind = .activate,
+    }));
+    var updated: TestWorkspaceWriter = .{ .second_workspace = initial.second_workspace };
+    try desktop.writeWorkspaceInventory(&updated);
+    try std.testing.expectEqual(@as(usize, 2), updated.active);
+    try std.testing.expect(updated.second_active);
+}
+
+test "desktop: windows follow the largest output when primary changes" {
+    var desktop = try initTestDesktop(24);
+    defer desktop.deinit();
+    var shell = TestShell{};
+    const first_output: TestDesktop.OutputId = .{ .value = 10 };
+    const secondary_output: TestDesktop.OutputId = .{ .value = 20 };
+    const new_primary: TestDesktop.OutputId = .{ .value = 30 };
+    const initial = [_]TestDesktop.OutputArea{
+        .{ .id = first_output, .geometry = .{ .x = 0, .y = 0, .width = 100, .height = 100 } },
+        .{ .id = secondary_output, .geometry = .{ .x = 120, .y = 0, .width = 80, .height = 80 } },
+    };
+    desktop.applyTopology(.{ .x = 0, .y = 0, .width = 200, .height = 100 }, &initial);
+
+    try desktop.switchWorkspace(first_output, 3);
+    desktop.setNextSpawnOutput(first_output);
+    shell.push(created(0));
+    shell.push(created(2));
+    _ = try desktop.consume(&shell, 2);
+    try settleDesktop(&desktop, &shell);
+    const tiled = try desktop.idForShell(.{ .index = 0, .generation = 1 });
+    const floating = try desktop.idForShell(.{ .index = 2, .generation = 1 });
+    try desktop.toggleFocusedFloating();
+    const floating_before = (try desktop.policy.windowState(floating)).floating;
+
+    try desktop.switchWorkspace(secondary_output, 4);
+    desktop.setNextSpawnOutput(secondary_output);
+    shell.push(created(1));
+    _ = try desktop.consume(&shell, 1);
+    try settleDesktop(&desktop, &shell);
+    const secondary = try desktop.idForShell(.{ .index = 1, .generation = 1 });
+
+    const plugged = [_]TestDesktop.OutputArea{
+        initial[0],
+        initial[1],
+        .{ .id = new_primary, .geometry = .{ .x = 300, .y = 0, .width = 200, .height = 100 } },
+    };
+    desktop.applyTopology(.{ .x = 0, .y = 0, .width = 500, .height = 100 }, &plugged);
+    try std.testing.expectEqual(new_primary, desktop.policy.primary_output.?);
+    for ([_]TestDesktop.ToplevelId{ tiled, floating }) |id| {
+        const state = try desktop.policy.windowState(id);
+        try std.testing.expectEqual(new_primary, state.output.?);
+        try std.testing.expectEqual(@as(u8, 3), state.workspace);
+    }
+    try std.testing.expectEqual(secondary_output, (try desktop.policy.windowState(secondary)).output.?);
+    try std.testing.expectEqual(@as(u8, 4), (try desktop.policy.windowState(secondary)).workspace);
+    try std.testing.expectEqual(floating_before.x + 300, (try desktop.policy.windowState(floating)).floating.x);
+
+    desktop.applyTopology(.{ .x = 0, .y = 0, .width = 200, .height = 100 }, &initial);
+    try std.testing.expectEqual(first_output, desktop.policy.primary_output.?);
+    for ([_]TestDesktop.ToplevelId{ tiled, floating }) |id| {
+        const state = try desktop.policy.windowState(id);
+        try std.testing.expectEqual(first_output, state.output.?);
+        try std.testing.expectEqual(@as(u8, 3), state.workspace);
+    }
+    try std.testing.expectEqual(secondary_output, (try desktop.policy.windowState(secondary)).output.?);
+}
+
+test "desktop: new toplevel uses the selected pointer output" {
+    var desktop = try initTestDesktop(8);
+    defer desktop.deinit();
+    var shell = TestShell{};
+    const topology = [_]TestDesktop.OutputArea{
+        .{ .id = .{ .value = 10 }, .geometry = .{ .x = 0, .y = 0, .width = 100, .height = 60 } },
+        .{ .id = .{ .value = 20 }, .geometry = .{ .x = 200, .y = 0, .width = 80, .height = 60 } },
+    };
+    desktop.applyTopology(.{ .x = 0, .y = 0, .width = 280, .height = 60 }, &topology);
+    desktop.setNextSpawnOutput(topology[1].id);
+    shell.push(created(0));
+    _ = try desktop.consume(&shell, 1);
+    try settleDesktop(&desktop, &shell);
+    const id = try desktop.idForShell(.{ .index = 0, .generation = 1 });
+    try std.testing.expectEqual(topology[1].geometry, (try desktop.scene(id)).geometry);
+    try std.testing.expectEqual(topology[1].id, (try desktop.policy.windowState(id)).output.?);
+    try desktop.toggleFocusedFloating();
+    try desktop.setFloatingGeometry(id, .{ .x = 210, .y = 10, .width = 40, .height = 30 });
+    try desktop.moveFocusedToOutput(true);
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expectEqual(
+        geometry.Rect{ .x = 10, .y = 10, .width = 40, .height = 30 },
+        (try desktop.scene(id)).geometry,
+    );
+    try std.testing.expectEqual(topology[0].id, (try desktop.policy.windowState(id)).output.?);
+}
+
+test "desktop: tiled edge resize changes a retained split" {
+    var desktop = try initTestDesktop(8);
+    defer desktop.deinit();
+    var shell = TestShell{};
+    shell.push(created(0));
+    shell.push(created(1));
+    _ = try desktop.consume(&shell, 2);
+    try settleDesktop(&desktop, &shell);
+    const first = try desktop.idForShell(.{ .index = 0, .generation = 1 });
+    try desktop.focusToplevel(first);
+    const initial = (try desktop.scene(first)).geometry;
+    const interactive = (try desktop.beginInteractive(.{ .id = first, .kind = .{ .resize = .right } })).?;
+    try std.testing.expectEqual(initial, interactive.rect);
+    try std.testing.expectEqual(TestDesktop.Mode.tiled, (try desktop.policy.windowState(first)).mode);
+    try desktop.updateInteractive(first, .{
+        .x = initial.x,
+        .y = initial.y,
+        .width = initial.width + 10,
+        .height = initial.height,
+    });
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expectEqual(@as(i32, 60), (try desktop.scene(first)).geometry.width);
+    try desktop.endInteractive(first);
+    try desktop.toggleFocusedFullscreen();
+    try settleDesktop(&desktop, &shell);
+    try desktop.toggleFocusedFullscreen();
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expectEqual(@as(i32, 60), (try desktop.scene(first)).geometry.width);
 }
 
 test "desktop: initial commit gates configure and unmap requires it again" {

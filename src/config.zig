@@ -12,9 +12,22 @@ const default_source =
     \\{"bindings":{
     \\"super+tab":["focus-next"],"super+q":["close"],
     \\"super+f":["toggle-fullscreen"],"super+m":["toggle-maximized"],
-    \\"super+space":["toggle-floating"],"super+j":["focus-next"],
-    \\"super+k":["focus-previous"],"super+shift+j":["move-next"],
-    \\"super+shift+k":["move-previous"],"super+shift+e":["exit"],
+    \\"super+space":["toggle-floating"],"super+h":["focus-left"],
+    \\"super+j":["focus-down"],"super+k":["focus-up"],"super+l":["focus-right"],
+    \\"super+shift+h":["move-left"],"super+shift+j":["move-down"],
+    \\"super+shift+k":["move-up"],"super+shift+l":["move-right"],
+    \\"super+ctrl+shift+h":["move-output-previous"],
+    \\"super+ctrl+shift+l":["move-output-next"],"super+shift+e":["exit"],
+    \\"super+1":["switch-workspace","1"],"super+2":["switch-workspace","2"],
+    \\"super+3":["switch-workspace","3"],"super+4":["switch-workspace","4"],
+    \\"super+5":["switch-workspace","5"],"super+6":["switch-workspace","6"],
+    \\"super+7":["switch-workspace","7"],"super+8":["switch-workspace","8"],
+    \\"super+9":["switch-workspace","9"],"super+0":["switch-workspace","10"],
+    \\"super+shift+1":["move-focused-to-workspace","1"],"super+shift+2":["move-focused-to-workspace","2"],
+    \\"super+shift+3":["move-focused-to-workspace","3"],"super+shift+4":["move-focused-to-workspace","4"],
+    \\"super+shift+5":["move-focused-to-workspace","5"],"super+shift+6":["move-focused-to-workspace","6"],
+    \\"super+shift+7":["move-focused-to-workspace","7"],"super+shift+8":["move-focused-to-workspace","8"],
+    \\"super+shift+9":["move-focused-to-workspace","9"],"super+shift+0":["move-focused-to-workspace","10"],
     \\"super+return":["run","monstar"]}}
 ;
 
@@ -26,6 +39,18 @@ pub const Action = union(enum) {
     focus_previous,
     move_next,
     move_previous,
+    focus_left,
+    focus_right,
+    focus_up,
+    focus_down,
+    move_left,
+    move_right,
+    move_up,
+    move_down,
+    move_output_next,
+    move_output_previous,
+    switch_workspace: u8,
+    move_to_workspace: u8,
     close,
     toggle_fullscreen,
     toggle_maximized,
@@ -455,11 +480,31 @@ fn parseAction(allocator: std.mem.Allocator, value: std.json.Value) !Action {
         return .{ .run = argv };
     }
 
+    if (std.mem.eql(u8, name, "switch-workspace") or
+        std.mem.eql(u8, name, "move-focused-to-workspace"))
+    {
+        if (items.len != 2 or items[1] != .string) return error.InvalidActionArity;
+        const number = std.fmt.parseInt(u8, items[1].string, 10) catch return error.InvalidWorkspace;
+        if (number < 1 or number > 10) return error.InvalidWorkspace;
+        if (std.mem.eql(u8, name, "switch-workspace")) return .{ .switch_workspace = number };
+        return .{ .move_to_workspace = number };
+    }
+
     if (items.len != 1) return error.InvalidActionArity;
     if (std.mem.eql(u8, name, "focus-next")) return .focus_next;
     if (std.mem.eql(u8, name, "focus-previous")) return .focus_previous;
     if (std.mem.eql(u8, name, "move-next")) return .move_next;
     if (std.mem.eql(u8, name, "move-previous")) return .move_previous;
+    if (std.mem.eql(u8, name, "focus-left")) return .focus_left;
+    if (std.mem.eql(u8, name, "focus-right")) return .focus_right;
+    if (std.mem.eql(u8, name, "focus-up")) return .focus_up;
+    if (std.mem.eql(u8, name, "focus-down")) return .focus_down;
+    if (std.mem.eql(u8, name, "move-left")) return .move_left;
+    if (std.mem.eql(u8, name, "move-right")) return .move_right;
+    if (std.mem.eql(u8, name, "move-up")) return .move_up;
+    if (std.mem.eql(u8, name, "move-down")) return .move_down;
+    if (std.mem.eql(u8, name, "move-output-next")) return .move_output_next;
+    if (std.mem.eql(u8, name, "move-output-previous")) return .move_output_previous;
     if (std.mem.eql(u8, name, "close")) return .close;
     if (std.mem.eql(u8, name, "toggle-fullscreen")) return .toggle_fullscreen;
     if (std.mem.eql(u8, name, "toggle-maximized")) return .toggle_maximized;
@@ -625,6 +670,11 @@ test "reject invalid run commands" {
     try std.testing.expectError(error.InvalidRunArgument, parseSource(std.testing.allocator, "{\"bindings\":{\"super+r\":[\"run\",\"echo\",\"a\\u0000b\"]}}"));
 }
 
+test "reject invalid workspace actions" {
+    try std.testing.expectError(error.InvalidWorkspace, parseSource(std.testing.allocator, "{\"bindings\":{\"super+1\":[\"switch-workspace\",\"0\"]}}"));
+    try std.testing.expectError(error.InvalidWorkspace, parseSource(std.testing.allocator, "{\"bindings\":{\"super+1\":[\"move-focused-to-workspace\",\"11\"]}}"));
+}
+
 test "reject duplicate normalized trigger" {
     try std.testing.expectError(error.DuplicateTrigger, parseSource(std.testing.allocator, "{\"bindings\":{\"ctrl+a\":[\"close\"],\"CONTROL+A\":[\"exit\"]}}"));
 }
@@ -704,7 +754,7 @@ test "store applies sibling fragments in lexical order" {
 test "default bindings" {
     var snapshot = try defaultSnapshot(std.testing.allocator);
     defer snapshot.deinit();
-    try std.testing.expectEqual(@as(usize, 11), snapshot.bindings.len);
+    try std.testing.expectEqual(@as(usize, 37), snapshot.bindings.len);
     var saw_exit = false;
     var saw_monstar = false;
     for (snapshot.bindings) |binding| switch (binding.action) {
