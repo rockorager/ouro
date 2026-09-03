@@ -3540,6 +3540,14 @@ pub fn Coordinator(comptime protocol: type) type {
                 error.Exhausted => return false,
                 else => return err,
             };
+            if (self.sessionLockActive() and event == .touch_down) {
+                if (self.input_touch_delivery.target) |target|
+                    if (self.sessionLockScene(target.surface) != null)
+                        self.setKeyboardSurface(target.surface) catch |err| switch (err) {
+                            error.Exhausted => return false,
+                            else => return err,
+                        };
+            }
             if (!self.input_relative_accepted) {
                 if (!self.sessionLockActive())
                     self.relative_pointer_adapter.consume(event) catch return false;
@@ -5772,10 +5780,12 @@ pub fn Coordinator(comptime protocol: type) type {
                     },
                     .keyboard_focus => |target| {
                         try self.setKeyboardSurface(
-                            if (self.sessionLockActive())
-                                self.firstSessionLockSurface()
+                            if (!self.sessionLockActive())
+                                self.exclusiveLayerSurface() orelse target.surface
+                            else if (self.sessionLockScene(target.surface) != null)
+                                target.surface
                             else
-                                self.exclusiveLayerSurface() orelse target.surface,
+                                self.firstSessionLockSurface(),
                         );
                     },
                     .cancel => |cancel| {
