@@ -12033,6 +12033,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (self.adapter.pendingPreferredBuffer(client.peer))
                     client.protocol_ready |= ProtocolReady.core;
             };
+            if (self.color_management_adapter.refreshPreferred())
+                self.markProtocolAll(ProtocolReady.color_management);
             self.output_associations_dirty = false;
         }
 

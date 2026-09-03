@@ -68,6 +68,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             luminance_min: u32 = 0,
             luminance_max: u32 = 0,
             luminance_reference: u32 = 0,
+            preferred_identity: u64 = 0,
+            preferred_pending: bool = false,
             pending: u8 = 0,
             version: u32 = 1,
             information_allowed: bool = false,
@@ -259,6 +261,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                         return try self.managerError(actor, decoded.handle.id, 0, @errorName(err));
                     };
                     child.handle = admitted.id;
+                    child.preferred_identity = self.preferredIdentity(child.peer, id);
                 },
                 .create_parametric_creator => |value| {
                     const child = self.create(.creator, undefined, manager.peer, null, manager.version) catch return try self.noMemory(actor);
@@ -705,14 +708,51 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     };
                     self.remove(r);
                     return count + 1;
+                } else if (r.kind == .feedback and r.preferred_pending) {
+                    const event: Feedback.Event = if (r.version >= 2)
+                        .{ .preferred_changed2 = .{
+                            .identity_hi = @truncate(r.preferred_identity >> 32),
+                            .identity_lo = @truncate(r.preferred_identity),
+                        } }
+                    else
+                        .{ .preferred_changed = .{ .identity = @truncate(r.preferred_identity) } };
+                    wayring.server.sendEvent(protocol, Feedback, server_objects, queue, r.handle, event) catch |err| switch (err) {
+                        error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return count,
+                        else => return err,
+                    };
+                    r.preferred_pending = false;
+                    count += 1;
                 }
             }
             return count;
         }
         pub fn pendingOutbound(self: *const Self, peer: wayring.io_uring.Peer) bool {
-            for (self.resources.items) |r| if (samePeer(r.peer, peer) and ((r.kind == .manager and r.pending < capabilities.len) or (r.kind == .image and r.pending == 0 and r.image_state != .compiling) or (r.kind == .info and r.pending < 8))) return true;
+            for (self.resources.items) |r| if (samePeer(r.peer, peer) and ((r.kind == .manager and r.pending < capabilities.len) or (r.kind == .image and r.pending == 0 and r.image_state != .compiling) or (r.kind == .info and r.pending < 8) or (r.kind == .feedback and r.preferred_pending))) return true;
             return false;
         }
+
+        pub fn refreshPreferred(self: *Self) bool {
+            var changed = false;
+            for (self.resources.items) |r| {
+                if (r.kind != .feedback or r.surface == null) continue;
+                const identity = self.preferredIdentity(r.peer, r.surface.?);
+                if (identity == r.preferred_identity) continue;
+                r.preferred_identity = identity;
+                r.preferred_pending = true;
+                changed = true;
+            }
+            return changed;
+        }
+
+        fn preferredIdentity(self: *Self, peer: wayring.io_uring.Peer, surface: CoreSurface.SurfaceId) u64 {
+            const resolver = self.output_resolver orelse return descriptionIdentity(.srgb);
+            const resource = self.core.surfaceResource(surface) catch return descriptionIdentity(.srgb);
+            const resolved = resolver.resolve(resolver.context, peer, null, resource) orelse
+                return descriptionIdentity(.srgb);
+            defer releaseResolvedOutput(resolved);
+            return descriptionIdentity(resolved.description);
+        }
+
         pub fn resourceRemoved(self: *Self, handle: objects.Handle, object: objects.Object) bool {
             if (object.interface == &protocol.wl_output.info) {
                 for (self.resources.items) |r| {
@@ -1151,4 +1191,55 @@ test "primary luminance interpretation is transfer-order independent" {
     try std.testing.expectEqual(@as(f32, 10_000.005), pq.max);
     try std.testing.expectError(error.InvalidLuminance, primaryLuminances(50, 0, 203, .srgb));
     try std.testing.expectError(error.InvalidLuminance, primaryLuminances(50, 80, 0, null));
+}
+
+test "surface feedback queues only changed preferred identities" {
+    const protocol = @import("core_protocol");
+    const FakeCore = struct {
+        pub const SurfaceId = u64;
+        resource: objects.Handle,
+
+        pub fn surfaceResource(self: *@This(), id: SurfaceId) !objects.Handle {
+            if (id != 7) return error.InvalidSurface;
+            return self.resource;
+        }
+    };
+    const ResolverState = struct {
+        wide_gamut: bool = false,
+
+        fn resolve(
+            context: ?*anyopaque,
+            _: wayring.io_uring.Peer,
+            _: ?objects.Handle,
+            _: ?objects.Handle,
+        ) ?ResolvedOutput {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            var description = color.Description.srgb;
+            if (self.wide_gamut) description.primaries = namedPrimaries(9).?;
+            return .{ .description = description };
+        }
+    };
+    const TestAdapter = Adapter(protocol, FakeCore);
+    const peer: wayring.io_uring.Peer = .{ .slot = 0, .generation = 1 };
+
+    var core: FakeCore = .{ .resource = .{ .id = 3, .generation = 1 } };
+    var adapter = try TestAdapter.init(std.testing.allocator, &core, .{
+        .resource_capacity = 1,
+        .async_jobs = 1,
+        .queued_profile_bytes = 1024,
+        .retained_luts = 1,
+    });
+    defer adapter.deinit();
+    var resolver_state: ResolverState = .{};
+    adapter.setOutputResolver(.{ .context = &resolver_state, .resolve = ResolverState.resolve });
+
+    const feedback = try adapter.create(.feedback, .{ .id = 4, .generation = 1 }, peer, 7, 2);
+    feedback.preferred_identity = adapter.preferredIdentity(peer, 7);
+    try std.testing.expect(!adapter.refreshPreferred());
+    try std.testing.expect(!adapter.pendingOutbound(peer));
+
+    resolver_state.wide_gamut = true;
+    try std.testing.expect(adapter.refreshPreferred());
+    try std.testing.expect(adapter.pendingOutbound(peer));
+    try std.testing.expect(!adapter.refreshPreferred());
 }
