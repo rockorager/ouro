@@ -979,6 +979,7 @@ pub const Lifecycle = struct {
     }
     pub fn enableHead(self: *Lifecycle, id: ConfigurationId, head: HeadId) !void {
         const c = try self.get(id);
+        if (c.submitted) return error.AlreadyUsed;
         const h = try self.configHead(c, head);
         if (h.covered) return error.AlreadyConfiguredHead;
         h.covered = true;
@@ -993,6 +994,7 @@ pub const Lifecycle = struct {
     }
     pub fn disableHead(self: *Lifecycle, id: ConfigurationId, head: HeadId) !void {
         const c = try self.get(id);
+        if (c.submitted) return error.AlreadyUsed;
         const h = try self.configHead(c, head);
         if (h.covered) return error.AlreadyConfiguredHead;
         h.covered = true;
@@ -1205,6 +1207,8 @@ test "configuration covers and atomically applies every exact head" {
     try std.testing.expectEqual(@as(i32, 240), command.heads[1].state.y);
     try std.testing.expectEqual(primary_state, try lifecycle.currentHead(lifecycle.primary));
     try std.testing.expectEqual(secondary_state, try lifecycle.currentHead(secondary));
+    try std.testing.expectError(error.AlreadyUsed, lifecycle.disableHead(configuration, lifecycle.primary));
+    try std.testing.expectError(error.AlreadyUsed, lifecycle.enableHead(configuration, secondary));
 
     _ = try lifecycle.complete(configuration, .succeeded);
     try std.testing.expectEqual(@as(i32, -1920), (try lifecycle.currentHead(lifecycle.primary)).x);
