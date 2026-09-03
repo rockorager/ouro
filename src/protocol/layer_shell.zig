@@ -264,7 +264,15 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
                 .ack_configure => |v| self.ackConfigure(slot, v.serial) catch
                     return try self.surfaceError(actor, decoded.handle.id, LayerSurface.@"error".invalid_surface_state.value, "invalid configure serial"),
                 .destroy => {},
-                .set_layer => |v| slot.pending.layer = parseLayer(v.layer.value) catch return try self.surfaceError(actor, decoded.handle.id, LayerSurface.@"error".invalid_surface_state.value, "invalid layer"),
+                .set_layer => |v| slot.pending.layer = parseLayerRequest(
+                    slot.initial_committed,
+                    v.layer.value,
+                ) catch return try self.surfaceError(
+                    actor,
+                    decoded.handle.id,
+                    LayerSurface.@"error".invalid_surface_state.value,
+                    "invalid layer or layer changed after initial commit",
+                ),
                 .set_exclusive_edge => |v| slot.pending.exclusive_edge = if (v.edge.value == 0) null else Anchor.fromBits(v.edge.value) catch return try self.surfaceError(actor, decoded.handle.id, LayerSurface.@"error".invalid_exclusive_edge.value, "invalid exclusive edge"),
             }
             try decoded.finish(protocol, server_objects, &actor.transmit);
@@ -616,6 +624,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
                 else => error.InvalidLayer,
             };
         }
+        fn parseLayerRequest(initial_committed: bool, value: u32) !Layer {
+            if (initial_committed) return error.InvalidSurfaceState;
+            return parseLayer(value);
+        }
         fn parseKeyboard(v: u32) !KeyboardInteractivity {
             return switch (v) {
                 0 => .none,
@@ -702,6 +714,12 @@ test "layer shell: size and exclusive edge validation follows anchors" {
         }, .{ .top = true, .bottom = false, .left = true, .right = true }),
         .exclusive_edge = null,
     });
+}
+
+test "layer shell: layer is immutable after the initial commit" {
+    const A = Adapter(@import("core_protocol"), struct {}, struct {});
+    try std.testing.expectEqual(A.Layer.top, try A.parseLayerRequest(false, 2));
+    try std.testing.expectError(error.InvalidSurfaceState, A.parseLayerRequest(true, 2));
 }
 
 test "layer shell: ownership grows past initial reservation without moving contexts" {
