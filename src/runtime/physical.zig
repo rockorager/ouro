@@ -6660,9 +6660,15 @@ pub fn Coordinator(comptime protocol: type) type {
             self.processing_virtual_pointer = true;
             defer self.processing_virtual_pointer = false;
             while (self.virtual_pointer_adapter.peekEvent()) |pending| {
+                if (self.pointer_reconcile_pending) {
+                    try self.retryPointerReconcile();
+                    if (self.pointer_reconcile_pending) return;
+                }
                 const event_seat = switch (pending.*) {
                     inline else => |value| value.seat,
                 };
+                const reconcile_pointer = event_seat == &self.seat_adapter and
+                    pending.* == .device_added;
                 const accepted = if (event_seat == &self.seat_adapter) switch (pending.*) {
                     .device_added => |value| try self.acceptNormalizedInput(.{ .device_added = .{
                         .device = value.device,
@@ -6750,6 +6756,17 @@ pub fn Coordinator(comptime protocol: type) type {
                 } else try self.acceptTransientPointerEvent(event_seat, pending.*);
                 if (!accepted) break;
                 self.virtual_pointer_adapter.dropEvent();
+                // A transient virtual-pointer client may issue only a button
+                // request. Re-establish hover at the retained cursor position
+                // when its device appears so that click can focus its target.
+                if (reconcile_pointer) {
+                    self.pointer_reconcile_pending = true;
+                    try self.retryPointerReconcile();
+                    self.applyInteractionCommands() catch |err| switch (err) {
+                        error.Exhausted => return,
+                        else => return err,
+                    };
+                }
             }
         }
 
@@ -8143,7 +8160,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (applied and !self.anyKmsOutput())
                     self.adapter.clearFifoBarriers();
                 if (applied) {
-                    if (self.findAppLayer(pending.id)) |layer| {
+                    if (self.findAppLayerAwaitingDamage(pending.id)) |layer| {
                         const now = damage_requested_at orelse blk: {
                             const value = try monotonicNs();
                             damage_requested_at = value;
@@ -8218,60 +8235,6 @@ pub fn Coordinator(comptime protocol: type) type {
                 return self.discardPendingCandidate(layer, pending.id);
             }
             const lease = content.attachment_lease orelse return error.MissingLease;
-            var source = try self.adapter.bufferSource(lease);
-            var source_access_owned = true;
-            defer if (source_access_owned) source.endShmAccess() catch {};
-            var imported_source: ?output_api.ImportedSource = null;
-            defer if (imported_source) |*imported| imported.deinit();
-            var borrowed_source: render.Source = switch (source) {
-                .shm => |shm| shm_source: {
-                    const pixel_format: render.PixelFormat = if (shm.format.value == protocol.wl_shm.format.argb8888.value) .argb8888_premultiplied else if (shm.format.value == protocol.wl_shm.format.xrgb8888.value) .xrgb8888 else return error.UnsupportedShmFormat;
-                    if (shm.stride > std.math.maxInt(u32)) return error.InvalidSource;
-                    break :shm_source .{
-                        .size = .{ .width = shm.width, .height = shm.height },
-                        .stride = @intCast(shm.stride),
-                        .format = pixel_format,
-                        .bytes = shm.bytes,
-                    };
-                },
-                .single_pixel => |pixel| .{
-                    .size = .{ .width = 1, .height = 1 },
-                    .stride = 4,
-                    .format = .argb8888_premultiplied,
-                    .bytes = pixel.bytes,
-                },
-                .external => |external| external_source: {
-                    const pixel_format = output_api.formatFromDrm(external.format) orelse
-                        return try self.discardPendingCandidate(
-                            layer,
-                            pending.id,
-                        );
-                    break :external_source .{
-                        .size = .{ .width = external.width, .height = external.height },
-                        .stride = external.strides[0],
-                        .format = pixel_format,
-                        .bytes = &.{},
-                        .external = .{
-                            .context = external.context,
-                            .token = external.token,
-                            .alive_fn = external.alive_fn,
-                            .drm_format = external.format,
-                            .modifier = external.modifier,
-                            .plane_count = external.plane_count,
-                            .fds = external.fds,
-                            .strides = external.strides,
-                            .offsets = external.offsets,
-                        },
-                    };
-                },
-            };
-            const logical_source_bytes = std.math.mul(
-                usize,
-                borrowed_source.stride,
-                borrowed_source.size.height,
-            ) catch return error.InvalidSource;
-            if (logical_source_bytes > output_api.surfaceByteCapacity(self.output_config))
-                return error.InvalidSource;
             const surface_id: @import("../output/headless.zig").SurfaceId = .{
                 .index = exact_surface_id.index,
                 .generation = exact_surface_id.generation,
@@ -8338,11 +8301,6 @@ pub fn Coordinator(comptime protocol: type) type {
                 .width = rendered_width,
                 .height = rendered_height,
             };
-            const crop = try sourceCrop(
-                content.surface,
-                borrowed_source.size.width,
-                borrowed_source.size.height,
-            );
             const clip = if (surface_scene) |scene|
                 if (scene.root.visible) try clipToOutput(destination, output_bounds) else null
             else
@@ -8350,8 +8308,79 @@ pub fn Coordinator(comptime protocol: type) type {
             const visible_clip = clip orelse {
                 return try self.discardPendingCandidate(layer, pending.id);
             };
+            var source = try self.adapter.bufferSource(lease);
+            var source_access_owned = true;
+            defer if (source_access_owned) source.endShmAccess() catch {};
+            var imported_source: ?output_api.ImportedSource = null;
+            defer if (imported_source) |*imported| imported.deinit();
+            var borrowed_source: render.Source = switch (source) {
+                .shm => |shm| shm_source: {
+                    const pixel_format: render.PixelFormat = if (shm.format.value == protocol.wl_shm.format.argb8888.value) .argb8888_premultiplied else if (shm.format.value == protocol.wl_shm.format.xrgb8888.value) .xrgb8888 else return error.UnsupportedShmFormat;
+                    if (shm.stride > std.math.maxInt(u32)) return error.InvalidSource;
+                    break :shm_source .{
+                        .size = .{ .width = shm.width, .height = shm.height },
+                        .stride = @intCast(shm.stride),
+                        .format = pixel_format,
+                        .bytes = shm.bytes,
+                    };
+                },
+                .single_pixel => |pixel| .{
+                    .size = .{ .width = 1, .height = 1 },
+                    .stride = 4,
+                    .format = .argb8888_premultiplied,
+                    .bytes = pixel.bytes,
+                },
+                .external => |external| external_source: {
+                    const pixel_format = output_api.formatFromDrm(external.format) orelse
+                        return try self.discardPendingCandidate(
+                            layer,
+                            pending.id,
+                        );
+                    break :external_source .{
+                        .size = .{ .width = external.width, .height = external.height },
+                        .stride = external.strides[0],
+                        .format = pixel_format,
+                        .bytes = &.{},
+                        .external = .{
+                            .context = external.context,
+                            .token = external.token,
+                            .alive_fn = external.alive_fn,
+                            .drm_format = external.format,
+                            .modifier = external.modifier,
+                            .plane_count = external.plane_count,
+                            .fds = external.fds,
+                            .strides = external.strides,
+                            .offsets = external.offsets,
+                        },
+                    };
+                },
+            };
+            const logical_source_bytes = std.math.mul(
+                usize,
+                borrowed_source.stride,
+                borrowed_source.size.height,
+            ) catch return error.InvalidSource;
+            if (logical_source_bytes > output_api.surfaceByteCapacity(self.output_config))
+                return error.InvalidSource;
+            const crop = try sourceCrop(
+                content.surface,
+                borrowed_source.size.width,
+                borrowed_source.size.height,
+            );
             const render_device = self.render_device orelse return false;
-            const upload_damage = renderUploadDamage(content.surface.upload_damage);
+            var upload_damage = renderUploadDamage(content.surface.upload_damage);
+            if (layer.sample) |current| {
+                const next = std.math.add(u64, current.sample.commit_sequence, 1) catch 0;
+                if (current.sample.surface == sample_identity.surface and
+                    sample_identity.commit_sequence != next)
+                {
+                    upload_damage.rects[0] = .{
+                        .max_x = @intCast(borrowed_source.size.width),
+                        .max_y = @intCast(borrowed_source.size.height),
+                    };
+                    upload_damage.count = 1;
+                }
+            }
             var retained_source = false;
             const prepared = native: {
                 if (borrowed_source.external != null) {
@@ -8413,16 +8442,19 @@ pub fn Coordinator(comptime protocol: type) type {
                     if (stable_bytes) |bytes| {
                         borrowed_source.bytes = bytes;
                         borrowed_source.retained_shm = true;
-                        const direct_prepared = render_device.content.prepareReplacingRetainedShm(
+                        const direct_prepared: ?render_content.Prepared = render_device.content.prepareReplacingRetainedShm(
                             layer.rendered,
                             sample_identity,
                             borrowed_source,
                         ) catch |err| switch (err) {
                             error.VersionCapacityExceeded, error.ByteCapacityExceeded => return false,
+                            error.NonAdjacentCommit => null,
                             else => return err,
                         };
-                        retained_source = true;
-                        break :native direct_prepared;
+                        if (direct_prepared) |value| {
+                            retained_source = true;
+                            break :native value;
+                        }
                     }
                 }
                 break :native render_device.content.prepareReplacing(
@@ -8437,9 +8469,9 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             var prepared_owned = true;
             defer if (prepared_owned) render_device.content.cancel(prepared);
+            source_access_owned = false;
             source.endShmAccess() catch |err| switch (err) {
                 error.InvalidBacking => {
-                    source_access_owned = false;
                     const peer = candidate.peer orelse return error.ClientDisconnected;
                     const actor = try self.root.runtime.clients.reactor.getActor(peer);
                     try self.adapter.postInvalidShmBacking(actor, attachment.buffer.?.handle);
@@ -8451,7 +8483,6 @@ pub fn Coordinator(comptime protocol: type) type {
                 },
                 else => return err,
             };
-            source_access_owned = false;
             const token = self.presentations.admitImported(.{}) catch |err| switch (err) {
                 error.Exhausted => return false,
                 else => return err,
@@ -8753,6 +8784,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.applied_updates,
             );
             std.debug.assert(applied.len == ready.len);
+            forwardEffectiveAttachments(applied);
             for (applied, 0..) |*update, index| {
                 const id = update.surface;
                 self.pendingCommitApplied(id);
@@ -11170,6 +11202,31 @@ pub fn Coordinator(comptime protocol: type) type {
             return null;
         }
 
+        /// A surface may temporarily have an older layer awaiting an output
+        /// outcome and a newer layer carrying the just-applied commit. Damage
+        /// must be associated with the latter rather than the first matching
+        /// surface identity.
+        fn findAppLayerAwaitingDamage(self: *Self, id: Adapter.SurfaceId) ?*Layer {
+            var result: ?*Layer = null;
+            var sequence: u64 = 0;
+            for (self.app_layers[0..self.app_layer_count]) |*layer| {
+                const current = layer.id orelse continue;
+                if (std.meta.eql(current, id) and layer.change != null and
+                    layer.change_output_count == 0)
+                {
+                    const candidate_sequence = if (layer.sample) |sample|
+                        sample.sample.commit_sequence
+                    else
+                        0;
+                    if (result == null or candidate_sequence > sequence) {
+                        result = layer;
+                        sequence = candidate_sequence;
+                    }
+                }
+            }
+            return result;
+        }
+
         fn appLayerIndex(self: *const Self, layer: *const Layer) ?usize {
             for (self.app_layers[0..self.app_layer_count], 0..) |*candidate, index|
                 if (candidate == layer) return index;
@@ -12248,6 +12305,10 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             if (session_lock_removed) self.sessionLockChanged() catch {};
             if (idle_inhibit_removed or idle_notify_removed) self.syncIdleNotifications() catch {};
+            if (removed_surface_peer) |peer| self.text_input_adapter.surfaceRemoved(.{
+                .peer = peer,
+                .surface = handle.id,
+            });
             if (removed_surface_peer) |peer| self.data_device_adapter.surfaceRemoved(peer, handle.id);
             if (removed_surface_peer) |peer| self.output_adapter.surfaceRemoved(peer, handle);
             if (removed_surface) |id| {
@@ -12762,6 +12823,35 @@ fn lastSurfaceOccurrence(surfaces: anytype, index: usize) bool {
     for (surfaces[index + 1 ..]) |later|
         if (std.meta.eql(surfaces[index], later)) return false;
     return true;
+}
+
+/// A later commit without wl_surface.attach retains the attachment transition
+/// from the preceding same-surface commit. When both are admitted together,
+/// move that transition to the final candidate so superseding the earlier
+/// commit cannot release its still-live lease.
+fn forwardEffectiveAttachments(applied: anytype) void {
+    for (applied, 0..) |*update, index| {
+        if (update.payload.surface.attachment != null) continue;
+        var previous_index = index;
+        while (previous_index != 0) {
+            previous_index -= 1;
+            const previous = &applied[previous_index];
+            if (!std.meta.eql(previous.surface, update.surface)) continue;
+            if (previous.payload.surface.attachment == null) break;
+            std.debug.assert(update.payload.surface.explicit_sync == null);
+            std.debug.assert(update.payload.attachment_lease == null);
+            std.debug.assert(update.payload.release_callbacks == null);
+            update.payload.surface.attachment = previous.payload.surface.attachment;
+            previous.payload.surface.attachment = null;
+            update.payload.surface.explicit_sync = previous.payload.surface.explicit_sync;
+            previous.payload.surface.explicit_sync = null;
+            update.payload.attachment_lease = previous.payload.attachment_lease;
+            previous.payload.attachment_lease = null;
+            update.payload.release_callbacks = previous.payload.release_callbacks;
+            previous.payload.release_callbacks = null;
+            break;
+        }
+    }
 }
 
 fn sameToken(a: completion.Token, b: completion.Token) bool {
@@ -13345,6 +13435,68 @@ test "physical: retained candidate matches only its exact pending owner" {
         .id = Id{ .index = 5, .generation = 8 },
         .handle = Handle{ .id = 15, .generation = 18 },
     }));
+}
+
+test "physical: superseded attachment transitions advance to the final commit" {
+    const Attachment = struct { buffer: ?u8 };
+    const Payload = struct {
+        surface: struct {
+            attachment: ?Attachment = null,
+            explicit_sync: ?u8 = null,
+        } = .{},
+        attachment_lease: ?u8 = null,
+        release_callbacks: ?u8 = null,
+    };
+    const Applied = struct { surface: u8, payload: Payload = .{} };
+
+    var attached = [_]Applied{
+        .{ .surface = 1, .payload = .{
+            .surface = .{ .attachment = .{ .buffer = 7 }, .explicit_sync = 8 },
+            .attachment_lease = 9,
+            .release_callbacks = 10,
+        } },
+        .{ .surface = 2 },
+        .{ .surface = 1 },
+        .{ .surface = 1 },
+    };
+    forwardEffectiveAttachments(&attached);
+    try std.testing.expect(attached[0].payload.surface.attachment == null);
+    try std.testing.expect(attached[2].payload.surface.attachment == null);
+    try std.testing.expectEqual(@as(?Attachment, .{ .buffer = 7 }), attached[3].payload.surface.attachment);
+    try std.testing.expectEqual(@as(?u8, 8), attached[3].payload.surface.explicit_sync);
+    try std.testing.expectEqual(@as(?u8, 9), attached[3].payload.attachment_lease);
+    try std.testing.expectEqual(@as(?u8, 10), attached[3].payload.release_callbacks);
+
+    var detached = [_]Applied{
+        .{ .surface = 1, .payload = .{ .surface = .{ .attachment = .{ .buffer = null } } } },
+        .{ .surface = 1 },
+    };
+    forwardEffectiveAttachments(&detached);
+    try std.testing.expect(detached[0].payload.surface.attachment == null);
+    try std.testing.expectEqual(
+        @as(?Attachment, .{ .buffer = null }),
+        detached[1].payload.surface.attachment,
+    );
+
+    var repeated = [_]Applied{
+        .{ .surface = 1, .payload = .{
+            .surface = .{ .attachment = .{ .buffer = 7 } },
+            .attachment_lease = 1,
+            .release_callbacks = 2,
+        } },
+        .{ .surface = 1, .payload = .{
+            .surface = .{ .attachment = .{ .buffer = 7 } },
+            .attachment_lease = 3,
+            .release_callbacks = 4,
+        } },
+        .{ .surface = 1 },
+    };
+    forwardEffectiveAttachments(&repeated);
+    try std.testing.expectEqual(@as(?u8, 1), repeated[0].payload.attachment_lease);
+    try std.testing.expectEqual(@as(?u8, 2), repeated[0].payload.release_callbacks);
+    try std.testing.expect(repeated[1].payload.surface.attachment == null);
+    try std.testing.expectEqual(@as(?u8, 3), repeated[2].payload.attachment_lease);
+    try std.testing.expectEqual(@as(?u8, 4), repeated[2].payload.release_callbacks);
 }
 
 test "physical: capture rectangles require exact output containment" {

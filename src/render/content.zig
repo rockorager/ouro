@@ -146,7 +146,8 @@ pub const Store = struct {
                 slot.identity.commit_sequence,
                 1,
             ) catch return error.NonAdjacentCommit;
-            if (identity.commit_sequence != next) return error.NonAdjacentCommit;
+            if (identity.commit_sequence != next and !coversSource(damage, source.size))
+                return error.NonAdjacentCommit;
         }
         const compatible = if (predecessor) |slot|
             std.meta.eql(slot.source.size, source.size) and slot.source.format == source.format
@@ -220,7 +221,8 @@ pub const Store = struct {
             if (identity.commit_sequence <= slot.identity.commit_sequence) return error.StaleCommit;
             const next = std.math.add(u64, slot.identity.commit_sequence, 1) catch
                 return error.NonAdjacentCommit;
-            if (identity.commit_sequence != next) return error.NonAdjacentCommit;
+            if (identity.commit_sequence != next and !coversSource(damage, source.size))
+                return error.NonAdjacentCommit;
             if (slot.source.native == null or !std.meta.eql(slot.source.size, source.size) or
                 slot.source.stride != source.stride or slot.source.format != source.format or
                 slot.accounted_bytes != logical_bytes)
@@ -392,7 +394,8 @@ pub const Store = struct {
             return error.StaleCommit;
         const next = std.math.add(u64, slot.identity.commit_sequence, 1) catch
             return error.NonAdjacentCommit;
-        if (identity.commit_sequence != next) return error.NonAdjacentCommit;
+        if (identity.commit_sequence != next and !coversSource(damage, source.size))
+            return error.NonAdjacentCommit;
 
         const packed_stride = std.math.mul(u32, source.size.width, 4) catch
             return error.InvalidSource;
@@ -1014,6 +1017,26 @@ test "render-content: prepare failure and cancellation preserve published conten
     store.cancel(prepared);
     try std.testing.expectEqualSlices(u8, &first, (try store.resolve(handle)).bytes);
     store.release(handle);
+}
+
+test "render-content: full replacement bridges superseded commit identities" {
+    var store = try Store.init(std.testing.allocator, .{ .version_capacity = 1, .byte_capacity = 4 });
+    defer store.deinit();
+    const first = [_]u8{ 1, 2, 3, 4 };
+    const old = store.publish(try store.prepare(
+        .{ .surface = 1, .commit_sequence = 1 },
+        testSource(&first, 1, 1, 4),
+        .{},
+    ));
+    const latest = [_]u8{ 5, 6, 7, 8 };
+    const current = store.publish(try store.prepareReplacing(
+        old,
+        .{ .surface = 1, .commit_sequence = 3 },
+        testSource(&latest, 1, 1, 4),
+        testDamage(&.{.{ .min_x = 0, .min_y = 0, .max_x = 1, .max_y = 1 }}),
+    ));
+    try std.testing.expectEqualSlices(u8, &latest, (try store.resolve(current)).bytes);
+    store.release(current);
 }
 
 test "render-content: versions grow beyond initial capacity with stable handles" {

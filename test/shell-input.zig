@@ -2328,6 +2328,7 @@ test "shell-input: two mapped toplevels sustain independent commit cycles" {
         .queue = &actor.transmit,
         .registry = registry,
         .activation_mode = true,
+        .metadata_commit_after_attach = true,
     };
     try submitMultiClient(&client_reactor, &driver, &handler);
 
@@ -4355,6 +4356,7 @@ const MultiHandler = struct {
     cycle_count: usize = two_toplevel_cycle_count,
     subsurface_mode: bool = false,
     activation_mode: bool = false,
+    metadata_commit_after_attach: bool = false,
     activation_requested: bool = false,
     activation_done: usize = 0,
 
@@ -4582,6 +4584,11 @@ const MultiHandler = struct {
             .damage_buffer = .{ .x = 0, .y = 0, .width = 3, .height = 2 },
         });
         try protocol.wl_surface.encodeRequest(
+            self.queue,
+            self.surfaces[index].?.id,
+            .{ .commit = .{} },
+        );
+        if (self.metadata_commit_after_attach) try protocol.wl_surface.encodeRequest(
             self.queue,
             self.surfaces[index].?.id,
             .{ .commit = .{} },

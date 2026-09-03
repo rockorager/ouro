@@ -4,7 +4,6 @@
 const std = @import("std");
 
 const c = @cImport({
-    @cInclude("fcntl.h");
     @cInclude("libudev.h");
     @cInclude("drm_fourcc.h");
     @cInclude("xf86drm.h");
@@ -416,7 +415,7 @@ fn realCreateLease(
         fd,
         objects.ptr,
         @intCast(objects.len),
-        c.O_CLOEXEC,
+        @bitCast(std.os.linux.O{ .CLOEXEC = true }),
         &lessee_id,
     );
     if (lease_fd < 0) return error.CreateLeaseFailed;

@@ -554,6 +554,28 @@ pub fn Adapter(comptime protocol: type) type {
             for (s.outbound) |o| if (o.active and same(o.peer, p)) return true;
             return false;
         }
+        /// A destroyed wl_surface cannot be referenced by a queued enter or
+        /// leave event. Drop those stale transitions before the coordinator's
+        /// next protocol flush; a subsequent focus reconciliation will enqueue
+        /// the replacement surface when one exists.
+        pub fn surfaceRemoved(s: *Self, removed: Focus) void {
+            const removed_focus = focusEq(s.focus, removed);
+            if (removed_focus) s.focus = null;
+            for (s.outbound) |*o| {
+                if (!o.active or !same(o.peer, removed.peer) or o.surface != removed.surface)
+                    continue;
+                if (o.kind == .enter or o.kind == .leave) s.dropOut(o);
+            }
+            if (removed_focus) {
+                for (s.devices.entries.items) |z| {
+                    if (!z.header.active or !same(z.peer, removed.peer) or !z.focused) continue;
+                    z.focused = false;
+                    z.pending = .{};
+                    z.current = .{};
+                    z.committed_rectangle = null;
+                }
+            }
+        }
         pub fn resourceRemoved(s: *Self, h: objects.Handle, o: objects.Object) bool {
             if (o.interface == &Input.info) {
                 const z = s.devices.fromContext(o.context) orelse return false;
@@ -778,6 +800,38 @@ test "text input focus replacement preflights every leave and enter" {
     try std.testing.expectEqual(@as(u32, 10), adapter.focus.?.surface);
     try std.testing.expectEqual(@as(usize, 0), adapter.out_len);
     for (adapter.devices.entries.items) |device| try std.testing.expect(device.focused);
+}
+
+test "text input surface removal drops stale focus transitions" {
+    const A = Adapter(@import("core_protocol"));
+    const validator: SeatValidator = .{ .validateFn = struct {
+        fn validate(_: ?*anyopaque, _: wayring.io_uring.Peer, _: u32) bool {
+            return true;
+        }
+    }.validate };
+    var adapter = try A.init(std.testing.allocator, validator, .{
+        .device_capacity = 1,
+        .event_capacity = 1,
+        .manager_capacity = 1,
+        .outbound_capacity = 2,
+        .surrounding_bytes = 8,
+        .edit_string_bytes = 8,
+    });
+    defer adapter.deinit();
+    const peer: wayring.io_uring.Peer = .{ .slot = 3, .generation = 4 };
+    const device = try adapter.acquire();
+    device.peer = peer;
+    try adapter.setFocus(.{ .peer = peer, .surface = 10 });
+    adapter.surfaceRemoved(.{ .peer = peer, .surface = 10 });
+    try std.testing.expectEqual(@as(usize, 0), adapter.pendingOutbound());
+    try std.testing.expect(adapter.focus == null);
+    try std.testing.expect(!device.focused);
+
+    try adapter.setFocus(.{ .peer = peer, .surface = 11 });
+    try adapter.setFocus(null);
+    try std.testing.expectEqual(@as(usize, 2), adapter.pendingOutbound());
+    adapter.surfaceRemoved(.{ .peer = peer, .surface = 11 });
+    try std.testing.expectEqual(@as(usize, 0), adapter.pendingOutbound());
 }
 
 test "text input manager and device reservations grow without moving contexts" {
