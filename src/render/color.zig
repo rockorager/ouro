@@ -36,6 +36,8 @@ pub const Description = struct {
     reference_luminance: f32 = 80,
     min_luminance: f32 = 0.2,
     max_luminance: f32 = 80,
+    target_max_cll: ?u32 = null,
+    target_max_fall: ?u32 = null,
     /// Optional compositor-owned ICC transform. The immutable LUT and its
     /// storage must remain alive until renderer teardown.
     lut: ?*const icc.Lut = null,
@@ -67,6 +69,9 @@ pub const Description = struct {
             value.reference_luminance <= 0 or value.min_luminance < 0 or
             value.max_luminance < value.reference_luminance or
             value.min_luminance >= value.max_luminance)
+            return error.InvalidColorDescription;
+        if (value.target_max_cll != null and value.target_max_fall != null and
+            value.target_max_fall.? > value.target_max_cll.?)
             return error.InvalidColorDescription;
         _ = try rgbToXyz(value.primaries);
     }

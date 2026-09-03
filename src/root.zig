@@ -14,6 +14,7 @@ pub const drm_syncobj = @import("drm_syncobj.zig");
 pub const protocol_linux_drm_syncobj = @import("protocol/linux_drm_syncobj.zig");
 pub const fractional_scale = @import("protocol/fractional_scale.zig");
 pub const alpha_modifier = @import("protocol/alpha_modifier.zig");
+pub const color_management = @import("protocol/color_management.zig");
 pub const pointer_warp = @import("protocol/pointer_warp.zig");
 pub const security_context = @import("protocol/security_context.zig");
 pub const completion = @import("runtime/completion.zig");
@@ -121,6 +122,7 @@ test {
     _ = drm_syncobj;
     _ = fractional_scale;
     _ = alpha_modifier;
+    _ = color_management;
     _ = pointer_warp;
     _ = security_context;
     _ = completion;

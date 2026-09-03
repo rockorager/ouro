@@ -419,9 +419,21 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     creator.description.reference_luminance = @floatFromInt(v.reference_lum);
                     creator.luminances_set = true;
                 },
-                .set_tf_power, .set_mastering_display_primaries, .set_mastering_luminance, .set_max_cll, .set_max_fall => return try self.creatorError(actor, decoded.handle.id, Creator.@"error".unsupported_feature.value, "unsupported feature"),
+                .set_max_cll => |v| {
+                    if (creator.description.target_max_cll != null)
+                        return try self.creatorError(actor, decoded.handle.id, Creator.@"error".already_set.value, "max_cll already set");
+                    creator.description.target_max_cll = v.max_cll;
+                },
+                .set_max_fall => |v| {
+                    if (creator.description.target_max_fall != null)
+                        return try self.creatorError(actor, decoded.handle.id, Creator.@"error".already_set.value, "max_fall already set");
+                    creator.description.target_max_fall = v.max_fall;
+                },
+                .set_tf_power, .set_mastering_display_primaries, .set_mastering_luminance => return try self.creatorError(actor, decoded.handle.id, Creator.@"error".unsupported_feature.value, "unsupported feature"),
                 .create => |v| {
                     if (!creator.tf_set or !creator.primaries_set) return try self.creatorError(actor, decoded.handle.id, Creator.@"error".incomplete_set.value, "incomplete image description");
+                    if (creator.version == 1 and !versionOneTargetLuminanceValid(creator.description))
+                        return try self.creatorError(actor, decoded.handle.id, Creator.@"error".invalid_luminance.value, "content light level is outside target luminance");
                     creator.description.validate() catch return try self.creatorError(actor, decoded.handle.id, Creator.@"error".invalid_luminance.value, "invalid image description");
                     const image = self.create(.image, undefined, creator.peer, null, creator.version) catch return try self.noMemory(actor);
                     image.description = creator.description;
@@ -612,9 +624,9 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                         self.remove(r);
                         return count + 1;
                     }
-                    while (r.pending < 5) {
+                    while (r.pending < 7) {
                         const primaries = infoPrimaries(r.description.primaries);
-                        const event: Info.Event = switch (r.pending) {
+                        const event: ?Info.Event = switch (r.pending) {
                             0 => .{ .primaries = primaries },
                             1 => .{ .tf_named = .{ .tf = if (r.version >= 2)
                                 namedTransfer(r.description.transfer, true)
@@ -630,14 +642,23 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                                 .min_lum = @intFromFloat(r.description.min_luminance * 10_000),
                                 .max_lum = @intFromFloat(r.description.max_luminance),
                             } },
+                            5 => if (r.description.target_max_cll) |value|
+                                .{ .target_max_cll = .{ .max_cll = value } }
+                            else
+                                null,
+                            6 => if (r.description.target_max_fall) |value|
+                                .{ .target_max_fall = .{ .max_fall = value } }
+                            else
+                                null,
                             else => unreachable,
                         };
-                        wayring.server.sendEvent(protocol, Info, server_objects, queue, r.handle, event) catch |err| switch (err) {
-                            error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return count,
-                            else => return err,
-                        };
+                        if (event) |value|
+                            wayring.server.sendEvent(protocol, Info, server_objects, queue, r.handle, value) catch |err| switch (err) {
+                                error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return count,
+                                else => return err,
+                            };
                         r.pending += 1;
-                        count += 1;
+                        count += @intFromBool(event != null);
                     }
                     // `done` is a destructor event. sendEvent synchronously
                     // invokes resourceRemoved, which frees r, so it must be the
@@ -653,7 +674,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             return count;
         }
         pub fn pendingOutbound(self: *const Self, peer: wayring.io_uring.Peer) bool {
-            for (self.resources.items) |r| if (samePeer(r.peer, peer) and ((r.kind == .manager and r.pending < capabilities.len) or (r.kind == .image and r.pending == 0 and r.image_state != .compiling) or (r.kind == .info and r.pending < 6))) return true;
+            for (self.resources.items) |r| if (samePeer(r.peer, peer) and ((r.kind == .manager and r.pending < capabilities.len) or (r.kind == .image and r.pending == 0 and r.image_state != .compiling) or (r.kind == .info and r.pending < 8))) return true;
             return false;
         }
         pub fn resourceRemoved(self: *Self, handle: objects.Handle, object: objects.Object) bool {
@@ -901,10 +922,25 @@ fn descriptionIdentity(description: color.Description) u64 {
         @bitCast(description.reference_luminance),
         @bitCast(description.min_luminance),
         @bitCast(description.max_luminance),
+        description.target_max_cll orelse 0,
+        description.target_max_fall orelse 0,
+        @intFromBool(description.target_max_cll != null) |
+            (@as(u32, @intFromBool(description.target_max_fall != null)) << 1),
     };
     var identity = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(&values));
     if (description.lut) |lut| identity = std.hash.Wyhash.hash(identity, &lut.profile_hash);
     return if (identity == 0) 1 else identity;
+}
+
+fn versionOneTargetLuminanceValid(description: color.Description) bool {
+    inline for (.{ description.target_max_cll, description.target_max_fall }) |level| {
+        if (level) |value| {
+            const luminance: f32 = @floatFromInt(value);
+            if (luminance <= description.min_luminance or
+                luminance > description.max_luminance) return false;
+        }
+    }
+    return true;
 }
 
 fn releaseResolvedOutput(resolved: ResolvedOutput) void {
@@ -940,7 +976,9 @@ fn failureMessage(failure: icc_worker.Failure) []const u8 {
 
 test "image description info completion does not access destroyed resource" {
     const protocol = @import("core_protocol");
-    const FakeCore = struct {};
+    const FakeCore = struct {
+        pub const SurfaceId = u64;
+    };
     const TestAdapter = Adapter(protocol, FakeCore);
     const peer: wayring.io_uring.Peer = .{ .slot = 0, .generation = 1 };
 
@@ -973,6 +1011,8 @@ test "image description info completion does not access destroyed resource" {
 
     const info = try adapter.create(.info, undefined, peer, null, 2);
     info.handle = try server_objects.insertClient(2, &protocol.wp_image_description_info_v1.info, 2, info);
+    info.description.target_max_cll = 1_000;
+    info.description.target_max_fall = 400;
     const info_handle = info.handle;
 
     var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 256, 2);
@@ -982,7 +1022,28 @@ test "image description info completion does not access destroyed resource" {
     var queue = wayring.tx.Queue.init(&blocks, 256, &descriptors, 0);
     defer queue.deinit();
 
-    try std.testing.expectEqual(@as(usize, 6), try adapter.flushOn(peer, &server_objects, &queue));
+    try std.testing.expectEqual(@as(usize, 8), try adapter.flushOn(peer, &server_objects, &queue));
     try std.testing.expect(server_objects.namespace.resolve(info_handle) == null);
     try std.testing.expect(!adapter.pendingOutbound(peer));
+}
+
+test "content light metadata validation and identity are exact" {
+    var description = color.Description.srgb;
+    description.max_luminance = 1_000;
+    description.target_max_cll = 1_000;
+    description.target_max_fall = 400;
+    try description.validate();
+    try std.testing.expect(versionOneTargetLuminanceValid(description));
+
+    const identity = descriptionIdentity(description);
+    description.target_max_fall = 1_001;
+    try std.testing.expectError(error.InvalidColorDescription, description.validate());
+    description.target_max_fall = null;
+    try std.testing.expect(identity != descriptionIdentity(description));
+
+    description.target_max_cll = 0;
+    try std.testing.expect(!versionOneTargetLuminanceValid(description));
+    try std.testing.expect(
+        descriptionIdentity(description) != descriptionIdentity(color.Description.srgb),
+    );
 }
