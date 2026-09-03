@@ -63,6 +63,7 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
             paint_cursors: bool,
             first: bool,
         };
+        pub const Candidate = struct { sequence: u64, capture: Capture };
         pub const Failure = enum { unknown, buffer_constraints, stopped };
 
         const Session = struct {
@@ -307,22 +308,47 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
                 return;
             };
         }
-        pub fn takeCapture(self: *Self) ?Capture {
+        pub fn nextCapture(self: *Self, after: ?u64) ?Candidate {
             if (self.capture_count == 0) return null;
             while (true) {
                 var best: ?*CaptureSlot = null;
                 for (self.captures) |*c| {
-                    if (c.active and (best == null or c.sequence < best.?.sequence)) best = c;
+                    if (!c.active or (after != null and c.sequence <= after.?)) continue;
+                    if (best == null or c.sequence < best.?.sequence) best = c;
                 }
                 const slot = best orelse return null;
                 const value = slot.value;
+                const frame = self.mutableFrame(value.frame) catch {
+                    slot.active = false;
+                    self.capture_count -= 1;
+                    continue;
+                };
+                if (frame.phase != .queued) {
+                    slot.active = false;
+                    self.capture_count -= 1;
+                    continue;
+                }
+                return .{ .sequence = slot.sequence, .capture = value };
+            }
+        }
+
+        pub fn acceptCapture(self: *Self, id: FrameId) !void {
+            const frame = try self.mutableFrame(id);
+            if (frame.phase != .queued) return error.InvalidCompletion;
+            for (self.captures) |*slot| {
+                if (!slot.active or !std.meta.eql(slot.value.frame, id)) continue;
                 slot.active = false;
                 self.capture_count -= 1;
-                const frame = self.mutableFrame(value.frame) catch continue;
-                if (frame.phase != .queued) continue;
                 frame.phase = .started;
-                return value;
+                return;
             }
+            return error.InvalidCompletion;
+        }
+
+        pub fn takeCapture(self: *Self) ?Capture {
+            const candidate = self.nextCapture(null) orelse return null;
+            self.acceptCapture(candidate.capture.frame) catch unreachable;
+            return candidate.capture;
         }
 
         pub fn requestOn(
@@ -1061,6 +1087,45 @@ test "image copy capture: constraints and successful completion retain protocol 
         adapter.outbound_count -= 1;
     }
     try std.testing.expectError(error.AlreadyCaptured, adapter.capture(frame));
+}
+
+test "image copy capture: queued work can be inspected before exact acceptance" {
+    var adapter = try TestAdapter.init(std.testing.allocator, .{
+        .session_capacity = 2,
+        .frame_capacity = 2,
+        .capture_capacity = 2,
+        .outbound_capacity = 8,
+    });
+    defer adapter.deinit();
+    const constraints: TestAdapter.Constraints = .{ .width = 64, .height = 32 };
+    const first_session = try adapter.admitSession(
+        test_peer,
+        .{ .id = 10, .generation = 1 },
+        test_snapshot,
+        constraints,
+        false,
+    );
+    const second_session = try adapter.admitSession(
+        test_peer,
+        .{ .id = 11, .generation = 1 },
+        test_snapshot,
+        constraints,
+        false,
+    );
+    const first_frame = try adapter.createFrame(first_session, .{ .id = 12, .generation = 1 });
+    try adapter.attachBuffer(first_frame, .{ .id = 14, .generation = 1 });
+    try adapter.capture(first_frame);
+    const second_frame = try adapter.createFrame(second_session, .{ .id = 13, .generation = 1 });
+    try adapter.attachBuffer(second_frame, .{ .id = 15, .generation = 1 });
+    try adapter.capture(second_frame);
+
+    const first = adapter.nextCapture(null).?;
+    try std.testing.expectEqual(first_frame, first.capture.frame);
+    const second = adapter.nextCapture(first.sequence).?;
+    try std.testing.expectEqual(second_frame, second.capture.frame);
+    try adapter.acceptCapture(second.capture.frame);
+    try std.testing.expectEqual(first_frame, adapter.nextCapture(null).?.capture.frame);
+    try std.testing.expectError(error.InvalidCompletion, adapter.acceptCapture(second.capture.frame));
 }
 
 test "image copy capture: generated events flush in protocol order" {
