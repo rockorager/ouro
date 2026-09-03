@@ -10062,12 +10062,12 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn processImageCopyCaptures(self: *Self) !void {
-            if (self.anyPendingScreencopy()) return;
             if (self.pending_image_copy) |pending| {
                 if (!pending.awaiting_output) try self.finishImageCopy(false, 0, null);
                 return;
             }
-            const capture = self.image_copy_capture_adapter.takeCapture() orelse return;
+            const capture = self.nextReadyImageCopyCapture() orelse return;
+            try self.image_copy_capture_adapter.acceptCapture(capture.frame);
             if (capture.target == .source) switch (capture.target.source) {
                 .toplevel => |id| {
                     try self.processToplevelImageCopy(capture, id);
@@ -10223,6 +10223,30 @@ pub fn Coordinator(comptime protocol: type) type {
                 return;
             }
             self.pending_image_copy.?.awaiting_output = true;
+        }
+
+        fn nextReadyImageCopyCapture(self: *Self) ?ImageCopyCaptureAdapter.Capture {
+            var after: ?u64 = null;
+            while (self.image_copy_capture_adapter.nextCapture(after)) |candidate| {
+                after = candidate.sequence;
+                const capture = candidate.capture;
+                const output = switch (capture.target) {
+                    .source => |source| switch (source) {
+                        .toplevel => |id| if (self.captureToplevelBounds(id)) |bounds|
+                            self.captureOutputForToplevelBounds(bounds)
+                        else
+                            null,
+                        .output => self.captureKmsOutput(capture.target),
+                    },
+                    .cursor => self.captureKmsOutput(capture.target),
+                };
+                const selected = output orelse return capture;
+                const physical = self.physicalOutputForKmsId(selected.outputId()) orelse
+                    return capture;
+                if (physical.pending_screencopy != null) continue;
+                return capture;
+            }
+            return null;
         }
 
         fn processToplevelImageCopy(
