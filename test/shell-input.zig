@@ -3185,13 +3185,13 @@ fn runImageCopyCapture(interrupt: bool) !void {
     for (0..512) |_| {
         client_progress = try drainClient(&client_reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
-        if (interrupt and !disable_sent and coordinator.pending_image_copy != null) {
+        if (interrupt and !disable_sent and coordinator.anyPendingImageCopy()) {
             try fixture.signalSession(.disable);
             disable_sent = true;
         }
         if ((!interrupt and handler.ready) or
             (interrupt and handler.failed and handler.stopped and
-                coordinator.pending_image_copy == null and
+                !coordinator.anyPendingImageCopy() and
                 coordinator.session.state == .disabled)) break;
         if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
             try waitForEither(&root.ring, client_reactor.ring);
@@ -3205,7 +3205,7 @@ fn runImageCopyCapture(interrupt: bool) !void {
     try std.testing.expectEqual(@as(usize, 1), handler.constraints_done_events);
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
     if (interrupt) {
-        try std.testing.expect(coordinator.pending_image_copy == null);
+        try std.testing.expect(!coordinator.anyPendingImageCopy());
         try std.testing.expectEqual(.disabled, coordinator.session.state);
     } else {
         try std.testing.expectEqual(@as(usize, 1), handler.transform_events);
