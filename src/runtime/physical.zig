@@ -7485,13 +7485,14 @@ pub fn Coordinator(comptime protocol: type) type {
                 }
                 if (existing) |physical| {
                     if (physical.kms_output != null) continue;
-                    physical.claim = self.manager.claimScanout(handle, candidate) catch |err| {
-                        std.log.err(
-                            "could not claim connector {d}: {t}",
-                            .{ connector_id, err },
-                        );
-                        continue;
-                    };
+                    if (physical.claim == null)
+                        physical.claim = self.manager.claimScanout(handle, candidate) catch |err| {
+                            std.log.err(
+                                "could not claim connector {d}: {t}",
+                                .{ connector_id, err },
+                            );
+                            continue;
+                        };
                     const snapshot = self.manager.claimSnapshot(physical.claim.?) catch {
                         self.manager.releaseScanout(physical.claim.?) catch {};
                         physical.claim = null;
