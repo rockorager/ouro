@@ -1303,6 +1303,7 @@ test "shell-input: security context filters nested manager before registry disco
             parent_handler.input_method_global_seen and
             parent_handler.virtual_keyboard_global_seen and
             parent_handler.virtual_pointer_global_seen and
+            parent_handler.transient_seat_global_seen and
             parent_handler.foreign_toplevel_global_seen and
             parent_handler.workspace_global_seen and
             parent_handler.output_management_global_seen and
@@ -1318,6 +1319,7 @@ test "shell-input: security context filters nested manager before registry disco
     try std.testing.expect(parent_handler.input_method_global_seen);
     try std.testing.expect(parent_handler.virtual_keyboard_global_seen);
     try std.testing.expect(parent_handler.virtual_pointer_global_seen);
+    try std.testing.expect(parent_handler.transient_seat_global_seen);
     try std.testing.expect(parent_handler.foreign_toplevel_global_seen);
     try std.testing.expect(parent_handler.workspace_global_seen);
     try std.testing.expect(parent_handler.output_management_global_seen);
@@ -1420,6 +1422,7 @@ test "shell-input: security context filters nested manager before registry disco
     try std.testing.expect(!child_handler.input_method_global_seen);
     try std.testing.expect(!child_handler.virtual_keyboard_global_seen);
     try std.testing.expect(!child_handler.virtual_pointer_global_seen);
+    try std.testing.expect(!child_handler.transient_seat_global_seen);
     try std.testing.expect(!child_handler.foreign_toplevel_global_seen);
     try std.testing.expect(!child_handler.workspace_global_seen);
     try std.testing.expect(!child_handler.output_management_global_seen);
@@ -5940,6 +5943,7 @@ const Handler = struct {
     input_method_global_seen: bool = false,
     virtual_keyboard_global_seen: bool = false,
     virtual_pointer_global_seen: bool = false,
+    transient_seat_global_seen: bool = false,
     text_input_manager: ?wayring.objects.Handle = null,
     text_input: ?wayring.objects.Handle = null,
     test_text_input: bool = false,
@@ -6533,6 +6537,8 @@ const Handler = struct {
                 self.virtual_keyboard_global_seen = true;
             if (std.mem.eql(u8, value.interface, protocol.zwlr_virtual_pointer_manager_v1.info.name))
                 self.virtual_pointer_global_seen = true;
+            if (std.mem.eql(u8, value.interface, protocol.ext_transient_seat_manager_v1.info.name))
+                self.transient_seat_global_seen = true;
             if (std.mem.eql(u8, value.interface, protocol.ext_foreign_toplevel_list_v1.info.name))
                 self.foreign_toplevel_global_seen = true;
             if (std.mem.eql(u8, value.interface, protocol.ext_workspace_manager_v1.info.name))
