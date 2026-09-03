@@ -1373,7 +1373,12 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                         return try adapter.protocolError(actor, decoded.handle.id, WmBase.@"error".role.value, "unknown wl_surface");
                     const wl_surface = adapter.core.getSurfaceObject(wl_handle, wl_object) catch
                         return try adapter.protocolError(actor, decoded.handle.id, WmBase.@"error".role.value, "surface belongs to another owner");
-                    if (wl_surface.role.id != 0)
+                    // GTK and Chromium recreate this wrapper after unmapping.
+                    // Preserve the permanent role; assign() below still rejects
+                    // changing between the toplevel and popup roles.
+                    if (wl_surface.role.object_active or (wl_surface.role.id != 0 and
+                        wl_surface.role.id != toplevel_role_id and
+                        wl_surface.role.id != popup_role_id))
                         return try adapter.protocolError(actor, decoded.handle.id, WmBase.@"error".role.value, "surface already has a role");
                     if (wl_surface.current_buffer != null or wl_surface.hasPendingBufferAttachment())
                         return try adapter.protocolError(actor, decoded.handle.id, WmBase.@"error".invalid_surface_state.value, "surface already has content");
@@ -3147,6 +3152,38 @@ test "xdg-shell: destroyed role object can be recreated with the permanent role"
 
     try test_protocol.xdg_surface.encodeRequest(&context.requests, 11, .{
         .get_toplevel = .{ .id = 16 },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    const second = switch (context.adapter.popEvent() orelse return error.MissingEvent) {
+        .toplevel_created => |event| event.id,
+        else => return error.UnexpectedEvent,
+    };
+    try std.testing.expect(!std.meta.eql(first, second));
+    try std.testing.expectEqual(toplevel_role_id, context.core.state.role.id);
+    try std.testing.expect(context.core.state.role.object_active);
+}
+
+test "xdg-shell: destroyed wrapper can be recreated with the permanent role" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const first = try context.createToplevel();
+
+    try test_protocol.xdg_toplevel.encodeRequest(&context.requests, 12, .{ .destroy = .{} });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try std.testing.expectEqual(first, switch (context.adapter.popEvent().?) {
+        .toplevel_destroyed => |destroyed| destroyed,
+        else => return error.UnexpectedEvent,
+    });
+    try test_protocol.xdg_surface.encodeRequest(&context.requests, 11, .{ .destroy = .{} });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try std.testing.expect(context.server_objects.namespace.lookupHandle(11) == null);
+
+    try test_protocol.xdg_wm_base.encodeRequest(&context.requests, context.manager.id, .{
+        .get_xdg_surface = .{ .id = 16, .surface = context.core.handle.id },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try test_protocol.xdg_surface.encodeRequest(&context.requests, 16, .{
+        .get_toplevel = .{ .id = 17 },
     });
     try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
     const second = switch (context.adapter.popEvent() orelse return error.MissingEvent) {
