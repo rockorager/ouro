@@ -2417,6 +2417,8 @@ test "shell-input: two mapped toplevels sustain independent commit cycles" {
     try std.testing.expect(coordinator.stats.presented >= two_toplevel_cycle_count);
     try std.testing.expectEqual(@as(usize, two_toplevel_cycle_count * 2), handler.buffer_releases);
     try std.testing.expectEqual(@as(usize, two_toplevel_cycle_count * 2), handler.frame_done);
+    try std.testing.expectEqual(@as(usize, 2), handler.preferred_buffer_scales);
+    try std.testing.expectEqual(@as(usize, 2), handler.preferred_buffer_transforms);
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
 
     const windows = try coordinator.desktop.sceneSnapshot(coordinator.scene_windows);
@@ -4570,6 +4572,8 @@ const MultiHandler = struct {
     shell_created: bool = false,
     buffer_releases: usize = 0,
     frame_done: usize = 0,
+    preferred_buffer_scales: usize = 0,
+    preferred_buffer_transforms: usize = 0,
     cycles_started: [2]usize = .{ 0, 0 },
     event_failures: usize = 0,
     surface_count: usize = 2,
@@ -4603,6 +4607,12 @@ const MultiHandler = struct {
             try self.maybeCreateShells();
         } else if (target.object.interface == &protocol.wl_shm.info) {
             _ = try protocol.wl_shm.decodeEvent(message, fds);
+        } else if (target.object.interface == &protocol.wl_surface.info) {
+            switch (try protocol.wl_surface.decodeEvent(message, fds)) {
+                .preferred_buffer_scale => self.preferred_buffer_scales += 1,
+                .preferred_buffer_transform => self.preferred_buffer_transforms += 1,
+                else => {},
+            }
         } else if (target.object.interface == &protocol.xdg_toplevel.info) {
             _ = try protocol.xdg_toplevel.decodeEvent(message, fds);
         } else if (target.object.interface == &protocol.wl_seat.info) {

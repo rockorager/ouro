@@ -2478,7 +2478,8 @@ pub fn Coordinator(comptime protocol: type) type {
                     self.surface_id = try self.adapter.surfaceId(first);
                 };
                 if (self.shellMaintenancePending()) try self.advanceShell();
-                if (self.adapter.pendingPresentationClock(peer) or
+                if (self.adapter.pendingPreferredBuffer(peer) or
+                    self.adapter.pendingPresentationClock(peer) or
                     self.adapter.pendingDiscardedFeedback(peer))
                     self.markProtocol(peer, ProtocolReady.core);
                 try self.flushProtocol();
@@ -7093,6 +7094,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 else => return err,
             };
             if (client.protocol_ready & ProtocolReady.core != 0) {
+                flushed += try self.adapter.flushPreferredBufferOn(peer, objects, &actor.transmit);
                 flushed += try self.adapter.flushPresentationClockOn(peer, objects, &actor.transmit);
                 flushed += try self.adapter.flushDiscardedFeedbackOn(peer, objects, &actor.transmit);
             }
@@ -7502,6 +7504,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 !self.idle_notify_adapter.pendingOutbound(client.peer))
                 ready &= ~ProtocolReady.idle_notify;
             if (ready & ProtocolReady.core != 0 and
+                !self.adapter.pendingPreferredBuffer(client.peer) and
                 !self.adapter.pendingPresentationClock(client.peer) and
                 !self.adapter.pendingDiscardedFeedback(client.peer))
                 ready &= ~ProtocolReady.core;
@@ -11869,12 +11872,19 @@ pub fn Coordinator(comptime protocol: type) type {
                         state.surface,
                         head.scale_120,
                     );
+                    try self.adapter.publishPreferredBuffer(
+                        state.surface,
+                        preferredIntegerScale(head.scale_120),
+                        .normal,
+                    );
                 }
                 try self.publishLayerPreferredScale(&self.cursor_layer, client.peer);
                 if (self.output_adapter.pendingOutboundOn(client.peer))
                     client.protocol_ready |= ProtocolReady.output;
                 if (self.fractional_scale_adapter.pendingOutbound(client.peer))
                     client.protocol_ready |= ProtocolReady.fractional_scale;
+                if (self.adapter.pendingPreferredBuffer(client.peer))
+                    client.protocol_ready |= ProtocolReady.core;
             };
             self.output_associations_dirty = false;
         }
@@ -11924,6 +11934,11 @@ pub fn Coordinator(comptime protocol: type) type {
                 _ = try self.fractional_scale_adapter.publishSurfacePreferredScale(
                     surface,
                     scale,
+                );
+                try self.adapter.publishPreferredBuffer(
+                    surface,
+                    preferredIntegerScale(scale),
+                    .normal,
                 );
             }
         }
@@ -12839,6 +12854,10 @@ fn longestCursorShapeName() usize {
     var longest: usize = 0;
     for (protocol_cursor_shape.shape_names) |name| longest = @max(longest, name.len);
     return longest;
+}
+
+fn preferredIntegerScale(scale_120: u32) i32 {
+    return @intCast(scale_120 / 120 + @intFromBool(scale_120 % 120 != 0));
 }
 
 fn fixedPointForScene(scene: anytype, global: anytype) ?geometry.Point {
@@ -14114,6 +14133,14 @@ test "physical: capture rectangles require exact output containment" {
         @as(u64, 0),
         rectangleIntersectionArea(secondary, .{ .x = -3, .y = 0, .width = 3, .height = 2 }),
     );
+}
+
+test "physical: fractional output scale rounds core preference upward" {
+    try std.testing.expectEqual(@as(i32, 1), preferredIntegerScale(120));
+    try std.testing.expectEqual(@as(i32, 2), preferredIntegerScale(121));
+    try std.testing.expectEqual(@as(i32, 2), preferredIntegerScale(180));
+    try std.testing.expectEqual(@as(i32, 2), preferredIntegerScale(240));
+    try std.testing.expectEqual(@as(i32, 3), preferredIntegerScale(241));
 }
 
 test "physical: toplevel capture bounds include every tree extension" {

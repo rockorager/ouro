@@ -219,6 +219,10 @@ pub fn Adapter(comptime protocol: type) type {
             viewport_resource: ?objects.Handle = null,
             explicit_sync_resource: ?objects.Handle = null,
             presentation_feedback: surface_state.PresentationFeedbackPending = undefined,
+            preferred_buffer_scale: ?i32 = null,
+            preferred_buffer_transform: ?protocol.wl_output.transform = null,
+            preferred_buffer_scale_pending: bool = false,
+            preferred_buffer_transform_pending: bool = false,
         };
 
         const RegionSlot = struct {
@@ -897,6 +901,54 @@ pub fn Adapter(comptime protocol: type) type {
                 false;
         }
 
+        pub fn flushPreferredBufferOn(
+            adapter: *Self,
+            peer: wayring.io_uring.Peer,
+            server_objects: anytype,
+            queue: *wayring.tx.Queue,
+        ) !usize {
+            var completed: usize = 0;
+            for (adapter.surfaces) |slot| {
+                if (!slot.active or !std.meta.eql(slot.peer, peer)) continue;
+                const object = server_objects.namespace.resolve(slot.resource) orelse continue;
+                if (object.version < 6) {
+                    slot.preferred_buffer_scale_pending = false;
+                    slot.preferred_buffer_transform_pending = false;
+                    continue;
+                }
+                if (slot.preferred_buffer_scale_pending) {
+                    SurfaceInterface.encodeEvent(queue, slot.resource.id, .{
+                        .preferred_buffer_scale = .{ .factor = slot.preferred_buffer_scale.? },
+                    }) catch |err| switch (err) {
+                        error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return completed,
+                        else => return err,
+                    };
+                    slot.preferred_buffer_scale_pending = false;
+                    completed += 1;
+                }
+                if (slot.preferred_buffer_transform_pending) {
+                    SurfaceInterface.encodeEvent(queue, slot.resource.id, .{
+                        .preferred_buffer_transform = .{ .transform = slot.preferred_buffer_transform.? },
+                    }) catch |err| switch (err) {
+                        error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return completed,
+                        else => return err,
+                    };
+                    slot.preferred_buffer_transform_pending = false;
+                    completed += 1;
+                }
+            }
+            return completed;
+        }
+
+        pub fn pendingPreferredBuffer(adapter: *const Self, peer: wayring.io_uring.Peer) bool {
+            for (adapter.surfaces) |slot|
+                if (slot.active and std.meta.eql(slot.peer, peer) and
+                    (slot.preferred_buffer_scale_pending or
+                        slot.preferred_buffer_transform_pending))
+                    return true;
+            return false;
+        }
+
         pub fn getSurface(
             adapter: *Self,
             handle: objects.Handle,
@@ -1026,6 +1078,26 @@ pub fn Adapter(comptime protocol: type) type {
             if (!slot.active or slot.resource.generation != id.generation)
                 return error.StaleSurface;
             return slot.peer;
+        }
+
+        pub fn publishPreferredBuffer(
+            adapter: *Self,
+            id: SurfaceId,
+            scale: i32,
+            transform: protocol.wl_output.transform,
+        ) !void {
+            if (scale <= 0) return error.InvalidScale;
+            const slot = try adapter.surfaceForId(id);
+            if (slot.preferred_buffer_scale == null or slot.preferred_buffer_scale.? != scale) {
+                slot.preferred_buffer_scale = scale;
+                slot.preferred_buffer_scale_pending = true;
+            }
+            if (slot.preferred_buffer_transform == null or
+                slot.preferred_buffer_transform.?.value != transform.value)
+            {
+                slot.preferred_buffer_transform = transform;
+                slot.preferred_buffer_transform_pending = true;
+            }
         }
 
         /// Installs the composition root's two-phase shell boundary. Validation
@@ -3676,6 +3748,91 @@ test "core surface: created surface retains exact connection peer" {
         wayring.io_uring.Peer{ .slot = context.actor.slot, .generation = context.actor.generation },
         try context.adapter.surfacePeer(id),
     );
+}
+
+test "core surface: preferred buffer state publishes changes on version six" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const surface = try context.createSurface(10);
+    const id = try context.adapter.surfaceId(surface);
+    const peer: wayring.io_uring.Peer = .{
+        .slot = context.actor.slot,
+        .generation = context.actor.generation,
+    };
+
+    try context.adapter.publishPreferredBuffer(id, 2, .normal);
+    try std.testing.expect(context.adapter.pendingPreferredBuffer(peer));
+    try std.testing.expectEqual(@as(usize, 2), try context.adapter.flushPreferredBufferOn(
+        peer,
+        &context.server_objects,
+        &context.actor.transmit,
+    ));
+    try std.testing.expect(!context.adapter.pendingPreferredBuffer(peer));
+
+    var descriptor_scratch: [1]linux.fd_t = undefined;
+    var control: [64]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+    var snapshot = try context.actor.transmit.snapshot(&descriptor_scratch, &control);
+    var message = (try wayring.wire.Message.decode(snapshot.first)).?;
+    const scale = (try test_protocol.wl_surface.decodeEvent(
+        message,
+        &context.received_fds,
+    )).preferred_buffer_scale;
+    try std.testing.expectEqual(@as(i32, 2), scale.factor);
+    try context.actor.transmit.begin(snapshot);
+    try context.actor.transmit.complete(message.header.size);
+
+    snapshot = try context.actor.transmit.snapshot(&descriptor_scratch, &control);
+    message = (try wayring.wire.Message.decode(snapshot.first)).?;
+    const transform = (try test_protocol.wl_surface.decodeEvent(
+        message,
+        &context.received_fds,
+    )).preferred_buffer_transform;
+    try std.testing.expectEqual(test_protocol.wl_output.transform.normal, transform.transform);
+    try context.actor.transmit.begin(snapshot);
+    try context.actor.transmit.complete(message.header.size);
+
+    try context.adapter.publishPreferredBuffer(id, 2, .normal);
+    try std.testing.expect(!context.adapter.pendingPreferredBuffer(peer));
+    try context.adapter.publishPreferredBuffer(id, 3, .normal);
+    try std.testing.expectEqual(@as(usize, 1), try context.adapter.flushPreferredBufferOn(
+        peer,
+        &context.server_objects,
+        &context.actor.transmit,
+    ));
+    snapshot = try context.actor.transmit.snapshot(&descriptor_scratch, &control);
+    message = (try wayring.wire.Message.decode(snapshot.first)).?;
+    const changed = (try test_protocol.wl_surface.decodeEvent(
+        message,
+        &context.received_fds,
+    )).preferred_buffer_scale;
+    try std.testing.expectEqual(@as(i32, 3), changed.factor);
+}
+
+test "core surface: preferred buffer state clears below version six" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    _ = try context.server_objects.removeClient(context.compositor);
+    context.compositor = try context.server_objects.insertClient(
+        2,
+        &test_protocol.wl_compositor.info,
+        5,
+        &context.adapter,
+    );
+    const surface = try context.createSurface(10);
+    const id = try context.adapter.surfaceId(surface);
+    const peer: wayring.io_uring.Peer = .{
+        .slot = context.actor.slot,
+        .generation = context.actor.generation,
+    };
+
+    try context.adapter.publishPreferredBuffer(id, 2, .normal);
+    try std.testing.expectEqual(@as(usize, 0), try context.adapter.flushPreferredBufferOn(
+        peer,
+        &context.server_objects,
+        &context.actor.transmit,
+    ));
+    try std.testing.expect(!context.adapter.pendingPreferredBuffer(peer));
+    try std.testing.expectEqual(@as(usize, 0), context.actor.transmit.queuedBytes());
 }
 
 test "viewporter: generated requests publish and clear double-buffered crop state" {
