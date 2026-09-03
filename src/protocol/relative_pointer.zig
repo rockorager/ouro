@@ -1,9 +1,8 @@
 //! Bounded relative-pointer-v1 ownership and motion publication.
 //!
 //! Relative motion follows the focus of the associated wl_pointer. Events
-//! retain their original microsecond timestamp and unclipped normalized delta;
-//! Ouro currently has no separate unaccelerated input stream, so the same
-//! normalized delta is reported for both protocol fields.
+//! retain their original microsecond timestamp and unclipped accelerated and
+//! unaccelerated normalized deltas.
 
 const std = @import("std");
 const wayring = @import("wayring");
@@ -45,6 +44,8 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
             time_usec: u64,
             dx: i32,
             dy: i32,
+            dx_unaccel: i32,
+            dy_unaccel: i32,
         };
         const Outbound = struct {
             active: bool = false,
@@ -182,6 +183,8 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
             if (self.outboundFree() < count) return error.Exhausted;
             const dx = fixed(motion.dx);
             const dy = fixed(motion.dy);
+            const dx_unaccel = fixed(motion.dx_unaccel orelse motion.dx);
+            const dy_unaccel = fixed(motion.dy_unaccel orelse motion.dy);
             for (self.slots.entries.items) |slot| {
                 if (!slot.header.active or !self.seat.pointerFocused(slot.pointer)) continue;
                 self.enqueue(slot.peer, .{
@@ -189,6 +192,8 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                     .time_usec = motion.time_usec,
                     .dx = dx,
                     .dy = dy,
+                    .dx_unaccel = dx_unaccel,
+                    .dy_unaccel = dy_unaccel,
                 }) catch unreachable;
             }
         }
@@ -220,8 +225,8 @@ pub fn Adapter(comptime protocol: type, comptime Seat: type) type {
                         .utime_lo = @truncate(timestamp),
                         .dx = outbound.motion.dx,
                         .dy = outbound.motion.dy,
-                        .dx_unaccel = outbound.motion.dx,
-                        .dy_unaccel = outbound.motion.dy,
+                        .dx_unaccel = outbound.motion.dx_unaccel,
+                        .dy_unaccel = outbound.motion.dy_unaccel,
                     } },
                 ) catch |err| switch (err) {
                     error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return completed,
@@ -394,6 +399,8 @@ test "relative pointer: focused resources retain exact unclipped motion" {
         .time_usec = 0x123456789,
         .dx = 1.5,
         .dy = -2.25,
+        .dx_unaccel = 3,
+        .dy_unaccel = -4.5,
     } });
 
     const motion = adapter.oldest(focused.peer).?.motion;
@@ -401,6 +408,8 @@ test "relative pointer: focused resources retain exact unclipped motion" {
     try std.testing.expectEqual(@as(u64, 0x123456789), motion.time_usec);
     try std.testing.expectEqual(@as(i32, 384), motion.dx);
     try std.testing.expectEqual(@as(i32, -576), motion.dy);
+    try std.testing.expectEqual(@as(i32, 768), motion.dx_unaccel);
+    try std.testing.expectEqual(@as(i32, -1152), motion.dy_unaccel);
     try std.testing.expectError(error.Exhausted, adapter.consume(.{ .pointer_motion = .{
         .device = .{ .slot = 0, .generation = 1, .seat_generation = 1 },
         .time_usec = 2,
@@ -428,7 +437,9 @@ test "relative pointer: focused resources retain exact unclipped motion" {
     try std.testing.expectEqual(@as(u32, 1), relative.utime_hi);
     try std.testing.expectEqual(@as(u32, 0x23456789), relative.utime_lo);
     try std.testing.expectEqual(@as(i32, 384), relative.dx);
-    try std.testing.expectEqual(@as(i32, -576), relative.dy_unaccel);
+    try std.testing.expectEqual(@as(i32, -576), relative.dy);
+    try std.testing.expectEqual(@as(i32, 768), relative.dx_unaccel);
+    try std.testing.expectEqual(@as(i32, -1152), relative.dy_unaccel);
 
     seat.focused = null;
     try adapter.consume(.{ .pointer_motion = .{

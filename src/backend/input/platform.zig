@@ -187,7 +187,14 @@ pub const TouchPosition = struct {
 pub const RawEvent = union(enum) {
     device_added: struct { device: DeviceRef, info: DeviceInfo },
     device_removed: DeviceRef,
-    pointer_motion: struct { device: DeviceRef, time_usec: u64, dx: f64, dy: f64 },
+    pointer_motion: struct {
+        device: DeviceRef,
+        time_usec: u64,
+        dx: f64,
+        dy: f64,
+        dx_unaccel: ?f64 = null,
+        dy_unaccel: ?f64 = null,
+    },
     pointer_button: struct { device: DeviceRef, time_usec: u64, button: u32, pressed: bool },
     pointer_axis: struct {
         device: DeviceRef,
@@ -416,6 +423,8 @@ fn realNextEvent(_: *anyopaque, value: *anyopaque) !?RawEvent {
                 .time_usec = c.libinput_event_pointer_get_time_usec(pointer),
                 .dx = c.libinput_event_pointer_get_dx(pointer),
                 .dy = c.libinput_event_pointer_get_dy(pointer),
+                .dx_unaccel = c.libinput_event_pointer_get_dx_unaccelerated(pointer),
+                .dy_unaccel = c.libinput_event_pointer_get_dy_unaccelerated(pointer),
             } };
         },
         c.LIBINPUT_EVENT_POINTER_BUTTON => blk: {

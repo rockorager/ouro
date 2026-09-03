@@ -65,7 +65,14 @@ pub const TouchPosition = struct {
 pub const Event = union(enum) {
     device_added: struct { device: DeviceId, info: platform_api.DeviceInfo },
     device_removed: DeviceId,
-    pointer_motion: struct { device: DeviceId, time_usec: u64, dx: f64, dy: f64 },
+    pointer_motion: struct {
+        device: DeviceId,
+        time_usec: u64,
+        dx: f64,
+        dy: f64,
+        dx_unaccel: ?f64 = null,
+        dy_unaccel: ?f64 = null,
+    },
     pointer_button: struct { device: DeviceId, time_usec: u64, button: u32, pressed: bool },
     pointer_axis: struct {
         device: DeviceId,
@@ -530,6 +537,8 @@ pub const Backend = struct {
                 .time_usec = value.time_usec,
                 .dx = value.dx,
                 .dy = value.dy,
+                .dx_unaccel = value.dx_unaccel,
+                .dy_unaccel = value.dy_unaccel,
             } }),
             .pointer_button => |value| {
                 const index = self.findReference(value.device) orelse return error.UnknownDevice;
@@ -1274,6 +1283,8 @@ test "input: pointer button motion and keyboard events retain generation identit
         .time_usec = 11,
         .dx = 1.25,
         .dy = -2.5,
+        .dx_unaccel = 2.5,
+        .dy_unaccel = -5,
     } });
     input_fake.append(.{ .pointer_button = .{
         .device = 7,
@@ -1296,7 +1307,10 @@ test "input: pointer button motion and keyboard events retain generation identit
     } });
     try backend.drainEvents();
     const id = backend.events()[0].device_added.device;
-    try std.testing.expectEqual(id, backend.events()[1].pointer_motion.device);
+    const motion = backend.events()[1].pointer_motion;
+    try std.testing.expectEqual(id, motion.device);
+    try std.testing.expectEqual(@as(?f64, 2.5), motion.dx_unaccel);
+    try std.testing.expectEqual(@as(?f64, -5), motion.dy_unaccel);
     try std.testing.expectEqual(id, backend.events()[2].pointer_button.device);
     const axis = backend.events()[3].pointer_axis;
     try std.testing.expectEqual(id, axis.device);
