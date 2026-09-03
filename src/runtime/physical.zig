@@ -11678,6 +11678,23 @@ pub fn Coordinator(comptime protocol: type) type {
             }
         }
 
+        fn destroyDrainedPhysicalOutput(
+            self: *Self,
+            physical: *PhysicalOutput,
+        ) !void {
+            const output = physical.kms_output orelse return error.OutputUnavailable;
+            try self.failCapturesForOutput(output.outputId());
+            try self.invalidateCaptureSource(.{ .output = output.outputId() });
+            try output.destroy();
+            physical.kms_output = null;
+            physical.damage_applied = physical.damage_requested;
+            self.clearFifoBarriersAfterOutputAttempts();
+            self.foreign_toplevel_outputs_dirty = true;
+            self.retireOutputTracking(@intCast(physical.id.index));
+            _ = try self.retryRetainedOutcomes();
+            self.stats.output_drains += 1;
+        }
+
         fn advanceDrain(self: *Self) !void {
             if (!self.stopping and !self.session_disable_pending and
                 !self.drm_remove_pending and !self.topology_refresh_pending and
@@ -11712,16 +11729,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (physical.drain_started and output.drainComplete()) {
                     if (!self.stopping and physical.reconfigure != null) continue;
                     if (self.stopping) self.abandonPending();
-                    try self.failCapturesForOutput(output.outputId());
-                    try self.invalidateCaptureSource(.{ .output = output.outputId() });
-                    try output.destroy();
-                    physical.kms_output = null;
-                    physical.damage_applied = physical.damage_requested;
-                    self.clearFifoBarriersAfterOutputAttempts();
-                    self.foreign_toplevel_outputs_dirty = true;
-                    self.retireOutputTracking(@intCast(physical.id.index));
-                    _ = try self.retryRetainedOutcomes();
-                    self.stats.output_drains += 1;
+                    try self.destroyDrainedPhysicalOutput(physical);
                     const connector_survives_refresh = self.topology_refresh_pending and
                         std.mem.indexOfScalar(
                             u32,
@@ -12069,15 +12077,11 @@ pub fn Coordinator(comptime protocol: type) type {
                 return self.finishOutputReconfigureRollback(transaction);
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
                 const pending = physical.reconfigure orelse continue;
-                const output = physical.kms_output orelse {
+                if (physical.kms_output == null) {
                     if (!pending.previous.enabled) continue;
                     return error.InvalidState;
-                };
-                try self.failCapturesForOutput(output.outputId());
-                try self.invalidateCaptureSource(.{ .output = output.outputId() });
-                try output.destroy();
-                physical.kms_output = null;
-                self.stats.output_drains += 1;
+                }
+                try self.destroyDrainedPhysicalOutput(physical);
             }
 
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
@@ -12147,12 +12151,8 @@ pub fn Coordinator(comptime protocol: type) type {
         ) !void {
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
                 if (physical.reconfigure == null) continue;
-                if (physical.kms_output) |output| {
-                    try self.failCapturesForOutput(output.outputId());
-                    try self.invalidateCaptureSource(.{ .output = output.outputId() });
-                    try output.destroy();
-                    physical.kms_output = null;
-                }
+                if (physical.kms_output != null)
+                    try self.destroyDrainedPhysicalOutput(physical);
                 const pending = physical.reconfigure.?;
                 if (!pending.previous.enabled) continue;
                 const claim = physical.claim orelse return error.StaleClaim;

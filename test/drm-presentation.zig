@@ -1240,7 +1240,10 @@ fn generatedMultiHeadApply(
                 first_ids[1],
                 coordinator.physical_outputs[1].kms_output.?.outputId(),
             ));
-            try std.testing.expectEqual(@as(usize, 2), coordinator.stats.output_drains);
+            try std.testing.expectEqual(
+                @as(usize, if (fail_second_activation) 3 else 2),
+                coordinator.stats.output_drains,
+            );
         } else if (disable_second and !reenable_second) {
             try std.testing.expectEqual(
                 first_ids[0],
@@ -1260,7 +1263,10 @@ fn generatedMultiHeadApply(
                 first_ids[1],
                 coordinator.physical_outputs[1].kms_output.?.outputId(),
             ));
-            try std.testing.expectEqual(@as(usize, 2), coordinator.stats.output_drains);
+            try std.testing.expectEqual(
+                @as(usize, if (fail_second_activation) 3 else 2),
+                coordinator.stats.output_drains,
+            );
         } else {
             try std.testing.expectEqual(
                 first_ids[0],
