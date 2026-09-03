@@ -545,7 +545,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     if (payload.serial == 0 or payload.serial != pointer.enter_serial or
                         adapter.pointer_delivery == null or
                         !sameClient(client, adapter.pointer_delivery.?.client))
-                        return try adapter.protocolError(actor, decoded.handle.id, 0, "invalid pointer serial");
+                        break :set_cursor;
                     adapter.requestCursorOn(
                         server_objects,
                         pointer.client,
@@ -671,8 +671,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         }
 
         /// Cursor-shape requests use the same exact enter serial and focused
-        /// pointer ownership as wl_pointer.set_cursor, but invalid requests are
-        /// ignored by that extension rather than becoming protocol errors.
+        /// pointer ownership as wl_pointer.set_cursor. Both ignore requests
+        /// from stale serials or pointers without focus.
         pub fn validateCursorShapeOn(
             adapter: *Self,
             server_objects: anytype,
@@ -3618,6 +3618,35 @@ test "seat: child resources can be created after capabilities disappear" {
     try std.testing.expect(server_objects.namespace.lookupHandle(4) != null);
     try std.testing.expect(server_objects.namespace.lookupHandle(5) != null);
     try std.testing.expectEqual(@as(usize, 4), adapter.resourceCount());
+
+    const replacement: input.DeviceId = .{ .slot = 0, .generation = 2, .seat_generation = 1 };
+    try adapter.consume(.{ .device_added = .{
+        .device = replacement,
+        .info = .{ .capabilities = .{ .pointer = true } },
+    } });
+    clearTestOutbound(&adapter);
+    const surface = try server_objects.insertClient(
+        10,
+        &test_protocol.wl_surface.info,
+        6,
+        &core.state,
+    );
+    core.generation = surface.generation;
+    const target = try adapter.makeTarget(seat.peer, .{ .index = 0, .generation = surface.generation });
+    try adapter.setPointerFocus(target, .{ .x = 0, .y = 0 });
+    const pointer = adapter.pointers.entries.items[0];
+    try std.testing.expect(pointer.enter_serial != 0);
+    try test_protocol.wl_pointer.encodeRequest(&requests, 3, .{ .set_cursor = .{
+        .serial = pointer.enter_serial -% 1,
+        .surface = null,
+        .hotspot_x = 0,
+        .hotspot_y = 0,
+    } });
+    try std.testing.expectEqual(
+        wayring.dispatch.Control.continue_dispatch,
+        try dispatchTestRequest(&adapter, &actor, &server_objects, &received_fds, &requests),
+    );
+    try std.testing.expect(adapter.popEvent() == null);
 }
 
 test "seat: device removal reserves cancellation releases and capabilities atomically" {
