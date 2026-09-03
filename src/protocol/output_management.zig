@@ -492,15 +492,23 @@ pub fn Adapter(comptime protocol: type) type {
                 if (ch.resource == null or !std.meta.eql(ch.resource.?, rh) or !samePeer(ch.peer, peer)) return null;
                 const c = self.configurations.at(ch.configuration) orelse return null;
                 const d = try wayring.server.decodeRequest(ConfigurationHead, server_objects, message, fds);
+                if ((try self.lifecycle.get(c.lifecycle)).submitted)
+                    return try self.configError(actor, c.resource.?.id, error.AlreadyUsed);
                 switch (d.value) {
-                    .set_mode => |v| if (self.validMode(c, ch.head, server_objects, v.mode)) |mode| try self.lifecycle.setHeadMode(c.lifecycle, ch.head, mode.mode.width, mode.mode.height, mode.mode.refresh_millihz) else return try self.protocolError(actor, d.handle.id, 2, "invalid mode"),
-                    .set_custom_mode => |v| self.lifecycle.setHeadCustomMode(c.lifecycle, ch.head, v.width, v.height, v.refresh) catch |e| return try self.headError(actor, d.handle.id, e),
-                    .set_position => |v| try self.lifecycle.setHeadPosition(c.lifecycle, ch.head, v.x, v.y),
-                    .set_transform => |v| self.lifecycle.setHeadTransform(c.lifecycle, ch.head, @intCast(v.transform.value)) catch |e| return try self.headError(actor, d.handle.id, e),
-                    .set_scale => |v| self.lifecycle.setHeadScale120(c.lifecycle, ch.head, if (v.scale > 0) scale120FromFixed(v.scale) else 0) catch |e| return try self.headError(actor, d.handle.id, e),
+                    .set_mode => |v| {
+                        const mode = self.validMode(c, ch.head, server_objects, v.mode) orelse
+                            return try self.protocolError(actor, d.handle.id, 2, "invalid mode");
+                        self.lifecycle.setHeadMode(c.lifecycle, ch.head, mode.mode.width, mode.mode.height, mode.mode.refresh_millihz) catch |e|
+                            return try self.configurationHeadError(actor, c, d.handle.id, e);
+                    },
+                    .set_custom_mode => |v| self.lifecycle.setHeadCustomMode(c.lifecycle, ch.head, v.width, v.height, v.refresh) catch |e| return try self.configurationHeadError(actor, c, d.handle.id, e),
+                    .set_position => |v| self.lifecycle.setHeadPosition(c.lifecycle, ch.head, v.x, v.y) catch |e| return try self.configurationHeadError(actor, c, d.handle.id, e),
+                    .set_transform => |v| self.lifecycle.setHeadTransform(c.lifecycle, ch.head, @intCast(v.transform.value)) catch |e| return try self.configurationHeadError(actor, c, d.handle.id, e),
+                    .set_scale => |v| self.lifecycle.setHeadScale120(c.lifecycle, ch.head, if (v.scale > 0) scale120FromFixed(v.scale) else 0) catch |e| return try self.configurationHeadError(actor, c, d.handle.id, e),
                     .set_adaptive_sync => |v| {
                         if (v.state.value > 1) return try self.protocolError(actor, d.handle.id, 6, "invalid adaptive sync");
-                        try self.lifecycle.setHeadAdaptiveSync(c.lifecycle, ch.head, v.state.value == 1);
+                        self.lifecycle.setHeadAdaptiveSync(c.lifecycle, ch.head, v.state.value == 1) catch |e|
+                            return try self.configurationHeadError(actor, c, d.handle.id, e);
                     },
                 }
                 try d.finish(protocol, server_objects, &actor.transmit);
@@ -535,6 +543,10 @@ pub fn Adapter(comptime protocol: type) type {
                 error.InvalidScale => 5,
                 else => 1,
             }, @errorName(e));
+        }
+        fn configurationHeadError(self: *Self, actor: *wayring.connection.Actor, c: *ConfigSlot, id: u32, e: anyerror) !?wayring.dispatch.Control {
+            if (e == error.AlreadyUsed) return self.configError(actor, c.resource.?.id, e);
+            return self.headError(actor, id, e);
         }
 
         fn ensureOutbound(self: *Self, additional: usize) !void {
@@ -1265,6 +1277,12 @@ test "configuration covers and atomically applies every exact head" {
     try std.testing.expectEqual(secondary_state, try lifecycle.currentHead(secondary));
     try std.testing.expectError(error.AlreadyUsed, lifecycle.disableHead(configuration, lifecycle.primary));
     try std.testing.expectError(error.AlreadyUsed, lifecycle.enableHead(configuration, secondary));
+    try std.testing.expectError(error.AlreadyUsed, lifecycle.setHeadMode(configuration, lifecycle.primary, 800, 600, 60_000));
+    try std.testing.expectError(error.AlreadyUsed, lifecycle.setHeadCustomMode(configuration, lifecycle.primary, 800, 600, 0));
+    try std.testing.expectError(error.AlreadyUsed, lifecycle.setHeadPosition(configuration, lifecycle.primary, 0, 0));
+    try std.testing.expectError(error.AlreadyUsed, lifecycle.setHeadTransform(configuration, lifecycle.primary, 1));
+    try std.testing.expectError(error.AlreadyUsed, lifecycle.setHeadScale120(configuration, lifecycle.primary, 240));
+    try std.testing.expectError(error.AlreadyUsed, lifecycle.setHeadAdaptiveSync(configuration, lifecycle.primary, true));
 
     _ = try lifecycle.complete(configuration, .succeeded);
     try std.testing.expectEqual(@as(i32, -1920), (try lifecycle.currentHead(lifecycle.primary)).x);
