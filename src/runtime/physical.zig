@@ -9774,7 +9774,8 @@ pub fn Coordinator(comptime protocol: type) type {
             for (surfaces) |surface| {
                 const layer = self.findAppLayer(surface) orelse continue;
                 if (!layer.active) continue;
-                if (!try self.refreshSubsurfaceLayer(layer, output_bounds)) continue;
+                if (!try self.refreshSubsurfaceLayer(layer)) continue;
+                if (try clipToOutput(layer.sample.?.destination, output_bounds) == null) continue;
                 try self.ensureFrameStorage(count.* + 1);
                 const head_state = try self.output_management_adapter.lifecycle.currentHead(
                     physical.management_head,
@@ -9795,11 +9796,11 @@ pub fn Coordinator(comptime protocol: type) type {
         fn refreshSubsurfaceLayer(
             self: *Self,
             layer: *Layer,
-            output_bounds: geometry.Rect,
         ) !bool {
             const id = layer.id orelse return false;
             const scene = self.surfaceScene(id) orelse return false;
             if (!scene.subsurface) return true;
+            const output_bounds = try self.globalOutputBounds();
             var sample = layer.sample orelse return false;
             sample.destination.x = try std.math.add(
                 i32,
