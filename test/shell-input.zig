@@ -3044,20 +3044,20 @@ fn runScreencopyCapture(interrupt: bool, repeat_with_damage: bool) !void {
             try submitClient(&client_reactor, &driver, &handler);
         }
         _ = try loop.turn(coordinator);
-        if (interrupt and !disable_sent and coordinator.pending_screencopy != null) {
+        if (interrupt and !disable_sent and coordinator.anyPendingScreencopy()) {
             try fixture.signalSession(.disable);
             disable_sent = true;
         }
         if (repeat_with_damage and !damage_sent and handler.ready_events == 1 and
             coordinator.screencopy_adapter.capture_count == 1 and
-            coordinator.pending_screencopy == null)
+            !coordinator.anyPendingScreencopy())
         {
             try coordinator.primaryKmsOutput().?.request(.damage, 1);
             damage_sent = true;
             _ = try loop.turn(coordinator);
         }
         if ((!interrupt and handler.ready) or
-            (interrupt and handler.failed and coordinator.pending_screencopy == null and
+            (interrupt and handler.failed and !coordinator.anyPendingScreencopy() and
                 coordinator.session.state == .disabled)) break;
         if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
             try waitForEither(&root.ring, client_reactor.ring);
@@ -3071,7 +3071,7 @@ fn runScreencopyCapture(interrupt: bool, repeat_with_damage: bool) !void {
     try std.testing.expectEqual(completed, handler.buffer_done_events);
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
     if (interrupt) {
-        try std.testing.expect(coordinator.pending_screencopy == null);
+        try std.testing.expect(!coordinator.anyPendingScreencopy());
         try std.testing.expectEqual(.disabled, coordinator.session.state);
     } else {
         try std.testing.expectEqual(

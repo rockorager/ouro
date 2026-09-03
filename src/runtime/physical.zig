@@ -534,6 +534,8 @@ pub fn Coordinator(comptime protocol: type) type {
             damage_requested: u64 = 0,
             damage_applied: u64 = 0,
             screencopy_generation: u64 = 1,
+            pending_screencopy: ?PendingScreencopy = null,
+            screencopy_bytes: std.ArrayListUnmanaged(u8) = .empty,
             drag_icon_previous: ?damage.SurfaceState = null,
             themed_cursor_previous: ?damage.SurfaceState = null,
             client_cursor_previous: ?damage.SurfaceState = null,
@@ -545,6 +547,7 @@ pub fn Coordinator(comptime protocol: type) type {
             commits: usize,
         };
         const PendingScreencopy = struct {
+            token: u64,
             frame: ScreencopyAdapter.FrameId,
             peer: wayring.io_uring.Peer,
             output: output_scheduler.OutputId,
@@ -562,6 +565,7 @@ pub fn Coordinator(comptime protocol: type) type {
             dmabuf: protocol_linux_dmabuf.Lease,
         };
         const PendingImageCopy = struct {
+            token: u64,
             frame: ImageCopyCaptureAdapter.FrameId,
             peer: wayring.io_uring.Peer,
             output: output_scheduler.OutputId,
@@ -999,8 +1003,8 @@ pub fn Coordinator(comptime protocol: type) type {
         cursor_cache: cursor_theme.Cache,
         themed_cursor: theme_cursor.Cursor = .{},
         screencopy_bytes: []u8,
-        pending_screencopy: ?PendingScreencopy = null,
         pending_image_copy: ?PendingImageCopy = null,
+        next_capture_token: u64 = 1,
         foreign_toplevels: []ForeignToplevel,
         foreign_toplevel_outputs_dirty: bool = false,
         cursor_path: []u8,
@@ -1302,7 +1306,6 @@ pub fn Coordinator(comptime protocol: type) type {
             self.themed_cursor = .{};
             self.screencopy_bytes = try allocator.alloc(u8, 0);
             errdefer allocator.free(self.screencopy_bytes);
-            self.pending_screencopy = null;
             self.pending_image_copy = null;
             self.output_management_modes = try allocator.alloc(
                 protocol_output_management.ModeState,
@@ -2180,7 +2183,7 @@ pub fn Coordinator(comptime protocol: type) type {
 
         pub fn backendDrainComplete(self: *const Self) bool {
             return self.stopping and !self.anyKmsOutput() and
-                self.pending_screencopy == null and self.pending_image_copy == null and
+                !self.anyPendingScreencopy() and self.pending_image_copy == null and
                 (self.input == null or self.input.?.drainComplete()) and
                 (self.hotplug == null or self.hotplug.?.drainComplete()) and
                 self.session.drainComplete() and self.timers.idle() and
@@ -2258,6 +2261,8 @@ pub fn Coordinator(comptime protocol: type) type {
             self.xdg_output_adapter.deinit();
             self.output_management_adapter.deinit();
             for (self.physical_outputs[0..self.physical_output_count]) |physical| {
+                var capture_bytes = physical.screencopy_bytes;
+                capture_bytes.deinit(self.allocator);
                 self.allocator.free(physical.gamma_ramps);
                 if (physical.output_profile) |profile| profile.release();
             }
@@ -4534,6 +4539,12 @@ pub fn Coordinator(comptime protocol: type) type {
         fn anyKmsOutput(self: *const Self) bool {
             for (self.physical_outputs[0..self.physical_output_count]) |physical|
                 if (physical.kms_output != null) return true;
+            return false;
+        }
+
+        pub fn anyPendingScreencopy(self: *const Self) bool {
+            for (self.physical_outputs[0..self.physical_output_count]) |physical|
+                if (physical.pending_screencopy != null) return true;
             return false;
         }
 
@@ -7754,6 +7765,10 @@ pub fn Coordinator(comptime protocol: type) type {
             errdefer self.output_management_adapter.removeHead(management_head) catch {};
 
             const index = reusable orelse self.physical_output_count;
+            const screencopy_bytes = if (reusable != null)
+                self.physical_outputs[index].screencopy_bytes
+            else
+                std.ArrayListUnmanaged(u8).empty;
             const generation = if (appending)
                 @as(u32, 1)
             else
@@ -7764,6 +7779,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .claim = claim,
                 .protocol_output = protocol_output_id,
                 .management_head = management_head,
+                .screencopy_bytes = screencopy_bytes,
             };
             if (appending) self.physical_output_count += 1;
             errdefer {
@@ -9374,19 +9390,19 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.frame_change_layers[change_count] = layer;
                 change_count += 1;
             }
-            const capture_request: ?output_api.CaptureRequest = if (self.pending_screencopy) |pending|
-                if (pending.awaiting_output and std.meta.eql(pending.output, frame.output)) .{
-                    .token = frameToken(pending.frame),
+            const capture_request: ?output_api.CaptureRequest = if (physical.pending_screencopy) |pending|
+                if (pending.awaiting_output) .{
+                    .token = pending.token,
                     .cursor_start = cursor_start,
                     .overlay_cursor = pending.overlay_cursor,
                     .destination = .{ .shm = .{
-                        .bytes = self.screencopy_bytes,
+                        .bytes = physical.screencopy_bytes.items,
                         .stride = pending.full_stride,
                     } },
                 } else null
             else if (self.pending_image_copy) |pending|
                 if (pending.awaiting_output and std.meta.eql(pending.output, frame.output)) .{
-                    .token = imageFrameToken(pending.frame),
+                    .token = pending.token,
                     .cursor_start = cursor_start,
                     .overlay_cursor = pending.overlay_cursor,
                     .destination = switch (pending.destination) {
@@ -9435,11 +9451,11 @@ pub fn Coordinator(comptime protocol: type) type {
                         &self.root.ring,
                     );
                 const rendered = result catch |cause| {
-                    if (capture_request != null) try self.finishActiveCapture(false, 0, null);
+                    if (capture_request != null) try self.finishActiveCapture(physical, false, 0, null);
                     return cause;
                 };
                 if (rendered == .retired) {
-                    if (capture_request != null) try self.finishActiveCapture(false, 0, null);
+                    if (capture_request != null) try self.finishActiveCapture(physical, false, 0, null);
                     self.outputDamageRetired(physical, damage_generation);
                     try self.finishOutcome(rendered.retired.frame, false);
                 } else {
@@ -9476,7 +9492,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     &self.root.ring,
                 );
             const render_result = result catch |cause| {
-                if (capture_request != null) try self.finishActiveCapture(false, 0, null);
+                if (capture_request != null) try self.finishActiveCapture(physical, false, 0, null);
                 return cause;
             };
             switch (render_result) {
@@ -9501,7 +9517,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     _ = try self.retryRetainedOutcomes();
                 },
                 .retired => |failure| {
-                    if (capture_request != null) try self.finishActiveCapture(false, 0, null);
+                    if (capture_request != null) try self.finishActiveCapture(physical, false, 0, null);
                     self.outputDamageRetired(physical, damage_generation);
                     try self.finishOutcome(failure.frame, false);
                 },
@@ -9521,7 +9537,7 @@ pub fn Coordinator(comptime protocol: type) type {
                         physical.protocol_output.index,
                 );
             }
-            if (self.pending_screencopy) |*pending| {
+            if (physical.pending_screencopy) |*pending| {
                 if (std.meta.eql(pending.output, output)) {
                     pending.output_generation = physical.screencopy_generation;
                 }
@@ -9919,11 +9935,13 @@ pub fn Coordinator(comptime protocol: type) type {
             readback: ?output_api.CaptureReadback,
         ) !void {
             const self: *Self = @ptrCast(@alignCast(context));
-            if (self.pending_screencopy) |pending| {
-                if (token != frameToken(pending.frame)) return error.InvalidCaptureToken;
-                try self.finishScreencopy(success, timestamp_ns, readback);
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                const pending = physical.pending_screencopy orelse continue;
+                if (token != pending.token) continue;
+                try self.finishScreencopy(physical, success, timestamp_ns, readback);
+                break;
             } else if (self.pending_image_copy) |pending| {
-                if (token != imageFrameToken(pending.frame)) return error.InvalidCaptureToken;
+                if (token != pending.token) return error.InvalidCaptureToken;
                 try self.finishImageCopy(success, timestamp_ns, readback);
             } else return error.InvalidCaptureToken;
             try self.processScreencopyCaptures();
@@ -9932,11 +9950,6 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn processScreencopyCaptures(self: *Self) !void {
-            if (self.pending_image_copy != null) return;
-            if (self.pending_screencopy) |pending| {
-                if (!pending.awaiting_output) try self.finishScreencopy(false, 0, null);
-                return;
-            }
             const capture = (try self.nextReadyScreencopyCapture()) orelse return;
             const server_objects = self.root.runtime.clients.get(capture.peer) catch {
                 try self.failQueuedScreencopy(capture);
@@ -9988,15 +10001,13 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.failQueuedScreencopy(capture);
                 return;
             };
-            self.screencopy_bytes = self.allocator.realloc(
-                self.screencopy_bytes,
-                capture_bytes,
-            ) catch {
+            physical.screencopy_bytes.resize(self.allocator, capture_bytes) catch {
                 self.shm.store.unpin(pin) catch unreachable;
                 try self.failQueuedScreencopy(capture);
                 return;
             };
-            self.pending_screencopy = .{
+            physical.pending_screencopy = .{
+                .token = self.allocateCaptureToken(),
                 .frame = capture.frame,
                 .peer = capture.peer,
                 .output = output.outputId(),
@@ -10007,10 +10018,11 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             try self.screencopy_adapter.acceptCapture(capture.frame);
             if (!(requestPhysicalOutputDamage(physical, try monotonicNs()) catch false)) {
-                try self.finishScreencopy(false, 0, null);
+                try self.finishScreencopy(physical, false, 0, null);
                 return;
             }
-            self.pending_screencopy.?.awaiting_output = true;
+            physical.pending_screencopy.?.awaiting_output = true;
+            try self.processScreencopyCaptures();
         }
 
         fn nextReadyScreencopyCapture(self: *Self) !?ScreencopyAdapter.Capture {
@@ -10038,6 +10050,10 @@ pub fn Coordinator(comptime protocol: type) type {
                     try self.failQueuedScreencopy(capture);
                     return null;
                 };
+                if (physical.pending_screencopy != null) continue;
+                if (self.pending_image_copy) |pending|
+                    if (physical.kms_output) |output|
+                        if (std.meta.eql(pending.output, output.outputId())) continue;
                 if (capture.wait_generation) |generation|
                     if (generation == physical.screencopy_generation) continue;
                 return capture;
@@ -10046,7 +10062,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn processImageCopyCaptures(self: *Self) !void {
-            if (self.pending_screencopy != null) return;
+            if (self.anyPendingScreencopy()) return;
             if (self.pending_image_copy) |pending| {
                 if (!pending.awaiting_output) try self.finishImageCopy(false, 0, null);
                 return;
@@ -10187,6 +10203,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 };
             }
             self.pending_image_copy = .{
+                .token = self.allocateCaptureToken(),
                 .frame = capture.frame,
                 .peer = capture.peer,
                 .output = output.outputId(),
@@ -10556,9 +10573,9 @@ pub fn Coordinator(comptime protocol: type) type {
             self: *Self,
             output: output_scheduler.OutputId,
         ) !void {
-            if (self.pending_screencopy) |pending|
-                if (std.meta.eql(pending.output, output))
-                    try self.finishScreencopy(false, 0, null);
+            if (self.physicalOutputForKmsIdMutable(output)) |physical|
+                if (physical.pending_screencopy != null)
+                    try self.finishScreencopy(physical, false, 0, null);
             if (self.pending_image_copy) |pending|
                 if (std.meta.eql(pending.output, output))
                     try self.finishImageCopy(false, 0, null);
@@ -10566,14 +10583,17 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn finishActiveCapture(
             self: *Self,
+            physical: *PhysicalOutput,
             success: bool,
             timestamp_ns: u64,
             readback: ?output_api.CaptureReadback,
         ) !void {
-            if (self.pending_screencopy != null)
-                return self.finishScreencopy(success, timestamp_ns, readback);
-            if (self.pending_image_copy != null)
-                return self.finishImageCopy(success, timestamp_ns, readback);
+            if (physical.pending_screencopy != null)
+                return self.finishScreencopy(physical, success, timestamp_ns, readback);
+            if (self.pending_image_copy) |pending|
+                if (physical.kms_output) |output|
+                    if (std.meta.eql(pending.output, output.outputId()))
+                        return self.finishImageCopy(success, timestamp_ns, readback);
             return error.MissingCapture;
         }
 
@@ -10679,11 +10699,12 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn finishScreencopy(
             self: *Self,
+            physical: *PhysicalOutput,
             output_success: bool,
             timestamp_ns: u64,
             readback: ?output_api.CaptureReadback,
         ) !void {
-            const pending = &(self.pending_screencopy orelse return error.MissingCapture);
+            const pending = &(physical.pending_screencopy orelse return error.MissingCapture);
             if (!pending.copied) {
                 pending.success = false;
                 if (output_success) {
@@ -10707,12 +10728,12 @@ pub fn Coordinator(comptime protocol: type) type {
                 pending.output_generation,
             ) catch |cause| switch (cause) {
                 error.StaleFrame, error.InvalidCompletion => {
-                    self.pending_screencopy = null;
+                    physical.pending_screencopy = null;
                     return;
                 },
                 else => return cause,
             };
-            self.pending_screencopy = null;
+            physical.pending_screencopy = null;
         }
 
         fn copyScreencopy(
@@ -10748,12 +10769,11 @@ pub fn Coordinator(comptime protocol: type) type {
             ended = true;
         }
 
-        fn frameToken(frame: ScreencopyAdapter.FrameId) u64 {
-            return (@as(u64, frame.generation) << 32) | frame.index;
-        }
-
-        fn imageFrameToken(frame: ImageCopyCaptureAdapter.FrameId) u64 {
-            return (@as(u64, frame.generation) << 32) | frame.index;
+        fn allocateCaptureToken(self: *Self) u64 {
+            const token = self.next_capture_token;
+            self.next_capture_token +%= 1;
+            if (self.next_capture_token == 0) self.next_capture_token = 1;
+            return token;
         }
 
         fn publishPresentedSessionLock(self: *Self) !void {
