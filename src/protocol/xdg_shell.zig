@@ -2144,7 +2144,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 } });
             }
             if (adapter.resolveRoleSurface(slot.xdg_surface_index, slot.xdg_surface_generation)) |surface| {
-                surface.last_acked_serial = 0;
+                resetSurfaceMapping(surface);
                 surface.acked_toplevel_configure = null;
             } else |_| {}
             adapter.dropOutstanding(slot.xdg_surface_index, slot.xdg_surface_generation);
@@ -2191,7 +2191,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             slot.mapped = false;
             slot.initial_committed = false;
             if (adapter.resolveRoleSurface(slot.xdg_surface_index, slot.xdg_surface_generation)) |surface| {
-                surface.last_acked_serial = 0;
+                resetSurfaceMapping(surface);
                 surface.acked_popup_configure = null;
                 surface.acked_popup_placement = null;
             } else |_| {}
@@ -2468,6 +2468,14 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
 
 const toplevel_role_id: surface_state.RoleId = 0x7864_675f_746f_706c;
 const popup_role_id: surface_state.RoleId = 0x7864_675f_706f_7075;
+
+fn resetSurfaceMapping(surface: anytype) void {
+    surface.last_acked_serial = 0;
+    surface.committed_acked_serial = 0;
+    surface.window_geometry = null;
+    surface.requested_window_geometry = null;
+    surface.pending_window_geometry = null;
+}
 
 fn allocSlots(comptime T: type, allocator: std.mem.Allocator, len: usize) ![]*T {
     const slots = try allocator.alloc(*T, len);
@@ -3673,6 +3681,11 @@ test "xdg-shell: unmap resets role state and requires a fresh initial commit" {
     role.pending_min_width = 10;
     _ = try context.adapter.queueToplevelConfigure(id, .{ .width = 70, .height = 50 });
     try std.testing.expectEqual(@as(usize, 1), context.adapter.pendingOutbound());
+    const surface = context.adapter.surfaces[0];
+    surface.committed_acked_serial = 1;
+    surface.window_geometry = .{ .x = 1, .y = 2, .width = 70, .height = 50 };
+    surface.requested_window_geometry = surface.window_geometry;
+    surface.pending_window_geometry = .{ .x = 3, .y = 4, .width = 60, .height = 40 };
 
     try context.core.state.attach(6, null, 0, 0);
     try context.adapter.validateSurfaceCommit(surface_id);
@@ -3688,7 +3701,11 @@ test "xdg-shell: unmap resets role state and requires a fresh initial commit" {
     try std.testing.expectEqual(@as(usize, 0), role.title_len);
     try std.testing.expectEqual(@as(usize, 0), role.app_id_len);
     try std.testing.expectEqual(@as(i32, 0), role.min_width);
-    try std.testing.expectEqual(@as(u32, 0), context.adapter.surfaces[0].last_acked_serial);
+    try std.testing.expectEqual(@as(u32, 0), surface.last_acked_serial);
+    try std.testing.expectEqual(@as(u32, 0), surface.committed_acked_serial);
+    try std.testing.expect(surface.window_geometry == null);
+    try std.testing.expect(surface.requested_window_geometry == null);
+    try std.testing.expect(surface.pending_window_geometry == null);
     try std.testing.expectEqual(@as(usize, 0), context.adapter.pendingOutbound());
 
     try context.core.state.attach(6, .{
@@ -4386,6 +4403,9 @@ test "xdg-shell: generated popup requests validate positioner and parent role" {
         .height = 20,
     });
     try std.testing.expectEqual(@as(usize, 1), context.adapter.pendingOutbound());
+    const popup_mapping = context.adapter.surfaces[1];
+    popup_mapping.committed_acked_serial = 1;
+    popup_mapping.pending_window_geometry = .{ .x = 3, .y = 4, .width = 60, .height = 40 };
     try context.core.second_state.attach(6, null, 0, 0);
     try context.adapter.validateSurfaceCommit(popup_surface);
     _ = try context.core.second_state.commit();
@@ -4398,7 +4418,11 @@ test "xdg-shell: generated popup requests validate positioner and parent role" {
     try std.testing.expect(!unmapped.initial_commit);
     try std.testing.expect(!context.adapter.popups[id.index].mapped);
     try std.testing.expect(!context.adapter.popups[id.index].initial_committed);
-    try std.testing.expectEqual(@as(u32, 0), context.adapter.surfaces[1].last_acked_serial);
+    try std.testing.expectEqual(@as(u32, 0), popup_mapping.last_acked_serial);
+    try std.testing.expectEqual(@as(u32, 0), popup_mapping.committed_acked_serial);
+    try std.testing.expect(popup_mapping.window_geometry == null);
+    try std.testing.expect(popup_mapping.requested_window_geometry == null);
+    try std.testing.expect(popup_mapping.pending_window_geometry == null);
     try std.testing.expectEqual(@as(usize, 0), context.adapter.pendingOutbound());
 
     try context.core.second_state.attach(6, .{
