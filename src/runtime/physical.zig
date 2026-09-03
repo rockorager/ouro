@@ -691,6 +691,7 @@ pub fn Coordinator(comptime protocol: type) type {
             peer: ?wayring.io_uring.Peer = null,
             surface: ?wayring.objects.Handle = null,
             id: ?Adapter.SurfaceId = null,
+            content_origin: geometry.Point = .{ .x = 0, .y = 0 },
             content: OwnedValue(Adapter.Content) = .{},
             rendered: ?render_content.Handle = null,
             presentation: ?Presentations.Token = null,
@@ -8103,14 +8104,26 @@ pub fn Coordinator(comptime protocol: type) type {
                     sample.destination.height = natural_size.height;
                 } else {
                     if (scene.root.has_window_geometry) {
-                        sample.destination.x = alignedOrigin(scene.root.geometry.x, scene.root.surface_offset.x);
-                        sample.destination.y = alignedOrigin(scene.root.geometry.y, scene.root.surface_offset.y);
+                        sample.destination.x = translatedCoordinate(
+                            alignedOrigin(scene.root.geometry.x, scene.root.surface_offset.x),
+                            layer.content_origin.x,
+                        );
+                        sample.destination.y = translatedCoordinate(
+                            alignedOrigin(scene.root.geometry.y, scene.root.surface_offset.y),
+                            layer.content_origin.y,
+                        );
                         sample.destination.width = natural_size.width;
                         sample.destination.height = natural_size.height;
                     } else {
                         sample.destination = .{
-                            .x = scene.root.geometry.x,
-                            .y = scene.root.geometry.y,
+                            .x = translatedCoordinate(
+                                scene.root.geometry.x,
+                                layer.content_origin.x,
+                            ),
+                            .y = translatedCoordinate(
+                                scene.root.geometry.y,
+                                layer.content_origin.y,
+                            ),
                             .width = @intCast(@min(
                                 scene.root.geometry.width,
                                 output_bounds.width,
@@ -8261,22 +8274,33 @@ pub fn Coordinator(comptime protocol: type) type {
                 !scene.subsurface and scene.root.has_window_geometry
             else
                 false;
-            const destination_x = if (surface_scene) |scene| try std.math.add(
-                i32,
-                if (scene.root.has_window_geometry)
-                    alignedOrigin(scene.root.geometry.x, scene.root.surface_offset.x)
-                else
-                    scene.root.geometry.x,
-                scene.offset_x,
-            ) else 0;
-            const destination_y = if (surface_scene) |scene| try std.math.add(
-                i32,
-                if (scene.root.has_window_geometry)
-                    alignedOrigin(scene.root.geometry.y, scene.root.surface_offset.y)
-                else
-                    scene.root.geometry.y,
-                scene.offset_y,
-            ) else 0;
+            var content_origin = layer.content_origin;
+            if (surface_scene == null or !surface_scene.?.subsurface) {
+                content_origin = translatedPoint(content_origin, attachment.offset);
+                content_origin = translatedPoint(content_origin, content.surface.offset);
+            }
+            const destination_x = if (surface_scene) |scene| translatedCoordinate(
+                try std.math.add(
+                    i32,
+                    if (scene.root.has_window_geometry)
+                        alignedOrigin(scene.root.geometry.x, scene.root.surface_offset.x)
+                    else
+                        scene.root.geometry.x,
+                    scene.offset_x,
+                ),
+                content_origin.x,
+            ) else content_origin.x;
+            const destination_y = if (surface_scene) |scene| translatedCoordinate(
+                try std.math.add(
+                    i32,
+                    if (scene.root.has_window_geometry)
+                        alignedOrigin(scene.root.geometry.y, scene.root.surface_offset.y)
+                    else
+                        scene.root.geometry.y,
+                    scene.offset_y,
+                ),
+                content_origin.y,
+            ) else content_origin.y;
             const rendered_width: u32 = if (has_window_geometry)
                 destination_size.width
             else if (surface_scene) |scene|
@@ -8538,6 +8562,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .buffer_damage = published.content.surface.buffer_damage,
             };
             layer.active = true;
+            layer.content_origin = content_origin;
             layer.content.set(published.content);
             layer.rendered = rendered;
             layer.peer = published.peer;
@@ -8569,7 +8594,12 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (layer.retains_source) try self.retireLayerSource(layer);
                 const candidate = layer.candidate.take() orelse return error.MissingCandidate;
                 var content = candidate.content;
-                content.deinit();
+                defer content.deinit();
+                // Keep callbacks committed before the surface's initial
+                // attachment pending until that surface is first presented.
+                // Invisible surfaces do not receive callbacks, but mapping
+                // them must not discard callbacks already committed to them.
+                _ = try self.adapter.activateFrames(candidate.surface, &content);
                 if (layer.retired_source != null) {
                     self.abandonLayerKeepingRetired(layer);
                     _ = try self.retryRetiredSource(layer);
@@ -8604,22 +8634,31 @@ pub fn Coordinator(comptime protocol: type) type {
                 !scene.subsurface and scene.root.has_window_geometry
             else
                 false;
-            const destination_x = if (surface_scene) |scene| try std.math.add(
-                i32,
-                if (scene.root.has_window_geometry)
-                    alignedOrigin(scene.root.geometry.x, scene.root.surface_offset.x)
-                else
-                    scene.root.geometry.x,
-                scene.offset_x,
-            ) else 0;
-            const destination_y = if (surface_scene) |scene| try std.math.add(
-                i32,
-                if (scene.root.has_window_geometry)
-                    alignedOrigin(scene.root.geometry.y, scene.root.surface_offset.y)
-                else
-                    scene.root.geometry.y,
-                scene.offset_y,
-            ) else 0;
+            var content_origin = layer.content_origin;
+            if (surface_scene == null or !surface_scene.?.subsurface)
+                content_origin = translatedPoint(content_origin, content.surface.offset);
+            const destination_x = if (surface_scene) |scene| translatedCoordinate(
+                try std.math.add(
+                    i32,
+                    if (scene.root.has_window_geometry)
+                        alignedOrigin(scene.root.geometry.x, scene.root.surface_offset.x)
+                    else
+                        scene.root.geometry.x,
+                    scene.offset_x,
+                ),
+                content_origin.x,
+            ) else content_origin.x;
+            const destination_y = if (surface_scene) |scene| translatedCoordinate(
+                try std.math.add(
+                    i32,
+                    if (scene.root.has_window_geometry)
+                        alignedOrigin(scene.root.geometry.y, scene.root.surface_offset.y)
+                    else
+                        scene.root.geometry.y,
+                    scene.offset_y,
+                ),
+                content_origin.y,
+            ) else content_origin.y;
             const rendered_width: u32 = if (has_window_geometry)
                 destination_size.width
             else if (surface_scene) |scene|
@@ -8729,6 +8768,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .surface_damage = published.content.surface.surface_damage,
                 .buffer_damage = published.content.surface.buffer_damage,
             };
+            layer.content_origin = content_origin;
             layer.content.set(published.content);
             layer.rendered = rendered;
             layer.peer = published.peer;
@@ -8987,7 +9027,16 @@ pub fn Coordinator(comptime protocol: type) type {
             if (!self.sessionLockActive() and self.cursor_layer.active and
                 self.themed_cursor.image == null)
             {
-                if (try self.interaction.cursor.composite(.{
+                var cursor = self.interaction.cursor;
+                cursor.hotspot.x = translatedCoordinate(
+                    cursor.hotspot.x,
+                    -@as(i64, self.cursor_layer.content_origin.x),
+                );
+                cursor.hotspot.y = translatedCoordinate(
+                    cursor.hotspot.y,
+                    -@as(i64, self.cursor_layer.content_origin.y),
+                );
+                if (try cursor.composite(.{
                     .surface = self.cursor_layer.id.?,
                     .sample = self.cursor_layer.sample.?,
                 }, output_bounds)) |cursor_sample| {
@@ -11212,7 +11261,7 @@ pub fn Coordinator(comptime protocol: type) type {
             for (self.app_layers[0..self.app_layer_count]) |*layer| {
                 const current = layer.id orelse continue;
                 if (std.meta.eql(current, id) and layer.change != null and
-                    layer.change_output_count == 0)
+                    !self.appLayerOutputTrackingPending(layer))
                 {
                     const candidate_sequence = if (layer.sample) |sample|
                         sample.sample.commit_sequence
@@ -11384,8 +11433,11 @@ pub fn Coordinator(comptime protocol: type) type {
                         const id = layer.id orelse return error.StaleSurface;
                         const lock_surface = self.surfaceBelongsToSessionLock(id);
                         if (lock_surface != self.sessionLockActive()) continue;
-                        self.association_surfaces[count] = layer.surface orelse return error.StaleSurface;
-                        count += 1;
+                        appendUniqueSurface(
+                            self.association_surfaces,
+                            &count,
+                            layer.surface orelse return error.StaleSurface,
+                        );
                     }
                     const layer_ids = try self.layer_shell_adapter.ids(self.layer_surface_ids);
                     for (layer_ids) |layer_id| {
@@ -11393,8 +11445,11 @@ pub fn Coordinator(comptime protocol: type) type {
                         if (!state.configured or state.mapped or state.closed or
                             !samePeer(state.peer, client.peer) or
                             !std.meta.eql(state.output, physical.protocol_output)) continue;
-                        self.association_surfaces[count] = state.wl_surface;
-                        count += 1;
+                        appendUniqueSurface(
+                            self.association_surfaces,
+                            &count,
+                            state.wl_surface,
+                        );
                     }
                     if (!self.sessionLockActive() and self.cursor_layer.active and
                         self.cursor_layer.peer != null and
@@ -11402,9 +11457,11 @@ pub fn Coordinator(comptime protocol: type) type {
                         samePeer(self.cursor_layer.peer.?, client.peer) and
                         try clipToOutput(self.cursor_layer.sample.?.destination, bounds) != null)
                     {
-                        self.association_surfaces[count] = self.cursor_layer.surface orelse
-                            return error.StaleSurface;
-                        count += 1;
+                        appendUniqueSurface(
+                            self.association_surfaces,
+                            &count,
+                            self.cursor_layer.surface orelse return error.StaleSurface,
+                        );
                     }
                     try self.output_adapter.reconcileSurfaces(
                         physical.protocol_output,
@@ -12784,6 +12841,17 @@ fn layerVacant(layer: anytype) bool {
         layer.retired_source == null;
 }
 
+fn appendUniqueSurface(
+    surfaces: []wayring.objects.Handle,
+    count: *usize,
+    surface: wayring.objects.Handle,
+) void {
+    for (surfaces[0..count.*]) |current|
+        if (std.meta.eql(current, surface)) return;
+    surfaces[count.*] = surface;
+    count.* += 1;
+}
+
 fn tokenOwnedBySession(session: *const session_api.Session, token: completion.Token) bool {
     if (session.poll_token) |value| if (sameToken(value, token)) return true;
     if (session.cancel_token) |value| if (sameToken(value, token)) return true;
@@ -13127,6 +13195,21 @@ fn alignedOrigin(target: i32, geometry_offset: i32) i32 {
     ));
 }
 
+fn translatedCoordinate(value: i32, delta: anytype) i32 {
+    return @intCast(std.math.clamp(
+        @as(i64, value) + @as(i64, delta),
+        std.math.minInt(i32),
+        std.math.maxInt(i32),
+    ));
+}
+
+fn translatedPoint(value: geometry.Point, delta: anytype) geometry.Point {
+    return .{
+        .x = translatedCoordinate(value.x, delta.x),
+        .y = translatedCoordinate(value.y, delta.y),
+    };
+}
+
 fn callbackData(timestamp_ns: u64) u32 {
     return @truncate(timestamp_ns / std.time.ns_per_ms);
 }
@@ -13350,6 +13433,39 @@ test "physical: window geometry origin alignment clamps hostile offsets" {
         std.math.maxInt(i32),
         std.math.minInt(i32),
     ));
+}
+
+test "physical: surface content origin accumulates commit deltas safely" {
+    var origin = translatedPoint(
+        .{ .x = 10, .y = -20 },
+        .{ .x = 7, .y = 4 },
+    );
+    origin = translatedPoint(origin, .{ .x = -2, .y = 9 });
+    try std.testing.expectEqual(geometry.Point{ .x = 15, .y = -7 }, origin);
+    try std.testing.expectEqual(std.math.maxInt(i32), translatedCoordinate(
+        std.math.maxInt(i32),
+        1,
+    ));
+    try std.testing.expectEqual(std.math.minInt(i32), translatedCoordinate(
+        std.math.minInt(i32),
+        -1,
+    ));
+}
+
+test "physical: output association surfaces form a set" {
+    const first: wayring.objects.Handle = .{ .id = 1, .generation = 2 };
+    const second: wayring.objects.Handle = .{ .id = 3, .generation = 4 };
+    var surfaces: [3]wayring.objects.Handle = undefined;
+    var count: usize = 0;
+    appendUniqueSurface(&surfaces, &count, first);
+    appendUniqueSurface(&surfaces, &count, first);
+    appendUniqueSurface(&surfaces, &count, second);
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqualSlices(
+        wayring.objects.Handle,
+        &.{ first, second },
+        surfaces[0..count],
+    );
 }
 
 test "physical: viewport source maps through buffer scale and inverse transform" {

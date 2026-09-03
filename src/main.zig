@@ -268,7 +268,10 @@ pub fn main(init: std.process.Init) !void {
     var signal_stop_started = false;
     while (!wayring_drained or !coordinator.backendDrainComplete()) {
         const progress = runner.turnAndWait() catch |err| {
-            if (run_error == null) run_error = err;
+            if (run_error == null) {
+                run_error = err;
+                std.log.err("compositor event loop failed: {t}", .{err});
+            }
             coordinator.requestStop() catch |stop_err| {
                 if (run_error == null) run_error = stop_err;
             };
@@ -435,7 +438,7 @@ fn compositorConfig() Compositor.Config {
                 .transmit_fd_budget = 2,
             },
             .object_capacity = 128,
-            .object_quota = std.math.maxInt(u32),
+            .object_quota = 1024,
             .buckets_per_client = 128,
             // Vulkan may publish wp_linux_drm_syncobj_manager_v1 only after
             // output discovery proves DRM syncobj support.

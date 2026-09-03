@@ -1553,6 +1553,7 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
         .test_toplevel_tag = true,
         .test_image_capture_sources = true,
         .test_toplevel_drag = true,
+        .frame_before_map = true,
     };
     defer {
         if (handler.image_capture_read_fd >= 0)
@@ -1691,11 +1692,13 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
             handler.pointer_axis_value120 != 0 and handler.keyboard_key != 0 and
             handler.drag_cancelled == 1 and handler.drag_enter == 1 and
             handler.drag_leave == 1) break;
+        if (handler.event_failures != 0) break;
         if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0) {
             try waitForEither(&root.ring, client_reactor.ring);
         }
     }
 
+    try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
     try std.testing.expect(handler.configure_count >= 2);
     try std.testing.expect(handler.configure_serial != 0);
     try std.testing.expectEqual(handler.configure_serial, handler.acked_serial);
@@ -3539,7 +3542,8 @@ test "shell-input: generated input-method client bridges focused text input" {
     const virtual_pointer = method_handler.virtual_pointer.?;
     const pointer_buttons_before = app_handler.pointer_button;
     const pointer_axes_before = app_handler.pointer_axis;
-    try protocol.zwlr_virtual_pointer_v1.encodeRequest(&method_actor.transmit, virtual_pointer.id, .{ .motion = .{ .time = 12, .dx = 0, .dy = 0 } });
+    const pointer_position_before = coordinator.interaction.pointerPosition();
+    try protocol.zwlr_virtual_pointer_v1.encodeRequest(&method_actor.transmit, virtual_pointer.id, .{ .motion = .{ .time = 12, .dx = 256, .dy = 0 } });
     try protocol.zwlr_virtual_pointer_v1.encodeRequest(&method_actor.transmit, virtual_pointer.id, .{ .button = .{ .time = 13, .button = 0x111, .state = .pressed } });
     try protocol.zwlr_virtual_pointer_v1.encodeRequest(&method_actor.transmit, virtual_pointer.id, .{ .button = .{ .time = 14, .button = 0x111, .state = .pressed } });
     try protocol.zwlr_virtual_pointer_v1.encodeRequest(&method_actor.transmit, virtual_pointer.id, .{ .button = .{ .time = 15, .button = 0x111, .state = .released } });
@@ -3568,6 +3572,10 @@ test "shell-input: generated input-method client bridges focused text input" {
     try std.testing.expectEqual(@as(usize, 0), app_handler.zero_time_pointer_buttons);
     try std.testing.expectEqual(pointer_buttons_before + 2, app_handler.pointer_button);
     try std.testing.expectEqual(pointer_axes_before + 1, app_handler.pointer_axis);
+    try std.testing.expectEqual(
+        pointer_position_before.x + 1,
+        coordinator.interaction.pointerPosition().x,
+    );
 
     const method_done_before_enable = method_handler.done;
     try protocol.zwp_text_input_v3.encodeRequest(&app_actor.transmit, app_handler.text_input.?.id, .{ .enable = .{} });
@@ -5711,6 +5719,7 @@ const Handler = struct {
     cursor_surface: ?wayring.objects.Handle = null,
     mapped_buffer: ?wayring.objects.Handle = null,
     frame_callback: ?wayring.objects.Handle = null,
+    frame_before_map: bool = false,
     shell_created: bool = false,
     mapped: bool = false,
     input_requested: bool = false,
@@ -6035,7 +6044,7 @@ const Handler = struct {
                         self.zero_time_pointer_buttons += 1;
                     }
                     if (self.cursor_surface == null and !self.test_text_input)
-                        try self.queueCursor(value.serial);
+                        try self.queueCursor(self.pointer_enter_serial);
                     if (value.state.value == protocol.wl_pointer.button_state.pressed.value and
                         self.drag_cancelled == 0 and !self.test_text_input)
                     {
@@ -6556,6 +6565,12 @@ const Handler = struct {
         try protocol.xdg_surface.encodeRequest(self.queue, self.xdg_surface.?.id, .{
             .set_window_geometry = .{ .x = 1, .y = 0, .width = 2, .height = 2 },
         });
+        if (self.frame_before_map) self.frame_callback = (try protocol.wl_surface.construct_frame(
+            self.objects,
+            self.queue,
+            self.surface.?,
+            .{},
+        )).callback;
         try protocol.wl_surface.encodeRequest(self.queue, self.surface.?.id, .{ .commit = .{} });
         self.shell_created = true;
         try self.maybeCreateToplevelDrag();
@@ -6604,7 +6619,7 @@ const Handler = struct {
             },
         )).id;
         self.mapped_buffer = buffer;
-        if (!self.test_text_input) {
+        if (!self.test_text_input and !self.frame_before_map) {
             self.frame_callback = (try protocol.wl_surface.construct_frame(
                 self.objects,
                 self.queue,

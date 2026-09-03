@@ -383,11 +383,11 @@ pub const Store = struct {
         damage: render.UploadDamage,
     ) !Prepared {
         const handle = previous orelse return self.prepare(identity, source, damage);
-        if (handle.index >= self.slots.len) return error.StaleContent;
+        if (handle.index >= self.slots.len) return self.prepare(identity, source, damage);
         const slot = &self.slots[handle.index];
         if (slot.state != .published or slot.generation != handle.generation or
             !slot.current)
-            return error.StaleContent;
+            return self.prepare(identity, source, damage);
         if (slot.identity.surface != identity.surface)
             return self.prepare(identity, source, damage);
         if (identity.commit_sequence <= slot.identity.commit_sequence)
@@ -1143,6 +1143,36 @@ test "render-content: retained commit advances identity without changing pixels"
     try std.testing.expectError(error.StaleContent, store.resolve(old));
     try std.testing.expectEqualSlices(u8, &bytes, (try store.resolve(current)).bytes);
     store.release(current);
+}
+
+test "render-content: superseded previous handle falls back to a fresh version" {
+    var store = try Store.init(std.testing.allocator, .{
+        .version_capacity = 3,
+        .byte_capacity = 12,
+    });
+    defer store.deinit();
+    const bytes = [_]u8{ 1, 2, 3, 4 };
+    const old = store.publish(try store.prepare(
+        .{ .surface = 1, .commit_sequence = 1 },
+        testSource(&bytes, 1, 1, 4),
+        .{},
+    ));
+    const current = store.publish(try store.prepare(
+        .{ .surface = 1, .commit_sequence = 2 },
+        testSource(&bytes, 1, 1, 4),
+        .{},
+    ));
+    const next = store.publish(try store.prepareReplacing(
+        old,
+        .{ .surface = 1, .commit_sequence = 3 },
+        testSource(&bytes, 1, 1, 4),
+        testDamage(&.{.{ .min_x = 0, .min_y = 0, .max_x = 1, .max_y = 1 }}),
+    ));
+    try std.testing.expectEqualSlices(u8, &bytes, (try store.resolve(old)).bytes);
+    try std.testing.expectEqualSlices(u8, &bytes, (try store.resolve(next)).bytes);
+    store.release(old);
+    store.release(current);
+    store.release(next);
 }
 
 test "render-content: GPU-pinned provider backing uses transactional copy-on-write" {

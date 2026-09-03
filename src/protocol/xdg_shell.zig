@@ -1057,6 +1057,15 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             if (value.width < 0 or value.height < 0) return error.InvalidSize;
             const role = try adapter.resolveToplevel(id);
             const surface = try adapter.resolveRoleSurface(role.xdg_surface_index, role.xdg_surface_generation);
+            var latest: ?Outstanding = null;
+            for (adapter.outstanding) |entry| {
+                if (entry.active and entry.surface_index == role.xdg_surface_index and
+                    entry.surface_generation == surface.header.generation and
+                    (latest == null or serialAtOrBefore(latest.?.serial, entry.serial)))
+                    latest = entry;
+            }
+            if (latest) |entry| if (entry.toplevel_configure != null and
+                std.meta.eql(entry.toplevel_configure.?, value)) return entry.serial;
             const outstanding = try adapter.acquireOutstanding();
             const serial = adapter.issueSerial();
             outstanding.* = .{
@@ -3308,6 +3317,33 @@ test "xdg-shell: contradictory pending size constraints are protocol errors" {
         try std.testing.expectEqual(@as(i32, 99), context.adapter.toplevels[0].min_height);
         try std.testing.expectEqual(@as(i32, 99), context.adapter.toplevels[0].max_height);
     }
+}
+
+test "xdg-shell: identical outstanding toplevel configures are coalesced" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const id = try context.createToplevel();
+    const value: TestAdapter.ToplevelConfigure = .{
+        .width = 800,
+        .height = 600,
+        .states = .{ .activated = true },
+    };
+    const first = try context.adapter.queueToplevelConfigure(id, value);
+    const duplicate = try context.adapter.queueToplevelConfigure(id, value);
+    try std.testing.expectEqual(first, duplicate);
+    try std.testing.expectEqual(@as(usize, 1), context.adapter.pendingOutbound());
+
+    const changed = try context.adapter.queueToplevelConfigure(id, .{
+        .width = 801,
+        .height = 600,
+        .states = .{ .activated = true },
+    });
+    try std.testing.expect(changed != first);
+    try std.testing.expectEqual(@as(usize, 2), context.adapter.pendingOutbound());
+    const changed_back = try context.adapter.queueToplevelConfigure(id, value);
+    try std.testing.expect(changed_back != first);
+    try std.testing.expect(changed_back != changed);
+    try std.testing.expectEqual(@as(usize, 3), context.adapter.pendingOutbound());
 }
 
 test "xdg-shell: configure emission resumes between role and surface events" {

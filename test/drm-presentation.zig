@@ -1189,10 +1189,11 @@ test "generated client leases and hotplugs two non-desktop connectors" {
         }
         if (handler.lease_fd_received) fixture.lease_active = false;
         _ = try loop.turn(coordinator);
-        if (handler.finished == 1) break;
+        if (handler.finished == 1 or handler.event_failures != 0) break;
         if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
             try waitForEither(&root.ring, reactor.ring);
     }
+    try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
     try std.testing.expect(handler.discovery_fd_received);
     try std.testing.expect(handler.lease_fd_received);
     try std.testing.expectEqual(@as(usize, 1), handler.finished);
@@ -3414,13 +3415,13 @@ const LeaseClientHandler = struct {
         } else if (target.object.interface == &protocol.wp_drm_lease_connector_v1.info) {
             switch (try protocol.wp_drm_lease_connector_v1.decodeEvent(message, fds)) {
                 .name => |value| {
-                    try std.testing.expect(std.mem.eql(u8, value.name, "DRM-11") or
-                        std.mem.eql(u8, value.name, "DRM-12"));
+                    try std.testing.expect(std.mem.eql(u8, value.name, "VGA-2") or
+                        std.mem.eql(u8, value.name, "VGA-3"));
                     self.connector_names += 1;
                 },
                 .description => |value| {
-                    try std.testing.expect(std.mem.indexOf(u8, value.description, "connector 11") != null or
-                        std.mem.indexOf(u8, value.description, "connector 12") != null);
+                    try std.testing.expect(std.mem.indexOf(u8, value.description, "connector VGA-2") != null or
+                        std.mem.indexOf(u8, value.description, "connector VGA-3") != null);
                     self.connector_descriptions += 1;
                 },
                 .connector_id => |value| {
