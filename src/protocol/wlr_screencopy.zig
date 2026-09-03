@@ -508,6 +508,12 @@ pub fn Adapter(comptime protocol: type) type {
                     manager.baselines[index] = manager.baselines[manager.baseline_count];
                 }
             }
+            for (self.captures) |*slot| {
+                if (!slot.active or slot.capture.wait_generation == null) continue;
+                const frame = self.resolve(slot.capture.frame) catch continue;
+                if (frame.output_identity == output)
+                    slot.capture.wait_generation = null;
+            }
         }
 
         pub fn flushOn(
@@ -848,6 +854,40 @@ test "screencopy: completion retains ordered success events" {
     try std.testing.expectEqual(@as(?u64, 4), adapter.managerBaseline(frame.manager, 3));
     adapter.outputRemoved(3);
     try std.testing.expectEqual(@as(?u64, null), adapter.managerBaseline(frame.manager, 3));
+}
+
+test "screencopy: output removal releases queued damage waits" {
+    const A = Adapter(@import("core_protocol"));
+    var adapter = try A.init(std.testing.allocator, .{
+        .manager_capacity = 1,
+        .frame_capacity = 1,
+        .capture_capacity = 1,
+        .outbound_capacity = 4,
+    });
+    defer adapter.deinit();
+    const frame = try adapter.acquireFrame();
+    frame.output_identity = 9;
+    frame.phase = .queued;
+    const id = adapter.frameId(frame);
+    adapter.captures[0] = .{
+        .active = true,
+        .capture = .{
+            .frame = id,
+            .peer = .{ .slot = 1, .generation = 2 },
+            .buffer = .{ .id = 3, .generation = 4 },
+            .output = .{ .id = 5, .generation = 6 },
+            .region = .{ .x = 0, .y = 0, .width = 10, .height = 10 },
+            .overlay_cursor = false,
+            .with_damage = true,
+            .wait_generation = 7,
+        },
+    };
+    adapter.capture_count = 1;
+
+    adapter.outputRemoved(8);
+    try std.testing.expectEqual(@as(?u64, 7), adapter.captures[0].capture.wait_generation);
+    adapter.outputRemoved(9);
+    try std.testing.expectEqual(@as(?u64, null), adapter.captures[0].capture.wait_generation);
 }
 
 test "screencopy: waiting capture does not block a later ready capture" {
