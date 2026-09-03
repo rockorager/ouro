@@ -497,7 +497,7 @@ pub fn Adapter(comptime protocol: type) type {
                     .set_custom_mode => |v| self.lifecycle.setHeadCustomMode(c.lifecycle, ch.head, v.width, v.height, v.refresh) catch |e| return try self.headError(actor, d.handle.id, e),
                     .set_position => |v| try self.lifecycle.setHeadPosition(c.lifecycle, ch.head, v.x, v.y),
                     .set_transform => |v| self.lifecycle.setHeadTransform(c.lifecycle, ch.head, @intCast(v.transform.value)) catch |e| return try self.headError(actor, d.handle.id, e),
-                    .set_scale => |v| self.lifecycle.setHeadScale120(c.lifecycle, ch.head, if (v.scale > 0) @intCast(@divTrunc(@as(i64, v.scale) * 120, 256)) else 0) catch |e| return try self.headError(actor, d.handle.id, e),
+                    .set_scale => |v| self.lifecycle.setHeadScale120(c.lifecycle, ch.head, if (v.scale > 0) scale120FromFixed(v.scale) else 0) catch |e| return try self.headError(actor, d.handle.id, e),
                     .set_adaptive_sync => |v| {
                         if (v.state.value > 1) return try self.protocolError(actor, d.handle.id, 6, "invalid adaptive sync");
                         try self.lifecycle.setHeadAdaptiveSync(c.lifecycle, ch.head, v.state.value == 1);
@@ -852,6 +852,10 @@ pub fn Adapter(comptime protocol: type) type {
         }
         fn samePeer(a: Peer, b: Peer) bool {
             return std.meta.eql(a, b);
+        }
+        fn scale120FromFixed(value: i32) u32 {
+            std.debug.assert(value > 0);
+            return @max(1, @as(u32, @intCast(@divTrunc(@as(i64, value) * 120, 256))));
         }
         fn sameInventory(a: []const ModeState, b: []const ModeState) bool {
             if (a.len != b.len) return false;
@@ -1339,6 +1343,13 @@ test "primary head promotion preserves identities and pending configuration stat
 test "Wayring output-management adapter compiles against generated protocol" {
     const A = Adapter(@import("core_protocol"));
     std.testing.refAllDecls(A);
+}
+
+test "positive fixed output scales remain valid after scale-120 conversion" {
+    const A = Adapter(@import("core_protocol"));
+    try std.testing.expectEqual(@as(u32, 1), A.scale120FromFixed(1));
+    try std.testing.expectEqual(@as(u32, 120), A.scale120FromFixed(256));
+    try std.testing.expectEqual(@as(u32, 150), A.scale120FromFixed(320));
 }
 
 test "destroying a pending wire configuration removes every configuration head" {
