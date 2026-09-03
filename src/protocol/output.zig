@@ -677,6 +677,24 @@ pub fn Adapter(comptime protocol: type) type {
             return output[0..count];
         }
 
+        pub fn resourceHandles(
+            adapter: *const Self,
+            output_id: OutputId,
+            peer: wayring.io_uring.Peer,
+            output: []objects.Handle,
+        ) ![]const objects.Handle {
+            _ = try adapter.resolveOutputConst(output_id);
+            var count: usize = 0;
+            for (adapter.resources) |resource| {
+                if (!resource.active or !samePeer(resource.peer, peer) or
+                    !std.meta.eql(resource.output, output_id)) continue;
+                if (count == output.len) return error.OutputTooSmall;
+                output[count] = resource.handle;
+                count += 1;
+            }
+            return output[0..count];
+        }
+
         pub fn reference(
             adapter: *Self,
             peer: wayring.io_uring.Peer,
@@ -1120,6 +1138,12 @@ test "output: resources and surface associations are peer scoped" {
     var ids: [2]u32 = undefined;
     try std.testing.expectEqualSlices(u32, &.{9}, try adapter.resourceIds(output, peer_a, &ids));
     try std.testing.expectEqualSlices(u32, &.{9}, try adapter.resourceIds(output, peer_b, &ids));
+    var handles: [1]objects.Handle = undefined;
+    try std.testing.expectEqualSlices(
+        objects.Handle,
+        &.{adapter.resources[resource_a].handle},
+        try adapter.resourceHandles(output, peer_a, &handles),
+    );
     const surface: objects.Handle = .{ .id = 12, .generation = 5 };
     try adapter.reconcileSurfaces(output, peer_a, &.{surface});
     try adapter.reconcileSurfaces(output, peer_b, &.{surface});

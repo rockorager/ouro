@@ -98,6 +98,7 @@ const interaction_model = @import("../input/interaction.zig");
 const tablet_input = @import("../input/tablet.zig");
 const confinement = @import("../input/confinement.zig");
 const surface_state = @import("../surface.zig");
+const presentation_feedback = @import("../presentation_feedback.zig");
 const viewport = @import("../viewport.zig");
 
 const linux = std.os.linux;
@@ -10681,13 +10682,13 @@ pub fn Coordinator(comptime protocol: type) type {
                 const peer = layer.peer orelse return error.ClientDisconnected;
                 const objects = try self.root.runtime.clients.get(peer);
                 const actor = try self.root.runtime.clients.reactor.getActor(peer);
-                var output_storage: [64]u32 = undefined;
+                var output_storage: [presentation_feedback.max_output_resources]wayring.objects.Handle = undefined;
                 var output_resource_count: usize = 0;
                 if (self.appLayerOutputRow(self.app_layer_feedback_outputs, layer)) |outputs| {
                     for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
                         const output_index: usize = @intCast(physical.id.index);
                         if (!outputs[output_index]) continue;
-                        const resources = try self.output_adapter.resourceIds(
+                        const resources = try self.output_adapter.resourceHandles(
                             physical.protocol_output,
                             peer,
                             output_storage[output_resource_count..],
@@ -10695,7 +10696,7 @@ pub fn Coordinator(comptime protocol: type) type {
                         output_resource_count += resources.len;
                     }
                 } else if (layer.feedback_output) |output| {
-                    const resources = try self.output_adapter.resourceIds(output, peer, &output_storage);
+                    const resources = try self.output_adapter.resourceHandles(output, peer, &output_storage);
                     output_resource_count = resources.len;
                 }
                 const output_resources = output_storage[0..output_resource_count];

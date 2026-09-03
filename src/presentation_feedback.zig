@@ -5,11 +5,15 @@ const wayring = @import("wayring");
 const objects = wayring.objects;
 
 const none = std.math.maxInt(u32);
+pub const max_output_resources = 64;
 
 const Node = struct {
     callback: objects.Handle = undefined,
     peer: wayring.io_uring.Peer = undefined,
     next: u32 = none,
+    output_resources: [max_output_resources]objects.Handle = undefined,
+    output_count: usize = 0,
+    outputs_set: bool = false,
     output_cursor: usize = 0,
 };
 
@@ -21,10 +25,9 @@ pub const Pool = struct {
     pub fn init(allocator: std.mem.Allocator, capacity: usize) !Pool {
         if (capacity == 0 or capacity >= none) return error.InvalidConfig;
         const nodes = try allocator.alloc(Node, capacity);
-        for (nodes, 0..) |*node, index| node.next = if (index + 1 < nodes.len)
-            @intCast(index + 1)
-        else
-            none;
+        for (nodes, 0..) |*node, index| node.* = .{
+            .next = if (index + 1 < nodes.len) @intCast(index + 1) else none,
+        };
         return .{ .nodes = nodes, .free_head = 0 };
     }
 
@@ -41,14 +44,22 @@ pub const Pool = struct {
     fn acquire(pool: *Pool, callback: objects.Handle, peer: wayring.io_uring.Peer) !u32 {
         if (pool.free_head == none) return error.Exhausted;
         const index = pool.free_head;
-        pool.free_head = pool.nodes[index].next;
-        pool.nodes[index] = .{ .callback = callback, .peer = peer };
+        const node = &pool.nodes[index];
+        pool.free_head = node.next;
+        node.* = .{
+            .callback = callback,
+            .peer = peer,
+        };
         pool.active_count += 1;
         return index;
     }
 
     fn release(pool: *Pool, index: u32) void {
-        pool.nodes[index].next = pool.free_head;
+        const node = &pool.nodes[index];
+        node.output_count = 0;
+        node.outputs_set = false;
+        node.output_cursor = 0;
+        node.next = pool.free_head;
         pool.free_head = index;
         pool.active_count -= 1;
     }
@@ -174,6 +185,7 @@ fn samePeer(a: wayring.io_uring.Peer, b: wayring.io_uring.Peer) bool {
 
 pub const Item = struct {
     callback: objects.Handle,
+    output_resources: []const objects.Handle,
     output_cursor: usize,
 };
 
@@ -195,8 +207,27 @@ pub const Batch = struct {
 
     pub fn peek(batch: Batch) ?Item {
         if (batch.head == none) return null;
-        const node = batch.pool.nodes[batch.head];
-        return .{ .callback = node.callback, .output_cursor = node.output_cursor };
+        const node = &batch.pool.nodes[batch.head];
+        return .{
+            .callback = node.callback,
+            .output_resources = node.output_resources[0..node.output_count],
+            .output_cursor = node.output_cursor,
+        };
+    }
+
+    pub fn setOutputs(
+        batch: *Batch,
+        outputs: []const objects.Handle,
+    ) !void {
+        if (outputs.len > max_output_resources) return error.OutputCapacityExceeded;
+        var index = batch.head;
+        while (index != none) : (index = batch.pool.nodes[index].next) {
+            const node = &batch.pool.nodes[index];
+            if (node.outputs_set) continue;
+            @memcpy(node.output_resources[0..outputs.len], outputs);
+            node.output_count = outputs.len;
+            node.outputs_set = true;
+        }
     }
 
     pub fn advanceOutput(batch: *Batch, callback: objects.Handle, cursor: usize) !void {
@@ -228,10 +259,39 @@ test "presentation feedback remains commit-owned across partial output publicati
     try pending.request(second, peer);
     var batch = pending.publishCommit().?;
     defer batch.deinit();
+    const outputs = [_]objects.Handle{
+        .{ .id = 8, .generation = 1 },
+        .{ .id = 9, .generation = 2 },
+    };
+    try batch.setOutputs(&outputs);
     try batch.advanceOutput(first, 2);
     try std.testing.expectEqual(@as(usize, 2), batch.peek().?.output_cursor);
+    try std.testing.expectEqualSlices(objects.Handle, &outputs, batch.peek().?.output_resources);
     try batch.consume(first);
     try std.testing.expectEqual(second, batch.peek().?.callback);
+}
+
+test "presentation feedback retry retains generation-safe output snapshot" {
+    var pool = try Pool.init(std.testing.allocator, 1);
+    defer pool.deinit(std.testing.allocator);
+    var pending = Pending.init(&pool);
+    defer pending.deinit();
+    const callback: objects.Handle = .{ .id = 3, .generation = 1 };
+    const peer: wayring.io_uring.Peer = .{ .slot = 1, .generation = 2 };
+    try pending.request(callback, peer);
+    var batch = pending.publishCommit().?;
+    defer batch.deinit();
+    const original = [_]objects.Handle{
+        .{ .id = 8, .generation = 1 },
+        .{ .id = 9, .generation = 1 },
+    };
+    try batch.setOutputs(&original);
+    try batch.advanceOutput(callback, 1);
+    const replacement = [_]objects.Handle{.{ .id = 8, .generation = 2 }};
+    try batch.setOutputs(&replacement);
+    const item = batch.peek().?;
+    try std.testing.expectEqual(@as(usize, 1), item.output_cursor);
+    try std.testing.expectEqualSlices(objects.Handle, &original, item.output_resources);
 }
 
 test "discarded presentation feedback remains peer scoped" {

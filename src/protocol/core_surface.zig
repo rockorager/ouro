@@ -1476,20 +1476,26 @@ pub fn Adapter(comptime protocol: type) type {
             server_objects: anytype,
             queue: *wayring.tx.Queue,
             content: *Content,
-            output_resources: []const u32,
+            output_resources: []const objects.Handle,
             outcome: PresentationOutcome,
         ) !bool {
             _ = adapter;
             const batch = &(content.presentation_feedback orelse return true);
+            try batch.setOutputs(output_resources);
             while (batch.peek()) |item| {
                 if (server_objects.namespace.resolve(item.callback) == null) {
                     try batch.consume(item.callback);
                     continue;
                 }
                 var cursor = item.output_cursor;
-                while (outcome == .presented and cursor < output_resources.len) : (cursor += 1) {
+                while (outcome == .presented and cursor < item.output_resources.len) : (cursor += 1) {
+                    const output = item.output_resources[cursor];
+                    if (server_objects.namespace.resolve(output) == null) {
+                        try batch.advanceOutput(item.callback, cursor + 1);
+                        continue;
+                    }
                     try PresentationFeedback.encodeEvent(queue, item.callback.id, .{
-                        .sync_output = .{ .output = output_resources[cursor] },
+                        .sync_output = .{ .output = output.id },
                     });
                     try batch.advanceOutput(item.callback, cursor + 1);
                 }
@@ -3777,7 +3783,7 @@ test "presentation-time: feedback follows its exact commit through presented com
         &context.server_objects,
         &context.actor.transmit,
         &content,
-        &.{output.id},
+        &.{output},
         .{ .presented = .{
             .actual_ns = 3 * std.time.ns_per_s + 500_000_007,
             .refresh_ns = 16_666_667,
@@ -3809,6 +3815,62 @@ test "presentation-time: feedback follows its exact commit through presented com
     try std.testing.expectEqual(@as(u32, 16_666_667), presented.refresh);
     try std.testing.expectEqual(@as(u32, 42), presented.seq_lo);
     try std.testing.expectEqual(@as(u32, 7), presented.flags.value);
+}
+
+test "presentation-time: stale output snapshot cannot target a reused resource" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const surface = try context.createSurface(10);
+    var output_context: u8 = 0;
+    const output = try context.server_objects.insertClient(
+        20,
+        &test_protocol.wl_output.info,
+        4,
+        &output_context,
+    );
+    try test_protocol.wp_presentation.encodeRequest(
+        &context.requests,
+        context.presentation_resource.id,
+        .{ .feedback = .{ .surface = surface.id, .callback = 11 } },
+    );
+    _ = try context.dispatchCore();
+    try test_protocol.wl_surface.encodeRequest(&context.requests, surface.id, .{ .commit = .{} });
+    _ = try context.dispatchCore();
+    var applied_storage: [1]TestAdapter.Applied = undefined;
+    var content = (try context.adapter.tryApply(surface, &applied_storage))[0].payload;
+    defer content.deinit();
+
+    _ = try context.server_objects.removeClient(output);
+    const replacement = try context.server_objects.insertClient(
+        output.id,
+        &test_protocol.wl_output.info,
+        4,
+        &output_context,
+    );
+    try std.testing.expectEqual(output.id, replacement.id);
+    try std.testing.expect(replacement.generation != output.generation);
+    try std.testing.expect(try context.adapter.completePresentationFeedbackOn(
+        &context.server_objects,
+        &context.actor.transmit,
+        &content,
+        &.{output},
+        .{ .presented = .{
+            .actual_ns = 1,
+            .refresh_ns = 16_666_667,
+            .sequence = 1,
+            .flags = 7,
+        } },
+    ));
+
+    var descriptor_scratch: [1]linux.fd_t = undefined;
+    var control: [64]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+    const snapshot = try context.actor.transmit.snapshot(&descriptor_scratch, &control);
+    const message = (try wayring.wire.Message.decode(snapshot.first)).?;
+    const event = try test_protocol.wp_presentation_feedback.decodeEvent(
+        message,
+        &context.received_fds,
+    );
+    try std.testing.expect(event == .presented);
 }
 
 test "presentation-time: destroying a surface discards committed feedback" {
