@@ -11,6 +11,8 @@ const c = @cImport({
     @cInclude("errno.h");
     @cInclude("xf86drm.h");
     @cInclude("libdrm/drm.h");
+    @cInclude("linux/dma-buf.h");
+    @cInclude("sys/ioctl.h");
 });
 
 pub const Error = std.mem.Allocator.Error || error{
@@ -173,6 +175,20 @@ pub const Point = struct {
             0,
             0,
         ) != 0) return error.TransferFailed;
+    }
+
+    /// Imports every current DMA-BUF user into this timeline point by
+    /// exporting the fence required before a subsequent write. The caller
+    /// retains ownership of `dma_buf`.
+    pub fn importDmaBufWriteFence(point: Point, dma_buf: linux.fd_t) Error!void {
+        var export_file: c.struct_dma_buf_export_sync_file = .{
+            .flags = c.DMA_BUF_SYNC_WRITE,
+            .fd = -1,
+        };
+        if (c.ioctl(dma_buf, c.DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &export_file) != 0 or
+            export_file.fd < 0) return error.ExportFailed;
+        defer _ = linux.close(export_file.fd);
+        try point.importSyncFile(export_file.fd);
     }
 };
 

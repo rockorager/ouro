@@ -266,11 +266,11 @@ pub const Update = struct {
     commit_timestamp: ?CommitTimestamp = null,
     explicit_sync: ?drm_syncobj.Commit = null,
 
-    /// Signals and releases the explicit release point after compositor use.
-    /// Ownership is retained on failure so the caller may retry.
-    pub fn releaseExplicitSync(update: *Update) !void {
+    /// Imports the DMA-BUF reservation's reader completion into the explicit
+    /// release point before dropping compositor ownership.
+    pub fn releaseExplicitSyncFromDmaBuf(update: *Update, fd: std.posix.fd_t) !void {
         if (update.explicit_sync) |*sync| {
-            try sync.release.signal();
+            try sync.release.importDmaBufWriteFence(fd);
             sync.deinit();
             update.explicit_sync = null;
         }

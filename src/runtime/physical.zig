@@ -11001,7 +11001,17 @@ pub fn Coordinator(comptime protocol: type) type {
             peer: wayring.io_uring.Peer,
             content: *Adapter.Content,
         ) !bool {
-            try content.surface.releaseExplicitSync();
+            if (content.surface.explicit_sync != null) {
+                const lease = content.attachment_lease orelse return error.MissingLease;
+                var source = try self.adapter.bufferSource(lease);
+                defer source.endShmAccess() catch {};
+                switch (source) {
+                    .external => |external| try content.surface.releaseExplicitSyncFromDmaBuf(
+                        external.fds[0],
+                    ),
+                    .shm, .single_pixel => return error.ExplicitSyncUnsupportedBuffer,
+                }
+            }
             if (content.attachment_lease) |*lease| {
                 lease.deinit();
                 content.attachment_lease = null;
