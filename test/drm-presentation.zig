@@ -45,6 +45,9 @@ test "configuration installs before physical startup claims an output" {
         fixture.platforms(),
         coordinatorConfig(),
     );
+    try std.testing.expect(!coordinator.processing_virtual_pointer);
+    try std.testing.expect(!coordinator.shell_maintenance_pending);
+    try std.testing.expect(!coordinator.pointer_reconcile_pending);
     var reference = try ouro.config.defaultSnapshot(allocator);
     defer reference.deinit();
     var engine = try Coordinator.EngineSettings.init(

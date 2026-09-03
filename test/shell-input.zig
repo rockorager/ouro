@@ -3181,6 +3181,160 @@ fn runImageCopyCapture(interrupt: bool) !void {
     try root.deinit();
 }
 
+test "shell-input: synchronized cursor subsurface batch renders root and child" {
+    const allocator = std.testing.allocator;
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-cursor-subsurface-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+
+    var fixture = try physical_fixture.Fixture.init();
+    defer fixture.deinit();
+    var root_config = physical_fixture.compositorConfig();
+    root_config.runtime.object_capacity = 24;
+    root_config.runtime.object_quota = 24;
+    root_config.runtime.actor.received_fd_budget = 2;
+    const root = try Compositor.create(
+        allocator,
+        try wayring.unix_socket.listen(path, 1),
+        root_config,
+    );
+    var config = physical_fixture.coordinatorConfig();
+    config.shm.pool_capacity = 2;
+    config.shm.buffer_capacity = 2;
+    config.surface.surface_capacity = 2;
+    config.surface.frame_callback_capacity = 2;
+    config.surface.content_update_capacity = 2;
+    config.surface.dependency_capacity = 2;
+    config.surface.attachment_capacity = 2;
+    config.surface.copy_capacity = 2;
+    config.output.max_samples = 2;
+    config.output.max_source_bytes = pixels.len * 2;
+    const coordinator = try Coordinator.create(
+        allocator,
+        root,
+        fixture.platforms(),
+        config,
+    );
+    var loop = try Loop.init(
+        allocator,
+        root,
+        &coordinator.router,
+        &coordinator.timers,
+        coordinator,
+        .{ .completion_batch = 16 },
+    );
+    try coordinator.start(&loop);
+
+    var client_reactor: wayring.io_uring.Reactor = undefined;
+    try client_reactor.initOwned(
+        allocator,
+        .{ .entries = 16, .flags = 0 },
+        physical_fixture.clientReactorConfig(),
+    );
+    var client = try ClientConnection.attach(
+        allocator,
+        &client_reactor,
+        try wayring.unix_socket.connect(path),
+        .{ .received_fd_budget = 2, .transmit_byte_budget = 4096, .transmit_fd_budget = 2 },
+        .{ .max_objects = 24, .max_client_ids = 23 },
+    );
+    const actor = try client.actor();
+    var driver = ClientDriver.init(&client);
+    const registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null);
+    var handler: MultiHandler = .{
+        .objects = &client.objects,
+        .queue = &actor.transmit,
+        .registry = registry,
+        .cycle_count = 1,
+        .cursor_mode = true,
+    };
+    try submitMultiClient(&client_reactor, &driver, &handler);
+
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    var client_progress: ClientDriver.Progress = .{};
+    var committed = false;
+    var observed = false;
+    for (0..512) |_| {
+        client_progress = try drainMultiClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (!committed and handler.shell_created) {
+            const root_id = coordinator.adapter.surfaceId(handler.surfaces[0].?) catch null;
+            if (root_id) |cursor_root| {
+                _ = try coordinator.adapter.surfaceId(handler.surfaces[1].?);
+                const pointer_device: ouro.input_backend.DeviceId = .{
+                    .slot = 0,
+                    .generation = 1,
+                    .seat_generation = 1,
+                };
+                try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .device_added = .{
+                    .device = pointer_device,
+                    .info = .{ .capabilities = .{ .pointer = true } },
+                } }));
+                coordinator.interaction.cursorRequest(cursor_root, .{ .x = 0, .y = 0 });
+                try handler.mapSurface(1);
+                try handler.mapSurface(0);
+                try submitMultiClient(&client_reactor, &driver, &handler);
+                committed = true;
+            }
+        }
+        if (!observed and coordinator.stats.submitted == 1) {
+            const root_id = try coordinator.adapter.surfaceId(handler.surfaces[0].?);
+            const child_id = try coordinator.adapter.surfaceId(handler.surfaces[1].?);
+            const child_layer = findLayer(coordinator.app_layers, child_id) orelse
+                return error.MissingChildLayer;
+            const submitted = coordinator.primaryKmsOutput().?.sample_storage[0..2];
+            try std.testing.expectEqual(coordinator.cursor_layer.binding.?.surface, submitted[0].surface);
+            try std.testing.expectEqual(child_layer.binding.?.surface, submitted[1].surface);
+            try std.testing.expectEqual(root_id, coordinator.cursor_layer.id.?);
+            try std.testing.expectEqual(
+                coordinator.cursor_layer.sample.?.destination.x + 1,
+                child_layer.sample.?.destination.x,
+            );
+            try std.testing.expectEqual(
+                coordinator.cursor_layer.sample.?.destination.y,
+                child_layer.sample.?.destination.y,
+            );
+            observed = true;
+        }
+        if (observed and coordinator.stats.presented == 1 and
+            handler.buffer_releases == 2 and handler.frame_done == 2) break;
+        if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, client_reactor.ring);
+    }
+    try std.testing.expect(committed);
+    try std.testing.expect(observed);
+    try std.testing.expectEqual(@as(usize, 2), coordinator.stats.applied);
+    try std.testing.expectEqual(@as(usize, 1), coordinator.stats.submitted);
+    try std.testing.expectEqual(@as(usize, 1), coordinator.stats.presented);
+    try std.testing.expectEqual(@as(usize, 2), handler.buffer_releases);
+    try std.testing.expectEqual(@as(usize, 2), handler.frame_done);
+    try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+
+    coordinator.disconnected(coordinator.peer.?);
+    _ = try client.prepareClose();
+    try submitMultiClient(&client_reactor, &driver, &handler);
+    var wayring_drained = false;
+    for (0..256) |_| {
+        client_progress = try drainMultiClient(&client_reactor, &driver, &handler);
+        const progress = try loop.turn(coordinator);
+        wayring_drained = progress.wayring.shutdown_complete;
+        if (wayring_drained and client_progress.quiescent and coordinator.backendDrainComplete()) break;
+        if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, client_reactor.ring);
+    }
+    try std.testing.expect(wayring_drained);
+    try std.testing.expect(client_progress.quiescent);
+    try std.testing.expect(coordinator.backendDrainComplete());
+
+    try client.deinit(allocator);
+    client_reactor.deinit(allocator);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
 test "shell-input: synchronized subsurface publishes with parent and receives pointer focus" {
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;
@@ -4363,6 +4517,7 @@ const MultiHandler = struct {
     surface_count: usize = 2,
     cycle_count: usize = two_toplevel_cycle_count,
     subsurface_mode: bool = false,
+    cursor_mode: bool = false,
     activation_mode: bool = false,
     metadata_commit_after_attach: bool = false,
     activation_requested: bool = false,
@@ -4506,9 +4661,10 @@ const MultiHandler = struct {
     }
 
     fn maybeCreateShells(self: *MultiHandler) !void {
-        if (self.shell_created or self.compositor == null or self.shm == null or self.wm_base == null)
+        if (self.shell_created or self.compositor == null or self.shm == null)
             return;
-        if (self.subsurface_mode and self.subcompositor == null) return;
+        if (!self.cursor_mode and self.wm_base == null) return;
+        if ((self.subsurface_mode or self.cursor_mode) and self.subcompositor == null) return;
         for (0..self.surface_count) |index| {
             self.surfaces[index] = (try protocol.wl_compositor.construct_create_surface(
                 self.objects,
@@ -4516,7 +4672,7 @@ const MultiHandler = struct {
                 self.compositor.?,
                 .{},
             )).id;
-            if (self.subsurface_mode and index != 0) continue;
+            if (self.cursor_mode or (self.subsurface_mode and index != 0)) continue;
             self.xdg_surfaces[index] = (try protocol.xdg_wm_base.construct_get_xdg_surface(
                 self.objects,
                 self.queue,
@@ -4535,7 +4691,7 @@ const MultiHandler = struct {
                 .{ .commit = .{} },
             );
         }
-        if (self.subsurface_mode) {
+        if (self.subsurface_mode or self.cursor_mode) {
             self.subsurfaces[1] = (try protocol.wl_subcompositor.construct_get_subsurface(
                 self.objects,
                 self.queue,
