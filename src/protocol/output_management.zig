@@ -426,12 +426,10 @@ pub fn Adapter(comptime protocol: type) type {
                 const m = self.managers.fromContext(target.object.context) orelse return null;
                 if (!samePeer(m.peer, peer) or m.resource == null or !std.meta.eql(m.resource.?, rh)) return null;
                 const d = try wayring.server.decodeRequest(Manager, server_objects, message, fds);
+                if (m.stopped)
+                    return try self.protocolError(actor, d.handle.id, 0, "request after output manager stop");
                 switch (d.value) {
                     .create_configuration => |v| {
-                        if (m.stopped) {
-                            try d.finish(protocol, server_objects, &actor.transmit);
-                            return .continue_dispatch;
-                        }
                         const c = try self.configurations.acquire();
                         errdefer self.configurations.release(c);
                         c.manager = m.header.index;
@@ -440,7 +438,7 @@ pub fn Adapter(comptime protocol: type) type {
                         const made = try Manager.admit_create_configuration(server_objects, d.handle, v, .{ .id = c });
                         c.resource = made.id;
                     },
-                    .stop => if (!m.stopped) {
+                    .stop => {
                         try self.ensureOutbound(1);
                         m.stopped = true;
                         self.outbound.appendAssumeCapacity(.{ .kind = .finished, .owner = m.header.index });
