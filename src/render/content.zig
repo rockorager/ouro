@@ -156,13 +156,9 @@ pub const Store = struct {
         if (packed_length > self.byte_capacity - self.used_bytes)
             return error.ByteCapacityExceeded;
         const index = try self.claimSlot();
-        // Full candidates can be copied straight into device upload memory.
-        // Partial histories remain CPU-owned so future adjacent commits can
-        // patch them in place without racing a GPU read or cloning the frame.
-        const allocation = try self.allocateBytes(
-            packed_length,
-            !compatible or coversSource(damage, source.size),
-        );
+        // Renderer-owned allocations can be sampled directly and still be
+        // patched in place whenever no submitted frame pins the allocation.
+        const allocation = try self.allocateBytes(packed_length, true);
         const bytes = allocation.bytes;
         errdefer self.releaseBytes(.{
             .size = source.size,
@@ -1214,7 +1210,7 @@ test "render-content: GPU-pinned provider backing uses transactional copy-on-wri
     );
     const current = store.publish(prepared);
     const current_source = try store.resolve(current);
-    try std.testing.expect(current_source.upload == null);
+    try std.testing.expectEqual(@as(u64, 2), current_source.upload.?.token);
     try std.testing.expectEqualSlices(u8, &.{ 5, 6, 7, 8, 9, 10, 11, 12 }, current_source.bytes);
     store.release(old);
     try std.testing.expectEqual(@as(u8, 1), backing.references[0]);

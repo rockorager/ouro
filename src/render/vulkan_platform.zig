@@ -197,6 +197,8 @@ const device_extensions = [_][*:0]const u8{
 };
 
 const sampled_image_capacity = 32;
+pub const direct_color_bit: u32 = 1 << 31;
+pub const direct_content_bit: u32 = 1 << 30;
 
 const Texture = struct {
     image: c.VkImage,
@@ -602,8 +604,8 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
         config.max_targets == 0 or config.max_targets > std.math.maxInt(u32) or
         descriptor_count > std.math.maxInt(u32) or
         storage_image_count > std.math.maxInt(u32) or
-        physical_properties.limits.maxPerStageDescriptorStorageBuffers < 3 or
-        physical_properties.limits.maxDescriptorSetStorageBuffers < 3 or
+        physical_properties.limits.maxPerStageDescriptorStorageBuffers < 4 or
+        physical_properties.limits.maxDescriptorSetStorageBuffers < 4 or
         physical_properties.limits.maxPerStageDescriptorStorageImages < 2 or
         physical_properties.limits.maxDescriptorSetStorageImages < 2)
         return error.InvalidConfig;
@@ -659,6 +661,7 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
         descriptorBinding(2, c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER),
         descriptorBinding(4, c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER),
         descriptorBinding(5, c.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE),
+        descriptorBinding(6, c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER),
         .{
             .binding = 3,
             .descriptorType = c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
@@ -2008,7 +2011,7 @@ fn growTargetBatches(self: *RealRenderer, target: *RealTarget, count: usize) !vo
     const combined_count = std.math.mul(usize, count, sampled_image_capacity) catch return error.CapacityExceeded;
     const pool_sizes = [_]c.VkDescriptorPoolSize{
         .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = @intCast(count * 2) },
-        .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = @intCast(count * 3) },
+        .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = @intCast(count * 4) },
         .{ .type = c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = if (self.sampled_enabled) @intCast(combined_count) else 0 },
     };
     var pool_info: c.VkDescriptorPoolCreateInfo = .{
@@ -2028,6 +2031,7 @@ fn growTargetBatches(self: *RealRenderer, target: *RealTarget, count: usize) !vo
     var linear_descriptor: c.VkDescriptorImageInfo = .{ .sampler = null, .imageView = target.linear_view, .imageLayout = c.VK_IMAGE_LAYOUT_GENERAL };
     var source_descriptor: c.VkDescriptorBufferInfo = .{ .buffer = target.source_buffer, .offset = 0, .range = self.max_source_bytes };
     var lut_descriptor: c.VkDescriptorBufferInfo = .{ .buffer = self.lut_buffer, .offset = 0, .range = c.VK_WHOLE_SIZE };
+    var content_descriptor: c.VkDescriptorBufferInfo = .{ .buffer = self.content_buffer, .offset = 0, .range = c.VK_WHOLE_SIZE };
     for (sets, 0..) |set, index| {
         var sample_descriptor: c.VkDescriptorBufferInfo = .{ .buffer = buffer, .offset = stride * index, .range = self.sample_buffer_size };
         const writes = [_]c.VkWriteDescriptorSet{
@@ -2036,6 +2040,7 @@ fn growTargetBatches(self: *RealRenderer, target: *RealTarget, count: usize) !vo
             descriptorWrite(set, 2, c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, null, &source_descriptor),
             descriptorWrite(set, 4, c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, null, &lut_descriptor),
             descriptorWrite(set, 5, c.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &linear_descriptor, null),
+            descriptorWrite(set, 6, c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, null, &content_descriptor),
         };
         c.vkUpdateDescriptorSets(self.device, writes.len, &writes, 0, null);
     }
@@ -2148,7 +2153,8 @@ fn prepareTextures(self: *RealRenderer, frame: Frame, staging_capacity: usize) !
             if (upload.owner == @as(*anyopaque, @ptrCast(self))) upload else null
         else
             null;
-        const upload_damage = if (direct_external)
+        const upload_damage = if (direct_external or
+            (direct_upload != null and existing != null and compatible and existing.?.texture.initialized))
             render.UploadDamage{}
         else if (native) |allocation|
             nativeTextureUpload(allocation, surface)
@@ -2636,7 +2642,10 @@ fn realDraw(_: *anyopaque, renderer: Renderer, target_value: Target, frame: Fram
             return error.CapacityExceeded;
         const end = std.math.add(usize, validated_bytes, length) catch
             return error.CapacityExceeded;
-        const source_offset = std.math.cast(u32, validated_bytes) orelse
+        const source_offset = std.math.cast(u32, if (source.upload) |upload|
+            if (upload.owner == @as(*anyopaque, @ptrCast(self))) upload.offset else validated_bytes
+        else
+            validated_bytes) orelse
             return error.CapacityExceeded;
         if (source.stride < packed_stride or
             (source.native == null and source.external == null and source_length > source.bytes.len) or
@@ -3085,8 +3094,9 @@ fn recordSampledBarrier(target: *RealTarget) void {
     c.vkCmdPipelineBarrier(target.command_buffer, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, null, 0, null, 1, &between);
 }
 
-fn recordRestartSampledPass(target: *RealTarget) void {
+fn recordRestartSampledPass(target: *RealTarget, uses_linear_image: bool) void {
     recordResumeAfterCapture(target);
+    if (!uses_linear_image) return;
     var barrier: c.VkImageMemoryBarrier = .{
         .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
         .pNext = null,
@@ -3322,25 +3332,33 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
             .pInheritanceInfo = null,
         };
         try vk(c.vkBeginCommandBuffer(target.command_buffer, &begin), error.BeginCommandBufferFailed);
-        for (self.prepared[0..batch.count], 0..) |prepared, index| {
-            const token = prepared.imported_token orelse continue;
-            if (prepared.native_token != null) continue;
-            var duplicate = false;
-            for (self.prepared[0..index]) |earlier|
-                duplicate = duplicate or (earlier.native_token == null and earlier.imported_token == token);
-            if (duplicate) continue;
-            var before: c.VkImageMemoryBarrier = .{
-                .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                .pNext = null,
-                .srcAccessMask = 0,
-                .dstAccessMask = c.VK_ACCESS_SHADER_READ_BIT,
-                .oldLayout = c.VK_IMAGE_LAYOUT_GENERAL,
-                .newLayout = c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                .srcQueueFamilyIndex = c.VK_QUEUE_FAMILY_FOREIGN_EXT,
-                .dstQueueFamilyIndex = self.queue_family,
-                .image = prepared.texture.image,
-                .subresourceRange = colorRange(),
-            };
+        var acquire_start: usize = 0;
+        while (acquire_start < batch.count) : (acquire_start += sampled_image_capacity) {
+            const acquire_end = @min(acquire_start + sampled_image_capacity, batch.count);
+            var barriers: [sampled_image_capacity]c.VkImageMemoryBarrier = undefined;
+            var barrier_count: usize = 0;
+            for (self.prepared[acquire_start..acquire_end], acquire_start..) |prepared, index| {
+                const token = prepared.imported_token orelse continue;
+                if (prepared.native_token != null) continue;
+                var duplicate = false;
+                for (self.prepared[0..index]) |earlier|
+                    duplicate = duplicate or (earlier.native_token == null and earlier.imported_token == token);
+                if (duplicate) continue;
+                barriers[barrier_count] = .{
+                    .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                    .pNext = null,
+                    .srcAccessMask = 0,
+                    .dstAccessMask = c.VK_ACCESS_SHADER_READ_BIT,
+                    .oldLayout = c.VK_IMAGE_LAYOUT_GENERAL,
+                    .newLayout = c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    .srcQueueFamilyIndex = c.VK_QUEUE_FAMILY_FOREIGN_EXT,
+                    .dstQueueFamilyIndex = self.queue_family,
+                    .image = prepared.texture.image,
+                    .subresourceRange = colorRange(),
+                };
+                barrier_count += 1;
+            }
+            if (barrier_count == 0) continue;
             c.vkCmdPipelineBarrier(
                 target.command_buffer,
                 c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
@@ -3350,8 +3368,8 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
                 null,
                 0,
                 null,
-                1,
-                &before,
+                @intCast(barrier_count),
+                &barriers,
             );
         }
         for (self.prepared[0..batch.count]) |prepared| {
@@ -3360,73 +3378,80 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
                 const imported = importedFromToken(self, token) orelse
                     return error.StaleExternalImage;
                 recordNativeCopies(self, target.command_buffer, prepared, imported);
-                continue;
             }
-            var before: c.VkImageMemoryBarrier = .{
-                .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                .pNext = null,
-                .srcAccessMask = if (prepared.texture.initialized) c.VK_ACCESS_SHADER_READ_BIT else 0,
-                .dstAccessMask = c.VK_ACCESS_TRANSFER_WRITE_BIT,
-                .oldLayout = if (prepared.texture.initialized)
-                    c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-                else
-                    c.VK_IMAGE_LAYOUT_UNDEFINED,
-                .newLayout = c.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                .srcQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
-                .dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
-                .image = prepared.texture.image,
-                .subresourceRange = colorRange(),
-            };
+        }
+        var upload_start: usize = 0;
+        while (upload_start < batch.count) : (upload_start += sampled_image_capacity) {
+            const upload_batch = self.prepared[upload_start..@min(
+                upload_start + sampled_image_capacity,
+                batch.count,
+            )];
+            var barriers: [sampled_image_capacity]c.VkImageMemoryBarrier = undefined;
+            var barrier_count: usize = 0;
+            for (upload_batch) |prepared| {
+                if (prepared.upload_count == 0 or prepared.imported_token != null) continue;
+                barriers[barrier_count] = .{
+                    .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                    .pNext = null,
+                    .srcAccessMask = if (prepared.texture.initialized) c.VK_ACCESS_SHADER_READ_BIT else 0,
+                    .dstAccessMask = c.VK_ACCESS_TRANSFER_WRITE_BIT,
+                    .oldLayout = if (prepared.texture.initialized)
+                        c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                    else
+                        c.VK_IMAGE_LAYOUT_UNDEFINED,
+                    .newLayout = c.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    .srcQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
+                    .image = prepared.texture.image,
+                    .subresourceRange = colorRange(),
+                };
+                barrier_count += 1;
+            }
+            if (barrier_count == 0) continue;
             c.vkCmdPipelineBarrier(
                 target.command_buffer,
-                if (prepared.texture.initialized)
-                    c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
-                else
-                    c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT | c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                 c.VK_PIPELINE_STAGE_TRANSFER_BIT,
                 0,
                 0,
                 null,
                 0,
                 null,
-                1,
-                &before,
+                @intCast(barrier_count),
+                &barriers,
             );
-            for (prepared.uploads[0..prepared.upload_count]) |upload| {
-                var copy: c.VkBufferImageCopy = .{
-                    .bufferOffset = upload.staging_offset,
-                    .bufferRowLength = upload.row_length,
-                    .bufferImageHeight = 0,
-                    .imageSubresource = .{
-                        .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT,
-                        .mipLevel = 0,
-                        .baseArrayLayer = 0,
-                        .layerCount = 1,
-                    },
-                    .imageOffset = .{ .x = @intCast(upload.x), .y = @intCast(upload.y), .z = 0 },
-                    .imageExtent = .{ .width = upload.width, .height = upload.height, .depth = 1 },
-                };
-                c.vkCmdCopyBufferToImage(
-                    target.command_buffer,
-                    if (upload.direct) self.content_buffer else target.source_buffer,
-                    prepared.texture.image,
-                    c.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                    1,
-                    &copy,
-                );
+            for (upload_batch) |prepared| {
+                if (prepared.upload_count == 0 or prepared.imported_token != null) continue;
+                for (prepared.uploads[0..prepared.upload_count]) |upload| {
+                    var copy: c.VkBufferImageCopy = .{
+                        .bufferOffset = upload.staging_offset,
+                        .bufferRowLength = upload.row_length,
+                        .bufferImageHeight = 0,
+                        .imageSubresource = .{
+                            .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT,
+                            .mipLevel = 0,
+                            .baseArrayLayer = 0,
+                            .layerCount = 1,
+                        },
+                        .imageOffset = .{ .x = @intCast(upload.x), .y = @intCast(upload.y), .z = 0 },
+                        .imageExtent = .{ .width = upload.width, .height = upload.height, .depth = 1 },
+                    };
+                    c.vkCmdCopyBufferToImage(
+                        target.command_buffer,
+                        if (upload.direct) self.content_buffer else target.source_buffer,
+                        prepared.texture.image,
+                        c.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        1,
+                        &copy,
+                    );
+                }
             }
-            var after: c.VkImageMemoryBarrier = .{
-                .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                .pNext = null,
-                .srcAccessMask = c.VK_ACCESS_TRANSFER_WRITE_BIT,
-                .dstAccessMask = c.VK_ACCESS_SHADER_READ_BIT,
-                .oldLayout = c.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                .newLayout = c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                .srcQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
-                .dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
-                .image = prepared.texture.image,
-                .subresourceRange = colorRange(),
-            };
+            for (barriers[0..barrier_count]) |*barrier| {
+                barrier.srcAccessMask = c.VK_ACCESS_TRANSFER_WRITE_BIT;
+                barrier.dstAccessMask = c.VK_ACCESS_SHADER_READ_BIT;
+                barrier.oldLayout = c.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                barrier.newLayout = c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            }
             c.vkCmdPipelineBarrier(
                 target.command_buffer,
                 c.VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -3436,8 +3461,8 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
                 null,
                 0,
                 null,
-                1,
-                &after,
+                @intCast(barrier_count),
+                &barriers,
             );
         }
         var target_barrier: c.VkImageMemoryBarrier = .{
@@ -3464,19 +3489,22 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
             1,
             &target_barrier,
         );
-        var linear_barrier: c.VkImageMemoryBarrier = .{
-            .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .pNext = null,
-            .srcAccessMask = 0,
-            .dstAccessMask = c.VK_ACCESS_SHADER_READ_BIT | c.VK_ACCESS_SHADER_WRITE_BIT,
-            .oldLayout = c.VK_IMAGE_LAYOUT_UNDEFINED,
-            .newLayout = c.VK_IMAGE_LAYOUT_GENERAL,
-            .srcQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
-            .image = target.linear_image,
-            .subresourceRange = colorRange(),
-        };
-        c.vkCmdPipelineBarrier(target.command_buffer, c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, null, 0, null, 1, &linear_barrier);
+        const uses_linear_image = frame.samples.len > self.max_samples;
+        if (uses_linear_image) {
+            var linear_barrier: c.VkImageMemoryBarrier = .{
+                .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .pNext = null,
+                .srcAccessMask = 0,
+                .dstAccessMask = c.VK_ACCESS_SHADER_READ_BIT | c.VK_ACCESS_SHADER_WRITE_BIT,
+                .oldLayout = c.VK_IMAGE_LAYOUT_UNDEFINED,
+                .newLayout = c.VK_IMAGE_LAYOUT_GENERAL,
+                .srcQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
+                .image = target.linear_image,
+                .subresourceRange = colorRange(),
+            };
+            c.vkCmdPipelineBarrier(target.command_buffer, c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, null, 0, null, 1, &linear_barrier);
+        }
         var transfer_final = false;
         if (frame.captures.before_cursor) {
             try recordSampledPass(self, target, frame, frame.cursor_start);
@@ -3490,7 +3518,7 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
             );
             transfer_final = true;
             if (frame.cursor_start != frame.samples.len) {
-                recordRestartSampledPass(target);
+                recordRestartSampledPass(target, uses_linear_image);
                 try recordSampledPass(self, target, frame, frame.samples.len);
                 transfer_final = false;
             }
@@ -3517,25 +3545,33 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
             wait_stages[wait_count] = c.VK_PIPELINE_STAGE_TRANSFER_BIT;
             wait_count += 1;
         }
-        for (self.prepared[0..batch.count], 0..) |prepared, index| {
-            const token = prepared.imported_token orelse continue;
-            if (prepared.native_token != null) continue;
-            var duplicate = false;
-            for (self.prepared[0..index]) |earlier|
-                duplicate = duplicate or (earlier.native_token == null and earlier.imported_token == token);
-            if (duplicate) continue;
-            var after: c.VkImageMemoryBarrier = .{
-                .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                .pNext = null,
-                .srcAccessMask = c.VK_ACCESS_SHADER_READ_BIT,
-                .dstAccessMask = 0,
-                .oldLayout = c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                .newLayout = c.VK_IMAGE_LAYOUT_GENERAL,
-                .srcQueueFamilyIndex = self.queue_family,
-                .dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_FOREIGN_EXT,
-                .image = prepared.texture.image,
-                .subresourceRange = colorRange(),
-            };
+        var release_start: usize = 0;
+        while (release_start < batch.count) : (release_start += sampled_image_capacity) {
+            const release_end = @min(release_start + sampled_image_capacity, batch.count);
+            var barriers: [sampled_image_capacity]c.VkImageMemoryBarrier = undefined;
+            var barrier_count: usize = 0;
+            for (self.prepared[release_start..release_end], release_start..) |prepared, index| {
+                const token = prepared.imported_token orelse continue;
+                if (prepared.native_token != null) continue;
+                var duplicate = false;
+                for (self.prepared[0..index]) |earlier|
+                    duplicate = duplicate or (earlier.native_token == null and earlier.imported_token == token);
+                if (duplicate) continue;
+                barriers[barrier_count] = .{
+                    .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                    .pNext = null,
+                    .srcAccessMask = c.VK_ACCESS_SHADER_READ_BIT,
+                    .dstAccessMask = 0,
+                    .oldLayout = c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    .newLayout = c.VK_IMAGE_LAYOUT_GENERAL,
+                    .srcQueueFamilyIndex = self.queue_family,
+                    .dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_FOREIGN_EXT,
+                    .image = prepared.texture.image,
+                    .subresourceRange = colorRange(),
+                };
+                barrier_count += 1;
+            }
+            if (barrier_count == 0) continue;
             c.vkCmdPipelineBarrier(
                 target.command_buffer,
                 c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -3545,8 +3581,8 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
                 null,
                 0,
                 null,
-                1,
-                &after,
+                @intCast(barrier_count),
+                &barriers,
             );
         }
         var release_barrier: c.VkImageMemoryBarrier = .{

@@ -265,6 +265,7 @@ compositor_csv=$(IFS=,; printf '%s' "${compositors[*]}")
     printf 'ouro_binary_sha256=%s\n' "$(sha256sum "$ouro_binary" | cut -d' ' -f1)"
     printf 'benchmark_client_source_sha256=%s\n' "$(sha256sum "$repo/benchmark/client.c" | cut -d' ' -f1)"
     printf 'benchmark_workloads_sha256=%s\n' "$(sha256sum "$repo/benchmark/workloads.sh" | cut -d' ' -f1)"
+    printf 'ouro_config_template_sha256=%s\n' "$(sha256sum "$repo/benchmark/ouro.json.in" | cut -d' ' -f1)"
     printf 'sway_config_template_sha256=%s\n' "$(sha256sum "$repo/benchmark/sway.conf.in" | cut -d' ' -f1)"
     printf 'hyprland_config_template_sha256=%s\n' "$(sha256sum "$repo/benchmark/hyprland.conf.in" | cut -d' ' -f1)"
     printf 'keywork_config_template_sha256=%s\n' "$(sha256sum "$repo/benchmark/keywork.conf.in" | cut -d' ' -f1)"
@@ -404,6 +405,7 @@ find_compositor_pid() {
 render_configs() {
     local directory=$1
     local x=0 index
+    cp "$repo/benchmark/ouro.json.in" "$directory/ouro.json"
     : >"$directory/sway.conf"
     : >"$directory/hyprland.conf"
     : >"$directory/keywork.conf"
@@ -452,7 +454,7 @@ run_case() {
         ouro)
             seatd-launch -l error -- env XDG_RUNTIME_DIR="$runtime" LIBSEAT_BACKEND=seatd \
                 "$ouro_binary" --socket="$expected_socket" --renderer="$renderer" \
-                --drm-device="$drm_device" \
+                --drm-device="$drm_device" --config="$directory/ouro.json" \
                 >"$directory/compositor.log" 2>&1 &
             launcher_pid=$!
             ;;

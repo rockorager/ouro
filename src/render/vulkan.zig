@@ -327,14 +327,25 @@ pub const Renderer = struct {
             // Native samples retain their dimensions/stride in the packed ABI,
             // but consume no bytes in the CPU source buffer.
             validated.source.stride = packed_stride;
+            const direct_content = if (source.source.upload) |upload|
+                upload.owner == self.implementation
+            else
+                false;
+            const source_offset = if (direct_content)
+                std.math.cast(u32, source.source.upload.?.offset) orelse
+                    return error.SourceCapacityExceeded
+            else
+                @as(u32, @intCast(start));
             self.samples[sample_count] = try packSample(
                 validated,
                 try self.colorTransform(validated.color_description, list.output_color_description),
+                directColorEncoding(validated.color_description, list.output_color_description),
+                direct_content,
                 if (validated.color_description.lut) |lut|
                     try self.platform.cacheLut(self.implementation, lut)
                 else
                     null,
-                @intCast(start),
+                source_offset,
                 planned.destination,
             );
             self.sources[sample_count] = source;
@@ -502,6 +513,8 @@ pub fn initTargetPool(
 fn packSample(
     sample: render_types.SurfaceSample,
     color_transform: render_types.color.Transform,
+    direct_color: bool,
+    direct_content: bool,
     lut_slot: ?u32,
     source_offset: u32,
     original_destination: render_types.PlanRect,
@@ -514,7 +527,12 @@ fn packSample(
         .clip = .{ sample.clip.x, sample.clip.y, @intCast(sample.clip.width), @intCast(sample.clip.height) },
         .attributes = .{
             @intFromEnum(sample.source.format),
-            @intFromEnum(sample.transform),
+            @intFromEnum(sample.transform) |
+                (if (direct_color and sample.source.format == .xrgb8888 and sample.global_alpha == 255)
+                    vk.direct_color_bit
+                else
+                    0) |
+                (if (direct_content) vk.direct_content_bit else 0),
             sample.global_alpha,
             @intFromEnum(color_transform.source_transfer),
         },
@@ -544,6 +562,13 @@ fn packSample(
             0,
         },
     };
+}
+
+fn directColorEncoding(source: render_types.color.Description, output: render_types.color.Description) bool {
+    return source.lut == null and output.lut == null and
+        source.transfer == output.transfer and
+        source.reference_luminance == output.reference_luminance and
+        std.meta.eql(source.primaries, output.primaries);
 }
 
 const Affine = struct { xx: i32, xy: i32, x0: i32, yx: i32, yy: i32, y0: i32 };
@@ -626,7 +651,7 @@ test "render-vulkan: packed ABI preserves order geometry transform alpha and ret
         .transform = .flipped_270,
         .global_alpha = 13,
     };
-    const gpu_sample = try packSample(value, try render_types.color.compile(.srgb, .srgb), null, 16, .{ .x = -5, .y = 6, .width = 7, .height = 8 });
+    const gpu_sample = try packSample(value, try render_types.color.compile(.srgb, .srgb), true, false, null, 16, .{ .x = -5, .y = 6, .width = 7, .height = 8 });
     try std.testing.expectEqual([4]u32{ 16, 1, 2, 4 }, gpu_sample.source);
     try std.testing.expectEqual([4]i32{ 1, 2, 3, 4 }, gpu_sample.crop);
     try std.testing.expectEqual([4]i32{ -5, 6, 7, 8 }, gpu_sample.destination);
@@ -649,12 +674,47 @@ test "render-vulkan: sampled DMA-BUF capabilities cross the platform boundary" {
     }, try renderer.sampledDmabufFormats(&storage));
 }
 
+test "render-vulkan: direct color flag requires identical opaque encoding" {
+    var value: render_types.SurfaceSample = undefined;
+    _ = testList(&.{ 0, 0, 0, 255 }, &value);
+    const transform = try render_types.color.compile(.srgb, .srgb);
+    const direct = try packSample(
+        value,
+        transform,
+        directColorEncoding(.srgb, .srgb),
+        true,
+        null,
+        64,
+        .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+    );
+    try std.testing.expect(direct.attributes[1] & vk.direct_color_bit != 0);
+    try std.testing.expect(direct.attributes[1] & vk.direct_content_bit != 0);
+    try std.testing.expectEqual(@as(u32, 64), direct.source[0]);
+
+    var different = render_types.color.Description.srgb;
+    different.reference_luminance = 100;
+    try std.testing.expect(!directColorEncoding(.srgb, different));
+    value.global_alpha = 254;
+    const translucent = try packSample(
+        value,
+        transform,
+        true,
+        false,
+        null,
+        0,
+        .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+    );
+    try std.testing.expectEqual(@as(u32, 0), translucent.attributes[1] & vk.direct_color_bit);
+}
+
 test "render-vulkan: LUT slot is packed without changing Sample ABI" {
     var value: render_types.SurfaceSample = undefined;
     _ = testList(&.{ 0, 0, 0, 255 }, &value);
     const gpu_sample = try packSample(
         value,
         try render_types.color.compile(.srgb, .srgb),
+        false,
+        false,
         6,
         0,
         .{ .x = 0, .y = 0, .width = 1, .height = 1 },

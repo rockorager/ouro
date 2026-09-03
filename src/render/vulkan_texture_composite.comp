@@ -9,7 +9,7 @@ layout(set = 0, binding = 0, rgba8) uniform image2D target_image;
 layout(set = 0, binding = 5, rgba16f) uniform image2D linear_image;
 
 struct Sample {
-    uvec4 source;       // reserved, width, height, reserved
+    uvec4 source;       // content byte offset, width, height, stride
     ivec4 crop;         // signed 16.16 x, y, width, height
     ivec4 destination;  // x, y, width, height
     ivec4 clip;         // x, y, width, height
@@ -24,6 +24,7 @@ struct Sample {
 layout(std430, set = 0, binding = 1) readonly buffer Samples { Sample items[]; };
 layout(set = 0, binding = 3) uniform sampler2D source_images[32];
 layout(std430, set = 0, binding = 4) readonly buffer ColorLuts { vec4 lut_texels[]; };
+layout(std430, set = 0, binding = 6) readonly buffer Contents { uint content_words[]; };
 
 layout(push_constant) uniform Frame {
     uvec4 clear_color;  // straight alpha, red, green, blue
@@ -104,8 +105,21 @@ vec3 sample_lut(vec3 value, int packed_slot) {
     return mix(z0, z1, fraction.z);
 }
 
+vec4 raw_pixel(Sample item, uint index, ivec2 coordinate) {
+    if ((item.attributes.y & 0x40000000u) == 0u)
+        return texelFetch(source_images[index], coordinate, 0);
+    uint byte_offset = item.source.x + uint(coordinate.y) * item.source.w + uint(coordinate.x) * 4u;
+    uint packed = content_words[byte_offset >> 2u];
+    return vec4(
+        float((packed >> 16u) & 255u),
+        float((packed >> 8u) & 255u),
+        float(packed & 255u),
+        float((packed >> 24u) & 255u)
+    ) / 255.0;
+}
+
 vec4 load_pixel(Sample item, uint index, ivec2 coordinate) {
-    vec4 value = texelFetch(source_images[index], coordinate, 0);
+    vec4 value = raw_pixel(item, index, coordinate);
     if (item.attributes.x == 1u) value.a = 1.0;
     vec3 electrical = item.affine_tail.z == 0u && value.a > 0.0 ? value.rgb / value.a : value.rgb;
     vec3 linear = item.affine_tail.w != 0
@@ -139,11 +153,18 @@ void main() {
     uint sample_count = frame.output_info.w & 0x3fffffffu;
     float alpha = frame.output_info.z == 1u ? 1.0 : float(frame.clear_color.x) / 255.0;
     vec3 clear_electrical = vec3(frame.clear_color.yzw) / 255.0;
-    vec4 color = continuation
+    vec4 base_color = continuation
         ? imageLoad(linear_image, pixel)
         : vec4(decode_transfer(clear_electrical, frame.output_color.x) * alpha, alpha);
     uint sample_end = frame.output_color.w + sample_count;
-    for (uint index = frame.output_color.w; index < sample_end; ++index) {
+    // Single-batch frames can composite front-to-back. This is the same OVER
+    // result, but an opaque visible sample makes all lower samples irrelevant.
+    // Continuation batches retain back-to-front accumulation in linear_image.
+    bool front_to_back = !continuation && !intermediate;
+    vec4 color = front_to_back ? vec4(0.0) : base_color;
+    float transmission = 1.0;
+    for (uint step = 0u; step < sample_count; ++step) {
+        uint index = front_to_back ? sample_end - 1u - step : frame.output_color.w + step;
         Sample item = items[index];
         ivec2 destination_end = item.destination.xy + item.destination.zw;
         ivec2 clip_end = item.clip.xy + item.clip.zw;
@@ -152,9 +173,25 @@ void main() {
         ivec2 coordinate = source_coordinate(item, pixel - item.destination.xy);
         if (any(lessThan(coordinate, ivec2(0))) ||
             coordinate.x >= int(item.source.y) || coordinate.y >= int(item.source.z)) continue;
+        // The high transform bit proves an opaque source has the same color
+        // encoding as the output and neither side uses an ICC LUT. With no
+        // higher contribution, decode -> identity transform -> encode is a
+        // no-op, so preserve the electrical RGB directly.
+        if (front_to_back && transmission == 1.0 && (item.attributes.y & 0x80000000u) != 0u) {
+            vec4 direct = raw_pixel(item, index, coordinate);
+            imageStore(target_image, pixel, vec4(direct.bgr, 1.0));
+            return;
+        }
         vec4 source_pixel = load_pixel(item, index, coordinate);
-        color = source_pixel + color * (1.0 - source_pixel.a);
+        if (front_to_back) {
+            color += source_pixel * transmission;
+            transmission *= 1.0 - source_pixel.a;
+            if (transmission == 0.0) break;
+        } else {
+            color = source_pixel + color * (1.0 - source_pixel.a);
+        }
     }
+    if (front_to_back) color += base_color * transmission;
     if (intermediate) {
         imageStore(linear_image, pixel, color);
     } else {
