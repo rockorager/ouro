@@ -92,7 +92,7 @@ pub fn Adapter(comptime protocol: type) type {
 
         const ManagerSlot = struct { header: slot_pool.Header = .{}, peer: Peer = undefined, resource: objects.Handle = .{ .id = 0, .generation = 0 }, version: u32 = 1, stopped: bool = false };
         const Child = struct { header: slot_pool.Header = .{}, manager: u32 = 0, peer: Peer = undefined, resource: ?objects.Handle = null, head: HeadId = undefined, mode: ModeState = undefined, retired: bool = false };
-        const ConfigSlot = struct { header: slot_pool.Header = .{}, manager: u32 = 0, peer: Peer = undefined, resource: ?objects.Handle = null, lifecycle: ConfigurationId = undefined, config_head: ?objects.Handle = null, destroyed: bool = false };
+        const ConfigSlot = struct { header: slot_pool.Header = .{}, manager: u32 = 0, peer: Peer = undefined, resource: ?objects.Handle = null, lifecycle: ConfigurationId = undefined, destroyed: bool = false };
         const CHeadSlot = struct { header: slot_pool.Header = .{}, configuration: u32 = 0, peer: Peer = undefined, resource: ?objects.Handle = null, head: HeadId = undefined };
         const Kind = enum { make_head, head_name, head_description, physical_size, make_mode, mode_size, mode_refresh, mode_preferred, enabled, current_mode, position, transform, scale, make, model, adaptive_sync, done, head_finished, finished, succeeded, failed, cancelled };
         const Out = struct { kind: Kind, owner: u32, head: ?u32 = null, mode: ?u32 = null };
@@ -474,7 +474,6 @@ pub fn Adapter(comptime protocol: type) type {
                         ch.head = selected.head;
                         const made = try ConfigurationWire.admit_enable_head(server_objects, d.handle, v, .{ .id = ch });
                         ch.resource = made.id;
-                        c.config_head = made.id;
                     },
                     .disable_head => |v| {
                         const selected = self.validHead(c, server_objects, v.head) orelse
@@ -483,7 +482,7 @@ pub fn Adapter(comptime protocol: type) type {
                     },
                     .apply => try self.submit(c, .apply),
                     .@"test" => try self.submit(c, .@"test"),
-                    .destroy => self.destroyConfig(c),
+                    .destroy => self.destroyConfigOn(c, server_objects),
                 }
                 try d.finish(protocol, server_objects, &actor.transmit);
                 return .continue_dispatch;
@@ -799,9 +798,22 @@ pub fn Adapter(comptime protocol: type) type {
             } else |_| {}
             self.retireConfig(c);
         }
+        fn destroyConfigOn(self: *Self, c: *ConfigSlot, server_objects: anytype) void {
+            while (self.findConfigHead(c.header.index)) |h| {
+                if (h.resource) |handle| _ = server_objects.removeClient(handle) catch {};
+                if (h.header.active and h.configuration == c.header.index)
+                    self.config_heads.release(h);
+            }
+            self.destroyConfig(c);
+        }
         fn retireConfig(self: *Self, c: *ConfigSlot) void {
             for (self.config_heads.entries.items) |h| if (h.header.active and h.configuration == c.header.index) self.config_heads.release(h);
             self.configurations.release(c);
+        }
+        fn findConfigHead(self: *Self, configuration: u32) ?*CHeadSlot {
+            for (self.config_heads.entries.items) |h|
+                if (h.header.active and h.configuration == configuration) return h;
+            return null;
         }
         fn releaseManager(self: *Self, m: *ManagerSlot) void {
             for (self.heads.entries.items) |h| if (h.header.active and h.manager == m.header.index) self.heads.release(h);
@@ -1287,6 +1299,73 @@ test "primary head promotion preserves identities and pending configuration stat
 test "Wayring output-management adapter compiles against generated protocol" {
     const A = Adapter(@import("core_protocol"));
     std.testing.refAllDecls(A);
+}
+
+test "destroying a pending wire configuration removes every configuration head" {
+    const protocol = @import("core_protocol");
+    const A = Adapter(protocol);
+    var adapter = try A.init(
+        std.testing.allocator,
+        .{ .configuration_capacity = 4 },
+        1,
+        .{ .width = 800, .height = 600, .refresh_millihz = 60_000 },
+    );
+    defer adapter.deinit();
+    var server_objects = try wayring.objects.ServerObjects.init(
+        std.testing.allocator,
+        8,
+        4,
+        &protocol.wl_display.info,
+        null,
+    );
+    defer server_objects.deinit(std.testing.allocator);
+
+    const second = try adapter.lifecycle.addHead(.{
+        .width = 1024,
+        .height = 768,
+        .refresh_millihz = 60_000,
+        .x = 800,
+    });
+    const lifecycle = try adapter.lifecycle.create(1);
+    try adapter.lifecycle.enableHead(lifecycle, adapter.lifecycle.primary);
+    try adapter.lifecycle.enableHead(lifecycle, second);
+    _ = (try adapter.lifecycle.submit(lifecycle, .apply)).?;
+
+    const configuration = try adapter.configurations.acquire();
+    configuration.lifecycle = lifecycle;
+    const configuration_index = configuration.header.index;
+    const parent = try server_objects.insertClient(
+        2,
+        &protocol.zwlr_output_configuration_v1.info,
+        4,
+        configuration,
+    );
+    configuration.resource = parent;
+    var child_resources: [2]wayring.objects.Handle = undefined;
+    for ([_]HeadId{ adapter.lifecycle.primary, second }, child_resources[0..], 3..) |head, *resource, id| {
+        const child = try adapter.config_heads.acquire();
+        child.configuration = configuration_index;
+        child.head = head;
+        resource.* = try server_objects.insertClient(
+            @intCast(id),
+            &protocol.zwlr_output_configuration_head_v1.info,
+            4,
+            child,
+        );
+        child.resource = resource.*;
+    }
+
+    adapter.destroyConfigOn(configuration, &server_objects);
+    for (child_resources) |resource|
+        try std.testing.expect(server_objects.namespace.resolve(resource) == null);
+    try std.testing.expect(configuration.header.active);
+    try std.testing.expect(configuration.destroyed);
+    try std.testing.expect(configuration.resource == null);
+    try std.testing.expect(adapter.findConfigHead(configuration_index) == null);
+
+    _ = try server_objects.removeClient(parent);
+    try adapter.completeCommand(.failed);
+    try std.testing.expect(adapter.configurations.at(configuration_index) == null);
 }
 
 test "output management inventory retains every exact mode and current selection" {
