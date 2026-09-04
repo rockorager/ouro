@@ -34,6 +34,7 @@ pub const Platform = struct {
 
     pub const VTable = struct {
         create_blob: *const fn (*anyopaque, std.posix.fd_t, drm.Mode) anyerror!u32,
+        create_property_blob: *const fn (*anyopaque, std.posix.fd_t, []const u8) anyerror!u32,
         destroy_blob: *const fn (*anyopaque, std.posix.fd_t, u32) anyerror!void,
         create_request: *const fn (*anyopaque) anyerror!Request,
         destroy_request: *const fn (*anyopaque, Request) void,
@@ -45,6 +46,11 @@ pub const Platform = struct {
 
     pub fn createBlob(self: Platform, fd: std.posix.fd_t, mode: drm.Mode) !u32 {
         return self.vtable.create_blob(self.context, fd, mode);
+    }
+
+    pub fn createPropertyBlob(self: Platform, fd: std.posix.fd_t, bytes: []const u8) !u32 {
+        if (bytes.len == 0) return error.InvalidPropertyBlob;
+        return self.vtable.create_property_blob(self.context, fd, bytes);
     }
 
     pub fn destroyBlob(self: Platform, fd: std.posix.fd_t, id: u32) !void {
@@ -88,6 +94,7 @@ pub const real: Platform = .{ .context = &real_context, .vtable = &real_vtable }
 
 const real_vtable: Platform.VTable = .{
     .create_blob = realCreateBlob,
+    .create_property_blob = realCreatePropertyBlob,
     .destroy_blob = realDestroyBlob,
     .create_request = realCreateRequest,
     .destroy_request = realDestroyRequest,
@@ -102,6 +109,13 @@ fn realCreateBlob(_: *anyopaque, fd: std.posix.fd_t, mode: drm.Mode) !u32 {
     var id: u32 = 0;
     if (c.drmModeCreatePropertyBlob(fd, &native, @sizeOf(c.drmModeModeInfo), &id) != 0 or id == 0)
         return error.CreateModeBlobFailed;
+    return id;
+}
+
+fn realCreatePropertyBlob(_: *anyopaque, fd: std.posix.fd_t, bytes: []const u8) !u32 {
+    var id: u32 = 0;
+    if (c.drmModeCreatePropertyBlob(fd, bytes.ptr, bytes.len, &id) != 0 or id == 0)
+        return error.CreatePropertyBlobFailed;
     return id;
 }
 

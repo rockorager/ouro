@@ -48,6 +48,21 @@ pub const Config = struct {
     commit_capacity: usize = 2,
     event_capacity: usize = 32,
     adaptive_sync: bool = false,
+    hdr_metadata: ?HdrMetadata = null,
+};
+
+pub const HdrMetadata = extern struct {
+    metadata_type: u32 = 0,
+    eotf: u8,
+    static_metadata_descriptor_id: u8 = 0,
+    display_primaries: [3]Chromaticity,
+    white_point: Chromaticity,
+    max_display_mastering_luminance: u16,
+    min_display_mastering_luminance: u16,
+    max_cll: u16,
+    max_fall: u16,
+
+    pub const Chromaticity = extern struct { x: u16, y: u16 };
 };
 
 /// Generation-checking adapter for R9's borrowed Session-owned DRM FD.
@@ -145,6 +160,7 @@ pub const Output = struct {
     mode: drm.Mode,
     fd: std.posix.fd_t,
     mode_blob: u32,
+    hdr_blob: ?u32,
     records: []CommitRecord,
     events_buffer: []Event,
     event_count: usize = 0,
@@ -174,6 +190,8 @@ pub const Output = struct {
         if (config.adaptive_sync and (!snapshot.selectedConnector().properties.vrr_capable or
             snapshot.selectedCrtc().properties.vrr_enabled == 0))
             return error.AdaptiveSyncUnsupported;
+        if (config.hdr_metadata) |metadata|
+            if (!hdrSupported(snapshot.selectedConnector(), metadata)) return error.HdrUnsupported;
         const fd = try device.fd(snapshot.handle);
         const records = try allocator.alloc(CommitRecord, config.commit_capacity);
         errdefer allocator.free(records);
@@ -186,6 +204,11 @@ pub const Output = struct {
             records[created] = .{ .request = try platform.createRequest() };
         const blob = try platform.createBlob(fd, snapshot.selectedMode());
         errdefer platform.destroyBlob(fd, blob) catch {};
+        const hdr_blob = if (config.hdr_metadata) |*metadata|
+            try platform.createPropertyBlob(fd, std.mem.asBytes(metadata))
+        else
+            null;
+        errdefer if (hdr_blob) |id| platform.destroyBlob(fd, id) catch {};
         const event_storage = try allocator.alloc(Event, config.event_capacity);
         errdefer allocator.free(event_storage);
         var inherited_plane_count: usize = 0;
@@ -217,6 +240,7 @@ pub const Output = struct {
             .mode = snapshot.selectedMode(),
             .fd = fd,
             .mode_blob = blob,
+            .hdr_blob = hdr_blob,
             .records = records,
             .events_buffer = event_storage,
             .adaptive_sync = config.adaptive_sync,
@@ -234,6 +258,10 @@ pub const Output = struct {
         if (!self.terminal_device_teardown)
             self.platform.destroyBlob(self.fd, self.mode_blob) catch |err| {
                 first_error = err;
+            };
+        if (!self.terminal_device_teardown) if (self.hdr_blob) |blob|
+            self.platform.destroyBlob(self.fd, blob) catch |err| {
+                if (first_error == null) first_error = err;
             };
         var index = self.records.len;
         while (index != 0) {
@@ -579,7 +607,7 @@ pub const Output = struct {
             try self.platform.addProperty(request, self.connector.id, self.connector.properties.crtc_id, self.crtc.id);
             try self.platform.addProperty(request, self.crtc.id, self.crtc.properties.mode_id, self.mode_blob);
             try self.platform.addProperty(request, self.crtc.id, self.crtc.properties.active, 1);
-            try self.addSdrConnectorState(request, false);
+            try self.addConnectorColorState(request, false);
             if (self.crtc.properties.vrr_enabled != 0)
                 try self.platform.addProperty(
                     request,
@@ -622,7 +650,7 @@ pub const Output = struct {
         try self.platform.addProperty(request, self.connector.id, self.connector.properties.crtc_id, 0);
         try self.platform.addProperty(request, self.crtc.id, self.crtc.properties.active, 0);
         try self.platform.addProperty(request, self.crtc.id, self.crtc.properties.mode_id, 0);
-        try self.addSdrConnectorState(request, true);
+        try self.addConnectorColorState(request, true);
         if (self.crtc.properties.vrr_enabled != 0)
             try self.platform.addProperty(request, self.crtc.id, self.crtc.properties.vrr_enabled, 0);
         self.platform.commit(fd, request, .{ .allow_modeset = true }, null) catch |err| {
@@ -638,27 +666,53 @@ pub const Output = struct {
         self.state = .paused;
     }
 
-    fn addSdrConnectorState(
+    fn addConnectorColorState(
         self: *const Output,
         request: atomic.Request,
         restore_link_depth: bool,
     ) !void {
         const properties = self.connector.properties;
-        if (properties.colorspace.id != 0) if (properties.colorspace.default) |value|
-            try self.platform.addProperty(request, self.connector.id, properties.colorspace.id, value);
+        if (properties.colorspace.id != 0) {
+            const colorspace = if (self.hdr_blob != null and !restore_link_depth)
+                properties.colorspace.bt2020_rgb
+            else
+                properties.colorspace.default;
+            if (colorspace) |value|
+                try self.platform.addProperty(request, self.connector.id, properties.colorspace.id, value);
+        }
         if (properties.hdr_output_metadata.id != 0)
-            try self.platform.addProperty(request, self.connector.id, properties.hdr_output_metadata.id, 0);
+            try self.platform.addProperty(
+                request,
+                self.connector.id,
+                properties.hdr_output_metadata.id,
+                if (restore_link_depth) 0 else self.hdr_blob orelse 0,
+            );
         if (properties.max_bpc.id != 0) {
             const value = if (restore_link_depth)
                 properties.max_bpc.inherited
             else
                 std.math.clamp(
-                    @as(u64, 8),
+                    @as(u64, if (self.hdr_blob != null) 10 else 8),
                     properties.max_bpc.minimum,
                     properties.max_bpc.maximum,
                 );
             try self.platform.addProperty(request, self.connector.id, properties.max_bpc.id, value);
         }
+    }
+
+    fn hdrSupported(connector: drm.Connector, metadata: HdrMetadata) bool {
+        const properties = connector.properties;
+        const eotf_supported = switch (metadata.eotf) {
+            2 => properties.hdr_capabilities.pq,
+            3 => properties.hdr_capabilities.hlg,
+            else => false,
+        };
+        return properties.hdr_capabilities.bt2020_rgb and
+            eotf_supported and metadata.metadata_type == 0 and
+            metadata.static_metadata_descriptor_id == 0 and
+            properties.colorspace.id != 0 and properties.colorspace.bt2020_rgb != null and
+            properties.hdr_output_metadata.id != 0 and properties.max_bpc.id != 0 and
+            properties.max_bpc.minimum <= 10 and properties.max_bpc.maximum >= 10;
     }
 
     fn rollbackQueued(self: *Output) !void {
@@ -981,6 +1035,67 @@ test "kms: SDR link depth is clamped to connector range" {
     try fixture.drainAndDestroy(output);
 }
 
+test "kms: HDR modesets own BT.2020 metadata and ten-bit link depth" {
+    try std.testing.expectEqual(@as(usize, 32), @sizeOf(HdrMetadata));
+    var fixture = Fixture{};
+    fixture.connector[0].properties = .{
+        .crtc_id = 11,
+        .colorspace = .{ .id = 51, .inherited = 3, .default = 3, .bt2020_rgb = 9 },
+        .hdr_output_metadata = .{ .id = 52 },
+        .max_bpc = .{ .id = 53, .inherited = 12, .minimum = 8, .maximum = 12 },
+        .hdr_capabilities = .{ .bt2020_rgb = true, .pq = true },
+    };
+    const metadata: HdrMetadata = .{
+        .eotf = 2,
+        .display_primaries = .{
+            .{ .x = 35_400, .y = 14_600 },
+            .{ .x = 8_500, .y = 39_850 },
+            .{ .x = 6_550, .y = 2_300 },
+        },
+        .white_point = .{ .x = 15_635, .y = 16_450 },
+        .max_display_mastering_luminance = 1000,
+        .min_display_mastering_luminance = 1,
+        .max_cll = 1000,
+        .max_fall = 400,
+    };
+    const output = try fixture.create(.{ .hdr_metadata = metadata });
+    try std.testing.expectEqual(@as(usize, 2), fixture.atomic_state.blob_create_count);
+    try output.queue(fixture.acquire(0), null);
+    try output.commitQueued();
+    try std.testing.expect(fixture.atomic_state.hasProperty(10, 51, 9));
+    try std.testing.expect(fixture.atomic_state.hasProperty(10, 52, 78));
+    try std.testing.expect(fixture.atomic_state.hasProperty(10, 53, 10));
+    fixture.flip(output, fixture.crtc[0].id, false);
+    try output.processCallbacks();
+    try output.requestPause();
+    try std.testing.expect(fixture.atomic_state.hasProperty(10, 51, 3));
+    try std.testing.expect(fixture.atomic_state.hasProperty(10, 52, 0));
+    try std.testing.expect(fixture.atomic_state.hasProperty(10, 53, 12));
+    try fixture.drainAndDestroy(output);
+    try std.testing.expectEqual(@as(usize, 2), fixture.atomic_state.blob_destroy_count);
+}
+
+test "kms: HDR rejects an EOTF absent from connector EDID" {
+    var fixture = Fixture{};
+    fixture.connector[0].properties = .{
+        .crtc_id = 11,
+        .colorspace = .{ .id = 51, .default = 3, .bt2020_rgb = 9 },
+        .hdr_output_metadata = .{ .id = 52 },
+        .max_bpc = .{ .id = 53, .inherited = 8, .minimum = 8, .maximum = 12 },
+        .hdr_capabilities = .{ .bt2020_rgb = true, .hlg = true },
+    };
+    const metadata: HdrMetadata = .{
+        .eotf = 2,
+        .display_primaries = @splat(.{ .x = 1, .y = 1 }),
+        .white_point = .{ .x = 1, .y = 1 },
+        .max_display_mastering_luminance = 1000,
+        .min_display_mastering_luminance = 1,
+        .max_cll = 0,
+        .max_fall = 0,
+    };
+    try std.testing.expectError(error.HdrUnsupported, fixture.create(.{ .hdr_metadata = metadata }));
+}
+
 test "kms: direct candidates receive an active-state TEST_ONLY commit" {
     var fixture = Fixture{};
     const output = try fixture.create(.{});
@@ -1244,6 +1359,7 @@ const FakeAtomic = struct {
 
     const vtable: atomic.Platform.VTable = .{
         .create_blob = createBlob,
+        .create_property_blob = createPropertyBlob,
         .destroy_blob = destroyBlob,
         .create_request = createRequest,
         .destroy_request = destroyRequest,
@@ -1266,6 +1382,11 @@ const FakeAtomic = struct {
         const self: *FakeAtomic = @ptrCast(@alignCast(context));
         self.blob_create_count += 1;
         return 77;
+    }
+    fn createPropertyBlob(context: *anyopaque, _: std.posix.fd_t, _: []const u8) !u32 {
+        const self: *FakeAtomic = @ptrCast(@alignCast(context));
+        self.blob_create_count += 1;
+        return 78;
     }
     fn destroyBlob(context: *anyopaque, _: std.posix.fd_t, _: u32) !void {
         const self: *FakeAtomic = @ptrCast(@alignCast(context));

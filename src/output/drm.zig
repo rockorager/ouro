@@ -926,13 +926,20 @@ pub const Output = struct {
         self.import_cache = try allocator.alloc(CachedImport, import_cache_capacity);
         @memset(self.import_cache, .{});
         errdefer allocator.free(self.import_cache);
+        var kms_config = config.kms;
+        kms_config.hdr_metadata = if (hdrRequested(config.output_color_description)) blk: {
+            if (self.pool.allocation.format != gbm.format_xrgb2101010)
+                return error.HdrUnsupported;
+            break :blk hdrOutputMetadata(snapshot, config.output_color_description) orelse
+                return error.HdrUnsupported;
+        } else null;
         self.kms_output = try kms.Output.create(
             allocator,
             platforms.atomic,
             device,
             self.scanout_images.adapter(),
             snapshot,
-            config.kms,
+            kms_config,
         );
         self.allocator = allocator;
         self.clear = config.clear;
@@ -1721,10 +1728,16 @@ fn retireAction(removal: anytype) ?RetireAction {
 
 fn initRenderPath(allocator: std.mem.Allocator, platforms: Platforms, fd: std.posix.fd_t, snapshot: drm.Snapshot, config: Config) !InitialRenderPath {
     return switch (config.renderer) {
-        .pixman => initPixman(allocator, platforms, fd, snapshot, config),
-        .vulkan => initVulkan(allocator, platforms, fd, snapshot, config),
-        .vulkan_then_pixman => initVulkan(allocator, platforms, fd, snapshot, config) catch
+        .pixman => if (hdrRequested(config.output_color_description))
+            error.HdrRequiresVulkan
+        else
             initPixman(allocator, platforms, fd, snapshot, config),
+        .vulkan => initVulkan(allocator, platforms, fd, snapshot, config),
+        .vulkan_then_pixman => initVulkan(allocator, platforms, fd, snapshot, config) catch |err|
+            if (hdrRequested(config.output_color_description))
+                return err
+            else
+                initPixman(allocator, platforms, fd, snapshot, config),
     };
 }
 
@@ -1773,6 +1786,9 @@ fn initVulkanOutput(
 ) !OutputPath {
     if (snapshot.selectedPlane().properties.in_fence_fd == 0)
         return error.InFenceUnsupported;
+    const prefer_10bit = hdrOutputMetadata(snapshot, config.output_color_description) != null;
+    if (hdrRequested(config.output_color_description) and !prefer_10bit)
+        return error.HdrUnsupported;
     var pool = try vulkan.initTargetPool(
         allocator,
         platforms.gbm,
@@ -1780,7 +1796,7 @@ fn initVulkanOutput(
         fd,
         snapshot,
         config.image_count,
-        true,
+        prefer_10bit,
     );
     errdefer pool.deinit() catch {};
     if (!renderer.supportsTarget(pool.allocation)) {
@@ -1823,6 +1839,9 @@ fn initPixman(allocator: std.mem.Allocator, platforms: Platforms, fd: std.posix.
 fn initVulkan(allocator: std.mem.Allocator, platforms: Platforms, fd: std.posix.fd_t, snapshot: drm.Snapshot, config: Config) !InitialRenderPath {
     if (snapshot.selectedPlane().properties.in_fence_fd == 0)
         return error.InFenceUnsupported;
+    const prefer_10bit = hdrOutputMetadata(snapshot, config.output_color_description) != null;
+    if (hdrRequested(config.output_color_description) and !prefer_10bit)
+        return error.HdrUnsupported;
     var pool = try vulkan.initTargetPool(
         allocator,
         platforms.gbm,
@@ -1830,7 +1849,7 @@ fn initVulkan(allocator: std.mem.Allocator, platforms: Platforms, fd: std.posix.
         fd,
         snapshot,
         config.image_count,
-        true,
+        prefer_10bit,
     );
     errdefer pool.deinit() catch {};
     const content_version_capacity = try contentVersionCapacity(config);
@@ -1916,6 +1935,140 @@ pub fn formatFromDrm(value: u32) ?render.PixelFormat {
 fn targetFormatFromDrm(value: u32) ?render.PixelFormat {
     if (value == gbm.format_xrgb2101010) return .xrgb8888;
     return formatFromDrm(value);
+}
+
+fn hdrRequested(description: render.color.Description) bool {
+    return description.transfer == .st2084_pq or description.transfer == .hlg;
+}
+
+fn hdrOutputMetadata(
+    snapshot: drm.Snapshot,
+    description: render.color.Description,
+) ?kms.HdrMetadata {
+    if (!hdrRequested(description) or !bt2020Primaries(description.primaries)) return null;
+    const properties = snapshot.selectedConnector().properties;
+    const eotf_supported = switch (description.transfer) {
+        .st2084_pq => properties.hdr_capabilities.pq,
+        .hlg => properties.hdr_capabilities.hlg,
+        else => unreachable,
+    };
+    if (!properties.hdr_capabilities.bt2020_rgb or !eotf_supported or
+        properties.colorspace.id == 0 or properties.colorspace.bt2020_rgb == null or
+        properties.hdr_output_metadata.id == 0 or properties.max_bpc.id == 0 or
+        properties.max_bpc.minimum > 10 or properties.max_bpc.maximum < 10) return null;
+
+    const primaries = description.targetPrimaries();
+    return .{
+        .eotf = if (description.transfer == .st2084_pq) 2 else 3,
+        .display_primaries = .{
+            hdrChromaticity(primaries.red),
+            hdrChromaticity(primaries.green),
+            hdrChromaticity(primaries.blue),
+        },
+        .white_point = hdrChromaticity(primaries.white),
+        .max_display_mastering_luminance = hdrLuminance(
+            description.targetMaxLuminance(),
+            1,
+        ),
+        .min_display_mastering_luminance = hdrLuminance(
+            description.targetMinLuminance(),
+            10_000,
+        ),
+        .max_cll = @intCast(@min(description.target_max_cll orelse 0, std.math.maxInt(u16))),
+        .max_fall = @intCast(@min(description.target_max_fall orelse 0, std.math.maxInt(u16))),
+    };
+}
+
+fn bt2020Primaries(primaries: render.color.Primaries) bool {
+    const expected: render.color.Primaries = .{
+        .red = .{ .x = 0.708, .y = 0.292 },
+        .green = .{ .x = 0.170, .y = 0.797 },
+        .blue = .{ .x = 0.131, .y = 0.046 },
+        .white = .{ .x = 0.3127, .y = 0.3290 },
+    };
+    inline for (.{
+        .{ primaries.red, expected.red },
+        .{ primaries.green, expected.green },
+        .{ primaries.blue, expected.blue },
+        .{ primaries.white, expected.white },
+    }) |pair| if (@abs(pair[0].x - pair[1].x) > 0.0001 or
+        @abs(pair[0].y - pair[1].y) > 0.0001) return false;
+    return true;
+}
+
+fn hdrChromaticity(value: render.color.Chromaticity) kms.HdrMetadata.Chromaticity {
+    return .{
+        .x = @intFromFloat(@round(std.math.clamp(value.x, 0, 1) * 50_000)),
+        .y = @intFromFloat(@round(std.math.clamp(value.y, 0, 1) * 50_000)),
+    };
+}
+
+fn hdrLuminance(value: f32, scale: f32) u16 {
+    return @intFromFloat(@round(std.math.clamp(
+        value * scale,
+        0,
+        @as(f32, std.math.maxInt(u16)),
+    )));
+}
+
+test "drm output: HDR10 metadata follows the configured output description" {
+    const connector: drm.Connector = .{
+        .id = 10,
+        .connector_type = 1,
+        .connector_type_id = 1,
+        .connected = true,
+        .desktop = true,
+        .width_mm = 1,
+        .height_mm = 1,
+        .encoder_id = 20,
+        .mode_start = 0,
+        .mode_count = 0,
+        .encoder_start = 0,
+        .encoder_count = 0,
+        .properties = .{
+            .crtc_id = 1,
+            .colorspace = .{ .id = 2, .bt2020_rgb = 9 },
+            .hdr_output_metadata = .{ .id = 3 },
+            .max_bpc = .{ .id = 4, .minimum = 8, .maximum = 12 },
+            .hdr_capabilities = .{ .bt2020_rgb = true, .pq = true },
+        },
+    };
+    const snapshot: drm.Snapshot = .{
+        .handle = .{ .generation = 1 },
+        .card = .{},
+        .connectors = &.{connector},
+        .modes = &.{},
+        .connector_encoders = &.{},
+        .encoders = &.{},
+        .crtcs = &.{},
+        .planes = &.{},
+        .formats = &.{},
+        .selection = .{ .connector_index = 0, .mode_index = 0, .crtc_index = 0, .plane_index = 0 },
+    };
+    var description = render.color.Description.srgb;
+    description.primaries = .{
+        .red = .{ .x = 0.708, .y = 0.292 },
+        .green = .{ .x = 0.170, .y = 0.797 },
+        .blue = .{ .x = 0.131, .y = 0.046 },
+        .white = .{ .x = 0.3127, .y = 0.3290 },
+    };
+    description.transfer = .st2084_pq;
+    description.reference_luminance = 203;
+    description.min_luminance = 0.0001;
+    description.max_luminance = 1000;
+    description.target_max_cll = 1000;
+    description.target_max_fall = 400;
+
+    const metadata = hdrOutputMetadata(snapshot, description).?;
+    try std.testing.expectEqual(@as(u8, 2), metadata.eotf);
+    try std.testing.expectEqual(kms.HdrMetadata.Chromaticity{
+        .x = 35_400,
+        .y = 14_600,
+    }, metadata.display_primaries[0]);
+    try std.testing.expectEqual(@as(u16, 1000), metadata.max_display_mastering_luminance);
+    try std.testing.expectEqual(@as(u16, 1), metadata.min_display_mastering_luminance);
+    try std.testing.expectEqual(@as(u16, 1000), metadata.max_cll);
+    try std.testing.expectEqual(@as(u16, 400), metadata.max_fall);
 }
 
 fn directScanoutSource(
@@ -2357,6 +2510,7 @@ const SimFixture = struct {
     };
     const atomic_vtable: atomic.Platform.VTable = .{
         .create_blob = createBlob,
+        .create_property_blob = createPropertyBlob,
         .destroy_blob = destroyBlob,
         .create_request = createRequest,
         .destroy_request = destroyRequest,
@@ -2475,6 +2629,9 @@ const SimFixture = struct {
     }
     fn createBlob(_: *anyopaque, _: std.posix.fd_t, _: drm.Mode) !u32 {
         return 1;
+    }
+    fn createPropertyBlob(_: *anyopaque, _: std.posix.fd_t, _: []const u8) !u32 {
+        return 2;
     }
     fn destroyBlob(_: *anyopaque, _: std.posix.fd_t, _: u32) !void {}
     fn createRequest(context: *anyopaque) !atomic.Request {

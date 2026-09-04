@@ -3912,6 +3912,7 @@ pub const Fixture = struct {
     };
     const atomic_vtable: ouro.drm_atomic.Platform.VTable = .{
         .create_blob = createBlob,
+        .create_property_blob = createPropertyBlob,
         .destroy_blob = destroyBlob,
         .create_request = createRequest,
         .destroy_request = destroyRequest,
@@ -4184,6 +4185,9 @@ pub const Fixture = struct {
     }
     fn createBlob(_: *anyopaque, _: linux.fd_t, _: ouro.drm.Mode) !u32 {
         return 1;
+    }
+    fn createPropertyBlob(_: *anyopaque, _: linux.fd_t, _: []const u8) !u32 {
+        return 2;
     }
     fn destroyBlob(_: *anyopaque, _: linux.fd_t, _: u32) !void {}
     fn createRequest(context: *anyopaque) !ouro.drm_atomic.Request {
