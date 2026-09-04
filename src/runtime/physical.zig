@@ -8346,6 +8346,11 @@ pub fn Coordinator(comptime protocol: type) type {
                     visibility_changed = true;
                     continue;
                 };
+                if (!scene.root.visible) {
+                    self.queueLayerRemoval(id);
+                    visibility_changed = true;
+                    continue;
+                }
                 var sample = layer.sample.?;
                 const natural_size = layer.change.?.current.?.surface_size;
                 if (scene.subsurface) {
@@ -8605,10 +8610,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .width = rendered_width,
                 .height = rendered_height,
             };
-            const clip = if (surface_scene) |scene|
-                if (scene.root.visible) try clipToOutput(destination, output_bounds) else null
-            else
-                try clipToOutput(destination, output_bounds);
+            const clip = try clipToOutput(destination, output_bounds);
             const visible_clip = clip orelse {
                 return try self.discardPendingCandidate(layer, pending.id);
             };
@@ -8973,10 +8975,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .width = rendered_width,
                 .height = rendered_height,
             };
-            const visible_clip = (if (surface_scene) |scene|
-                if (scene.root.visible) try clipToOutput(destination, output_bounds) else null
-            else
-                try clipToOutput(destination, output_bounds)) orelse
+            const visible_clip = (try clipToOutput(destination, output_bounds)) orelse
                 return self.discardPendingCandidate(
                     layer,
                     pending_id,

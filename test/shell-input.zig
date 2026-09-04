@@ -2430,6 +2430,38 @@ test "shell-input: two mapped toplevels sustain independent commit cycles" {
 
     const windows = try coordinator.desktop.sceneSnapshot(coordinator.scene_windows);
     try std.testing.expectEqual(windows[1].id, coordinator.desktop.focused().?);
+    try coordinator.switchWorkspace(2);
+    var hidden_layers_retained = false;
+    for (0..256) |_| {
+        client_progress = try drainMultiClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        var active_layers: usize = 0;
+        for (coordinator.app_layers) |layer| active_layers += @intFromBool(layer.active);
+        if (coordinator.removed_layer_len == 2 and active_layers == 2) {
+            hidden_layers_retained = true;
+            break;
+        }
+        if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, client_reactor.ring);
+    }
+    try std.testing.expect(hidden_layers_retained);
+    try coordinator.switchWorkspace(1);
+    const submitted_before_restore = coordinator.stats.submitted;
+    var restored_layers_rendered = false;
+    for (0..256) |_| {
+        client_progress = try drainMultiClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (coordinator.stats.submitted > submitted_before_restore and
+            coordinator.primaryKmsOutput().?.scheduler.sample_count == 2)
+        {
+            restored_layers_rendered = true;
+            break;
+        }
+        if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, client_reactor.ring);
+    }
+    try std.testing.expect(restored_layers_rendered);
+
     const pointer_device: ouro.input_backend.DeviceId = .{
         .slot = 0,
         .generation = 1,
