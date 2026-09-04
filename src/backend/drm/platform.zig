@@ -54,14 +54,41 @@ pub const Mode = struct {
     }
 };
 
+pub const BlobProperty = struct {
+    id: u32 = 0,
+    inherited: u64 = 0,
+};
+
+pub const RangeProperty = struct {
+    id: u32 = 0,
+    inherited: u64 = 0,
+    minimum: u64 = 0,
+    maximum: u64 = 0,
+};
+
+pub const ColorspaceProperty = struct {
+    id: u32 = 0,
+    inherited: u64 = 0,
+    default: ?u64 = null,
+    bt2020_rgb: ?u64 = null,
+};
+
 pub const ConnectorProperties = struct {
     crtc_id: u32,
     vrr_capable: bool = false,
+    colorspace: ColorspaceProperty = .{},
+    hdr_output_metadata: BlobProperty = .{},
+    max_bpc: RangeProperty = .{},
 };
 pub const CrtcProperties = struct {
     active: u32,
     mode_id: u32,
     vrr_enabled: u32 = 0,
+    degamma_lut: BlobProperty = .{},
+    degamma_lut_size: u64 = 0,
+    ctm: BlobProperty = .{},
+    gamma_lut: BlobProperty = .{},
+    gamma_lut_size: u64 = 0,
 };
 pub const PlaneProperties = struct {
     plane_type: u32,
@@ -276,11 +303,7 @@ fn realReadTopology(_: *anyopaque, fd: std.posix.fd_t, out: *TopologyBuffer) !vo
         out.crtcs[out.crtc_count] = .{
             .id = id,
             .index = @intCast(index),
-            .properties = .{
-                .active = try requiredProperty(fd, props, "ACTIVE"),
-                .mode_id = try requiredProperty(fd, props, "MODE_ID"),
-                .vrr_enabled = if (try optionalProperty(fd, props, "VRR_ENABLED")) |value| value.id else 0,
-            },
+            .properties = try crtcProperties(fd, props),
         };
         out.crtc_count += 1;
     }
@@ -335,13 +358,7 @@ fn realReadTopology(_: *anyopaque, fd: std.posix.fd_t, out: *TopologyBuffer) !vo
             .mode_count = @intCast(out.mode_count - mode_start),
             .encoder_start = @intCast(encoder_start),
             .encoder_count = @intCast(out.connector_encoder_count - encoder_start),
-            .properties = .{
-                .crtc_id = try requiredProperty(fd, props, "CRTC_ID"),
-                .vrr_capable = if (try optionalProperty(fd, props, "vrr_capable")) |value|
-                    value.value != 0
-                else
-                    false,
-            },
+            .properties = try connectorProperties(fd, props),
         };
         out.connector_count += 1;
     }
@@ -442,6 +459,122 @@ fn realListLessees(_: *anyopaque, fd: std.posix.fd_t, storage: []u32) !usize {
 
 const PropertyValue = struct { id: u32, value: u64 };
 
+fn connectorProperties(fd: std.posix.fd_t, props: *c.drmModeObjectProperties) !ConnectorProperties {
+    return .{
+        .crtc_id = try requiredProperty(fd, props, "CRTC_ID"),
+        .vrr_capable = if (try optionalProperty(fd, props, "vrr_capable")) |value|
+            value.value != 0
+        else
+            false,
+        .colorspace = try optionalColorspaceProperty(fd, props),
+        .hdr_output_metadata = try optionalBlobProperty(fd, props, "HDR_OUTPUT_METADATA"),
+        .max_bpc = try optionalRangeProperty(fd, props, "max bpc"),
+    };
+}
+
+fn crtcProperties(fd: std.posix.fd_t, props: *c.drmModeObjectProperties) !CrtcProperties {
+    return .{
+        .active = try requiredProperty(fd, props, "ACTIVE"),
+        .mode_id = try requiredProperty(fd, props, "MODE_ID"),
+        .vrr_enabled = if (try optionalProperty(fd, props, "VRR_ENABLED")) |value| value.id else 0,
+        .degamma_lut = try optionalBlobProperty(fd, props, "DEGAMMA_LUT"),
+        .degamma_lut_size = if (try optionalProperty(fd, props, "DEGAMMA_LUT_SIZE")) |value| value.value else 0,
+        .ctm = try optionalBlobProperty(fd, props, "CTM"),
+        .gamma_lut = try optionalBlobProperty(fd, props, "GAMMA_LUT"),
+        .gamma_lut_size = if (try optionalProperty(fd, props, "GAMMA_LUT_SIZE")) |value| value.value else 0,
+    };
+}
+
+fn optionalColorspaceProperty(
+    fd: std.posix.fd_t,
+    props: *c.drmModeObjectProperties,
+) !ColorspaceProperty {
+    const found = try propertyByName(fd, props, "Colorspace") orelse return .{};
+    defer c.drmModeFreeProperty(found.property);
+    return parseColorspaceProperty(found.property, found.value);
+}
+
+fn parseColorspaceProperty(
+    property: *const c.drmModePropertyRes,
+    inherited: u64,
+) !ColorspaceProperty {
+    if (property.*.flags & c.DRM_MODE_PROP_ENUM == 0 or property.*.count_enums < 0)
+        return error.MalformedProperty;
+    var result: ColorspaceProperty = .{
+        .id = property.*.prop_id,
+        .inherited = inherited,
+    };
+    var index: usize = 0;
+    while (index < @as(usize, @intCast(property.*.count_enums))) : (index += 1) {
+        const entry = property.*.enums[index];
+        const name = std.mem.sliceTo(entry.name[0..], 0);
+        if (std.mem.eql(u8, name, "Default")) result.default = entry.value;
+        if (std.mem.eql(u8, name, "BT2020_RGB")) result.bt2020_rgb = entry.value;
+    }
+    return result;
+}
+
+fn optionalBlobProperty(
+    fd: std.posix.fd_t,
+    props: *c.drmModeObjectProperties,
+    name: []const u8,
+) !BlobProperty {
+    const found = try propertyByName(fd, props, name) orelse return .{};
+    defer c.drmModeFreeProperty(found.property);
+    if (found.property.*.flags & c.DRM_MODE_PROP_BLOB == 0)
+        return error.MalformedProperty;
+    return .{ .id = found.property.*.prop_id, .inherited = found.value };
+}
+
+fn optionalRangeProperty(
+    fd: std.posix.fd_t,
+    props: *c.drmModeObjectProperties,
+    name: []const u8,
+) !RangeProperty {
+    const found = try propertyByName(fd, props, name) orelse return .{};
+    defer c.drmModeFreeProperty(found.property);
+    return parseRangeProperty(found.property, found.value);
+}
+
+fn parseRangeProperty(
+    property: *const c.drmModePropertyRes,
+    inherited: u64,
+) !RangeProperty {
+    if (property.*.flags & c.DRM_MODE_PROP_RANGE == 0 or property.*.count_values != 2 or
+        property.*.values[0] > property.*.values[1])
+        return error.MalformedProperty;
+    return .{
+        .id = property.*.prop_id,
+        .inherited = inherited,
+        .minimum = property.*.values[0],
+        .maximum = property.*.values[1],
+    };
+}
+
+const Property = struct {
+    property: *c.drmModePropertyRes,
+    value: u64,
+};
+
+fn propertyByName(
+    fd: std.posix.fd_t,
+    props: *c.drmModeObjectProperties,
+    name: []const u8,
+) !?Property {
+    var index: usize = 0;
+    while (index < props.*.count_props) : (index += 1) {
+        const property = c.drmModeGetProperty(fd, props.*.props[index]) orelse
+            return error.GetPropertyFailed;
+        const property_name = std.mem.sliceTo(property.*.name[0..], 0);
+        if (std.mem.eql(u8, property_name, name)) return .{
+            .property = property,
+            .value = props.*.prop_values[index],
+        };
+        c.drmModeFreeProperty(property);
+    }
+    return null;
+}
+
 fn objectProperties(fd: std.posix.fd_t, id: u32, object_type: u32) !*c.drmModeObjectProperties {
     return c.drmModeObjectGetProperties(fd, id, object_type) orelse error.GetPropertiesFailed;
 }
@@ -455,18 +588,9 @@ fn requiredPropertyValue(fd: std.posix.fd_t, props: *c.drmModeObjectProperties, 
 }
 
 fn optionalProperty(fd: std.posix.fd_t, props: *c.drmModeObjectProperties, name: []const u8) !?PropertyValue {
-    var index: usize = 0;
-    while (index < props.*.count_props) : (index += 1) {
-        const property = c.drmModeGetProperty(fd, props.*.props[index]) orelse
-            return error.GetPropertyFailed;
-        defer c.drmModeFreeProperty(property);
-        const property_name = std.mem.sliceTo(property.*.name[0..], 0);
-        if (std.mem.eql(u8, property_name, name)) return .{
-            .id = property.*.prop_id,
-            .value = props.*.prop_values[index],
-        };
-    }
-    return null;
+    const found = try propertyByName(fd, props, name) orelse return null;
+    defer c.drmModeFreeProperty(found.property);
+    return .{ .id = found.property.*.prop_id, .value = found.value };
 }
 
 fn appendFormat(out: *TopologyBuffer, fourcc: u32, modifier: u64) !void {
@@ -555,4 +679,45 @@ test "drm platform: card sysname filtering is strict" {
     try std.testing.expect(!isCardName("card"));
     try std.testing.expect(!isCardName("card0-DP-1"));
     try std.testing.expect(!isCardName("renderD128"));
+}
+
+test "drm platform: color properties preserve driver values" {
+    var enums = [_]c.struct_drm_mode_property_enum{
+        std.mem.zeroes(c.struct_drm_mode_property_enum),
+        std.mem.zeroes(c.struct_drm_mode_property_enum),
+    };
+    @memcpy(enums[0].name[0..7], "Default");
+    enums[0].value = 3;
+    @memcpy(enums[1].name[0..10], "BT2020_RGB");
+    enums[1].value = 9;
+    var colorspace = std.mem.zeroes(c.drmModePropertyRes);
+    colorspace.prop_id = 41;
+    colorspace.flags = c.DRM_MODE_PROP_ENUM;
+    colorspace.count_enums = enums.len;
+    colorspace.enums = &enums;
+    try std.testing.expectEqual(ColorspaceProperty{
+        .id = 41,
+        .inherited = 9,
+        .default = 3,
+        .bt2020_rgb = 9,
+    }, try parseColorspaceProperty(&colorspace, 9));
+
+    var values = [_]u64{ 8, 16 };
+    var max_bpc = std.mem.zeroes(c.drmModePropertyRes);
+    max_bpc.prop_id = 42;
+    max_bpc.flags = c.DRM_MODE_PROP_RANGE;
+    max_bpc.count_values = values.len;
+    max_bpc.values = &values;
+    try std.testing.expectEqual(RangeProperty{
+        .id = 42,
+        .inherited = 10,
+        .minimum = 8,
+        .maximum = 16,
+    }, try parseRangeProperty(&max_bpc, 10));
+}
+
+test "drm platform: malformed color property types are rejected" {
+    var property = std.mem.zeroes(c.drmModePropertyRes);
+    try std.testing.expectError(error.MalformedProperty, parseColorspaceProperty(&property, 0));
+    try std.testing.expectError(error.MalformedProperty, parseRangeProperty(&property, 0));
 }
