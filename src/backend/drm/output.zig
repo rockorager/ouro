@@ -392,11 +392,56 @@ pub const Output = struct {
         return self.commitQueuedInternal(ring);
     }
 
+    /// Tests the complete primary/overlay state without transferring either
+    /// image to the kernel. Failure discards the queued pair; success leaves it
+    /// queued for the real commit.
+    pub fn testQueued(self: *Output) !void {
+        if (self.state != .queued) return error.InvalidState;
+        const queued = self.queued.?;
+        const modeset = queued.previous_state == .initial or queued.previous_state == .paused;
+        if (!((modeset and !self.modeset_tested) or queued.test_before_commit)) return;
+        const fd = self.device.fd(self.snapshot_handle) catch |err| {
+            try self.rollbackQueued();
+            return err;
+        };
+        const slot = self.freeRecord() orelse {
+            try self.rollbackQueued();
+            return error.CommitCapacityExhausted;
+        };
+        const record = &self.records[slot];
+        const image = self.images.get_image(self.images.context, queued.image) catch |err| {
+            try self.rollbackQueued();
+            return err;
+        };
+        const overlay_framebuffer_id = if (queued.overlay) |overlay|
+            (self.images.get_image(self.images.context, overlay.image) catch |err| {
+                try self.rollbackQueued();
+                return err;
+            }).framebuffer_id
+        else
+            null;
+        self.buildScanout(record, image.framebuffer_id, queued.in_fence_fd, queued.overlay, overlay_framebuffer_id, modeset) catch |err| {
+            try self.rollbackRecordAndQueued(record);
+            return err;
+        };
+        self.platform.commit(fd, record.request, .{
+            .test_only = true,
+            .allow_modeset = modeset,
+        }, null) catch |err| {
+            try self.rollbackRecordAndQueued(record);
+            return err;
+        };
+        self.platform.resetRequest(record.request);
+        if (modeset) self.modeset_tested = true;
+        self.queued.?.test_before_commit = false;
+    }
+
     fn commitQueuedInternal(
         self: *Output,
         ring: ?*linux.IoUring,
     ) !void {
         if (self.state != .queued) return error.InvalidState;
+        try self.testQueued();
         const queued = self.queued.?;
         const fd = self.device.fd(self.snapshot_handle) catch |err| {
             try self.rollbackQueued();
@@ -420,21 +465,6 @@ pub const Output = struct {
             null;
         const modeset = queued.previous_state == .initial or queued.previous_state == .paused;
 
-        if ((modeset and !self.modeset_tested) or queued.test_before_commit) {
-            self.buildScanout(record, image.framebuffer_id, queued.in_fence_fd, queued.overlay, overlay_framebuffer_id, modeset) catch |err| {
-                try self.rollbackRecordAndQueued(record);
-                return err;
-            };
-            self.platform.commit(fd, record.request, .{
-                .test_only = true,
-                .allow_modeset = modeset,
-            }, null) catch |err| {
-                try self.rollbackRecordAndQueued(record);
-                return err;
-            };
-            if (modeset) self.modeset_tested = true;
-            self.platform.resetRequest(record.request);
-        }
         self.buildScanout(record, image.framebuffer_id, queued.in_fence_fd, queued.overlay, overlay_framebuffer_id, modeset) catch |err| {
             try self.rollbackRecordAndQueued(record);
             return err;
@@ -1250,7 +1280,12 @@ test "kms: overlay ownership is atomic through replacement flip" {
         .width = 64,
         .height = 48,
     });
+    try output.testQueued();
+    try std.testing.expectEqual(@as(usize, 1), fixture.atomic_state.commit_count);
+    try std.testing.expectEqual(framebuffer.State.acquired, fixture.images_state.states[0]);
+    try std.testing.expectEqual(framebuffer.State.acquired, fixture.images_state.states[1]);
     try output.commitQueued();
+    try std.testing.expectEqual(@as(usize, 2), fixture.atomic_state.commit_count);
     try std.testing.expectEqual(@as(usize, 2), fixture.images_state.submit_count);
     try std.testing.expect(fixture.atomic_state.commits[0].flags.test_only);
     try std.testing.expect(fixture.atomic_state.hasProperty(50, 52, 101));
