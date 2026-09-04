@@ -33,9 +33,14 @@ const PlaneRank = struct {
     }
 };
 
-const OverlayZpos = struct {
+pub const OverlayZpos = struct {
     property_id: ?u32,
     value: u64,
+};
+
+pub const OverlaySelection = struct {
+    plane_index: u32,
+    zpos: OverlayZpos,
 };
 
 fn planeRank(
@@ -153,6 +158,43 @@ pub const Snapshot = struct {
 
     pub fn selectedPlane(self: Snapshot) Plane {
         return self.planes[self.selection.plane_index];
+    }
+
+    pub fn overlayPlane(self: Snapshot, preferred_plane_id: ?u32) ?OverlaySelection {
+        const crtc = self.selectedCrtc();
+        if (crtc.index >= 32) return null;
+        const primary_zpos = self.selectedPlane().properties.zpos orelse return null;
+        var best: ?OverlaySelection = null;
+        var best_rank: PlaneRank = undefined;
+        for (self.planes, 0..) |plane, plane_index| {
+            if (plane_index == self.selection.plane_index or plane.plane_type_value != 0 or
+                !plane.has_in_formats or plane.properties.in_fence_fd == 0 or
+                plane.possible_crtcs & (@as(u32, 1) << @intCast(crtc.index)) == 0) continue;
+            const rank = planeRank(plane, crtc.id, preferred_plane_id);
+            if (rank.attachment == 0) continue;
+            const zpos = overlayZpos(plane.properties.zpos orelse continue, primary_zpos.inherited) orelse
+                continue;
+            if (best == null or rank.betterThan(best_rank)) {
+                best = .{ .plane_index = @intCast(plane_index), .zpos = zpos };
+                best_rank = rank;
+            }
+        }
+        return best;
+    }
+
+    pub fn planeSupportsFormat(
+        self: Snapshot,
+        plane_index: u32,
+        fourcc: u32,
+        modifier: u64,
+    ) bool {
+        if (plane_index >= self.planes.len) return false;
+        const plane = self.planes[plane_index];
+        const end = std.math.add(usize, plane.format_start, plane.format_count) catch return false;
+        if (end > self.formats.len) return false;
+        for (self.formats[plane.format_start..end]) |format|
+            if (format.fourcc == fourcc and format.modifier == modifier) return true;
+        return false;
     }
 };
 
@@ -2082,6 +2124,40 @@ test "drm: overlay z-order remains strictly above primary" {
         .{ .id = 9, .inherited = 0, .maximum = 3, .immutable = false },
         1,
     ).?);
+}
+
+test "drm: snapshot selects only synchronized format-compatible overlay planes" {
+    var primary_properties = testPlaneProperties();
+    primary_properties.zpos = .{ .id = 21, .inherited = 1, .maximum = 1, .immutable = true };
+    var overlay_properties = testPlaneProperties();
+    overlay_properties.in_fence_fd = 22;
+    overlay_properties.zpos = .{ .id = 23, .inherited = 2, .maximum = 4, .immutable = false };
+    const planes = [_]Plane{
+        .{ .id = 30, .possible_crtcs = 1, .plane_type_value = primary_plane_type, .has_in_formats = true, .format_start = 0, .format_count = 1, .properties = primary_properties },
+        .{ .id = 31, .possible_crtcs = 1, .plane_type_value = 0, .has_in_formats = true, .format_start = 1, .format_count = 1, .properties = overlay_properties },
+    };
+    const crtcs = [_]Crtc{.{ .id = 40, .index = 0, .properties = .{ .active = 1, .mode_id = 2 } }};
+    const formats = [_]Format{
+        .{ .fourcc = 1, .modifier = 2 },
+        .{ .fourcc = 3, .modifier = 4 },
+    };
+    const snapshot: Snapshot = .{
+        .handle = .{ .generation = 1 },
+        .card = .{},
+        .connectors = &.{},
+        .modes = &.{},
+        .connector_encoders = &.{},
+        .encoders = &.{},
+        .crtcs = &crtcs,
+        .planes = &planes,
+        .formats = &formats,
+        .selection = .{ .connector_index = 0, .mode_index = 0, .crtc_index = 0, .plane_index = 0 },
+    };
+    const overlay = snapshot.overlayPlane(null).?;
+    try std.testing.expectEqual(@as(u32, 1), overlay.plane_index);
+    try std.testing.expectEqual(OverlayZpos{ .property_id = 23, .value = 2 }, overlay.zpos);
+    try std.testing.expect(snapshot.planeSupportsFormat(overlay.plane_index, 3, 4));
+    try std.testing.expect(!snapshot.planeSupportsFormat(overlay.plane_index, 3, 5));
 }
 
 const TestTopology = struct {
