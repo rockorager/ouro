@@ -1481,6 +1481,151 @@ test "shell-input: security context filters nested manager before registry disco
     try root.deinit();
 }
 
+test "shell-input: terminal notifications survive full outbound queues" {
+    const allocator = std.testing.allocator;
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-terminal-backpressure-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+    var fixture = try physical_fixture.Fixture.init();
+    defer fixture.deinit();
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), physical_fixture.compositorConfig());
+    var config = physical_fixture.coordinatorConfig();
+    config.data_device.outbound_capacity = 1;
+    config.input_method.outbound_capacity = 3;
+    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), config);
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
+    try coordinator.start(&loop);
+    const fd = try wayring.unix_socket.connect(path);
+    defer _ = linux.close(fd);
+    for (0..256) |_| {
+        _ = try loop.turn(coordinator);
+        if (coordinator.peer != null) break;
+        _ = linux.sched_yield();
+    }
+    const peer = coordinator.peer orelse return error.MissingPeer;
+    const objects = try root.runtime.clients.get(peer);
+
+    // Seed live protocol resources and full producer queues, without relying
+    // on client/server timing to hit the backpressure boundary.
+    const source = coordinator.data_device_adapter.sources.items[0];
+    coordinator.data_device_adapter.source_free = source.header.next_free;
+    source.header.active = true;
+    source.peer = peer;
+    source.header.resource = try objects.insertClient(2, &protocol.wl_data_source.info, 3, source);
+    coordinator.data_device_adapter.drag = .{
+        .peer = peer,
+        .source = .{ .index = 0, .generation = source.header.generation },
+        .origin_object = 4,
+    };
+    const source_id = coordinator.data_device_adapter.drag.?.source.?;
+    coordinator.data_device_adapter.outbound[0] = .{
+        .active = true,
+        .sequence = 1,
+        .peer = peer,
+        .value = .{ .source_action = .{ .source = source_id, .action = 0 } },
+    };
+    coordinator.data_device_adapter.outbound_len = 1;
+    coordinator.data_device_adapter.next_sequence = 2;
+    coordinator.seat_adapter.events[0] = .{ .pointer_grab_cancelled = .{
+        .client = .{ .slot = peer.slot, .generation = peer.generation },
+        .surface = .{ .index = 0, .generation = 1 },
+    } };
+    coordinator.seat_adapter.event_head = 0;
+    coordinator.seat_adapter.event_len = 1;
+
+    const method = try coordinator.input_method_adapter.methods.acquire();
+    method.available = true;
+    method.peer = peer;
+    method.resource = try objects.insertClient(3, &protocol.zwp_input_method_v2.info, 1, method);
+    try coordinator.input_method_adapter.synchronize(0, .{
+        .device = .{ .index = 0, .generation = 1 },
+        .peer = peer,
+        .seat = 0,
+        .state = .{ .enabled = true },
+        .surrounding = "",
+        .serial = 1,
+    });
+    try std.testing.expectEqual(@as(usize, 3), coordinator.input_method_adapter.pendingOutbound());
+    try std.testing.expect(coordinator.text_input_adapter.activeState() == null);
+
+    // Both terminal transitions must wait, but their existing output must
+    // still be marked ready and transferred to the client's transport queue.
+    try coordinator.prepare();
+    try std.testing.expect(coordinator.data_device_adapter.dragActive());
+    try std.testing.expectEqual(@as(usize, 1), coordinator.seat_adapter.event_len);
+    try std.testing.expect(method.enabled);
+    try std.testing.expectEqual(@as(usize, 0), coordinator.data_device_adapter.pendingOutbound());
+    try std.testing.expectEqual(@as(usize, 0), coordinator.input_method_adapter.pendingOutbound());
+
+    // No new input or client request is needed to finish either transition.
+    try coordinator.prepare();
+    try std.testing.expect(!coordinator.data_device_adapter.dragActive());
+    try std.testing.expectEqual(@as(usize, 0), coordinator.seat_adapter.event_len);
+    try std.testing.expect(!method.enabled);
+    try std.testing.expectEqual(@as(u32, 2), method.done_serial);
+    try coordinator.prepare();
+    try std.testing.expectEqual(@as(u32, 2), method.done_serial);
+
+    var bytes: [256]u8 = undefined;
+    var received: usize = 0;
+    for (0..256) |_| {
+        _ = try loop.turn(coordinator);
+        const count = linux.recvfrom(fd, bytes[received..].ptr, bytes.len - received, linux.MSG.DONTWAIT, null, null);
+        switch (linux.errno(count)) {
+            .SUCCESS => received += count,
+            .AGAIN, .INTR => {},
+            else => return error.ReceiveFailed,
+        }
+        if (received >= 64) break;
+        _ = linux.sched_yield();
+    }
+    // Decode the actual wire output: one cancellation and one deactivation,
+    // each after its older queued events, with no duplicate terminal events.
+    var descriptors = try wayring.pool.SharedFds.init(allocator, 1);
+    defer descriptors.deinit(allocator);
+    var fds = wayring.ancillary.FdQueue.init(&descriptors, 0);
+    defer fds.deinit();
+    const source_events = [_]std.meta.Tag(protocol.wl_data_source.Event){ .action, .cancelled };
+    const method_events = [_]std.meta.Tag(protocol.zwp_input_method_v2.Event){ .activate, .text_change_cause, .done, .deactivate, .done };
+    var source_count: usize = 0;
+    var method_count: usize = 0;
+    var offset: usize = 0;
+    while (offset < received) {
+        const message = (try wayring.wire.Message.decode(bytes[offset..received])) orelse return error.IncompleteEvent;
+        switch (message.header.object_id) {
+            2 => {
+                try std.testing.expect(source_count < source_events.len);
+                const event = try protocol.wl_data_source.decodeEvent(message, &fds);
+                try std.testing.expectEqual(source_events[source_count], std.meta.activeTag(event));
+                source_count += 1;
+            },
+            3 => {
+                try std.testing.expect(method_count < method_events.len);
+                const event = try protocol.zwp_input_method_v2.decodeEvent(message, &fds);
+                try std.testing.expectEqual(method_events[method_count], std.meta.activeTag(event));
+                method_count += 1;
+            },
+            else => return error.UnexpectedEvent,
+        }
+        offset += message.header.size;
+    }
+    try std.testing.expectEqual(source_events.len, source_count);
+    try std.testing.expectEqual(method_events.len, method_count);
+    try coordinator.requestStop();
+    var drained = false;
+    for (0..256) |_| {
+        const progress = try loop.turn(coordinator);
+        drained = progress.wayring.shutdown_complete and coordinator.backendDrainComplete();
+        if (drained) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(drained);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
 test "shell-input: pollable backend retains a backpressured suffix without replay" {
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;

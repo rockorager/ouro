@@ -6597,7 +6597,14 @@ pub fn Coordinator(comptime protocol: type) type {
                         try self.applyReady();
                         try self.requestCursorRedraw();
                     },
-                    .pointer_grab_cancelled => try self.data_device_adapter.cancelDrag(),
+                    .pointer_grab_cancelled => {
+                        // Retain the event until cancellation fits, and let
+                        // queued output drain even without another input event.
+                        self.markProtocolAll(ProtocolReady.data_device);
+                        self.data_device_adapter.cancelDrag() catch |err| switch (err) {
+                            error.Exhausted => return,
+                        };
+                    },
                 }
                 self.seat_adapter.dropEvent();
             }
@@ -7321,7 +7328,12 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn reconcileInputMethod(self: *Self) !void {
             if (self.text_input_adapter.activeState() == null)
-                _ = try self.input_method_adapter.deactivate(0);
+                _ = self.input_method_adapter.deactivate(0) catch |err| switch (err) {
+                    // The method remains enabled on exhaustion, so the next
+                    // flush retries after its older output has made progress.
+                    error.Exhausted => false,
+                    else => return err,
+                };
             self.markInputMethodProtocol();
         }
 
