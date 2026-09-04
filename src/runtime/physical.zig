@@ -10919,8 +10919,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 const binding = layer.binding orelse return error.SampleBindingMismatch;
                 if (!std.meta.eql(sampled.surface, binding.surface)) return error.SampleBindingMismatch;
                 const content = layer.content.get() orelse return error.MissingContent;
-                const owner_live = layer.peer != null and self.peerLive(layer.peer.?) and
-                    self.layerSurfaceLive(layer);
+                const owner_live = self.layerOwnerLive(layer);
                 if (!owner_live) {
                     if (!output_pending and !self.appLayerOutputTrackingPending(layer))
                         self.abandonLayer(layer);
@@ -11014,6 +11013,11 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn retryLayerOutcome(self: *Self, layer: *Layer) !bool {
+            if (!self.layerOwnerLive(layer)) {
+                if (self.appLayerOutputTrackingPending(layer)) return false;
+                self.abandonLayer(layer);
+                return true;
+            }
             const token = layer.presentation orelse return error.MissingPresentation;
             const content = layer.content.get() orelse return error.MissingContent;
             if (layer.source_release_pending and !layer.retains_source and
@@ -11110,8 +11114,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (!render_device.content.ready(rendered)) return false;
             }
             const content = layer.content.get() orelse return error.MissingContent;
-            const peer = layer.peer orelse return error.ClientDisconnected;
-            if (!try self.releaseSource(peer, content)) return false;
+            if (!try self.releaseSource(layer.peer, content)) return false;
             layer.source_release_pending = false;
             layer.retains_source = false;
             return true;
@@ -11119,9 +11122,15 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn releaseSource(
             self: *Self,
-            peer: wayring.io_uring.Peer,
+            peer: ?wayring.io_uring.Peer,
             content: *Adapter.Content,
         ) !bool {
+            if (peer == null or !self.peerLive(peer.?)) {
+                if (content.attachment_lease) |*lease| lease.deinit();
+                content.attachment_lease = null;
+                return true;
+            }
+            const owner = peer.?;
             if (content.surface.explicit_sync != null) {
                 const lease = content.attachment_lease orelse return error.MissingLease;
                 var source = try self.adapter.bufferSource(lease);
@@ -11137,9 +11146,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 lease.deinit();
                 content.attachment_lease = null;
             }
-            if (!self.peerLive(peer)) return error.ClientDisconnected;
-            const objects = try self.root.runtime.clients.get(peer);
-            const actor = try self.root.runtime.clients.reactor.getActor(peer);
+            const objects = try self.root.runtime.clients.get(owner);
+            const actor = try self.root.runtime.clients.reactor.getActor(owner);
             var notification_queued = false;
             if (content.surface.attachment) |*attachment| if (attachment.buffer) |buffer| {
                 notification_queued = Adapter.completeBufferReleaseOn(
@@ -11159,7 +11167,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     Adapter.completeReleaseOn(objects, &actor.transmit, callback) catch |err| switch (err) {
                         error.Exhausted => {
                             if (notification_queued)
-                                _ = try self.loop.?.driver.schedule(peer);
+                                _ = try self.loop.?.driver.schedule(owner);
                             return false;
                         },
                         else => return err,
@@ -11170,7 +11178,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 }
                 content.release_callbacks = null;
             }
-            if (notification_queued) _ = try self.loop.?.driver.schedule(peer);
+            if (notification_queued) _ = try self.loop.?.driver.schedule(owner);
             return true;
         }
 
@@ -11868,6 +11876,11 @@ pub fn Coordinator(comptime protocol: type) type {
             const surface = layer.surface orelse return false;
             const id = self.adapter.surfaceId(surface) catch return false;
             return layer.id != null and std.meta.eql(id, layer.id.?);
+        }
+
+        fn layerOwnerLive(self: *Self, layer: *const Layer) bool {
+            const peer = layer.peer orelse return false;
+            return self.peerLive(peer) and self.layerSurfaceLive(layer);
         }
 
         fn armTimer(self: *Self) anyerror!void {

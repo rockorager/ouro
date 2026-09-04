@@ -1525,6 +1525,8 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         /// Queues callback.done and delete_id before consuming ready ownership.
+        /// A removed surface has already discarded its callback queue and is
+        /// therefore complete from the deferred caller's perspective.
         pub fn completeFrameOn(
             adapter: *Self,
             server_objects: anytype,
@@ -1532,7 +1534,7 @@ pub fn Adapter(comptime protocol: type) type {
             surface_handle: objects.Handle,
             callback_data: u32,
         ) !bool {
-            const slot = try adapter.resolveSurface(surface_handle);
+            const slot = adapter.resolveSurface(surface_handle) catch return false;
             const callback = slot.frames.peekReady() orelse return false;
             try ProtocolCore.completeSync(server_objects, queue, callback, callback_data);
             try slot.frames.consumeReady(callback);
@@ -5407,6 +5409,44 @@ test "frame callback activates on apply and generated completion removes it" {
         42,
     ));
     try std.testing.expect(context.server_objects.namespace.resolve(callback) == null);
+    try std.testing.expect(!(try context.adapter.completeFrameOn(
+        &context.server_objects,
+        &context.actor.transmit,
+        surface,
+        42,
+    )));
+}
+
+test "frame callback completion tolerates surface removal after activation" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const surface = try context.createSurface(10);
+
+    try test_protocol.wl_surface.encodeRequest(&context.requests, surface.id, .{
+        .frame = .{ .callback = 13 },
+    });
+    _ = try context.dispatchCore();
+    try test_protocol.wl_surface.encodeRequest(
+        &context.requests,
+        surface.id,
+        .{ .commit = .{} },
+    );
+    _ = try context.dispatchCore();
+
+    var output: [1]TestAdapter.Applied = undefined;
+    var content = (try context.adapter.tryApply(surface, &output))[0].payload;
+    defer content.deinit();
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try context.adapter.activateFrames(surface, &content),
+    );
+
+    try test_protocol.wl_surface.encodeRequest(
+        &context.requests,
+        surface.id,
+        .{ .destroy = .{} },
+    );
+    _ = try context.dispatchCore();
     try std.testing.expect(!(try context.adapter.completeFrameOn(
         &context.server_objects,
         &context.actor.transmit,

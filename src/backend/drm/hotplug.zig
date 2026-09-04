@@ -107,13 +107,13 @@ pub const Monitor = struct {
 
     pub fn beginDrain(self: *Monitor, router: *completion.Router, ring: *linux.IoUring) !void {
         if (self.draining) return;
-        self.draining = true;
         if (self.poll_token) |poll| {
             const cancel = try router.acquire(.hotplug_ready);
             errdefer router.retire(cancel) catch unreachable;
             _ = try ring.poll_remove(cancel.encode(), poll.encode());
             self.cancel_token = cancel;
         }
+        self.draining = true;
     }
 
     pub fn drainComplete(self: *const Monitor) bool {
@@ -134,6 +134,27 @@ pub const Monitor = struct {
 
 fn sameToken(value: ?completion.Token, token: completion.Token) bool {
     return value != null and std.meta.eql(value.?, token);
+}
+
+test "hotplug drain remains retryable when cancellation admission fails" {
+    var router = try completion.Router.init(std.testing.allocator, 1);
+    defer router.deinit(std.testing.allocator);
+    const poll = try router.acquire(.hotplug_ready);
+    var monitor: Monitor = .{
+        .platform = undefined,
+        .context = undefined,
+        .fd = -1,
+        .poll_token = poll,
+    };
+    var ring: linux.IoUring = undefined;
+
+    try std.testing.expectError(error.Exhausted, monitor.beginDrain(&router, &ring));
+    try std.testing.expect(!monitor.draining);
+    try std.testing.expectEqual(poll, monitor.poll_token.?);
+    try std.testing.expect(monitor.cancel_token == null);
+
+    try router.retire(poll);
+    monitor.poll_token = null;
 }
 
 const Real = struct {

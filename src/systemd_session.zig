@@ -69,7 +69,6 @@ pub fn ready(self: *const Self, wayland_display: []const u8) !void {
 
 pub fn shutdown(self: *Self) !void {
     if (!self.enabled or self.shutdown_started) return;
-    self.shutdown_started = true;
     if (!try self.run(&.{
         "systemctl",
         "--user",
@@ -78,6 +77,9 @@ pub fn shutdown(self: *Self) !void {
         "ouro-session.target",
         "graphical-session.target",
     })) return error.SessionTargetStopFailed;
+    // Record completion only after systemctl accepted the stop. A failed
+    // attempt must remain retryable by final process cleanup.
+    self.shutdown_started = true;
     // Session exit must not depend on synchronous activation-bus updates.
     // The next managed session's prepare phase clears both environments
     // before publishing its own values.

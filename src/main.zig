@@ -264,7 +264,6 @@ pub fn main(init: std.process.Init) !void {
     if (run_error == null) runner.installShutdown(&shutdown_signals) catch |err| {
         run_error = err;
     };
-    if (run_error != null) coordinator.requestStop() catch {};
 
     if (run_error == null)
         std.log.info("Ouro listening on {s}; renderer policy={s}", .{
@@ -274,14 +273,18 @@ pub fn main(init: std.process.Init) !void {
     var wayring_drained = false;
     var signal_stop_started = false;
     while (!wayring_drained or !coordinator.backendDrainComplete()) {
+        if (run_error != null and !signal_stop_started) {
+            beginShutdown(&systemd_session, coordinator) catch |stop_err| {
+                std.log.err("compositor shutdown failed: {t}", .{stop_err});
+                continue;
+            };
+            signal_stop_started = true;
+        }
         const progress = runner.turnAndWait() catch |err| {
             if (run_error == null) {
                 run_error = err;
                 std.log.err("compositor event loop failed: {t}", .{err});
             }
-            coordinator.requestStop() catch |stop_err| {
-                if (run_error == null) run_error = stop_err;
-            };
             continue;
         };
         const key_consumer = coordinator.bindingState();
@@ -293,16 +296,14 @@ pub fn main(init: std.process.Init) !void {
         }
         wayring_drained = progress.wayring.shutdown_complete;
         if (!signal_stop_started and progress.shutdown_requested) {
-            signal_stop_started = true;
             // Stop managed clients before draining their Wayland connections.
             // Waiting until the compositor defer runs creates a cycle: Ouro
             // waits for clients which systemd keeps alive until Ouro exits.
-            systemd_session.shutdown() catch |err| {
+            beginShutdown(&systemd_session, coordinator) catch |err| {
                 if (run_error == null) run_error = err;
+                continue;
             };
-            coordinator.requestStop() catch |err| {
-                if (run_error == null) run_error = err;
-            };
+            signal_stop_started = true;
         }
         if (!signal_stop_started and progress.reload_requested) {
             var candidate = config_store.load() catch |err| {
@@ -351,6 +352,13 @@ pub fn main(init: std.process.Init) !void {
     if (run_error) |err| return err;
     try destroy_result;
     try root_result;
+}
+
+fn beginShutdown(systemd_session: *SystemdSession, coordinator: *Runtime) !void {
+    // Managed clients must stop before their Wayland connections and physical
+    // outputs drain. Both operations remain retryable until each succeeds.
+    try systemd_session.shutdown();
+    try coordinator.requestStop();
 }
 
 fn applyBinding(
