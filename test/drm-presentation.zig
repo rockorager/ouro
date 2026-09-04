@@ -496,7 +496,7 @@ test "physical coordinator retires a disconnected secondary output" {
     ));
     try std.testing.expectEqual(drains_before_reconnect, coordinator.stats.output_drains);
     try std.testing.expectEqual(
-        serial_before_reconnect + 1,
+        serial_before_reconnect + 2,
         coordinator.output_management_adapter.lifecycle.serial,
     );
 

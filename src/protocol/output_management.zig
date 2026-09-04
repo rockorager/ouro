@@ -95,7 +95,7 @@ pub fn Adapter(comptime protocol: type) type {
         const ConfigSlot = struct { header: slot_pool.Header = .{}, manager: u32 = 0, peer: Peer = undefined, resource: ?objects.Handle = null, lifecycle: ConfigurationId = undefined, destroyed: bool = false };
         const CHeadSlot = struct { header: slot_pool.Header = .{}, configuration: u32 = 0, peer: Peer = undefined, resource: ?objects.Handle = null, head: HeadId = undefined };
         const Kind = enum { make_head, head_name, head_description, physical_size, make_mode, mode_size, mode_refresh, mode_preferred, enabled, current_mode, position, transform, scale, make, model, adaptive_sync, done, head_finished, finished, succeeded, failed, cancelled };
-        const Out = struct { kind: Kind, owner: u32, head: ?u32 = null, mode: ?u32 = null };
+        const Out = struct { kind: Kind, owner: u32, head: ?u32 = null, mode: ?u32 = null, serial: u32 = 0 };
         const InventoryHead = struct { id: HeadId, name: []u8, description: []u8, make: ?[]u8, model: ?[]u8, physical_width_mm: ?i32, physical_height_mm: ?i32, modes: []ModeState, modes_owned: bool = true };
         pub const WireCommand = struct { peer: Peer, configuration: ConfigurationId, wire_configuration: ?objects.Handle, operation: Operation, serial: u32, desired: HeadState, heads: []const DesiredHead };
 
@@ -216,7 +216,7 @@ pub fn Adapter(comptime protocol: type) type {
             m.resource = binding.resource;
             m.version = binding.version;
             for (self.inventory.items) |*item| try self.queueSnapshot(m, item);
-            self.outbound.appendAssumeCapacity(.{ .kind = .done, .owner = m.header.index });
+            self.outbound.appendAssumeCapacity(.{ .kind = .done, .owner = m.header.index, .serial = self.lifecycle.serial });
             return m;
         }
         pub fn addHead(self: *Self, info: HeadInfo, modes_: []const ModeState, state: HeadState) !HeadId {
@@ -258,16 +258,17 @@ pub fn Adapter(comptime protocol: type) type {
             }
             for (self.managers.entries.items) |m| if (m.header.active and !m.stopped) {
                 try self.queueSnapshot(m, &self.inventory.items[self.inventory.items.len - 1]);
-                self.outbound.appendAssumeCapacity(.{ .kind = .done, .owner = m.header.index });
             };
+            const serial = self.advanceSerial();
+            for (self.managers.entries.items) |m| if (m.header.active and !m.stopped)
+                self.outbound.appendAssumeCapacity(.{ .kind = .done, .owner = m.header.index, .serial = serial });
             return id;
         }
         pub fn publishHead(self: *Self, id: HeadId, state: HeadState) !u32 {
             _ = self.findInventory(id) orelse return error.InvalidHead;
             try self.ensureOutbound(self.synchronizeHeadCount(id));
             try self.lifecycle.publishHead(id, state);
-            self.lifecycle.serial +%= 1;
-            if (self.lifecycle.serial == 0) self.lifecycle.serial = 1;
+            _ = self.advanceSerial();
             self.queueHeadSynchronization(id);
             return self.lifecycle.serial;
         }
@@ -292,6 +293,7 @@ pub fn Adapter(comptime protocol: type) type {
                 return error.Exhausted;
             try self.outbound.ensureUnusedCapacity(self.allocator, additional);
             try self.lifecycle.removeHead(id);
+            const serial = self.advanceSerial();
             const removed = self.inventory.orderedRemove(index);
             for (self.managers.entries.items) |m| {
                 if (!m.header.active) continue;
@@ -310,7 +312,7 @@ pub fn Adapter(comptime protocol: type) type {
                 } else {
                     self.retireWireHead(h);
                 }
-                self.outbound.appendAssumeCapacity(.{ .kind = .done, .owner = m.header.index });
+                self.outbound.appendAssumeCapacity(.{ .kind = .done, .owner = m.header.index, .serial = serial });
             }
             if (removed.modes_owned) self.allocator.free(removed.modes);
             if (removed.model) |v| self.allocator.free(v);
@@ -341,8 +343,7 @@ pub fn Adapter(comptime protocol: type) type {
         pub fn publish(self: *Self, state: HeadState) !u32 {
             try self.ensureOutbound(self.synchronizeCount());
             try self.lifecycle.publishHead(self.lifecycle.primary, state);
-            self.lifecycle.serial +%= 1;
-            if (self.lifecycle.serial == 0) self.lifecycle.serial = 1;
+            _ = self.advanceSerial();
             self.queueSynchronization();
             return self.lifecycle.serial;
         }
@@ -375,7 +376,7 @@ pub fn Adapter(comptime protocol: type) type {
                             .head = h.header.index,
                         });
                 }
-                self.outbound.appendAssumeCapacity(.{ .kind = .done, .owner = m.header.index });
+                self.outbound.appendAssumeCapacity(.{ .kind = .done, .owner = m.header.index, .serial = self.lifecycle.serial });
             }
         }
         fn synchronizeHeadCount(self: *const Self, id: HeadId) usize {
@@ -391,8 +392,13 @@ pub fn Adapter(comptime protocol: type) type {
                 const h = self.findWireHead(m.header.index, id) orelse continue;
                 for ([_]Kind{ .enabled, .current_mode, .position, .transform, .scale, .adaptive_sync }) |k|
                     if (k != .adaptive_sync or m.version >= 4) self.outbound.appendAssumeCapacity(.{ .kind = k, .owner = m.header.index, .head = h.header.index });
-                self.outbound.appendAssumeCapacity(.{ .kind = .done, .owner = m.header.index });
+                self.outbound.appendAssumeCapacity(.{ .kind = .done, .owner = m.header.index, .serial = self.lifecycle.serial });
             }
+        }
+        fn advanceSerial(self: *Self) u32 {
+            self.lifecycle.serial +%= 1;
+            if (self.lifecycle.serial == 0) self.lifecycle.serial = 1;
+            return self.lifecycle.serial;
         }
         pub fn peekCommand(self: *Self) ?WireCommand {
             const c = self.lifecycle.peek() orelse return null;
@@ -709,7 +715,7 @@ pub fn Adapter(comptime protocol: type) type {
                 }
                 return;
             }
-            if (o.kind == .done) return Manager.encodeEvent(q, manager_resource.id, .{ .done = .{ .serial = self.lifecycle.serial } });
+            if (o.kind == .done) return Manager.encodeEvent(q, manager_resource.id, .{ .done = .{ .serial = o.serial } });
             const h = self.headChild(o) orelse return;
             const item = self.findInventory(h.head);
             if (o.kind == .head_finished) {
@@ -996,27 +1002,14 @@ pub const Lifecycle = struct {
         return .{ .index = c.header.index, .generation = c.header.generation };
     }
     pub fn addHead(self: *Lifecycle, state: HeadState) !HeadId {
-        for (self.configurations.entries.items) |c|
-            if (c.header.active and !c.submitted)
-                try c.heads.ensureUnusedCapacity(self.allocator, 1);
         const head = try self.heads.acquire();
         head.current = state;
-        const id: HeadId = .{ .index = head.header.index, .generation = head.header.generation };
-        for (self.configurations.entries.items) |c|
-            if (c.header.active and !c.submitted)
-                c.heads.appendAssumeCapacity(.{ .id = id, .desired = state });
-        return id;
+        return .{ .index = head.header.index, .generation = head.header.generation };
     }
     pub fn removeHead(self: *Lifecycle, id: HeadId) !void {
         if (std.meta.eql(id, self.primary)) return error.PrimaryHead;
         const head = try self.getHead(id);
         self.heads.release(head);
-        for (self.configurations.entries.items) |c| if (c.header.active and !c.submitted) {
-            for (c.heads.items, 0..) |configured, i| if (std.meta.eql(configured.id, id)) {
-                _ = c.heads.orderedRemove(i);
-                break;
-            };
-        };
     }
     pub fn currentHead(self: *Lifecycle, id: HeadId) !HeadState {
         return (try self.getHead(id)).current;
@@ -1025,11 +1018,6 @@ pub const Lifecycle = struct {
         const head = try self.getHead(id);
         self.primary = id;
         self.current = head.current;
-        for (self.configurations.entries.items) |c| if (c.header.active and !c.submitted) {
-            const configured = try self.configHead(c, id);
-            c.desired = configured.desired;
-            c.covered = configured.covered;
-        };
     }
     pub fn publishHead(self: *Lifecycle, id: HeadId, state: HeadState) !void {
         const head = try self.getHead(id);
@@ -1141,11 +1129,11 @@ pub const Lifecycle = struct {
     pub fn submit(self: *Lifecycle, id: ConfigurationId, operation: Operation) !?Command {
         const c = try self.get(id);
         if (c.submitted) return error.AlreadyUsed;
-        for (c.heads.items) |head| if (!head.covered) return error.UnconfiguredHead;
         if (c.serial != self.serial) {
             c.submitted = true;
             return null; // transport emits cancelled directly
         }
+        for (c.heads.items) |head| if (!head.covered) return error.UnconfiguredHead;
         const desired = try self.allocator.alloc(DesiredHead, c.heads.items.len);
         errdefer self.allocator.free(desired);
         for (c.heads.items, desired) |head, *out| out.* = .{ .id = head.id, .state = head.desired };
@@ -1347,17 +1335,13 @@ test "head removal cannot let a stale identity cover its recycled slot" {
     try std.testing.expectEqual(removed.index, recycled.index);
     try std.testing.expect(removed.generation != recycled.generation);
     try std.testing.expectError(error.InvalidHead, lifecycle.enableHead(configuration, removed));
-
-    try lifecycle.enable(configuration);
-    try std.testing.expectError(error.UnconfiguredHead, lifecycle.submit(configuration, .@"test"));
-    try lifecycle.disableHead(configuration, recycled);
-    const command = (try lifecycle.submit(configuration, .@"test")).?;
-    try std.testing.expectEqual(recycled, command.heads[1].id);
-    try std.testing.expect(!command.heads[1].state.enabled);
+    try std.testing.expectError(error.InvalidHead, lifecycle.disableHead(configuration, recycled));
+    lifecycle.serial += 1;
+    try std.testing.expect((try lifecycle.submit(configuration, .@"test")) == null);
     try std.testing.expectError(error.PrimaryHead, lifecycle.removeHead(lifecycle.primary));
 }
 
-test "primary head promotion preserves identities and pending configuration state" {
+test "primary head promotion preserves configuration snapshots" {
     const first_state: HeadState = .{
         .width = 800,
         .height = 600,
@@ -1377,17 +1361,22 @@ test "primary head promotion preserves identities and pending configuration stat
     try lifecycle.disableHead(configuration, first);
     try lifecycle.enableHead(configuration, second);
     try lifecycle.setHeadPosition(configuration, second, 0, 0);
+    const configured_primary = (try lifecycle.get(configuration)).desired;
+    const configured_covered = (try lifecycle.get(configuration)).covered;
 
     try lifecycle.promotePrimary(second);
     try std.testing.expectEqual(second, lifecycle.primary);
     try std.testing.expectEqual(second_state, lifecycle.current);
-    try std.testing.expect((try lifecycle.get(configuration)).covered);
-    try std.testing.expectEqual(
-        @as(i32, 0),
-        (try lifecycle.get(configuration)).desired.x,
-    );
+    try std.testing.expectEqual(configured_covered, (try lifecycle.get(configuration)).covered);
+    try std.testing.expectEqual(configured_primary, (try lifecycle.get(configuration)).desired);
     try lifecycle.removeHead(first);
-    const command = (try lifecycle.submit(configuration, .apply)).?;
+    lifecycle.serial += 1;
+    try std.testing.expect((try lifecycle.submit(configuration, .apply)) == null);
+
+    const current = try lifecycle.create(lifecycle.serial);
+    try lifecycle.enableHead(current, second);
+    try lifecycle.setHeadPosition(current, second, 0, 0);
+    const command = (try lifecycle.submit(current, .apply)).?;
     try std.testing.expectEqual(@as(usize, 1), command.heads.len);
     try std.testing.expectEqual(second, command.heads[0].id);
 }
@@ -1630,6 +1619,37 @@ test "output management refreshes an exact secondary mode inventory" {
         error.ModeInventoryInUse,
         adapter.setHeadModes(secondary, &.{refreshed[1]}, current),
     );
+}
+
+test "output management topology changes invalidate configuration snapshots" {
+    const A = Adapter(@import("core_protocol"));
+    const primary: HeadState = .{ .width = 800, .height = 600, .refresh_millihz = 60000 };
+    var adapter = try A.init(
+        std.testing.allocator,
+        .{ .manager_capacity = 1, .mode_capacity = 2, .configuration_capacity = 1 },
+        9,
+        primary,
+    );
+    defer adapter.deinit();
+
+    const stale = try adapter.lifecycle.create(9);
+    const manager = try adapter.managers.acquire();
+    const manager_index = manager.header.index;
+    manager.version = 4;
+    const secondary = try adapter.addHead(
+        .{ .name = "second", .description = "Second output" },
+        &.{.{ .width = 1024, .height = 768, .refresh_millihz = 60000 }},
+        .{ .width = 1024, .height = 768, .refresh_millihz = 60000, .x = 800 },
+    );
+    try std.testing.expectEqual(@as(u32, 10), adapter.lifecycle.serial);
+    try std.testing.expectEqual(@as(u32, 10), adapter.outbound.items[adapter.outbound.items.len - 1].serial);
+    try std.testing.expectEqual(@as(usize, 1), (try adapter.lifecycle.get(stale)).heads.items.len);
+
+    try adapter.removeHead(secondary);
+    try std.testing.expectEqual(@as(u32, 11), adapter.lifecycle.serial);
+    try std.testing.expectEqual(@as(u32, 11), adapter.outbound.items[adapter.outbound.items.len - 1].serial);
+    try std.testing.expect((try adapter.lifecycle.submit(stale, .@"test")) == null);
+    try std.testing.expect(adapter.managers.at(manager_index) == null);
 }
 
 test "output management binding snapshots every mode in protocol order" {
