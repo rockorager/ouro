@@ -3538,6 +3538,20 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn processInput(self: *Self) !void {
+            if (self.stopping) {
+                // A failed normalized event can be retained midway through
+                // admission. Shutdown must retire backend IO, not replay that
+                // event (or its remaining commands) before starting the drain.
+                self.resetInputAdmission();
+                self.input_event_cursor = 0;
+                self.pointer_reconcile_pending = false;
+                while (self.interaction.peekCommand() != null) self.interaction.dropCommand();
+                if (self.input) |input| {
+                    try input.beginDrain(&self.router, &self.root.ring);
+                    input.clearEvents();
+                }
+                return;
+            }
             const input = self.input orelse return;
             const events = input.events();
             if (self.input_event_cursor > events.len) return error.InputBatchChanged;
@@ -3562,10 +3576,7 @@ pub fn Coordinator(comptime protocol: type) type {
             input.clearEvents();
             self.input_event_cursor = 0;
             if (self.session_disable_pending) {
-                if (self.stopping)
-                    try input.beginDrain(&self.router, &self.root.ring)
-                else
-                    try input.beginQuiesce(&self.router, &self.root.ring);
+                try input.beginQuiesce(&self.router, &self.root.ring);
             } else {
                 try input.advance(&self.router, &self.root.ring);
             }
@@ -3596,6 +3607,19 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.syncIdleNotifications();
             }
             if (!self.input_delivery_prepared) {
+                // Reconcile between events, not just between turns: a grab
+                // release and the next press may share one backend batch.
+                if (self.interaction.peekCommand() != null) self.applyInteractionCommands() catch |err| switch (err) {
+                    error.Exhausted => return false,
+                    else => return err,
+                };
+                try self.retryPointerReconcile();
+                if (self.pointer_reconcile_pending and self.interaction.interactionMode() == .default)
+                    return false;
+                if (self.interaction.peekCommand() != null) self.applyInteractionCommands() catch |err| switch (err) {
+                    error.Exhausted => return false,
+                    else => return err,
+                };
                 self.input_delivery_event = self.pointerDeliveryEvent(event) catch |err| switch (err) {
                     error.Exhausted => return false,
                     else => return err,
@@ -3728,17 +3752,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 },
                 else => {},
             }
-            self.input_interaction_accepted = false;
-            self.input_relative_accepted = false;
-            self.input_gesture_accepted = false;
-            self.input_idle_accepted = false;
-            self.input_keyboard_consumed = false;
-            self.input_seat_accepted = false;
-            self.input_tablet_accepted = false;
-            self.input_drag_accepted = false;
-            self.input_delivery_prepared = false;
-            self.input_delivery_event = null;
-            self.input_touch_delivery = .{};
+            self.resetInputAdmission();
             self.stats.input_events += 1;
             self.markProtocolAll(ProtocolReady.seat | ProtocolReady.relative_pointer |
                 ProtocolReady.pointer_gestures | ProtocolReady.tablet | ProtocolReady.input_method);
@@ -3750,6 +3764,20 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.processSeatEvents();
             try self.flushProtocol();
             return true;
+        }
+
+        fn resetInputAdmission(self: *Self) void {
+            self.input_interaction_accepted = false;
+            self.input_relative_accepted = false;
+            self.input_gesture_accepted = false;
+            self.input_idle_accepted = false;
+            self.input_keyboard_consumed = false;
+            self.input_seat_accepted = false;
+            self.input_tablet_accepted = false;
+            self.input_drag_accepted = false;
+            self.input_delivery_prepared = false;
+            self.input_delivery_event = null;
+            self.input_touch_delivery = .{};
         }
 
         fn consumeInputMethodKey(self: *Self, event: input_api.Event) !bool {
@@ -5859,10 +5887,14 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn retryPointerReconcile(self: *Self) !void {
             if (!self.pointer_reconcile_pending) return;
-            if (self.sessionLockActive()) {
+            if (self.stopping or self.sessionLockActive()) {
                 self.pointer_reconcile_pending = false;
                 return;
             }
+            // Interaction deliberately skips hit testing during grabs. Keep
+            // the request pending until the grab ends, including any retained
+            // event whose release has reached interaction but not the seat.
+            if (self.input_delivery_prepared or self.interaction.interactionMode() != .default) return;
             var input_scene: InputScene = .{ .coordinator = self };
             self.interaction.reconcilePointer(&self.desktop, &input_scene) catch |err| switch (err) {
                 // Surface destruction deliberately queues a terminal focus
@@ -6930,9 +6962,9 @@ pub fn Coordinator(comptime protocol: type) type {
             self.processing_virtual_pointer = true;
             defer self.processing_virtual_pointer = false;
             while (self.virtual_pointer_adapter.peekEvent()) |pending| {
-                if (self.pointer_reconcile_pending) {
-                    try self.retryPointerReconcile();
-                    if (self.pointer_reconcile_pending) return;
+                if (self.stopping) {
+                    self.virtual_pointer_adapter.dropEvent();
+                    continue;
                 }
                 const event_seat = switch (pending.*) {
                     inline else => |value| value.seat,
@@ -12269,13 +12301,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 }
                 if (!pending) return;
             }
+            if (self.stopping) try self.processInput();
             if (self.input) |input| {
-                if (self.stopping and input.state != .draining) {
-                    try self.processInput();
-                    if (self.input_event_cursor == input.events().len and
-                        !self.input_interaction_accepted and input.state != .draining)
-                        try input.beginDrain(&self.router, &self.root.ring);
-                }
                 _ = input.quiesceComplete();
             }
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {

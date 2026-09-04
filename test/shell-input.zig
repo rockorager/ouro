@@ -1626,6 +1626,226 @@ test "shell-input: terminal notifications survive full outbound queues" {
     try root.deinit();
 }
 
+test "shell-input: deferred hover reconciles between grab release and next press" {
+    for ([_]bool{ false, true }) |virtual| {
+        const allocator = std.testing.allocator;
+        var path_storage: [128]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-deferred-hover-{d}.sock", .{linux.getpid()});
+        wayring.unix_socket.unlink(path) catch {};
+        defer wayring.unix_socket.unlink(path) catch {};
+        var fixture = try physical_fixture.Fixture.init();
+        defer fixture.deinit();
+        var input = try FakeInput.init();
+        defer input.deinit();
+        var root_config = physical_fixture.compositorConfig();
+        root_config.runtime.object_capacity = 64;
+        root_config.runtime.object_quota = 64;
+        root_config.runtime.buckets_per_client = 64;
+        const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), root_config);
+        var platforms = fixture.platforms();
+        platforms.input = input.platform();
+        var config = physical_fixture.coordinatorConfig();
+        config.input.device_capacity = 1;
+        config.input.event_capacity = 4;
+        config.surface.guarded_shm_access = false;
+        const coordinator = try Coordinator.create(allocator, root, platforms, config);
+        var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
+        try coordinator.start(&loop);
+
+        var reactor: wayring.io_uring.Reactor = undefined;
+        try reactor.initOwned(allocator, .{ .entries = 16, .flags = 0 }, physical_fixture.clientReactorConfig());
+        var client = try ClientConnection.attach(
+            allocator,
+            &reactor,
+            try wayring.unix_socket.connect(path),
+            .{ .received_fd_budget = 2, .transmit_byte_budget = 4096, .transmit_fd_budget = 2 },
+            .{ .max_objects = 64, .max_client_ids = 63 },
+        );
+        const actor = try client.actor();
+        var driver = ClientDriver.init(&client);
+        const registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null);
+        // This handler mode maps one surface without starting a data drag or
+        // creating a cursor surface in response to the button press.
+        var handler: Handler = .{ .objects = &client.objects, .queue = &actor.transmit, .registry = registry, .test_text_input = true };
+        try submitClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        try fixture.signalSession(.enable);
+        var device_added = false;
+        for (0..512) |_| {
+            _ = try drainClient(&reactor, &driver, &handler);
+            _ = try loop.turn(coordinator);
+            if (!device_added and coordinator.input != null) {
+                try input.publish(&.{.{ .device_added = .{
+                    .device = 42,
+                    .info = .{ .capabilities = .{ .pointer = true, .keyboard = true } },
+                } }});
+                device_added = true;
+            }
+            if (handler.mapped and handler.input_ready and coordinator.stats.presented >= 1) break;
+            _ = linux.sched_yield();
+        }
+        try std.testing.expect(handler.mapped and handler.input_ready);
+        try input.publish(&.{
+            .{ .pointer_motion = .{ .device = 42, .time_usec = 1_000, .dx = 1, .dy = 1 } },
+            .{ .pointer_button = .{ .device = 42, .time_usec = 2_000, .button = 0x110, .pressed = true } },
+        });
+        for (0..256) |_| {
+            _ = try drainClient(&reactor, &driver, &handler);
+            _ = try loop.turn(coordinator);
+            if (handler.pointer_button == 1) break;
+            _ = linux.sched_yield();
+        }
+        try std.testing.expectEqual(@as(usize, 1), handler.pointer_button);
+        try std.testing.expect(coordinator.interaction.interactionMode() == .button_grab);
+        const original_hover = coordinator.interaction.hover.?;
+        const position = coordinator.interaction.pointerPosition();
+        try coordinator.switchWorkspace(2);
+        try coordinator.prepare();
+        try std.testing.expect(coordinator.pointer_reconcile_pending);
+        try std.testing.expectEqual(original_hover, coordinator.interaction.hover.?);
+        const windows = try coordinator.desktop.sceneSnapshot(coordinator.scene_windows);
+        try std.testing.expectEqual(@as(usize, 1), windows.len);
+        try std.testing.expect(!windows[0].visible);
+
+        // Both events are pending together: end-of-turn reconciliation is too
+        // late. The release belongs to the old grab; the press must not.
+        const before = coordinator.stats.input_events;
+        if (virtual) {
+            var devices: [1]ouro.input_backend.DeviceId = undefined;
+            try std.testing.expectEqual(@as(usize, 1), coordinator.input.?.enumerateDevices(&devices));
+            for ([_]bool{ false, true }, 0..) |pressed, index| {
+                coordinator.virtual_pointer_adapter.events[index] = .{ .button = .{
+                    .seat = &coordinator.seat_adapter,
+                    .device = devices[0],
+                    .time = @intCast(3 + index),
+                    .button = 0x110,
+                    .pressed = pressed,
+                } };
+            }
+            coordinator.virtual_pointer_adapter.event_head = 0;
+            coordinator.virtual_pointer_adapter.event_count = 2;
+            coordinator.virtual_pointer_adapter.normal_count = 2;
+        } else {
+            try input.publish(&.{
+                .{ .pointer_button = .{ .device = 42, .time_usec = 3_000, .button = 0x110, .pressed = false } },
+                .{ .pointer_button = .{ .device = 42, .time_usec = 4_000, .button = 0x110, .pressed = true } },
+            });
+        }
+        for (0..256) |_| {
+            _ = try loop.turn(coordinator);
+            _ = try drainClient(&reactor, &driver, &handler);
+            if (coordinator.stats.input_events == before + 2 and handler.pointer_button == 2) break;
+            _ = linux.sched_yield();
+        }
+        try std.testing.expectEqual(before + 2, coordinator.stats.input_events);
+        try std.testing.expectEqual(@as(usize, 2), handler.pointer_button);
+        try std.testing.expect(!coordinator.pointer_reconcile_pending);
+        try std.testing.expect(coordinator.interaction.hover == null);
+        try std.testing.expect(coordinator.interaction.interactionMode() == .default);
+        try std.testing.expect(coordinator.seat_adapter.pointerState().focus == null);
+        try std.testing.expect(coordinator.seat_adapter.grabState() == .idle);
+        try std.testing.expectEqual(position, coordinator.interaction.pointerPosition());
+        try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+
+        try coordinator.requestStop();
+        var drained = false;
+        for (0..256) |_| {
+            const cp = try drainClient(&reactor, &driver, &handler);
+            const progress = try loop.turn(coordinator);
+            drained = progress.wayring.shutdown_complete and cp.quiescent and coordinator.backendDrainComplete();
+            if (drained) break;
+            _ = linux.sched_yield();
+        }
+        try std.testing.expect(drained);
+        try client.deinit(allocator);
+        reactor.deinit(allocator);
+        loop.deinit();
+        try coordinator.destroy();
+        try root.deinit();
+    }
+}
+
+test "shell-input: shutdown discards a failed normalized event and drains backend IO" {
+    const allocator = std.testing.allocator;
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-input-shutdown-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+    var fixture = try physical_fixture.Fixture.init();
+    defer fixture.deinit();
+    var input = try FakeInput.init();
+    defer input.deinit();
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), physical_fixture.compositorConfig());
+    var platforms = fixture.platforms();
+    platforms.input = input.platform();
+    var config = physical_fixture.coordinatorConfig();
+    config.input.device_capacity = 1;
+    config.input.event_capacity = 4;
+    const coordinator = try Coordinator.create(allocator, root, platforms, config);
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
+    try coordinator.start(&loop);
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    for (0..256) |_| {
+        _ = try loop.turn(coordinator);
+        if (coordinator.input != null and coordinator.primaryKmsOutput() != null) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(coordinator.input != null and coordinator.primaryKmsOutput() != null);
+    try input.publish(&.{
+        .{ .device_added = .{ .device = 42, .info = .{ .capabilities = .{ .pointer = true } } } },
+        .{ .pointer_motion = .{ .device = 42, .time_usec = 1_000, .dx = std.math.nan(f64), .dy = 0 } },
+        .{ .pointer_motion = .{ .device = 42, .time_usec = 2_000, .dx = 1, .dy = 0 } },
+    });
+    var failed = false;
+    for (0..256) |_| {
+        _ = loop.turn(coordinator) catch |err| {
+            try std.testing.expectEqual(error.InvalidMotion, err);
+            failed = true;
+            break;
+        };
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(failed);
+    try std.testing.expectEqual(@as(usize, 1), coordinator.input_event_cursor);
+    try std.testing.expectEqual(@as(usize, 3), coordinator.input.?.events().len);
+    try std.testing.expect(coordinator.input_idle_accepted);
+    const accepted = coordinator.stats.input_events;
+    try std.testing.expectError(error.InvalidMotion, coordinator.prepare());
+
+    // Pending virtual input must also be discarded, not replayed from the
+    // protocol flush after the physical backend has started draining.
+    var stale_device = coordinator.input.?.events()[1].pointer_motion.device;
+    stale_device.generation += 1;
+    coordinator.virtual_pointer_adapter.events[0] = .{ .button = .{
+        .seat = &coordinator.seat_adapter,
+        .device = stale_device,
+        .time = 3,
+        .button = 0x110,
+        .pressed = true,
+    } };
+    coordinator.virtual_pointer_adapter.event_count = 1;
+    coordinator.virtual_pointer_adapter.normal_count = 1;
+    try coordinator.requestStop();
+    var drained = false;
+    for (0..256) |_| {
+        const progress = try loop.turn(coordinator);
+        drained = progress.wayring.shutdown_complete and coordinator.backendDrainComplete();
+        if (drained) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(drained);
+    try std.testing.expectEqual(accepted, coordinator.stats.input_events);
+    try std.testing.expectEqual(@as(usize, 0), coordinator.input_event_cursor);
+    try std.testing.expectEqual(@as(usize, 0), coordinator.input.?.events().len);
+    try std.testing.expect(!coordinator.input_idle_accepted);
+    try std.testing.expect(!coordinator.input_delivery_prepared);
+    try std.testing.expect(!coordinator.virtual_pointer_adapter.hasPendingEvents());
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
 test "shell-input: pollable backend retains a backpressured suffix without replay" {
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;
