@@ -9259,6 +9259,7 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             const candidate = layer.candidate.take() orelse return error.MissingCandidate;
             if (layer.active) if (layer.id) |id| self.queueLayerRemoval(id);
+            if (layer.retains_source) try self.retireLayerSource(layer);
             layer.content.set(candidate.content);
             layer.peer = candidate.peer;
             layer.surface = candidate.surface;
