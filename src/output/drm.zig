@@ -40,6 +40,9 @@ pub const Config = struct {
     max_samples: usize,
     max_color_luts: usize = 16,
     enable_color_management: bool = false,
+    /// Prefer HDR automatically when the connector and render path support it.
+    /// Explicit non-sRGB output descriptions are never replaced by this policy.
+    enable_hdr: bool = true,
     output_color_description: render.color.Description = .srgb,
     /// Aggregate packed source bytes available to one fallback render frame.
     max_source_bytes: usize,
@@ -789,7 +792,15 @@ pub const Output = struct {
     ) !*Output {
         try validateConfig(config);
         const fd = try device.fd(snapshot.handle);
-        var path = try initRenderPath(allocator, platforms, fd, snapshot, config);
+        var selected_config = config;
+        const automatic_hdr = automaticHdrDescription(snapshot, config, config.renderer != .pixman);
+        if (automatic_hdr) |description| selected_config.output_color_description = description;
+        var path = initRenderPath(allocator, platforms, fd, snapshot, selected_config) catch |err| blk: {
+            if (automatic_hdr == null) return err;
+            selected_config = config;
+            selected_config.enable_hdr = false;
+            break :blk try initRenderPath(allocator, platforms, fd, snapshot, selected_config);
+        };
         var path_owned = true;
         errdefer if (path_owned) {
             if (path.output.vulkan_targets) |*targets| switch (path.renderer) {
@@ -827,7 +838,7 @@ pub const Output = struct {
             platforms,
             device,
             snapshot,
-            config,
+            selected_config,
             render_device,
             true,
             path.output,
@@ -848,13 +859,39 @@ pub const Output = struct {
         try validateConfig(config);
         if (!render_device.matches(&snapshot.card)) return error.RenderDeviceMismatch;
         const fd = try device.fd(snapshot.handle);
-        const path = try initOutputPath(allocator, platforms, fd, snapshot, config, render_device);
+        var selected_config = config;
+        const automatic_hdr = automaticHdrDescription(
+            snapshot,
+            config,
+            render_device.rendererKind() == .vulkan,
+        );
+        if (automatic_hdr) |description| selected_config.output_color_description = description;
+        const path = initOutputPath(
+            allocator,
+            platforms,
+            fd,
+            snapshot,
+            selected_config,
+            render_device,
+        ) catch |err| blk: {
+            if (automatic_hdr == null) return err;
+            selected_config = config;
+            selected_config.enable_hdr = false;
+            break :blk try initOutputPath(
+                allocator,
+                platforms,
+                fd,
+                snapshot,
+                selected_config,
+                render_device,
+            );
+        };
         return createWithPath(
             allocator,
             platforms,
             device,
             snapshot,
-            config,
+            selected_config,
             render_device,
             false,
             path,
@@ -1827,6 +1864,8 @@ fn initVulkanOutput(
         pool = fallback;
         if (!renderer.supportsTarget(pool.allocation)) return error.UnsupportedOutputFormat;
     }
+    if (prefer_10bit and pool.allocation.format != gbm.format_xrgb2101010)
+        return error.HdrUnsupported;
     return .{
         .pool = pool,
         .vulkan_targets = try renderer.createTargets(config.image_count),
@@ -1912,6 +1951,8 @@ fn initVulkan(allocator: std.mem.Allocator, platforms: Platforms, fd: std.posix.
         if (!owned_renderer.supportsTarget(pool.allocation))
             return error.UnsupportedOutputFormat;
     }
+    if (prefer_10bit and pool.allocation.format != gbm.format_xrgb2101010)
+        return error.HdrUnsupported;
     const targets = try owned_renderer.createTargets(config.image_count);
     return .{
         .output = .{
@@ -1950,6 +1991,30 @@ fn targetFormatFromDrm(value: u32) ?render.PixelFormat {
 
 fn hdrRequested(description: render.color.Description) bool {
     return description.transfer == .st2084_pq or description.transfer == .hlg;
+}
+
+fn automaticHdrDescription(
+    snapshot: drm.Snapshot,
+    config: Config,
+    renderer_capable: bool,
+) ?render.color.Description {
+    if (!config.enable_hdr or !renderer_capable or
+        !std.meta.eql(config.output_color_description, render.color.Description.srgb)) return null;
+    const capabilities = snapshot.selectedConnector().properties.hdr_capabilities;
+    const transfer: render.color.TransferFunction = if (capabilities.pq)
+        .st2084_pq
+    else if (capabilities.hlg)
+        .hlg
+    else
+        return null;
+    var description = render.color.Description.srgb;
+    description.primaries = bt2020();
+    description.transfer = transfer;
+    description.reference_luminance = 203;
+    description.min_luminance = 0.0001;
+    description.max_luminance = 1000;
+    if (hdrOutputMetadata(snapshot, description) == null) return null;
+    return description;
 }
 
 fn hdrOutputMetadata(
@@ -1991,12 +2056,7 @@ fn hdrOutputMetadata(
 }
 
 fn bt2020Primaries(primaries: render.color.Primaries) bool {
-    const expected: render.color.Primaries = .{
-        .red = .{ .x = 0.708, .y = 0.292 },
-        .green = .{ .x = 0.170, .y = 0.797 },
-        .blue = .{ .x = 0.131, .y = 0.046 },
-        .white = .{ .x = 0.3127, .y = 0.3290 },
-    };
+    const expected = bt2020();
     inline for (.{
         .{ primaries.red, expected.red },
         .{ primaries.green, expected.green },
@@ -2005,6 +2065,15 @@ fn bt2020Primaries(primaries: render.color.Primaries) bool {
     }) |pair| if (@abs(pair[0].x - pair[1].x) > 0.0001 or
         @abs(pair[0].y - pair[1].y) > 0.0001) return false;
     return true;
+}
+
+fn bt2020() render.color.Primaries {
+    return .{
+        .red = .{ .x = 0.708, .y = 0.292 },
+        .green = .{ .x = 0.170, .y = 0.797 },
+        .blue = .{ .x = 0.131, .y = 0.046 },
+        .white = .{ .x = 0.3127, .y = 0.3290 },
+    };
 }
 
 fn hdrChromaticity(value: render.color.Chromaticity) kms.HdrMetadata.Chromaticity {
@@ -2056,6 +2125,23 @@ test "drm output: HDR10 metadata follows the configured output description" {
         .formats = &.{},
         .selection = .{ .connector_index = 0, .mode_index = 0, .crtc_index = 0, .plane_index = 0 },
     };
+    var config: Config = .{
+        .output_id = .{ .index = 0, .generation = 1 },
+        .scheduler = .{ .refresh_ns = 1, .render_budget_ns = 0 },
+        .max_samples = 1,
+        .max_source_bytes = 4,
+        .max_source_width = 1,
+        .max_source_height = 1,
+    };
+    try std.testing.expectEqual(
+        render.color.TransferFunction.st2084_pq,
+        automaticHdrDescription(snapshot, config, true).?.transfer,
+    );
+    config.enable_hdr = false;
+    try std.testing.expect(automaticHdrDescription(snapshot, config, true) == null);
+    config.enable_hdr = true;
+    try std.testing.expect(automaticHdrDescription(snapshot, config, false) == null);
+
     var description = render.color.Description.srgb;
     description.primaries = .{
         .red = .{ .x = 0.708, .y = 0.292 },
