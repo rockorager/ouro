@@ -1549,6 +1549,15 @@ test "generated session lock publishes only after presentation and client loss s
         secondary.management_head,
         secondary_head,
     );
+    const keyboard_device: ouro.input_backend.DeviceId = .{
+        .slot = 0,
+        .generation = 1,
+        .seat_generation = 1,
+    };
+    try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .device_added = .{
+        .device = keyboard_device,
+        .info = .{ .capabilities = .{ .keyboard = true } },
+    } }));
 
     var reactor: wayring.io_uring.Reactor = undefined;
     try reactor.initOwned(allocator, .{ .entries = 16, .flags = 0 }, clientReactorConfig());
@@ -1557,7 +1566,7 @@ test "generated session lock publishes only after presentation and client loss s
         &reactor,
         try wayring.unix_socket.connect(path),
         .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 },
-        .{ .max_objects = 32, .max_client_ids = 31 },
+        .{ .max_objects = 48, .max_client_ids = 47 },
     );
     var driver = ClientDriver.init(&client);
     const actor = try client.actor();
@@ -1587,7 +1596,7 @@ test "generated session lock publishes only after presentation and client loss s
                 observed_partial_secure_presentation = true;
             }
         }
-        if (handler.locked == 1 and handler.surface_enters == 1 and
+        if (handler.locked == 1 and handler.surface_enters == 1 and handler.keyboard_enters == 1 and
             handler.preferred_scale == 240) break;
         if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
             try waitForEither(&root.ring, reactor.ring);
@@ -1599,7 +1608,23 @@ test "generated session lock publishes only after presentation and client loss s
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
     try std.testing.expectEqual(@as(usize, 1), handler.surface_enters);
     try std.testing.expectEqual(@as(usize, 0), handler.surface_leaves);
+    try std.testing.expectEqual(@as(usize, 1), handler.keyboard_enters);
+    try std.testing.expectEqual(handler.surface.?.id, handler.keyboard_surface);
     try std.testing.expectEqual(@as(u32, 240), handler.preferred_scale);
+    try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .keyboard_key = .{
+        .device = keyboard_device,
+        .time_usec = 1,
+        .key = 30,
+        .pressed = true,
+    } }));
+    for (0..128) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.keyboard_keys == 1) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expectEqual(@as(usize, 1), handler.keyboard_keys);
     try std.testing.expect(coordinator.stats.presented >= 1);
     try std.testing.expect(coordinator.session_lock_adapter.isFailClosed());
     const lock_ids = try coordinator.session_lock_adapter.surfaceIds(coordinator.lock_surface_ids);
@@ -2891,6 +2916,8 @@ const SessionLockClientHandler = struct {
     compositor: ?wayring.objects.Handle = null,
     shm: ?wayring.objects.Handle = null,
     output: ?wayring.objects.Handle = null,
+    seat: ?wayring.objects.Handle = null,
+    keyboard: ?wayring.objects.Handle = null,
     manager: ?wayring.objects.Handle = null,
     fractional_scale_manager: ?wayring.objects.Handle = null,
     fractional_scale: ?wayring.objects.Handle = null,
@@ -2910,6 +2937,9 @@ const SessionLockClientHandler = struct {
     event_failures: usize = 0,
     surface_enters: usize = 0,
     surface_leaves: usize = 0,
+    keyboard_enters: usize = 0,
+    keyboard_surface: u32 = 0,
+    keyboard_keys: usize = 0,
     preferred_scale: u32 = 0,
 
     pub fn eventError(self: *SessionLockClientHandler, _: wayring.io_uring.Peer, _: ClientCore.EventFailure) void {
@@ -2928,6 +2958,8 @@ const SessionLockClientHandler = struct {
                         self.output = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wl_output.info, @min(global.version, 4), null);
                         self.output_count += 1;
                     }
+                    if (std.mem.eql(u8, global.interface, protocol.wl_seat.info.name))
+                        self.seat = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wl_seat.info, @min(global.version, 9), null);
                     if (std.mem.eql(u8, global.interface, protocol.ext_session_lock_manager_v1.info.name))
                         self.manager = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.ext_session_lock_manager_v1.info, 1, null);
                     if (std.mem.eql(u8, global.interface, protocol.wp_fractional_scale_manager_v1.info.name))
@@ -2945,6 +2977,30 @@ const SessionLockClientHandler = struct {
                         self.output_ready = true;
                     try self.maybeRequestLock();
                 },
+                else => {},
+            }
+        } else if (target.object.interface == &protocol.wl_seat.info) {
+            switch (try protocol.wl_seat.decodeEvent(message, fds)) {
+                .capabilities => |value| if (self.keyboard == null and
+                    value.capabilities.contains(protocol.wl_seat.capability.keyboard))
+                {
+                    self.keyboard = (try protocol.wl_seat.construct_get_keyboard(
+                        self.objects,
+                        self.queue,
+                        self.seat.?,
+                        .{},
+                    )).id;
+                },
+                .name => {},
+            }
+        } else if (target.object.interface == &protocol.wl_keyboard.info) {
+            switch (try protocol.wl_keyboard.decodeEvent(message, fds)) {
+                .keymap => |value| _ = linux.close(value.fd),
+                .enter => |value| {
+                    self.keyboard_enters += 1;
+                    self.keyboard_surface = value.surface;
+                },
+                .key => self.keyboard_keys += 1,
                 else => {},
             }
         } else if (target.object.interface == &protocol.ext_session_lock_v1.info) {
