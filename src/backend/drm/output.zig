@@ -136,6 +136,7 @@ const CommitRecord = struct {
     state: RecordState = .free,
     output_generation: u32 = 0,
     image: framebuffer.Handle = undefined,
+    overlay_image: ?framebuffer.Handle = null,
     callback_count: u32 = 0,
     fact: FlipFact = undefined,
 };
@@ -143,8 +144,18 @@ const CommitRecord = struct {
 const Queued = struct {
     image: framebuffer.Handle,
     in_fence_fd: ?std.posix.fd_t,
+    overlay: ?OverlayFrame,
     previous_state: State,
     test_before_commit: bool,
+};
+
+pub const OverlayFrame = struct {
+    image: framebuffer.Handle,
+    in_fence_fd: ?std.posix.fd_t,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
 };
 
 pub const Output = struct {
@@ -156,6 +167,8 @@ pub const Output = struct {
     connector: drm.Connector,
     crtc: drm.Crtc,
     plane: drm.Plane,
+    overlay_plane: ?drm.Plane,
+    overlay_zpos: ?drm.OverlayZpos,
     inherited_planes: []drm.Plane,
     mode: drm.Mode,
     fd: std.posix.fd_t,
@@ -167,6 +180,7 @@ pub const Output = struct {
     state: State = .initial,
     queued: ?Queued = null,
     current: ?framebuffer.Handle = null,
+    current_overlay: ?framebuffer.Handle = null,
     in_flight_slot: ?u32 = null,
     output_generation: u32 = 1,
     modeset_tested: bool = false,
@@ -227,6 +241,7 @@ pub const Output = struct {
             inherited_plane_index += 1;
         }
         const self = try allocator.create(Output);
+        const overlay = snapshot.overlayPlane(null);
         self.* = .{
             .allocator = allocator,
             .platform = platform,
@@ -236,6 +251,8 @@ pub const Output = struct {
             .connector = snapshot.selectedConnector(),
             .crtc = snapshot.selectedCrtc(),
             .plane = snapshot.selectedPlane(),
+            .overlay_plane = if (overlay) |value| snapshot.planes[value.plane_index] else null,
+            .overlay_zpos = if (overlay) |value| value.zpos else null,
             .inherited_planes = inherited_planes,
             .mode = snapshot.selectedMode(),
             .fd = fd,
@@ -299,7 +316,7 @@ pub const Output = struct {
     /// fence only after all validation succeeds. The fence is closed after the
     /// real atomic ioctl attempt or on any earlier rollback.
     pub fn queue(self: *Output, image_handle: framebuffer.Handle, in_fence_fd: ?std.posix.fd_t) !void {
-        return self.queueImage(image_handle, in_fence_fd, false);
+        return self.queueImage(image_handle, in_fence_fd, null, false);
     }
 
     /// Direct client images are not part of the compositor's negotiated target
@@ -307,13 +324,23 @@ pub const Output = struct {
     /// so unsupported format/modifier combinations can fall back to rendering
     /// without disturbing the current scanout.
     pub fn queueTested(self: *Output, image_handle: framebuffer.Handle, in_fence_fd: ?std.posix.fd_t) !void {
-        return self.queueImage(image_handle, in_fence_fd, true);
+        return self.queueImage(image_handle, in_fence_fd, null, true);
+    }
+
+    pub fn queueOverlay(
+        self: *Output,
+        image_handle: framebuffer.Handle,
+        in_fence_fd: ?std.posix.fd_t,
+        overlay: OverlayFrame,
+    ) !void {
+        return self.queueImage(image_handle, in_fence_fd, overlay, true);
     }
 
     fn queueImage(
         self: *Output,
         image_handle: framebuffer.Handle,
         in_fence_fd: ?std.posix.fd_t,
+        overlay: ?OverlayFrame,
         test_before_commit: bool,
     ) !void {
         if (self.state != .initial and self.state != .active and self.state != .paused)
@@ -326,9 +353,23 @@ pub const Output = struct {
             image.metadata.height != self.mode.vdisplay)
             return error.InvalidImage;
         try self.images.validate_submit(self.images.context, image_handle);
+        if (overlay) |value| {
+            const plane = self.overlay_plane orelse return error.OverlayUnsupported;
+            if (std.meta.eql(value.image, image_handle) or
+                (value.in_fence_fd != null and plane.properties.in_fence_fd == 0) or
+                value.width == 0 or value.height == 0 or
+                value.x > self.mode.hdisplay or value.y > self.mode.vdisplay or
+                value.width > self.mode.hdisplay - value.x or
+                value.height > self.mode.vdisplay - value.y) return error.InvalidOverlay;
+            const overlay_image = try self.images.get_image(self.images.context, value.image);
+            if (overlay_image.state != .acquired or overlay_image.metadata.width != value.width or
+                overlay_image.metadata.height != value.height) return error.InvalidOverlay;
+            try self.images.validate_submit(self.images.context, value.image);
+        }
         self.queued = .{
             .image = image_handle,
             .in_fence_fd = in_fence_fd,
+            .overlay = overlay,
             .previous_state = self.state,
             .test_before_commit = test_before_commit,
         };
@@ -370,10 +411,17 @@ pub const Output = struct {
             try self.rollbackQueued();
             return err;
         };
+        const overlay_framebuffer_id = if (queued.overlay) |overlay|
+            (self.images.get_image(self.images.context, overlay.image) catch |err| {
+                try self.rollbackQueued();
+                return err;
+            }).framebuffer_id
+        else
+            null;
         const modeset = queued.previous_state == .initial or queued.previous_state == .paused;
 
         if ((modeset and !self.modeset_tested) or queued.test_before_commit) {
-            self.buildScanout(record, image.framebuffer_id, queued.in_fence_fd, modeset) catch |err| {
+            self.buildScanout(record, image.framebuffer_id, queued.in_fence_fd, queued.overlay, overlay_framebuffer_id, modeset) catch |err| {
                 try self.rollbackRecordAndQueued(record);
                 return err;
             };
@@ -387,7 +435,7 @@ pub const Output = struct {
             if (modeset) self.modeset_tested = true;
             self.platform.resetRequest(record.request);
         }
-        self.buildScanout(record, image.framebuffer_id, queued.in_fence_fd, modeset) catch |err| {
+        self.buildScanout(record, image.framebuffer_id, queued.in_fence_fd, queued.overlay, overlay_framebuffer_id, modeset) catch |err| {
             try self.rollbackRecordAndQueued(record);
             return err;
         };
@@ -395,6 +443,7 @@ pub const Output = struct {
         record.state = .in_flight;
         record.output_generation = self.output_generation;
         record.image = queued.image;
+        record.overlay_image = if (queued.overlay) |overlay| overlay.image else null;
         record.callback_count = 0;
         const flags: atomic.CommitFlags = .{
             .allow_modeset = modeset,
@@ -410,14 +459,21 @@ pub const Output = struct {
         // turn contract; a failure here means that contract was violated after
         // KMS accepted the image and therefore cannot be rolled back safely.
         self.images.submit_image(self.images.context, queued.image) catch {
-            self.closeQueuedInFence();
+            self.closeQueuedInFences();
+            self.state = .failed;
+            self.queued = null;
+            self.in_flight_slot = @intCast(slot);
+            return error.ImageOwnershipViolation;
+        };
+        if (queued.overlay) |overlay| self.images.submit_image(self.images.context, overlay.image) catch {
+            self.closeQueuedInFences();
             self.state = .failed;
             self.queued = null;
             self.in_flight_slot = @intCast(slot);
             return error.ImageOwnershipViolation;
         };
         if (ring) |value| self.queueInFenceClose(value);
-        self.closeQueuedInFence();
+        self.closeQueuedInFences();
         self.queued = null;
         self.in_flight_slot = @intCast(slot);
         self.state = .in_flight;
@@ -451,18 +507,26 @@ pub const Output = struct {
     pub fn terminalDeviceTeardown(self: *Output) !void {
         if (self.event_count == self.events_buffer.len) return error.EventQueueFull;
         if (self.queued) |queued| {
-            self.closeQueuedInFence();
+            self.closeQueuedInFences();
             try self.images.discard_image(self.images.context, queued.image);
+            if (queued.overlay) |overlay|
+                try self.images.discard_image(self.images.context, overlay.image);
             self.queued = null;
         }
         if (self.current) |current| {
             try releaseTerminal(self.images, current);
             self.current = null;
         }
+        if (self.current_overlay) |current| {
+            try releaseTerminal(self.images, current);
+            self.current_overlay = null;
+        }
         if (self.in_flight_slot) |slot| {
             const record = &self.records[slot];
             if (record.state == .in_flight or record.state == .callback)
                 try releaseTerminal(self.images, record.image);
+            if (record.overlay_image) |overlay| if (record.state == .in_flight or record.state == .callback)
+                try releaseTerminal(self.images, overlay);
             retireRecord(self.platform, record);
             self.in_flight_slot = null;
         }
@@ -484,8 +548,11 @@ pub const Output = struct {
         if (self.event_count == self.events_buffer.len) return error.EventQueueFull;
 
         const previous = self.current;
+        const previous_overlay = self.current_overlay;
         if (previous) |old| try releaseDisplayed(self.images, old);
+        if (previous_overlay) |old| try releaseDisplayed(self.images, old);
         self.current = record.image;
+        self.current_overlay = record.overlay_image;
         self.events_buffer[self.event_count] = .{ .presented = .{
             .image = record.image,
             .previous = previous,
@@ -568,7 +635,8 @@ pub const Output = struct {
     /// Requires scanout quiescence first. Cancel and target CQEs may arrive
     /// in either order; callback/request storage remains alive until both do.
     pub fn beginDrain(self: *Output, router: *completion.Router, ring: *linux.IoUring) !void {
-        if (self.current != null or self.queued != null or self.in_flight_slot != null)
+        if (self.current != null or self.current_overlay != null or self.queued != null or
+            self.in_flight_slot != null)
             return error.ScanoutNotQuiescent;
         if (self.state != .paused and self.state != .removed and self.state != .draining)
             return error.InvalidState;
@@ -584,7 +652,8 @@ pub const Output = struct {
 
     pub fn drainComplete(self: *const Output) bool {
         return self.state == .drained and self.read_token == null and self.cancel_token == null and
-            self.current == null and self.queued == null and self.in_flight_slot == null;
+            self.current == null and self.current_overlay == null and self.queued == null and
+            self.in_flight_slot == null;
     }
 
     fn buildScanout(
@@ -592,6 +661,8 @@ pub const Output = struct {
         record: *CommitRecord,
         framebuffer_id: u32,
         in_fence_fd: ?std.posix.fd_t,
+        overlay: ?OverlayFrame,
+        overlay_framebuffer_id: ?u32,
         modeset: bool,
     ) !void {
         const request = record.request;
@@ -601,6 +672,8 @@ pub const Output = struct {
             // primary plane, so inherited planes must be detached atomically
             // with the takeover instead of remaining visible above it.
             for (self.inherited_planes) |plane| {
+                if (overlay != null and self.overlay_plane != null and
+                    plane.id == self.overlay_plane.?.id) continue;
                 try self.platform.addProperty(request, plane.id, plane.properties.fb_id, 0);
                 try self.platform.addProperty(request, plane.id, plane.properties.crtc_id, 0);
             }
@@ -628,6 +701,25 @@ pub const Output = struct {
         try self.platform.addProperty(request, self.plane.id, self.plane.properties.crtc_h, self.mode.vdisplay);
         if (in_fence_fd) |fence|
             try self.platform.addProperty(request, self.plane.id, self.plane.properties.in_fence_fd, @bitCast(@as(i64, fence)));
+        if (self.overlay_plane) |plane| if (overlay) |frame| {
+            try self.platform.addProperty(request, plane.id, plane.properties.fb_id, overlay_framebuffer_id.?);
+            try self.platform.addProperty(request, plane.id, plane.properties.crtc_id, self.crtc.id);
+            try self.platform.addProperty(request, plane.id, plane.properties.src_x, 0);
+            try self.platform.addProperty(request, plane.id, plane.properties.src_y, 0);
+            try self.platform.addProperty(request, plane.id, plane.properties.src_w, @as(u64, frame.width) << 16);
+            try self.platform.addProperty(request, plane.id, plane.properties.src_h, @as(u64, frame.height) << 16);
+            try self.platform.addProperty(request, plane.id, plane.properties.crtc_x, frame.x);
+            try self.platform.addProperty(request, plane.id, plane.properties.crtc_y, frame.y);
+            try self.platform.addProperty(request, plane.id, plane.properties.crtc_w, frame.width);
+            try self.platform.addProperty(request, plane.id, plane.properties.crtc_h, frame.height);
+            if (frame.in_fence_fd) |fence|
+                try self.platform.addProperty(request, plane.id, plane.properties.in_fence_fd, @bitCast(@as(i64, fence)));
+            if (self.overlay_zpos.?.property_id) |property|
+                try self.platform.addProperty(request, plane.id, property, self.overlay_zpos.?.value);
+        } else {
+            try self.platform.addProperty(request, plane.id, plane.properties.fb_id, 0);
+            try self.platform.addProperty(request, plane.id, plane.properties.crtc_id, 0);
+        };
     }
 
     fn disableNow(self: *Output) !void {
@@ -647,6 +739,10 @@ pub const Output = struct {
         self.platform.resetRequest(request);
         try self.platform.addProperty(request, self.plane.id, self.plane.properties.fb_id, 0);
         try self.platform.addProperty(request, self.plane.id, self.plane.properties.crtc_id, 0);
+        if (self.overlay_plane) |plane| {
+            try self.platform.addProperty(request, plane.id, plane.properties.fb_id, 0);
+            try self.platform.addProperty(request, plane.id, plane.properties.crtc_id, 0);
+        }
         try self.platform.addProperty(request, self.connector.id, self.connector.properties.crtc_id, 0);
         try self.platform.addProperty(request, self.crtc.id, self.crtc.properties.active, 0);
         try self.platform.addProperty(request, self.crtc.id, self.crtc.properties.mode_id, 0);
@@ -661,6 +757,10 @@ pub const Output = struct {
         const old = self.current.?;
         self.current = null;
         try releaseDisplayed(self.images, old);
+        if (self.current_overlay) |overlay| {
+            self.current_overlay = null;
+            try releaseDisplayed(self.images, overlay);
+        }
         self.platform.resetRequest(request);
         try self.pushEvent(.paused);
         self.state = .paused;
@@ -717,19 +817,31 @@ pub const Output = struct {
 
     fn rollbackQueued(self: *Output) !void {
         const queued = self.queued orelse return;
-        self.closeQueuedInFence();
+        self.closeQueuedInFences();
         self.queued = null;
         self.state = queued.previous_state;
         // Restore KMS admission state even when terminal image cleanup reports
         // an error. Direct-scanout fallback must never inherit `.queued` from
         // a rejected TEST_ONLY or real commit.
-        try self.images.discard_image(self.images.context, queued.image);
+        var first_error: ?anyerror = null;
+        self.images.discard_image(self.images.context, queued.image) catch |err| {
+            first_error = err;
+        };
+        if (queued.overlay) |overlay|
+            self.images.discard_image(self.images.context, overlay.image) catch |err| {
+                if (first_error == null) first_error = err;
+            };
+        if (first_error) |err| return err;
     }
 
-    fn closeQueuedInFence(self: *Output) void {
+    fn closeQueuedInFences(self: *Output) void {
         if (self.queued) |*queued| if (queued.in_fence_fd) |fence| {
             _ = linux.close(fence);
             queued.in_fence_fd = null;
+        };
+        if (self.queued) |*queued| if (queued.overlay) |*overlay| if (overlay.in_fence_fd) |fence| {
+            _ = linux.close(fence);
+            overlay.in_fence_fd = null;
         };
     }
 
@@ -738,10 +850,16 @@ pub const Output = struct {
         ring: *linux.IoUring,
     ) void {
         const queued = if (self.queued) |*value| value else return;
-        const fence = queued.in_fence_fd orelse return;
-        const sqe = ring.close(completion.skipped_success_user_data, fence) catch return;
-        sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
-        queued.in_fence_fd = null;
+        if (queued.in_fence_fd) |fence| {
+            const sqe = ring.close(completion.skipped_success_user_data, fence) catch return;
+            sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
+            queued.in_fence_fd = null;
+        }
+        if (queued.overlay) |*overlay| if (overlay.in_fence_fd) |fence| {
+            const sqe = ring.close(completion.skipped_success_user_data, fence) catch return;
+            sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
+            overlay.in_fence_fd = null;
+        };
     }
 
     fn rollbackRecordAndQueued(self: *Output, record: *CommitRecord) !void {
@@ -798,6 +916,7 @@ fn pageFlipCallback(
 fn retireRecord(platform: atomic.Platform, record: *CommitRecord) void {
     platform.resetRequest(record.request);
     record.callback_count = 0;
+    record.overlay_image = null;
     if (record.generation == std.math.maxInt(u32)) {
         record.state = .retired;
     } else {
@@ -1113,6 +1232,42 @@ test "kms: direct candidates receive an active-state TEST_ONLY commit" {
     try std.testing.expect(!fixture.atomic_state.commits[3].flags.allow_modeset);
     fixture.flip(output, fixture.crtc[0].id, false);
     try output.processCallbacks();
+    try output.requestPause();
+    try fixture.drainAndDestroy(output);
+}
+
+test "kms: overlay ownership is atomic through replacement flip" {
+    var fixture = Fixture{};
+    const output = try fixture.create(.{});
+    var pipe: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&pipe, .{ .CLOEXEC = true })));
+    defer _ = linux.close(pipe[1]);
+    try output.queueOverlay(fixture.acquire(0), null, .{
+        .image = fixture.acquire(1),
+        .in_fence_fd = pipe[0],
+        .x = 0,
+        .y = 0,
+        .width = 64,
+        .height = 48,
+    });
+    try output.commitQueued();
+    try std.testing.expectEqual(@as(usize, 2), fixture.images_state.submit_count);
+    try std.testing.expect(fixture.atomic_state.commits[0].flags.test_only);
+    try std.testing.expect(fixture.atomic_state.hasProperty(50, 52, 101));
+    try std.testing.expect(fixture.atomic_state.hasProperty(50, 53, 20));
+    try std.testing.expect(fixture.atomic_state.hasProperty(50, 63, 1));
+    fixture.flip(output, fixture.crtc[0].id, false);
+    try output.processCallbacks();
+    try std.testing.expect(output.current_overlay != null);
+
+    try output.queue(fixture.acquire(2), null);
+    try output.commitQueued();
+    try std.testing.expect(fixture.atomic_state.hasProperty(50, 52, 0));
+    try std.testing.expect(fixture.atomic_state.hasProperty(50, 53, 0));
+    fixture.flip(output, fixture.crtc[0].id, false);
+    try output.processCallbacks();
+    try std.testing.expectEqual(@as(usize, 2), fixture.images_state.release_count);
+    try std.testing.expect(output.current_overlay == null);
     try output.requestPause();
     try fixture.drainAndDestroy(output);
 }
@@ -1552,28 +1707,58 @@ const Fixture = struct {
         .index = 0,
         .properties = .{ .active = 21, .mode_id = 22 },
     }},
-    plane: [1]drm.Plane = .{.{
-        .id = 30,
-        .possible_crtcs = 1,
-        .plane_type_value = 1,
-        .format_start = 0,
-        .format_count = 1,
-        .properties = .{
-            .plane_type = 31,
-            .fb_id = 32,
-            .crtc_id = 33,
-            .src_x = 34,
-            .src_y = 35,
-            .src_w = 36,
-            .src_h = 37,
-            .crtc_x = 38,
-            .crtc_y = 39,
-            .crtc_w = 40,
-            .crtc_h = 41,
-            .in_fence_fd = 42,
+    plane: [2]drm.Plane = .{
+        .{
+            .id = 30,
+            .possible_crtcs = 1,
+            .plane_type_value = 1,
+            .has_in_formats = true,
+            .format_start = 0,
+            .format_count = 1,
+            .properties = .{
+                .plane_type = 31,
+                .fb_id = 32,
+                .crtc_id = 33,
+                .src_x = 34,
+                .src_y = 35,
+                .src_w = 36,
+                .src_h = 37,
+                .crtc_x = 38,
+                .crtc_y = 39,
+                .crtc_w = 40,
+                .crtc_h = 41,
+                .in_fence_fd = 42,
+                .zpos = .{ .id = 43, .inherited = 0, .maximum = 0, .immutable = true },
+            },
         },
-    }},
-    formats: [1]drm.Format = .{.{ .fourcc = 0, .modifier = 0 }},
+        .{
+            .id = 50,
+            .possible_crtcs = 1,
+            .plane_type_value = 0,
+            .has_in_formats = true,
+            .format_start = 1,
+            .format_count = 1,
+            .properties = .{
+                .plane_type = 51,
+                .fb_id = 52,
+                .crtc_id = 53,
+                .src_x = 54,
+                .src_y = 55,
+                .src_w = 56,
+                .src_h = 57,
+                .crtc_x = 58,
+                .crtc_y = 59,
+                .crtc_w = 60,
+                .crtc_h = 61,
+                .in_fence_fd = 62,
+                .zpos = .{ .id = 63, .inherited = 1, .maximum = 2, .immutable = false },
+            },
+        },
+    },
+    formats: [2]drm.Format = .{
+        .{ .fourcc = 0, .modifier = 0 },
+        .{ .fourcc = 0, .modifier = 0 },
+    },
 
     fn create(self: *Fixture, config: Config) !*Output {
         return Output.create(
