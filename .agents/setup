@@ -2,7 +2,7 @@
 set -euo pipefail
 
 libinput_version=1.28.1
-packages=(glslang-tools libdrm-dev libgbm-dev libinput-dev libpixman-1-dev libseat-dev libudev-dev libvulkan-dev libxkbcommon-dev pkg-config)
+packages=(glslang-tools libdrm-dev libgbm-dev libinput-dev liblcms2-dev libpixman-1-dev libseat-dev libudev-dev libvulkan-dev libwayland-dev libxkbcommon-dev pkg-config)
 # Debian 12's libinput lacks the three-finger-drag configuration API.
 if ! pkg-config --atleast-version="$libinput_version" libinput; then
     packages+=(build-essential meson ninja-build libevdev-dev libmtdev-dev libwacom-dev)
