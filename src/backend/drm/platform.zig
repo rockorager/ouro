@@ -73,6 +73,13 @@ pub const ColorspaceProperty = struct {
     bt2020_rgb: ?u64 = null,
 };
 
+pub const ZposProperty = struct {
+    id: u32,
+    inherited: u64,
+    maximum: u64,
+    immutable: bool,
+};
+
 pub const ConnectorProperties = struct {
     crtc_id: u32,
     vrr_capable: bool = false,
@@ -103,6 +110,7 @@ pub const PlaneProperties = struct {
     crtc_w: u32,
     crtc_h: u32,
     in_fence_fd: u32 = 0,
+    zpos: ?ZposProperty = null,
 };
 
 pub const Connector = struct {
@@ -148,6 +156,7 @@ pub const Plane = struct {
     possible_crtcs: u32,
     current_crtc_id: u32 = 0,
     plane_type_value: u64,
+    has_in_formats: bool = false,
     format_start: u32,
     format_count: u32,
     properties: PlaneProperties,
@@ -387,6 +396,7 @@ fn realReadTopology(_: *anyopaque, fd: std.posix.fd_t, out: *TopologyBuffer) !vo
             .possible_crtcs = plane.*.possible_crtcs,
             .current_crtc_id = plane.*.crtc_id,
             .plane_type_value = plane_type.value,
+            .has_in_formats = in_formats != null and in_formats.?.value != 0,
             .format_start = @intCast(format_start),
             .format_count = @intCast(out.format_count - format_start),
             .properties = .{
@@ -402,6 +412,7 @@ fn realReadTopology(_: *anyopaque, fd: std.posix.fd_t, out: *TopologyBuffer) !vo
                 .crtc_w = try requiredProperty(fd, props, "CRTC_W"),
                 .crtc_h = try requiredProperty(fd, props, "CRTC_H"),
                 .in_fence_fd = if (try optionalProperty(fd, props, "IN_FENCE_FD")) |value| value.id else 0,
+                .zpos = try optionalZposProperty(fd, props),
             },
         };
         out.plane_count += 1;
@@ -548,6 +559,24 @@ fn parseRangeProperty(
         .inherited = inherited,
         .minimum = property.*.values[0],
         .maximum = property.*.values[1],
+    };
+}
+
+fn optionalZposProperty(
+    fd: std.posix.fd_t,
+    props: *c.drmModeObjectProperties,
+) !?ZposProperty {
+    const found = try propertyByName(fd, props, "zpos") orelse return null;
+    defer c.drmModeFreeProperty(found.property);
+    const immutable = found.property.*.flags & c.DRM_MODE_PROP_IMMUTABLE != 0;
+    var maximum = found.value;
+    if (!immutable and found.property.*.count_values >= 2)
+        maximum = @max(maximum, found.property.*.values[1]);
+    return .{
+        .id = found.property.*.prop_id,
+        .inherited = found.value,
+        .maximum = maximum,
+        .immutable = immutable,
     };
 }
 

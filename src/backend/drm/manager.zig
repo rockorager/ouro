@@ -1062,6 +1062,7 @@ fn candidateConfigurationEqual(
     if (left_plane.id != right_plane.id or
         left_plane.possible_crtcs != right_plane.possible_crtcs or
         left_plane.plane_type_value != right_plane.plane_type_value or
+        left_plane.has_in_formats != right_plane.has_in_formats or
         left_plane.format_count != right_plane.format_count or
         !std.meta.eql(left_plane.properties, right_plane.properties)) return false;
     const left_format_end = @as(usize, left_plane.format_start) + left_plane.format_count;
@@ -1936,6 +1937,59 @@ test "drm: fixed card and event capacities fail before ownership mutation" {
     _ = try manager.rescan();
     try std.testing.expectError(error.EventQueueFull, manager.rescan());
     try std.testing.expectEqual(@as(usize, 1), seat.device_open_count);
+}
+
+test "drm: plane capability changes invalidate candidate configuration" {
+    var left: TestTopology = undefined;
+    left.init();
+    var right: TestTopology = undefined;
+    right.init();
+    const candidate = ScanoutCandidate{
+        .connector_index = 0,
+        .mode_index = 0,
+        .crtc_index = 0,
+        .plane_index = 0,
+    };
+    var left_candidates: [1]ScanoutCandidate = undefined;
+    var left_leases: [1]ScanoutCandidate = undefined;
+    var right_candidates: [1]ScanoutCandidate = undefined;
+    var right_leases: [1]ScanoutCandidate = undefined;
+    const left_storage = Storage{
+        .buffer = left.buffer,
+        .candidates = &left_candidates,
+        .lease_candidates = &left_leases,
+    };
+    const right_storage = Storage{
+        .buffer = right.buffer,
+        .candidates = &right_candidates,
+        .lease_candidates = &right_leases,
+    };
+    try std.testing.expect(candidateConfigurationEqual(
+        &left_storage,
+        candidate,
+        &right_storage,
+        candidate,
+    ));
+    right.planes[0].has_in_formats = true;
+    try std.testing.expect(!candidateConfigurationEqual(
+        &left_storage,
+        candidate,
+        &right_storage,
+        candidate,
+    ));
+    right.planes[0].has_in_formats = false;
+    right.planes[0].properties.zpos = .{
+        .id = 21,
+        .inherited = 1,
+        .maximum = 3,
+        .immutable = false,
+    };
+    try std.testing.expect(!candidateConfigurationEqual(
+        &left_storage,
+        candidate,
+        &right_storage,
+        candidate,
+    ));
 }
 
 const TestTopology = struct {
