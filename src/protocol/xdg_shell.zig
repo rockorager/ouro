@@ -1772,12 +1772,15 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         }
 
         fn setMetadata(adapter: *Self, slot: *ToplevelSlot, title: bool, bytes: []const u8) !void {
-            if (bytes.len > adapter.metadata_bytes) return error.MetadataTooLong;
             if (!std.unicode.utf8ValidateSlice(bytes)) return error.InvalidUtf8;
             if (!adapter.canPublishWithLive(adapter.live_toplevels, adapter.live_popups)) return error.Exhausted;
+            var len = @min(bytes.len, adapter.metadata_bytes);
+            if (len < bytes.len) {
+                while (len > 0 and (bytes[len] & 0xc0) == 0x80) len -= 1;
+            }
             const destination = if (title) slot.title else slot.app_id;
-            @memcpy(destination[0..bytes.len], bytes);
-            if (title) slot.title_len = bytes.len else slot.app_id_len = bytes.len;
+            @memcpy(destination[0..len], bytes[0..len]);
+            if (title) slot.title_len = len else slot.app_id_len = len;
             try adapter.publish(.{ .metadata_changed = adapter.toplevelId(slot) });
         }
 
@@ -3215,6 +3218,32 @@ test "xdg-shell: toplevel metadata rejects invalid UTF-8" {
     try expectDisplayError(context, 12, 0);
     try std.testing.expectEqualStrings("", (try context.adapter.metadata(id)).title);
     try std.testing.expect(context.adapter.popEvent() == null);
+}
+
+test "xdg-shell: toplevel metadata truncates at a UTF-8 boundary" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const id = try context.createToplevel();
+
+    try test_protocol.xdg_toplevel.encodeRequest(&context.requests, 12, .{
+        .set_title = .{ .title = "1234567890123456789012345678901étail" },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try std.testing.expectEqualStrings("1234567890123456789012345678901", (try context.adapter.metadata(id)).title);
+    try std.testing.expectEqual(id, switch (context.adapter.popEvent().?) {
+        .metadata_changed => |changed| changed,
+        else => return error.UnexpectedEvent,
+    });
+
+    try test_protocol.xdg_toplevel.encodeRequest(&context.requests, 12, .{
+        .set_app_id = .{ .app_id = "abcdefghijklmnopqrstuvwxyz0123456789" },
+    });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+    try std.testing.expectEqualStrings("abcdefghijklmnopqrstuvwxyz012345", (try context.adapter.metadata(id)).app_id);
+    try std.testing.expectEqual(id, switch (context.adapter.popEvent().?) {
+        .metadata_changed => |changed| changed,
+        else => return error.UnexpectedEvent,
+    });
 }
 
 test "xdg-shell: toplevel parents are mapped, nullable, and cleared on retirement" {

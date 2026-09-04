@@ -1079,6 +1079,9 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         fn offerMime(self: *Self, source: *SourceSlot, value: []const u8) !void {
+            // An unrepresentable MIME type is equivalent to an unsupported one.
+            // Do not disconnect the source for exceeding a local storage bound.
+            if (value.len > self.mime_bytes or value.len > std.math.maxInt(u16)) return;
             const selected = self.selectionUsesSource(source);
             if (source.used and !selected) return error.SourceUsed;
             if (self.findMime(source, value) != null) return;
@@ -1780,6 +1783,8 @@ test "data device: current selection accepts MIME updates without replacement" {
     const peer: wayring.io_uring.Peer = .{ .slot = 2, .generation = 9 };
     const first = try adapter.acquireSource();
     first.peer = peer;
+    try adapter.offerMime(first, "mime-type-that-is-longer-than-32-bytes");
+    try std.testing.expectEqual(@as(usize, 0), first.mime_count);
     var offered = [_]u8{ 't', 'e', 'x', 't', '/', 'p', 'l', 'a', 'i', 'n' };
     try adapter.addMime(first, &offered);
     offered[0] = 'X';

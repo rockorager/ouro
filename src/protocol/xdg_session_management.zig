@@ -9,6 +9,8 @@ const std = @import("std");
 const wayring = @import("wayring");
 const objects = wayring.objects;
 
+pub const max_wire_string_bytes = 4096;
+
 pub const Config = struct {
     manager_resources: usize = 8,
     outbound: usize = 64,
@@ -17,7 +19,7 @@ pub const Config = struct {
     stored_sessions: usize = 16,
     stored_toplevels: usize = 64,
     events: usize = 64,
-    max_string_bytes: usize = 256,
+    max_string_bytes: usize = max_wire_string_bytes,
 
     fn validate(c: Config) !void {
         inline for (.{ c.manager_resources, c.session_resources, c.toplevel_resources, c.stored_sessions, c.stored_toplevels, c.events, c.outbound, c.max_string_bytes }) |n|
@@ -918,6 +920,15 @@ test "replacement, persistence, inertness, and generation reuse" {
     const third = try owner.getSession(2, 3, "s1", generator);
     try std.testing.expectEqual(second.index, third.index);
     try std.testing.expect(second.generation != third.generation);
+}
+
+test "default storage accepts protocol-sized session identifiers" {
+    const O = Owner(u32, u64);
+    var owner = try O.init(std.testing.allocator, .{});
+    defer owner.deinit();
+    const identifier = [_]u8{'s'} ** max_wire_string_bytes;
+    const stored = try owner.importSession(&identifier);
+    try std.testing.expectEqualStrings(&identifier, owner.sessionIdentifier(stored).?);
 }
 
 test "unknown restore is add; rename atomic; restore gate" {

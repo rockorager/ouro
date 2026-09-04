@@ -207,10 +207,7 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type, comptime Shm: type
                     .destroy => {},
                     .set_name => |payload| {
                         if (icon.immutable) return try self.immutable(actor, decoded.handle.id);
-                        if (payload.icon_name.len > self.name_bytes) return try self.noMemory(actor);
-                        const destination = self.iconName(icon);
-                        @memcpy(destination[0..payload.icon_name.len], payload.icon_name);
-                        icon.name_len = payload.icon_name.len;
+                        self.setName(icon, payload.icon_name);
                     },
                     .add_buffer => |payload| {
                         if (icon.immutable) return try self.immutable(actor, decoded.handle.id);
@@ -419,6 +416,14 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type, comptime Shm: type
             };
             return slot;
         }
+        fn setName(self: *Self, icon: *IconSlot, name: []const u8) void {
+            if (name.len > self.name_bytes) {
+                icon.name_len = 0;
+                return;
+            }
+            @memcpy(icon.name[0..name.len], name);
+            icon.name_len = name.len;
+        }
         fn acquireVariant(self: *Self) !*SourceVariant {
             return self.variants.acquire();
         }
@@ -596,8 +601,9 @@ test "toplevel icon assignment snapshots name and publishes on commit" {
     const toplevel: FakeShell.ToplevelId = .{ .index = 2, .generation = 7 };
     const surface: FakeShell.SurfaceId = .{ .index = 2, .generation = 7 };
     const icon = try adapter.acquireIcon();
-    @memcpy(adapter.iconName(icon)[0..4], "ouro");
-    icon.name_len = 4;
+    adapter.setName(icon, "name-too-long-for-storage");
+    try std.testing.expectEqual(@as(usize, 0), icon.name_len);
+    adapter.setName(icon, "ouro");
     try adapter.assign(toplevel, icon);
     try std.testing.expect(icon.immutable);
     try std.testing.expect(adapter.snapshot(toplevel) == null);

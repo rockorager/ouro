@@ -228,7 +228,7 @@ pub fn Adapter(comptime protocol: type) type {
             switch (decoded.value) {
                 .offer => |payload| {
                     if (source.used) return self.protocolError(actor, decoded.handle.id, 0, "primary selection source is already in use");
-                    self.addMime(source, payload.mime_type) catch |err| switch (err) {
+                    self.offerMime(source, payload.mime_type) catch |err| switch (err) {
                         error.Exhausted => return self.noMemory(actor),
                         else => return self.protocolError(actor, decoded.handle.id, 0, @errorName(err)),
                     };
@@ -463,6 +463,12 @@ pub fn Adapter(comptime protocol: type) type {
             @memcpy(source.mime_storage[i * self.mime_bytes ..][0..value.len], value);
             source.mime_lengths[i] = @intCast(value.len);
             source.mime_count += 1;
+        }
+        fn offerMime(self: *Self, source: *SourceSlot, value: []const u8) !void {
+            // An unrepresentable MIME type is equivalent to an unsupported one.
+            // Do not disconnect the source for exceeding a local storage bound.
+            if (value.len > self.mime_bytes or value.len > std.math.maxInt(u16)) return;
+            try self.addMime(source, value);
         }
         fn findMime(self: *const Self, source: *const SourceSlot, value: []const u8) ?usize {
             for (0..source.mime_count) |i| if (std.mem.eql(u8, self.mime(source, i), value)) return i;
@@ -711,6 +717,8 @@ test "primary selection: MIME storage is copied and bounded" {
     var adapter = try testAdapter(.{ .source_capacity = 1, .mime_capacity = 1, .mime_bytes = 10 });
     defer adapter.deinit();
     const source = try adapter.acquireSource();
+    try adapter.offerMime(source, "longer-than-ten");
+    try std.testing.expectEqual(@as(usize, 0), source.mime_count);
     var value = [_]u8{ 't', 'e', 'x', 't' };
     try adapter.addMime(source, &value);
     value[0] = 'X';

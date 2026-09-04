@@ -192,7 +192,6 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
                     .destroy => {},
                     .get_layer_surface => |v| {
                         const layer = parseLayer(v.layer.value) catch return try self.managerError(actor, decoded.handle.id, Manager.@"error".invalid_layer.value, "invalid layer");
-                        if (v.namespace.len > self.namespace_bytes) return try self.noMemory(actor);
                         const wh = server_objects.namespace.lookupHandle(v.surface) orelse return try self.managerError(actor, decoded.handle.id, Manager.@"error".role.value, "invalid wl_surface");
                         const wo = server_objects.namespace.resolve(wh) orelse return try self.managerError(actor, decoded.handle.id, Manager.@"error".role.value, "invalid wl_surface");
                         const surface = self.core.getSurfaceObject(wh, wo) catch return try self.managerError(actor, decoded.handle.id, Manager.@"error".role.value, "foreign wl_surface");
@@ -215,12 +214,14 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
                         slot.peer = peer;
                         slot.surface = sid;
                         slot.wl_surface = wh;
+                        self.setNamespace(slot, v.namespace) catch {
+                            self.release(self.index(slot));
+                            return try self.noMemory(actor);
+                        };
                         slot.output_resource = output_resource;
                         slot.output = output;
                         slot.pending.layer = layer;
                         slot.committed.layer = layer;
-                        @memcpy(slot.namespace[0..v.namespace.len], v.namespace);
-                        slot.namespace_len = v.namespace.len;
                         surface.role.assign(layer_role_id, true) catch {
                             self.release(self.index(slot));
                             return try self.managerError(actor, decoded.handle.id, Manager.@"error".role.value, "surface role conflict");
@@ -552,6 +553,12 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Out
             };
             return s;
         }
+        fn setNamespace(self: *Self, slot: *Slot, namespace: []const u8) !void {
+            if (namespace.len > slot.namespace.len)
+                slot.namespace = try self.allocator.realloc(slot.namespace, namespace.len);
+            @memcpy(slot.namespace[0..namespace.len], namespace);
+            slot.namespace_len = namespace.len;
+        }
         fn release(self: *Self, i: u32) void {
             const s = self.slots.at(i) orelse return;
             if (!s.header.active) return;
@@ -808,6 +815,9 @@ test "layer shell: commit lifecycle requires an acknowledged configure and reset
     defer adapter.deinit();
     const slot = try adapter.acquire();
     slot.surface = .{ .index = 3, .generation = 4 };
+    const long_namespace = "namespace-longer-than-the-initial-reservation";
+    try adapter.setNamespace(slot, long_namespace);
+    try std.testing.expectEqualStrings(long_namespace, adapter.stateForSurface(slot.surface).?.namespace);
     slot.pending = .{
         .width = 100,
         .height = 20,
