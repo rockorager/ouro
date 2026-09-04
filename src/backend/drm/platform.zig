@@ -73,6 +73,12 @@ pub const ColorspaceProperty = struct {
     bt2020_rgb: ?u64 = null,
 };
 
+pub const HdrCapabilities = struct {
+    bt2020_rgb: bool = false,
+    pq: bool = false,
+    hlg: bool = false,
+};
+
 pub const ZposProperty = struct {
     id: u32,
     inherited: u64,
@@ -86,6 +92,7 @@ pub const ConnectorProperties = struct {
     colorspace: ColorspaceProperty = .{},
     hdr_output_metadata: BlobProperty = .{},
     max_bpc: RangeProperty = .{},
+    hdr_capabilities: HdrCapabilities = .{},
 };
 pub const CrtcProperties = struct {
     active: u32,
@@ -480,6 +487,7 @@ fn connectorProperties(fd: std.posix.fd_t, props: *c.drmModeObjectProperties) !C
         .colorspace = try optionalColorspaceProperty(fd, props),
         .hdr_output_metadata = try optionalBlobProperty(fd, props, "HDR_OUTPUT_METADATA"),
         .max_bpc = try optionalRangeProperty(fd, props, "max bpc"),
+        .hdr_capabilities = try optionalHdrCapabilities(fd, props),
     };
 }
 
@@ -535,6 +543,67 @@ fn optionalBlobProperty(
     if (found.property.*.flags & c.DRM_MODE_PROP_BLOB == 0)
         return error.MalformedProperty;
     return .{ .id = found.property.*.prop_id, .inherited = found.value };
+}
+
+fn optionalHdrCapabilities(
+    fd: std.posix.fd_t,
+    props: *c.drmModeObjectProperties,
+) !HdrCapabilities {
+    const found = try propertyByName(fd, props, "EDID") orelse return .{};
+    defer c.drmModeFreeProperty(found.property);
+    if (found.property.*.flags & c.DRM_MODE_PROP_BLOB == 0)
+        return error.MalformedProperty;
+    if (found.value == 0 or found.value > std.math.maxInt(u32)) return .{};
+    const blob = c.drmModeGetPropertyBlob(fd, @intCast(found.value)) orelse return .{};
+    defer c.drmModeFreePropertyBlob(blob);
+    const bytes: [*]const u8 = @ptrCast(blob.*.data orelse return .{});
+    return parseEdidHdrCapabilities(bytes[0..blob.*.length]);
+}
+
+fn parseEdidHdrCapabilities(edid: []const u8) HdrCapabilities {
+    const block_bytes = 128;
+    const header = [_]u8{ 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00 };
+    if (edid.len < block_bytes or !std.mem.eql(u8, edid[0..header.len], &header) or
+        !validEdidBlock(edid[0..block_bytes])) return .{};
+    const extension_count = edid[126];
+    const required = std.math.mul(usize, @as(usize, extension_count) + 1, block_bytes) catch
+        return .{};
+    if (required > edid.len) return .{};
+
+    var capabilities: HdrCapabilities = .{};
+    for (0..extension_count) |extension_index| {
+        const start = (extension_index + 1) * block_bytes;
+        const extension = edid[start..][0..block_bytes];
+        if (extension[0] != 0x02 or !validEdidBlock(extension)) continue;
+        const data_end = extension[2];
+        if (data_end < 4 or data_end > 127) continue;
+        var cursor: usize = 4;
+        while (cursor < data_end) {
+            const header_byte = extension[cursor];
+            const payload_len: usize = header_byte & 0x1f;
+            const next = cursor + 1 + payload_len;
+            if (next > data_end) break;
+            const payload = extension[cursor + 1 .. next];
+            if (header_byte >> 5 == 0x07 and payload.len >= 2) switch (payload[0]) {
+                0x05 => capabilities.bt2020_rgb = capabilities.bt2020_rgb or
+                    payload[1] & 0x80 != 0,
+                0x06 => {
+                    capabilities.pq = capabilities.pq or payload[1] & 0x04 != 0;
+                    capabilities.hlg = capabilities.hlg or payload[1] & 0x08 != 0;
+                },
+                else => {},
+            };
+            cursor = next;
+        }
+    }
+    return capabilities;
+}
+
+fn validEdidBlock(block: []const u8) bool {
+    if (block.len != 128) return false;
+    var checksum: u8 = 0;
+    for (block) |byte| checksum +%= byte;
+    return checksum == 0;
 }
 
 fn optionalRangeProperty(
@@ -749,4 +818,50 @@ test "drm platform: malformed color property types are rejected" {
     var property = std.mem.zeroes(c.drmModePropertyRes);
     try std.testing.expectError(error.MalformedProperty, parseColorspaceProperty(&property, 0));
     try std.testing.expectError(error.MalformedProperty, parseRangeProperty(&property, 0));
+}
+
+test "drm platform: CTA EDID publishes exact HDR capabilities" {
+    var edid = [_]u8{0} ** 256;
+    edid[0..8].* = .{ 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00 };
+    edid[126] = 1;
+    setEdidChecksum(edid[0..128]);
+    edid[128] = 0x02;
+    edid[129] = 3;
+    edid[130] = 10;
+    edid[132] = 0xe2;
+    edid[133] = 0x05;
+    edid[134] = 0x80;
+    edid[135] = 0xe2;
+    edid[136] = 0x06;
+    edid[137] = 0x0c;
+    setEdidChecksum(edid[128..256]);
+
+    try std.testing.expectEqual(HdrCapabilities{
+        .bt2020_rgb = true,
+        .pq = true,
+        .hlg = true,
+    }, parseEdidHdrCapabilities(&edid));
+}
+
+test "drm platform: malformed EDID cannot advertise HDR" {
+    var edid = [_]u8{0} ** 256;
+    edid[0..8].* = .{ 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00 };
+    edid[126] = 1;
+    setEdidChecksum(edid[0..128]);
+    edid[128] = 0x02;
+    edid[130] = 7;
+    edid[132] = 0xe2;
+    edid[133] = 0x06;
+    edid[134] = 0x04;
+    // Leave the extension checksum invalid.
+    try std.testing.expectEqual(HdrCapabilities{}, parseEdidHdrCapabilities(&edid));
+    try std.testing.expectEqual(HdrCapabilities{}, parseEdidHdrCapabilities(edid[0..127]));
+}
+
+fn setEdidChecksum(block: []u8) void {
+    std.debug.assert(block.len == 128);
+    block[127] = 0;
+    var checksum: u8 = 0;
+    for (block) |byte| checksum +%= byte;
+    block[127] = 0 -% checksum;
 }
