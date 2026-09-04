@@ -180,6 +180,7 @@ pub fn Policy(
 
         pub fn destroyed(policy: *Self, id: ToplevelId) void {
             if (policy.resolve(id)) |_| {
+                if (policy.states[id.index].committed) policy.workspace_revision +%= 1;
                 policy.removeFocus(id);
                 policy.clearTiledResize(id);
                 policy.tiling.remove(id);
@@ -192,6 +193,7 @@ pub fn Policy(
             const state = try policy.resolve(id);
             if (state.committed) return;
             state.committed = true;
+            policy.workspace_revision +%= 1;
             if (state.mode == .tiled) {
                 policy.appendTile(id);
                 policy.tiling.add(id, policy.layoutOutput(state.*), policy.focusedToplevel());
@@ -206,6 +208,7 @@ pub fn Policy(
             floating: geometry.Rect,
         ) !void {
             const state = try policy.resolve(id);
+            if (state.committed) policy.workspace_revision +%= 1;
             policy.removeFocus(id);
             policy.clearTiledResize(id);
             policy.tiling.remove(id);
@@ -246,14 +249,19 @@ pub fn Policy(
             for (policy.output_workspaces[0..policy.output_workspace_len]) |record| {
                 try writer.addGroup(.{ .id = record.group });
                 try writer.addOutput(record.group, record.output);
-                for (record.ids, 0..) |id, index| try writer.addWorkspace(.{
-                    .id = id,
-                    .group = record.group,
-                    .identifier = workspace_names[index],
-                    .name = workspace_display_names[index],
-                    .state = .{ .active = record.active == index + 1 },
-                    .capabilities = .{ .activate = true },
-                });
+                for (record.ids, 0..) |id, index| {
+                    const number: u8 = @intCast(index + 1);
+                    if (record.active != number and !policy.workspaceOccupied(record.output, number))
+                        continue;
+                    try writer.addWorkspace(.{
+                        .id = id,
+                        .group = record.group,
+                        .identifier = workspace_names[index],
+                        .name = workspace_display_names[index],
+                        .state = .{ .active = record.active == number },
+                        .capabilities = .{ .activate = true },
+                    });
+                }
             }
         }
 
@@ -291,6 +299,7 @@ pub fn Policy(
             const state = try policy.resolve(id);
             if (state.workspace == number) return false;
             state.workspace = number;
+            if (state.committed) policy.workspace_revision +%= 1;
             if (state.mode == .tiled and state.committed)
                 policy.tiling.moveToOutput(id, policy.layoutOutput(state.*), policy.focusedToplevel());
             policy.clearTiledResize(id);
@@ -507,6 +516,7 @@ pub fn Policy(
             }
             state.output = destination.id;
             state.workspace = policy.activeWorkspace(destination.id);
+            if (state.committed) policy.workspace_revision +%= 1;
             if (state.mode == .tiled and state.committed)
                 policy.tiling.moveToOutput(id, policy.layoutOutput(state.*), policy.focusedToplevel());
             return true;
@@ -594,8 +604,11 @@ pub fn Policy(
                 .fullscreen => {
                     state.fullscreen = enabled;
                     if (output) |destination| {
+                        const workspace_changed = !std.meta.eql(state.output, destination) or
+                            state.workspace != policy.activeWorkspace(destination);
                         state.output = destination;
                         state.workspace = policy.activeWorkspace(destination);
+                        if (state.committed and workspace_changed) policy.workspace_revision +%= 1;
                         if (state.mode == .tiled and state.committed)
                             policy.tiling.moveToOutput(id, policy.layoutOutput(state.*), policy.focusedToplevel());
                     }
@@ -676,6 +689,8 @@ pub fn Policy(
                     ));
                 } else if (state_value.fullscreen or state_value.maximized) {
                     const output = view.outputFor(state_value.output, view.windowFor(id).current_geometry);
+                    if (state_value.committed and !std.meta.eql(state_value.output, output.id))
+                        policy.workspace_revision +%= 1;
                     state_value.output = output.id;
                     try transaction.place(id, policy.target(state_value.*, output.geometry, true, stacking));
                 } else try transaction.setStacking(id, stacking);
@@ -688,14 +703,18 @@ pub fn Policy(
                 if (!state_value.committed or state_value.mode != .floating) continue;
                 const rect = if (state_value.fullscreen or state_value.maximized) rect: {
                     const output = view.outputFor(state_value.output, window.current_geometry);
-                    if (state_value.output == null or !std.meta.eql(state_value.output.?, output.id))
+                    if (state_value.output == null or !std.meta.eql(state_value.output.?, output.id)) {
                         state_value.workspace = policy.activeWorkspace(output.id);
+                        policy.workspace_revision +%= 1;
+                    }
                     state_value.output = output.id;
                     break :rect output.geometry;
                 } else rect: {
                     const output = view.output(view.outputIndexForRect(state_value.floating));
-                    if (state_value.output == null or !std.meta.eql(state_value.output.?, output.id))
+                    if (state_value.output == null or !std.meta.eql(state_value.output.?, output.id)) {
                         state_value.workspace = policy.activeWorkspace(output.id);
+                        policy.workspace_revision +%= 1;
+                    }
                     state_value.output = output.id;
                     break :rect state_value.floating;
                 };
@@ -786,6 +805,14 @@ pub fn Policy(
             return 1;
         }
 
+        fn workspaceOccupied(policy: *const Self, output: OutputId, number: u8) bool {
+            for (policy.states) |state| {
+                if (state.active and state.committed and state.output != null and
+                    std.meta.eql(state.output.?, output) and state.workspace == number) return true;
+            }
+            return false;
+        }
+
         fn reconcilePrimaryOutput(policy: *Self, view: anytype) !void {
             var primary = view.output(0);
             var primary_area = primaryArea(primary);
@@ -847,6 +874,7 @@ pub fn Policy(
                         );
                     }
                 }
+                if (state.committed) policy.workspace_revision +%= 1;
                 state.output = primary.id;
                 if (state.mode == .tiled and state.committed)
                     policy.tiling.moveToOutput(state.id, policy.layoutOutput(state.*), policy.focusedToplevel());

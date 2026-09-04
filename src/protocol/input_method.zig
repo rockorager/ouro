@@ -459,6 +459,23 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type, comptime Tex
             }
             try self.enqueueGrab(child, id, .grab_keymap, .{ .size = size });
         }
+        pub fn repeatInfoUpdated(self: *Self) !void {
+            const id = self.active_grab orelse return;
+            const child = self.resolveGrab(id) orelse return;
+            const method = self.resolveMethod(child.parent) orelse return;
+            const snapshot = self.provider.?.snapshot(method.seat_key);
+            for (self.outbound) |*out| {
+                if (out.active and out.kind == .grab_repeat and std.meta.eql(out.grab, id)) {
+                    out.rate = snapshot.repeat_rate;
+                    out.delay = snapshot.repeat_delay;
+                    return;
+                }
+            }
+            try self.enqueueGrab(child, id, .grab_repeat, .{
+                .rate = snapshot.repeat_rate,
+                .delay = snapshot.repeat_delay,
+            });
+        }
         const GrabPayload = struct { serial: u32 = 0, time: u32 = 0, key: u32 = 0, state: u32 = 0, modifiers: Modifiers = .{}, rate: i32 = 0, delay: i32 = 0, size: u32 = 0 };
         fn enqueueGrab(self: *Self, c: *Child, id: GrabId, kind: OutKind, p: GrabPayload) !void {
             if (!self.canEnqueue(1)) return error.Exhausted;
@@ -964,11 +981,20 @@ test "input method keyboard grab orders sync, excludes stale generations, and pr
     second.parent = a.methodId(method);
     second.peer = method.peer;
     second.order = 2;
+    const Repeat = struct { rate: i32, delay: i32 };
+    var repeat: Repeat = .{ .rate = 25, .delay = 600 };
     a.setKeyboardProvider(.{
+        .context = &repeat,
         .snapshotFn = struct {
-            fn snapshot(_: ?*anyopaque, seat: u32) KeyboardSnapshot {
+            fn snapshot(context: ?*anyopaque, seat: u32) KeyboardSnapshot {
                 std.debug.assert(seat == 9);
-                return .{ .keymap_size = 12, .repeat_rate = 25, .repeat_delay = 600, .modifiers = .{ .serial = 4 } };
+                const current: *Repeat = @ptrCast(@alignCast(context.?));
+                return .{
+                    .keymap_size = 12,
+                    .repeat_rate = current.rate,
+                    .repeat_delay = current.delay,
+                    .modifiers = .{ .serial = 4 },
+                };
             }
         }.snapshot,
         .duplicateKeymapFn = struct {
@@ -979,6 +1005,15 @@ test "input method keyboard grab orders sync, excludes stale generations, and pr
             }
         }.duplicate,
     });
+    repeat = .{ .rate = 40, .delay = 250 };
+    try a.repeatInfoUpdated();
+    var repeat_events: usize = 0;
+    for (a.outbound) |out| if (out.active and out.kind == .grab_repeat) {
+        repeat_events += 1;
+        try std.testing.expectEqual(@as(i32, 40), out.rate);
+        try std.testing.expectEqual(@as(i32, 250), out.delay);
+    };
+    try std.testing.expectEqual(@as(usize, 1), repeat_events);
     const old = a.activeGrab().?;
     try std.testing.expectEqual(@as(u32, 0), old.index);
     try std.testing.expectEqual(A.OutKind.grab_keymap, a.oldest(method.peer).?.kind);

@@ -289,10 +289,20 @@ pub fn main(init: std.process.Init) !void {
         };
         const key_consumer = coordinator.bindingState();
         while (key_consumer.peekAction()) |binding| {
-            applyBinding(coordinator, &launcher, binding) catch |err| {
+            const binding_stopped = applyBinding(
+                coordinator,
+                &systemd_session,
+                &launcher,
+                binding,
+            ) catch |err| failed: {
                 std.log.err("binding action failed: {t}", .{err});
+                break :failed false;
             };
             key_consumer.dropAction();
+            if (binding_stopped) {
+                signal_stop_started = true;
+                break;
+            }
         }
         wayring_drained = progress.wayring.shutdown_complete;
         if (!signal_stop_started and progress.shutdown_requested) {
@@ -363,9 +373,10 @@ fn beginShutdown(systemd_session: *SystemdSession, coordinator: *Runtime) !void 
 
 fn applyBinding(
     coordinator: *Runtime,
+    systemd_session: *SystemdSession,
     launcher: *const ouro.launcher.Systemd,
     binding: ouro.config.Binding,
-) !void {
+) !bool {
     switch (binding.action) {
         .focus_next => try coordinator.focusNext(),
         .focus_previous => try coordinator.focusPrevious(),
@@ -387,13 +398,17 @@ fn applyBinding(
         .toggle_fullscreen => try coordinator.toggleFocusedFullscreen(),
         .toggle_maximized => try coordinator.toggleFocusedMaximized(),
         .toggle_floating => try coordinator.toggleFocusedFloating(),
-        .exit => try coordinator.requestStop(),
+        .exit => {
+            try beginShutdown(systemd_session, coordinator);
+            return true;
+        },
         .run => |argv| {
             launcher.launch(argv) catch |err| {
                 std.log.err("could not launch {s}: {t}", .{ argv[0], err });
             };
         },
     }
+    return false;
 }
 
 fn parseOptions(args: std.process.Args) !Options {

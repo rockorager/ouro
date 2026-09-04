@@ -2140,7 +2140,10 @@ pub fn Coordinator(comptime protocol: type) type {
             const ids = try self.allocator.alloc(input_api.DeviceId, input.deviceCount());
             defer self.allocator.free(ids);
             const count = input.enumerateDevices(ids);
-            for (ids[0..count]) |id| try self.applyInputDeviceConfiguration(input, id, snapshot);
+            for (ids[0..count]) |id| {
+                try self.applyInputDeviceConfiguration(input, id, snapshot);
+                try self.syncConfiguredKeyRepeat(id, try input.describeDevice(id));
+            }
         }
 
         fn applyInputDeviceConfiguration(
@@ -2186,6 +2189,25 @@ pub fn Coordinator(comptime protocol: type) type {
                 resolvedSoftwareInputSetting(i32, settings.repeat_rate, 25),
                 resolvedSoftwareInputSetting(i32, settings.repeat_delay, 600),
             );
+        }
+
+        fn syncConfiguredKeyRepeat(
+            self: *Self,
+            id: input_api.DeviceId,
+            description: input_api.DeviceDescription,
+        ) !void {
+            if (!description.info.capabilities.keyboard) return;
+            try self.interaction.setKeyRepeat(
+                id,
+                description.repeat_rate,
+                description.repeat_delay,
+            );
+            try self.seat_adapter.setRepeatInfo(
+                description.repeat_rate,
+                description.repeat_delay,
+            );
+            try self.input_method_adapter.repeatInfoUpdated();
+            self.markProtocolAll(ProtocolReady.seat | ProtocolReady.input_method);
         }
 
         pub fn requestStop(self: *Self) !void {
@@ -3526,12 +3548,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 }
                 if (event == .device_added) {
                     const description = try input.describeDevice(event.device_added.device);
-                    if (description.info.capabilities.keyboard)
-                        try self.interaction.setKeyRepeat(
-                            event.device_added.device,
-                            description.repeat_rate,
-                            description.repeat_delay,
-                        );
+                    try self.syncConfiguredKeyRepeat(event.device_added.device, description);
                 }
                 try self.syncConsumerTimer();
                 self.input_event_cursor += 1;
@@ -12024,7 +12041,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     const bounds = self.outputBoundsFor(physical) catch continue;
                     var count: usize = 0;
                     for (self.app_layers[0..self.app_layer_count]) |*layer| {
-                        if (!layer.active or layer.peer == null or layer.sample == null or
+                        if (!layer.active or !self.layerOwnerLive(layer) or layer.sample == null or
                             !samePeer(layer.peer.?, client.peer)) continue;
                         if (self.boundLayerOutput(layer)) |output| {
                             if (!std.meta.eql(output, physical.protocol_output)) continue;
@@ -12055,7 +12072,7 @@ pub fn Coordinator(comptime protocol: type) type {
                         );
                     }
                     if (!self.sessionLockActive() and self.cursor_layer.active and
-                        self.cursor_layer.peer != null and
+                        self.layerOwnerLive(&self.cursor_layer) and
                         self.cursor_layer.sample != null and
                         samePeer(self.cursor_layer.peer.?, client.peer) and
                         try clipToOutput(self.cursor_layer.sample.?.destination, bounds) != null)
@@ -12128,7 +12145,8 @@ pub fn Coordinator(comptime protocol: type) type {
             layer: *const Layer,
             peer: wayring.io_uring.Peer,
         ) !void {
-            if (!layer.active or layer.peer == null or !samePeer(layer.peer.?, peer)) return;
+            if (!layer.active or !self.layerOwnerLive(layer) or
+                !samePeer(layer.peer.?, peer)) return;
             const surface = layer.id orelse return;
             if (self.surfaceBelongsToSessionLock(surface) != self.sessionLockActive()) return;
             const sample = layer.sample orelse return;

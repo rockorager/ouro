@@ -30,6 +30,12 @@ pub const Systemd = struct {
             .stdout = .ignore,
             .stderr = .inherit,
         });
+        const reaper = std.Thread.spawn(.{}, reap, .{ self.io, child }) catch |err| {
+            var fallback = child;
+            _ = fallback.wait(self.io) catch {};
+            return err;
+        };
+        reaper.detach();
         std.log.info("submitted {s} through systemd-run (pid {d})", .{ argv[0], child.id.? });
     }
 
@@ -38,6 +44,13 @@ pub const Systemd = struct {
         try self.launch(argv);
     }
 };
+
+fn reap(io: std.Io, child_value: std.process.Child) void {
+    var child = child_value;
+    _ = child.wait(io) catch |err| {
+        std.log.warn("could not reap systemd-run process: {t}", .{err});
+    };
+}
 
 fn validateArgv(argv: []const []const u8) !void {
     if (argv.len == 0 or argv[0].len == 0) return error.InvalidArgv;

@@ -773,6 +773,38 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             };
         }
 
+        /// Updates the seat-wide repeat policy and republishes it to every
+        /// existing wl_keyboard resource. Already queued repeat events encode
+        /// the latest values at flush time and therefore need no duplicate.
+        pub fn setRepeatInfo(adapter: *Self, rate: i32, delay: i32) !void {
+            if (rate < 0 or delay < 0) return error.InvalidRepeatInfo;
+            if (adapter.repeat_rate == rate and adapter.repeat_delay == delay) return;
+            var needed: usize = 0;
+            for (adapter.keyboards.entries.items, 0..) |slot, index| {
+                if (!slot.header.active) continue;
+                const id: Id = .{ .index = @intCast(index), .generation = slot.header.generation };
+                var pending = false;
+                for (adapter.outbound) |out| if (out.active) switch (out.value) {
+                    .keyboard_repeat => |value| pending = pending or std.meta.eql(value, id),
+                    else => {},
+                };
+                needed += @intFromBool(!pending);
+            }
+            try adapter.ensureOutbound(needed);
+            adapter.repeat_rate = rate;
+            adapter.repeat_delay = delay;
+            for (adapter.keyboards.entries.items, 0..) |slot, index| {
+                if (!slot.header.active) continue;
+                const id: Id = .{ .index = @intCast(index), .generation = slot.header.generation };
+                var pending = false;
+                for (adapter.outbound) |out| if (out.active) switch (out.value) {
+                    .keyboard_repeat => |value| pending = pending or std.meta.eql(value, id),
+                    else => {},
+                };
+                if (!pending) adapter.enqueue(slot.client, .{ .keyboard_repeat = id }) catch unreachable;
+            }
+        }
+
         /// The caller owns the returned descriptor.
         pub fn duplicateKeymap(adapter: *const Self) !linux.fd_t {
             const duplicated = linux.dup(adapter.keymap_fd);
@@ -3352,6 +3384,30 @@ test "seat: version one resource does not receive seat name" {
     try std.testing.expectEqual(@as(usize, 1), try adapter.flushOn(&server_objects, &output));
     try std.testing.expectEqual(@as(usize, 0), output.queuedBytes());
     try std.testing.expectEqual(@as(usize, 0), adapter.pendingOutbound());
+}
+
+test "seat: repeat policy updates existing keyboards without duplicate outbound" {
+    var core: FakeCore = .{};
+    var adapter = try testAdapter(&core);
+    defer adapter.deinit();
+    const seat = try adapter.seats.acquire();
+    seat.peer = .{ .slot = 0, .generation = 1 };
+    const keyboard = try adapter.keyboards.acquire();
+    keyboard.seat_index = adapter.seatIndex(seat);
+    keyboard.seat_generation = seat.header.generation;
+    keyboard.client = clientId(seat.peer);
+
+    try adapter.setRepeatInfo(40, 250);
+    try std.testing.expectEqual(@as(usize, 1), countTestOutbound(&adapter, .keyboard_repeat));
+    var snapshot = adapter.keyboardSnapshot();
+    try std.testing.expectEqual(@as(i32, 40), snapshot.repeat_rate);
+    try std.testing.expectEqual(@as(i32, 250), snapshot.repeat_delay);
+
+    try adapter.setRepeatInfo(50, 200);
+    try std.testing.expectEqual(@as(usize, 1), countTestOutbound(&adapter, .keyboard_repeat));
+    snapshot = adapter.keyboardSnapshot();
+    try std.testing.expectEqual(@as(i32, 50), snapshot.repeat_rate);
+    try std.testing.expectEqual(@as(i32, 200), snapshot.repeat_delay);
 }
 
 test "seat: keymap FD delivery retains ownership across TX backpressure" {

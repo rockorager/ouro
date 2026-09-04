@@ -1819,7 +1819,24 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
                     slot.target_scene.geometry.height = slot.window_height;
                 }
             }
+            desktop.publishTargetVisibility();
             desktop.publishReadyScene();
+        }
+
+        /// Workspace visibility is compositor policy, not client-owned state.
+        /// Apply it immediately for established windows while geometry and
+        /// xdg_toplevel state continue to wait for the configure transaction.
+        fn publishTargetVisibility(desktop: *Self) void {
+            var changed = false;
+            for (desktop.slots) |*slot| {
+                if (!slot.header.active or slot.applied_configure == null or
+                    slot.scene.visible == slot.target_scene.visible) continue;
+                slot.scene.visible = slot.target_scene.visible;
+                changed = true;
+            }
+            if (!changed) return;
+            desktop.updatePopupScenes();
+            desktop.scene_changed = true;
         }
 
         fn validatePolicyOutput(desktop: *const Self, output: OutputId) !void {
@@ -3202,11 +3219,46 @@ test "desktop: outputs select independent workspaces and restore workspace focus
     try std.testing.expect(desktop.desired[third.index].visible);
 }
 
-test "desktop: workspace inventory publishes ten workspaces per output" {
+test "desktop: workspace switches publish established visibility without configure commits" {
+    var desktop = try initTestDesktop(8);
+    defer desktop.deinit();
+    var shell = TestShell{};
+    const output: TestDesktop.OutputId = .{ .value = 10 };
+    const topology = [_]TestDesktop.OutputArea{
+        .{ .id = output, .geometry = .{ .x = 0, .y = 0, .width = 100, .height = 60 } },
+    };
+    try desktop.validateTopology(.{ .x = 0, .y = 0, .width = 100, .height = 60 }, &topology);
+    desktop.applyTopology(.{ .x = 0, .y = 0, .width = 100, .height = 60 }, &topology);
+
+    desktop.setNextSpawnOutput(output);
+    shell.push(created(0));
+    _ = try desktop.consume(&shell, 1);
+    try settleDesktop(&desktop, &shell);
+    _ = desktop.takeSceneChanged();
+    const window = try desktop.idForShell(.{ .index = 0, .generation = 1 });
+    const established = try desktop.scene(window);
+    try std.testing.expect(established.visible);
+
+    try desktop.switchWorkspace(output, 2);
+    const hidden = try desktop.scene(window);
+    try std.testing.expect(!hidden.visible);
+    try std.testing.expectEqual(established.geometry, hidden.geometry);
+    try std.testing.expect(desktop.takeSceneChanged());
+
+    try desktop.switchWorkspace(output, 1);
+    const restored = try desktop.scene(window);
+    try std.testing.expect(restored.visible);
+    try std.testing.expectEqual(established.geometry, restored.geometry);
+    try std.testing.expect(desktop.takeSceneChanged());
+}
+
+test "desktop: workspace inventory publishes active and occupied workspaces" {
     var desktop = try initTestDesktop(4);
     defer desktop.deinit();
+    var shell = TestShell{};
+    const first_output: TestDesktop.OutputId = .{ .value = 10 };
     const topology = [_]TestDesktop.OutputArea{
-        .{ .id = .{ .value = 10 }, .geometry = .{ .x = 0, .y = 0, .width = 100, .height = 60 } },
+        .{ .id = first_output, .geometry = .{ .x = 0, .y = 0, .width = 100, .height = 60 } },
         .{ .id = .{ .value = 20 }, .geometry = .{ .x = 100, .y = 0, .width = 100, .height = 60 } },
     };
     try desktop.validateTopology(.{ .x = 0, .y = 0, .width = 200, .height = 60 }, &topology);
@@ -3216,18 +3268,49 @@ test "desktop: workspace inventory publishes ten workspaces per output" {
     try desktop.writeWorkspaceInventory(&initial);
     try std.testing.expectEqual(@as(usize, 2), initial.groups);
     try std.testing.expectEqual(@as(usize, 2), initial.outputs);
-    try std.testing.expectEqual(@as(usize, 20), initial.workspaces);
+    try std.testing.expectEqual(@as(usize, 2), initial.workspaces);
     try std.testing.expectEqual(@as(usize, 2), initial.active);
-    try std.testing.expect(!initial.second_active);
+    try std.testing.expect(initial.second_workspace == null);
+
+    const initial_revision = desktop.workspaceRevision();
+    desktop.setNextSpawnOutput(first_output);
+    shell.push(created(0));
+    _ = try desktop.consume(&shell, 1);
+    try std.testing.expectEqual(initial_revision, desktop.workspaceRevision());
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expect(!std.meta.eql(desktop.workspaceRevision(), initial_revision));
+
+    var mapped: TestWorkspaceWriter = .{};
+    try desktop.writeWorkspaceInventory(&mapped);
+    try std.testing.expectEqual(@as(usize, 2), mapped.workspaces);
+
+    try desktop.moveFocusedToWorkspace(2);
+    var occupied: TestWorkspaceWriter = .{};
+    try desktop.writeWorkspaceInventory(&occupied);
+    try std.testing.expectEqual(@as(usize, 3), occupied.workspaces);
+    try std.testing.expectEqual(@as(usize, 2), occupied.active);
+    try std.testing.expect(occupied.second_workspace != null);
+    try std.testing.expect(!occupied.second_active);
 
     try std.testing.expect(try desktop.requestWorkspace(.{
-        .workspace = initial.second_workspace.?,
+        .workspace = occupied.second_workspace.?,
         .kind = .activate,
     }));
-    var updated: TestWorkspaceWriter = .{ .second_workspace = initial.second_workspace };
+    var updated: TestWorkspaceWriter = .{ .second_workspace = occupied.second_workspace };
     try desktop.writeWorkspaceInventory(&updated);
+    try std.testing.expectEqual(@as(usize, 2), updated.workspaces);
     try std.testing.expectEqual(@as(usize, 2), updated.active);
     try std.testing.expect(updated.second_active);
+
+    try desktop.switchWorkspace(first_output, 1);
+    const before_destroy = desktop.workspaceRevision();
+    shell.push(.{ .toplevel_destroyed = .{ .index = 0, .generation = 1 } });
+    _ = try desktop.consume(&shell, 1);
+    try std.testing.expect(!std.meta.eql(desktop.workspaceRevision(), before_destroy));
+    var destroyed: TestWorkspaceWriter = .{};
+    try desktop.writeWorkspaceInventory(&destroyed);
+    try std.testing.expectEqual(@as(usize, 2), destroyed.workspaces);
+    try std.testing.expect(destroyed.second_workspace == null);
 }
 
 test "desktop: windows follow the largest output when primary changes" {

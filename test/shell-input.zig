@@ -583,7 +583,7 @@ test "shell-input: generated workspace client observes output workspaces and act
     }
     try std.testing.expect(handler.manager != null);
     try std.testing.expect(handler.group_count >= 1);
-    try std.testing.expect(handler.workspace_count >= 10);
+    try std.testing.expect(handler.workspace_count >= 1);
     try std.testing.expectEqual(handler.workspace_count, handler.workspace_ids);
     try std.testing.expect(handler.active_states >= 1);
     try std.testing.expectEqual(handler.workspace_count, handler.workspace_enter);
@@ -699,7 +699,7 @@ const WorkspaceHandler = struct {
                 .workspace => |value| {
                     const admitted = try protocol.ext_workspace_manager_v1.admit_event_workspace(self.objects, self.manager.?, value, .{});
                     self.workspaces[self.workspace_count] = admitted.workspace;
-                    if (self.workspace_count == 1) self.target_workspace = admitted.workspace;
+                    if (self.workspace_count == 0) self.target_workspace = admitted.workspace;
                     self.workspace_count += 1;
                 },
                 .done => {
