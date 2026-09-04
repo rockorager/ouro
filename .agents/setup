@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+libinput_version=1.28.1
 packages=(glslang-tools libdrm-dev libgbm-dev libinput-dev libpixman-1-dev libseat-dev libudev-dev libvulkan-dev libxkbcommon-dev pkg-config)
+# Debian 12's libinput lacks the three-finger-drag configuration API.
+if ! pkg-config --atleast-version="$libinput_version" libinput; then
+    packages+=(build-essential meson ninja-build libevdev-dev libmtdev-dev libwacom-dev)
+fi
 missing=()
 for package in "${packages[@]}"; do
     if ! dpkg-query -W -f='${db:Status-Abbrev}' "$package" 2>/dev/null | grep -q '^ii '; then
@@ -11,6 +16,29 @@ done
 if ((${#missing[@]})); then
     sudo apt-get update
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"
+fi
+
+if ! pkg-config --atleast-version="$libinput_version" libinput; then
+    (
+        echo "Building libinput $libinput_version"
+        temporary="$(mktemp -d)"
+        trap 'rm -rf "$temporary"' EXIT
+        archive="libinput_$libinput_version.orig.tar.gz"
+        checksum=a13f8c9a7d93df3c85c66afd135f0296701d8d32f911991b7aa4273fdd6a42a3
+        curl --fail --location --silent --show-error \
+            "https://deb.debian.org/debian/pool/main/libi/libinput/$archive" \
+            --output "$temporary/$archive"
+        echo "$checksum  $temporary/$archive" | sha256sum --check --status
+        tar -xzf "$temporary/$archive" -C "$temporary"
+        # A distinct include path keeps Zig from preferring Debian's older header.
+        meson setup "$temporary/build" "$temporary/libinput-$libinput_version" \
+            --prefix=/usr/local --libdir=lib --includedir=include/libinput \
+            --buildtype=release \
+            -Dtests=false -Ddocumentation=false -Ddebug-gui=false
+        meson compile -C "$temporary/build"
+        sudo meson install -C "$temporary/build"
+        sudo ldconfig
+    )
 fi
 
 zig_version=0.16.0
