@@ -11290,11 +11290,6 @@ pub fn Coordinator(comptime protocol: type) type {
         fn retryRetiredSource(self: *Self, layer: *Layer) !bool {
             const source = &(layer.retired_source orelse return false);
             if (!source.releasable) return false;
-            if (!self.peerLive(source.peer)) {
-                source.content.deinit();
-                layer.retired_source = null;
-                return true;
-            }
             if (!try self.releaseSource(source.peer, &source.content)) return false;
             source.content.deinit();
             layer.retired_source = null;
