@@ -777,7 +777,7 @@ pub fn Policy(
                 else
                     false else false,
                 .resizing = state_value.resizing,
-                .suspended = state_value.minimized,
+                .suspended = !visible,
             };
         }
 

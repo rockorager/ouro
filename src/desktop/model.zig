@@ -3219,7 +3219,7 @@ test "desktop: outputs select independent workspaces and restore workspace focus
     try std.testing.expect(desktop.desired[third.index].visible);
 }
 
-test "desktop: workspace switches publish established visibility without configure commits" {
+test "desktop: workspace switches publish visibility before suspended configures commit" {
     var desktop = try initTestDesktop(8);
     defer desktop.deinit();
     var shell = TestShell{};
@@ -3242,12 +3242,16 @@ test "desktop: workspace switches publish established visibility without configu
     try desktop.switchWorkspace(output, 2);
     const hidden = try desktop.scene(window);
     try std.testing.expect(!hidden.visible);
+    try std.testing.expect(desktop.desired[window.index].suspended);
+    try std.testing.expect(desktop.slots[window.index].last_configure.states.suspended);
     try std.testing.expectEqual(established.geometry, hidden.geometry);
     try std.testing.expect(desktop.takeSceneChanged());
 
     try desktop.switchWorkspace(output, 1);
     const restored = try desktop.scene(window);
     try std.testing.expect(restored.visible);
+    try std.testing.expect(!desktop.desired[window.index].suspended);
+    try std.testing.expect(!desktop.slots[window.index].last_configure.states.suspended);
     try std.testing.expectEqual(established.geometry, restored.geometry);
     try std.testing.expect(desktop.takeSceneChanged());
 }

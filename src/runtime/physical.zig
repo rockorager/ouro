@@ -5836,6 +5836,14 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.retryPointerReconcile();
             try self.syncIdleNotifications();
             _ = self.refreshRetainedLayersForOutput();
+            const now = try monotonicNs();
+            for (self.app_layers[0..self.app_layer_count]) |*layer| {
+                if (!layer.active or self.appLayerOutputTrackingPending(layer)) continue;
+                const id = layer.id orelse continue;
+                const scene = self.surfaceScene(id) orelse continue;
+                if (!scene.root.visible) continue;
+                _ = try self.requestLayerOutputDamage(layer, now);
+            }
             try self.requestOutputDamage();
         }
 
@@ -8452,6 +8460,17 @@ pub fn Coordinator(comptime protocol: type) type {
                     self.adapter.clearFifoBarriers();
                 if (applied) {
                     if (self.findAppLayerAwaitingDamage(pending.id)) |layer| {
+                        if (layer.id) |id| if (self.surfaceScene(id)) |scene| {
+                            if (!scene.root.visible) {
+                                if (layer.presentation != null) {
+                                    layer.feedback_outcome = .discarded;
+                                    layer.outcome_pending = true;
+                                    _ = try self.retryLayerOutcome(layer);
+                                    _ = try self.retryRetiredSource(layer);
+                                }
+                                continue;
+                            }
+                        };
                         const now = damage_requested_at orelse blk: {
                             const value = try monotonicNs();
                             damage_requested_at = value;
@@ -8459,6 +8478,8 @@ pub fn Coordinator(comptime protocol: type) type {
                         };
                         _ = try self.requestLayerOutputDamage(layer, now);
                     } else {
+                        if (self.surfaceScene(pending.id)) |scene|
+                            if (!scene.root.visible) continue;
                         global_damage = true;
                     }
                 }
