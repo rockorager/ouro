@@ -579,6 +579,7 @@ pub const Output = struct {
             try self.platform.addProperty(request, self.connector.id, self.connector.properties.crtc_id, self.crtc.id);
             try self.platform.addProperty(request, self.crtc.id, self.crtc.properties.mode_id, self.mode_blob);
             try self.platform.addProperty(request, self.crtc.id, self.crtc.properties.active, 1);
+            try self.addSdrConnectorState(request, false);
             if (self.crtc.properties.vrr_enabled != 0)
                 try self.platform.addProperty(
                     request,
@@ -621,6 +622,7 @@ pub const Output = struct {
         try self.platform.addProperty(request, self.connector.id, self.connector.properties.crtc_id, 0);
         try self.platform.addProperty(request, self.crtc.id, self.crtc.properties.active, 0);
         try self.platform.addProperty(request, self.crtc.id, self.crtc.properties.mode_id, 0);
+        try self.addSdrConnectorState(request, true);
         if (self.crtc.properties.vrr_enabled != 0)
             try self.platform.addProperty(request, self.crtc.id, self.crtc.properties.vrr_enabled, 0);
         self.platform.commit(fd, request, .{ .allow_modeset = true }, null) catch |err| {
@@ -634,6 +636,29 @@ pub const Output = struct {
         self.platform.resetRequest(request);
         try self.pushEvent(.paused);
         self.state = .paused;
+    }
+
+    fn addSdrConnectorState(
+        self: *const Output,
+        request: atomic.Request,
+        restore_link_depth: bool,
+    ) !void {
+        const properties = self.connector.properties;
+        if (properties.colorspace.id != 0) if (properties.colorspace.default) |value|
+            try self.platform.addProperty(request, self.connector.id, properties.colorspace.id, value);
+        if (properties.hdr_output_metadata.id != 0)
+            try self.platform.addProperty(request, self.connector.id, properties.hdr_output_metadata.id, 0);
+        if (properties.max_bpc.id != 0) {
+            const value = if (restore_link_depth)
+                properties.max_bpc.inherited
+            else
+                std.math.clamp(
+                    @as(u64, 8),
+                    properties.max_bpc.minimum,
+                    properties.max_bpc.maximum,
+                );
+            try self.platform.addProperty(request, self.connector.id, properties.max_bpc.id, value);
+        }
     }
 
     fn rollbackQueued(self: *Output) !void {
@@ -908,6 +933,50 @@ test "kms: adaptive sync requires capability and programs exact CRTC property" {
     try output.queue(fixture.acquire(0), null);
     try output.commitQueued();
     try std.testing.expect(fixture.atomic_state.hasProperty(20, 24, 1));
+    try output.terminalDeviceTeardown();
+    try fixture.drainAndDestroy(output);
+}
+
+test "kms: modeset owns SDR connector state and disable restores link depth" {
+    var fixture = Fixture{};
+    fixture.connector[0].properties.colorspace = .{
+        .id = 51,
+        .inherited = 9,
+        .default = 3,
+        .bt2020_rgb = 9,
+    };
+    fixture.connector[0].properties.hdr_output_metadata = .{ .id = 52, .inherited = 88 };
+    fixture.connector[0].properties.max_bpc = .{
+        .id = 53,
+        .inherited = 12,
+        .minimum = 6,
+        .maximum = 16,
+    };
+    const output = try fixture.create(.{});
+    try output.queue(fixture.acquire(0), null);
+    try output.commitQueued();
+    try std.testing.expect(fixture.atomic_state.hasProperty(10, 51, 3));
+    try std.testing.expect(fixture.atomic_state.hasProperty(10, 52, 0));
+    try std.testing.expect(fixture.atomic_state.hasProperty(10, 53, 8));
+    fixture.flip(output, fixture.crtc[0].id, false);
+    try output.processCallbacks();
+    try output.requestPause();
+    try std.testing.expect(fixture.atomic_state.hasProperty(10, 53, 12));
+    try fixture.drainAndDestroy(output);
+}
+
+test "kms: SDR link depth is clamped to connector range" {
+    var fixture = Fixture{};
+    fixture.connector[0].properties.max_bpc = .{
+        .id = 53,
+        .inherited = 12,
+        .minimum = 10,
+        .maximum = 16,
+    };
+    const output = try fixture.create(.{});
+    try output.queue(fixture.acquire(0), null);
+    try output.commitQueued();
+    try std.testing.expect(fixture.atomic_state.hasProperty(10, 53, 10));
     try output.terminalDeviceTeardown();
     try fixture.drainAndDestroy(output);
 }
