@@ -1000,6 +1000,28 @@ pub fn Adapter(comptime protocol: type) type {
             return slot.region.copyOperations(destination);
         }
 
+        /// Copies one wl_region into the pending background-blur state of a
+        /// live surface. Null clears the pending region. Publication remains
+        /// synchronized with that surface's next wl_surface.commit.
+        pub fn setBlurRegionOn(
+            adapter: *Self,
+            server_objects: anytype,
+            surface: SurfaceId,
+            region_id: ?u32,
+        ) !void {
+            const destination = &(try adapter.surfaceForId(surface)).regions;
+            const source = if (region_id) |id| source: {
+                const handle = server_objects.namespace.lookupHandle(id) orelse
+                    return error.UnknownObject;
+                const object = server_objects.namespace.resolve(handle) orelse
+                    return error.UnknownObject;
+                const slot = adapter.regionFromObject(object) orelse return error.WrongOwner;
+                if (!std.meta.eql(slot.resource, handle)) return error.StaleHandle;
+                break :source &slot.region;
+            } else null;
+            try destination.setBlur(source);
+        }
+
         pub fn surfaceIdObject(
             adapter: *Self,
             handle: objects.Handle,

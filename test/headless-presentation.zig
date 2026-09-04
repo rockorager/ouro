@@ -802,11 +802,19 @@ fn drainClient(
 }
 
 fn waitForEither(server: *linux.IoUring, client: *linux.IoUring) !void {
-    for (0..1_000_000) |_| {
-        if (server.cq_ready() != 0 or client.cq_ready() != 0) return;
-        _ = linux.sched_yield();
+    if (server.cq_ready() != 0 or client.cq_ready() != 0) return;
+    var descriptors = [_]std.posix.pollfd{
+        .{ .fd = server.fd, .events = linux.POLL.IN, .revents = 0 },
+        .{ .fd = client.fd, .events = linux.POLL.IN, .revents = 0 },
+    };
+    if (try std.posix.poll(&descriptors, 10) == 0) return;
+    for (descriptors) |descriptor| if (descriptor.revents &
+        (linux.POLL.ERR | linux.POLL.HUP | linux.POLL.NVAL) != 0)
+        return error.CompletionWaitFailed;
+    if (server.cq_ready() == 0 and client.cq_ready() == 0) {
+        const delay: linux.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
+        _ = linux.nanosleep(&delay, null);
     }
-    return error.CompletionTimeout;
 }
 
 fn ordinaryMemfd(size: usize, offset: usize, bytes: []const u8) !linux.fd_t {

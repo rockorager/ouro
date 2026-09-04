@@ -822,6 +822,7 @@ pub fn CommitState(comptime Key: type) type {
         pub const Content = struct {
             surface: Update,
             regions: SurfaceRegions.Changes,
+            effects: SurfaceRegions.EffectSnapshot,
             frame_callbacks: ?FrameBatch,
             release_callbacks: ?ReleaseBatch,
             presentation_feedback: ?PresentationFeedbackBatch,
@@ -830,6 +831,7 @@ pub fn CommitState(comptime Key: type) type {
             /// Releases callback and import ownership when an unapplied CU is discarded.
             pub fn deinit(content: *Content) void {
                 content.surface.discardExplicitSync();
+                content.effects.deinit();
                 if (content.frame_callbacks) |*batch| batch.deinit();
                 if (content.release_callbacks) |*batch| batch.deinit();
                 if (content.presentation_feedback) |*batch| batch.deinit();
@@ -979,11 +981,14 @@ pub fn CommitState(comptime Key: type) type {
             );
             var region_plan = try regions.prepareCommit();
             defer region_plan.deinit();
+            var effects = try region_plan.effectSnapshot();
+            errdefer effects.deinit();
             try releases.validateCommit(surface.hasPendingBufferAttachment());
 
             const content: Content = .{
                 .surface = surface.publishCommit(),
                 .regions = region_plan.publish(),
+                .effects = effects,
                 .frame_callbacks = frames.detachPending(),
                 .release_callbacks = releases.publishCommit(),
                 .presentation_feedback = if (feedback) |pending| pending.publishCommit() else null,

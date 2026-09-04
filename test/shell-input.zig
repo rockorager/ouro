@@ -319,7 +319,7 @@ test "shell-input: generated transient seat publishes before ready and retires i
     root_config.runtime.object_capacity = 32;
     root_config.runtime.object_quota = 24;
     root_config.runtime.registry_capacity = 1;
-    root_config.runtime.max_globals = 68;
+    root_config.runtime.max_globals = 69;
     const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), root_config);
     var config = physical_fixture.coordinatorConfig();
     config.router_capacity = 24;
@@ -638,7 +638,8 @@ test "shell-input: generated workspace client observes output workspaces and act
         const progress = try loop.turn(coordinator);
         drained = progress.wayring.shutdown_complete and cp.quiescent and coordinator.backendDrainComplete();
         if (drained) break;
-        _ = linux.sched_yield();
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
     }
     try std.testing.expect(drained);
     try client.deinit(allocator);
@@ -2584,6 +2585,16 @@ test "shell-input: secondary output removal closes its reactive layer popup root
         .{ .completion_batch = 16 },
     );
     try coordinator.start(&loop);
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    for (0..128) |_| {
+        const progress = try loop.turn(coordinator);
+        if (coordinator.physical_output_count == 2 and
+            coordinator.physical_outputs[0].kms_output != null and
+            coordinator.physical_outputs[1].kms_output != null) break;
+        if (!progress.needs_more_work and root.ring.cq_ready() == 0)
+            try waitServer(&root.ring);
+    }
 
     var client_reactor: wayring.io_uring.Reactor = undefined;
     try client_reactor.initOwned(
@@ -2612,9 +2623,6 @@ test "shell-input: secondary output removal closes its reactive layer popup root
         .require_layer_enter_before_map = true,
     };
     try submitLayerPopupClient(&client_reactor, &driver, &handler);
-
-    _ = try loop.turn(coordinator);
-    try fixture.signalSession(.enable);
     var client_progress: ClientDriver.Progress = .{};
     var observed = false;
     for (0..512) |_| {
@@ -7224,28 +7232,43 @@ fn submitClient(
 }
 
 fn waitForEither(server: *linux.IoUring, client: *linux.IoUring) !void {
-    for (0..10_000_000) |_| {
-        if (server.cq_ready() != 0 or client.cq_ready() != 0) return;
-        _ = linux.sched_yield();
-    }
-    return error.CompletionTimeout;
+    return waitForAny(server, client, null);
 }
 
-fn waitForAny(first: *linux.IoUring, second: *linux.IoUring, third: *linux.IoUring) !void {
-    for (0..10_000_000) |_| {
-        if (first.cq_ready() != 0 or second.cq_ready() != 0 or third.cq_ready() != 0)
-            return;
-        _ = linux.sched_yield();
+fn waitForAny(first: *linux.IoUring, second: *linux.IoUring, third: ?*linux.IoUring) !void {
+    if (first.cq_ready() != 0 or second.cq_ready() != 0 or
+        (third != null and third.?.cq_ready() != 0)) return;
+    var descriptors: [3]std.posix.pollfd = .{
+        .{ .fd = first.fd, .events = linux.POLL.IN, .revents = 0 },
+        .{ .fd = second.fd, .events = linux.POLL.IN, .revents = 0 },
+        .{ .fd = if (third) |ring| ring.fd else -1, .events = linux.POLL.IN, .revents = 0 },
+    };
+    const active = if (third == null) descriptors[0..2] else descriptors[0..3];
+    // Some compositor transitions need another outer-loop turn without first
+    // producing a CQE. Keep this as a bounded sleep; the enclosing test loop
+    // owns the actual progress deadline and terminal assertion.
+    if (try std.posix.poll(active, 10) == 0) return;
+    for (active) |descriptor| if (descriptor.revents &
+        (linux.POLL.ERR | linux.POLL.HUP | linux.POLL.NVAL) != 0)
+        return error.CompletionWaitFailed;
+    if (first.cq_ready() == 0 and second.cq_ready() == 0 and
+        (third == null or third.?.cq_ready() == 0))
+    {
+        const delay: linux.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
+        _ = linux.nanosleep(&delay, null);
     }
-    return error.CompletionTimeout;
 }
 
 fn waitServer(server: *linux.IoUring) !void {
-    for (0..1_000_000) |_| {
-        if (server.cq_ready() != 0) return;
-        _ = linux.sched_yield();
-    }
-    return error.CompletionTimeout;
+    if (server.cq_ready() != 0) return;
+    var descriptors = [_]std.posix.pollfd{.{
+        .fd = server.fd,
+        .events = linux.POLL.IN,
+        .revents = 0,
+    }};
+    if (try std.posix.poll(&descriptors, 5_000) == 0) return error.CompletionTimeout;
+    if (descriptors[0].revents & (linux.POLL.ERR | linux.POLL.HUP | linux.POLL.NVAL) != 0 or
+        server.cq_ready() == 0) return error.CompletionWaitFailed;
 }
 
 fn ordinaryMemfd(size: usize, offset: usize, bytes: []const u8) !linux.fd_t {

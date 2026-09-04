@@ -1,0 +1,49 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 5, rgba16f) uniform image2D linear_image;
+layout(set = 0, binding = 7, rgba16f) uniform image2D blur_image;
+layout(set = 0, binding = 8) uniform sampler2D linear_source;
+layout(set = 0, binding = 9) uniform sampler2D blur_source;
+
+layout(push_constant) uniform Frame {
+    uvec4 unused_clear;
+    uvec4 output_info;
+    uvec4 damage;
+    uvec4 blur_info; // direction, scale bits, unused, unused
+} frame;
+
+const float center_weight = 0.0499767536;
+const float weights[12] = float[](
+    0.0980269620, 0.0906877868, 0.0788341890, 0.0643936182,
+    0.0494234786, 0.0356439502, 0.0241546147, 0.0153806911,
+    0.0092026449, 0.0051738061, 0.0027331774, 0.0013567042
+);
+const float offsets[12] = float[](
+    1.4941408932, 3.4863315314, 5.4785288375, 7.4707366066,
+    9.4629586132, 11.4551986043, 13.4474602919, 15.4397473464,
+    17.4320633892, 19.4244119867, 21.4167966432, 23.4092207951
+);
+
+void main() {
+    ivec2 local = ivec2(gl_GlobalInvocationID.xy);
+    if (local.x >= int(frame.damage.z) || local.y >= int(frame.damage.w)) return;
+    ivec2 pixel = ivec2(frame.damage.xy) + local;
+    vec2 extent = vec2(frame.output_info.xy);
+    vec2 uv = (vec2(pixel) + vec2(0.5)) / extent;
+    float scale = uintBitsToFloat(frame.blur_info.y);
+    bool vertical = frame.blur_info.x != 0u;
+    vec2 axis = vertical ? vec2(0.0, 1.0 / extent.y) : vec2(1.0 / extent.x, 0.0);
+    vec4 color = (vertical ? texture(blur_source, uv) : texture(linear_source, uv)) * center_weight;
+    for (int index = 0; index < 12; ++index) {
+        vec2 delta = axis * offsets[index] * scale;
+        vec4 pair = vertical
+            ? texture(blur_source, uv - delta) + texture(blur_source, uv + delta)
+            : texture(linear_source, uv - delta) + texture(linear_source, uv + delta);
+        color += pair * weights[index];
+    }
+    if (vertical)
+        imageStore(linear_image, pixel, color);
+    else
+        imageStore(blur_image, pixel, color);
+}

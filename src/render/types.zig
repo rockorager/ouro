@@ -7,6 +7,7 @@
 
 const std = @import("std");
 pub const color = @import("color.zig");
+pub const RegionOperation = @import("../region.zig").Operation;
 
 pub const fixed_one: i32 = 1 << 16;
 
@@ -156,6 +157,10 @@ pub const SurfaceSample = struct {
     clip: Rect,
     transform: Transform = .normal,
     global_alpha: u8 = 255,
+    /// Surface-local effect geometry. A zero effect size disables all effects.
+    effect_size: Size = .{ .width = 0, .height = 0 },
+    opaque_region: []const RegionOperation = &.{},
+    blur_region: []const RegionOperation = &.{},
     color_description: color.Description = .srgb,
     color_representation: color.Representation = .{},
 };
@@ -190,6 +195,7 @@ pub const PlannedSample = struct {
 /// All slices borrow the planner until its next successful prepare.
 pub const DamagePlan = struct {
     output: Size,
+    output_transform: Transform = .normal,
     samples: []const PlannedSample,
     client_damage: []const Rect,
     scene_damage: []const Rect,
@@ -274,7 +280,43 @@ pub fn validateSample(sample: SurfaceSample) ValidationError!usize {
         return error.InvalidCrop;
     if (!validRect(sample.destination)) return error.InvalidDestination;
     if (!validRect(sample.clip)) return error.InvalidClip;
+    if ((sample.effect_size.width == 0) != (sample.effect_size.height == 0))
+        return error.InvalidDestination;
     return length;
+}
+
+/// True when a background effect can contribute visible pixels. Whole-buffer
+/// opacity is sufficient to prove the blur invisible without inspecting region
+/// geometry; renderers additionally skip declared opaque subregions per pixel.
+pub fn hasVisibleBlur(sample: SurfaceSample) bool {
+    return sample.blur_region.len != 0 and sample.effect_size.width != 0 and
+        !(sample.global_alpha == 255 and
+            (sample.source.format == .xrgb8888 or effectRegionCoversSurface(
+                sample.opaque_region,
+                sample.effect_size,
+            )));
+}
+
+/// Recognizes the common exact full-surface opaque declaration without
+/// allocating canonical geometry. False negatives only retain the slower
+/// renderer check; they never suppress a visible effect.
+fn effectRegionCoversSurface(operations: []const RegionOperation, size: Size) bool {
+    var covered = false;
+    for (operations) |operation| switch (operation) {
+        .add => |rect| {
+            if (rect.x <= 0 and rect.y <= 0 and
+                @as(i64, rect.x) + rect.width >= size.width and
+                @as(i64, rect.y) + rect.height >= size.height)
+                covered = true;
+        },
+        .subtract => |rect| {
+            if (@as(i64, rect.x) < size.width and @as(i64, rect.y) < size.height and
+                @as(i64, rect.x) + rect.width > 0 and
+                @as(i64, rect.y) + rect.height > 0)
+                covered = false;
+        },
+    };
+    return covered;
 }
 
 fn validRect(rect: Rect) bool {

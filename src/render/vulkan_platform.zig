@@ -66,6 +66,7 @@ pub const CaptureDestination = struct {
 
 pub const Frame = struct {
     output: render.Size,
+    output_transform: render.Transform = .normal,
     output_format: render.PixelFormat,
     output_color_description: render.color.Description = .srgb,
     output_lut_slot: ?u32 = null,
@@ -300,6 +301,8 @@ const RealRenderer = struct {
     descriptor_pool: c.VkDescriptorPool,
     sampled_pipeline: ?c.VkPipeline,
     sampler: ?c.VkSampler,
+    blur_pipeline: ?c.VkPipeline,
+    blur_sampler: ?c.VkSampler,
     cache: []CacheEntry,
     prepared: []PreparedTexture,
     sampled_enabled: bool,
@@ -338,6 +341,10 @@ const RealTarget = struct {
     linear_image: c.VkImage,
     linear_memory: c.VkDeviceMemory,
     linear_view: c.VkImageView,
+    blur_image: c.VkImage,
+    blur_memory: c.VkDeviceMemory,
+    blur_view: c.VkImageView,
+    blur_initialized_layout: bool = false,
     sample_buffer: c.VkBuffer,
     sample_memory: c.VkDeviceMemory,
     sample_map: *anyopaque,
@@ -582,7 +589,7 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
         return error.InvalidConfig;
     const descriptor_count = std.math.mul(usize, config.max_targets, 3) catch
         return error.InvalidConfig;
-    const storage_image_count = std.math.mul(usize, config.max_targets, 2) catch
+    const storage_image_count = std.math.mul(usize, config.max_targets, 3) catch
         return error.InvalidConfig;
     const lut_texels = std.math.mul(usize, config.max_color_luts, icc.texel_count) catch
         return error.InvalidConfig;
@@ -591,7 +598,7 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
     const sampled_descriptor_count = std.math.mul(
         usize,
         config.max_targets,
-        sampled_image_capacity,
+        sampled_image_capacity + 2,
     ) catch return error.InvalidConfig;
     if (physical_properties.apiVersion < c.VK_API_VERSION_1_2 or
         sample_size == 0 or sample_size > physical_properties.limits.maxStorageBufferRange or
@@ -606,16 +613,16 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
         storage_image_count > std.math.maxInt(u32) or
         physical_properties.limits.maxPerStageDescriptorStorageBuffers < 4 or
         physical_properties.limits.maxDescriptorSetStorageBuffers < 4 or
-        physical_properties.limits.maxPerStageDescriptorStorageImages < 2 or
-        physical_properties.limits.maxDescriptorSetStorageImages < 2)
+        physical_properties.limits.maxPerStageDescriptorStorageImages < 3 or
+        physical_properties.limits.maxDescriptorSetStorageImages < 3)
         return error.InvalidConfig;
     self.sampled_enabled = config.max_samples <= sampled_image_capacity and
         sampled_descriptor_count <= std.math.maxInt(u32) and
         physical_features.shaderSampledImageArrayDynamicIndexing == c.VK_TRUE and
-        physical_properties.limits.maxPerStageDescriptorSampledImages >= sampled_image_capacity and
-        physical_properties.limits.maxDescriptorSetSampledImages >= sampled_image_capacity and
-        physical_properties.limits.maxPerStageDescriptorSamplers >= sampled_image_capacity and
-        physical_properties.limits.maxDescriptorSetSamplers >= sampled_image_capacity and
+        physical_properties.limits.maxPerStageDescriptorSampledImages >= sampled_image_capacity + 2 and
+        physical_properties.limits.maxDescriptorSetSampledImages >= sampled_image_capacity + 2 and
+        physical_properties.limits.maxPerStageDescriptorSamplers >= sampled_image_capacity + 2 and
+        physical_properties.limits.maxDescriptorSetSamplers >= sampled_image_capacity + 2 and
         source_format.optimalTilingFeatures &
             (c.VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | c.VK_FORMAT_FEATURE_TRANSFER_DST_BIT) ==
             (c.VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | c.VK_FORMAT_FEATURE_TRANSFER_DST_BIT);
@@ -669,12 +676,15 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
             .stageFlags = c.VK_SHADER_STAGE_COMPUTE_BIT,
             .pImmutableSamplers = null,
         },
+        descriptorBinding(7, c.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE),
+        descriptorBinding(8, c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER),
+        descriptorBinding(9, c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER),
     };
     var descriptor_info: c.VkDescriptorSetLayoutCreateInfo = .{
         .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
         .pNext = null,
         .flags = 0,
-        .bindingCount = if (self.sampled_enabled) bindings.len else bindings.len - 1,
+        .bindingCount = if (self.sampled_enabled) bindings.len else 6,
         .pBindings = &bindings,
     };
     try vk(c.vkCreateDescriptorSetLayout(self.device, &descriptor_info, null, &self.descriptor_layout), error.CreateDescriptorLayoutFailed);
@@ -714,6 +724,7 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
     try vk(c.vkCreateComputePipelines(self.device, null, 1, &pipeline_info, null, &self.pipeline), error.CreatePipelineFailed);
     errdefer c.vkDestroyPipeline(self.device, self.pipeline, null);
     self.sampled_pipeline = null;
+    self.blur_pipeline = null;
     if (self.sampled_enabled) {
         const sampled_shader_bytes align(@alignOf(u32)) = @embedFile("vulkan_texture_composite.spv").*;
         var sampled_shader_info = shader_info;
@@ -740,8 +751,23 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
             error.CreatePipelineFailed,
         );
         self.sampled_pipeline = sampled_pipeline;
+
+        const blur_shader_bytes align(@alignOf(u32)) = @embedFile("vulkan_backdrop_blur.spv").*;
+        var blur_shader_info = shader_info;
+        blur_shader_info.codeSize = blur_shader_bytes.len;
+        blur_shader_info.pCode = @ptrCast(&blur_shader_bytes);
+        var blur_shader: c.VkShaderModule = undefined;
+        try vk(c.vkCreateShaderModule(self.device, &blur_shader_info, null, &blur_shader), error.CreateShaderFailed);
+        defer c.vkDestroyShaderModule(self.device, blur_shader, null);
+        var blur_pipeline_info = pipeline_info;
+        blur_pipeline_info.stage.module = blur_shader;
+        var blur_pipeline: c.VkPipeline = undefined;
+        try vk(c.vkCreateComputePipelines(self.device, null, 1, &blur_pipeline_info, null, &blur_pipeline), error.CreatePipelineFailed);
+        self.blur_pipeline = blur_pipeline;
     }
     errdefer if (self.sampled_pipeline) |pipeline|
+        c.vkDestroyPipeline(self.device, pipeline, null);
+    errdefer if (self.blur_pipeline) |pipeline|
         c.vkDestroyPipeline(self.device, pipeline, null);
     const pool_sizes = [_]c.VkDescriptorPoolSize{
         .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = @intCast(storage_image_count) },
@@ -765,6 +791,7 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
     try vk(c.vkCreateDescriptorPool(self.device, &pool_info, null, &self.descriptor_pool), error.CreateDescriptorPoolFailed);
     errdefer c.vkDestroyDescriptorPool(self.device, self.descriptor_pool, null);
     self.sampler = null;
+    self.blur_sampler = null;
     self.cache = &.{};
     self.prepared = &.{};
     if (self.sampled_enabled) {
@@ -792,6 +819,12 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
         try vk(c.vkCreateSampler(self.device, &sampler_info, null, &sampler), error.CreateSamplerFailed);
         self.sampler = sampler;
         errdefer c.vkDestroySampler(self.device, sampler, null);
+        sampler_info.magFilter = c.VK_FILTER_LINEAR;
+        sampler_info.minFilter = c.VK_FILTER_LINEAR;
+        var blur_sampler: c.VkSampler = undefined;
+        try vk(c.vkCreateSampler(self.device, &sampler_info, null, &blur_sampler), error.CreateSamplerFailed);
+        self.blur_sampler = blur_sampler;
+        errdefer c.vkDestroySampler(self.device, blur_sampler, null);
         self.cache = try allocator.alloc(CacheEntry, config.max_samples);
         @memset(self.cache, .{});
         errdefer allocator.free(self.cache);
@@ -887,8 +920,10 @@ fn realDestroy(_: *anyopaque, renderer: Renderer) void {
     std.heap.c_allocator.free(self.prepared);
     std.heap.c_allocator.free(self.cache);
     if (self.sampler) |sampler| c.vkDestroySampler(self.device, sampler, null);
+    if (self.blur_sampler) |sampler| c.vkDestroySampler(self.device, sampler, null);
     c.vkDestroyDescriptorPool(self.device, self.descriptor_pool, null);
     if (self.sampled_pipeline) |pipeline| c.vkDestroyPipeline(self.device, pipeline, null);
+    if (self.blur_pipeline) |pipeline| c.vkDestroyPipeline(self.device, pipeline, null);
     c.vkDestroyPipeline(self.device, self.pipeline, null);
     c.vkDestroyPipelineLayout(self.device, self.pipeline_layout, null);
     c.vkDestroyDescriptorSetLayout(self.device, self.descriptor_layout, null);
@@ -1727,6 +1762,10 @@ fn realImportTarget(_: *anyopaque, renderer: Renderer, metadata: gbm.Metadata, d
         &target.linear_view,
     );
     errdefer destroyLinearImage(self, target);
+    target.blur_image = null;
+    target.blur_memory = null;
+    target.blur_view = null;
+    target.blur_initialized_layout = false;
 
     target.sample_buffer = null;
     target.sample_memory = null;
@@ -1797,6 +1836,7 @@ fn realDestroyTarget(_: *anyopaque, renderer: Renderer, target_value: Target) vo
     c.vkDestroyImageView(self.device, target.view, null);
     c.vkDestroyImage(self.device, target.image, null);
     c.vkFreeMemory(self.device, target.image_memory, null);
+    if (target.blur_image != null) destroyBlurImage(self, target);
     destroyLinearImage(self, target);
     std.heap.c_allocator.free(target.retired_textures);
     std.heap.c_allocator.free(target.content_leases);
@@ -2008,9 +2048,9 @@ fn growTargetBatches(self: *RealRenderer, target: *RealTarget, count: usize) !vo
     const layouts = try allocator.alloc(c.VkDescriptorSetLayout, count);
     defer allocator.free(layouts);
     @memset(layouts, self.descriptor_layout);
-    const combined_count = std.math.mul(usize, count, sampled_image_capacity) catch return error.CapacityExceeded;
+    const combined_count = std.math.mul(usize, count, sampled_image_capacity + 2) catch return error.CapacityExceeded;
     const pool_sizes = [_]c.VkDescriptorPoolSize{
-        .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = @intCast(count * 2) },
+        .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = @intCast(count * 3) },
         .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = @intCast(count * 4) },
         .{ .type = c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = if (self.sampled_enabled) @intCast(combined_count) else 0 },
     };
@@ -2052,6 +2092,7 @@ fn growTargetBatches(self: *RealRenderer, target: *RealTarget, count: usize) !vo
     target.descriptor_pool = pool;
     target.descriptor_sets = sets;
     target.batch_capacity = count;
+    if (target.blur_image != null) updateBlurDescriptors(self, target);
 }
 
 fn growTargetSource(self: *RealRenderer, target: *RealTarget, size: usize) !void {
@@ -2878,6 +2919,114 @@ fn recordSampledPass(
     }
 }
 
+fn recordBackdropEffectPass(
+    self: *RealRenderer,
+    target: *RealTarget,
+    frame: Frame,
+    sample_count: usize,
+) !void {
+    const allocator = std.heap.c_allocator;
+    c.vkCmdBindDescriptorSets(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 0, 1, &target.descriptor_sets[0], 0, null);
+    var segment_start: usize = 0;
+    for (frame.sources[0..sample_count], 0..) |_, index| {
+        var regions = try mappedBlurRects(allocator, frame, index);
+        defer regions.deinit(allocator);
+        if (regions.items.len == 0) continue;
+
+        recordSampledRange(self, target, frame, segment_start, index, true);
+        recordSampledBarrier(target);
+        recordBlurRegions(self, target, frame, index, regions.items);
+        segment_start = index;
+    }
+    recordSampledRange(self, target, frame, segment_start, sample_count, false);
+}
+
+fn recordSampledRange(
+    self: *RealRenderer,
+    target: *RealTarget,
+    frame: Frame,
+    first: usize,
+    end: usize,
+    intermediate: bool,
+) void {
+    std.debug.assert(first <= end and end <= self.max_samples);
+    c.vkCmdBindPipeline(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.sampled_pipeline.?);
+    const flags: u32 = (if (first != 0) continuation_bit else 0) |
+        (if (intermediate) intermediate_bit else 0);
+    for (frame.render_damage) |damage|
+        recordSampledDispatch(
+            self,
+            target,
+            frame,
+            damage,
+            @as(u32, @intCast(end - first)) | flags,
+            @intCast(first),
+        );
+}
+
+fn recordBlurRegions(
+    self: *RealRenderer,
+    target: *RealTarget,
+    frame: Frame,
+    sample_index: usize,
+    regions: []const render.Rect,
+) void {
+    const source = frame.sources[sample_index];
+    const planned = frame.samples[sample_index];
+    const scale_x = @as(f32, @floatFromInt(planned.destination[2])) /
+        @as(f32, @floatFromInt(source.effect_size.width));
+    const scale_y = @as(f32, @floatFromInt(planned.destination[3])) /
+        @as(f32, @floatFromInt(source.effect_size.height));
+    const scale = @max(scale_x, scale_y);
+    const support: u32 = @intFromFloat(@ceil(24.0 * scale));
+
+    c.vkCmdBindPipeline(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.blur_pipeline.?);
+    for (regions) |region| for (frame.render_damage) |damage| {
+        const exact = intersectRect(region, damage) orelse continue;
+        recordBlurDispatch(self, target, frame, expandVertical(exact, support, frame.output), false, scale);
+    };
+    recordBlurBarrier(target);
+    for (regions) |region| for (frame.render_damage) |damage| {
+        const exact = intersectRect(region, damage) orelse continue;
+        recordBlurDispatch(self, target, frame, exact, true, scale);
+    };
+    recordSampledBarrier(target);
+}
+
+fn recordBlurDispatch(
+    self: *RealRenderer,
+    target: *RealTarget,
+    frame: Frame,
+    rect: render.Rect,
+    vertical: bool,
+    scale: f32,
+) void {
+    const push: Push = .{
+        .clear_color = @splat(0),
+        .output = .{ frame.output.width, frame.output.height, 0, 0 },
+        .damage = .{ @intCast(rect.x), @intCast(rect.y), rect.width, rect.height },
+        .output_color = .{ @intFromBool(vertical), @bitCast(scale), 0, 0 },
+    };
+    c.vkCmdPushConstants(target.command_buffer, self.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(Push), &push);
+    c.vkCmdDispatch(target.command_buffer, (rect.width + 7) / 8, (rect.height + 7) / 8, 1);
+}
+
+fn recordBlurBarrier(target: *RealTarget) void {
+    var barrier: c.VkImageMemoryBarrier = .{
+        .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .pNext = null,
+        .srcAccessMask = c.VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = c.VK_ACCESS_SHADER_READ_BIT,
+        .oldLayout = c.VK_IMAGE_LAYOUT_GENERAL,
+        .newLayout = c.VK_IMAGE_LAYOUT_GENERAL,
+        .srcQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
+        .image = target.blur_image,
+        .subresourceRange = colorRange(),
+    };
+    c.vkCmdPipelineBarrier(target.command_buffer, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, null, 0, null, 1, &barrier);
+}
+
 fn recordSampledDispatch(
     self: *RealRenderer,
     target: *RealTarget,
@@ -3078,6 +3227,217 @@ fn sampleIntersection(sample: Sample, rect: render.Rect) ?SampleIntersection {
         null;
 }
 
+fn frameMayHaveBlur(frame: Frame) bool {
+    for (frame.sources) |source| if (render.hasVisibleBlur(source)) return true;
+    return false;
+}
+
+fn frameHasVisibleBlur(frame: Frame) !bool {
+    const allocator = std.heap.c_allocator;
+    for (frame.sources, 0..) |_, index| {
+        var rectangles = try mappedBlurRects(allocator, frame, index);
+        defer rectangles.deinit(allocator);
+        if (rectangles.items.len != 0) return true;
+    }
+    return false;
+}
+
+fn mappedBlurRects(
+    allocator: std.mem.Allocator,
+    frame: Frame,
+    sample_index: usize,
+) !std.ArrayListUnmanaged(render.Rect) {
+    const source = frame.sources[sample_index];
+    var mapped: std.ArrayListUnmanaged(render.Rect) = .empty;
+    errdefer mapped.deinit(allocator);
+    if (!render.hasVisibleBlur(source)) return mapped;
+
+    var blur: std.ArrayListUnmanaged(render.Rect) = .empty;
+    defer blur.deinit(allocator);
+    var opaque_rects: std.ArrayListUnmanaged(render.Rect) = .empty;
+    defer opaque_rects.deinit(allocator);
+    try canonicalRegion(allocator, source.effect_size, source.blur_region, &blur);
+    if (source.global_alpha == 255 and source.opaque_region.len != 0) {
+        try canonicalRegion(allocator, source.effect_size, source.opaque_region, &opaque_rects);
+        var remainder: std.ArrayListUnmanaged(render.Rect) = .empty;
+        defer remainder.deinit(allocator);
+        for (opaque_rects.items) |cover| {
+            remainder.clearRetainingCapacity();
+            for (blur.items) |value| try subtractRect(allocator, &remainder, value, cover);
+            std.mem.swap(std.ArrayListUnmanaged(render.Rect), &blur, &remainder);
+        }
+    }
+
+    for (blur.items) |local| if (mapEffectRect(frame, sample_index, local)) |physical|
+        try mapped.append(allocator, physical);
+    return mapped;
+}
+
+fn canonicalRegion(
+    allocator: std.mem.Allocator,
+    size: render.Size,
+    operations: []const render.RegionOperation,
+    rectangles: *std.ArrayListUnmanaged(render.Rect),
+) !void {
+    rectangles.clearRetainingCapacity();
+    const bounds: render.Rect = .{ .x = 0, .y = 0, .width = size.width, .height = size.height };
+    var fragments: std.ArrayListUnmanaged(render.Rect) = .empty;
+    defer fragments.deinit(allocator);
+    var scratch: std.ArrayListUnmanaged(render.Rect) = .empty;
+    defer scratch.deinit(allocator);
+
+    for (operations) |operation| {
+        const value = switch (operation) {
+            .add => |rectangle| rectangle,
+            .subtract => |rectangle| rectangle,
+        };
+        const candidate = intersectRect(bounds, rectangleFromRegion(value) orelse continue) orelse continue;
+        switch (operation) {
+            .add => {
+                fragments.clearRetainingCapacity();
+                try fragments.append(allocator, candidate);
+                for (rectangles.items) |cover| {
+                    scratch.clearRetainingCapacity();
+                    for (fragments.items) |fragment|
+                        try subtractRect(allocator, &scratch, fragment, cover);
+                    std.mem.swap(std.ArrayListUnmanaged(render.Rect), &fragments, &scratch);
+                }
+                try rectangles.appendSlice(allocator, fragments.items);
+            },
+            .subtract => {
+                scratch.clearRetainingCapacity();
+                for (rectangles.items) |rectangle|
+                    try subtractRect(allocator, &scratch, rectangle, candidate);
+                std.mem.swap(std.ArrayListUnmanaged(render.Rect), rectangles, &scratch);
+            },
+        }
+    }
+}
+
+fn rectangleFromRegion(value: @import("../region.zig").Rectangle) ?render.Rect {
+    if (value.width <= 0 or value.height <= 0) return null;
+    return .{
+        .x = value.x,
+        .y = value.y,
+        .width = @intCast(value.width),
+        .height = @intCast(value.height),
+    };
+}
+
+fn mapEffectRect(frame: Frame, sample_index: usize, local: render.Rect) ?render.Rect {
+    const source = frame.sources[sample_index];
+    const destination = source.destination;
+    const left = @as(i64, destination.x) + @divFloor(
+        @as(i64, local.x) * destination.width,
+        source.effect_size.width,
+    );
+    const top = @as(i64, destination.y) + @divFloor(
+        @as(i64, local.y) * destination.height,
+        source.effect_size.height,
+    );
+    const right = @as(i64, destination.x) + (std.math.divCeil(
+        i64,
+        (@as(i64, local.x) + local.width) * destination.width,
+        source.effect_size.width,
+    ) catch return null);
+    const bottom = @as(i64, destination.y) + (std.math.divCeil(
+        i64,
+        (@as(i64, local.y) + local.height) * destination.height,
+        source.effect_size.height,
+    ) catch return null);
+    const logical_output = switch (frame.output_transform) {
+        .@"90", .@"270", .flipped_90, .flipped_270 => render.Size{ .width = frame.output.height, .height = frame.output.width },
+        else => frame.output,
+    };
+    const transformed = transformEffectRect(left, top, right, bottom, logical_output, frame.output_transform);
+    const clipped = rectFromEdges(
+        @max(transformed.x, 0),
+        @max(transformed.y, 0),
+        @min(transformed.x + transformed.width, frame.output.width),
+        @min(transformed.y + transformed.height, frame.output.height),
+    ) orelse return null;
+    const visible = sampleIntersection(frame.samples[sample_index], clipped) orelse return null;
+    return rectFromEdges(visible.min_x, visible.min_y, visible.max_x, visible.max_y);
+}
+
+fn transformEffectRect(
+    left: i64,
+    top: i64,
+    right: i64,
+    bottom: i64,
+    output: render.Size,
+    transform: render.Transform,
+) render.PlanRect {
+    const width: i64 = output.width;
+    const height: i64 = output.height;
+    const edges: [4]i64 = switch (transform) {
+        .normal => .{ left, top, right, bottom },
+        .@"90" => .{ top, width - right, bottom, width - left },
+        .@"180" => .{ width - right, height - bottom, width - left, height - top },
+        .@"270" => .{ height - bottom, left, height - top, right },
+        .flipped => .{ width - right, top, width - left, bottom },
+        .flipped_90 => .{ top, left, bottom, right },
+        .flipped_180 => .{ left, height - bottom, right, height - top },
+        .flipped_270 => .{ height - bottom, width - right, height - top, width - left },
+    };
+    return .{
+        .x = edges[0],
+        .y = edges[1],
+        .width = @intCast(edges[2] - edges[0]),
+        .height = @intCast(edges[3] - edges[1]),
+    };
+}
+
+fn subtractRect(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayListUnmanaged(render.Rect),
+    value: render.Rect,
+    cover: render.Rect,
+) !void {
+    const overlap = intersectRect(value, cover) orelse {
+        try output.append(allocator, value);
+        return;
+    };
+    const left: i64 = value.x;
+    const top: i64 = value.y;
+    const right = left + value.width;
+    const bottom = top + value.height;
+    const overlap_right = @as(i64, overlap.x) + overlap.width;
+    const overlap_bottom = @as(i64, overlap.y) + overlap.height;
+    if (rectFromEdges(left, top, right, overlap.y)) |remaining| try output.append(allocator, remaining);
+    if (rectFromEdges(left, overlap_bottom, right, bottom)) |remaining| try output.append(allocator, remaining);
+    if (rectFromEdges(left, overlap.y, overlap.x, overlap_bottom)) |remaining| try output.append(allocator, remaining);
+    if (rectFromEdges(overlap_right, overlap.y, right, overlap_bottom)) |remaining| try output.append(allocator, remaining);
+}
+
+fn intersectRect(a: render.Rect, b: render.Rect) ?render.Rect {
+    return rectFromEdges(
+        @max(a.x, b.x),
+        @max(a.y, b.y),
+        @min(@as(i64, a.x) + a.width, @as(i64, b.x) + b.width),
+        @min(@as(i64, a.y) + a.height, @as(i64, b.y) + b.height),
+    );
+}
+
+fn rectFromEdges(left: i64, top: i64, right: i64, bottom: i64) ?render.Rect {
+    if (left < std.math.minInt(i32) or left > std.math.maxInt(i32) or
+        top < std.math.minInt(i32) or top > std.math.maxInt(i32) or
+        right <= left or bottom <= top or right - left > std.math.maxInt(u32) or
+        bottom - top > std.math.maxInt(u32)) return null;
+    return .{
+        .x = @intCast(left),
+        .y = @intCast(top),
+        .width = @intCast(right - left),
+        .height = @intCast(bottom - top),
+    };
+}
+
+fn expandVertical(value: render.Rect, radius: u32, output: render.Size) render.Rect {
+    const top = @max(@as(i64, 0), @as(i64, value.y) - radius);
+    const bottom = @min(@as(i64, output.height), @as(i64, value.y) + value.height + radius);
+    return .{ .x = value.x, .y = @intCast(top), .width = value.width, .height = @intCast(bottom - top) };
+}
+
 fn recordSampledBarrier(target: *RealTarget) void {
     var between: c.VkImageMemoryBarrier = .{
         .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -3114,7 +3474,7 @@ fn recordRestartSampledPass(target: *RealTarget, uses_linear_image: bool) void {
 
 fn sampledFrameReplayable(frame: Frame, prepared_batch: []const PreparedTexture) bool {
     if (frame.captures.before_cursor or frame.captures.after_cursor or
-        frame.capture_destination != null)
+        frame.capture_destination != null or frameMayHaveBlur(frame))
         return false;
     for (prepared_batch) |prepared| if (prepared.native_token != null or
         prepared.imported_token != null or prepared.direct_external)
@@ -3124,7 +3484,10 @@ fn sampledFrameReplayable(frame: Frame, prepared_batch: []const PreparedTexture)
 
 fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.posix.fd_t {
     const allocator = std.heap.c_allocator;
+    const has_blur = try frameHasVisibleBlur(frame);
+    if (has_blur and frame.samples.len > self.max_samples) return error.CapacityExceeded;
     const batch_count = try ensureSampledFrameCapacity(self, target, frame.samples.len);
+    if (has_blur) try ensureBlurImage(self, target);
     const batch = try prepareTextures(self, frame, target.source_buffer_size);
     var prepared_owned = true;
     defer if (prepared_owned) cleanupPreparedTextures(self, batch.count);
@@ -3489,7 +3852,7 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
             1,
             &target_barrier,
         );
-        const uses_linear_image = frame.samples.len > self.max_samples;
+        const uses_linear_image = frame.samples.len > self.max_samples or has_blur;
         if (uses_linear_image) {
             var linear_barrier: c.VkImageMemoryBarrier = .{
                 .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -3505,9 +3868,30 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
             };
             c.vkCmdPipelineBarrier(target.command_buffer, c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, null, 0, null, 1, &linear_barrier);
         }
+        if (has_blur) {
+            var blur_barrier: c.VkImageMemoryBarrier = .{
+                .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .pNext = null,
+                .srcAccessMask = 0,
+                .dstAccessMask = c.VK_ACCESS_SHADER_READ_BIT | c.VK_ACCESS_SHADER_WRITE_BIT,
+                .oldLayout = if (target.blur_initialized_layout)
+                    c.VK_IMAGE_LAYOUT_GENERAL
+                else
+                    c.VK_IMAGE_LAYOUT_UNDEFINED,
+                .newLayout = c.VK_IMAGE_LAYOUT_GENERAL,
+                .srcQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
+                .image = target.blur_image,
+                .subresourceRange = colorRange(),
+            };
+            c.vkCmdPipelineBarrier(target.command_buffer, c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, null, 0, null, 1, &blur_barrier);
+        }
         var transfer_final = false;
         if (frame.captures.before_cursor) {
-            try recordSampledPass(self, target, frame, frame.cursor_start);
+            if (has_blur)
+                try recordBackdropEffectPass(self, target, frame, frame.cursor_start)
+            else
+                try recordSampledPass(self, target, frame, frame.cursor_start);
             recordCapture(
                 self,
                 target,
@@ -3519,11 +3903,17 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
             transfer_final = true;
             if (frame.cursor_start != frame.samples.len) {
                 recordRestartSampledPass(target, uses_linear_image);
-                try recordSampledPass(self, target, frame, frame.samples.len);
+                if (has_blur)
+                    try recordBackdropEffectPass(self, target, frame, frame.samples.len)
+                else
+                    try recordSampledPass(self, target, frame, frame.samples.len);
                 transfer_final = false;
             }
         } else {
-            try recordSampledPass(self, target, frame, frame.samples.len);
+            if (has_blur)
+                try recordBackdropEffectPass(self, target, frame, frame.samples.len)
+            else
+                try recordSampledPass(self, target, frame, frame.samples.len);
         }
         if (frame.captures.after_cursor) {
             if (transfer_final)
@@ -3641,6 +4031,7 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
         (@as(*RealCaptureTarget, @ptrCast(@alignCast(destination.target)))).completion_fence = target.fence;
     target.state = .in_flight;
     target.initialized_layout = true;
+    if (has_blur) target.blur_initialized_layout = true;
     target.captured = frame.captures;
     std.debug.assert(target.content_lease_count == 0);
     @memcpy(target.content_leases[0..content_token_count], content_tokens[0..content_token_count]);
@@ -4215,7 +4606,7 @@ fn createLinearImage(
         .arrayLayers = 1,
         .samples = c.VK_SAMPLE_COUNT_1_BIT,
         .tiling = c.VK_IMAGE_TILING_OPTIMAL,
-        .usage = c.VK_IMAGE_USAGE_STORAGE_BIT,
+        .usage = c.VK_IMAGE_USAGE_STORAGE_BIT | c.VK_IMAGE_USAGE_SAMPLED_BIT,
         .sharingMode = c.VK_SHARING_MODE_EXCLUSIVE,
         .queueFamilyIndexCount = 0,
         .pQueueFamilyIndices = null,
@@ -4256,6 +4647,57 @@ fn destroyLinearImage(self: *RealRenderer, target: *RealTarget) void {
     c.vkDestroyImageView(self.device, target.linear_view, null);
     c.vkDestroyImage(self.device, target.linear_image, null);
     c.vkFreeMemory(self.device, target.linear_memory, null);
+}
+
+fn ensureBlurImage(self: *RealRenderer, target: *RealTarget) !void {
+    if (target.blur_image != null) return;
+    try createLinearImage(
+        self,
+        target.width,
+        target.height,
+        &target.blur_image,
+        &target.blur_memory,
+        &target.blur_view,
+    );
+    target.blur_initialized_layout = false;
+    updateBlurDescriptors(self, target);
+}
+
+fn updateBlurDescriptors(self: *RealRenderer, target: *RealTarget) void {
+    std.debug.assert(target.blur_image != null);
+    var storage = c.VkDescriptorImageInfo{
+        .sampler = null,
+        .imageView = target.blur_view,
+        .imageLayout = c.VK_IMAGE_LAYOUT_GENERAL,
+    };
+    var linear_source = c.VkDescriptorImageInfo{
+        .sampler = self.blur_sampler.?,
+        .imageView = target.linear_view,
+        .imageLayout = c.VK_IMAGE_LAYOUT_GENERAL,
+    };
+    var blur_source = c.VkDescriptorImageInfo{
+        .sampler = self.blur_sampler.?,
+        .imageView = target.blur_view,
+        .imageLayout = c.VK_IMAGE_LAYOUT_GENERAL,
+    };
+    for (target.descriptor_sets) |set| {
+        const writes = [_]c.VkWriteDescriptorSet{
+            descriptorWrite(set, 7, c.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &storage, null),
+            descriptorWrite(set, 8, c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &linear_source, null),
+            descriptorWrite(set, 9, c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &blur_source, null),
+        };
+        c.vkUpdateDescriptorSets(self.device, writes.len, &writes, 0, null);
+    }
+}
+
+fn destroyBlurImage(self: *RealRenderer, target: *RealTarget) void {
+    c.vkDestroyImageView(self.device, target.blur_view, null);
+    c.vkDestroyImage(self.device, target.blur_image, null);
+    c.vkFreeMemory(self.device, target.blur_memory, null);
+    target.blur_view = null;
+    target.blur_image = null;
+    target.blur_memory = null;
+    target.blur_initialized_layout = false;
 }
 
 fn createTexture(self: *RealRenderer, size: render.Size) !Texture {
@@ -4628,4 +5070,86 @@ fn testUploadDamage(rects: []const render.UploadRect) render.UploadDamage {
     @memcpy(damage.rects[0..rects.len], rects);
     damage.count = @intCast(rects.len);
     return damage;
+}
+
+test "vulkan backdrop regions preserve ordered union and subtraction" {
+    const operations = [_]render.RegionOperation{
+        .{ .add = .{ .x = 0, .y = 0, .width = 10, .height = 10 } },
+        .{ .subtract = .{ .x = 2, .y = 2, .width = 6, .height = 6 } },
+        .{ .add = .{ .x = 4, .y = 4, .width = 2, .height = 2 } },
+    };
+    var rectangles: std.ArrayListUnmanaged(render.Rect) = .empty;
+    defer rectangles.deinit(std.testing.allocator);
+    try canonicalRegion(
+        std.testing.allocator,
+        .{ .width = 10, .height = 10 },
+        &operations,
+        &rectangles,
+    );
+    try std.testing.expectEqualSlices(render.Rect, &.{
+        .{ .x = 0, .y = 0, .width = 10, .height = 2 },
+        .{ .x = 0, .y = 8, .width = 10, .height = 2 },
+        .{ .x = 0, .y = 2, .width = 2, .height = 6 },
+        .{ .x = 8, .y = 2, .width = 2, .height = 6 },
+        .{ .x = 4, .y = 4, .width = 2, .height = 2 },
+    }, rectangles.items);
+}
+
+test "vulkan backdrop blur is inactive when opaque coverage hides its region" {
+    const pixel = [_]u8{0} ** 4;
+    const whole = [_]render.RegionOperation{.{
+        .add = .{ .x = 0, .y = 0, .width = 20, .height = 10 },
+    }};
+    var source: render.SurfaceSample = .{
+        .sample = .{ .surface = 1, .commit_sequence = 1 },
+        .presentation = .{ .slot = 0, .generation = 1 },
+        .source = .{
+            .size = .{ .width = 1, .height = 1 },
+            .stride = 4,
+            .format = .argb8888_premultiplied,
+            .bytes = &pixel,
+        },
+        .crop = render.SourceRect.pixels(0, 0, 1, 1),
+        .destination = .{ .x = 10, .y = 15, .width = 40, .height = 20 },
+        .clip = .{ .x = 0, .y = 0, .width = 100, .height = 80 },
+        .effect_size = .{ .width = 20, .height = 10 },
+        .opaque_region = &whole,
+        .blur_region = &whole,
+    };
+    const packed_sample: Sample = .{
+        .source = .{ 0, 1, 1, 4 },
+        .crop = .{ 0, 0, render.fixed_one, render.fixed_one },
+        .destination = .{ 10, 15, 40, 20 },
+        .clip = .{ 0, 0, 100, 80 },
+        .attributes = @splat(0),
+        .affine = @splat(0),
+        .affine_tail = @splat(0),
+        .color_matrix_0 = @splat(0),
+        .color_matrix_1 = @splat(0),
+        .color_matrix_2 = @splat(0),
+    };
+    var frame: Frame = .{
+        .output = .{ .width = 100, .height = 80 },
+        .output_format = .xrgb8888,
+        .clear = .{ .r = 0, .g = 0, .b = 0 },
+        .samples = &.{packed_sample},
+        .sources = &.{source},
+        .source_byte_count = 4,
+        .render_damage = &.{.{ .x = 0, .y = 0, .width = 100, .height = 80 }},
+    };
+    try std.testing.expect(!try frameHasVisibleBlur(frame));
+
+    source.opaque_region = &.{.{
+        .add = .{ .x = 0, .y = 0, .width = 10, .height = 10 },
+    }};
+    frame.sources = &.{source};
+    try std.testing.expect(try frameHasVisibleBlur(frame));
+    var mapped = try mappedBlurRects(std.testing.allocator, frame, 0);
+    defer mapped.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(render.Rect, &.{.{
+        .x = 30,
+        .y = 15,
+        .width = 20,
+        .height = 20,
+    }}, mapped.items);
 }

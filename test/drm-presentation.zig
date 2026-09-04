@@ -88,6 +88,10 @@ test "generated alpha modifier reaches the physical render sample" {
     try runVertical(.client_disconnect, .alpha_shm);
 }
 
+test "generated background effect reaches the physical render sample" {
+    try runVertical(.client_disconnect, .blur_shm);
+}
+
 test "physical coordinator keeps serving until its final client disconnects" {
     const allocator = std.testing.allocator;
     var fixture = try Fixture.init();
@@ -1787,11 +1791,12 @@ test "generated output power client drains and recreates the physical output" {
     _ = try loop.turn(coordinator);
     try fixture.signalSession(.enable);
     for (0..128) |_| {
-        _ = try loop.turn(coordinator);
+        const progress = try loop.turn(coordinator);
         if (coordinator.physical_output_count == 2 and
             coordinator.physical_outputs[0].kms_output != null and
             coordinator.physical_outputs[1].kms_output != null) break;
-        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+        if (!progress.needs_more_work and root.ring.cq_ready() == 0)
+            try waitReady(&root.ring);
     }
     try std.testing.expect(coordinator.primaryKmsOutput() != null);
     const initial_primary = coordinator.primaryKmsOutput().?.outputId();
@@ -1834,7 +1839,7 @@ test "generated output power client drains and recreates the physical output" {
     for (0..128) |_| {
         _ = try loop.turn(coordinator);
         if (fixture.page_flips != flips_while_primary_off) break;
-        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+        if (root.ring.cq_ready() == 0) try pauseReady(&root.ring);
     }
     try std.testing.expectEqual(flips_while_primary_off + 1, fixture.page_flips);
     handler.hold_primary_off = false;
@@ -1943,11 +1948,12 @@ fn generatedGammaControl(output_index: usize) !void {
     _ = try loop.turn(coordinator);
     try fixture.signalSession(.enable);
     for (0..128) |_| {
-        _ = try loop.turn(coordinator);
+        const progress = try loop.turn(coordinator);
         if (coordinator.physical_output_count == 2 and
             coordinator.physical_outputs[0].kms_output != null and
             coordinator.physical_outputs[1].kms_output != null) break;
-        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+        if (!progress.needs_more_work and root.ring.cq_ready() == 0)
+            try waitReady(&root.ring);
     }
 
     var reactor: wayring.io_uring.Reactor = undefined;
@@ -1973,7 +1979,8 @@ fn generatedGammaControl(output_index: usize) !void {
         _ = try drainClient(&reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
         if (fixture.gamma_sets == 1) break;
-        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0) try waitForEither(&root.ring, reactor.ring);
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
     }
     try std.testing.expectEqualSlices(u16, &GammaClientHandler.first_ramps, &fixture.gamma_current);
     try std.testing.expectEqual(@as(u32, if (output_index == 0) 30 else 31), fixture.gamma_crtc);
@@ -1985,7 +1992,8 @@ fn generatedGammaControl(output_index: usize) !void {
         _ = try drainClient(&reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
         if (fixture.gamma_sets == 2) break;
-        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0) try waitForEither(&root.ring, reactor.ring);
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
     }
     try std.testing.expectEqualSlices(u16, &fixture.gamma_original, &fixture.gamma_current);
     try handler.createControl();
@@ -1994,7 +2002,8 @@ fn generatedGammaControl(output_index: usize) !void {
         _ = try drainClient(&reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
         if (fixture.gamma_sets == 3) break;
-        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0) try waitForEither(&root.ring, reactor.ring);
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
     }
     try std.testing.expectEqualSlices(u16, &GammaClientHandler.second_ramps, &fixture.gamma_current);
     try std.testing.expectEqual(@as(usize, 1), fixture.gamma_gets);
@@ -2030,7 +2039,8 @@ fn generatedGammaControl(output_index: usize) !void {
         _ = try drainClient(&reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
         if (fixture.gamma_sets == 6) break;
-        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0) try waitForEither(&root.ring, reactor.ring);
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
     }
     try std.testing.expectEqualSlices(u16, &fixture.gamma_original, &fixture.gamma_current);
     try std.testing.expectEqual(@as(usize, 2), handler.gamma_sizes);
@@ -2149,7 +2159,7 @@ test "output readiness exhaustion destroys output and releases device" {
 }
 
 const TerminalTrigger = enum { session_disable, client_disconnect };
-const ClientSource = enum { shm, alpha_shm, dmabuf, single_pixel };
+const ClientSource = enum { shm, alpha_shm, blur_shm, dmabuf, single_pixel };
 
 fn runVertical(trigger: TerminalTrigger, source: ClientSource) !void {
     const allocator = std.testing.allocator;
@@ -2225,6 +2235,12 @@ fn runVertical(trigger: TerminalTrigger, source: ClientSource) !void {
             }
             if (source == .alpha_shm)
                 try std.testing.expectEqual(@as(u8, 128), sample.global_alpha);
+            if (source == .blur_shm) {
+                try std.testing.expectEqual(ouro.render.Size{ .width = 3, .height = 2 }, sample.effect_size);
+                try std.testing.expectEqualSlices(ouro.render.RegionOperation, &.{.{
+                    .add = .{ .x = 0, .y = 0, .width = 2, .height = 2 },
+                }}, sample.blur_region);
+            }
             observed_identity = true;
         }
         if (client_handler.complete()) break;
@@ -2241,6 +2257,18 @@ fn runVertical(trigger: TerminalTrigger, source: ClientSource) !void {
     try std.testing.expectEqual(@as(usize, 1), coordinator.stats.releases);
     try std.testing.expectEqual(@as(usize, 1), coordinator.stats.imported_disposals);
     try std.testing.expectEqual(@as(usize, 1), fixture.page_flips);
+    if (source == .blur_shm) {
+        try std.testing.expect(!coordinator.cursor_layer.content.owned);
+        const effects = coordinator.cursor_layer.effects orelse
+            return error.MissingRetainedEffects;
+        try std.testing.expect(coordinator.cursor_layer.sample.?.blur_region.ptr ==
+            effects.blur_operations.ptr);
+        try std.testing.expectEqualSlices(
+            ouro.render.RegionOperation,
+            effects.blur_operations,
+            coordinator.cursor_layer.sample.?.blur_region,
+        );
+    }
     if (source == .dmabuf) {
         try std.testing.expectEqual(@as(usize, 2), fixture.imported_bos);
         try std.testing.expectEqual(@as(usize, 2), fixture.read_maps);
@@ -2453,6 +2481,8 @@ const ClientHandler = struct {
     single_pixel_manager: ?wayring.objects.Handle = null,
     viewporter: ?wayring.objects.Handle = null,
     alpha_modifier_manager: ?wayring.objects.Handle = null,
+    background_effect_manager: ?wayring.objects.Handle = null,
+    background_blur_capable: bool = false,
     presentation: ?wayring.objects.Handle = null,
     output: ?wayring.objects.Handle = null,
     xdg_output_manager: ?wayring.objects.Handle = null,
@@ -2494,7 +2524,7 @@ const ClientHandler = struct {
                         self.tablet_v2_announced = true;
                     if (std.mem.eql(u8, global.interface, protocol.wl_compositor.info.name))
                         self.compositor = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wl_compositor.info, @min(global.version, 7), null);
-                    if ((self.source == .shm or self.source == .alpha_shm) and
+                    if ((self.source == .shm or self.source == .alpha_shm or self.source == .blur_shm) and
                         std.mem.eql(u8, global.interface, protocol.wl_shm.info.name))
                         self.shm = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wl_shm.info, @min(global.version, 2), null);
                     if (self.source == .dmabuf and std.mem.eql(u8, global.interface, protocol.zwp_linux_dmabuf_v1.info.name))
@@ -2505,6 +2535,8 @@ const ClientHandler = struct {
                         self.viewporter = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wp_viewporter.info, @min(global.version, 1), null);
                     if (self.source == .alpha_shm and std.mem.eql(u8, global.interface, protocol.wp_alpha_modifier_v1.info.name))
                         self.alpha_modifier_manager = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wp_alpha_modifier_v1.info, @min(global.version, 1), null);
+                    if (self.source == .blur_shm and std.mem.eql(u8, global.interface, protocol.ext_background_effect_manager_v1.info.name))
+                        self.background_effect_manager = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.ext_background_effect_manager_v1.info, @min(global.version, 1), null);
                     if (std.mem.eql(u8, global.interface, protocol.wp_presentation.info.name))
                         self.presentation = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wp_presentation.info, 1, null);
                     if (std.mem.eql(u8, global.interface, protocol.wl_output.info.name))
@@ -2512,19 +2544,25 @@ const ClientHandler = struct {
                     if (std.mem.eql(u8, global.interface, protocol.zxdg_output_manager_v1.info.name))
                         self.xdg_output_manager = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.zxdg_output_manager_v1.info, @min(global.version, 3), null);
                     try self.maybeCreateXdgOutput();
-                    const source_ready = switch (self.source) {
-                        .shm => self.shm != null,
-                        .alpha_shm => self.shm != null and self.alpha_modifier_manager != null,
-                        .dmabuf => self.dmabuf != null,
-                        .single_pixel => self.single_pixel_manager != null and self.viewporter != null,
-                    };
-                    if (self.compositor != null and self.presentation != null and self.output != null and
-                        source_ready and !self.queued) try self.queueWork();
+                    try self.maybeQueueWork();
                 },
                 .global_remove => {},
             }
         } else if (target.object.interface == &protocol.wl_shm.info) {
             _ = try wayring.client.decodeEvent(protocol.wl_shm, self.objects, self.shm.?, message, fds);
+        } else if (target.object.interface == &protocol.ext_background_effect_manager_v1.info) {
+            switch (try wayring.client.decodeEvent(
+                protocol.ext_background_effect_manager_v1,
+                self.objects,
+                self.background_effect_manager.?,
+                message,
+                fds,
+            )) {
+                .capabilities => |value| {
+                    self.background_blur_capable = value.flags.contains(.blur);
+                    try self.maybeQueueWork();
+                },
+            }
         } else if (target.object.interface == &protocol.zwp_linux_dmabuf_v1.info) {
             _ = try wayring.client.decodeEvent(protocol.zwp_linux_dmabuf_v1, self.objects, self.dmabuf.?, message, fds);
         } else if (target.object.interface == &protocol.wl_output.info) {
@@ -2611,6 +2649,18 @@ const ClientHandler = struct {
         self.queued = true;
     }
 
+    fn maybeQueueWork(self: *ClientHandler) !void {
+        const source_ready = switch (self.source) {
+            .shm => self.shm != null,
+            .alpha_shm => self.shm != null and self.alpha_modifier_manager != null,
+            .blur_shm => self.shm != null and self.background_effect_manager != null and self.background_blur_capable,
+            .dmabuf => self.dmabuf != null,
+            .single_pixel => self.single_pixel_manager != null and self.viewporter != null,
+        };
+        if (self.compositor != null and self.presentation != null and self.output != null and
+            source_ready and !self.queued) try self.queueWork();
+    }
+
     fn maybeCreateXdgOutput(self: *ClientHandler) !void {
         if (self.xdg_output != null or self.xdg_output_manager == null or self.output == null) return;
         self.xdg_output = (try protocol.zxdg_output_manager_v1.construct_get_xdg_output(
@@ -2646,7 +2696,7 @@ const ClientHandler = struct {
         const surface = (try protocol.wl_compositor.construct_create_surface(self.objects, self.queue, self.compositor.?, .{})).id;
         self.surface = surface;
         const buffer = switch (self.source) {
-            .shm, .alpha_shm => try self.createShmBuffer(),
+            .shm, .alpha_shm, .blur_shm => try self.createShmBuffer(),
             .dmabuf => try self.createDmabufBuffer(),
             .single_pixel => try self.createSinglePixelBuffer(),
         };
@@ -2666,6 +2716,30 @@ const ClientHandler = struct {
             handle,
             .{ .set_multiplier = .{ .factor = 0x8080_8080 } },
         );
+        const background_effect = if (self.source == .blur_shm)
+            (try protocol.ext_background_effect_manager_v1.construct_get_background_effect(
+                self.objects,
+                self.queue,
+                self.background_effect_manager.?,
+                .{ .surface = surface.id },
+            )).id
+        else
+            null;
+        if (background_effect) |effect| {
+            const region = (try protocol.wl_compositor.construct_create_region(
+                self.objects,
+                self.queue,
+                self.compositor.?,
+                .{},
+            )).id;
+            try wayring.client.sendRequest(protocol.wl_region, self.objects, self.queue, region, .{
+                .add = .{ .x = 0, .y = 0, .width = 2, .height = 2 },
+            });
+            try wayring.client.sendRequest(protocol.ext_background_effect_surface_v1, self.objects, self.queue, effect, .{
+                .set_blur_region = .{ .region = region.id },
+            });
+            try wayring.client.sendRequest(protocol.wl_region, self.objects, self.queue, region, .{ .destroy = .{} });
+        }
         const viewport = if (self.source == .single_pixel)
             (try protocol.wp_viewporter.construct_get_viewport(
                 self.objects,
@@ -2698,6 +2772,13 @@ const ClientHandler = struct {
         try wayring.client.sendRequest(protocol.wl_surface, self.objects, self.queue, surface, .{ .commit = .{} });
         if (alpha_modifier) |handle| try wayring.client.sendRequest(
             protocol.wp_alpha_modifier_surface_v1,
+            self.objects,
+            self.queue,
+            handle,
+            .{ .destroy = .{} },
+        );
+        if (background_effect) |handle| try wayring.client.sendRequest(
+            protocol.ext_background_effect_surface_v1,
             self.objects,
             self.queue,
             handle,
@@ -4147,7 +4228,7 @@ pub fn coordinatorConfig() Coordinator.Config {
     return .{ .router_capacity = 12, .timer_capacity = 6, .device_capacity = 1, .shm = .{ .limits = .{ .max_pool_bytes = 4096 }, .pool_capacity = 1, .buffer_capacity = 1, .formats = &shm_formats }, .surface = .{ .surface_capacity = 1, .region_capacity = 1, .viewport_capacity = 1, .presentation_resource_capacity = 1, .presentation_feedback_capacity = 2, .region_operation_capacity = 1, .frame_callback_capacity = 1, .release_callback_capacity = 1, .content_update_capacity = 1, .dependency_capacity = 1, .attachment_capacity = 1, .copy_capacity = 1, .max_copy_bytes = pixels.len }, .drm = .{ .card_capacity = 1, .connector_capacity = 3, .mode_capacity = 3, .connector_encoder_capacity = 3, .encoder_capacity = 3, .crtc_capacity = 3, .plane_capacity = 3, .format_capacity = 3, .event_capacity = 4 }, .output = .{ .output_id = .{ .index = 0, .generation = 1 }, .scheduler = .{ .refresh_ns = 4 * std.time.ns_per_ms, .render_budget_ns = std.time.ns_per_ms }, .renderer = .pixman, .image_count = 2, .max_samples = 2, .max_source_bytes = pixels.len, .max_source_width = 3, .max_source_height = 2, .kms = .{ .event_capacity = 2 } } };
 }
 pub fn compositorConfig() Compositor.Config {
-    return .{ .ring = .{ .entries = 32, .flags = 0 }, .reactor = clientReactorConfig(), .runtime = .{ .actor = .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 }, .object_capacity = 32, .object_quota = 32, .buckets_per_client = 32, .max_globals = 63, .registry_capacity = 1 } };
+    return .{ .ring = .{ .entries = 32, .flags = 0 }, .reactor = clientReactorConfig(), .runtime = .{ .actor = .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 }, .object_capacity = 32, .object_quota = 32, .buckets_per_client = 32, .max_globals = 64, .registry_capacity = 1 } };
 }
 pub fn clientReactorConfig() wayring.io_uring.Config {
     return .{ .receive_buffer_size = 4096, .receive_buffer_count = 4, .receive_control_capacity = 256, .fragment_block_size = 256, .fragment_block_count = 4, .transmit_block_size = 512, .transmit_block_count = 8, .descriptor_count = 4, .send_descriptor_capacity = 2 };
@@ -4170,7 +4251,8 @@ pub fn drainServer(root: *Compositor, coordinator: *Coordinator, loop: *Loop) !v
         const progress = try loop.turn(coordinator);
         wayring_drained = progress.wayring.shutdown_complete;
         if (wayring_drained and coordinator.backendDrainComplete()) return;
-        if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+        if (!progress.needs_more_work and root.ring.cq_ready() == 0)
+            try waitReady(&root.ring);
     }
     return error.DrainTimeout;
 }
@@ -4182,18 +4264,45 @@ fn physicalOutputsSettled(coordinator: *Coordinator) bool {
     return true;
 }
 fn waitForEither(server: *linux.IoUring, client: *linux.IoUring) !void {
-    for (0..1_000_000) |_| {
-        if (server.cq_ready() != 0 or client.cq_ready() != 0) return;
-        _ = linux.sched_yield();
+    if (server.cq_ready() != 0 or client.cq_ready() != 0) return;
+    var descriptors = [_]std.posix.pollfd{
+        .{ .fd = server.fd, .events = linux.POLL.IN, .revents = 0 },
+        .{ .fd = client.fd, .events = linux.POLL.IN, .revents = 0 },
+    };
+    // A coordinator transition can require another turn without submitting an
+    // SQE. Bound this wait so the enclosing state-machine loop can advance and
+    // report its meaningful terminal assertion instead of a load-dependent
+    // completion timeout.
+    if (try std.posix.poll(&descriptors, 10) == 0) return;
+    for (descriptors) |descriptor| if (descriptor.revents &
+        (linux.POLL.ERR | linux.POLL.HUP | linux.POLL.NVAL) != 0)
+        return error.CompletionWaitFailed;
+    if (server.cq_ready() == 0 and client.cq_ready() == 0) {
+        const delay: linux.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
+        _ = linux.nanosleep(&delay, null);
     }
-    return error.CompletionTimeout;
 }
 fn waitReady(ring: *linux.IoUring) !void {
-    for (0..1_000_000) |_| {
-        if (ring.cq_ready() != 0) return;
-        _ = linux.sched_yield();
-    }
-    return error.CompletionTimeout;
+    if (ring.cq_ready() != 0) return;
+    var descriptors = [_]std.posix.pollfd{.{
+        .fd = ring.fd,
+        .events = linux.POLL.IN,
+        .revents = 0,
+    }};
+    if (try std.posix.poll(&descriptors, 5_000) == 0) return error.CompletionTimeout;
+    if (descriptors[0].revents & (linux.POLL.ERR | linux.POLL.HUP | linux.POLL.NVAL) != 0 or
+        ring.cq_ready() == 0) return error.CompletionWaitFailed;
+}
+fn pauseReady(ring: *linux.IoUring) !void {
+    if (ring.cq_ready() != 0) return;
+    var descriptors = [_]std.posix.pollfd{.{
+        .fd = ring.fd,
+        .events = linux.POLL.IN,
+        .revents = 0,
+    }};
+    _ = try std.posix.poll(&descriptors, 10);
+    if (descriptors[0].revents & (linux.POLL.ERR | linux.POLL.HUP | linux.POLL.NVAL) != 0)
+        return error.CompletionWaitFailed;
 }
 fn eventFd() !linux.fd_t {
     const result = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);

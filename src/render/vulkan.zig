@@ -378,6 +378,7 @@ pub const Renderer = struct {
         record.generation = handle.generation;
         const completion_fd = self.platform.draw(self.implementation, record.imported.?, .{
             .output = plan.output,
+            .output_transform = plan.output_transform,
             .output_format = list.output_format,
             .output_color_description = list.output_color_description,
             .output_lut_slot = output_lut_slot,

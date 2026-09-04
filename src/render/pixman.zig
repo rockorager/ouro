@@ -51,6 +51,8 @@ pub const Renderer = struct {
     caches: []Cache,
     max_source_width: u32,
     max_source_height: u32,
+    blur_a: std.ArrayListUnmanaged(u32) = .empty,
+    blur_b: std.ArrayListUnmanaged(u32) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) Error!Renderer {
         if (config.max_samples == 0 or config.max_source_width == 0 or
@@ -88,6 +90,8 @@ pub const Renderer = struct {
     }
 
     pub fn deinit(self: *Renderer) void {
+        self.blur_b.deinit(self.allocator);
+        self.blur_a.deinit(self.allocator);
         deinitCaches(self.caches);
         self.allocator.free(self.caches);
         self.* = undefined;
@@ -287,6 +291,15 @@ pub const Renderer = struct {
             sample.global_alpha = planned.global_alpha;
             _ = try render.validateSample(sample);
 
+            try self.applyBackdropBlur(
+                list,
+                plan,
+                planned,
+                sample,
+                destination_bytes,
+                destination_stride,
+            );
+
             // Pixman's large SRC fast path batches scanlines more efficiently
             // than one libc memcpy per row. Keep direct copies for bounded
             // damage, where they avoid walking untouched pixels.
@@ -356,7 +369,253 @@ pub const Renderer = struct {
             );
         }
     }
+
+    fn applyBackdropBlur(
+        self: *Renderer,
+        list: render.List,
+        plan: render.DamagePlan,
+        planned: render.PlannedSample,
+        sample: render.SurfaceSample,
+        destination: []u8,
+        destination_stride: u32,
+    ) Error!void {
+        if (!render.hasVisibleBlur(sample)) return;
+        const clipped = intersection(sample.destination, sample.clip, plan.output) orelse return;
+        const visible: render.Rect = .{
+            .x = clipped.x,
+            .y = clipped.y,
+            .width = clipped.width,
+            .height = clipped.height,
+        };
+        if (!damaged(plan, visible)) return;
+        const effect = visibleBlurBounds(list, sample, planned, plan, visible) orelse return;
+
+        const scale_x = @as(f64, @floatFromInt(sample.destination.width)) /
+            @as(f64, @floatFromInt(sample.effect_size.width));
+        const scale_y = @as(f64, @floatFromInt(sample.destination.height)) /
+            @as(f64, @floatFromInt(sample.effect_size.height));
+        const scale = @max(scale_x, scale_y);
+        const radii = [3]u32{
+            @max(1, @as(u32, @intFromFloat(@round(7.0 * scale)))),
+            @max(1, @as(u32, @intFromFloat(@round(7.0 * scale)))),
+            @max(1, @as(u32, @intFromFloat(@round(8.0 * scale)))),
+        };
+        const support = radii[0] + radii[1] + radii[2];
+        const area = expand(effect, support, plan.output);
+        const pixel_count = std.math.mul(usize, area.width, area.height) catch
+            return error.SourceCapacityExceeded;
+        try self.blur_a.resize(self.allocator, pixel_count);
+        try self.blur_b.resize(self.allocator, pixel_count);
+        copyDestinationRect(
+            self.blur_a.items,
+            destination,
+            destination_stride,
+            area,
+        );
+        for (radii) |radius| {
+            boxBlurHorizontal(self.blur_b.items, self.blur_a.items, area.width, area.height, radius);
+            boxBlurVertical(self.blur_a.items, self.blur_b.items, area.width, area.height, radius);
+        }
+
+        var y = effect.y;
+        while (y < effect.y + @as(i32, @intCast(effect.height))) : (y += 1) {
+            var x = effect.x;
+            while (x < effect.x + @as(i32, @intCast(effect.width))) : (x += 1) {
+                const point = inverseOutputPoint(.{ .x = x, .y = y }, list.output, plan.output_transform);
+                const local = surfacePoint(point, list.samples[planned.source_index]) orelse continue;
+                if (!regionContains(sample.blur_region, local) or
+                    (sample.global_alpha == 255 and regionContains(sample.opaque_region, local)) or
+                    !pixelDamaged(plan, x, y))
+                    continue;
+                const source_index = @as(usize, @intCast(y - area.y)) * area.width +
+                    @as(usize, @intCast(x - area.x));
+                const destination_offset = @as(usize, @intCast(y)) * destination_stride +
+                    @as(usize, @intCast(x)) * 4;
+                const bytes: *[4]u8 = @ptrCast(destination[destination_offset..][0..4].ptr);
+                const value = self.blur_a.items[source_index];
+                bytes.* = @bitCast(value);
+                if (list.output_format == .xrgb8888) bytes[3] = 255;
+            }
+        }
+    }
 };
+
+const EffectPoint = struct { x: i32, y: i32 };
+
+fn visibleBlurBounds(
+    list: render.List,
+    sample: render.SurfaceSample,
+    planned: render.PlannedSample,
+    plan: render.DamagePlan,
+    visible: render.Rect,
+) ?render.Rect {
+    var left: i64 = std.math.maxInt(i64);
+    var top: i64 = std.math.maxInt(i64);
+    var right: i64 = std.math.minInt(i64);
+    var bottom: i64 = std.math.minInt(i64);
+    var y = visible.y;
+    while (y < @as(i64, visible.y) + visible.height) : (y += 1) {
+        var x = visible.x;
+        while (x < @as(i64, visible.x) + visible.width) : (x += 1) {
+            if (!pixelDamaged(plan, x, y)) continue;
+            const point = inverseOutputPoint(.{ .x = x, .y = y }, list.output, plan.output_transform);
+            const local = surfacePoint(point, list.samples[planned.source_index]) orelse continue;
+            if (!regionContains(sample.blur_region, local) or
+                (sample.global_alpha == 255 and regionContains(sample.opaque_region, local)))
+                continue;
+            left = @min(left, x);
+            top = @min(top, y);
+            right = @max(right, @as(i64, x) + 1);
+            bottom = @max(bottom, @as(i64, y) + 1);
+        }
+    }
+    if (left >= right or top >= bottom) return null;
+    return .{
+        .x = @intCast(left),
+        .y = @intCast(top),
+        .width = @intCast(right - left),
+        .height = @intCast(bottom - top),
+    };
+}
+
+fn damaged(plan: render.DamagePlan, rect: render.Rect) bool {
+    if (plan.render_full) return true;
+    for (plan.render_damage) |value| if (intersection(rect, value, plan.output) != null)
+        return true;
+    return false;
+}
+
+fn pixelDamaged(plan: render.DamagePlan, x: i32, y: i32) bool {
+    if (plan.render_full) return true;
+    for (plan.render_damage) |value| if (x >= value.x and y >= value.y and
+        @as(i64, x) < @as(i64, value.x) + value.width and
+        @as(i64, y) < @as(i64, value.y) + value.height) return true;
+    return false;
+}
+
+fn expand(value: render.Rect, radius: u32, output: render.Size) render.Rect {
+    const left = @max(@as(i64, 0), @as(i64, value.x) - radius);
+    const top = @max(@as(i64, 0), @as(i64, value.y) - radius);
+    const right = @min(@as(i64, output.width), @as(i64, value.x) + value.width + radius);
+    const bottom = @min(@as(i64, output.height), @as(i64, value.y) + value.height + radius);
+    return .{
+        .x = @intCast(left),
+        .y = @intCast(top),
+        .width = @intCast(right - left),
+        .height = @intCast(bottom - top),
+    };
+}
+
+fn inverseOutputPoint(point: EffectPoint, output: render.Size, transform: render.Transform) EffectPoint {
+    const width: i32 = @intCast(output.width);
+    const height: i32 = @intCast(output.height);
+    return switch (transform) {
+        .normal => point,
+        .@"90" => .{ .x = width - 1 - point.y, .y = point.x },
+        .@"180" => .{ .x = width - 1 - point.x, .y = height - 1 - point.y },
+        .@"270" => .{ .x = point.y, .y = height - 1 - point.x },
+        .flipped => .{ .x = width - 1 - point.x, .y = point.y },
+        .flipped_90 => .{ .x = point.y, .y = point.x },
+        .flipped_180 => .{ .x = point.x, .y = height - 1 - point.y },
+        .flipped_270 => .{ .x = width - 1 - point.y, .y = height - 1 - point.x },
+    };
+}
+
+fn surfacePoint(point: EffectPoint, sample: render.SurfaceSample) ?EffectPoint {
+    const dx = @as(i64, point.x) - sample.destination.x;
+    const dy = @as(i64, point.y) - sample.destination.y;
+    if (dx < 0 or dy < 0 or dx >= sample.destination.width or dy >= sample.destination.height)
+        return null;
+    return .{
+        .x = @intCast(@divFloor(dx * sample.effect_size.width, sample.destination.width)),
+        .y = @intCast(@divFloor(dy * sample.effect_size.height, sample.destination.height)),
+    };
+}
+
+fn regionContains(operations: []const render.RegionOperation, point: EffectPoint) bool {
+    var contains = false;
+    for (operations) |operation| {
+        const result = switch (operation) {
+            .add => |value| .{ value, true },
+            .subtract => |value| .{ value, false },
+        };
+        const rectangle = result[0];
+        const inside = point.x >= rectangle.x and point.y >= rectangle.y and
+            @as(i64, point.x) < @as(i64, rectangle.x) + rectangle.width and
+            @as(i64, point.y) < @as(i64, rectangle.y) + rectangle.height;
+        if (!inside) continue;
+        contains = result[1];
+    }
+    return contains;
+}
+
+fn copyDestinationRect(
+    output: []u32,
+    destination: []const u8,
+    stride: u32,
+    area: render.Rect,
+) void {
+    for (0..area.height) |row| {
+        for (0..area.width) |column| {
+            const offset = (@as(usize, @intCast(area.y)) + row) * stride +
+                (@as(usize, @intCast(area.x)) + column) * 4;
+            output[row * area.width + column] = @bitCast(destination[offset..][0..4].*);
+        }
+    }
+}
+
+fn boxBlurHorizontal(output: []u32, input: []const u32, width: u32, height: u32, radius: u32) void {
+    const divisor = radius * 2 + 1;
+    for (0..height) |y| {
+        var sums: [4]u64 = @splat(0);
+        var offset: i64 = -@as(i64, radius);
+        while (offset <= radius) : (offset += 1)
+            addPixel(&sums, input[y * width + clampCoordinate(offset, width)]);
+        for (0..width) |x| {
+            output[y * width + x] = averagePixel(sums, divisor);
+            if (x + 1 == width) continue;
+            subtractPixel(&sums, input[y * width + clampCoordinate(@as(i64, @intCast(x)) - radius, width)]);
+            addPixel(&sums, input[y * width + clampCoordinate(@as(i64, @intCast(x)) + radius + 1, width)]);
+        }
+    }
+}
+
+fn boxBlurVertical(output: []u32, input: []const u32, width: u32, height: u32, radius: u32) void {
+    const divisor = radius * 2 + 1;
+    for (0..width) |x| {
+        var sums: [4]u64 = @splat(0);
+        var offset: i64 = -@as(i64, radius);
+        while (offset <= radius) : (offset += 1)
+            addPixel(&sums, input[clampCoordinate(offset, height) * width + x]);
+        for (0..height) |y| {
+            output[y * width + x] = averagePixel(sums, divisor);
+            if (y + 1 == height) continue;
+            subtractPixel(&sums, input[clampCoordinate(@as(i64, @intCast(y)) - radius, height) * width + x]);
+            addPixel(&sums, input[clampCoordinate(@as(i64, @intCast(y)) + radius + 1, height) * width + x]);
+        }
+    }
+}
+
+fn clampCoordinate(value: i64, extent: u32) usize {
+    return @intCast(std.math.clamp(value, 0, @as(i64, extent) - 1));
+}
+
+fn addPixel(sums: *[4]u64, pixel: u32) void {
+    inline for (0..4) |channel| sums[channel] += (pixel >> @intCast(channel * 8)) & 0xff;
+}
+
+fn subtractPixel(sums: *[4]u64, pixel: u32) void {
+    inline for (0..4) |channel| sums[channel] -= (pixel >> @intCast(channel * 8)) & 0xff;
+}
+
+fn averagePixel(sums: [4]u64, divisor: u32) u32 {
+    var pixel: u32 = 0;
+    inline for (0..4) |channel| {
+        const value: u32 = @intCast((sums[channel] + divisor / 2) / divisor);
+        pixel |= value << @intCast(channel * 8);
+    }
+    return pixel;
+}
 
 fn subtractOpaqueCoverage(
     list: render.List,
@@ -823,4 +1082,116 @@ test "render-pixman: opaque cursor does not suppress pre-cursor clear" {
     );
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 255 }, &before);
     try std.testing.expectEqualSlices(u8, &source, &after);
+}
+
+test "render-pixman: backdrop blur smooths transparency and skips opaque coverage" {
+    var renderer = try Renderer.init(std.testing.allocator, .{
+        .max_samples = 2,
+        .max_source_width = 64,
+        .max_source_height = 1,
+    });
+    defer renderer.deinit();
+    var background: [64 * 4]u8 align(4) = undefined;
+    var foreground: [64 * 4]u8 align(4) = undefined;
+    for (0..64) |x| {
+        const value: u8 = if (x < 32) 0 else 255;
+        background[x * 4 ..][0..4].* = .{ value, value, value, 255 };
+        foreground[x * 4 ..][0..4].* = if (x < 32)
+            .{ 0, 0, 0, 0 }
+        else
+            .{ 0, 0, 255, 255 };
+    }
+    const blur_region = [_]render.RegionOperation{.{
+        .add = .{ .x = 0, .y = 0, .width = 64, .height = 1 },
+    }};
+    const opaque_right = [_]render.RegionOperation{.{
+        .add = .{ .x = 32, .y = 0, .width = 32, .height = 1 },
+    }};
+    const samples = [_]render.SurfaceSample{
+        .{
+            .sample = .{ .surface = 1, .commit_sequence = 1 },
+            .presentation = .{ .slot = 0, .generation = 1 },
+            .source = .{ .size = .{ .width = 64, .height = 1 }, .stride = 256, .format = .xrgb8888, .bytes = &background },
+            .crop = render.SourceRect.pixels(0, 0, 64, 1),
+            .destination = .{ .x = 0, .y = 0, .width = 64, .height = 1 },
+            .clip = .{ .x = 0, .y = 0, .width = 64, .height = 1 },
+        },
+        .{
+            .sample = .{ .surface = 2, .commit_sequence = 1 },
+            .presentation = .{ .slot = 1, .generation = 1 },
+            .source = .{ .size = .{ .width = 64, .height = 1 }, .stride = 256, .format = .argb8888_premultiplied, .bytes = &foreground },
+            .crop = render.SourceRect.pixels(0, 0, 64, 1),
+            .destination = .{ .x = 0, .y = 0, .width = 64, .height = 1 },
+            .clip = .{ .x = 0, .y = 0, .width = 64, .height = 1 },
+            .effect_size = .{ .width = 64, .height = 1 },
+            .opaque_region = &opaque_right,
+            .blur_region = &blur_region,
+        },
+    };
+    const planned = [_]render.PlannedSample{
+        .{
+            .source_index = 0,
+            .sample = samples[0].sample,
+            .presentation = samples[0].presentation,
+            .crop = samples[0].crop,
+            .destination = .{ .x = 0, .y = 0, .width = 64, .height = 1 },
+            .clip = .{ .x = 0, .y = 0, .width = 64, .height = 1 },
+            .transform = .normal,
+            .global_alpha = 255,
+        },
+        .{
+            .source_index = 1,
+            .sample = samples[1].sample,
+            .presentation = samples[1].presentation,
+            .crop = samples[1].crop,
+            .destination = .{ .x = 0, .y = 0, .width = 64, .height = 1 },
+            .clip = .{ .x = 0, .y = 0, .width = 64, .height = 1 },
+            .transform = .normal,
+            .global_alpha = 255,
+        },
+    };
+    const list: render.List = .{
+        .output = .{ .width = 64, .height = 1 },
+        .output_format = .xrgb8888,
+        .clear = .{ .r = 0, .g = 0, .b = 0 },
+        .samples = &samples,
+    };
+    const plan: render.DamagePlan = .{
+        .output = list.output,
+        .samples = &planned,
+        .client_damage = &.{},
+        .scene_damage = &.{},
+        .repair_damage = &.{},
+        .render_damage = &.{},
+        .client_full = false,
+        .scene_full = false,
+        .repair_full = false,
+        .render_full = true,
+    };
+    var destination: [64 * 4]u8 align(4) = undefined;
+    try renderer.draw(list, plan, &destination, 256);
+    try std.testing.expect(destination[31 * 4] > 0 and destination[31 * 4] < 255);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, destination[32 * 4 ..][0..4]);
+    try std.testing.expectEqual(@as(usize, 54), renderer.blur_a.items.len);
+
+    var opaque_renderer = try Renderer.init(std.testing.allocator, .{
+        .max_samples = 2,
+        .max_source_width = 64,
+        .max_source_height = 1,
+    });
+    defer opaque_renderer.deinit();
+    var opaque_samples = samples;
+    const opaque_all = [_]render.RegionOperation{.{
+        .add = .{ .x = 0, .y = 0, .width = 64, .height = 1 },
+    }};
+    opaque_samples[1].opaque_region = &opaque_all;
+    try std.testing.expect(!render.hasVisibleBlur(opaque_samples[1]));
+    try std.testing.expect(render.hasVisibleBlur(samples[1]));
+    try opaque_renderer.draw(.{
+        .output = list.output,
+        .output_format = list.output_format,
+        .clear = list.clear,
+        .samples = &opaque_samples,
+    }, plan, &destination, 256);
+    try std.testing.expectEqual(@as(usize, 0), opaque_renderer.blur_a.items.len);
 }

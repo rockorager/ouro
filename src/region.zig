@@ -192,20 +192,49 @@ pub const SurfaceRegions = struct {
     pending_opaque: Region,
     current_input: Region,
     pending_input: Region,
+    current_blur: Region,
+    pending_blur: Region,
     current_input_infinite: bool = true,
     pending_input_infinite: bool = true,
     opaque_dirty: bool = false,
     input_dirty: bool = false,
+    blur_dirty: bool = false,
 
     pub const Changes = struct {
-        opaque_changed: bool,
-        input_changed: bool,
+        opaque_changed: bool = false,
+        input_changed: bool = false,
+        blur_changed: bool = false,
+    };
+
+    /// Versioned effect geometry retained by one content update. This prevents
+    /// a later wl_surface commit from changing the regions of an older queued
+    /// update before the compositor applies it.
+    pub const EffectSnapshot = struct {
+        allocator: std.mem.Allocator,
+        opaque_operations: []Operation,
+        blur_operations: []Operation,
+
+        /// Transfers allocation ownership while leaving this snapshot safe to
+        /// deinitialize with the rest of its originating content update.
+        pub fn take(snapshot: *EffectSnapshot) EffectSnapshot {
+            const owned = snapshot.*;
+            snapshot.opaque_operations = snapshot.opaque_operations[0..0];
+            snapshot.blur_operations = snapshot.blur_operations[0..0];
+            return owned;
+        }
+
+        pub fn deinit(snapshot: *EffectSnapshot) void {
+            snapshot.allocator.free(snapshot.blur_operations);
+            snapshot.allocator.free(snapshot.opaque_operations);
+            snapshot.* = undefined;
+        }
     };
 
     pub const Prepared = struct {
         owner: *SurfaceRegions,
         next_opaque: Region,
         next_input: Region,
+        next_blur: Region,
         changes: Changes,
 
         /// Releases prepared snapshots when a later preflight check fails.
@@ -214,6 +243,32 @@ pub const SurfaceRegions = struct {
         pub fn deinit(prepared: *Prepared) void {
             prepared.next_opaque.clear();
             prepared.next_input.clear();
+            prepared.next_blur.clear();
+        }
+
+        /// Copies the effective post-commit regions before publication, so a
+        /// fallible snapshot allocation cannot partially publish a commit.
+        pub fn effectSnapshot(prepared: *const Prepared) Error!EffectSnapshot {
+            const opaque_source = if (prepared.changes.opaque_changed)
+                &prepared.next_opaque
+            else
+                &prepared.owner.current_opaque;
+            const blur_source = if (prepared.changes.blur_changed)
+                &prepared.next_blur
+            else
+                &prepared.owner.current_blur;
+            const allocator = prepared.owner.current_opaque.pool.allocator;
+            const opaque_operations = try allocator.alloc(Operation, opaque_source.count);
+            errdefer allocator.free(opaque_operations);
+            const blur_operations = try allocator.alloc(Operation, blur_source.count);
+            errdefer allocator.free(blur_operations);
+            _ = opaque_source.copyOperations(opaque_operations) catch unreachable;
+            _ = blur_source.copyOperations(blur_operations) catch unreachable;
+            return .{
+                .allocator = allocator,
+                .opaque_operations = opaque_operations,
+                .blur_operations = blur_operations,
+            };
         }
 
         pub fn publish(prepared: *Prepared) Changes {
@@ -229,6 +284,11 @@ pub const SurfaceRegions = struct {
                 regions.current_input_infinite = regions.pending_input_infinite;
                 regions.input_dirty = false;
             }
+            if (prepared.changes.blur_changed) {
+                std.mem.swap(Region, &regions.current_blur, &prepared.next_blur);
+                prepared.next_blur.clear();
+                regions.blur_dirty = false;
+            }
             return prepared.changes;
         }
     };
@@ -239,6 +299,8 @@ pub const SurfaceRegions = struct {
             .pending_opaque = Region.init(pool),
             .current_input = Region.init(pool),
             .pending_input = Region.init(pool),
+            .current_blur = Region.init(pool),
+            .pending_blur = Region.init(pool),
         };
     }
 
@@ -247,6 +309,8 @@ pub const SurfaceRegions = struct {
         regions.pending_opaque.deinit();
         regions.current_input.deinit();
         regions.pending_input.deinit();
+        regions.current_blur.deinit();
+        regions.pending_blur.deinit();
         regions.* = undefined;
     }
 
@@ -268,6 +332,15 @@ pub const SurfaceRegions = struct {
             regions.pending_input_infinite = true;
         }
         regions.input_dirty = true;
+    }
+
+    pub fn setBlur(regions: *SurfaceRegions, source: ?*const Region) Error!void {
+        if (source) |value| {
+            try regions.pending_blur.cloneFrom(value);
+        } else {
+            regions.pending_blur.clear();
+        }
+        regions.blur_dirty = true;
     }
 
     /// Evaluates the exact committed Wayland input-region program at one
@@ -305,15 +378,20 @@ pub const SurfaceRegions = struct {
         errdefer next_opaque.clear();
         var input = Region.init(regions.current_input.pool);
         errdefer input.clear();
+        var blur = Region.init(regions.current_blur.pool);
+        errdefer blur.clear();
         if (regions.opaque_dirty) try next_opaque.cloneFrom(&regions.pending_opaque);
         if (regions.input_dirty) try input.cloneFrom(&regions.pending_input);
+        if (regions.blur_dirty) try blur.cloneFrom(&regions.pending_blur);
         return .{
             .owner = regions,
             .next_opaque = next_opaque,
             .next_input = input,
+            .next_blur = blur,
             .changes = .{
                 .opaque_changed = regions.opaque_dirty,
                 .input_changed = regions.input_dirty,
+                .blur_changed = regions.blur_dirty,
             },
         };
     }
@@ -431,4 +509,41 @@ test "surface region commit grows shared pool atomically" {
     const null_change = try regions.commit();
     try std.testing.expect(null_change.input_changed);
     try std.testing.expect(regions.current_input_infinite);
+}
+
+test "blur regions are double buffered and content snapshots remain immutable" {
+    var pool = try Pool.init(std.testing.allocator, 8);
+    defer pool.deinit(std.testing.allocator);
+    var first = Region.init(&pool);
+    defer first.deinit();
+    try first.add(.{ .x = 1, .y = 2, .width = 30, .height = 20 });
+    try first.subtract(.{ .x = 5, .y = 6, .width = 7, .height = 8 });
+    var second = Region.init(&pool);
+    defer second.deinit();
+    try second.add(.{ .x = 40, .y = 50, .width = 9, .height = 10 });
+
+    var regions = SurfaceRegions.init(&pool);
+    defer regions.deinit();
+    try regions.setBlur(&first);
+    try std.testing.expectEqual(@as(usize, 0), regions.current_blur.count);
+    var prepared = try regions.prepareCommit();
+    var snapshot = try prepared.effectSnapshot();
+    var retained = snapshot.take();
+    defer retained.deinit();
+    snapshot.deinit();
+    _ = prepared.publish();
+    prepared.deinit();
+
+    try regions.setBlur(&second);
+    _ = try regions.commit();
+    try std.testing.expectEqualSlices(Operation, &.{
+        .{ .add = .{ .x = 1, .y = 2, .width = 30, .height = 20 } },
+        .{ .subtract = .{ .x = 5, .y = 6, .width = 7, .height = 8 } },
+    }, retained.blur_operations);
+    var current: [1]Operation = undefined;
+    try std.testing.expectEqualSlices(
+        Operation,
+        &.{.{ .add = .{ .x = 40, .y = 50, .width = 9, .height = 10 } }},
+        try regions.current_blur.copyOperations(&current),
+    );
 }

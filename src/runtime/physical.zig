@@ -70,6 +70,7 @@ const protocol_fractional_scale = @import("../protocol/fractional_scale.zig");
 const protocol_color_management = @import("../protocol/color_management.zig");
 const protocol_color_representation = @import("../protocol/color_representation.zig");
 const protocol_alpha_modifier = @import("../protocol/alpha_modifier.zig");
+const protocol_background_effect = @import("../protocol/background_effect.zig");
 const protocol_pointer_warp = @import("../protocol/pointer_warp.zig");
 const protocol_security_context = @import("../protocol/security_context.zig");
 const protocol_output = @import("../protocol/output.zig");
@@ -391,6 +392,7 @@ pub fn Coordinator(comptime protocol: type) type {
         const ColorManagementAdapter = protocol_color_management.Adapter(protocol, Adapter);
         const ColorRepresentationAdapter = protocol_color_representation.Adapter(protocol, Adapter);
         const AlphaModifierAdapter = protocol_alpha_modifier.Adapter(protocol, Adapter);
+        const BackgroundEffectAdapter = protocol_background_effect.Adapter(protocol, Adapter);
         const PointerWarpAdapter = protocol_pointer_warp.Adapter(protocol, Adapter);
         const SecurityContextAdapter = protocol_security_context.Adapter(protocol);
         const OutputAdapter = protocol_output.Adapter(protocol);
@@ -683,6 +685,7 @@ pub fn Coordinator(comptime protocol: type) type {
             const output_power: u64 = 1 << 34;
             const gamma_control: u64 = 1 << 35;
             const drm_lease: u64 = 1 << 36;
+            const background_effect: u64 = 1 << 37;
             const all: u64 = decoration | shell | seat | data_device | dmabuf |
                 activation | relative_pointer | fractional_scale | output | core |
                 pointer_constraints | color_management | color_representation |
@@ -690,7 +693,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 shortcuts_inhibit | xdg_foreign | xdg_output | layer_shell | session_lock |
                 idle_notify | tablet | ext_data_control | wlr_data_control | input_method |
                 screencopy | foreign_toplevel_list | image_copy_capture | xdg_toplevel_icon | gtk_shell |
-                workspace | xdg_session | output_management | output_power | gamma_control | drm_lease;
+                workspace | xdg_session | output_management | output_power | gamma_control |
+                drm_lease | background_effect;
         };
         const Client = struct {
             active: bool = false,
@@ -716,6 +720,7 @@ pub fn Coordinator(comptime protocol: type) type {
             id: ?Adapter.SurfaceId = null,
             content_origin: geometry.Point = .{ .x = 0, .y = 0 },
             content: OwnedValue(Adapter.Content) = .{},
+            effects: ?surface_state.SurfaceRegions.EffectSnapshot = null,
             rendered: ?render_content.Handle = null,
             presentation: ?Presentations.Token = null,
             sample: ?render_list.AppliedSurface = null,
@@ -834,6 +839,7 @@ pub fn Coordinator(comptime protocol: type) type {
             color_management: protocol_color_management.Config = .{},
             color_representation: protocol_color_representation.Config = .{},
             alpha_modifier: protocol_alpha_modifier.Config = .{},
+            background_effect: protocol_background_effect.Config = .{},
             pointer_warp: protocol_pointer_warp.Config = .{},
             security_context: protocol_security_context.Config = .{},
             enable_color_protocols: bool = false,
@@ -987,6 +993,7 @@ pub fn Coordinator(comptime protocol: type) type {
         color_protocols_enabled: bool = false,
         color_representation_adapter: ColorRepresentationAdapter,
         alpha_modifier_adapter: AlphaModifierAdapter,
+        background_effect_adapter: BackgroundEffectAdapter,
         pointer_warp_adapter: PointerWarpAdapter,
         security_context_adapter: SecurityContextAdapter,
         output_adapter: OutputAdapter,
@@ -1648,6 +1655,12 @@ pub fn Coordinator(comptime protocol: type) type {
                 config.alpha_modifier,
             );
             errdefer self.alpha_modifier_adapter.deinit();
+            self.background_effect_adapter = try BackgroundEffectAdapter.init(
+                allocator,
+                &self.adapter,
+                config.background_effect,
+            );
+            errdefer self.background_effect_adapter.deinit();
             self.pointer_warp_adapter = try PointerWarpAdapter.init(
                 allocator,
                 &self.adapter,
@@ -1833,6 +1846,9 @@ pub fn Coordinator(comptime protocol: type) type {
                     return error.GlobalPublicationIncomplete;
             }
             _ = try self.alpha_modifier_adapter.install(&root.runtime);
+            if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
+                return error.GlobalPublicationIncomplete;
+            _ = try self.background_effect_adapter.install(&root.runtime);
             if (try root.runtime.publishNext() != Runtime.PublishResult.complete)
                 return error.GlobalPublicationIncomplete;
             _ = try self.pointer_warp_adapter.install(&root.runtime);
@@ -2303,6 +2319,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.output_adapter.deinit();
             self.fractional_scale_adapter.deinit();
             self.alpha_modifier_adapter.deinit();
+            self.background_effect_adapter.deinit();
             self.pointer_warp_adapter.deinit();
             self.security_context_adapter.deinit();
             self.color_representation_adapter.deinit();
@@ -2424,6 +2441,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.wlr_data_control_adapter.disconnected(peer);
             self.ext_data_control_adapter.disconnected(peer);
             self.alpha_modifier_adapter.disconnected(peer);
+            self.background_effect_adapter.disconnected(peer);
             self.pointer_warp_adapter.disconnected(peer);
             self.security_context_adapter.disconnected(peer);
             if (self.clientFor(peer)) |client| {
@@ -2547,6 +2565,11 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             if (try self.alpha_modifier_adapter.request(peer, target, message, fds)) |control|
                 return control;
+            if (try self.background_effect_adapter.request(peer, target, message, fds)) |control| {
+                if (self.background_effect_adapter.pendingOutbound(peer))
+                    self.markProtocol(peer, ProtocolReady.background_effect);
+                return control;
+            }
             if (try self.pointer_warp_adapter.request(peer, target, message, fds)) |control|
                 return control;
             if (try self.security_context_adapter.request(peer, target, message, fds)) |control|
@@ -2866,6 +2889,7 @@ pub fn Coordinator(comptime protocol: type) type {
             timer_outcomes: []const loop_api.TimerOutcome,
             ouro_outcomes: []const loop_api.OuroCompletion,
         ) !void {
+            var hotplug_completed = false;
             for (ouro_outcomes) |outcome| switch (outcome.token.kind) {
                 .icc_worker => try self.completeIcc(outcome),
                 .security_accept, .security_close, .security_cancel => try self.completeSecurity(outcome),
@@ -2891,7 +2915,11 @@ pub fn Coordinator(comptime protocol: type) type {
                         outcome.token,
                         outcome.cqe.res,
                     );
-                    try self.processHotplug();
+                    // Timer storage is retired by Loop before this callback,
+                    // but output schedulers consume the matching outcome
+                    // below. Defer connector removal until then so a hotplug
+                    // CQE sharing this batch cannot cancel a stale timer.
+                    hotplug_completed = true;
                 },
                 else => return error.UnexpectedCompletion,
             };
@@ -2926,6 +2954,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     try self.renderFrame(request_value.frame);
                 }
             }
+            if (hotplug_completed) try self.processHotplug();
             try self.processSession();
             try self.processOutput();
             try self.prepareSecurityClosures();
@@ -7148,6 +7177,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 flushed += try self.color_management_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.color_representation != 0)
                 flushed += try self.color_representation_adapter.flushOn(peer, objects, &actor.transmit);
+            if (client.protocol_ready & ProtocolReady.background_effect != 0)
+                flushed += try self.background_effect_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.screencopy != 0)
                 flushed += try self.screencopy_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.foreign_toplevel_list != 0)
@@ -7553,6 +7584,9 @@ pub fn Coordinator(comptime protocol: type) type {
             if (ready & ProtocolReady.color_representation != 0 and
                 !self.color_representation_adapter.pendingOutbound(client.peer))
                 ready &= ~ProtocolReady.color_representation;
+            if (ready & ProtocolReady.background_effect != 0 and
+                !self.background_effect_adapter.pendingOutbound(client.peer))
+                ready &= ~ProtocolReady.background_effect;
             if (ready & ProtocolReady.screencopy != 0 and
                 !self.screencopy_adapter.pendingOutbound(client.peer))
                 ready &= ~ProtocolReady.screencopy;
@@ -8745,6 +8779,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 content.surface.sequence,
                 output_api.presentationIdentity(token),
             ) catch unreachable;
+            const effects = content.effects.take();
+            if (layer.effects) |*previous_effects| previous_effects.deinit();
+            layer.effects = effects;
+            const stable_effects = &layer.effects.?;
             // All source, geometry, upload, identity, and presentation
             // admission has succeeded. Only this non-fallible edge publishes
             // the renderer-owned version, consuming a compatible previous
@@ -8764,6 +8802,12 @@ pub fn Coordinator(comptime protocol: type) type {
                 .color_description = content.surface.color_description,
                 .color_representation = content.surface.color_representation,
                 .global_alpha = alphaMultiplier(content.surface.alpha_multiplier),
+                .effect_size = .{
+                    .width = content.surface.size.width,
+                    .height = content.surface.size.height,
+                },
+                .opaque_region = stable_effects.opaque_operations,
+                .blur_region = stable_effects.blur_operations,
             };
             const published = .{
                 .peer = candidate.peer,
@@ -8933,6 +8977,12 @@ pub fn Coordinator(comptime protocol: type) type {
             sample.color_description = content.surface.color_description;
             sample.color_representation = content.surface.color_representation;
             sample.global_alpha = alphaMultiplier(content.surface.alpha_multiplier);
+            sample.effect_size = .{
+                .width = content.surface.size.width,
+                .height = content.surface.size.height,
+            };
+            sample.opaque_region = content.effects.opaque_operations;
+            sample.blur_region = content.effects.blur_operations;
             if (std.meta.eql(sample, layer.sample.?) and
                 content.surface.surface_damage.count == 0 and
                 content.surface.buffer_damage.count == 0 and
@@ -8988,6 +9038,11 @@ pub fn Coordinator(comptime protocol: type) type {
                 retained.deinit();
                 layer.content.clear();
             }
+            const effects = published.content.effects.take();
+            if (layer.effects) |*previous_effects| previous_effects.deinit();
+            layer.effects = effects;
+            sample.opaque_region = layer.effects.?.opaque_operations;
+            sample.blur_region = layer.effects.?.blur_operations;
             layer.change = .{
                 .previous = previous,
                 .current = damage.SurfaceState.fromSample(sample, .{
@@ -11986,7 +12041,11 @@ pub fn Coordinator(comptime protocol: type) type {
                     const layer_ids = try self.layer_shell_adapter.ids(self.layer_surface_ids);
                     for (layer_ids) |layer_id| {
                         const state = try self.layer_shell_adapter.state(layer_id);
-                        if (!state.configured or state.mapped or state.closed or
+                        // Keep configured layer surfaces associated throughout
+                        // the handoff from role state to an applied render
+                        // layer. Dropping mapped-but-not-yet-applied surfaces
+                        // here produces an enter/leave/enter sequence.
+                        if (!state.configured or state.closed or
                             !samePeer(state.peer, client.peer) or
                             !std.meta.eql(state.output, physical.protocol_output)) continue;
                         appendUniqueSurface(
@@ -12698,6 +12757,7 @@ pub fn Coordinator(comptime protocol: type) type {
             if (layerHasOutputAssociation(layer)) self.output_associations_dirty = true;
             if (layer.presentation) |token| self.presentations.discard(token) catch unreachable;
             if (layer.content.get()) |content| content.deinit();
+            if (layer.effects) |*effects| effects.deinit();
             if (layer.candidate.get()) |candidate| candidate.content.deinit();
             if (layer.retired_source) |*source| source.content.deinit();
             if (layer.rendered) |rendered| if (self.render_device) |render_device|
@@ -12904,6 +12964,7 @@ pub fn Coordinator(comptime protocol: type) type {
             _ = self.color_management_adapter.resourceRemoved(handle, object);
             _ = self.color_representation_adapter.resourceRemoved(handle, object);
             _ = self.alpha_modifier_adapter.resourceRemoved(handle, object);
+            _ = self.background_effect_adapter.resourceRemoved(handle, object);
             _ = self.pointer_warp_adapter.resourceRemoved(handle, object);
             _ = self.security_context_adapter.resourceRemoved(handle, object);
             const layer_shell_removed = self.layer_shell_adapter.resourceRemoved(handle, object);
@@ -12949,6 +13010,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.color_management_adapter.surfaceRemoved(id);
                 self.color_representation_adapter.surfaceRemoved(id);
                 self.alpha_modifier_adapter.surfaceRemoved(id);
+                self.background_effect_adapter.surfaceRemoved(id);
                 self.dropPendingSurface(id);
                 if (self.render_device) |render_device| render_device.content.destroySurface(
                     (@as(u64, id.generation) << 32) | id.index,

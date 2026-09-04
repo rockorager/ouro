@@ -131,6 +131,13 @@ const Region = struct {
     fn slice(self: Region) []const render.Rect {
         return self.rects[0..self.count];
     }
+
+    fn intersects(self: Region, value: render.Rect) bool {
+        if (self.full) return true;
+        for (self.rects[0..self.count]) |rect| if (intersect(rect, value) != null)
+            return true;
+        return false;
+    }
 };
 
 const Image = struct {
@@ -320,11 +327,30 @@ pub const Planner = struct {
         self.combined.addRegion(self.physical_output, self.client);
         self.combined.addRegion(self.physical_output, self.scene);
         self.combined.addRegion(self.physical_output, self.repair);
+        // A backdrop effect depends on pixels below its own destination. Walk
+        // back-to-front so damage propagated through one blur can invalidate a
+        // later overlapping blur. The complete surface rectangle is
+        // conservative for non-rectangular client regions; renderers retain
+        // the exact region mask.
+        for (list.samples, self.planned_samples[0..list.samples.len]) |sample, planned| {
+            if (!render.hasVisibleBlur(sample)) continue;
+            const visible = clippedPlanRect(
+                planned.destination,
+                planned.clip,
+                self.physical_output,
+            ) orelse continue;
+            const radius = blurRadius(sample, planned);
+            const dependency = expandRect(visible, radius, self.physical_output);
+            if (!self.combined.intersects(dependency)) continue;
+            self.combined.add(self.physical_output, dependency);
+            self.combined.add(self.physical_output, visible);
+        }
         if (force_full) self.combined.setFull(self.physical_output);
         self.pending = true;
         self.pending_handle = handle;
         return .{
             .output = self.physical_output,
+            .output_transform = self.output_transform,
             .samples = self.planned_samples[0..planned_count],
             .client_damage = self.client.slice(),
             .scene_damage = self.scene.slice(),
@@ -615,6 +641,39 @@ fn transformGeometryRect(value: render.Rect, output: render.Size, transform: ren
         .y = edges[1],
         .width = @intCast(edges[2] - edges[0]),
         .height = @intCast(edges[3] - edges[1]),
+    };
+}
+
+fn blurRadius(sample: render.SurfaceSample, planned: render.PlannedSample) u32 {
+    const x = std.math.divCeil(
+        u64,
+        @as(u64, 24) * planned.destination.width,
+        sample.effect_size.width,
+    ) catch 24;
+    const y = std.math.divCeil(
+        u64,
+        @as(u64, 24) * planned.destination.height,
+        sample.effect_size.height,
+    ) catch 24;
+    return @intCast(@min(@as(u64, std.math.maxInt(u32)), @max(x, y)));
+}
+
+fn expandRect(value: render.Rect, radius: u32, output: render.Size) render.Rect {
+    const left = @max(@as(i64, 0), @as(i64, value.x) - radius);
+    const top = @max(@as(i64, 0), @as(i64, value.y) - radius);
+    const right = @min(
+        @as(i64, output.width),
+        @as(i64, value.x) + value.width + radius,
+    );
+    const bottom = @min(
+        @as(i64, output.height),
+        @as(i64, value.y) + value.height + radius,
+    );
+    return .{
+        .x = @intCast(left),
+        .y = @intCast(top),
+        .width = @intCast(right - left),
+        .height = @intCast(bottom - top),
     };
 }
 
@@ -927,6 +986,69 @@ test "damage: translucent and partial coverage never cull hidden pixels" {
     );
     try std.testing.expectEqual(@as(usize, 2), plan.samples.len);
     try planner.cancel();
+}
+
+test "damage: backdrop blur expands underlying damage while opaque XRGB does not" {
+    const pixel = [_]u8{0} ** 4;
+    const blur_region = [_]render.RegionOperation{.{
+        .add = .{ .x = 0, .y = 0, .width = 40, .height = 40 },
+    }};
+    const background_old = testSample(1, 1, &pixel, .{ .x = 0, .y = 0, .width = 100, .height = 100 });
+    const background_new = testSample(1, 2, &pixel, background_old.destination);
+    var blur = testSample(2, 1, &pixel, .{ .x = 30, .y = 30, .width = 40, .height = 40 });
+    blur.source.format = .argb8888_premultiplied;
+    blur.effect_size = .{ .width = 40, .height = 40 };
+    blur.blur_region = &blur_region;
+    const old_state = SurfaceState.fromSample(background_old, .{ .width = 100, .height = 100 });
+    const new_state = SurfaceState.fromSample(background_new, .{ .width = 100, .height = 100 });
+    const change = Change{
+        .previous = old_state,
+        .current = new_state,
+        .surface_damage = damageRegion(Damage.rect(45, 45, 1, 1)),
+    };
+
+    var planner = try Planner.init(std.testing.allocator, .{ .width = 100, .height = 100 }, .normal, testConfig(1));
+    defer planner.deinit();
+    _ = try planner.prepare(
+        .{ .slot = 0, .generation = 1 },
+        testList(&.{ background_old, blur }),
+        &.{},
+    );
+    try planner.publish();
+    var plan = try planner.prepare(
+        .{ .slot = 0, .generation = 2 },
+        testList(&.{ background_new, blur }),
+        &.{change},
+    );
+    try std.testing.expectEqualSlices(render.Rect, &.{.{
+        .x = 6,
+        .y = 6,
+        .width = 88,
+        .height = 88,
+    }}, plan.render_damage);
+    try planner.cancel();
+
+    var opaque_planner = try Planner.init(std.testing.allocator, .{ .width = 100, .height = 100 }, .normal, testConfig(1));
+    defer opaque_planner.deinit();
+    blur.source.format = .xrgb8888;
+    _ = try opaque_planner.prepare(
+        .{ .slot = 0, .generation = 1 },
+        testList(&.{ background_old, blur }),
+        &.{},
+    );
+    try opaque_planner.publish();
+    plan = try opaque_planner.prepare(
+        .{ .slot = 0, .generation = 2 },
+        testList(&.{ background_new, blur }),
+        &.{change},
+    );
+    try std.testing.expectEqualSlices(render.Rect, &.{.{
+        .x = 45,
+        .y = 45,
+        .width = 1,
+        .height = 1,
+    }}, plan.render_damage);
+    try opaque_planner.cancel();
 }
 
 test "damage: committed surface damage scales through destination and clip" {
