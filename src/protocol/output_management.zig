@@ -95,7 +95,7 @@ pub fn Adapter(comptime protocol: type) type {
         const ConfigSlot = struct { header: slot_pool.Header = .{}, manager: u32 = 0, peer: Peer = undefined, resource: ?objects.Handle = null, lifecycle: ConfigurationId = undefined, destroyed: bool = false };
         const CHeadSlot = struct { header: slot_pool.Header = .{}, configuration: u32 = 0, peer: Peer = undefined, resource: ?objects.Handle = null, head: HeadId = undefined };
         const Kind = enum { make_head, head_name, head_description, physical_size, make_mode, mode_size, mode_refresh, mode_preferred, enabled, current_mode, position, transform, scale, make, model, adaptive_sync, done, head_finished, finished, succeeded, failed, cancelled };
-        const Out = struct { kind: Kind, owner: u32, head: ?u32 = null, mode: ?u32 = null, serial: u32 = 0 };
+        const Out = struct { kind: Kind, owner: u32, head: ?u32 = null, mode: ?u32 = null, serial: u32 = 0, state: ?HeadState = null };
         const InventoryHead = struct { id: HeadId, name: []u8, description: []u8, make: ?[]u8, model: ?[]u8, physical_width_mm: ?i32, physical_height_mm: ?i32, modes: []ModeState, modes_owned: bool = true };
         pub const WireCommand = struct { peer: Peer, configuration: ConfigurationId, wire_configuration: ?objects.Handle, operation: Operation, serial: u32, desired: HeadState, heads: []const DesiredHead };
 
@@ -369,11 +369,13 @@ pub fn Adapter(comptime protocol: type) type {
                 if (!m.header.active or m.stopped) continue;
                 for (self.inventory.items) |item| {
                     const h = self.findWireHead(m.header.index, item.id) orelse continue;
+                    const state = self.lifecycle.currentHead(item.id) catch continue;
                     for ([_]Kind{ .enabled, .current_mode, .position, .transform, .scale, .adaptive_sync }) |k|
                         if (k != .adaptive_sync or m.version >= 4) self.outbound.appendAssumeCapacity(.{
                             .kind = k,
                             .owner = m.header.index,
                             .head = h.header.index,
+                            .state = state,
                         });
                 }
                 self.outbound.appendAssumeCapacity(.{ .kind = .done, .owner = m.header.index, .serial = self.lifecycle.serial });
@@ -390,8 +392,9 @@ pub fn Adapter(comptime protocol: type) type {
             for (self.managers.entries.items) |m| {
                 if (!m.header.active or m.stopped) continue;
                 const h = self.findWireHead(m.header.index, id) orelse continue;
+                const state = self.lifecycle.currentHead(id) catch continue;
                 for ([_]Kind{ .enabled, .current_mode, .position, .transform, .scale, .adaptive_sync }) |k|
-                    if (k != .adaptive_sync or m.version >= 4) self.outbound.appendAssumeCapacity(.{ .kind = k, .owner = m.header.index, .head = h.header.index });
+                    if (k != .adaptive_sync or m.version >= 4) self.outbound.appendAssumeCapacity(.{ .kind = k, .owner = m.header.index, .head = h.header.index, .state = state });
                 self.outbound.appendAssumeCapacity(.{ .kind = .done, .owner = m.header.index, .serial = self.lifecycle.serial });
             }
         }
@@ -581,6 +584,7 @@ pub fn Adapter(comptime protocol: type) type {
             h.manager = m.header.index;
             h.peer = m.peer;
             h.head = item.id;
+            const head_state = try self.lifecycle.currentHead(item.id);
             for ([_]Kind{ .make_head, .head_name, .head_description, .physical_size }) |k| {
                 if (k == .physical_size and item.physical_width_mm == null) continue;
                 self.outbound.appendAssumeCapacity(.{ .kind = k, .owner = m.header.index, .head = h.header.index });
@@ -598,7 +602,7 @@ pub fn Adapter(comptime protocol: type) type {
             }
             for ([_]Kind{ .enabled, .current_mode, .position, .transform, .scale, .make, .model, .adaptive_sync }) |k| {
                 if (k == .make and (m.version < 2 or item.make == null) or k == .model and (m.version < 2 or item.model == null) or k == .adaptive_sync and m.version < 4) continue;
-                self.outbound.appendAssumeCapacity(.{ .kind = k, .owner = m.header.index, .head = h.header.index });
+                self.outbound.appendAssumeCapacity(.{ .kind = k, .owner = m.header.index, .head = h.header.index, .state = head_state });
             }
         }
         fn findInventoryIndex(self: *const Self, id: HeadId) ?usize {
@@ -724,7 +728,7 @@ pub fn Adapter(comptime protocol: type) type {
                 return;
             }
             const metadata = item orelse return;
-            const s = self.lifecycle.currentHead(h.head) catch return;
+            const s = o.state orelse self.lifecycle.currentHead(h.head) catch return;
             switch (o.kind) {
                 .make_head => {
                     const made = try Manager.construct_event_head(protocol, so, q, manager_resource, .{ .head = .{ .context = h } });
@@ -752,7 +756,7 @@ pub fn Adapter(comptime protocol: type) type {
                 },
                 .enabled => try Head.encodeEvent(q, h.resource.?.id, .{ .enabled = .{ .enabled = @intFromBool(s.enabled) } }),
                 .current_mode => if (s.enabled) {
-                    if (self.currentModeFor(o.owner, h.head)) |mode| if (mode.resource) |resource|
+                    if (self.currentModeFor(o.owner, h.head, s)) |mode| if (mode.resource) |resource|
                         try Head.encodeEvent(q, h.resource.?.id, .{ .current_mode = .{ .mode = resource.id } });
                 },
                 .position => try Head.encodeEvent(q, h.resource.?.id, .{ .position = .{ .x = s.x, .y = s.y } }),
@@ -882,8 +886,7 @@ pub fn Adapter(comptime protocol: type) type {
             const mode = self.modes.at(index) orelse return null;
             return if (mode.manager == out.owner) mode else null;
         }
-        fn currentModeFor(self: *Self, manager: u32, id: HeadId) ?*Child {
-            const state = self.lifecycle.currentHead(id) catch return null;
+        fn currentModeFor(self: *Self, manager: u32, id: HeadId, state: HeadState) ?*Child {
             for (self.modes.entries.items) |mode| if (mode.header.active and
                 mode.manager == manager and std.meta.eql(mode.head, id) and mode.mode.matches(state)) return mode;
             return null;
@@ -1644,10 +1647,25 @@ test "output management topology changes invalidate configuration snapshots" {
     try std.testing.expectEqual(@as(u32, 10), adapter.lifecycle.serial);
     try std.testing.expectEqual(@as(u32, 10), adapter.outbound.items[adapter.outbound.items.len - 1].serial);
     try std.testing.expectEqual(@as(usize, 1), (try adapter.lifecycle.get(stale)).heads.items.len);
+    var first_position: ?usize = null;
+    for (adapter.outbound.items, 0..) |event, index| if (event.kind == .position) {
+        first_position = index;
+        break;
+    };
+    try std.testing.expectEqual(@as(i32, 800), adapter.outbound.items[first_position.?].state.?.x);
+    _ = try adapter.publishHead(secondary, .{
+        .width = 1024,
+        .height = 768,
+        .refresh_millihz = 60000,
+        .x = 900,
+    });
+    try std.testing.expectEqual(@as(u32, 11), adapter.lifecycle.serial);
+    try std.testing.expectEqual(@as(i32, 800), adapter.outbound.items[first_position.?].state.?.x);
+    try std.testing.expectEqual(@as(i32, 900), adapter.outbound.items[adapter.outbound.items.len - 2].state.?.x);
 
     try adapter.removeHead(secondary);
-    try std.testing.expectEqual(@as(u32, 11), adapter.lifecycle.serial);
-    try std.testing.expectEqual(@as(u32, 11), adapter.outbound.items[adapter.outbound.items.len - 1].serial);
+    try std.testing.expectEqual(@as(u32, 12), adapter.lifecycle.serial);
+    try std.testing.expectEqual(@as(u32, 12), adapter.outbound.items[adapter.outbound.items.len - 1].serial);
     try std.testing.expect((try adapter.lifecycle.submit(stale, .@"test")) == null);
     try std.testing.expect(adapter.managers.at(manager_index) == null);
 }
@@ -1766,7 +1784,7 @@ test "output management binds two exact heads and targets synchronization" {
     try adapter.synchronizeHead(secondary);
     for (adapter.outbound.items[0 .. adapter.outbound.items.len - 1]) |event|
         try std.testing.expectEqual(adapter.heads.entries.items[1].header.index, event.head.?);
-    try std.testing.expect(adapter.currentModeFor(0, secondary).?.mode.matches(secondary_state));
+    try std.testing.expect(adapter.currentModeFor(0, secondary, secondary_state).?.mode.matches(secondary_state));
 
     adapter.outbound.clearRetainingCapacity();
     try adapter.synchronize();
