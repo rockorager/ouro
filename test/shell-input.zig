@@ -2430,6 +2430,24 @@ test "shell-input: two mapped toplevels sustain independent commit cycles" {
 
     const windows = try coordinator.desktop.sceneSnapshot(coordinator.scene_windows);
     try std.testing.expectEqual(windows[1].id, coordinator.desktop.focused().?);
+    const applied_before_hidden_commit = coordinator.stats.applied;
+    const frames_before_hidden_commit = handler.frame_done;
+    handler.metadata_commit_after_attach = false;
+    try handler.mapSurface(0);
+    var hidden_commit_applied = false;
+    for (0..256) |_| {
+        client_progress = try drainMultiClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (coordinator.stats.applied > applied_before_hidden_commit) {
+            hidden_commit_applied = true;
+            break;
+        }
+        if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, client_reactor.ring);
+    }
+    try std.testing.expect(hidden_commit_applied);
+    try std.testing.expectEqual(frames_before_hidden_commit, handler.frame_done);
+
     try coordinator.switchWorkspace(2);
     var hidden_layers_retained = false;
     for (0..256) |_| {
@@ -2445,6 +2463,8 @@ test "shell-input: two mapped toplevels sustain independent commit cycles" {
             try waitForEither(&root.ring, client_reactor.ring);
     }
     try std.testing.expect(hidden_layers_retained);
+    try std.testing.expectEqual(frames_before_hidden_commit, handler.frame_done);
+
     try coordinator.switchWorkspace(1);
     const submitted_before_restore = coordinator.stats.submitted;
     var restored_layers_rendered = false;
@@ -2452,7 +2472,8 @@ test "shell-input: two mapped toplevels sustain independent commit cycles" {
         client_progress = try drainMultiClient(&client_reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
         if (coordinator.stats.submitted > submitted_before_restore and
-            coordinator.primaryKmsOutput().?.scheduler.sample_count == 2)
+            coordinator.primaryKmsOutput().?.scheduler.sample_count == 2 and
+            handler.frame_done > frames_before_hidden_commit)
         {
             restored_layers_rendered = true;
             break;

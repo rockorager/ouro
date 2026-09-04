@@ -5842,6 +5842,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 const id = layer.id orelse continue;
                 const scene = self.surfaceScene(id) orelse continue;
                 if (!scene.root.visible) continue;
+                if (layer.presentation == null and layer.callback_data == null) {
+                    layer.callback_data = callbackData(now);
+                    _ = try self.retryLayerFrameCallbacks(layer);
+                }
                 _ = try self.requestLayerOutputDamage(layer, now);
             }
             try self.requestOutputDamage();
@@ -8463,6 +8467,9 @@ pub fn Coordinator(comptime protocol: type) type {
                         if (layer.id) |id| if (self.surfaceScene(id)) |scene| {
                             if (!scene.root.visible) {
                                 if (layer.presentation != null) {
+                                    const surface = layer.surface orelse return error.StaleSurface;
+                                    const content = layer.content.get() orelse return error.MissingContent;
+                                    _ = try self.adapter.activateFrames(surface, content);
                                     layer.feedback_outcome = .discarded;
                                     layer.outcome_pending = true;
                                     _ = try self.retryLayerOutcome(layer);
@@ -11087,6 +11094,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 }
                 if (layer.source_release_pending and !layer.retains_source)
                     _ = try self.retryLayerSourceRelease(layer);
+                if (layer.presentation == null and layer.callback_data != null)
+                    _ = try self.retryLayerFrameCallbacks(layer);
                 if (layer.outcome_pending and
                     (!layer.source_release_pending or layer.retains_source))
                 {
@@ -11163,22 +11172,8 @@ pub fn Coordinator(comptime protocol: type) type {
                     else => return err,
                 };
             }
-            if (layer.callback_data) |data| {
-                const peer = layer.peer orelse return error.ClientDisconnected;
-                const surface = layer.surface orelse return error.StaleSurface;
-                const objects = try self.root.runtime.clients.get(peer);
-                const actor = try self.root.runtime.clients.reactor.getActor(peer);
-                while (self.adapter.completeFrameOn(
-                    objects,
-                    &actor.transmit,
-                    surface,
-                    data,
-                ) catch |err| switch (err) {
-                    error.Exhausted => return false,
-                    else => return err,
-                }) {}
-                layer.callback_data = null;
-            }
+            if (layer.callback_data != null and !try self.retryLayerFrameCallbacks(layer))
+                return false;
             try self.presentations.finish(token);
             if (!layer.retains_source) {
                 content.deinit();
@@ -11205,6 +11200,25 @@ pub fn Coordinator(comptime protocol: type) type {
                 return true;
             }
             return false;
+        }
+
+        fn retryLayerFrameCallbacks(self: *Self, layer: *Layer) !bool {
+            const data = layer.callback_data orelse return true;
+            const peer = layer.peer orelse return error.ClientDisconnected;
+            const surface = layer.surface orelse return error.StaleSurface;
+            const objects = try self.root.runtime.clients.get(peer);
+            const actor = try self.root.runtime.clients.reactor.getActor(peer);
+            while (self.adapter.completeFrameOn(
+                objects,
+                &actor.transmit,
+                surface,
+                data,
+            ) catch |err| switch (err) {
+                error.Exhausted => return false,
+                else => return err,
+            }) {}
+            layer.callback_data = null;
+            return true;
         }
 
         /// Once renderer use no longer requires a borrowed source, drop its
