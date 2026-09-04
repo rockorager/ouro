@@ -11207,12 +11207,9 @@ pub fn Coordinator(comptime protocol: type) type {
             peer: ?wayring.io_uring.Peer,
             content: *Adapter.Content,
         ) !bool {
-            if (peer == null or !self.peerLive(peer.?)) {
-                if (content.attachment_lease) |*lease| lease.deinit();
-                content.attachment_lease = null;
-                return true;
-            }
-            const owner = peer.?;
+            // A disconnected client may retain and wait on its timeline fd.
+            // Publish compositor completion before dropping the DMA-BUF lease
+            // even though no Wayland release event can still be delivered.
             if (content.surface.explicit_sync != null) {
                 const lease = content.attachment_lease orelse return error.MissingLease;
                 var source = try self.adapter.bufferSource(lease);
@@ -11224,6 +11221,12 @@ pub fn Coordinator(comptime protocol: type) type {
                     .shm, .single_pixel => return error.ExplicitSyncUnsupportedBuffer,
                 }
             }
+            if (peer == null or !self.peerLive(peer.?)) {
+                if (content.attachment_lease) |*lease| lease.deinit();
+                content.attachment_lease = null;
+                return true;
+            }
+            const owner = peer.?;
             if (content.attachment_lease) |*lease| {
                 lease.deinit();
                 content.attachment_lease = null;
