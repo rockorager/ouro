@@ -776,15 +776,44 @@ pub fn Adapter(comptime protocol: type, comptime ShellAdapter: type, comptime St
         }
         fn releaseSession(self: *Self, s: *SessionSlot, remove: bool) void {
             if (!s.active) return;
+            self.dropSessionOutbound(s.owner);
             self.owner.destroySession(s.owner, remove);
             s.active = false;
             s.generation = nextGeneration(s.generation);
         }
         fn releaseToplevel(self: *Self, s: *ToplevelSlot) void {
             if (!s.active) return;
+            self.dropToplevelOutbound(s.owner);
             self.owner.destroyToplevelSession(s.owner);
             s.active = false;
             s.generation = nextGeneration(s.generation);
+        }
+        fn dropSessionOutbound(self: *Self, id: SessionId) void {
+            for (self.outbound) |*out| {
+                if (!out.active) continue;
+                const matches = switch (out.value) {
+                    .created => |value| std.meta.eql(value.id, id),
+                    .restored, .replaced => |value| std.meta.eql(value, id),
+                    .toplevel_restored => false,
+                };
+                if (matches) self.dropOutbound(out);
+            }
+        }
+        fn dropToplevelOutbound(self: *Self, id: ToplevelSessionId) void {
+            for (self.outbound) |*out| {
+                if (!out.active) continue;
+                const matches = switch (out.value) {
+                    .toplevel_restored => |value| std.meta.eql(value, id),
+                    else => false,
+                };
+                if (matches) self.dropOutbound(out);
+            }
+        }
+        fn dropOutbound(self: *Self, out: *OutSlot) void {
+            std.debug.assert(out.active);
+            std.debug.assert(self.pending_outbound > 0);
+            out.active = false;
+            self.pending_outbound -= 1;
         }
         fn reserve(self: *Self) ?*OutSlot {
             for (self.outbound) |*o| if (!o.active) {
@@ -887,6 +916,59 @@ test "wire adapter declarations compile against generated protocol" {
         }
     };
     std.testing.refAllDecls(Adapter(@import("core_protocol"), Shell, u32));
+}
+
+test "destroyed resources release queued outbound capacity" {
+    const Shell = struct {
+        pub const ToplevelId = packed struct { index: u32, generation: u32 };
+
+        pub fn toplevelIdOn(_: *@This(), _: anytype, object_id: u32) !ToplevelId {
+            return .{ .index = object_id, .generation = 1 };
+        }
+    };
+    const A = Adapter(@import("core_protocol"), Shell, u32);
+    const Resolver = struct {
+        fn resolve(_: *anyopaque, _: Shell.ToplevelId) !A.ResolvedToplevel {
+            return error.Unused;
+        }
+    };
+    var shell: Shell = .{};
+    var context: u8 = 0;
+    var adapter = try A.init(
+        std.testing.allocator,
+        &shell,
+        .{
+            .manager_resources = 1,
+            .outbound = 2,
+            .session_resources = 1,
+            .toplevel_resources = 1,
+            .stored_sessions = 1,
+            .stored_toplevels = 1,
+            .events = 2,
+            .max_string_bytes = 8,
+        },
+        .{ .context = &context, .resolve = Resolver.resolve },
+        .{ .context = &context, .generate = testGenerate },
+    );
+    defer adapter.deinit();
+
+    const session = try adapter.owner.getSession(1, 1, null, adapter.generator);
+    adapter.sessions[0].active = true;
+    adapter.sessions[0].owner = session;
+    try adapter.collectEvents();
+    try std.testing.expectEqual(@as(usize, 1), adapter.pending_outbound);
+    adapter.releaseSession(&adapter.sessions[0], false);
+    try std.testing.expectEqual(@as(usize, 0), adapter.pending_outbound);
+    try std.testing.expectEqual(adapter.outbound.len, adapter.freeOutCount());
+
+    const out = adapter.reserve().?;
+    const toplevel = ToplevelSessionId{ .index = 0, .generation = 7 };
+    adapter.toplevels[0].active = true;
+    adapter.toplevels[0].owner = toplevel;
+    out.value = .{ .toplevel_restored = toplevel };
+    adapter.releaseToplevel(&adapter.toplevels[0]);
+    try std.testing.expectEqual(@as(usize, 0), adapter.pending_outbound);
+    try std.testing.expectEqual(adapter.outbound.len, adapter.freeOutCount());
 }
 
 test "replacement, persistence, inertness, and generation reuse" {

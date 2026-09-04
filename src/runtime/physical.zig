@@ -1078,6 +1078,7 @@ pub fn Coordinator(comptime protocol: type) type {
         drag_icon_root: ?Adapter.SurfaceId = null,
         output_power_transition: ?OutputPowerAdapter.Command = null,
         stopping: bool = false,
+        wayring_shutdown_requested: bool = false,
         session_disable_pending: bool = false,
         stats: Stats = .{},
 
@@ -2227,9 +2228,14 @@ pub fn Coordinator(comptime protocol: type) type {
                     for (self.physical_outputs[0..self.physical_output_count]) |*physical|
                         physical.reconfigure = null;
                 }
-                if (self.loop) |value| try value.requestShutdown();
                 for (self.security_context_adapter.committedListeners()) |listener|
                     listener.closing = true;
+            }
+            if (!self.wayring_shutdown_requested) {
+                if (self.loop) |value| {
+                    try value.requestShutdown();
+                    self.wayring_shutdown_requested = true;
+                }
             }
             if (self.icc_poll) |token| if (!self.icc_poll_canceling) {
                 const cancel = try self.router.acquire(.icc_worker);
@@ -10096,19 +10102,18 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             try self.processScreencopyCaptures();
             try self.processImageCopyCaptures();
+            try self.scheduleClients();
         }
 
         fn presented(context: *anyopaque, outcome: output_api.FrameOutcome, callback_data: u32) !void {
             const self: *Self = @ptrCast(@alignCast(context));
             try self.finishOutcome(outcome, true);
-            try self.scheduleClients();
             _ = callback_data;
         }
 
         fn retired(context: *anyopaque, outcome: output_api.FrameOutcome) !void {
             const self: *Self = @ptrCast(@alignCast(context));
             try self.finishOutcome(outcome, false);
-            try self.scheduleClients();
         }
 
         fn captured(
@@ -10130,9 +10135,6 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.finishImageCopy(physical, success, timestamp_ns, readback);
                 break;
             } else return error.InvalidCaptureToken;
-            try self.processScreencopyCaptures();
-            try self.processImageCopyCaptures();
-            try self.scheduleClients();
         }
 
         fn processScreencopyCaptures(self: *Self) !void {
@@ -11073,9 +11075,9 @@ pub fn Coordinator(comptime protocol: type) type {
                     }
                 }
             };
-            if (was_presented) self.stats.presented += 1 else self.stats.retired += 1;
             _ = try self.retryRetainedOutcomes();
             try self.applyReady();
+            if (was_presented) self.stats.presented += 1 else self.stats.retired += 1;
         }
 
         fn retryRetainedOutcomes(self: *Self) !bool {

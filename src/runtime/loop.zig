@@ -79,6 +79,10 @@ pub fn Loop(comptime protocol: type) type {
         shutdown: ?*shutdown_signal.Watcher = null,
         shutdown_token: ?completion.Token = null,
         shutdown_seen: bool = false,
+        pending_wayring_count: usize = 0,
+        retained_wayring_progress: Driver.Progress = .{},
+        retained_shutdown_requested: bool = false,
+        retained_reload_requested: bool = false,
 
         /// Allocates all turn storage and queues the initial listener accept.
         /// Nothing is submitted until the first call to `turn`.
@@ -124,6 +128,7 @@ pub fn Loop(comptime protocol: type) type {
         /// last turn.
         pub fn deinit(self: *Self) void {
             std.debug.assert(self.shutdown_token == null);
+            std.debug.assert(self.pending_wayring_count == 0);
             self.driver.deinit(self.allocator);
             self.allocator.free(self.unrouted_completions);
             self.allocator.free(self.ouro_completions);
@@ -205,19 +210,21 @@ pub fn Loop(comptime protocol: type) type {
         }
 
         fn turnInternal(self: *Self, handler: anytype, wait_on_idle: bool) !Progress {
-            const ready = self.compositor.ring.cq_ready();
-            const count = boundedCount(ready, self.cqes.len);
-            const copied = if (count == 0)
+            const copied = if (self.pending_wayring_count != 0)
                 0
-            else
-                try self.compositor.ring.copy_cqes(self.cqes[0..count], 0);
+            else copied: {
+                const ready = self.compositor.ring.cq_ready();
+                const count = boundedCount(ready, self.cqes.len);
+                break :copied if (count == 0)
+                    0
+                else
+                    try self.compositor.ring.copy_cqes(self.cqes[0..count], 0);
+            };
 
-            var wayring_count: usize = 0;
+            var wayring_count = self.pending_wayring_count;
             var timer_count: usize = 0;
             var ouro_count: usize = 0;
             var unrouted_count: usize = 0;
-            var shutdown_requested = false;
-            var reload_requested = false;
             for (self.cqes[0..copied]) |cqe| {
                 if (cqe.user_data == completion.skipped_success_user_data) {
                     if (cqe.res < 0) return error.SkippedOperationFailed;
@@ -237,8 +244,10 @@ pub fn Loop(comptime protocol: type) type {
                         );
                         try self.router.retire(token);
                         self.shutdown_token = null;
-                        shutdown_requested = shutdown_requested or events.shutdown;
-                        reload_requested = reload_requested or events.reload;
+                        self.retained_shutdown_requested =
+                            self.retained_shutdown_requested or events.shutdown;
+                        self.retained_reload_requested =
+                            self.retained_reload_requested or events.reload;
                         self.shutdown_seen = self.shutdown_seen or events.shutdown;
                         if (!self.shutdown_seen) try self.armSignalPoll();
                         continue;
@@ -283,6 +292,7 @@ pub fn Loop(comptime protocol: type) type {
                 };
                 wayring_count += 1;
             }
+            self.pending_wayring_count = wayring_count;
 
             const completed_timers = self.timer_outcomes[0..timer_count];
             const completed_ouro = self.ouro_completions[0..ouro_count];
@@ -291,10 +301,28 @@ pub fn Loop(comptime protocol: type) type {
                     try handler.completions(completed_timers, completed_ouro);
             }
 
-            var wayring_progress = try self.driver.dispatchRouted(
+            const dispatched = self.driver.dispatchRouted(
                 self.wayring_cqes[0..wayring_count],
                 handler,
             );
+            switch (dispatched) {
+                .complete => |progress| {
+                    self.retained_wayring_progress.merge(progress);
+                    self.pending_wayring_count = 0;
+                },
+                .failed => |failure| {
+                    self.retained_wayring_progress.merge(failure.progress);
+                    const suffix = self.wayring_cqes[failure.progress.completions..wayring_count];
+                    std.mem.copyForwards(
+                        WayringCompletion,
+                        self.wayring_cqes[0..suffix.len],
+                        suffix,
+                    );
+                    self.pending_wayring_count = suffix.len;
+                    return failure.cause;
+                },
+            }
+            var wayring_progress = self.retained_wayring_progress;
             if (@hasDecl(@TypeOf(handler.*), "prepare"))
                 try handler.prepare();
             // Dispatch and coordinator convergence can both schedule peers.
@@ -310,7 +338,8 @@ pub fn Loop(comptime protocol: type) type {
             else
                 false;
             const can_wait = wait_on_idle and self.compositor.ring.cq_ready() == 0 and
-                !wayring_progress.pending and !shutdown_requested and !reload_requested and
+                !wayring_progress.pending and !self.retained_shutdown_requested and
+                !self.retained_reload_requested and
                 !bindings_work_pending and
                 !(wayring_progress.shutdown_complete and backend_drained);
             const submitted = if (can_wait)
@@ -325,7 +354,7 @@ pub fn Loop(comptime protocol: type) type {
                 try self.compositor.ring.submit()
             else
                 0;
-            return .{
+            const progress: Progress = .{
                 .reaped = copied,
                 .wayring_completions = wayring_count,
                 .timer_outcomes = completed_timers,
@@ -333,11 +362,16 @@ pub fn Loop(comptime protocol: type) type {
                 .unrouted_completions = self.unrouted_completions[0..unrouted_count],
                 .wayring = wayring_progress,
                 .submitted = submitted,
-                .shutdown_requested = shutdown_requested,
-                .reload_requested = reload_requested,
+                .shutdown_requested = self.retained_shutdown_requested,
+                .reload_requested = self.retained_reload_requested,
                 .needs_more_work = self.compositor.ring.cq_ready() != 0 or
-                    wayring_progress.pending or bindings_work_pending,
+                    self.pending_wayring_count != 0 or wayring_progress.pending or
+                    bindings_work_pending,
             };
+            self.retained_wayring_progress = .{};
+            self.retained_shutdown_requested = false;
+            self.retained_reload_requested = false;
+            return progress;
         }
     };
 }

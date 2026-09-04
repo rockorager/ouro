@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .wayring = .{
-            .url = "https://github.com/rockorager/wayring/archive/2f9cc671f42e567c36081ee28b89d2340dbdb5bb.tar.gz",
-            .hash = "wayring-0.1.0-N0pph03zEwCHrNBRpiQcLQud_i0ofxS4d-0AASLmtyec",
+            .url = "https://github.com/rockorager/wayring/archive/c747bdf0169673c6d6968065a1096d5fc12cc88c.tar.gz",
+            .hash = "wayring-0.1.0-N0pph69GFAB-qqsnyDxalVbyUESALjqL7fIyemq-pLkY",
         },
         .wayland = .{
             .url = "https://gitlab.freedesktop.org/wayland/wayland/-/releases/1.26.0/downloads/wayland-1.26.0.tar.xz",
