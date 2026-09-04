@@ -147,6 +147,8 @@ pub const Config = struct {
     /// Pixman targets use lifetime-mapped DRM dumb buffers rather than a GBM
     /// transfer mapping whose writes may require an unmap before scanout.
     cpu_mapped: bool = false,
+    /// A GPU renderer with a genuine 10-bit path may prefer XRGB2101010.
+    prefer_10bit: bool = false,
 };
 
 pub const Handle = struct {
@@ -199,7 +201,13 @@ pub const Pool = struct {
             return error.InvalidConfig;
         const mode = snapshot.selectedMode();
         if (mode.hdisplay == 0 or mode.vdisplay == 0) return error.InvalidMode;
-        const allocation = try negotiate(snapshot, mode.hdisplay, mode.vdisplay, config.linear_only);
+        const allocation = try negotiate(
+            snapshot,
+            mode.hdisplay,
+            mode.vdisplay,
+            config.linear_only,
+            config.prefer_10bit,
+        );
         const slots = try allocator.alloc(Slot, config.capacity);
         errdefer allocator.free(slots);
         const device = try gbm_platform.createDevice(fd);
@@ -416,12 +424,25 @@ fn recycle(slot: *Slot) !void {
     slot.state = .free;
 }
 
-fn negotiate(snapshot: drm.Snapshot, width: u32, height: u32, linear_only: bool) !gbm.Allocation {
+fn negotiate(
+    snapshot: drm.Snapshot,
+    width: u32,
+    height: u32,
+    linear_only: bool,
+    prefer_10bit: bool,
+) !gbm.Allocation {
     const plane = snapshot.selectedPlane();
     const start: usize = plane.format_start;
     const end = start + plane.format_count;
     if (end > snapshot.formats.len) return error.MalformedTopology;
     const formats = snapshot.formats[start..end];
+    if (prefer_10bit) if (formatAllocation(
+        formats,
+        width,
+        height,
+        gbm.format_xrgb2101010,
+        !linear_only,
+    )) |allocation| return allocation;
     const preferred = [_]u32{ gbm.format_xrgb8888, gbm.format_argb8888 };
 
     // Prefer a CPU-capable target across all supported compositor formats
@@ -468,6 +489,45 @@ fn negotiate(snapshot: drm.Snapshot, width: u32, height: u32, linear_only: bool)
     return error.NoRenderFormat;
 }
 
+fn formatAllocation(
+    formats: []const drm.Format,
+    width: u32,
+    height: u32,
+    fourcc: u32,
+    allow_tiled: bool,
+) ?gbm.Allocation {
+    var implicit = false;
+    var tiled: ?u64 = null;
+    for (formats) |format| if (format.fourcc == fourcc) {
+        if (format.modifier == gbm.modifier_linear) return .{
+            .width = width,
+            .height = height,
+            .format = fourcc,
+            .modifier = gbm.modifier_linear,
+            .explicit_modifier = true,
+        };
+        if (format.modifier == drm_api.modifier_invalid) implicit = true else if (
+            format.modifier != gbm.modifier_linear and
+                (tiled == null or format.modifier < tiled.?))
+            tiled = format.modifier;
+    };
+    if (implicit) return .{
+        .width = width,
+        .height = height,
+        .format = fourcc,
+        .modifier = gbm.modifier_linear,
+        .explicit_modifier = false,
+    };
+    if (allow_tiled) if (tiled) |modifier| return .{
+        .width = width,
+        .height = height,
+        .format = fourcc,
+        .modifier = modifier,
+        .explicit_modifier = true,
+    };
+    return null;
+}
+
 fn validateMetadata(allocation: gbm.Allocation, metadata: gbm.Metadata) !void {
     if (metadata.width != allocation.width or metadata.height != allocation.height or
         metadata.format != allocation.format or metadata.modifier != allocation.modifier)
@@ -502,34 +562,53 @@ test "scanout: negotiation prefers explicit linear then implicit fallback" {
         .{ .fourcc = gbm.format_xrgb8888, .modifier = 9 },
         .{ .fourcc = gbm.format_xrgb8888, .modifier = gbm.modifier_linear },
     });
-    var allocation = try negotiate(fixture.snapshot(), 100, 50, false);
+    var allocation = try negotiate(fixture.snapshot(), 100, 50, false, false);
     try std.testing.expect(allocation.explicit_modifier);
     try std.testing.expectEqual(gbm.modifier_linear, allocation.modifier);
     fixture = TestSnapshot.init(&.{.{
         .fourcc = gbm.format_xrgb8888,
         .modifier = drm_api.modifier_invalid,
     }});
-    allocation = try negotiate(fixture.snapshot(), 100, 50, false);
+    allocation = try negotiate(fixture.snapshot(), 100, 50, false, false);
     try std.testing.expect(!allocation.explicit_modifier);
     try std.testing.expectEqual(gbm.modifier_linear, allocation.modifier);
     fixture = TestSnapshot.init(&.{
         .{ .fourcc = gbm.format_xrgb8888, .modifier = 9 },
         .{ .fourcc = gbm.format_argb8888, .modifier = gbm.modifier_linear },
     });
-    allocation = try negotiate(fixture.snapshot(), 100, 50, false);
+    allocation = try negotiate(fixture.snapshot(), 100, 50, false, false);
     try std.testing.expectEqual(gbm.format_argb8888, allocation.format);
     try std.testing.expectEqual(gbm.modifier_linear, allocation.modifier);
     fixture = TestSnapshot.init(&.{.{ .fourcc = gbm.format_xrgb8888, .modifier = 9 }});
     try std.testing.expectError(
         error.NoLinearRenderFormat,
-        negotiate(fixture.snapshot(), 100, 50, true),
+        negotiate(fixture.snapshot(), 100, 50, true, false),
     );
-    allocation = try negotiate(fixture.snapshot(), 100, 50, false);
+    allocation = try negotiate(fixture.snapshot(), 100, 50, false, false);
     try std.testing.expectEqual(@as(u64, 9), allocation.modifier);
     var metadata: gbm.Metadata = .{ .width = 1, .height = 1, .format = gbm.format_xrgb8888, .modifier = gbm.modifier_linear, .plane_count = 1 };
     try std.testing.expect(!requiresModifierRegistration(metadata));
     metadata.modifier = 9;
     try std.testing.expect(requiresModifierRegistration(metadata));
+}
+
+test "scanout: 10-bit preference remains an explicit GPU choice" {
+    var fixture = TestSnapshot.init(&.{
+        .{ .fourcc = gbm.format_xrgb8888, .modifier = gbm.modifier_linear },
+        .{ .fourcc = gbm.format_xrgb2101010, .modifier = 9 },
+    });
+    var allocation = try negotiate(fixture.snapshot(), 100, 50, false, false);
+    try std.testing.expectEqual(gbm.format_xrgb8888, allocation.format);
+    allocation = try negotiate(fixture.snapshot(), 100, 50, false, true);
+    try std.testing.expectEqual(gbm.format_xrgb2101010, allocation.format);
+    try std.testing.expectEqual(@as(u64, 9), allocation.modifier);
+
+    fixture = TestSnapshot.init(&.{.{
+        .fourcc = gbm.format_xrgb8888,
+        .modifier = gbm.modifier_linear,
+    }});
+    allocation = try negotiate(fixture.snapshot(), 100, 50, false, true);
+    try std.testing.expectEqual(gbm.format_xrgb8888, allocation.format);
 }
 
 test "scanout: multiplane metadata is copied and mismatches roll back" {
