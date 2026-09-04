@@ -764,6 +764,7 @@ pub const Output = struct {
     import_cache: []CachedImport,
     import_cache_cursor: usize,
     kms_output: *kms.Output,
+    overlay_formats: []drm.Format,
     output_format: render.PixelFormat,
     output_color_description: render.color.Description,
     clear: render.Color,
@@ -879,6 +880,14 @@ pub const Output = struct {
             };
             path.pool.deinit() catch {};
         }
+        const overlay_formats = if (snapshot.overlayPlane(null)) |overlay| blk: {
+            const plane = snapshot.planes[overlay.plane_index];
+            const end = std.math.add(usize, plane.format_start, plane.format_count) catch
+                return error.MalformedTopology;
+            if (end > snapshot.formats.len) return error.MalformedTopology;
+            break :blk try allocator.dupe(drm.Format, snapshot.formats[plane.format_start..end]);
+        } else try allocator.alloc(drm.Format, 0);
+        errdefer allocator.free(overlay_formats);
         const self = try allocator.create(Output);
         errdefer allocator.destroy(self);
         self.pool = path.pool;
@@ -941,6 +950,7 @@ pub const Output = struct {
             snapshot,
             kms_config,
         );
+        self.overlay_formats = overlay_formats;
         self.allocator = allocator;
         self.clear = config.clear;
         self.accepting_frames = true;
@@ -990,6 +1000,7 @@ pub const Output = struct {
         self.scheduler.deinit(self.allocator);
         self.planner.deinit();
         self.builder.deinit();
+        self.allocator.free(self.overlay_formats);
         const allocator = self.allocator;
         const render_device = self.render_device;
         const owns_render_device = self.owns_render_device;
@@ -2102,6 +2113,58 @@ fn directScanoutSource(
     return sample.source;
 }
 
+const OverlayCandidate = struct {
+    source: render.Source,
+    frame: kms.OverlayFrame,
+};
+
+fn overlayScanoutCandidate(
+    list: render.List,
+    output_color: render.color.Description,
+    formats: []const drm.Format,
+) ?OverlayCandidate {
+    if (list.samples.len < 2 or formats.len == 0) return null;
+    const sample = list.samples[list.samples.len - 1];
+    const external = sample.source.external orelse return null;
+    if (sample.source.native != null or sample.source.upload != null or
+        sample.source.format != .xrgb8888 or list.output_format != .xrgb8888 or
+        targetFormatFromDrm(external.drm_format) != .xrgb8888 or
+        sample.transform != .normal or sample.global_alpha != 255 or
+        !std.meta.eql(sample.color_description, output_color) or
+        !std.meta.eql(sample.color_representation, render.color.Representation{}) or
+        !std.meta.eql(sample.effect_size, render.Size{ .width = 0, .height = 0 }) or
+        sample.blur_region.len != 0 or sample.destination.x < 0 or sample.destination.y < 0 or
+        !std.meta.eql(sample.destination, sample.clip) or
+        sample.destination.width != sample.source.size.width or
+        sample.destination.height != sample.source.size.height or
+        sample.destination.width > list.output.width -| @as(u32, @intCast(sample.destination.x)) or
+        sample.destination.height > list.output.height -| @as(u32, @intCast(sample.destination.y)))
+        return null;
+    const fixed_width = @as(i64, sample.source.size.width) * render.fixed_one;
+    const fixed_height = @as(i64, sample.source.size.height) * render.fixed_one;
+    if (sample.crop.x != 0 or sample.crop.y != 0 or
+        sample.crop.width != fixed_width or sample.crop.height != fixed_height) return null;
+    var supported = false;
+    for (formats) |format| if (format.fourcc == external.drm_format and
+        format.modifier == external.modifier)
+    {
+        supported = true;
+        break;
+    };
+    if (!supported) return null;
+    return .{
+        .source = sample.source,
+        .frame = .{
+            .image = undefined,
+            .in_fence_fd = null,
+            .x = @intCast(sample.destination.x),
+            .y = @intCast(sample.destination.y),
+            .width = sample.destination.width,
+            .height = sample.destination.height,
+        },
+    };
+}
+
 fn flipTimestampNs(seconds: u32, microseconds: u32) u64 {
     return @as(u64, seconds) * std.time.ns_per_s + @as(u64, microseconds) * std.time.ns_per_us;
 }
@@ -2213,6 +2276,48 @@ test "drm-output: direct scanout eligibility is exact and conservative" {
     sample.source.native = .{ .owner = @ptrFromInt(1), .token = 1 };
     list.samples = &.{sample};
     try std.testing.expect(directScanoutSource(list, .srgb) == null);
+}
+
+test "drm-output: overlay eligibility requires an exact topmost scanout" {
+    const external: render.ExternalSource = .{
+        .context = @ptrFromInt(1),
+        .token = 1,
+        .alive_fn = testExternalAlive,
+        .drm_format = gbm.format_xrgb8888,
+        .modifier = 7,
+        .plane_count = 1,
+        .fds = .{ 3, -1, -1, -1 },
+        .strides = .{ 8, 0, 0, 0 },
+        .offsets = .{ 0, 0, 0, 0 },
+    };
+    const background: render.SurfaceSample = .{
+        .sample = .{ .surface = 1, .commit_sequence = 1 },
+        .presentation = .{ .slot = 0, .generation = 1 },
+        .source = .{ .size = .{ .width = 2, .height = 1 }, .stride = 8, .format = .xrgb8888, .bytes = &.{ 0, 0, 0, 0, 0, 0, 0, 0 } },
+        .crop = render.SourceRect.pixels(0, 0, 2, 1),
+        .destination = .{ .x = 0, .y = 0, .width = 2, .height = 1 },
+        .clip = .{ .x = 0, .y = 0, .width = 2, .height = 1 },
+    };
+    var top = background;
+    top.sample.surface = 2;
+    top.presentation.slot = 1;
+    top.source.bytes = &.{};
+    top.source.external = external;
+    var samples = [_]render.SurfaceSample{ background, top };
+    var list: render.List = .{
+        .output = .{ .width = 2, .height = 1 },
+        .output_format = .xrgb8888,
+        .clear = .{ .r = 0, .g = 0, .b = 0 },
+        .samples = &samples,
+    };
+    const formats = [_]drm.Format{.{ .fourcc = gbm.format_xrgb8888, .modifier = 7 }};
+    try std.testing.expect(overlayScanoutCandidate(list, .srgb, &formats) != null);
+    samples[1].clip.width = 1;
+    try std.testing.expect(overlayScanoutCandidate(list, .srgb, &formats) == null);
+    samples[1].clip.width = 2;
+    try std.testing.expect(overlayScanoutCandidate(list, .srgb, &.{}) == null);
+    list.samples = samples[0..1];
+    try std.testing.expect(overlayScanoutCandidate(list, .srgb, &formats) == null);
 }
 
 fn testExternalAlive(_: *anyopaque, _: u64) bool {
