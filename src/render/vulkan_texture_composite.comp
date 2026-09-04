@@ -5,7 +5,11 @@
 // advances through the same ordered sample loop.
 
 layout(local_size_x = 8, local_size_y = 8) in;
-layout(set = 0, binding = 0, rgba8) uniform image2D target_image;
+#ifdef TARGET_FORMATLESS
+layout(set = 0, binding = 0) uniform writeonly image2D target_image;
+#else
+layout(set = 0, binding = 0, rgba8) uniform writeonly image2D target_image;
+#endif
 layout(set = 0, binding = 5, rgba16f) uniform image2D linear_image;
 
 struct Sample {

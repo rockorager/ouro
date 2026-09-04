@@ -187,6 +187,10 @@ pub const Renderer = struct {
         self.* = undefined;
     }
 
+    pub fn supportsTarget(self: *const Renderer, allocation: gbm.Allocation) bool {
+        return self.platform.supportsTarget(self.implementation, allocation);
+    }
+
     /// Success returns a new sync_file FD owned by the caller. Ordinary failure
     /// leaves the R10 image discardable. `CompletionExportFailedAfterSubmit`
     /// is different: GPU work owns the image, so R14 must retain it, terminally
@@ -500,6 +504,7 @@ pub fn initTargetPool(
     fd: std.posix.fd_t,
     snapshot: @import("../backend/drm/manager.zig").Snapshot,
     capacity: usize,
+    prefer_10bit: bool,
 ) !framebuffer.Pool {
     return framebuffer.Pool.init(
         allocator,
@@ -507,7 +512,7 @@ pub fn initTargetPool(
         drm_platform,
         fd,
         snapshot,
-        .{ .capacity = capacity },
+        .{ .capacity = capacity, .prefer_10bit = prefer_10bit },
     );
 }
 
@@ -612,7 +617,8 @@ fn affine(sample: render_types.SurfaceSample, original: render_types.PlanRect) !
 
 fn formatFromDrm(format: u32) ?render_types.PixelFormat {
     if (format == gbm.format_argb8888) return .argb8888_premultiplied;
-    if (format == gbm.format_xrgb8888) return .xrgb8888;
+    if (format == gbm.format_xrgb8888 or format == gbm.format_xrgb2101010)
+        return .xrgb8888;
     return null;
 }
 
@@ -1274,6 +1280,7 @@ const FakePlatform = struct {
     const vtable: vk.Platform.VTable = .{
         .create = create,
         .destroy = destroy,
+        .supports_target = supportsTarget,
         .import_target = importTarget,
         .destroy_target = destroyTarget,
         .supports_capture_target = supportsCaptureTarget,
@@ -1296,6 +1303,9 @@ const FakePlatform = struct {
         const self: *FakePlatform = @ptrCast(@alignCast(context));
         self.create_count += 1;
         return context;
+    }
+    fn supportsTarget(_: *anyopaque, _: vk.Renderer, _: gbm.Allocation) bool {
+        return true;
     }
     fn contentProvider(_: *anyopaque, _: vk.Renderer) ?@import("content.zig").Provider {
         return null;

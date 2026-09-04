@@ -899,7 +899,7 @@ pub const Output = struct {
             },
             else => .{ .width = mode.hdisplay, .height = mode.vdisplay },
         };
-        self.output_format = formatFromDrm(self.pool.allocation.format) orelse
+        self.output_format = targetFormatFromDrm(self.pool.allocation.format) orelse
             return error.UnsupportedOutputFormat;
         try config.output_color_description.validate();
         self.output_color_description = config.output_color_description;
@@ -1780,8 +1780,26 @@ fn initVulkanOutput(
         fd,
         snapshot,
         config.image_count,
+        true,
     );
     errdefer pool.deinit() catch {};
+    if (!renderer.supportsTarget(pool.allocation)) {
+        var fallback = try vulkan.initTargetPool(
+            allocator,
+            platforms.gbm,
+            platforms.framebuffer,
+            fd,
+            snapshot,
+            config.image_count,
+            false,
+        );
+        pool.deinit() catch |err| {
+            fallback.deinit() catch {};
+            return err;
+        };
+        pool = fallback;
+        if (!renderer.supportsTarget(pool.allocation)) return error.UnsupportedOutputFormat;
+    }
     return .{
         .pool = pool,
         .vulkan_targets = try renderer.createTargets(config.image_count),
@@ -1805,7 +1823,15 @@ fn initPixman(allocator: std.mem.Allocator, platforms: Platforms, fd: std.posix.
 fn initVulkan(allocator: std.mem.Allocator, platforms: Platforms, fd: std.posix.fd_t, snapshot: drm.Snapshot, config: Config) !InitialRenderPath {
     if (snapshot.selectedPlane().properties.in_fence_fd == 0)
         return error.InFenceUnsupported;
-    var pool = try vulkan.initTargetPool(allocator, platforms.gbm, platforms.framebuffer, fd, snapshot, config.image_count);
+    var pool = try vulkan.initTargetPool(
+        allocator,
+        platforms.gbm,
+        platforms.framebuffer,
+        fd,
+        snapshot,
+        config.image_count,
+        true,
+    );
     errdefer pool.deinit() catch {};
     const content_version_capacity = try contentVersionCapacity(config);
     const content_store_bytes = try contentByteCapacity(config);
@@ -1838,6 +1864,24 @@ fn initVulkan(allocator: std.mem.Allocator, platforms: Platforms, fd: std.posix.
     });
     var owned_renderer = renderer;
     errdefer owned_renderer.deinit();
+    if (!owned_renderer.supportsTarget(pool.allocation)) {
+        var fallback = try vulkan.initTargetPool(
+            allocator,
+            platforms.gbm,
+            platforms.framebuffer,
+            fd,
+            snapshot,
+            config.image_count,
+            false,
+        );
+        pool.deinit() catch |err| {
+            fallback.deinit() catch {};
+            return err;
+        };
+        pool = fallback;
+        if (!owned_renderer.supportsTarget(pool.allocation))
+            return error.UnsupportedOutputFormat;
+    }
     const targets = try owned_renderer.createTargets(config.image_count);
     return .{
         .output = .{
@@ -1867,6 +1911,11 @@ pub fn formatFromDrm(value: u32) ?render.PixelFormat {
     if (value == gbm.format_argb8888 or value == gbm.format_abgr8888)
         return .argb8888_premultiplied;
     return null;
+}
+
+fn targetFormatFromDrm(value: u32) ?render.PixelFormat {
+    if (value == gbm.format_xrgb2101010) return .xrgb8888;
+    return formatFromDrm(value);
 }
 
 fn directScanoutSource(

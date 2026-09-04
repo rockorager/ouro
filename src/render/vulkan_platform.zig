@@ -87,6 +87,7 @@ pub const Platform = struct {
     pub const VTable = struct {
         create: *const fn (*anyopaque, std.posix.fd_t, Config) anyerror!Renderer,
         destroy: *const fn (*anyopaque, Renderer) void,
+        supports_target: *const fn (*anyopaque, Renderer, gbm.Allocation) bool,
         import_target: *const fn (*anyopaque, Renderer, gbm.Metadata, std.posix.fd_t) anyerror!Target,
         destroy_target: *const fn (*anyopaque, Renderer, Target) void,
         supports_capture_target: *const fn (*anyopaque, Renderer, gbm.Metadata) bool,
@@ -107,6 +108,9 @@ pub const Platform = struct {
     }
     pub fn destroy(self: Platform, renderer: Renderer) void {
         self.vtable.destroy(self.context, renderer);
+    }
+    pub fn supportsTarget(self: Platform, renderer: Renderer, allocation: gbm.Allocation) bool {
+        return self.vtable.supports_target(self.context, renderer, allocation);
     }
     pub fn importTarget(self: Platform, renderer: Renderer, metadata: gbm.Metadata, fd: std.posix.fd_t) !Target {
         // The implementation takes FD ownership on every outcome.
@@ -173,6 +177,7 @@ pub const real: Platform = .{ .context = &real_context, .vtable = &real_vtable }
 const real_vtable: Platform.VTable = .{
     .create = realCreate,
     .destroy = realDestroy,
+    .supports_target = realSupportsTarget,
     .import_target = realImportTarget,
     .destroy_target = realDestroyTarget,
     .supports_capture_target = realSupportsCaptureTarget,
@@ -298,8 +303,10 @@ const RealRenderer = struct {
     descriptor_layout: c.VkDescriptorSetLayout,
     pipeline_layout: c.VkPipelineLayout,
     pipeline: c.VkPipeline,
+    pipeline_10bit: ?c.VkPipeline,
     descriptor_pool: c.VkDescriptorPool,
     sampled_pipeline: ?c.VkPipeline,
+    sampled_pipeline_10bit: ?c.VkPipeline,
     sampler: ?c.VkSampler,
     blur_pipeline: ?c.VkPipeline,
     blur_sampler: ?c.VkSampler,
@@ -369,6 +376,7 @@ const RealTarget = struct {
     state: TargetState = .ready,
     fence_needs_reset: bool = false,
     initialized_layout: bool = false,
+    ten_bit: bool = false,
     content_leases: []u64,
     content_lease_count: usize = 0,
     native_leases: []u64,
@@ -643,6 +651,8 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
         c.VK_TRUE
     else
         c.VK_FALSE;
+    enabled_features.shaderStorageImageWriteWithoutFormat =
+        physical_features.shaderStorageImageWriteWithoutFormat;
     var device_info: c.VkDeviceCreateInfo = .{
         .sType = c.VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .pNext = null,
@@ -768,6 +778,63 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
     errdefer if (self.sampled_pipeline) |pipeline|
         c.vkDestroyPipeline(self.device, pipeline, null);
     errdefer if (self.blur_pipeline) |pipeline|
+        c.vkDestroyPipeline(self.device, pipeline, null);
+    self.pipeline_10bit = null;
+    self.sampled_pipeline_10bit = null;
+    if (physical_features.shaderStorageImageWriteWithoutFormat == c.VK_TRUE) {
+        const shader_10bit_bytes align(@alignOf(u32)) = @embedFile("vulkan_composite_10bit.spv").*;
+        var shader_10bit_info = shader_info;
+        shader_10bit_info.codeSize = shader_10bit_bytes.len;
+        shader_10bit_info.pCode = @ptrCast(&shader_10bit_bytes);
+        var shader_10bit: c.VkShaderModule = undefined;
+        try vk(
+            c.vkCreateShaderModule(self.device, &shader_10bit_info, null, &shader_10bit),
+            error.CreateShaderFailed,
+        );
+        defer c.vkDestroyShaderModule(self.device, shader_10bit, null);
+        var pipeline_10bit_info = pipeline_info;
+        pipeline_10bit_info.stage.module = shader_10bit;
+        var pipeline_10bit: c.VkPipeline = undefined;
+        try vk(c.vkCreateComputePipelines(
+            self.device,
+            null,
+            1,
+            &pipeline_10bit_info,
+            null,
+            &pipeline_10bit,
+        ), error.CreatePipelineFailed);
+        self.pipeline_10bit = pipeline_10bit;
+        errdefer c.vkDestroyPipeline(self.device, pipeline_10bit, null);
+
+        if (self.sampled_enabled) {
+            const sampled_10bit_bytes align(@alignOf(u32)) =
+                @embedFile("vulkan_texture_composite_10bit.spv").*;
+            var sampled_10bit_info = shader_info;
+            sampled_10bit_info.codeSize = sampled_10bit_bytes.len;
+            sampled_10bit_info.pCode = @ptrCast(&sampled_10bit_bytes);
+            var sampled_10bit: c.VkShaderModule = undefined;
+            try vk(c.vkCreateShaderModule(
+                self.device,
+                &sampled_10bit_info,
+                null,
+                &sampled_10bit,
+            ), error.CreateShaderFailed);
+            defer c.vkDestroyShaderModule(self.device, sampled_10bit, null);
+            var sampled_pipeline_10bit_info = pipeline_info;
+            sampled_pipeline_10bit_info.stage.module = sampled_10bit;
+            var sampled_pipeline_10bit: c.VkPipeline = undefined;
+            try vk(c.vkCreateComputePipelines(
+                self.device,
+                null,
+                1,
+                &sampled_pipeline_10bit_info,
+                null,
+                &sampled_pipeline_10bit,
+            ), error.CreatePipelineFailed);
+            self.sampled_pipeline_10bit = sampled_pipeline_10bit;
+        }
+    }
+    errdefer if (self.sampled_pipeline_10bit) |pipeline|
         c.vkDestroyPipeline(self.device, pipeline, null);
     const pool_sizes = [_]c.VkDescriptorPoolSize{
         .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = @intCast(storage_image_count) },
@@ -924,12 +991,28 @@ fn realDestroy(_: *anyopaque, renderer: Renderer) void {
     c.vkDestroyDescriptorPool(self.device, self.descriptor_pool, null);
     if (self.sampled_pipeline) |pipeline| c.vkDestroyPipeline(self.device, pipeline, null);
     if (self.blur_pipeline) |pipeline| c.vkDestroyPipeline(self.device, pipeline, null);
+    if (self.sampled_pipeline_10bit) |pipeline| c.vkDestroyPipeline(self.device, pipeline, null);
+    if (self.pipeline_10bit) |pipeline| c.vkDestroyPipeline(self.device, pipeline, null);
     c.vkDestroyPipeline(self.device, self.pipeline, null);
     c.vkDestroyPipelineLayout(self.device, self.pipeline_layout, null);
     c.vkDestroyDescriptorSetLayout(self.device, self.descriptor_layout, null);
     c.vkDestroyDevice(self.device, null);
     c.vkDestroyInstance(self.instance, null);
     std.heap.c_allocator.destroy(self);
+}
+
+fn realSupportsTarget(_: *anyopaque, renderer: Renderer, allocation: gbm.Allocation) bool {
+    const self: *RealRenderer = @ptrCast(@alignCast(renderer));
+    const target_format = targetVkFormat(allocation.format) orelse return false;
+    if (target_format.ten_bit and self.pipeline_10bit == null) return false;
+    requireTargetFormat(self.physical_device, .{
+        .width = allocation.width,
+        .height = allocation.height,
+        .format = allocation.format,
+        .modifier = allocation.modifier,
+        .plane_count = 1,
+    }, target_format) catch return false;
+    return true;
 }
 
 fn realContentProvider(_: *anyopaque, renderer: Renderer) ?render_content.Provider {
@@ -1669,10 +1752,13 @@ fn realImportTarget(_: *anyopaque, renderer: Renderer, metadata: gbm.Metadata, d
         allocator.free(target.acquire_semaphores);
     }
     if (metadata.plane_count != 1) return error.UnsupportedPlaneCount;
-    try requireTargetFormat(self.physical_device, metadata);
+    const target_format = targetVkFormat(metadata.format) orelse return error.UnsupportedTargetFormat;
+    if (target_format.ten_bit and self.pipeline_10bit == null)
+        return error.TenBitTargetUnsupported;
+    try requireTargetFormat(self.physical_device, metadata, target_format);
 
     var plane_layout: c.VkSubresourceLayout = .{ .offset = metadata.offsets[0], .size = 0, .rowPitch = metadata.strides[0], .arrayPitch = 0, .depthPitch = 0 };
-    const view_formats = [_]c.VkFormat{ c.VK_FORMAT_B8G8R8A8_UNORM, c.VK_FORMAT_R8G8B8A8_UNORM };
+    const view_formats = [_]c.VkFormat{ target_format.image, target_format.view };
     var format_list: c.VkImageFormatListCreateInfo = .{
         .sType = c.VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
         .pNext = null,
@@ -1696,7 +1782,7 @@ fn realImportTarget(_: *anyopaque, renderer: Renderer, metadata: gbm.Metadata, d
         .pNext = &external_info,
         .flags = c.VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,
         .imageType = c.VK_IMAGE_TYPE_2D,
-        .format = c.VK_FORMAT_B8G8R8A8_UNORM,
+        .format = target_format.image,
         .extent = .{ .width = metadata.width, .height = metadata.height, .depth = 1 },
         .mipLevels = 1,
         .arrayLayers = 1,
@@ -1747,7 +1833,7 @@ fn realImportTarget(_: *anyopaque, renderer: Renderer, metadata: gbm.Metadata, d
         .flags = 0,
         .image = target.image,
         .viewType = c.VK_IMAGE_VIEW_TYPE_2D,
-        .format = c.VK_FORMAT_R8G8B8A8_UNORM,
+        .format = target_format.view,
         .components = .{ .r = c.VK_COMPONENT_SWIZZLE_IDENTITY, .g = c.VK_COMPONENT_SWIZZLE_IDENTITY, .b = c.VK_COMPONENT_SWIZZLE_IDENTITY, .a = c.VK_COMPONENT_SWIZZLE_IDENTITY },
         .subresourceRange = colorRange(),
     };
@@ -1810,6 +1896,7 @@ fn realImportTarget(_: *anyopaque, renderer: Renderer, metadata: gbm.Metadata, d
     target.height = metadata.height;
     target.fence_needs_reset = false;
     target.initialized_layout = false;
+    target.ten_bit = target_format.ten_bit;
     return @ptrCast(target);
 }
 
@@ -2415,7 +2502,11 @@ fn recordPackedPass(
     sample_count: usize,
 ) !void {
     if (sample_count > sample_count_mask) return error.CapacityExceeded;
-    c.vkCmdBindPipeline(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
+    c.vkCmdBindPipeline(
+        target.command_buffer,
+        c.VK_PIPELINE_BIND_POINT_COMPUTE,
+        if (target.ten_bit) self.pipeline_10bit.? else self.pipeline,
+    );
     c.vkCmdBindDescriptorSets(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 0, 1, &target.descriptor_sets[0], 0, null);
     for (frame.render_damage) |damage| {
         const push: Push = .{
@@ -2865,7 +2956,7 @@ fn recordSampledPass(
     c.vkCmdBindPipeline(
         target.command_buffer,
         c.VK_PIPELINE_BIND_POINT_COMPUTE,
-        self.sampled_pipeline.?,
+        if (target.ten_bit) self.sampled_pipeline_10bit.? else self.sampled_pipeline.?,
     );
     if (pass_batch_count > 1) {
         // Initialize linear light once, render each ordered descriptor batch
@@ -4349,11 +4440,35 @@ fn requireDeviceExtensions(device: c.VkPhysicalDevice) !void {
     }
 }
 
-fn requireTargetFormat(device: c.VkPhysicalDevice, metadata: gbm.Metadata) !void {
-    try requireModifierStorage(device, c.VK_FORMAT_B8G8R8A8_UNORM, metadata);
-    try requireModifierStorage(device, c.VK_FORMAT_R8G8B8A8_UNORM, metadata);
+const TargetVkFormat = struct {
+    image: c.VkFormat,
+    view: c.VkFormat,
+    ten_bit: bool,
+};
 
-    const view_formats = [_]c.VkFormat{ c.VK_FORMAT_B8G8R8A8_UNORM, c.VK_FORMAT_R8G8B8A8_UNORM };
+fn targetVkFormat(fourcc: u32) ?TargetVkFormat {
+    if (fourcc == gbm.format_xrgb2101010) return .{
+        .image = c.VK_FORMAT_A2R10G10B10_UNORM_PACK32,
+        .view = c.VK_FORMAT_A2B10G10R10_UNORM_PACK32,
+        .ten_bit = true,
+    };
+    if (fourcc == gbm.format_xrgb8888 or fourcc == gbm.format_argb8888) return .{
+        .image = c.VK_FORMAT_B8G8R8A8_UNORM,
+        .view = c.VK_FORMAT_R8G8B8A8_UNORM,
+        .ten_bit = false,
+    };
+    return null;
+}
+
+fn requireTargetFormat(
+    device: c.VkPhysicalDevice,
+    metadata: gbm.Metadata,
+    target_format: TargetVkFormat,
+) !void {
+    try requireModifierStorage(device, target_format.image, metadata);
+    try requireModifierStorage(device, target_format.view, metadata);
+
+    const view_formats = [_]c.VkFormat{ target_format.image, target_format.view };
     var format_list: c.VkImageFormatListCreateInfo = .{
         .sType = c.VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
         .pNext = null,
@@ -4376,7 +4491,7 @@ fn requireTargetFormat(device: c.VkPhysicalDevice, metadata: gbm.Metadata) !void
     var image_info: c.VkPhysicalDeviceImageFormatInfo2 = .{
         .sType = c.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
         .pNext = &external_info,
-        .format = c.VK_FORMAT_B8G8R8A8_UNORM,
+        .format = target_format.image,
         .type = c.VK_IMAGE_TYPE_2D,
         .tiling = c.VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
         .usage = c.VK_IMAGE_USAGE_STORAGE_BIT | c.VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
@@ -4822,8 +4937,32 @@ test "render-vulkan: real Vulkan ABI and shader artifact are linked" {
         @as(u32, 0x07230203),
         std.mem.readInt(u32, sampled_shader[0..4], .little),
     );
+    const shader_10bit = @embedFile("vulkan_composite_10bit.spv");
+    const sampled_shader_10bit = @embedFile("vulkan_texture_composite_10bit.spv");
+    try std.testing.expectEqual(
+        @as(u32, 0x07230203),
+        std.mem.readInt(u32, shader_10bit[0..4], .little),
+    );
+    try std.testing.expectEqual(
+        @as(u32, 0x07230203),
+        std.mem.readInt(u32, sampled_shader_10bit[0..4], .little),
+    );
     try std.testing.expect(c.VK_QUEUE_FAMILY_FOREIGN_EXT != c.VK_QUEUE_FAMILY_IGNORED);
     try std.testing.expectEqual(@as(u32, 0b0010), intersectMemoryTypeBits(0b1010, 0b0110));
+}
+
+test "render-vulkan: 10-bit DRM targets preserve packed channel order" {
+    const target = targetVkFormat(gbm.format_xrgb2101010).?;
+    try std.testing.expect(target.ten_bit);
+    try std.testing.expectEqual(
+        @as(c.VkFormat, @intCast(c.VK_FORMAT_A2R10G10B10_UNORM_PACK32)),
+        target.image,
+    );
+    try std.testing.expectEqual(
+        @as(c.VkFormat, @intCast(c.VK_FORMAT_A2B10G10R10_UNORM_PACK32)),
+        target.view,
+    );
+    try std.testing.expect(!targetVkFormat(gbm.format_xrgb8888).?.ten_bit);
 }
 
 test "render-vulkan: sampled batches preserve order and only first initializes" {
