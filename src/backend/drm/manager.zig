@@ -20,6 +20,58 @@ const seat_capacity = 64;
 const primary_plane_type: u64 = 1;
 const no_claim: u32 = std.math.maxInt(u32);
 
+const PlaneRank = struct {
+    attachment: u8,
+    possible_crtc_count: u8,
+    plane_id: u32,
+
+    fn betterThan(self: PlaneRank, other: PlaneRank) bool {
+        if (self.attachment != other.attachment) return self.attachment > other.attachment;
+        if (self.possible_crtc_count != other.possible_crtc_count)
+            return self.possible_crtc_count < other.possible_crtc_count;
+        return self.plane_id < other.plane_id;
+    }
+};
+
+const OverlayZpos = struct {
+    property_id: ?u32,
+    value: u64,
+};
+
+fn planeRank(
+    plane: Plane,
+    crtc_id: u32,
+    preferred_plane_id: ?u32,
+) PlaneRank {
+    const attachment: u8 = if (preferred_plane_id == plane.id and
+        (plane.current_crtc_id == 0 or plane.current_crtc_id == crtc_id))
+        3
+    else if (plane.current_crtc_id == crtc_id)
+        2
+    else if (plane.current_crtc_id == 0)
+        1
+    else
+        0;
+    return .{
+        .attachment = attachment,
+        .possible_crtc_count = @intCast(@popCount(plane.possible_crtcs)),
+        .plane_id = plane.id,
+    };
+}
+
+fn overlayZpos(zpos: api.ZposProperty, primary_zpos: u64) ?OverlayZpos {
+    const value = if (zpos.inherited > primary_zpos)
+        zpos.inherited
+    else if (zpos.immutable or zpos.maximum <= primary_zpos)
+        return null
+    else
+        primary_zpos + 1;
+    return .{
+        .property_id = if (zpos.immutable) null else zpos.id,
+        .value = value,
+    };
+}
+
 pub const Config = struct {
     card_capacity: usize,
     connector_capacity: usize,
@@ -1990,6 +2042,46 @@ test "drm: plane capability changes invalidate candidate configuration" {
         &right_storage,
         candidate,
     ));
+}
+
+test "drm: overlay plane ranking preserves attached and scarce resources" {
+    const base = Plane{
+        .id = 20,
+        .possible_crtcs = 3,
+        .plane_type_value = 0,
+        .format_start = 0,
+        .format_count = 1,
+        .properties = testPlaneProperties(),
+    };
+    const detached = base;
+    var attached = base;
+    attached.id = 30;
+    attached.current_crtc_id = 7;
+    try std.testing.expect(planeRank(attached, 7, null).betterThan(planeRank(detached, 7, null)));
+
+    var scarce = base;
+    scarce.possible_crtcs = 1;
+    try std.testing.expect(planeRank(scarce, 7, null).betterThan(planeRank(detached, 7, null)));
+    try std.testing.expect(planeRank(detached, 7, 20).betterThan(planeRank(attached, 7, null)));
+
+    var unavailable = base;
+    unavailable.current_crtc_id = 8;
+    try std.testing.expectEqual(@as(u8, 0), planeRank(unavailable, 7, null).attachment);
+}
+
+test "drm: overlay z-order remains strictly above primary" {
+    try std.testing.expectEqual(OverlayZpos{ .property_id = null, .value = 2 }, overlayZpos(
+        .{ .id = 9, .inherited = 2, .maximum = 2, .immutable = true },
+        1,
+    ).?);
+    try std.testing.expect(overlayZpos(
+        .{ .id = 9, .inherited = 1, .maximum = 1, .immutable = true },
+        1,
+    ) == null);
+    try std.testing.expectEqual(OverlayZpos{ .property_id = 9, .value = 2 }, overlayZpos(
+        .{ .id = 9, .inherited = 0, .maximum = 3, .immutable = false },
+        1,
+    ).?);
 }
 
 const TestTopology = struct {
