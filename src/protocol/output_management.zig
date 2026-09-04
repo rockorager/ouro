@@ -113,6 +113,8 @@ pub fn Adapter(comptime protocol: type) type {
         outbound: std.ArrayListUnmanaged(Out) = .empty,
         runtime: ?*Runtime = null,
         global: ?objects.Handle = null,
+        update_in_progress: bool = false,
+        update_changed: bool = false,
 
         pub fn init(allocator: std.mem.Allocator, c: Config, serial: u32, state: HeadState) !Self {
             try c.validate();
@@ -259,23 +261,21 @@ pub fn Adapter(comptime protocol: type) type {
             for (self.managers.entries.items) |m| if (m.header.active and !m.stopped) {
                 try self.queueSnapshot(m, &self.inventory.items[self.inventory.items.len - 1]);
             };
-            const serial = self.advanceSerial();
-            for (self.managers.entries.items) |m| if (m.header.active and !m.stopped)
-                self.outbound.appendAssumeCapacity(.{ .kind = .done, .owner = m.header.index, .serial = serial });
+            self.finishChange();
             return id;
         }
         pub fn publishHead(self: *Self, id: HeadId, state: HeadState) !u32 {
             _ = self.findInventory(id) orelse return error.InvalidHead;
             try self.ensureOutbound(self.synchronizeHeadCount(id));
             try self.lifecycle.publishHead(id, state);
-            _ = self.advanceSerial();
-            self.queueHeadSynchronization(id);
+            self.queueHeadSynchronization(id, false);
+            self.finishChange();
             return self.lifecycle.serial;
         }
         pub fn synchronizeHead(self: *Self, id: HeadId) !void {
             _ = self.findInventory(id) orelse return error.InvalidHead;
             try self.ensureOutbound(self.synchronizeHeadCount(id));
-            self.queueHeadSynchronization(id);
+            self.queueHeadSynchronization(id, true);
         }
         pub fn removeHead(self: *Self, id: HeadId) !void {
             const index = self.findInventoryIndex(id) orelse return error.InvalidHead;
@@ -293,7 +293,6 @@ pub fn Adapter(comptime protocol: type) type {
                 return error.Exhausted;
             try self.outbound.ensureUnusedCapacity(self.allocator, additional);
             try self.lifecycle.removeHead(id);
-            const serial = self.advanceSerial();
             const removed = self.inventory.orderedRemove(index);
             for (self.managers.entries.items) |m| {
                 if (!m.header.active) continue;
@@ -312,8 +311,8 @@ pub fn Adapter(comptime protocol: type) type {
                 } else {
                     self.retireWireHead(h);
                 }
-                self.outbound.appendAssumeCapacity(.{ .kind = .done, .owner = m.header.index, .serial = serial });
             }
+            self.finishChange();
             if (removed.modes_owned) self.allocator.free(removed.modes);
             if (removed.model) |v| self.allocator.free(v);
             if (removed.make) |v| self.allocator.free(v);
@@ -343,13 +342,13 @@ pub fn Adapter(comptime protocol: type) type {
         pub fn publish(self: *Self, state: HeadState) !u32 {
             try self.ensureOutbound(self.synchronizeCount());
             try self.lifecycle.publishHead(self.lifecycle.primary, state);
-            _ = self.advanceSerial();
-            self.queueSynchronization();
+            self.queueSynchronization(false);
+            self.finishChange();
             return self.lifecycle.serial;
         }
         pub fn synchronize(self: *Self) !void {
             try self.ensureOutbound(self.synchronizeCount());
-            self.queueSynchronization();
+            self.queueSynchronization(true);
         }
         fn synchronizeCount(self: *const Self) usize {
             var needed: usize = 0;
@@ -364,7 +363,7 @@ pub fn Adapter(comptime protocol: type) type {
             }
             return needed;
         }
-        fn queueSynchronization(self: *Self) void {
+        fn queueSynchronization(self: *Self, done: bool) void {
             for (self.managers.entries.items) |m| {
                 if (!m.header.active or m.stopped) continue;
                 for (self.inventory.items) |item| {
@@ -378,7 +377,7 @@ pub fn Adapter(comptime protocol: type) type {
                             .state = state,
                         });
                 }
-                self.outbound.appendAssumeCapacity(.{ .kind = .done, .owner = m.header.index, .serial = self.lifecycle.serial });
+                if (done) self.outbound.appendAssumeCapacity(.{ .kind = .done, .owner = m.header.index, .serial = self.lifecycle.serial });
             }
         }
         fn synchronizeHeadCount(self: *const Self, id: HeadId) usize {
@@ -388,15 +387,40 @@ pub fn Adapter(comptime protocol: type) type {
             }
             return needed;
         }
-        fn queueHeadSynchronization(self: *Self, id: HeadId) void {
+        fn queueHeadSynchronization(self: *Self, id: HeadId, done: bool) void {
             for (self.managers.entries.items) |m| {
                 if (!m.header.active or m.stopped) continue;
                 const h = self.findWireHead(m.header.index, id) orelse continue;
                 const state = self.lifecycle.currentHead(id) catch continue;
                 for ([_]Kind{ .enabled, .current_mode, .position, .transform, .scale, .adaptive_sync }) |k|
                     if (k != .adaptive_sync or m.version >= 4) self.outbound.appendAssumeCapacity(.{ .kind = k, .owner = m.header.index, .head = h.header.index, .state = state });
-                self.outbound.appendAssumeCapacity(.{ .kind = .done, .owner = m.header.index, .serial = self.lifecycle.serial });
+                if (done) self.outbound.appendAssumeCapacity(.{ .kind = .done, .owner = m.header.index, .serial = self.lifecycle.serial });
             }
+        }
+        pub fn beginUpdate(self: *Self) !void {
+            if (self.update_in_progress) return error.UpdateInProgress;
+            self.update_in_progress = true;
+            self.update_changed = false;
+        }
+        pub fn endUpdate(self: *Self) void {
+            std.debug.assert(self.update_in_progress);
+            self.update_in_progress = false;
+            if (!self.update_changed) return;
+            self.update_changed = false;
+            const serial = self.advanceSerial();
+            self.queueDone(serial);
+        }
+        fn finishChange(self: *Self) void {
+            if (self.update_in_progress) {
+                self.update_changed = true;
+                return;
+            }
+            const serial = self.advanceSerial();
+            self.queueDone(serial);
+        }
+        fn queueDone(self: *Self, serial: u32) void {
+            for (self.managers.entries.items) |m| if (m.header.active and !m.stopped)
+                self.outbound.appendAssumeCapacity(.{ .kind = .done, .owner = m.header.index, .serial = serial });
         }
         fn advanceSerial(self: *Self) u32 {
             self.lifecycle.serial +%= 1;
@@ -1665,9 +1689,39 @@ test "output management topology changes invalidate configuration snapshots" {
 
     try adapter.removeHead(secondary);
     try std.testing.expectEqual(@as(u32, 12), adapter.lifecycle.serial);
-    try std.testing.expectEqual(@as(u32, 12), adapter.outbound.items[adapter.outbound.items.len - 1].serial);
     try std.testing.expect((try adapter.lifecycle.submit(stale, .@"test")) == null);
     try std.testing.expect(adapter.managers.at(manager_index) == null);
+}
+
+test "output management batches topology changes under one serial" {
+    const A = Adapter(@import("core_protocol"));
+    const primary: HeadState = .{ .width = 800, .height = 600, .refresh_millihz = 60000 };
+    var adapter = try A.init(std.testing.allocator, .{ .manager_capacity = 1, .mode_capacity = 1 }, 9, primary);
+    defer adapter.deinit();
+    const manager = try adapter.managers.acquire();
+    manager.resource = .{ .id = 1, .generation = 1 };
+
+    try adapter.beginUpdate();
+    const secondary = try adapter.addHead(
+        .{ .name = "second", .description = "Second output" },
+        &.{.{ .width = 1024, .height = 768, .refresh_millihz = 60000 }},
+        .{ .width = 1024, .height = 768, .refresh_millihz = 60000, .x = 800 },
+    );
+    _ = try adapter.publishHead(secondary, .{
+        .width = 1024,
+        .height = 768,
+        .refresh_millihz = 60000,
+        .x = 900,
+    });
+    try adapter.removeHead(secondary);
+    try std.testing.expectEqual(@as(u32, 9), adapter.lifecycle.serial);
+    try std.testing.expectError(error.UpdateInProgress, adapter.beginUpdate());
+    adapter.endUpdate();
+
+    try std.testing.expectEqual(@as(u32, 10), adapter.lifecycle.serial);
+    try std.testing.expectEqual(@as(usize, 1), adapter.outbound.items.len);
+    try std.testing.expectEqual(A.Kind.done, adapter.outbound.items[0].kind);
+    try std.testing.expectEqual(@as(u32, 10), adapter.outbound.items[0].serial);
 }
 
 test "output management binding snapshots every mode in protocol order" {

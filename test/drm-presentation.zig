@@ -543,6 +543,7 @@ test "physical coordinator rebuilds an output when its modes change" {
     const unchanged_protocol_output = coordinator.physical_outputs[1].protocol_output;
     const unchanged_management_head = coordinator.physical_outputs[1].management_head;
     const drains_before = coordinator.stats.output_drains;
+    const serial_before = coordinator.output_management_adapter.lifecycle.serial;
     fixture.first_mode_width = 4;
     try fixture.signalHotplug();
     for (0..512) |_| {
@@ -584,6 +585,10 @@ test "physical coordinator rebuilds an output when its modes change" {
         coordinator.physical_outputs[1].management_head,
     ));
     try std.testing.expectEqual(drains_before + 1, coordinator.stats.output_drains);
+    try std.testing.expectEqual(
+        serial_before + 1,
+        coordinator.output_management_adapter.lifecycle.serial,
+    );
 
     try coordinator.requestStop();
     try drainServer(root, coordinator, &loop);
@@ -624,6 +629,7 @@ test "physical coordinator preserves outputs while changing and adding connector
     const unchanged_output = coordinator.physical_outputs[1].protocol_output;
     const unchanged_head = coordinator.physical_outputs[1].management_head;
     const drains_before = coordinator.stats.output_drains;
+    const serial_before = coordinator.output_management_adapter.lifecycle.serial;
     fixture.first_mode_width = 4;
     fixture.third_connector = true;
     fixture.third_desktop = true;
@@ -651,6 +657,10 @@ test "physical coordinator preserves outputs while changing and adding connector
         coordinator.physical_outputs[2].protocol_output,
     ));
     try std.testing.expectEqual(drains_before + 1, coordinator.stats.output_drains);
+    try std.testing.expectEqual(
+        serial_before + 1,
+        coordinator.output_management_adapter.lifecycle.serial,
+    );
 
     try coordinator.requestStop();
     try drainServer(root, coordinator, &loop);
@@ -692,6 +702,7 @@ test "physical coordinator rebuilds multiple changed outputs together" {
     const unchanged_output = coordinator.physical_outputs[2].protocol_output;
     const unchanged_head = coordinator.physical_outputs[2].management_head;
     const drains_before = coordinator.stats.output_drains;
+    const serial_before = coordinator.output_management_adapter.lifecycle.serial;
     fixture.first_mode_width = 4;
     fixture.second_mode_width = 4;
     try fixture.signalHotplug();
@@ -719,6 +730,10 @@ test "physical coordinator rebuilds multiple changed outputs together" {
     try std.testing.expect(std.meta.eql(unchanged_output, coordinator.physical_outputs[2].protocol_output));
     try std.testing.expect(std.meta.eql(unchanged_head, coordinator.physical_outputs[2].management_head));
     try std.testing.expectEqual(drains_before + 2, coordinator.stats.output_drains);
+    try std.testing.expectEqual(
+        serial_before + 1,
+        coordinator.output_management_adapter.lifecycle.serial,
+    );
 
     try coordinator.requestStop();
     try drainServer(root, coordinator, &loop);

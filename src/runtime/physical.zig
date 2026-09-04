@@ -12360,6 +12360,12 @@ pub fn Coordinator(comptime protocol: type) type {
             for (self.physical_outputs[0..self.physical_output_count]) |*physical|
                 physical.claim = null;
             const replace_management_heads = self.topology_refresh_draining;
+            var management_update = false;
+            if (replace_management_heads) {
+                try self.output_management_adapter.beginUpdate();
+                management_update = true;
+            }
+            defer if (management_update) self.output_management_adapter.endUpdate();
             const primary = self.primaryPhysicalOutputMutable();
             const primary_state = try self.output_management_adapter.lifecycle.currentHead(
                 primary.management_head,
@@ -12401,6 +12407,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.setPhysicalOutputRemoving(primary, true);
             }
             try self.activateAdditionalOutputs(handle, replace_management_heads);
+            if (management_update) {
+                self.output_management_adapter.endUpdate();
+                management_update = false;
+            }
             try self.advanceOutputGlobals();
             try self.publishOutputLayout();
             self.reconcileActiveOutputConfig();
@@ -12475,6 +12485,9 @@ pub fn Coordinator(comptime protocol: type) type {
             }
 
             const topology = try self.manager.snapshot(handle);
+            try self.output_management_adapter.beginUpdate();
+            var management_update = true;
+            defer if (management_update) self.output_management_adapter.endUpdate();
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
                 if (physical.kms_output != null) continue;
                 if (std.mem.indexOfScalar(
@@ -12507,6 +12520,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (physical.claim == null) return error.NoConnectedOutput;
             }
             try self.activateAdditionalOutputs(handle, false);
+            self.output_management_adapter.endUpdate();
+            management_update = false;
             try self.ensureDrmLeasing(topology);
             try self.advanceOutputGlobals();
             try self.publishOutputLayout();
