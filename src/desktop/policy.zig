@@ -317,9 +317,14 @@ pub fn Policy(
         pub fn focusRequested(policy: *Self, id: ToplevelId, source: FocusSource) !FocusDecision {
             if (source == .pointer_motion and !policy.focus_follows_mouse)
                 return .{ .accepted = false };
+            // Retained input and client requests can outlive visibility.
+            const changed = policy.focus(id) catch |err| switch (err) {
+                error.NotVisible => return .{ .accepted = false },
+                else => return err,
+            };
             return .{
                 .accepted = true,
-                .changed = try policy.focus(id),
+                .changed = changed,
             };
         }
 
@@ -330,7 +335,7 @@ pub fn Policy(
             current_geometry: geometry.Rect,
         ) !bool {
             const state = try policy.resolve(id);
-            if (state.minimized or state.fullscreen or state.maximized) return false;
+            if (!policy.isVisible(state.*) or state.fullscreen or state.maximized) return false;
             policy.tiled_resize = null;
             if (state.mode == .tiled) {
                 switch (kind) {

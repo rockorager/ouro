@@ -3256,6 +3256,62 @@ test "desktop: workspace switches publish visibility before suspended configures
     try std.testing.expect(desktop.takeSceneChanged());
 }
 
+test "desktop: hidden windows decline focus requests without changing focus" {
+    const Hidden = enum { uncommitted, minimized, inactive_workspace };
+    for (std.enums.values(Hidden)) |hidden| {
+        var desktop = try initTestDesktop(8);
+        defer desktop.deinit();
+        var shell = TestShell{};
+        desktop.policy.focus_follows_mouse = true;
+        shell.push(created(0));
+        _ = try desktop.consume(&shell, 1);
+        const id = try desktop.idForShell(.{ .index = 0, .generation = 1 });
+        if (hidden != .uncommitted) {
+            try settleDesktop(&desktop, &shell);
+            switch (hidden) {
+                .minimized => try desktop.setToplevelState(id, .minimized, true),
+                .inactive_workspace => try desktop.moveFocusedToWorkspace(2),
+                .uncommitted => unreachable,
+            }
+        }
+        const before = try desktop.policy.windowState(id);
+        const commands = desktop.pendingCommands();
+        const focus = desktop.focused();
+        for (std.enums.values(TestDesktop.FocusSource)) |source|
+            try std.testing.expect(!try desktop.requestFocus(id, source));
+        try std.testing.expectEqual(before, try desktop.policy.windowState(id));
+        try std.testing.expectEqual(commands, desktop.pendingCommands());
+        try std.testing.expectEqual(focus, desktop.focused());
+    }
+}
+
+test "desktop: hidden interactive requests leave window and tiling state unchanged" {
+    const kinds = [_]TestDesktop.InteractiveKind{ .move, .{ .resize = .right } };
+    for (kinds) |kind| {
+        var desktop = try initTestDesktop(8);
+        defer desktop.deinit();
+        var shell = TestShell{};
+        shell.push(created(0));
+        _ = try desktop.consume(&shell, 1);
+        try settleDesktop(&desktop, &shell);
+        const id = try desktop.idForShell(.{ .index = 0, .generation = 1 });
+        const output = (try desktop.policy.windowState(id)).output.?;
+        try desktop.switchWorkspace(output, 2);
+        const before = try desktop.policy.windowState(id);
+        const commands = desktop.pendingCommands();
+        try std.testing.expect(try desktop.beginInteractive(.{ .id = id, .kind = kind }) == null);
+        try std.testing.expectEqual(before, try desktop.policy.windowState(id));
+        try std.testing.expect(desktop.policy.tiling.contains(id));
+        try std.testing.expect(desktop.policy.tiled_resize == null);
+        try std.testing.expectEqual(commands, desktop.pendingCommands());
+        try std.testing.expect(desktop.focused() == null);
+
+        try desktop.switchWorkspace(output, 1);
+        try std.testing.expect(try desktop.requestFocus(id, .pointer_button));
+        try std.testing.expect(try desktop.beginInteractive(.{ .id = id, .kind = kind }) != null);
+    }
+}
+
 test "desktop: workspace inventory publishes active and occupied workspaces" {
     var desktop = try initTestDesktop(4);
     defer desktop.deinit();
