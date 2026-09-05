@@ -1437,6 +1437,14 @@ static void setup_scene(struct client *client) {
         if (client->global_alpha)
             layer->alpha_modifier = create_alpha_modifier(client, layer->surface);
         const bool alpha = client->scene_mode == SCENE_OVERLAP && !client->global_alpha;
+        const bool declared_opaque = client->scene_mode == SCENE_OCCLUSION && client->opaque_region;
+        if (declared_opaque) {
+            struct wl_region *region = wl_compositor_create_region(client->compositor);
+            if (region == NULL) protocol_fail("create scene opaque region");
+            wl_region_add(region, 0, 0, client->scene_layer_width, client->scene_layer_height);
+            wl_surface_set_opaque_region(layer->surface, region);
+            wl_region_destroy(region);
+        }
         layer->canonical_pixels = allocate_pixels(
             client->scene_layer_width,
             client->scene_layer_height,
@@ -1451,7 +1459,7 @@ static void setup_scene(struct client *client) {
                 layer->canonical_pixels,
                 client->scene_layer_width,
                 client->scene_layer_height,
-                alpha,
+                alpha || declared_opaque,
                 true
             );
             create_buffer(client, &layer->buffers[buffer_index]);

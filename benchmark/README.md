@@ -158,6 +158,9 @@ Workloads are declared in `workloads.sh`:
   instructions, not refresh-capped FPS: an occlusion-aware renderer should
   submit only the frontmost sample while preserving every covered commit's
   release and presentation lifecycle;
+- `layers-occlusion-declared-{8,32}` and `layers-occlusion-toggle-declared-8`:
+  matching occlusion workloads whose children use ARGB buffers with opaque
+  pixels and full-surface opaque declarations, rather than implicit XRGB opacity;
 - `layers-{motion,resize,restack,map}-8`: eight synchronized translucent SHM
   subsurfaces whose positions, viewporter destinations, stacking order, or
   mapped state change once per atomic parent commit. The map workload repeatedly

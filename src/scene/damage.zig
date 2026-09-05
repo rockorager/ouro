@@ -321,8 +321,6 @@ pub const Planner = struct {
                 .global_alpha = sample.global_alpha,
             };
         }
-        const planned_count = try self.cullOccluded(list);
-
         for (changes) |change| self.addChange(change);
         self.combined.addRegion(self.physical_output, self.client);
         self.combined.addRegion(self.physical_output, self.scene);
@@ -346,6 +344,8 @@ pub const Planner = struct {
             self.combined.add(self.physical_output, visible);
         }
         if (force_full) self.combined.setFull(self.physical_output);
+        // Blur dependencies above still need the original sample/plan pairing.
+        const planned_count = try self.cullOccluded(list);
         self.pending = true;
         self.pending_handle = handle;
         return .{
@@ -365,8 +365,7 @@ pub const Planner = struct {
 
     /// Removes only renderer-plan entries. `list` remains complete so output
     /// presentation bindings retire every committed surface on the page flip.
-    /// XRGB plus full global alpha is the only implicit whole-buffer opacity;
-    /// ARGB requires explicit opaque-region integration before it can cover.
+    /// Alpha-capable buffers cover only with a full-surface opaque declaration.
     fn cullOccluded(self: *Planner, list: render.List) !usize {
         var index = list.samples.len;
         while (index != 0) {
@@ -391,7 +390,11 @@ pub const Planner = struct {
         self.occlusion_fragments.clearRetainingCapacity();
         try self.occlusion_fragments.append(self.allocator, candidate);
         for (list.samples[candidate_index + 1 ..], candidate_index + 1..) |sample, cover_index| {
-            if (sample.source.format != .xrgb8888 or sample.global_alpha != 255) continue;
+            if (sample.global_alpha != 255 or
+                (sample.source.format != .xrgb8888 and !render.effectRegionCoversSurface(
+                    sample.opaque_region,
+                    sample.effect_size,
+                ))) continue;
             const cover = clippedPlanRect(
                 self.planned_samples[cover_index].destination,
                 self.planned_samples[cover_index].clip,
@@ -959,6 +962,74 @@ test "damage: opaque coverage culls exact render samples and reveal restores the
     );
     try std.testing.expectEqual(@as(usize, 1), plan.samples.len);
     try std.testing.expectEqual(background.sample, plan.samples[0].sample);
+    try planner.cancel();
+}
+
+test "damage: declared opacity culls covered samples and movement reveals them" {
+    var planner = try Planner.init(std.testing.allocator, .{ .width = 100, .height = 100 }, .normal, testConfig(1));
+    defer planner.deinit();
+    const pixel = [_]u8{0} ** 4;
+    const background = testSample(1, 1, &pixel, .{ .x = 0, .y = 0, .width = 100, .height = 100 });
+    var cover = testSample(2, 1, &pixel, background.destination);
+    cover.source.format = .argb8888_premultiplied;
+    cover.effect_size = .{ .width = 100, .height = 100 };
+    const whole: render.RegionOperation = .{ .add = .{ .x = 0, .y = 0, .width = 100, .height = 100 } };
+    cover.opaque_region = &.{whole};
+    const list = testList(&.{ background, cover });
+    var plan = try planner.prepare(.{ .slot = 0, .generation = 1 }, list, &.{});
+    try std.testing.expectEqual(@as(usize, 1), plan.samples.len);
+    try std.testing.expectEqual(@as(u32, 1), plan.samples[0].source_index);
+    try std.testing.expectEqual(cover.presentation, plan.samples[0].presentation);
+    try std.testing.expectEqual(@as(usize, 2), list.samples.len);
+    try planner.publish();
+
+    // Every failed opacity/geometry proof must retain the lower sample.
+    for (0..7) |variant| {
+        var changed = cover;
+        switch (variant) {
+            0 => changed.destination.x = 1,
+            1 => changed.clip.width = 99,
+            2 => changed.global_alpha = 254,
+            3 => changed.opaque_region = &.{},
+            4 => changed.opaque_region = &.{.{ .add = .{ .x = 0, .y = 0, .width = 99, .height = 100 } }},
+            5 => changed.opaque_region = &.{ whole, .{ .subtract = .{ .x = 0, .y = 0, .width = 1, .height = 1 } } },
+            6 => changed.effect_size = .{ .width = 0, .height = 0 },
+            else => unreachable,
+        }
+        plan = try planner.prepare(.{ .slot = 0, .generation = 2 }, testList(&.{ background, changed }), &.{});
+        try std.testing.expectEqual(@as(usize, 2), plan.samples.len);
+        try std.testing.expectEqual(background.sample, plan.samples[0].sample);
+        try planner.cancel();
+    }
+    plan = try planner.prepare(.{ .slot = 0, .generation = 2 }, testList(&.{background}), &.{});
+    try std.testing.expectEqual(background.sample, plan.samples[0].sample);
+    try planner.cancel();
+}
+
+test "damage: culling preserves blur dependency geometry" {
+    var planner = try Planner.init(std.testing.allocator, .{ .width = 100, .height = 100 }, .normal, testConfig(1));
+    defer planner.deinit();
+    const pixel = [_]u8{0} ** 4;
+    const hidden = testSample(1, 1, &pixel, .{ .x = 0, .y = 0, .width = 10, .height = 10 });
+    var blur = testSample(2, 1, &pixel, .{ .x = 30, .y = 30, .width = 40, .height = 40 });
+    blur.source.format = .argb8888_premultiplied;
+    blur.effect_size = .{ .width = 40, .height = 40 };
+    blur.blur_region = &.{.{ .add = .{ .x = 0, .y = 0, .width = 40, .height = 40 } }};
+    var cover = testSample(3, 1, &pixel, hidden.destination);
+    cover.source.format = .argb8888_premultiplied;
+    cover.effect_size = .{ .width = 10, .height = 10 };
+    cover.opaque_region = &.{.{ .add = .{ .x = 0, .y = 0, .width = 10, .height = 10 } }};
+    _ = try planner.prepare(.{ .slot = 0, .generation = 1 }, testList(&.{ hidden, blur, cover }), &.{});
+    try planner.publish();
+    const previous = SurfaceState.fromSample(blur, .{ .width = 100, .height = 100 });
+    blur.sample.commit_sequence = 2;
+    const plan = try planner.prepare(.{ .slot = 0, .generation = 2 }, testList(&.{ hidden, blur, cover }), &.{.{
+        .previous = previous,
+        .current = SurfaceState.fromSample(blur, .{ .width = 100, .height = 100 }),
+        .surface_damage = damageRegion(Damage.rect(20, 20, 1, 1)),
+    }});
+    try std.testing.expectEqual(@as(usize, 2), plan.samples.len);
+    try std.testing.expectEqualSlices(render.Rect, &.{.{ .x = 6, .y = 6, .width = 88, .height = 88 }}, plan.render_damage);
     try planner.cancel();
 }
 
