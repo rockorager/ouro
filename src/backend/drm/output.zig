@@ -621,17 +621,22 @@ pub const Output = struct {
         if (self.read_token) |read| if (sameToken(read, token)) {
             try router.retire(token);
             self.read_token = null;
+            if (self.state == .removed or self.state == .failed) return;
+            // A successful read can beat drain cancellation and contain
+            // events for other CRTCs sharing this DRM FD. Dispatch those
+            // bytes before retiring the reader, but never rearm it.
+            if (self.state != .draining or result > 0) {
+                if (result <= 0 or result > self.drm_events.len)
+                    return self.markFailed(.readiness);
+                self.platform.handleEvents(
+                    self.drm_events[0..@intCast(result)],
+                    pageFlipCallback,
+                ) catch return self.markFailed(.event_dispatch);
+            }
             if (self.state == .draining) {
                 if (self.cancel_token == null) try self.finishDrain();
                 return;
             }
-            if (self.state == .removed or self.state == .failed) return;
-            if (result <= 0 or result > self.drm_events.len)
-                return self.markFailed(.readiness);
-            self.platform.handleEvents(
-                self.drm_events[0..@intCast(result)],
-                pageFlipCallback,
-            ) catch return self.markFailed(.event_dispatch);
             try self.prepareReadiness(router, ring);
             return;
         };
@@ -1463,6 +1468,33 @@ test "kms: read cancellation CQEs drain in either order" {
     try output.completeReadiness(&router, &ring, cancel2, errorNoEntry());
     try std.testing.expect(output.drainComplete());
     try output.destroy();
+}
+
+test "kms: successful reads racing drain cancellation still dispatch shared DRM events" {
+    for ([_]bool{ false, true }) |cancel_first| {
+        var fixture = Fixture{};
+        const output = try fixture.create(.{});
+        var router = try completion.Router.init(std.testing.allocator, 4);
+        defer router.deinit(std.testing.allocator);
+        const read = try router.acquire(.backend_ready);
+        const cancel = try router.acquire(.backend_ready);
+        output.read_token = read;
+        output.cancel_token = cancel;
+        output.state = .draining;
+        // The read won the race with cancellation. Its bytes can belong to
+        // another CRTC on the same DRM FD, even though this output is idle.
+        @memset(&output.drm_events, 0);
+        var ring: linux.IoUring = undefined;
+        if (cancel_first)
+            try output.completeReadiness(&router, &ring, cancel, errorNoEntry());
+        try output.completeReadiness(&router, &ring, read, 8);
+        if (!cancel_first)
+            try output.completeReadiness(&router, &ring, cancel, errorNoEntry());
+        const drained = output.drainComplete();
+        try output.destroy();
+        try std.testing.expect(drained);
+        try std.testing.expectEqual(@as(usize, 1), fixture.atomic_state.handle_event_count);
+    }
 }
 
 test "kms: one-shot event reads rearm without submitting internally" {
