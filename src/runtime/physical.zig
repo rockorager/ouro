@@ -6072,6 +6072,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 ProtocolReady.primary_selection | ProtocolReady.text_input |
                 ProtocolReady.tablet);
             if (self.sessionLockActive()) {
+                // A down retained before seat acceptance has no contact for
+                // touchCancel to retire. Drop its cached background delivery,
+                // preserving the admission stages that already completed.
+                self.input_touch_delivery = .{};
                 if (self.session_lock_adapter.pendingLock() != null) {
                     for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
                         physical.session_lock_frame = null;
@@ -6130,7 +6134,15 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.syncIdleNotifications();
         }
 
-        fn setKeyboardSurface(self: *Self, surface: ?Adapter.SurfaceId) !void {
+        fn setKeyboardSurface(self: *Self, requested: ?Adapter.SurfaceId) !void {
+            // Enforce lock isolation at the shared focus boundary, including
+            // layer commits/removal and keymap-triggered focus reconciliation.
+            // With no mapped lock surface (including locker loss), focus nobody.
+            const surface = if (self.sessionLockActive() and
+                (requested == null or self.sessionLockScene(requested.?) == null))
+                self.firstSessionLockSurface()
+            else
+                requested;
             const focus: ?protocol_text_input.Focus = if (surface) |id| focus: {
                 const peer = try self.adapter.surfacePeer(id);
                 break :focus .{
@@ -9990,7 +10002,10 @@ pub fn Coordinator(comptime protocol: type) type {
             output_bounds: geometry.Rect,
             output_scale: geometry.OutputScale,
         ) !?damage.SurfaceState {
-            const root = self.drag_icon_root orelse {
+            // Protocol cancellation may be backpressured. Hide the icon and
+            // damage its old bounds regardless of whether cancellation fit.
+            const visible_root = if (self.sessionLockActive()) null else self.drag_icon_root;
+            const root = visible_root orelse {
                 if (physical.drag_icon_previous) |previous| {
                     try self.ensureFrameStorage(@max(sample_count.*, change_count.*) + 1);
                     self.frame_changes[change_count.*] = .{ .previous = try scaleSurfaceState(
@@ -10542,6 +10557,12 @@ pub fn Coordinator(comptime protocol: type) type {
             capture: ImageCopyCaptureAdapter.Capture,
             id: Desktop.ToplevelId,
         ) !void {
+            // Check at execution as well as for newly requested work: captures
+            // queued before locking must not read the hidden desktop either.
+            if (self.sessionLockActive()) {
+                try self.failImageCopy(capture);
+                return;
+            }
             const bounds = self.captureToplevelBounds(id) orelse {
                 try self.failImageCopy(capture);
                 return;

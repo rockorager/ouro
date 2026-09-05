@@ -2303,6 +2303,33 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     try std.testing.expectEqual(@as(usize, toplevel_pixels.len), capture_read);
     try std.testing.expectEqualSlices(u8, pixels[0..12], toplevel_pixels[0..12]);
     try std.testing.expectEqualSlices(u8, pixels[16..28], toplevel_pixels[12..24]);
+    _ = linux.close(handler.image_capture_read_fd);
+    handler.image_capture_read_fd = -1;
+
+    handler.image_capture_ready = false;
+    try handler.queueToplevelCapture();
+    coordinator.session_lock_adapter.fail_closed = true;
+    try submitClient(&client_reactor, &driver, &handler);
+    for (0..128) |_| {
+        client_progress = try drainClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.image_capture_failed) break;
+        if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, client_reactor.ring);
+    }
+    try std.testing.expect(handler.image_capture_failed);
+    try std.testing.expect(!handler.image_capture_ready);
+    var denied_pixels: [24]u8 = undefined;
+    const denied_read = linux.pread(
+        handler.image_capture_read_fd,
+        &denied_pixels,
+        denied_pixels.len,
+        0,
+    );
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(denied_read));
+    try std.testing.expectEqual(@as(usize, denied_pixels.len), denied_read);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0x55} ** 24), &denied_pixels);
+    coordinator.session_lock_adapter.fail_closed = false;
 
     const motion_before_warp = handler.pointer_motion;
     try handler.queuePointerWarp();
@@ -6654,6 +6681,7 @@ const Handler = struct {
     image_capture_width: u32 = 0,
     image_capture_height: u32 = 0,
     image_capture_ready: bool = false,
+    image_capture_failed: bool = false,
     test_image_capture_sources: bool = false,
     image_output_global_seen: bool = false,
     image_toplevel_global_seen: bool = false,
@@ -6933,7 +6961,10 @@ const Handler = struct {
                     self.image_capture_ready = true;
                     try self.destroyToplevelCapture();
                 },
-                .failed => return error.UnexpectedCaptureFailure,
+                .failed => {
+                    self.image_capture_failed = true;
+                    try self.destroyToplevelCapture();
+                },
             }
         } else if (target.object.interface == &protocol.ext_image_copy_capture_cursor_session_v1.info) {
             switch (try protocol.ext_image_copy_capture_cursor_session_v1.decodeEvent(message, fds)) {

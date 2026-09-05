@@ -1556,7 +1556,7 @@ test "generated session lock publishes only after presentation and client loss s
     };
     try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .device_added = .{
         .device = keyboard_device,
-        .info = .{ .capabilities = .{ .keyboard = true } },
+        .info = .{ .capabilities = .{ .keyboard = true, .touch = true } },
     } }));
 
     var reactor: wayring.io_uring.Reactor = undefined;
@@ -1611,6 +1611,121 @@ test "generated session lock publishes only after presentation and client loss s
     try std.testing.expectEqual(@as(usize, 1), handler.keyboard_enters);
     try std.testing.expectEqual(handler.surface.?.id, handler.keyboard_surface);
     try std.testing.expectEqual(@as(u32, 240), handler.preferred_scale);
+
+    // Background layer commits must not clear lock focus or steal it with
+    // exclusive keyboard interactivity (as a panel/overlay could do).
+    const background_surface = (try protocol.wl_compositor.construct_create_surface(
+        &client.objects,
+        &actor.transmit,
+        handler.compositor.?,
+        .{},
+    )).id;
+    const background_layer = (try protocol.zwlr_layer_shell_v1.construct_get_layer_surface(
+        &client.objects,
+        &actor.transmit,
+        handler.layer_shell.?,
+        .{ .surface = background_surface.id, .output = handler.output.?.id, .layer = .overlay, .namespace = "lock-focus-test" },
+    )).id;
+    try protocol.zwlr_layer_surface_v1.encodeRequest(&actor.transmit, background_layer.id, .{
+        .set_size = .{ .width = 1, .height = 1 },
+    });
+    try protocol.zwlr_layer_surface_v1.encodeRequest(&actor.transmit, background_layer.id, .{
+        .set_keyboard_interactivity = .{ .keyboard_interactivity = .exclusive },
+    });
+    try protocol.wl_surface.encodeRequest(&actor.transmit, background_surface.id, .{ .commit = .{} });
+    try submitClient(&reactor, &driver, &handler);
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.layer_configure_serial != null) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(handler.layer_configure_serial != null);
+    try std.testing.expect(coordinator.seat_adapter.keyboard_focus != null);
+    const focused_lock = coordinator.seat_adapter.keyboard_focus.?.surface;
+    try std.testing.expectEqual(handler.surface.?.id, (try coordinator.adapter.surfaceResource(focused_lock)).id);
+    try protocol.zwlr_layer_surface_v1.encodeRequest(&actor.transmit, background_layer.id, .{
+        .ack_configure = .{ .serial = handler.layer_configure_serial.? },
+    });
+    try protocol.wl_surface.encodeRequest(&actor.transmit, background_surface.id, .{
+        .attach = .{ .buffer = handler.buffer.?.id, .x = 0, .y = 0 },
+    });
+    try protocol.wl_surface.encodeRequest(&actor.transmit, background_surface.id, .{ .commit = .{} });
+    try submitClient(&reactor, &driver, &handler);
+    const layer_ids = try coordinator.layer_shell_adapter.ids(coordinator.layer_surface_ids);
+    try std.testing.expectEqual(@as(usize, 1), layer_ids.len);
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if ((try coordinator.layer_shell_adapter.state(layer_ids[0])).mapped) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect((try coordinator.layer_shell_adapter.state(layer_ids[0])).mapped);
+    try std.testing.expectEqual(focused_lock, coordinator.seat_adapter.keyboard_focus.?.surface);
+
+    // Seed the exact admission state left by a pre-lock touchDown whose seat
+    // queue was full: target selected, interaction accepted, no contact yet.
+    const background = try coordinator.layer_shell_adapter.state(layer_ids[0]);
+    const down: ouro.input_backend.Event = .{ .touch_down = .{
+        .device = keyboard_device,
+        .time_usec = 1,
+        .slot = 0,
+        .seat_slot = 0,
+        .x = 0.875,
+        .y = 0.25,
+    } };
+    const contact: @TypeOf(coordinator.seat_adapter).TouchContactId = .{ .device = keyboard_device, .id = 0 };
+    coordinator.input_delivery_prepared = true;
+    coordinator.input_delivery_event = down;
+    coordinator.input_interaction_accepted = true;
+    coordinator.input_idle_accepted = true;
+    coordinator.input_touch_delivery = .{
+        .target = try coordinator.seat_adapter.makeTarget(background.peer, background.surface),
+        .point = .{ .x = 0, .y = 0 },
+        .offset = .{ .x = 0, .y = 0 },
+    };
+    coordinator.session_lock_input_ready = false;
+    try std.testing.expect(try coordinator.acceptNormalizedInput(down));
+    try std.testing.expect(coordinator.seat_adapter.touchTarget(contact) == null);
+    try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .touch_motion = down.touch_down }));
+    try std.testing.expect(coordinator.seat_adapter.touchTarget(contact) == null);
+    // Fresh input still targets the locker, rather than disabling touch.
+    try std.testing.expect(try coordinator.acceptNormalizedInput(down));
+    try std.testing.expectEqual(focused_lock, coordinator.seat_adapter.touchTarget(contact).?.focus.surface);
+    try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .touch_up = .{
+        .device = keyboard_device,
+        .time_usec = 2,
+        .slot = 0,
+        .seat_slot = 0,
+    } }));
+
+    // Retain an icon as if drag cancellation were backpressured. Locked
+    // composition must not sample it, even while the protocol drag is live.
+    coordinator.data_device_adapter.drag = .{
+        .peer = background.peer,
+        .source = null,
+        .origin_object = background_surface.id,
+        .icon_object = background_surface.id,
+    };
+    coordinator.drag_icon_root = background.surface;
+    const presented_before_icon = coordinator.stats.presented;
+    for (coordinator.physical_outputs[0..coordinator.physical_output_count]) |*physical| {
+        physical.damage_requested +%= 1;
+        if (physical.kms_output) |output| try output.request(.damage, 1);
+    }
+    for (0..512) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (coordinator.stats.presented > presented_before_icon and physicalOutputsSettled(coordinator)) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expect(coordinator.stats.presented > presented_before_icon);
+    try std.testing.expect(physicalOutputsSettled(coordinator));
+    try std.testing.expect(coordinator.data_device_adapter.dragActive());
+    for (coordinator.physical_outputs[0..coordinator.physical_output_count]) |physical|
+        try std.testing.expect(physical.drag_icon_previous == null);
+    try coordinator.data_device_adapter.cancelDrag();
     try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .keyboard_key = .{
         .device = keyboard_device,
         .time_usec = 1,
@@ -1625,6 +1740,8 @@ test "generated session lock publishes only after presentation and client loss s
             try waitForEither(&root.ring, reactor.ring);
     }
     try std.testing.expectEqual(@as(usize, 1), handler.keyboard_keys);
+    try std.testing.expectEqual(handler.surface.?.id, handler.keyboard_surface);
+    try std.testing.expectEqual(@as(usize, 1), handler.keyboard_enters);
     try std.testing.expect(coordinator.stats.presented >= 1);
     try std.testing.expect(coordinator.session_lock_adapter.isFailClosed());
     const lock_ids = try coordinator.session_lock_adapter.surfaceIds(coordinator.lock_surface_ids);
@@ -1704,6 +1821,7 @@ test "generated session lock publishes only after presentation and client loss s
     try std.testing.expect(!retired_lock.mapped);
     try std.testing.expect(coordinator.session_lock_adapter.activeLock() != null);
     try std.testing.expect(coordinator.session_lock_adapter.isFailClosed());
+    try std.testing.expect(coordinator.seat_adapter.keyboard_focus == null);
     try std.testing.expect(coordinator.physical_outputs[0].kms_output != null);
     lock_associations = 0;
     for (coordinator.output_adapter.associations) |association| {
@@ -1727,6 +1845,7 @@ test "generated session lock publishes only after presentation and client loss s
     try std.testing.expectEqual(@as(usize, 0), coordinator.client_count);
     try std.testing.expect(coordinator.session_lock_adapter.activeLock() == null);
     try std.testing.expect(coordinator.session_lock_adapter.isFailClosed());
+    try std.testing.expect(coordinator.seat_adapter.keyboard_focus == null);
     try std.testing.expect(!coordinator.stopping);
 
     try coordinator.requestStop();
@@ -2940,11 +3059,14 @@ const SessionLockClientHandler = struct {
     objects: *wayring.objects.ClientObjects,
     queue: *wayring.tx.Queue,
     registry: wayring.objects.Handle,
+    layer_shell: ?wayring.objects.Handle = null,
+    layer_configure_serial: ?u32 = null,
     compositor: ?wayring.objects.Handle = null,
     shm: ?wayring.objects.Handle = null,
     output: ?wayring.objects.Handle = null,
     seat: ?wayring.objects.Handle = null,
     keyboard: ?wayring.objects.Handle = null,
+    touch: ?wayring.objects.Handle = null,
     manager: ?wayring.objects.Handle = null,
     fractional_scale_manager: ?wayring.objects.Handle = null,
     fractional_scale: ?wayring.objects.Handle = null,
@@ -2989,6 +3111,8 @@ const SessionLockClientHandler = struct {
                         self.seat = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wl_seat.info, @min(global.version, 9), null);
                     if (std.mem.eql(u8, global.interface, protocol.ext_session_lock_manager_v1.info.name))
                         self.manager = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.ext_session_lock_manager_v1.info, 1, null);
+                    if (std.mem.eql(u8, global.interface, protocol.zwlr_layer_shell_v1.info.name))
+                        self.layer_shell = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.zwlr_layer_shell_v1.info, @min(global.version, 5), null);
                     if (std.mem.eql(u8, global.interface, protocol.wp_fractional_scale_manager_v1.info.name))
                         self.fractional_scale_manager = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wp_fractional_scale_manager_v1.info, 1, null);
                 },
@@ -3008,17 +3132,28 @@ const SessionLockClientHandler = struct {
             }
         } else if (target.object.interface == &protocol.wl_seat.info) {
             switch (try protocol.wl_seat.decodeEvent(message, fds)) {
-                .capabilities => |value| if (self.keyboard == null and
-                    value.capabilities.contains(protocol.wl_seat.capability.keyboard))
-                {
-                    self.keyboard = (try protocol.wl_seat.construct_get_keyboard(
-                        self.objects,
-                        self.queue,
-                        self.seat.?,
-                        .{},
-                    )).id;
+                .capabilities => |value| {
+                    if (self.keyboard == null and value.capabilities.contains(protocol.wl_seat.capability.keyboard))
+                        self.keyboard = (try protocol.wl_seat.construct_get_keyboard(
+                            self.objects,
+                            self.queue,
+                            self.seat.?,
+                            .{},
+                        )).id;
+                    if (self.touch == null and value.capabilities.contains(protocol.wl_seat.capability.touch))
+                        self.touch = (try protocol.wl_seat.construct_get_touch(
+                            self.objects,
+                            self.queue,
+                            self.seat.?,
+                            .{},
+                        )).id;
                 },
                 .name => {},
+            }
+        } else if (target.object.interface == &protocol.wl_touch.info) {
+            switch (try protocol.wl_touch.decodeEvent(message, fds)) {
+                .down => |value| try std.testing.expectEqual(self.surface.?.id, value.surface),
+                else => {},
             }
         } else if (target.object.interface == &protocol.wl_keyboard.info) {
             switch (try protocol.wl_keyboard.decodeEvent(message, fds)) {
@@ -3039,7 +3174,16 @@ const SessionLockClientHandler = struct {
             switch (try protocol.ext_session_lock_surface_v1.decodeEvent(message, fds)) {
                 .configure => |value| try self.commitConfigured(value.serial, value.width, value.height),
             }
+        } else if (target.object.interface == &protocol.zwlr_layer_surface_v1.info) {
+            switch (try protocol.zwlr_layer_surface_v1.decodeEvent(message, fds)) {
+                .configure => |value| self.layer_configure_serial = value.serial,
+                .closed => {},
+            }
         } else if (target.object.interface == &protocol.wl_surface.info) {
+            if (message.header.object_id != self.surface.?.id) {
+                _ = try protocol.wl_surface.decodeEvent(message, fds);
+                return .continue_dispatch;
+            }
             switch (try protocol.wl_surface.decodeEvent(message, fds)) {
                 .enter => |value| {
                     try std.testing.expectEqual(self.output.?.id, value.output);
