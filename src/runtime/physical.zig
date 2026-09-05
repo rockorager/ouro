@@ -8563,10 +8563,11 @@ pub fn Coordinator(comptime protocol: type) type {
             while (remaining != 0 and self.pending_surface_len != 0) : (remaining -= 1) {
                 const before_len = self.pending_surface_len;
                 const pending = self.pending_surfaces[self.pending_surface_head];
-                const applied = try self.applyPendingSurface(pending);
+                var needs_frame = true;
+                const applied = try self.applyPendingSurface(pending, &needs_frame);
                 if (applied and !self.anyKmsOutput())
                     self.adapter.clearFifoBarriers();
-                if (applied) {
+                if (applied and needs_frame) {
                     if (self.findAppLayerAwaitingDamage(pending.id)) |layer| {
                         if (layer.id) |id| if (self.surfaceScene(id)) |scene| {
                             if (!scene.root.visible) {
@@ -8605,7 +8606,7 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.syncCommitTimer();
         }
 
-        fn applyPendingSurface(self: *Self, pending: PendingSurface) !bool {
+        fn applyPendingSurface(self: *Self, pending: PendingSurface, needs_frame: *bool) !bool {
             const surface = pending.handle;
             const current_surface = self.adapter.surfaceResource(pending.id) catch {
                 self.dropPendingSurface(pending.id);
@@ -8655,7 +8656,7 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             const content = &candidate.content;
             const attachment = content.surface.attachment orelse {
-                return self.applyRetainedCandidate(layer, pending.id, surface_scene);
+                return self.applyRetainedCandidate(layer, pending.id, surface_scene, needs_frame);
             };
             if (attachment.buffer == null) {
                 if (layer.retains_source) {
@@ -9014,6 +9015,7 @@ pub fn Coordinator(comptime protocol: type) type {
             layer: *Layer,
             pending_id: Adapter.SurfaceId,
             surface_scene: ?SurfaceScene,
+            needs_frame: *bool,
         ) !bool {
             if (!layer.active or layer.rendered == null or layer.sample == null) {
                 if (layer.retains_source) try self.retireLayerSource(layer);
@@ -9132,11 +9134,13 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             sample.opaque_region = content.effects.opaque_operations;
             sample.blur_region = content.effects.blur_operations;
-            if (std.meta.eql(sample, layer.sample.?) and
+            if (retainedSampleUnchanged(layer.sample.?, sample) and
                 content.surface.surface_damage.count == 0 and
                 content.surface.buffer_damage.count == 0 and
                 content.frame_callbacks == null and
-                content.presentation_feedback == null)
+                content.presentation_feedback == null and
+                content.release_callbacks == null and
+                !content.surface.fifo_set)
             {
                 const rendered = render_device.content.publish(prepared);
                 prepared_owned = false;
@@ -9144,6 +9148,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 consumed.content.deinit();
                 layer.rendered = rendered;
                 self.finishPendingCandidate(pending_id);
+                // A wait-only FIFO commit advances protocol state, not pixels.
+                // A new barrier still needs the ordinary output latching path.
+                needs_frame.* = false;
+                self.stats.applied += 1;
                 return true;
             }
             const token = self.presentations.admitImported(.{}) catch |err| switch (err) {
@@ -14100,6 +14108,51 @@ fn translatedPoint(value: geometry.Point, delta: anytype) geometry.Point {
         .x = translatedCoordinate(value.x, delta.x),
         .y = translatedCoordinate(value.y, delta.y),
     };
+}
+
+fn retainedSampleUnchanged(previous: render.SurfaceSample, current: render.SurfaceSample) bool {
+    // Region snapshots may be separately allocated but describe identical
+    // pixels. Upload damage belongs to the already-applied buffer commit.
+    const old_regions = [_][]const render.RegionOperation{ previous.opaque_region, previous.blur_region };
+    const new_regions = [_][]const render.RegionOperation{ current.opaque_region, current.blur_region };
+    for (old_regions, new_regions) |old, new| {
+        if (old.len != new.len) return false;
+        for (old, new) |a, b| if (!std.meta.eql(a, b)) return false;
+    }
+    var normalized = previous;
+    normalized.upload_damage = current.upload_damage;
+    normalized.opaque_region = current.opaque_region;
+    normalized.blur_region = current.blur_region;
+    return std.meta.eql(normalized, current);
+}
+
+test "physical: retained sample equality ignores uploads but preserves visual changes" {
+    const region = [_]render.RegionOperation{.{ .add = .{ .x = 0, .y = 0, .width = 1, .height = 1 } }};
+    var copied_region = region;
+    const previous: render.SurfaceSample = .{
+        .sample = .{ .surface = 1, .commit_sequence = 1 },
+        .presentation = .{ .slot = 0, .generation = 1 },
+        .source = .{ .size = .{ .width = 1, .height = 1 }, .stride = 4, .format = .xrgb8888, .bytes = &.{ 0, 0, 0, 255 } },
+        .upload_damage = .{ .count = 1 },
+        .crop = render.SourceRect.pixels(0, 0, 1, 1),
+        .destination = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+        .clip = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+        .opaque_region = &region,
+        .blur_region = &region,
+    };
+    var current = previous;
+    current.upload_damage = .{};
+    current.opaque_region = &copied_region;
+    current.blur_region = &copied_region;
+    try std.testing.expect(retainedSampleUnchanged(previous, current));
+    copied_region[0] = .{ .subtract = .{ .x = 0, .y = 0, .width = 1, .height = 1 } };
+    try std.testing.expect(!retainedSampleUnchanged(previous, current));
+    copied_region = region;
+    current.global_alpha = 128;
+    try std.testing.expect(!retainedSampleUnchanged(previous, current));
+    current.global_alpha = 255;
+    current.destination.x = 1;
+    try std.testing.expect(!retainedSampleUnchanged(previous, current));
 }
 
 fn callbackData(timestamp_ns: u64) u32 {

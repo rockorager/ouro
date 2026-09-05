@@ -2344,6 +2344,33 @@ fn runVertical(trigger: TerminalTrigger, source: ClientSource) !void {
         physical.management_head,
     );
 
+    // Retaining the same pixels must not schedule another output frame after
+    // an upload. Other variants destroy their viewport/effect objects after
+    // the initial commit, so their next commit really does change the image.
+    // Repetition also proves renderer content sequences continue advancing.
+    const damage_before_noop = coordinator.physical_outputs[0].damage_requested;
+    const noop_count: usize = if (source == .shm or source == .dmabuf) 2 else 0;
+    for (0..noop_count) |index| {
+        try wayring.client.sendRequest(protocol.wl_surface, client_handler.objects, client_handler.queue, client_handler.surface.?, .{ .commit = .{} });
+        try submitClient(&client_reactor, &client_driver, &client_handler);
+        const expected_sequence = index + 2;
+        for (0..256) |_| {
+            _ = try drainClient(&client_reactor, &client_driver, &client_handler);
+            _ = try loop.turn(coordinator);
+            const rendered = coordinator.cursor_layer.rendered.?;
+            if (coordinator.render_device.?.content.slots[rendered.index].identity.commit_sequence == expected_sequence) break;
+            if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
+                try waitForEither(&root.ring, client_reactor.ring);
+        }
+        const rendered = coordinator.cursor_layer.rendered.?;
+        try std.testing.expectEqual(expected_sequence, coordinator.render_device.?.content.slots[rendered.index].identity.commit_sequence);
+        try std.testing.expectEqual(@as(usize, 0), coordinator.adapter.pendingContentUpdates());
+        try std.testing.expectEqual(@as(usize, 0), coordinator.pending_surface_len);
+        try std.testing.expectEqual(damage_before_noop, coordinator.physical_outputs[0].damage_requested);
+        try std.testing.expectEqual(@as(usize, 1), coordinator.stats.submitted);
+        try std.testing.expectEqual(@as(usize, 1), fixture.page_flips);
+    }
+
     // Admit a second ordinary SHM commit, but replace its exact generational
     // surface before the render deadline. Disable then proves that an applied
     // presentation with no possible physical outcome is abandoned exactly
@@ -2360,14 +2387,14 @@ fn runVertical(trigger: TerminalTrigger, source: ClientSource) !void {
             coordinator.interaction.cursorRequest(id, .{ .x = 0, .y = 0 });
             _ = try loop.turn(coordinator);
         };
-        const second_consumed = coordinator.stats.applied == 2 and
+        const second_consumed = coordinator.stats.applied == 2 + noop_count and
             coordinator.cursor_layer.content.owned;
         if (second_consumed and client_handler.surface_enters == 2) break;
         if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
             try waitForEither(&root.ring, client_reactor.ring);
     }
     const abandoned_surface = coordinator.cursor_layer.surface.?;
-    try std.testing.expectEqual(@as(usize, 2), coordinator.stats.applied);
+    try std.testing.expectEqual(2 + noop_count, coordinator.stats.applied);
     try std.testing.expect(!coordinator.cursor_layer.source_release_pending);
     try std.testing.expect(coordinator.cursor_layer.content.owned);
     try std.testing.expect(coordinator.cursor_layer.content.value.attachment_lease == null);
