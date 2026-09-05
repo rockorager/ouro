@@ -210,6 +210,8 @@ pub fn Loop(comptime protocol: type) type {
         }
 
         fn turnInternal(self: *Self, handler: anytype, wait_on_idle: bool) !Progress {
+            var phase: enum { reap, route, completions, dispatch, coordinator_prepare, driver_prepare, submit } = .reap;
+            errdefer std.log.err("compositor loop failed in phase {t}", .{phase});
             const copied = if (self.pending_wayring_count != 0)
                 0
             else copied: {
@@ -225,6 +227,7 @@ pub fn Loop(comptime protocol: type) type {
             var timer_count: usize = 0;
             var ouro_count: usize = 0;
             var unrouted_count: usize = 0;
+            phase = .route;
             for (self.cqes[0..copied]) |cqe| {
                 if (cqe.user_data == completion.skipped_success_user_data) {
                     if (cqe.res < 0) return error.SkippedOperationFailed;
@@ -296,11 +299,13 @@ pub fn Loop(comptime protocol: type) type {
 
             const completed_timers = self.timer_outcomes[0..timer_count];
             const completed_ouro = self.ouro_completions[0..ouro_count];
+            phase = .completions;
             if (timer_count != 0 or ouro_count != 0) {
                 if (@hasDecl(@TypeOf(handler.*), "completions"))
                     try handler.completions(completed_timers, completed_ouro);
             }
 
+            phase = .dispatch;
             const dispatched = self.driver.dispatchRouted(
                 self.wayring_cqes[0..wayring_count],
                 handler,
@@ -323,11 +328,13 @@ pub fn Loop(comptime protocol: type) type {
                 },
             }
             var wayring_progress = self.retained_wayring_progress;
+            phase = .coordinator_prepare;
             if (@hasDecl(@TypeOf(handler.*), "prepare"))
                 try handler.prepare();
             // Dispatch and coordinator convergence can both schedule peers.
             // Prepare their combined output once before this turn's sole
             // submission.
+            phase = .driver_prepare;
             wayring_progress.merge(try self.driver.prepare(handler));
             const backend_drained = if (@hasDecl(@TypeOf(handler.*), "backendDrainComplete"))
                 handler.backendDrainComplete()
@@ -342,6 +349,7 @@ pub fn Loop(comptime protocol: type) type {
                 !self.retained_reload_requested and
                 !bindings_work_pending and
                 !(wayring_progress.shutdown_complete and backend_drained);
+            phase = .submit;
             const submitted = if (can_wait)
                 self.compositor.ring.submit_and_wait(1) catch |err| switch (err) {
                     // TERM/INT and tracing can interrupt the wait after the

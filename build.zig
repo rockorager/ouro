@@ -178,6 +178,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    // Fatal compositor errors need their originating return path in production.
+    if (optimize == .ReleaseSafe) executable.root_module.error_tracing = true;
     b.installArtifact(executable);
     b.installFile(
         "resources/ouro.desktop",

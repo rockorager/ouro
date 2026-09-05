@@ -284,6 +284,10 @@ pub fn main(init: std.process.Init) !void {
             if (run_error == null) {
                 run_error = err;
                 std.log.err("compositor event loop failed: {t}", .{err});
+                if (@errorReturnTrace()) |trace|
+                    std.debug.dumpErrorReturnTrace(trace)
+                else
+                    std.log.err("error-return trace unavailable in this build", .{});
             }
             continue;
         };
