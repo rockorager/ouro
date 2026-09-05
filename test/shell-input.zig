@@ -535,6 +535,14 @@ const TransientSeatHandler = struct {
 };
 
 test "shell-input: generated workspace client observes output workspaces and activates one" {
+    try workspaceClient(false);
+}
+
+test "shell-input: workspace output membership is event driven across late bind and release" {
+    try workspaceClient(true);
+}
+
+fn workspaceClient(late_bind: bool) !void {
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-workspace-{d}.sock", .{linux.getpid()});
@@ -567,7 +575,7 @@ test "shell-input: generated workspace client observes output workspaces and act
     const actor = try client.actor();
     var driver = ClientDriver.init(&client);
     const registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null);
-    var handler: WorkspaceHandler = .{ .objects = &client.objects, .queue = &actor.transmit, .registry = registry };
+    var handler: WorkspaceHandler = .{ .objects = &client.objects, .queue = &actor.transmit, .registry = registry, .late_bind = late_bind };
     try submitClient(&reactor, &driver, &handler);
 
     _ = try loop.turn(coordinator);
@@ -595,7 +603,69 @@ test "shell-input: generated workspace client observes output workspaces and act
     // Depending on registry publication order, output_enter may be part of
     // the initial done batch or a separate association update.
     try std.testing.expect(handler.output_done <= 2);
+    if (late_bind) {
+        try std.testing.expectEqual(@as(usize, 0), handler.output_enter);
+        try std.testing.expect(handler.output_global_count != 0);
+        for (handler.output_globals[0..handler.output_global_count]) |name| {
+            handler.outputs[handler.output_count] = try ClientCore.bind(&client.objects, &actor.transmit, registry, name, &protocol.wl_output.info, 4, null);
+            handler.output_count += 1;
+        }
+        try submitClient(&reactor, &driver, &handler);
+        for (0..128) |_| {
+            _ = try drainClient(&reactor, &driver, &handler);
+            _ = try loop.turn(coordinator);
+        }
+        try std.testing.expectEqual(handler.output_global_count, handler.output_enter);
+
+        // Bind a second resource for the same output, then remove the one
+        // currently used by workspace membership. Removal must wake it again.
+        handler.outputs[handler.output_count] = try ClientCore.bind(&client.objects, &actor.transmit, registry, handler.output_globals[0], &protocol.wl_output.info, 4, null);
+        handler.output_count += 1;
+        try submitClient(&reactor, &driver, &handler);
+        for (0..128) |_| {
+            _ = try drainClient(&reactor, &driver, &handler);
+            _ = try loop.turn(coordinator);
+        }
+        const enters = handler.output_enter;
+        try wayring.client.sendRequest(protocol.wl_output, &client.objects, &actor.transmit, handler.outputs[0], .{ .release = .{} });
+        try submitClient(&reactor, &driver, &handler);
+        for (0..128) |_| {
+            _ = try drainClient(&reactor, &driver, &handler);
+            _ = try loop.turn(coordinator);
+        }
+        try std.testing.expectEqual(enters + 1, handler.output_enter);
+        // The client destroyed the old resource, so no event may name it.
+        try std.testing.expectEqual(@as(usize, 0), handler.output_leave);
+    }
+
+    const Resolver = struct {
+        calls: usize = 0,
+        context: ?*anyopaque,
+        original: @TypeOf(coordinator.workspace_adapter.resolver),
+
+        fn resolve(context: ?*anyopaque, peer: wayring.io_uring.Peer, id: ouro.workspace.Adapter(protocol).OutputId) ?wayring.objects.Handle {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.calls += 1;
+            return self.original.?(self.context, peer, id);
+        }
+    };
+    var resolver: Resolver = .{ .context = coordinator.workspace_adapter.resolver_context, .original = coordinator.workspace_adapter.resolver };
+    coordinator.workspace_adapter.setOutputResolver(&resolver, Resolver.resolve);
+    // Let queued membership drain, then exercise unrelated event-loop turns.
+    for (0..32) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+    }
+    resolver.calls = 0;
+    for (0..64) |_| {
+        _ = try drainClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+    }
+    try std.testing.expectEqual(@as(usize, 0), resolver.calls);
+    coordinator.workspace_adapter.setOutputResolver(resolver.context, resolver.original);
+
     const output_done_before_disable = handler.output_done;
+    const output_leave_before_disable = handler.output_leave;
     try fixture.signalSession(.disable);
     for (0..256) |_| {
         _ = try drainClient(&reactor, &driver, &handler);
@@ -606,7 +676,7 @@ test "shell-input: generated workspace client observes output workspaces and act
     try std.testing.expect(coordinator.primaryKmsOutput() == null);
     // Session suspension removes scanout ownership, not the physical output.
     // Workspace membership therefore remains associated with the connector.
-    try std.testing.expectEqual(@as(usize, 0), handler.output_leave);
+    try std.testing.expectEqual(output_leave_before_disable, handler.output_leave);
     try std.testing.expectEqual(output_done_before_disable, handler.output_done);
 
     try protocol.ext_workspace_manager_v1.encodeRequest(&actor.transmit, handler.manager.?.id, .{ .stop = .{} });
@@ -653,7 +723,10 @@ const WorkspaceHandler = struct {
     objects: *wayring.objects.ClientObjects,
     queue: *wayring.tx.Queue,
     registry: wayring.objects.Handle,
-    outputs: [2]wayring.objects.Handle = undefined,
+    late_bind: bool = false,
+    output_globals: [2]u32 = undefined,
+    output_global_count: usize = 0,
+    outputs: [3]wayring.objects.Handle = undefined,
     output_count: usize = 0,
     manager: ?wayring.objects.Handle = null,
     groups: [8]wayring.objects.Handle = undefined,
@@ -680,8 +753,12 @@ const WorkspaceHandler = struct {
         if (target.object.interface == &ClientCore.Registry.info) {
             switch (try ClientCore.decodeRegistryEvent(self.objects, self.registry, message, fds)) {
                 .global => |value| if (std.mem.eql(u8, value.interface, protocol.wl_output.info.name)) {
-                    self.outputs[self.output_count] = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_output.info, @min(value.version, 4), null);
-                    self.output_count += 1;
+                    self.output_globals[self.output_global_count] = value.name;
+                    self.output_global_count += 1;
+                    if (!self.late_bind) {
+                        self.outputs[self.output_count] = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_output.info, @min(value.version, 4), null);
+                        self.output_count += 1;
+                    }
                 } else if (std.mem.eql(u8, value.interface, protocol.ext_workspace_manager_v1.info.name)) {
                     self.manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.ext_workspace_manager_v1.info, 1, null);
                 },
@@ -2710,6 +2787,7 @@ test "shell-input: two mapped toplevels sustain independent commit cycles" {
     );
     coordinator.scene_windows = try allocator.realloc(coordinator.scene_windows, 1);
     coordinator.foreign_toplevels = try allocator.realloc(coordinator.foreign_toplevels, 1);
+    coordinator.desktop.policy.focus_follows_mouse = true;
     var loop = try Loop.init(
         allocator,
         root,
@@ -2795,6 +2873,49 @@ test "shell-input: two mapped toplevels sustain independent commit cycles" {
 
     const windows = try coordinator.desktop.sceneSnapshot(coordinator.scene_windows);
     try std.testing.expectEqual(windows[1].id, coordinator.desktop.focused().?);
+    try std.testing.expect(coordinator.seat_adapter.keyboard_focus != null);
+    try std.testing.expectEqual(windows[1].surface, coordinator.seat_adapter.keyboard_focus.?.surface);
+    const keyboard_device: ouro.input_backend.DeviceId = .{
+        .slot = 1,
+        .generation = 1,
+        .seat_generation = 1,
+    };
+    try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .device_added = .{
+        .device = keyboard_device,
+        .info = .{ .capabilities = .{ .keyboard = true } },
+    } }));
+    for (0..128) |_| {
+        client_progress = try drainMultiClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.keyboard_surface != null) break;
+        if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, client_reactor.ring);
+    }
+    try std.testing.expectEqual(handler.surfaces[1].?.id, handler.keyboard_surface.?);
+    // Send keys immediately after policy changes, without moving the pointer
+    // or waiting for a frame. Check the receiving wl_keyboard surface too.
+    for ([_]usize{ 1, 0, 1 }, 0..) |expected, index| {
+        if (index == 1) try coordinator.focusNext();
+        if (index == 2) try coordinator.focusPrevious();
+        for ([_]bool{ true, false }) |pressed| {
+            try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .keyboard_key = .{
+                .device = keyboard_device,
+                .time_usec = 1_000 + index * 2_000 + @as(u64, @intFromBool(!pressed)) * 1_000,
+                .key = 30,
+                .pressed = pressed,
+            } }));
+        }
+        for (0..128) |_| {
+            client_progress = try drainMultiClient(&client_reactor, &driver, &handler);
+            _ = try loop.turn(coordinator);
+            if (handler.keyboard_keys == (index + 1) * 2) break;
+            if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
+                try waitForEither(&root.ring, client_reactor.ring);
+        }
+        try std.testing.expectEqual((index + 1) * 2, handler.keyboard_keys);
+        try std.testing.expectEqual(handler.surfaces[expected].?.id, handler.key_surface.?);
+        try std.testing.expectEqual(windows[expected].surface, coordinator.seat_adapter.keyboard_focus.?.surface);
+    }
     const applied_before_hidden_commit = coordinator.stats.applied;
     const frames_before_hidden_commit = handler.frame_done;
     handler.metadata_commit_after_attach = false;
@@ -2829,6 +2950,7 @@ test "shell-input: two mapped toplevels sustain independent commit cycles" {
     }
     try std.testing.expect(hidden_layers_retained);
     try std.testing.expectEqual(frames_before_hidden_commit, handler.frame_done);
+    try std.testing.expect(coordinator.seat_adapter.keyboard_focus == null);
 
     try coordinator.switchWorkspace(1);
     const submitted_before_restore = coordinator.stats.submitted;
@@ -2847,6 +2969,7 @@ test "shell-input: two mapped toplevels sustain independent commit cycles" {
             try waitForEither(&root.ring, client_reactor.ring);
     }
     try std.testing.expect(restored_layers_rendered);
+    try std.testing.expectEqual(windows[1].surface, coordinator.seat_adapter.keyboard_focus.?.surface);
 
     const pointer_device: ouro.input_backend.DeviceId = .{
         .slot = 0,
@@ -2964,6 +3087,14 @@ test "shell-input: two mapped toplevels sustain independent commit cycles" {
 }
 
 test "shell-input: secondary output removal closes its reactive layer popup root" {
+    try layerPopupOutputLifecycle(false);
+}
+
+test "shell-input: powered off outputs retain client commits and resume after pointer input" {
+    try layerPopupOutputLifecycle(true);
+}
+
+fn layerPopupOutputLifecycle(power_cycle: bool) !void {
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-layer-popup-{d}.sock", .{linux.getpid()});
@@ -3036,6 +3167,7 @@ test "shell-input: secondary output removal closes its reactive layer popup root
         .registry = registry,
         .minimum_outputs = 2,
         .reactive = true,
+        .test_output_power = power_cycle,
         // Model Vulkan clients which cannot allocate their first buffer until
         // the compositor publishes the selected output.
         .require_layer_enter_before_map = true,
@@ -3101,69 +3233,158 @@ test "shell-input: secondary output removal closes its reactive layer popup root
     );
     try std.testing.expectEqual(@as(usize, 1), popups.len);
 
-    try fixture.signalSession(.disable);
-    for (0..512) |_| {
-        client_progress = try drainLayerPopupClient(&client_reactor, &driver, &handler);
-        _ = try loop.turn(coordinator);
-        if (coordinator.physical_outputs[0].kms_output == null and
-            coordinator.physical_outputs[1].kms_output == null and
-            coordinator.session.state == .disabled and handler.layer_leaves == 1) break;
-        if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
-            try waitForEither(&root.ring, client_reactor.ring);
-    }
-    try std.testing.expectEqual(@as(usize, 1), handler.layer_leaves);
-    try fixture.signalSession(.enable);
-    for (0..512) |_| {
-        client_progress = try drainLayerPopupClient(&client_reactor, &driver, &handler);
-        _ = try loop.turn(coordinator);
-        if (coordinator.physical_outputs[0].kms_output != null and
-            coordinator.physical_outputs[1].kms_output != null and
-            handler.layer_enters == 2) break;
-        _ = linux.sched_yield();
-    }
-    try std.testing.expectEqual(@as(usize, 2), handler.layer_enters);
-    try std.testing.expectEqual(@as(usize, 0), handler.layer_closed);
-    popups = try coordinator.desktop.externalPopupSnapshot(layer_state.surface, &popup_storage);
-    try std.testing.expectEqual(@as(usize, 1), popups.len);
-    try std.testing.expect(popups[0].visible);
+    if (power_cycle) {
+        const work_area_before_power_off = coordinator.desktop.workArea();
+        for (handler.powers) |power| try protocol.zwlr_output_power_v1.encodeRequest(
+            &actor.transmit,
+            power.?.id,
+            .{ .set_mode = .{ .mode = .off } },
+        );
+        for (0..512) |_| {
+            client_progress = try drainLayerPopupClient(&client_reactor, &driver, &handler);
+            _ = try loop.turn(coordinator);
+            if (handler.power_modes == 4 and handler.layer_leaves == 1) break;
+            if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
+                try waitForEither(&root.ring, client_reactor.ring);
+        }
+        try std.testing.expectEqual(@as(usize, 4), handler.power_modes);
+        try std.testing.expect(coordinator.physical_outputs[0].kms_output == null);
+        try std.testing.expect(coordinator.physical_outputs[1].kms_output == null);
+        const submitted_while_off = coordinator.stats.submitted;
+        const applied_before_off_commit = coordinator.stats.applied;
+        // A clock/bar/notification can commit after idle has powered off every
+        // display. It must retain its logical geometry without restarting scanout.
+        // Cover both a retained-buffer commit and a newly attached buffer.
+        try handler.commitPopup();
+        try handler.mapSurface(0, handler.layer_wl_surface.?);
+        for (0..512) |_| {
+            client_progress = try drainLayerPopupClient(&client_reactor, &driver, &handler);
+            _ = try loop.turn(coordinator);
+            if (coordinator.stats.applied == applied_before_off_commit + 2) break;
+            if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
+                try waitForEither(&root.ring, client_reactor.ring);
+        }
+        try std.testing.expectEqual(applied_before_off_commit + 2, coordinator.stats.applied);
+        try std.testing.expectEqual(work_area_before_power_off, coordinator.desktop.workArea());
+        try std.testing.expectEqual(submitted_while_off, coordinator.stats.submitted);
+        try std.testing.expectEqual(@as(usize, 0), handler.layer_closed);
+        const off_commit = findLayer(coordinator.app_layers, layer_state.surface).?.binding.?;
 
-    const popup_configures_before_reposition = handler.popup_configure_count;
-    handler.hold_popup_configures = true;
-    try handler.repositionPopup();
-    for (0..256) |_| {
-        client_progress = try drainLayerPopupClient(&client_reactor, &driver, &handler);
-        _ = try loop.turn(coordinator);
-        if (handler.popup_configure_count > popup_configures_before_reposition) break;
-        _ = linux.sched_yield();
-    }
-    try std.testing.expectEqual(
-        popup_configures_before_reposition + 1,
-        handler.popup_configure_count,
-    );
-    try std.testing.expect(handler.popup_configures[handler.popup_configure_count - 1] !=
-        handler.popup_configures[handler.popup_configure_count - 2]);
+        // Input remains live while scanout is suspended. The idle client's
+        // resumed notification can therefore request the power-on transition.
+        const pointer_device: ouro.input_backend.DeviceId = .{
+            .slot = 0,
+            .generation = 1,
+            .seat_generation = 1,
+        };
+        try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .device_added = .{
+            .device = pointer_device,
+            .info = .{ .capabilities = .{ .pointer = true } },
+        } }));
+        try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_motion = .{
+            .device = pointer_device,
+            .time_usec = 1_000,
+            .dx = 1,
+            .dy = 0,
+        } }));
 
-    fixture.second_desktop = false;
-    try fixture.signalHotplug();
-    for (0..512) |_| {
-        client_progress = try drainLayerPopupClient(&client_reactor, &driver, &handler);
-        _ = try loop.turn(coordinator);
-        if (handler.layer_closed == 1 and
-            !coordinator.physical_outputs[1].connected and
-            !coordinator.physical_outputs[1].removing) break;
-        _ = linux.sched_yield();
+        for (handler.powers) |power| try protocol.zwlr_output_power_v1.encodeRequest(
+            &actor.transmit,
+            power.?.id,
+            .{ .set_mode = .{ .mode = .on } },
+        );
+        const presented_before_wake = coordinator.stats.presented;
+        for (0..512) |_| {
+            client_progress = try drainLayerPopupClient(&client_reactor, &driver, &handler);
+            _ = try loop.turn(coordinator);
+            if (handler.power_modes == 6 and handler.layer_enters == 2 and
+                coordinator.stats.presented > presented_before_wake and handler.releases == 3 and
+                coordinator.physical_outputs[0].kms_output.?.scheduler.physical_phase_ns != null and
+                coordinator.physical_outputs[1].kms_output.?.scheduler.physical_phase_ns != null and
+                coordinator.physical_outputs[1].kms_output.?.scheduler.sample_count == 2) break;
+            if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
+                try waitForEither(&root.ring, client_reactor.ring);
+        }
+        try std.testing.expectEqual(@as(usize, 6), handler.power_modes);
+        try std.testing.expectEqual(@as(usize, 3), handler.releases);
+        try std.testing.expect(coordinator.stats.submitted > submitted_while_off);
+        try std.testing.expect(coordinator.stats.presented > presented_before_wake);
+        for (coordinator.physical_outputs[0..2]) |physical|
+            try std.testing.expect(physical.kms_output.?.scheduler.physical_phase_ns != null);
+        try std.testing.expectEqual(work_area_before_power_off, coordinator.desktop.workArea());
+        try std.testing.expectEqual(
+            off_commit.surface,
+            coordinator.physical_outputs[1].kms_output.?.sample_storage[0].surface,
+        );
+        try std.testing.expectEqual(
+            off_commit.presentation,
+            coordinator.physical_outputs[1].kms_output.?.sample_storage[0].presentation,
+        );
+    } else {
+        try fixture.signalSession(.disable);
+        for (0..512) |_| {
+            client_progress = try drainLayerPopupClient(&client_reactor, &driver, &handler);
+            _ = try loop.turn(coordinator);
+            if (coordinator.physical_outputs[0].kms_output == null and
+                coordinator.physical_outputs[1].kms_output == null and
+                coordinator.session.state == .disabled and handler.layer_leaves == 1) break;
+            if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
+                try waitForEither(&root.ring, client_reactor.ring);
+        }
+        try std.testing.expectEqual(@as(usize, 1), handler.layer_leaves);
+        try fixture.signalSession(.enable);
+        for (0..512) |_| {
+            client_progress = try drainLayerPopupClient(&client_reactor, &driver, &handler);
+            _ = try loop.turn(coordinator);
+            if (coordinator.physical_outputs[0].kms_output != null and
+                coordinator.physical_outputs[1].kms_output != null and
+                handler.layer_enters == 2) break;
+            _ = linux.sched_yield();
+        }
+        try std.testing.expectEqual(@as(usize, 2), handler.layer_enters);
+        try std.testing.expectEqual(@as(usize, 0), handler.layer_closed);
+        popups = try coordinator.desktop.externalPopupSnapshot(layer_state.surface, &popup_storage);
+        try std.testing.expectEqual(@as(usize, 1), popups.len);
+        try std.testing.expect(popups[0].visible);
+
+        const popup_configures_before_reposition = handler.popup_configure_count;
+        handler.hold_popup_configures = true;
+        try handler.repositionPopup();
+        for (0..256) |_| {
+            client_progress = try drainLayerPopupClient(&client_reactor, &driver, &handler);
+            _ = try loop.turn(coordinator);
+            if (handler.popup_configure_count > popup_configures_before_reposition) break;
+            _ = linux.sched_yield();
+        }
+        try std.testing.expectEqual(
+            popup_configures_before_reposition + 1,
+            handler.popup_configure_count,
+        );
+        try std.testing.expect(handler.popup_configures[handler.popup_configure_count - 1] !=
+            handler.popup_configures[handler.popup_configure_count - 2]);
+
+        fixture.second_desktop = false;
+        try fixture.signalHotplug();
+        for (0..512) |_| {
+            client_progress = try drainLayerPopupClient(&client_reactor, &driver, &handler);
+            _ = try loop.turn(coordinator);
+            if (handler.layer_closed == 1 and
+                !coordinator.physical_outputs[1].connected and
+                !coordinator.physical_outputs[1].removing) break;
+            _ = linux.sched_yield();
+        }
+        try std.testing.expectEqual(@as(usize, 1), handler.layer_closed);
+        try std.testing.expect(!coordinator.physical_outputs[1].connected);
+        try std.testing.expectEqual(
+            popup_configures_before_reposition + 1,
+            handler.popup_configure_count,
+        );
+        try std.testing.expectEqual(@as(usize, 2), handler.layer_leaves);
+        popups = try coordinator.desktop.externalPopupSnapshot(layer_state.surface, &popup_storage);
+        try std.testing.expectEqual(@as(usize, 1), popups.len);
+        try std.testing.expect(!popups[0].visible);
+        try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
     }
-    try std.testing.expectEqual(@as(usize, 1), handler.layer_closed);
-    try std.testing.expect(!coordinator.physical_outputs[1].connected);
-    try std.testing.expectEqual(
-        popup_configures_before_reposition + 1,
-        handler.popup_configure_count,
-    );
-    try std.testing.expectEqual(@as(usize, 2), handler.layer_leaves);
-    popups = try coordinator.desktop.externalPopupSnapshot(layer_state.surface, &popup_storage);
-    try std.testing.expectEqual(@as(usize, 1), popups.len);
-    try std.testing.expect(!popups[0].visible);
-    try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
 
     coordinator.disconnected(coordinator.peer.?);
     _ = try client.prepareClose();
@@ -4992,6 +5213,10 @@ const MultiHandler = struct {
     wm_base: ?wayring.objects.Handle = null,
     seat: ?wayring.objects.Handle = null,
     pointer: ?wayring.objects.Handle = null,
+    keyboard: ?wayring.objects.Handle = null,
+    keyboard_surface: ?u32 = null,
+    key_surface: ?u32 = null,
+    keyboard_keys: usize = 0,
     activation: ?wayring.objects.Handle = null,
     activation_token: ?wayring.objects.Handle = null,
     surfaces: [2]?wayring.objects.Handle = .{ null, null },
@@ -5060,8 +5285,29 @@ const MultiHandler = struct {
                             .{},
                         )).id;
                     }
+                    if (self.keyboard == null and value.capabilities.contains(
+                        protocol.wl_seat.capability.keyboard,
+                    )) {
+                        self.keyboard = (try protocol.wl_seat.construct_get_keyboard(
+                            self.objects,
+                            self.queue,
+                            self.seat.?,
+                            .{},
+                        )).id;
+                    }
                 },
                 .name => {},
+            }
+        } else if (target.object.interface == &protocol.wl_keyboard.info) {
+            switch (try protocol.wl_keyboard.decodeEvent(message, fds)) {
+                .keymap => |value| _ = linux.close(value.fd),
+                .enter => |value| self.keyboard_surface = value.surface,
+                .leave => self.keyboard_surface = null,
+                .key => {
+                    self.key_surface = self.keyboard_surface;
+                    self.keyboard_keys += 1;
+                },
+                else => {},
             }
         } else if (target.object.interface == &protocol.wl_pointer.info) {
             switch (try protocol.wl_pointer.decodeEvent(message, fds)) {
@@ -5697,6 +5943,11 @@ const LayerPopupHandler = struct {
     output: ?wayring.objects.Handle = null,
     output_count: usize = 0,
     minimum_outputs: usize = 0,
+    test_output_power: bool = false,
+    power_manager: ?wayring.objects.Handle = null,
+    power_outputs: [2]?wayring.objects.Handle = .{ null, null },
+    powers: [2]?wayring.objects.Handle = .{ null, null },
+    power_modes: usize = 0,
     layer_shell: ?wayring.objects.Handle = null,
     layer_surface: ?wayring.objects.Handle = null,
     layer_wl_surface: ?wayring.objects.Handle = null,
@@ -5746,6 +5997,11 @@ const LayerPopupHandler = struct {
             _ = try protocol.wl_shm.decodeEvent(message, fds);
         } else if (target.object.interface == &protocol.wl_output.info) {
             _ = try protocol.wl_output.decodeEvent(message, fds);
+        } else if (target.object.interface == &protocol.zwlr_output_power_v1.info) {
+            switch (try protocol.zwlr_output_power_v1.decodeEvent(message, fds)) {
+                .mode => self.power_modes += 1,
+                .failed => return error.OutputPowerFailed,
+            }
         } else if (target.object.interface == &protocol.wl_surface.info) {
             switch (try protocol.wl_surface.decodeEvent(message, fds)) {
                 .enter => |value| if (!self.toplevel_root and self.layer_wl_surface != null and
@@ -5857,8 +6113,12 @@ const LayerPopupHandler = struct {
             self.wm_base = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.xdg_wm_base.info, @min(value.version, 7), null);
         if (std.mem.eql(u8, value.interface, protocol.wl_output.info.name)) {
             self.output = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_output.info, @min(value.version, 4), null);
+            if (self.test_output_power and !self.created)
+                self.power_outputs[self.output_count] = self.output;
             self.output_count += 1;
         }
+        if (self.test_output_power and std.mem.eql(u8, value.interface, protocol.zwlr_output_power_manager_v1.info.name))
+            self.power_manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.zwlr_output_power_manager_v1.info, 1, null);
         if (std.mem.eql(u8, value.interface, protocol.zwlr_layer_shell_v1.info.name))
             self.layer_shell = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.zwlr_layer_shell_v1.info, @min(value.version, 5), null);
     }
@@ -5866,7 +6126,16 @@ const LayerPopupHandler = struct {
     fn maybeCreate(self: *LayerPopupHandler) !void {
         if (self.created or self.compositor == null or self.shm == null or
             self.wm_base == null or (!self.toplevel_root and self.layer_shell == null) or
+            (self.test_output_power and self.power_manager == null) or
             self.output_count < self.minimum_outputs) return;
+        if (self.test_output_power) for (self.power_outputs, 0..) |output, index| {
+            self.powers[index] = (try protocol.zwlr_output_power_manager_v1.construct_get_output_power(
+                self.objects,
+                self.queue,
+                self.power_manager.?,
+                .{ .output = output.?.id },
+            )).id;
+        };
         self.layer_wl_surface = (try protocol.wl_compositor.construct_create_surface(
             self.objects,
             self.queue,

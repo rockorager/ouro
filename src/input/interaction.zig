@@ -509,21 +509,43 @@ fn interactionWithKeyConsumer(comptime Desktop: type, comptime KeyConsumerFactor
             self.enqueueCancellation(cancellation);
         }
 
+        /// Publishes policy-selected keyboard focus, including mapping a new
+        /// window and keyboard-driven workspace/focus changes. Grabs and
+        /// unmanaged surfaces retain their independently selected focus.
+        pub fn reconcileKeyboardFocus(self: *Self, desktop: *Desktop) !void {
+            if (self.mode != .default) return;
+            if (self.keyboard_focus) |current| if (!current.managed) return;
+            if (desktop.focusedToplevel()) |id| {
+                const window = try desktop.scene(id);
+                if (window.visible and window.content_ready) {
+                    // Preserve an exact subsurface target within this toplevel.
+                    if (self.keyboard_focus) |current|
+                        if (std.meta.eql(current.toplevel, id)) return;
+                    try self.ensureCommandCapacity(1);
+                    const target: Target = .{
+                        .toplevel = id,
+                        .surface = window.surface,
+                        .point = .{ .x = 0, .y = 0 },
+                    };
+                    self.keyboard_focus = target;
+                    self.enqueue(.{ .keyboard_focus = target });
+                    return;
+                }
+            }
+            // Never send keys to the previous workspace or an unmapped window.
+            if (self.keyboard_focus != null) {
+                self.keyboard_focus = null;
+                self.enqueueCancellation(.{ .keyboard_focus = true });
+            }
+        }
+
         /// Re-hit-tests a stationary pointer after the published scene changes.
+        /// Only real pointer input may change policy-selected keyboard focus.
         /// Active grabs retain their original target until their normal end.
         pub fn reconcilePointer(self: *Self, desktop: *Desktop, surfaces: anytype) !void {
             if (self.mode != .default) return;
             const target = try self.targetAtPointer(desktop, surfaces, self.x_fixed, self.y_fixed);
-            const focus_candidate = target != null and target.?.managed and
-                target.?.keyboard_focusable and
-                (self.keyboard_focus == null or
-                    !std.meta.eql(self.keyboard_focus.?.toplevel, target.?.toplevel) or
-                    !std.meta.eql(self.keyboard_focus.?.surface, target.?.surface));
-            if (focus_candidate) try self.ensureCommandCapacity(2) else try self.ensureCommandCapacity(1);
-            if (focus_candidate and try desktop.requestFocus(target.?.toplevel, .pointer_motion)) {
-                self.keyboard_focus = target.?;
-                self.enqueue(.{ .keyboard_focus = target.? });
-            }
+            try self.ensureCommandCapacity(1);
             if (!std.meta.eql(self.hover, target)) self.enqueue(.{ .pointer_focus = target });
             self.hover = target;
             self.pointer_inside = target != null;
@@ -1485,7 +1507,7 @@ test "interaction: pointer motion asks desktop policy before changing keyboard f
     try std.testing.expectEqual(desktop.windows[1].surface, interaction.peekCommand().?.pointer_focus.?.surface);
 }
 
-test "interaction: stationary pointer reconciles focus after scene reflow" {
+test "interaction: stationary pointer reflow does not override policy keyboard focus" {
     var interaction = try initTestInteraction(3);
     defer interaction.deinit();
     var desktop = testDesktop();
@@ -1500,13 +1522,89 @@ test "interaction: stationary pointer reconciles focus after scene reflow" {
     } });
     while (interaction.pendingCommands() != 0) interaction.dropCommand();
 
-    desktop.len = 1;
+    // Policy focuses another window while the pointer stays over window 1.
+    desktop.focused = desktop.windows[0].id;
+    try interaction.reconcileKeyboardFocus(&desktop);
     try interaction.reconcilePointer(&desktop, &surfaces);
-
     try std.testing.expectEqual(desktop.windows[0].id, desktop.focused.?);
     try std.testing.expectEqual(desktop.windows[0].surface, interaction.peekCommand().?.keyboard_focus.surface);
     interaction.dropCommand();
+    try std.testing.expectEqual(@as(usize, 0), interaction.pendingCommands());
+
+    // Reflow changes the hit target, but not the keyboard's selected window.
+    desktop.windows[1].geometry.x = 30;
+    try interaction.reconcilePointer(&desktop, &surfaces);
     try std.testing.expectEqual(desktop.windows[0].surface, interaction.peekCommand().?.pointer_focus.?.surface);
+    interaction.dropCommand();
+    desktop.windows[1].geometry.x = 10;
+    try interaction.reconcilePointer(&desktop, &surfaces);
+    try std.testing.expectEqual(desktop.windows[1].surface, interaction.peekCommand().?.pointer_focus.?.surface);
+    interaction.dropCommand();
+    try std.testing.expectEqual(desktop.windows[0].surface, interaction.keyboard_focus.?.surface);
+    try std.testing.expectEqual(desktop.windows[0].id, desktop.focused.?);
+
+    // Actual movement still follows the mouse.
+    try interaction.consume(&desktop, &surfaces, .{ .pointer_motion = .{
+        .device = device_a,
+        .time_usec = 2,
+        .dx = 1,
+        .dy = 0,
+    } });
+    try std.testing.expectEqual(desktop.windows[1].id, desktop.focused.?);
+    try std.testing.expectEqual(desktop.windows[1].surface, interaction.peekCommand().?.keyboard_focus.surface);
+}
+
+test "interaction: policy keyboard focus waits for mapping and clears on an empty workspace" {
+    var interaction = try initTestInteraction(1);
+    defer interaction.deinit();
+    var desktop = testDesktop();
+    interaction.keyboard_focus = targetFor(desktop.windows[0]);
+    desktop.focused = desktop.windows[1].id;
+    desktop.windows[1].content_ready = false;
+
+    try interaction.reconcileKeyboardFocus(&desktop);
+    try std.testing.expect(interaction.keyboard_focus == null);
+    try std.testing.expect(interaction.peekCommand().?.cancel.keyboard_focus);
+    desktop.windows[1].content_ready = true;
+    try std.testing.expectError(error.Backpressure, interaction.reconcileKeyboardFocus(&desktop));
+    try std.testing.expect(interaction.keyboard_focus == null);
+    interaction.dropCommand();
+    try interaction.reconcileKeyboardFocus(&desktop);
+    try std.testing.expectEqual(desktop.windows[1].surface, interaction.peekCommand().?.keyboard_focus.surface);
+    interaction.dropCommand();
+    try interaction.reconcileKeyboardFocus(&desktop);
+    try std.testing.expectEqual(@as(usize, 0), interaction.pendingCommands());
+
+    desktop.focused = null;
+    try interaction.reconcileKeyboardFocus(&desktop);
+    try std.testing.expect(interaction.keyboard_focus == null);
+    try std.testing.expect(interaction.peekCommand().?.cancel.keyboard_focus);
+}
+
+test "interaction: policy keyboard focus preserves grabs unmanaged focus and exact subsurfaces" {
+    var interaction = try initTestInteraction(1);
+    defer interaction.deinit();
+    var desktop = testDesktop();
+    const old = targetFor(desktop.windows[0]);
+    interaction.keyboard_focus = old;
+    desktop.focused = desktop.windows[1].id;
+    interaction.mode = .{ .button_grab = old };
+    try interaction.reconcileKeyboardFocus(&desktop);
+    try std.testing.expectEqual(old, interaction.keyboard_focus.?);
+    try std.testing.expectEqual(@as(usize, 0), interaction.pendingCommands());
+
+    interaction.mode = .default;
+    interaction.keyboard_focus.?.managed = false;
+    try interaction.reconcileKeyboardFocus(&desktop);
+    try std.testing.expectEqual(old.surface, interaction.keyboard_focus.?.surface);
+    try std.testing.expectEqual(@as(usize, 0), interaction.pendingCommands());
+
+    interaction.keyboard_focus = old;
+    desktop.focused = old.toplevel;
+    interaction.keyboard_focus.?.surface.index = 42;
+    try interaction.reconcileKeyboardFocus(&desktop);
+    try std.testing.expectEqual(@as(u32, 42), interaction.keyboard_focus.?.surface.index);
+    try std.testing.expectEqual(@as(usize, 0), interaction.pendingCommands());
 }
 
 test "interaction: default press updates desktop and enters exact button grab" {

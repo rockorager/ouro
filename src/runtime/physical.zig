@@ -518,6 +518,8 @@ pub fn Coordinator(comptime protocol: type) type {
             id: PhysicalOutputId,
             connected: bool = true,
             desired_enabled: bool = true,
+            // DPMS suspends scanout, not the logical display used by clients.
+            power_suspended: bool = false,
             removing: bool = false,
             removal_global_pending: bool = false,
             removal_protocol_retired: bool = false,
@@ -542,6 +544,11 @@ pub fn Coordinator(comptime protocol: type) type {
             drag_icon_previous: ?damage.SurfaceState = null,
             themed_cursor_previous: ?damage.SurfaceState = null,
             client_cursor_previous: ?damage.SurfaceState = null,
+
+            fn hasLayout(self: *const PhysicalOutput) bool {
+                return self.kms_output != null or
+                    (self.connected and !self.removing and self.power_suspended);
+            }
         };
         const Presentations = presentation.Queue(Imported);
         const PendingSurface = struct {
@@ -700,6 +707,7 @@ pub fn Coordinator(comptime protocol: type) type {
             active: bool = false,
             peer: wayring.io_uring.Peer = undefined,
             protocol_ready: u64 = 0,
+            workspace_outputs_dirty: bool = false,
         };
         const Candidate = struct {
             peer: ?wayring.io_uring.Peer,
@@ -1706,6 +1714,8 @@ pub fn Coordinator(comptime protocol: type) type {
             });
             self.output_adapter = try OutputAdapter.init(allocator, config.protocol_output);
             errdefer self.output_adapter.deinit();
+            self.output_adapter.resource_change_context = self;
+            self.output_adapter.resource_changed = workspaceOutputResourcesChanged;
             self.color_management_adapter.setOutputResolver(.{
                 .context = self,
                 .resolve = resolveColorManagedOutput,
@@ -2802,6 +2812,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 return control;
             }
             if (try self.workspace_adapter.request(peer, target, message, fds)) |control| {
+                self.markProtocol(peer, ProtocolReady.workspace);
                 try self.syncWorkspace();
                 try self.flushProtocol();
                 return control;
@@ -3240,7 +3251,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 error.Exhausted => {},
                 else => return err,
             };
-            try self.retryPointerReconcile();
+            try self.retryFocusReconcile();
             self.applyInteractionCommands() catch |err| switch (err) {
                 error.Exhausted => {},
                 else => return err,
@@ -3613,7 +3624,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     error.Exhausted => return false,
                     else => return err,
                 };
-                try self.retryPointerReconcile();
+                try self.retryFocusReconcile();
                 if (self.pointer_reconcile_pending and self.interaction.interactionMode() == .default)
                     return false;
                 if (self.interaction.peekCommand() != null) self.applyInteractionCommands() catch |err| switch (err) {
@@ -4840,6 +4851,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 writer.workspaces[0..writer.workspace_count],
             );
             self.workspace_revision = self.desktop.workspaceRevision();
+            self.markProtocolAll(ProtocolReady.workspace);
         }
 
         fn syncWorkspace(self: *Self) !void {
@@ -4861,11 +4873,6 @@ pub fn Coordinator(comptime protocol: type) type {
                     });
                 }
                 self.workspace_adapter.dropCommand();
-            }
-            for (self.clients.items) |client| {
-                if (!client.active) continue;
-                const pending = self.workspace_adapter.outputResourcesChanged(client.peer) catch true;
-                if (pending) self.markProtocol(client.peer, ProtocolReady.workspace);
             }
         }
 
@@ -5239,6 +5246,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (command.mode == .off) {
                     self.output_power_transition = command;
                     try self.pausePhysicalOutput(physical);
+                    physical.power_suspended = true;
                     return;
                 }
                 const claim = physical.claim orelse {
@@ -5270,7 +5278,11 @@ pub fn Coordinator(comptime protocol: type) type {
                     continue;
                 };
                 physical.desired_enabled = true;
-                try self.syncOutputAssociations();
+                physical.power_suspended = false;
+                try self.publishOutputLayout();
+                // Retained clients need not commit again just because DPMS
+                // ended. Present their latest contents, including on primary.
+                _ = try requestPhysicalOutputDamage(physical, try monotonicNs());
                 try self.output_power_adapter.completeCommand(command, .succeeded);
                 self.markProtocol(command.peer, ProtocolReady.output_power);
             }
@@ -5300,6 +5312,13 @@ pub fn Coordinator(comptime protocol: type) type {
             if (desired.adaptive_sync and (!snapshot.selectedConnector().properties.vrr_capable or
                 snapshot.selectedCrtc().properties.vrr_enabled == 0)) return false;
             return true;
+        }
+
+        fn workspaceOutputResourcesChanged(context: ?*anyopaque, peer: wayring.io_uring.Peer) void {
+            const self: *Self = @ptrCast(@alignCast(context.?));
+            const client = self.clientFor(peer) orelse return;
+            client.workspace_outputs_dirty = true;
+            client.protocol_ready |= ProtocolReady.workspace;
         }
 
         fn resolveWorkspaceOutput(
@@ -5867,7 +5886,7 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn desktopSceneChanged(self: *Self) !void {
             self.pointer_reconcile_pending = true;
-            try self.retryPointerReconcile();
+            try self.retryFocusReconcile();
             try self.syncIdleNotifications();
             _ = self.refreshRetainedLayersForOutput();
             const now = try monotonicNs();
@@ -5885,8 +5904,7 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.requestOutputDamage();
         }
 
-        fn retryPointerReconcile(self: *Self) !void {
-            if (!self.pointer_reconcile_pending) return;
+        fn retryFocusReconcile(self: *Self) !void {
             if (self.stopping or self.sessionLockActive()) {
                 self.pointer_reconcile_pending = false;
                 return;
@@ -5895,6 +5913,13 @@ pub fn Coordinator(comptime protocol: type) type {
             // the request pending until the grab ends, including any retained
             // event whose release has reached interaction but not the seat.
             if (self.input_delivery_prepared or self.interaction.interactionMode() != .default) return;
+            // Focus-only policy changes need not publish a different scene.
+            // Reconcile keyboard focus before the next event even in that case.
+            self.interaction.reconcileKeyboardFocus(&self.desktop) catch |err| switch (err) {
+                error.Backpressure => return,
+                else => return err,
+            };
+            if (!self.pointer_reconcile_pending) return;
             var input_scene: InputScene = .{ .coordinator = self };
             self.interaction.reconcilePointer(&self.desktop, &input_scene) catch |err| switch (err) {
                 // Surface destruction deliberately queues a terminal focus
@@ -6511,7 +6536,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 const image = self.cursorImage(event.shape.name()) orelse
                     self.cursorImage(protocol_cursor_shape.fallback_name);
                 if (image) |value| {
-                    std.log.info("using cursor shape {s}", .{event.shape.name()});
+                    std.log.debug("using cursor shape {s}", .{event.shape.name()});
                     self.interaction.cursorRequest(null, .{ .x = 0, .y = 0 });
                     _ = self.themed_cursor.setImage(value);
                     try self.requestCursorRedraw();
@@ -7063,7 +7088,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 // when its device appears so that click can focus its target.
                 if (reconcile_pointer) {
                     self.pointer_reconcile_pending = true;
-                    try self.retryPointerReconcile();
+                    try self.retryFocusReconcile();
                     self.applyInteractionCommands() catch |err| switch (err) {
                         error.Exhausted => return,
                         else => return err,
@@ -7265,8 +7290,14 @@ pub fn Coordinator(comptime protocol: type) type {
                 flushed += try self.image_copy_capture_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.output != 0)
                 flushed += try self.output_adapter.flushOn(peer, objects, &actor.transmit);
-            if (client.protocol_ready & ProtocolReady.workspace != 0)
+            if (client.protocol_ready & ProtocolReady.workspace != 0) {
+                // Reconcile only after wl_output resources change. Keep the
+                // dirty bit through backpressure and queued membership so a
+                // replacement cannot be lost behind an older output_enter.
+                if (client.workspace_outputs_dirty)
+                    client.workspace_outputs_dirty = self.workspace_adapter.outputResourcesChanged(peer) catch true;
                 flushed += try self.workspace_adapter.flushOn(peer, objects, &actor.transmit);
+            }
             if (client.protocol_ready & ProtocolReady.xdg_output != 0)
                 flushed += try self.xdg_output_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.output_management != 0)
@@ -7679,6 +7710,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 !self.output_adapter.pendingOutboundOn(client.peer))
                 ready &= ~ProtocolReady.output;
             if (ready & ProtocolReady.workspace != 0 and
+                !client.workspace_outputs_dirty and
                 !self.workspace_adapter.pendingOutbound(client.peer))
                 ready &= ~ProtocolReady.workspace;
             if (ready & ProtocolReady.xdg_output != 0 and
@@ -8286,8 +8318,9 @@ pub fn Coordinator(comptime protocol: type) type {
             const interaction_areas = try self.physicalOutputAreas();
             try self.interaction.validateTopology(bounds, interaction_areas);
             const output_areas = try self.desktopOutputAreas(null);
-            try self.desktop.validateTopology(bounds, output_areas);
-            self.desktop.applyTopology(bounds, output_areas);
+            const work_area = try self.layerWorkArea(null);
+            try self.desktop.validateTopology(work_area, output_areas);
+            self.desktop.applyTopology(work_area, output_areas);
             self.interaction.applyTopology(bounds, interaction_areas);
             _ = self.refreshRetainedLayersForOutput();
             try self.recomputeLayerConfigures();
@@ -8624,15 +8657,15 @@ pub fn Coordinator(comptime protocol: type) type {
             const destination_size = content.surface.size;
             if (destination_size.width == 0 or destination_size.height == 0)
                 return error.InvalidDestination;
-            const output_bounds: geometry.Rect = if (self.anyKmsOutput())
-                try self.globalOutputBounds()
-            else
-                .{
+            const output_bounds = self.globalOutputBounds() catch |err| switch (err) {
+                error.NoOutput => geometry.Rect{
                     .x = 0,
                     .y = 0,
                     .width = @intCast(destination_size.width),
                     .height = @intCast(destination_size.height),
-                };
+                },
+                else => return err,
+            };
             const has_window_geometry = if (surface_scene) |scene|
                 !scene.subsurface and scene.root.has_window_geometry
             else
@@ -11643,7 +11676,7 @@ pub fn Coordinator(comptime protocol: type) type {
         fn globalOutputBounds(self: *const Self) !geometry.Rect {
             var result: ?geometry.Rect = null;
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
-                if (physical.kms_output == null) continue;
+                if (!physical.hasLayout()) continue;
                 const bounds = try self.outputBoundsFor(physical);
                 if (result == null) {
                     result = bounds;
@@ -11675,7 +11708,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self: *const Self,
             physical: *const PhysicalOutput,
         ) !geometry.Rect {
-            if (physical.kms_output == null) return error.NoOutput;
+            if (!physical.hasLayout()) return error.NoOutput;
             const snapshot = try self.output_adapter.logicalSnapshot(
                 physical.protocol_output,
             );
@@ -11693,7 +11726,7 @@ pub fn Coordinator(comptime protocol: type) type {
         ) ![]const Desktop.OutputArea {
             var count: usize = 0;
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
-                if (physical.kms_output == null) continue;
+                if (!physical.hasLayout()) continue;
                 if (count == self.desktop_output_topology.len) return error.Exhausted;
                 const bounds = try self.outputBoundsFor(physical);
                 self.desktop_output_topology[count] = .{
@@ -11715,7 +11748,7 @@ pub fn Coordinator(comptime protocol: type) type {
         fn physicalOutputAreas(self: *Self) ![]const geometry.Rect {
             var count: usize = 0;
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
-                if (physical.kms_output == null) continue;
+                if (!physical.hasLayout()) continue;
                 if (count == self.physical_output_areas.len) return error.Exhausted;
                 self.physical_output_areas[count] = try self.outputBoundsFor(physical);
                 count += 1;
@@ -11731,7 +11764,7 @@ pub fn Coordinator(comptime protocol: type) type {
             var left: i32 = 0;
             var right: i32 = 0;
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
-                if (physical.kms_output == null) continue;
+                if (!physical.hasLayout()) continue;
                 const bounds = try self.outputBoundsFor(physical);
                 const local = try self.layerWorkAreaFor(
                     physical.protocol_output,
@@ -12716,6 +12749,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 const pending = physical.reconfigure orelse continue;
                 const state = pending.desired;
                 physical.desired_enabled = state.enabled;
+                physical.power_suspended = false;
                 if (!state.enabled) {
                     _ = try self.output_management_adapter.publishHead(
                         physical.management_head,

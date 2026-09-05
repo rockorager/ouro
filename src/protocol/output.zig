@@ -152,6 +152,8 @@ pub fn Adapter(comptime protocol: type) type {
         outbound_len: usize = 0,
         associations_dirty: bool = false,
         next_sequence: u64 = 1,
+        resource_change_context: ?*anyopaque = null,
+        resource_changed: ?*const fn (?*anyopaque, wayring.io_uring.Peer) void = null,
 
         pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
             try config.validate();
@@ -250,6 +252,8 @@ pub fn Adapter(comptime protocol: type) type {
                 adapter.releaseResource(index);
                 return error.OutOfMemory;
             };
+            if (adapter.resource_changed) |notify|
+                notify(adapter.resource_change_context, resource.peer);
             return resource;
         }
 
@@ -626,8 +630,11 @@ pub fn Adapter(comptime protocol: type) type {
                 if (!association.desired and association.entered.items.len == 0)
                     adapter.releaseAssociation(@intCast(association_index));
             }
+            const peer = resource.peer;
             adapter.releaseResource(id.index);
             adapter.associations_dirty = true;
+            if (adapter.resource_changed) |notify|
+                notify(adapter.resource_change_context, peer);
             return true;
         }
 

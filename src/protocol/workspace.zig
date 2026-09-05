@@ -334,6 +334,9 @@ pub fn Adapter(comptime protocol: type) type {
             var queued = false;
             for (self.managers, 0..) |*m, i| if (m.active and !m.stopped and samePeer(m.peer, peer)) {
                 var manager_queued = false;
+                // Every partial batch must end in done, even if a later
+                // membership exhausts the queue and reconciliation is retried.
+                defer if (manager_queued) self.enqueue(@intCast(i), .done, "", null, null) catch unreachable;
                 for (self.inventory_groups[0..self.inventory_group_count]) |group| {
                     for (group.outputs) |output| {
                         var pending = false;
@@ -350,18 +353,14 @@ pub fn Adapter(comptime protocol: type) type {
                                 break;
                             };
                             if (previous != null and std.meta.eql(previous.?, resource)) continue;
-                            try self.ensureOut(1 + @intFromBool(previous != null));
+                            try self.ensureOut(2 + @as(usize, @intFromBool(previous != null)));
                             if (previous) |old| try self.enqueueTarget(@intCast(i), .output_leave, group.id.value, 0, child.inventory_generation, "", output, old, 0);
                             try self.enqueueTarget(@intCast(i), .output_enter, group.id.value, 0, child.inventory_generation, "", output, resource, 0);
                             manager_queued = true;
                         }
                     }
                 }
-                if (manager_queued) {
-                    try self.ensureOut(1);
-                    try self.enqueue(@intCast(i), .done, "", null, null);
-                    queued = true;
-                }
+                queued = queued or manager_queued;
             };
             return queued or self.pendingOutbound(peer);
         }
@@ -463,6 +462,7 @@ pub fn Adapter(comptime protocol: type) type {
             return null;
         }
         pub fn pendingOutbound(self: *const Self, peer: wayring.io_uring.Peer) bool {
+            if (self.outbound_count == 0) return false;
             for (self.outbound) |o| if (o.active and self.validOut(o) and samePeer(self.managers[o.manager].peer, peer)) return true;
             return false;
         }
@@ -514,6 +514,14 @@ pub fn Adapter(comptime protocol: type) type {
                             self.dropOut(o);
                             continue;
                         };
+                        // A queued membership can outlive the client's output
+                        // resource. Never reference its destroyed or reused ID.
+                        if (server_objects.namespace.resolve(output) == null) {
+                            if (o.kind == .output_leave)
+                                self.withdrawOutput(mi, o.group, o.target_generation, o.output);
+                            self.dropOut(o);
+                            continue;
+                        }
                         if (o.kind == .output_enter) {
                             wayring.server.sendEvent(protocol, ProtoGroup, server_objects, queue, g.?.resource.?, .{ .output_enter = .{ .output = output.id } }) catch |e| {
                                 if (backpressure(e)) return count;
@@ -637,6 +645,7 @@ pub fn Adapter(comptime protocol: type) type {
             return self.out_text[i * self.string_capacity ..][0..o.text_len];
         }
         fn oldest(self: *Self, peer: wayring.io_uring.Peer) ?*Out {
+            if (self.outbound_count == 0) return null;
             var result: ?*Out = null;
             for (self.outbound) |*o| if (o.active and self.validOut(o.*) and samePeer(self.managers[o.manager].peer, peer) and (result == null or o.sequence < result.?.sequence)) {
                 result = o;
@@ -863,6 +872,40 @@ test "workspace output membership retries transmit backpressure" {
     try std.testing.expectEqual(@as(usize, 1), try adapter.flushOn(peer, &server_objects, &accepting));
     try std.testing.expectEqual(@as(usize, 0), adapter.outbound_count);
     try std.testing.expect(adapter.announcedFor(0)[0].active);
+}
+
+test "workspace output reconciliation reserves done across queue exhaustion" {
+    const peer: wayring.io_uring.Peer = .{ .slot = 0, .generation = 1 };
+    var adapter = try TestAdapter.init(std.testing.allocator, .{
+        .manager_capacity = 1,
+        .group_handle_capacity = 1,
+        .workspace_handle_capacity = 1,
+        .outbound_capacity = 2,
+    });
+    defer adapter.deinit();
+    const groups = [_]TestAdapter.Group{.{ .id = .{ .value = 1 }, .outputs = &.{ .{ .value = 4 }, .{ .value = 7 } } }};
+    try adapter.inventory(1, &groups, &.{});
+    activateDefaultTestProjection(&adapter);
+    adapter.managers[0].peer = peer;
+    adapter.setOutputResolver(null, resolveTestOutput);
+
+    try std.testing.expectError(error.Exhausted, adapter.outputResourcesChanged(peer));
+    try std.testing.expectEqual(@as(usize, 2), adapter.outbound_count);
+    try std.testing.expectEqual(TestAdapter.Kind.output_enter, adapter.outbound[0].kind);
+    try std.testing.expectEqual(TestAdapter.Kind.done, adapter.outbound[1].kind);
+
+    // Simulate draining the first batch, then retry without another bind.
+    adapter.announceOutput(0, 1, adapter.inventory_generation, .{ .value = 4 }, .{ .id = 4, .generation = 1 });
+    for (adapter.outbound) |*out| adapter.dropOut(out);
+    try std.testing.expect(try adapter.outputResourcesChanged(peer));
+    try std.testing.expectEqual(@as(usize, 2), adapter.outbound_count);
+    try std.testing.expectEqual(TestAdapter.Kind.output_enter, adapter.outbound[0].kind);
+    try std.testing.expectEqual(@as(u64, 7), adapter.outbound[0].output.value);
+    try std.testing.expectEqual(TestAdapter.Kind.done, adapter.outbound[1].kind);
+    adapter.announceOutput(0, 1, adapter.inventory_generation, .{ .value = 7 }, .{ .id = 7, .generation = 1 });
+    for (adapter.outbound) |*out| adapter.dropOut(out);
+    try std.testing.expect(!try adapter.outputResourcesChanged(peer));
+    try std.testing.expect(!adapter.pendingOutbound(peer));
 }
 
 test "workspace output replacement snapshots leave enter and one done" {
