@@ -2980,34 +2980,22 @@ fn recordSampledPass(
             recordSampledDispatch(self, target, frame, damage, continuation_bit, 0);
         return;
     }
-    for (0..pass_batch_count) |batch_index| {
-        const partition = if (sample_count == 0)
-            Batch{ .first = 0, .count = 0, .initialize = true }
-        else
-            batchAt(sample_count, self.max_samples, batch_index);
-        c.vkCmdBindDescriptorSets(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 0, 1, &target.descriptor_sets[batch_index], 0, null);
-        for (frame.render_damage) |damage| {
-            const encoded_count: u32 = @intCast(partition.count);
-            const flags: u32 = (if (!partition.initialize) continuation_bit else 0) |
-                (if (batch_index + 1 < pass_batch_count) intermediate_bit else 0);
-            const push: Push = .{
-                .clear_color = .{ frame.clear.a, frame.clear.r, frame.clear.g, frame.clear.b },
-                .output = .{ frame.output.width, frame.output.height, @intFromEnum(frame.output_format), encoded_count | flags },
-                .damage = .{ @intCast(damage.x), @intCast(damage.y), damage.width, damage.height },
-                .output_color = .{
-                    @intFromEnum(frame.output_color_description.transfer),
-                    @bitCast(frame.output_color_description.reference_luminance),
-                    if (frame.output_lut_slot) |slot| slot + 1 else 0,
-                    0,
-                },
-            };
-            c.vkCmdPushConstants(target.command_buffer, self.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(Push), &push);
-            c.vkCmdDispatch(target.command_buffer, (damage.width + 7) / 8, (damage.height + 7) / 8, 1);
-        }
-        if (batch_index + 1 < pass_batch_count) {
-            recordSampledBarrier(target);
-        }
+    c.vkCmdBindDescriptorSets(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 0, 1, &target.descriptor_sets[0], 0, null);
+    for (frame.render_damage) |damage| {
+        const range = damageSampleRange(frame.samples[0..sample_count], damage);
+        // Empty ranges still dispatch: exposed background must be cleared.
+        recordSampledDispatch(self, target, frame, damage, range.count, range.first);
     }
+}
+
+fn damageSampleRange(samples: []const Sample, damage: render.Rect) struct { first: u32, count: u32 } {
+    var first: usize = 0;
+    var end = samples.len;
+    while (first < end and sampleIntersection(samples[first], damage) == null) : (first += 1) {}
+    while (end > first and sampleIntersection(samples[end - 1], damage) == null) : (end -= 1) {}
+    // Retain the contiguous range, including holes, so descriptor indices and
+    // translucent sample ordering stay unchanged.
+    return .{ .first = @intCast(first), .count = @intCast(end - first) };
 }
 
 fn recordBackdropEffectPass(
@@ -4975,6 +4963,40 @@ test "render-vulkan: sampled batches preserve order and only first initializes" 
         try std.testing.expectEqual(value, batchAt(8, 3, index));
     try std.testing.expectEqual(@as(u32, 3), @as(u32, 3) | 0);
     try std.testing.expectEqual(continuation_bit | 3, @as(u32, 3) | continuation_bit);
+}
+
+test "render-vulkan: damage sample range trims only nonintersecting ends" {
+    var samples = [_]Sample{std.mem.zeroes(Sample)} ** 4;
+    for (&samples, 0..) |*sample, index| {
+        sample.destination = .{ @intCast(index * 10), 0, 10, 10 };
+        sample.clip = .{ 0, 0, 40, 10 };
+    }
+    const damage: render.Rect = .{ .x = 10, .y = 0, .width = 10, .height = 10 };
+    const single = damageSampleRange(&samples, damage);
+    try std.testing.expectEqual(@as(u32, 1), single.first);
+    try std.testing.expectEqual(@as(u32, 1), single.count);
+
+    // Two translucent layers intersect with an unrelated layer between them.
+    samples[3].destination = samples[1].destination;
+    samples[1].attributes[2] = 128;
+    samples[3].attributes[2] = 128;
+    const overlap = damageSampleRange(&samples, damage);
+    try std.testing.expectEqual(@as(u32, 1), overlap.first);
+    try std.testing.expectEqual(@as(u32, 3), overlap.count);
+
+    // Clipping removes the top layer, even though its destination overlaps.
+    samples[3].clip = .{ 0, 0, 10, 10 };
+    const clipped = damageSampleRange(&samples, damage);
+    try std.testing.expectEqual(single, clipped);
+    const background = damageSampleRange(&samples, .{ .x = 0, .y = 10, .width = 40, .height = 10 });
+    try std.testing.expectEqual(@as(u32, 0), background.count);
+    try std.testing.expectEqual(@as(u32, 0), damageSampleRange(&.{}, damage).count);
+
+    const full = damageSampleRange(&samples, .{ .x = 0, .y = 0, .width = 40, .height = 10 });
+    try std.testing.expectEqual(@as(u32, 0), full.first);
+    try std.testing.expectEqual(@as(u32, 3), full.count);
+    const prefix = damageSampleRange(samples[0..2], damage);
+    try std.testing.expectEqual(single, prefix);
 }
 
 test "render-vulkan: sampled command replay ignores pixels and rejects recorded changes" {
