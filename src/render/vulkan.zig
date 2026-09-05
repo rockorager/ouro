@@ -534,7 +534,11 @@ fn packSample(
         .attributes = .{
             @intFromEnum(sample.source.format),
             @intFromEnum(sample.transform) |
-                (if (direct_color and sample.source.format == .xrgb8888 and sample.global_alpha == 255)
+                (if (direct_color and sample.global_alpha == 255 and
+                    (sample.source.format == .xrgb8888 or render_types.effectRegionCoversSurface(
+                        sample.opaque_region,
+                        sample.effect_size,
+                    )))
                     vk.direct_color_bit
                 else
                     0) |
@@ -701,6 +705,15 @@ test "render-vulkan: direct color flag requires identical opaque encoding" {
     var different = render_types.color.Description.srgb;
     different.reference_luminance = 100;
     try std.testing.expect(!directColorEncoding(.srgb, different));
+    const lut: @import("icc.zig").Lut = .{
+        .profile_hash = .{0} ** 32,
+        .lut_hash = .{0} ** 32,
+        .rgba = &.{},
+    };
+    different = .srgb;
+    different.lut = &lut;
+    try std.testing.expect(!directColorEncoding(.srgb, different));
+    try std.testing.expect(!directColorEncoding(different, .srgb));
     value.global_alpha = 254;
     const translucent = try packSample(
         value,
@@ -712,6 +725,45 @@ test "render-vulkan: direct color flag requires identical opaque encoding" {
         .{ .x = 0, .y = 0, .width = 1, .height = 1 },
     );
     try std.testing.expectEqual(@as(u32, 0), translucent.attributes[1] & vk.direct_color_bit);
+}
+
+test "render-vulkan: declared opacity enables direct color only for the whole surface" {
+    const whole: render_types.RegionOperation = .{ .add = .{ .x = 0, .y = 0, .width = 10, .height = 10 } };
+    const cases = [_]struct {
+        region: []const render_types.RegionOperation,
+        alpha: u8 = 255,
+        same_encoding: bool = true,
+        size: render_types.Size = .{ .width = 10, .height = 10 },
+        expected: bool = false,
+    }{
+        .{ .region = &.{whole}, .expected = true },
+        .{ .region = &.{} },
+        .{ .region = &.{.{ .add = .{ .x = 0, .y = 0, .width = 5, .height = 10 } }} },
+        .{ .region = &.{ whole, .{ .subtract = .{ .x = 1, .y = 1, .width = 1, .height = 1 } } } },
+        .{ .region = &.{whole}, .alpha = 254 },
+        .{ .region = &.{whole}, .same_encoding = false },
+        .{ .region = &.{whole}, .size = .{ .width = 0, .height = 0 } },
+    };
+    for (cases) |case| {
+        var sample: render_types.SurfaceSample = undefined;
+        _ = testList(&.{ 0, 0, 0, 255 }, &sample);
+        sample.source.format = .argb8888_premultiplied;
+        sample.effect_size = case.size;
+        sample.opaque_region = case.region;
+        sample.global_alpha = case.alpha;
+        sample.transform = .flipped_90;
+        const packed_sample = try packSample(
+            sample,
+            try render_types.color.compile(.srgb, .srgb),
+            case.same_encoding,
+            false,
+            null,
+            0,
+            .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+        );
+        try std.testing.expectEqual(case.expected, packed_sample.attributes[1] & vk.direct_color_bit != 0);
+        try std.testing.expectEqual(@intFromEnum(sample.transform), packed_sample.attributes[1] & ~vk.direct_color_bit);
+    }
 }
 
 test "render-vulkan: LUT slot is packed without changing Sample ABI" {
