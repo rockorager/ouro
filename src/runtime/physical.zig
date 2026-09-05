@@ -2236,7 +2236,22 @@ pub fn Coordinator(comptime protocol: type) type {
             self.markProtocolAll(ProtocolReady.seat | ProtocolReady.input_method);
         }
 
+        /// A failed KMS owner may still have submitted images, and a failed
+        /// seat transport does not prove device revocation. Neither can be
+        /// drained by pretending scanout is paused. The executable must exit
+        /// with these owners pinned and let the kernel tear down the process,
+        /// rather than recycle images or wait for an impossible completion.
+        pub fn terminalFailure(self: *const Self) ?anyerror {
+            if (self.session.state == .failed) return error.SessionFailed;
+            for (self.physical_outputs[0..self.physical_output_count]) |physical| {
+                if (physical.kms_output) |output|
+                    if (output.kms_output.state == .failed) return error.KmsFailed;
+            }
+            return null;
+        }
+
         pub fn requestStop(self: *Self) !void {
+            if (self.terminalFailure()) |err| return err;
             if (!self.stopping) {
                 self.stopping = true;
                 if (self.output_reconfigure) |transaction| {
@@ -2265,7 +2280,7 @@ pub fn Coordinator(comptime protocol: type) type {
             if (self.icc_poll) |token| if (!self.icc_poll_canceling) {
                 const cancel = try self.router.acquire(.icc_worker);
                 errdefer self.router.retire(cancel) catch {};
-                _ = try self.root.ring.poll_remove(token.encode(), cancel.encode());
+                _ = try self.root.ring.poll_remove(cancel.encode(), token.encode());
                 self.icc_poll_canceling = true;
             };
             try self.adapter.prepareAcquireWaits(true);
@@ -3266,6 +3281,7 @@ pub fn Coordinator(comptime protocol: type) type {
         /// End-of-turn backend phase. This consumes at most one fixed input
         /// batch and may prepare (but never submit) its next readiness poll.
         pub fn prepare(self: *Self) !void {
+            if (self.terminalFailure()) |err| return err;
             try self.prepareSecurityClosures();
             try self.processSession();
             try self.processInput();
@@ -3541,18 +3557,10 @@ pub fn Coordinator(comptime protocol: type) type {
                     try self.pauseAllOutputs();
                 },
                 .none => switch (event) {
-                    .failed => {
-                        if (!self.stopping) {
-                            self.stopping = true;
-                            if (self.loop) |loop| try loop.requestShutdown();
-                        }
-                        self.session_disable_pending = true;
-                        if (self.input != null) try self.processInput();
-                        for (self.physical_outputs[0..self.physical_output_count]) |*physical| if (physical.kms_output) |output| {
-                            if (try output.terminalDeviceTeardown()) |action|
-                                try self.consumeRetireAction(action);
-                        };
-                    },
+                    // A broken libseat connection is not a scanout fence.
+                    // Keep all image and callback owners alive for process
+                    // teardown; do not assert terminalDeviceTeardown here.
+                    .failed => return error.SessionFailed,
                     else => {},
                 },
             };

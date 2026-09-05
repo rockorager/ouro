@@ -1415,6 +1415,42 @@ test "kms: pause pending flip and terminal removal preserve scanout lifetime" {
     try std.testing.expectEqual(@as(usize, 0), fixture.atomic_state.blob_destroy_count);
 }
 
+test "kms: failed disable retains scanout and only discards uncommitted images" {
+    for ([_]bool{ false, true }) |submitted| {
+        var fixture = Fixture{};
+        const output = try fixture.create(.{});
+        const current = fixture.acquire(0);
+        try output.queue(current, null);
+        try output.commitQueued();
+        fixture.flip(output, fixture.crtc[0].id, false);
+        try output.processCallbacks();
+        output.clearEvents();
+        const next = fixture.acquire(1);
+        try output.queue(next, null);
+        if (submitted) try output.commitQueued();
+        fixture.atomic_state.fail_commit_at = fixture.atomic_state.commit_count + 1;
+        if (submitted) {
+            try output.requestPause();
+            fixture.flip(output, fixture.crtc[0].id, false);
+            try std.testing.expectError(error.FakeCommit, output.processCallbacks());
+        } else {
+            try std.testing.expectError(error.FakeCommit, output.requestPause());
+        }
+        try std.testing.expectEqual(State.failed, output.state);
+        try std.testing.expectEqual(if (submitted) next else current, output.current.?);
+        try std.testing.expectEqual(@as(usize, if (submitted) 1 else 0), fixture.images_state.release_count);
+        try std.testing.expectEqual(@as(usize, if (submitted) 0 else 1), fixture.images_state.discard_count);
+        var router = try completion.Router.init(std.testing.allocator, 2);
+        defer router.deinit(std.testing.allocator);
+        var ring: linux.IoUring = undefined;
+        try std.testing.expectError(error.ScanoutNotQuiescent, output.beginDrain(&router, &ring));
+        // Only the fixture's external terminal boundary permits cleanup.
+        output.clearEvents();
+        try output.terminalDeviceTeardown();
+        try fixture.drainAndDestroy(output);
+    }
+}
+
 test "kms: mode blob and request cleanup is reverse and generation exhaustion never aliases" {
     var fixture = Fixture{};
     const output = try fixture.create(.{ .commit_capacity = 2 });

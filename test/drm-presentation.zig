@@ -72,6 +72,172 @@ test "generated ordinary SHM traverses the physical coordinator exactly once and
     try runVertical(.session_disable, .shm);
 }
 
+test "shutdown: failed disable after final flip is terminal without releasing scanout" {
+    try runShutdownFailure(.shutdown, 1);
+    try runShutdownFailure(.shutdown, 2);
+}
+
+test "shutdown: failed pause after seat disable does not assume revocation" {
+    try runShutdownFailure(.seat_disable, 2);
+}
+
+test "shutdown: failed seat connection is not device revocation" {
+    try runShutdownFailure(.seat_failure, 2);
+}
+
+test "shutdown: ICC poll cancellation drains both CQEs in either order" {
+    for ([_]bool{ false, true }) |cancel_first| {
+        const allocator = std.testing.allocator;
+        var fixture = try Fixture.init();
+        defer fixture.deinit();
+        var path_storage: [128]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-shutdown-icc-{d}.sock", .{linux.getpid()});
+        wayring.unix_socket.unlink(path) catch {};
+        defer wayring.unix_socket.unlink(path) catch {};
+        const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), compositorConfig());
+        const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), coordinatorConfig());
+        const available = coordinator.router.available();
+        // An idle worker notification must not be required to finish shutdown.
+        const poll = try coordinator.router.acquire(.icc_worker);
+        _ = try root.ring.poll_add(poll.encode(), fixture.hotplug_fd, linux.POLL.IN);
+        coordinator.icc_poll = poll;
+        _ = try root.ring.submit();
+        try coordinator.requestStop();
+        try std.testing.expect(!coordinator.backendDrainComplete());
+        _ = try root.ring.submit();
+        var cqes: [2]linux.io_uring_cqe = undefined;
+        var count: usize = 0;
+        while (count < cqes.len) {
+            try waitReady(&root.ring);
+            count += try root.ring.copy_cqes(cqes[count..], 0);
+        }
+        if ((cqes[0].user_data == poll.encode()) == cancel_first)
+            std.mem.swap(linux.io_uring_cqe, &cqes[0], &cqes[1]);
+        for (cqes, 0..) |cqe, index| {
+            try std.testing.expectEqual(
+                @as(i32, if (cqe.user_data == poll.encode()) -@as(i32, @intFromEnum(linux.E.CANCELED)) else 0),
+                cqe.res,
+            );
+            try coordinator.completions(&.{}, &.{.{
+                .token = coordinator.router.route(cqe.user_data).?,
+                .cqe = cqe,
+            }});
+            try std.testing.expectEqual(index == 1, coordinator.backendDrainComplete());
+        }
+        try std.testing.expectEqual(available, coordinator.router.available());
+        try coordinator.destroy();
+        try root.deinit();
+    }
+}
+
+fn runShutdownFailure(trigger: enum { shutdown, seat_disable, seat_failure }, event_capacity: usize) !void {
+    const seat_failure = trigger == .seat_failure;
+    const allocator = std.testing.allocator;
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-shutdown-failure-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), compositorConfig());
+    var config = coordinatorConfig();
+    config.output.kms.event_capacity = event_capacity;
+    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), config);
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
+    try coordinator.start(&loop);
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    for (0..128) |_| {
+        _ = try loop.turn(coordinator);
+        if (coordinator.primaryKmsOutput() != null) break;
+        try waitReady(&root.ring);
+    }
+    const output = coordinator.primaryKmsOutput().?;
+    try output.request(.damage, 1);
+    coordinator.physical_outputs[0].damage_requested +%= 1;
+    for (0..128) |_| {
+        _ = try loop.turn(coordinator);
+        if (output.in_flight_frame != null) break;
+        try waitReady(&root.ring);
+    }
+    const kms = output.kms_output;
+    try std.testing.expectEqual(.in_flight, kms.state);
+    const image = kms.records[kms.in_flight_slot.?].image;
+    try std.testing.expectEqual(.submitted, (try output.pool.image(image)).state);
+
+    // Reap the real eventfd read but route it directly through the coordinator
+    // so the expected error is asserted, not logged as an unexpected loop
+    // failure. No Wayland clients or other ready sources exist in this test.
+    try waitReady(&root.ring);
+    var cqes: [1]linux.io_uring_cqe = undefined;
+    try std.testing.expectEqual(@as(u32, 1), try root.ring.copy_cqes(&cqes, 0));
+    const token = coordinator.router.route(cqes[0].user_data).?;
+    try std.testing.expect(kms.ownsReadinessToken(token));
+    if (trigger != .shutdown) {
+        // Neither a disable callback nor a seat transport failure proves
+        // that this other device, its read, or its scanout has been revoked.
+        fixture.fail_dispatch = seat_failure;
+        try fixture.signalSession(.disable);
+        try waitReady(&root.ring);
+        var seat_cqes: [1]linux.io_uring_cqe = undefined;
+        try std.testing.expectEqual(@as(u32, 1), try root.ring.copy_cqes(&seat_cqes, 0));
+        const result = coordinator.completions(&.{}, &.{.{
+            .token = coordinator.router.route(seat_cqes[0].user_data).?,
+            .cqe = seat_cqes[0],
+        }});
+        if (seat_failure) {
+            try std.testing.expectError(error.SessionFailed, result);
+            try std.testing.expectEqual(.in_flight, kms.state);
+        } else {
+            try result;
+            try std.testing.expectEqual(.disabling, coordinator.session.state);
+        }
+        try std.testing.expect(kms.in_flight_slot != null);
+    }
+    if (!seat_failure) {
+        fixture.fail_disable = true;
+        if (trigger == .shutdown) try coordinator.requestStop();
+        try std.testing.expectEqual(.disabling, kms.state);
+        try std.testing.expectError(error.AtomicCommitFailed, coordinator.completions(&.{}, &.{.{ .token = token, .cqe = cqes[0] }}));
+        try std.testing.expectEqual(.failed, kms.state);
+        try std.testing.expect(kms.in_flight_slot == null);
+        try std.testing.expectEqual(image, kms.current.?);
+    }
+    const failure = if (seat_failure) error.SessionFailed else error.KmsFailed;
+    try std.testing.expectEqual(failure, coordinator.terminalFailure().?);
+    try std.testing.expectError(failure, coordinator.requestStop());
+    // Even an embedder retrying after the original error cannot enter an
+    // idle wait: prepare reports the permanent failure without touching IO.
+    try std.testing.expectError(failure, coordinator.prepare());
+    try std.testing.expect(!coordinator.backendDrainComplete());
+    try std.testing.expect(!output.paused);
+    try std.testing.expectEqual(.submitted, (try output.pool.image(image)).state);
+    try std.testing.expectEqual(@as(usize, 0), fixture.bo_destroyed);
+    try std.testing.expectEqual(@as(usize, 0), fixture.device_closes);
+    try std.testing.expectEqual(@as(usize, if (seat_failure) 0 else 1), fixture.disable_attempts);
+
+    // Test-only external teardown: the fake device now drops ALL callback
+    // references and stops scanout. Production must exit instead of asserting
+    // this boundary on a failed ioctl or a failed seat connection.
+    fixture.flip_len = 0;
+    fixture.pending_flips = .{Fixture.PendingFlip{}} ** 4;
+    if (seat_failure) {
+        // Consume the read already reaped above before freeing its storage.
+        try kms.completeReadiness(&coordinator.router, &root.ring, token, cqes[0].res);
+    } else {
+        try std.testing.expectError(error.KmsFailed, coordinator.completions(&.{}, &.{}));
+        try coordinator.completions(&.{}, &.{});
+    }
+    _ = try output.terminalDeviceTeardown();
+    try coordinator.session.beginDrain(&coordinator.router, &root.ring);
+    try coordinator.completions(&.{}, &.{});
+    try coordinator.requestStop();
+    try drainServer(root, coordinator, &loop);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
 test "client disconnect before render deadline abandons pending presentation" {
     try runVertical(.client_disconnect, .shm);
 }
@@ -4000,6 +4166,9 @@ pub const Fixture = struct {
     hotplug_pending: bool = false,
     callback: ?*ouro.backend_platform.CallbackContext = null,
     command: SessionCommand = .enable,
+    fail_dispatch: bool = false,
+    fail_disable: bool = false,
+    disable_attempts: usize = 0,
     bo_bytes: [12][32]u8 align(4) = .{[_]u8{0} ** 32} ** 12,
     dumb_bytes: [12][std.heap.page_size_min]u8 align(std.heap.page_size_min) =
         .{[_]u8{0} ** std.heap.page_size_min} ** 12,
@@ -4219,6 +4388,7 @@ pub const Fixture = struct {
         if (linux.errno(result) == .AGAIN) return;
         if (linux.errno(result) != .SUCCESS or result != @sizeOf(u64))
             return error.EventFdReadFailed;
+        if (self.fail_dispatch) return error.FakeSeatDisconnected;
         const callback = self.callback.?;
         switch (self.command) {
             .enable => callback.listener.enable(callback.userdata),
@@ -4433,6 +4603,10 @@ pub const Fixture = struct {
     }
     fn atomicCommit(context: *anyopaque, _: linux.fd_t, request: ouro.drm_atomic.Request, flags: ouro.drm_atomic.CommitFlags, userdata: ?*anyopaque) !void {
         const self: *Fixture = @ptrCast(@alignCast(context));
+        if (!flags.test_only and !flags.page_flip_event and flags.allow_modeset) {
+            self.disable_attempts += 1;
+            if (self.fail_disable) return error.AtomicCommitFailed;
+        }
         if (flags.page_flip_event) {
             const atomic_request: *AtomicRequest = @ptrCast(@alignCast(request));
             if (atomic_request.crtc == 0) return error.MissingCrtc;

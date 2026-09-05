@@ -152,8 +152,15 @@ fn realCommit(
     if (flags.allow_modeset) native_flags |= c.DRM_MODE_ATOMIC_ALLOW_MODESET;
     if (flags.nonblock) native_flags |= c.DRM_MODE_ATOMIC_NONBLOCK;
     if (flags.page_flip_event) native_flags |= c.DRM_MODE_PAGE_FLIP_EVENT;
-    if (c.drmModeAtomicCommit(fd, @ptrCast(@alignCast(request)), native_flags, userdata) != 0)
+    if (c.drmModeAtomicCommit(fd, @ptrCast(@alignCast(request)), native_flags, userdata) != 0) {
+        const errno = std.c.errno(@as(c_int, -1));
+        const message = "DRM atomic commit failed: fd={d}, flags=0x{x}, errno={t} ({d})";
+        const args = .{ fd, native_flags, errno, @intFromEnum(errno) };
+        // TEST_ONLY rejection is ordinary capability probing, not a failed
+        // presentation or disable. Capture errno before any logging call.
+        if (flags.test_only) std.log.debug(message, args) else std.log.err(message, args);
         return error.AtomicCommitFailed;
+    }
 }
 
 fn realHandleEvents(_: *anyopaque, bytes: []const u8, callback: FlipCallback) !void {

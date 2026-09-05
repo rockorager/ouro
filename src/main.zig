@@ -273,6 +273,14 @@ pub fn main(init: std.process.Init) !void {
     var wayring_drained = false;
     var signal_stop_started = false;
     while (!wayring_drained or !coordinator.backendDrainComplete()) {
+        if (coordinator.terminalFailure()) |terminal_error| {
+            std.log.err("backend cannot safely drain: {t}; exiting with scanout pinned for kernel teardown", .{terminal_error});
+            // Do not run the normal destructors or publish buffer releases:
+            // neither a failed disable nor loss of the seat connection proves
+            // scanout idle. Process exit closes all process-owned FD/ring
+            // references, unlike closing the manager's borrowed DRM FD alone.
+            return run_error orelse terminal_error;
+        }
         if (run_error != null and !signal_stop_started) {
             beginShutdown(&systemd_session, coordinator) catch |stop_err| {
                 std.log.err("compositor shutdown failed: {t}", .{stop_err});

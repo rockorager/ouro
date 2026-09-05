@@ -1601,6 +1601,10 @@ pub const Output = struct {
                 .failed => {
                     try self.finishCapture(callbacks, false, 0);
                     self.discardRenderTiming(ring);
+                    // Report this fact once. Keep scanout ownership pinned,
+                    // but permit a later proven terminal-device event to be
+                    // consumed instead of replaying failure forever.
+                    self.event_cursor += 1;
                     return error.KmsFailed;
                 },
                 .drained => {},
