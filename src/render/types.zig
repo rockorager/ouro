@@ -300,7 +300,8 @@ pub fn hasVisibleBlur(sample: SurfaceSample) bool {
 /// Recognizes the common exact full-surface opaque declaration without
 /// allocating canonical geometry. False negatives only retain the slower
 /// renderer check; they never suppress a visible effect.
-fn effectRegionCoversSurface(operations: []const RegionOperation, size: Size) bool {
+pub fn effectRegionCoversSurface(operations: []const RegionOperation, size: Size) bool {
+    if (size.width == 0 or size.height == 0) return false;
     var covered = false;
     for (operations) |operation| switch (operation) {
         .add => |rect| {

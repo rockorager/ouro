@@ -1477,7 +1477,7 @@ pub const Output = struct {
         self.in_flight_ready_ns = now_ns;
     }
 
-    /// Attempts the strict one-sample bypass while the scheduler still owns a
+    /// Attempts the opaque full-output bypass while the scheduler still owns a
     /// reversible rendering-stage frame. Candidate import, FB registration,
     /// and TEST_ONLY failure all leave the current KMS image untouched and
     /// return to ordinary composition. After the real commit succeeds, the
@@ -2172,16 +2172,24 @@ fn directScanoutSource(
     list: render.List,
     output_color: render.color.Description,
 ) ?render.Source {
-    if (list.samples.len != 1) return null;
-    const sample = list.samples[0];
+    if (list.samples.len == 0) return null;
+    // Samples are back-to-front. An opaque topmost sample covering the entire
+    // output hides every earlier sample; their presentation bindings remain
+    // captured by the scheduler even when no composition is necessary.
+    const sample = list.samples[list.samples.len - 1];
     const external = sample.source.external orelse return null;
     if (sample.source.native != null or sample.source.upload != null or
-        sample.source.format != .xrgb8888 or list.output_format != .xrgb8888 or
-        formatFromDrm(external.drm_format) != .xrgb8888 or
+        list.output_format != .xrgb8888 or
+        formatFromDrm(external.drm_format) != sample.source.format or
         !std.meta.eql(sample.source.size, list.output) or sample.transform != .normal or
         sample.global_alpha != 255 or
         !std.meta.eql(sample.color_description, output_color) or
         !std.meta.eql(sample.color_representation, render.color.Representation{}))
+        return null;
+    // Alpha-capable buffers are opaque when the client declares their entire
+    // surface opaque. Keep the original DRM format for KMS validation.
+    if (sample.source.format != .xrgb8888 and
+        !render.effectRegionCoversSurface(sample.opaque_region, sample.effect_size))
         return null;
     const fixed_width = @as(i64, sample.source.size.width) * render.fixed_one;
     const fixed_height = @as(i64, sample.source.size.height) * render.fixed_one;
@@ -2361,6 +2369,54 @@ test "drm-output: direct scanout eligibility is exact and conservative" {
     sample.global_alpha = 255;
     sample.source.native = .{ .owner = @ptrFromInt(1), .token = 1 };
     list.samples = &.{sample};
+    try std.testing.expect(directScanoutSource(list, .srgb) == null);
+
+    sample.source.native = null;
+    sample.source.format = .argb8888_premultiplied;
+    sample.source.external.?.drm_format = gbm.format_abgr8888;
+    sample.effect_size = .{ .width = 2, .height = 1 };
+    list.samples = &.{sample};
+    try std.testing.expect(directScanoutSource(list, .srgb) == null);
+    sample.opaque_region = &.{.{ .add = .{ .x = 0, .y = 0, .width = 2, .height = 1 } }};
+    list.samples = &.{sample};
+    try std.testing.expectEqual(gbm.format_abgr8888, directScanoutSource(list, .srgb).?.external.?.drm_format);
+    sample.opaque_region = &.{
+        .{ .add = .{ .x = 0, .y = 0, .width = 2, .height = 1 } },
+        .{ .subtract = .{ .x = 1, .y = 0, .width = 1, .height = 1 } },
+    };
+    list.samples = &.{sample};
+    try std.testing.expect(directScanoutSource(list, .srgb) == null);
+    sample.opaque_region = &.{.{ .add = .{ .x = 0, .y = 0, .width = 1, .height = 1 } }};
+    list.samples = &.{sample};
+    try std.testing.expect(directScanoutSource(list, .srgb) == null);
+
+    sample.opaque_region = &.{.{ .add = .{ .x = 0, .y = 0, .width = 2, .height = 1 } }};
+    sample.effect_size = .{ .width = 0, .height = 0 };
+    list.samples = &.{sample};
+    try std.testing.expect(directScanoutSource(list, .srgb) == null);
+    sample.effect_size = .{ .width = 2, .height = 1 };
+    var behind = sample;
+    behind.source.external = null;
+    list.samples = &.{ behind, sample };
+    try std.testing.expect(directScanoutSource(list, .srgb) != null);
+    list.samples = &.{ sample, behind };
+    try std.testing.expect(directScanoutSource(list, .srgb) == null);
+    sample.global_alpha = 254;
+    list.samples = &.{ behind, sample };
+    try std.testing.expect(directScanoutSource(list, .srgb) == null);
+    sample.global_alpha = 255;
+    sample.clip.width = 1;
+    list.samples = &.{ behind, sample };
+    try std.testing.expect(directScanoutSource(list, .srgb) == null);
+    sample.clip.width = 2;
+    sample.crop.width = render.fixed_one;
+    list.samples = &.{ behind, sample };
+    try std.testing.expect(directScanoutSource(list, .srgb) == null);
+    sample.crop.width = 2 * render.fixed_one;
+    sample.source.external.?.drm_format = gbm.format_xrgb8888;
+    list.samples = &.{ behind, sample };
+    try std.testing.expect(directScanoutSource(list, .srgb) == null);
+    list.samples = &.{};
     try std.testing.expect(directScanoutSource(list, .srgb) == null);
 }
 

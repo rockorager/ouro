@@ -61,7 +61,7 @@ const real_vtable: Platform.VTable = .{
 fn realAdd(_: *anyopaque, fd: std.posix.fd_t, metadata: gbm.Metadata) !u32 {
     var framebuffer_id: u32 = 0;
     const result = if (requiresModifierRegistration(metadata)) blk: {
-        const modifiers = [_]u64{metadata.modifier} ** gbm.max_planes;
+        const modifiers = framebufferModifiers(metadata);
         break :blk c.drmModeAddFB2WithModifiers(
             fd,
             metadata.width,
@@ -92,6 +92,26 @@ fn realAdd(_: *anyopaque, fd: std.posix.fd_t, metadata: gbm.Metadata) !u32 {
 fn requiresModifierRegistration(metadata: gbm.Metadata) bool {
     return metadata.modifier != gbm.modifier_invalid and
         metadata.modifier != gbm.modifier_linear;
+}
+
+fn framebufferModifiers(metadata: gbm.Metadata) [gbm.max_planes]u64 {
+    // DRM rejects nonzero modifiers in unused plane slots.
+    var modifiers = [_]u64{0} ** gbm.max_planes;
+    @memset(modifiers[0..metadata.plane_count], metadata.modifier);
+    return modifiers;
+}
+
+test "scanout: framebuffer modifiers leave unused planes zero" {
+    var metadata: gbm.Metadata = .{
+        .width = 2,
+        .height = 1,
+        .format = gbm.format_xrgb8888,
+        .modifier = 9,
+        .plane_count = 1,
+    };
+    try std.testing.expectEqual([_]u64{ 9, 0, 0, 0 }, framebufferModifiers(metadata));
+    metadata.plane_count = 2;
+    try std.testing.expectEqual([_]u64{ 9, 9, 0, 0 }, framebufferModifiers(metadata));
 }
 
 fn realRemove(_: *anyopaque, fd: std.posix.fd_t, id: u32) !void {
