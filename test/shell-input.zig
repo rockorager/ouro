@@ -3611,18 +3611,25 @@ test "shell-input: popup applies each acknowledged configure after output remova
 }
 
 test "shell-input: screencopy captures clipped output into writable SHM" {
-    try runScreencopyCapture(false, false);
+    try runScreencopyCapture(.none, false);
 }
 
 test "shell-input: copy with damage waits for a newer output frame" {
-    try runScreencopyCapture(false, true);
+    try runScreencopyCapture(.none, true);
 }
 
-test "shell-input: session disable fails pending screencopy" {
-    try runScreencopyCapture(true, false);
+test "shell-input: session disable fails screencopy before submission" {
+    try runScreencopyCapture(.before_submission, false);
 }
 
-fn runScreencopyCapture(interrupt: bool, repeat_with_damage: bool) !void {
+test "shell-input: session disable completes submitted screencopy" {
+    try runScreencopyCapture(.after_submission, false);
+}
+
+fn runScreencopyCapture(
+    disable: enum { none, before_submission, after_submission },
+    repeat_with_damage: bool,
+) !void {
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-screencopy-{d}.sock", .{linux.getpid()});
@@ -3697,9 +3704,25 @@ fn runScreencopyCapture(interrupt: bool, repeat_with_damage: bool) !void {
             try submitClient(&client_reactor, &driver, &handler);
         }
         _ = try loop.turn(coordinator);
-        if (interrupt and !disable_sent and coordinator.anyPendingScreencopy()) {
-            try fixture.signalSession(.disable);
-            disable_sent = true;
+        if (disable != .none and !disable_sent and coordinator.anyPendingScreencopy()) {
+            const output = coordinator.primaryKmsOutput().?;
+            if (disable == .before_submission or output.in_flight_frame != null) {
+                if (disable == .before_submission) {
+                    try std.testing.expectEqual(.armed, output.scheduler.currentStage());
+                    try std.testing.expect(output.in_flight_frame == null);
+                    try std.testing.expect(output.pending_capture == null);
+                } else {
+                    try std.testing.expectEqual(.submitted, output.scheduler.currentStage());
+                    try std.testing.expect(output.pending_capture != null);
+                }
+                try std.testing.expectEqual(@as(usize, 0), fixture.page_flips);
+                // Apply the libseat callback at the command boundary before
+                // another turn can dispatch render-timer or page-flip CQEs.
+                const callback = fixture.callback.?;
+                callback.listener.disable(callback.userdata);
+                try coordinator.prepare();
+                disable_sent = true;
+            }
         }
         if (repeat_with_damage and !damage_sent and handler.ready_events == 1 and
             coordinator.screencopy_adapter.capture_count == 1 and
@@ -3709,25 +3732,30 @@ fn runScreencopyCapture(interrupt: bool, repeat_with_damage: bool) !void {
             damage_sent = true;
             _ = try loop.turn(coordinator);
         }
-        if ((!interrupt and handler.ready) or
-            (interrupt and handler.failed and !coordinator.anyPendingScreencopy() and
+        const completed_capture = if (disable == .before_submission) handler.failed else handler.ready;
+        if ((disable == .none and completed_capture) or
+            (disable != .none and completed_capture and !coordinator.anyPendingScreencopy() and
                 coordinator.session.state == .disabled)) break;
         if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
             try waitForEither(&root.ring, client_reactor.ring);
     }
-    try std.testing.expectEqual(interrupt, disable_sent);
-    try std.testing.expectEqual(!interrupt, handler.ready);
-    try std.testing.expectEqual(interrupt, handler.failed);
+    const cancelled = disable == .before_submission;
+    try std.testing.expectEqual(disable != .none, disable_sent);
+    try std.testing.expectEqual(!cancelled, handler.ready);
+    try std.testing.expectEqual(cancelled, handler.failed);
     try std.testing.expectEqual(repeat_with_damage, damage_sent);
     const completed: usize = if (repeat_with_damage) 2 else 1;
+    try std.testing.expectEqual(@as(usize, if (cancelled) 0 else completed), handler.ready_events);
     try std.testing.expectEqual(completed, handler.buffer_events);
     try std.testing.expectEqual(completed, handler.buffer_done_events);
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
-    if (interrupt) {
+    if (disable != .none) {
         try std.testing.expect(!coordinator.anyPendingScreencopy());
         try std.testing.expectEqual(.disabled, coordinator.session.state);
-    } else {
-        try std.testing.expectEqual(
+        try std.testing.expectEqual(@as(usize, if (cancelled) 0 else 1), fixture.page_flips);
+    }
+    if (!cancelled) {
+        if (disable == .none) try std.testing.expectEqual(
             .@"90",
             coordinator.primaryKmsOutput().?.planner.output_transform,
         );
