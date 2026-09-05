@@ -188,6 +188,8 @@ pub fn Loop(comptime protocol: type) type {
         /// `prepare(*Handler) !void` runs afterward so the coordinator can
         /// consume events produced by that dispatch and schedule their protocol
         /// output before Wayring's single preparation pass and submission.
+        /// `submissionWorkPending(*const Handler) bool` prevents sleeping when
+        /// SQ pressure requires a submit followed by another prepare turn.
         /// The ring enter is deliberately last and includes initial accept,
         /// timer, completion/dispatch/prepare-hook, shutdown, and Wayring SQEs.
         /// The completion hook has this contract:
@@ -344,10 +346,14 @@ pub fn Loop(comptime protocol: type) type {
                 handler.bindingsWorkPending()
             else
                 false;
+            const submission_work_pending = if (@hasDecl(@TypeOf(handler.*), "submissionWorkPending"))
+                handler.submissionWorkPending()
+            else
+                false;
             const can_wait = wait_on_idle and self.compositor.ring.cq_ready() == 0 and
                 !wayring_progress.pending and !self.retained_shutdown_requested and
                 !self.retained_reload_requested and
-                !bindings_work_pending and
+                !bindings_work_pending and !submission_work_pending and
                 !(wayring_progress.shutdown_complete and backend_drained);
             phase = .submit;
             const submitted = if (can_wait)
@@ -374,7 +380,7 @@ pub fn Loop(comptime protocol: type) type {
                 .reload_requested = self.retained_reload_requested,
                 .needs_more_work = self.compositor.ring.cq_ready() != 0 or
                     self.pending_wayring_count != 0 or wayring_progress.pending or
-                    bindings_work_pending,
+                    bindings_work_pending or submission_work_pending,
             };
             self.retained_wayring_progress = .{};
             self.retained_shutdown_requested = false;

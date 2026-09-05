@@ -302,6 +302,7 @@ pub fn Adapter(comptime protocol: type) type {
         shm: *Shm,
         ring: *std.os.linux.IoUring,
         router: *completion.Router,
+        acquire_waits: @import("../runtime/acquire_fence.zig").Waits = .{},
         runtime: ?*Runtime = null,
         global: ?objects.Handle = null,
         viewporter_global: ?objects.Handle = null,
@@ -578,6 +579,7 @@ pub fn Adapter(comptime protocol: type) type {
                 (!slot.owner_alive and slot.state != .pending));
             adapter.imports.deinit(adapter.allocator);
             adapter.scheduler.deinit(adapter.allocator);
+            adapter.acquire_waits.deinit(adapter.allocator);
             if (adapter.discarded_feedback) |*pending| pending.deinit();
             adapter.release_pool.deinit(adapter.allocator);
             adapter.presentation_feedback_pool.deinit(adapter.allocator);
@@ -1415,7 +1417,7 @@ pub fn Adapter(comptime protocol: type) type {
 
         pub fn nextCommitDeadline(adapter: *Self, now_ns: u64) !?surface_state.CommitTimestamp {
             var result: ?surface_state.CommitTimestamp = null;
-            const context = DeadlineSearch{ .now_ns = now_ns, .result = &result };
+            const context = DeadlineSearch{ .adapter = adapter, .now_ns = now_ns, .result = &result };
             var mutable = context;
             for (adapter.surfaces) |slot| {
                 if (!slot.active) continue;
@@ -1425,7 +1427,17 @@ pub fn Adapter(comptime protocol: type) type {
                     collectCommitDeadline,
                 );
             }
+            if (mutable.failure) |err| return err;
             return result;
+        }
+
+        pub fn prepareAcquireWaits(adapter: *Self, stopping: bool) !void {
+            adapter.acquire_waits.stopping = stopping;
+            try adapter.acquire_waits.prepare(adapter.allocator, adapter.router, adapter.ring);
+        }
+
+        pub fn completeAcquireWait(adapter: *Self, outcome: anytype) !void {
+            try adapter.acquire_waits.complete(adapter.router, outcome.token, outcome.cqe.res);
         }
 
         pub fn pendingContentUpdates(adapter: *const Self) usize {
@@ -2947,14 +2959,16 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         const DeadlineSearch = struct {
+            adapter: *Self,
             now_ns: u64,
             result: *?surface_state.CommitTimestamp,
+            failure: ?anyerror = null,
         };
 
         fn commitReady(context: ?*const anyopaque, content: *const Content) bool {
             const now_ns: *const u64 = @ptrCast(@alignCast(context.?));
             if (content.surface.explicit_sync) |sync|
-                if (!(sync.acquire.signaled() catch false)) return false;
+                if (sync.acquire_wait == null or !sync.acquire_wait.?.signaled) return false;
             if (now_ns.* == std.math.maxInt(u64)) return true;
             const timestamp = content.surface.commit_timestamp orelse return true;
             return timestamp.ready(now_ns.*);
@@ -2962,8 +2976,13 @@ pub fn Adapter(comptime protocol: type) type {
 
         fn collectCommitDeadline(context: ?*anyopaque, content: *const Content) void {
             const search: *DeadlineSearch = @ptrCast(@alignCast(context.?));
-            if (content.surface.explicit_sync) |sync| {
-                if (!(sync.acquire.signaled() catch false)) {
+            if (@constCast(&content.surface).explicit_sync) |*sync| {
+                const adapter = search.adapter;
+                const ready = adapter.acquire_waits.ready(adapter.allocator, adapter.router, adapter.ring, sync) catch |err| {
+                    search.failure = err;
+                    return;
+                };
+                if (!ready and (sync.acquire_wait == null or !sync.acquire_wait.?.registered)) {
                     const retry_ns = std.math.add(u64, search.now_ns, std.time.ns_per_ms) catch
                         std.math.maxInt(u64);
                     const retry = surface_state.CommitTimestamp{
@@ -6056,4 +6075,84 @@ test "stale removal cannot release a reused surface slot" {
         error.StaleSurface,
         context.adapter.tryApplyAtId(stale_id, &applied, std.math.maxInt(u64)),
     );
+}
+
+test "acquire fence unsubmitted fallback becomes a real sync_file wait and disconnect releases it" {
+    const drm = @cImport({
+        @cInclude("xf86drm.h");
+    });
+    const syncobj = @import("../drm_syncobj.zig");
+    const opened = std.os.linux.open("/dev/dri/renderD128", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+    if (std.os.linux.errno(opened) != .SUCCESS) return error.SkipZigTest;
+    const fd: std.os.linux.fd_t = @intCast(opened);
+    defer _ = std.os.linux.close(fd);
+    var device = syncobj.Device.init(std.testing.allocator, fd) catch |err| switch (err) {
+        error.Unsupported => return error.SkipZigTest,
+        else => return err,
+    };
+    defer device.deinit();
+    var handle: u32 = 0;
+    try std.testing.expectEqual(@as(c_int, 0), drm.drmSyncobjCreate(device.fd, 0, &handle));
+    defer std.debug.assert(drm.drmSyncobjDestroy(device.fd, handle) == 0);
+    // Keep a sentinel reference for this stack-owned test timeline.
+    var timeline: syncobj.Timeline = .{ .device = &device, .handle = handle };
+    const context = try TestContext.init();
+    defer context.deinit();
+    const surface = try context.createSurface(10);
+    try test_protocol.wl_surface.encodeRequest(&context.requests, surface.id, .{ .commit = .{} });
+    _ = try context.dispatchCore();
+    const id = try context.adapter.surfaceId(surface);
+    const slot = try context.adapter.surfaceForId(id);
+    const pending = (try context.adapter.scheduler.peek(&slot.updates)).?;
+    const content = @constCast(pending.payload);
+    content.surface.explicit_sync = .{
+        .acquire = try timeline.point(10),
+        .release = try timeline.point(11),
+    };
+    const now = 2 * std.time.ns_per_s;
+    try std.testing.expectEqual(surface_state.CommitTimestamp{ .sec = 2, .nsec = std.time.ns_per_ms }, (try context.adapter.nextCommitDeadline(now)).?);
+    try std.testing.expect(content.surface.explicit_sync.?.acquire_wait == null);
+    try std.testing.expectEqual(@as(usize, 0), context.router.active_count);
+    try std.testing.expectEqual(@as(usize, 0), try context.adapter.readyUpdateCountAtId(id, now));
+    try content.surface.explicit_sync.?.acquire.signal();
+    const blocker = try context.router.acquire(.copy);
+    try std.testing.expectEqual(surface_state.CommitTimestamp{ .sec = 2, .nsec = std.time.ns_per_ms }, (try context.adapter.nextCommitDeadline(now)).?);
+    const wait = content.surface.explicit_sync.?.acquire_wait.?;
+    try std.testing.expect(!wait.signaled);
+    try std.testing.expect(!wait.registered);
+    try std.testing.expect(try context.adapter.nextCommitDeadline(now) != null);
+    try std.testing.expectEqual(wait, content.surface.explicit_sync.?.acquire_wait.?);
+    try context.router.retire(blocker);
+    try context.adapter.prepareAcquireWaits(false);
+    try std.testing.expect(wait.registered);
+    // Repeated scans neither re-export nor register another poll.
+    try std.testing.expect(try context.adapter.nextCommitDeadline(now) == null);
+    try std.testing.expectEqual(@as(usize, 2), context.router.active_count);
+    _ = try context.ring.submit_and_wait(1);
+    const cqe = try context.ring.copy_cqe();
+    try context.adapter.completeAcquireWait(.{ .token = context.router.route(cqe.user_data).?, .cqe = cqe });
+    try std.testing.expectEqual(@as(usize, 1), try context.adapter.readyUpdateCountAtId(id, now));
+    context.adapter.releaseSurface(id.index);
+    try std.testing.expect(!wait.owned);
+    try context.adapter.prepareAcquireWaits(false);
+    try std.testing.expect(context.adapter.acquire_waits.head == null);
+    try std.testing.expectEqual(@as(usize, 1), timeline.references);
+
+    const abandoned_surface = try context.createSurface(12);
+    try test_protocol.wl_surface.encodeRequest(&context.requests, abandoned_surface.id, .{ .commit = .{} });
+    _ = try context.dispatchCore();
+    const abandoned_id = try context.adapter.surfaceId(abandoned_surface);
+    const abandoned_slot = try context.adapter.surfaceForId(abandoned_id);
+    const abandoned = (try context.adapter.scheduler.peek(&abandoned_slot.updates)).?;
+    @constCast(abandoned.payload).surface.explicit_sync = .{
+        .acquire = try timeline.point(20),
+        .release = try timeline.point(21),
+    };
+    try std.testing.expect(try context.adapter.nextCommitDeadline(now) != null);
+    context.adapter.releaseSurface(abandoned_id.index);
+    try context.adapter.prepareAcquireWaits(false);
+    try std.testing.expect(try context.adapter.nextCommitDeadline(now) == null);
+    try std.testing.expectEqual(@as(usize, 0), context.router.active_count);
+    try std.testing.expect(context.adapter.acquire_waits.head == null);
+    try std.testing.expectEqual(@as(usize, 1), timeline.references);
 }

@@ -1084,6 +1084,7 @@ pub fn Coordinator(comptime protocol: type) type {
         commit_timer: ?timer.Handle = null,
         commit_timer_canceling: bool = false,
         commit_timer_deadline: ?surface_state.CommitTimestamp = null,
+        commit_timer_retry: enum { none, resources, submission } = .none,
         xdg_session_store_timer: ?timer.Handle = null,
         xdg_session_store_timer_canceling: bool = false,
         consumer_timer: ?timer.Handle = null,
@@ -1306,6 +1307,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.commit_timer = null;
             self.commit_timer_canceling = false;
             self.commit_timer_deadline = null;
+            self.commit_timer_retry = .none;
             self.xdg_session_store_timer = null;
             self.xdg_session_store_timer_canceling = false;
             self.consumer_timer = null;
@@ -2085,6 +2087,10 @@ pub fn Coordinator(comptime protocol: type) type {
             return self.interaction.keyConsumerConst().workPending();
         }
 
+        pub fn submissionWorkPending(self: *const Self) bool {
+            return self.adapter.acquire_waits.submission_pending or self.commit_timer_retry == .submission;
+        }
+
         pub fn focusedToplevel(self: *const Self) ?ToplevelId {
             return self.desktop.focusedToplevel();
         }
@@ -2262,6 +2268,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 _ = try self.root.ring.poll_remove(token.encode(), cancel.encode());
                 self.icc_poll_canceling = true;
             };
+            try self.adapter.prepareAcquireWaits(true);
             try self.syncDesktopTimer();
             try self.syncIdleTimer();
             try self.syncCommitTimer();
@@ -2280,6 +2287,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 (self.input == null or self.input.?.drainComplete()) and
                 (self.hotplug == null or self.hotplug.?.drainComplete()) and
                 self.session.drainComplete() and self.timers.idle() and
+                self.adapter.acquire_waits.drained() and
                 self.icc_poll == null and !self.icc_poll_canceling and
                 self.security_context_adapter.drainComplete();
         }
@@ -2938,9 +2946,14 @@ pub fn Coordinator(comptime protocol: type) type {
             ouro_outcomes: []const loop_api.OuroCompletion,
         ) !void {
             var hotplug_completed = false;
+            var acquire_completed = false;
             for (ouro_outcomes) |outcome| switch (outcome.token.kind) {
                 .icc_worker => try self.completeIcc(outcome),
                 .security_accept, .security_close, .security_cancel => try self.completeSecurity(outcome),
+                .renderer_fence => {
+                    try self.adapter.completeAcquireWait(outcome);
+                    acquire_completed = true;
+                },
                 .copy => {
                     try self.adapter.completeShmCopy(outcome);
                     try self.applyReady();
@@ -3002,6 +3015,9 @@ pub fn Coordinator(comptime protocol: type) type {
                     try self.renderFrame(request_value.frame);
                 }
             }
+            // Loop has already retired timers in this batch. Consume their
+            // outcomes before applying commits can change/cancel a deadline.
+            if (acquire_completed and !self.stopping) try self.applyReady();
             if (hotplug_completed) try self.processHotplug();
             try self.processSession();
             try self.processOutput();
@@ -3280,6 +3296,10 @@ pub fn Coordinator(comptime protocol: type) type {
             // converged. In particular, a surface commit and a following
             // capture request from one client write must share the same frame.
             try self.armTimer();
+            // Applying/discarding updates above can release the last commit
+            // owner. Queue cancellation before the loop can sleep again.
+            if (self.commit_timer_retry != .none) try self.syncCommitTimer();
+            try self.adapter.prepareAcquireWaits(self.stopping);
         }
 
         fn validateSurfaceCommit(context: *anyopaque, id: Adapter.SurfaceId) !void {
@@ -5782,13 +5802,22 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn syncCommitTimer(self: *Self) !void {
+            self.commit_timer_retry = .none;
+            self.updateCommitTimer() catch |err| switch (err) {
+                error.Exhausted => self.commit_timer_retry = .resources,
+                error.SubmissionQueueFull => self.commit_timer_retry = .submission,
+                else => return err,
+            };
+        }
+
+        fn updateCommitTimer(self: *Self) !void {
             const deadline = if (self.stopping or self.adapter.pendingContentUpdates() == 0)
                 null
             else
                 try self.adapter.nextCommitDeadline(try monotonicNs());
             if (self.commit_timer) |handle| {
                 if (!self.commit_timer_canceling and
-                    !std.meta.eql(self.commit_timer_deadline, deadline))
+                    commitTimerNeedsCancel(self.commit_timer_deadline.?, deadline))
                 {
                     try self.timers.cancel(&self.router, &self.root.ring, handle);
                     self.commit_timer_canceling = true;
@@ -13305,6 +13334,25 @@ pub fn Coordinator(comptime protocol: type) type {
             self.stats.imported_disposals += 1;
         }
     };
+}
+
+fn commitTimerNeedsCancel(armed: surface_state.CommitTimestamp, next: ?surface_state.CommitTimestamp) bool {
+    const deadline = next orelse return true;
+    // Fence retries are computed as now + 1 ms. Keep an earlier wakeup rather
+    // than postponing it (and generating cancel completions) on every turn.
+    // An early wakeup is safe: applyReady rechecks fences and commit timestamps.
+    return deadline.sec < armed.sec or
+        (deadline.sec == armed.sec and deadline.nsec < armed.nsec);
+}
+
+test "physical: commit timer retains earlier fence retry deadlines" {
+    const armed: surface_state.CommitTimestamp = .{ .sec = 7, .nsec = 999_000_000 };
+    try std.testing.expect(!commitTimerNeedsCancel(armed, armed));
+    try std.testing.expect(!commitTimerNeedsCancel(armed, .{ .sec = 7, .nsec = 999_500_000 }));
+    try std.testing.expect(!commitTimerNeedsCancel(armed, .{ .sec = 8, .nsec = 0 }));
+    try std.testing.expect(commitTimerNeedsCancel(armed, .{ .sec = 7, .nsec = 998_000_000 }));
+    try std.testing.expect(commitTimerNeedsCancel(armed, .{ .sec = 6, .nsec = 999_999_999 }));
+    try std.testing.expect(commitTimerNeedsCancel(armed, null));
 }
 
 fn longestCursorShapeName() usize {

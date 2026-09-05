@@ -21,6 +21,7 @@ pub const Error = std.mem.Allocator.Error || error{
     InvalidTimeline,
     CreateFailed,
     TransferFailed,
+    Unavailable,
     ExportFailed,
     ImportFailed,
     SignalFailed,
@@ -140,7 +141,8 @@ pub const Point = struct {
     }
 
     /// Exports this timeline point as a CLOEXEC sync_file. The caller owns the
-    /// returned descriptor.
+    /// returned descriptor. Unavailable means the point has not been submitted
+    /// yet; unlike a syncobj eventfd, a failed export retains no registration.
     pub fn exportSyncFile(point: Point) Error!linux.fd_t {
         const device = point.timeline.device;
         const binary = try device.createBinary();
@@ -152,7 +154,10 @@ pub const Point = struct {
             point.timeline.handle,
             point.value,
             0,
-        ) != 0) return error.TransferFailed;
+        ) != 0) {
+            if (std.c.errno(@as(c_int, -1)) == .INVAL) return error.Unavailable;
+            return error.TransferFailed;
+        }
         var sync_file: c_int = -1;
         if (c.drmSyncobjExportSyncFile(device.fd, binary, &sync_file) != 0)
             return error.ExportFailed;
@@ -195,12 +200,22 @@ pub const Point = struct {
 pub const Commit = struct {
     acquire: Point,
     release: Point,
+    acquire_wait: ?*AcquireWait = null,
 
     pub fn deinit(commit: *Commit) void {
+        if (commit.acquire_wait) |wait| wait.owned = false;
         commit.acquire.deinit();
         commit.release.deinit();
         commit.* = undefined;
     }
+};
+
+/// Shared lifetime between a committed point and its asynchronous poll owner.
+/// The owner may reclaim this only after the commit releases it and I/O drains.
+pub const AcquireWait = struct {
+    owned: bool = true,
+    signaled: bool = false,
+    registered: bool = false,
 };
 
 pub fn pointValue(high: u32, low: u32) u64 {
