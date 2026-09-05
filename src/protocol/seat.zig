@@ -204,9 +204,14 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         const Id = PointerId;
         const OutboundSlot = struct {
             active: bool = false,
-            sequence: u64 = 0,
+            previous: ?*OutboundSlot = null,
+            next: ?*OutboundSlot = null,
             client: ClientId = undefined,
             value: Outbound = undefined,
+        };
+        const OutboundQueue = struct {
+            head: ?*OutboundSlot = null,
+            tail: ?*OutboundSlot = null,
         };
 
         pub const GrabbedKeyboardKey = struct {
@@ -231,7 +236,6 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         repeat_rate: i32,
         repeat_delay: i32,
         next_serial: u32,
-        next_sequence: u64 = 1,
         seats: slot_pool.Pool(SeatSlot),
         pointers: slot_pool.Pool(PointerSlot),
         keyboards: slot_pool.Pool(KeyboardSlot),
@@ -240,6 +244,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         devices: []DeviceSlot,
         outbound: []OutboundSlot,
         outbound_len: usize = 0,
+        outbound_free: ?*OutboundSlot,
+        outbound_clients: std.AutoHashMapUnmanaged(u64, OutboundQueue),
         events: []Event,
         event_head: usize = 0,
         event_len: usize = 0,
@@ -281,6 +287,11 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             errdefer allocator.free(devices);
             const outbound = try allocator.alloc(OutboundSlot, config.outbound_capacity);
             errdefer allocator.free(outbound);
+            var outbound_clients: std.AutoHashMapUnmanaged(u64, OutboundQueue) = .empty;
+            errdefer outbound_clients.deinit(allocator);
+            // Every pending client owns at least one slot. Reserve once so
+            // input admission never allocates or fails after capacity checks.
+            try outbound_clients.ensureTotalCapacity(allocator, @intCast(config.outbound_capacity));
             const event_slots = try std.math.add(usize, config.event_capacity, 1);
             const events = try allocator.alloc(Event, event_slots);
             errdefer allocator.free(events);
@@ -290,6 +301,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             errdefer _ = linux.close(keymap.fd);
             @memset(devices, .{});
             @memset(outbound, .{});
+            for (outbound, 0..) |*slot, index|
+                slot.next = if (index + 1 < outbound.len) &outbound[index + 1] else null;
             @memset(contacts, .{});
             return .{
                 .allocator = allocator,
@@ -308,6 +321,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .contacts = contacts,
                 .devices = devices,
                 .outbound = outbound,
+                .outbound_free = &outbound[0],
+                .outbound_clients = outbound_clients,
                 .events = events,
             };
         }
@@ -316,6 +331,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             _ = linux.close(adapter.keymap_fd);
             adapter.allocator.free(adapter.name);
             adapter.allocator.free(adapter.events);
+            adapter.outbound_clients.deinit(adapter.allocator);
             adapter.allocator.free(adapter.outbound);
             adapter.allocator.free(adapter.devices);
             adapter.allocator.free(adapter.contacts);
@@ -1378,21 +1394,19 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             return adapter.outbound_len;
         }
 
-        pub fn pendingOutboundOn(adapter: *Self, server_objects: anytype) bool {
-            if (adapter.outbound_len == 0) return false;
-            return adapter.oldestOutboundFor(server_objects) != null;
+        pub fn pendingOutboundOn(adapter: *const Self, peer: wayring.io_uring.Peer) bool {
+            return adapter.outbound_clients.contains(@bitCast(clientId(peer)));
         }
 
-        pub fn flushOn(adapter: *Self, server_objects: anytype, queue: *wayring.tx.Queue) !usize {
+        pub fn flushOn(adapter: *Self, peer: wayring.io_uring.Peer, server_objects: anytype, queue: *wayring.tx.Queue) !usize {
             var completed: usize = 0;
-            if (adapter.outbound_len == 0) return completed;
-            while (adapter.oldestOutboundFor(server_objects)) |slot| {
+            while (adapter.outbound_clients.get(@bitCast(clientId(peer)))) |pending| {
+                const slot = pending.head.?;
                 const done = adapter.emitOutbound(server_objects, queue, slot.value) catch |err| switch (err) {
                     error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return completed,
                     else => return err,
                 };
-                slot.active = false;
-                adapter.outbound_len -= 1;
+                adapter.removeOutbound(slot);
                 if (done) completed += 1;
             }
             return completed;
@@ -1967,8 +1981,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             for (adapter.outbound) |*slot| {
                 if (slot.active and outboundTargets(slot.value, id)) {
                     adapter.dropPendingTouchEvent(slot.value);
-                    slot.active = false;
-                    adapter.outbound_len -= 1;
+                    adapter.removeOutbound(slot);
                 }
             }
         }
@@ -2145,50 +2158,36 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         }
 
         fn enqueue(adapter: *Self, client: ClientId, value: Outbound) !void {
-            for (adapter.outbound) |*slot| if (!slot.active) {
-                slot.* = .{ .active = true, .sequence = adapter.next_sequence, .client = client, .value = value };
-                adapter.next_sequence +%= 1;
-                adapter.outbound_len += 1;
-                return;
-            };
-            return error.Exhausted;
+            const slot = adapter.outbound_free orelse return error.Exhausted;
+            adapter.outbound_free = slot.next;
+            const entry = adapter.outbound_clients.getOrPutAssumeCapacity(@bitCast(client));
+            if (!entry.found_existing) entry.value_ptr.* = .{};
+            const pending = entry.value_ptr;
+            slot.* = .{ .active = true, .previous = pending.tail, .client = client, .value = value };
+            if (pending.tail) |tail| tail.next = slot else pending.head = slot;
+            pending.tail = slot;
+            adapter.outbound_len += 1;
+        }
+
+        fn removeOutbound(adapter: *Self, slot: *OutboundSlot) void {
+            std.debug.assert(slot.active);
+            const key: u64 = @bitCast(slot.client);
+            const pending = adapter.outbound_clients.getPtr(key).?;
+            if (slot.previous) |previous| previous.next = slot.next else pending.head = slot.next;
+            if (slot.next) |next| next.previous = slot.previous else pending.tail = slot.previous;
+            if (pending.head == null) {
+                const removed = adapter.outbound_clients.remove(key);
+                std.debug.assert(removed);
+            }
+            slot.active = false;
+            slot.previous = null;
+            slot.next = adapter.outbound_free;
+            adapter.outbound_free = slot;
+            adapter.outbound_len -= 1;
         }
 
         fn ensureOutbound(adapter: *const Self, needed: usize) !void {
             if (adapter.outbound.len - adapter.outbound_len < needed) return error.Exhausted;
-        }
-
-        fn oldestOutboundFor(adapter: *Self, server_objects: anytype) ?*OutboundSlot {
-            var result: ?*OutboundSlot = null;
-            for (adapter.outbound) |*slot| {
-                if (!slot.active) continue;
-                if (!adapter.clientPresent(server_objects, slot.client)) continue;
-                if (result == null or slot.sequence < result.?.sequence) result = slot;
-            }
-            return result;
-        }
-
-        fn clientPresent(adapter: *Self, server_objects: anytype, client: ClientId) bool {
-            for (adapter.seats.entries.items) |seat| if (seat.header.active and sameClient(clientId(seat.peer), client)) {
-                const object = server_objects.namespace.resolve(seat.resource) orelse continue;
-                if (object.interface == &Seat.info and object.context == @as(?*anyopaque, @ptrCast(seat)))
-                    return true;
-            };
-            for (adapter.pointers.entries.items) |pointer| if (pointer.header.active and sameClient(pointer.client, client)) {
-                const object = server_objects.namespace.resolve(pointer.resource) orelse continue;
-                if (object.interface == &Pointer.info and object.context == @as(?*anyopaque, @ptrCast(pointer)))
-                    return true;
-            };
-            for (adapter.keyboards.entries.items) |keyboard| if (keyboard.header.active and sameClient(keyboard.client, client)) {
-                const object = server_objects.namespace.resolve(keyboard.resource) orelse continue;
-                if (object.interface == &Keyboard.info and object.context == @as(?*anyopaque, @ptrCast(keyboard)))
-                    return true;
-            };
-            for (adapter.touches.entries.items) |touch| if (touch.header.active and sameClient(touch.client, client)) {
-                const object = server_objects.namespace.resolve(touch.resource) orelse continue;
-                if (object.interface == &Touch.info and object.context == @as(?*anyopaque, @ptrCast(touch))) return true;
-            };
-            return false;
         }
 
         fn surfaceObject(adapter: *Self, server_objects: anytype, target: FocusTarget) !objects.Handle {
@@ -2353,14 +2352,12 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             for (adapter.outbound) |*slot| if (slot.active) switch (slot.value) {
                 .seat_capabilities => |value| {
                     if (value.seat.index == index and value.seat.generation == generation) {
-                        slot.active = false;
-                        adapter.outbound_len -= 1;
+                        adapter.removeOutbound(slot);
                     }
                 },
                 .seat_name => |value| {
                     if (value.index == index and value.generation == generation) {
-                        slot.active = false;
-                        adapter.outbound_len -= 1;
+                        adapter.removeOutbound(slot);
                     }
                 },
                 else => {},
@@ -2396,8 +2393,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 };
                 if (id == null) continue;
                 if (id.?.index == index and id.?.generation == generation) {
-                    slot.active = false;
-                    adapter.outbound_len -= 1;
+                    adapter.removeOutbound(slot);
                 }
             };
         }
@@ -2597,8 +2593,42 @@ fn testAdapterWithCapacity(core: *FakeCore, outbound_capacity: usize, event_capa
 }
 
 fn clearTestOutbound(adapter: *TestAdapter) void {
-    for (adapter.outbound) |*slot| slot.active = false;
-    adapter.outbound_len = 0;
+    for (adapter.outbound) |*slot| if (slot.active) adapter.removeOutbound(slot);
+}
+
+test "seat: per-client FIFO survives removal, exhaustion and peer generation reuse" {
+    var core: FakeCore = .{};
+    var adapter = try testAdapterWithCapacity(&core, 4, 8);
+    defer adapter.deinit();
+    const a: wayring.io_uring.Peer = .{ .slot = 0, .generation = 1 };
+    const b: wayring.io_uring.Peer = .{ .slot = 1, .generation = 1 };
+    const replacement: wayring.io_uring.Peer = .{ .slot = 0, .generation = 2 };
+    const value: TestAdapter.Outbound = .{ .seat_name = .{ .index = 0, .generation = 1 } };
+    try adapter.enqueue(clientId(a), value);
+    const first = adapter.outbound_clients.get(@bitCast(clientId(a))).?.head.?;
+    try adapter.enqueue(clientId(b), value);
+    try adapter.enqueue(clientId(a), value);
+    const middle = adapter.outbound_clients.get(@bitCast(clientId(a))).?.tail.?;
+    try adapter.enqueue(clientId(a), value);
+    const last = adapter.outbound_clients.get(@bitCast(clientId(a))).?.tail.?;
+    try std.testing.expectError(error.Exhausted, adapter.enqueue(clientId(replacement), value));
+    try std.testing.expect(!adapter.pendingOutboundOn(replacement));
+    adapter.removeOutbound(middle);
+    try std.testing.expect(first.next.? == last);
+    try std.testing.expect(last.previous.? == first);
+    try adapter.enqueue(clientId(replacement), value);
+    try std.testing.expect(adapter.pendingOutboundOn(replacement));
+    adapter.removeOutbound(first);
+    try std.testing.expect(adapter.outbound_clients.get(@bitCast(clientId(a))).?.head.? == last);
+    adapter.removeOutbound(last);
+    try std.testing.expect(!adapter.pendingOutboundOn(a));
+    try std.testing.expect(adapter.pendingOutboundOn(b));
+    try std.testing.expect(adapter.pendingOutboundOn(replacement));
+    clearTestOutbound(&adapter);
+    try std.testing.expectEqual(@as(usize, 0), adapter.pendingOutbound());
+    try std.testing.expectEqual(@as(u32, 0), adapter.outbound_clients.count());
+    for (0..4) |_| try adapter.enqueue(clientId(a), value);
+    try std.testing.expectError(error.Exhausted, adapter.enqueue(clientId(b), value));
 }
 
 fn addTestTouchResource(adapter: *TestAdapter, client: TestAdapter.ClientId) !*TestAdapter.TouchSlot {
@@ -3381,7 +3411,7 @@ test "seat: version one resource does not receive seat name" {
     var output = wayring.tx.Queue.init(&blocks, 64, &descriptors, 0);
     defer output.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), try adapter.flushOn(&server_objects, &output));
+    try std.testing.expectEqual(@as(usize, 1), try adapter.flushOn(seat.peer, &server_objects, &output));
     try std.testing.expectEqual(@as(usize, 0), output.queuedBytes());
     try std.testing.expectEqual(@as(usize, 0), adapter.pendingOutbound());
 }
@@ -3438,12 +3468,12 @@ test "seat: keymap FD delivery retains ownership across TX backpressure" {
     defer descriptors.deinit(std.testing.allocator);
     var blocked = wayring.tx.Queue.init(&blocks, 64, &descriptors, 0);
     defer blocked.deinit();
-    try std.testing.expectEqual(@as(usize, 0), try adapter.flushOn(&server_objects, &blocked));
+    try std.testing.expectEqual(@as(usize, 0), try adapter.flushOn(seat.peer, &server_objects, &blocked));
     try std.testing.expectEqual(@as(usize, 1), adapter.pendingOutbound());
 
     var accepting = wayring.tx.Queue.init(&blocks, 64, &descriptors, 1);
     defer accepting.deinit();
-    try std.testing.expectEqual(@as(usize, 1), try adapter.flushOn(&server_objects, &accepting));
+    try std.testing.expectEqual(@as(usize, 1), try adapter.flushOn(seat.peer, &server_objects, &accepting));
     try std.testing.expectEqual(@as(usize, 0), adapter.pendingOutbound());
     try std.testing.expectEqual(@as(usize, 1), accepting.queuedDescriptors());
     var descriptor_scratch: [1]linux.fd_t = undefined;
@@ -3929,12 +3959,12 @@ test "seat: surface removal retires ordinary commands but not terminal releases"
     defer descriptors.deinit(std.testing.allocator);
     var output = wayring.tx.Queue.init(&blocks, 512, &descriptors, 0);
     defer output.deinit();
-    try std.testing.expectEqual(@as(usize, 0), try adapter.flushOn(&server_objects, &output));
+    try std.testing.expectEqual(@as(usize, 0), try adapter.flushOn(peer, &server_objects, &output));
     try std.testing.expectEqual(@as(usize, 0), output.queuedBytes());
 
     _ = adapter.popEvent() orelse return error.MissingCancellation;
     try adapter.cancelPointerGrab();
-    try std.testing.expectEqual(@as(usize, 2), try adapter.flushOn(&server_objects, &output));
+    try std.testing.expectEqual(@as(usize, 2), try adapter.flushOn(peer, &server_objects, &output));
     var descriptor_scratch: [1]linux.fd_t = undefined;
     var control: [64]u8 align(@alignOf(linux.cmsghdr)) = undefined;
     const snapshot = try output.snapshot(&descriptor_scratch, &control);
@@ -3990,7 +4020,7 @@ test "seat: keyboard enter retains admission-time pressed keys through backpress
     defer descriptors.deinit(std.testing.allocator);
     var blocked = wayring.tx.Queue.init(&blocks, 8, &descriptors, 0);
     defer blocked.deinit();
-    try std.testing.expectEqual(@as(usize, 0), try adapter.flushOn(&server_objects, &blocked));
+    try std.testing.expectEqual(@as(usize, 0), try adapter.flushOn(peer, &server_objects, &blocked));
 
     try adapter.consume(.{ .keyboard_key = .{
         .device = device,
@@ -4000,7 +4030,7 @@ test "seat: keyboard enter retains admission-time pressed keys through backpress
     } });
     var output = wayring.tx.Queue.init(&blocks, 512, &descriptors, 0);
     defer output.deinit();
-    try std.testing.expectEqual(@as(usize, 3), try adapter.flushOn(&server_objects, &output));
+    try std.testing.expectEqual(@as(usize, 3), try adapter.flushOn(peer, &server_objects, &output));
     var descriptor_scratch: [1]linux.fd_t = undefined;
     var control: [64]u8 align(@alignOf(linux.cmsghdr)) = undefined;
     const snapshot = try output.snapshot(&descriptor_scratch, &control);

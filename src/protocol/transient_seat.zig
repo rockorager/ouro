@@ -323,9 +323,9 @@ pub fn Adapter(comptime protocol: type, comptime SeatAdapter: type) type {
             return false;
         }
 
-        pub fn pendingSeatOutboundOn(self: *Self, server_objects: anytype) bool {
+        pub fn pendingSeatOutboundOn(self: *Self, peer: wayring.io_uring.Peer) bool {
             for (self.seats) |*seat| {
-                if (seat.initialized and seat.adapter.pendingOutboundOn(server_objects)) return true;
+                if (seat.initialized and seat.adapter.pendingOutboundOn(peer)) return true;
             }
             return false;
         }
@@ -345,10 +345,10 @@ pub fn Adapter(comptime protocol: type, comptime SeatAdapter: type) type {
             return count;
         }
 
-        pub fn flushSeatsOn(self: *Self, server_objects: anytype, queue: *wayring.tx.Queue) !usize {
+        pub fn flushSeatsOn(self: *Self, peer: wayring.io_uring.Peer, server_objects: anytype, queue: *wayring.tx.Queue) !usize {
             var count: usize = 0;
             for (self.seats) |*seat| {
-                if (seat.initialized) count += try seat.adapter.flushOn(server_objects, queue);
+                if (seat.initialized) count += try seat.adapter.flushOn(peer, server_objects, queue);
             }
             return count;
         }

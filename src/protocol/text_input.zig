@@ -60,9 +60,11 @@ pub fn Adapter(comptime protocol: type) type {
         const Device = struct { header: slot_pool.Header = .{}, focused: bool = false, resource: objects.Handle = .{ .id = 0, .generation = 0 }, peer: wayring.io_uring.Peer = undefined, seat: u32 = 0, version: u32 = 1, pending: State = .{}, current: State = .{}, committed_rectangle: ?Rectangle = null, serial: u32 = 0, text: []u8 = &.{}, pending_text: []u8 = &.{} };
         const EventSlot = struct { event: Event = undefined, text: []u8 = &.{} };
         const OutKind = enum { enter, leave, preedit, preedit_hint, commit, delete, action, language, done };
+        const OutQueue = struct { head: u32 = none, tail: u32 = none };
         const Out = struct {
             active: bool = false,
-            sequence: u64 = 0,
+            next: u32 = none,
+            prev: u32 = none,
             peer: wayring.io_uring.Peer = undefined,
             device: DeviceId = undefined,
             kind: OutKind = .enter,
@@ -84,6 +86,8 @@ pub fn Adapter(comptime protocol: type) type {
         devices: slot_pool.Pool(Device),
         events: []EventSlot,
         outbound: []Out,
+        out_queues: std.AutoHashMapUnmanaged(wayring.io_uring.Peer, OutQueue),
+        out_free: u32 = 0,
         all_event_text: []u8,
         all_out_text: []u8,
         language: []u8,
@@ -94,7 +98,6 @@ pub fn Adapter(comptime protocol: type) type {
         event_head: usize = 0,
         event_len: usize = 0,
         out_len: usize = 0,
-        next_sequence: u64 = 1,
         focus: ?Focus = null,
         runtime: ?*Runtime = null,
         global: ?objects.Handle = null,
@@ -109,6 +112,10 @@ pub fn Adapter(comptime protocol: type) type {
             errdefer a.free(es);
             const os = try a.alloc(Out, c.outbound_capacity);
             errdefer a.free(os);
+            // Every nonempty peer queue owns at least one outbound slot.
+            var out_queues: std.AutoHashMapUnmanaged(wayring.io_uring.Peer, OutQueue) = .empty;
+            try out_queues.ensureTotalCapacity(a, @intCast(c.outbound_capacity));
+            errdefer out_queues.deinit(a);
             const event_text_bytes = try std.math.mul(usize, c.event_capacity, c.surrounding_bytes);
             const outbound_text_bytes = try std.math.mul(usize, c.outbound_capacity, c.edit_string_bytes);
             const et = try a.alloc(u8, event_text_bytes);
@@ -120,11 +127,13 @@ pub fn Adapter(comptime protocol: type) type {
             for (es, 0..) |*s, i| s.text = et[i * c.surrounding_bytes ..][0..c.surrounding_bytes];
             for (os, 0..) |*s, i| {
                 s.* = .{};
+                s.next = if (i + 1 < os.len) @intCast(i + 1) else none;
                 s.storage = ot[i * c.edit_string_bytes ..][0..c.edit_string_bytes];
             }
-            return .{ .allocator = a, .validator = v, .managers = ms, .devices = ds, .events = es, .outbound = os, .all_event_text = et, .all_out_text = ot, .language = language, .surrounding_bytes = c.surrounding_bytes, .edit_bytes = c.edit_string_bytes };
+            return .{ .allocator = a, .validator = v, .managers = ms, .devices = ds, .events = es, .outbound = os, .out_queues = out_queues, .all_event_text = et, .all_out_text = ot, .language = language, .surrounding_bytes = c.surrounding_bytes, .edit_bytes = c.edit_string_bytes };
         }
         pub fn deinit(s: *Self) void {
+            s.out_queues.deinit(s.allocator);
             s.allocator.free(s.all_out_text);
             s.allocator.free(s.all_event_text);
             s.allocator.free(s.language);
@@ -476,20 +485,16 @@ pub fn Adapter(comptime protocol: type) type {
         };
         fn enqueue(s: *Self, z: *Device, k: OutKind, surface: u32, payload: ?OutPayload) !void {
             if (s.out_len == s.outbound.len) return error.Exhausted;
-            if (s.next_sequence == std.math.maxInt(u64)) {
-                if (s.out_len != 0) return error.SequenceExhausted;
-                s.next_sequence = 1;
-            }
-            var o: *Out = undefined;
-            for (s.outbound) |*x| {
-                if (!x.active) {
-                    o = x;
-                    break;
-                }
-            }
+            const entry = s.out_queues.getOrPutAssumeCapacity(z.peer);
+            if (!entry.found_existing) entry.value_ptr.* = .{};
+            const queue = entry.value_ptr;
+            const index = s.out_free;
+            const o = &s.outbound[index];
+            s.out_free = o.next;
             const storage = o.storage;
-            o.* = .{ .active = true, .sequence = s.next_sequence, .peer = z.peer, .device = s.id(z), .kind = k, .surface = surface, .storage = storage };
-            s.next_sequence +%= 1;
+            o.* = .{ .active = true, .prev = queue.tail, .peer = z.peer, .device = s.id(z), .kind = k, .surface = surface, .storage = storage };
+            if (queue.tail != none) s.outbound[queue.tail].next = index else queue.head = index;
+            queue.tail = index;
             if (payload) |value| {
                 if (value.text) |text| {
                     @memcpy(o.storage[0..text.len], text);
@@ -551,8 +556,7 @@ pub fn Adapter(comptime protocol: type) type {
             return s.out_len;
         }
         pub fn pendingOutboundOn(s: *const Self, p: wayring.io_uring.Peer) bool {
-            for (s.outbound) |o| if (o.active and same(o.peer, p)) return true;
-            return false;
+            return s.out_queues.contains(p);
         }
         /// A destroyed wl_surface cannot be referenced by a queued enter or
         /// leave event. Drop those stale transitions before the coordinator's
@@ -637,22 +641,28 @@ pub fn Adapter(comptime protocol: type) type {
             return if (z.header.generation == device_id.generation) z else null;
         }
         fn oldest(s: *Self, p: wayring.io_uring.Peer) ?*Out {
-            var result: ?*Out = null;
-            for (s.outbound) |*o| {
-                if (o.active and same(o.peer, p) and (result == null or o.sequence < result.?.sequence)) result = o;
-            }
-            return result;
+            const queue = s.out_queues.get(p) orelse return null;
+            return &s.outbound[queue.head];
         }
         fn availableOutbound(s: *const Self) usize {
             return s.outbound.len - s.out_len;
         }
         fn canEnqueue(s: *const Self, count: usize) bool {
-            return s.availableOutbound() >= count and
-                (s.next_sequence != std.math.maxInt(u64) or s.out_len == 0);
+            return s.availableOutbound() >= count;
         }
         fn dropOut(s: *Self, o: *Out) void {
             if (o.active) {
+                const queue = s.out_queues.getPtr(o.peer).?;
+                if (o.prev != none) s.outbound[o.prev].next = o.next else queue.head = o.next;
+                if (o.next != none) s.outbound[o.next].prev = o.prev else queue.tail = o.prev;
+                if (queue.head == none) {
+                    const removed = s.out_queues.remove(o.peer);
+                    std.debug.assert(removed);
+                }
                 o.active = false;
+                o.next = s.out_free;
+                o.prev = none;
+                s.out_free = @intCast((@intFromPtr(o) - @intFromPtr(s.outbound.ptr)) / @sizeOf(Out));
                 s.out_len -= 1;
             }
         }
@@ -898,6 +908,120 @@ test "text input edit transaction retains event order and commit serial" {
         if (kind == .done) try std.testing.expectEqual(@as(u32, 7), out.serial);
         adapter.dropOut(out);
     }
+}
+
+test "text input peer FIFOs retain order through removal and slot reuse" {
+    const A = Adapter(@import("core_protocol"));
+    const validator: SeatValidator = .{ .validateFn = struct {
+        fn validate(_: ?*anyopaque, _: wayring.io_uring.Peer, _: u32) bool {
+            return true;
+        }
+    }.validate };
+    var adapter = try A.init(std.testing.allocator, validator, .{ .outbound_capacity = 6 });
+    defer adapter.deinit();
+    const first = try adapter.acquire();
+    first.peer = .{ .slot = 1, .generation = 1 };
+    const second = try adapter.acquire();
+    second.peer = first.peer;
+    const other = try adapter.acquire();
+    other.peer = .{ .slot = 1, .generation = 2 };
+
+    try adapter.enqueue(first, .done, 0, .{ .serial = 1 });
+    try adapter.enqueue(other, .done, 0, .{ .serial = 10 });
+    try adapter.enqueue(second, .enter, 9, null);
+    try adapter.enqueue(first, .done, 0, .{ .serial = 2 });
+    try adapter.enqueue(second, .done, 0, .{ .serial = 3 });
+    try adapter.enqueue(first, .leave, 9, null);
+    try std.testing.expectError(error.Exhausted, adapter.enqueue(other, .done, 0, null));
+
+    // Unlink a middle and tail transition without disturbing either FIFO.
+    adapter.surfaceRemoved(.{ .peer = first.peer, .surface = 9 });
+    try adapter.enqueue(first, .done, 0, .{ .serial = 4 });
+    adapter.release(second);
+    try adapter.enqueue(other, .done, 0, .{ .serial = 11 });
+    for ([_]u32{ 1, 2, 4 }) |serial| {
+        const out = adapter.oldest(first.peer).?;
+        try std.testing.expectEqual(serial, out.serial);
+        adapter.dropOut(out);
+    }
+    try std.testing.expect(!adapter.pendingOutboundOn(first.peer));
+    try std.testing.expect(adapter.pendingOutboundOn(other.peer));
+    for ([_]u32{ 10, 11 }) |serial| {
+        const out = adapter.oldest(other.peer).?;
+        try std.testing.expectEqual(serial, out.serial);
+        adapter.dropOut(out);
+    }
+    // Repeatedly recycle map entries and all slots, including peer generations.
+    for (3..100) |generation| {
+        first.peer.generation = @intCast(generation);
+        for (0..6) |serial| try adapter.enqueue(first, .done, 0, .{ .serial = @intCast(serial) });
+        for (0..6) |serial| {
+            const out = adapter.oldest(first.peer).?;
+            try std.testing.expectEqual(@as(u32, @intCast(serial)), out.serial);
+            adapter.dropOut(out);
+        }
+        try std.testing.expectEqual(@as(usize, 0), adapter.pendingOutbound());
+        try std.testing.expectEqual(@as(u32, 0), adapter.out_queues.count());
+    }
+    const removed_peer = first.peer;
+    try adapter.enqueue(first, .done, 0, null);
+    try adapter.enqueue(other, .done, 0, null);
+    adapter.disconnected(removed_peer);
+    try std.testing.expect(!adapter.pendingOutboundOn(removed_peer));
+    try std.testing.expect(adapter.pendingOutboundOn(other.peer));
+    try std.testing.expectEqual(@as(usize, 1), adapter.pendingOutbound());
+}
+
+test "text input peer FIFO resumes at unsent head after backpressure" {
+    const protocol = @import("core_protocol");
+    const A = Adapter(protocol);
+    const validator: SeatValidator = .{ .validateFn = struct {
+        fn validate(_: ?*anyopaque, _: wayring.io_uring.Peer, _: u32) bool {
+            return true;
+        }
+    }.validate };
+    var adapter = try A.init(std.testing.allocator, validator, .{ .outbound_capacity = 4 });
+    defer adapter.deinit();
+    var server_objects = try objects.ServerObjects.init(std.testing.allocator, 8, 2, &protocol.wl_display.info, null);
+    defer server_objects.deinit(std.testing.allocator);
+    const first = try adapter.acquire();
+    first.peer = .{ .slot = 1, .generation = 1 };
+    first.resource = try server_objects.insertClient(4, &protocol.zwp_text_input_v3.info, 1, first);
+    const second = try adapter.acquire();
+    second.peer = first.peer;
+    second.resource = try server_objects.insertClient(5, &protocol.zwp_text_input_v3.info, 1, second);
+    const other = try adapter.acquire();
+    other.peer = .{ .slot = 2, .generation = 1 };
+    other.resource = first.resource;
+    try adapter.enqueue(first, .done, 0, .{ .serial = 1 });
+    try adapter.enqueue(other, .done, 0, .{ .serial = 9 });
+    try adapter.enqueue(second, .done, 0, .{ .serial = 2 });
+    try adapter.enqueue(first, .done, 0, .{ .serial = 3 });
+
+    var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 64, 2);
+    defer blocks.deinit(std.testing.allocator);
+    var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 1);
+    defer descriptors.deinit(std.testing.allocator);
+    for (1..4) |serial| {
+        // Exactly one done event fits, forcing a partial flush on each pass.
+        var queue = wayring.tx.Queue.init(&blocks, 12, &descriptors, 0);
+        defer queue.deinit();
+        try std.testing.expectEqual(@as(usize, 1), try adapter.flushOn(first.peer, &server_objects, &queue));
+        try std.testing.expectEqual(@as(usize, 0), try adapter.flushOn(first.peer, &server_objects, &queue));
+        var descriptor_scratch: [1]std.os.linux.fd_t = undefined;
+        var control: [64]u8 align(@alignOf(std.os.linux.cmsghdr)) = undefined;
+        const snapshot = try queue.snapshot(&descriptor_scratch, &control);
+        const message = (try wayring.wire.Message.decode(snapshot.first)).?;
+        try std.testing.expectEqual(@as(u32, if (serial == 2) 5 else 4), message.header.object_id);
+        const event = try protocol.zwp_text_input_v3.decodeEvent(message, &queue.descriptors);
+        try std.testing.expectEqual(@as(u32, @intCast(serial)), event.done.serial);
+        try std.testing.expectEqual(serial != 3, adapter.pendingOutboundOn(first.peer));
+        try std.testing.expect(adapter.pendingOutboundOn(other.peer));
+    }
+    var queue = wayring.tx.Queue.init(&blocks, 12, &descriptors, 0);
+    defer queue.deinit();
+    try std.testing.expectEqual(@as(usize, 1), try adapter.flushOn(other.peer, &server_objects, &queue));
+    try std.testing.expectEqual(@as(usize, 0), adapter.pendingOutbound());
 }
 
 test "text input disconnect compacts copied event text" {

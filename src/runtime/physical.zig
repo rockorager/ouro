@@ -747,6 +747,9 @@ pub fn Coordinator(comptime protocol: type) type {
             retains_source: bool = false,
             floating: bool = false,
             retired_source: ?RetiredSource = null,
+            retry_queued: bool = false,
+            retry_previous: ?usize = null,
+            retry_next: ?usize = null,
         };
 
         pub const Platforms = struct {
@@ -889,6 +892,8 @@ pub fn Coordinator(comptime protocol: type) type {
             configures: usize = 0,
             transaction_timeouts: usize = 0,
             interaction_commands: usize = 0,
+            idle_reconciliations: usize = 0,
+            retained_retry_visits: usize = 0,
         };
 
         allocator: std.mem.Allocator,
@@ -1044,6 +1049,7 @@ pub fn Coordinator(comptime protocol: type) type {
         pending_surface_len: usize = 0,
         app_layers: []Layer,
         app_layer_count: usize,
+        layer_retry_head: ?usize = null,
         output_tracking_capacity: usize,
         app_layer_change_outputs: []bool,
         app_layer_outcome_outputs: []bool,
@@ -1074,6 +1080,7 @@ pub fn Coordinator(comptime protocol: type) type {
         idle_timer: ?timer.Handle = null,
         idle_timer_canceling: bool = false,
         idle_timer_deadline_ns: ?u64 = null,
+        idle_sync_pending: bool = false,
         commit_timer: ?timer.Handle = null,
         commit_timer_canceling: bool = false,
         commit_timer_deadline: ?surface_state.CommitTimestamp = null,
@@ -1186,6 +1193,7 @@ pub fn Coordinator(comptime protocol: type) type {
             errdefer allocator.free(self.app_layers);
             @memset(self.app_layers, .{});
             self.app_layer_count = 0;
+            self.layer_retry_head = null;
             self.output_tracking_capacity = config.drm.connector_capacity;
             const app_layer_output_capacity = try std.math.mul(
                 usize,
@@ -1294,6 +1302,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.idle_timer = null;
             self.idle_timer_canceling = false;
             self.idle_timer_deadline_ns = null;
+            self.idle_sync_pending = false;
             self.commit_timer = null;
             self.commit_timer_canceling = false;
             self.commit_timer_deadline = null;
@@ -2631,7 +2640,7 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             if (try self.seat_adapter.request(peer, target, message, fds)) |control| {
                 try self.processSeatEvents();
-                if (self.seat_adapter.pendingOutboundOn(objects))
+                if (self.seat_adapter.pendingOutboundOn(peer))
                     self.markProtocol(peer, ProtocolReady.seat);
                 try self.flushProtocol();
                 return control;
@@ -2640,7 +2649,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.processSeatEvents();
                 if (self.tablet_adapter.pendingOutbound(peer))
                     self.markProtocol(peer, ProtocolReady.tablet);
-                if (self.seat_adapter.pendingOutboundOn(objects))
+                if (self.seat_adapter.pendingOutboundOn(peer))
                     self.markProtocol(peer, ProtocolReady.seat);
                 try self.flushProtocol();
                 return control;
@@ -5728,6 +5737,10 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn syncIdleNotifications(self: *Self) !void {
+            // Callers are activity, topology/inhibitor changes, or timer
+            // events. Only failed reconciliation needs a transport retry.
+            self.idle_sync_pending = true;
+            self.stats.idle_reconciliations += 1;
             const now = try monotonicNs();
             try self.idle_notify_adapter.setInhibited(self.idleInhibited(), now);
             try self.idle_notify_adapter.advance(now);
@@ -5735,6 +5748,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (client.active and self.idle_notify_adapter.pendingOutbound(client.peer))
                     self.markProtocol(client.peer, ProtocolReady.idle_notify);
             try self.syncIdleTimer();
+            self.idle_sync_pending = false;
         }
 
         fn syncIdleTimer(self: *Self) !void {
@@ -7238,8 +7252,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 !self.decoration_adapter.readyOutbound(peer))
                 flushed += try self.shell_adapter.flushOn(objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.seat != 0) {
-                flushed += try self.seat_adapter.flushOn(objects, &actor.transmit);
-                flushed += try self.transient_seat_adapter.flushSeatsOn(objects, &actor.transmit);
+                flushed += try self.seat_adapter.flushOn(peer, objects, &actor.transmit);
+                flushed += try self.transient_seat_adapter.flushSeatsOn(peer, objects, &actor.transmit);
                 flushed += try self.transient_seat_adapter.flushOn(peer, objects, &actor.transmit);
             }
             if (client.protocol_ready & ProtocolReady.tablet != 0)
@@ -7314,7 +7328,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 flushed += try self.session_lock_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.idle_notify != 0)
                 flushed += try self.idle_notify_adapter.flushOn(peer, objects, &actor.transmit);
-            self.syncIdleNotifications() catch |err| switch (err) {
+            if (self.idle_sync_pending) self.syncIdleNotifications() catch |err| switch (err) {
                 error.Exhausted => {},
                 else => return err,
             };
@@ -7341,7 +7355,14 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn markProtocolAll(self: *Self, ready: u64) void {
             for (self.clients.items) |*client| {
-                if (client.active) client.protocol_ready |= ready;
+                if (!client.active) continue;
+                var pending = ready;
+                if (pending & ProtocolReady.seat != 0 and
+                    !self.seat_adapter.pendingOutboundOn(client.peer) and
+                    !self.transient_seat_adapter.pendingSeatOutboundOn(client.peer) and
+                    !self.transient_seat_adapter.pendingOutbound(client.peer))
+                    pending &= ~ProtocolReady.seat;
+                client.protocol_ready |= pending;
             }
         }
 
@@ -7639,8 +7660,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 !self.shell_adapter.pendingOutboundOn(objects))
                 ready &= ~ProtocolReady.shell;
             if (ready & ProtocolReady.seat != 0 and
-                !self.seat_adapter.pendingOutboundOn(objects) and
-                !self.transient_seat_adapter.pendingSeatOutboundOn(objects) and
+                !self.seat_adapter.pendingOutboundOn(client.peer) and
+                !self.transient_seat_adapter.pendingSeatOutboundOn(client.peer) and
                 !self.transient_seat_adapter.pendingOutbound(client.peer))
                 ready &= ~ProtocolReady.seat;
             if (ready & ProtocolReady.tablet != 0 and
@@ -8974,6 +8995,7 @@ pub fn Coordinator(comptime protocol: type) type {
             layer.presentation = token;
             layer.source_release_pending = true;
             layer.retains_source = retained_source;
+            self.syncLayerRetry(layer);
             layer.sample = sample;
             layer.binding = binding;
             if (association_changed) self.output_associations_dirty = true;
@@ -11129,6 +11151,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     layer.feedback_outcome = .discarded;
                 }
                 if (!output_pending) layer.outcome_pending = true;
+                self.syncLayerRetry(layer);
             }
             for (self.app_layers[0..self.app_layer_count]) |*layer|
                 if (layer.active and !self.layerSurfaceLive(layer) and
@@ -11159,7 +11182,12 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn retryRetainedOutcomes(self: *Self) !bool {
             var changed = false;
-            for (self.app_layers[0..self.app_layer_count]) |*layer| {
+            var next = self.layer_retry_head;
+            while (next) |index| {
+                const layer = &self.app_layers[index];
+                next = layer.retry_next;
+                self.stats.retained_retry_visits += 1;
+                defer self.syncLayerRetry(layer);
                 _ = try self.retryRetiredSource(layer);
                 if (layer.retire_after_source_release) {
                     if (layer.source_release_pending and
@@ -11203,6 +11231,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn retryLayerOutcome(self: *Self, layer: *Layer) !bool {
+            defer self.syncLayerRetry(layer);
             if (!self.layerOwnerLive(layer)) {
                 if (self.appLayerOutputTrackingPending(layer)) return false;
                 self.abandonLayer(layer);
@@ -11282,6 +11311,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn retryLayerFrameCallbacks(self: *Self, layer: *Layer) !bool {
+            defer self.syncLayerRetry(layer);
             const data = layer.callback_data orelse return true;
             const peer = layer.peer orelse return error.ClientDisconnected;
             const surface = layer.surface orelse return error.StaleSurface;
@@ -11304,6 +11334,7 @@ pub fn Coordinator(comptime protocol: type) type {
         /// backing ownership and queue protocol releases with retryable
         /// transport backpressure independently of presentation.
         fn retryLayerSourceRelease(self: *Self, layer: *Layer) !bool {
+            defer self.syncLayerRetry(layer);
             if (layer.rendered) |rendered| {
                 const render_device = self.render_device orelse return false;
                 if (!render_device.content.ready(rendered)) return false;
@@ -11381,6 +11412,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn retireLayerSource(self: *Self, layer: *Layer) !void {
+            defer self.syncLayerRetry(layer);
             if (layer.retired_source != null) return error.RetiredSourceOccupied;
             const releasable = if (layer.rendered) |rendered|
                 if (self.render_device) |render_device|
@@ -11401,6 +11433,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn retryRetiredSource(self: *Self, layer: *Layer) !bool {
+            defer self.syncLayerRetry(layer);
             const source = &(layer.retired_source orelse return false);
             if (!source.releasable) return false;
             if (!try self.releaseSource(source.peer, &source.content)) return false;
@@ -12000,9 +12033,39 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn appLayerIndex(self: *const Self, layer: *const Layer) ?usize {
-            for (self.app_layers[0..self.app_layer_count], 0..) |*candidate, index|
-                if (candidate == layer) return index;
-            return null;
+            const address = @intFromPtr(layer);
+            const base = @intFromPtr(self.app_layers.ptr);
+            if (address < base or address - base >= self.app_layer_count * @sizeOf(Layer)) return null;
+            std.debug.assert((address - base) % @sizeOf(Layer) == 0);
+            return (address - base) / @sizeOf(Layer);
+        }
+
+        // Indices survive app-layer storage growth. Only owners with retained
+        // completion work belong here; ordinary scene layers are never polled.
+        fn syncLayerRetry(self: *Self, layer: *Layer) void {
+            const index = self.appLayerIndex(layer) orelse return;
+            const pending = layer.retired_source != null or layer.retire_after_source_release or
+                (layer.source_release_pending and !layer.retains_source) or
+                (layer.presentation == null and layer.callback_data != null) or layer.outcome_pending;
+            if (!pending) return self.removeLayerRetry(layer);
+            if (layer.retry_queued) return;
+            layer.retry_queued = true;
+            layer.retry_next = self.layer_retry_head;
+            layer.retry_previous = null;
+            if (self.layer_retry_head) |head| self.app_layers[head].retry_previous = index;
+            self.layer_retry_head = index;
+        }
+
+        fn removeLayerRetry(self: *Self, layer: *Layer) void {
+            if (!layer.retry_queued) return;
+            if (layer.retry_previous) |previous|
+                self.app_layers[previous].retry_next = layer.retry_next
+            else
+                self.layer_retry_head = layer.retry_next;
+            if (layer.retry_next) |next| self.app_layers[next].retry_previous = layer.retry_previous;
+            layer.retry_queued = false;
+            layer.retry_previous = null;
+            layer.retry_next = null;
         }
 
         fn appLayerOutputRow(
@@ -12055,6 +12118,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     if (layer.feedback_outcome == null)
                         layer.feedback_outcome = .discarded;
                     layer.outcome_pending = true;
+                    self.syncLayerRetry(layer);
                 }
             }
             self.markRemovedChangesApplied(output_index);
@@ -12904,6 +12968,7 @@ pub fn Coordinator(comptime protocol: type) type {
             if (layer.rendered) |rendered| if (self.render_device) |render_device|
                 render_device.content.release(rendered);
             self.clearAppLayerOutputTracking(layer);
+            self.removeLayerRetry(layer);
             layer.* = .{};
         }
 
@@ -12912,9 +12977,11 @@ pub fn Coordinator(comptime protocol: type) type {
             layer.retired_source = null;
             self.abandonLayer(layer);
             layer.retired_source = source;
+            self.syncLayerRetry(layer);
         }
 
         fn retireLayer(self: *Self, layer: *Layer) void {
+            defer self.syncLayerRetry(layer);
             if (layerHasOutputAssociation(layer)) self.output_associations_dirty = true;
             layer.active = false;
             if (layer.presentation != null) {

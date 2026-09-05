@@ -223,6 +223,22 @@ pub fn Adapter(comptime protocol: type) type {
             preferred_buffer_transform: ?protocol.wl_output.transform = null,
             preferred_buffer_scale_pending: bool = false,
             preferred_buffer_transform_pending: bool = false,
+            preferred_pending_entry: u32 = none,
+        };
+
+        const PreferredPendingEntry = struct {
+            surface: SurfaceId = .{ .index = 0, .generation = 0 },
+            client: u32 = none,
+            next: u32 = none,
+            next_free: u32 = none,
+        };
+
+        const PreferredPendingClient = struct {
+            active: bool = false,
+            peer: wayring.io_uring.Peer = undefined,
+            head: u32 = none,
+            tail: u32 = none,
+            next_free: u32 = none,
         };
 
         const RegionSlot = struct {
@@ -297,6 +313,11 @@ pub fn Adapter(comptime protocol: type) type {
         presentation_global: ?objects.Handle = null,
         compositor_version: u32,
         surfaces: []*SurfaceSlot,
+        preferred_pending_entries: []PreferredPendingEntry,
+        preferred_pending_clients: []PreferredPendingClient,
+        preferred_client_index: std.AutoHashMapUnmanaged(wayring.io_uring.Peer, u32),
+        preferred_pending_entry_free: u32,
+        preferred_pending_client_free: u32,
         regions: []*RegionSlot,
         viewports: []*ViewportSlot,
         single_pixels: []*SinglePixelSlot,
@@ -342,6 +363,19 @@ pub fn Adapter(comptime protocol: type) type {
 
             const surfaces = try allocSlots(SurfaceSlot, allocator, config.surface_capacity);
             errdefer freeSlots(SurfaceSlot, allocator, surfaces);
+            const preferred_pending_entries = try allocator.alloc(
+                PreferredPendingEntry,
+                config.surface_capacity,
+            );
+            errdefer allocator.free(preferred_pending_entries);
+            const preferred_pending_clients = try allocator.alloc(
+                PreferredPendingClient,
+                config.surface_capacity,
+            );
+            errdefer allocator.free(preferred_pending_clients);
+            var preferred_client_index: std.AutoHashMapUnmanaged(wayring.io_uring.Peer, u32) = .empty;
+            errdefer preferred_client_index.deinit(allocator);
+            try preferred_client_index.ensureTotalCapacity(allocator, @intCast(config.surface_capacity));
             const commit_dependencies = try allocator.alloc(
                 UpdateToken,
                 config.surface_capacity,
@@ -430,6 +464,18 @@ pub fn Adapter(comptime protocol: type) type {
                 .next_free = if (index + 1 < surfaces.len) @intCast(index + 1) else none,
                 .index = @intCast(index),
             };
+            for (preferred_pending_entries, 0..) |*entry, index| entry.* = .{
+                .next_free = if (index + 1 < preferred_pending_entries.len)
+                    @intCast(index + 1)
+                else
+                    none,
+            };
+            for (preferred_pending_clients, 0..) |*client, index| client.* = .{
+                .next_free = if (index + 1 < preferred_pending_clients.len)
+                    @intCast(index + 1)
+                else
+                    none,
+            };
             for (regions, 0..) |slot, index| slot.* = .{
                 .next_free = if (index + 1 < regions.len) @intCast(index + 1) else none,
             };
@@ -464,6 +510,11 @@ pub fn Adapter(comptime protocol: type) type {
                 .router = router,
                 .compositor_version = config.compositor_version,
                 .surfaces = surfaces,
+                .preferred_pending_entries = preferred_pending_entries,
+                .preferred_pending_clients = preferred_pending_clients,
+                .preferred_client_index = preferred_client_index,
+                .preferred_pending_entry_free = 0,
+                .preferred_pending_client_free = 0,
                 .regions = regions,
                 .viewports = viewports,
                 .single_pixels = single_pixels,
@@ -534,6 +585,9 @@ pub fn Adapter(comptime protocol: type) type {
             adapter.region_pool.deinit(adapter.allocator);
             freeSlots(RegionSlot, adapter.allocator, adapter.regions);
             freeSlots(SurfaceSlot, adapter.allocator, adapter.surfaces);
+            adapter.allocator.free(adapter.preferred_pending_entries);
+            adapter.allocator.free(adapter.preferred_pending_clients);
+            adapter.preferred_client_index.deinit(adapter.allocator);
             adapter.allocator.free(adapter.commit_dependencies);
             freeSlots(ViewportSlot, adapter.allocator, adapter.viewports);
             freeSlots(SinglePixelSlot, adapter.allocator, adapter.single_pixels);
@@ -908,12 +962,26 @@ pub fn Adapter(comptime protocol: type) type {
             queue: *wayring.tx.Queue,
         ) !usize {
             var completed: usize = 0;
-            for (adapter.surfaces) |slot| {
-                if (!slot.active or !std.meta.eql(slot.peer, peer)) continue;
-                const object = server_objects.namespace.resolve(slot.resource) orelse continue;
+            const client_index = adapter.preferredClientForPeer(peer) orelse return 0;
+            while (adapter.preferred_pending_clients[client_index].head != none) {
+                const entry_index = adapter.preferred_pending_clients[client_index].head;
+                const entry = &adapter.preferred_pending_entries[entry_index];
+                if (entry.surface.index >= adapter.surfaces.len) {
+                    adapter.removePreferredPending(entry_index);
+                    continue;
+                }
+                const slot = adapter.surfaces[entry.surface.index];
+                if (!slot.active or slot.resource.generation != entry.surface.generation or
+                    !std.meta.eql(slot.peer, peer))
+                {
+                    adapter.removePreferredPending(entry_index);
+                    continue;
+                }
+                const object = server_objects.namespace.resolve(slot.resource) orelse break;
                 if (object.version < 6) {
                     slot.preferred_buffer_scale_pending = false;
                     slot.preferred_buffer_transform_pending = false;
+                    adapter.removePreferredPending(entry_index);
                     continue;
                 }
                 if (slot.preferred_buffer_scale_pending) {
@@ -936,17 +1004,14 @@ pub fn Adapter(comptime protocol: type) type {
                     slot.preferred_buffer_transform_pending = false;
                     completed += 1;
                 }
+                adapter.removePreferredPending(entry_index);
             }
             return completed;
         }
 
         pub fn pendingPreferredBuffer(adapter: *const Self, peer: wayring.io_uring.Peer) bool {
-            for (adapter.surfaces) |slot|
-                if (slot.active and std.meta.eql(slot.peer, peer) and
-                    (slot.preferred_buffer_scale_pending or
-                        slot.preferred_buffer_transform_pending))
-                    return true;
-            return false;
+            const client_index = adapter.preferredClientForPeer(peer) orelse return false;
+            return adapter.preferred_pending_clients[client_index].head != none;
         }
 
         pub fn getSurface(
@@ -1120,6 +1185,10 @@ pub fn Adapter(comptime protocol: type) type {
                 slot.preferred_buffer_transform = transform;
                 slot.preferred_buffer_transform_pending = true;
             }
+            if ((slot.preferred_buffer_scale_pending or
+                slot.preferred_buffer_transform_pending) and
+                slot.preferred_pending_entry == none)
+                try adapter.enqueuePreferredPending(slot);
         }
 
         /// Installs the composition root's two-phase shell boundary. Validation
@@ -2566,7 +2635,12 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         fn acquireSurface(adapter: *Self) !*SurfaceSlot {
-            if (adapter.surface_free == none) try adapter.growSlots(SurfaceSlot, &adapter.surfaces, &adapter.surface_free);
+            if (adapter.preferred_pending_entries.len < adapter.surfaces.len)
+                try adapter.growPreferredPending(adapter.surfaces.len);
+            if (adapter.surface_free == none) {
+                try adapter.growSlots(SurfaceSlot, &adapter.surfaces, &adapter.surface_free);
+                try adapter.growPreferredPending(adapter.surfaces.len);
+            }
             const index = adapter.surface_free;
             const slot = adapter.surfaces[index];
             adapter.surface_free = slot.next_free;
@@ -2586,6 +2660,8 @@ pub fn Adapter(comptime protocol: type) type {
         fn releaseSurface(adapter: *Self, index: u32) void {
             const slot = adapter.surfaces[index];
             if (!slot.active) return;
+            if (slot.preferred_pending_entry != none)
+                adapter.removePreferredPending(slot.preferred_pending_entry);
             // The queue is initialized only after generated object admission.
             if (slot.resource.id != 0) {
                 slot.presentation_feedback.moveTo(adapter.discardedFeedback());
@@ -2599,6 +2675,72 @@ pub fn Adapter(comptime protocol: type) type {
             slot.state.deinit();
             slot.* = .{ .next_free = adapter.surface_free, .index = index };
             adapter.surface_free = index;
+        }
+
+        fn preferredClientForPeer(
+            adapter: *const Self,
+            peer: wayring.io_uring.Peer,
+        ) ?u32 {
+            return adapter.preferred_client_index.get(peer);
+        }
+
+        fn enqueuePreferredPending(adapter: *Self, slot: *SurfaceSlot) !void {
+            if (adapter.preferred_pending_entry_free == none) return error.Exhausted;
+            var client_index = adapter.preferredClientForPeer(slot.peer);
+            if (client_index == null) {
+                if (adapter.preferred_pending_client_free == none) return error.Exhausted;
+                const index = adapter.preferred_pending_client_free;
+                const client = &adapter.preferred_pending_clients[index];
+                adapter.preferred_pending_client_free = client.next_free;
+                client.* = .{ .active = true, .peer = slot.peer };
+                client_index = index;
+                adapter.preferred_client_index.putAssumeCapacity(slot.peer, index);
+            }
+            const entry_index = adapter.preferred_pending_entry_free;
+            const entry = &adapter.preferred_pending_entries[entry_index];
+            adapter.preferred_pending_entry_free = entry.next_free;
+            entry.* = .{
+                .surface = .{ .index = slot.index, .generation = slot.resource.generation },
+                .client = client_index.?,
+            };
+            const client = &adapter.preferred_pending_clients[client_index.?];
+            if (client.tail == none)
+                client.head = entry_index
+            else
+                adapter.preferred_pending_entries[client.tail].next = entry_index;
+            client.tail = entry_index;
+            slot.preferred_pending_entry = entry_index;
+        }
+
+        fn removePreferredPending(adapter: *Self, entry_index: u32) void {
+            const entry = &adapter.preferred_pending_entries[entry_index];
+            const client_index = entry.client;
+            const client = &adapter.preferred_pending_clients[client_index];
+            var previous: u32 = none;
+            var current = client.head;
+            while (current != none and current != entry_index) {
+                previous = current;
+                current = adapter.preferred_pending_entries[current].next;
+            }
+            if (current == none) return;
+            if (entry.surface.index < adapter.surfaces.len) {
+                const slot = adapter.surfaces[entry.surface.index];
+                if (slot.preferred_pending_entry == entry_index)
+                    slot.preferred_pending_entry = none;
+            }
+            if (previous == none)
+                client.head = entry.next
+            else
+                adapter.preferred_pending_entries[previous].next = entry.next;
+            if (client.tail == entry_index) client.tail = previous;
+            entry.* = .{ .next_free = adapter.preferred_pending_entry_free };
+            adapter.preferred_pending_entry_free = entry_index;
+            if (client.head == none) {
+                const removed = adapter.preferred_client_index.remove(client.peer);
+                std.debug.assert(removed);
+                client.* = .{ .next_free = adapter.preferred_pending_client_free };
+                adapter.preferred_pending_client_free = client_index;
+            }
         }
 
         fn discardContentFeedback(context: *anyopaque, content: *Content) void {
@@ -3105,6 +3247,33 @@ pub fn Adapter(comptime protocol: type) type {
                 slots.*[initialized] = slot;
             }
             free_head.* = @intCast(old_len);
+        }
+
+        fn growPreferredPending(adapter: *Self, new_len: usize) !void {
+            const old_len = adapter.preferred_pending_entries.len;
+            std.debug.assert(new_len > old_len and new_len < none);
+            try adapter.preferred_client_index.ensureTotalCapacity(adapter.allocator, @intCast(new_len));
+            const entries = try adapter.allocator.alloc(PreferredPendingEntry, new_len);
+            errdefer adapter.allocator.free(entries);
+            const clients = try adapter.allocator.alloc(PreferredPendingClient, new_len);
+            @memcpy(entries[0..old_len], adapter.preferred_pending_entries);
+            @memcpy(clients[0..old_len], adapter.preferred_pending_clients);
+            adapter.allocator.free(adapter.preferred_pending_entries);
+            adapter.allocator.free(adapter.preferred_pending_clients);
+            adapter.preferred_pending_entries = entries;
+            adapter.preferred_pending_clients = clients;
+            for (adapter.preferred_pending_entries[old_len..], old_len..) |*entry, index|
+                entry.* = .{ .next_free = if (index + 1 < new_len)
+                    @intCast(index + 1)
+                else
+                    adapter.preferred_pending_entry_free };
+            for (adapter.preferred_pending_clients[old_len..], old_len..) |*client, index|
+                client.* = .{ .next_free = if (index + 1 < new_len)
+                    @intCast(index + 1)
+                else
+                    adapter.preferred_pending_client_free };
+            adapter.preferred_pending_entry_free = @intCast(old_len);
+            adapter.preferred_pending_client_free = @intCast(old_len);
         }
 
         fn slotIndex(comptime T: type, slots: []*T, target: *T) u32 {
@@ -3857,6 +4026,33 @@ test "core surface: preferred buffer state clears below version six" {
     ));
     try std.testing.expect(!context.adapter.pendingPreferredBuffer(peer));
     try std.testing.expectEqual(@as(usize, 0), context.actor.transmit.queuedBytes());
+}
+
+test "core surface: removing a surface unlinks its preferred buffer update" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    const surface = try context.createSurface(10);
+    const id = try context.adapter.surfaceId(surface);
+    const peer: wayring.io_uring.Peer = .{
+        .slot = context.actor.slot,
+        .generation = context.actor.generation,
+    };
+
+    try context.adapter.publishPreferredBuffer(id, 2, .normal);
+    try std.testing.expect(context.adapter.pendingPreferredBuffer(peer));
+    _ = try context.server_objects.removeClient(surface);
+    try std.testing.expect(!context.adapter.pendingPreferredBuffer(peer));
+
+    const replacement = try context.createSurface(10);
+    const replacement_id = try context.adapter.surfaceId(replacement);
+    try std.testing.expect(replacement_id.generation != id.generation);
+    try context.adapter.publishPreferredBuffer(replacement_id, 3, .normal);
+    try std.testing.expectEqual(@as(usize, 2), try context.adapter.flushPreferredBufferOn(
+        peer,
+        &context.server_objects,
+        &context.actor.transmit,
+    ));
+    try std.testing.expect(!context.adapter.pendingPreferredBuffer(peer));
 }
 
 test "viewporter: generated requests publish and clear double-buffered crop state" {

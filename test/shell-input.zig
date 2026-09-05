@@ -657,11 +657,15 @@ fn workspaceClient(late_bind: bool) !void {
         _ = try loop.turn(coordinator);
     }
     resolver.calls = 0;
+    const idle_reconciliations = coordinator.stats.idle_reconciliations;
+    const retained_retry_visits = coordinator.stats.retained_retry_visits;
     for (0..64) |_| {
         _ = try drainClient(&reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
     }
     try std.testing.expectEqual(@as(usize, 0), resolver.calls);
+    try std.testing.expectEqual(idle_reconciliations, coordinator.stats.idle_reconciliations);
+    try std.testing.expectEqual(retained_retry_visits, coordinator.stats.retained_retry_visits);
     coordinator.workspace_adapter.setOutputResolver(resolver.context, resolver.original);
 
     const output_done_before_disable = handler.output_done;
