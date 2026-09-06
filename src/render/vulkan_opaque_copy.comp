@@ -1,0 +1,12 @@
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0, rgba8) uniform writeonly image2D target_image;
+layout(set = 0, binding = 3) uniform sampler2D source_images[32];
+// Same 64-byte Push ABI as the compositor; source.z is the descriptor index.
+layout(push_constant) uniform Frame { uvec4 source; uvec4 unused; uvec4 damage; uvec4 unused_color; } frame;
+void main() {
+    ivec2 local = ivec2(gl_GlobalInvocationID.xy);
+    if (local.x >= int(frame.damage.z) || local.y >= int(frame.damage.w)) return;
+    vec4 value = texelFetch(source_images[frame.source.z], ivec2(frame.source.xy) + local, 0);
+    imageStore(target_image, ivec2(frame.damage.xy) + local, vec4(value.bgr, 1.0));
+}

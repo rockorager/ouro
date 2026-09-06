@@ -309,6 +309,7 @@ const RealRenderer = struct {
     pipeline_10bit: ?c.VkPipeline,
     descriptor_pool: c.VkDescriptorPool,
     sampled_pipeline: ?c.VkPipeline,
+    opaque_copy_pipeline: ?c.VkPipeline,
     sampled_pipeline_10bit: ?c.VkPipeline,
     sampler: ?c.VkSampler,
     blur_pipeline: ?c.VkPipeline,
@@ -738,7 +739,14 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
     try vk(c.vkCreateComputePipelines(self.device, null, 1, &pipeline_info, null, &self.pipeline), error.CreatePipelineFailed);
     errdefer c.vkDestroyPipeline(self.device, self.pipeline, null);
     self.sampled_pipeline = null;
+    self.opaque_copy_pipeline = null;
     self.blur_pipeline = null;
+    errdefer if (self.sampled_pipeline) |pipeline|
+        c.vkDestroyPipeline(self.device, pipeline, null);
+    errdefer if (self.opaque_copy_pipeline) |pipeline|
+        c.vkDestroyPipeline(self.device, pipeline, null);
+    errdefer if (self.blur_pipeline) |pipeline|
+        c.vkDestroyPipeline(self.device, pipeline, null);
     if (self.sampled_enabled) {
         const sampled_shader_bytes align(@alignOf(u32)) = @embedFile("vulkan_texture_composite.spv").*;
         var sampled_shader_info = shader_info;
@@ -766,6 +774,19 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
         );
         self.sampled_pipeline = sampled_pipeline;
 
+        const copy_bytes align(@alignOf(u32)) = @embedFile("vulkan_opaque_copy.spv").*;
+        var copy_shader_info = shader_info;
+        copy_shader_info.codeSize = copy_bytes.len;
+        copy_shader_info.pCode = @ptrCast(&copy_bytes);
+        var copy_shader: c.VkShaderModule = undefined;
+        try vk(c.vkCreateShaderModule(self.device, &copy_shader_info, null, &copy_shader), error.CreateShaderFailed);
+        defer c.vkDestroyShaderModule(self.device, copy_shader, null);
+        var copy_pipeline_info = pipeline_info;
+        copy_pipeline_info.stage.module = copy_shader;
+        var copy_pipeline: c.VkPipeline = undefined;
+        try vk(c.vkCreateComputePipelines(self.device, null, 1, &copy_pipeline_info, null, &copy_pipeline), error.CreatePipelineFailed);
+        self.opaque_copy_pipeline = copy_pipeline;
+
         const blur_shader_bytes align(@alignOf(u32)) = @embedFile("vulkan_backdrop_blur.spv").*;
         var blur_shader_info = shader_info;
         blur_shader_info.codeSize = blur_shader_bytes.len;
@@ -779,10 +800,6 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
         try vk(c.vkCreateComputePipelines(self.device, null, 1, &blur_pipeline_info, null, &blur_pipeline), error.CreatePipelineFailed);
         self.blur_pipeline = blur_pipeline;
     }
-    errdefer if (self.sampled_pipeline) |pipeline|
-        c.vkDestroyPipeline(self.device, pipeline, null);
-    errdefer if (self.blur_pipeline) |pipeline|
-        c.vkDestroyPipeline(self.device, pipeline, null);
     self.pipeline_10bit = null;
     self.sampled_pipeline_10bit = null;
     if (physical_features.shaderStorageImageWriteWithoutFormat == c.VK_TRUE) {
@@ -994,6 +1011,7 @@ fn realDestroy(_: *anyopaque, renderer: Renderer) void {
     if (self.blur_sampler) |sampler| c.vkDestroySampler(self.device, sampler, null);
     c.vkDestroyDescriptorPool(self.device, self.descriptor_pool, null);
     if (self.sampled_pipeline) |pipeline| c.vkDestroyPipeline(self.device, pipeline, null);
+    if (self.opaque_copy_pipeline) |pipeline| c.vkDestroyPipeline(self.device, pipeline, null);
     if (self.blur_pipeline) |pipeline| c.vkDestroyPipeline(self.device, pipeline, null);
     if (self.sampled_pipeline_10bit) |pipeline| c.vkDestroyPipeline(self.device, pipeline, null);
     if (self.pipeline_10bit) |pipeline| c.vkDestroyPipeline(self.device, pipeline, null);
@@ -3085,9 +3103,50 @@ fn recordSampledPass(
     c.vkCmdBindDescriptorSets(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 0, 1, &target.descriptor_sets[0], 0, null);
     for (frame.render_damage) |damage| {
         const range = damageSampleRange(frame.samples[0..sample_count], damage);
+        if (!target.ten_bit and range.count != 0) {
+            // In the single descriptor batch, source and descriptor indices
+            // are identical. The last intersecting sample is topmost.
+            const source_index = range.first + range.count - 1;
+            if (opaqueCopyOrigin(frame, source_index, damage)) |origin| {
+                const push: Push = .{
+                    .clear_color = .{ origin[0], origin[1], source_index, 0 },
+                    .output = @splat(0),
+                    .damage = .{ @intCast(damage.x), @intCast(damage.y), damage.width, damage.height },
+                    .output_color = @splat(0),
+                };
+                c.vkCmdBindPipeline(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.opaque_copy_pipeline.?);
+                c.vkCmdPushConstants(target.command_buffer, self.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(Push), &push);
+                c.vkCmdDispatch(target.command_buffer, (damage.width + 7) / 8, (damage.height + 7) / 8, 1);
+                c.vkCmdBindPipeline(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.sampled_pipeline.?);
+                continue;
+            }
+        }
         // Empty ranges still dispatch: exposed background must be cleared.
         recordSampledDispatch(self, target, frame, damage, range.count, range.first);
     }
+}
+
+/// Returns the source texel origin only when the ordinary compositor would
+/// perform an opaque, color-identity, one-to-one external fetch for every
+/// damaged pixel. This deliberately excludes all multi-batch and 10-bit use.
+fn opaqueCopyOrigin(frame: Frame, source_index: usize, damage: render.Rect) ?[2]u32 {
+    const sample = frame.samples[source_index];
+    if (frame.sources[source_index].source.external == null or
+        sample.attributes[1] & (direct_color_bit | direct_content_bit) != direct_color_bit or
+        sample.attributes[2] != 255 or
+        sample.affine[0] != 65536 or sample.affine[1] != 0 or
+        sample.affine[3] != 0 or sample.affine_tail[0] != 65536)
+        return null;
+    const visible = sampleIntersection(sample, damage) orelse return null;
+    if (visible.min_x != damage.x or visible.min_y != damage.y or
+        visible.max_x != @as(i64, damage.x) + damage.width or
+        visible.max_y != @as(i64, damage.y) + damage.height) return null;
+    // Match source_coordinate's arithmetic shift, including half-pixel x0/y0.
+    const x = @as(i64, damage.x) - sample.destination[0] + @divFloor(sample.affine[2], 65536);
+    const y = @as(i64, damage.y) - sample.destination[1] + @divFloor(sample.affine_tail[1], 65536);
+    if (x < 0 or y < 0 or x + damage.width > sample.source[1] or
+        y + damage.height > sample.source[2]) return null;
+    return .{ @intCast(x), @intCast(y) };
 }
 
 fn damageSampleRange(samples: []const Sample, damage: render.Rect) struct { first: u32, count: u32 } {
@@ -5027,6 +5086,12 @@ test "render-vulkan: real Vulkan ABI and shader artifact are linked" {
         @as(u32, 0x07230203),
         std.mem.readInt(u32, sampled_shader[0..4], .little),
     );
+    const copy_shader = @embedFile("vulkan_opaque_copy.spv");
+    try std.testing.expect(copy_shader.len > 20);
+    try std.testing.expectEqual(
+        @as(u32, 0x07230203),
+        std.mem.readInt(u32, copy_shader[0..4], .little),
+    );
     const shader_10bit = @embedFile("vulkan_composite_10bit.spv");
     const sampled_shader_10bit = @embedFile("vulkan_texture_composite_10bit.spv");
     try std.testing.expectEqual(
@@ -5135,6 +5200,60 @@ test "render-vulkan: damage sample range trims only nonintersecting ends" {
     try std.testing.expectEqual(@as(u32, 3), full.count);
     const prefix = damageSampleRange(samples[0..2], damage);
     try std.testing.expectEqual(single, prefix);
+}
+
+test "render-vulkan: opaque copy requires exact external opaque coverage and mapping" {
+    const damage: render.Rect = .{ .x = 12, .y = 23, .width = 4, .height = 5 };
+    var sample = std.mem.zeroes(Sample);
+    sample.source = .{ 0, 8, 9, 32 };
+    sample.destination = .{ 10, 20, 8, 9 };
+    sample.clip = sample.destination;
+    sample.attributes[1] = direct_color_bit;
+    sample.attributes[2] = 255;
+    sample.affine = .{ 65536, 0, 32768, 0 };
+    sample.affine_tail[0] = 65536;
+    sample.affine_tail[1] = 32768;
+    var source: render.SurfaceSample = undefined;
+    source.source.external = @as(render.ExternalSource, undefined);
+    var frame: Frame = .{
+        .output = .{ .width = 32, .height = 32 },
+        .output_format = .xrgb8888,
+        .clear = .{ .r = 0, .g = 0, .b = 0 },
+        .samples = @as([*]const Sample, @ptrCast(&sample))[0..1],
+        .sources = @as([*]const render.SurfaceSample, @ptrCast(&source))[0..1],
+        .source_byte_count = 0,
+        .render_damage = @as([*]const render.Rect, @ptrCast(&damage))[0..1],
+    };
+    try std.testing.expectEqual([2]u32{ 2, 3 }, opaqueCopyOrigin(frame, 0, damage).?);
+
+    sample.affine[2] = -32768; // floor, not truncation, for a negative half-texel
+    try std.testing.expectEqual([2]u32{ 1, 3 }, opaqueCopyOrigin(frame, 0, damage).?);
+    sample.affine[2] = -3 * 65536; // first damaged texel falls outside the source
+    try std.testing.expect(opaqueCopyOrigin(frame, 0, damage) == null);
+    sample.affine[2] = 32768;
+    sample.affine[1] = 1; // rotation/shear
+    try std.testing.expect(opaqueCopyOrigin(frame, 0, damage) == null);
+    sample.affine[1] = 0;
+    sample.affine[0] = 32768; // scale
+    try std.testing.expect(opaqueCopyOrigin(frame, 0, damage) == null);
+    sample.affine[0] = 65536;
+    sample.attributes[1] = 0; // color conversion or incomplete opacity coverage
+    try std.testing.expect(opaqueCopyOrigin(frame, 0, damage) == null);
+    sample.attributes[1] = direct_color_bit | direct_content_bit; // buffer, not texture fetch
+    try std.testing.expect(opaqueCopyOrigin(frame, 0, damage) == null);
+    sample.attributes[1] = direct_color_bit;
+    sample.attributes[2] = 254; // global alpha
+    try std.testing.expect(opaqueCopyOrigin(frame, 0, damage) == null);
+    sample.attributes[2] = 255;
+    sample.clip[2] = 3; // damage not fully covered
+    try std.testing.expect(opaqueCopyOrigin(frame, 0, damage) == null);
+    sample.clip = sample.destination;
+    sample.source[1] = 5; // source fetch would leave bounds
+    try std.testing.expect(opaqueCopyOrigin(frame, 0, damage) == null);
+    sample.source[1] = 8;
+    source.source.external = null;
+    frame.sources = @as([*]const render.SurfaceSample, @ptrCast(&source))[0..1];
+    try std.testing.expect(opaqueCopyOrigin(frame, 0, damage) == null);
 }
 
 test "render-vulkan: sampled command replay ignores pixels and rejects recorded changes" {
