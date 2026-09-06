@@ -28,7 +28,8 @@ const Options = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
-    const allocator = std.heap.page_allocator;
+    // Reuse small allocations instead of mapping a page for every commit.
+    const allocator = std.heap.smp_allocator;
     const options = parseOptions(init.minimal.args) catch |err| {
         usage();
         return err;
