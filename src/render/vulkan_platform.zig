@@ -243,6 +243,8 @@ const ImportedImage = struct {
     generation: u32 = 0,
     references: usize = 0,
     source: render.ExternalSource = undefined,
+    size: render.Size = undefined,
+    format: render.PixelFormat = undefined,
     image: c.VkImage = undefined,
     memory: c.VkDeviceMemory = undefined,
     view: c.VkImageView = undefined,
@@ -1224,7 +1226,9 @@ fn validateRetainedExternal(
     size: render.Size,
     format: render.PixelFormat,
 ) !void {
-    try requireExternalSampling(@ptrCast(@alignCast(context)), source, size, format);
+    const self: *RealRenderer = @ptrCast(@alignCast(context));
+    if (try cachedImportedImage(self, source, size, format) != null) return;
+    try requireExternalSampling(self, source, size, format);
 }
 
 fn realValidateExternal(
@@ -1364,15 +1368,23 @@ fn requireExternalSampling(
         return error.ExternalSamplingUnsupported;
 }
 
-fn importedImage(self: *RealRenderer, source: render.ExternalSource, size: render.Size, format: render.PixelFormat) !u64 {
-    try requireExternalSampling(self, source, size, format);
-    const vk_format = externalVkFormat(source.drm_format, format) orelse unreachable;
+/// A successful import already proved device support for this immutable
+/// descriptor. Reuse that proof only when every part of the image agrees.
+fn cachedImportedImage(self: *const RealRenderer, source: render.ExternalSource, size: render.Size, format: render.PixelFormat) !?u64 {
     for (self.imported_images, 0..) |*entry, index| if (entry.occupied and
         entry.source.context == source.context and entry.source.token == source.token)
     {
-        if (!std.meta.eql(entry.source, source)) return error.ExternalIdentityMismatch;
+        if (!std.meta.eql(entry.source, source) or !std.meta.eql(entry.size, size) or
+            entry.format != format) return error.ExternalIdentityMismatch;
         return importedToken(entry, index);
     };
+    return null;
+}
+
+fn importedImage(self: *RealRenderer, source: render.ExternalSource, size: render.Size, format: render.PixelFormat) !u64 {
+    if (try cachedImportedImage(self, source, size, format)) |token| return token;
+    try requireExternalSampling(self, source, size, format);
+    const vk_format = externalVkFormat(source.drm_format, format) orelse unreachable;
 
     // Reclaim cache-only imports whose protocol source has gone away before
     // consuming another slot. Persistent buffers remain cached, while buffer
@@ -1501,6 +1513,8 @@ fn importedImage(self: *RealRenderer, source: render.ExternalSource, size: rende
         .generation = entry.generation,
         .references = 1,
         .source = source,
+        .size = size,
+        .format = format,
         .image = image,
         .memory = memory,
         .view = view,
@@ -1519,6 +1533,69 @@ fn importedFromToken(self: *RealRenderer, token: u64) ?*ImportedImage {
     const entry = &self.imported_images[index];
     if (!entry.occupied or entry.generation != generation) return null;
     return entry;
+}
+
+test "cached external imports preserve metadata and bypass device queries" {
+    var owner: u8 = 0;
+    const source: render.ExternalSource = .{
+        .context = &owner,
+        .token = 17,
+        .alive_fn = validationSourceAlive,
+        .drm_format = c.DRM_FORMAT_XRGB8888,
+        .modifier = gbm.modifier_linear,
+        .plane_count = 1,
+        .fds = .{ 4, -1, -1, -1 },
+        .strides = .{ 5120, 0, 0, 0 },
+        .offsets = @splat(0),
+    };
+    const size: render.Size = .{ .width = 1280, .height = 720 };
+    var entries = [_]ImportedImage{.{
+        .occupied = true,
+        .generation = 7,
+        .references = 3,
+        .source = source,
+        .size = size,
+        .format = .xrgb8888,
+    }};
+    // No device is initialized: these paths must use the cached import only.
+    var renderer: RealRenderer = undefined;
+    renderer.imported_images = &entries;
+    const expected = importedToken(&entries[0], 0);
+    try std.testing.expectEqual(expected, (try cachedImportedImage(&renderer, source, size, .xrgb8888)).?);
+    try std.testing.expectEqual(expected, try importedImage(&renderer, source, size, .xrgb8888));
+    try validateRetainedExternal(&renderer, source, size, .xrgb8888);
+    try std.testing.expectEqual(@as(usize, 3), entries[0].references);
+    inline for (.{ "width", "height" }) |field| {
+        var changed = size;
+        @field(changed, field) += 1;
+        try std.testing.expectError(error.ExternalIdentityMismatch, importedImage(&renderer, source, changed, .xrgb8888));
+        try std.testing.expectError(error.ExternalIdentityMismatch, validateRetainedExternal(&renderer, source, changed, .xrgb8888));
+    }
+    try std.testing.expectError(error.ExternalIdentityMismatch, importedImage(&renderer, source, size, .argb8888_premultiplied));
+    try std.testing.expectError(error.ExternalIdentityMismatch, validateRetainedExternal(&renderer, source, size, .argb8888_premultiplied));
+    inline for (.{ "drm_format", "modifier", "plane_count" }) |field| {
+        var changed = source;
+        @field(changed, field) += 1;
+        try std.testing.expectError(error.ExternalIdentityMismatch, cachedImportedImage(&renderer, changed, size, .xrgb8888));
+    }
+    inline for (.{ "fds", "strides", "offsets" }) |field| {
+        var changed = source;
+        @field(changed, field)[0] += 1;
+        try std.testing.expectError(error.ExternalIdentityMismatch, cachedImportedImage(&renderer, changed, size, .xrgb8888));
+    }
+    var different = source;
+    different.token += 1;
+    try std.testing.expectEqual(null, try cachedImportedImage(&renderer, different, size, .xrgb8888));
+    var other_owner: u8 = 0;
+    different = source;
+    different.context = &other_owner;
+    try std.testing.expectEqual(null, try cachedImportedImage(&renderer, different, size, .xrgb8888));
+    entries[0].occupied = false;
+    try std.testing.expectEqual(null, try cachedImportedImage(&renderer, source, size, .xrgb8888));
+    different = source;
+    different.fds[0] = -1;
+    try std.testing.expectError(error.UnsupportedExternalSource, importedImage(&renderer, different, size, .xrgb8888));
+    try std.testing.expectError(error.UnsupportedExternalSource, validateRetainedExternal(&renderer, different, size, .xrgb8888));
 }
 
 fn inferExternalFormat(drm_format: u32) ?render.PixelFormat {
