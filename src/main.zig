@@ -18,10 +18,13 @@ const shm_formats = [_]wayring.shm.Format{
 const Options = struct {
     socket: ?[]const u8 = null,
     renderer: ouro.real_output.RendererPreference = .vulkan_then_pixman,
+    scanout_modifier: ?u64 = null,
     drm_device: ?[]const u8 = null,
     config: ?[]const u8 = null,
     managed_session: bool = false,
     headless: bool = false,
+    disable_hdr: bool = false,
+    trace_pacing: bool = false,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -214,6 +217,9 @@ pub fn main(init: std.process.Init) !void {
                 .adaptive_render_margin_ns = 2 * std.time.ns_per_ms,
             },
             .renderer = options.renderer,
+            .scanout_modifier = options.scanout_modifier,
+            .enable_hdr = !options.disable_hdr,
+            .trace_pacing = options.trace_pacing,
             .image_count = 3,
             .max_samples = 17,
             .max_source_bytes = 32 * 1024 * 1024,
@@ -437,6 +443,11 @@ fn parseOptions(args: std.process.Args) !Options {
             options.renderer = .vulkan;
         } else if (std.mem.eql(u8, argument, "--renderer=auto")) {
             options.renderer = .vulkan_then_pixman;
+        } else if (std.mem.startsWith(u8, argument, "--scanout-modifier=")) {
+            options.scanout_modifier = std.fmt.parseInt(u64, argument["--scanout-modifier=".len..], 0) catch
+                return error.InvalidScanoutModifier;
+            if (options.scanout_modifier.? == ouro.gbm.modifier_invalid)
+                return error.InvalidScanoutModifier;
         } else if (std.mem.startsWith(u8, argument, "--socket=")) {
             options.socket = argument["--socket=".len..];
             if (options.socket.?.len == 0) return error.InvalidSocket;
@@ -450,8 +461,14 @@ fn parseOptions(args: std.process.Args) !Options {
             options.managed_session = true;
         } else if (std.mem.eql(u8, argument, "--headless")) {
             options.headless = true;
+        } else if (std.mem.eql(u8, argument, "--disable-hdr")) {
+            options.disable_hdr = true;
+        } else if (std.mem.eql(u8, argument, "--trace-pacing")) {
+            options.trace_pacing = true;
         } else return error.UnknownArgument;
     }
+    if (options.scanout_modifier != null and options.renderer != .vulkan)
+        return error.ModifierRequiresVulkan;
     return options;
 }
 
@@ -462,6 +479,9 @@ fn usage() void {
         \\  auto    try Vulkan, then fall back to Pixman at startup
         \\  pixman  require the CPU Pixman renderer
         \\  vulkan  require Vulkan and KMS IN_FENCE_FD (no host wait)
+        \\  --scanout-modifier=0xHEX  diagnostic: require exact Vulkan output layout; no fallback
+        \\  --disable-hdr  disable automatic HDR output selection (use SDR)
+        \\  --trace-pacing  diagnostic: log per-frame monotonic timing; adds measurement overhead
         \\  --drm-device  require this DRM card instead of automatic selection
         \\  --config      load JSON output rules, including per-output ICC profiles
         \\  --managed-session  publish and bind the systemd graphical session lifecycle

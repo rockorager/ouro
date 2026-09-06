@@ -505,6 +505,7 @@ pub fn initTargetPool(
     snapshot: @import("../backend/drm/manager.zig").Snapshot,
     capacity: usize,
     prefer_10bit: bool,
+    required_modifier: ?u64,
 ) !framebuffer.Pool {
     return framebuffer.Pool.init(
         allocator,
@@ -512,7 +513,7 @@ pub fn initTargetPool(
         drm_platform,
         fd,
         snapshot,
-        .{ .capacity = capacity, .prefer_10bit = prefer_10bit },
+        .{ .capacity = capacity, .prefer_10bit = prefer_10bit, .required_modifier = required_modifier },
     );
 }
 

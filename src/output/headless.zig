@@ -67,6 +67,9 @@ pub const Config = struct {
     /// Conservative ceiling used until adaptive physical timing is ready and
     /// whenever adaptive timing is disabled.
     render_budget_ns: Timestamp,
+    /// Display readiness deadline precedes the reported presentation time by
+    /// this much (physical vertical blanking). Not part of learned render time.
+    presentation_lead_ns: Timestamp = 0,
     /// Number of trustworthy physical render timings required before delaying
     /// rendering toward vblank. Zero retains the fixed-budget behavior.
     adaptive_render_samples: u16 = 0,
@@ -244,7 +247,7 @@ pub fn Scheduler(comptime PresentationToken: type) type {
                     break :blk .{
                         .purpose = .render_deadline,
                         .frame = id,
-                        .deadline = try deadlineFromNs(target - render_budget_ns),
+                        .deadline = try deadlineFromNs(target - self.config.presentation_lead_ns - render_budget_ns),
                         .render_budget_ns = render_budget_ns,
                     };
                 },
@@ -275,17 +278,19 @@ pub fn Scheduler(comptime PresentationToken: type) type {
                         !std.meta.eql(request_value.frame, try self.prospectiveFrameId()))
                         return error.StaleTimerRequest;
                     const deadline_ns = try nsFromDeadline(request_value.deadline);
-                    const target = std.math.add(
+                    const ready_deadline = std.math.add(
                         Timestamp,
                         deadline_ns,
                         request_value.render_budget_ns,
                     ) catch return error.TimestampOverflow;
+                    const target = std.math.add(Timestamp, ready_deadline, self.config.presentation_lead_ns) catch
+                        return error.TimestampOverflow;
                     self.frame = .{
                         .id = request_value.frame,
                         .requests = self.pending,
                         .requested_ns = self.pending_since_ns,
                         .target_ns = target,
-                        .render_deadline_ns = target - request_value.render_budget_ns,
+                        .render_deadline_ns = deadline_ns,
                     };
                     self.pending = .{};
                     self.samples_captured = false;
@@ -503,7 +508,9 @@ pub fn Scheduler(comptime PresentationToken: type) type {
             now_ns: Timestamp,
             render_budget_ns: Timestamp,
         ) Error!Timestamp {
-            const threshold = std.math.add(Timestamp, now_ns, render_budget_ns) catch
+            const ready_threshold = std.math.add(Timestamp, now_ns, render_budget_ns) catch
+                return error.TimestampOverflow;
+            const threshold = std.math.add(Timestamp, ready_threshold, self.config.presentation_lead_ns) catch
                 return error.TimestampOverflow;
             const phase_ns = self.physical_phase_ns orelse self.config.phase_ns;
             if (phase_ns > threshold) return phase_ns;
@@ -805,6 +812,61 @@ test "physical presentation anchors future refresh targets" {
     try std.testing.expectEqual(@as(Timestamp, 22), scheduler.frame.?.target_ns);
     _ = try scheduler.remove();
     _ = try scheduler.timerEvent(fakeHandle(2), .canceled, 14);
+}
+
+test "physical blanking lead skips an already latched future timestamp and preserves learning" {
+    var scheduler = try TestScheduler.init(std.testing.allocator, test_output, .{
+        .refresh_ns = 10,
+        .render_budget_ns = 3,
+        .presentation_lead_ns = 4,
+        .adaptive_render_samples = 3,
+        .adaptive_render_margin_ns = 1,
+        .adaptive_miss_tolerance_ns = 1,
+    }, 1);
+    defer scheduler.deinit(std.testing.allocator);
+    const requested = [_]Timestamp{ 0, 6, 16 };
+    for (requested, 0..) |now, index| {
+        const target: Timestamp = (index + 1) * 10;
+        try scheduler.request(.damage, now);
+        const request_value = (try scheduler.timerRequest(now)).?;
+        try std.testing.expectEqual(target - 7, try nsFromDeadline(request_value.deadline));
+        try std.testing.expectEqual(@as(Timestamp, 3), request_value.render_budget_ns);
+        const handle = fakeHandle(@intCast(index + 1));
+        try scheduler.timerArmed(request_value, handle, now);
+        try std.testing.expectEqual(target, scheduler.frame.?.target_ns);
+        const frame = try startRender(&scheduler, handle, target - 7);
+        try scheduler.captureSamples(frame, &.{});
+        _ = try scheduler.renderComplete(frame, target - 6);
+        try scheduler.submitPhysical(frame, target - 6);
+        _ = try scheduler.presentPhysical(frame, target, target - 6);
+        // The event is delivered at blanking start, before its timestamp.
+        try std.testing.expectEqual(target + 10, try scheduler.nextTarget(target - 4));
+    }
+    try std.testing.expect(scheduler.adaptiveReady());
+    try std.testing.expectEqual(@as(Timestamp, 2), scheduler.renderBudget());
+    try scheduler.request(.damage, 26);
+    const request_value = (try scheduler.timerRequest(26)).?;
+    try std.testing.expectEqual(@as(Timestamp, 34), try nsFromDeadline(request_value.deadline));
+    try scheduler.timerArmed(request_value, fakeHandle(4), 26);
+    const frame = try startRender(&scheduler, fakeHandle(4), 34);
+    try scheduler.captureSamples(frame, &.{});
+    _ = try scheduler.renderComplete(frame, 39); // Ready inside blanking, misses the latch.
+    try scheduler.submitPhysical(frame, 39);
+    _ = try scheduler.presentPhysical(frame, 50, 39);
+    try std.testing.expect(!scheduler.adaptiveReady());
+    try std.testing.expectEqual(@as(Timestamp, 3), scheduler.renderBudget());
+}
+
+test "presentation lead arithmetic checks overflow without restricting combined budget" {
+    var scheduler = try TestScheduler.init(std.testing.allocator, test_output, .{
+        .refresh_ns = 10,
+        .render_budget_ns = 7,
+        .presentation_lead_ns = 8,
+    }, 1);
+    defer scheduler.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(Timestamp, 20), try scheduler.nextTarget(0));
+    scheduler.config.presentation_lead_ns = std.math.maxInt(Timestamp);
+    try std.testing.expectError(error.TimestampOverflow, scheduler.nextTarget(0));
 }
 
 test "physical timing warms adaptive render deadlines and resets after a miss" {

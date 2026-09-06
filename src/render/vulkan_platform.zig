@@ -55,6 +55,7 @@ pub const Captures = packed struct(u2) {
 };
 
 pub const Readback = struct {
+    /// Packed 8-bit B, G, R, A/X bytes, including for 10-bit scanout targets.
     bytes: []const u8,
     stride: u32,
 };
@@ -389,6 +390,7 @@ const RealTarget = struct {
     readback_memories: [2]c.VkDeviceMemory,
     readback_maps: [2]*anyopaque,
     readback_size: usize,
+    readback_normalized: [2]bool = .{ false, false },
     captured: Captures = .{},
     recorded_sampled_frame: RecordedSampledFrame = .{},
 };
@@ -1938,6 +1940,7 @@ fn realImportTarget(_: *anyopaque, renderer: Renderer, metadata: gbm.Metadata, d
     target.readback_memories = .{ null, null };
     target.readback_maps = undefined;
     target.readback_size = try captureByteCount(metadata.width, metadata.height);
+    target.readback_normalized = .{ false, false };
     target.captured = .{};
     target.descriptor_sets = &.{};
     target.batch_capacity = 0;
@@ -2174,11 +2177,32 @@ fn realReadback(_: *anyopaque, renderer: Renderer, target_value: Target, phase: 
         .after_cursor => target.captured.after_cursor,
     };
     if (!captured) return error.CaptureUnavailable;
-    const index = @intFromEnum(phase);
     return .{
-        .bytes = @as([*]const u8, @ptrCast(target.readback_maps[index]))[0..target.readback_size],
+        .bytes = readbackBytes(target, phase),
         .stride = try captureStride(target.width),
     };
+}
+
+/// Called only after the submission fence signals. The GPU copy preserves
+/// A2R10G10B10 packing, whereas capture clients consume 8-bit BGRA. Normalize
+/// coherent staging memory once per phase/submission, never the scanout image.
+fn readbackBytes(target: *RealTarget, phase: CapturePhase) []const u8 {
+    const index = @intFromEnum(phase);
+    const bytes = @as([*]u8, @ptrCast(target.readback_maps[index]))[0..target.readback_size];
+    if (target.ten_bit and !target.readback_normalized[index]) {
+        var offset: usize = 0;
+        while (offset < bytes.len) : (offset += 4) {
+            const pixel = bytes[offset..][0..4];
+            const value = std.mem.readInt(u32, pixel, .little);
+            for (0..3) |channel| {
+                const shift: u5 = @intCast(channel * 10);
+                pixel[channel] = @intCast((((value >> shift) & 1023) * 255 + 511) / 1023);
+            }
+            pixel[3] = 255; // XR30 scanout is opaque.
+        }
+        target.readback_normalized[index] = true;
+    }
+    return bytes;
 }
 
 fn destroyTargetBatchResources(self: *RealRenderer, target: *RealTarget) void {
@@ -2643,6 +2667,7 @@ fn recordCaptureCopy(self: *RealRenderer, target: *RealTarget, frame: Frame, pha
         return;
     }
     const index = @intFromEnum(phase);
+    target.readback_normalized[index] = false;
     var copy: c.VkBufferImageCopy = .{
         .bufferOffset = 0,
         .bufferRowLength = target.width,
@@ -5028,6 +5053,42 @@ test "render-vulkan: 10-bit DRM targets preserve packed channel order" {
         target.view,
     );
     try std.testing.expect(!targetVkFormat(gbm.format_xrgb8888).?.ten_bit);
+}
+
+test "render-vulkan: 10-bit readbacks normalize both phases once and preserve 8-bit bytes" {
+    var before: [24]u8 = undefined;
+    var after: [24]u8 = undefined;
+    const values = [_]u32{
+        0,                               0x3fffffff, 1023 << 20, 1023 << 10, 1023,
+        (512 << 20) | (341 << 10) | 682,
+    };
+    for (values, 0..) |pixel, i|
+        std.mem.writeInt(u32, before[i * 4 ..][0..4], pixel, .little);
+    after = before;
+    var target: RealTarget = undefined;
+    target.ten_bit = true;
+    target.readback_size = before.len;
+    target.readback_maps = .{ &before, &after };
+    target.readback_normalized = .{ false, false };
+    const expected = [_]u8{
+        0,   0, 0,   255, 255, 255, 255, 255,
+        0,   0, 255, 255, 0,   255, 0,   255,
+        255, 0, 0,   255, 170, 85,  128, 255,
+    };
+    try std.testing.expectEqualSlices(u8, &expected, readbackBytes(&target, .before_cursor));
+    try std.testing.expectEqualSlices(u8, &expected, readbackBytes(&target, .before_cursor));
+    try std.testing.expect(!target.readback_normalized[1]);
+    try std.testing.expectEqualSlices(u8, &expected, readbackBytes(&target, .after_cursor));
+    // A new GPU copy replaces staging contents and resets only that phase.
+    @memset(&before, 0);
+    target.readback_normalized[0] = false;
+    _ = readbackBytes(&target, .before_cursor);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 255 }, before[0..4]);
+    try std.testing.expectEqualSlices(u8, &expected, readbackBytes(&target, .after_cursor));
+    target.ten_bit = false;
+    target.readback_normalized[0] = false;
+    @memset(&before, 37);
+    try std.testing.expectEqualSlices(u8, &(@as([24]u8, @splat(37))), readbackBytes(&target, .before_cursor));
 }
 
 test "render-vulkan: sampled batches preserve order and only first initializes" {

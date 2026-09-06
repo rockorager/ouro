@@ -169,6 +169,9 @@ pub const Config = struct {
     cpu_mapped: bool = false,
     /// A GPU renderer with a genuine 10-bit path may prefer XRGB2101010.
     prefer_10bit: bool = false,
+    /// Diagnostic override: retain the negotiated format, require this exact
+    /// advertised modifier, and never silently fall back to another layout.
+    required_modifier: ?u64 = null,
 };
 
 pub const Handle = struct {
@@ -221,13 +224,25 @@ pub const Pool = struct {
             return error.InvalidConfig;
         const mode = snapshot.selectedMode();
         if (mode.hdisplay == 0 or mode.vdisplay == 0) return error.InvalidMode;
-        const allocation = try negotiate(
+        var allocation = try negotiate(
             snapshot,
             mode.hdisplay,
             mode.vdisplay,
             config.linear_only,
             config.prefer_10bit,
         );
+        if (config.required_modifier) |modifier| {
+            if (modifier == gbm.modifier_invalid or
+                ((config.linear_only or config.cpu_mapped) and modifier != gbm.modifier_linear))
+                return error.InvalidModifierOverride;
+            const plane = snapshot.selectedPlane();
+            const formats = snapshot.formats[plane.format_start..][0..plane.format_count];
+            for (formats) |format| {
+                if (format.fourcc == allocation.format and format.modifier == modifier) break;
+            } else return error.ScanoutModifierUnsupported;
+            allocation.modifier = modifier;
+            allocation.explicit_modifier = true;
+        }
         const slots = try allocator.alloc(Slot, config.capacity);
         errdefer allocator.free(slots);
         const device = try gbm_platform.createDevice(fd);
@@ -526,9 +541,8 @@ fn formatAllocation(
             .modifier = gbm.modifier_linear,
             .explicit_modifier = true,
         };
-        if (format.modifier == drm_api.modifier_invalid) implicit = true else if (
-            format.modifier != gbm.modifier_linear and
-                (tiled == null or format.modifier < tiled.?))
+        if (format.modifier == drm_api.modifier_invalid) implicit = true else if (format.modifier != gbm.modifier_linear and
+            (tiled == null or format.modifier < tiled.?))
             tiled = format.modifier;
     };
     if (implicit) return .{
@@ -648,6 +662,31 @@ test "scanout: multiplane metadata is copied and mismatches roll back" {
     try std.testing.expectError(error.AllocationMismatch, Pool.init(std.testing.allocator, fake.gbmPlatform(), fake.drmPlatform(), 17, fixture.snapshot(), .{ .capacity = 1 }));
     try std.testing.expectEqual(@as(usize, 1), fake.bo_destroy_count);
     try std.testing.expectEqual(@as(usize, 1), fake.device_destroy_count);
+}
+
+test "scanout: modifier override preserves format and rejects fallback" {
+    var fixture = TestSnapshot.init(&.{
+        .{ .fourcc = gbm.format_xrgb8888, .modifier = gbm.modifier_linear },
+        .{ .fourcc = gbm.format_xrgb8888, .modifier = 9 },
+        .{ .fourcc = gbm.format_argb8888, .modifier = 10 },
+    });
+    var fake = FakePlatform{ .modifier = 9 };
+    var pool = try Pool.init(std.testing.allocator, fake.gbmPlatform(), fake.drmPlatform(), 17, fixture.snapshot(), .{ .capacity = 1, .required_modifier = 9 });
+    try std.testing.expectEqual(gbm.format_xrgb8888, pool.allocation.format);
+    try std.testing.expectEqual(@as(u64, 9), pool.allocation.modifier);
+    try std.testing.expect(pool.allocation.explicit_modifier);
+    try pool.deinit();
+
+    fake = .{};
+    // Do not change the pixel format to satisfy the requested modifier.
+    try std.testing.expectError(error.ScanoutModifierUnsupported, Pool.init(std.testing.allocator, fake.gbmPlatform(), fake.drmPlatform(), 17, fixture.snapshot(), .{ .required_modifier = 10 }));
+    try std.testing.expectError(error.InvalidModifierOverride, Pool.init(std.testing.allocator, fake.gbmPlatform(), fake.drmPlatform(), 17, fixture.snapshot(), .{ .required_modifier = gbm.modifier_invalid }));
+    try std.testing.expectError(error.InvalidModifierOverride, Pool.init(std.testing.allocator, fake.gbmPlatform(), fake.drmPlatform(), 17, fixture.snapshot(), .{ .linear_only = true, .required_modifier = 9 }));
+    try std.testing.expectEqual(@as(usize, 0), fake.bo_create_count);
+    // An allocator returning linear storage must not masquerade as tiled.
+    try std.testing.expectError(error.AllocationMismatch, Pool.init(std.testing.allocator, fake.gbmPlatform(), fake.drmPlatform(), 17, fixture.snapshot(), .{ .capacity = 1, .required_modifier = 9 }));
+    try std.testing.expectEqual(@as(usize, 0), fake.add_count);
+    try std.testing.expectEqual(@as(usize, 1), fake.bo_destroy_count);
 }
 
 test "scanout: ordinary linear allocation normalizes invalid GBM modifier" {

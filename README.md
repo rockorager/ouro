@@ -335,6 +335,20 @@ Renderer selection is explicit:
 - `--renderer=vulkan` requires Vulkan and a primary KMS plane with
   `IN_FENCE_FD`. Vulkan exports a sync-file fence to KMS and never host-waits.
 
+For controlled output-layout experiments, strict Vulkan mode accepts
+`--scanout-modifier=0xHEX`. It preserves the normally selected pixel format
+and requires that exact modifier on every output. Unsupported KMS pairs,
+GBM allocation failures, and incompatible Vulkan targets fail rather than
+silently falling back. Startup logs the actual format, modifier, and stride.
+Omitting the option preserves the existing allocation policy; there is no
+vendor-specific automatic selection.
+
+For example, compare `--scanout-modifier=0` (linear) with
+`--scanout-modifier=0x100000000000009` (Intel 4-tiled) on hardware that supports
+both. Keep renderer, resolution, scale, pixel format, and workload identical;
+verify the actual KMS framebuffer modifier and rendering before profiling.
+Run these as separate compositor sessions, not inside an active desktop.
+
 Strict Vulkan mode also publishes `color-management-v1` and
 `color-representation-v1`. Client parametric descriptions and ICC v2/v4 RGB
 Display or ColorSpace profiles are transformed in linear light. ICC parsing and

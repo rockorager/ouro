@@ -21,10 +21,12 @@ const render_list = @import("../scene/render_list.zig");
 const damage = @import("../scene/damage.zig");
 const scheduler_api = @import("headless.zig");
 const c = @cImport({
+    @cInclude("drm_mode.h");
     @cInclude("linux/dma-buf.h");
     @cInclude("linux/sync_file.h");
     @cInclude("sys/ioctl.h");
     @cInclude("sys/stat.h");
+    @cInclude("time.h");
 });
 
 pub const RendererPreference = enum { pixman, vulkan, vulkan_then_pixman };
@@ -34,6 +36,10 @@ pub const Config = struct {
     output_id: scheduler_api.OutputId,
     scheduler: scheduler_api.Config,
     renderer: RendererPreference = .vulkan_then_pixman,
+    /// Opt-in layout experiment; requires strict Vulkan, without fallback.
+    scanout_modifier: ?u64 = null,
+    /// Diagnostic only: logging perturbs timing; leave disabled for CPU comparisons.
+    trace_pacing: bool = false,
     image_count: usize = framebuffer.default_capacity,
     /// Total imported output images across every output sharing one renderer.
     max_render_targets: usize = framebuffer.default_capacity * 4,
@@ -173,6 +179,8 @@ fn contentByteCapacity(config: Config) !usize {
 fn validateConfig(config: Config) !void {
     const surface_bytes = surfaceByteCapacity(config);
     const content_bytes = try contentByteCapacity(config);
+    if (config.scanout_modifier != null and config.renderer != .vulkan)
+        return error.ModifierRequiresVulkan;
     if (config.image_count == 0 or config.max_render_targets < config.image_count or
         config.max_samples == 0 or config.max_source_bytes == 0 or surface_bytes == 0 or
         content_bytes < surface_bytes)
@@ -198,6 +206,13 @@ test "drm-output: surface, retained content, and fallback frame capacities are i
     var invalid = large_surface;
     invalid.max_content_bytes = 15;
     try std.testing.expectError(error.InvalidConfig, validateConfig(invalid));
+    invalid = base;
+    invalid.scanout_modifier = 0;
+    try std.testing.expectError(error.ModifierRequiresVulkan, validateConfig(invalid));
+    invalid.renderer = .vulkan_then_pixman;
+    try std.testing.expectError(error.ModifierRequiresVulkan, validateConfig(invalid));
+    invalid.renderer = .vulkan;
+    try validateConfig(invalid);
 }
 
 pub const RenderDevice = struct {
@@ -771,6 +786,7 @@ pub const Output = struct {
     output_format: render.PixelFormat,
     output_color_description: render.color.Description,
     clear: render.Color,
+    trace_pacing: bool = false,
     accepting_frames: bool = true,
     in_flight_frame: ?scheduler_api.FrameId = null,
     in_flight_handle: ?framebuffer.Handle = null,
@@ -960,7 +976,9 @@ pub const Output = struct {
             .max_render_rects = config.max_render_damage,
         });
         errdefer self.planner.deinit();
-        self.scheduler = try Scheduler.init(allocator, config.output_id, config.scheduler, config.max_samples);
+        var scheduler_config = config.scheduler;
+        scheduler_config.presentation_lead_ns = try verticalBlankNs(mode);
+        self.scheduler = try Scheduler.init(allocator, config.output_id, scheduler_config, config.max_samples);
         errdefer self.scheduler.deinit(allocator);
         self.sample_storage = try allocator.alloc(
             scheduler_api.Sample(render.PresentationIdentity),
@@ -990,6 +1008,7 @@ pub const Output = struct {
         self.overlay_formats = overlay_formats;
         self.allocator = allocator;
         self.clear = config.clear;
+        self.trace_pacing = config.trace_pacing;
         self.accepting_frames = true;
         self.in_flight_frame = null;
         self.in_flight_handle = null;
@@ -1002,6 +1021,14 @@ pub const Output = struct {
         self.event_cursor = 0;
         self.import_cache_cursor = 0;
         self.paused = false;
+        if (config.scanout_modifier != null) {
+            const format = std.mem.toBytes(self.pool.allocation.format);
+            const metadata = self.pool.slots[0].metadata;
+            std.log.info("scanout override: {d}x{d} {s} modifier=0x{x} planes={d} stride={d}", .{
+                self.pool.allocation.width, self.pool.allocation.height, &format,
+                metadata.modifier,          metadata.plane_count,        metadata.strides[0],
+            });
+        }
         return self;
     }
 
@@ -1566,11 +1593,21 @@ pub const Output = struct {
                         // scanout can already be null when a queued pause is
                         // committed in the same event batch, so it is not a
                         // stable identity source at this handoff boundary.
+                        const dispatch_ns = if (self.trace_pacing) pacingTimestamp() else null;
+                        const ready_ns = self.takeRenderReadyTimestamp(ring);
                         self.pending_callback = try self.scheduler.presentPhysical(
                             frame_id,
                             timestamp_ns,
-                            self.takeRenderReadyTimestamp(ring),
+                            ready_ns,
                         );
+                        if (self.trace_pacing) {
+                            const timing = self.pending_callback.?;
+                            std.log.info("pacing output={d} frame={d} requested={d} deadline={d} started={d} ready={?d} target={d} actual={d} dispatch={?d}", .{
+                                frame_id.output.index,     frame_id.sequence,        timing.requested_ns,
+                                timing.render_deadline_ns, timing.render_started_ns, ready_ns,
+                                timing.target_ns,          timestamp_ns,             dispatch_ns,
+                            });
+                        }
                         // The page flip is physically complete before the
                         // coordinator callback runs. Publish that boundary so
                         // callback work can apply commits and queue the next
@@ -1849,9 +1886,11 @@ fn initVulkanOutput(
         snapshot,
         config.image_count,
         prefer_10bit,
+        config.scanout_modifier,
     );
     errdefer pool.deinit() catch {};
     if (!renderer.supportsTarget(pool.allocation)) {
+        if (config.scanout_modifier != null) return error.UnsupportedOutputFormat;
         var fallback = try vulkan.initTargetPool(
             allocator,
             platforms.gbm,
@@ -1860,6 +1899,7 @@ fn initVulkanOutput(
             snapshot,
             config.image_count,
             false,
+            null,
         );
         pool.deinit() catch |err| {
             fallback.deinit() catch {};
@@ -1904,6 +1944,7 @@ fn initVulkan(allocator: std.mem.Allocator, platforms: Platforms, fd: std.posix.
         snapshot,
         config.image_count,
         prefer_10bit,
+        config.scanout_modifier,
     );
     errdefer pool.deinit() catch {};
     const content_version_capacity = try contentVersionCapacity(config);
@@ -1938,6 +1979,7 @@ fn initVulkan(allocator: std.mem.Allocator, platforms: Platforms, fd: std.posix.
     var owned_renderer = renderer;
     errdefer owned_renderer.deinit();
     if (!owned_renderer.supportsTarget(pool.allocation)) {
+        if (config.scanout_modifier != null) return error.UnsupportedOutputFormat;
         var fallback = try vulkan.initTargetPool(
             allocator,
             platforms.gbm,
@@ -1946,6 +1988,7 @@ fn initVulkan(allocator: std.mem.Allocator, platforms: Platforms, fd: std.posix.
             snapshot,
             config.image_count,
             false,
+            null,
         );
         pool.deinit() catch |err| {
             fallback.deinit() catch {};
@@ -2269,6 +2312,54 @@ fn flipTimestampNs(seconds: u32, microseconds: u32) u64 {
 
 fn callbackData(timestamp_ns: u64) u32 {
     return @truncate(timestamp_ns / std.time.ns_per_ms);
+}
+
+fn pacingTimestamp() ?u64 {
+    var now: c.struct_timespec = undefined;
+    if (c.clock_gettime(c.CLOCK_MONOTONIC, &now) != 0) return null;
+    return @as(u64, @intCast(now.tv_sec)) * std.time.ns_per_s + @as(u64, @intCast(now.tv_nsec));
+}
+
+fn verticalBlankNs(mode: drm.Mode) !u64 {
+    if (mode.clock == 0 or mode.vtotal < mode.vdisplay) return error.MalformedTopology;
+    // Progressive mode timestamps describe scanout start, while the latch is
+    // at blanking start. Preserve existing scheduling for field/repeated-line
+    // modes until their adjusted hardware timing is available here.
+    if (mode.flags & (c.DRM_MODE_FLAG_INTERLACE | c.DRM_MODE_FLAG_DBLSCAN) != 0 or mode.vscan > 1)
+        return 0;
+    return @as(u64, mode.vtotal - mode.vdisplay) * mode.htotal * std.time.ns_per_ms / mode.clock;
+}
+
+test "drm-sim: physical presentation lead follows progressive mode blanking" {
+    var mode: drm.Mode = .{
+        .clock = 652260,
+        .hdisplay = 2880,
+        .hsync_start = 2888,
+        .hsync_end = 2920,
+        .htotal = 2980,
+        .hskew = 0,
+        .vdisplay = 1800,
+        .vsync_start = 1808,
+        .vsync_end = 1816,
+        .vtotal = 3648,
+        .vscan = 0,
+        .vrefresh = 60,
+        .flags = 0,
+        .mode_type = 0,
+    };
+    try std.testing.expectEqual(@as(u64, 8_443_013), try verticalBlankNs(mode));
+    mode.clock = 148500;
+    mode.htotal = 2200;
+    mode.vtotal = 1125;
+    mode.vdisplay = 1080;
+    try std.testing.expectEqual(@as(u64, 666_666), try verticalBlankNs(mode));
+    mode.flags = c.DRM_MODE_FLAG_INTERLACE;
+    try std.testing.expectEqual(@as(u64, 0), try verticalBlankNs(mode));
+    mode.flags = 0;
+    mode.vtotal = mode.vdisplay;
+    try std.testing.expectEqual(@as(u64, 0), try verticalBlankNs(mode));
+    mode.clock = 0;
+    try std.testing.expectError(error.MalformedTopology, verticalBlankNs(mode));
 }
 
 fn duplicateFence(fd: std.posix.fd_t) ?std.posix.fd_t {
