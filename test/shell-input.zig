@@ -3094,6 +3094,46 @@ test "shell-input: two mapped toplevels sustain independent commit cycles" {
     try std.testing.expectEqual(@as(usize, 1), handler.activation_done);
     try std.testing.expectEqual(windows[1].id, coordinator.desktop.focused().?);
 
+    try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_button = .{
+        .device = pointer_device,
+        .time_usec = 10_000,
+        .button = 0x110,
+        .pressed = false,
+    } }));
+    try std.testing.expect(coordinator.interaction.interactionMode() == .default);
+
+    // Client teardown removes resources before the coordinator's next input
+    // admission. Keep the desktop destruction event pending, as when a client
+    // disconnect and a keyboard event share a completion batch. Exercise both
+    // replacement focus and closing the last window.
+    const server_objects = try root.runtime.clients.get(coordinator.peer.?);
+    for ([_]usize{ 1, 0 }) |index| {
+        const closing_surface = try coordinator.adapter.surfaceIdOn(server_objects, handler.surfaces[index].?.id);
+        try std.testing.expectEqual(closing_surface, coordinator.seat_adapter.keyboard_focus.?.surface);
+        for ([_]u32{
+            handler.toplevels[index].?.id,
+            handler.xdg_surfaces[index].?.id,
+            handler.surfaces[index].?.id,
+        }) |id| {
+            _ = try server_objects.removeClient(server_objects.namespace.lookupHandle(id).?);
+        }
+        try std.testing.expectError(error.StaleSurface, coordinator.adapter.surfaceResource(closing_surface));
+        try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .keyboard_key = .{
+            .device = keyboard_device,
+            .time_usec = if (index == 1) 20_000 else 21_000,
+            .key = 32,
+            .pressed = index == 1,
+        } }));
+        if (index == 1) {
+            try std.testing.expect(coordinator.seat_adapter.keyboard_focus != null);
+            try std.testing.expect(!std.meta.eql(closing_surface, coordinator.seat_adapter.keyboard_focus.?.surface));
+        } else {
+            try std.testing.expect(coordinator.desktop.focused() == null);
+            try std.testing.expect(coordinator.seat_adapter.keyboard_focus == null);
+        }
+        try std.testing.expect(!coordinator.stopping);
+    }
+
     coordinator.disconnected(coordinator.peer.?);
     _ = try client.prepareClose();
     try submitMultiClient(&client_reactor, &driver, &handler);

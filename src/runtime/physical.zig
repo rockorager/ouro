@@ -3640,6 +3640,10 @@ pub fn Coordinator(comptime protocol: type) type {
             // another event until main has handled it.
             if (!self.input_interaction_accepted and self.bindingsWorkPending())
                 return false;
+            // Resource teardown can precede input in the same completion
+            // batch. Retire its desktop entries before focus reconciliation
+            // can recreate a keyboard target for a destroyed wl_surface.
+            if (self.shellMaintenancePending()) try self.advanceShell();
             if (self.sessionLockActive() and !self.session_lock_input_ready) {
                 try self.sessionLockChanged();
                 if (!self.session_lock_input_ready) return false;
