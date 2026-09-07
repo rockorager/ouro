@@ -770,9 +770,12 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
 
         pub fn reconfigureShellToplevel(desktop: *Self, shell_id: Shell.ToplevelId) !void {
             const id = try desktop.idForShell(shell_id);
+            const slot = &desktop.slots[try desktop.resolveIndex(id)];
+            // Decoration negotiation must not bypass the initial bufferless
+            // commit: placement and output scale are not established yet.
+            if (!slot.initial_committed) return;
             if (desktop.commandCountFor(id) != 0) return;
             try desktop.requireCommandCapacity(1);
-            const slot = &desktop.slots[try desktop.resolveIndex(id)];
             desktop.enqueue(.{
                 .id = id,
                 .shell_id = slot.shell_id,
@@ -3514,6 +3517,7 @@ test "desktop: initial commit gates configure and unmap requires it again" {
     shell.push(created(0));
     _ = try desktop.consume(&shell, 1);
     const id = try desktop.idForShell(.{ .index = 0, .generation = 1 });
+    try desktop.reconfigureShellToplevel(try desktop.shellToplevel(id));
     try std.testing.expectEqual(@as(usize, 0), desktop.pendingCommands());
     try std.testing.expect(desktop.focused() == null);
     try std.testing.expect(!(try desktop.scene(id)).visible);
@@ -3541,6 +3545,7 @@ test "desktop: initial commit gates configure and unmap requires it again" {
     try std.testing.expect(!desktop.slots[id.index].configured);
     try std.testing.expect(desktop.focused() == null);
     try std.testing.expect(!(try desktop.scene(id)).visible);
+    try desktop.reconfigureShellToplevel(try desktop.shellToplevel(id));
     try std.testing.expectEqual(@as(usize, 0), desktop.pendingCommands());
 
     try beginInitialDesktop(&desktop, &shell);

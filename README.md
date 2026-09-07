@@ -141,9 +141,11 @@ responsibilities:
   across launcher/client boundaries, and activate a target toplevel exactly
   once through the normal desktop and keyboard-focus policy boundary.
 - [XDG decoration](src/protocol/xdg_decoration.zig): bounded per-toplevel
-  negotiation reports client-side decoration until Ouro gains a real
-  server-side frame renderer, with mode events ordered before their matching
-  XDG surface configure and retained across transport backpressure.
+  negotiation selects server-side decorations. Ouro intentionally leaves
+  tiled and floating windows borderless, with no compositor-drawn title bar or
+  shadow; window management uses compositor bindings. Clients without this
+  protocol can still draw their own decorations. Mode events are ordered before
+  their matching XDG surface configure and retained across transport backpressure.
 - [Desktop interaction](src/input/interaction.zig): pointer motion hit-tests
   exact committed input regions against the copied desktop scene, retains
   default, button-grab, popup-grab, and validated interactive move/resize state

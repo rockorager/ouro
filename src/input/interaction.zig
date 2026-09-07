@@ -582,6 +582,15 @@ fn interactionWithKeyConsumer(comptime Desktop: type, comptime KeyConsumerFactor
             };
         }
 
+        fn keyboardTarget(desktop: *Desktop, pointer: Target) !Target {
+            var target = pointer;
+            // Subsurfaces receive pointer input, but keyboard focus belongs to
+            // the owning toplevel (e.g. Chrome's inactive omnibox dropdown).
+            if (target.managed and target.keyboard_focusable)
+                target.surface = (try desktop.scene(target.toplevel)).surface;
+            return target;
+        }
+
         fn pointerMotion(
             self: *Self,
             desktop: *Desktop,
@@ -619,11 +628,12 @@ fn interactionWithKeyConsumer(comptime Desktop: type, comptime KeyConsumerFactor
             if (self.mode == .popup_grab and target != null and
                 !std.meta.eql(target.?.toplevel, self.mode.popup_grab.toplevel))
                 target = null;
+            const keyboard_target = if (target) |pointer| try keyboardTarget(desktop, pointer) else null;
             const focus_candidate = self.mode == .default and target != null and target.?.managed and
                 target.?.keyboard_focusable and
                 (self.keyboard_focus == null or
-                    !std.meta.eql(self.keyboard_focus.?.toplevel, target.?.toplevel) or
-                    !std.meta.eql(self.keyboard_focus.?.surface, target.?.surface));
+                    !std.meta.eql(self.keyboard_focus.?.toplevel, keyboard_target.?.toplevel) or
+                    !std.meta.eql(self.keyboard_focus.?.surface, keyboard_target.?.surface));
             if (focus_candidate) try self.ensureCommandCapacity(2);
             const inside = target != null;
             if (target == null) switch (self.mode) {
@@ -647,8 +657,8 @@ fn interactionWithKeyConsumer(comptime Desktop: type, comptime KeyConsumerFactor
             if (interactive_rect) |rect|
                 try desktop.updateInteractive(self.mode.interactive.target.toplevel, rect);
             if (focus_candidate and try desktop.requestFocus(target.?.toplevel, .pointer_motion)) {
-                self.keyboard_focus = target.?;
-                self.enqueue(.{ .keyboard_focus = target.? });
+                self.keyboard_focus = keyboard_target.?;
+                self.enqueue(.{ .keyboard_focus = keyboard_target.? });
             }
             self.enqueue(.{ .pointer_focus = target });
             self.x_fixed = next_x;
@@ -694,8 +704,9 @@ fn interactionWithKeyConsumer(comptime Desktop: type, comptime KeyConsumerFactor
                 const target = self.hover.?;
                 self.mode = .{ .button_grab = target };
                 if (target.keyboard_focusable and accepts_keyboard_focus) {
-                    self.keyboard_focus = target;
-                    self.enqueue(.{ .keyboard_focus = target });
+                    const keyboard_target = try keyboardTarget(desktop, target);
+                    self.keyboard_focus = keyboard_target;
+                    self.enqueue(.{ .keyboard_focus = keyboard_target });
                 }
             } else if (dismisses_popup) {
                 self.mode = .default;

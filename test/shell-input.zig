@@ -2784,12 +2784,17 @@ test "shell-input: tablet global delivers normalized device and tool metadata" {
     try root.deinit();
 }
 
-test "shell-input: each new toplevel gets its output scale before initial configure" {
-    try runInitialToplevelScale(4096);
-    try runInitialToplevelScale(128);
+test "shell-input: each new toplevel gets decorations and output scale before initial configure" {
+    try runInitialToplevelScale(4096, false);
+    try runInitialToplevelScale(128, false);
 }
 
-fn runInitialToplevelScale(transmit_byte_budget: usize) !void {
+test "shell-input: client shadow on adjacent output does not change window scale" {
+    try runInitialToplevelScale(4096, true);
+    try runInitialToplevelScale(128, true);
+}
+
+fn runInitialToplevelScale(transmit_byte_budget: usize, shadow: bool) !void {
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-initial-scale-{d}.sock", .{linux.getpid()});
@@ -2853,6 +2858,8 @@ fn runInitialToplevelScale(transmit_byte_budget: usize) !void {
         .cycle_count = 1,
         .fractional_mode = true,
         .defer_mapping = true,
+        .window_shadow = shadow,
+        .decoration_mode = !shadow,
     };
     try submitMultiClient(&reactor, &driver, &handler);
     for (0..512) |_| {
@@ -2915,7 +2922,11 @@ fn runInitialToplevelScale(transmit_byte_budget: usize) !void {
     const windows = try coordinator.desktop.sceneSnapshot(coordinator.scene_windows);
     const mapped_layer = findLayer(coordinator.app_layers, windows[1].surface) orelse return error.MissingLayer;
     try std.testing.expectEqual(ouro.render.Size{ .width = 3, .height = 1 }, mapped_layer.sample.?.source.size);
-    try std.testing.expectEqual(ouro.render.Rect{ .x = 2, .y = -1, .width = 2, .height = 1 }, mapped_layer.sample.?.destination);
+    const destination: ouro.render.Rect = if (shadow)
+        .{ .x = 1, .y = -2, .width = 4, .height = 3 }
+    else
+        .{ .x = 2, .y = -1, .width = 2, .height = 1 };
+    try std.testing.expectEqual(destination, mapped_layer.sample.?.destination);
 
     // Moving established windows still uses applied geometry, not the initial
     // placement fallback. A repeated round trip must continue publishing both scales.
@@ -2929,6 +2940,27 @@ fn runInitialToplevelScale(transmit_byte_budget: usize) !void {
             _ = linux.sched_yield();
         }
         scale.* = handler.preferred_scales[1];
+    }
+
+    if (handler.decoration_mode) {
+        // Neither a different preference nor withdrawing it changes Ouro's
+        // borderless server-side policy. Exercise each response on the wire.
+        const Decoration = protocol.zxdg_toplevel_decoration_v1;
+        for ([_]Decoration.Request{
+            .{ .set_mode = .{ .mode = .client_side } },
+            .{ .set_mode = .{ .mode = .server_side } },
+            .{ .unset_mode = .{} },
+        }) |request| {
+            const before = handler.decoration_configures[1];
+            try Decoration.encodeRequest(handler.queue, handler.decorations[1].?.id, request);
+            for (0..512) |_| {
+                _ = try drainMultiClient(&reactor, &driver, &handler);
+                _ = try loop.turn(coordinator);
+                if (handler.decoration_configures[1] > before) break;
+                _ = linux.sched_yield();
+            }
+            try std.testing.expect(handler.decoration_configures[1] > before);
+        }
     }
 
     coordinator.disconnected(coordinator.peer.?);
@@ -4942,6 +4974,7 @@ test "shell-input: synchronized subsurface publishes with parent and receives po
     try std.testing.expectEqual(@as(usize, 2), handler.frame_done);
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
 
+    coordinator.desktop.policy.focus_follows_mouse = true;
     const pointer_device: ouro.input_backend.DeviceId = .{
         .slot = 0,
         .generation = 1,
@@ -4949,8 +4982,16 @@ test "shell-input: synchronized subsurface publishes with parent and receives po
     };
     try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .device_added = .{
         .device = pointer_device,
-        .info = .{ .capabilities = .{ .pointer = true } },
+        .info = .{ .capabilities = .{ .pointer = true, .keyboard = true } },
     } }));
+    for (0..256) |_| {
+        _ = try drainMultiClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.keyboard_surface != null) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(handler.surfaces[0].?.id, handler.keyboard_surface.?);
+    const keyboard_leaves = handler.keyboard_leaves;
     try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_motion = .{
         .device = pointer_device,
         .time_usec = 1,
@@ -4964,6 +5005,34 @@ test "shell-input: synchronized subsurface publishes with parent and receives po
     );
     try std.testing.expectEqual(@as(i32, 64), pointer.point.x);
     try std.testing.expectEqual(@as(i32, 64), pointer.point.y);
+
+    // Chrome's omnibox is an inactive subsurface, not an xdg_popup. Hover
+    // and click must deliver pointer input to it without blurring the parent.
+    for ([_]bool{ true, false }) |pressed| {
+        try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_button = .{
+            .device = pointer_device,
+            .time_usec = 2,
+            .button = 272,
+            .pressed = pressed,
+        } }));
+    }
+    for ([_]bool{ true, false }) |pressed| {
+        try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .keyboard_key = .{
+            .device = pointer_device,
+            .time_usec = 3,
+            .key = 30,
+            .pressed = pressed,
+        } }));
+    }
+    for (0..256) |_| {
+        _ = try drainMultiClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.keyboard_keys == 2) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(usize, 2), handler.keyboard_keys);
+    try std.testing.expectEqual(handler.surfaces[0].?.id, handler.key_surface.?);
+    try std.testing.expectEqual(keyboard_leaves, handler.keyboard_leaves);
 
     try wayring.client.sendRequest(
         protocol.wl_subsurface,
@@ -6004,6 +6073,7 @@ const MultiHandler = struct {
     keyboard_surface: ?u32 = null,
     key_surface: ?u32 = null,
     keyboard_keys: usize = 0,
+    keyboard_leaves: usize = 0,
     activation: ?wayring.objects.Handle = null,
     activation_token: ?wayring.objects.Handle = null,
     surfaces: [2]?wayring.objects.Handle = .{ null, null },
@@ -6031,6 +6101,11 @@ const MultiHandler = struct {
     activation_done: usize = 0,
     fractional_mode: bool = false,
     defer_mapping: bool = false,
+    window_shadow: bool = false,
+    decoration_mode: bool = false,
+    decoration_manager: ?wayring.objects.Handle = null,
+    decorations: [2]?wayring.objects.Handle = .{ null, null },
+    decoration_configures: [2]usize = .{ 0, 0 },
     fractional_manager: ?wayring.objects.Handle = null,
     viewporter: ?wayring.objects.Handle = null,
     fractional_scales: [2]?wayring.objects.Handle = .{ null, null },
@@ -6063,6 +6138,12 @@ const MultiHandler = struct {
             _ = try protocol.wl_shm.decodeEvent(message, fds);
         } else if (target.object.interface == &protocol.wl_output.info) {
             _ = try protocol.wl_output.decodeEvent(message, fds);
+        } else if (target.object.interface == &protocol.zxdg_toplevel_decoration_v1.info) {
+            const index = self.indexFor(self.decorations, message.header.object_id) orelse
+                return error.UnknownDecoration;
+            const value = try protocol.zxdg_toplevel_decoration_v1.decodeEvent(message, fds);
+            try std.testing.expectEqual(protocol.zxdg_toplevel_decoration_v1.mode.server_side, value.configure.mode);
+            self.decoration_configures[index] += 1;
         } else if (target.object.interface == &protocol.wp_fractional_scale_v1.info) {
             const index = self.indexFor(self.fractional_scales, message.header.object_id) orelse
                 return error.UnknownFractionalScale;
@@ -6110,7 +6191,10 @@ const MultiHandler = struct {
             switch (try protocol.wl_keyboard.decodeEvent(message, fds)) {
                 .keymap => |value| _ = linux.close(value.fd),
                 .enter => |value| self.keyboard_surface = value.surface,
-                .leave => self.keyboard_surface = null,
+                .leave => {
+                    self.keyboard_surface = null;
+                    self.keyboard_leaves += 1;
+                },
                 .key => {
                     self.key_surface = self.keyboard_surface;
                     self.keyboard_keys += 1;
@@ -6119,7 +6203,7 @@ const MultiHandler = struct {
             }
         } else if (target.object.interface == &protocol.wl_pointer.info) {
             switch (try protocol.wl_pointer.decodeEvent(message, fds)) {
-                .button => |value| if (!self.activation_requested and
+                .button => |value| if (self.activation_mode and !self.activation_requested and
                     value.state.value == protocol.wl_pointer.button_state.pressed.value)
                     try self.requestActivation(value.serial),
                 else => {},
@@ -6143,6 +6227,7 @@ const MultiHandler = struct {
                 return error.UnknownXdgSurface;
             switch (try protocol.xdg_surface.decodeEvent(message, fds)) {
                 .configure => |value| {
+                    if (self.decoration_mode) try std.testing.expect(self.decoration_configures[index] != 0);
                     if (self.initial_configure_scales[index] == null)
                         self.initial_configure_scales[index] = self.preferred_scales[index];
                     try protocol.xdg_surface.encodeRequest(self.queue, self.xdg_surfaces[index].?.id, .{
@@ -6211,7 +6296,9 @@ const MultiHandler = struct {
             self.shm = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_shm.info, @min(value.version, 2), null);
         if (std.mem.eql(u8, value.interface, protocol.xdg_wm_base.info.name))
             self.wm_base = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.xdg_wm_base.info, @min(value.version, 7), null);
-        if (self.activation_mode and std.mem.eql(u8, value.interface, protocol.wl_seat.info.name))
+        if (self.decoration_mode and std.mem.eql(u8, value.interface, protocol.zxdg_decoration_manager_v1.info.name))
+            self.decoration_manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.zxdg_decoration_manager_v1.info, @min(value.version, 2), null);
+        if ((self.activation_mode or self.subsurface_mode) and std.mem.eql(u8, value.interface, protocol.wl_seat.info.name))
             self.seat = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_seat.info, @min(value.version, 9), null);
         if (self.activation_mode and std.mem.eql(u8, value.interface, protocol.xdg_activation_v1.info.name))
             self.activation = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.xdg_activation_v1.info, 1, null);
@@ -6230,6 +6317,7 @@ const MultiHandler = struct {
         if (!self.cursor_mode and self.wm_base == null) return;
         if ((self.subsurface_mode or self.cursor_mode) and self.subcompositor == null) return;
         if (self.fractional_mode and (self.fractional_manager == null or self.viewporter == null)) return;
+        if (self.decoration_mode and self.decoration_manager == null) return;
         for (0..self.surface_count) |index| {
             if (self.surfaces[index] != null) continue;
             self.surfaces[index] = (try protocol.wl_compositor.construct_create_surface(
@@ -6254,7 +6342,10 @@ const MultiHandler = struct {
                     .{ .surface = self.surfaces[index].?.id },
                 )).id;
                 try protocol.wp_viewport.encodeRequest(self.queue, self.viewports[index].?.id, .{
-                    .set_destination = .{ .width = 2, .height = 1 },
+                    .set_destination = .{
+                        .width = if (self.window_shadow) 4 else 2,
+                        .height = if (self.window_shadow) 3 else 1,
+                    },
                 });
             }
             if (self.cursor_mode or (self.subsurface_mode and index != 0)) continue;
@@ -6269,6 +6360,12 @@ const MultiHandler = struct {
                 self.queue,
                 self.xdg_surfaces[index].?,
                 .{},
+            )).id;
+            if (self.decoration_mode) self.decorations[index] = (try protocol.zxdg_decoration_manager_v1.construct_get_toplevel_decoration(
+                self.objects,
+                self.queue,
+                self.decoration_manager.?,
+                .{ .toplevel = self.toplevels[index].?.id },
             )).id;
             try protocol.wl_surface.encodeRequest(
                 self.queue,
@@ -6301,6 +6398,11 @@ const MultiHandler = struct {
     }
 
     fn mapSurface(self: *MultiHandler, index: usize) !void {
+        if (self.window_shadow) try protocol.xdg_surface.encodeRequest(
+            self.queue,
+            self.xdg_surfaces[index].?.id,
+            .{ .set_window_geometry = .{ .x = 1, .y = 1, .width = 2, .height = 1 } },
+        );
         const descriptor = try ordinaryMemfd(4096, 16, self.source_pixels);
         const pool = try protocol.wl_shm.construct_create_pool(
             self.objects,

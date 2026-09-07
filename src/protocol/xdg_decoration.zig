@@ -1,7 +1,7 @@
 //! Bounded XDG decoration negotiation.
 //!
-//! Ouro does not draw server-side window frames yet, so every negotiation
-//! resolves honestly to client-side decoration. Each mode event is ordered
+//! Ouro selects server-side decoration and intentionally leaves windows
+//! borderless; window management uses compositor bindings. Each mode event is ordered
 //! before the corresponding xdg_surface configure by the physical runtime.
 
 const std = @import("std");
@@ -230,7 +230,7 @@ pub fn Adapter(comptime protocol: type, comptime Shell: type) type {
                     server_objects,
                     queue,
                     slot.resource,
-                    .{ .configure = .{ .mode = Decoration.mode.client_side } },
+                    .{ .configure = .{ .mode = Decoration.mode.server_side } },
                 ) catch |err| switch (err) {
                     error.Exhausted, error.ByteBudgetExceeded, error.DescriptorBudgetExceeded => return completed,
                     else => return err,
@@ -424,7 +424,7 @@ test "xdg decoration: reservation grows stably and negotiation coalesces request
     defer fds.deinit();
     const event = try protocol.zxdg_toplevel_decoration_v1.decodeEvent(message, &fds);
     try std.testing.expectEqual(
-        protocol.zxdg_toplevel_decoration_v1.mode.client_side,
+        protocol.zxdg_toplevel_decoration_v1.mode.server_side,
         event.configure.mode,
     );
 }

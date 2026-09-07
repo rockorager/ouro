@@ -12844,7 +12844,15 @@ pub fn Coordinator(comptime protocol: type) type {
             const surface = layer.id orelse return;
             if (self.surfaceBelongsToSessionLock(surface) != self.sessionLockActive()) return;
             const sample = layer.sample orelse return;
-            try self.publishPreferredScaleForRect(surface, sample.destination, self.boundLayerOutput(layer));
+            var destination = sample.destination;
+            if (self.desktop.sceneForSurface(surface) catch null) |window| {
+                // XDG window geometry excludes client-side shadows. A shadow
+                // spilling onto a higher-density neighbor must not change the
+                // content's scale after its first buffer arrives.
+                if (window.has_window_geometry)
+                    destination = try clipToOutput(destination, window.geometry) orelse return;
+            }
+            try self.publishPreferredScaleForRect(surface, destination, self.boundLayerOutput(layer));
         }
 
         fn publishPreferredScaleForRect(
