@@ -3763,7 +3763,7 @@ fn layerPopupOutputLifecycle(power_cycle: bool) !void {
     try root.deinit();
 }
 
-test "shell-input: popup applies each acknowledged configure after output removal" {
+test "shell-input: popup retains parent keyboard focus and applies each configure after output removal" {
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-toplevel-popup-{d}.sock", .{linux.getpid()});
@@ -3856,6 +3856,84 @@ test "shell-input: popup applies each acknowledged configure after output remova
     }
     try std.testing.expect(root_id != null);
     try std.testing.expectEqual(@as(usize, 1), handler.popup_configure_count);
+
+    // Exercise the production tree hit test and wire focus publication, not
+    // just the interaction model's synthetic popup target.
+    coordinator.desktop.policy.focus_follows_mouse = true;
+    const device: ouro.input_backend.DeviceId = .{
+        .slot = 10,
+        .generation = 1,
+        .seat_generation = 1,
+    };
+    try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .device_added = .{
+        .device = device,
+        .info = .{ .capabilities = .{ .pointer = true, .keyboard = true } },
+    } }));
+    for (0..256) |_| {
+        client_progress = try drainLayerPopupClient(&client_reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.keyboard_surface != null and handler.pointer != null) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(handler.layer_wl_surface.?.id, handler.keyboard_surface.?);
+    const keyboard_enters = handler.keyboard_enters;
+    const keyboard_leaves = handler.keyboard_leaves;
+    const popup_scene = (try coordinator.desktop.sceneSnapshot(&scene_storage))[1];
+    try std.testing.expectEqual(
+        handler.popup_surface.?.id,
+        (try coordinator.adapter.surfaceHandle(popup_scene.surface)).id,
+    );
+    const parent_scene = try coordinator.desktop.scene(root_id.?);
+    for ([_]bool{ false, true }) |dragging| for ([_]bool{ false, true, false, true }) |into_popup| {
+        if (dragging) try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_button = .{
+            .device = device,
+            .time_usec = 1_000,
+            .button = 273,
+            .pressed = true,
+        } }));
+        const target_scene = if (into_popup) popup_scene else parent_scene;
+        const delta = coordinator.interaction.motionToPoint(.{
+            .x = target_scene.geometry.x,
+            .y = target_scene.geometry.y,
+        });
+        try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_motion = .{
+            .device = device,
+            .time_usec = 2_000,
+            .dx = delta.dx,
+            .dy = delta.dy,
+        } }));
+        if (dragging) try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_button = .{
+            .device = device,
+            .time_usec = 3_000,
+            .button = 273,
+            .pressed = false,
+        } }));
+        const expected_surface = (try coordinator.adapter.surfaceHandle(target_scene.surface)).id;
+        for (0..256) |_| {
+            client_progress = try drainLayerPopupClient(&client_reactor, &driver, &handler);
+            _ = try loop.turn(coordinator);
+            if (handler.pointer_surface == expected_surface) break;
+            _ = linux.sched_yield();
+        }
+        try std.testing.expectEqual(expected_surface, handler.pointer_surface.?);
+        // Include a full click on each side of the popup boundary.
+        for ([_]bool{ true, false }) |pressed| {
+            try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_button = .{
+                .device = device,
+                .time_usec = 4_000,
+                .button = 273,
+                .pressed = pressed,
+            } }));
+        }
+        for (0..32) |_| {
+            client_progress = try drainLayerPopupClient(&client_reactor, &driver, &handler);
+            _ = try loop.turn(coordinator);
+        }
+        try std.testing.expectEqual(handler.layer_wl_surface.?.id, handler.keyboard_surface.?);
+        try std.testing.expectEqual(keyboard_enters, handler.keyboard_enters);
+        try std.testing.expectEqual(keyboard_leaves, handler.keyboard_leaves);
+        try std.testing.expectEqual(@as(usize, 0), handler.popup_done);
+    };
 
     try coordinator.desktop.setFloating(root_id.?, true);
     try coordinator.desktop.setFloatingGeometry(
@@ -6700,6 +6778,14 @@ const LayerPopupHandler = struct {
     registry: wayring.objects.Handle,
     compositor: ?wayring.objects.Handle = null,
     shm: ?wayring.objects.Handle = null,
+    seat: ?wayring.objects.Handle = null,
+    pointer: ?wayring.objects.Handle = null,
+    keyboard: ?wayring.objects.Handle = null,
+    pointer_surface: ?u32 = null,
+    keyboard_surface: ?u32 = null,
+    keyboard_enters: usize = 0,
+    keyboard_leaves: usize = 0,
+    popup_done: usize = 0,
     wm_base: ?wayring.objects.Handle = null,
     output: ?wayring.objects.Handle = null,
     output_count: usize = 0,
@@ -6754,6 +6840,35 @@ const LayerPopupHandler = struct {
                 .global_remove => {},
             }
             try self.maybeCreate();
+        } else if (target.object.interface == &protocol.wl_seat.info) {
+            switch (try protocol.wl_seat.decodeEvent(message, fds)) {
+                .capabilities => |value| {
+                    if (self.pointer == null and value.capabilities.contains(protocol.wl_seat.capability.pointer))
+                        self.pointer = (try protocol.wl_seat.construct_get_pointer(self.objects, self.queue, self.seat.?, .{})).id;
+                    if (self.keyboard == null and value.capabilities.contains(protocol.wl_seat.capability.keyboard))
+                        self.keyboard = (try protocol.wl_seat.construct_get_keyboard(self.objects, self.queue, self.seat.?, .{})).id;
+                },
+                .name => {},
+            }
+        } else if (target.object.interface == &protocol.wl_pointer.info) {
+            switch (try protocol.wl_pointer.decodeEvent(message, fds)) {
+                .enter => |value| self.pointer_surface = value.surface,
+                .leave => self.pointer_surface = null,
+                else => {},
+            }
+        } else if (target.object.interface == &protocol.wl_keyboard.info) {
+            switch (try protocol.wl_keyboard.decodeEvent(message, fds)) {
+                .keymap => |value| _ = linux.close(value.fd),
+                .enter => |value| {
+                    self.keyboard_surface = value.surface;
+                    self.keyboard_enters += 1;
+                },
+                .leave => {
+                    self.keyboard_surface = null;
+                    self.keyboard_leaves += 1;
+                },
+                else => {},
+            }
         } else if (target.object.interface == &protocol.wl_shm.info) {
             _ = try protocol.wl_shm.decodeEvent(message, fds);
         } else if (target.object.interface == &protocol.wl_output.info) {
@@ -6794,7 +6909,10 @@ const LayerPopupHandler = struct {
                 .closed => self.layer_closed += 1,
             }
         } else if (target.object.interface == &protocol.xdg_popup.info) {
-            _ = try protocol.xdg_popup.decodeEvent(message, fds);
+            switch (try protocol.xdg_popup.decodeEvent(message, fds)) {
+                .popup_done => self.popup_done += 1,
+                else => {},
+            }
         } else if (target.object.interface == &protocol.xdg_toplevel.info) {
             _ = try protocol.xdg_toplevel.decodeEvent(message, fds);
         } else if (target.object.interface == &protocol.xdg_surface.info) {
@@ -6870,6 +6988,8 @@ const LayerPopupHandler = struct {
             self.compositor = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_compositor.info, @min(value.version, 7), null);
         if (std.mem.eql(u8, value.interface, protocol.wl_shm.info.name))
             self.shm = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_shm.info, @min(value.version, 2), null);
+        if (self.toplevel_root and std.mem.eql(u8, value.interface, protocol.wl_seat.info.name))
+            self.seat = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_seat.info, @min(value.version, 9), null);
         if (std.mem.eql(u8, value.interface, protocol.xdg_wm_base.info.name))
             self.wm_base = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.xdg_wm_base.info, @min(value.version, 7), null);
         if (std.mem.eql(u8, value.interface, protocol.wl_output.info.name)) {
