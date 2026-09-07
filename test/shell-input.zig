@@ -3157,6 +3157,111 @@ test "shell-input: two mapped toplevels sustain independent commit cycles" {
     try root.deinit();
 }
 
+test "shell-input: last window removal clears every reused scanout image" {
+    for ([_]bool{ false, true }) |destroy| {
+        const allocator = std.testing.allocator;
+        var path_storage: [128]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-last-window-{d}.sock", .{linux.getpid()});
+        wayring.unix_socket.unlink(path) catch {};
+        defer wayring.unix_socket.unlink(path) catch {};
+        var fixture = try physical_fixture.Fixture.init();
+        defer fixture.deinit();
+        const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), physical_fixture.compositorConfig());
+        const config = physical_fixture.coordinatorConfig();
+        const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), config);
+        var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
+        try coordinator.start(&loop);
+
+        var reactor: wayring.io_uring.Reactor = undefined;
+        try reactor.initOwned(allocator, .{ .entries = 16, .flags = 0 }, physical_fixture.clientReactorConfig());
+        var client = try ClientConnection.attach(
+            allocator,
+            &reactor,
+            try wayring.unix_socket.connect(path),
+            .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 },
+            .{ .max_objects = 32, .max_client_ids = 31 },
+        );
+        const actor = try client.actor();
+        var driver = ClientDriver.init(&client);
+        const registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null);
+        var handler: MultiHandler = .{
+            .objects = &client.objects,
+            .queue = &actor.transmit,
+            .registry = registry,
+            .surface_count = 1,
+            .cycle_count = 3,
+        };
+        try submitMultiClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        try fixture.signalSession(.enable);
+        for (0..256) |_| {
+            _ = try drainMultiClient(&reactor, &driver, &handler);
+            _ = try loop.turn(coordinator);
+            if (handler.frame_done == 3 and handler.buffer_releases == 3) break;
+            if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+                try waitForEither(&root.ring, reactor.ring);
+        }
+        try std.testing.expectEqual(@as(usize, 3), handler.frame_done);
+        try std.testing.expectEqual(@as(usize, 3), handler.buffer_releases);
+        // Both targets must contain the window before it disappears; an
+        // uninitialized target's full repair would mask missing removal damage.
+        try std.testing.expectEqual(config.output.image_count, fixture.dumb_count);
+        for (fixture.dumb_bytes[0..fixture.dumb_count]) |image| {
+            try std.testing.expectEqualSlices(u8, pixels[0..12], image[0..12]);
+            try std.testing.expectEqualSlices(u8, pixels[16..28], image[16..28]);
+        }
+
+        var presented = coordinator.stats.presented;
+        if (destroy) {
+            // Retiring the role must repaint even if wl_surface destruction
+            // arrives in a later dispatch batch.
+            try wayring.client.sendRequest(protocol.xdg_toplevel, handler.objects, handler.queue, handler.toplevels[0].?, .{ .destroy = .{} });
+        } else {
+            try protocol.wl_surface.encodeRequest(handler.queue, handler.surfaces[0].?.id, .{ .attach = .{ .buffer = null, .x = 0, .y = 0 } });
+            try protocol.wl_surface.encodeRequest(handler.queue, handler.surfaces[0].?.id, .{ .commit = .{} });
+        }
+        try submitMultiClient(&reactor, &driver, &handler);
+        // Repaint repeatedly without any additional client damage. Each target
+        // must stay clear, rather than alternating back to the closed window.
+        for (0..config.output.image_count * 2) |frame| {
+            if (frame != 0) try coordinator.primaryKmsOutput().?.request(.damage, 1);
+            for (0..256) |_| {
+                _ = try drainMultiClient(&reactor, &driver, &handler);
+                _ = try loop.turn(coordinator);
+                if (coordinator.stats.presented > presented) break;
+                if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+                    try waitForEither(&root.ring, reactor.ring);
+            }
+            try std.testing.expect(coordinator.stats.presented > presented);
+            presented = coordinator.stats.presented;
+            const output = coordinator.primaryKmsOutput().?;
+            const image = fixture.dumb_bytes[output.kms_output.current.?.slot];
+            for (0..2) |y| for (0..3) |x| {
+                try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 255 }, image[y * 16 + x * 4 ..][0..4]);
+            };
+            try std.testing.expect(coordinator.desktop.focused() == null);
+        }
+        try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+        try std.testing.expect(!coordinator.stopping);
+        try coordinator.requestStop();
+        var drained = false;
+        for (0..256) |_| {
+            const cp = try drainMultiClient(&reactor, &driver, &handler);
+            const progress = try loop.turn(coordinator);
+            drained = progress.wayring.shutdown_complete and cp.quiescent and coordinator.backendDrainComplete();
+            if (drained) break;
+            if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+                try waitForEither(&root.ring, reactor.ring);
+        }
+        try std.testing.expect(drained);
+        try client.deinit(allocator);
+        reactor.deinit(allocator);
+        loop.deinit();
+        try coordinator.destroy();
+        try root.deinit();
+    }
+}
+
 test "shell-input: secondary output removal closes its reactive layer popup root" {
     try layerPopupOutputLifecycle(false);
 }

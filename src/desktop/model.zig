@@ -1624,6 +1624,9 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
             desktop.release(index);
             desktop.live -= 1;
             try desktop.reflow();
+            // Reflow may have no surviving windows to publish, but removing
+            // the last toplevel still changes the scene.
+            desktop.scene_changed = true;
             desktop.destroyed = id;
             desktop.foreign_toplevel_changed = true;
         }

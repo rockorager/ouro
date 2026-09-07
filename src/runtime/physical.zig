@@ -13052,6 +13052,10 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn retireLayer(self: *Self, layer: *Layer) void {
             defer self.syncLayerRetry(layer);
+            // A role can disappear before wl_surface destruction. Preserve
+            // its old bounds while the layer is still active so every scanout
+            // image repairs the pixels it previously occupied.
+            if (layer.id) |id| self.queueLayerRemoval(id);
             if (layerHasOutputAssociation(layer)) self.output_associations_dirty = true;
             layer.active = false;
             if (layer.presentation != null) {
