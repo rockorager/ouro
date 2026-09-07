@@ -24,6 +24,7 @@ pub const engine_settings = @import("runtime/settings.zig");
 pub const timer = @import("runtime/timer.zig");
 pub const loop = @import("runtime/loop.zig");
 pub const physical = @import("runtime/physical.zig");
+pub const diagnostics = @import("diagnostics.zig");
 pub const shutdown_signal = @import("runtime/shutdown_signal.zig");
 pub const config = @import("config.zig");
 pub const launcher = @import("launcher.zig");
@@ -132,6 +133,7 @@ test {
     _ = timer;
     _ = loop;
     _ = physical;
+    _ = diagnostics;
     _ = shutdown_signal;
     _ = config;
     _ = launcher;

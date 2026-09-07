@@ -30,6 +30,7 @@ const output_api = @import("../output/drm.zig");
 const output_scheduler = @import("../output/headless.zig");
 const render = @import("../render/types.zig");
 const render_content = @import("../render/content.zig");
+const diagnostics = @import("../diagnostics.zig");
 const render_pixman = @import("../render/pixman.zig");
 const render_list = @import("../scene/render_list.zig");
 const damage = @import("../scene/damage.zig");
@@ -1099,6 +1100,8 @@ pub fn Coordinator(comptime protocol: type) type {
         wayring_shutdown_requested: bool = false,
         session_disable_pending: bool = false,
         stats: Stats = .{},
+        /// Borrowed, single-producer recorder; installed by the executable.
+        performance: ?*diagnostics.Recorder = null,
 
         /// Allocates the coordinator at its final address before installing any
         /// callback context or queue which retains an interior pointer.
@@ -1345,6 +1348,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.stopping = false;
             self.session_disable_pending = false;
             self.stats = .{};
+            self.performance = null;
 
             self.router = try completion.Router.init(allocator, config.router_capacity);
             errdefer self.router.deinit(allocator);
@@ -8921,6 +8925,18 @@ pub fn Coordinator(comptime protocol: type) type {
             if (trace) |*work| work.mark("apply-begin");
             // A return marker also covers errors/retries; it does not imply success.
             defer if (trace) |*work| work.mark("apply-return");
+            var content_work: diagnostics.ContentWork = .{
+                .scope = if (self.performance) |recorder| .{
+                    .recorder = recorder,
+                    .context = .{
+                        .surface = (@as(u64, exact_surface_id.generation) << 32) | exact_surface_id.index,
+                        .commit = content.surface.sequence,
+                    },
+                } else null,
+                .verbose = if (trace) |*work| .{ .context = work, .emit_fn = SurfaceWorkTrace.markContent } else null,
+            };
+            const commit_start = if (self.performance != null) diagnostics.Stamp.now() else null;
+            defer if (content_work.scope) |*scope| scope.finish(.commit, commit_start);
             const attachment = content.surface.attachment orelse {
                 return self.applyRetainedCandidate(layer, pending.id, surface_scene, needs_frame);
             };
@@ -9092,9 +9108,18 @@ pub fn Coordinator(comptime protocol: type) type {
                     upload_damage.count = 1;
                 }
             }
+            if (content_work.scope) |*scope| {
+                scope.context.bytes = @as(u64, borrowed_source.size.width) * borrowed_source.size.height * 4;
+                for (upload_damage.rects[0..upload_damage.count]) |rect| {
+                    scope.context.damage_pixels +|= @as(u64, @intCast(rect.max_x - rect.min_x)) *
+                        @as(u64, @intCast(rect.max_y - rect.min_y));
+                }
+            }
             var retained_source = false;
             if (trace) |*work| work.mark("content-prepare-begin");
             const prepared = native: {
+                const prepare_start = if (self.performance != null) diagnostics.Stamp.now() else null;
+                defer if (content_work.scope) |*scope| scope.finish(.content_prepare, prepare_start);
                 if (borrowed_source.external != null) {
                     if (render_device.content.prepareReplacingRetainedExternal(
                         layer.rendered,
@@ -9174,10 +9199,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     sample_identity,
                     borrowed_source,
                     upload_damage,
-                    if (trace) |*work| .{
-                        .context = work,
-                        .emit_fn = SurfaceWorkTrace.markContent,
-                    } else null,
+                    content_work.observer(),
                 ) catch |err| switch (err) {
                     error.VersionCapacityExceeded, error.ByteCapacityExceeded => return false,
                     else => return err,
@@ -9226,7 +9248,11 @@ pub fn Coordinator(comptime protocol: type) type {
             // handle in place when it is uniquely owned by this layer.
             if (layer.retains_source) try self.retireLayerSource(layer);
             if (trace) |*work| work.mark("content-publish-begin");
-            const rendered = render_device.content.publish(prepared);
+            const rendered = publish: {
+                const publish_start = if (self.performance != null) diagnostics.Stamp.now() else null;
+                defer if (content_work.scope) |*scope| scope.finish(.content_publish, publish_start);
+                break :publish render_device.content.publish(prepared);
+            };
             if (trace) |*work| work.mark("content-publish-end");
             prepared_owned = false;
             const sample: render_list.AppliedSurface = .{
@@ -9718,6 +9744,21 @@ pub fn Coordinator(comptime protocol: type) type {
         fn renderFrame(self: *Self, frame: @import("../output/headless.zig").FrameId) !void {
             const physical = self.physicalOutputForKmsIdMutable(frame.output) orelse return;
             const output = physical.kms_output orelse return;
+            const render_start = if (self.performance != null) diagnostics.Stamp.now() else null;
+            const perf_context: diagnostics.Context = .{
+                .output = (@as(u64, frame.output.generation) << 32) | frame.output.index,
+                .frame = frame.sequence,
+            };
+            defer if (self.performance) |recorder| recorder.finish(.render, render_start, perf_context);
+            if (self.performance) |recorder| if (render_start) |started| if (output.scheduler.frame) |active| {
+                recorder.record(.{
+                    .kind = .render_late,
+                    .start_ns = active.render_deadline_ns,
+                    .end_ns = started.ns,
+                    .budget_ns = output.scheduler.config.refresh_ns,
+                    .context = perf_context,
+                });
+            };
             const damage_generation = physical.damage_requested;
             const output_bounds = try self.outputBoundsFor(physical);
             var sample_count: usize = 0;
@@ -10093,13 +10134,19 @@ pub fn Coordinator(comptime protocol: type) type {
                     self.advanceScreencopyGeneration(physical, frame.output);
                     if (output.rendererKind() == .pixman)
                         try output.renderReady(frame, try monotonicNs());
-                    if (self.output_config.trace_pacing) {
+                    if (self.output_config.trace_pacing or self.performance != null) {
                         const now = monotonicNs() catch null;
                         for (self.frame_bindings[0..sample_count]) |binding| {
-                            std.log.info("pacing-sample ns={?d} output={d} frame={d} surface={d}:{d} commit={d}", .{
+                            if (self.output_config.trace_pacing) std.log.info("pacing-sample ns={?d} output={d} frame={d} surface={d}:{d} commit={d}", .{
                                 now,                   frame.output.index,         frame.sequence,
                                 binding.surface.index, binding.surface.generation, binding.sample.commit_sequence,
                             });
+                            if (self.performance) |recorder| if (now) |ns| {
+                                var context = perf_context;
+                                context.surface = binding.sample.surface;
+                                context.commit = binding.sample.commit_sequence;
+                                recorder.record(.{ .kind = .sample, .start_ns = ns, .end_ns = ns, .context = context });
+                            };
                         }
                     }
                     self.stats.submitted += 1;
@@ -10508,6 +10555,7 @@ pub fn Coordinator(comptime protocol: type) type {
         fn processOutput(self: *Self) !void {
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
                 const output = physical.kms_output orelse continue;
+                output.performance = self.performance;
                 try output.processKmsEventsOn(.{
                     .context = self,
                     .presented_fn = presented,

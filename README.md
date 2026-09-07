@@ -382,6 +382,50 @@ and interaction steps remain available as `test-drm-presentation`,
 
 ### Startup and frame-pacing diagnostics
 
+The `ouro` executable automatically records performance incidents, without
+`WAYLAND_DEBUG` or `--trace-pacing`. Look for `perf-incident`, `perf-summary`,
+`perf-worst`, and `perf-context` in the compositor's stderr/session log:
+
+```sh
+grep '^perf-' /path/to/ouro-session.log
+```
+
+Synchronous candidate processing, content preparation/allocation/inheritance/
+copy/publication, and render work have an initial 2 ms diagnostic budget.
+Render-start lateness, render-start-to-fence-readiness, and physical-flip-to-
+completion-processing use the affected output's refresh interval. These are
+investigation thresholds, not guarantees that an incident is a bug. Time between
+frames is **not** measured as a stall: an idle/static desktop is normal.
+
+The first incident is reported after about a second, allowing nearby context to
+arrive. Further reports are limited to one per 30 seconds, plus a final pending
+report on clean shutdown. Summaries contain session-cumulative observed counts,
+slow counts, worst durations and duration buckets (≤1, ≤2, ≤8, ≤16, ≤50, >50 ms).
+Each report retains a representative worst-budget-overrun incident with up to
+15 preceding records and 8 following records; overlapping nested durations must
+not be added together. Generation-packed surface/output IDs (generation in the
+high 32 bits), commit sequences and sampled frame IDs connect work across stages.
+Copied-content records include backing bytes, summed canonical damage-rectangle
+area, reuse decisions, upload tokens and Vulkan memory flags when available.
+No key events, titles, client strings, pixels or addresses are recorded.
+
+Wall and thread CPU clocks distinguish executing from nonexecuting time, not
+specific blocking causes. `render_ready` includes CPU work before the GPU fence,
+not just GPU execution. Flip processing can include capture handling; a callback
+or buffer release is not proof of client receipt. Missing CPU/fence information
+is not fabricated, and negative cross-provider timestamp deltas are omitted.
+
+The compositor only reads clocks and enqueues fixed-size records. A background
+worker analyzes and writes them, without taking the compositor's logging lock.
+Storage is bounded to 1,024 queued records plus fixed summaries/context; overflow
+drops records and reports `dropped_total`, so counts are then incomplete. There
+are no per-record allocations or disk writes on the compositor thread. The
+worker checks every 100 ms; this has a small idle wakeup and timing cost, not
+zero overhead. A blocked log sink cannot block active composition, but clean
+shutdown joins the worker and may wait for that sink. Reports are best-effort,
+not crash/hang dumps; they require measured work to finish. Keep session logs
+rotated using the existing logging setup.
+
 Add `--trace-pacing` to the existing compositor invocation and capture stderr
 to a file. This opt-in trace adds measurement overhead; use a release build and
 compare several launches. Capture the client separately with
@@ -451,8 +495,9 @@ indicates time not executing on this thread, but cannot distinguish blocking,
 descheduling, or a particular wait cause. Similar elapsed and CPU time suggests
 execution, not necessarily useful work. Clock reads and synchronous trace
 logging add overhead, included in these intervals; blocking on the log itself
-can contribute. No new clocks, allocations, or log output occur when tracing
-is disabled, and the normal scheduling/rendering policy is unchanged.
+can contribute. Disabling verbose tracing avoids its synchronous logging; the
+automatic bounded performance recorder remains active. Neither diagnostic
+changes the scheduling/rendering policy.
 
 Queueing is not socket transmission or client receipt. These server timestamps
 are monotonic, unlike the client's wall-clock log prefix; correlate identities

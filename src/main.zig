@@ -66,6 +66,10 @@ pub fn main(init: std.process.Init) !void {
     // inherit the blocked mask so TERM/INT/HUP are delivered through signalfd.
     var shutdown_signals = try ouro.shutdown_signal.Watcher.install();
     defer shutdown_signals.deinit();
+    var performance: ouro.diagnostics.Recorder = .{};
+    // Diagnostics must not prevent a graphical session from starting.
+    performance.start() catch |err| std.log.warn("performance recorder unavailable: {t}", .{err});
+    defer performance.stop();
     try systemd_session.prepare();
     defer systemd_session.shutdown() catch |err| {
         std.log.warn("could not shut down the managed graphical session: {t}", .{err});
@@ -236,6 +240,7 @@ pub fn main(init: std.process.Init) !void {
         root.deinit() catch {};
         return err;
     };
+    if (performance.thread != null) coordinator.performance = &performance;
     coordinator.installConfig(
         &initial_engine_settings,
         &initial_key_consumer,
