@@ -1,4 +1,5 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
 
 // Compute compositor ABI is defined by vulkan_platform.Sample and Push.
 
@@ -105,7 +106,7 @@ vec3 sample_lut(vec3 value, int packed_slot) {
     return mix(z0, z1, fraction.z);
 }
 
-vec4 load_pixel(Sample item, ivec2 coordinate) {
+vec4 raw_pixel(Sample item, uint index, ivec2 coordinate) {
     uint byte_offset = item.source.x + uint(coordinate.y) * item.source.w +
         uint(coordinate.x) * 4u;
     uint packed = source_words[byte_offset / 4u];
@@ -115,7 +116,10 @@ vec4 load_pixel(Sample item, ivec2 coordinate) {
         packed & 255u,
         (packed >> 24u) & 255u
     );
-    value /= 255.0;
+    return value / 255.0;
+}
+
+vec4 decode_pixel(Sample item, vec4 value) {
     if (item.attributes.x == 1u) value.a = 1.0;
     vec3 electrical = item.affine_tail.z == 0u && value.a > 0.0 ? value.rgb / value.a : value.rgb;
     vec3 linear = item.affine_tail.w != 0
@@ -137,20 +141,7 @@ ivec2 source_coordinate(Sample item, ivec2 local) {
     return fixed_coordinate;
 }
 
-vec4 filtered_pixel(Sample item, ivec2 fixed_coordinate) {
-    // Match the sampled-image path: pixel centers, edge clamping, and
-    // interpolation of decoded premultiplied linear-light texels.
-    vec2 position = vec2(fixed_coordinate) / 65536.0 - 0.5;
-    ivec2 lower = ivec2(floor(position));
-    vec2 fraction = fract(position);
-    ivec2 last = ivec2(item.source.yz) - 1;
-    vec4 a = load_pixel(item, clamp(lower, ivec2(0), last));
-    if (all(equal(fraction, vec2(0.0)))) return a;
-    vec4 b = load_pixel(item, clamp(lower + ivec2(1, 0), ivec2(0), last));
-    vec4 c = load_pixel(item, clamp(lower + ivec2(0, 1), ivec2(0), last));
-    vec4 d = load_pixel(item, clamp(lower + ivec2(1, 1), ivec2(0), last));
-    return mix(mix(a, b, fraction.x), mix(c, d, fraction.x), fraction.y);
-}
+#include "vulkan_cursor_filter.glsl"
 
 void main() {
     ivec2 local_damage = ivec2(gl_GlobalInvocationID.xy);
@@ -170,8 +161,9 @@ void main() {
         ivec2 coordinate = fixed_coordinate >> 16;
         if (any(lessThan(coordinate, ivec2(0))) ||
             coordinate.x >= int(item.source.y) || coordinate.y >= int(item.source.z)) continue;
-        vec4 source_pixel = (item.attributes.y & 0x20000000u) != 0u
-            ? filtered_pixel(item, fixed_coordinate) : load_pixel(item, coordinate);
+        vec4 source_pixel = (item.attributes.y & 0x30000000u) != 0u
+            ? filtered_pixel(item, index, fixed_coordinate)
+            : decode_pixel(item, raw_pixel(item, index, coordinate));
         color = source_pixel + color * (1.0 - source_pixel.a);
     }
     vec3 straight = color.rgb / max(color.a, 0.000001);

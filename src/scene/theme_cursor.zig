@@ -131,7 +131,7 @@ pub const Cursor = struct {
             // geometry.
             .upload_damage = upload_damage,
             .crop = render.SourceRect.pixels(0, 0, @intCast(image.width), @intCast(image.height)),
-            .filter = .bilinear,
+            .filter = .cursor,
             .destination = .{ .x = x, .y = y, .width = width, .height = height },
             .clip = .{
                 .x = @intCast(left),

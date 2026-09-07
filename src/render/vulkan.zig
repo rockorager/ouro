@@ -544,7 +544,7 @@ fn packSample(
                 else
                     0) |
                 (if (direct_content) vk.direct_content_bit else 0) |
-                (if (sample.filter == .bilinear) vk.bilinear_bit else 0),
+                cursorFilterBits(sample, original_destination),
             sample.global_alpha,
             @intFromEnum(color_transform.source_transfer),
         },
@@ -581,6 +581,27 @@ fn directColorEncoding(source: render_types.color.Description, output: render_ty
         source.transfer == output.transfer and
         source.reference_luminance == output.reference_luminance and
         std.meta.eql(source.primaries, output.primaries);
+}
+
+fn cursorFilterBits(sample: render_types.SurfaceSample, original: render_types.PlanRect) u32 {
+    if (sample.filter == .nearest) return 0;
+    const swap = switch (sample.transform) {
+        .@"90", .@"270", .flipped_90, .flipped_270 => true,
+        else => false,
+    };
+    // Use the unclipped destination and native source axes. Output-edge
+    // clipping must not change which reconstruction filter a cursor uses.
+    const width = @as(i64, if (swap) original.height else original.width) * 65536;
+    const height = @as(i64, if (swap) original.width else original.height) * 65536;
+    if (sample.crop.width == width and sample.crop.height == height and
+        @mod(sample.crop.x, 65536) == 0 and @mod(sample.crop.y, 65536) == 0) return 0;
+    if (sample.crop.width > 2 * width or sample.crop.height > 2 * height) return vk.area_bits;
+    const full_source = sample.crop.x == 0 and sample.crop.y == 0 and
+        sample.crop.width == @as(i64, sample.source.size.width) * 65536 and
+        sample.crop.height == @as(i64, sample.source.size.height) * 65536;
+    if (full_source and sample.crop.width < width and sample.crop.height < height)
+        return vk.bilinear_bit;
+    return vk.reconstruction_bit;
 }
 
 const Affine = struct { xx: i32, xy: i32, x0: i32, yx: i32, yy: i32, y0: i32 };
@@ -774,13 +795,46 @@ test "render-vulkan: cursor filtering is explicit and preserves pixel center map
     const original: render_types.PlanRect = .{ .x = 0, .y = 0, .width = 1, .height = 1 };
     const transform = try render_types.color.compile(.srgb, .srgb);
     const nearest = try packSample(value, transform, true, false, null, 0, original);
-    try std.testing.expectEqual(@as(u32, 0), nearest.attributes[1] & vk.bilinear_bit);
-    value.filter = .bilinear;
+    try std.testing.expectEqual(@as(u32, 0), nearest.attributes[1] & vk.filter_mask);
+    value.filter = .cursor;
     const filtered = try packSample(value, transform, true, false, null, 0, original);
-    try std.testing.expectEqual(nearest.attributes[1] | vk.bilinear_bit, filtered.attributes[1]);
+    try std.testing.expectEqual(nearest.attributes[1], filtered.attributes[1]);
     try std.testing.expectEqual(nearest.affine, filtered.affine);
     try std.testing.expectEqual(@as(i32, 32768), filtered.affine[2]);
     try std.testing.expectEqual(@as(i32, 32768), filtered.affine_tail[1]);
+}
+
+test "render-vulkan: cursor filter follows density crop and transform rather than output scale presets" {
+    const pixels = [_]u8{0} ** (48 * 48 * 4);
+    var value: render_types.SurfaceSample = undefined;
+    _ = testList(&pixels, &value);
+    value.source.size = .{ .width = 48, .height = 48 };
+    value.source.stride = 48 * 4;
+    value.crop = render_types.SourceRect.pixels(0, 0, 48, 48);
+    const transform = try render_types.color.compile(.srgb, .srgb);
+    for ([_]u32{ 12, 23, 24, 30, 36, 48, 60 }, [_]u32{
+        vk.area_bits,          vk.area_bits, vk.reconstruction_bit, vk.reconstruction_bit,
+        vk.reconstruction_bit, 0,            vk.bilinear_bit,
+    }) |size, expected| {
+        const original: render_types.PlanRect = .{ .x = -2, .y = 0, .width = size, .height = size };
+        // Simulate output clipping: it must not affect density selection.
+        value.destination = .{ .x = 0, .y = 0, .width = size - 2, .height = size };
+        value.filter = .cursor;
+        const cursor = try packSample(value, transform, true, false, null, 0, original);
+        try std.testing.expectEqual(expected, cursor.attributes[1] & vk.filter_mask);
+        value.filter = .nearest;
+        const ordinary = try packSample(value, transform, true, false, null, 0, original);
+        try std.testing.expectEqual(@as(u32, 0), ordinary.attributes[1] & vk.filter_mask);
+    }
+    value.filter = .cursor;
+    value.crop = render_types.SourceRect.pixels(1, 2, 24, 12);
+    const rotated: render_types.PlanRect = .{ .x = 0, .y = 0, .width = 12, .height = 24 };
+    value.transform = .@"90";
+    try std.testing.expectEqual(@as(u32, 0), cursorFilterBits(value, rotated));
+    value.crop.x += 32768;
+    try std.testing.expectEqual(vk.reconstruction_bit, cursorFilterBits(value, rotated));
+    value.transform = .normal;
+    try std.testing.expectEqual(vk.reconstruction_bit, cursorFilterBits(value, rotated));
 }
 
 test "render-vulkan: LUT slot is packed without changing Sample ABI" {

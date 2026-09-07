@@ -474,6 +474,18 @@ cursor-inclusive screenshots (for example, `grim -c -o DP-1 cursor.png`);
 resizing a screenshot can introduce its own sampling artifacts. A submitted
 sample describes renderer input, not proof of the pixels shown by the monitor.
 
+`filter=cursor` selects Vulkan sampling from the source-to-destination mapping:
+nearest for aligned 1:1 pixels, bilinear for full-source enlargement,
+Catmull–Rom for moderate reductions or fractional crops, and bounded area
+filtering for reductions beyond 2×. Electrical-premultiplied cursor pixels are
+filtered before color decoding; compositing remains linear-light. Pixman uses
+bilinear for cursors. Ordinary surface sampling is unchanged. The offscreen
+check `uv run --with vulkan --with pillow python test/vulkan-cursor.py` exercises
+both Vulkan paths and 8/10-bit targets. Add `--capture cursor.png` for a visual
+comparison, and `--compare-shader-dir DIR` to compare against saved older
+`vulkan_composite.spv` and `vulkan_texture_composite.spv` files using the same
+source images.
+
 `pacing-work` subdivides candidate application and active-source release using
 the same peer/object/surface/commit identity. Its `stage` boundaries cover:
 

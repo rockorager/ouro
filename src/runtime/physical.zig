@@ -9940,7 +9940,7 @@ pub fn Coordinator(comptime protocol: type) type {
                         };
                     }
                     var output_sample = sample;
-                    output_sample.filter = .bilinear;
+                    output_sample.filter = .cursor;
                     output_sample.clip = try clipToOutput(sample.destination, output_bounds) orelse
                         continue;
                     try self.ensureFrameStorage(@max(sample_count, change_count) + 1);
