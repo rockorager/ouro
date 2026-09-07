@@ -206,6 +206,7 @@ const device_extensions = [_][*:0]const u8{
 const sampled_image_capacity = 32;
 pub const direct_color_bit: u32 = 1 << 31;
 pub const direct_content_bit: u32 = 1 << 30;
+pub const bilinear_bit: u32 = 1 << 29;
 
 const Texture = struct {
     image: c.VkImage,
@@ -3145,6 +3146,9 @@ fn opaqueCopyOrigin(frame: Frame, source_index: usize, damage: render.Rect) ?[2]
         sample.affine[0] != 65536 or sample.affine[1] != 0 or
         sample.affine[3] != 0 or sample.affine_tail[0] != 65536)
         return null;
+    if (sample.attributes[1] & bilinear_bit != 0 and
+        (@mod(sample.affine[2], 65536) != 32768 or
+            @mod(sample.affine_tail[1], 65536) != 32768)) return null;
     const visible = sampleIntersection(sample, damage) orelse return null;
     if (visible.min_x != damage.x or visible.min_y != damage.y or
         visible.max_x != @as(i64, damage.x) + damage.width or
@@ -5259,6 +5263,11 @@ test "render-vulkan: opaque copy requires exact external opaque coverage and map
     };
     try std.testing.expectEqual([2]u32{ 2, 3 }, opaqueCopyOrigin(frame, 0, damage).?);
 
+    sample.attributes[1] |= bilinear_bit;
+    try std.testing.expectEqual([2]u32{ 2, 3 }, opaqueCopyOrigin(frame, 0, damage).?);
+    sample.affine[2] += 1;
+    try std.testing.expect(opaqueCopyOrigin(frame, 0, damage) == null);
+    sample.attributes[1] = direct_color_bit;
     sample.affine[2] = -32768; // floor, not truncation, for a negative half-texel
     try std.testing.expectEqual([2]u32{ 1, 3 }, opaqueCopyOrigin(frame, 0, damage).?);
     sample.affine[2] = -3 * 65536; // first damaged texel falls outside the source

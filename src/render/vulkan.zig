@@ -543,7 +543,8 @@ fn packSample(
                     vk.direct_color_bit
                 else
                     0) |
-                (if (direct_content) vk.direct_content_bit else 0),
+                (if (direct_content) vk.direct_content_bit else 0) |
+                (if (sample.filter == .bilinear) vk.bilinear_bit else 0),
             sample.global_alpha,
             @intFromEnum(color_transform.source_transfer),
         },
@@ -765,6 +766,21 @@ test "render-vulkan: declared opacity enables direct color only for the whole su
         try std.testing.expectEqual(case.expected, packed_sample.attributes[1] & vk.direct_color_bit != 0);
         try std.testing.expectEqual(@intFromEnum(sample.transform), packed_sample.attributes[1] & ~vk.direct_color_bit);
     }
+}
+
+test "render-vulkan: cursor filtering is explicit and preserves pixel center mapping" {
+    var value: render_types.SurfaceSample = undefined;
+    _ = testList(&.{ 0, 0, 0, 255 }, &value);
+    const original: render_types.PlanRect = .{ .x = 0, .y = 0, .width = 1, .height = 1 };
+    const transform = try render_types.color.compile(.srgb, .srgb);
+    const nearest = try packSample(value, transform, true, false, null, 0, original);
+    try std.testing.expectEqual(@as(u32, 0), nearest.attributes[1] & vk.bilinear_bit);
+    value.filter = .bilinear;
+    const filtered = try packSample(value, transform, true, false, null, 0, original);
+    try std.testing.expectEqual(nearest.attributes[1] | vk.bilinear_bit, filtered.attributes[1]);
+    try std.testing.expectEqual(nearest.affine, filtered.affine);
+    try std.testing.expectEqual(@as(i32, 32768), filtered.affine[2]);
+    try std.testing.expectEqual(@as(i32, 32768), filtered.affine_tail[1]);
 }
 
 test "render-vulkan: LUT slot is packed without changing Sample ABI" {

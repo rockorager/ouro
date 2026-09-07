@@ -2721,6 +2721,10 @@ fn runVertical(trigger: TerminalTrigger, source: ClientSource, trace_pacing: boo
     var config = coordinatorConfig();
     config.output.trace_pacing = trace_pacing;
     const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), config);
+    // Exercise the recorder independently of --trace-pacing, without a log
+    // worker. Synthetic DRM timestamps are not real performance evidence.
+    var performance: ouro.diagnostics.Recorder = .{};
+    coordinator.performance = &performance;
     var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
     try coordinator.start(&loop);
 
@@ -2806,6 +2810,23 @@ fn runVertical(trigger: TerminalTrigger, source: ClientSource, trace_pacing: boo
     try std.testing.expectEqual(@as(usize, 1), coordinator.stats.releases);
     try std.testing.expectEqual(@as(usize, 1), coordinator.stats.imported_disposals);
     try std.testing.expectEqual(@as(usize, 1), fixture.page_flips);
+    var perf_commit: ?ouro.diagnostics.Event = null;
+    var perf_sample: ?ouro.diagnostics.Event = null;
+    var perf_render = false;
+    var perf_flip = false;
+    while (performance.take()) |event| switch (event.kind) {
+        .commit => perf_commit = event,
+        .sample => perf_sample = event,
+        .render => perf_render = true,
+        .flip_dispatch => perf_flip = true,
+        else => {},
+    };
+    try std.testing.expect(perf_commit != null and perf_sample != null);
+    try std.testing.expect(perf_render and perf_flip);
+    try std.testing.expectEqual(perf_commit.?.context.surface, perf_sample.?.context.surface);
+    try std.testing.expectEqual(perf_commit.?.context.commit, perf_sample.?.context.commit);
+    try std.testing.expect(perf_sample.?.context.output != 0 and perf_sample.?.context.frame != 0);
+    try std.testing.expect(perf_commit.?.cpu_ns != null);
     if (source == .blur_shm) {
         try std.testing.expect(!coordinator.cursor_layer.content.owned);
         const effects = coordinator.cursor_layer.effects orelse
@@ -2880,10 +2901,14 @@ fn runVertical(trigger: TerminalTrigger, source: ClientSource, trace_pacing: boo
         try std.testing.expectEqual(@as(usize, 1), fixture.page_flips);
     }
 
-    // Admit a second ordinary SHM commit, but replace its exact generational
-    // surface before the render deadline. Disable then proves that an applied
-    // presentation with no possible physical outcome is abandoned exactly
+    // Hold off new frames while admitting a second ordinary SHM commit and
+    // replacing its exact generational surface. Racing a real render timer
+    // here made this teardown scenario depend on logging/instrumentation cost.
+    // Keep scanout alive: only the following Session disable may tear it down.
+    // An applied but unsampled presentation must still be abandoned exactly
     // once and cannot target the replacement surface.
+    try std.testing.expect(coordinator.primaryKmsOutput().?.in_flight_frame == null);
+    coordinator.primaryKmsOutput().?.accepting_frames = false;
     const first_surface_id = coordinator.cursor_layer.id.?;
     try client_handler.replaceCommittedSurface();
     try submitClient(&client_reactor, &client_driver, &client_handler);
@@ -2942,6 +2967,8 @@ fn runVertical(trigger: TerminalTrigger, source: ClientSource, trace_pacing: boo
     try std.testing.expectEqual(@as(usize, 1), client_handler.xdg_sizes);
     try std.testing.expectEqual(@as(usize, 1), client_handler.xdg_names);
     try std.testing.expectEqual(@as(usize, 1), client_handler.xdg_descriptions);
+    // Restore the admission gate before exercising the real pause/drain path.
+    coordinator.primaryKmsOutput().?.accepting_frames = true;
 
     if (trigger == .session_disable) {
         // Session disable quiesces R11, renderer, R10, then releases the DRM

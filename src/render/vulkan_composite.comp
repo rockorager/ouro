@@ -134,7 +134,22 @@ ivec2 source_coordinate(Sample item, ivec2 local) {
         item.affine.x * local.x + item.affine.y * local.y + item.affine.z,
         item.affine.w * local.x + item.affine_tail.x * local.y + item.affine_tail.y
     );
-    return fixed_coordinate >> 16;
+    return fixed_coordinate;
+}
+
+vec4 filtered_pixel(Sample item, ivec2 fixed_coordinate) {
+    // Match the sampled-image path: pixel centers, edge clamping, and
+    // interpolation of decoded premultiplied linear-light texels.
+    vec2 position = vec2(fixed_coordinate) / 65536.0 - 0.5;
+    ivec2 lower = ivec2(floor(position));
+    vec2 fraction = fract(position);
+    ivec2 last = ivec2(item.source.yz) - 1;
+    vec4 a = load_pixel(item, clamp(lower, ivec2(0), last));
+    if (all(equal(fraction, vec2(0.0)))) return a;
+    vec4 b = load_pixel(item, clamp(lower + ivec2(1, 0), ivec2(0), last));
+    vec4 c = load_pixel(item, clamp(lower + ivec2(0, 1), ivec2(0), last));
+    vec4 d = load_pixel(item, clamp(lower + ivec2(1, 1), ivec2(0), last));
+    return mix(mix(a, b, fraction.x), mix(c, d, fraction.x), fraction.y);
 }
 
 void main() {
@@ -151,10 +166,12 @@ void main() {
         ivec2 clip_end = item.clip.xy + item.clip.zw;
         if (any(lessThan(pixel, item.destination.xy)) || any(greaterThanEqual(pixel, destination_end)) ||
             any(lessThan(pixel, item.clip.xy)) || any(greaterThanEqual(pixel, clip_end))) continue;
-        ivec2 coordinate = source_coordinate(item, pixel - item.destination.xy);
+        ivec2 fixed_coordinate = source_coordinate(item, pixel - item.destination.xy);
+        ivec2 coordinate = fixed_coordinate >> 16;
         if (any(lessThan(coordinate, ivec2(0))) ||
             coordinate.x >= int(item.source.y) || coordinate.y >= int(item.source.z)) continue;
-        vec4 source_pixel = load_pixel(item, coordinate);
+        vec4 source_pixel = (item.attributes.y & 0x20000000u) != 0u
+            ? filtered_pixel(item, fixed_coordinate) : load_pixel(item, coordinate);
         color = source_pixel + color * (1.0 - source_pixel.a);
     }
     vec3 straight = color.rgb / max(color.a, 0.000001);

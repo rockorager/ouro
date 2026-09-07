@@ -142,7 +142,22 @@ ivec2 source_coordinate(Sample item, ivec2 local) {
         item.affine.x * local.x + item.affine.y * local.y + item.affine.z,
         item.affine.w * local.x + item.affine_tail.x * local.y + item.affine_tail.y
     );
-    return fixed_coordinate >> 16;
+    return fixed_coordinate;
+}
+
+vec4 filtered_pixel(Sample item, uint index, ivec2 fixed_coordinate) {
+    // Affine coordinates address pixel centers. Interpolate in premultiplied
+    // linear light, after decoding each texel (not encoded/straight RGB).
+    vec2 position = vec2(fixed_coordinate) / 65536.0 - 0.5;
+    ivec2 lower = ivec2(floor(position));
+    vec2 fraction = fract(position);
+    ivec2 last = ivec2(item.source.yz) - 1;
+    vec4 a = load_pixel(item, index, clamp(lower, ivec2(0), last));
+    if (all(equal(fraction, vec2(0.0)))) return a;
+    vec4 b = load_pixel(item, index, clamp(lower + ivec2(1, 0), ivec2(0), last));
+    vec4 c = load_pixel(item, index, clamp(lower + ivec2(0, 1), ivec2(0), last));
+    vec4 d = load_pixel(item, index, clamp(lower + ivec2(1, 1), ivec2(0), last));
+    return mix(mix(a, b, fraction.x), mix(c, d, fraction.x), fraction.y);
 }
 
 void main() {
@@ -174,19 +189,23 @@ void main() {
         ivec2 clip_end = item.clip.xy + item.clip.zw;
         if (any(lessThan(pixel, item.destination.xy)) || any(greaterThanEqual(pixel, destination_end)) ||
             any(lessThan(pixel, item.clip.xy)) || any(greaterThanEqual(pixel, clip_end))) continue;
-        ivec2 coordinate = source_coordinate(item, pixel - item.destination.xy);
+        ivec2 fixed_coordinate = source_coordinate(item, pixel - item.destination.xy);
+        ivec2 coordinate = fixed_coordinate >> 16;
+        bool filtering = (item.attributes.y & 0x20000000u) != 0u &&
+            any(notEqual(fixed_coordinate & 65535, ivec2(32768)));
         if (any(lessThan(coordinate, ivec2(0))) ||
             coordinate.x >= int(item.source.y) || coordinate.y >= int(item.source.z)) continue;
         // The high transform bit proves an opaque source has the same color
         // encoding as the output and neither side uses an ICC LUT. With no
         // higher contribution, decode -> identity transform -> encode is a
         // no-op, so preserve the electrical RGB directly.
-        if (front_to_back && transmission == 1.0 && (item.attributes.y & 0x80000000u) != 0u) {
+        if (!filtering && front_to_back && transmission == 1.0 && (item.attributes.y & 0x80000000u) != 0u) {
             vec4 direct = raw_pixel(item, index, coordinate);
             imageStore(target_image, pixel, vec4(direct.bgr, 1.0));
             return;
         }
-        vec4 source_pixel = load_pixel(item, index, coordinate);
+        vec4 source_pixel = filtering ? filtered_pixel(item, index, fixed_coordinate)
+                                     : load_pixel(item, index, coordinate);
         if (front_to_back) {
             color += source_pixel * transmission;
             transmission *= 1.0 - source_pixel.a;

@@ -14,6 +14,7 @@ const atomic = @import("../backend/drm/atomic.zig");
 const kms = @import("../backend/drm/output.zig");
 const render = @import("../render/types.zig");
 const render_content = @import("../render/content.zig");
+const diagnostics = @import("../diagnostics.zig");
 const cpu = @import("../render/cpu.zig");
 const vulkan = @import("../render/vulkan.zig");
 const vulkan_platform = @import("../render/vulkan_platform.zig");
@@ -787,6 +788,7 @@ pub const Output = struct {
     output_color_description: render.color.Description,
     clear: render.Color,
     trace_pacing: bool = false,
+    performance: ?*diagnostics.Recorder = null,
     accepting_frames: bool = true,
     in_flight_frame: ?scheduler_api.FrameId = null,
     in_flight_handle: ?framebuffer.Handle = null,
@@ -1009,6 +1011,7 @@ pub const Output = struct {
         self.allocator = allocator;
         self.clear = config.clear;
         self.trace_pacing = config.trace_pacing;
+        self.performance = null;
         self.accepting_frames = true;
         self.in_flight_frame = null;
         self.in_flight_handle = null;
@@ -1593,13 +1596,35 @@ pub const Output = struct {
                         // scanout can already be null when a queued pause is
                         // committed in the same event batch, so it is not a
                         // stable identity source at this handoff boundary.
-                        const dispatch_ns = if (self.trace_pacing) pacingTimestamp() else null;
+                        const dispatch_ns = if (self.trace_pacing or self.performance != null) pacingTimestamp() else null;
                         const ready_ns = self.takeRenderReadyTimestamp(ring);
                         self.pending_callback = try self.scheduler.presentPhysical(
                             frame_id,
                             timestamp_ns,
                             ready_ns,
                         );
+                        if (self.performance) |recorder| {
+                            const identity: diagnostics.Context = .{
+                                .output = (@as(u64, frame_id.output.generation) << 32) | frame_id.output.index,
+                                .frame = frame_id.sequence,
+                            };
+                            if (dispatch_ns) |dispatch| recorder.record(.{
+                                .kind = .flip_dispatch,
+                                .start_ns = timestamp_ns,
+                                .end_ns = dispatch,
+                                .budget_ns = self.scheduler.config.refresh_ns,
+                                .context = identity,
+                            });
+                            // Fence readiness includes CPU submission work;
+                            // this is not a GPU execution-time measurement.
+                            if (ready_ns) |ready| recorder.record(.{
+                                .kind = .render_ready,
+                                .start_ns = self.pending_callback.?.render_started_ns,
+                                .end_ns = ready,
+                                .budget_ns = self.scheduler.config.refresh_ns,
+                                .context = identity,
+                            });
+                        }
                         if (self.trace_pacing) {
                             const timing = self.pending_callback.?;
                             std.log.info("pacing output={d} frame={d} requested={d} deadline={d} started={d} ready={?d} target={d} actual={d} dispatch={?d}", .{
