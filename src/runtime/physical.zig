@@ -3320,6 +3320,10 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn validateSurfaceCommit(context: *anyopaque, id: Adapter.SurfaceId) !void {
             const self: *Self = @ptrCast(@alignCast(context));
+            if (self.output_config.trace_pacing) {
+                const state = try self.adapter.getSurfaceById(id);
+                self.traceSurfacePacing("commit-dispatch", id, state.sequence +| 1);
+            }
             var shell_owned = true;
             self.shell_adapter.validateSurfaceCommit(id) catch |err| switch (err) {
                 error.StaleSurface => shell_owned = false,
@@ -3370,6 +3374,10 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn surfaceCommitted(context: *anyopaque, id: Adapter.SurfaceId) !void {
             const self: *Self = @ptrCast(@alignCast(context));
+            if (self.output_config.trace_pacing) {
+                const state = try self.adapter.getSurfaceById(id);
+                self.traceSurfacePacing("commit-published", id, state.sequence);
+            }
             if (try self.text_input_adapter.focusedSurfaceCommitted(.{
                 .peer = try self.adapter.surfacePeer(id),
                 .surface = (try self.adapter.surfaceResource(id)).id,
@@ -3421,6 +3429,16 @@ pub fn Coordinator(comptime protocol: type) type {
             self.surface_id = id;
             try self.enqueuePendingSurface(.{ .handle = self.surface.?, .id = id, .commits = 1 });
             self.syncIdleNotifications() catch {};
+        }
+
+        fn traceSurfacePacing(self: *Self, comptime event: []const u8, id: Adapter.SurfaceId, sequence: u64) void {
+            if (!self.output_config.trace_pacing) return;
+            const now = monotonicNs() catch return;
+            const peer = self.adapter.surfacePeer(id) catch return;
+            const resource = self.adapter.surfaceResource(id) catch return;
+            std.log.info("pacing-surface event=" ++ event ++ " ns={d} peer={d}:{d} object={d} surface={d}:{d} commit={d}", .{
+                now, peer.slot, peer.generation, resource.id, id.index, id.generation, sequence,
+            });
         }
 
         fn independentXdgGeometryRoot(self: *Self, id: Adapter.SurfaceId) ?Adapter.SurfaceId {
@@ -4766,6 +4784,27 @@ pub fn Coordinator(comptime protocol: type) type {
             for (self.physical_outputs[0..self.physical_output_count]) |physical|
                 if (physical.kms_output) |output|
                     if (output.in_flight_frame != null) return true;
+            return false;
+        }
+
+        /// A repaint can still sample a layer whose presentation token has
+        /// already completed. Use the submitted frame's immutable surface IDs,
+        /// not just layer.presentation, before replacing its content/effects.
+        fn surfaceInFlight(self: *const Self, id: Adapter.SurfaceId) bool {
+            for (self.physical_outputs[0..self.physical_output_count]) |physical| {
+                const output = physical.kms_output orelse continue;
+                const frame = output.in_flight_frame orelse continue;
+                for (output.scheduler.samples[0..output.scheduler.sample_count]) |sample| {
+                    if (sample.surface.index != id.index or sample.surface.generation != id.generation)
+                        continue;
+                    if (self.output_config.trace_pacing) {
+                        std.log.info("pacing-defer ns={?d} reason=surface-in-flight output={d} frame={d} surface={d}:{d}", .{
+                            monotonicNs() catch null, frame.output.index, frame.sequence, id.index, id.generation,
+                        });
+                    }
+                    return true;
+                }
+            }
             return false;
         }
 
@@ -8602,10 +8641,6 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn applyReady(self: *Self) !void {
-            if (self.anyOutputInFlight()) {
-                try self.syncCommitTimer();
-                return;
-            }
             var remaining: usize = 0;
             for (0..self.pending_surface_len) |offset| {
                 const index = (self.pending_surface_head + offset) % self.pending_surfaces.len;
@@ -8670,6 +8705,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 return false;
             }
             const exact_surface_id = pending.id;
+            if (self.surfaceInFlight(exact_surface_id)) return false;
             const surface_scene = self.surfaceScene(exact_surface_id);
             const cursor_surface = self.cursorTreeContains(exact_surface_id);
             const drag_icon_surface = self.dragIconTreeContains(exact_surface_id);
@@ -9292,6 +9328,9 @@ pub fn Coordinator(comptime protocol: type) type {
                 else => return err,
             } orelse return false;
             const ready = self.ready_update_ids[0..inspected.count];
+            // A synchronized group is indivisible: an unsampled parent must
+            // not admit updates for a child still used by another output.
+            for (ready) |id| if (self.surfaceInFlight(id)) return false;
             try self.ensureAvailableAppLayers(ready.len);
             var superseded_count: usize = 0;
             for (ready, 0..) |id, index| {
@@ -9323,6 +9362,7 @@ pub fn Coordinator(comptime protocol: type) type {
             forwardEffectiveAttachments(applied);
             for (applied, 0..) |*update, index| {
                 const id = update.surface;
+                self.traceSurfacePacing("commit-applied", id, update.payload.surface.sequence);
                 self.pendingCommitApplied(id);
                 self.applied_layers[index].candidate.set(.{
                     .peer = try self.adapter.surfacePeer(id),
@@ -9850,6 +9890,15 @@ pub fn Coordinator(comptime protocol: type) type {
                     self.advanceScreencopyGeneration(physical, frame.output);
                     if (output.rendererKind() == .pixman)
                         try output.renderReady(frame, try monotonicNs());
+                    if (self.output_config.trace_pacing) {
+                        const now = monotonicNs() catch null;
+                        for (self.frame_bindings[0..sample_count]) |binding| {
+                            std.log.info("pacing-sample ns={?d} output={d} frame={d} surface={d}:{d} commit={d}", .{
+                                now,                   frame.output.index,         frame.sequence,
+                                binding.surface.index, binding.surface.generation, binding.sample.commit_sequence,
+                            });
+                        }
+                    }
                     self.stats.submitted += 1;
                     self.markFrameChangesApplied(
                         @intCast(physical.id.index),
@@ -11393,9 +11442,22 @@ pub fn Coordinator(comptime protocol: type) type {
                 surface,
                 data,
             ) catch |err| switch (err) {
-                error.Exhausted => return false,
+                error.Exhausted => {
+                    if (self.output_config.trace_pacing) {
+                        std.log.info("pacing-callback-blocked ns={?d} peer={d}:{d} object={d} generation={d} reason=tx-backpressure", .{
+                            monotonicNs() catch null, peer.slot, peer.generation, surface.id, surface.generation,
+                        });
+                    }
+                    return false;
+                },
                 else => return err,
-            }) {}
+            }) {
+                if (self.output_config.trace_pacing) {
+                    std.log.info("pacing-callback-queued ns={?d} peer={d}:{d} object={d} generation={d} presentation_ms={d}", .{
+                        monotonicNs() catch null, peer.slot, peer.generation, surface.id, surface.generation, data,
+                    });
+                }
+            }
             layer.callback_data = null;
             return true;
         }
@@ -11457,6 +11519,12 @@ pub fn Coordinator(comptime protocol: type) type {
                     error.Exhausted => return false,
                     else => return err,
                 };
+                if (self.output_config.trace_pacing and notification_queued) {
+                    std.log.info("pacing-buffer-release-queued ns={?d} peer={d}:{d} buffer={d} generation={d} commit={d}", .{
+                        monotonicNs() catch null, owner.slot,               owner.generation,
+                        buffer.handle.id,         buffer.handle.generation, content.surface.sequence,
+                    });
+                }
                 // Successful admission or an already-destroyed exact resource
                 // both consume release ownership exactly once.
                 attachment.buffer = null;
