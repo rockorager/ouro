@@ -1084,6 +1084,7 @@ pub fn Coordinator(comptime protocol: type) type {
         commit_timer: ?timer.Handle = null,
         commit_timer_canceling: bool = false,
         commit_timer_deadline: ?surface_state.CommitTimestamp = null,
+        commit_timer_render: ?output_scheduler.TimerRequest = null,
         commit_timer_retry: enum { none, resources, submission } = .none,
         xdg_session_store_timer: ?timer.Handle = null,
         xdg_session_store_timer_canceling: bool = false,
@@ -1307,6 +1308,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.commit_timer = null;
             self.commit_timer_canceling = false;
             self.commit_timer_deadline = null;
+            self.commit_timer_render = null;
             self.commit_timer_retry = .none;
             self.xdg_session_store_timer = null;
             self.xdg_session_store_timer_canceling = false;
@@ -5867,8 +5869,17 @@ pub fn Coordinator(comptime protocol: type) type {
             else
                 try self.adapter.nextCommitDeadline(try monotonicNs());
             if (self.commit_timer) |handle| {
+                const plan_invalid = if (self.commit_timer_render != null)
+                    deadline == null or !deadline.?.coalescible or
+                        self.commitRenderOutput() == null or
+                        self.commitRenderOutput().?.scheduler.currentStage() != .idle
+                else
+                    false;
                 if (!self.commit_timer_canceling and
-                    commitTimerNeedsCancel(self.commit_timer_deadline.?, deadline))
+                    (plan_invalid or commitTimerNeedsCancel(
+                        self.commit_timer_deadline.?,
+                        if (deadline) |value| value.timestamp else null,
+                    )))
                 {
                     try self.timers.cancel(&self.router, &self.root.ring, handle);
                     self.commit_timer_canceling = true;
@@ -5876,23 +5887,81 @@ pub fn Coordinator(comptime protocol: type) type {
                 return;
             }
             const value = deadline orelse return;
-            if (value.sec > std.math.maxInt(i64)) return;
+            if (value.timestamp.sec > std.math.maxInt(i64)) return;
+            var wake: timer.Deadline = .{
+                .sec = @intCast(value.timestamp.sec),
+                .nsec = value.timestamp.nsec,
+            };
+            var render_plan: ?output_scheduler.TimerRequest = null;
+            if (value.coalescible) if (self.commitRenderOutput()) |output| {
+                if (output.scheduler.currentStage() == .idle) coalesce: {
+                    // Protocol timestamps can exceed the scheduler's u64
+                    // nanosecond range. Leave those on the original timer path.
+                    const seconds = std.math.mul(u64, value.timestamp.sec, std.time.ns_per_s) catch break :coalesce;
+                    const eligible_ns = std.math.add(u64, seconds, value.timestamp.nsec) catch break :coalesce;
+                    const plan = output.scheduler.planRender(eligible_ns) catch |err| switch (err) {
+                        error.TimestampOverflow => break :coalesce,
+                        else => return err,
+                    };
+                    render_plan = plan;
+                    wake = plan.deadline;
+                }
+            };
             self.commit_timer = try self.timers.arm(
                 &self.router,
                 &self.root.ring,
-                .{ .sec = @intCast(value.sec), .nsec = value.nsec },
+                wake,
             );
-            self.commit_timer_deadline = value;
+            // Compare future updates with the original eligibility timestamp,
+            // not the later render deadline, or every event would cancel it.
+            self.commit_timer_deadline = value.timestamp;
+            self.commit_timer_render = render_plan;
             self.commit_timer_canceling = false;
+        }
+
+        fn commitRenderOutput(self: *Self) ?*output_api.Output {
+            // Keep multi-output latching and lifecycle transitions on the
+            // ordinary path. A saved plan never owns an output or a frame.
+            if (self.physical_output_count != 1 or self.stopping or
+                self.session_disable_pending or self.drm_remove_pending or
+                self.topology_refresh_pending or self.output_reconfigure != null or
+                self.output_power_transition != null) return null;
+            const physical = &self.physical_outputs[0];
+            if (!physical.connected or physical.removing or physical.drain_started or
+                physical.reconfigure != null) return null;
+            const output = physical.kms_output orelse return null;
+            if (!output.accepting_frames or output.paused) return null;
+            return output;
         }
 
         fn commitTimerEvent(self: *Self, event: timer.Event) !void {
             if (event == .pending_cleanup or event == .cleanup_complete) return;
             const was_canceling = self.commit_timer_canceling;
+            const handle = self.commit_timer.?;
+            const plan = self.commit_timer_render;
             self.commit_timer = null;
             self.commit_timer_deadline = null;
+            self.commit_timer_render = null;
             self.commit_timer_canceling = false;
-            if (event == .fired and !was_canceling) try self.applyReady();
+            if (event == .fired and !was_canceling) {
+                // Include update admission in adaptive completion measurements.
+                const started_ns = try monotonicNs();
+                try self.applyReady();
+                if (plan) |saved| if (self.commitRenderOutput()) |output| {
+                    if (output.scheduler.currentStage() == .requested) {
+                        const current = (try output.timerRequest(started_ns)).?;
+                        if (std.meta.eql(current.frame, saved.frame)) {
+                            // Transfer the already-fired timer through the
+                            // normal scheduler transitions synchronously. No
+                            // second timer/SQE is created, and the old target
+                            // is retained even at or just past its deadline.
+                            try output.timerArmed(saved, handle, started_ns);
+                            const request_value = (try output.timerEvent(handle, .fired, started_ns)).?;
+                            try self.renderFrame(request_value.frame);
+                        }
+                    }
+                };
+            }
             try self.syncCommitTimer();
         }
 

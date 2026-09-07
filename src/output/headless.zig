@@ -240,17 +240,7 @@ pub fn Scheduler(comptime PresentationToken: type) type {
         /// can be retried without losing or duplicating a frame request.
         pub fn timerRequest(self: *const Self, now_ns: Timestamp) Error!?TimerRequest {
             return switch (self.stage) {
-                .requested => blk: {
-                    const id = try self.prospectiveFrameId();
-                    const render_budget_ns = self.renderBudget();
-                    const target = try self.nextTargetWithBudget(now_ns, render_budget_ns);
-                    break :blk .{
-                        .purpose = .render_deadline,
-                        .frame = id,
-                        .deadline = try deadlineFromNs(target - self.config.presentation_lead_ns - render_budget_ns),
-                        .render_budget_ns = render_budget_ns,
-                    };
-                },
+                .requested => try self.planRender(now_ns),
                 .rendering => blk: {
                     const active = self.frame.?;
                     if (active.render_finished_ns == null or self.retiring) break :blk null;
@@ -261,6 +251,20 @@ pub fn Scheduler(comptime PresentationToken: type) type {
                     };
                 },
                 else => null,
+            };
+        }
+
+        /// Plans without assigning a frame, allowing a timestamp-gated commit
+        /// to share its wakeup with rendering. The coordinator must revalidate
+        /// the frame identity and requested stage after admitting the update.
+        pub fn planRender(self: *const Self, eligible_ns: Timestamp) Error!TimerRequest {
+            const budget = self.renderBudget();
+            const target = try self.nextTargetWithBudget(eligible_ns, budget);
+            return .{
+                .purpose = .render_deadline,
+                .frame = try self.prospectiveFrameId(),
+                .deadline = try deadlineFromNs(target - self.config.presentation_lead_ns - budget),
+                .render_budget_ns = budget,
             };
         }
 
@@ -784,6 +788,58 @@ test "missed and exact render deadlines defer to a future refresh" {
     try exact.timerArmed(deferred, fakeHandle(2), 17);
     _ = try exact.remove();
     _ = try exact.timerEvent(fakeHandle(2), .canceled, 18);
+}
+
+test "commit render plan retains target at exact and late wakeups" {
+    for ([_]Timestamp{ 17, 18 }) |wake| {
+        var scheduler = try testInit(1);
+        defer scheduler.deinit(std.testing.allocator);
+        try std.testing.expectError(error.TimestampOverflow, scheduler.planRender(std.math.maxInt(Timestamp)));
+        const plan = try scheduler.planRender(10);
+        try std.testing.expectEqual(Stage.idle, scheduler.currentStage());
+        try std.testing.expectEqual(@as(Timestamp, 17), try nsFromDeadline(plan.deadline));
+        // Admission requests damage only after the commit timer has fired.
+        try scheduler.request(.damage, wake);
+        const recomputed = (try scheduler.timerRequest(wake)).?;
+        try std.testing.expectEqual(@as(Timestamp, 27), try nsFromDeadline(recomputed.deadline));
+        try scheduler.timerArmed(plan, fakeHandle(1), wake);
+        const started = (try scheduler.timerEvent(fakeHandle(1), .fired, wake)).?.render;
+        try std.testing.expectEqual(@as(Timestamp, 20), started.target_ns);
+        try scheduler.captureSamples(started.frame, &.{});
+        _ = try scheduler.renderComplete(started.frame, wake);
+        try scheduler.submitPhysical(started.frame, wake);
+        _ = try scheduler.presentPhysical(started.frame, 20, wake);
+        try std.testing.expectEqual(Stage.idle, scheduler.currentStage());
+        // An intervening completed frame invalidates the unused plan.
+        try scheduler.request(.damage, 21);
+        try std.testing.expectError(error.StaleTimerRequest, scheduler.timerArmed(plan, fakeHandle(2), 21));
+        _ = try scheduler.remove();
+    }
+}
+
+test "commit render planning preserves adaptive budget and blanking lead" {
+    var scheduler = try TestScheduler.init(std.testing.allocator, test_output, .{
+        .refresh_ns = 100,
+        .render_budget_ns = 30,
+        .presentation_lead_ns = 10,
+        .adaptive_render_samples = 1,
+        .adaptive_render_margin_ns = 5,
+    }, 1);
+    defer scheduler.deinit(std.testing.allocator);
+    scheduler.recordPhysicalTiming(60, 65, 100, 100);
+    const plan = try scheduler.planRender(110);
+    try std.testing.expectEqual(@as(Timestamp, 10), plan.render_budget_ns);
+    try std.testing.expectEqual(@as(Timestamp, 180), try nsFromDeadline(plan.deadline));
+    try scheduler.request(.damage, 183); // Admission consumed three units.
+    try scheduler.timerArmed(plan, fakeHandle(1), 180);
+    const started = (try scheduler.timerEvent(fakeHandle(1), .fired, 180)).?.render;
+    try scheduler.captureSamples(started.frame, &.{});
+    _ = try scheduler.renderComplete(started.frame, 184);
+    try scheduler.submitPhysical(started.frame, 184);
+    const outcome = try scheduler.presentPhysical(started.frame, 200, 188);
+    try std.testing.expectEqual(@as(Timestamp, 200), outcome.target_ns);
+    // Learning includes admission, rather than starting the clock afterward.
+    try std.testing.expectEqual(@as(Timestamp, 13), scheduler.renderBudget());
 }
 
 test "physical presentation anchors future refresh targets" {
