@@ -295,20 +295,25 @@ pub fn main(init: std.process.Init) !void {
         }
         if (run_error != null and !signal_stop_started) {
             beginShutdown(&systemd_session, coordinator) catch |stop_err| {
-                std.log.err("compositor shutdown failed: {t}", .{stop_err});
-                continue;
+                std.log.err("compositor shutdown failed: {t}; exiting with scanout pinned for kernel teardown", .{stop_err});
+                return run_error.?;
             };
             signal_stop_started = true;
         }
         const progress = runner.turnAndWait() catch |err| {
-            if (run_error == null) {
-                run_error = err;
-                std.log.err("compositor event loop failed: {t}", .{err});
-                if (@errorReturnTrace()) |trace|
-                    std.debug.dumpErrorReturnTrace(trace)
-                else
-                    std.log.err("error-return trace unavailable in this build", .{});
+            if (run_error) |original_error| {
+                // A fatal turn gets one attempt to start a normal drain. If
+                // draining also fails, retrying retained work can spin forever
+                // before submission. Keep GPU/buffer owners pinned on exit.
+                std.log.err("compositor drain failed: {t}; exiting with scanout pinned for kernel teardown", .{err});
+                return original_error;
             }
+            run_error = err;
+            std.log.err("compositor event loop failed: {t}", .{err});
+            if (@errorReturnTrace()) |trace|
+                std.debug.dumpErrorReturnTrace(trace)
+            else
+                std.log.err("error-return trace unavailable in this build", .{});
             continue;
         };
         const key_consumer = coordinator.bindingState();

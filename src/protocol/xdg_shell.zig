@@ -3149,6 +3149,70 @@ test "xdg-shell: generated requests publish owned generational toplevel state" {
     try std.testing.expectError(error.StaleToplevel, context.adapter.metadata(id));
 }
 
+test "xdg-shell: desktop drains updates queued before toplevel destruction and reuse" {
+    const Desktop = @import("../desktop/model.zig").Desktop(TestAdapter);
+    for ([_]bool{ false, true }) |constraints_changed| {
+        const context = try TestContext.init();
+        defer context.deinit();
+        var desktop = try Desktop.init(std.testing.allocator, .{
+            .toplevel_capacity = 2,
+            .command_capacity = 4,
+            .metadata_bytes = 32,
+        }, .{ .x = 0, .y = 0, .width = 100, .height = 100 });
+        defer desktop.deinit();
+
+        try test_protocol.xdg_wm_base.encodeRequest(&context.requests, context.manager.id, .{
+            .get_xdg_surface = .{ .id = 11, .surface = context.core.handle.id },
+        });
+        try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+        try test_protocol.xdg_surface.encodeRequest(&context.requests, 11, .{
+            .get_toplevel = .{ .id = 12 },
+        });
+        try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+        const first = context.adapter.peekEvent().?.toplevel_created.id;
+        try std.testing.expectEqual(@as(usize, 1), try desktop.consume(&context.adapter, 8));
+        const first_desktop = try desktop.idForShell(first);
+
+        // Dispatch a whole client batch before desktop consumption, just as
+        // the coordinator does. Metadata is no longer live when read later.
+        if (constraints_changed) {
+            try test_protocol.xdg_toplevel.encodeRequest(&context.requests, 12, .{
+                .set_min_size = .{ .width = 20, .height = 10 },
+            });
+            try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+            try context.adapter.surfaceCommitted(context.adapter.surfaces[0].surface_id);
+            try std.testing.expect(context.adapter.peekEvent().?.commit_ready.constraints_changed);
+        } else {
+            try test_protocol.xdg_toplevel.encodeRequest(&context.requests, 12, .{
+                .set_title = .{ .title = "closing" },
+            });
+            try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+        }
+        try test_protocol.xdg_toplevel.encodeRequest(&context.requests, 12, .{ .destroy = .{} });
+        try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+        try test_protocol.xdg_surface.encodeRequest(&context.requests, 11, .{
+            .get_toplevel = .{ .id = 16 },
+        });
+        try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+        const replacement = context.adapter.surfaces[0].role.toplevel;
+        try std.testing.expectEqual(first.index, replacement.index);
+        try std.testing.expect(first.generation != replacement.generation);
+        try test_protocol.xdg_toplevel.encodeRequest(&context.requests, 16, .{
+            .set_title = .{ .title = "replacement" },
+        });
+        try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try context.dispatch());
+
+        try std.testing.expectEqual(@as(usize, 2), try desktop.consume(&context.adapter, 8));
+        try std.testing.expectEqual(first_desktop, desktop.takeDestroyed().?);
+        try std.testing.expect(desktop.pending_event == null);
+        try std.testing.expectEqual(@as(usize, 2), try desktop.consume(&context.adapter, 8));
+        const current = try desktop.idForShell(replacement);
+        try std.testing.expectEqualStrings("replacement", (try desktop.metadata(current)).title);
+        try std.testing.expectEqual(@as(usize, 1), desktop.live);
+        try std.testing.expectEqual(@as(usize, 0), try desktop.consume(&context.adapter, 8));
+    }
+}
+
 test "xdg-shell: destroyed role object can be recreated with the permanent role" {
     const context = try TestContext.init();
     defer context.deinit();

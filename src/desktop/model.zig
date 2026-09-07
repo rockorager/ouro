@@ -1212,7 +1212,13 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
                 .popup_destroyed => |id| desktop.destroyPopup(id),
                 .metadata_changed => |shell_id| {
                     const id = try desktop.idForShell(shell_id);
-                    const source = try shell.metadata(shell_id);
+                    // Dispatch may already have destroyed this shell role.
+                    // Its terminal event is still queued behind this update;
+                    // consume the obsolete read so destruction can advance.
+                    const source = shell.metadata(shell_id) catch |err| {
+                        if (err != error.StaleToplevel) return err;
+                        return;
+                    };
                     try desktop.copyMetadata(id, source);
                 },
                 .parent_changed => |value| try desktop.setParent(
@@ -1242,8 +1248,15 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
                 .commit_ready => |commit| {
                     const id = try desktop.idForShell(commit.id);
                     const index = try desktop.resolveIndex(id);
-                    if (commit.constraints_changed or commit.unmapped)
-                        try desktop.copyMetadata(id, try shell.metadata(commit.id));
+                    if (commit.constraints_changed or commit.unmapped) {
+                        // As with metadata_changed, only the shell read may
+                        // legitimately be stale before the destroy is consumed.
+                        const source = shell.metadata(commit.id) catch |err| {
+                            if (err != error.StaleToplevel) return err;
+                            return;
+                        };
+                        try desktop.copyMetadata(id, source);
+                    }
                     if (commit.unmapped) {
                         try desktop.resetUnmapped(index);
                         return;
