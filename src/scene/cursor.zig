@@ -51,6 +51,7 @@ pub fn Cursor(comptime SurfaceId: type) type {
             _ = try render.validateSample(source.sample);
 
             var sample = source.sample;
+            sample.filter = .bilinear;
             sample.destination.x = std.math.sub(i32, self.position.x, self.hotspot.x) catch
                 return error.InvalidDestination;
             sample.destination.y = std.math.sub(i32, self.position.y, self.hotspot.y) catch

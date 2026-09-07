@@ -358,6 +358,32 @@ test "render: clear is exact and target stride padding is untouched" {
     );
 }
 
+test "render: bilinear cursor preserves 1:1 pixels and clamps scaled edges" {
+    var renderer = try Renderer.init(std.testing.allocator, .{
+        .max_samples = 1,
+        .max_source_width = 2,
+        .max_source_height = 1,
+    });
+    defer renderer.deinit();
+    const pixels = [_]u8{ 0, 0, 255, 255, 0, 0, 0, 0 };
+    var cursor = sample(&pixels, 2, 1, 8, .{ .x = 0, .y = 0, .width = 2, .height = 1 });
+    cursor.source.format = .argb8888_premultiplied;
+    var target = FakeTarget{ .width = 2, .height = 1, .stride = 8 };
+    try renderFull(&renderer, &target, list(2, 1, &.{cursor}));
+    const original = target.bytes;
+    cursor.filter = .bilinear;
+    try renderFull(&renderer, &target, list(2, 1, &.{cursor}));
+    try std.testing.expectEqualSlices(u8, &original, &target.bytes);
+    cursor.destination.width = 3;
+    cursor.clip.width = 3;
+    target.width = 3;
+    target.stride = 12;
+    try renderFull(&renderer, &target, list(3, 1, &.{cursor}));
+    try std.testing.expectEqualSlices(u8, original[0..4], target.bytes[0..4]);
+    try std.testing.expectEqualSlices(u8, original[4..8], target.bytes[8..12]);
+    try std.testing.expect(target.bytes[6] > 0 and target.bytes[6] < 255);
+}
+
 test "render: allocation is bounded by sample metadata instead of maximum source pixels" {
     var renderer = try Renderer.init(std.testing.allocator, .{
         .max_samples = 17,

@@ -4285,6 +4285,26 @@ test "shell-input: synchronized cursor subsurface batch renders root and child" 
     wayring.unix_socket.unlink(path) catch {};
     defer wayring.unix_socket.unlink(path) catch {};
 
+    var theme_dir = std.testing.tmpDir(.{});
+    defer theme_dir.cleanup();
+    var theme_words: std.ArrayList(u32) = .empty;
+    defer theme_words.deinit(allocator);
+    try theme_words.appendSlice(allocator, &.{ 0x72756358, 16, 0x10000, 3 });
+    var offset: u32 = 52;
+    for ([_]u32{ 24, 32, 48 }) |nominal| {
+        try theme_words.appendSlice(allocator, &.{ 0xfffd0002, nominal, offset });
+        offset += 36 + (nominal / 4) * (nominal / 4) * 4;
+    }
+    for ([_]u32{ 24, 32, 48 }) |nominal| {
+        try theme_words.appendSlice(allocator, &.{ 36, 0xfffd0002, nominal, 1, nominal / 4, nominal / 4, nominal / 12, nominal / 12, 0 });
+        try theme_words.appendNTimes(allocator, 0xffffffff, (nominal / 4) * (nominal / 4));
+    }
+    for (theme_words.items) |*word| word.* = std.mem.nativeToLittle(u32, word.*);
+    try theme_dir.dir.writeFile(std.testing.io, .{ .sub_path = "default", .data = std.mem.sliceAsBytes(theme_words.items) });
+    theme_words.items[theme_words.items.len - 1] = 0;
+    try theme_dir.dir.writeFile(std.testing.io, .{ .sub_path = "text", .data = std.mem.sliceAsBytes(theme_words.items) });
+    var theme_path: [128]u8 = undefined;
+
     var fixture = try physical_fixture.Fixture.init();
     defer fixture.deinit();
     var root_config = physical_fixture.compositorConfig();
@@ -4297,6 +4317,7 @@ test "shell-input: synchronized cursor subsurface batch renders root and child" 
         root_config,
     );
     var config = physical_fixture.coordinatorConfig();
+    config.cursor_directory = try std.fmt.bufPrint(&theme_path, ".zig-cache/tmp/{s}", .{theme_dir.sub_path});
     config.shm.pool_capacity = 2;
     config.shm.buffer_capacity = 2;
     config.surface.surface_capacity = 2;
@@ -4310,7 +4331,7 @@ test "shell-input: synchronized cursor subsurface batch renders root and child" 
     const coordinator = try Coordinator.create(
         allocator,
         root,
-        fixture.platforms(),
+        fixture.platformsWithHotplug(),
         config,
     );
     var loop = try Loop.init(
@@ -4408,6 +4429,131 @@ test "shell-input: synchronized cursor subsurface batch renders root and child" 
     try std.testing.expectEqual(@as(usize, 2), handler.buffer_releases);
     try std.testing.expectEqual(@as(usize, 2), handler.frame_done);
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+
+    // Introduce the second output after the initial composition assertions.
+    fixture.second_desktop = true;
+    try fixture.signalHotplug();
+    for (0..256) |_| {
+        _ = try loop.turn(coordinator);
+        _ = try drainMultiClient(&client_reactor, &driver, &handler);
+        if (coordinator.physical_output_count == 2 and coordinator.physical_outputs[1].kms_output != null) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(usize, 2), coordinator.physical_output_count);
+    // The fixture destroys released buffers; supply fresh cursor content after
+    // topology refresh before testing movement without further client commits.
+    try handler.mapSurface(1);
+    try handler.mapSurface(0);
+    try submitMultiClient(&client_reactor, &driver, &handler);
+    for (0..256) |_| {
+        _ = try loop.turn(coordinator);
+        _ = try drainMultiClient(&client_reactor, &driver, &handler);
+        const child_id = try coordinator.adapter.surfaceId(handler.surfaces[1].?);
+        if (coordinator.cursor_layer.active and findLayer(coordinator.app_layers, child_id) != null) break;
+        _ = linux.sched_yield();
+    }
+    // Association-only topology: no rendering is needed to notify the client.
+    // Use the reported displaced 150% laptop / 125% external layout.
+    for (coordinator.physical_outputs[0..2], 0..) |physical, index| {
+        const scale: u32 = if (index == 0) 180 else 150;
+        try coordinator.output_adapter.publishMode(physical.protocol_output, if (index == 0) 2880 else 3840, if (index == 0) 1800 else 2160, 60_000, 1, 1);
+        try coordinator.output_adapter.publishScale(physical.protocol_output, scale);
+        try coordinator.output_adapter.publishPosition(physical.protocol_output, if (index == 0) 0 else 1920, if (index == 0) 0 else -528);
+        var head = try coordinator.output_management_adapter.lifecycle.currentHead(physical.management_head);
+        head.scale_120 = scale;
+        _ = try coordinator.output_management_adapter.publishHead(physical.management_head, head);
+    }
+    const root_id = try coordinator.adapter.surfaceId(handler.surfaces[0].?);
+    const child_id = try coordinator.adapter.surfaceId(handler.surfaces[1].?);
+    const child = findLayer(coordinator.app_layers, child_id).?;
+    const identity = coordinator.cursor_layer.sample.?.sample;
+    // Root is three logical pixels wide; child is offset by one. At x=1918
+    // both straddle; at x=1919 only the root still touches the higher scale.
+    for ([_]i32{ 1900, 1918, 1919, 1921, 1900 }, [_]u32{ 180, 180, 180, 150, 180 }) |x, expected| {
+        coordinator.interaction.x_fixed = @as(i64, x) * 256;
+        coordinator.interaction.y_fixed = 10 * 256;
+        coordinator.interaction.cursor.move(.{ .x = x, .y = 10 });
+        const submitted = coordinator.stats.submitted;
+        try coordinator.prepare();
+        try std.testing.expectEqual(submitted, coordinator.stats.submitted);
+        try std.testing.expectEqual(x, coordinator.cursor_layer.sample.?.destination.x);
+        try std.testing.expectEqual(x + 1, child.sample.?.destination.x);
+        try std.testing.expectEqual(identity, coordinator.cursor_layer.sample.?.sample);
+        try std.testing.expectEqual(@as(?i32, 2), coordinator.adapter.surfaces[root_id.index].preferred_buffer_scale);
+        try std.testing.expectEqual(@as(usize, 2), coordinator.fractional_scale_adapter.slots.entries.items.len);
+        for (coordinator.fractional_scale_adapter.slots.entries.items) |slot| {
+            if (slot.header.active and std.meta.eql(slot.surface, root_id))
+                try std.testing.expectEqual(expected, slot.preferred_scale);
+            if (slot.header.active and std.meta.eql(slot.surface, child_id))
+                try std.testing.expectEqual(if (x == 1919) @as(u32, 150) else expected, slot.preferred_scale);
+        }
+        for (coordinator.output_adapter.associations) |association| {
+            if (!association.active or !std.meta.eql(association.surface, handler.surfaces[0].?)) continue;
+            const left = std.meta.eql(association.output, coordinator.physical_outputs[0].protocol_output);
+            try std.testing.expectEqual(if (left) x < 1920 else x + 3 > 1920, association.desired);
+        }
+    }
+
+    // Client cursors receive both integer and fractional scale preferences.
+    const secondary = &coordinator.physical_outputs[1];
+    coordinator.interaction.x_fixed = 1925 * 256;
+    coordinator.interaction.cursor.move(.{ .x = 1925, .y = 10 });
+    for ([_]u32{ 120, 150, 180, 240, 150 }) |scale| {
+        var head = try coordinator.output_management_adapter.lifecycle.currentHead(secondary.management_head);
+        head.scale_120 = scale;
+        _ = try coordinator.output_management_adapter.publishHead(secondary.management_head, head);
+        coordinator.output_associations_dirty = true;
+        try coordinator.prepare();
+        try std.testing.expectEqual(@as(?i32, if (scale == 120) 1 else 2), coordinator.adapter.surfaces[root_id.index].preferred_buffer_scale);
+        for (coordinator.fractional_scale_adapter.slots.entries.items) |slot|
+            if (slot.header.active) try std.testing.expectEqual(scale, slot.preferred_scale);
+    }
+    // Compositor-owned images use independent output densities and identities.
+    // The capture path and normal rendering share cursorThemeForOutput.
+    coordinator.themed_cursor_shape = .default;
+    coordinator.interaction.x_fixed = 1920 * 256;
+    coordinator.interaction.cursor.move(.{ .x = 1920, .y = 10 });
+    var identities: [2]@TypeOf(identity) = undefined;
+    for (coordinator.physical_outputs[0..2], 0..) |*physical, index| {
+        const info = coordinator.cursorCaptureInfo(.{ .cursor = .{
+            .source = .{ .output = physical.kms_output.?.outputId() },
+            .cursor = .{ .index = 0, .generation = 1 },
+        } }).?;
+        const cursor = &physical.themed_cursor;
+        try std.testing.expectEqual(@as(u32, if (index == 0) 48 else 32), cursor.image.?.nominal_size);
+        try std.testing.expectEqual(@as(i32, 3), info.hotspot.x);
+        identities[index] = cursor.sampleIdentity();
+        const sample = (try cursor.sample(.{ .x = 0, .y = -528, .width = 4992, .height = 1728 })).?;
+        try std.testing.expectEqual(@as(u32, 6), sample.destination.width);
+        try std.testing.expectEqual(@as(i32, 1918), sample.destination.x);
+    }
+    try std.testing.expect(identities[0].surface != identities[1].surface);
+    try std.testing.expectEqual(@as(usize, 1), coordinator.cursor_cache.retainedFiles());
+    const physical = &coordinator.physical_outputs[1];
+    for ([_]u32{ 120, 150, 180, 240, 150, 137, 275 }, [_]u32{ 24, 32, 48, 48, 32, 32, 48 }) |scale, nominal| {
+        var head = try coordinator.output_management_adapter.lifecycle.currentHead(physical.management_head);
+        head.scale_120 = scale;
+        _ = try coordinator.output_management_adapter.publishHead(physical.management_head, head);
+        const capture: @TypeOf(coordinator.image_copy_capture_adapter).Target = .{ .cursor = .{
+            .source = .{ .output = physical.kms_output.?.outputId() },
+            .cursor = .{ .index = @as(u32, 0), .generation = @as(u32, 1) },
+        } };
+        _ = coordinator.cursorCaptureInfo(capture).?;
+        try std.testing.expectEqual(nominal, physical.themed_cursor.image.?.nominal_size);
+        const image_identity = physical.themed_cursor.sampleIdentity();
+        _ = coordinator.cursorCaptureInfo(capture).?;
+        try std.testing.expectEqual(image_identity, physical.themed_cursor.sampleIdentity());
+        try std.testing.expectEqual(identities[0], coordinator.physical_outputs[0].themed_cursor.sampleIdentity());
+    }
+    const prior_shape = physical.themed_cursor.sampleIdentity();
+    coordinator.themed_cursor_shape = .text;
+    _ = coordinator.cursorCaptureInfo(.{ .cursor = .{
+        .source = .{ .output = physical.kms_output.?.outputId() },
+        .cursor = .{ .index = 0, .generation = 1 },
+    } }).?;
+    try std.testing.expect(prior_shape.commit_sequence != physical.themed_cursor.sampleIdentity().commit_sequence);
+    try std.testing.expectEqual(@as(usize, 2), coordinator.cursor_cache.retainedFiles());
+    coordinator.themed_cursor_shape = null;
 
     coordinator.disconnected(coordinator.peer.?);
     _ = try client.prepareClose();
@@ -5987,7 +6133,7 @@ const MultiHandler = struct {
             self.seat = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_seat.info, @min(value.version, 9), null);
         if (self.activation_mode and std.mem.eql(u8, value.interface, protocol.xdg_activation_v1.info.name))
             self.activation = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.xdg_activation_v1.info, 1, null);
-        if (self.fractional_mode and std.mem.eql(u8, value.interface, protocol.wp_fractional_scale_manager_v1.info.name))
+        if ((self.fractional_mode or self.cursor_mode) and std.mem.eql(u8, value.interface, protocol.wp_fractional_scale_manager_v1.info.name))
             self.fractional_manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wp_fractional_scale_manager_v1.info, 1, null);
         if (self.fractional_mode and std.mem.eql(u8, value.interface, protocol.wp_viewporter.info.name))
             self.viewporter = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wp_viewporter.info, 1, null);
@@ -5998,6 +6144,7 @@ const MultiHandler = struct {
     fn maybeCreateShells(self: *MultiHandler) !void {
         if (self.shell_created or self.compositor == null or self.shm == null)
             return;
+        if (self.cursor_mode and self.fractional_manager == null) return;
         if (!self.cursor_mode and self.wm_base == null) return;
         if ((self.subsurface_mode or self.cursor_mode) and self.subcompositor == null) return;
         if (self.fractional_mode and (self.fractional_manager == null or self.viewporter == null)) return;
@@ -6009,13 +6156,15 @@ const MultiHandler = struct {
                 self.compositor.?,
                 .{},
             )).id;
-            if (self.fractional_mode) {
+            if (self.fractional_mode or self.cursor_mode) {
                 self.fractional_scales[index] = (try protocol.wp_fractional_scale_manager_v1.construct_get_fractional_scale(
                     self.objects,
                     self.queue,
                     self.fractional_manager.?,
                     .{ .surface = self.surfaces[index].?.id },
                 )).id;
+            }
+            if (self.fractional_mode) {
                 self.viewports[index] = (try protocol.wp_viewporter.construct_get_viewport(
                     self.objects,
                     self.queue,
