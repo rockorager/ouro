@@ -4279,6 +4279,9 @@ fn runImageCopyCapture(interrupt: bool) !void {
 }
 
 test "shell-input: synchronized cursor subsurface batch renders root and child" {
+    const previous_level = std.testing.log_level;
+    std.testing.log_level = .info;
+    defer std.testing.log_level = previous_level;
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-cursor-subsurface-{d}.sock", .{linux.getpid()});
@@ -4318,6 +4321,7 @@ test "shell-input: synchronized cursor subsurface batch renders root and child" 
     );
     var config = physical_fixture.coordinatorConfig();
     config.cursor_directory = try std.fmt.bufPrint(&theme_path, ".zig-cache/tmp/{s}", .{theme_dir.sub_path});
+    config.output.trace_pacing = true;
     config.shm.pool_capacity = 2;
     config.shm.buffer_capacity = 2;
     config.surface.surface_capacity = 2;
