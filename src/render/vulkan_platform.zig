@@ -972,11 +972,14 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
     errdefer allocator.free(self.lut_hashes);
     self.lut_count = 0;
     self.resource_epoch = 1;
-    _ = try createHostBuffer(self, lut_buffer_size, &self.lut_buffer, &self.lut_memory, &self.lut_map);
+    _ = try createHostBuffer(self, lut_buffer_size, 0, &self.lut_buffer, &self.lut_memory, &self.lut_map);
     errdefer destroyBuffer(self, self.lut_buffer, self.lut_memory);
+    // Partial copy-on-write commits read the whole predecessor on the CPU.
+    // Prefer cached backing without relaxing host visibility or coherency.
     self.content_memory_type = try createHostBuffer(
         self,
         self.content_buffer_size,
+        c.VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
         &self.content_buffer,
         &self.content_memory,
         &self.content_map,
@@ -1969,7 +1972,7 @@ fn realImportTarget(_: *anyopaque, renderer: Renderer, metadata: gbm.Metadata, d
     target.batch_capacity = 0;
     target.sample_buffer_size = 0;
     target.state = .ready;
-    _ = try createHostBuffer(self, self.staging_buffer_size, &target.source_buffer, &target.source_memory, &target.source_map);
+    _ = try createHostBuffer(self, self.staging_buffer_size, 0, &target.source_buffer, &target.source_memory, &target.source_map);
     target.source_buffer_size = self.staging_buffer_size;
     errdefer destroyBuffer(self, target.source_buffer, target.source_memory);
 
@@ -2252,7 +2255,7 @@ fn growTargetBatches(self: *RealRenderer, target: *RealTarget, count: usize) !vo
     var buffer: c.VkBuffer = undefined;
     var memory: c.VkDeviceMemory = undefined;
     var map: *anyopaque = undefined;
-    _ = try createHostBuffer(self, buffer_size, &buffer, &memory, &map);
+    _ = try createHostBuffer(self, buffer_size, 0, &buffer, &memory, &map);
     errdefer destroyBuffer(self, buffer, memory);
     const sets = try allocator.alloc(c.VkDescriptorSet, count);
     errdefer allocator.free(sets);
@@ -2312,7 +2315,7 @@ fn growTargetSource(self: *RealRenderer, target: *RealTarget, size: usize) !void
     var buffer: c.VkBuffer = undefined;
     var memory: c.VkDeviceMemory = undefined;
     var map: *anyopaque = undefined;
-    _ = try createHostBuffer(self, size, &buffer, &memory, &map);
+    _ = try createHostBuffer(self, size, 0, &buffer, &memory, &map);
     const old_batches = target.batch_capacity;
     destroyTargetBatchResources(self, target);
     destroyBuffer(self, target.source_buffer, target.source_memory);
@@ -4762,15 +4765,16 @@ fn chooseQueueFamily(device: c.VkPhysicalDevice) !u32 {
     return error.NoComputeQueue;
 }
 
-// Return the selected type for diagnostics; allocation policy is unchanged.
-fn createHostBuffer(self: *RealRenderer, size: usize, buffer: *c.VkBuffer, memory: *c.VkDeviceMemory, map: **anyopaque) !u32 {
+// Zero preference preserves first-compatible selection for write-only staging.
+// Return the actual selected type for diagnostics, including fallback choices.
+fn createHostBuffer(self: *RealRenderer, size: usize, preferred: c.VkMemoryPropertyFlags, buffer: *c.VkBuffer, memory: *c.VkDeviceMemory, map: **anyopaque) !u32 {
     var info: c.VkBufferCreateInfo = .{ .sType = c.VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = null, .flags = 0, .size = size, .usage = c.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | c.VK_BUFFER_USAGE_TRANSFER_SRC_BIT, .sharingMode = c.VK_SHARING_MODE_EXCLUSIVE, .queueFamilyIndexCount = 0, .pQueueFamilyIndices = null };
     try vk(c.vkCreateBuffer(self.device, &info, null, buffer), error.CreateBufferFailed);
     var buffer_only_cleanup = true;
     errdefer if (buffer_only_cleanup) c.vkDestroyBuffer(self.device, buffer.*, null);
     var requirements: c.VkMemoryRequirements = undefined;
     c.vkGetBufferMemoryRequirements(self.device, buffer.*, &requirements);
-    var allocation: c.VkMemoryAllocateInfo = .{ .sType = c.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = null, .allocationSize = requirements.size, .memoryTypeIndex = try memoryType(self, requirements.memoryTypeBits, c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) };
+    var allocation: c.VkMemoryAllocateInfo = .{ .sType = c.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = null, .allocationSize = requirements.size, .memoryTypeIndex = try preferredMemoryType(self, requirements.memoryTypeBits, c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, preferred) };
     try vk(c.vkAllocateMemory(self.device, &allocation, null, memory), error.AllocateBufferMemoryFailed);
     buffer_only_cleanup = false;
     errdefer {
@@ -5111,6 +5115,28 @@ test "render-vulkan: real Vulkan ABI and shader artifact are linked" {
     );
     try std.testing.expect(c.VK_QUEUE_FAMILY_FOREIGN_EXT != c.VK_QUEUE_FAMILY_IGNORED);
     try std.testing.expectEqual(@as(u32, 0b0010), intersectMemoryTypeBits(0b1010, 0b0110));
+}
+
+test "render-vulkan: cached host preference preserves compatible coherent fallback" {
+    var renderer: RealRenderer = undefined;
+    renderer.memory = std.mem.zeroes(c.VkPhysicalDeviceMemoryProperties);
+    const required = c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    const cached = c.VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    renderer.memory.memoryTypeCount = 3;
+    renderer.memory.memoryTypes[0].propertyFlags = required | c.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    renderer.memory.memoryTypes[1].propertyFlags = required | cached;
+    renderer.memory.memoryTypes[2].propertyFlags = c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | cached;
+
+    try std.testing.expectEqual(@as(u32, 1), try preferredMemoryType(&renderer, 0b111, required, cached));
+    // Existing non-content callers still choose the first compatible type.
+    try std.testing.expectEqual(@as(u32, 0), try preferredMemoryType(&renderer, 0b111, required, 0));
+    // A cached type excluded by the resource's bitmask is not eligible.
+    try std.testing.expectEqual(@as(u32, 0), try preferredMemoryType(&renderer, 0b101, required, cached));
+    // Lack of cached memory retains the coherent fallback, not a weaker type.
+    renderer.memory.memoryTypes[1].propertyFlags = required;
+    try std.testing.expectEqual(@as(u32, 0), try preferredMemoryType(&renderer, 0b111, required, cached));
+    try std.testing.expectError(error.NoCompatibleMemoryType, preferredMemoryType(&renderer, 0b100, required, cached));
+    try std.testing.expectError(error.NoCompatibleMemoryType, preferredMemoryType(&renderer, 0, required, cached));
 }
 
 test "render-vulkan: 10-bit DRM targets preserve packed channel order" {
