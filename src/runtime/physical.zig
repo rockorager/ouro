@@ -8322,6 +8322,18 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             output_committed = true;
             _ = retained_visibility_changed;
+            // Commits can be applied while their outputs are powered off.
+            // Re-enroll presentations that had no output to track: merely
+            // redrawing retained pixels leaves finishOutcome ignoring them
+            // as untracked, so the client never gets its frame callback.
+            for (self.app_layers[0..self.app_layer_count]) |*layer| {
+                if (!layer.active or layer.presentation == null or layer.outcome_pending or
+                    self.appLayerOutputTrackingPending(layer)) continue;
+                _ = self.requestLayerOutputDamage(
+                    layer,
+                    monotonicNs() catch return error.ActivatedOutputFailure,
+                ) catch return error.ActivatedOutputFailure;
+            }
             // A secondary connector has no primary desktop damage to guarantee
             // its first scanout, so schedule one even before clients map there.
             if (!primary)

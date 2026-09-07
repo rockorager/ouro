@@ -1676,6 +1676,156 @@ test "generated client leases and hotplugs two non-desktop connectors" {
     try root.deinit();
 }
 
+test "session lock frame callbacks resume after commits while the output is powered off" {
+    // Exercise the only display going dark and a secondary display sleeping
+    // while the primary remains active.
+    for ([_]bool{ false, true }) |second_desktop| {
+        const allocator = std.testing.allocator;
+        var fixture = try Fixture.init();
+        defer fixture.deinit();
+        fixture.second_desktop = second_desktop;
+        const output_index: usize = if (second_desktop) 1 else 0;
+        var path_storage: [128]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-lock-power-{d}.sock", .{linux.getpid()});
+        wayring.unix_socket.unlink(path) catch {};
+        defer wayring.unix_socket.unlink(path) catch {};
+
+        const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), compositorConfig());
+        const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), coordinatorConfig());
+        var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
+        try coordinator.start(&loop);
+        _ = try loop.turn(coordinator);
+        try fixture.signalSession(.enable);
+        for (0..128) |_| {
+            _ = try loop.turn(coordinator);
+            if (coordinator.physical_output_count == output_index + 1 and
+                coordinator.physical_outputs[output_index].kms_output != null) break;
+            if (root.ring.cq_ready() == 0) try waitReady(&root.ring);
+        }
+        const physical = &coordinator.physical_outputs[output_index];
+        try std.testing.expect(physical.kms_output != null);
+
+        var reactor: wayring.io_uring.Reactor = undefined;
+        try reactor.initOwned(allocator, .{ .entries = 16, .flags = 0 }, clientReactorConfig());
+        var client = try ClientConnection.attach(
+            allocator,
+            &reactor,
+            try wayring.unix_socket.connect(path),
+            .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 },
+            .{ .max_objects = 48, .max_client_ids = 47 },
+        );
+        var driver = ClientDriver.init(&client);
+        const actor = try client.actor();
+        const registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null);
+        var handler: SessionLockClientHandler = .{
+            .objects = &client.objects,
+            .queue = &actor.transmit,
+            .registry = registry,
+            .minimum_outputs = output_index + 1,
+        };
+        try submitClient(&reactor, &driver, &handler);
+        for (0..512) |_| {
+            _ = try drainClient(&reactor, &driver, &handler);
+            _ = try loop.turn(coordinator);
+            if (handler.locked == 1 and physicalOutputsSettled(coordinator)) break;
+            try waitForEither(&root.ring, reactor.ring);
+        }
+        try std.testing.expectEqual(@as(usize, 1), handler.locked);
+        const power = (try protocol.zwlr_output_power_manager_v1.construct_get_output_power(
+            &client.objects,
+            &actor.transmit,
+            handler.power_manager.?,
+            .{ .output = handler.output.?.id },
+        )).id;
+
+        // Both newly attached buffers and callback-only commits can arrive after
+        // DPMS has drained the output. Neither should require another client
+        // commit to receive its callback when the output wakes.
+        for ([_]bool{ true, false }) |attach| {
+            try protocol.zwlr_output_power_v1.encodeRequest(&actor.transmit, power.id, .{
+                .set_mode = .{ .mode = .off },
+            });
+            try submitClient(&reactor, &driver, &handler);
+            for (0..512) |_| {
+                _ = try drainClient(&reactor, &driver, &handler);
+                _ = try loop.turn(coordinator);
+                if (handler.power_mode != null and
+                    handler.power_mode.?.value == protocol.zwlr_output_power_v1.mode.off.value and
+                    physical.kms_output == null) break;
+                try waitForEither(&root.ring, reactor.ring);
+            }
+            try std.testing.expectEqual(protocol.zwlr_output_power_v1.mode.off, handler.power_mode.?);
+            try std.testing.expect(physical.kms_output == null);
+            if (second_desktop) try std.testing.expect(coordinator.primaryKmsOutput() != null);
+            const applied_before = coordinator.stats.applied;
+            const callbacks_before = handler.frame_done;
+            if (attach) {
+                try protocol.wl_surface.encodeRequest(&actor.transmit, handler.surface.?.id, .{
+                    .attach = .{ .buffer = handler.buffer.?.id, .x = 0, .y = 0 },
+                });
+                try protocol.wl_surface.encodeRequest(&actor.transmit, handler.surface.?.id, .{
+                    .damage_buffer = .{ .x = 0, .y = 0, .width = 3, .height = 2 },
+                });
+            }
+            _ = try protocol.wl_surface.construct_frame(&client.objects, &actor.transmit, handler.surface.?, .{});
+            try protocol.wl_surface.encodeRequest(&actor.transmit, handler.surface.?.id, .{ .commit = .{} });
+            try submitClient(&reactor, &driver, &handler);
+            for (0..512) |_| {
+                _ = try drainClient(&reactor, &driver, &handler);
+                _ = try loop.turn(coordinator);
+                if (coordinator.stats.applied > applied_before) break;
+                try waitForEither(&root.ring, reactor.ring);
+            }
+            try std.testing.expect(coordinator.stats.applied > applied_before);
+            try std.testing.expectEqual(callbacks_before, handler.frame_done);
+            try std.testing.expect(physical.kms_output == null);
+
+            try protocol.zwlr_output_power_v1.encodeRequest(&actor.transmit, power.id, .{
+                .set_mode = .{ .mode = .on },
+            });
+            try submitClient(&reactor, &driver, &handler);
+            for (0..512) |_| {
+                _ = try drainClient(&reactor, &driver, &handler);
+                _ = try loop.turn(coordinator);
+                if (handler.frame_done > callbacks_before and physicalOutputsSettled(coordinator)) break;
+                try waitForEither(&root.ring, reactor.ring);
+            }
+            try std.testing.expectEqual(callbacks_before + 1, handler.frame_done);
+            try std.testing.expect(physical.kms_output != null);
+            try std.testing.expect(coordinator.session_lock_adapter.isFailClosed());
+
+            // A follow-up redraw must also complete, not remain behind the frame
+            // that was admitted while powered off.
+            _ = try protocol.wl_surface.construct_frame(&client.objects, &actor.transmit, handler.surface.?, .{});
+            try protocol.wl_surface.encodeRequest(&actor.transmit, handler.surface.?.id, .{ .commit = .{} });
+            try submitClient(&reactor, &driver, &handler);
+            for (0..512) |_| {
+                _ = try drainClient(&reactor, &driver, &handler);
+                _ = try loop.turn(coordinator);
+                if (handler.frame_done == callbacks_before + 2 and physicalOutputsSettled(coordinator)) break;
+                try waitForEither(&root.ring, reactor.ring);
+            }
+            try std.testing.expectEqual(callbacks_before + 2, handler.frame_done);
+        }
+        try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+        _ = try client.prepareClose();
+        try submitClient(&reactor, &driver, &handler);
+        try coordinator.requestStop();
+        for (0..256) |_| {
+            const client_progress = try drainClient(&reactor, &driver, &handler);
+            const server_progress = try loop.turn(coordinator);
+            if (client_progress.quiescent and server_progress.wayring.shutdown_complete and
+                coordinator.backendDrainComplete()) break;
+            try waitForEither(&root.ring, reactor.ring);
+        }
+        try client.deinit(allocator);
+        reactor.deinit(allocator);
+        loop.deinit();
+        try coordinator.destroy();
+        try root.deinit();
+    }
+}
+
 test "generated session lock publishes only after presentation and client loss stays fail closed" {
     const allocator = std.testing.allocator;
     var fixture = try Fixture.init();
@@ -3225,6 +3375,9 @@ const SessionLockClientHandler = struct {
     objects: *wayring.objects.ClientObjects,
     queue: *wayring.tx.Queue,
     registry: wayring.objects.Handle,
+    power_manager: ?wayring.objects.Handle = null,
+    power_mode: ?protocol.zwlr_output_power_v1.mode = null,
+    frame_done: usize = 0,
     layer_shell: ?wayring.objects.Handle = null,
     layer_configure_serial: ?u32 = null,
     compositor: ?wayring.objects.Handle = null,
@@ -3265,6 +3418,8 @@ const SessionLockClientHandler = struct {
         if (target.object.interface == &ClientCore.Registry.info) {
             switch (try ClientCore.decodeRegistryEvent(self.objects, self.registry, message, fds)) {
                 .global => |global| {
+                    if (std.mem.eql(u8, global.interface, protocol.zwlr_output_power_manager_v1.info.name))
+                        self.power_manager = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.zwlr_output_power_manager_v1.info, 1, null);
                     if (std.mem.eql(u8, global.interface, protocol.wl_compositor.info.name))
                         self.compositor = try ClientCore.bind(self.objects, self.queue, self.registry, global.name, &protocol.wl_compositor.info, @min(global.version, 7), null);
                     if (std.mem.eql(u8, global.interface, protocol.wl_shm.info.name))
@@ -3285,6 +3440,15 @@ const SessionLockClientHandler = struct {
                 .global_remove => {},
             }
             try self.maybeRequestLock();
+        } else if (target.object.interface == &ClientCore.Callback.info) {
+            const callback = self.objects.namespace.lookupHandle(message.header.object_id) orelse return error.MissingCallback;
+            _ = try ClientCore.decodeCallbackEvent(self.objects, callback, message, fds);
+            self.frame_done += 1;
+        } else if (target.object.interface == &protocol.zwlr_output_power_v1.info) {
+            switch (try protocol.zwlr_output_power_v1.decodeEvent(message, fds)) {
+                .mode => |value| self.power_mode = value.mode,
+                .failed => return error.OutputPowerFailed,
+            }
         } else if (target.object.interface == &protocol.wl_shm.info) {
             _ = try protocol.wl_shm.decodeEvent(message, fds);
         } else if (target.object.interface == &protocol.wl_output.info) {
