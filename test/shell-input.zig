@@ -964,6 +964,12 @@ const XdgSessionHandler = struct {
                 .global_remove => {},
             }
             try self.maybeCreate();
+        } else if (target.object.interface == &protocol.wl_surface.info) {
+            switch (try protocol.wl_surface.decodeEvent(message, fds)) {
+                .preferred_buffer_scale => |value| try std.testing.expectEqual(@as(i32, 1), value.factor),
+                .preferred_buffer_transform => |value| try std.testing.expectEqual(protocol.wl_output.transform.normal, value.transform),
+                else => return error.UnexpectedSurfaceEvent,
+            }
         } else if (target.object.interface == &protocol.xdg_session_v1.info) {
             switch (try protocol.xdg_session_v1.decodeEvent(message, fds)) {
                 .restored => self.session_restored = true,
@@ -2778,6 +2784,180 @@ test "shell-input: tablet global delivers normalized device and tool metadata" {
     try root.deinit();
 }
 
+test "shell-input: each new toplevel gets its output scale before initial configure" {
+    try runInitialToplevelScale(4096);
+    try runInitialToplevelScale(128);
+}
+
+fn runInitialToplevelScale(transmit_byte_budget: usize) !void {
+    const allocator = std.testing.allocator;
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-initial-scale-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+    var fixture = try physical_fixture.Fixture.init();
+    defer fixture.deinit();
+    fixture.second_desktop = true;
+    var root_config = physical_fixture.compositorConfig();
+    root_config.runtime.actor.transmit_byte_budget = transmit_byte_budget;
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), root_config);
+    var config = physical_fixture.coordinatorConfig();
+    config.surface.surface_capacity = 2;
+    config.surface.viewport_capacity = 2;
+    config.surface.content_update_capacity = 4;
+    config.surface.attachment_capacity = 2;
+    config.output.max_source_bytes = pixels.len * 2;
+    config.output.max_samples = 3;
+    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), config);
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
+    try coordinator.start(&loop);
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    for (0..512) |_| {
+        _ = try loop.turn(coordinator);
+        if (coordinator.physical_output_count == 2 and coordinator.output_global_index == 2) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(usize, 2), coordinator.physical_output_count);
+
+    // Tiny physical outputs exercise the real coordinator without DRM hardware.
+    // Both have logical size 2x1; the second is displaced above/right of the first.
+    var areas: [2]Coordinator.Desktop.OutputArea = undefined;
+    for (coordinator.physical_outputs[0..2], 0..) |physical, index| {
+        const scale: u32 = if (index == 0) 180 else 150;
+        try coordinator.output_adapter.publishScale(physical.protocol_output, scale);
+        try coordinator.output_adapter.publishPosition(physical.protocol_output, @intCast(index * 2), -@as(i32, @intCast(index)));
+        var head = try coordinator.output_management_adapter.lifecycle.currentHead(physical.management_head);
+        head.scale_120 = scale;
+        _ = try coordinator.output_management_adapter.publishHead(physical.management_head, head);
+        areas[index] = .{
+            .id = .{ .value = @as(u64, physical.id.generation) << 32 | physical.id.index },
+            .geometry = .{ .x = @intCast(index * 2), .y = -@as(i32, @intCast(index)), .width = 2, .height = 1 },
+        };
+    }
+    try coordinator.fractional_scale_adapter.setDefaultPreferredScale(180);
+    coordinator.desktop.applyTopology(.{ .x = 0, .y = -1, .width = 4, .height = 2 }, &areas);
+    coordinator.output_associations_dirty = true;
+
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(allocator, .{ .entries = 16, .flags = 0 }, physical_fixture.clientReactorConfig());
+    var client = try ClientConnection.attach(allocator, &reactor, try wayring.unix_socket.connect(path), .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 }, .{ .max_objects = 32, .max_client_ids = 31 });
+    const actor = try client.actor();
+    var driver = ClientDriver.init(&client);
+    const registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null);
+    var handler: MultiHandler = .{
+        .objects = &client.objects,
+        .queue = &actor.transmit,
+        .registry = registry,
+        .surface_count = 1,
+        .cycle_count = 1,
+        .fractional_mode = true,
+        .defer_mapping = true,
+    };
+    try submitMultiClient(&reactor, &driver, &handler);
+    for (0..512) |_| {
+        _ = try drainMultiClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.initial_configure_scales[0] != null) break;
+        _ = linux.sched_yield();
+    }
+    try handler.mapSurface(0);
+    for (0..512) |_| {
+        _ = try drainMultiClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.frame_done == 1 and handler.buffer_releases == 1) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
+    }
+
+    // A later window on the same connection must not inherit the first one's
+    // scale while waiting for its own first buffer (Chrome's process-reuse case).
+    coordinator.interaction.x_fixed = 2 * 256;
+    coordinator.interaction.y_fixed = -256;
+    handler.surface_count = 2;
+    handler.shell_created = false;
+    try handler.maybeCreateShells();
+    for (0..512) |_| {
+        _ = try drainMultiClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.initial_configure_scales[1] != null) break;
+        _ = linux.sched_yield();
+    }
+    const initial_scales = handler.initial_configure_scales;
+    const existing_scale = handler.preferred_scales[0];
+    const enters_before_map = handler.surface_enters[1];
+    // Recreating the binding after configure must also resolve placement,
+    // rather than resetting an unmapped surface to the global fallback.
+    try wayring.client.sendRequest(protocol.wp_fractional_scale_v1, &client.objects, &actor.transmit, handler.fractional_scales[1].?, .{ .destroy = .{} });
+    handler.fractional_scales[1] = (try protocol.wp_fractional_scale_manager_v1.construct_get_fractional_scale(
+        &client.objects,
+        &actor.transmit,
+        handler.fractional_manager.?,
+        .{ .surface = handler.surfaces[1].?.id },
+    )).id;
+    handler.preferred_scales[1] = 0;
+    for (0..512) |_| {
+        _ = try drainMultiClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.preferred_scales[1] != 0) break;
+        _ = linux.sched_yield();
+    }
+    const rebound_scale = handler.preferred_scales[1];
+    try handler.mapSurface(1);
+    for (0..512) |_| {
+        _ = try drainMultiClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.frame_done == 2 and handler.buffer_releases == 2) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
+    }
+    const mapped_scale = handler.preferred_scales[1];
+    const windows = try coordinator.desktop.sceneSnapshot(coordinator.scene_windows);
+    const mapped_layer = findLayer(coordinator.app_layers, windows[1].surface) orelse return error.MissingLayer;
+    try std.testing.expectEqual(ouro.render.Size{ .width = 3, .height = 1 }, mapped_layer.sample.?.source.size);
+    try std.testing.expectEqual(ouro.render.Rect{ .x = 2, .y = -1, .width = 2, .height = 1 }, mapped_layer.sample.?.destination);
+
+    // Moving established windows still uses applied geometry, not the initial
+    // placement fallback. A repeated round trip must continue publishing both scales.
+    var moved_scales: [4]u32 = undefined;
+    for (&moved_scales, 0..) |*scale, index| {
+        try coordinator.moveFocusedToOutput(index % 2 == 0);
+        for (0..512) |_| {
+            _ = try drainMultiClient(&reactor, &driver, &handler);
+            _ = try loop.turn(coordinator);
+            if (handler.preferred_scales[1] == (if (index % 2 == 0) @as(u32, 180) else 150)) break;
+            _ = linux.sched_yield();
+        }
+        scale.* = handler.preferred_scales[1];
+    }
+
+    coordinator.disconnected(coordinator.peer.?);
+    _ = try client.prepareClose();
+    try submitMultiClient(&reactor, &driver, &handler);
+    var drained = false;
+    for (0..512) |_| {
+        const client_progress = try drainMultiClient(&reactor, &driver, &handler);
+        const progress = try loop.turn(coordinator);
+        drained = progress.wayring.shutdown_complete and client_progress.quiescent and coordinator.backendDrainComplete();
+        if (drained) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(drained);
+    try client.deinit(allocator);
+    reactor.deinit(allocator);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+    try std.testing.expectEqual(@as(?u32, 180), initial_scales[0]);
+    try std.testing.expectEqual(@as(?u32, 150), initial_scales[1]);
+    try std.testing.expectEqual(@as(u32, 180), existing_scale);
+    try std.testing.expectEqual(@as(usize, 0), enters_before_map);
+    try std.testing.expectEqual(@as(u32, 150), rebound_scale);
+    try std.testing.expectEqual(@as(u32, 150), mapped_scale);
+    try std.testing.expectEqualSlices(u32, &.{ 180, 150, 180, 150 }, &moved_scales);
+    try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+}
+
 test "shell-input: two mapped toplevels sustain independent commit cycles" {
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;
@@ -4105,6 +4285,26 @@ test "shell-input: synchronized cursor subsurface batch renders root and child" 
     wayring.unix_socket.unlink(path) catch {};
     defer wayring.unix_socket.unlink(path) catch {};
 
+    var theme_dir = std.testing.tmpDir(.{});
+    defer theme_dir.cleanup();
+    var theme_words: std.ArrayList(u32) = .empty;
+    defer theme_words.deinit(allocator);
+    try theme_words.appendSlice(allocator, &.{ 0x72756358, 16, 0x10000, 3 });
+    var offset: u32 = 52;
+    for ([_]u32{ 24, 32, 48 }) |nominal| {
+        try theme_words.appendSlice(allocator, &.{ 0xfffd0002, nominal, offset });
+        offset += 36 + (nominal / 4) * (nominal / 4) * 4;
+    }
+    for ([_]u32{ 24, 32, 48 }) |nominal| {
+        try theme_words.appendSlice(allocator, &.{ 36, 0xfffd0002, nominal, 1, nominal / 4, nominal / 4, nominal / 12, nominal / 12, 0 });
+        try theme_words.appendNTimes(allocator, 0xffffffff, (nominal / 4) * (nominal / 4));
+    }
+    for (theme_words.items) |*word| word.* = std.mem.nativeToLittle(u32, word.*);
+    try theme_dir.dir.writeFile(std.testing.io, .{ .sub_path = "default", .data = std.mem.sliceAsBytes(theme_words.items) });
+    theme_words.items[theme_words.items.len - 1] = 0;
+    try theme_dir.dir.writeFile(std.testing.io, .{ .sub_path = "text", .data = std.mem.sliceAsBytes(theme_words.items) });
+    var theme_path: [128]u8 = undefined;
+
     var fixture = try physical_fixture.Fixture.init();
     defer fixture.deinit();
     var root_config = physical_fixture.compositorConfig();
@@ -4117,6 +4317,7 @@ test "shell-input: synchronized cursor subsurface batch renders root and child" 
         root_config,
     );
     var config = physical_fixture.coordinatorConfig();
+    config.cursor_directory = try std.fmt.bufPrint(&theme_path, ".zig-cache/tmp/{s}", .{theme_dir.sub_path});
     config.shm.pool_capacity = 2;
     config.shm.buffer_capacity = 2;
     config.surface.surface_capacity = 2;
@@ -4130,7 +4331,7 @@ test "shell-input: synchronized cursor subsurface batch renders root and child" 
     const coordinator = try Coordinator.create(
         allocator,
         root,
-        fixture.platforms(),
+        fixture.platformsWithHotplug(),
         config,
     );
     var loop = try Loop.init(
@@ -4228,6 +4429,131 @@ test "shell-input: synchronized cursor subsurface batch renders root and child" 
     try std.testing.expectEqual(@as(usize, 2), handler.buffer_releases);
     try std.testing.expectEqual(@as(usize, 2), handler.frame_done);
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+
+    // Introduce the second output after the initial composition assertions.
+    fixture.second_desktop = true;
+    try fixture.signalHotplug();
+    for (0..256) |_| {
+        _ = try loop.turn(coordinator);
+        _ = try drainMultiClient(&client_reactor, &driver, &handler);
+        if (coordinator.physical_output_count == 2 and coordinator.physical_outputs[1].kms_output != null) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(usize, 2), coordinator.physical_output_count);
+    // The fixture destroys released buffers; supply fresh cursor content after
+    // topology refresh before testing movement without further client commits.
+    try handler.mapSurface(1);
+    try handler.mapSurface(0);
+    try submitMultiClient(&client_reactor, &driver, &handler);
+    for (0..256) |_| {
+        _ = try loop.turn(coordinator);
+        _ = try drainMultiClient(&client_reactor, &driver, &handler);
+        const child_id = try coordinator.adapter.surfaceId(handler.surfaces[1].?);
+        if (coordinator.cursor_layer.active and findLayer(coordinator.app_layers, child_id) != null) break;
+        _ = linux.sched_yield();
+    }
+    // Association-only topology: no rendering is needed to notify the client.
+    // Use the reported displaced 150% laptop / 125% external layout.
+    for (coordinator.physical_outputs[0..2], 0..) |physical, index| {
+        const scale: u32 = if (index == 0) 180 else 150;
+        try coordinator.output_adapter.publishMode(physical.protocol_output, if (index == 0) 2880 else 3840, if (index == 0) 1800 else 2160, 60_000, 1, 1);
+        try coordinator.output_adapter.publishScale(physical.protocol_output, scale);
+        try coordinator.output_adapter.publishPosition(physical.protocol_output, if (index == 0) 0 else 1920, if (index == 0) 0 else -528);
+        var head = try coordinator.output_management_adapter.lifecycle.currentHead(physical.management_head);
+        head.scale_120 = scale;
+        _ = try coordinator.output_management_adapter.publishHead(physical.management_head, head);
+    }
+    const root_id = try coordinator.adapter.surfaceId(handler.surfaces[0].?);
+    const child_id = try coordinator.adapter.surfaceId(handler.surfaces[1].?);
+    const child = findLayer(coordinator.app_layers, child_id).?;
+    const identity = coordinator.cursor_layer.sample.?.sample;
+    // Root is three logical pixels wide; child is offset by one. At x=1918
+    // both straddle; at x=1919 only the root still touches the higher scale.
+    for ([_]i32{ 1900, 1918, 1919, 1921, 1900 }, [_]u32{ 180, 180, 180, 150, 180 }) |x, expected| {
+        coordinator.interaction.x_fixed = @as(i64, x) * 256;
+        coordinator.interaction.y_fixed = 10 * 256;
+        coordinator.interaction.cursor.move(.{ .x = x, .y = 10 });
+        const submitted = coordinator.stats.submitted;
+        try coordinator.prepare();
+        try std.testing.expectEqual(submitted, coordinator.stats.submitted);
+        try std.testing.expectEqual(x, coordinator.cursor_layer.sample.?.destination.x);
+        try std.testing.expectEqual(x + 1, child.sample.?.destination.x);
+        try std.testing.expectEqual(identity, coordinator.cursor_layer.sample.?.sample);
+        try std.testing.expectEqual(@as(?i32, 2), coordinator.adapter.surfaces[root_id.index].preferred_buffer_scale);
+        try std.testing.expectEqual(@as(usize, 2), coordinator.fractional_scale_adapter.slots.entries.items.len);
+        for (coordinator.fractional_scale_adapter.slots.entries.items) |slot| {
+            if (slot.header.active and std.meta.eql(slot.surface, root_id))
+                try std.testing.expectEqual(expected, slot.preferred_scale);
+            if (slot.header.active and std.meta.eql(slot.surface, child_id))
+                try std.testing.expectEqual(if (x == 1919) @as(u32, 150) else expected, slot.preferred_scale);
+        }
+        for (coordinator.output_adapter.associations) |association| {
+            if (!association.active or !std.meta.eql(association.surface, handler.surfaces[0].?)) continue;
+            const left = std.meta.eql(association.output, coordinator.physical_outputs[0].protocol_output);
+            try std.testing.expectEqual(if (left) x < 1920 else x + 3 > 1920, association.desired);
+        }
+    }
+
+    // Client cursors receive both integer and fractional scale preferences.
+    const secondary = &coordinator.physical_outputs[1];
+    coordinator.interaction.x_fixed = 1925 * 256;
+    coordinator.interaction.cursor.move(.{ .x = 1925, .y = 10 });
+    for ([_]u32{ 120, 150, 180, 240, 150 }) |scale| {
+        var head = try coordinator.output_management_adapter.lifecycle.currentHead(secondary.management_head);
+        head.scale_120 = scale;
+        _ = try coordinator.output_management_adapter.publishHead(secondary.management_head, head);
+        coordinator.output_associations_dirty = true;
+        try coordinator.prepare();
+        try std.testing.expectEqual(@as(?i32, if (scale == 120) 1 else 2), coordinator.adapter.surfaces[root_id.index].preferred_buffer_scale);
+        for (coordinator.fractional_scale_adapter.slots.entries.items) |slot|
+            if (slot.header.active) try std.testing.expectEqual(scale, slot.preferred_scale);
+    }
+    // Compositor-owned images use independent output densities and identities.
+    // The capture path and normal rendering share cursorThemeForOutput.
+    coordinator.themed_cursor_shape = .default;
+    coordinator.interaction.x_fixed = 1920 * 256;
+    coordinator.interaction.cursor.move(.{ .x = 1920, .y = 10 });
+    var identities: [2]@TypeOf(identity) = undefined;
+    for (coordinator.physical_outputs[0..2], 0..) |*physical, index| {
+        const info = coordinator.cursorCaptureInfo(.{ .cursor = .{
+            .source = .{ .output = physical.kms_output.?.outputId() },
+            .cursor = .{ .index = 0, .generation = 1 },
+        } }).?;
+        const cursor = &physical.themed_cursor;
+        try std.testing.expectEqual(@as(u32, if (index == 0) 48 else 32), cursor.image.?.nominal_size);
+        try std.testing.expectEqual(@as(i32, 3), info.hotspot.x);
+        identities[index] = cursor.sampleIdentity();
+        const sample = (try cursor.sample(.{ .x = 0, .y = -528, .width = 4992, .height = 1728 })).?;
+        try std.testing.expectEqual(@as(u32, 6), sample.destination.width);
+        try std.testing.expectEqual(@as(i32, 1918), sample.destination.x);
+    }
+    try std.testing.expect(identities[0].surface != identities[1].surface);
+    try std.testing.expectEqual(@as(usize, 1), coordinator.cursor_cache.retainedFiles());
+    const physical = &coordinator.physical_outputs[1];
+    for ([_]u32{ 120, 150, 180, 240, 150, 137, 275 }, [_]u32{ 24, 32, 48, 48, 32, 32, 48 }) |scale, nominal| {
+        var head = try coordinator.output_management_adapter.lifecycle.currentHead(physical.management_head);
+        head.scale_120 = scale;
+        _ = try coordinator.output_management_adapter.publishHead(physical.management_head, head);
+        const capture: @TypeOf(coordinator.image_copy_capture_adapter).Target = .{ .cursor = .{
+            .source = .{ .output = physical.kms_output.?.outputId() },
+            .cursor = .{ .index = @as(u32, 0), .generation = @as(u32, 1) },
+        } };
+        _ = coordinator.cursorCaptureInfo(capture).?;
+        try std.testing.expectEqual(nominal, physical.themed_cursor.image.?.nominal_size);
+        const image_identity = physical.themed_cursor.sampleIdentity();
+        _ = coordinator.cursorCaptureInfo(capture).?;
+        try std.testing.expectEqual(image_identity, physical.themed_cursor.sampleIdentity());
+        try std.testing.expectEqual(identities[0], coordinator.physical_outputs[0].themed_cursor.sampleIdentity());
+    }
+    const prior_shape = physical.themed_cursor.sampleIdentity();
+    coordinator.themed_cursor_shape = .text;
+    _ = coordinator.cursorCaptureInfo(.{ .cursor = .{
+        .source = .{ .output = physical.kms_output.?.outputId() },
+        .cursor = .{ .index = 0, .generation = 1 },
+    } }).?;
+    try std.testing.expect(prior_shape.commit_sequence != physical.themed_cursor.sampleIdentity().commit_sequence);
+    try std.testing.expectEqual(@as(usize, 2), coordinator.cursor_cache.retainedFiles());
+    coordinator.themed_cursor_shape = null;
 
     coordinator.disconnected(coordinator.peer.?);
     _ = try client.prepareClose();
@@ -5621,6 +5947,15 @@ const MultiHandler = struct {
     metadata_commit_after_attach: bool = false,
     activation_requested: bool = false,
     activation_done: usize = 0,
+    fractional_mode: bool = false,
+    defer_mapping: bool = false,
+    fractional_manager: ?wayring.objects.Handle = null,
+    viewporter: ?wayring.objects.Handle = null,
+    fractional_scales: [2]?wayring.objects.Handle = .{ null, null },
+    viewports: [2]?wayring.objects.Handle = .{ null, null },
+    preferred_scales: [2]u32 = .{ 0, 0 },
+    initial_configure_scales: [2]?u32 = .{ null, null },
+    surface_enters: [2]usize = .{ 0, 0 },
 
     pub fn eventError(
         self: *MultiHandler,
@@ -5644,10 +5979,21 @@ const MultiHandler = struct {
             try self.maybeCreateShells();
         } else if (target.object.interface == &protocol.wl_shm.info) {
             _ = try protocol.wl_shm.decodeEvent(message, fds);
+        } else if (target.object.interface == &protocol.wl_output.info) {
+            _ = try protocol.wl_output.decodeEvent(message, fds);
+        } else if (target.object.interface == &protocol.wp_fractional_scale_v1.info) {
+            const index = self.indexFor(self.fractional_scales, message.header.object_id) orelse
+                return error.UnknownFractionalScale;
+            const value = try protocol.wp_fractional_scale_v1.decodeEvent(message, fds);
+            self.preferred_scales[index] = value.preferred_scale.scale;
         } else if (target.object.interface == &protocol.wl_surface.info) {
             switch (try protocol.wl_surface.decodeEvent(message, fds)) {
                 .preferred_buffer_scale => self.preferred_buffer_scales += 1,
                 .preferred_buffer_transform => self.preferred_buffer_transforms += 1,
+                .enter => {
+                    const index = self.indexFor(self.surfaces, message.header.object_id) orelse return error.UnknownSurface;
+                    self.surface_enters[index] += 1;
+                },
                 else => {},
             }
         } else if (target.object.interface == &protocol.xdg_toplevel.info) {
@@ -5715,10 +6061,13 @@ const MultiHandler = struct {
                 return error.UnknownXdgSurface;
             switch (try protocol.xdg_surface.decodeEvent(message, fds)) {
                 .configure => |value| {
+                    if (self.initial_configure_scales[index] == null)
+                        self.initial_configure_scales[index] = self.preferred_scales[index];
                     try protocol.xdg_surface.encodeRequest(self.queue, self.xdg_surfaces[index].?.id, .{
                         .ack_configure = .{ .serial = value.serial },
                     });
                     if (!self.mapped[index]) {
+                        if (self.defer_mapping) return .continue_dispatch;
                         if (self.subsurface_mode) try self.mapSurface(1);
                         try self.mapSurface(index);
                     } else {
@@ -5784,20 +6133,48 @@ const MultiHandler = struct {
             self.seat = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_seat.info, @min(value.version, 9), null);
         if (self.activation_mode and std.mem.eql(u8, value.interface, protocol.xdg_activation_v1.info.name))
             self.activation = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.xdg_activation_v1.info, 1, null);
+        if ((self.fractional_mode or self.cursor_mode) and std.mem.eql(u8, value.interface, protocol.wp_fractional_scale_manager_v1.info.name))
+            self.fractional_manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wp_fractional_scale_manager_v1.info, 1, null);
+        if (self.fractional_mode and std.mem.eql(u8, value.interface, protocol.wp_viewporter.info.name))
+            self.viewporter = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wp_viewporter.info, 1, null);
+        if (self.fractional_mode and std.mem.eql(u8, value.interface, protocol.wl_output.info.name))
+            _ = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_output.info, @min(value.version, 4), null);
     }
 
     fn maybeCreateShells(self: *MultiHandler) !void {
         if (self.shell_created or self.compositor == null or self.shm == null)
             return;
+        if (self.cursor_mode and self.fractional_manager == null) return;
         if (!self.cursor_mode and self.wm_base == null) return;
         if ((self.subsurface_mode or self.cursor_mode) and self.subcompositor == null) return;
+        if (self.fractional_mode and (self.fractional_manager == null or self.viewporter == null)) return;
         for (0..self.surface_count) |index| {
+            if (self.surfaces[index] != null) continue;
             self.surfaces[index] = (try protocol.wl_compositor.construct_create_surface(
                 self.objects,
                 self.queue,
                 self.compositor.?,
                 .{},
             )).id;
+            if (self.fractional_mode or self.cursor_mode) {
+                self.fractional_scales[index] = (try protocol.wp_fractional_scale_manager_v1.construct_get_fractional_scale(
+                    self.objects,
+                    self.queue,
+                    self.fractional_manager.?,
+                    .{ .surface = self.surfaces[index].?.id },
+                )).id;
+            }
+            if (self.fractional_mode) {
+                self.viewports[index] = (try protocol.wp_viewporter.construct_get_viewport(
+                    self.objects,
+                    self.queue,
+                    self.viewporter.?,
+                    .{ .surface = self.surfaces[index].?.id },
+                )).id;
+                try protocol.wp_viewport.encodeRequest(self.queue, self.viewports[index].?.id, .{
+                    .set_destination = .{ .width = 2, .height = 1 },
+                });
+            }
             if (self.cursor_mode or (self.subsurface_mode and index != 0)) continue;
             self.xdg_surfaces[index] = (try protocol.xdg_wm_base.construct_get_xdg_surface(
                 self.objects,
@@ -5856,7 +6233,7 @@ const MultiHandler = struct {
             .{
                 .offset = 16,
                 .width = 3,
-                .height = 2,
+                .height = if (self.fractional_mode) @intCast((self.preferred_scales[index] + 60) / 120) else 2,
                 .stride = 16,
                 .format = .argb8888,
             },

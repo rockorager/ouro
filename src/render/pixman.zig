@@ -4,7 +4,8 @@
 //! them directly instead of copying every sample into a maximum-sized cache.
 //! Only bounded alpha-mask wrappers live for the renderer lifetime. Source and
 //! destination wrappers are released before their borrowed storage can change.
-//! Sampling is nearest-neighbour and output writes are clipped to R13 damage.
+//! Sampling defaults to nearest, with bilinear cursor resampling. Output writes
+//! are clipped to R13 damage.
 
 const std = @import("std");
 const render = @import("types.zig");
@@ -345,8 +346,12 @@ pub const Renderer = struct {
             var transform = sampleTransform(sample);
             if (c.pixman_image_set_transform(source, &transform) == 0)
                 return error.PixmanTransformFailed;
-            if (c.pixman_image_set_filter(source, c.PIXMAN_FILTER_NEAREST, null, 0) == 0)
+            if (c.pixman_image_set_filter(source, if (sample.filter == .bilinear)
+                c.PIXMAN_FILTER_BILINEAR
+            else
+                c.PIXMAN_FILTER_NEAREST, null, 0) == 0)
                 return error.PixmanFilterFailed;
+            if (sample.filter == .bilinear) c.pixman_image_set_repeat(source, c.PIXMAN_REPEAT_PAD);
 
             const clipped = intersection(sample.destination, sample.clip, plan.output) orelse
                 continue;

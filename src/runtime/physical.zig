@@ -542,6 +542,7 @@ pub fn Coordinator(comptime protocol: type) type {
             pending_image_copy: ?PendingImageCopy = null,
             capture_bytes: std.ArrayListUnmanaged(u8) = .empty,
             drag_icon_previous: ?damage.SurfaceState = null,
+            themed_cursor: theme_cursor.Cursor = .{},
             themed_cursor_previous: ?damage.SurfaceState = null,
             client_cursor_previous: ?damage.SurfaceState = null,
 
@@ -1022,7 +1023,7 @@ pub fn Coordinator(comptime protocol: type) type {
         session_lock_adapter: SessionLockAdapter,
         cursor_shape_adapter: CursorShapeAdapter,
         cursor_cache: cursor_theme.Cache,
-        themed_cursor: theme_cursor.Cursor = .{},
+        themed_cursor_shape: ?protocol_cursor_shape.Shape = null,
         next_capture_token: u64 = 1,
         foreign_toplevels: []ForeignToplevel,
         foreign_toplevel_outputs_dirty: bool = false,
@@ -1334,7 +1335,7 @@ pub fn Coordinator(comptime protocol: type) type {
             @memcpy(self.cursor_path[0..config.cursor_directory.len], config.cursor_directory);
             self.cursor_directory_len = config.cursor_directory.len;
             self.cursor_size = config.cursor_size;
-            self.themed_cursor = .{};
+            self.themed_cursor_shape = null;
             self.output_management_modes = try allocator.alloc(
                 protocol_output_management.ModeState,
                 config.output_management.mode_capacity,
@@ -4345,6 +4346,12 @@ pub fn Coordinator(comptime protocol: type) type {
                 };
                 if (consumed == 0) break;
                 if (destroyed_shell) |id| self.xdg_session_adapter.toplevelDestroyed(id);
+                if (pending_shell) |event| switch (event) {
+                    .commit_ready => |commit| if (commit.initial_commit) {
+                        self.output_associations_dirty = true;
+                    },
+                    else => {},
+                };
                 self.stats.shell_events += consumed;
             }
             try self.syncSessionState();
@@ -4381,6 +4388,7 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.syncDesktopTimer();
             if (self.desktop.takeSceneChanged()) try self.desktopSceneChanged();
             try self.syncToplevelDrag();
+            try self.syncOutputAssociations();
             if (self.shell_adapter.pendingOutbound() != 0)
                 self.markProtocolAll(ProtocolReady.shell);
         }
@@ -5696,14 +5704,19 @@ pub fn Coordinator(comptime protocol: type) type {
                 .source => return null,
             };
             if (self.sessionLockActive() or !self.interaction.cursor.pointer_available) return null;
+            const output = self.captureKmsOutput(target) orelse return null;
+            const physical = self.physicalOutputForKmsIdMutable(output.outputId()) orelse return null;
+            const output_bounds = self.outputBoundsFor(physical) catch return null;
             const pointer = self.interaction.pointerPosition();
             var width: u32 = 0;
             var height: u32 = 0;
             var hotspot = self.interaction.cursor.hotspot;
-            if (self.themed_cursor.image) |image| {
-                width = image.width;
-                height = image.height;
-                hotspot = .{ .x = @intCast(image.x_hotspot), .y = @intCast(image.y_hotspot) };
+            if (self.themed_cursor_shape != null) {
+                const cursor = self.cursorThemeForOutput(physical) catch return null;
+                const sample = (cursor.sample(self.globalOutputBounds() catch return null) catch return null) orelse return null;
+                width = sample.destination.width;
+                height = sample.destination.height;
+                hotspot = .{ .x = pointer.x - sample.destination.x, .y = pointer.y - sample.destination.y };
             } else if (self.cursor_layer.active) {
                 const sample = self.cursor_layer.sample orelse return null;
                 width = std.math.cast(u32, sample.destination.width) orelse return null;
@@ -5716,9 +5729,6 @@ pub fn Coordinator(comptime protocol: type) type {
                 ) catch return null,
                 .toplevel => |id| (self.desktop.scene(id) catch return null).geometry,
             };
-            const output = self.captureKmsOutput(target) orelse return null;
-            const physical = self.physicalOutputForKmsId(output.outputId()) orelse return null;
-            const output_bounds = self.outputBoundsFor(physical) catch return null;
             const cursor_region: geometry.Rect = .{
                 .x = std.math.sub(i32, pointer.x, hotspot.x) catch return null,
                 .y = std.math.sub(i32, pointer.y, hotspot.y) catch return null,
@@ -6103,6 +6113,8 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn desktopSceneChanged(self: *Self) !void {
             self.pointer_reconcile_pending = true;
+            // Unmapped XDG placement now supplies a scale even without a layer.
+            self.output_associations_dirty = true;
             try self.retryFocusReconcile();
             try self.syncIdleNotifications();
             _ = self.refreshRetainedLayersForOutput();
@@ -6754,20 +6766,43 @@ pub fn Coordinator(comptime protocol: type) type {
             return .{ .index = id.index, .generation = id.generation };
         }
 
-        fn cursorImage(self: *Self, name: []const u8) ?cursor_theme.Image {
+        fn cursorImage(self: *Self, name: []const u8, size: u32) ?cursor_theme.Image {
             const suffix = std.fmt.bufPrint(self.cursor_path[self.cursor_directory_len..], "/{s}", .{name}) catch return null;
             const path = self.cursor_path[0 .. self.cursor_directory_len + suffix.len];
-            return self.cursor_cache.load(path, self.cursor_size) catch null;
+            return self.cursor_cache.load(path, size) catch null;
+        }
+
+        fn cursorThemeForOutput(self: *Self, physical: *PhysicalOutput) !*theme_cursor.Cursor {
+            const cursor = &physical.themed_cursor;
+            // KMS output generations are globally unique, including reconnects.
+            // Reserve the impossible client surface index, not a real surface.
+            cursor.surface_generation = physical.kms_output.?.outputId().generation;
+            cursor.logical_size = self.cursor_size;
+            cursor.move(self.interaction.cursor.position);
+            cursor.setPointerAvailable(self.interaction.cursor.pointer_available);
+            const image = if (self.themed_cursor_shape) |shape| blk: {
+                const head = try self.output_management_adapter.lifecycle.currentHead(physical.management_head);
+                const size: u32 = @intCast(@min(std.math.maxInt(u32), (@as(u64, self.cursor_size) * head.scale_120 + 119) / 120));
+                break :blk self.cursorImage(shape.name(), size) orelse
+                    self.cursorImage(protocol_cursor_shape.fallback_name, size);
+            } else null;
+            _ = cursor.setImage(image);
+            return cursor;
         }
 
         fn processCursorShapeEvents(self: *Self) !void {
             while (self.cursor_shape_adapter.peekEvent()) |event| {
-                const image = self.cursorImage(event.shape.name()) orelse
-                    self.cursorImage(protocol_cursor_shape.fallback_name);
-                if (image) |value| {
+                var shape = event.shape;
+                const image = self.cursorImage(shape.name(), self.cursor_size) orelse blk: {
+                    // Retain the resolved name, avoiding a failed file lookup
+                    // on every frame when the theme only has the fallback.
+                    shape = .default;
+                    break :blk self.cursorImage(protocol_cursor_shape.fallback_name, self.cursor_size);
+                };
+                if (image != null) {
                     std.log.debug("using cursor shape {s}", .{event.shape.name()});
                     self.interaction.cursorRequest(null, .{ .x = 0, .y = 0 });
-                    _ = self.themed_cursor.setImage(value);
+                    self.themed_cursor_shape = shape;
                     try self.requestCursorRedraw();
                 } else {
                     std.log.warn("could not load cursor shape {s}", .{event.shape.name()});
@@ -6875,7 +6910,7 @@ pub fn Coordinator(comptime protocol: type) type {
             while (self.seat_adapter.peekEvent()) |event| {
                 switch (event) {
                     .cursor_requested => |request_value| {
-                        _ = self.themed_cursor.setImage(null);
+                        self.themed_cursor_shape = null;
                         self.interaction.cursorRequest(
                             request_value.surface,
                             .{ .x = request_value.hotspot.x, .y = request_value.hotspot.y },
@@ -6897,7 +6932,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn requestCursorRedraw(self: *Self) !void {
-            if (!self.cursor_layer.active and self.themed_cursor.image == null and
+            if (!self.cursor_layer.active and self.themed_cursor_shape == null and
                 self.drag_icon_root == null and !self.anyCursorPrevious()) return;
             try self.requestOutputDamage();
         }
@@ -7463,7 +7498,12 @@ pub fn Coordinator(comptime protocol: type) type {
                 flushed += try self.gtk_shell_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.xdg_session != 0)
                 flushed += try self.xdg_session_adapter.flushOn(peer, objects, &actor.transmit);
+            // The first XDG configure must not prompt allocation at the
+            // primary-output fallback when placement already supplies a scale.
+            if (client.protocol_ready & ProtocolReady.fractional_scale != 0)
+                flushed += try self.fractional_scale_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.shell != 0 and
+                !self.fractional_scale_adapter.pendingOutbound(peer) and
                 !self.decoration_adapter.readyOutbound(peer))
                 flushed += try self.shell_adapter.flushOn(objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.seat != 0) {
@@ -7499,8 +7539,6 @@ pub fn Coordinator(comptime protocol: type) type {
                 flushed += try self.foreign_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.pointer_constraints != 0)
                 flushed += try self.pointer_constraints_adapter.flushOn(peer, objects, &actor.transmit);
-            if (client.protocol_ready & ProtocolReady.fractional_scale != 0)
-                flushed += try self.fractional_scale_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.color_management != 0)
                 flushed += try self.color_management_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.color_representation != 0)
@@ -9734,7 +9772,7 @@ pub fn Coordinator(comptime protocol: type) type {
             var next_client_cursor_previous: ?damage.SurfaceState = null;
             var client_cursor_visible = false;
             if (!self.sessionLockActive() and self.cursor_layer.active and
-                self.themed_cursor.image == null)
+                self.themed_cursor_shape == null)
             {
                 const global_bounds = try self.globalOutputBounds();
                 const root = self.cursor_layer.id.?;
@@ -9837,6 +9875,7 @@ pub fn Coordinator(comptime protocol: type) type {
                         };
                     }
                     var output_sample = sample;
+                    output_sample.filter = .bilinear;
                     output_sample.clip = try clipToOutput(sample.destination, output_bounds) orelse
                         continue;
                     try self.ensureFrameStorage(@max(sample_count, change_count) + 1);
@@ -9872,19 +9911,18 @@ pub fn Coordinator(comptime protocol: type) type {
                 next_client_cursor_previous = null;
                 change_count += 1;
             }
-            self.themed_cursor.move(self.interaction.cursor.position);
-            self.themed_cursor.setPointerAvailable(self.interaction.cursor.pointer_available);
+            const themed = try self.cursorThemeForOutput(physical);
             var next_themed_cursor_previous = physical.themed_cursor_previous;
-            if (self.themed_cursor.image != null) {
-                if (try self.themed_cursor.sample(output_bounds)) |sample| {
+            if (themed.image != null) {
+                if (try themed.sample(output_bounds)) |sample| {
                     try self.ensureFrameStorage(@max(sample_count, change_count) + 1);
                     self.frame_samples[sample_count] = try scaleSample(
                         sample,
                         output_bounds,
                         output_scale,
                     );
-                    self.frame_bindings[sample_count] = self.themed_cursor.sampleBinding(output_api.SampleBinding);
-                    var logical_change = try self.themed_cursor.damageChange(
+                    self.frame_bindings[sample_count] = themed.sampleBinding(output_api.SampleBinding);
+                    var logical_change = try themed.damageChange(
                         physical.themed_cursor_previous,
                         output_bounds,
                     );
@@ -10854,12 +10892,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 sample_count += 1;
             }
             if (capture.paint_cursors and !self.sessionLockActive()) {
-                if (self.themed_cursor.image) |_| {
-                    self.themed_cursor.move(self.interaction.cursor.position);
-                    self.themed_cursor.setPointerAvailable(
-                        self.interaction.cursor.pointer_available,
-                    );
-                    if (try self.themed_cursor.sample(bounds)) |sample| {
+                if (self.themed_cursor_shape != null) {
+                    const physical = self.physicalOutputForKmsIdMutable(output.outputId()) orelse return error.NoOutput;
+                    const cursor = try self.cursorThemeForOutput(physical);
+                    if (try cursor.sample(bounds)) |sample| {
                         try self.ensureFrameStorage(sample_count + 1);
                         self.frame_samples[sample_count] = sample;
                         sample_count += 1;
@@ -12517,7 +12553,53 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.processOutput();
         }
 
+        fn syncCursorGeometry(self: *Self) !void {
+            // Input precedes this phase, rendering follows it. Relocate the
+            // cursor now so enter/leave and preferred scale do not wait for a
+            // later frame (or for another input event after crossing outputs).
+            if (!self.cursor_layer.active or self.cursor_layer.sample == null or
+                self.themed_cursor_shape != null or
+                !std.meta.eql(self.interaction.cursor.surface, self.cursor_layer.id)) return;
+            const bounds = self.globalOutputBounds() catch |err| switch (err) {
+                error.NoOutput => return,
+                else => return err,
+            };
+            const root = self.cursor_layer.id.?;
+            for (try self.sceneOrder(root)) |surface| {
+                const is_root = std.meta.eql(surface, root);
+                const layer = if (is_root) &self.cursor_layer else self.findAppLayer(surface) orelse continue;
+                if (!layer.active or layer.sample == null) continue;
+                const offset: geometry.Point = if (is_root) .{ .x = 0, .y = 0 } else blk: {
+                    const placement = self.subcompositor_adapter.placement(surface) catch continue;
+                    break :blk .{ .x = placement.offset.x, .y = placement.offset.y };
+                };
+                var cursor = self.interaction.cursor;
+                cursor.surface = surface;
+                cursor.hotspot.x = translatedCoordinate(cursor.hotspot.x, -@as(i64, layer.content_origin.x) - offset.x);
+                cursor.hotspot.y = translatedCoordinate(cursor.hotspot.y, -@as(i64, layer.content_origin.y) - offset.y);
+                if (try cursor.composite(.{
+                    .surface = surface,
+                    .sample = layer.sample.?,
+                }, bounds)) |sample| {
+                    if (!std.meta.eql(sample.destination, layer.sample.?.destination)) {
+                        self.output_associations_dirty = true;
+                        if (!is_root) {
+                            const previous = layer.change.?.current;
+                            const natural_size = (previous orelse layer.change.?.previous.?).surface_size;
+                            layer.change = .{
+                                .previous = previous,
+                                .current = damage.SurfaceState.fromSample(sample, natural_size),
+                                .invalidate_bounds = true,
+                            };
+                        }
+                    }
+                    layer.sample = sample;
+                }
+            }
+        }
+
         fn syncOutputAssociations(self: *Self) !void {
+            try self.syncCursorGeometry();
             if (!self.output_associations_dirty) return;
             const needed = std.math.add(
                 usize,
@@ -12530,6 +12612,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     self.association_surfaces,
                     needed,
                 );
+            const windows = try self.desktop.sceneSnapshotGrowing(self.allocator, &self.scene_windows);
             for (self.clients.items) |*client| if (client.active) {
                 for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
                     if (!physical.connected) continue;
@@ -12586,6 +12669,20 @@ pub fn Coordinator(comptime protocol: type) type {
                 }
                 for (self.app_layers[0..self.app_layer_count]) |*layer|
                     try self.publishLayerPreferredScale(layer, client.peer);
+                // Initial XDG placement is known before there is a render
+                // layer. Publish its scale without inventing wl_surface.enter
+                // events for a surface that has not attached a buffer yet.
+                for (windows) |window| {
+                    if (window.content_ready or !window.visible or self.sessionLockActive()) continue;
+                    const peer = self.adapter.surfacePeer(window.surface) catch continue;
+                    if (!samePeer(peer, client.peer)) continue;
+                    try self.publishPreferredScaleForRect(window.surface, .{
+                        .x = window.geometry.x,
+                        .y = window.geometry.y,
+                        .width = @intCast(window.geometry.width),
+                        .height = @intCast(window.geometry.height),
+                    }, null);
+                }
                 const layer_ids = try self.layer_shell_adapter.ids(self.layer_surface_ids);
                 for (layer_ids) |layer_id| {
                     const state = try self.layer_shell_adapter.state(layer_id);
@@ -12645,15 +12742,23 @@ pub fn Coordinator(comptime protocol: type) type {
             const surface = layer.id orelse return;
             if (self.surfaceBelongsToSessionLock(surface) != self.sessionLockActive()) return;
             const sample = layer.sample orelse return;
+            try self.publishPreferredScaleForRect(surface, sample.destination, self.boundLayerOutput(layer));
+        }
+
+        fn publishPreferredScaleForRect(
+            self: *Self,
+            surface: Adapter.SurfaceId,
+            destination: render.Rect,
+            bound_output: ?OutputAdapter.OutputId,
+        ) !void {
             var preferred_scale: ?u32 = null;
-            const bound_output = self.boundLayerOutput(layer);
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
                 if (!physical.connected) continue;
                 if (bound_output) |output| {
                     if (!std.meta.eql(output, physical.protocol_output)) continue;
                 } else {
                     const bounds = self.outputBoundsFor(physical) catch continue;
-                    if (try clipToOutput(sample.destination, bounds) == null) continue;
+                    if (try clipToOutput(destination, bounds) == null) continue;
                 }
                 const state = try self.output_management_adapter.lifecycle.currentHead(
                     physical.management_head,

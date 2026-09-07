@@ -1390,6 +1390,9 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
                 .scene = .{
                     .id = parent.id,
                     .surface = value.surface,
+                    // Pointer hover/click must not take keyboard focus from the
+                    // parent. Popup keyboard focus belongs to explicit grabs.
+                    .keyboard_focusable = false,
                     .geometry = popupAbsolute(configure, parent.geometry),
                     .visible = false,
                     .stacking = desktop.nextStacking(),
@@ -1481,6 +1484,7 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
             const next = SceneWindow{
                 .id = slot.owner,
                 .surface = slot.surface,
+                .keyboard_focusable = false,
                 .geometry = popupAbsolute(configure, parent.geometry),
                 .has_window_geometry = value.has_window_geometry,
                 .surface_offset = .{ .x = value.surface_offset_x, .y = value.surface_offset_y },
@@ -3678,6 +3682,8 @@ test "desktop: popup configure maps above its owning toplevel" {
     try std.testing.expectEqual(@as(usize, 2), snapshot.len);
     try std.testing.expect(snapshot[0].stacking < snapshot[1].stacking);
     try std.testing.expectEqual(popup_surface, snapshot[1].surface);
+    try std.testing.expect(snapshot[0].keyboard_focusable);
+    try std.testing.expect(!snapshot[1].keyboard_focusable);
 
     _ = desktop.takeSceneChanged();
     shell.push(.{ .popup_commit_ready = .{
@@ -3753,6 +3759,7 @@ test "desktop: popup configure maps above its owning toplevel" {
     _ = try desktop.consume(&shell, 1);
     try std.testing.expect((try desktop.sceneForSurface(popup_surface)).visible);
     try std.testing.expect((try desktop.sceneForSurface(popup_surface)).content_ready);
+    try std.testing.expect(!(try desktop.sceneForSurface(popup_surface)).keyboard_focusable);
 
     shell.push(.{ .popup_grab_requested = popup_id });
     _ = try desktop.consume(&shell, 1);

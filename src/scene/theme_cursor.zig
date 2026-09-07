@@ -2,8 +2,8 @@
 //!
 //! Images and their pixel bytes are borrowed from `cursor_theme.Cache`; the
 //! caller must keep that cache alive while an image is installed. The maximum
-//! generational values below are reserved for this synthetic surface and must
-//! never be allocated by normal surface or presentation queues.
+//! surface index and presentation slot below are reserved and must never be
+//! allocated by normal surface or presentation queues.
 
 const std = @import("std");
 const cursor_theme = @import("../cursor_theme.zig");
@@ -30,9 +30,13 @@ pub const Cursor = struct {
     pub const Error = render.ValidationError || error{InvalidGeometry};
 
     image: ?cursor_theme.Image = null,
+    /// Configured logical nominal size; zero preserves native image geometry.
+    logical_size: u32 = 0,
     position: geometry.Point = .{ .x = 0, .y = 0 },
     pointer_available: bool = false,
     generation: u64 = 1,
+    /// Each physical output lifetime gets a distinct synthetic texture key.
+    surface_generation: u32 = synthetic_surface_generation,
 
     /// Installs borrowed pixels or hides the cursor. Returns whether state
     /// changed. Shape changes advance the nonzero wrapping commit identity.
@@ -53,7 +57,10 @@ pub const Cursor = struct {
     }
 
     pub fn sampleIdentity(self: Cursor) render.SampleIdentity {
-        return .{ .surface = synthetic_surface, .commit_sequence = self.generation };
+        return .{
+            .surface = @as(u64, self.surface_generation) << 32 | synthetic_surface_index,
+            .commit_sequence = self.generation,
+        };
     }
 
     /// Forms the exact structural binding used by physical without importing
@@ -61,10 +68,17 @@ pub const Cursor = struct {
     pub fn sampleBinding(self: Cursor, comptime Binding: type) Binding {
         const SurfaceId = @TypeOf(@as(Binding, undefined).surface);
         return .{
-            .surface = syntheticSurfaceId(SurfaceId),
+            .surface = SurfaceId{ .index = synthetic_surface_index, .generation = self.surface_generation },
             .sample = self.sampleIdentity(),
             .presentation = synthetic_presentation,
         };
+    }
+
+    fn logical(self: Cursor, pixels: u32) Error!u32 {
+        const nominal = self.image.?.nominal_size;
+        if (nominal == 0 or self.logical_size == 0) return pixels;
+        return std.math.cast(u32, (@as(u64, pixels) * self.logical_size + nominal / 2) / nominal) orelse
+            error.InvalidDestination;
     }
 
     pub fn sample(self: Cursor, output: geometry.Rect) Error!?render.SurfaceSample {
@@ -80,12 +94,16 @@ pub const Cursor = struct {
         if (stride > std.math.maxInt(i32)) return error.InvalidSource;
         const byte_len = std.math.mul(usize, stride, image.height) catch return error.InvalidSource;
         if (image.pixels.len != byte_len) return error.InvalidSource;
-        const x = std.math.sub(i32, self.position.x, @as(i32, @intCast(image.x_hotspot))) catch
+        const width = @max(1, try self.logical(image.width));
+        const height = @max(1, try self.logical(image.height));
+        const hot_x = std.math.cast(i32, try self.logical(image.x_hotspot)) orelse return error.InvalidDestination;
+        const hot_y = std.math.cast(i32, try self.logical(image.y_hotspot)) orelse return error.InvalidDestination;
+        const x = std.math.sub(i32, self.position.x, hot_x) catch
             return error.InvalidDestination;
-        const y = std.math.sub(i32, self.position.y, @as(i32, @intCast(image.y_hotspot))) catch
+        const y = std.math.sub(i32, self.position.y, hot_y) catch
             return error.InvalidDestination;
-        const right = @min(@as(i64, output.x) + output.width, @as(i64, x) + image.width);
-        const bottom = @min(@as(i64, output.y) + output.height, @as(i64, y) + image.height);
+        const right = @min(@as(i64, output.x) + output.width, @as(i64, x) + width);
+        const bottom = @min(@as(i64, output.y) + output.height, @as(i64, y) + height);
         const left = @max(@as(i64, output.x), x);
         const top = @max(@as(i64, output.y), y);
         if (right <= left or bottom <= top) return null;
@@ -113,7 +131,8 @@ pub const Cursor = struct {
             // geometry.
             .upload_damage = upload_damage,
             .crop = render.SourceRect.pixels(0, 0, @intCast(image.width), @intCast(image.height)),
-            .destination = .{ .x = x, .y = y, .width = image.width, .height = image.height },
+            .filter = .bilinear,
+            .destination = .{ .x = x, .y = y, .width = width, .height = height },
             .clip = .{
                 .x = @intCast(left),
                 .y = @intCast(top),
@@ -146,7 +165,7 @@ fn sameImage(a: ?cursor_theme.Image, b: ?cursor_theme.Image) bool {
     if (a == null or b == null) return a == null and b == null;
     const x = a.?;
     const y = b.?;
-    return x.width == y.width and x.height == y.height and
+    return x.nominal_size == y.nominal_size and x.width == y.width and x.height == y.height and
         x.x_hotspot == y.x_hotspot and x.y_hotspot == y.y_hotspot and
         x.delay == y.delay and x.pixels.ptr == y.pixels.ptr and x.pixels.len == y.pixels.len;
 }
@@ -246,4 +265,41 @@ test "theme cursor: damage transition contains old and new geometry" {
     _ = cursor.setImage(null);
     const hidden = try cursor.damageChange(change.current, .{ .x = 0, .y = 0, .width = 20, .height = 20 });
     try std.testing.expect(hidden.previous != null and hidden.current == null);
+}
+
+test "theme cursor: output densities preserve logical size hotspot and separate texture identities" {
+    const pixels = [_]u8{0xff} ** (48 * 48 * 4);
+    const internal: geometry.Rect = .{ .x = 0, .y = 0, .width = 1920, .height = 1200 };
+    const external: geometry.Rect = .{ .x = 1920, .y = -528, .width = 3072, .height = 1728 };
+    var cursor = Cursor{ .pointer_available = true, .logical_size = 24, .surface_generation = 1 };
+    for ([_]u32{ 24, 32, 48, 48 }, [_]u32{ 120, 150, 180, 240 }) |nominal, scale_120| {
+        _ = cursor.setImage(.{
+            .nominal_size = nominal,
+            .width = nominal,
+            .height = nominal,
+            .x_hotspot = nominal / 4,
+            .y_hotspot = nominal / 4,
+            .delay = 0,
+            .pixels = pixels[0 .. nominal * nominal * 4],
+        });
+        cursor.move(.{ .x = 1920, .y = 10 });
+        const left = (try cursor.sample(internal)).?;
+        const right = (try cursor.sample(external)).?;
+        try std.testing.expectEqual(render.Rect{ .x = 1914, .y = 4, .width = 24, .height = 24 }, left.destination);
+        try std.testing.expectEqual(left.destination, right.destination);
+        try std.testing.expectEqual(@as(u32, 6), left.clip.width);
+        try std.testing.expectEqual(@as(u32, 18), right.clip.width);
+        const scale = try geometry.OutputScale.init(scale_120);
+        try std.testing.expectEqual(@as(i64, 24 * scale_120 / 120), try scale.physicalEdge(left.destination.width));
+        const identity = cursor.sampleIdentity();
+        var other = cursor;
+        other.surface_generation = 2;
+        try std.testing.expect(identity.surface != other.sampleIdentity().surface);
+        cursor.move(.{ .x = 1940, .y = 10 });
+        try std.testing.expect((try cursor.sample(internal)) == null);
+        try std.testing.expectEqual(identity, (try cursor.sample(external)).?.sample);
+        cursor.move(.{ .x = 1900, .y = 10 });
+        try std.testing.expect((try cursor.sample(external)) == null);
+        try std.testing.expectEqual(identity, (try cursor.sample(internal)).?.sample);
+    }
 }

@@ -1507,6 +1507,55 @@ test "interaction: pointer motion asks desktop policy before changing keyboard f
     try std.testing.expectEqual(desktop.windows[1].surface, interaction.peekCommand().?.pointer_focus.?.surface);
 }
 
+test "interaction: ungrabbed popup hover and click retain parent keyboard focus" {
+    var interaction = try initTestInteraction(3);
+    defer interaction.deinit();
+    var desktop = testDesktop();
+    desktop.focus_follows_mouse = true;
+    desktop.windows[1].id = desktop.windows[0].id;
+    desktop.windows[1].keyboard_focusable = false;
+    var surfaces = TestSurfaces{};
+    try addPointer(&interaction, &desktop, &surfaces);
+    desktop.focused = desktop.windows[0].id;
+    try interaction.reconcileKeyboardFocus(&desktop);
+    const parent = interaction.peekCommand().?.keyboard_focus;
+    interaction.dropCommand();
+
+    // Cross from the parent into its popup and back without a keyboard leave.
+    for ([_]f64{ 12, -12, 12 }) |dx| {
+        try interaction.consume(&desktop, &surfaces, .{ .pointer_motion = .{
+            .device = device_a,
+            .time_usec = 1,
+            .dx = dx,
+            .dy = if (dx > 0) 7 else -7,
+        } });
+        try std.testing.expectEqual(@as(usize, 1), interaction.pendingCommands());
+        const target = interaction.peekCommand().?.pointer_focus.?;
+        const window = desktop.windows[if (dx > 0) @as(usize, 1) else 0];
+        try std.testing.expectEqual(window.surface, target.surface);
+        try std.testing.expectEqual(window.keyboard_focusable, target.keyboard_focusable);
+        try std.testing.expectEqual(parent, interaction.keyboard_focus.?);
+        interaction.dropCommand();
+    }
+
+    for ([_]bool{ true, false }) |pressed| {
+        try interaction.consume(&desktop, &surfaces, .{ .pointer_button = .{
+            .device = device_a,
+            .time_usec = 2,
+            .button = 272,
+            .pressed = pressed,
+        } });
+        if (pressed) try std.testing.expectEqual(
+            desktop.windows[1].surface,
+            interaction.interactionMode().button_grab.surface,
+        );
+        try std.testing.expectEqual(@as(usize, 0), interaction.pendingCommands());
+        try std.testing.expectEqual(parent, interaction.keyboard_focus.?);
+    }
+    try std.testing.expect(interaction.interactionMode() == .default);
+    try std.testing.expect(!desktop.popup_dismissed);
+}
+
 test "interaction: stationary pointer reflow does not override policy keyboard focus" {
     var interaction = try initTestInteraction(3);
     defer interaction.deinit();

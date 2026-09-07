@@ -101,6 +101,8 @@ pub const Cache = struct {
 pub const Store = Cache;
 
 pub const Image = struct {
+    /// Xcursor TOC size, which need not equal the image's pixel dimensions.
+    nominal_size: u32 = 0,
     width: u32,
     height: u32,
     x_hotspot: u32,
@@ -118,8 +120,8 @@ pub const Error = error{
 
 const image_type: u32 = 0xfffd0002;
 
-/// Selects the first frame at the nominal size nearest `requested_size`.
-/// Equal distances prefer the smaller nominal size. The returned pixels borrow
+/// Selects the first frame at the smallest nominal size >= `requested_size`,
+/// falling back to the largest available size. The returned pixels borrow
 /// `bytes`; Xcursor pixels are exposed in renderer-friendly BGRA byte order.
 pub fn select(bytes: []const u8, requested_size: u32) Error!Image {
     if (requested_size == 0) return error.InvalidSize;
@@ -197,6 +199,7 @@ fn parseImage(
     if (pixel_start < fixed_end or pixel_end != chunk_end) return error.InvalidFormat;
 
     return .{
+        .nominal_size = subtype,
         .width = width,
         .height = height,
         .x_hotspot = x_hotspot,
@@ -207,10 +210,8 @@ fn parseImage(
 }
 
 fn closer(candidate: u32, current: u32, requested: u32) bool {
-    const candidate_distance = if (candidate > requested) candidate - requested else requested - candidate;
-    const current_distance = if (current > requested) current - requested else requested - current;
-    return candidate_distance < current_distance or
-        (candidate_distance == current_distance and candidate < current);
+    if (current < requested) return candidate > current;
+    return candidate >= requested and candidate < current;
 }
 
 fn readU32(bytes: []const u8, offset: usize) ?u32 {
@@ -266,7 +267,7 @@ const Fixture = struct {
     }
 };
 
-test "cursor theme: exact and nearest size with smaller tie" {
+test "cursor theme: exact size or smallest sufficient asset without undersampling" {
     var fixture = Fixture.init(3);
     fixture.toc(24, 52);
     fixture.toc(32, 92);
@@ -275,8 +276,12 @@ test "cursor theme: exact and nearest size with smaller tie" {
     fixture.image(32, 1, 1, 0, 0, 32, 0xff000020);
     fixture.image(48, 1, 1, 0, 0, 48, 0xff000030);
     try std.testing.expectEqual(@as(u32, 32), (try select(fixture.slice(), 32)).delay);
-    try std.testing.expectEqual(@as(u32, 32), (try select(fixture.slice(), 40)).delay);
+    try std.testing.expectEqual(@as(u32, 24), (try select(fixture.slice(), 24)).nominal_size);
+    try std.testing.expectEqual(@as(u32, 32), (try select(fixture.slice(), 30)).nominal_size);
+    try std.testing.expectEqual(@as(u32, 48), (try select(fixture.slice(), 36)).nominal_size);
+    try std.testing.expectEqual(@as(u32, 48), (try select(fixture.slice(), 40)).delay);
     try std.testing.expectEqual(@as(u32, 48), (try select(fixture.slice(), 46)).delay);
+    try std.testing.expectEqual(@as(u32, 48), (try select(fixture.slice(), 96)).nominal_size);
 }
 
 test "cursor theme: first frame and renderer byte order" {

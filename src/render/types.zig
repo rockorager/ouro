@@ -156,6 +156,8 @@ pub const SurfaceSample = struct {
     destination: Rect,
     clip: Rect,
     transform: Transform = .normal,
+    /// Cursors opt into resampling; ordinary surfaces retain nearest sampling.
+    filter: enum { nearest, bilinear } = .nearest,
     global_alpha: u8 = 255,
     /// Surface-local effect geometry. A zero effect size disables all effects.
     effect_size: Size = .{ .width = 0, .height = 0 },
