@@ -329,6 +329,7 @@ const RealRenderer = struct {
     content_buffer: c.VkBuffer,
     content_memory: c.VkDeviceMemory,
     content_map: *anyopaque,
+    content_memory_type: u32,
     content_buffer_size: usize,
     content_allocations: []UploadAllocation,
     native_allocations: []NativeAllocation,
@@ -971,9 +972,9 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
     errdefer allocator.free(self.lut_hashes);
     self.lut_count = 0;
     self.resource_epoch = 1;
-    try createHostBuffer(self, lut_buffer_size, &self.lut_buffer, &self.lut_memory, &self.lut_map);
+    _ = try createHostBuffer(self, lut_buffer_size, &self.lut_buffer, &self.lut_memory, &self.lut_map);
     errdefer destroyBuffer(self, self.lut_buffer, self.lut_memory);
-    try createHostBuffer(
+    self.content_memory_type = try createHostBuffer(
         self,
         self.content_buffer_size,
         &self.content_buffer,
@@ -1045,6 +1046,10 @@ fn realContentProvider(_: *anyopaque, renderer: Renderer) ?render_content.Provid
         .allocate_fn = allocateContent,
         .release_fn = releaseContentOwner,
         .pinned_fn = contentPinned,
+        .memory_info = .{
+            .type_index = self.content_memory_type,
+            .property_flags = self.memory.memoryTypes[self.content_memory_type].propertyFlags,
+        },
         .allocate_native_fn = allocateNative,
         .prepare_native_fn = prepareNative,
         .cancel_native_fn = cancelNative,
@@ -1964,7 +1969,7 @@ fn realImportTarget(_: *anyopaque, renderer: Renderer, metadata: gbm.Metadata, d
     target.batch_capacity = 0;
     target.sample_buffer_size = 0;
     target.state = .ready;
-    try createHostBuffer(self, self.staging_buffer_size, &target.source_buffer, &target.source_memory, &target.source_map);
+    _ = try createHostBuffer(self, self.staging_buffer_size, &target.source_buffer, &target.source_memory, &target.source_map);
     target.source_buffer_size = self.staging_buffer_size;
     errdefer destroyBuffer(self, target.source_buffer, target.source_memory);
 
@@ -2247,7 +2252,7 @@ fn growTargetBatches(self: *RealRenderer, target: *RealTarget, count: usize) !vo
     var buffer: c.VkBuffer = undefined;
     var memory: c.VkDeviceMemory = undefined;
     var map: *anyopaque = undefined;
-    try createHostBuffer(self, buffer_size, &buffer, &memory, &map);
+    _ = try createHostBuffer(self, buffer_size, &buffer, &memory, &map);
     errdefer destroyBuffer(self, buffer, memory);
     const sets = try allocator.alloc(c.VkDescriptorSet, count);
     errdefer allocator.free(sets);
@@ -2307,7 +2312,7 @@ fn growTargetSource(self: *RealRenderer, target: *RealTarget, size: usize) !void
     var buffer: c.VkBuffer = undefined;
     var memory: c.VkDeviceMemory = undefined;
     var map: *anyopaque = undefined;
-    try createHostBuffer(self, size, &buffer, &memory, &map);
+    _ = try createHostBuffer(self, size, &buffer, &memory, &map);
     const old_batches = target.batch_capacity;
     destroyTargetBatchResources(self, target);
     destroyBuffer(self, target.source_buffer, target.source_memory);
@@ -4757,7 +4762,8 @@ fn chooseQueueFamily(device: c.VkPhysicalDevice) !u32 {
     return error.NoComputeQueue;
 }
 
-fn createHostBuffer(self: *RealRenderer, size: usize, buffer: *c.VkBuffer, memory: *c.VkDeviceMemory, map: **anyopaque) !void {
+// Return the selected type for diagnostics; allocation policy is unchanged.
+fn createHostBuffer(self: *RealRenderer, size: usize, buffer: *c.VkBuffer, memory: *c.VkDeviceMemory, map: **anyopaque) !u32 {
     var info: c.VkBufferCreateInfo = .{ .sType = c.VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = null, .flags = 0, .size = size, .usage = c.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | c.VK_BUFFER_USAGE_TRANSFER_SRC_BIT, .sharingMode = c.VK_SHARING_MODE_EXCLUSIVE, .queueFamilyIndexCount = 0, .pQueueFamilyIndices = null };
     try vk(c.vkCreateBuffer(self.device, &info, null, buffer), error.CreateBufferFailed);
     var buffer_only_cleanup = true;
@@ -4775,6 +4781,7 @@ fn createHostBuffer(self: *RealRenderer, size: usize, buffer: *c.VkBuffer, memor
     var mapped: ?*anyopaque = null;
     try vk(c.vkMapMemory(self.device, memory.*, 0, size, 0, &mapped), error.MapBufferFailed);
     map.* = mapped orelse return error.MapBufferFailed;
+    return allocation.memoryTypeIndex;
 }
 
 fn createReadbackBuffer(self: *RealRenderer, size: usize, buffer: *c.VkBuffer, memory: *c.VkDeviceMemory, map: **anyopaque) !void {

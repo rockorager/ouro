@@ -32,11 +32,33 @@ pub const Allocation = struct {
     upload: ?render.UploadBacking = null,
 };
 
+/// Diagnostic metadata only; these are Vulkan memory type/property values.
+pub const MemoryInfo = struct { type_index: u32, property_flags: u32 };
+
+/// Synchronous, borrowed observer. The caller owns clocks and commit identity;
+/// null tracing performs no timing, logging or diagnostic allocation.
+pub const PreparationTrace = struct {
+    context: *const anyopaque,
+    emit_fn: *const fn (*const anyopaque, Event) void,
+
+    pub const Event = struct {
+        stage: []const u8,
+        token: ?u64 = null,
+        bytes: ?usize = null,
+        memory: ?MemoryInfo = null,
+    };
+
+    fn emit(self: PreparationTrace, event: Event) void {
+        self.emit_fn(self.context, event);
+    }
+};
+
 pub const Provider = struct {
     context: *anyopaque,
     allocate_fn: *const fn (*anyopaque, usize) anyerror!Allocation,
     release_fn: *const fn (*anyopaque, u64) void,
     pinned_fn: *const fn (*anyopaque, u64) bool,
+    memory_info: ?MemoryInfo = null,
     allocate_native_fn: ?*const fn (*anyopaque, render.Size, render.PixelFormat) anyerror!render.NativeBacking = null,
     prepare_native_fn: ?*const fn (*anyopaque, render.NativeBacking, render.SampleIdentity, render.ExternalSource) anyerror!void = null,
     cancel_native_fn: ?*const fn (*anyopaque, render.NativeBacking, render.SampleIdentity) void = null,
@@ -123,6 +145,16 @@ pub const Store = struct {
         source: render.Source,
         damage: render.UploadDamage,
     ) !Prepared {
+        return self.prepareTraced(identity, source, damage, null);
+    }
+
+    fn prepareTraced(
+        self: *Store,
+        identity: render.SampleIdentity,
+        source: render.Source,
+        damage: render.UploadDamage,
+        trace: ?PreparationTrace,
+    ) !Prepared {
         if (identity.surface == 0 or identity.commit_sequence == 0)
             return error.InvalidIdentity;
         const packed_stride = std.math.mul(u32, source.size.width, 4) catch
@@ -155,9 +187,12 @@ pub const Store = struct {
             false;
         if (packed_length > self.byte_capacity - self.used_bytes)
             return error.ByteCapacityExceeded;
+        if (trace) |t| t.emit(.{ .stage = "content-slot-begin" });
         const index = try self.claimSlot();
+        if (trace) |t| t.emit(.{ .stage = "content-slot-end" });
         // Renderer-owned allocations can be sampled directly and still be
         // patched in place whenever no submitted frame pins the allocation.
+        if (trace) |t| t.emit(.{ .stage = "content-backing-begin", .bytes = packed_length });
         const allocation = try self.allocateBytes(packed_length, true);
         const bytes = allocation.bytes;
         errdefer self.releaseBytes(.{
@@ -167,12 +202,28 @@ pub const Store = struct {
             .bytes = bytes,
             .upload = allocation.upload,
         });
+        if (trace) |t| t.emit(.{
+            .stage = "content-backing-end",
+            .bytes = bytes.len,
+            .token = if (allocation.upload) |upload| upload.token else null,
+            .memory = if (self.provider) |provider| provider.memory_info else null,
+        });
 
         if (compatible and !coversSource(damage, source.size)) {
+            if (trace) |t| t.emit(.{
+                .stage = "content-inherit-begin",
+                .bytes = bytes.len,
+                .token = if (self.slots[predecessor_index.?].source.upload) |upload| upload.token else null,
+            });
             @memcpy(bytes, self.slots[predecessor_index.?].source.bytes);
+            if (trace) |t| t.emit(.{ .stage = "content-inherit-end" });
+            if (trace) |t| t.emit(.{ .stage = "content-damage-begin" });
             copyDamage(bytes, packed_stride, source, damage);
+            if (trace) |t| t.emit(.{ .stage = "content-damage-end" });
         } else {
+            if (trace) |t| t.emit(.{ .stage = "content-full-copy-begin", .bytes = bytes.len });
             copyFull(bytes, packed_stride, source);
+            if (trace) |t| t.emit(.{ .stage = "content-full-copy-end" });
         }
 
         var slot = &self.slots[index];
@@ -378,14 +429,36 @@ pub const Store = struct {
         source: render.Source,
         damage: render.UploadDamage,
     ) !Prepared {
-        const handle = previous orelse return self.prepare(identity, source, damage);
-        if (handle.index >= self.slots.len) return self.prepare(identity, source, damage);
+        return self.prepareReplacingTraced(previous, identity, source, damage, null);
+    }
+
+    pub fn prepareReplacingTraced(
+        self: *Store,
+        previous: ?Handle,
+        identity: render.SampleIdentity,
+        source: render.Source,
+        damage: render.UploadDamage,
+        trace: ?PreparationTrace,
+    ) !Prepared {
+        const handle = previous orelse {
+            if (trace) |t| t.emit(.{ .stage = "content-reuse-rejected-missing" });
+            return self.prepareTraced(identity, source, damage, trace);
+        };
+        if (handle.index >= self.slots.len) {
+            if (trace) |t| t.emit(.{ .stage = "content-reuse-rejected-index" });
+            return self.prepareTraced(identity, source, damage, trace);
+        }
         const slot = &self.slots[handle.index];
         if (slot.state != .published or slot.generation != handle.generation or
             !slot.current)
-            return self.prepare(identity, source, damage);
-        if (slot.identity.surface != identity.surface)
-            return self.prepare(identity, source, damage);
+        {
+            if (trace) |t| t.emit(.{ .stage = "content-reuse-rejected-stale" });
+            return self.prepareTraced(identity, source, damage, trace);
+        }
+        if (slot.identity.surface != identity.surface) {
+            if (trace) |t| t.emit(.{ .stage = "content-reuse-rejected-surface" });
+            return self.prepareTraced(identity, source, damage, trace);
+        }
         if (identity.commit_sequence <= slot.identity.commit_sequence)
             return error.StaleCommit;
         const next = std.math.add(u64, slot.identity.commit_sequence, 1) catch
@@ -406,9 +479,24 @@ pub const Store = struct {
 
         if (!std.meta.eql(slot.source.size, source.size) or
             slot.source.format != source.format or slot.source.bytes.len != packed_length)
-            return self.prepare(identity, source, damage);
+        {
+            if (trace) |t| t.emit(.{ .stage = "content-reuse-rejected-incompatible" });
+            return self.prepareTraced(identity, source, damage, trace);
+        }
         if (self.provider) |provider| if (slot.source.upload) |upload|
-            if (provider.pinned(upload.token)) return self.prepare(identity, source, damage);
+            if (provider.pinned(upload.token)) {
+                if (trace) |t| t.emit(.{
+                    .stage = "content-reuse-rejected-pinned",
+                    .token = upload.token,
+                    .memory = provider.memory_info,
+                });
+                return self.prepareTraced(identity, source, damage, trace);
+            };
+        if (trace) |t| t.emit(.{
+            .stage = "content-reuse-accepted",
+            .token = if (slot.source.upload) |upload| upload.token else null,
+            .memory = if (self.provider) |provider| provider.memory_info else null,
+        });
         slot.state = .replacing;
         slot.replacement = .{
             .identity = identity,
@@ -1218,6 +1306,86 @@ test "render-content: GPU-pinned provider backing uses transactional copy-on-wri
     try std.testing.expectEqual(@as(u8, 0), backing.references[1]);
     TestProvider.release(&backing, old_token);
     try std.testing.expectEqual(@as(u8, 0), backing.references[0]);
+}
+
+test "render-content: preparation trace separates allocation inheritance and patch without changing ownership" {
+    const Capture = struct {
+        events: [16]PreparationTrace.Event = undefined,
+        count: usize = 0,
+
+        fn emit(context: *const anyopaque, event: PreparationTrace.Event) void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(context)));
+            self.events[self.count] = event;
+            self.count += 1;
+        }
+
+        fn expectStages(self: *@This(), expected: []const []const u8) !void {
+            try std.testing.expectEqual(expected.len, self.count);
+            for (expected, self.events[0..self.count]) |stage, event|
+                try std.testing.expectEqualStrings(stage, event.stage);
+        }
+    };
+    var capture: Capture = .{};
+    const trace: PreparationTrace = .{ .context = &capture, .emit_fn = Capture.emit };
+    var backing: TestProvider = .{};
+    var provider = backing.provider();
+    provider.memory_info = .{ .type_index = 3, .property_flags = 6 };
+    var store = try Store.initWithProvider(std.testing.allocator, .{ .version_capacity = 2, .byte_capacity = 16 }, provider);
+    defer store.deinit();
+    const first = [_]u8{ 1, 2, 3, 4, 9, 10, 11, 12 };
+    const old = store.publish(try store.prepareReplacingTraced(
+        null,
+        .{ .surface = 1, .commit_sequence = 1 },
+        testSource(&first, 2, 1, 8),
+        .{},
+        trace,
+    ));
+    defer store.release(old);
+    try capture.expectStages(&.{
+        "content-reuse-rejected-missing", "content-slot-begin",  "content-slot-end",
+        "content-backing-begin",          "content-backing-end", "content-full-copy-begin",
+        "content-full-copy-end",
+    });
+    try std.testing.expectEqual(provider.memory_info, capture.events[4].memory);
+    try std.testing.expectEqual(@as(?usize, 8), capture.events[4].bytes);
+    const old_token = (try store.resolve(old)).upload.?.token;
+    try std.testing.expectEqual(@as(?u64, old_token), capture.events[4].token);
+
+    backing.retain(old_token);
+    const second = [_]u8{ 5, 6, 7, 8, 13, 14, 15, 16 };
+    const source = testSource(&second, 2, 1, 8);
+    const identity: render.SampleIdentity = .{ .surface = 1, .commit_sequence = 2 };
+    const damage = testDamage(&.{.{ .min_x = 0, .min_y = 0, .max_x = 1, .max_y = 1 }});
+    capture.count = 0;
+    const prepared = try store.prepareReplacingTraced(old, identity, source, damage, trace);
+    try capture.expectStages(&.{
+        "content-reuse-rejected-pinned", "content-slot-begin",   "content-slot-end",
+        "content-backing-begin",         "content-backing-end",  "content-inherit-begin",
+        "content-inherit-end",           "content-damage-begin", "content-damage-end",
+    });
+    try std.testing.expect(!prepared.replaces);
+    try std.testing.expectEqual(@as(?u64, old_token), capture.events[0].token);
+    try std.testing.expectEqual(provider.memory_info, capture.events[0].memory);
+    try std.testing.expectEqual(@as(?u64, old_token), capture.events[5].token);
+    try std.testing.expectEqual(@as(?usize, 8), capture.events[5].bytes);
+    try std.testing.expect(capture.events[4].token.? != old_token);
+    try std.testing.expectEqualSlices(u8, &.{ 5, 6, 7, 8, 9, 10, 11, 12 }, store.preparedSlot(prepared).?.source.bytes);
+    store.cancel(prepared);
+    try std.testing.expectEqualSlices(u8, &first, (try store.resolve(old)).bytes);
+
+    // An allocation failure has no success/end marker and preserves old pixels.
+    capture.count = 0;
+    backing.used = backing.storage.len;
+    try std.testing.expectError(error.OutOfMemory, store.prepareReplacingTraced(old, identity, source, damage, trace));
+    try capture.expectStages(&.{ "content-reuse-rejected-pinned", "content-slot-begin", "content-slot-end", "content-backing-begin" });
+    TestProvider.release(&backing, old_token);
+    capture.count = 0;
+    const replacement = try store.prepareReplacingTraced(old, identity, source, damage, trace);
+    try std.testing.expect(replacement.replaces);
+    try capture.expectStages(&.{"content-reuse-accepted"});
+    store.cancel(replacement);
+    try std.testing.expectEqualSlices(u8, &first, (try store.resolve(old)).bytes);
+    try std.testing.expectEqual(@as(u8, 1), backing.references[0]);
 }
 
 test "render-content: stale generation destruction does not invalidate handles" {

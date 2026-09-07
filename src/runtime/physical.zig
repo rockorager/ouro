@@ -3438,9 +3438,63 @@ pub fn Coordinator(comptime protocol: type) type {
             const now = monotonicNs() catch return;
             const peer = self.adapter.surfacePeer(id) catch return;
             const resource = self.adapter.surfaceResource(id) catch return;
-            std.log.info("pacing-surface event=" ++ event ++ " ns={d} peer={d}:{d} object={d} surface={d}:{d} commit={d}", .{
-                now, peer.slot, peer.generation, resource.id, id.index, id.generation, sequence,
+            std.log.info("pacing-surface event=" ++ event ++ " ns={d} peer={d}:{d} object={d} surface={d}:{d} commit={d} thread_cpu_ns={?d}", .{
+                now, peer.slot, peer.generation, resource.id, id.index, id.generation, sequence, threadCpuNs() catch null,
             });
+        }
+
+        const SurfaceWorkTrace = struct {
+            peer: wayring.io_uring.Peer,
+            object: u32,
+            id: Adapter.SurfaceId,
+            sequence: u64,
+            start_ns: u64,
+            start_cpu_ns: ?u64,
+
+            fn mark(self: *const SurfaceWorkTrace, comptime stage: []const u8) void {
+                markContent(self, .{ .stage = stage });
+            }
+
+            fn markContent(context: *const anyopaque, event: render_content.PreparationTrace.Event) void {
+                const self: *const SurfaceWorkTrace = @ptrCast(@alignCast(context));
+                const now = monotonicNs() catch return;
+                const cpu = threadCpuNs() catch null;
+                const cpu_elapsed = if (cpu) |end|
+                    if (self.start_cpu_ns) |begin| end -| begin else null
+                else
+                    null;
+                std.log.info("pacing-work stage={s} ns={d} thread_cpu_ns={?d} start_ns={d} elapsed_ns={d} cpu_elapsed_ns={?d} peer={d}:{d} object={d} surface={d}:{d} commit={d} upload_token={?d} bytes={?d} memory_type={?d} memory_flags={?d}", .{
+                    event.stage,
+                    now,
+                    cpu,
+                    self.start_ns,
+                    now -| self.start_ns,
+                    cpu_elapsed,
+                    self.peer.slot,
+                    self.peer.generation,
+                    self.object,
+                    self.id.index,
+                    self.id.generation,
+                    self.sequence,
+                    event.token,
+                    event.bytes,
+                    if (event.memory) |memory| memory.type_index else null,
+                    if (event.memory) |memory| memory.property_flags else null,
+                });
+            }
+        };
+
+        fn beginSurfaceWork(self: *Self, id: Adapter.SurfaceId, sequence: u64) ?SurfaceWorkTrace {
+            // No clock reads, identity lookups or logging in the normal path.
+            if (!self.output_config.trace_pacing) return null;
+            return .{
+                .start_ns = monotonicNs() catch return null,
+                .start_cpu_ns = threadCpuNs() catch null,
+                .peer = self.adapter.surfacePeer(id) catch return null,
+                .object = (self.adapter.surfaceResource(id) catch return null).id,
+                .id = id,
+                .sequence = sequence,
+            };
         }
 
         fn independentXdgGeometryRoot(self: *Self, id: Adapter.SurfaceId) ?Adapter.SurfaceId {
@@ -8825,6 +8879,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 return self.discardPendingCandidate(layer, pending.id);
             }
             const content = &candidate.content;
+            const trace = self.beginSurfaceWork(exact_surface_id, content.surface.sequence);
+            if (trace) |*work| work.mark("apply-begin");
+            // A return marker also covers errors/retries; it does not imply success.
+            defer if (trace) |*work| work.mark("apply-return");
             const attachment = content.surface.attachment orelse {
                 return self.applyRetainedCandidate(layer, pending.id, surface_scene, needs_frame);
             };
@@ -8917,7 +8975,13 @@ pub fn Coordinator(comptime protocol: type) type {
             const visible_clip = clip orelse {
                 return try self.discardPendingCandidate(layer, pending.id);
             };
+            if (trace) |*work| work.mark("source-access-begin");
             var source = try self.adapter.bufferSource(lease);
+            if (trace) |*work| switch (source) {
+                .shm => work.mark("source-access-end-shm"),
+                .single_pixel => work.mark("source-access-end-single-pixel"),
+                .external => work.mark("source-access-end-external"),
+            };
             var source_access_owned = true;
             defer if (source_access_owned) source.endShmAccess() catch {};
             var imported_source: ?output_api.ImportedSource = null;
@@ -8991,6 +9055,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 }
             }
             var retained_source = false;
+            if (trace) |*work| work.mark("content-prepare-begin");
             const prepared = native: {
                 if (borrowed_source.external != null) {
                     if (render_device.content.prepareReplacingRetainedExternal(
@@ -9066,19 +9131,30 @@ pub fn Coordinator(comptime protocol: type) type {
                         }
                     }
                 }
-                break :native render_device.content.prepareReplacing(
+                break :native render_device.content.prepareReplacingTraced(
                     layer.rendered,
                     sample_identity,
                     borrowed_source,
                     upload_damage,
+                    if (trace) |*work| .{
+                        .context = work,
+                        .emit_fn = SurfaceWorkTrace.markContent,
+                    } else null,
                 ) catch |err| switch (err) {
                     error.VersionCapacityExceeded, error.ByteCapacityExceeded => return false,
                     else => return err,
                 };
             };
+            if (trace) |*work| {
+                if (prepared.replaces)
+                    work.mark("content-prepare-end-replace")
+                else
+                    work.mark("content-prepare-end-new");
+            }
             var prepared_owned = true;
             defer if (prepared_owned) render_device.content.cancel(prepared);
             source_access_owned = false;
+            if (trace) |*work| work.mark("source-finish-begin");
             source.endShmAccess() catch |err| switch (err) {
                 error.InvalidBacking => {
                     const peer = candidate.peer orelse return error.ClientDisconnected;
@@ -9092,6 +9168,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 },
                 else => return err,
             };
+            if (trace) |*work| work.mark("source-finish-end");
             const token = self.presentations.admitImported(.{}) catch |err| switch (err) {
                 error.Exhausted => return false,
                 else => return err,
@@ -9110,7 +9187,9 @@ pub fn Coordinator(comptime protocol: type) type {
             // the renderer-owned version, consuming a compatible previous
             // handle in place when it is uniquely owned by this layer.
             if (layer.retains_source) try self.retireLayerSource(layer);
+            if (trace) |*work| work.mark("content-publish-begin");
             const rendered = render_device.content.publish(prepared);
+            if (trace) |*work| work.mark("content-publish-end");
             prepared_owned = false;
             const sample: render_list.AppliedSurface = .{
                 .sample = binding.sample,
@@ -9145,8 +9224,10 @@ pub fn Coordinator(comptime protocol: type) type {
             );
             const previous = if (layer.change) |change| change.current else null;
             layer.candidate.clear();
+            if (trace) |*work| work.mark("previous-content-release-begin");
             if (!prepared.replaces) if (layer.rendered) |previous_handle|
                 render_device.content.release(previous_handle);
+            if (trace) |*work| work.mark("previous-content-release-end");
             layer.change = .{
                 .previous = previous,
                 .current = damage.SurfaceState.fromSample(sample, .{
@@ -9172,8 +9253,10 @@ pub fn Coordinator(comptime protocol: type) type {
             if (association_changed) self.output_associations_dirty = true;
             self.finishPendingCandidate(pending.id);
             self.stats.applied += 1;
+            if (trace) |*work| work.mark("source-release-check-begin");
             if (!retained_source and render_device.content.ready(rendered))
                 _ = try self.retryLayerSourceRelease(layer);
+            if (trace) |*work| work.mark("source-release-check-end");
             return true;
         }
 
@@ -9443,6 +9526,7 @@ pub fn Coordinator(comptime protocol: type) type {
             forwardEffectiveAttachments(applied);
             for (applied, 0..) |*update, index| {
                 const id = update.surface;
+                // Historical name: adapter admission, before renderer content work.
                 self.traceSurfacePacing("commit-applied", id, update.payload.surface.sequence);
                 self.pendingCommitApplied(id);
                 self.applied_layers[index].candidate.set(.{
@@ -11553,7 +11637,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (!render_device.content.ready(rendered)) return false;
             }
             const content = layer.content.get() orelse return error.MissingContent;
-            if (!try self.releaseSource(layer.peer, content)) return false;
+            const trace = if (layer.id) |id| self.beginSurfaceWork(id, content.surface.sequence) else null;
+            if (trace) |*work| work.mark("release-begin");
+            defer if (trace) |*work| work.mark("release-return");
+            if (!try self.releaseSource(layer.peer, content, if (trace) |*work| work else null)) return false;
             layer.source_release_pending = false;
             layer.retains_source = false;
             return true;
@@ -11563,6 +11650,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self: *Self,
             peer: ?wayring.io_uring.Peer,
             content: *Adapter.Content,
+            trace: ?*const SurfaceWorkTrace,
         ) !bool {
             // A disconnected client may retain and wait on its timeline fd.
             // Publish compositor completion before dropping the DMA-BUF lease
@@ -11584,22 +11672,29 @@ pub fn Coordinator(comptime protocol: type) type {
                 return true;
             }
             const owner = peer.?;
+            if (trace) |work| work.mark("lease-drop-begin");
             if (content.attachment_lease) |*lease| {
                 lease.deinit();
                 content.attachment_lease = null;
             }
+            if (trace) |work| work.mark("lease-drop-end");
             const objects = try self.root.runtime.clients.get(owner);
             const actor = try self.root.runtime.clients.reactor.getActor(owner);
             var notification_queued = false;
             if (content.surface.attachment) |*attachment| if (attachment.buffer) |buffer| {
+                if (trace) |work| work.mark("buffer-release-begin");
                 notification_queued = Adapter.completeBufferReleaseOn(
                     objects,
                     &actor.transmit,
                     buffer.handle,
                 ) catch |err| switch (err) {
-                    error.Exhausted => return false,
+                    error.Exhausted => {
+                        if (trace) |work| work.mark("buffer-release-blocked");
+                        return false;
+                    },
                     else => return err,
                 };
+                if (trace) |work| work.mark("buffer-release-end");
                 if (self.output_config.trace_pacing and notification_queued) {
                     std.log.info("pacing-buffer-release-queued ns={?d} peer={d}:{d} buffer={d} generation={d} commit={d}", .{
                         monotonicNs() catch null, owner.slot,               owner.generation,
@@ -11610,10 +11705,12 @@ pub fn Coordinator(comptime protocol: type) type {
                 // both consume release ownership exactly once.
                 attachment.buffer = null;
             };
+            if (trace) |work| work.mark("release-callbacks-begin");
             if (content.release_callbacks) |*batch| {
                 while (batch.peek()) |callback| {
                     Adapter.completeReleaseOn(objects, &actor.transmit, callback) catch |err| switch (err) {
                         error.Exhausted => {
+                            if (trace) |work| work.mark("release-callbacks-blocked");
                             if (notification_queued)
                                 _ = try self.loop.?.driver.schedule(owner);
                             return false;
@@ -11626,7 +11723,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 }
                 content.release_callbacks = null;
             }
+            if (trace) |work| work.mark("release-callbacks-end");
+            if (trace) |work| work.mark("release-schedule-begin");
             if (notification_queued) _ = try self.loop.?.driver.schedule(owner);
+            if (trace) |work| work.mark("release-schedule-end");
             return true;
         }
 
@@ -11655,7 +11755,7 @@ pub fn Coordinator(comptime protocol: type) type {
             defer self.syncLayerRetry(layer);
             const source = &(layer.retired_source orelse return false);
             if (!source.releasable) return false;
-            if (!try self.releaseSource(source.peer, &source.content)) return false;
+            if (!try self.releaseSource(source.peer, &source.content, null)) return false;
             source.content.deinit();
             layer.retired_source = null;
             return true;
@@ -14396,6 +14496,17 @@ fn callbackData(timestamp_ns: u64) u32 {
 fn monotonicNs() !u64 {
     var now: libc.struct_timespec = undefined;
     if (libc.clock_gettime(libc.CLOCK_MONOTONIC, &now) != 0)
+        return error.ClockUnavailable;
+    return std.math.add(
+        u64,
+        try std.math.mul(u64, @intCast(now.tv_sec), std.time.ns_per_s),
+        @intCast(now.tv_nsec),
+    );
+}
+
+fn threadCpuNs() !u64 {
+    var now: libc.struct_timespec = undefined;
+    if (libc.clock_gettime(libc.CLOCK_THREAD_CPUTIME_ID, &now) != 0)
         return error.ClockUnavailable;
     return std.math.add(
         u64,

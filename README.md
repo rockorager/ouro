@@ -388,8 +388,10 @@ compare several launches. Capture the client separately with
 `WAYLAND_DEBUG=client monstar 2>monstar-startup.log`.
 
 `pacing-surface` records commit dispatch (before validation), publication, and
-application with monotonic nanoseconds, peer identity, wire object ID,
-generation-safe surface identity, and commit sequence. A dispatch record alone
+adapter admission with monotonic nanoseconds, thread CPU nanoseconds, peer
+identity, wire object ID, generation-safe surface identity, and commit sequence.
+The historical `commit-applied` name means admission into a candidate, **not**
+completion of SHM copying or renderer-owned publication. A dispatch record alone
 does not imply that validation succeeded. `pacing-sample` connects a submitted
 output/frame to each sampled surface/commit; join it to the existing `pacing`
 record for render deadline, render start/readiness, target/actual presentation,
@@ -400,6 +402,57 @@ replace its content until the flip completes, even on a repaint after its
 original presentation token has completed. Synchronized groups wait if any
 member is still sampled. Callback backpressure, callback queueing, and buffer
 release queueing have separate records.
+
+`pacing-work` subdivides candidate application and active-source release using
+the same peer/object/surface/commit identity. Its `stage` boundaries cover:
+
+- `apply-begin` / `apply-return`: one candidate application attempt, including
+  cleanup on retry/error; a return marker does not imply successful application.
+- `source-access-begin` / `source-access-end-shm` (or `single-pixel`/`external`):
+  buffer source acquisition, including SHM access setup.
+- `content-prepare-begin` / `content-prepare-end-new` or `-replace`: content
+  preparation. For copied SHM, new content includes allocation and pixel copy;
+  compatible replacement reserves reuse and defers pixel copy to publication.
+  Copied-content preparation has nested `content-slot-begin/end` (slot lookup/
+  growth), `content-backing-begin/end` (pixel backing allocation),
+  `content-inherit-begin/end` (full predecessor copy), and
+  `content-damage-begin/end` (patch damaged pixels) markers. The full-client-copy
+  path instead emits `content-full-copy-begin/end`. An error may leave a begin
+  without its end; the enclosing `apply-return` still does not imply success.
+  `content-reuse-accepted` or `content-reuse-rejected-*` records the actual reuse
+  decision: missing handle, invalid index, stale/noncurrent handle, different
+  surface, incompatible dimensions/format, or pinned backing.
+- `source-finish-begin/end`, `content-publish-begin/end`, and
+  `previous-content-release-begin/end`: finish source access, publish content
+  (including replacement SHM copy), then release the old renderer content.
+- `source-release-check-begin/end`: readiness check and immediate release attempt.
+  Nested `release-begin` / `release-return` attempts subdivide `lease-drop`,
+  `buffer-release`, `release-callbacks`, and `release-schedule` with begin/end
+  markers. `buffer-release-blocked` / `release-callbacks-blocked` identify TX
+  backpressure; a later retry has a new `start_ns`. Retired-source cleanup does
+  not emit these active-source spans.
+
+`upload_token` identifies the predecessor on rejection/inheritance records and
+the new allocation on `content-backing-end`; it includes the backing generation
+and is scoped to the renderer/session. `bytes` gives backing/full-copy size where
+applicable, not damage size. `memory_type` and `memory_flags` describe the actual
+selected Vulkan content-arena memory on backing/reuse records, without changing
+selection policy. Flags are decimal Vulkan bits: device-local=1, host-visible=2,
+host-coherent=4, host-cached=8. Coherent does not imply cached. Missing/not-applicable
+fields are `null`. These are metadata only, never pixel contents or addresses.
+
+Each work record has absolute `ns` (CLOCK_MONOTONIC) and `thread_cpu_ns`
+(CLOCK_THREAD_CPUTIME_ID), plus `elapsed_ns` and `cpu_elapsed_ns` since that
+attempt's `start_ns`. Match identities and `start_ns` when nesting/retries occur;
+subtract adjacent absolute readings to time a stage, or subtract the
+`commit-applied` readings from an application record to include admission work.
+CPU-clock failure is reported as `null`, not zero. A large elapsed/CPU difference
+indicates time not executing on this thread, but cannot distinguish blocking,
+descheduling, or a particular wait cause. Similar elapsed and CPU time suggests
+execution, not necessarily useful work. Clock reads and synchronous trace
+logging add overhead, included in these intervals; blocking on the log itself
+can contribute. No new clocks, allocations, or log output occur when tracing
+is disabled, and the normal scheduling/rendering policy is unchanged.
 
 Queueing is not socket transmission or client receipt. These server timestamps
 are monotonic, unlike the client's wall-clock log prefix; correlate identities
