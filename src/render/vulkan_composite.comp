@@ -32,6 +32,7 @@ layout(push_constant) uniform Frame {
     uvec4 output_info;  // width, height, format, sample count
     uvec4 damage;       // x, y, width, height
     uvec4 output_color; // transfer, reference luminance bits, reserved, reserved
+    vec4 capture_color[3]; // linear working space to sRGB; row 0 w = phase mask
 } frame;
 
 uint multiply_unorm(uint value, uint alpha) {
@@ -142,6 +143,7 @@ ivec2 source_coordinate(Sample item, ivec2 local) {
 }
 
 #include "vulkan_cursor_filter.glsl"
+#include "vulkan_capture.glsl"
 
 void main() {
     ivec2 local_damage = ivec2(gl_GlobalInvocationID.xy);
@@ -166,6 +168,7 @@ void main() {
             : decode_pixel(item, raw_pixel(item, index, coordinate));
         color = source_pixel + color * (1.0 - source_pixel.a);
     }
+    capture_pixel(pixel, color);
     vec3 straight = color.rgb / max(color.a, 0.000001);
     vec3 encoded = frame.output_color.z != 0u
         ? sample_lut(straight, int(frame.output_color.z))

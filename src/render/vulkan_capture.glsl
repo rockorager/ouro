@@ -1,0 +1,19 @@
+// Capture clients consume sRGB, not the monitor's PQ/HLG or ICC encoding.
+// Export from the linear composition before output encoding and quantization.
+layout(std430, set = 0, binding = 10) writeonly buffer CaptureBefore { uint capture_before[]; };
+layout(std430, set = 0, binding = 11) writeonly buffer CaptureAfter { uint capture_after[]; };
+
+void capture_pixel(ivec2 pixel, vec4 color) {
+    uint phases = uint(frame.capture_color[0].w);
+    if (phases == 0u) return;
+    mat3 transform = mat3(frame.capture_color[0].xyz,
+                          frame.capture_color[1].xyz,
+                          frame.capture_color[2].xyz);
+    vec3 straight = transpose(transform) * color.rgb / max(color.a, 0.000001);
+    // SDR captures clip out-of-gamut colors and highlights above SDR white.
+    vec3 encoded = clamp(encode_transfer(straight, 0u), 0.0, 1.0) * color.a;
+    uint packed = packUnorm4x8(vec4(encoded.bgr, color.a));
+    uint offset = uint(pixel.y) * frame.output_info.x + uint(pixel.x);
+    if ((phases & 1u) != 0u) capture_before[offset] = packed;
+    if ((phases & 2u) != 0u) capture_after[offset] = packed;
+}

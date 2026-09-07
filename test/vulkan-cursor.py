@@ -53,7 +53,10 @@ class Renderer:
 
     def render(self, pixels, source_size, size, mode, xrgb=False,
                alpha=255, crop=None, transform=0, filtering=None, shader_dir=None,
-               alpha_mode=0, background=(80, 100, 120), background_alpha=255, ten_bit=False):
+               alpha_mode=0, background=(80, 100, 120), background_alpha=255, ten_bit=False,
+               output_transfer=0, source_transfer=0, color_matrix=(1, 0, 0, 0, 1, 0, 0, 0, 1),
+               luminance_scale=1, capture_matrix=(1, 0, 0, 0, 1, 0, 0, 0, 1),
+               capture_phases=None, continuation=False, capture_sequence=False, copy_capture=False):
         d = self.device
         sw, sh = source_size
         w, h = size
@@ -112,23 +115,29 @@ class Renderer:
             flags = {"nearest": 0, "reconstruction": 1, "bilinear": 2, "area": 3}[filtering] << 28
             flags |= 0x40000000 if mode == "texture-buffer" else 0
             # Include the opaque fast path: it must not bypass filtering.
-            if xrgb and alpha == 255:
+            if xrgb and alpha == 255 and output_transfer == source_transfer:
                 flags |= 0x80000000
             sample = struct.pack("<4I12i4I8i12f", 0, sw, sh, sw * 4,
                 int(sx * 65536), int(sy * 65536), int(cw * 65536), int(ch * 65536),
-                0, 0, w, h, 0, 0, w, h, int(xrgb), flags, alpha, 0,
+                0, 0, w, h, 0, 0, w, h, int(xrgb), flags, alpha, source_transfer,
                 xx, xy, x0, yx, yy, y0, alpha_mode, 0,
-                1, 0, 0, 1, 0, 1, 0, 0, 0, 0, 1, 0)
+                *color_matrix[:3], luminance_scale, *color_matrix[3:6], 0, *color_matrix[6:], 0)
             storage = v.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
             samples = buffer(sample, storage)
             source = buffer(pixels, storage | v.VK_BUFFER_USAGE_TRANSFER_SRC_BIT)
             lut = buffer(bytes(16), storage)
             readback = buffer(bytes(w * h * 4), v.VK_BUFFER_USAGE_TRANSFER_DST_BIT)
+            captures = [buffer(bytes([37]) * (w * h * 4), storage | v.VK_BUFFER_USAGE_TRANSFER_SRC_BIT)
+                        for _ in range(2)]
             target, target_view = image(w, h, v.VK_FORMAT_A2B10G10R10_UNORM_PACK32 if ten_bit else v.VK_FORMAT_R8G8B8A8_UNORM,
                 v.VK_IMAGE_USAGE_STORAGE_BIT | v.VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
             src_image, src_view = image(sw, sh, v.VK_FORMAT_B8G8R8A8_UNORM,
                 v.VK_IMAGE_USAGE_SAMPLED_BIT | v.VK_IMAGE_USAGE_TRANSFER_DST_BIT)
             linear, linear_view = image(w, h, v.VK_FORMAT_R16G16B16A16_SFLOAT, v.VK_IMAGE_USAGE_STORAGE_BIT)
+            if copy_capture:
+                copied, _ = image(w, h, v.VK_FORMAT_B8G8R8A8_UNORM,
+                                  v.VK_IMAGE_USAGE_TRANSFER_DST_BIT | v.VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
+                copied_readback = buffer(bytes(w * h * 4), v.VK_BUFFER_USAGE_TRANSFER_DST_BIT)
             sampler = own(v.vkCreateSampler, v.vkDestroySampler, v.VkSamplerCreateInfo(
                 magFilter=v.VK_FILTER_NEAREST, minFilter=v.VK_FILTER_NEAREST,
                 addressModeU=v.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
@@ -136,7 +145,9 @@ class Renderer:
                 addressModeW=v.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE))
             types = {0: (v.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1),
                      1: (v.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1),
-                     4: (v.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1)}
+                     4: (v.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1),
+                     10: (v.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1),
+                     11: (v.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1)}
             if texture:
                 types.update({3: (v.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 32),
                               5: (v.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1),
@@ -154,8 +165,8 @@ class Renderer:
                 descriptorPool=pool, pSetLayouts=[layout]))[0]
             writes = []
             for b, (t, n) in types.items():
-                if b in (1, 2, 4, 6):
-                    buf = samples if b == 1 else lut if b == 4 else source
+                if b in (1, 2, 4, 6, 10, 11):
+                    buf = captures[b - 10] if b >= 10 else samples if b == 1 else lut if b == 4 else source
                     args = dict(pBufferInfo=[v.VkDescriptorBufferInfo(buffer=buf[0], offset=0, range=buf[2])])
                 else:
                     view = target_view if b == 0 else linear_view if b == 5 else src_view
@@ -166,7 +177,7 @@ class Renderer:
             v.vkUpdateDescriptorSets(d, len(writes), writes, 0, None)
             pl = own(v.vkCreatePipelineLayout, v.vkDestroyPipelineLayout, v.VkPipelineLayoutCreateInfo(
                 pSetLayouts=[layout], pPushConstantRanges=[v.VkPushConstantRange(
-                    stageFlags=v.VK_SHADER_STAGE_COMPUTE_BIT, size=64)]))
+                    stageFlags=v.VK_SHADER_STAGE_COMPUTE_BIT, size=112)]))
             shader_name = "vulkan_texture_composite" if texture else "vulkan_composite"
             code = ((shader_dir or ROOT / "src/render") /
                     (shader_name + ("_10bit" if ten_bit else "") + ".spv")).read_bytes()
@@ -201,13 +212,44 @@ class Renderer:
                     v.VK_ACCESS_TRANSFER_WRITE_BIT, v.VK_ACCESS_SHADER_READ_BIT)
             v.vkCmdBindPipeline(cmd, v.VK_PIPELINE_BIND_POINT_COMPUTE, pipeline)
             v.vkCmdBindDescriptorSets(cmd, v.VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, [ds], 0, None)
-            push = struct.pack("<16I", background_alpha, *background, w, h,
-                               int(background_alpha == 255), 1, 0, 0, w, h, 0, 0, 0, 0)
-            v.vkCmdPushConstants(cmd, pl, v.VK_SHADER_STAGE_COMPUTE_BIT, 0, 64, v.ffi.from_buffer(push))
-            v.vkCmdDispatch(cmd, (w + 7) // 8, (h + 7) // 8, 1)
+            def dispatch(count, phases=capture_phases):
+                push = struct.pack("<16I12f", background_alpha, *background, w, h,
+                    int(background_alpha == 255), count, 0, 0, w, h, output_transfer, 0, 0, 0,
+                    *capture_matrix[:3], phases or 0,
+                    *capture_matrix[3:6], 0, *capture_matrix[6:], 0)
+                v.vkCmdPushConstants(cmd, pl, v.VK_SHADER_STAGE_COMPUTE_BIT, 0, 112, v.ffi.from_buffer(push))
+                v.vkCmdDispatch(cmd, (w + 7) // 8, (h + 7) // 8, 1)
+            if capture_sequence:
+                dispatch(0, 1)
+                barrier(v.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, v.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        v.VK_ACCESS_SHADER_WRITE_BIT, v.VK_ACCESS_SHADER_WRITE_BIT)
+                dispatch(1, 2)
+            elif continuation:
+                assert texture
+                dispatch(0x40000001)
+                barrier(v.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, v.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        v.VK_ACCESS_SHADER_WRITE_BIT, v.VK_ACCESS_SHADER_READ_BIT | v.VK_ACCESS_SHADER_WRITE_BIT)
+                dispatch(0x80000000)
+            else:
+                dispatch(1)
             barrier(v.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, v.VK_PIPELINE_STAGE_TRANSFER_BIT,
                     v.VK_ACCESS_SHADER_WRITE_BIT, v.VK_ACCESS_TRANSFER_READ_BIT)
             v.vkCmdCopyImageToBuffer(cmd, target, v.VK_IMAGE_LAYOUT_GENERAL, readback[0], 1, [region(w, h)])
+            if copy_capture:
+                # Same 8-bit buffer-to-image export used for DMA-BUF capture,
+                # even when the scanout image is packed 10-bit HDR.
+                ready = v.VkImageMemoryBarrier(oldLayout=v.VK_IMAGE_LAYOUT_UNDEFINED,
+                    newLayout=v.VK_IMAGE_LAYOUT_GENERAL, image=copied, subresourceRange=subresource,
+                    srcQueueFamilyIndex=v.VK_QUEUE_FAMILY_IGNORED, dstQueueFamilyIndex=v.VK_QUEUE_FAMILY_IGNORED,
+                    dstAccessMask=v.VK_ACCESS_TRANSFER_WRITE_BIT)
+                v.vkCmdPipelineBarrier(cmd, v.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                    v.VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, None, 0, None, 1, [ready])
+                v.vkCmdCopyBufferToImage(cmd, captures[0][0], copied, v.VK_IMAGE_LAYOUT_GENERAL, 1, [region(w, h)])
+                barrier(v.VK_PIPELINE_STAGE_TRANSFER_BIT, v.VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        v.VK_ACCESS_TRANSFER_WRITE_BIT, v.VK_ACCESS_TRANSFER_READ_BIT)
+                v.vkCmdCopyImageToBuffer(cmd, copied, v.VK_IMAGE_LAYOUT_GENERAL, copied_readback[0], 1, [region(w, h)])
+            barrier(v.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, v.VK_PIPELINE_STAGE_HOST_BIT,
+                    v.VK_ACCESS_SHADER_WRITE_BIT, v.VK_ACCESS_HOST_READ_BIT)
             barrier(v.VK_PIPELINE_STAGE_TRANSFER_BIT, v.VK_PIPELINE_STAGE_HOST_BIT,
                     v.VK_ACCESS_TRANSFER_WRITE_BIT, v.VK_ACCESS_HOST_READ_BIT)
             v.vkEndCommandBuffer(cmd)
@@ -223,6 +265,17 @@ class Renderer:
                                                round(((pixel >> 10) & 1023) * 255 / 1023),
                                                round(((pixel >> 20) & 1023) * 255 / 1023),
                                                ((pixel >> 30) & 3) * 85))
+            if capture_phases is not None:
+                captured = []
+                for buf in captures:
+                    mapped = v.vkMapMemory(d, buf[1], 0, buf[2], 0)
+                    captured.append(bytes(mapped))
+                    v.vkUnmapMemory(d, buf[1])
+                if copy_capture:
+                    mapped = v.vkMapMemory(d, copied_readback[1], 0, copied_readback[2], 0)
+                    assert bytes(mapped) == captured[0], "8-bit capture image export differs from SHM"
+                    v.vkUnmapMemory(d, copied_readback[1])
+                return result, *captured
             return result
 
 
@@ -336,6 +389,95 @@ def test(renderer, compare_shader_dir):
     print(f"PASS: {renderer.draw_count - start} Vulkan cursor draws; sampling, alpha, crop and fallback checks")
 
 
+def test_hdr_capture(renderer, capture_path):
+    # D65 sRGB <-> BT.2020 matrices, independent of the Zig compiler's matrix
+    # construction (whose round-trip is tested in vulkan_platform.zig).
+    to_2020 = (0.627404, 0.329283, 0.043313,
+               0.069097, 0.919540, 0.011362,
+               0.016391, 0.088013, 0.895595)
+    to_srgb = (1.660491, -0.587641, -0.072850,
+               -0.124550, 1.132900, -0.008349,
+               -0.018151, -0.100579, 1.118730)
+    capture_matrix = tuple(x * 203 / 80 for x in to_srgb)
+    # Neutral ramp, primaries, mixed colors and transparent edges.
+    pixels = bytes(c for x in range(256) for c in (x, x, x, 255))
+    pixels += bytes((0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255,
+                     41, 173, 96, 255, 0, 0, 128, 128, 0, 0, 0, 0))
+    size = (len(pixels) // 4, 1)
+    start = renderer.draw_count
+    for mode in ("buffer", "texture", "texture-buffer"):
+        for ten_bit in (False, True):
+            for transfer in (4, 5):  # PQ and HLG output
+                options = dict(ten_bit=ten_bit, output_transfer=transfer,
+                               color_matrix=to_2020, luminance_scale=80 / 203,
+                               capture_matrix=capture_matrix, background=(0, 0, 0), background_alpha=0)
+                scanout = renderer.render(pixels, size, size, mode, **options)
+                for phases in (0, 1, 2, 3):
+                    actual, before, after = renderer.render(pixels, size, size, mode,
+                        capture_phases=phases, copy_capture=phases == 1, **options)
+                    assert actual == scanout, "capture changed HDR scanout"
+                    for bit, captured in ((1, before), (2, after)):
+                        if phases & bit:
+                            assert all(abs(a - b) <= 1 for a, b in zip(captured, pixels)), (mode, transfer, phases)
+                        else:
+                            assert captured == bytes([37]) * len(pixels), "inactive phase was overwritten"
+                actual, before, after = renderer.render(pixels, size, size, mode,
+                    capture_phases=3, capture_sequence=True, **options)
+                assert actual == scanout
+                assert before == bytes(len(pixels)), "later cursor pass overwrote cursor-free capture"
+                assert all(abs(a - b) <= 1 for a, b in zip(after, pixels))
+                if mode != "buffer":
+                    _, before, after = renderer.render(pixels, size, size, mode,
+                        capture_phases=3, continuation=True, **options)
+                    assert before == after
+                    assert all(abs(a - b) <= 1 for a, b in zip(before, pixels)), "linear continuation capture"
+        # The opaque sRGB fast path must not skip the capture write.
+        _, before, after = renderer.render(pixels, size, size, mode, xrgb=True, capture_phases=3)
+        assert before == after
+        assert all(abs(a - b) <= 1 for a, b in zip(before[:256*4], pixels[:256*4]))
+        # Native PQ content can use the exact encoded passthrough on scanout.
+        # Exporting it must decode for capture without changing that passthrough.
+        levels = (0, 101, 124, 192, 255)
+        pq_pixels = bytes(c for p in levels for c in (p, p, p, 255))
+        pq_size = (len(levels), 1)
+        for ten_bit in (False, True):
+            options = dict(xrgb=True, ten_bit=ten_bit, source_transfer=4, output_transfer=4,
+                           luminance_scale=10000 / 203, capture_matrix=capture_matrix)
+            scanout = renderer.render(pq_pixels, pq_size, pq_size, mode, **options)
+            actual, captured, _ = renderer.render(pq_pixels, pq_size, pq_size, mode,
+                                                 capture_phases=1, **options)
+            assert actual == scanout, "capture changed native HDR passthrough"
+            for i, level in enumerate(levels):
+                p = (level / 255) ** (32 / 2523)
+                linear = (max(p - 3424 / 4096, 0) / (2413 / 128 - 2392 / 128 * p)) ** (16384 / 2610) * 10000 / 80
+                srgb = 12.92 * linear if linear <= 0.0031308 else 1.055 * linear ** (1 / 2.4) - 0.055
+                expected = round(min(1, max(0, srgb)) * 255)
+                assert all(abs(v - expected) <= 1 for v in captured[i * 4:i * 4 + 3]), (level, captured, expected)
+    print(f"PASS: {renderer.draw_count - start} Vulkan capture draws; PQ/HLG brightness, gamut, alpha, phases, continuation, image export, unchanged scanout")
+
+    if capture_path:
+        chart = Image.new("RGB", (256, 160))
+        draw = ImageDraw.Draw(chart)
+        for x in range(256):
+            draw.line((x, 0, x, 79), fill=(x, x, x))
+        for i, rgb in enumerate(((255, 0, 0), (0, 255, 0), (0, 0, 255), (96, 173, 41))):
+            draw.rectangle((i * 64, 80, (i + 1) * 64 - 1, 159), fill=rgb)
+        data = chart.convert("RGBA").tobytes("raw", "BGRA")
+        old, corrected, _ = renderer.render(data, chart.size, chart.size, "texture", ten_bit=True,
+            output_transfer=4, color_matrix=to_2020, luminance_scale=80 / 203,
+            capture_matrix=capture_matrix, capture_phases=1)
+        sheet = Image.new("RGB", (800, 200), "#202020")
+        labels = ("Source (sRGB)", "Before: HDR bytes as sRGB", "After: sRGB capture")
+        for i, (label, image) in enumerate(zip(labels, (chart,
+                Image.frombytes("RGBA", chart.size, old, "raw", "BGRA"),
+                Image.frombytes("RGBA", chart.size, corrected, "raw", "BGRA")))):
+            ImageDraw.Draw(sheet).text((8 + i * 264, 10), label, fill="white")
+            sheet.paste(image, (8 + i * 264, 32))
+        capture_path.parent.mkdir(parents=True, exist_ok=True)
+        sheet.save(capture_path)
+        print("HDR capture comparison:", capture_path)
+
+
 def xcursor(name, requested):
     data = (Path("/usr/share/icons/Adwaita/cursors") / name).read_bytes()
     header, _, count = struct.unpack_from("<3I", data, 4)
@@ -384,11 +526,13 @@ def capture(renderer, path, compare_shader_dir):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--capture", type=Path)
+    parser.add_argument("--capture-hdr", type=Path)
     parser.add_argument("--compare-shader-dir", type=Path)
     args = parser.parse_args()
     renderer = Renderer()
     try:
         test(renderer, args.compare_shader_dir)
+        test_hdr_capture(renderer, args.capture_hdr)
         if args.capture:
             capture(renderer, args.capture, args.compare_shader_dir)
     finally:

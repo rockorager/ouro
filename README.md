@@ -486,6 +486,14 @@ comparison, and `--compare-shader-dir DIR` to compare against saved older
 `vulkan_composite.spv` and `vulkan_texture_composite.spv` files using the same
 source images.
 
+Vulkan screenshots export 8-bit sRGB from the linear composition, before the
+monitor's HDR or ICC encoding. SDR white and colors are preserved on HDR
+outputs; highlights above SDR white and out-of-gamut colors are clipped.
+Capture redraws the full output, including unchanged regions, but does not
+change its display encoding. The same offscreen check covers PQ/HLG capture,
+cursor phases, and 8-bit image export; add `--capture-hdr hdr.png` for a visual
+comparison of the old raw HDR readback and the sRGB capture.
+
 `pacing-work` subdivides candidate application and active-source release using
 the same peer/object/surface/commit identity. Its `stage` boundaries cover:
 

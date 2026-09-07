@@ -1373,9 +1373,9 @@ pub const Output = struct {
             self.pool.discard(handle) catch {};
             return self.retireRender(frame_id, cause);
         };
-        // Capture reads the complete acquired output image after ordinary
-        // per-image repair. Forcing full damage here would redraw unchanged
-        // output even though the planner already restores every stale region.
+        // Keep ordinary per-image repair here. Pixman captures the repaired
+        // image; Vulkan expands capture damage to export a complete sRGB frame
+        // from linear composition, independently of the scanout encoding.
         const plan = self.planner.prepare(handle, color_list, changes) catch |cause| {
             self.pool.discard(handle) catch {};
             return self.retireRender(frame_id, cause);
