@@ -3,11 +3,13 @@
 
 Run: uv run --with vulkan --with pillow python test/vulkan-cursor.py
 Optional: --capture path.png (uses installed Adwaita Xcursor assets).
+Use --compare-shader-dir with saved pre-change SPIR-V for identical-source A/B.
 No DRM device, compositor session, or display server is required.
 """
 
 import argparse
 from contextlib import ExitStack
+import math
 from pathlib import Path
 import struct
 
@@ -17,8 +19,22 @@ from PIL import Image, ImageDraw
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def sampling_filter(source_size, size, crop):
+    sw, sh = source_size
+    w, h = size
+    x, y, cw, ch = crop
+    if cw == w and ch == h and x == int(x) and y == int(y):
+        return "nearest"
+    if cw > 2 * w or ch > 2 * h:
+        return "area"
+    if crop == (0, 0, sw, sh) and cw < w and ch < h:
+        return "bilinear"
+    return "reconstruction"
+
+
 class Renderer:
     def __init__(self):
+        self.draw_count = 0
         self.instance = v.vkCreateInstance(v.VkInstanceCreateInfo(), None)
         self.gpu = v.vkEnumeratePhysicalDevices(self.instance)[0]
         self.family = next(i for i, p in enumerate(v.vkGetPhysicalDeviceQueueFamilyProperties(self.gpu))
@@ -35,8 +51,9 @@ class Renderer:
         v.vkDestroyDevice(self.device, None)
         v.vkDestroyInstance(self.instance, None)
 
-    def render(self, pixels, source_size, size, mode, bilinear=True, xrgb=False,
-               alpha=255, crop=None, transform=0):
+    def render(self, pixels, source_size, size, mode, xrgb=False,
+               alpha=255, crop=None, transform=0, filtering=None, shader_dir=None,
+               alpha_mode=0, background=(80, 100, 120), background_alpha=255, ten_bit=False):
         d = self.device
         sw, sh = source_size
         w, h = size
@@ -81,27 +98,33 @@ class Renderer:
                 return im, view
 
             sx, sy, cw, ch = crop or (0, 0, sw, sh)
-            xx, yy = int(cw * 65536) // w, int(ch * 65536) // h
-            x0, y0 = int(sx * 65536) + xx // 2, int(sy * 65536) + yy // 2
-            if transform == 2:  # 180-degree buffer transform
-                x0 = int((sx + cw) * 65536) - xx // 2
-                y0 = int((sy + ch) * 65536) - yy // 2
-                xx, yy = -xx, -yy
-            flags = (0x20000000 if bilinear else 0) | (0x40000000 if mode == "texture-buffer" else 0)
+            native_destination = size[::-1] if transform % 2 else size
+            dx, dy = int(cw * 65536) // native_destination[0], int(ch * 65536) // native_destination[1]
+            left, top = int(sx * 65536) + dx // 2, int(sy * 65536) + dy // 2
+            right, bottom = int((sx + cw) * 65536) - dx // 2, int((sy + ch) * 65536) - dy // 2
+            xx, xy, x0, yx, yy, y0 = (
+                (dx, 0, left, 0, dy, top), (0, -dx, right, dy, 0, top),
+                (-dx, 0, right, 0, -dy, bottom), (0, dx, left, -dy, 0, bottom),
+                (-dx, 0, right, 0, dy, top), (0, dx, left, dy, 0, top),
+                (dx, 0, left, 0, -dy, bottom), (0, -dx, right, -dy, 0, bottom),
+            )[transform]
+            filtering = filtering or sampling_filter(source_size, native_destination, (sx, sy, cw, ch))
+            flags = {"nearest": 0, "reconstruction": 1, "bilinear": 2, "area": 3}[filtering] << 28
+            flags |= 0x40000000 if mode == "texture-buffer" else 0
             # Include the opaque fast path: it must not bypass filtering.
             if xrgb and alpha == 255:
                 flags |= 0x80000000
             sample = struct.pack("<4I12i4I8i12f", 0, sw, sh, sw * 4,
                 int(sx * 65536), int(sy * 65536), int(cw * 65536), int(ch * 65536),
                 0, 0, w, h, 0, 0, w, h, int(xrgb), flags, alpha, 0,
-                xx, 0, x0, 0, yy, y0, 0, 0,
+                xx, xy, x0, yx, yy, y0, alpha_mode, 0,
                 1, 0, 0, 1, 0, 1, 0, 0, 0, 0, 1, 0)
             storage = v.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
             samples = buffer(sample, storage)
             source = buffer(pixels, storage | v.VK_BUFFER_USAGE_TRANSFER_SRC_BIT)
             lut = buffer(bytes(16), storage)
             readback = buffer(bytes(w * h * 4), v.VK_BUFFER_USAGE_TRANSFER_DST_BIT)
-            target, target_view = image(w, h, v.VK_FORMAT_R8G8B8A8_UNORM,
+            target, target_view = image(w, h, v.VK_FORMAT_A2B10G10R10_UNORM_PACK32 if ten_bit else v.VK_FORMAT_R8G8B8A8_UNORM,
                 v.VK_IMAGE_USAGE_STORAGE_BIT | v.VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
             src_image, src_view = image(sw, sh, v.VK_FORMAT_B8G8R8A8_UNORM,
                 v.VK_IMAGE_USAGE_SAMPLED_BIT | v.VK_IMAGE_USAGE_TRANSFER_DST_BIT)
@@ -144,7 +167,9 @@ class Renderer:
             pl = own(v.vkCreatePipelineLayout, v.vkDestroyPipelineLayout, v.VkPipelineLayoutCreateInfo(
                 pSetLayouts=[layout], pPushConstantRanges=[v.VkPushConstantRange(
                     stageFlags=v.VK_SHADER_STAGE_COMPUTE_BIT, size=64)]))
-            code = (ROOT / "src/render" / ("vulkan_texture_composite.spv" if texture else "vulkan_composite.spv")).read_bytes()
+            shader_name = "vulkan_texture_composite" if texture else "vulkan_composite"
+            code = ((shader_dir or ROOT / "src/render") /
+                    (shader_name + ("_10bit" if ten_bit else "") + ".spv")).read_bytes()
             module = own(v.vkCreateShaderModule, v.vkDestroyShaderModule,
                          v.VkShaderModuleCreateInfo(codeSize=len(code), pCode=code))
             stage = v.VkPipelineShaderStageCreateInfo(stage=v.VK_SHADER_STAGE_COMPUTE_BIT,
@@ -176,7 +201,8 @@ class Renderer:
                     v.VK_ACCESS_TRANSFER_WRITE_BIT, v.VK_ACCESS_SHADER_READ_BIT)
             v.vkCmdBindPipeline(cmd, v.VK_PIPELINE_BIND_POINT_COMPUTE, pipeline)
             v.vkCmdBindDescriptorSets(cmd, v.VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, [ds], 0, None)
-            push = struct.pack("<16I", 255, 80, 100, 120, w, h, 1, 1, 0, 0, w, h, 0, 0, 0, 0)
+            push = struct.pack("<16I", background_alpha, *background, w, h,
+                               int(background_alpha == 255), 1, 0, 0, w, h, 0, 0, 0, 0)
             v.vkCmdPushConstants(cmd, pl, v.VK_SHADER_STAGE_COMPUTE_BIT, 0, 64, v.ffi.from_buffer(push))
             v.vkCmdDispatch(cmd, (w + 7) // 8, (h + 7) // 8, 1)
             barrier(v.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, v.VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -190,14 +216,21 @@ class Renderer:
             mapped = v.vkMapMemory(d, readback[1], 0, readback[2], 0)
             result = bytes(mapped)
             v.vkUnmapMemory(d, readback[1])
+            self.draw_count += 1
+            if ten_bit:
+                result = bytes(channel for (pixel,) in struct.iter_unpack("<I", result)
+                               for channel in (round((pixel & 1023) * 255 / 1023),
+                                               round(((pixel >> 10) & 1023) * 255 / 1023),
+                                               round(((pixel >> 20) & 1023) * 255 / 1023),
+                                               ((pixel >> 30) & 3) * 85))
             return result
 
 
-def test(renderer):
+def test(renderer, compare_shader_dir):
     # BGRA: opaque red next to transparent black. Correct premultiplied
     # filtering keeps saturated red, without dark/colored fringes.
     pixels = bytes([0, 0, 255, 255, 0, 0, 0, 0])
-    count = 0
+    start = renderer.draw_count
     for size in [(2, 1), (3, 2), (5, 3), (1, 1)]:
         for alpha in (255, 128):
             for xrgb in (False, True):
@@ -206,10 +239,9 @@ def test(renderer):
                                                xrgb=xrgb, transform=transform)
                                for mode in ("buffer", "texture", "texture-buffer")]
                     assert results[0] == results[1] == results[2], (size, alpha, xrgb, transform)
-                    count += 3
     for mode in ("buffer", "texture", "texture-buffer"):
         identity = renderer.render(pixels, (2, 1), (2, 1), mode)
-        assert identity == renderer.render(pixels, (2, 1), (2, 1), mode, bilinear=False)
+        assert identity == renderer.render(pixels, (2, 1), (2, 1), mode, filtering="nearest")
         midpoint = renderer.render(pixels, (2, 1), (3, 1), mode)[4:8]
         # Linear OVER: half red plus half background (RGB 80,100,120).
         assert all(abs(a - b) <= 1 for a, b in zip(midpoint, (86, 71, 194, 255))), midpoint
@@ -217,9 +249,8 @@ def test(renderer):
         cropped = renderer.render(pixels, (2, 1), (1, 1), mode, crop=(0.5, 0, 1, 1))
         assert cropped == midpoint
         enlarged = renderer.render(pixels, (2, 1), (5, 1), mode)
-        assert enlarged != renderer.render(pixels, (2, 1), (5, 1), mode, bilinear=False)
+        assert enlarged != renderer.render(pixels, (2, 1), (5, 1), mode, filtering="nearest")
         assert enlarged[:4] == identity[:4] and enlarged[-4:] == identity[-4:]
-        count += 6
     # Client 2x buffers resized to 100%, 125%, 150%, and 200% outputs.
     pattern = bytes(channel for y in range(48) for x in range(48)
                     for channel in ((255, 255, 255, 255) if x <= y else (0, 0, 0, 0)))
@@ -227,8 +258,82 @@ def test(renderer):
         results = [renderer.render(pattern, (48, 48), (size, size), mode)
                    for mode in ("buffer", "texture", "texture-buffer")]
         assert results[0] == results[1] == results[2], size
-        count += 3
-    print(f"PASS: {count} Vulkan cursor draws; sampled image, direct-content and buffer fallback agree")
+
+    for mode in ("buffer", "texture", "texture-buffer"):
+        # Interpolate encoded values BEFORE transfer decoding. Opaque black /
+        # white midpoint must be 128, not the linear-light midpoint of 188.
+        black_white = bytes((0, 0, 0, 255, 255, 255, 255, 255))
+        midpoint = renderer.render(black_white, (2, 1), (3, 1), mode, xrgb=True)[4:8]
+        assert all(abs(v - 128) <= 1 for v in midpoint[:3]), midpoint
+
+        # Independent 1-D cubic reference (polynomial interpolation of four
+        # control values, rather than the shader's distance-based tap weights).
+        values = (0, 0, 255, 255, 0, 0)
+        ramp = bytes(c for p in values for c in (p, p, p, 255))
+        expected = []
+        for x in range(4):
+            position = (x + 0.5) * 6 / 4 - 0.5
+            base = math.floor(position)
+            t = position - base
+            a, b, c, d = (values[min(5, max(0, base + i))] for i in (-1, 0, 1, 2))
+            value = (2*b + (-a+c)*t + (2*a-5*b+4*c-d)*t*t + (-a+3*b-3*c+d)*t*t*t) / 2
+            expected.append(round(min(255, max(0, value))))
+        cubic = renderer.render(ramp, (6, 1), (4, 1), mode, xrgb=True)
+        assert all(abs(cubic[x * 4] - value) <= 1 for x, value in enumerate(expected)), (cubic, expected)
+
+        # 3:1 reduction lands on texel centers: area integration must not be
+        # bypassed as an opaque 1:1 fetch or a zero-fraction bilinear sample.
+        stripes = bytes(c for _ in range(3) for x in range(9)
+                        for c in ((255, 255, 255, 255) if x % 3 == 1 else (0, 0, 0, 255)))
+        for transform in range(8):
+            size = (1, 3) if transform % 2 else (3, 1)
+            area = renderer.render(stripes, (9, 3), size, mode, transform=transform, xrgb=True)
+            assert all(abs(area[x] - 85) <= 1 for x in range(12) if x % 4 != 3), area
+
+        # Integer crop boundaries must exclude brightly colored neighboring
+        # texels even when the cubic/area kernel extends beyond that crop.
+        crop_pixels = bytes((0, 255, 0, 255, 0, 0, 255, 255, 255, 0, 0, 255))
+        for filtering in ("bilinear", "reconstruction", "area"):
+            cropped = renderer.render(crop_pixels, (3, 1), (5, 1), mode,
+                                      crop=(1, 0, 1, 1), filtering=filtering)
+            assert cropped == bytes((0, 0, 255, 255)) * 5, cropped
+
+        # Equivalent electrical-premultiplied, optical-premultiplied and
+        # straight half-red texels. Straight transparent pixels may hold RGB.
+        representations = ((0, 0, 128, 128, 0, 0, 0, 0),
+                           (0, 0, 188, 128, 0, 0, 0, 0),
+                           (0, 0, 255, 128, 255, 255, 0, 0))
+        for alpha in (128, 255):
+            for filtering in ("bilinear", "reconstruction", "area"):
+                results = [renderer.render(bytes(data), (2, 1), (5, 1), mode,
+                                           filtering=filtering, alpha_mode=representation, alpha=alpha,
+                                           background=(0, 0, 0), background_alpha=0)
+                           for representation, data in enumerate(representations)]
+                for result in results[1:]:
+                    assert all(abs(a - b) <= 2 for a, b in zip(results[0], result)), results
+                for result in results:
+                    for x in range(0, len(result), 4):
+                        assert result[x:x+2] == bytes(2), result  # no hidden-color fringe
+                        assert result[x+2] <= result[x+3] + 1, result
+
+        # Opaque -> transparent cubic overshoot must not exceed global alpha,
+        # including optical-alpha sources filtered in linear light.
+        for alpha_mode in range(3):
+            result = renderer.render(pixels, (2, 1), (7, 1), mode, alpha=128,
+                                     alpha_mode=alpha_mode, filtering="reconstruction",
+                                     background=(0, 0, 0), background_alpha=0)
+            assert max(result[3::4]) <= 128, result
+        for filtering in ("nearest", "bilinear", "reconstruction", "area"):
+            normal = renderer.render(ramp, (6, 1), (4, 1), mode, filtering=filtering)
+            ten_bit = renderer.render(ramp, (6, 1), (4, 1), mode, filtering=filtering, ten_bit=True)
+            assert all(abs(a - b) <= 1 for a, b in zip(normal, ten_bit)), (normal, ten_bit)
+        if compare_shader_dir:
+            for size in ((2, 1), (3, 2), (1, 1)):
+                previous = renderer.render(pixels, (2, 1), size, mode, filtering="nearest",
+                                           shader_dir=compare_shader_dir)
+                current = renderer.render(pixels, (2, 1), size, mode, filtering="nearest")
+                assert previous == current, "ordinary nearest sampling changed"
+    print(f"PASS: {renderer.draw_count - start} Vulkan cursor draws; sampling, alpha, crop and fallback checks")
 
 
 def xcursor(name, requested):
@@ -241,24 +346,33 @@ def xcursor(name, requested):
     return data[offset + chunk:offset + chunk + w * h * 4], (w, h), nominal
 
 
-def capture(renderer, path):
-    scales = (1, 1.25, 1.5, 2)
-    sheet = Image.new("RGB", (850, 1380), "#18212b")
+def capture(renderer, path, compare_shader_dir):
+    scales = (0.5, 1, 1.25, 1.5, 2)
+    variants = [("encoded bilinear", "bilinear", None), ("adaptive", None, None)]
+    if compare_shader_dir:
+        variants.insert(0, ("previous linear-light", "bilinear", compare_shader_dir))
+    sheet = Image.new("RGB", (1000, 66 + 4 * len(variants) * 160), "#18212b")
     draw = ImageDraw.Draw(sheet)
-    draw.text((16, 10), "Ouro cursor rendering - actual Vulkan shader readback (3x pixel zoom)", fill="white")
+    draw.text((16, 10), "Identical cursor sources - Vulkan shader readback (3x pixel zoom)", fill="white")
     for col, scale in enumerate(scales):
         draw.text((220 + col * 150, 36), f"{scale * 100:g}%", fill="white")
-    for row, (shape, client, after) in enumerate((s, c, a) for s in ("default", "text")
-                                               for c in (False, True) for a in (False, True)):
-        label = f"{shape} / {'client 2x' if client else 'theme'}\n{'after' if after else 'before'}"
+    for row, (shape, client, variant) in enumerate((s, c, v) for s in ("default", "text")
+                                                 for c in (False, True) for v in variants):
+        title, filtering, shader_dir = variant
+        label = f"{shape} / {'client 2x' if client else 'theme'}\n{title}"
         y = 66 + row * 160
         draw.text((16, y + 12), label, fill="white")
         for col, scale in enumerate(scales):
-            requested = 48 if client else int(24 * scale) if after else 24
+            requested = 48 if client else int(24 * scale)
             pixels, (w, h), nominal = xcursor(shape, requested)
-            logical = (round(w * 24 / nominal), round(h * 24 / nominal)) if after or client else (w, h)
+            logical = (round(w * 24 / nominal), round(h * 24 / nominal))
             size = tuple(round(n * scale) for n in logical)
-            result = renderer.render(pixels, (w, h), size, "texture", bilinear=after)
+            result = renderer.render(pixels, (w, h), size, "texture", filtering=filtering,
+                                     shader_dir=shader_dir)
+            if size == (w, h) and compare_shader_dir and shader_dir is None:
+                previous = renderer.render(pixels, (w, h), size, "texture", filtering="bilinear",
+                                           shader_dir=compare_shader_dir)
+                assert previous == result, "aligned 1:1 cursor changed"
             im = Image.frombytes("RGBA", size, result, "raw", "BGRA").convert("RGB")
             # Zoom is nearest so the sheet exposes, rather than smooths, GPU pixels.
             sheet.paste(im.resize((size[0] * 3, size[1] * 3), Image.Resampling.NEAREST), (210 + col * 150, y))
@@ -270,11 +384,12 @@ def capture(renderer, path):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--capture", type=Path)
+    parser.add_argument("--compare-shader-dir", type=Path)
     args = parser.parse_args()
     renderer = Renderer()
     try:
-        test(renderer)
+        test(renderer, args.compare_shader_dir)
         if args.capture:
-            capture(renderer, args.capture)
+            capture(renderer, args.capture, args.compare_shader_dir)
     finally:
         renderer.close()

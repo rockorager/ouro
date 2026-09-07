@@ -346,12 +346,12 @@ pub const Renderer = struct {
             var transform = sampleTransform(sample);
             if (c.pixman_image_set_transform(source, &transform) == 0)
                 return error.PixmanTransformFailed;
-            if (c.pixman_image_set_filter(source, if (sample.filter == .bilinear)
+            if (c.pixman_image_set_filter(source, if (sample.filter == .cursor)
                 c.PIXMAN_FILTER_BILINEAR
             else
                 c.PIXMAN_FILTER_NEAREST, null, 0) == 0)
                 return error.PixmanFilterFailed;
-            if (sample.filter == .bilinear) c.pixman_image_set_repeat(source, c.PIXMAN_REPEAT_PAD);
+            if (sample.filter == .cursor) c.pixman_image_set_repeat(source, c.PIXMAN_REPEAT_PAD);
 
             const clipped = intersection(sample.destination, sample.clip, plan.output) orelse
                 continue;

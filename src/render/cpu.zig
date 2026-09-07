@@ -371,7 +371,7 @@ test "render: bilinear cursor preserves 1:1 pixels and clamps scaled edges" {
     var target = FakeTarget{ .width = 2, .height = 1, .stride = 8 };
     try renderFull(&renderer, &target, list(2, 1, &.{cursor}));
     const original = target.bytes;
-    cursor.filter = .bilinear;
+    cursor.filter = .cursor;
     try renderFull(&renderer, &target, list(2, 1, &.{cursor}));
     try std.testing.expectEqualSlices(u8, &original, &target.bytes);
     cursor.destination.width = 3;
