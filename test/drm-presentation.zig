@@ -69,7 +69,14 @@ test "configuration installs before physical startup claims an output" {
 }
 
 test "generated ordinary SHM traverses the physical coordinator exactly once and drains" {
-    try runVertical(.session_disable, .shm);
+    try runVertical(.session_disable, .shm, false);
+}
+
+test "pacing trace preserves generated SHM presentation and teardown" {
+    const previous_level = std.testing.log_level;
+    std.testing.log_level = .info;
+    defer std.testing.log_level = previous_level;
+    try runVertical(.session_disable, .shm, true);
 }
 
 test "shutdown: failed disable after final flip is terminal without releasing scanout" {
@@ -239,23 +246,23 @@ fn runShutdownFailure(trigger: enum { shutdown, seat_disable, seat_failure }, ev
 }
 
 test "client disconnect before render deadline abandons pending presentation" {
-    try runVertical(.client_disconnect, .shm);
+    try runVertical(.client_disconnect, .shm, false);
 }
 
 test "generated DMA-BUF traverses GBM import and the physical coordinator" {
-    try runVertical(.client_disconnect, .dmabuf);
+    try runVertical(.client_disconnect, .dmabuf, false);
 }
 
 test "generated single pixel buffer scales through the physical coordinator" {
-    try runVertical(.client_disconnect, .single_pixel);
+    try runVertical(.client_disconnect, .single_pixel, false);
 }
 
 test "generated alpha modifier reaches the physical render sample" {
-    try runVertical(.client_disconnect, .alpha_shm);
+    try runVertical(.client_disconnect, .alpha_shm, false);
 }
 
 test "generated background effect reaches the physical render sample" {
-    try runVertical(.client_disconnect, .blur_shm);
+    try runVertical(.client_disconnect, .blur_shm, false);
 }
 
 test "physical coordinator keeps serving until its final client disconnects" {
@@ -2636,7 +2643,7 @@ test "output readiness exhaustion destroys output and releases device" {
 const TerminalTrigger = enum { session_disable, client_disconnect };
 const ClientSource = enum { shm, alpha_shm, blur_shm, dmabuf, single_pixel };
 
-fn runVertical(trigger: TerminalTrigger, source: ClientSource) !void {
+fn runVertical(trigger: TerminalTrigger, source: ClientSource, trace_pacing: bool) !void {
     const allocator = std.testing.allocator;
     var fixture = try Fixture.init();
     defer fixture.deinit();
@@ -2646,7 +2653,9 @@ fn runVertical(trigger: TerminalTrigger, source: ClientSource) !void {
     defer wayring.unix_socket.unlink(path) catch {};
 
     const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), compositorConfig());
-    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), coordinatorConfig());
+    var config = coordinatorConfig();
+    config.output.trace_pacing = trace_pacing;
+    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), config);
     var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
     try coordinator.start(&loop);
 
@@ -4348,6 +4357,7 @@ pub const Fixture = struct {
     flip_head: usize = 0,
     flip_len: usize = 0,
     flip_batch_limit: ?usize = null,
+    held_crtc: ?u32 = null,
     page_flips: usize = 0,
     device_closes: usize = 0,
     seat_closes: usize = 0,
@@ -4792,18 +4802,34 @@ pub const Fixture = struct {
         const self: *Fixture = @ptrCast(@alignCast(context));
         if (self.flip_len == 0) return;
         var handled: usize = 0;
-        while (self.flip_len != 0) {
+        var remaining = self.flip_len;
+        while (remaining != 0) : (remaining -= 1) {
             const flip = self.pending_flips[self.flip_head];
             const userdata = flip.userdata orelse return error.MissingFlip;
             if (flip.crtc == 0) return error.MissingCrtc;
             self.pending_flips[self.flip_head] = .{};
             self.flip_head = (self.flip_head + 1) % self.pending_flips.len;
             self.flip_len -= 1;
+            if (self.held_crtc == flip.crtc) {
+                self.pending_flips[(self.flip_head + self.flip_len) % self.pending_flips.len] = flip;
+                self.flip_len += 1;
+                continue;
+            }
             self.page_flips += 1;
             callback(userdata, 1, 2, 3000, flip.crtc);
             handled += 1;
             if (self.flip_batch_limit) |limit| if (handled == limit) break;
         }
+        for (0..self.flip_len) |offset| {
+            const flip = self.pending_flips[(self.flip_head + offset) % self.pending_flips.len];
+            if (self.held_crtc == flip.crtc) continue;
+            try signalFd(self.drm_fd);
+            break;
+        }
+    }
+
+    pub fn releaseHeldFlips(self: *Fixture) !void {
+        self.held_crtc = null;
         if (self.flip_len != 0) try signalFd(self.drm_fd);
     }
 };

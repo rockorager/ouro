@@ -4252,6 +4252,181 @@ test "shell-input: synchronized cursor subsurface batch renders root and child" 
     try root.deinit();
 }
 
+test "shell-input: independent commits proceed while another output flip is held" {
+    try runCommitDuringRepaint(false, false);
+}
+
+test "shell-input: repaint pins completed surface contents and synchronized commits" {
+    try runCommitDuringRepaint(false, true);
+    try runCommitDuringRepaint(true, true);
+    // Only the child crosses onto the secondary output. A commit to the
+    // unsampled parent must still wait for that child's held repaint.
+    try runCommitDuringRepaint(true, false);
+}
+
+fn runCommitDuringRepaint(synchronized: bool, hold_primary: bool) !void {
+    const allocator = std.testing.allocator;
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-commit-during-flip-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+    var fixture = try physical_fixture.Fixture.init();
+    defer fixture.deinit();
+    fixture.second_desktop = true;
+    var root_config = physical_fixture.compositorConfig();
+    root_config.runtime.actor.received_fd_budget = 2;
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), root_config);
+    var config = physical_fixture.coordinatorConfig();
+    config.shm.pool_capacity = 2;
+    config.shm.buffer_capacity = 2;
+    config.surface.surface_capacity = 2;
+    config.surface.frame_callback_capacity = 2;
+    config.surface.release_callback_capacity = 2;
+    config.surface.content_update_capacity = 2;
+    config.surface.dependency_capacity = 2;
+    config.surface.attachment_capacity = 2;
+    config.surface.copy_capacity = 2;
+    config.output.max_samples = 3;
+    config.output.max_source_bytes = pixels.len * 2;
+    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), config);
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
+    try coordinator.start(&loop);
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(allocator, .{ .entries = 16, .flags = 0 }, physical_fixture.clientReactorConfig());
+    var client = try ClientConnection.attach(
+        allocator,
+        &reactor,
+        try wayring.unix_socket.connect(path),
+        .{ .received_fd_budget = 2, .transmit_byte_budget = 4096, .transmit_fd_budget = 2 },
+        .{ .max_objects = 32, .max_client_ids = 31 },
+    );
+    const actor = try client.actor();
+    var driver = ClientDriver.init(&client);
+    var handler: MultiHandler = .{
+        .objects = &client.objects,
+        .queue = &actor.transmit,
+        .registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null),
+        .cycle_count = 1,
+        .subsurface_mode = synchronized,
+    };
+    try submitMultiClient(&reactor, &driver, &handler);
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    for (0..512) |_| {
+        _ = try drainMultiClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.frame_done == 2 and handler.buffer_releases == 2 and
+            coordinator.pending_surface_len == 0 and fixture.flip_len == 0) break;
+        try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expectEqual(@as(usize, 2), handler.frame_done);
+    try std.testing.expectEqual(@as(usize, 2), handler.buffer_releases);
+    try std.testing.expectEqual(@as(usize, 2), coordinator.physical_output_count);
+    var ids: [2]ouro.core_surface.Adapter(protocol).SurfaceId = undefined;
+    var sequences: [2]u64 = undefined;
+    for (handler.surfaces, 0..) |surface, index| {
+        ids[index] = try coordinator.adapter.surfaceId(surface.?);
+        const layer = findLayer(coordinator.app_layers, ids[index]).?;
+        try std.testing.expect(layer.presentation == null);
+        sequences[index] = layer.sample.?.sample.commit_sequence;
+    }
+
+    // Repaint already-presented content: per-layer presentation tokens alone
+    // cannot protect it. The other output has a different refresh period and
+    // must remain independent even if this flip never arrives.
+    coordinator.physical_outputs[1].kms_output.?.scheduler.config.refresh_ns = 8 * std.time.ns_per_ms;
+    const output_index: usize = if (hold_primary) 0 else 1;
+    const output = coordinator.physical_outputs[output_index].kms_output.?;
+    fixture.held_crtc = output.kms_output.crtc.id;
+    var now: linux.timespec = undefined;
+    try std.testing.expectEqual(@as(usize, 0), linux.clock_gettime(.MONOTONIC, &now));
+    try output.request(.damage, @as(u64, @intCast(now.sec)) * std.time.ns_per_s + @as(u64, @intCast(now.nsec)));
+    for (0..128) |_| {
+        _ = try loop.turn(coordinator);
+        if (output.in_flight_frame != null) break;
+        try waitForEither(&root.ring, reactor.ring);
+    }
+    const held_frame = output.in_flight_frame orelse return error.MissingRepaint;
+    try std.testing.expectEqual(@as(usize, if (hold_primary) 2 else 1), output.scheduler.sample_count);
+    if (!hold_primary) {
+        const held_surface = output.scheduler.samples[0].surface;
+        try std.testing.expectEqual(ids[1].index, held_surface.index);
+        try std.testing.expectEqual(ids[1].generation, held_surface.generation);
+    }
+    const applied_before = coordinator.stats.applied;
+    const flips_before = fixture.page_flips;
+    const blocked = hold_primary or synchronized;
+    const commit_count: usize = if (blocked) 2 else 1;
+    const expected_completions = 2 + commit_count;
+    var replacement_pixels = pixels;
+    replacement_pixels[0] = 0x7f;
+    handler.source_pixels = &replacement_pixels;
+    // Child first, parent last also exercises atomic synchronized admission.
+    if (blocked) try handler.mapSurface(1);
+    try handler.mapSurface(0);
+    try submitMultiClient(&reactor, &driver, &handler);
+    for (0..64) |_| {
+        _ = try drainMultiClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (!blocked and handler.frame_done == expected_completions and
+            handler.buffer_releases == expected_completions) break;
+        const delay: linux.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
+        _ = linux.nanosleep(&delay, null);
+    }
+    try std.testing.expectEqual(held_frame, output.in_flight_frame.?);
+    if (blocked) {
+        try std.testing.expectEqual(applied_before, coordinator.stats.applied);
+        try std.testing.expectEqual(@as(usize, 2), handler.frame_done);
+        try std.testing.expectEqual(@as(usize, 2), handler.buffer_releases);
+        for (ids, sequences) |id, sequence| {
+            const layer = findLayer(coordinator.app_layers, id).?;
+            try std.testing.expect(layer.presentation == null);
+            try std.testing.expectEqual(sequence, layer.sample.?.sample.commit_sequence);
+            const source = try coordinator.render_device.?.content.resolve(layer.rendered.?);
+            try std.testing.expectEqualSlices(u8, pixels[0..12], source.bytes[0..12]);
+        }
+    } else {
+        try std.testing.expectEqual(applied_before + commit_count, coordinator.stats.applied);
+        try std.testing.expectEqual(expected_completions, handler.frame_done);
+        try std.testing.expectEqual(expected_completions, handler.buffer_releases);
+        try std.testing.expect(fixture.page_flips > flips_before);
+    }
+    try fixture.releaseHeldFlips();
+    for (0..256) |_| {
+        _ = try drainMultiClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.frame_done == expected_completions and
+            handler.buffer_releases == expected_completions and fixture.flip_len == 0) break;
+        try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expectEqual(expected_completions, handler.frame_done);
+    try std.testing.expectEqual(expected_completions, handler.buffer_releases);
+    try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+    for (ids[0..commit_count], sequences[0..commit_count]) |id, sequence| {
+        const layer = findLayer(coordinator.app_layers, id).?;
+        try std.testing.expect(layer.sample.?.sample.commit_sequence > sequence);
+        const source = try coordinator.render_device.?.content.resolve(layer.rendered.?);
+        try std.testing.expectEqualSlices(u8, replacement_pixels[0..12], source.bytes[0..12]);
+    }
+    try coordinator.requestStop();
+    _ = try client.prepareClose();
+    try submitMultiClient(&reactor, &driver, &handler);
+    var drained = false;
+    for (0..256) |_| {
+        const cp = try drainMultiClient(&reactor, &driver, &handler);
+        const progress = try loop.turn(coordinator);
+        drained = progress.wayring.shutdown_complete and cp.quiescent and coordinator.backendDrainComplete();
+        if (drained) break;
+        try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expect(drained);
+    try client.deinit(allocator);
+    reactor.deinit(allocator);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
 test "shell-input: synchronized subsurface publishes with parent and receives pointer focus" {
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;
@@ -5439,6 +5614,7 @@ const MultiHandler = struct {
     event_failures: usize = 0,
     surface_count: usize = 2,
     cycle_count: usize = two_toplevel_cycle_count,
+    source_pixels: []const u8 = &pixels,
     subsurface_mode: bool = false,
     cursor_mode: bool = false,
     activation_mode: bool = false,
@@ -5666,7 +5842,7 @@ const MultiHandler = struct {
     }
 
     fn mapSurface(self: *MultiHandler, index: usize) !void {
-        const descriptor = try ordinaryMemfd(4096, 16, &pixels);
+        const descriptor = try ordinaryMemfd(4096, 16, self.source_pixels);
         const pool = try protocol.wl_shm.construct_create_pool(
             self.objects,
             self.queue,

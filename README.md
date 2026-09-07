@@ -380,6 +380,34 @@ test-shell-input`; lower-level physical presentation, libinput ownership, seat,
 and interaction steps remain available as `test-drm-presentation`,
 `test-input-backend`, `test-seat`, and `test-interaction`.
 
+### Startup and frame-pacing diagnostics
+
+Add `--trace-pacing` to the existing compositor invocation and capture stderr
+to a file. This opt-in trace adds measurement overhead; use a release build and
+compare several launches. Capture the client separately with
+`WAYLAND_DEBUG=client monstar 2>monstar-startup.log`.
+
+`pacing-surface` records commit dispatch (before validation), publication, and
+application with monotonic nanoseconds, peer identity, wire object ID,
+generation-safe surface identity, and commit sequence. A dispatch record alone
+does not imply that validation succeeded. `pacing-sample` connects a submitted
+output/frame to each sampled surface/commit; join it to the existing `pacing`
+record for render deadline, render start/readiness, target/actual presentation,
+and page-flip dispatch timing. `pacing-defer` identifies the surface and
+in-flight output/frame holding up a pending commit. Independent surfaces may
+apply while another frame is in flight; a surface sampled by that frame cannot
+replace its content until the flip completes, even on a repaint after its
+original presentation token has completed. Synchronized groups wait if any
+member is still sampled. Callback backpressure, callback queueing, and buffer
+release queueing have separate records.
+
+Queueing is not socket transmission or client receipt. These server timestamps
+are monotonic, unlike the client's wall-clock log prefix; correlate identities
+and callback payloads rather than subtracting the two clock domains. The
+`test-drm-presentation` suite exercises the trace with real client transport and
+simulated DRM; its synthetic presentation timestamps are not hardware latency
+measurements.
+
 ## Compositor benchmarks
 
 The opt-in hardware benchmark suite runs identical presentation-aware SHM

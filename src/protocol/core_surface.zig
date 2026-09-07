@@ -1415,7 +1415,10 @@ pub fn Adapter(comptime protocol: type) type {
             );
         }
 
-        pub fn nextCommitDeadline(adapter: *Self, now_ns: u64) !?surface_state.CommitTimestamp {
+        pub fn nextCommitDeadline(adapter: *Self, now_ns: u64) !?struct {
+            timestamp: surface_state.CommitTimestamp,
+            coalescible: bool,
+        } {
             var result: ?surface_state.CommitTimestamp = null;
             const context = DeadlineSearch{ .adapter = adapter, .now_ns = now_ns, .result = &result };
             var mutable = context;
@@ -1428,7 +1431,10 @@ pub fn Adapter(comptime protocol: type) type {
                 );
             }
             if (mutable.failure) |err| return err;
-            return result;
+            return .{
+                .timestamp = result orelse return null,
+                .coalescible = !mutable.fence_retry,
+            };
         }
 
         pub fn prepareAcquireWaits(adapter: *Self, stopping: bool) !void {
@@ -2963,6 +2969,7 @@ pub fn Adapter(comptime protocol: type) type {
             now_ns: u64,
             result: *?surface_state.CommitTimestamp,
             failure: ?anyerror = null,
+            fence_retry: bool = false,
         };
 
         fn commitReady(context: ?*const anyopaque, content: *const Content) bool {
@@ -2983,6 +2990,7 @@ pub fn Adapter(comptime protocol: type) type {
                     return;
                 };
                 if (!ready and (sync.acquire_wait == null or !sync.acquire_wait.?.registered)) {
+                    search.fence_retry = true;
                     const retry_ns = std.math.add(u64, search.now_ns, std.time.ns_per_ms) catch
                         std.math.maxInt(u64);
                     const retry = surface_state.CommitTimestamp{
@@ -4818,9 +4826,11 @@ test "commit timing preserves exact ordered commits after timer destruction" {
     _ = try context.dispatchCore();
 
     try std.testing.expectEqual(@as(usize, 2), context.adapter.pendingContentUpdates());
+    const deadline = (try context.adapter.nextCommitDeadline(std.time.ns_per_s)).?;
+    try std.testing.expect(deadline.coalescible);
     try std.testing.expectEqual(
         surface_state.CommitTimestamp{ .sec = 2, .nsec = 7 },
-        (try context.adapter.nextCommitDeadline(std.time.ns_per_s)).?,
+        deadline.timestamp,
     );
     var output: [1]TestAdapter.Applied = undefined;
     try std.testing.expectEqual(
@@ -6110,13 +6120,15 @@ test "acquire fence unsubmitted fallback becomes a real sync_file wait and disco
         .release = try timeline.point(11),
     };
     const now = 2 * std.time.ns_per_s;
-    try std.testing.expectEqual(surface_state.CommitTimestamp{ .sec = 2, .nsec = std.time.ns_per_ms }, (try context.adapter.nextCommitDeadline(now)).?);
+    const deadline = (try context.adapter.nextCommitDeadline(now)).?;
+    try std.testing.expect(!deadline.coalescible);
+    try std.testing.expectEqual(surface_state.CommitTimestamp{ .sec = 2, .nsec = std.time.ns_per_ms }, deadline.timestamp);
     try std.testing.expect(content.surface.explicit_sync.?.acquire_wait == null);
     try std.testing.expectEqual(@as(usize, 0), context.router.active_count);
     try std.testing.expectEqual(@as(usize, 0), try context.adapter.readyUpdateCountAtId(id, now));
     try content.surface.explicit_sync.?.acquire.signal();
     const blocker = try context.router.acquire(.copy);
-    try std.testing.expectEqual(surface_state.CommitTimestamp{ .sec = 2, .nsec = std.time.ns_per_ms }, (try context.adapter.nextCommitDeadline(now)).?);
+    try std.testing.expectEqual(surface_state.CommitTimestamp{ .sec = 2, .nsec = std.time.ns_per_ms }, (try context.adapter.nextCommitDeadline(now)).?.timestamp);
     const wait = content.surface.explicit_sync.?.acquire_wait.?;
     try std.testing.expect(!wait.signaled);
     try std.testing.expect(!wait.registered);
