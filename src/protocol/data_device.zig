@@ -477,6 +477,14 @@ pub fn Adapter(comptime protocol: type) type {
 
         fn offerRequest(self: *Self, actor: *wayring.connection.Actor, server_objects: anytype, offer: *OfferSlot, message: wayring.wire.Message, fds: *wayring.ancillary.FdQueue) !wayring.dispatch.Control {
             const decoded = try wayring.server.decodeRequest(Offer, server_objects, message, fds);
+            // Requests already in flight may cross a leave or cancellation.
+            // Keep the offer resource inert until the client destroys it, but
+            // retain successful drops for receive/finish and ask negotiation.
+            if (offer.kind == .drag and !offer.current and !offer.dropped) {
+                if (decoded.value == .receive) _ = linux.close(decoded.value.receive.fd);
+                try decoded.finish(protocol, server_objects, &actor.transmit);
+                return .continue_dispatch;
+            }
             if (offer.finished and std.meta.activeTag(decoded.value) != .destroy)
                 return try self.protocolError(actor, decoded.handle.id, Offer.@"error".invalid_offer.value, "finished drag offer only accepts destroy");
             switch (decoded.value) {
@@ -1680,6 +1688,91 @@ test "data device: accepted drag drops once and retains finish publication" {
     try std.testing.expectEqual(@as(usize, 3), adapter.pendingOutbound());
     try std.testing.expectEqual(TestAdapter.Outbound.source_finished, std.meta.activeTag(adapter.outbound[2].value));
     try std.testing.expectError(error.InvalidFinish, adapter.finishOffer(offer));
+}
+
+test "data device: requests racing drag leave or cancellation are inert" {
+    const End = enum { leave, cancel, source_destroyed };
+    for (std.enums.values(End)) |ending| {
+        var adapter = try testAdapter(.{});
+        defer adapter.deinit();
+        var server_objects = try objects.ServerObjects.init(
+            std.testing.allocator,
+            16,
+            8,
+            &test_protocol.wl_display.info,
+            null,
+        );
+        defer server_objects.deinit(std.testing.allocator);
+        var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 512, 8);
+        defer blocks.deinit(std.testing.allocator);
+        var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 2);
+        defer descriptors.deinit(std.testing.allocator);
+        var output = wayring.tx.Queue.init(&blocks, 1024, &descriptors, 0);
+        defer output.deinit();
+        var fragment_storage: [64]u8 = undefined;
+        var actor = wayring.connection.Actor.init(0, 1, &fragment_storage, &descriptors, 0, &blocks, 512, 0);
+        defer actor.deinit();
+        const peer: wayring.io_uring.Peer = .{ .slot = 0, .generation = 1 };
+        const source = try adapter.acquireSource();
+        source.peer = peer;
+        source.header.resource = try server_objects.insertClient(4, &test_protocol.wl_data_source.info, 3, source);
+        source.drag_actions = test_protocol.wl_data_device_manager.dnd_action.copy.value;
+        try adapter.addMime(source, "text/plain");
+        const device = try acquire(TestAdapter.DeviceSlot, adapter.allocator, &adapter.devices, &adapter.device_free);
+        device.peer = peer;
+        device.header.resource = try server_objects.insertClient(5, &test_protocol.wl_data_device.info, 3, device);
+        _ = try server_objects.insertClient(7, &test_protocol.wl_surface.info, 1, null);
+        adapter.drag = .{ .peer = peer, .source = adapter.sourceId(source), .origin_object = 7 };
+        try adapter.updateDragTarget(.{ .peer = peer, .surface_object = 7, .x = 0, .y = 0 }, 1, 0, false);
+        try std.testing.expectEqual(@as(usize, 1), try adapter.flushOn(peer, &server_objects, &output));
+        const offer = adapter.offers.items[0];
+        try std.testing.expect(offer.current);
+        switch (ending) {
+            .leave => try adapter.updateDragTarget(null, 2, 0, false),
+            .cancel => try adapter.cancelDrag(),
+            .source_destroyed => try std.testing.expect(adapter.resourceRemoved(source.header.resource, .{
+                .interface = &test_protocol.wl_data_source.info,
+                .version = 3,
+                .context = source,
+            })),
+        }
+        try std.testing.expect(!offer.current);
+        const pending = adapter.pendingOutbound();
+        const raw_fd = linux.eventfd(0, linux.EFD.CLOEXEC);
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(raw_fd));
+        const fd: linux.fd_t = @intCast(raw_fd);
+        var owns_fd = true;
+        defer if (owns_fd) {
+            _ = linux.close(fd);
+        };
+        const action = test_protocol.wl_data_device_manager.dnd_action.copy;
+        const requests = [_]test_protocol.wl_data_offer.Request{
+            .{ .set_actions = .{ .dnd_actions = action, .preferred_action = action } },
+            .{ .accept = .{ .serial = 1, .mime_type = "text/plain" } },
+            .{ .receive = .{ .mime_type = "text/plain", .fd = fd } },
+            .{ .finish = .{} },
+            .{ .destroy = .{} },
+        };
+        for (requests) |request| {
+            var input = wayring.tx.Queue.init(&blocks, 512, &descriptors, 1);
+            defer input.deinit();
+            try test_protocol.wl_data_offer.encodeRequest(&input, offer.header.resource.id, request);
+            if (request == .receive) owns_fd = false;
+            var descriptor_scratch: [1]linux.fd_t = undefined;
+            var control: [64]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+            const snapshot = try input.snapshot(&descriptor_scratch, &control);
+            const message = (try wayring.wire.Message.decode(snapshot.first)).?;
+            try std.testing.expectEqual(
+                wayring.dispatch.Control.continue_dispatch,
+                try adapter.offerRequest(&actor, &server_objects, offer, message, &input.descriptors),
+            );
+            try std.testing.expectEqual(pending, adapter.pendingOutbound());
+            try std.testing.expect(!offer.finished);
+            if (request == .receive)
+                try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(fd, linux.F.GETFD, 0)));
+        }
+        try std.testing.expect(server_objects.namespace.resolve(offer.header.resource) == null);
+    }
 }
 
 test "data device: source destruction retains drag cancellation through backpressure" {
