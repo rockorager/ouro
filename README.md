@@ -403,6 +403,17 @@ original presentation token has completed. Synchronized groups wait if any
 member is still sampled. Callback backpressure, callback queueing, and buffer
 release queueing have separate records.
 
+`pacing-cursor` records the submitted cursor samples, including client versus
+theme ownership, theme shape and nominal asset size, output scale in 120ths,
+source pixel dimensions, source crop in 16.16 units, physical destination,
+requested filter, pixel format, alpha mode, renderer, and backing type. It
+contains no pixel contents. To diagnose cursor quality, move the same cursor
+onto each output and switch between arrow and text shapes, then extract these
+records with `grep 'pacing-cursor' ouro.log`. Pair the trace with original-size
+cursor-inclusive screenshots (for example, `grim -c -o DP-1 cursor.png`);
+resizing a screenshot can introduce its own sampling artifacts. A submitted
+sample describes renderer input, not proof of the pixels shown by the monitor.
+
 `pacing-work` subdivides candidate application and active-source release using
 the same peer/object/surface/commit identity. Its `stage` boundaries cover:
 

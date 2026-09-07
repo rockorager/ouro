@@ -10095,11 +10095,41 @@ pub fn Coordinator(comptime protocol: type) type {
                         try output.renderReady(frame, try monotonicNs());
                     if (self.output_config.trace_pacing) {
                         const now = monotonicNs() catch null;
-                        for (self.frame_bindings[0..sample_count]) |binding| {
+                        for (self.frame_bindings[0..sample_count], 0..) |binding, index| {
                             std.log.info("pacing-sample ns={?d} output={d} frame={d} surface={d}:{d} commit={d}", .{
                                 now,                   frame.output.index,         frame.sequence,
                                 binding.surface.index, binding.surface.generation, binding.sample.commit_sequence,
                             });
+                            if (index >= cursor_start) {
+                                const sample = self.frame_samples[index];
+                                std.log.info("pacing-cursor ns={?d} output={d} frame={d} surface={d}:{d} commit={d} kind={s} shape={s} nominal={d} scale_120={d} source={d}x{d} crop_16_16={d},{d},{d},{d} destination={d},{d},{d},{d} filter={t} format={t} alpha_mode={t} renderer={?t} backing={s}", .{
+                                    now,
+                                    frame.output.index,
+                                    frame.sequence,
+                                    binding.surface.index,
+                                    binding.surface.generation,
+                                    binding.sample.commit_sequence,
+                                    if (self.themed_cursor_shape != null) "theme" else "client",
+                                    if (self.themed_cursor_shape) |shape| shape.name() else "client",
+                                    if (self.themed_cursor_shape != null) themed.image.?.nominal_size else @as(u32, 0),
+                                    head_state.scale_120,
+                                    sample.source.size.width,
+                                    sample.source.size.height,
+                                    sample.crop.x,
+                                    sample.crop.y,
+                                    sample.crop.width,
+                                    sample.crop.height,
+                                    sample.destination.x,
+                                    sample.destination.y,
+                                    sample.destination.width,
+                                    sample.destination.height,
+                                    sample.filter,
+                                    sample.source.format,
+                                    sample.color_representation.alpha_mode,
+                                    output.rendererKind(),
+                                    if (sample.source.native != null) "native" else if (sample.source.upload != null) "upload" else if (sample.source.external != null) "external" else "cpu",
+                                });
+                            }
                         }
                     }
                     self.stats.submitted += 1;
