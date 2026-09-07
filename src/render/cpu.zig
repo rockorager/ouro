@@ -358,7 +358,7 @@ test "render: clear is exact and target stride padding is untouched" {
     );
 }
 
-test "render: bilinear cursor preserves 1:1 pixels and clamps scaled edges" {
+test "render: default bilinear preserves 1:1 pixels and clamps scaled edges" {
     var renderer = try Renderer.init(std.testing.allocator, .{
         .max_samples = 1,
         .max_source_width = 2,
@@ -371,9 +371,10 @@ test "render: bilinear cursor preserves 1:1 pixels and clamps scaled edges" {
     var target = FakeTarget{ .width = 2, .height = 1, .stride = 8 };
     try renderFull(&renderer, &target, list(2, 1, &.{cursor}));
     const original = target.bytes;
-    cursor.filter = .cursor;
+    cursor.filter = .nearest;
     try renderFull(&renderer, &target, list(2, 1, &.{cursor}));
     try std.testing.expectEqualSlices(u8, &original, &target.bytes);
+    cursor.filter = .adaptive;
     cursor.destination.width = 3;
     cursor.clip.width = 3;
     target.width = 3;
@@ -382,6 +383,36 @@ test "render: bilinear cursor preserves 1:1 pixels and clamps scaled edges" {
     try std.testing.expectEqualSlices(u8, original[0..4], target.bytes[0..4]);
     try std.testing.expectEqualSlices(u8, original[4..8], target.bytes[8..12]);
     try std.testing.expect(target.bytes[6] > 0 and target.bytes[6] < 255);
+}
+
+test "render: fractional reduction blends texels and output clipping preserves mapping" {
+    var renderer = try Renderer.init(std.testing.allocator, .{
+        .max_samples = 1,
+        .max_source_width = 4,
+        .max_source_height = 1,
+    });
+    defer renderer.deinit();
+    const pixels = [_]u8{ 0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255, 255, 255, 255, 255 };
+    var value = sample(&pixels, 4, 1, 16, .{ .x = 0, .y = 0, .width = 3, .height = 1 });
+    var target = FakeTarget{ .width = 3, .height = 1, .stride = 12 };
+    for (std.meta.tags(render_types.Transform)) |transform| {
+        // Square destination permits every rotation with the same target.
+        value.destination = .{ .x = 0, .y = 0, .width = 3, .height = 3 };
+        value.clip = value.destination;
+        value.transform = transform;
+        target.height = 3;
+        try renderFull(&renderer, &target, list(3, 3, &.{value}));
+        const full = target.bytes;
+        try std.testing.expect(full[16] > 100 and full[16] < 150);
+        value.destination.x = -1;
+        value.clip.x = -1;
+        target.width = 2;
+        target.stride = 8;
+        try renderFull(&renderer, &target, list(2, 3, &.{value}));
+        for (0..3) |row| try std.testing.expectEqualSlices(u8, full[row * 12 + 4 ..][0..8], target.bytes[row * 8 ..][0..8]);
+        target.width = 3;
+        target.stride = 12;
+    }
 }
 
 test "render: allocation is bounded by sample metadata instead of maximum source pixels" {
@@ -502,9 +533,17 @@ test "render: crop nearest scale and source stride padding are exact" {
     putPixel(&source_bytes, 12, 0xffffffff);
     var value = sample(&source_bytes, 4, 1, 20, .{ .x = 0, .y = 0, .width = 4, .height = 1 });
     value.crop = render_types.SourceRect.pixels(1, 0, 2, 1);
+    value.filter = .nearest;
     var target = FakeTarget{ .width = 4, .height = 1, .stride = 16 };
     try renderFull(&renderer, &target, list(4, 1, &.{value}));
     try expectPixels(&target, &.{ 0xff00ff00, 0xff00ff00, 0xff0000ff, 0xff0000ff });
+    value.filter = .adaptive;
+    try renderFull(&renderer, &target, list(4, 1, &.{value}));
+    // PAD clamps to the green/blue crop, not the surrounding red/white.
+    try std.testing.expectEqual(@as(u32, 0xff00ff00), std.mem.readInt(u32, target.bytes[0..4], .little));
+    try std.testing.expectEqual(@as(u32, 0xff0000ff), std.mem.readInt(u32, target.bytes[12..16], .little));
+    try std.testing.expect(target.bytes[4] > 0 and target.bytes[5] > 0);
+    try std.testing.expectEqual(@as(u8, 0), target.bytes[6]);
 }
 
 test "render: all wl_output transforms are exact" {

@@ -1,12 +1,12 @@
-// Cursor-only resampling, shared by image and storage-buffer compositors.
+// Adaptive surface resampling, shared by image and storage-buffer compositors.
 // Filter bits: 1 = Catmull-Rom, 2 = bilinear, 3 = bounded area.
-// Ordinary surfaces bypass this code. Coordinates address source pixel centers.
+// Aligned 1:1 surfaces bypass this code. Coordinates address pixel centers.
 
 vec4 cursor_texel(Sample item, uint index, ivec2 coordinate) {
     vec4 value = raw_pixel(item, index, coordinate);
     if (item.attributes.x == 1u) value.a = 1.0;
     // Optical premultiplication must be decoded before interpolation. Other
-    // cursors reconstruct encoded premultiplied values, as authored by clients
+    // surfaces reconstruct encoded premultiplied values, as authored by clients
     // and Xcursor themes, then decode once for linear-light compositing.
     if (item.affine_tail.z == 1) return decode_pixel(item, value);
     if (item.affine_tail.z == 2) value.rgb *= value.a;

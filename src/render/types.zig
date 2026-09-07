@@ -147,6 +147,19 @@ pub const UploadDamage = struct {
     }
 };
 
+pub const Filter = enum { nearest, adaptive };
+
+/// An aligned 1:1 mapping needs no reconstruction, even when rotated.
+pub fn pixelAligned(crop: SourceRect, destination: Size, transform: Transform) bool {
+    const swap = switch (transform) {
+        .@"90", .@"270", .flipped_90, .flipped_270 => true,
+        else => false,
+    };
+    return crop.width == @as(i64, if (swap) destination.height else destination.width) * fixed_one and
+        crop.height == @as(i64, if (swap) destination.width else destination.height) * fixed_one and
+        @mod(crop.x, fixed_one) == 0 and @mod(crop.y, fixed_one) == 0;
+}
+
 pub const SurfaceSample = struct {
     sample: SampleIdentity,
     presentation: PresentationIdentity,
@@ -156,9 +169,9 @@ pub const SurfaceSample = struct {
     destination: Rect,
     clip: Rect,
     transform: Transform = .normal,
-    /// Cursor quality policy: Vulkan selects a filter from the source mapping;
-    /// Pixman uses bilinear. Ordinary surfaces retain nearest sampling.
-    filter: enum { nearest, cursor } = .nearest,
+    /// Vulkan selects reconstruction from the source mapping; Pixman uses
+    /// bilinear. Both preserve aligned 1:1 pixels without filtering.
+    filter: Filter = .adaptive,
     global_alpha: u8 = 255,
     /// Surface-local effect geometry. A zero effect size disables all effects.
     effect_size: Size = .{ .width = 0, .height = 0 },

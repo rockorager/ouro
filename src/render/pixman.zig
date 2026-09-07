@@ -4,7 +4,7 @@
 //! them directly instead of copying every sample into a maximum-sized cache.
 //! Only bounded alpha-mask wrappers live for the renderer lifetime. Source and
 //! destination wrappers are released before their borrowed storage can change.
-//! Sampling defaults to nearest, with bilinear cursor resampling. Output writes
+//! Sampling preserves aligned pixels and otherwise uses bilinear. Output writes
 //! are clipped to R13 damage.
 
 const std = @import("std");
@@ -304,7 +304,11 @@ pub const Renderer = struct {
             // Pixman's large SRC fast path batches scanlines more efficiently
             // than one libc memcpy per row. Keep direct copies for bounded
             // damage, where they avoid walking untouched pixels.
-            if (prefer_direct_copy and canCopyDirect(sample, list.output_format)) {
+            if (prefer_direct_copy and
+                planned.destination.x == sample.destination.x and planned.destination.y == sample.destination.y and
+                planned.destination.width == sample.destination.width and planned.destination.height == sample.destination.height and
+                canCopyDirect(sample, list.output_format))
+            {
                 copyDirect(
                     destination_bytes,
                     destination_stride,
@@ -335,23 +339,42 @@ pub const Renderer = struct {
 
             const cache = &self.caches[index];
             cache.mask_value = sample.global_alpha;
+            const filtered = sample.filter == .adaptive and !render.pixelAligned(sample.crop, .{
+                .width = planned.destination.width,
+                .height = planned.destination.height,
+            }, sample.transform);
+            // Wrap only the viewport's texels so PAD cannot bleed unrelated
+            // buffer contents into the filtered crop's edges.
+            const left: u32 = if (filtered) @intCast(@divFloor(sample.crop.x, render.fixed_one)) else 0;
+            const top: u32 = if (filtered) @intCast(@divFloor(sample.crop.y, render.fixed_one)) else 0;
+            const right: u32 = if (filtered)
+                @intCast(std.math.divCeil(i64, @as(i64, sample.crop.x) + sample.crop.width, render.fixed_one) catch unreachable)
+            else
+                sample.source.size.width;
+            const bottom: u32 = if (filtered)
+                @intCast(std.math.divCeil(i64, @as(i64, sample.crop.y) + sample.crop.height, render.fixed_one) catch unreachable)
+            else
+                sample.source.size.height;
+            const source_offset = @as(usize, top) * source_stride + @as(usize, left) * 4;
             const source = c.pixman_image_create_bits(
                 pixmanFormat(sample.source.format),
-                @intCast(sample.source.size.width),
-                @intCast(sample.source.size.height),
-                @ptrCast(@alignCast(@constCast(source_bytes.ptr))),
+                @intCast(right - left),
+                @intCast(bottom - top),
+                @ptrCast(@alignCast(@constCast(source_bytes[source_offset..].ptr))),
                 @intCast(source_stride),
             ) orelse return error.PixmanImageFailed;
             defer _ = c.pixman_image_unref(source);
-            var transform = sampleTransform(sample);
+            var transform = sampleTransform(sample, planned.destination);
+            transform.matrix[0][2] -= @intCast(left * render.fixed_one);
+            transform.matrix[1][2] -= @intCast(top * render.fixed_one);
             if (c.pixman_image_set_transform(source, &transform) == 0)
                 return error.PixmanTransformFailed;
-            if (c.pixman_image_set_filter(source, if (sample.filter == .cursor)
+            if (c.pixman_image_set_filter(source, if (filtered)
                 c.PIXMAN_FILTER_BILINEAR
             else
                 c.PIXMAN_FILTER_NEAREST, null, 0) == 0)
                 return error.PixmanFilterFailed;
-            if (sample.filter == .cursor) c.pixman_image_set_repeat(source, c.PIXMAN_REPEAT_PAD);
+            if (filtered) c.pixman_image_set_repeat(source, c.PIXMAN_REPEAT_PAD);
 
             const clipped = intersection(sample.destination, sample.clip, plan.output) orelse
                 continue;
@@ -781,19 +804,19 @@ fn premultiply(channel: u8, alpha: u8) u8 {
     return @intCast((@as(u16, channel) * alpha + 127) / 255);
 }
 
-fn sampleTransform(sample: render.SurfaceSample) c.pixman_transform_t {
+fn sampleTransform(sample: render.SurfaceSample, original: render.PlanRect) c.pixman_transform_t {
     const swaps_axes = switch (sample.transform) {
         .@"90", .@"270", .flipped_90, .flipped_270 => true,
         else => false,
     };
     const source_x_denominator = if (swaps_axes)
-        sample.destination.height
+        original.height
     else
-        sample.destination.width;
+        original.width;
     const source_y_denominator = if (swaps_axes)
-        sample.destination.width
+        original.width
     else
-        sample.destination.height;
+        original.height;
     const sx = @divTrunc(@as(i64, sample.crop.width), source_x_denominator);
     const sy = @divTrunc(@as(i64, sample.crop.height), source_y_denominator);
     const x = sample.crop.x;
@@ -812,6 +835,11 @@ fn sampleTransform(sample: render.SurfaceSample) c.pixman_transform_t {
         .flipped_180 => setAffine(&result, sx, 0, x, 0, -sy, bottom),
         .flipped_270 => setAffine(&result, 0, -sx, right, -sy, 0, bottom),
     }
+    // Clipping changes the draw origin, not the source-to-output density.
+    const dx = @as(i64, sample.destination.x) - original.x;
+    const dy = @as(i64, sample.destination.y) - original.y;
+    result.matrix[0][2] = @intCast(result.matrix[0][2] + result.matrix[0][0] * dx + result.matrix[0][1] * dy);
+    result.matrix[1][2] = @intCast(result.matrix[1][2] + result.matrix[1][0] * dx + result.matrix[1][1] * dy);
     return result;
 }
 

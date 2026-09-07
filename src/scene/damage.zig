@@ -42,6 +42,7 @@ pub const SurfaceState = struct {
     clip: render.Rect,
     transform: render.Transform,
     surface_size: render.Size,
+    filter: render.Filter = .adaptive,
 
     pub fn fromSample(value: render.SurfaceSample, surface_size: render.Size) SurfaceState {
         return .{
@@ -52,6 +53,7 @@ pub const SurfaceState = struct {
             .clip = value.clip,
             .transform = value.transform,
             .surface_size = surface_size,
+            .filter = value.filter,
         };
     }
 };
@@ -512,6 +514,7 @@ fn matchesSample(state: SurfaceState, sample: render.SurfaceSample) bool {
     return std.meta.eql(state.crop, sample.crop) and
         std.meta.eql(state.destination, sample.destination) and
         std.meta.eql(state.clip, sample.clip) and state.transform == sample.transform and
+        state.filter == sample.filter and
         state.surface_size.width != 0 and state.surface_size.height != 0;
 }
 
@@ -519,6 +522,7 @@ fn sameVisual(a: SurfaceState, b: SurfaceState) bool {
     return std.meta.eql(a.crop, b.crop) and
         std.meta.eql(a.destination, b.destination) and
         std.meta.eql(a.clip, b.clip) and a.transform == b.transform and
+        a.filter == b.filter and
         std.meta.eql(a.surface_size, b.surface_size);
 }
 
@@ -537,7 +541,23 @@ fn clippedBounds(state: SurfaceState) ?render.Rect {
 }
 
 fn mapSurfaceDamage(state: SurfaceState, damage: Damage) ?render.Rect {
-    const source = clipDamage(damage, state.surface_size) orelse return null;
+    var expanded = damage;
+    const padding = filterPadding(state);
+    if (padding != 0) {
+        const swap = switch (state.transform) {
+            .@"90", .@"270", .flipped_90, .flipped_270 => true,
+            else => false,
+        };
+        const width = if (swap) state.crop.height else state.crop.width;
+        const height = if (swap) state.crop.width else state.crop.height;
+        const px = std.math.divCeil(i64, padding * render.fixed_one * state.surface_size.width, width) catch return clippedBounds(state);
+        const py = std.math.divCeil(i64, padding * render.fixed_one * state.surface_size.height, height) catch return clippedBounds(state);
+        expanded.min_x -|= px;
+        expanded.min_y -|= py;
+        expanded.max_x +|= px;
+        expanded.max_y +|= py;
+    }
+    const source = clipDamage(expanded, state.surface_size) orelse return null;
     const x = scaleInterval(source[0], source[2], state.surface_size.width, state.destination.width) orelse
         return null;
     const y = scaleInterval(source[1], source[3], state.surface_size.height, state.destination.height) orelse
@@ -545,13 +565,24 @@ fn mapSurfaceDamage(state: SurfaceState, damage: Damage) ?render.Rect {
     return clipMapped(state, x, y);
 }
 
+fn filterPadding(state: SurfaceState) i64 {
+    if (state.filter == .nearest or render.pixelAligned(state.crop, .{
+        .width = state.destination.width,
+        .height = state.destination.height,
+    }, state.transform)) return 0;
+    // Conservative native-pixel support for both renderers: bilinear and
+    // cubic need at most two pixels; bounded area reaches 3.5 pixels.
+    return 4;
+}
+
 fn mapBufferDamage(state: SurfaceState, damage: Damage) ?render.Rect {
     if (damage.empty) return null;
     const one: i128 = render.fixed_one;
-    const left = @max(@as(i128, state.crop.x), @as(i128, damage.min_x) * one);
-    const top = @max(@as(i128, state.crop.y), @as(i128, damage.min_y) * one);
-    const right = @min(@as(i128, state.crop.x) + state.crop.width, @as(i128, damage.max_x) * one);
-    const bottom = @min(@as(i128, state.crop.y) + state.crop.height, @as(i128, damage.max_y) * one);
+    const padding = filterPadding(state);
+    const left = @max(@as(i128, state.crop.x), (@as(i128, damage.min_x) - padding) * one);
+    const top = @max(@as(i128, state.crop.y), (@as(i128, damage.min_y) - padding) * one);
+    const right = @min(@as(i128, state.crop.x) + state.crop.width, (@as(i128, damage.max_x) + padding) * one);
+    const bottom = @min(@as(i128, state.crop.y) + state.crop.height, (@as(i128, damage.max_y) + padding) * one);
     if (right <= left or bottom <= top) return null;
     const swaps_axes = switch (state.transform) {
         .@"90", .@"270", .flipped_90, .flipped_270 => true,
@@ -848,6 +879,8 @@ fn testSample(
         .crop = render.SourceRect.pixels(0, 0, 1, 1),
         .destination = destination,
         .clip = .{ .x = 0, .y = 0, .width = 100, .height = 100 },
+        // These geometry fixtures intentionally isolate mapping from filtering.
+        .filter = .nearest,
     };
 }
 
@@ -1238,6 +1271,86 @@ test "damage: all source and output transforms map exact conservative bounds" {
             wanted,
             transformRect(.{ .x = 1, .y = 0, .width = 1, .height = 1 }, .{ .width = 4, .height = 3 }, transform).?,
         );
+    }
+}
+
+test "damage: adaptive filter expands both damage spaces and invalidates policy changes" {
+    const pixels = [_]u8{0} ** (48 * 48 * 4);
+    var sample = testSample(1, 1, &pixels, .{ .x = 0, .y = 0, .width = 30, .height = 30 });
+    sample.source.size = .{ .width = 48, .height = 48 };
+    sample.source.stride = 48 * 4;
+    sample.crop = render.SourceRect.pixels(0, 0, 48, 48);
+    sample.filter = .adaptive;
+    for (std.meta.tags(render.Transform)) |transform| {
+        sample.transform = transform;
+        const state = SurfaceState.fromSample(sample, .{ .width = 24, .height = 24 });
+        // A centered 4x4 buffer update corresponds to 2x2 surface damage.
+        const expected: render.Rect = .{ .x = 11, .y = 11, .width = 8, .height = 8 };
+        try std.testing.expectEqual(expected, mapBufferDamage(state, Damage.rect(22, 22, 4, 4)).?);
+        try std.testing.expectEqual(expected, mapSurfaceDamage(state, Damage.rect(11, 11, 2, 2)).?);
+        var nearest = state;
+        nearest.filter = .nearest;
+        try std.testing.expect(!sameVisual(nearest, state));
+        try std.testing.expectEqual(render.Rect{ .x = 13, .y = 13, .width = 4, .height = 4 }, mapBufferDamage(nearest, Damage.rect(22, 22, 4, 4)).?);
+    }
+    var state = SurfaceState.fromSample(sample, .{ .width = 24, .height = 24 });
+    state.destination = .{ .x = 0, .y = 0, .width = 48, .height = 48 };
+    try std.testing.expectEqual(@as(i64, 0), filterPadding(state));
+    state.crop.x += render.fixed_one / 2;
+    try std.testing.expectEqual(@as(i64, 4), filterPadding(state));
+    state.transform = .normal;
+    state.crop = render.SourceRect.pixels(10, 10, 24, 24);
+    // An adjacent buffer texel can affect a filtered viewport edge.
+    try std.testing.expect(mapBufferDamage(state, Damage.rect(9, 10, 1, 1)) != null);
+    state.clip = .{ .x = 20, .y = 20, .width = 10, .height = 10 };
+    try std.testing.expectEqual(@as(?render.Rect, null), mapBufferDamage(state, Damage.rect(9, 10, 1, 1)));
+}
+
+test "damage: filtered partial repaint matches a full redraw" {
+    const pixman = @import("../render/pixman.zig");
+    var renderer = try pixman.Renderer.init(std.testing.allocator, .{
+        .max_samples = 1,
+        .max_source_width = 48,
+        .max_source_height = 48,
+    });
+    defer renderer.deinit();
+    for (std.meta.tags(render.Transform)) |transform| {
+        for ([_]u32{ 30, 36, 60 }) |size| {
+            var planner = try Planner.init(std.testing.allocator, .{ .width = 100, .height = 100 }, .normal, testConfig(1));
+            defer planner.deinit();
+            var pixels = [_]u32{0xff404040} ** (48 * 48);
+            var sample = testSample(1, 1, std.mem.sliceAsBytes(&pixels), .{ .x = 3, .y = 5, .width = size, .height = size });
+            sample.source.size = .{ .width = 48, .height = 48 };
+            sample.source.stride = 48 * 4;
+            sample.crop = render.SourceRect.pixels(0, 0, 48, 48);
+            sample.filter = .adaptive;
+            sample.transform = transform;
+            var partial: [100 * 100 * 4]u8 align(@alignOf(u32)) = undefined;
+            var full: [100 * 100 * 4]u8 align(@alignOf(u32)) = undefined;
+            var plan = try planner.prepare(.{ .slot = 0, .generation = 1 }, testList(&.{sample}), &.{});
+            try renderer.draw(testList(&.{sample}), plan, &partial, 400);
+            try planner.publish();
+            const state = SurfaceState.fromSample(sample, .{ .width = 24, .height = 24 });
+            // Off-center update exercises rotated source damage and pixels
+            // influenced by interpolation just outside the changed texels.
+            for (28..32) |y| for (20..24) |x| {
+                pixels[y * 48 + x] = 0xfff0f0f0;
+            };
+            plan = try planner.prepare(.{ .slot = 0, .generation = 2 }, testList(&.{sample}), &.{.{
+                .previous = state,
+                .current = state,
+                .buffer_damage = damageRegion(Damage.rect(20, 28, 4, 4)),
+            }});
+            try std.testing.expect(!plan.render_full);
+            try std.testing.expectEqual(@as(usize, 1), plan.render_damage.len);
+            try std.testing.expect(plan.render_damage[0].width < size);
+            try renderer.draw(testList(&.{sample}), plan, &partial, 400);
+            try planner.cancel();
+            plan = try planner.prepareFull(.{ .slot = 0, .generation = 2 }, testList(&.{sample}), &.{});
+            try renderer.draw(testList(&.{sample}), plan, &full, 400);
+            try std.testing.expectEqualSlices(u8, &full, &partial);
+            try planner.cancel();
+        }
     }
 }
 

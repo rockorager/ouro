@@ -488,6 +488,40 @@ def xcursor(name, requested):
     return data[offset + chunk:offset + chunk + w * h * 4], (w, h), nominal
 
 
+def capture_surface(renderer, source_path, path):
+    """Compare identical 2x app pixels with old and default surface sampling."""
+    source = Image.open(source_path).convert("RGBA")
+    pixels = source.tobytes("raw", "BGRA")
+    scales = (1.25, 1.5, 1.75, 2)
+    sizes = [tuple(round(n * scale / 2) for n in source.size) for scale in scales]
+    column = source.width + 24
+    sheet = Image.new("RGB", (column * 2 + 24, sum(h + 40 for _, h in sizes) + 50), "#18212b")
+    draw = ImageDraw.Draw(sheet)
+    draw.text((16, 12), "Before: nearest", fill="white")
+    draw.text((column + 16, 12), "After: adaptive - identical GTK 2x source, Vulkan readback", fill="white")
+    y = 45
+    for scale, size in zip(scales, sizes):
+        results = []
+        for col, filtering in enumerate(("nearest", None)):
+            result = renderer.render(pixels, source.size, size, "texture", filtering=filtering)
+            # Normalized texture fetches and integer-buffer conversion can
+            # round interpolated colors differently by one 8-bit code value.
+            storage = renderer.render(pixels, source.size, size, "buffer", filtering=filtering)
+            assert max(abs(a - b) for a, b in zip(result, storage)) <= 1
+            results.append(result)
+            draw.text((16 + col * column, y), f"{scale * 100:g}% - native output pixels", fill="white")
+            sheet.paste(Image.frombytes("RGBA", size, result, "raw", "BGRA").convert("RGB"),
+                        (16 + col * column, y + 22))
+        if size == source.size:
+            assert results[0] == results[1], "aligned 1:1 surface changed"
+        else:
+            assert results[0] != results[1], "fractional surface was not filtered"
+        y += size[1] + 40
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sheet.save(path)
+    print("PASS: 16 Vulkan app draws; fractional filtering, native 1:1, SHM/texture parity; capture:", path)
+
+
 def capture(renderer, path, compare_shader_dir):
     scales = (0.5, 1, 1.25, 1.5, 2)
     variants = [("encoded bilinear", "bilinear", None), ("adaptive", None, None)]
@@ -527,6 +561,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--capture", type=Path)
     parser.add_argument("--capture-hdr", type=Path)
+    parser.add_argument("--capture-surface", type=Path, nargs=2, metavar=("SOURCE_2X", "OUTPUT"))
     parser.add_argument("--compare-shader-dir", type=Path)
     args = parser.parse_args()
     renderer = Renderer()
@@ -535,5 +570,7 @@ if __name__ == "__main__":
         test_hdr_capture(renderer, args.capture_hdr)
         if args.capture:
             capture(renderer, args.capture, args.compare_shader_dir)
+        if args.capture_surface:
+            capture_surface(renderer, *args.capture_surface)
     finally:
         renderer.close()
