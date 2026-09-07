@@ -11527,6 +11527,17 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             for (outcome.sampled) |sampled| {
                 const layer = self.layerForPresentation(sampled.presentation) orelse continue;
+                // A rejected frame can retire the presentation while its
+                // pixels remain available for a later scanout. Complete the
+                // retained callbacks only once those pixels actually present.
+                if (layer.presentation == null) {
+                    if (was_presented and outcome.frame_callbacks_due and self.layerOwnerLive(layer)) {
+                        if (layer.callback_data == null)
+                            layer.callback_data = callbackData(outcome.actual_ns.?);
+                        _ = try self.retryLayerFrameCallbacks(layer);
+                    }
+                    continue;
+                }
                 var output_pending = false;
                 if (self.appLayerOutputRow(self.app_layer_outcome_outputs, layer)) |outputs| {
                     const owner = physical orelse continue;
@@ -11702,6 +11713,12 @@ pub fn Coordinator(comptime protocol: type) type {
                     else => return err,
                 };
             }
+            // Frame callbacks pace the client; they are not presentation
+            // feedback. Preserve callbacks from applied, retained content
+            // when its first scanout attempt is discarded, rather than
+            // destroying them along with the completed presentation lease.
+            if (layer.active)
+                _ = try self.adapter.activateFrames(layer.surface.?, content);
             if (layer.callback_data != null and !try self.retryLayerFrameCallbacks(layer))
                 return false;
             try self.presentations.finish(token);
@@ -11913,6 +11930,12 @@ pub fn Coordinator(comptime protocol: type) type {
             if (self.cursor_layer.presentation) |token|
                 if (std.meta.eql(output_api.presentationIdentity(token), identity))
                     return &self.cursor_layer;
+            for (self.app_layers[0..self.app_layer_count]) |*layer|
+                if (layer.active and layer.presentation == null) if (layer.binding) |binding|
+                    if (std.meta.eql(binding.presentation, identity)) return layer;
+            if (self.cursor_layer.active and self.cursor_layer.presentation == null)
+                if (self.cursor_layer.binding) |binding|
+                    if (std.meta.eql(binding.presentation, identity)) return &self.cursor_layer;
             return null;
         }
 

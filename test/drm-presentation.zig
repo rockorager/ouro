@@ -1750,8 +1750,14 @@ test "generated client leases and hotplugs two non-desktop connectors" {
 
 test "session lock frame callbacks resume after commits while the output is powered off" {
     // Exercise the only display going dark and a secondary display sleeping
-    // while the primary remains active.
-    for ([_]bool{ false, true }) |second_desktop| {
+    // while the primary remains active, including a rejected first wake frame.
+    for ([_]struct { second_desktop: bool, reject_wake: bool }{
+        .{ .second_desktop = false, .reject_wake = false },
+        .{ .second_desktop = true, .reject_wake = false },
+        .{ .second_desktop = false, .reject_wake = true },
+        .{ .second_desktop = true, .reject_wake = true },
+    }) |case| {
+        const second_desktop = case.second_desktop;
         const allocator = std.testing.allocator;
         var fixture = try Fixture.init();
         defer fixture.deinit();
@@ -1852,15 +1858,35 @@ test "session lock frame callbacks resume after commits while the output is powe
             try std.testing.expectEqual(callbacks_before, handler.frame_done);
             try std.testing.expect(physical.kms_output == null);
 
+            if (case.reject_wake) {
+                fixture.fail_page_flip_crtc = if (second_desktop) 31 else 30;
+                fixture.held_crtc = fixture.fail_page_flip_crtc;
+            }
             try protocol.zwlr_output_power_v1.encodeRequest(&actor.transmit, power.id, .{
                 .set_mode = .{ .mode = .on },
             });
             try submitClient(&reactor, &driver, &handler);
+            if (case.reject_wake) {
+                // Rejection must not manufacture a callback or presentation.
+                // Hold the successful retry until the client has been drained.
+                for (0..512) |_| {
+                    _ = try loop.turn(coordinator);
+                    _ = try drainClient(&reactor, &driver, &handler);
+                    if (fixture.fail_page_flip_crtc == null and fixture.flip_len != 0) break;
+                    if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+                        try pauseReady(&root.ring);
+                }
+                try std.testing.expect(fixture.fail_page_flip_crtc == null);
+                try std.testing.expect(fixture.flip_len != 0);
+                try std.testing.expectEqual(callbacks_before, handler.frame_done);
+                try fixture.releaseHeldFlips();
+            }
             for (0..512) |_| {
                 _ = try drainClient(&reactor, &driver, &handler);
                 _ = try loop.turn(coordinator);
                 if (handler.frame_done > callbacks_before and physicalOutputsSettled(coordinator)) break;
-                try waitForEither(&root.ring, reactor.ring);
+                if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+                    try pauseReady(&root.ring);
             }
             try std.testing.expectEqual(callbacks_before + 1, handler.frame_done);
             try std.testing.expect(physical.kms_output != null);
