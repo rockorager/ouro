@@ -4291,6 +4291,12 @@ pub fn Coordinator(comptime protocol: type) type {
                 };
                 if (consumed == 0) break;
                 if (destroyed_shell) |id| self.xdg_session_adapter.toplevelDestroyed(id);
+                if (pending_shell) |event| switch (event) {
+                    .commit_ready => |commit| if (commit.initial_commit) {
+                        self.output_associations_dirty = true;
+                    },
+                    else => {},
+                };
                 self.stats.shell_events += consumed;
             }
             try self.syncSessionState();
@@ -4327,6 +4333,7 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.syncDesktopTimer();
             if (self.desktop.takeSceneChanged()) try self.desktopSceneChanged();
             try self.syncToplevelDrag();
+            try self.syncOutputAssociations();
             if (self.shell_adapter.pendingOutbound() != 0)
                 self.markProtocolAll(ProtocolReady.shell);
         }
@@ -6049,6 +6056,8 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn desktopSceneChanged(self: *Self) !void {
             self.pointer_reconcile_pending = true;
+            // Unmapped XDG placement now supplies a scale even without a layer.
+            self.output_associations_dirty = true;
             try self.retryFocusReconcile();
             try self.syncIdleNotifications();
             _ = self.refreshRetainedLayersForOutput();
@@ -7409,7 +7418,12 @@ pub fn Coordinator(comptime protocol: type) type {
                 flushed += try self.gtk_shell_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.xdg_session != 0)
                 flushed += try self.xdg_session_adapter.flushOn(peer, objects, &actor.transmit);
+            // The first XDG configure must not prompt allocation at the
+            // primary-output fallback when placement already supplies a scale.
+            if (client.protocol_ready & ProtocolReady.fractional_scale != 0)
+                flushed += try self.fractional_scale_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.shell != 0 and
+                !self.fractional_scale_adapter.pendingOutbound(peer) and
                 !self.decoration_adapter.readyOutbound(peer))
                 flushed += try self.shell_adapter.flushOn(objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.seat != 0) {
@@ -7445,8 +7459,6 @@ pub fn Coordinator(comptime protocol: type) type {
                 flushed += try self.foreign_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.pointer_constraints != 0)
                 flushed += try self.pointer_constraints_adapter.flushOn(peer, objects, &actor.transmit);
-            if (client.protocol_ready & ProtocolReady.fractional_scale != 0)
-                flushed += try self.fractional_scale_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.color_management != 0)
                 flushed += try self.color_management_adapter.flushOn(peer, objects, &actor.transmit);
             if (client.protocol_ready & ProtocolReady.color_representation != 0)
@@ -12430,6 +12442,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     self.association_surfaces,
                     needed,
                 );
+            const windows = try self.desktop.sceneSnapshotGrowing(self.allocator, &self.scene_windows);
             for (self.clients.items) |*client| if (client.active) {
                 for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
                     if (!physical.connected) continue;
@@ -12486,6 +12499,20 @@ pub fn Coordinator(comptime protocol: type) type {
                 }
                 for (self.app_layers[0..self.app_layer_count]) |*layer|
                     try self.publishLayerPreferredScale(layer, client.peer);
+                // Initial XDG placement is known before there is a render
+                // layer. Publish its scale without inventing wl_surface.enter
+                // events for a surface that has not attached a buffer yet.
+                for (windows) |window| {
+                    if (window.content_ready or !window.visible or self.sessionLockActive()) continue;
+                    const peer = self.adapter.surfacePeer(window.surface) catch continue;
+                    if (!samePeer(peer, client.peer)) continue;
+                    try self.publishPreferredScaleForRect(window.surface, .{
+                        .x = window.geometry.x,
+                        .y = window.geometry.y,
+                        .width = @intCast(window.geometry.width),
+                        .height = @intCast(window.geometry.height),
+                    }, null);
+                }
                 const layer_ids = try self.layer_shell_adapter.ids(self.layer_surface_ids);
                 for (layer_ids) |layer_id| {
                     const state = try self.layer_shell_adapter.state(layer_id);
@@ -12545,15 +12572,23 @@ pub fn Coordinator(comptime protocol: type) type {
             const surface = layer.id orelse return;
             if (self.surfaceBelongsToSessionLock(surface) != self.sessionLockActive()) return;
             const sample = layer.sample orelse return;
+            try self.publishPreferredScaleForRect(surface, sample.destination, self.boundLayerOutput(layer));
+        }
+
+        fn publishPreferredScaleForRect(
+            self: *Self,
+            surface: Adapter.SurfaceId,
+            destination: render.Rect,
+            bound_output: ?OutputAdapter.OutputId,
+        ) !void {
             var preferred_scale: ?u32 = null;
-            const bound_output = self.boundLayerOutput(layer);
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
                 if (!physical.connected) continue;
                 if (bound_output) |output| {
                     if (!std.meta.eql(output, physical.protocol_output)) continue;
                 } else {
                     const bounds = self.outputBoundsFor(physical) catch continue;
-                    if (try clipToOutput(sample.destination, bounds) == null) continue;
+                    if (try clipToOutput(destination, bounds) == null) continue;
                 }
                 const state = try self.output_management_adapter.lifecycle.currentHead(
                     physical.management_head,
