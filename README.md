@@ -382,6 +382,20 @@ and interaction steps remain available as `test-drm-presentation`,
 
 ### Startup and frame-pacing diagnostics
 
+Normal stderr logs include output activation identities, power transitions,
+and failure-only DRM diagnostics without enabling protocol or frame tracing.
+Before a generic `KmsFailed`, look for `DRM output failed` and its `reason`,
+connector, CRTC, generation, and prior state. Adjacent diagnostics include the
+raw event-read result and errno, event-dispatch error, mismatched/duplicate
+page-flip details, or failed scanout/disable operation. Atomic ioctl failures
+also report errno. Output power-on and reconfiguration failures retain their
+original errors, including when reconfiguration rolls back.
+
+Match connector/CRTC IDs to the `activated output` records. The DRM event FD
+is shared: an event-read diagnostic identifies the reader, not necessarily the
+display whose event was in the batch. These diagnostics do not log keyboard
+events, protocol payloads, or framebuffer contents.
+
 Add `--trace-pacing` to the existing compositor invocation and capture stderr
 to a file. This opt-in trace adds measurement overhead; use a release build and
 compare several launches. Capture the client separately with

@@ -5170,7 +5170,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 const current = try self.output_management_adapter.lifecycle.currentHead(head.id);
                 const claim = physical.claim orelse return error.StaleClaim;
                 const snapshot = try self.manager.claimSnapshot(claim);
-                const desired_profile = try configuredOutputProfile(candidate, snapshot);
+                const desired_profile = try configuredOutputProfile(self.outputSettingsForActivation(), snapshot);
                 const profile_changed = !sameOutputProfile(
                     physical.output_profile,
                     desired_profile,
@@ -5379,6 +5379,9 @@ pub fn Coordinator(comptime protocol: type) type {
                     self.markProtocol(command.peer, ProtocolReady.output_power);
                     continue;
                 }
+                std.log.info("output power change: output={d}:{d} connector={d} mode={t}", .{
+                    physical.id.index, physical.id.generation, physical.connector_id, command.mode,
+                });
                 if (command.mode == .off) {
                     self.output_power_transition = command;
                     try self.pausePhysicalOutput(physical);
@@ -5386,18 +5389,27 @@ pub fn Coordinator(comptime protocol: type) type {
                     return;
                 }
                 const claim = physical.claim orelse {
+                    std.log.warn("output power-on failed: output={d}:{d} connector={d} reason=no-scanout-claim", .{
+                        physical.id.index, physical.id.generation, physical.connector_id,
+                    });
                     try self.output_power_adapter.completeCommand(command, .failed);
                     self.markProtocol(command.peer, ProtocolReady.output_power);
                     continue;
                 };
-                const snapshot = self.manager.claimSnapshot(claim) catch {
+                const snapshot = self.manager.claimSnapshot(claim) catch |err| {
+                    std.log.warn("output power-on snapshot failed: output={d}:{d} connector={d} error={t}", .{
+                        physical.id.index, physical.id.generation, physical.connector_id, err,
+                    });
                     try self.output_power_adapter.completeCommand(command, .failed);
                     self.markProtocol(command.peer, ProtocolReady.output_power);
                     continue;
                 };
                 const state = self.output_management_adapter.lifecycle.currentHead(
                     physical.management_head,
-                ) catch {
+                ) catch |err| {
+                    std.log.warn("output power-on head lookup failed: output={d}:{d} connector={d} error={t}", .{
+                        physical.id.index, physical.id.generation, physical.connector_id, err,
+                    });
                     try self.output_power_adapter.completeCommand(command, .failed);
                     self.markProtocol(command.peer, ProtocolReady.output_power);
                     continue;
@@ -5408,7 +5420,10 @@ pub fn Coordinator(comptime protocol: type) type {
                     state.scale_120,
                     state.transform,
                     state.adaptive_sync,
-                ) catch {
+                ) catch |err| {
+                    std.log.warn("output power-on activation failed: output={d}:{d} connector={d} error={t}", .{
+                        physical.id.index, physical.id.generation, physical.connector_id, err,
+                    });
                     try self.output_power_adapter.completeCommand(command, .failed);
                     self.markProtocol(command.peer, ProtocolReady.output_power);
                     continue;
@@ -8328,6 +8343,11 @@ pub fn Coordinator(comptime protocol: type) type {
             const mode_end = try std.math.add(usize, connector.mode_start, connector.mode_count);
             if (mode_end > snapshot.modes.len) return error.InvalidModeInventory;
             const mode = snapshot.selectedMode();
+            errdefer |err| std.log.warn("output activation failed: output={d}:{d} connector={d} crtc={d} mode={d}x{d} scale={d}/120 transform={d} error={t}", .{
+                physical.id.index, physical.id.generation, connector.id, snapshot.selectedCrtc().id,
+                mode.hdisplay,     mode.vdisplay,          scale_120,    transform,
+                err,
+            });
             const output_scale = try geometry.OutputScale.init(scale_120);
             const quarter_turn = transform == 1 or transform == 3 or
                 transform == 5 or transform == 7;
@@ -8410,11 +8430,11 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.desktop.validateWorkArea(work_area);
                 try self.interaction.validateBounds(work_area);
             }
-            // Every output on this manager shares one DRM fd. A single poll
+            // Every output on this manager shares one DRM fd. A single read
             // dispatches all page-flip records through their commit userdata;
-            // polling once per CRTC lets the first completion drain the fd and
-            // makes later completions misclassify EAGAIN as a device failure.
-            if (primary) try output.prepareReadiness(&self.router, &self.root.ring);
+            // reconfiguring the primary may have transferred that reader to
+            // another output. Preserve its ownership instead of adding one.
+            try self.ensureDrmReadiness();
             if (primary and publish_protocol) {
                 self.desktop.applyWorkArea(work_area);
                 self.interaction.applyBounds(work_area);
@@ -8506,7 +8526,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     return error.ActivatedOutputFailure;
             var name_buffer: [64]u8 = undefined;
             std.log.info(
-                "activated output {s} at {d}x{d}, logical {d}x{d}, scale {d}/120",
+                "activated output {s} at {d}x{d}, logical {d}x{d}, scale {d}/120; output={d}:{d} connector={d} crtc={d}",
                 .{
                     try drmConnectorName(&name_buffer, connector),
                     mode.hdisplay,
@@ -8514,6 +8534,10 @@ pub fn Coordinator(comptime protocol: type) type {
                     logical_width,
                     logical_height,
                     scale_120,
+                    physical.id.index,
+                    physical.id.generation,
+                    connector.id,
+                    snapshot.selectedCrtc().id,
                 },
             );
         }
@@ -13117,7 +13141,12 @@ pub fn Coordinator(comptime protocol: type) type {
                     pending.desired.transform,
                     pending.desired.adaptive_sync,
                     false,
-                ) catch {
+                ) catch |err| {
+                    std.log.warn("output reconfiguration failed; rolling back: output={d}:{d} connector={d} mode={d}x{d}@{d}mHz scale={d}/120 transform={d} error={t}", .{
+                        physical.id.index,         physical.id.generation,    physical.connector_id,
+                        pending.desired.width,     pending.desired.height,    pending.desired.refresh_millihz,
+                        pending.desired.scale_120, pending.desired.transform, err,
+                    });
                     self.output_reconfigure.?.phase = .rollback;
                     for (self.physical_outputs[0..self.physical_output_count]) |*candidate|
                         if (candidate.reconfigure != null and candidate.kms_output != null)

@@ -481,6 +481,9 @@ pub const Output = struct {
             .page_flip_event = true,
         };
         self.platform.commit(fd, record.request, flags, record) catch |err| {
+            std.log.warn("DRM scanout commit rejected: connector={d} crtc={d} plane={d} framebuffer={d} modeset={} overlay={} error={t}", .{
+                self.connector.id, self.crtc.id, self.plane.id, image.framebuffer_id, modeset, queued.overlay != null, err,
+            });
             record.state = .free;
             try self.rollbackRecordAndQueued(record);
             return err;
@@ -625,13 +628,25 @@ pub const Output = struct {
             // A successful read can beat drain cancellation and contain
             // events for other CRTCs sharing this DRM FD. Dispatch those
             // bytes before retiring the reader, but never rearm it.
-            if (self.state != .draining or result > 0) {
-                if (result <= 0 or result > self.drm_events.len)
+            // EAGAIN has no bytes to dispatch and is not a device failure;
+            // retry through the normal rearm path unless we are draining.
+            if ((self.state != .draining or result > 0) and result != negativeErrno(.AGAIN)) {
+                if (result <= 0 or result > self.drm_events.len) {
+                    const errno = linux.errno(@bitCast(@as(isize, result)));
+                    std.log.warn("DRM event read failed: connector={d} crtc={d} result={d} capacity={d} errno={t} ({d})", .{
+                        self.connector.id, self.crtc.id, result, self.drm_events.len, errno, @intFromEnum(errno),
+                    });
                     return self.markFailed(.readiness);
+                }
                 self.platform.handleEvents(
                     self.drm_events[0..@intCast(result)],
                     pageFlipCallback,
-                ) catch return self.markFailed(.event_dispatch);
+                ) catch |err| {
+                    std.log.warn("DRM event dispatch failed: connector={d} crtc={d} bytes={d} error={t}", .{
+                        self.connector.id, self.crtc.id, result, err,
+                    });
+                    return self.markFailed(.event_dispatch);
+                };
             }
             if (self.state == .draining) {
                 if (self.cancel_token == null) try self.finishDrain();
@@ -765,6 +780,9 @@ pub const Output = struct {
             return;
         }
         const fd = self.device.fd(self.snapshot_handle) catch |err| {
+            std.log.warn("DRM disable device lookup failed: connector={d} crtc={d} error={t}", .{
+                self.connector.id, self.crtc.id, err,
+            });
             try self.markFailed(.disable_commit);
             return err;
         };
@@ -785,6 +803,9 @@ pub const Output = struct {
         if (self.crtc.properties.vrr_enabled != 0)
             try self.platform.addProperty(request, self.crtc.id, self.crtc.properties.vrr_enabled, 0);
         self.platform.commit(fd, request, .{ .allow_modeset = true }, null) catch |err| {
+            std.log.warn("DRM disable commit failed: connector={d} crtc={d} plane={d} error={t}", .{
+                self.connector.id, self.crtc.id, self.plane.id, err,
+            });
             self.platform.resetRequest(request);
             try self.markFailed(.disable_commit);
             return err;
@@ -909,12 +930,21 @@ pub const Output = struct {
     }
 
     fn failCallback(self: *Output, failure: Failure) !void {
+        const record = &self.records[self.in_flight_slot.?];
+        std.log.warn("DRM page-flip callback invalid: connector={d} expected_crtc={d} received_crtc={d} expected_generation={d} received_generation={d} callbacks={d} sequence={d}", .{
+            self.connector.id, self.crtc.id, record.fact.crtc_id, self.output_generation, record.output_generation, record.callback_count, record.fact.sequence,
+        });
         try self.markFailed(failure);
         return error.InvalidPageFlipCallback;
     }
 
     fn markFailed(self: *Output, failure: Failure) !void {
         try self.pushEvent(.{ .failed = failure });
+        // Preserve the backend reason before the presentation layer collapses
+        // it to KmsFailed. These are cold-path diagnostics, not pacing traces.
+        std.log.warn("DRM output failed: connector={d} crtc={d} plane={d} generation={d} state={t} reason={t} in_flight_slot={?d}", .{
+            self.connector.id, self.crtc.id, self.plane.id, self.output_generation, self.state, failure, self.in_flight_slot,
+        });
         self.state = .failed;
     }
 
@@ -1506,31 +1536,123 @@ test "kms: read cancellation CQEs drain in either order" {
     try output.destroy();
 }
 
-test "kms: successful reads racing drain cancellation still dispatch shared DRM events" {
-    for ([_]bool{ false, true }) |cancel_first| {
+test "kms: failed event reads preserve readiness failure and scanout ownership" {
+    for ([_]i32{ negativeErrno(.IO), 0, std.math.maxInt(i32) }) |result| {
         var fixture = Fixture{};
         const output = try fixture.create(.{});
-        var router = try completion.Router.init(std.testing.allocator, 4);
+        defer fixture.destroy(output) catch unreachable;
+        try output.queue(fixture.acquire(0), null);
+        try output.commitQueued();
+        var router = try completion.Router.init(std.testing.allocator, 2);
         defer router.deinit(std.testing.allocator);
         const read = try router.acquire(.backend_ready);
-        const cancel = try router.acquire(.backend_ready);
         output.read_token = read;
-        output.cancel_token = cancel;
-        output.state = .draining;
-        // The read won the race with cancellation. Its bytes can belong to
-        // another CRTC on the same DRM FD, even though this output is idle.
-        @memset(&output.drm_events, 0);
+        // Failure must not rearm or otherwise touch the ring.
         var ring: linux.IoUring = undefined;
-        if (cancel_first)
-            try output.completeReadiness(&router, &ring, cancel, errorNoEntry());
-        try output.completeReadiness(&router, &ring, read, 8);
-        if (!cancel_first)
-            try output.completeReadiness(&router, &ring, cancel, errorNoEntry());
-        const drained = output.drainComplete();
-        try output.destroy();
-        try std.testing.expect(drained);
-        try std.testing.expectEqual(@as(usize, 1), fixture.atomic_state.handle_event_count);
+        try output.completeReadiness(&router, &ring, read, result);
+        try std.testing.expectEqual(State.failed, output.state);
+        try std.testing.expectEqual(Failure.readiness, output.events()[0].failed);
+        try std.testing.expect(output.read_token == null);
+        try std.testing.expectEqual(@as(usize, 0), router.active_count);
+        try std.testing.expectEqual(@as(usize, 0), fixture.atomic_state.handle_event_count);
+        try std.testing.expectEqual(@as(usize, 0), fixture.images_state.release_count);
     }
+}
+
+test "kms: event dispatch error remains terminal without releasing scanout" {
+    var fixture = Fixture{};
+    fixture.atomic_state.fail_handle_events = true;
+    const output = try fixture.create(.{});
+    defer fixture.destroy(output) catch unreachable;
+    try output.queue(fixture.acquire(0), null);
+    try output.commitQueued();
+    var router = try completion.Router.init(std.testing.allocator, 2);
+    defer router.deinit(std.testing.allocator);
+    const read = try router.acquire(.backend_ready);
+    output.read_token = read;
+    @memset(&output.drm_events, 0);
+    var ring: linux.IoUring = undefined;
+    try output.completeReadiness(&router, &ring, read, 8);
+    try std.testing.expectEqual(State.failed, output.state);
+    try std.testing.expectEqual(Failure.event_dispatch, output.events()[0].failed);
+    try std.testing.expect(output.read_token == null);
+    try std.testing.expectEqual(@as(usize, 0), router.active_count);
+    try std.testing.expectEqual(@as(usize, 1), fixture.atomic_state.handle_event_count);
+    try std.testing.expectEqual(@as(usize, 0), fixture.images_state.release_count);
+}
+
+test "kms: reads racing drain cancellation dispatch only successful shared DRM events" {
+    for ([_]i32{ 8, negativeErrno(.AGAIN) }) |result| {
+        for ([_]bool{ false, true }) |cancel_first| {
+            var fixture = Fixture{};
+            const output = try fixture.create(.{});
+            var router = try completion.Router.init(std.testing.allocator, 4);
+            defer router.deinit(std.testing.allocator);
+            const read = try router.acquire(.backend_ready);
+            const cancel = try router.acquire(.backend_ready);
+            output.read_token = read;
+            output.cancel_token = cancel;
+            output.state = .draining;
+            // The read won the race with cancellation. Its bytes can belong to
+            // another CRTC on the same DRM FD, even though this output is idle.
+            @memset(&output.drm_events, 0);
+            var ring: linux.IoUring = undefined;
+            if (cancel_first)
+                try output.completeReadiness(&router, &ring, cancel, errorNoEntry());
+            try output.completeReadiness(&router, &ring, read, result);
+            if (!cancel_first)
+                try output.completeReadiness(&router, &ring, cancel, errorNoEntry());
+            const drained = output.drainComplete();
+            try output.destroy();
+            try std.testing.expect(drained);
+            try std.testing.expectEqual(@as(usize, @intFromBool(result > 0)), fixture.atomic_state.handle_event_count);
+            try std.testing.expectEqual(@as(usize, 0), router.active_count);
+        }
+    }
+}
+
+test "kms: EAGAIN rearms the event read without dispatching or failing" {
+    var ring = linux.IoUring.init(8, 0) catch |err| switch (err) {
+        error.PermissionDenied, error.SystemOutdated => return error.SkipZigTest,
+        else => return err,
+    };
+    defer ring.deinit();
+    const raw_fd = linux.eventfd(1, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
+    if (linux.errno(raw_fd) != .SUCCESS) return error.EventFdFailed;
+    const fd: std.posix.fd_t = @intCast(raw_fd);
+    defer _ = linux.close(fd);
+
+    var fixture = Fixture{ .device_fd = fd };
+    const output = try fixture.create(.{});
+    var router = try completion.Router.init(std.testing.allocator, 4);
+    defer router.deinit(std.testing.allocator);
+    const read = try router.acquire(.backend_ready);
+    output.read_token = read;
+    try output.completeReadiness(&router, &ring, read, negativeErrno(.AGAIN));
+    try std.testing.expectEqual(State.initial, output.state);
+    try std.testing.expectEqual(@as(usize, 0), output.events().len);
+    try std.testing.expectEqual(@as(usize, 0), fixture.atomic_state.handle_event_count);
+    try std.testing.expectEqual(@as(usize, 1), router.active_count);
+    try std.testing.expectEqual(@as(u32, 1), ring.sq_ready());
+    try std.testing.expect(router.route(read.encode()) == null);
+    _ = try ring.submit_and_wait(1);
+    const cqe = try ring.copy_cqe();
+    const token = router.route(cqe.user_data) orelse return error.UnknownToken;
+    try output.completeReadiness(&router, &ring, token, cqe.res);
+    try std.testing.expectEqual(@as(usize, 1), fixture.atomic_state.handle_event_count);
+    try std.testing.expectEqual(@as(u32, 1), ring.sq_ready());
+
+    try output.requestPause();
+    try output.beginDrain(&router, &ring);
+    _ = try ring.submit_and_wait(2);
+    for (0..2) |_| {
+        const drained = try ring.copy_cqe();
+        const drained_token = router.route(drained.user_data) orelse return error.UnknownToken;
+        try output.completeReadiness(&router, &ring, drained_token, drained.res);
+    }
+    try std.testing.expect(output.drainComplete());
+    try std.testing.expectEqual(@as(usize, 0), router.active_count);
+    try output.destroy();
 }
 
 test "kms: one-shot event reads rearm without submitting internally" {
@@ -1613,6 +1735,7 @@ const FakeAtomic = struct {
     blob_create_count: usize = 0,
     blob_destroy_count: usize = 0,
     handle_event_count: usize = 0,
+    fail_handle_events: bool = false,
     callback_userdata: ?*anyopaque = null,
 
     const vtable: atomic.Platform.VTable = .{
@@ -1686,6 +1809,7 @@ const FakeAtomic = struct {
     fn handleEvents(context: *anyopaque, _: []const u8, _: atomic.FlipCallback) !void {
         const self: *FakeAtomic = @ptrCast(@alignCast(context));
         self.handle_event_count += 1;
+        if (self.fail_handle_events) return error.FakeEventDispatch;
     }
 };
 
