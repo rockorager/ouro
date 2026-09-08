@@ -102,6 +102,7 @@ pub const scene_geometry = @import("scene/geometry.zig");
 pub const scene_hit_test = @import("scene/hit_test.zig");
 pub const scene_cursor = @import("scene/cursor.zig");
 pub const scene_theme_cursor = @import("scene/theme_cursor.zig");
+pub const scene_drop_preview = @import("scene/drop_preview.zig");
 pub const desktop_layout = @import("desktop/layout.zig");
 pub const desktop = @import("desktop/model.zig");
 pub const interaction = @import("input/interaction.zig");
@@ -205,6 +206,7 @@ test {
     _ = scene_hit_test;
     _ = scene_cursor;
     _ = scene_theme_cursor;
+    _ = scene_drop_preview;
     _ = desktop_layout;
     _ = desktop;
     _ = interaction;

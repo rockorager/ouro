@@ -448,6 +448,15 @@ fn interactionWithKeyConsumer(comptime Desktop: type, comptime KeyConsumerFactor
             return self.mode == .interactive and self.mode.interactive.compositor;
         }
 
+        /// The same threshold controls both visual feedback and drop admission.
+        pub fn reorderSource(self: *const Self) ?ToplevelId {
+            if (!self.compositorGrab() or self.mode.interactive.kind != .reorder) return null;
+            const operation = self.mode.interactive;
+            const dx = @abs(self.x_fixed - operation.start_x_fixed);
+            const dy = @abs(self.y_fixed - operation.start_y_fixed);
+            return if (@max(dx, dy) >= 8 * 256) operation.target.toplevel else null;
+        }
+
         pub fn cursorShape(self: *const Self) ?CursorShape {
             if (self.mode == .interactive) {
                 const operation = self.mode.interactive;
@@ -747,10 +756,8 @@ fn interactionWithKeyConsumer(comptime Desktop: type, comptime KeyConsumerFactor
                     !self.otherDeviceButton(device, button))
                 {
                     const operation = self.mode.interactive;
-                    const dx = @abs(self.x_fixed - operation.start_x_fixed);
-                    const dy = @abs(self.y_fixed - operation.start_y_fixed);
-                    if (operation.kind == .reorder and @max(dx, dy) >= 8 * 256)
-                        try desktop.finishReorder(operation.target.toplevel, self.pointerPosition());
+                    if (self.reorderSource()) |source|
+                        try desktop.finishReorder(source, self.pointerPosition());
                     try desktop.endInteractive(operation.target.toplevel);
                     self.mode = .default;
                     self.resize_handle = null;
@@ -2027,12 +2034,14 @@ test "interaction: Super left drag reorders on release and moves floating window
         } });
         try interaction.pointerMotion(&desktop, &surfaces, device_a, 15, 10);
         try std.testing.expect(desktop.reorder_point == null);
+        try std.testing.expectEqual(!floating, interaction.reorderSource() != null);
         if (floating) {
             try std.testing.expectEqual(geometry.Rect{ .x = 15, .y = 10, .width = 40, .height = 30 }, desktop.interactive_rect.?);
         } else try std.testing.expect(desktop.interactive_rect == null);
         while (interaction.peekCommand() != null) interaction.dropCommand();
         try interaction.pointerButton(&desktop, device_a, 272, false, false);
         try std.testing.expect(interaction.mode == .default);
+        try std.testing.expect(interaction.reorderSource() == null);
         try std.testing.expect(interaction.peekCommand().? == .pointer_consumed);
         if (!floating) try std.testing.expectEqual(geometry.Point{ .x = 16, .y = 11 }, desktop.reorder_point.?);
     }
@@ -2074,12 +2083,15 @@ test "interaction: reorder threshold, cancellation, and inhibited shortcuts" {
         while (interaction.peekCommand() != null) interaction.dropCommand();
         if (scenario == 3) interaction.setPopupGrab(@as(?TestInteraction.Target, targetFor(desktop.windows[0])));
         try interaction.pointerButton(&desktop, device_a, 272, true, scenario == 2);
+        try std.testing.expect(interaction.reorderSource() == null);
         if (scenario >= 2) {
             try std.testing.expect(!interaction.compositorGrab());
             continue;
         }
-        try interaction.pointerMotion(&desktop, &surfaces, device_a, if (scenario == 0) 7 else 20, 0);
+        try interaction.pointerMotion(&desktop, &surfaces, device_a, if (scenario == 0) 7 else 8, 0);
+        try std.testing.expectEqual(scenario == 1, interaction.reorderSource() != null);
         if (scenario == 1) interaction.surfaceDestroyed(desktop.windows[0].surface);
+        try std.testing.expect(interaction.reorderSource() == null);
         while (interaction.peekCommand() != null) interaction.dropCommand();
         try interaction.pointerButton(&desktop, device_a, 272, false, false);
         try std.testing.expect(desktop.reorder_point == null);

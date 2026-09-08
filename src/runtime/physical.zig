@@ -95,6 +95,7 @@ const protocol_image_capture_source = @import("../protocol/image_capture_source.
 const protocol_image_copy_capture = @import("../protocol/image_copy_capture.zig");
 const cursor_theme = @import("../cursor_theme.zig");
 const theme_cursor = @import("../scene/theme_cursor.zig");
+const drop_preview = @import("../scene/drop_preview.zig");
 const desktop_model = @import("../desktop/model.zig");
 const interaction_model = @import("../input/interaction.zig");
 const tablet_input = @import("../input/tablet.zig");
@@ -543,6 +544,7 @@ pub fn Coordinator(comptime protocol: type) type {
             pending_image_copy: ?PendingImageCopy = null,
             capture_bytes: std.ArrayListUnmanaged(u8) = .empty,
             drag_icon_previous: ?damage.SurfaceState = null,
+            drop_preview_previous: drop_preview.State = drop_preview.empty_state,
             themed_cursor: theme_cursor.Cursor = .{},
             themed_cursor_previous: ?damage.SurfaceState = null,
             client_cursor_previous: ?damage.SurfaceState = null,
@@ -989,6 +991,7 @@ pub fn Coordinator(comptime protocol: type) type {
         syncobj_adapter: ?SyncobjAdapter = null,
         activation_adapter: ActivationAdapter,
         decoration_adapter: DecorationAdapter,
+        reorder_preview: ?geometry.Rect = null,
         dialog_adapter: DialogAdapter,
         toplevel_tag_adapter: ToplevelTagAdapter,
         gtk_shell_adapter: GtkShellAdapter,
@@ -1154,6 +1157,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.processing_virtual_pointer = false;
             self.shell_maintenance_pending = false;
             self.pointer_reconcile_pending = false;
+            self.reorder_preview = null;
             self.render_device = null;
             self.syncobj_device = null;
             self.syncobj_adapter = null;
@@ -4401,6 +4405,7 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.syncDesktopTimer();
             if (self.desktop.takeSceneChanged()) try self.desktopSceneChanged();
             try self.syncToplevelDrag();
+            try self.syncReorderPreview();
             try self.syncOutputAssociations();
             if (self.shell_adapter.pendingOutbound() != 0)
                 self.markProtocolAll(ProtocolReady.shell);
@@ -6141,6 +6146,7 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn desktopSceneChanged(self: *Self) !void {
             self.pointer_reconcile_pending = true;
+            try self.syncReorderPreview();
             // Unmapped XDG placement now supplies a scale even without a layer.
             self.output_associations_dirty = true;
             try self.retryFocusReconcile();
@@ -6966,6 +6972,21 @@ pub fn Coordinator(comptime protocol: type) type {
                 }
                 self.seat_adapter.dropEvent();
             }
+        }
+
+        fn syncReorderPreview(self: *Self) !void {
+            const next = if (!self.sessionLockActive() and !self.stopping)
+                if (self.interaction.reorderSource()) |source|
+                    try self.desktop.reorderPreview(source, self.interaction.pointerPosition())
+                else
+                    null
+            else
+                null;
+            if (std.meta.eql(next, self.reorder_preview)) return;
+            // Unlike cursor motion, this must repaint the primary plane even
+            // when the cursor itself is on a hardware plane.
+            try self.requestOutputDamage();
+            self.reorder_preview = next;
         }
 
         fn requestCursorRedraw(self: *Self) !void {
@@ -9861,7 +9882,12 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             const damage_generation = physical.damage_requested;
             const output_bounds = try self.outputBoundsFor(physical);
+            const head_state = try self.output_management_adapter.lifecycle.currentHead(
+                physical.management_head,
+            );
+            const output_scale = try geometry.OutputScale.init(head_state.scale_120);
             var sample_count: usize = 0;
+            var change_count: usize = 0;
             if (self.sessionLockActive()) {
                 try self.appendSessionLock(physical, &sample_count, output_bounds);
                 self.physical_outputs[physical.id.index].session_lock_frame = frame;
@@ -9881,17 +9907,19 @@ pub fn Coordinator(comptime protocol: type) type {
                         output_bounds,
                     );
                 }
+            }
+            const next_drop_preview_previous = try self.appendDropPreview(
+                physical,
+                &sample_count,
+                &change_count,
+                output_bounds,
+                output_scale,
+            );
+            if (!self.sessionLockActive()) {
                 try self.appendLayerShell(physical, .top, &sample_count, output_bounds);
                 try self.appendLayerShell(physical, .overlay, &sample_count, output_bounds);
                 try self.appendInputMethodPopups(physical, &sample_count, output_bounds);
             }
-            var change_count: usize = 0;
-            const head_state = try self.output_management_adapter.lifecycle.currentHead(
-                physical.management_head,
-            );
-            const output_scale = try geometry.OutputScale.init(
-                head_state.scale_120,
-            );
             const output_index: usize = @intCast(physical.id.index);
             for (self.removed_layers[0..self.removed_layer_len], 0..) |removed, index| {
                 if (!self.removedLayerOutputRow(index)[output_index]) continue;
@@ -10200,6 +10228,7 @@ pub fn Coordinator(comptime protocol: type) type {
                         physical,
                         damage_generation,
                         next_drag_icon_previous,
+                        next_drop_preview_previous,
                         next_themed_cursor_previous,
                         next_client_cursor_previous,
                     );
@@ -10291,6 +10320,7 @@ pub fn Coordinator(comptime protocol: type) type {
                         physical,
                         damage_generation,
                         next_drag_icon_previous,
+                        next_drop_preview_previous,
                         next_themed_cursor_previous,
                         next_client_cursor_previous,
                     );
@@ -10329,11 +10359,13 @@ pub fn Coordinator(comptime protocol: type) type {
             physical: *PhysicalOutput,
             damage_generation: u64,
             next_drag_icon_previous: ?damage.SurfaceState,
+            next_drop_preview_previous: drop_preview.State,
             next_themed_cursor_previous: ?damage.SurfaceState,
             next_client_cursor_previous: ?damage.SurfaceState,
         ) void {
             physical.damage_applied = damage_generation;
             physical.drag_icon_previous = next_drag_icon_previous;
+            physical.drop_preview_previous = next_drop_preview_previous;
             physical.themed_cursor_previous = next_themed_cursor_previous;
             physical.client_cursor_previous = next_client_cursor_previous;
             self.clearFifoBarriersAfterOutputAttempts();
@@ -10463,6 +10495,37 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (!std.meta.eql(popup.output, physical.id)) continue;
                 try self.appendSceneRoot(physical, popup.surface, count, output_bounds);
             }
+        }
+
+        fn appendDropPreview(
+            self: *Self,
+            physical: *const PhysicalOutput,
+            sample_count: *usize,
+            change_count: *usize,
+            output_bounds: geometry.Rect,
+            output_scale: geometry.OutputScale,
+        ) !drop_preview.State {
+            var storage: [drop_preview.max_samples]render.SurfaceSample = undefined;
+            var values: []const render.SurfaceSample = &.{};
+            if (!self.sessionLockActive()) if (self.reorder_preview) |rect| {
+                values = try drop_preview.samples(rect, output_bounds, &storage);
+            };
+            for (values) |sample| {
+                try self.ensureFrameStorage(@max(sample_count.*, change_count.*) + 1);
+                self.frame_samples[sample_count.*] = try scaleSample(sample, output_bounds, output_scale);
+                self.frame_bindings[sample_count.*] = drop_preview.sampleBinding(sample, output_api.SampleBinding);
+                sample_count.* += 1;
+            }
+            var changes: [drop_preview.max_samples]damage.Change = undefined;
+            const current = drop_preview.damageChanges(physical.drop_preview_previous, values, &changes);
+            for (changes) |change| {
+                if (change.previous == null and change.current == null) continue;
+                try self.ensureFrameStorage(@max(sample_count.*, change_count.*) + 1);
+                self.frame_changes[change_count.*] = try scaleChange(change, output_bounds, output_scale);
+                self.frame_change_layers[change_count.*] = null;
+                change_count.* += 1;
+            }
+            return current;
         }
 
         fn appendDragIcon(

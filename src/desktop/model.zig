@@ -760,6 +760,11 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
             return null;
         }
 
+        pub fn reorderPreview(desktop: *Self, id: ToplevelId, point: geometry.Point) !?geometry.Rect {
+            _ = desktop.resolveIndex(id) catch return null;
+            return desktop.policy.reorderPreview(id, point, PolicyView{ .context = desktop });
+        }
+
         pub fn finishReorder(desktop: *Self, id: ToplevelId, point: geometry.Point) !void {
             _ = try desktop.resolveIndex(id);
             try desktop.requireCommandCapacity(desktop.live);
@@ -4785,6 +4790,15 @@ test "desktop: pointer drops swap centers and insert on all four sides without f
         const before = (try desktop.scene(first)).geometry;
         _ = (try desktop.beginInteractive(.{ .id = first, .kind = .reorder })).?;
         try std.testing.expectEqual(before, (try desktop.scene(first)).geometry);
+        const previews = [_]geometry.Rect{
+            .{ .x = 300, .y = 0, .width = 300, .height = 400 },
+            .{ .x = 300, .y = 0, .width = 150, .height = 400 },
+            .{ .x = 450, .y = 0, .width = 150, .height = 400 },
+            .{ .x = 300, .y = 0, .width = 300, .height = 200 },
+            .{ .x = 300, .y = 200, .width = 300, .height = 200 },
+        };
+        try std.testing.expectEqual(previews[direction], (try desktop.reorderPreview(first, point)).?);
+        try std.testing.expectEqual(before, (try desktop.scene(first)).geometry);
         try desktop.finishReorder(first, point);
         try desktop.endInteractive(first);
         try settleDesktop(&desktop, &shell);
@@ -4800,6 +4814,29 @@ test "desktop: pointer drops swap centers and insert on all four sides without f
             else => unreachable,
         }
     }
+}
+
+test "desktop: drop preview respects odd geometry, root strips, and invalid targets" {
+    var desktop = try initTestDesktop(16);
+    defer desktop.deinit();
+    try desktop.setWorkArea(.{ .x = -602, .y = 20, .width = 602, .height = 401 });
+    var shell = TestShell{};
+    shell.push(created(0));
+    shell.push(created(1));
+    _ = try desktop.consume(&shell, 2);
+    try settleDesktop(&desktop, &shell);
+    const first = try desktop.idForShell(.{ .index = 0, .generation = 1 });
+    try std.testing.expectEqual(geometry.Rect{ .x = -301, .y = 20, .width = 150, .height = 401 }, (try desktop.reorderPreview(first, .{ .x = -290, .y = 220 })).?);
+    try std.testing.expectEqual(geometry.Rect{ .x = -151, .y = 20, .width = 151, .height = 401 }, (try desktop.reorderPreview(first, .{ .x = -33, .y = 220 })).?);
+    try std.testing.expectEqual(geometry.Rect{ .x = -301, .y = 220, .width = 301, .height = 201 }, (try desktop.reorderPreview(first, .{ .x = -150, .y = 410 })).?);
+    // The last 32 pixels select the output root, rather than this tile's half.
+    try std.testing.expectEqual(geometry.Rect{ .x = -301, .y = 20, .width = 301, .height = 401 }, (try desktop.reorderPreview(first, .{ .x = -32, .y = 220 })).?);
+    try std.testing.expect((try desktop.reorderPreview(first, .{ .x = -450, .y = 220 })) == null);
+    try std.testing.expect((try desktop.reorderPreview(first, .{ .x = 1, .y = 220 })) == null);
+    try std.testing.expect(!desktop.transactionPending());
+    try std.testing.expectEqual(@as(usize, 0), desktop.pendingCommands());
+    try desktop.setFloating(first, true);
+    try std.testing.expect((try desktop.reorderPreview(first, .{ .x = -150, .y = 220 })) == null);
 }
 
 test "desktop: reorder transfers only source across outputs and honors active workspace" {
@@ -4822,6 +4859,7 @@ test "desktop: reorder transfers only source across outputs and honors active wo
     try settleDesktop(&desktop, &shell);
     const first = try desktop.idForShell(.{ .index = 0, .generation = 1 });
     const second = try desktop.idForShell(.{ .index = 1, .generation = 1 });
+    try std.testing.expectEqual(topology[1].geometry, (try desktop.reorderPreview(first, .{ .x = 900, .y = 200 })).?);
     try desktop.finishReorder(first, .{ .x = 900, .y = 200 });
     try settleDesktop(&desktop, &shell);
     for ([_]TestDesktop.ToplevelId{ first, second }) |id| {
@@ -4830,11 +4868,14 @@ test "desktop: reorder transfers only source across outputs and honors active wo
         try std.testing.expectEqual(@as(u8, 3), state.workspace);
         try std.testing.expect((try desktop.scene(id)).geometry.x >= 600);
     }
+    try std.testing.expectEqual(topology[0].geometry, (try desktop.reorderPreview(first, .{ .x = 300, .y = 200 })).?);
+    try std.testing.expectEqual(topology[0].geometry, (try desktop.reorderPreview(first, .{ .x = 0, .y = 200 })).?);
     try desktop.finishReorder(first, .{ .x = 300, .y = 200 }); // empty output
     try settleDesktop(&desktop, &shell);
     try std.testing.expectEqual(topology[0].geometry, (try desktop.scene(first)).geometry);
     try std.testing.expectEqual(@as(u8, 1), (try desktop.policy.windowState(first)).workspace);
     const before = (try desktop.scene(first)).geometry;
+    try std.testing.expect((try desktop.reorderPreview(first, .{ .x = 0, .y = 200 })) == null);
     try desktop.finishReorder(first, .{ .x = 300, .y = 200 }); // own tile
     try settleDesktop(&desktop, &shell);
     try std.testing.expectEqual(before, (try desktop.scene(first)).geometry);

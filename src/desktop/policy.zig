@@ -363,11 +363,18 @@ pub fn Policy(
             return policy.tiling.boundaryAt(point, 8, Eligibility{ .policy = policy });
         }
 
-        /// Applies a completed reorder in one topology mutation. Motion itself
-        /// deliberately carries no policy state.
-        pub fn finishReorder(policy: *Self, id: ToplevelId, point: geometry.Point, view: anytype) !bool {
-            const state = try policy.resolve(id);
-            if (!policy.layoutEligible(state.*)) return false;
+        const ReorderTarget = struct {
+            destination: LayoutOutput,
+            same_workspace: bool,
+            window: ?ToplevelId = null,
+            direction: ?layout.Direction,
+            rect: geometry.Rect,
+        };
+
+        // Preview and release resolve the same target without mutating layout.
+        fn reorderTarget(policy: *const Self, id: ToplevelId, point: geometry.Point, view: anytype) !?ReorderTarget {
+            const state = try policy.resolveConst(id);
+            if (!policy.layoutEligible(state.*)) return null;
             var output_index: ?usize = null;
             for (0..view.outputCount()) |index| {
                 const rect = view.output(index).geometry;
@@ -375,7 +382,7 @@ pub fn Policy(
                     point.y >= rect.y and point.y < rect.y + rect.height)
                     output_index = index;
             }
-            const index = output_index orelse return false;
+            const index = output_index orelse return null;
             const output = view.output(index);
             const destination = LayoutOutput{ .output = output.id, .workspace = policy.activeWorkspace(output.id) };
             const source = policy.layoutOutput(state.*);
@@ -384,13 +391,7 @@ pub fn Policy(
             // The outer horizontal strips are explicit output-root insertion.
             if (point.x < output.geometry.x + 32 or point.x >= output.geometry.x + output.geometry.width - 32) {
                 const direction: layout.Direction = if (point.x < output.geometry.x + 32) .left else .right;
-                const changed = policy.tiling.insertAtRoot(id, destination, direction);
-                if (changed) {
-                    state.output = output.id;
-                    state.workspace = destination.workspace;
-                    policy.workspace_revision +%= 1;
-                }
-                return changed;
+                return .{ .destination = destination, .same_workspace = same_workspace, .direction = direction, .rect = output.geometry };
             }
 
             var drop_target: ?ToplevelId = null;
@@ -401,7 +402,7 @@ pub fn Policy(
                 if (std.meta.eql(window.id, id)) {
                     const rect = window.current_geometry;
                     if (same_workspace and point.x >= rect.x and point.x < rect.x + rect.width and
-                        point.y >= rect.y and point.y < rect.y + rect.height) return false;
+                        point.y >= rect.y and point.y < rect.y + rect.height) return null;
                     continue;
                 }
                 const candidate = policy.resolveConst(window.id) catch continue;
@@ -419,32 +420,72 @@ pub fn Policy(
                 }
             }
             const target_id = drop_target orelse {
-                if (same_workspace) return false;
-                const changed = policy.tiling.insertAtRoot(id, destination, .right);
-                if (changed) {
-                    state.output = output.id;
-                    state.workspace = destination.workspace;
-                    policy.workspace_revision +%= 1;
-                }
-                return changed;
+                if (same_workspace) return null;
+                return .{ .destination = destination, .same_workspace = false, .direction = null, .rect = output.geometry };
             };
             const nx = @as(f64, @floatFromInt(point.x - target_rect.x)) / @as(f64, @floatFromInt(target_rect.width)) * 2.0 - 1.0;
             const ny = @as(f64, @floatFromInt(point.y - target_rect.y)) / @as(f64, @floatFromInt(target_rect.height)) * 2.0 - 1.0;
             const center = @abs(nx) <= 0.5 and @abs(ny) <= 0.5;
-            if (center and !same_workspace) {
-                policy.tiling.moveToOutput(id, destination, target_id);
-                state.output = output.id;
-                state.workspace = destination.workspace;
-            }
-            const changed = if (center)
-                policy.tiling.swap(id, target_id)
-            else
-                policy.tiling.insertBeside(id, target_id, if (@abs(nx) >= @abs(ny))
+            return .{
+                .destination = destination,
+                .same_workspace = same_workspace,
+                .window = target_id,
+                .direction = if (center) null else if (@abs(nx) >= @abs(ny))
                     if (nx < 0) .left else .right
-                else if (ny < 0) .up else .down);
+                else if (ny < 0) .up else .down,
+                .rect = target_rect,
+            };
+        }
+
+        pub fn reorderPreview(policy: *const Self, id: ToplevelId, point: geometry.Point, view: anytype) !?geometry.Rect {
+            const drop = try policy.reorderTarget(id, point, view) orelse return null;
+            if (drop.window == null) {
+                var windows = view.windows();
+                const occupied = while (windows.next()) |window| {
+                    if (std.meta.eql(window.id, id)) continue;
+                    const state = policy.resolveConst(window.id) catch continue;
+                    if (policy.layoutEligible(state.*) and std.meta.eql(policy.layoutOutput(state.*), drop.destination)) break true;
+                } else false;
+                // There is nothing to split on an empty output, nor anything
+                // to reorder when the source is its only tile.
+                if (!occupied) return if (drop.same_workspace) null else drop.rect;
+            }
+            var rect = drop.rect;
+            if (drop.direction) |direction| switch (direction) {
+                .left => rect.width = @divTrunc(rect.width, 2),
+                .right => {
+                    const half = @divTrunc(rect.width, 2);
+                    rect.x += half;
+                    rect.width -= half;
+                },
+                .up => rect.height = @divTrunc(rect.height, 2),
+                .down => {
+                    const half = @divTrunc(rect.height, 2);
+                    rect.y += half;
+                    rect.height -= half;
+                },
+            };
+            return if (rect.width > 0 and rect.height > 0) rect else null;
+        }
+
+        /// Applies a completed reorder in one topology mutation.
+        pub fn finishReorder(policy: *Self, id: ToplevelId, point: geometry.Point, view: anytype) !bool {
+            const drop = try policy.reorderTarget(id, point, view) orelse return false;
+            const state = try policy.resolve(id);
+            if (drop.window != null and drop.direction == null and !drop.same_workspace) {
+                policy.tiling.moveToOutput(id, drop.destination, drop.window.?);
+                state.output = drop.destination.output;
+                state.workspace = drop.destination.workspace;
+            }
+            const changed = if (drop.window == null)
+                policy.tiling.insertAtRoot(id, drop.destination, drop.direction orelse .right)
+            else if (drop.direction) |direction|
+                policy.tiling.insertBeside(id, drop.window.?, direction)
+            else
+                policy.tiling.swap(id, drop.window.?);
             if (changed) {
-                state.output = output.id;
-                state.workspace = destination.workspace;
+                state.output = drop.destination.output;
+                state.workspace = drop.destination.workspace;
                 policy.workspace_revision +%= 1;
             }
             return changed;
