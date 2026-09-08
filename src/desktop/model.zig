@@ -158,6 +158,7 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
         // Retained through button release and transaction expiry: a client can
         // still be painting an older configure when the drag has finished.
         const ResizeAnchor = struct {
+            mode: Mode = .floating,
             right: bool,
             bottom: bool,
             final_serial: ?u32 = null,
@@ -303,6 +304,7 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
 
         const PolicyTransaction = struct {
             context: *anyopaque,
+            tiled_resizing: bool = false,
 
             fn owner(transaction: PolicyTransaction) *Self {
                 return @ptrCast(@alignCast(transaction.context));
@@ -340,6 +342,29 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
                 };
                 try target_value.rect.validate();
                 if (target_value.output) |output| try desktop.validatePolicyOutput(output);
+                const slot = &desktop.slots[index];
+                if (slot.resize_anchor) |anchor| {
+                    if (anchor.mode != target_value.mode) slot.resize_anchor = null;
+                }
+                if (slot.configured and target_value.mode == .tiled) {
+                    const previous = desktop.desired[index];
+                    if (previous.mode == .tiled and previous.visible and target_value.visible and
+                        !std.meta.eql(previous.rect, target_value.rect))
+                    {
+                        // Every leaf affected by a split keeps its unchanged
+                        // outer edges, including neighbours of the grab.
+                        // Relocation (both edges move) remains transactional.
+                        const left = previous.rect.x != target_value.rect.x;
+                        const right = previous.rect.x + previous.rect.width != target_value.rect.x + target_value.rect.width;
+                        const top = previous.rect.y != target_value.rect.y;
+                        const bottom = previous.rect.y + previous.rect.height != target_value.rect.y + target_value.rect.height;
+                        slot.resize_anchor = if (!transaction.tiled_resizing or (left and right) or (top and bottom)) null else .{
+                            .mode = .tiled,
+                            .right = left,
+                            .bottom = top,
+                        };
+                    }
+                }
                 desktop.desired[index] = target_value;
                 desktop.desired_epochs[index] = desktop.policy_epoch;
                 if (desktop.slots[index].initial_committed)
@@ -666,7 +691,7 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
                 return null;
             const state = try desktop.policy.windowState(request.id);
             const tiled = state.mode == .tiled;
-            slot.resize_anchor = if (!tiled and request.kind == .resize) .{
+            if (!tiled) slot.resize_anchor = if (request.kind == .resize) .{
                 .right = switch (request.kind.resize) {
                     .left, .top_left, .bottom_left => true,
                     else => false,
@@ -1375,11 +1400,9 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
                         slot.target_scene.geometry.width = commit.window_width;
                         slot.target_scene.geometry.height = commit.window_height;
                         const state = try desktop.policy.windowState(id);
-                        if (state.mode == .floating and
-                            !state.fullscreen and !state.maximized)
-                        {
+                        if (!state.fullscreen and !state.maximized) {
                             if (slot.resize_anchor) |anchor| {
-                                slot.target_scene.geometry = anchor.committed(state.floating, commit.window_width, commit.window_height);
+                                slot.target_scene.geometry = anchor.committed(desktop.desired[index].rect, commit.window_width, commit.window_height);
                                 // Buffers for intermediate configures are displayed
                                 // before the newest transaction is ready. Publish
                                 // their matching origin without readying that barrier.
@@ -1389,11 +1412,13 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
                                 slot.scene.surface_offset = slot.target_scene.surface_offset;
                                 desktop.scene_changed = !std.meta.eql(previous, slot.scene) or desktop.scene_changed;
                                 desktop.updatePopupScenes();
-                                if (!state.resizing and anchor.final_serial == commit.serial) {
+                                // Tiled anchors belong to the placement, not
+                                // the grab; the neighbour has no resizing state.
+                                if (state.mode == .floating and !state.resizing and anchor.final_serial == commit.serial) {
                                     _ = try desktop.policy.setFloatingGeometry(id, slot.target_scene.geometry);
                                     slot.resize_anchor = null;
                                 }
-                            } else {
+                            } else if (state.mode == .floating) {
                                 _ = try desktop.policy.setFloatingGeometry(id, .{
                                     .x = state.floating.x,
                                     .y = state.floating.y,
@@ -1900,16 +1925,27 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
 
         fn reflow(desktop: *Self) !void {
             try desktop.requirePopupCommandCapacity(desktop.popup_live);
+            var tiled_resizing = false;
+            for (desktop.slots, 0..) |slot, index| {
+                if (!slot.header.active or !slot.initial_committed) continue;
+                const state = try desktop.policy.windowState(desktop.idFor(@intCast(index)));
+                if (state.mode == .tiled and state.resizing and
+                    !state.fullscreen and !state.maximized and !state.minimized)
+                {
+                    tiled_resizing = true;
+                    break;
+                }
+            }
             try desktop.policy.arrange(
                 PolicyView{ .context = desktop },
-                PolicyTransaction{ .context = desktop },
+                PolicyTransaction{ .context = desktop, .tiled_resizing = tiled_resizing },
             );
             try (PolicyTransaction{ .context = desktop }).finish();
 
             for (desktop.slots, 0..) |*slot, index| {
                 if (!slot.header.active or !slot.initial_committed) continue;
                 const desired = &desktop.desired[index];
-                if (desired.mode != .floating or desired.fullscreen or desired.maximized or !desired.visible)
+                if (desired.fullscreen or desired.maximized or !desired.visible)
                     slot.resize_anchor = null;
                 const output_area = outputAreaForRect(desired.rect, desktop.outputAreas());
                 const configure: Shell.ToplevelConfigure = .{
@@ -3626,6 +3662,142 @@ test "desktop: tiled edge resize changes a retained split" {
     try desktop.toggleFocusedFullscreen();
     try settleDesktop(&desktop, &shell);
     try std.testing.expectEqual(@as(i32, 60), (try desktop.scene(first)).geometry.width);
+}
+
+test "desktop: tiled resize anchors late neighbour commits across timeout and release" {
+    for ([_]bool{ false, true }) |vertical| {
+        for ([_]bool{ false, true }) |grab_neighbour| {
+            var desktop = try initTestDesktop(16);
+            defer desktop.deinit();
+            if (vertical) try desktop.setWorkArea(.{ .x = 0, .y = 0, .width = 60, .height = 100 });
+            var shell = TestShell{};
+            shell.push(created(0));
+            shell.push(created(1));
+            _ = try desktop.consume(&shell, 2);
+            try settleDesktop(&desktop, &shell);
+            const first = try desktop.idForShell(.{ .index = 0, .generation = 1 });
+            const second = try desktop.idForShell(.{ .index = 1, .generation = 1 });
+            for ([_]u32{ 0, 1 }) |index| {
+                shell.push(.{ .commit_ready = .{
+                    .id = .{ .index = index, .generation = 1 },
+                    .serial = 0,
+                    .mapped = true,
+                    .has_window_geometry = true,
+                    .window_width = if (vertical) 60 else 50,
+                    .window_height = if (vertical) 50 else 60,
+                } });
+                _ = try desktop.consume(&shell, 1);
+            }
+            const unchanged = (try desktop.scene(first)).geometry;
+            const grabbed = if (grab_neighbour) second else first;
+            const edge: TestShell.ResizeEdge = if (vertical)
+                (if (grab_neighbour) .top else .bottom)
+            else
+                (if (grab_neighbour) .left else .right);
+            const initial = (try desktop.beginInteractive(.{ .id = grabbed, .kind = .{ .resize = edge } })).?.rect;
+            var serials: [2]u32 = undefined;
+            for ([_]i32{ 10, 20 }, 0..) |delta, step| {
+                var requested = initial;
+                if (vertical) {
+                    if (grab_neighbour) requested.y += delta;
+                    requested.height += if (grab_neighbour) -delta else delta;
+                } else {
+                    if (grab_neighbour) requested.x += delta;
+                    requested.width += if (grab_neighbour) -delta else delta;
+                }
+                try desktop.updateInteractive(grabbed, requested);
+                while (desktop.pendingCommands() != 0) _ = try desktop.flushConfigure(&shell);
+                serials[step] = desktop.slots[second.index].expected_serial.?;
+            }
+            // The far neighbour paints an old configure; the first window
+            // does not respond at all. Its fixed outer edge must stay at 100.
+            for ([_]i32{ 40, 30 }, serials, 0..) |length, serial, step| {
+                shell.push(.{ .commit_ready = .{
+                    .id = .{ .index = 1, .generation = 1 },
+                    .serial = serial,
+                    .mapped = true,
+                    .has_window_geometry = true,
+                    .window_width = if (vertical) 60 else length,
+                    .window_height = if (vertical) length else 60,
+                } });
+                _ = try desktop.consume(&shell, 1);
+                const expected: geometry.Rect = .{
+                    .x = if (vertical) 0 else 100 - length,
+                    .y = if (vertical) 100 - length else 0,
+                    .width = if (vertical) 60 else length,
+                    .height = if (vertical) length else 60,
+                };
+                try std.testing.expectEqual(expected, (try desktop.scene(second)).geometry);
+                try std.testing.expectEqual(unchanged, (try desktop.scene(first)).geometry);
+                if (step == 0) {
+                    try std.testing.expect(desktop.transactionPending());
+                    try std.testing.expect(desktop.expireTransaction());
+                    try std.testing.expectEqual(expected, (try desktop.scene(second)).geometry);
+                    try desktop.endInteractive(grabbed);
+                    while (desktop.pendingCommands() != 0) _ = try desktop.flushConfigure(&shell);
+                }
+            }
+            // The anchor belongs to the tiled placement, not a subsequent
+            // floating position, even when the new buffer is smaller.
+            try desktop.setFloating(second, true);
+            try desktop.setFloatingGeometry(second, .{ .x = 20, .y = 10, .width = 40, .height = 30 });
+            try settleDesktop(&desktop, &shell);
+            shell.push(.{ .commit_ready = .{
+                .id = .{ .index = 1, .generation = 1 },
+                .serial = shell.configure_serial,
+                .mapped = true,
+                .window_width = 20,
+                .window_height = 20,
+            } });
+            _ = try desktop.consume(&shell, 1);
+            try std.testing.expectEqual(@as(i32, 20), (try desktop.scene(second)).geometry.x);
+            try std.testing.expectEqual(@as(i32, 10), (try desktop.scene(second)).geometry.y);
+        }
+    }
+}
+
+test "desktop: relocating a resized tile still waits for the layout transaction" {
+    var desktop = try initTestDesktop(16);
+    defer desktop.deinit();
+    var shell = TestShell{};
+    shell.push(created(0));
+    shell.push(created(1));
+    _ = try desktop.consume(&shell, 2);
+    try settleDesktop(&desktop, &shell);
+    const first = try desktop.idForShell(.{ .index = 0, .generation = 1 });
+    const second = try desktop.idForShell(.{ .index = 1, .generation = 1 });
+    _ = (try desktop.beginInteractive(.{ .id = first, .kind = .{ .resize = .right } })).?;
+    try desktop.updateInteractive(first, .{ .x = 0, .y = 0, .width = 60, .height = 60 });
+    try desktop.endInteractive(first);
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expect(desktop.slots[second.index].resize_anchor.?.right);
+    try desktop.focusToplevel(second);
+    try settleDesktop(&desktop, &shell);
+    const previous = (try desktop.scene(second)).geometry;
+    try desktop.moveFocusedTile(.previous);
+    try std.testing.expect(desktop.slots[second.index].resize_anchor == null);
+    while (desktop.pendingCommands() != 0) _ = try desktop.flushConfigure(&shell);
+    shell.push(.{ .commit_ready = .{
+        .id = .{ .index = 1, .generation = 1 },
+        .serial = desktop.slots[second.index].expected_serial.?,
+        .mapped = true,
+        .has_window_geometry = true,
+        .window_width = 60,
+        .window_height = 60,
+    } });
+    _ = try desktop.consume(&shell, 1);
+    try std.testing.expectEqual(previous, (try desktop.scene(second)).geometry);
+    try std.testing.expect(desktop.transactionPending());
+    shell.push(.{ .commit_ready = .{
+        .id = .{ .index = 0, .generation = 1 },
+        .serial = desktop.slots[first.index].expected_serial.?,
+        .mapped = true,
+        .has_window_geometry = true,
+        .window_width = 40,
+        .window_height = 60,
+    } });
+    _ = try desktop.consume(&shell, 1);
+    try std.testing.expectEqual(geometry.Rect{ .x = 0, .y = 0, .width = 60, .height = 60 }, (try desktop.scene(second)).geometry);
 }
 
 test "desktop: initial commit gates configure and unmap requires it again" {

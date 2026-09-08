@@ -4736,6 +4736,20 @@ test "shell-input: synchronized cursor subsurface batch renders root and child" 
 }
 
 test "shell-input: floating left resize keeps the right edge fixed across buffer admission" {
+    try runWindowResize(.floating);
+}
+
+test "shell-input: floating resize anchors synchronized child content during repaint" {
+    try runWindowResize(.floating_child);
+}
+
+test "shell-input: tiled resize anchors the neighbour across buffer admission" {
+    try runWindowResize(.tiled);
+}
+
+fn runWindowResize(mode: enum { floating, floating_child, tiled }) !void {
+    const subsurface = mode == .floating_child;
+    const tiled = mode == .tiled;
     const allocator = std.testing.allocator;
     var path_storage: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-floating-resize-{d}.sock", .{linux.getpid()});
@@ -4743,8 +4757,24 @@ test "shell-input: floating left resize keeps the right edge fixed across buffer
     defer wayring.unix_socket.unlink(path) catch {};
     var fixture = try physical_fixture.Fixture.init();
     defer fixture.deinit();
-    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), physical_fixture.compositorConfig());
-    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), physical_fixture.coordinatorConfig());
+    fixture.second_desktop = subsurface;
+    if (tiled) fixture.first_mode_width = 4;
+    var root_config = physical_fixture.compositorConfig();
+    root_config.runtime.actor.received_fd_budget = 2;
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), root_config);
+    var config = physical_fixture.coordinatorConfig();
+    config.shm.pool_capacity = 2;
+    config.shm.buffer_capacity = 2;
+    config.surface.surface_capacity = 2;
+    config.surface.viewport_capacity = 2;
+    config.surface.frame_callback_capacity = 2;
+    config.surface.content_update_capacity = 3;
+    config.surface.dependency_capacity = 2;
+    config.surface.attachment_capacity = 2;
+    config.surface.copy_capacity = 2;
+    config.output.max_samples = 3;
+    config.output.max_source_bytes = pixels.len * 2;
+    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), config);
     var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
     try coordinator.start(&loop);
     var reactor: wayring.io_uring.Reactor = undefined;
@@ -4753,7 +4783,7 @@ test "shell-input: floating left resize keeps the right edge fixed across buffer
         allocator,
         &reactor,
         try wayring.unix_socket.connect(path),
-        .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 },
+        .{ .received_fd_budget = 2, .transmit_byte_budget = 4096, .transmit_fd_budget = 2 },
         .{ .max_objects = 32, .max_client_ids = 31 },
     );
     const actor = try client.actor();
@@ -4762,43 +4792,55 @@ test "shell-input: floating left resize keeps the right edge fixed across buffer
         .objects = &client.objects,
         .queue = &actor.transmit,
         .registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null),
-        .surface_count = 1,
+        .surface_count = if (subsurface or tiled) 2 else 1,
+        .subsurface_mode = subsurface,
         .cycle_count = 1,
         .fractional_mode = true,
+        // The synchronized child has no output association before mapping.
+        .preferred_scales = .{ 120, 120 },
     };
+    const initial_frames: usize = handler.surface_count;
     try submitMultiClient(&reactor, &driver, &handler);
     _ = try loop.turn(coordinator);
     try fixture.signalSession(.enable);
     for (0..256) |_| {
         _ = try drainMultiClient(&reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
-        if (handler.frame_done == 1 and handler.buffer_releases == 1 and fixture.flip_len == 0) break;
+        if (handler.frame_done == initial_frames and handler.buffer_releases == initial_frames and fixture.flip_len == 0) break;
         try waitForEither(&root.ring, reactor.ring);
     }
-    try std.testing.expectEqual(@as(usize, 1), handler.frame_done);
+    try std.testing.expectEqual(initial_frames, handler.frame_done);
     var windows: [2]Coordinator.Desktop.SceneWindow = undefined;
-    const window = (try coordinator.desktop.sceneSnapshot(&windows))[0];
-    try coordinator.desktop.setFloating(window.id, true);
-    try coordinator.desktop.setFloatingGeometry(window.id, .{ .x = 1, .y = 0, .width = 2, .height = 1 });
+    const scene_windows = try coordinator.desktop.sceneSnapshot(&windows);
+    const window = scene_windows[0];
+    const neighbour = if (tiled) scene_windows[1] else window;
+    const content_index: usize = if (subsurface or tiled) 1 else 0;
+    const content_surface = try coordinator.adapter.surfaceId(handler.surfaces[content_index].?);
+    const initial_x: i32 = 1;
+    const initial_width: i32 = if (subsurface) 3 else 2;
+    if (!tiled) {
+        try coordinator.desktop.setFloating(window.id, true);
+        try coordinator.desktop.setFloatingGeometry(window.id, .{ .x = initial_x, .y = 0, .width = initial_width, .height = 1 });
+    }
     for (0..256) |_| {
         _ = try drainMultiClient(&reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
         if (!coordinator.desktop.transactionPending() and coordinator.pending_surface_len == 0 and
-            fixture.flip_len == 0 and (try coordinator.desktop.scene(window.id)).geometry.x == 1) break;
+            fixture.flip_len == 0 and (tiled or (try coordinator.desktop.scene(window.id)).geometry.x == initial_x)) break;
         try waitForEither(&root.ring, reactor.ring);
     }
-    const original = findLayer(coordinator.app_layers, window.surface).?.sample.?.destination;
-    try std.testing.expectEqual(@as(i32, 1), original.x);
+    const original = findLayer(coordinator.app_layers, content_surface).?.sample.?.destination;
+    try std.testing.expectEqual(initial_x + @as(i32, @intCast(content_index)), original.x);
     try std.testing.expectEqual(@as(u32, 2), original.width);
-    _ = (try coordinator.desktop.beginInteractive(.{ .id = window.id, .kind = .{ .resize = .left } })).?;
-    try coordinator.desktop.updateInteractive(window.id, .{ .x = 0, .y = 0, .width = 3, .height = 1 });
+    _ = (try coordinator.desktop.beginInteractive(.{ .id = window.id, .kind = .{ .resize = if (tiled) .right else .left } })).?;
+    try coordinator.desktop.updateInteractive(window.id, .{ .x = if (tiled) 0 else initial_x - 1, .y = 0, .width = initial_width + 1, .height = 1 });
     for (0..256) |_| {
         _ = try drainMultiClient(&reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
         if (!coordinator.desktop.transactionPending() and coordinator.pending_surface_len == 0 and fixture.flip_len == 0) break;
         try waitForEither(&root.ring, reactor.ring);
     }
-    try std.testing.expectEqual(original, findLayer(coordinator.app_layers, window.surface).?.sample.?.destination);
+    try std.testing.expectEqual(original, findLayer(coordinator.app_layers, content_surface).?.sample.?.destination);
 
     // Hold a repaint of the old buffer, then commit a wider replacement.
     const output = coordinator.primaryKmsOutput().?;
@@ -4813,32 +4855,66 @@ test "shell-input: floating left resize keeps the right edge fixed across buffer
         try waitForEither(&root.ring, reactor.ring);
     }
     try std.testing.expect(output.in_flight_frame != null);
-    try protocol.wp_viewport.encodeRequest(handler.queue, handler.viewports[0].?.id, .{
-        .set_destination = .{ .width = 3, .height = 1 },
+    const new_content_width: i32 = if (tiled) 1 else 3;
+    try protocol.wp_viewport.encodeRequest(handler.queue, handler.viewports[content_index].?.id, .{
+        .set_destination = .{ .width = new_content_width, .height = 1 },
     });
-    try handler.mapSurface(0);
+    if (subsurface) try protocol.xdg_surface.encodeRequest(handler.queue, handler.xdg_surfaces[0].?.id, .{
+        .set_window_geometry = .{ .x = 0, .y = 0, .width = initial_width + 1, .height = 1 },
+    });
+    try handler.mapSurface(content_index);
+    // Chromium-style delegation: commit the synchronized content child,
+    // then latch it with a root commit retaining the background buffer.
+    if (subsurface) try protocol.wl_surface.encodeRequest(handler.queue, handler.surfaces[0].?.id, .{ .commit = .{} });
     try submitMultiClient(&reactor, &driver, &handler);
+    const new_window_width: i32 = if (tiled) 1 else initial_width + 1;
     for (0..128) |_| {
         _ = try drainMultiClient(&reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
-        if ((try coordinator.desktop.scene(window.id)).geometry.width == 3) break;
+        if ((try coordinator.desktop.scene(neighbour.id)).geometry.width == new_window_width) break;
         try waitForEither(&root.ring, reactor.ring);
     }
-    try std.testing.expectEqual(@as(i32, 3), (try coordinator.desktop.scene(window.id)).geometry.width);
-    try std.testing.expectEqual(original, findLayer(coordinator.app_layers, window.surface).?.sample.?.destination);
+    try std.testing.expectEqual(new_window_width, (try coordinator.desktop.scene(neighbour.id)).geometry.width);
+    try std.testing.expectEqual(original, findLayer(coordinator.app_layers, content_surface).?.sample.?.destination);
+    if (subsurface) {
+        // Repainting the other output also refreshes subsurface placement.
+        // Its old pixels must stay put while the primary output holds them.
+        const submitted = coordinator.stats.submitted;
+        const secondary = coordinator.physical_outputs[1].kms_output.?;
+        try std.testing.expectEqual(@as(usize, 0), linux.clock_gettime(.MONOTONIC, &now));
+        try secondary.request(.damage, @as(u64, @intCast(now.sec)) * std.time.ns_per_s + @as(u64, @intCast(now.nsec)));
+        for (0..128) |_| {
+            _ = try drainMultiClient(&reactor, &driver, &handler);
+            _ = try loop.turn(coordinator);
+            if (coordinator.stats.submitted > submitted) break;
+            try waitForEither(&root.ring, reactor.ring);
+        }
+        try std.testing.expect(coordinator.stats.submitted > submitted);
+        try std.testing.expectEqual(original, findLayer(coordinator.app_layers, content_surface).?.sample.?.destination);
+    }
     try fixture.releaseHeldFlips();
     for (0..256) |_| {
         _ = try drainMultiClient(&reactor, &driver, &handler);
         _ = try loop.turn(coordinator);
-        if (handler.frame_done == 2 and handler.buffer_releases == 2 and fixture.flip_len == 0) break;
+        if (handler.frame_done == initial_frames + 1 and handler.buffer_releases == initial_frames + 1 and fixture.flip_len == 0) break;
         try waitForEither(&root.ring, reactor.ring);
     }
-    const resized = findLayer(coordinator.app_layers, window.surface).?.sample.?.destination;
-    try std.testing.expectEqual(@as(i32, 0), resized.x);
-    try std.testing.expectEqual(@as(u32, 3), resized.width);
+    const resized = findLayer(coordinator.app_layers, content_surface).?.sample.?.destination;
+    try std.testing.expectEqual(original.x + @as(i32, if (tiled) 1 else -1), resized.x);
+    try std.testing.expectEqual(@as(u32, @intCast(new_content_width)), resized.width);
     try std.testing.expectEqual(original.x + @as(i32, @intCast(original.width)), resized.x + @as(i32, @intCast(resized.width)));
-    try std.testing.expectEqual(@as(usize, 2), handler.frame_done);
+    try std.testing.expectEqual(initial_frames + 1, handler.frame_done);
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+    if (!tiled) {
+        // Moving the window still moves retained content without a new buffer.
+        var moved = (try coordinator.desktop.scene(window.id)).geometry;
+        moved.x += 1;
+        try coordinator.desktop.setFloatingGeometry(window.id, moved);
+        _ = try loop.turn(coordinator);
+        const moved_content = findLayer(coordinator.app_layers, content_surface).?.sample.?.destination;
+        try std.testing.expectEqual(resized.x + 1, moved_content.x);
+        try std.testing.expectEqual(resized.width, moved_content.width);
+    }
     try coordinator.requestStop();
     _ = try client.prepareClose();
     try submitMultiClient(&reactor, &driver, &handler);

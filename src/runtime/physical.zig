@@ -8871,17 +8871,10 @@ pub fn Coordinator(comptime protocol: type) type {
                         };
                     }
                 }
-                // A scene commit can precede admission of its buffer (for
-                // example while a page flip still owns the previous content).
-                // Do not move that old, natural-sized buffer to the new
-                // resize origin. Pure moves still reposition it immediately.
-                if (!scene.subsurface and scene.root.has_window_geometry) {
-                    if (layer.window_geometry) |previous_geometry| {
-                        if ((previous_geometry.width != scene.root.geometry.width or
-                            previous_geometry.height != scene.root.geometry.height) and
-                            self.pendingSurfaceContains(id))
-                            sample.destination = layer.sample.?.destination;
-                    }
+                if (self.retainedResizePending(layer, scene)) {
+                    sample.destination = layer.sample.?.destination;
+                } else {
+                    layer.window_geometry = scene.root.geometry;
                 }
                 sample.clip = clipToOutput(sample.destination, output_bounds) catch unreachable orelse {
                     self.retireLayer(layer);
@@ -8900,6 +8893,19 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             if (self.cursor_layer.active) self.cursor_layer.change.?.invalidate_bounds = true;
             return visibility_changed;
+        }
+
+        // Scene geometry precedes buffer admission. This applies to the whole
+        // XDG tree: delegated child content must not move to the new resize
+        // origin while its old buffer is still being sampled. A retained
+        // child without its own commit also waits for its root's admission.
+        fn retainedResizePending(self: *const Self, layer: *const Layer, scene: SurfaceScene) bool {
+            if (!scene.root.has_window_geometry) return false;
+            const previous = layer.window_geometry orelse return false;
+            if (previous.width == scene.root.geometry.width and
+                previous.height == scene.root.geometry.height) return false;
+            return self.pendingSurfaceContains(layer.id.?) or
+                (scene.subsurface and self.pendingSurfaceContains(scene.root.surface));
         }
 
         fn applyReady(self: *Self) !void {
@@ -9550,6 +9556,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 var consumed = layer.candidate.take() orelse return error.MissingCandidate;
                 consumed.content.deinit();
                 layer.rendered = rendered;
+                layer.window_geometry = if (surface_scene) |scene| scene.root.geometry else null;
                 self.finishPendingCandidate(pending_id);
                 // A wait-only FIFO commit advances protocol state, not pixels.
                 // A new barrier still needs the ordinary output latching path.
@@ -10615,6 +10622,11 @@ pub fn Coordinator(comptime protocol: type) type {
                     scene.root.geometry.y,
                 scene.offset_y,
             );
+            if (self.retainedResizePending(layer, scene)) {
+                sample.destination = layer.sample.?.destination;
+            } else {
+                layer.window_geometry = scene.root.geometry;
+            }
             sample.clip = try clipToOutput(sample.destination, output_bounds) orelse return false;
             if (std.meta.eql(sample.destination, layer.sample.?.destination) and
                 std.meta.eql(sample.clip, layer.sample.?.clip)) return true;
