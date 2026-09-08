@@ -1432,6 +1432,7 @@ pub const Output = struct {
             .vulkan => |*value| {
                 if (self.vulkan_targets == null)
                     return self.retireAndDiscard(frame_id, error.RendererUnavailable, handle);
+                const composition = compositionList(list);
                 const render_result = if (capture) |capture_request| capture_result: {
                     const captures: vulkan_platform.Captures = if (capture_request.overlay_cursor)
                         .{ .after_cursor = true }
@@ -1442,7 +1443,7 @@ pub const Output = struct {
                             &self.vulkan_targets.?,
                             vulkan.Target.fromPool(&self.pool),
                             handle,
-                            list,
+                            composition,
                             plan,
                             capture_request.cursor_start,
                             captures,
@@ -1454,7 +1455,7 @@ pub const Output = struct {
                                 &self.vulkan_targets.?,
                                 vulkan.Target.fromPool(&self.pool),
                                 handle,
-                                list,
+                                composition,
                                 plan,
                                 capture_request.cursor_start,
                                 captures,
@@ -1466,7 +1467,7 @@ pub const Output = struct {
                     &self.vulkan_targets.?,
                     &self.pool,
                     handle,
-                    list,
+                    composition,
                     plan,
                 );
                 in_fence = render_result catch |cause| {
@@ -2096,6 +2097,33 @@ pub fn formatFromDrm(value: u32) ?render.PixelFormat {
 fn targetFormatFromDrm(value: u32) ?render.PixelFormat {
     if (value == gbm.format_xrgb2101010) return .xrgb8888;
     return formatFromDrm(value);
+}
+
+// The ICC capture fix must not also switch the established non-ICC HDR
+// scanout encoding. Keep that behavior until HDR conversion is validated
+// end-to-end. Captures must use the same composition encoding as scanout.
+fn compositionList(configured: render.List) render.List {
+    var list = configured;
+    if (list.output_color_description.lut == null)
+        list.output_color_description = .srgb;
+    return list;
+}
+
+test "drm-sim: ICC fix preserves ordinary non-ICC HDR composition encoding" {
+    var list: render.List = .{
+        .output = .{ .width = 1, .height = 1 },
+        .output_format = .xrgb8888,
+        .clear = .{ .r = 0, .g = 0, .b = 0 },
+        .samples = &.{},
+    };
+    for ([_]render.color.TransferFunction{ .srgb, .st2084_pq, .hlg }) |transfer| {
+        list.output_color_description.transfer = transfer;
+        list.output_color_description.reference_luminance = 203;
+        list.output_color_description.max_luminance = 1000;
+        try std.testing.expectEqualDeep(render.color.Description.srgb, compositionList(list).output_color_description);
+        // Selecting composition must not mutate the configured output state.
+        try std.testing.expectEqual(transfer, list.output_color_description.transfer);
+    }
 }
 
 fn hdrRequested(description: render.color.Description) bool {
@@ -2742,9 +2770,10 @@ test "drm-sim: render device survives output target recreation" {
     try std.testing.expectEqual(@as(usize, 4), fixture.framebuffers_removed);
 }
 
-test "drm-sim: ordinary and capture frames both forward the output ICC profile" {
+test "drm-sim: ordinary and capture frames keep ICC and non-ICC output encoding stable" {
     const Probe = struct {
-        expected: *const @import("../render/icc.zig").Lut,
+        expected: ?*const @import("../render/icc.zig").Lut,
+        capture: bool = false,
         calls: usize = 0,
 
         fn create(context: *anyopaque, _: std.posix.fd_t, _: vulkan_platform.Config) !vulkan_platform.Renderer {
@@ -2757,9 +2786,18 @@ test "drm-sim: ordinary and capture frames both forward the output ICC profile" 
         fn cache(context: *anyopaque, _: vulkan_platform.Renderer, lut: *const @import("../render/icc.zig").Lut) !u32 {
             const self: *@This() = @ptrCast(@alignCast(context));
             try std.testing.expectEqual(self.expected, lut);
+            return 0;
+        }
+        fn destroyTarget(_: *anyopaque, _: vulkan_platform.Renderer, _: vulkan_platform.Target) void {}
+        fn draw(context: *anyopaque, _: vulkan_platform.Renderer, _: vulkan_platform.Target, frame: vulkan_platform.Frame) !std.posix.fd_t {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            var expected = render.color.Description.srgb;
+            expected.lut = self.expected;
+            try std.testing.expectEqualDeep(expected, frame.output_color_description);
+            try std.testing.expectEqual(self.capture, frame.captures.after_cursor);
             self.calls += 1;
-            // Stop at the GPU upload boundary: no real Vulkan device is needed.
-            return error.ProfileObserved;
+            // Inspect the actual frame at the GPU boundary without submitting it.
+            return error.FrameObserved;
         }
     };
     const lut: @import("../render/icc.zig").Lut = .{
@@ -2787,13 +2825,28 @@ test "drm-sim: ordinary and capture frames both forward the output ICC profile" 
     vtable.destroy = Probe.destroy;
     vtable.packs_sources = Probe.packs;
     vtable.cache_lut = Probe.cache;
+    vtable.draw = Probe.draw;
+    vtable.destroy_target = Probe.destroyTarget;
     const renderer = try vulkan.Renderer.init(std.testing.allocator, .{ .context = &probe, .vtable = &vtable }, -1, .{ .max_samples = 1, .max_source_bytes = 4 });
     output.render_device.renderer.?.pixman.deinit();
     output.render_device.renderer = .{ .vulkan = renderer };
     output.vulkan_targets = try output.render_device.renderer.?.vulkan.createTargets(2);
-    output.output_color_description.lut = &lut;
+    for (output.vulkan_targets.?.records, output.pool.slots) |*record, slot| {
+        record.imported = &probe;
+        record.metadata = slot.metadata;
+    }
     var bytes: [4]u8 = @splat(0);
-    for ([_]bool{ false, true, false, true }, 0..) |capture, index| {
+    for (0..8) |index| {
+        const capture = index % 2 == 1;
+        probe.capture = capture;
+        probe.expected = if (index < 4) &lut else null;
+        output.output_color_description = .srgb;
+        output.output_color_description.lut = probe.expected;
+        if (probe.expected == null) {
+            output.output_color_description.transfer = .st2084_pq;
+            output.output_color_description.reference_luminance = 203;
+            output.output_color_description.max_luminance = 1000;
+        }
         const frame = try startSimFrame(output, 1 + index * 10, .{ .slot = 0, .generation = @intCast(index + 1) });
         const result = if (capture)
             try output.renderFrameCapture(frame, &.{}, &.{}, &.{}, 8 + index * 10, .{
@@ -2804,7 +2857,7 @@ test "drm-sim: ordinary and capture frames both forward the output ICC profile" 
             })
         else
             try output.renderFrame(frame, &.{}, &.{}, &.{}, 8 + index * 10);
-        try std.testing.expectEqual(error.ProfileObserved, result.retired.cause);
+        try std.testing.expectEqual(error.FrameObserved, result.retired.cause);
         try std.testing.expectEqual(index + 1, probe.calls);
     }
 }
