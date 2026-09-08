@@ -288,20 +288,21 @@ pub fn Adapter(comptime protocol: type) type {
                 return try self.invalidObject(actor, parent.id, "invalid output");
             const output_object = server_objects.namespace.resolve(output_handle) orelse
                 return try self.invalidObject(actor, parent.id, "invalid output");
-            const validator = self.output_validator orelse
-                return try self.invalidObject(actor, parent.id, "output unavailable");
-            const mode = validator.validateFn(
+            if (output_object.interface != &protocol.wl_output.info)
+                return try self.invalidObject(actor, parent.id, "invalid output");
+            const mode = if (self.output_validator) |validator| validator.validateFn(
                 validator.context,
                 peer,
                 output_handle,
                 output_object.*,
-            ) orelse
-                return try self.invalidObject(actor, parent.id, "foreign output");
-            if (mode.width == 0 or mode.height == 0 or mode.width > std.math.maxInt(i32) or
-                mode.height > std.math.maxInt(i32))
-                return try self.invalidObject(actor, parent.id, "output unavailable");
-            _ = std.math.mul(u32, mode.width, 4) catch
-                return try self.invalidObject(actor, parent.id, "output unavailable");
+            ) else null;
+            const output_available = if (mode) |available| available: {
+                if (available.width == 0 or available.height == 0 or
+                    available.width > std.math.maxInt(i32) or
+                    available.height > std.math.maxInt(i32)) break :available false;
+                _ = std.math.mul(u32, available.width, 4) catch break :available false;
+                break :available true;
+            } else false;
 
             const frame = self.acquireFrame() catch return try self.noMemory(actor);
             var frame_owned = true;
@@ -309,11 +310,13 @@ pub fn Adapter(comptime protocol: type) type {
             frame.peer = peer;
             frame.manager = self.managerId(manager);
             frame.output = output_handle;
-            frame.output_identity = mode.identity;
-            frame.output_generation = mode.generation;
+            frame.output_identity = if (mode) |available| available.identity else 0;
+            frame.output_generation = if (mode) |available| available.generation else 0;
             frame.overlay_cursor = value.overlay_cursor != 0;
-            frame.region = if (requested) |region| clipped: {
-                const clipped = clipRegion(region, mode.width, mode.height) orelse
+            frame.region = if (!output_available)
+                .{ .x = 0, .y = 0, .width = 0, .height = 0 }
+            else if (requested) |region| clipped: {
+                const clipped = clipRegion(region, mode.?.width, mode.?.height) orelse
                     break :clipped .{ .x = 0, .y = 0, .width = 0, .height = 0 };
                 break :clipped .{
                     .x = clipped.x,
@@ -321,12 +324,11 @@ pub fn Adapter(comptime protocol: type) type {
                     .width = clipped.width,
                     .height = clipped.height,
                 };
-            } else .{ .x = 0, .y = 0, .width = mode.width, .height = mode.height };
+            } else .{ .x = 0, .y = 0, .width = mode.?.width, .height = mode.?.height };
             frame.failed_creation = frame.region.width == 0 or frame.region.height == 0;
 
             const event_count: usize = if (frame.failed_creation) 1 else 2;
-            if (self.outbound.len - self.outbound_count < event_count)
-                return try self.noMemory(actor);
+            self.reserveOutbound(event_count) catch return try self.noMemory(actor);
             const admitted = if (with_region)
                 Manager.admit_capture_output_region(server_objects, parent, value, .{ .frame = frame })
             else
@@ -613,6 +615,15 @@ pub fn Adapter(comptime protocol: type) type {
             unreachable;
         }
 
+        fn reserveOutbound(self: *Self, additional: usize) !void {
+            if (self.outbound.len - self.outbound_count >= additional) return;
+            const old_len = self.outbound.len;
+            const needed = try std.math.add(usize, self.outbound_count, additional);
+            const doubled = std.math.mul(usize, old_len, 2) catch needed;
+            self.outbound = try self.allocator.realloc(self.outbound, @max(doubled, needed));
+            @memset(self.outbound[old_len..], .{});
+        }
+
         fn oldestOutbound(self: *Self, peer: wayring.io_uring.Peer) ?*Outbound {
             var oldest: ?*Outbound = null;
             for (self.outbound) |*slot| {
@@ -794,6 +805,83 @@ test "screencopy: frame ownership grows without moving existing contexts" {
     const address = @intFromPtr(first);
     _ = try adapter.acquireFrame();
     try std.testing.expectEqual(address, @intFromPtr(adapter.frames.entries.items[0]));
+}
+
+test "screencopy: outbound creation events grow without losing queued work" {
+    const A = Adapter(@import("core_protocol"));
+    var adapter = try A.init(std.testing.allocator, .{ .manager_capacity = 1, .frame_capacity = 1, .capture_capacity = 1, .outbound_capacity = 3 });
+    defer adapter.deinit();
+    adapter.outbound[0] = .{ .active = true, .sequence = 9, .frame = .{ .index = 2, .generation = 3 }, .event = .buffer };
+    adapter.outbound_count = 1;
+
+    try adapter.reserveOutbound(3);
+
+    try std.testing.expect(adapter.outbound.len >= 4);
+    try std.testing.expect(adapter.outbound[0].active);
+    try std.testing.expectEqual(@as(u64, 9), adapter.outbound[0].sequence);
+    try std.testing.expectEqual(@as(usize, 1), adapter.outbound_count);
+}
+
+test "screencopy: unavailable output fails frames without disconnecting" {
+    const protocol = @import("core_protocol");
+    const linux = std.os.linux;
+    const Manager = protocol.zwlr_screencopy_manager_v1;
+    const FrameProtocol = protocol.zwlr_screencopy_frame_v1;
+    const A = Adapter(protocol);
+    const Validator = struct {
+        fn validate(context: ?*anyopaque, _: wayring.io_uring.Peer, _: objects.Handle, _: objects.Object) ?OutputMode {
+            const available: *bool = @ptrCast(@alignCast(context.?));
+            return if (available.*) .{ .width = 8, .height = 8, .identity = 1, .generation = 1 } else null;
+        }
+    };
+    var adapter = try A.init(std.testing.allocator, .{ .outbound_capacity = 3 });
+    defer adapter.deinit();
+    var available = false;
+    adapter.setOutputValidator(.{ .context = &available, .validateFn = Validator.validate });
+    const peer: wayring.io_uring.Peer = .{ .slot = 0, .generation = 1 };
+    var so = try objects.ServerObjects.init(std.testing.allocator, 12, 8, &protocol.wl_display.info, null);
+    defer so.deinit(std.testing.allocator);
+    const manager = try adapter.managers.acquire();
+    manager.peer = peer;
+    manager.resource = try so.insertClient(2, &Manager.info, 3, manager);
+    _ = try so.insertClient(3, &protocol.wl_output.info, 1, null);
+    var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 256, 8);
+    defer blocks.deinit(std.testing.allocator);
+    var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 1);
+    defer descriptors.deinit(std.testing.allocator);
+    var fragment: [64]u8 = undefined;
+    var actor = wayring.connection.Actor.init(0, 1, &fragment, &descriptors, 0, &blocks, 1024, 0);
+    defer actor.deinit();
+    for (0..3) |i| {
+        available = i == 2;
+        var input = wayring.tx.Queue.init(&blocks, 512, &descriptors, 0);
+        defer input.deinit();
+        const frame_id: u32 = @intCast(i + 4);
+        if (i == 1)
+            try Manager.encodeRequest(&input, 2, .{ .capture_output_region = .{ .frame = frame_id, .output = 3, .overlay_cursor = 0, .x = 0, .y = 0, .width = 8, .height = 8 } })
+        else
+            try Manager.encodeRequest(&input, 2, .{ .capture_output = .{ .frame = frame_id, .output = 3, .overlay_cursor = 0 } });
+        var scratch: [1]linux.fd_t = undefined;
+        var control: [64]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+        const snapshot = try input.snapshot(&scratch, &control);
+        const message = (try wayring.wire.Message.decode(snapshot.first)).?;
+        const target = try so.namespace.request(2, message.header.opcode);
+        try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, (try adapter.requestOn(&actor, &so, peer, target, message, &input.descriptors)).?);
+        try std.testing.expectEqual(@as(usize, 0), actor.transmit.queuedBytes());
+    }
+    try std.testing.expectEqual(@as(usize, 4), try adapter.flushOn(peer, &so, &actor.transmit));
+    var scratch: [1]linux.fd_t = undefined;
+    var control: [64]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+    const snapshot = try actor.transmit.snapshot(&scratch, &control);
+    var bytes = snapshot.first;
+    var fds = wayring.ancillary.FdQueue.init(&descriptors, 0);
+    defer fds.deinit();
+    for ([_]std.meta.Tag(FrameProtocol.Event){ .failed, .failed, .buffer, .buffer_done }, [_]u32{ 4, 5, 6, 6 }) |tag, id| {
+        const message = (try wayring.wire.Message.decode(bytes)).?;
+        try std.testing.expectEqual(id, message.header.object_id);
+        try std.testing.expectEqual(tag, std.meta.activeTag(try FrameProtocol.decodeEvent(message, &fds)));
+        bytes = bytes[message.header.size..];
+    }
 }
 
 test "screencopy: frame generations reject stale completion and cleanup retained work" {

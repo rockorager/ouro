@@ -40,7 +40,7 @@ pub fn Adapter(comptime protocol: type, comptime OutputId: type, comptime Resolv
             resource: objects.Handle = .{ .id = 0, .generation = 0 },
             output: OutputId = undefined,
             valid: bool = true,
-            pending: bool = false,
+            pending: usize = 0,
         };
         const SlotId = packed struct { index: u32, generation: u32 };
         const Event = union(enum) { mode: Mode, failed };
@@ -55,7 +55,6 @@ pub fn Adapter(comptime protocol: type, comptime OutputId: type, comptime Resolv
 
         allocator: std.mem.Allocator,
         resolver: *Resolver,
-        config: Config,
         slots: slot_pool.Pool(Slot),
         outbound: std.ArrayListUnmanaged(Outbound) = .empty,
         commands: std.ArrayListUnmanaged(Command) = .empty,
@@ -66,12 +65,15 @@ pub fn Adapter(comptime protocol: type, comptime OutputId: type, comptime Resolv
 
         pub fn init(allocator: std.mem.Allocator, resolver: *Resolver, config: Config) !Self {
             try config.validate();
-            return .{
+            var self: Self = .{
                 .allocator = allocator,
                 .resolver = resolver,
-                .config = config,
                 .slots = try slot_pool.Pool(Slot).init(allocator, config.initial_capacity),
             };
+            errdefer self.deinit();
+            try self.commands.ensureTotalCapacity(allocator, config.command_capacity);
+            try self.outbound.ensureTotalCapacity(allocator, config.outbound_capacity);
+            return self;
         }
 
         pub fn deinit(self: *Self) void {
@@ -110,21 +112,24 @@ pub fn Adapter(comptime protocol: type, comptime OutputId: type, comptime Resolv
                             return try self.protocolError(actor, decoded.handle.id, 0, "invalid wl_output");
                         const output_object = server_objects.namespace.resolve(output_handle) orelse
                             return try self.protocolError(actor, decoded.handle.id, 0, "invalid wl_output");
-                        const resolution = self.resolver.resolveOutput(peer, output_handle, output_object) catch
-                            return try self.protocolError(actor, decoded.handle.id, 0, "foreign or stale wl_output");
-                        try self.ensureOutbound(1);
+                        if (output_object.interface != &protocol.wl_output.info)
+                            return try self.protocolError(actor, decoded.handle.id, 0, "invalid wl_output");
+                        // The output may have been removed while this request
+                        // was in flight, leaving its wl_output resource alive.
+                        const resolution = self.resolver.resolveOutput(peer, output_handle, output_object) catch null;
+                        self.ensureOutbound(1) catch return try self.noMemory(actor);
                         const slot = self.slots.acquire() catch return try self.noMemory(actor);
                         errdefer self.slots.release(slot);
                         const admitted = Manager.admit_get_output_power(server_objects, decoded.handle, value, .{ .id = slot }) catch |err|
                             return try self.failure(actor, decoded.handle.id, err);
                         slot.peer = peer;
                         slot.resource = admitted.id;
-                        slot.output = resolution.id;
-                        if (self.findOtherOutput(slot, resolution.id)) {
+                        if (resolution) |resolved| slot.output = resolved.id;
+                        if (resolution == null or self.findOtherOutput(slot, resolution.?.id)) {
                             slot.valid = false;
                             self.outbound.appendAssumeCapacity(.{ .owner = id(slot), .event = .failed });
                         } else {
-                            self.outbound.appendAssumeCapacity(.{ .owner = id(slot), .event = .{ .mode = resolution.mode } });
+                            self.outbound.appendAssumeCapacity(.{ .owner = id(slot), .event = .{ .mode = resolution.?.mode } });
                         }
                     },
                 }
@@ -136,7 +141,10 @@ pub fn Adapter(comptime protocol: type, comptime OutputId: type, comptime Resolv
             if (!samePeer(slot.peer, peer) or !std.meta.eql(slot.resource, handle)) return null;
             const decoded = try wayring.server.decodeRequest(Power, server_objects, message, fds);
             switch (decoded.value) {
-                .destroy => self.release(slot),
+                .destroy => {
+                    self.release(slot);
+                    self.dropInvalidCommands();
+                },
                 .set_mode => |value| {
                     const mode: Mode = switch (value.mode.value) {
                         0 => .off,
@@ -151,15 +159,13 @@ pub fn Adapter(comptime protocol: type, comptime OutputId: type, comptime Resolv
         }
 
         fn submit(self: *Self, slot: *Slot, mode: Mode) !void {
-            if (!slot.valid) return error.InvalidOutput;
-            if (slot.pending) return error.CommandPending;
-            if (self.pendingCommandCount() >= self.config.command_capacity) return error.Exhausted;
-            if (self.outbound_reservations >= self.config.outbound_capacity -| self.outbound.items.len)
-                return error.Exhausted;
+            // A failed control is inert. The protocol still requires the request
+            // to be consumed (and its enum to have been validated by the caller).
+            if (!slot.valid) return;
             try self.commands.ensureUnusedCapacity(self.allocator, 1);
-            try self.outbound.ensureUnusedCapacity(self.allocator, 1);
+            try self.ensureOutbound(1);
             self.commands.appendAssumeCapacity(.{ .peer = slot.peer, .object = slot.resource, .output = slot.output, .mode = mode, .token = id(slot) });
-            slot.pending = true;
+            slot.pending += 1;
             self.outbound_reservations += 1;
         }
 
@@ -179,9 +185,14 @@ pub fn Adapter(comptime protocol: type, comptime OutputId: type, comptime Resolv
                 .failed => .failed,
             } });
             self.outbound_reservations -= 1;
-            slot.pending = false;
-            if (completion == .failed) slot.valid = false;
+            std.debug.assert(slot.pending > 0);
+            slot.pending -= 1;
+            if (completion == .failed) {
+                slot.valid = false;
+                slot.pending = 0;
+            }
             self.advanceCommand();
+            if (!slot.valid) self.dropInvalidCommands();
         }
 
         pub fn publishMode(self: *Self, output: OutputId, mode: Mode) !void {
@@ -212,7 +223,7 @@ pub fn Adapter(comptime protocol: type, comptime OutputId: type, comptime Resolv
             try self.ensureOutbound(count);
             for (self.slots.entries.items) |slot| if (slot.header.active and slot.valid and std.meta.eql(slot.output, output)) {
                 slot.valid = false;
-                slot.pending = false;
+                slot.pending = 0;
                 self.outbound.appendAssumeCapacity(.{ .owner = id(slot), .event = .failed });
             };
             self.dropInvalidCommands();
@@ -273,7 +284,7 @@ pub fn Adapter(comptime protocol: type, comptime OutputId: type, comptime Resolv
         fn release(self: *Self, slot: *Slot) void {
             if (!slot.header.active) return;
             slot.valid = false;
-            slot.pending = false;
+            slot.pending = 0;
             self.slots.release(slot);
         }
         fn findOutput(self: *Self, output: OutputId) ?*Slot {
@@ -297,9 +308,6 @@ pub fn Adapter(comptime protocol: type, comptime OutputId: type, comptime Resolv
         }
         fn id(slot: *const Slot) SlotId {
             return .{ .index = slot.header.index, .generation = slot.header.generation };
-        }
-        fn pendingCommandCount(self: *const Self) usize {
-            return self.commands.items.len - self.command_head;
         }
         fn advanceCommand(self: *Self) void {
             self.command_head += 1;
@@ -332,9 +340,8 @@ pub fn Adapter(comptime protocol: type, comptime OutputId: type, comptime Resolv
             }
         }
         fn ensureOutbound(self: *Self, count: usize) !void {
-            if (count > self.config.outbound_capacity -| self.outbound.items.len -| self.outbound_reservations)
-                return error.Exhausted;
-            try self.outbound.ensureUnusedCapacity(self.allocator, count);
+            const needed = std.math.add(usize, self.outbound_reservations, count) catch return error.OutOfMemory;
+            try self.outbound.ensureUnusedCapacity(self.allocator, needed);
         }
         fn noMemory(_: *Self, actor: *wayring.connection.Actor) !wayring.dispatch.Control {
             try Core.postError(actor, objects.display_id, 2, "out of memory");
@@ -433,7 +440,7 @@ test "output power: external mode publication targets the exact output" {
     try std.testing.expectEqual(Mode.off, adapter.outbound.items[0].event.mode);
 }
 
-test "output power: completion capacity is reserved and commands are FIFO" {
+test "output power: repeated commands are FIFO and grow beyond capacity hints" {
     const protocol = @import("core_protocol");
     if (!@hasDecl(protocol, "zwlr_output_power_manager_v1")) return error.SkipZigTest;
     const Resolver = struct {};
@@ -441,7 +448,8 @@ test "output power: completion capacity is reserved and commands are FIFO" {
     var resolver = Resolver{};
     var adapter = try A.init(std.testing.allocator, &resolver, .{
         .initial_capacity = 3,
-        .outbound_capacity = 2,
+        .outbound_capacity = 1,
+        .command_capacity = 1,
     });
     defer adapter.deinit();
     const first = try adapter.slots.acquire();
@@ -457,10 +465,97 @@ test "output power: completion capacity is reserved and commands are FIFO" {
     blocked.resource = .{ .id = 10, .generation = 1 };
     blocked.output = 3;
     try adapter.submit(first, .off);
+    try adapter.submit(first, .on);
     try adapter.submit(second, .on);
-    try std.testing.expectError(error.Exhausted, adapter.submit(blocked, .off));
+    try adapter.submit(blocked, .off);
+    try std.testing.expectEqual(@as(usize, 2), first.pending);
+    try std.testing.expectEqual(@as(usize, 4), adapter.outbound_reservations);
     const command = adapter.peekCommand().?;
     try adapter.completeCommand(command, .succeeded);
-    try std.testing.expectEqual(@as(u32, 2), adapter.peekCommand().?.output);
-    try std.testing.expectEqual(@as(usize, 1), adapter.outbound_reservations);
+    try std.testing.expectEqual(Mode.on, adapter.peekCommand().?.mode);
+    try std.testing.expectEqual(@as(u32, 1), adapter.peekCommand().?.output);
+    try std.testing.expectEqual(@as(usize, 1), first.pending);
+    try std.testing.expectEqual(@as(usize, 3), adapter.outbound_reservations);
+}
+
+test "output power: invalid controls are inert but modes remain validated" {
+    const protocol = @import("core_protocol");
+    const Manager = protocol.zwlr_output_power_manager_v1;
+    const Power = protocol.zwlr_output_power_v1;
+    const Resolver = struct {
+        pub fn resolveOutput(_: *@This(), _: wayring.io_uring.Peer, _: objects.Handle, _: *const objects.Object) !struct { id: u32, mode: Mode } {
+            return error.InvalidOutput;
+        }
+    };
+    const A = Adapter(protocol, u32, Resolver);
+    var resolver = Resolver{};
+    var adapter = try A.init(std.testing.allocator, &resolver, .{ .initial_capacity = 1 });
+    defer adapter.deinit();
+    const peer: wayring.io_uring.Peer = .{ .slot = 0, .generation = 1 };
+    var so = try objects.ServerObjects.init(std.testing.allocator, 8, 2, &protocol.wl_display.info, null);
+    defer so.deinit(std.testing.allocator);
+    _ = try so.insertClient(2, &Manager.info, 1, &adapter);
+    _ = try so.insertClient(3, &protocol.wl_output.info, 1, null);
+    var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 256, 8);
+    defer blocks.deinit(std.testing.allocator);
+    var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 1);
+    defer descriptors.deinit(std.testing.allocator);
+    var fragment: [64]u8 = undefined;
+    var actor = wayring.connection.Actor.init(0, 1, &fragment, &descriptors, 0, &blocks, 512, 0);
+    defer actor.deinit();
+    for (0..4) |i| {
+        var input = wayring.tx.Queue.init(&blocks, 512, &descriptors, 0);
+        defer input.deinit();
+        if (i == 0) {
+            try Manager.encodeRequest(&input, 2, .{ .get_output_power = .{ .id = 4, .output = 3 } });
+        } else if (i == 2) {
+            const pending = try adapter.slots.acquire();
+            pending.peer = peer;
+            pending.output = 1;
+            pending.resource = try so.insertClient(5, &Power.info, 1, pending);
+            try adapter.submit(pending, .off);
+            try adapter.submit(pending, .on);
+            try Power.encodeRequest(&input, 5, .{ .destroy = .{} });
+        } else {
+            try Power.encodeRequest(&input, 4, .{ .set_mode = .{ .mode = .fromInt(if (i == 1) 1 else 2) } });
+        }
+        var scratch: [1]std.os.linux.fd_t = undefined;
+        var control: [64]u8 align(@alignOf(std.os.linux.cmsghdr)) = undefined;
+        const snapshot = try input.snapshot(&scratch, &control);
+        const message = (try wayring.wire.Message.decode(snapshot.first)).?;
+        const target = try so.namespace.request(message.header.object_id, message.header.opcode);
+        try std.testing.expectEqual(
+            if (i == 3) wayring.dispatch.Control.stop else wayring.dispatch.Control.continue_dispatch,
+            (try adapter.requestOn(&actor, &so, peer, target, message, &input.descriptors)).?,
+        );
+        try std.testing.expect(adapter.peekCommand() == null);
+        try std.testing.expectEqual(@as(usize, 0), adapter.outbound_reservations);
+        if (i < 2) try std.testing.expectEqual(@as(usize, 0), actor.transmit.queuedBytes());
+    }
+    try std.testing.expectEqual(@as(usize, 1), adapter.outbound.items.len);
+    try std.testing.expect(adapter.outbound.items[0].event == .failed);
+    try std.testing.expect(!adapter.slots.entries.items[0].valid);
+}
+
+test "output power: failed completion drops later requests for that control" {
+    const protocol = @import("core_protocol");
+    if (!@hasDecl(protocol, "zwlr_output_power_manager_v1")) return error.SkipZigTest;
+    const Resolver = struct {};
+    const A = Adapter(protocol, u32, Resolver);
+    var resolver = Resolver{};
+    var adapter = try A.init(std.testing.allocator, &resolver, .{ .initial_capacity = 1 });
+    defer adapter.deinit();
+    const slot = try adapter.slots.acquire();
+    slot.peer = .{ .slot = 1, .generation = 1 };
+    slot.resource = .{ .id = 8, .generation = 1 };
+    slot.output = 42;
+    try adapter.submit(slot, .off);
+    try adapter.submit(slot, .on);
+
+    try adapter.completeCommand(adapter.peekCommand().?, .failed);
+
+    try std.testing.expect(adapter.peekCommand() == null);
+    try std.testing.expectEqual(@as(usize, 0), adapter.outbound_reservations);
+    try std.testing.expectEqual(@as(usize, 0), slot.pending);
+    try std.testing.expect(!slot.valid);
 }

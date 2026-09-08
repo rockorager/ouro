@@ -182,7 +182,7 @@ pub fn Adapter(comptime protocol: type) type {
                 needed_o += 3 + @as(usize, @intFromBool(t.title_len != 0)) +
                     @as(usize, @intFromBool(t.app_len != 0));
             };
-            if (self.outbound.len - self.outbound_count < needed_o) return error.OutOfMemory;
+            try self.ensureOutboundCapacity(needed_o);
             const list = try self.lists.acquire();
             errdefer self.releaseList(list.header.index);
             list.peer = binding.peer;
@@ -198,7 +198,8 @@ pub fn Adapter(comptime protocol: type) type {
                 count += 1;
                 events += 5 + t.output_count + @as(usize, @intFromBool(binding.version >= 3));
             };
-            if (self.wmanager_free == none or freeCount(WHandleSlot, self.whandles) < count or self.woutbound.len - self.woutbound_count < events) return error.OutOfMemory;
+            if (self.wmanager_free == none or freeCount(WHandleSlot, self.whandles) < count) return error.OutOfMemory;
+            try self.ensureWOutboundCapacity(events);
             const mi = self.wmanager_free;
             self.wmanager_free = self.wmanagers[mi].next_free;
             const generation = self.wmanagers[mi].generation;
@@ -223,9 +224,9 @@ pub fn Adapter(comptime protocol: type) type {
             };
             const per: usize = 3 + @as(usize, @intFromBool(title != null and title.?.len != 0)) + @as(usize, @intFromBool(app_id != null and app_id.?.len != 0));
             if (self.serial == 0) return error.IdentifierExhausted;
-            if (self.outbound.len - self.outbound_count < lists * per or
-                freeCount(WHandleSlot, self.whandles) < wmanagers or
-                self.woutbound.len - self.woutbound_count < wevents) return error.Exhausted;
+            try self.ensureOutboundCapacity(lists * per);
+            try self.ensureWOutboundCapacity(wevents);
+            if (freeCount(WHandleSlot, self.whandles) < wmanagers) return error.Exhausted;
             const top = try self.tops.acquire();
             errdefer self.releaseTop(top.header.index);
             top.title = try self.allocator.alloc(u8, self.metadata_capacity);
@@ -273,7 +274,7 @@ pub fn Adapter(comptime protocol: type) type {
             const top = try self.resolveTop(id);
             if (std.meta.eql(top.state, value)) return false;
             const n = self.wHandleCount(id);
-            if (self.woutbound.len - self.woutbound_count < n * 2) return error.Exhausted;
+            try self.ensureWOutboundCapacity(n * 2);
             top.state = value;
             self.queueWUpdate(id, .state, null);
             return true;
@@ -289,7 +290,7 @@ pub fn Adapter(comptime protocol: type) type {
             }
             if (std.meta.eql(top.parent, value)) return false;
             const n = self.wHandleCount(id);
-            if (self.woutbound.len - self.woutbound_count < n * 2) return error.Exhausted;
+            try self.ensureWOutboundCapacity(n * 2);
             top.parent = value;
             self.queueWUpdate(id, .parent, null);
             return true;
@@ -306,10 +307,10 @@ pub fn Adapter(comptime protocol: type) type {
             values[top.output_count] = output;
             top.output_count += 1;
             const n = self.wHandleCount(id);
-            if (self.woutbound.len - self.woutbound_count < n * 2) {
+            self.ensureWOutboundCapacity(n * 2) catch |err| {
                 top.output_count -= 1;
-                return error.Exhausted;
-            }
+                return err;
+            };
             self.queueWUpdate(id, .output_enter, output);
             return true;
         }
@@ -319,7 +320,7 @@ pub fn Adapter(comptime protocol: type) type {
             for (values[0..top.output_count], 0..) |value, i| if (std.meta.eql(value, output)) {
                 if (i + 1 < top.output_count) values[i] = values[top.output_count - 1];
                 const n = self.wHandleCount(id);
-                if (self.woutbound.len - self.woutbound_count < n * 2) return error.Exhausted;
+                try self.ensureWOutboundCapacity(n * 2);
                 top.output_count -= 1;
                 self.queueWUpdate(id, .output_leave, output);
                 return true;
@@ -347,9 +348,9 @@ pub fn Adapter(comptime protocol: type) type {
             for (self.handles.entries.items) |h| {
                 if (h.header.active and !h.closed and std.meta.eql(h.top, id)) n += 1;
             }
-            if (self.outbound.len - self.outbound_count < n * 2) return error.Exhausted;
+            try self.ensureOutboundCapacity(n * 2);
             const wn = self.wHandleCount(id);
-            if (self.woutbound.len - self.woutbound_count < wn * 2) return error.Exhausted;
+            try self.ensureWOutboundCapacity(wn * 2);
             const dst = if (kind == .title) t.title else t.app;
             @memcpy(dst[0..value.len], value);
             if (kind == .title) t.title_len = value.len else t.app_len = value.len;
@@ -365,14 +366,14 @@ pub fn Adapter(comptime protocol: type) type {
             for (self.handles.entries.items) |h| {
                 if (h.header.active and !h.closed and std.meta.eql(h.top, id)) n += 1;
             }
-            if (self.outbound.len - self.outbound_count < n) return error.Exhausted;
+            try self.ensureOutboundCapacity(n);
             const wn = self.wHandleCount(id);
             var parent_events: usize = 0;
             for (self.tops.entries.items) |top| {
                 if (top.header.active and top.parent != null and std.meta.eql(top.parent.?, id))
                     parent_events += self.wHandleCount(.{ .index = top.header.index, .generation = top.header.generation }) * 2;
             }
-            if (self.woutbound.len - self.woutbound_count < wn + parent_events) return error.Exhausted;
+            try self.ensureWOutboundCapacity(wn + parent_events);
             for (self.handles.entries.items) |h| if (h.header.active and !h.closed and std.meta.eql(h.top, id)) {
                 h.closed = true;
                 self.enqueue(.closed, h.header.index, "") catch unreachable;
@@ -392,7 +393,7 @@ pub fn Adapter(comptime protocol: type) type {
         pub fn stop(self: *Self, list_index: u32) !void {
             const l = self.lists.at(list_index) orelse return error.StaleList;
             if (l.finished_queued) return;
-            if (self.outbound_count == self.outbound.len) return error.Exhausted;
+            try self.ensureOutboundCapacity(1);
             l.stopped = true;
             l.finished_queued = true;
             try self.enqueue(.finished, list_index, "");
@@ -416,7 +417,7 @@ pub fn Adapter(comptime protocol: type) type {
             try self.enqueue(.done, hi, "");
         }
         fn enqueue(self: *Self, kind: Kind, owner: u32, text: []const u8) !void {
-            if (self.outbound_count == self.outbound.len) return error.Exhausted;
+            try self.ensureOutboundCapacity(1);
             for (self.outbound, 0..) |*o, i| if (!o.active) {
                 o.* = .{ .active = true, .sequence = self.sequence, .kind = kind, .owner = owner, .text_len = text.len };
                 @memcpy(self.outText(@intCast(i))[0..text.len], text);
@@ -434,7 +435,7 @@ pub fn Adapter(comptime protocol: type) type {
             return n;
         }
         fn enqueueW(self: *Self, kind: WKind, owner: u32, output: ?OutputId) !void {
-            if (self.woutbound_count == self.woutbound.len) return error.Exhausted;
+            try self.ensureWOutboundCapacity(1);
             for (self.woutbound, 0..) |*o, i| if (!o.active) {
                 var text: []const u8 = "";
                 var state_snapshot: State = .{};
@@ -495,6 +496,50 @@ pub fn Adapter(comptime protocol: type) type {
             }
         }
 
+        fn ensureOutboundCapacity(self: *Self, additional: usize) !void {
+            if (self.outbound.len - self.outbound_count >= additional) return;
+            const needed = std.math.add(usize, self.outbound_count, additional) catch return error.OutOfMemory;
+            const new_len = @max(needed, std.math.mul(usize, self.outbound.len, 2) catch return error.OutOfMemory);
+            const grown = try self.allocator.alloc(Out, new_len);
+            errdefer self.allocator.free(grown);
+            const text = try self.allocator.alloc(u8, std.math.mul(usize, new_len, self.metadata_capacity) catch return error.OutOfMemory);
+            @memset(grown, .{});
+            @memcpy(grown[0..self.outbound.len], self.outbound);
+            @memcpy(text[0..self.out_text.len], self.out_text);
+            self.allocator.free(self.outbound);
+            self.allocator.free(self.out_text);
+            self.outbound = grown;
+            self.out_text = text;
+        }
+
+        fn ensureWOutboundCapacity(self: *Self, additional: usize) !void {
+            if (self.woutbound.len - self.woutbound_count >= additional) return;
+            const needed = std.math.add(usize, self.woutbound_count, additional) catch return error.OutOfMemory;
+            const new_len = @max(needed, std.math.mul(usize, self.woutbound.len, 2) catch return error.OutOfMemory);
+            const grown = try self.allocator.alloc(WOut, new_len);
+            errdefer self.allocator.free(grown);
+            const text = try self.allocator.alloc(u8, std.math.mul(usize, new_len, self.metadata_capacity) catch return error.OutOfMemory);
+            @memset(grown, .{});
+            @memcpy(grown[0..self.woutbound.len], self.woutbound);
+            @memcpy(text[0..self.wout_text.len], self.wout_text);
+            self.allocator.free(self.woutbound);
+            self.allocator.free(self.wout_text);
+            self.woutbound = grown;
+            self.wout_text = text;
+        }
+
+        fn ensureCommandCapacity(self: *Self, additional: usize) !void {
+            if (self.commands.len - self.command_count >= additional) return;
+            const needed = std.math.add(usize, self.command_count, additional) catch return error.OutOfMemory;
+            const new_len = @max(needed, std.math.mul(usize, self.commands.len, 2) catch return error.OutOfMemory);
+            const grown = try self.allocator.alloc(Command, new_len);
+            for (0..self.command_count) |i|
+                grown[i] = self.commands[(self.command_head + i) % self.commands.len];
+            self.allocator.free(self.commands);
+            self.commands = grown;
+            self.command_head = 0;
+        }
+
         pub fn request(self: *Self, peer: wayring.io_uring.Peer, target: objects.Dispatch, message: wayring.wire.Message, fds: *wayring.ancillary.FdQueue) !?wayring.dispatch.Control {
             const r = self.runtime orelse return error.NotInstalled;
             return self.requestOn(try r.clients.reactor.getActor(peer), try r.clients.get(peer), peer, target, message, fds);
@@ -526,7 +571,7 @@ pub fn Adapter(comptime protocol: type) type {
                 switch (d.value) {
                     .stop => {
                         if (!m.stopped) {
-                            if (self.woutbound_count == self.woutbound.len) return try self.failure(actor, d.handle.id, error.Exhausted);
+                            self.ensureWOutboundCapacity(1) catch |e| return try self.failure(actor, d.handle.id, e);
                             m.stopped = true;
                             try self.enqueueW(.finished, indexOf(WManagerSlot, self.wmanagers, m), null);
                         }
@@ -540,7 +585,7 @@ pub fn Adapter(comptime protocol: type) type {
                 if (h.resource == null or !std.meta.eql(h.resource.?, rh) or !samePeer(h.peer, peer)) return null;
                 const d = try wayring.server.decodeRequest(WHandle, server_objects, message, fds);
                 if (!h.closed and d.value != .destroy) {
-                    if (self.command_count == self.commands.len) return try self.failure(actor, d.handle.id, error.Exhausted);
+                    self.ensureCommandCapacity(1) catch |e| return try self.failure(actor, d.handle.id, e);
                     const command: Command = .{ .peer = peer, .toplevel = h.top, .request = switch (d.value) {
                         .set_maximized => .set_maximized,
                         .unset_maximized => .unset_maximized,
@@ -979,7 +1024,7 @@ test "foreign toplevel: bind retains ordered initial state and stop is atomic" {
     try adapter.close(first);
 }
 
-test "foreign toplevel: update backpressure preserves metadata and list removal preserves live handles" {
+test "foreign toplevel: metadata and manager stop grow the wire event queue" {
     const A = Adapter(@import("core_protocol"));
     var adapter = try A.init(std.testing.allocator, .{
         .list_capacity = 1,
@@ -998,13 +1043,16 @@ test "foreign toplevel: update backpressure preserves metadata and list removal 
         .version = 1,
     });
     const id = try adapter.publish("old", "app");
-    try std.testing.expectError(error.Exhausted, adapter.updateTitle(id, "new"));
+    const initial_capacity = adapter.outbound.len;
+    try adapter.updateTitle(id, "new");
     try std.testing.expectEqualStrings(
-        "old",
+        "new",
         adapter.tops.entries.items[id.index].title[0..adapter.tops.entries.items[id.index].title_len],
     );
-    try std.testing.expectError(error.Exhausted, adapter.stop(0));
-    try std.testing.expect(!adapter.lists.entries.items[0].stopped);
+    try adapter.stop(0);
+    try std.testing.expect(adapter.lists.entries.items[0].stopped);
+    try std.testing.expect(adapter.lists.entries.items[0].finished_queued);
+    try std.testing.expect(adapter.outbound.len > initial_capacity);
 
     for (adapter.outbound) |*event| adapter.dropOut(event);
     adapter.handles.entries.items[0].resource = .{ .id = 8, .generation = 3 };
@@ -1102,15 +1150,16 @@ test "foreign toplevel: wlr outbound metadata state and parent are snapshots" {
     try std.testing.expectEqual(@as(usize, 2), parent_index);
 }
 
-test "foreign toplevel: wlr publication backpressure is atomic" {
+test "foreign toplevel: wlr publication grows the wire event queue" {
     const A = Adapter(@import("core_protocol"));
     var adapter = try A.init(std.testing.allocator, .{ .list_capacity = 1, .toplevel_capacity = 1, .handle_capacity = 1, .outbound_capacity = 4, .metadata_capacity = 8, .wlr_manager_capacity = 1, .wlr_handle_capacity = 1, .wlr_outbound_capacity = 5, .command_capacity = 1 });
     defer adapter.deinit();
     const peer: wayring.io_uring.Peer = .{ .slot = 1, .generation = 1 };
     _ = try A.bindWlr(&adapter, .{ .peer = peer, .credentials = .{ .pid = 1, .uid = 2, .gid = 3 }, .global = .{ .id = 2, .generation = 1 }, .resource = .{ .id = 3, .generation = 1 }, .version = 3 });
-    try std.testing.expectError(error.Exhausted, adapter.publish("x", "y"));
-    try std.testing.expectEqual(@as(usize, 0), adapter.woutbound_count);
-    try std.testing.expectEqual(@as(usize, 0), adapter.tops.entries.items.len);
+    _ = try adapter.publish("x", "y");
+    try std.testing.expectEqual(@as(usize, 6), adapter.woutbound_count);
+    try std.testing.expect(adapter.woutbound.len > 5);
+    try std.testing.expectEqual(@as(usize, 1), adapter.tops.entries.items.len);
 }
 
 test "foreign toplevel: disconnect drops only that peer's queued controls" {
@@ -1137,6 +1186,31 @@ test "foreign toplevel: disconnect drops only that peer's queued controls" {
     const retained = adapter.peekCommand().?;
     try std.testing.expectEqual(second, retained.peer);
     try std.testing.expectEqual(.set_maximized, retained.request);
+}
+
+test "foreign toplevel: wrapped control queue grows without reordering" {
+    const A = Adapter(@import("core_protocol"));
+    var adapter = try A.init(std.testing.allocator, .{
+        .list_capacity = 1,
+        .toplevel_capacity = 1,
+        .handle_capacity = 1,
+        .outbound_capacity = 2,
+        .metadata_capacity = 8,
+        .command_capacity = 2,
+    });
+    defer adapter.deinit();
+    const id = try adapter.publish(null, null);
+    const peer: wayring.io_uring.Peer = .{ .slot = 1, .generation = 1 };
+    adapter.command_head = 1;
+    adapter.command_count = 2;
+    adapter.commands[1] = .{ .peer = peer, .toplevel = id, .request = .close };
+    adapter.commands[0] = .{ .peer = peer, .toplevel = id, .request = .set_maximized };
+
+    try adapter.ensureCommandCapacity(1);
+    try std.testing.expect(adapter.commands.len > 2);
+    try std.testing.expectEqual(.close, adapter.peekCommand().?.request);
+    adapter.dropCommand();
+    try std.testing.expectEqual(.set_maximized, adapter.peekCommand().?.request);
 }
 
 test "foreign toplevel: lists and per-list handles grow beyond initial reservations" {

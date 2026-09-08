@@ -1636,11 +1636,11 @@ test "shell-input: terminal notifications survive full outbound queues" {
     try std.testing.expectEqual(@as(usize, 3), coordinator.input_method_adapter.pendingOutbound());
     try std.testing.expect(coordinator.text_input_adapter.activeState() == null);
 
-    // Both terminal transitions must wait, but their existing output must
-    // still be marked ready and transferred to the client's transport queue.
+    // Drag cancellation grows its producer queue immediately. The bounded
+    // input-method transition waits, but its older output must still drain.
     try coordinator.prepare();
-    try std.testing.expect(coordinator.data_device_adapter.dragActive());
-    try std.testing.expectEqual(@as(usize, 1), coordinator.seat_adapter.event_len);
+    try std.testing.expect(!coordinator.data_device_adapter.dragActive());
+    try std.testing.expectEqual(@as(usize, 0), coordinator.seat_adapter.event_len);
     try std.testing.expect(method.enabled);
     try std.testing.expectEqual(@as(usize, 0), coordinator.data_device_adapter.pendingOutbound());
     try std.testing.expectEqual(@as(usize, 0), coordinator.input_method_adapter.pendingOutbound());

@@ -517,22 +517,25 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .create => |v| {
                     if (!creator.icc_set) return try self.managerError(actor, decoded.handle.id, IccCreator.@"error".incomplete_set.value, "ICC file was not set");
                     const image = self.create(.image, undefined, creator.peer, null, creator.version) catch return try self.noMemory(actor);
-                    if (self.jobs.items.len == self.jobs.capacity) {
-                        self.remove(image);
-                        return try self.noMemory(actor);
-                    }
-                    const handle = self.worker.submit(creator.icc_fd, creator.icc_offset, creator.icc_length) catch |err| {
-                        self.remove(image);
-                        return try self.managerError(actor, decoded.handle.id, IccCreator.@"error".incomplete_set.value, @errorName(err));
-                    };
-                    self.jobs.appendAssumeCapacity(.{ .handle = handle, .image = image });
-                    image.image_state = .compiling;
-                    image.information_allowed = false;
                     const admitted = IccCreator.admit_create(server_objects, decoded.handle, v, .{ .image_description = image }) catch |err| {
                         self.remove(image);
                         return try self.managerError(actor, decoded.handle.id, IccCreator.@"error".incomplete_set.value, @errorName(err));
                     };
                     image.handle = admitted.image_description;
+                    image.information_allowed = false;
+                    if (self.jobs.items.len == self.jobs.capacity) {
+                        image.failure = .out_of_memory;
+                        image.image_state = .failed;
+                    } else if (self.worker.submit(creator.icc_fd, creator.icc_offset, creator.icc_length)) |handle| {
+                        self.jobs.appendAssumeCapacity(.{ .handle = handle, .image = image });
+                        image.image_state = .compiling;
+                    } else |_| {
+                        // A valid create request has already produced its image
+                        // object. Runtime worker exhaustion is reported on that
+                        // object rather than disconnecting the client.
+                        image.failure = .out_of_memory;
+                        image.image_state = .failed;
+                    }
                 },
             }
             try decoded.finish(protocol, server_objects, &actor.transmit);
@@ -1118,6 +1121,160 @@ fn failureMessage(failure: icc_worker.Failure) []const u8 {
         .transform_creation_failed => "failed to create ICC transform",
         .invalid_transform_output => "ICC transform produced invalid output",
     };
+}
+
+test "ICC image admission reports worker exhaustion without protocol errors" {
+    const protocol = @import("core_protocol");
+    const FakeCore = struct {
+        pub const SurfaceId = u64;
+        const Surface = struct {
+            fn unsetColorDescription(_: *@This()) void {}
+            fn setColorDescription(_: *@This(), _: color.Description) !void {}
+        };
+        surface: Surface = .{},
+
+        fn surfaceIdObject(_: *@This(), _: objects.Handle, _: *const objects.Object) !SurfaceId {
+            return 1;
+        }
+        fn getSurfaceById(self: *@This(), _: SurfaceId) !*Surface {
+            return &self.surface;
+        }
+        fn surfaceResource(_: *@This(), _: SurfaceId) !objects.Handle {
+            return .{ .id = 1, .generation = 1 };
+        }
+    };
+    const TestAdapter = Adapter(protocol, FakeCore);
+    const peer: wayring.io_uring.Peer = .{ .slot = 0, .generation = 1 };
+
+    var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 256, 8);
+    defer blocks.deinit(std.testing.allocator);
+    var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 2);
+    defer descriptors.deinit(std.testing.allocator);
+    var requests = wayring.tx.Queue.init(&blocks, 1024, &descriptors, 1);
+    defer requests.deinit();
+    var fragment: [64]u8 = undefined;
+    var actor = wayring.connection.Actor.init(0, 1, &fragment, &descriptors, 1, &blocks, 1024, 0);
+    defer actor.deinit();
+    var received_fds = wayring.ancillary.FdQueue.init(&descriptors, 1);
+    defer received_fds.deinit();
+    var server_objects = try objects.ServerObjects.init(std.testing.allocator, 16, 2, &protocol.wl_display.info, null);
+    defer server_objects.deinit(std.testing.allocator);
+    var core: FakeCore = .{};
+    var adapter = try TestAdapter.init(std.testing.allocator, &core, .{
+        .resource_capacity = 8,
+        .async_jobs = 1,
+        .queued_profile_bytes = 64,
+        .retained_luts = 1,
+    });
+    defer adapter.deinit();
+
+    const Dispatch = struct {
+        fn one(a: *TestAdapter, act: *wayring.connection.Actor, so: *objects.ServerObjects, input: *wayring.tx.Queue, fds: *wayring.ancillary.FdQueue) !wayring.dispatch.Control {
+            var fd_scratch: [1]linux.fd_t = undefined;
+            var control: [64]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+            const snapshot = try input.snapshot(&fd_scratch, &control);
+            const message = (try wayring.wire.Message.decode(snapshot.first)) orelse return error.IncompleteMessage;
+            const target = try so.namespace.request(message.header.object_id, message.header.opcode);
+            const result = (try a.requestOn(act, so, target, message, fds)).?;
+            try input.begin(snapshot);
+            try input.complete(snapshot.byteCount());
+            return result;
+        }
+    };
+
+    // Fill the adapter-side admission queue directly. Unlike waiting for a
+    // worker thread, this cannot race with completion.
+    adapter.jobs.appendAssumeCapacity(.{ .handle = .{ .index = 0, .generation = 0 }, .image = null });
+    const saturated = try adapter.create(.icc_creator, undefined, peer, null, 1);
+    saturated.icc_set = true;
+    saturated.handle = try server_objects.insertClient(2, &protocol.wp_image_description_creator_icc_v1.info, 1, saturated);
+    try protocol.wp_image_description_creator_icc_v1.encodeRequest(&requests, 2, .{ .create = .{ .image_description = 3 } });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try Dispatch.one(&adapter, &actor, &server_objects, &requests, &received_fds));
+    const saturated_image = adapter.fromObject(server_objects.namespace.resolve((server_objects.namespace.lookupHandle(3)).?).?).?;
+    try std.testing.expectEqual(TestAdapter.ImageState.failed, saturated_image.image_state);
+    try std.testing.expectEqual(icc_worker.Failure.out_of_memory, saturated_image.failure);
+    _ = adapter.jobs.pop();
+
+    // An invalid retained descriptor forces Worker.submit's DuplicateFailed
+    // path without depending on scheduling or allocator behavior.
+    const rejected = try adapter.create(.icc_creator, undefined, peer, null, 1);
+    rejected.icc_set = true;
+    rejected.icc_fd = -1;
+    rejected.icc_length = 16;
+    rejected.handle = try server_objects.insertClient(4, &protocol.wp_image_description_creator_icc_v1.info, 1, rejected);
+    try protocol.wp_image_description_creator_icc_v1.encodeRequest(&requests, 4, .{ .create = .{ .image_description = 5 } });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try Dispatch.one(&adapter, &actor, &server_objects, &requests, &received_fds));
+    const rejected_image = adapter.fromObject(server_objects.namespace.resolve((server_objects.namespace.lookupHandle(5)).?).?).?;
+    try std.testing.expectEqual(TestAdapter.ImageState.failed, rejected_image.image_state);
+
+    // Both runtime failures are image events, not wl_display errors.
+    try std.testing.expectEqual(@as(usize, 2), try adapter.flushOn(peer, &server_objects, &actor.transmit));
+    var fd_scratch: [1]linux.fd_t = undefined;
+    var control: [64]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+    var snapshot = try actor.transmit.snapshot(&fd_scratch, &control);
+    var bytes = snapshot.first;
+    var failed_events: usize = 0;
+    while (bytes.len != 0) {
+        const message = (try wayring.wire.Message.decode(bytes)).?;
+        if (message.header.object_id == 3 or message.header.object_id == 5) {
+            switch (try protocol.wp_image_description_v1.decodeEvent(message, &received_fds)) {
+                .failed => |event| {
+                    try std.testing.expectEqual(protocol.wp_image_description_v1.cause.operating_system, event.cause);
+                    failed_events += 1;
+                },
+                else => return error.UnexpectedEvent,
+            }
+        } else {
+            switch (try protocol.wl_display.decodeEvent(message, &received_fds)) {
+                .delete_id => {},
+                .@"error" => return error.UnexpectedDisplayError,
+            }
+        }
+        bytes = bytes[message.header.size..];
+    }
+    try std.testing.expectEqual(@as(usize, 2), failed_events);
+    try actor.transmit.begin(snapshot);
+    try actor.transmit.complete(snapshot.byteCount());
+
+    // Protocol misuse remains fatal and does not create an image.
+    const invalid = try adapter.create(.icc_creator, undefined, peer, null, 1);
+    invalid.handle = try server_objects.insertClient(6, &protocol.wp_image_description_creator_icc_v1.info, 1, invalid);
+    try protocol.wp_image_description_creator_icc_v1.encodeRequest(&requests, 6, .{ .create = .{ .image_description = 7 } });
+    try std.testing.expectEqual(wayring.dispatch.Control.stop, try Dispatch.one(&adapter, &actor, &server_objects, &requests, &received_fds));
+    try std.testing.expect(server_objects.namespace.lookupHandle(7) == null);
+    snapshot = try actor.transmit.snapshot(&fd_scratch, &control);
+    const error_message = (try wayring.wire.Message.decode(snapshot.first)).?;
+    switch (try protocol.wl_display.decodeEvent(error_message, &received_fds)) {
+        .@"error" => |event| try std.testing.expectEqual(protocol.wp_image_description_creator_icc_v1.@"error".incomplete_set.value, event.code),
+        else => return error.UnexpectedEvent,
+    }
+    try actor.transmit.begin(snapshot);
+    try actor.transmit.complete(snapshot.byteCount());
+
+    // Once capacity is available, submission enters the normal asynchronous
+    // lifecycle. The tiny profile is intentionally malformed; completion must
+    // replace compiling with the worker's terminal failure.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var profile = try tmp.dir.createFile(std.testing.io, "profile.icc", .{ .read = true });
+    defer profile.close(std.testing.io);
+    try profile.writeStreamingAll(std.testing.io, &([_]u8{0} ** 16));
+    const available = try adapter.create(.icc_creator, undefined, peer, null, 1);
+    available.icc_set = true;
+    available.icc_fd = @intCast(linux.dup(profile.handle));
+    available.icc_length = 16;
+    available.handle = try server_objects.insertClient(8, &protocol.wp_image_description_creator_icc_v1.info, 1, available);
+    try protocol.wp_image_description_creator_icc_v1.encodeRequest(&requests, 8, .{ .create = .{ .image_description = 9 } });
+    try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try Dispatch.one(&adapter, &actor, &server_objects, &requests, &received_fds));
+    const available_image = adapter.fromObject(server_objects.namespace.resolve((server_objects.namespace.lookupHandle(9)).?).?).?;
+    try std.testing.expectEqual(TestAdapter.ImageState.compiling, available_image.image_state);
+    for (0..10_000) |_| {
+        if (available_image.image_state != .compiling) break;
+        _ = c.usleep(1000);
+        try adapter.completeWorker();
+    }
+    try std.testing.expectEqual(TestAdapter.ImageState.failed, available_image.image_state);
+    try std.testing.expectEqual(icc_worker.Failure.malformed_profile, available_image.failure);
 }
 
 test "image description info completion does not access destroyed resource" {

@@ -395,7 +395,7 @@ pub fn Adapter(comptime protocol: type) type {
             switch (decoded.value) {
                 .offer => |payload| self.offerMime(source, payload.mime_type) catch |err| switch (err) {
                     error.SourceUsed => return try self.protocolError(actor, decoded.handle.id, Source.@"error".invalid_source.value, "selection source is already in use"),
-                    error.Exhausted, error.OutOfMemory => return try self.noMemory(actor),
+                    error.OutOfMemory => return try self.noMemory(actor),
                     else => return try self.protocolError(actor, decoded.handle.id, Source.@"error".invalid_source.value, @errorName(err)),
                 },
                 .destroy => if (self.selection) |selected| if (selected.eql(self.selectionSource(source)))
@@ -479,8 +479,10 @@ pub fn Adapter(comptime protocol: type) type {
             const decoded = try wayring.server.decodeRequest(Offer, server_objects, message, fds);
             // Requests already in flight may cross a leave or cancellation.
             // Keep the offer resource inert until the client destroys it, but
-            // retain successful drops for receive/finish and ask negotiation.
-            if (offer.kind == .drag and !offer.current and !offer.dropped) {
+            // retain successful drops while their source is still alive.
+            if (offer.kind == .drag and ((!offer.current and !offer.dropped) or
+                (self.resolveSource(offer.source) catch null) == null))
+            {
                 if (decoded.value == .receive) _ = linux.close(decoded.value.receive.fd);
                 try decoded.finish(protocol, server_objects, &actor.transmit);
                 return .continue_dispatch;
@@ -490,40 +492,15 @@ pub fn Adapter(comptime protocol: type) type {
             switch (decoded.value) {
                 .receive => |payload| {
                     if (offer.kind == .selection) {
-                        const source = offer.selection_source orelse {
+                        if (offer.selection_source) |source| {
+                            source.receive(payload.mime_type, payload.fd);
+                        } else {
                             _ = linux.close(payload.fd);
-                            return try self.protocolError(actor, decoded.handle.id, Offer.@"error".invalid_offer.value, "selection source is gone");
-                        };
-                        const mime_index = source.findMime(payload.mime_type) catch {
-                            _ = linux.close(payload.fd);
-                            return try self.protocolError(actor, decoded.handle.id, Offer.@"error".invalid_offer.value, "selection source is gone");
-                        } orelse {
-                            _ = linux.close(payload.fd);
-                            return try self.protocolError(actor, decoded.handle.id, Offer.@"error".invalid_offer.value, "MIME type was not offered");
-                        };
-                        source.send(mime_index, payload.fd) catch {
-                            _ = linux.close(payload.fd);
-                            return try self.noMemory(actor);
-                        };
-                        try decoded.finish(protocol, server_objects, &actor.transmit);
-                        return .continue_dispatch;
+                        }
+                    } else {
+                        const source = self.resolveSource(offer.source) catch unreachable;
+                        self.selectionSource(source).receive(payload.mime_type, payload.fd);
                     }
-                    const source = self.resolveSource(offer.source) catch {
-                        _ = linux.close(payload.fd);
-                        return try self.protocolError(actor, decoded.handle.id, Offer.@"error".invalid_offer.value, "selection source is gone");
-                    };
-                    const mime_index = self.findMime(source, payload.mime_type) orelse {
-                        _ = linux.close(payload.fd);
-                        return try self.protocolError(actor, decoded.handle.id, Offer.@"error".invalid_offer.value, "MIME type was not offered");
-                    };
-                    self.enqueue(source.peer, .{ .source_send = .{
-                        .source = offer.source,
-                        .mime_index = mime_index,
-                        .fd = payload.fd,
-                    } }) catch {
-                        _ = linux.close(payload.fd);
-                        return try self.noMemory(actor);
-                    };
                 },
                 .destroy => {},
                 .accept => |payload| if (offer.kind == .drag and offer.current) {
@@ -541,7 +518,7 @@ pub fn Adapter(comptime protocol: type) type {
                 },
                 .finish => {
                     self.finishOffer(offer) catch |err| switch (err) {
-                        error.Exhausted => return try self.noMemory(actor),
+                        error.OutOfMemory => return try self.noMemory(actor),
                         error.InvalidFinish, error.SourceGone => return try self.protocolError(actor, decoded.handle.id, Offer.@"error".invalid_finish.value, "drag offer cannot be finished"),
                     };
                 },
@@ -566,7 +543,7 @@ pub fn Adapter(comptime protocol: type) type {
                     const selected = selectDragAction(source_actions, actions, preferred);
                     if (selected != offer.selected_action) {
                         const needed: usize = if (post_drop_ask) 1 else 2;
-                        if (self.outboundFree() < needed) return try self.noMemory(actor);
+                        self.ensureOutbound(needed) catch return try self.noMemory(actor);
                         self.enqueue(source.peer, .{ .source_action = .{
                             .source = offer.source,
                             .action = selected,
@@ -589,8 +566,8 @@ pub fn Adapter(comptime protocol: type) type {
         pub fn setFocus(self: *Self, focus: ?wayring.io_uring.Peer) !void {
             if (optionalPeerEqual(self.focus, focus)) return;
             const needed = if (focus) |peer| self.deviceCount(peer) else 0;
-            if (self.outboundFree() < needed) return error.Exhausted;
-            if (self.selection != null and self.offerFree() < needed) return error.Exhausted;
+            try self.ensureOutbound(needed);
+            if (self.selection != null) try self.ensureOffers(needed);
             self.focus = focus;
             if (focus) |peer| for (self.devices.items) |device| if (device.header.active and std.meta.eql(device.peer, peer))
                 self.enqueueSelection(device) catch unreachable;
@@ -657,7 +634,7 @@ pub fn Adapter(comptime protocol: type) type {
                 if (!emit_motion) return;
                 const value = target orelse return;
                 const count = self.deviceCount(value.peer);
-                if (self.outboundFree() < count) return error.Exhausted;
+                try self.ensureOutbound(count);
                 for (self.devices.items) |device| if (device.header.active and
                     std.meta.eql(device.peer, value.peer))
                     self.enqueue(value.peer, .{ .drag_motion = .{
@@ -678,8 +655,8 @@ pub fn Adapter(comptime protocol: type) type {
                         offer.current and offer.selected_action != 0 and std.meta.eql(offer.peer, old.peer))) * 2;
                 }
             }
-            if (self.outboundFree() < old_count + old_action_count + new_count) return error.Exhausted;
-            if (drag.source != null and self.offerFree() < new_count) return error.Exhausted;
+            try self.ensureOutbound(old_count + old_action_count + new_count);
+            if (drag.source != null) try self.ensureOffers(new_count);
 
             if (drag.target) |old| {
                 for (self.offers.items) |offer| if (offer.header.active and offer.kind == .drag and
@@ -734,7 +711,7 @@ pub fn Adapter(comptime protocol: type) type {
             const drag = self.drag orelse return;
             const leave_count = if (drag.target) |target| self.deviceCount(target.peer) else 0;
             const source_count: usize = @intFromBool(drag.source != null);
-            if (self.outboundFree() < leave_count + source_count) return error.Exhausted;
+            try self.ensureOutbound(leave_count + source_count);
             if (drag.target) |target| {
                 for (self.devices.items) |device| if (device.header.active and
                     std.meta.eql(device.peer, target.peer))
@@ -764,7 +741,7 @@ pub fn Adapter(comptime protocol: type) type {
             if (accepted == 0 and !internal_drop) return self.cancelDrag();
             const device_count = self.deviceCount(target.peer);
             const source_count: usize = @intFromBool(drag.source != null);
-            if (self.outboundFree() < device_count + source_count) return error.Exhausted;
+            try self.ensureOutbound(device_count + source_count);
             for (self.devices.items) |device| if (device.header.active and std.meta.eql(device.peer, target.peer))
                 self.enqueue(target.peer, .{ .drag_drop = self.deviceId(device) }) catch unreachable;
             for (self.offers.items) |offer| if (offer.header.active and offer.kind == .drag and
@@ -807,8 +784,8 @@ pub fn Adapter(comptime protocol: type) type {
             const focus_count = if (self.focus) |peer| self.deviceCount(peer) else 0;
             const cancel_count: usize = @intFromBool(cancel_old and old != null and
                 (next == null or !old.?.eql(next.?)));
-            if (self.outboundFree() < focus_count + cancel_count) return error.Exhausted;
-            if (next != null and self.offerFree() < focus_count) return error.Exhausted;
+            try self.ensureOutbound(focus_count + cancel_count);
+            if (next != null) try self.ensureOffers(focus_count);
             if (cancel_count != 0) try old.?.cancel();
             self.selection = next;
             if (self.focus) |peer| for (self.devices.items) |device| if (device.header.active and std.meta.eql(device.peer, peer))
@@ -818,7 +795,7 @@ pub fn Adapter(comptime protocol: type) type {
         fn enqueueSelection(self: *Self, device: *DeviceSlot) !void {
             var publication: Publication = .{ .device = self.deviceId(device), .source = self.selection };
             if (self.selection) |source| {
-                const offer = acquire(OfferSlot, self.allocator, &self.offers, &self.offer_free) catch return error.Exhausted;
+                const offer = try acquire(OfferSlot, self.allocator, &self.offers, &self.offer_free);
                 offer.peer = device.peer;
                 offer.device = publication.device;
                 offer.selection_source = source;
@@ -1094,7 +1071,7 @@ pub fn Adapter(comptime protocol: type) type {
             if (source.used and !selected) return error.SourceUsed;
             if (self.findMime(source, value) != null) return;
             const live_offers = if (selected) self.liveSelectionOfferCount(source) else 0;
-            if (self.outboundFree() < live_offers) return error.Exhausted;
+            try self.ensureOutbound(live_offers);
             try self.addMime(source, value);
             if (selected) self.enqueueSelectionMime(source, source.mime_count - 1);
         }
@@ -1143,13 +1120,21 @@ pub fn Adapter(comptime protocol: type) type {
         }
 
         fn enqueue(self: *Self, peer: wayring.io_uring.Peer, value: Outbound) !void {
+            try self.ensureOutbound(1);
             for (self.outbound) |*slot| if (!slot.active) {
                 slot.* = .{ .active = true, .sequence = self.next_sequence, .peer = peer, .value = value };
                 self.next_sequence +%= 1;
                 self.outbound_len += 1;
                 return;
             };
-            return error.Exhausted;
+            unreachable;
+        }
+
+        fn ensureOutbound(self: *Self, count: usize) !void {
+            if (self.outboundFree() >= count) return;
+            const old_len = self.outbound.len;
+            self.outbound = try self.allocator.realloc(self.outbound, @max(old_len * 2, self.outbound_len + count));
+            @memset(self.outbound[old_len..], .{});
         }
 
         fn oldestOutbound(self: *Self, peer: wayring.io_uring.Peer) ?*OutboundSlot {
@@ -1226,6 +1211,18 @@ pub fn Adapter(comptime protocol: type) type {
             var count: usize = 0;
             for (self.offers.items) |offer| count += @intFromBool(!offer.header.active and !offer.header.retired);
             return count;
+        }
+
+        fn ensureOffers(self: *Self, count: usize) !void {
+            const missing = count -| self.offerFree();
+            for (0..missing) |_| {
+                if (self.offers.items.len >= none) return error.OutOfMemory;
+                const slot = try self.allocator.create(OfferSlot);
+                errdefer self.allocator.destroy(slot);
+                slot.* = .{ .header = .{ .next_free = self.offer_free } };
+                try self.offers.append(self.allocator, slot);
+                self.offer_free = @intCast(self.offers.items.len - 1);
+            }
         }
 
         fn abandonPublicationOffer(self: *Self, value: *Publication) void {
@@ -1691,7 +1688,7 @@ test "data device: accepted drag drops once and retains finish publication" {
 }
 
 test "data device: requests racing drag leave or cancellation are inert" {
-    const End = enum { leave, cancel, source_destroyed };
+    const End = enum { leave, cancel, source_destroyed, source_destroyed_after_drop };
     for (std.enums.values(End)) |ending| {
         var adapter = try testAdapter(.{});
         defer adapter.deinit();
@@ -1735,6 +1732,17 @@ test "data device: requests racing drag leave or cancellation are inert" {
                 .version = 3,
                 .context = source,
             })),
+            .source_destroyed_after_drop => {
+                offer.accepted_mime = 0;
+                offer.selected_action = test_protocol.wl_data_device_manager.dnd_action.copy.value;
+                try adapter.dropDrag();
+                try std.testing.expect(offer.dropped);
+                try std.testing.expect(adapter.resourceRemoved(source.header.resource, .{
+                    .interface = &test_protocol.wl_data_source.info,
+                    .version = 3,
+                    .context = source,
+                }));
+            },
         }
         try std.testing.expect(!offer.current);
         const pending = adapter.pendingOutbound();
@@ -1775,7 +1783,7 @@ test "data device: requests racing drag leave or cancellation are inert" {
     }
 }
 
-test "data device: source destruction retains drag cancellation through backpressure" {
+test "data device: source destruction grows the queue to retain drag cancellation" {
     var adapter = try testAdapter(.{
         .manager_capacity = 1,
         .source_capacity = 1,
@@ -1807,16 +1815,11 @@ test "data device: source destruction retains drag cancellation through backpres
         .version = 3,
         .context = source,
     }));
-    try std.testing.expect(adapter.drag != null);
-    try std.testing.expect(adapter.drag.?.source == null);
-    try std.testing.expect(adapter.drag_cancel_pending);
-    try std.testing.expectEqual(@as(usize, 2), adapter.pendingOutbound());
-
-    adapter.dropOutboundSlot(&adapter.outbound[0]);
-    adapter.progressDragCancellation();
     try std.testing.expect(adapter.drag == null);
     try std.testing.expect(!adapter.drag_cancel_pending);
-    try std.testing.expectEqual(TestAdapter.Outbound.drag_leave, std.meta.activeTag(adapter.outbound[0].value));
+    try std.testing.expectEqual(@as(usize, 2), adapter.pendingOutbound());
+    try std.testing.expectEqual(TestAdapter.Outbound.drag_motion, std.meta.activeTag(adapter.outbound[0].value));
+    try std.testing.expectEqual(TestAdapter.Outbound.drag_leave, std.meta.activeTag(adapter.outbound[1].value));
 }
 
 test "data device: removing the exact drag origin cancels the session" {
@@ -1849,14 +1852,10 @@ test "data device: removing the exact drag origin cancels the session" {
     try std.testing.expect(adapter.drag.?.icon_object == null);
     adapter.surfaceRemoved(peer, 23);
     try std.testing.expect(adapter.drag != null);
-    try std.testing.expect(adapter.drag.?.target != null);
-    try std.testing.expect(adapter.drag_target_clear_pending);
-    try std.testing.expectEqual(@as(usize, 2), adapter.pendingOutbound());
-    adapter.dropOutboundSlot(&adapter.outbound[0]);
-    adapter.progressDragCancellation();
     try std.testing.expect(adapter.drag.?.target == null);
     try std.testing.expect(!adapter.drag_target_clear_pending);
-    try std.testing.expectEqual(TestAdapter.Outbound.drag_leave, std.meta.activeTag(adapter.outbound[0].value));
+    try std.testing.expectEqual(@as(usize, 2), adapter.pendingOutbound());
+    try std.testing.expectEqual(TestAdapter.Outbound.drag_leave, std.meta.activeTag(adapter.outbound[1].value));
     adapter.surfaceRemoved(peer, 17);
     try std.testing.expect(adapter.drag == null);
     try std.testing.expect(!adapter.drag_cancel_pending);
@@ -1921,9 +1920,9 @@ test "data device: current selection accepts MIME updates without replacement" {
     second.used = true;
     try std.testing.expectError(error.SourceUsed, adapter.offerMime(second, "text/uri-list"));
 
-    try std.testing.expectError(error.Exhausted, adapter.replaceSelection(adapter.selectionSource(second), true));
-    try std.testing.expect(first_selection.eql(adapter.selection.?));
-    try std.testing.expectEqual(@as(usize, 1), adapter.pendingOutbound());
+    try adapter.replaceSelection(adapter.selectionSource(second), true);
+    try std.testing.expect(adapter.selectionSource(second).eql(adapter.selection.?));
+    try std.testing.expectEqual(@as(usize, 3), adapter.pendingOutbound());
 }
 
 test "data device: dropping a source closes retained receive FDs and reserved offers" {
@@ -2100,4 +2099,52 @@ test "data device: receive FD stays owned while source send is backpressured" {
     try output.begin(snapshot);
     try output.complete(snapshot.byteCount());
     try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(fd, linux.F.GETFD, 0)));
+}
+
+test "data device: receive survives queue growth and stale selection offers" {
+    var adapter = try testAdapter(.{ .source_capacity = 1, .outbound_capacity = 1 });
+    defer adapter.deinit();
+    var so = try objects.ServerObjects.init(std.testing.allocator, 8, 2, &test_protocol.wl_display.info, null);
+    defer so.deinit(std.testing.allocator);
+    var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 256, 8);
+    defer blocks.deinit(std.testing.allocator);
+    var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 4);
+    defer descriptors.deinit(std.testing.allocator);
+    var fragment: [64]u8 = undefined;
+    var actor = wayring.connection.Actor.init(0, 1, &fragment, &descriptors, 0, &blocks, 512, 0);
+    defer actor.deinit();
+    const source = try adapter.acquireSource();
+    source.peer = .{ .slot = 1, .generation = 1 };
+    try adapter.addMime(source, "text/plain");
+    const offer = try acquire(TestAdapter.OfferSlot, adapter.allocator, &adapter.offers, &adapter.offer_free);
+    offer.selection_source = adapter.selectionSource(source);
+    offer.header.resource = try so.insertClient(2, &test_protocol.wl_data_offer.info, 3, offer);
+    // Valid transfers fill and grow the queue, an unknown MIME fails only the
+    // transfer, and reusing the source slot must not revive the old offer.
+    for (0..4) |i| {
+        if (i == 3) {
+            adapter.dropSourceOutbound(adapter.sourceId(source));
+            release(TestAdapter.SourceSlot, adapter.sources.items, &adapter.source_free, adapter.sourceId(source).index);
+            const replacement = try adapter.acquireSource();
+            replacement.peer = .{ .slot = 1, .generation = 1 };
+            try adapter.addMime(replacement, "text/plain");
+        }
+        const raw = linux.eventfd(0, linux.EFD.CLOEXEC);
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(raw));
+        const fd: linux.fd_t = @intCast(raw);
+        var input = wayring.tx.Queue.init(&blocks, 512, &descriptors, 1);
+        defer input.deinit();
+        try test_protocol.wl_data_offer.encodeRequest(&input, 2, .{ .receive = .{
+            .mime_type = if (i == 2) "unknown" else "text/plain",
+            .fd = fd,
+        } });
+        var scratch: [1]linux.fd_t = undefined;
+        var control: [64]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+        const snapshot = try input.snapshot(&scratch, &control);
+        const message = (try wayring.wire.Message.decode(snapshot.first)).?;
+        try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try adapter.offerRequest(&actor, &so, offer, message, &input.descriptors));
+        try std.testing.expectEqual(if (i < 2) linux.E.SUCCESS else linux.E.BADF, linux.errno(linux.fcntl(fd, linux.F.GETFD, 0)));
+        try std.testing.expectEqual(@as(usize, if (i < 2) i + 1 else if (i == 2) 2 else 0), adapter.pendingOutbound());
+        try std.testing.expectEqual(@as(usize, 0), actor.transmit.queuedBytes());
+    }
 }

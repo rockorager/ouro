@@ -42,6 +42,18 @@ pub const Source = struct {
         return self.vtable.send(self.owner, self.token, mime_index, fd);
     }
 
+    /// Takes ownership of a receive FD. A vanished source or unavailable
+    /// format fails the transfer with EOF, not the recipient's connection.
+    pub fn receive(self: Source, mime_type: []const u8, fd: linux.fd_t) void {
+        const index = (self.findMime(mime_type) catch null) orelse {
+            _ = linux.close(fd);
+            return;
+        };
+        self.send(index, fd) catch {
+            _ = linux.close(fd);
+        };
+    }
+
     pub fn cancel(self: Source) !void {
         return self.vtable.cancel(self.owner, self.token);
     }
@@ -74,4 +86,36 @@ test "selection source identity includes owner, generation token, and implementa
     try std.testing.expect(first.eql(first));
     try std.testing.expect(!first.eql(.{ .owner = &b, .token = 7, .vtable = &Testing.vtable }));
     try std.testing.expect(!first.eql(.{ .owner = &a, .token = 8, .vtable = &Testing.vtable }));
+}
+
+test "selection receive closes the transfer when its source cannot send" {
+    const Testing = struct {
+        fn mimeCount(_: *anyopaque, _: u64) !usize {
+            return 1;
+        }
+        fn mime(_: *anyopaque, _: u64, _: usize) ![]const u8 {
+            return "text/plain";
+        }
+        fn send(_: *anyopaque, token: u64, _: usize, _: linux.fd_t) !void {
+            return if (token == 0) error.Stale else error.OutOfMemory;
+        }
+        fn cancel(_: *anyopaque, _: u64) !void {}
+        const vtable: Source.VTable = .{
+            .mimeCount = mimeCount,
+            .mime = mime,
+            .send = send,
+            .cancel = cancel,
+        };
+    };
+    var owner: u8 = 0;
+    for (0..2) |token| {
+        var pipe: [2]linux.fd_t = undefined;
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&pipe, .{ .CLOEXEC = true })));
+        defer _ = linux.close(pipe[0]);
+        const source: Source = .{ .owner = &owner, .token = token, .vtable = &Testing.vtable };
+        source.receive("text/plain", pipe[1]);
+        try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(pipe[1], linux.F.GETFD, 0)));
+        var byte: [1]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 0), linux.read(pipe[0], &byte, byte.len));
+    }
 }

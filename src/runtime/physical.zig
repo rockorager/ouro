@@ -3862,13 +3862,13 @@ pub fn Coordinator(comptime protocol: type) type {
                 switch (event) {
                     .pointer_motion => |motion| {
                         self.syncDragTarget(motion.time_usec, true) catch |err| switch (err) {
-                            error.Exhausted => return false,
+                            error.OutOfMemory => return false,
                         };
                         try self.syncToplevelDrag();
                     },
                     .pointer_button => |button| if (!button.pressed)
                         self.syncDragTarget(button.time_usec, false) catch |err| switch (err) {
-                            error.Exhausted => return false,
+                            error.OutOfMemory => return false,
                         },
                     else => {},
                 }
@@ -6942,7 +6942,7 @@ pub fn Coordinator(comptime protocol: type) type {
                         // queued output drain even without another input event.
                         self.markProtocolAll(ProtocolReady.data_device);
                         self.data_device_adapter.cancelDrag() catch |err| switch (err) {
-                            error.Exhausted => return,
+                            error.OutOfMemory => return,
                         };
                     },
                 }

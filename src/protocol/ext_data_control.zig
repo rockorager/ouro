@@ -282,21 +282,10 @@ fn Owner(comptime protocol: type, comptime flavor: Flavor) type {
             return .continue_dispatch;
         }
         fn offerRequest(self: *Self, actor: *wayring.connection.Actor, so: anytype, offer: *OfferSlot, message: wayring.wire.Message, fds: *wayring.ancillary.FdQueue) !wayring.dispatch.Control {
+            _ = self;
             const decoded = try wayring.server.decodeRequest(Offer, so, message, fds);
             switch (decoded.value) {
-                .receive => |payload| {
-                    const mime_index = offer.source.findMime(payload.mime_type) catch {
-                        _ = linux.close(payload.fd);
-                        return self.protocolError(actor, decoded.handle.id, 0, "ext data control source is gone");
-                    } orelse {
-                        _ = linux.close(payload.fd);
-                        return self.protocolError(actor, decoded.handle.id, 0, "MIME type was not offered");
-                    };
-                    offer.source.send(mime_index, payload.fd) catch {
-                        _ = linux.close(payload.fd);
-                        return self.noMemory(actor);
-                    };
-                },
+                .receive => |payload| offer.source.receive(payload.mime_type, payload.fd),
                 .destroy => {},
             }
             try decoded.finish(protocol, so, &actor.transmit);
@@ -313,16 +302,16 @@ fn Owner(comptime protocol: type, comptime flavor: Flavor) type {
             for (self.devices.items) |device| if (device.header.active and self.coordinator.validSeat(self.coordinator.context, device.peer, device.seat_object))
                 if (!primary or flavor == .ext or device.version >= 2) try self.enqueueSelection(device, primary);
         }
-        fn prepareSelectionChanged(self: *const Self, primary: bool) !void {
+        fn prepareSelectionChanged(self: *Self, primary: bool) !void {
             var count: usize = 0;
             for (self.devices.items) |device| {
                 if (device.header.active and
                     self.coordinator.validSeat(self.coordinator.context, device.peer, device.seat_object) and
                     (!primary or flavor == .ext or device.version >= 2)) count += 1;
             }
-            if (self.outboundFree() < count) return error.Exhausted;
-            if (self.coordinator.current(self.coordinator.context, primary) != null and self.offerFree() < count)
-                return error.Exhausted;
+            try self.ensureOutbound(count);
+            if (self.coordinator.current(self.coordinator.context, primary) != null)
+                try self.ensureOffers(count);
         }
         pub fn retrySelectionChanges(self: *Self) void {
             inline for (.{ false, true }) |primary| {
@@ -481,7 +470,10 @@ fn Owner(comptime protocol: type, comptime flavor: Flavor) type {
             // An unrepresentable MIME type is equivalent to an unsupported one.
             // Do not disconnect the source for exceeding a local storage bound.
             if (value.len > self.mime_bytes or value.len > std.math.maxInt(u16)) return;
-            try self.addMime(source, value);
+            self.addMime(source, value) catch |err| switch (err) {
+                error.Exhausted => {},
+                else => return err,
+            };
         }
         fn findMime(self: *const Self, source: *const SourceSlot, value: []const u8) ?usize {
             for (0..source.mime_count) |i| if (std.mem.eql(u8, self.mime(source, i), value)) return i;
@@ -497,13 +489,20 @@ fn Owner(comptime protocol: type, comptime flavor: Flavor) type {
             return if (std.meta.eql(source.header.resource, handle)) source else null;
         }
         fn enqueue(self: *Self, peer: wayring.io_uring.Peer, value: Outbound) !void {
+            try self.ensureOutbound(1);
             for (self.outbound) |*slot| if (!slot.active) {
                 slot.* = .{ .active = true, .sequence = self.next_sequence, .peer = peer, .value = value };
                 self.next_sequence +%= 1;
                 self.outbound_len += 1;
                 return;
             };
-            return error.Exhausted;
+            unreachable;
+        }
+        fn ensureOutbound(self: *Self, count: usize) !void {
+            if (self.outboundFree() >= count) return;
+            const old_len = self.outbound.len;
+            self.outbound = try self.allocator.realloc(self.outbound, @max(old_len * 2, self.outbound_len + count));
+            @memset(self.outbound[old_len..], .{});
         }
         fn oldestOutbound(self: *Self, peer: wayring.io_uring.Peer) ?*OutboundSlot {
             var result: ?*OutboundSlot = null;
@@ -529,6 +528,17 @@ fn Owner(comptime protocol: type, comptime flavor: Flavor) type {
             var n: usize = 0;
             for (self.offers.items) |slot| n += @intFromBool(!slot.header.active and !slot.header.retired);
             return n;
+        }
+        fn ensureOffers(self: *Self, count: usize) !void {
+            const missing = count -| self.offerFree();
+            for (0..missing) |_| {
+                if (self.offers.items.len >= none) return error.OutOfMemory;
+                const slot = try self.allocator.create(OfferSlot);
+                errdefer self.allocator.destroy(slot);
+                slot.* = .{ .header = .{ .next_free = self.offer_free } };
+                try self.offers.append(self.allocator, slot);
+                self.offer_free = @intCast(self.offers.items.len - 1);
+            }
         }
         fn abandonOffer(self: *Self, publication: *Publication) void {
             const id = publication.offer orelse return;
@@ -744,6 +754,8 @@ test "ext data control copies and deduplicates bounded MIME values" {
     try std.testing.expectEqual(@as(usize, 1), source.mime_count);
     try std.testing.expectEqualStrings("text", adapter.mime(source, 0));
     try std.testing.expectError(error.Exhausted, adapter.addMime(source, "png"));
+    try adapter.offerMime(source, "png");
+    try std.testing.expectEqual(@as(usize, 1), source.mime_count);
 }
 
 test "ext data control publishes initial null selections and ignores inert seats" {
@@ -808,7 +820,7 @@ test "wlr data control v1 suppresses primary while v2 publishes both selections"
     try std.testing.expectEqual(@as(usize, 3), adapter.pendingOutbound());
 }
 
-test "data control retries a selection change after bounded backpressure" {
+test "data control grows the queue for a selection change" {
     var selections: TestSelections = .{};
     var adapter = try TestAdapter.init(std.testing.allocator, selections.coordinator(), .{
         .device_capacity = 1,
@@ -819,8 +831,10 @@ test "data control retries a selection change after bounded backpressure" {
     device.peer = .{ .slot = 1, .generation = 1 };
     try adapter.enqueueSelection(device, false);
 
-    try std.testing.expectError(error.Exhausted, adapter.selectionChanged(true));
-    try std.testing.expect(adapter.selection_dirty[1]);
+    try adapter.selectionChanged(true);
+    try std.testing.expect(!adapter.selection_dirty[1]);
+    try std.testing.expectEqual(@as(usize, 2), adapter.pendingOutbound());
+    try std.testing.expect(!adapter.oldestOutbound(device.peer).?.value.selection.primary);
     adapter.dropOutbound(adapter.oldestOutbound(device.peer).?);
     adapter.retrySelectionChanges();
     try std.testing.expect(!adapter.selection_dirty[1]);
@@ -841,4 +855,60 @@ test "data control ownership grows past initial reservations" {
     _ = try acquire(TestAdapter.OfferSlot, adapter.allocator, &adapter.offers, &adapter.offer_free);
     _ = try acquire(TestAdapter.OfferSlot, adapter.allocator, &adapter.offers, &adapter.offer_free);
     try std.testing.expect(fromContext(TestAdapter.SourceSlot, adapter.sources.items, source) == source);
+}
+
+test "ext and wlr data control: receive survives queue growth and stale offers" {
+    inline for (.{ Flavor.ext, Flavor.wlr }) |flavor| {
+        const A = Owner(test_protocol, flavor);
+        const Offer = A.Offer;
+        var selections: TestSelections = .{};
+        var adapter = try A.init(std.testing.allocator, .{
+            .context = &selections,
+            .validSeat = TestSelections.validSeat,
+            .current = TestSelections.current,
+            .set = TestSelections.set,
+        }, .{ .source_capacity = 1, .outbound_capacity = 1 });
+        defer adapter.deinit();
+        var so = try objects.ServerObjects.init(std.testing.allocator, 8, 2, &test_protocol.wl_display.info, null);
+        defer so.deinit(std.testing.allocator);
+        var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 256, 8);
+        defer blocks.deinit(std.testing.allocator);
+        var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 4);
+        defer descriptors.deinit(std.testing.allocator);
+        var fragment: [64]u8 = undefined;
+        var actor = wayring.connection.Actor.init(0, 1, &fragment, &descriptors, 0, &blocks, 512, 0);
+        defer actor.deinit();
+        const source = try adapter.acquireSource();
+        source.peer = .{ .slot = 1, .generation = 1 };
+        try adapter.addMime(source, "text/plain");
+        const offer = try acquire(A.OfferSlot, adapter.allocator, &adapter.offers, &adapter.offer_free);
+        offer.source = adapter.selectionSource(source);
+        offer.header.resource = try so.insertClient(2, &Offer.info, 1, offer);
+        for (0..4) |i| {
+            if (i == 3) {
+                adapter.dropSource(adapter.sourceId(source));
+                release(A.SourceSlot, adapter.sources.items, &adapter.source_free, adapter.sourceId(source).index);
+                const replacement = try adapter.acquireSource();
+                replacement.peer = .{ .slot = 1, .generation = 1 };
+                try adapter.addMime(replacement, "text/plain");
+            }
+            const raw = linux.eventfd(0, linux.EFD.CLOEXEC);
+            try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(raw));
+            const fd: linux.fd_t = @intCast(raw);
+            var input = wayring.tx.Queue.init(&blocks, 512, &descriptors, 1);
+            defer input.deinit();
+            try Offer.encodeRequest(&input, 2, .{ .receive = .{
+                .mime_type = if (i == 2) "unknown" else "text/plain",
+                .fd = fd,
+            } });
+            var scratch: [1]linux.fd_t = undefined;
+            var control: [64]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+            const snapshot = try input.snapshot(&scratch, &control);
+            const message = (try wayring.wire.Message.decode(snapshot.first)).?;
+            try std.testing.expectEqual(wayring.dispatch.Control.continue_dispatch, try adapter.offerRequest(&actor, &so, offer, message, &input.descriptors));
+            try std.testing.expectEqual(if (i < 2) linux.E.SUCCESS else linux.E.BADF, linux.errno(linux.fcntl(fd, linux.F.GETFD, 0)));
+            try std.testing.expectEqual(@as(usize, if (i < 2) i + 1 else if (i == 2) 2 else 0), adapter.pendingOutbound());
+            try std.testing.expectEqual(@as(usize, 0), actor.transmit.queuedBytes());
+        }
+    }
 }
