@@ -1370,21 +1370,20 @@ pub const Output = struct {
         if (!self.accepting_frames or self.in_flight_frame != null or
             self.pending_callback != null or self.pending_capture != null)
             return error.InvalidState;
-        const list = self.builder.buildBorrowed(
+        var list = self.builder.buildBorrowed(
             self.planner.output,
             self.output_format,
             self.clear,
             applied,
         ) catch |cause| return self.retireUnstartedRender(frame_id, cause);
-        var color_list = list;
-        color_list.output_color_description = self.output_color_description;
+        list.output_color_description = self.output_color_description;
         if (bindings.len > self.sample_storage.len)
             self.sample_storage = self.allocator.realloc(self.sample_storage, bindings.len) catch |cause|
                 return self.retireUnstartedRender(frame_id, cause);
-        bindSamples(color_list, bindings, self.sample_storage) catch |cause|
+        bindSamples(list, bindings, self.sample_storage) catch |cause|
             return self.retireUnstartedRender(frame_id, cause);
         try self.scheduler.captureSamples(frame_id, self.sample_storage[0..bindings.len]);
-        if (capture == null and try self.submitDirectScanout(frame_id, color_list, now_ns, ring))
+        if (capture == null and try self.submitDirectScanout(frame_id, list, now_ns, ring))
             return .submitted;
         const handle = self.pool.acquire() catch |cause|
             return self.retireRender(frame_id, cause);
@@ -1399,7 +1398,7 @@ pub const Output = struct {
         // Keep ordinary per-image repair here. Pixman captures the repaired
         // image; Vulkan expands capture damage to export a complete sRGB frame
         // from linear composition, independently of the scanout encoding.
-        const plan = self.planner.prepare(handle, color_list, changes) catch |cause| {
+        const plan = self.planner.prepare(handle, list, changes) catch |cause| {
             self.pool.discard(handle) catch {};
             return self.retireRender(frame_id, cause);
         };
@@ -1443,7 +1442,7 @@ pub const Output = struct {
                             &self.vulkan_targets.?,
                             vulkan.Target.fromPool(&self.pool),
                             handle,
-                            color_list,
+                            list,
                             plan,
                             capture_request.cursor_start,
                             captures,
@@ -1455,7 +1454,7 @@ pub const Output = struct {
                                 &self.vulkan_targets.?,
                                 vulkan.Target.fromPool(&self.pool),
                                 handle,
-                                color_list,
+                                list,
                                 plan,
                                 capture_request.cursor_start,
                                 captures,
@@ -2741,6 +2740,73 @@ test "drm-sim: render device survives output target recreation" {
     fixture.router.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 4), fixture.bos_destroyed);
     try std.testing.expectEqual(@as(usize, 4), fixture.framebuffers_removed);
+}
+
+test "drm-sim: ordinary and capture frames both forward the output ICC profile" {
+    const Probe = struct {
+        expected: *const @import("../render/icc.zig").Lut,
+        calls: usize = 0,
+
+        fn create(context: *anyopaque, _: std.posix.fd_t, _: vulkan_platform.Config) !vulkan_platform.Renderer {
+            return context;
+        }
+        fn destroy(_: *anyopaque, _: vulkan_platform.Renderer) void {}
+        fn packs(_: *anyopaque, _: vulkan_platform.Renderer) bool {
+            return false;
+        }
+        fn cache(context: *anyopaque, _: vulkan_platform.Renderer, lut: *const @import("../render/icc.zig").Lut) !u32 {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            try std.testing.expectEqual(self.expected, lut);
+            self.calls += 1;
+            // Stop at the GPU upload boundary: no real Vulkan device is needed.
+            return error.ProfileObserved;
+        }
+    };
+    const lut: @import("../render/icc.zig").Lut = .{
+        .profile_hash = @splat(1),
+        .lut_hash = @splat(2),
+        .rgba = &.{},
+    };
+    var probe: Probe = .{ .expected = &lut };
+    var fixture = SimFixture{};
+    const output = try Output.create(std.testing.allocator, fixture.platforms(), fixture.device(), fixture.snapshot(), .{
+        .output_id = .{ .index = 0, .generation = 1 },
+        .scheduler = .{ .refresh_ns = 10, .render_budget_ns = 3 },
+        .renderer = .pixman,
+        .image_count = 2,
+        .max_samples = 1,
+        .max_source_bytes = 4,
+        .max_source_width = 1,
+        .max_source_height = 1,
+    });
+    defer fixture.router.deinit(std.testing.allocator);
+    defer fixture.ring.deinit();
+    defer drainIdleSimOutput(output, &fixture) catch unreachable;
+    var vtable = vulkan_platform.real.vtable.*;
+    vtable.create = Probe.create;
+    vtable.destroy = Probe.destroy;
+    vtable.packs_sources = Probe.packs;
+    vtable.cache_lut = Probe.cache;
+    const renderer = try vulkan.Renderer.init(std.testing.allocator, .{ .context = &probe, .vtable = &vtable }, -1, .{ .max_samples = 1, .max_source_bytes = 4 });
+    output.render_device.renderer.?.pixman.deinit();
+    output.render_device.renderer = .{ .vulkan = renderer };
+    output.vulkan_targets = try output.render_device.renderer.?.vulkan.createTargets(2);
+    output.output_color_description.lut = &lut;
+    var bytes: [4]u8 = @splat(0);
+    for ([_]bool{ false, true, false, true }, 0..) |capture, index| {
+        const frame = try startSimFrame(output, 1 + index * 10, .{ .slot = 0, .generation = @intCast(index + 1) });
+        const result = if (capture)
+            try output.renderFrameCapture(frame, &.{}, &.{}, &.{}, 8 + index * 10, .{
+                .token = 1,
+                .cursor_start = 0,
+                .overlay_cursor = true,
+                .destination = .{ .shm = .{ .bytes = &bytes, .stride = 4 } },
+            })
+        else
+            try output.renderFrame(frame, &.{}, &.{}, &.{}, 8 + index * 10);
+        try std.testing.expectEqual(error.ProfileObserved, result.retired.cause);
+        try std.testing.expectEqual(index + 1, probe.calls);
+    }
 }
 
 test "drm-sim: pre-capture failures retire scheduler and remain removable" {
