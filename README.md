@@ -169,6 +169,20 @@ the former primary follow it without changing workspace number; windows from
 any disconnected secondary output also move to primary. Matched key
 press/release pairs are consumed before client seat delivery.
 
+Hold `Super` (`Logo`) and left-drag to move a floating window or reposition a
+tiled window. Tiled drops swap with a window's center or split beside its
+left/right/top/bottom edge; dropping at an output's left/right edge inserts at
+the outside of the layout. Crossing outputs moves the tile to the destination's
+active workspace. Tiled layout changes on release after at least 8 logical
+pixels of motion; dragging a tile never makes it floating.
+
+Left-drag a floating window's edge or corner, or a tiled split boundary
+(including the gap), to resize without a modifier. Handles extend 8 logical
+pixels and show directional resize cursors. Floating resizes honor client size
+limits; tiled resizes adjust the shared split within 10–90%. Fullscreen and
+maximized windows do not expose handles. Compositor drags consume their pointer
+buttons rather than delivering them to applications.
+
 ## Configuration
 
 Ouro loads strict JSON from `$XDG_CONFIG_HOME/ouro/config.json` (or

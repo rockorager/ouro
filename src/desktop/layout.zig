@@ -159,6 +159,106 @@ pub fn Tree(comptime Id: type, comptime OutputId: type) type {
             return true;
         }
 
+        /// Removes `id` from its old position and inserts it beside `target`.
+        pub fn insertBeside(self: *Self, id: Id, target_id: Id, direction: Direction) bool {
+            if (std.meta.eql(id, target_id)) return false;
+            _ = self.outputFor(target_id) orelse return false;
+            if (self.contains(id)) self.remove(id);
+            const target = self.findLeaf(target_id) orelse return false;
+            const old_id = self.nodes[target].content.leaf;
+            const old_rect = self.nodes[target].rect;
+            const before = direction == .left or direction == .up;
+            const old = self.allocate(.{ .active = true, .parent = target, .rect = old_rect, .content = .{ .leaf = old_id } });
+            const added = self.allocate(.{ .active = true, .parent = target, .rect = old_rect, .content = .{ .leaf = id } });
+            self.nodes[target].content = .{ .split = .{
+                .axis = if (direction == .left or direction == .right) .horizontal else .vertical,
+                .ratio = 50,
+                .first = if (before) added else old,
+                .second = if (before) old else added,
+            } };
+            if (old_rect) |rect| self.refreshNode(target, rect);
+            return true;
+        }
+
+        /// Inserts at the outside edge of an output, creating its root if empty.
+        pub fn insertAtRoot(self: *Self, id: Id, output: OutputId, direction: Direction) bool {
+            if (self.contains(id)) self.remove(id);
+            const position = self.rootPosition(output) orelse {
+                self.add(id, output, null);
+                return true;
+            };
+            const old_root = self.roots[position].node;
+            const rect = self.roots[position].rect;
+            const added = self.allocate(.{ .active = true, .rect = rect, .content = .{ .leaf = id } });
+            const root = self.allocate(.{ .active = true, .rect = rect, .content = .{ .split = undefined } });
+            const before = direction == .left or direction == .up;
+            self.nodes[old_root].parent = root;
+            self.nodes[added].parent = root;
+            self.nodes[root].content = .{ .split = .{
+                .axis = if (direction == .left or direction == .right) .horizontal else .vertical,
+                .ratio = 50,
+                .first = if (before) added else old_root,
+                .second = if (before) old_root else added,
+            } };
+            self.roots[position].node = root;
+            if (rect) |area| self.refreshNode(root, area);
+            return true;
+        }
+
+        pub const BoundaryHit = struct { id: Id, direction: Direction };
+
+        /// Finds the closest actual ancestor split touching a leaf. Gaps count
+        /// as part of the boundary, while the pointer must remain on the leaf's
+        /// cross-axis span.
+        pub fn boundaryAt(self: *const Self, point: geometry.Point, tolerance: i32, eligibility: anytype) ?BoundaryHit {
+            var best: ?BoundaryHit = null;
+            var best_distance: i64 = tolerance + 1;
+            for (self.nodes, 0..) |node, index| {
+                if (!node.active or node.content != .leaf or !eligibility.isEligible(node.content.leaf)) continue;
+                const leaf_rect = node.rect orelse continue;
+                var child: Index = @intCast(index);
+                while (self.nodes[child].parent) |parent| {
+                    const split = self.nodes[parent].content.split;
+                    const first = self.nodes[split.first].rect;
+                    const second = self.nodes[split.second].rect;
+                    if (first == null or second == null) {
+                        child = parent;
+                        continue;
+                    }
+                    const horizontal = split.axis == .horizontal;
+                    const first_side = split.first == child;
+                    const leaf_edge = if (horizontal)
+                        if (first_side) leaf_rect.x + leaf_rect.width else leaf_rect.x
+                    else if (first_side) leaf_rect.y + leaf_rect.height else leaf_rect.y;
+                    const subtree_edge = if (horizontal)
+                        if (first_side) first.?.x + first.?.width else second.?.x
+                    else if (first_side) first.?.y + first.?.height else second.?.y;
+                    if (leaf_edge != subtree_edge) {
+                        child = parent;
+                        continue;
+                    }
+                    const cross_inside = if (horizontal)
+                        point.y >= leaf_rect.y and point.y < leaf_rect.y + leaf_rect.height
+                    else
+                        point.x >= leaf_rect.x and point.x < leaf_rect.x + leaf_rect.width;
+                    if (cross_inside) {
+                        const low = if (horizontal) first.?.x + first.?.width else first.?.y + first.?.height;
+                        const high = if (horizontal) second.?.x else second.?.y;
+                        const coordinate = if (horizontal) point.x else point.y;
+                        const distance: i64 = if (coordinate < low) low - coordinate else if (coordinate > high) coordinate - high else 0;
+                        if (distance <= tolerance and distance < best_distance) {
+                            best = .{ .id = node.content.leaf, .direction = if (horizontal)
+                                if (first_side) .right else .left
+                            else if (first_side) .down else .up };
+                            best_distance = distance;
+                        }
+                    }
+                    child = parent;
+                }
+            }
+            return best;
+        }
+
         pub fn next(self: *const Self, id: Id, reverse: bool) ?Id {
             var node = self.findLeaf(id) orelse return null;
             const root = self.rootForNode(node);
@@ -285,8 +385,14 @@ pub fn Tree(comptime Id: type, comptime OutputId: type) type {
             while (self.nodes[child].parent) |parent| {
                 const split = self.nodes[parent].content.split;
                 if (split.axis == wanted and ((low_edge and split.second == child) or (!low_edge and split.first == child))) {
-                    const first = self.nodes[split.first].rect orelse return null;
-                    const second = self.nodes[split.second].rect orelse return null;
+                    const first = self.nodes[split.first].rect orelse {
+                        child = parent;
+                        continue;
+                    };
+                    const second = self.nodes[split.second].rect orelse {
+                        child = parent;
+                        continue;
+                    };
                     const first_len: u32 = @intCast(if (wanted == .horizontal) first.width else first.height);
                     const second_len: u32 = @intCast(if (wanted == .horizontal) second.width else second.height);
                     return .{
@@ -295,7 +401,11 @@ pub fn Tree(comptime Id: type, comptime OutputId: type) type {
                         .axis = wanted,
                         .low_edge = low_edge,
                         .initial_ratio = split.ratio,
-                        .initial_boundary = if (wanted == .horizontal) second.x else second.y,
+                        // Compare like edges. A high-edge resize uses the first
+                        // child's edge, not the gap-shifted second origin.
+                        .initial_boundary = if (wanted == .horizontal)
+                            if (low_edge) second.x else first.x + first.width
+                        else if (low_edge) second.y else first.y + first.height,
                         .available = first_len + second_len,
                     };
                 }

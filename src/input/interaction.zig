@@ -83,6 +83,20 @@ fn interactionWithKeyConsumer(comptime Desktop: type, comptime KeyConsumerFactor
             keyboard_focus: Target,
             cancel: Cancellation,
             key_consumed,
+            pointer_consumed,
+        };
+        pub const CursorShape = enum {
+            grabbing,
+            e_resize,
+            n_resize,
+            ne_resize,
+            nw_resize,
+            s_resize,
+            se_resize,
+            sw_resize,
+            w_resize,
+            ew_resize,
+            ns_resize,
         };
         const InteractiveOperation = struct {
             target: Target,
@@ -90,6 +104,8 @@ fn interactionWithKeyConsumer(comptime Desktop: type, comptime KeyConsumerFactor
             start_x_fixed: i64,
             start_y_fixed: i64,
             geometry: Desktop.InteractiveGeometry,
+            compositor: bool = false,
+            tiled: bool = false,
         };
         pub const Mode = union(enum) {
             default,
@@ -103,6 +119,7 @@ fn interactionWithKeyConsumer(comptime Desktop: type, comptime KeyConsumerFactor
             id: input.DeviceId = undefined,
             capabilities: input_platform.Capabilities = .{},
             buttons: [state_words]u64 = [_]u64{0} ** state_words,
+            swallowed_buttons: [state_words]u64 = [_]u64{0} ** state_words,
             keys: [state_words]u64 = [_]u64{0} ** state_words,
             swallowed_keys: [state_words]u64 = [_]u64{0} ** state_words,
             repeat_rate: i32 = 25,
@@ -125,6 +142,7 @@ fn interactionWithKeyConsumer(comptime Desktop: type, comptime KeyConsumerFactor
         pointer_inside: bool = false,
         keyboard_focus: ?Target = null,
         mode: Mode = .default,
+        resize_handle: ?Desktop.ResizeHandle = null,
         cursor: Cursor = .{},
         key_consumer: KeyConsumer,
         keymap_state: keymap.State,
@@ -250,6 +268,7 @@ fn interactionWithKeyConsumer(comptime Desktop: type, comptime KeyConsumerFactor
                     value.device,
                     value.button,
                     value.pressed,
+                    shortcuts_inhibited,
                 ),
                 .pointer_axis => |value| _ = try self.resolveDevice(value.device),
                 .swipe_begin => |value| try self.acceptGesture(value.device),
@@ -425,6 +444,39 @@ fn interactionWithKeyConsumer(comptime Desktop: type, comptime KeyConsumerFactor
             return self.mode;
         }
 
+        pub fn compositorGrab(self: *const Self) bool {
+            return self.mode == .interactive and self.mode.interactive.compositor;
+        }
+
+        pub fn cursorShape(self: *const Self) ?CursorShape {
+            if (self.mode == .interactive) {
+                const operation = self.mode.interactive;
+                if (!operation.compositor) return null;
+                if (operation.kind != .resize) return .grabbing;
+                return resizeCursor(operation.kind.resize, operation.tiled);
+            }
+            if (self.mode == .default) if (self.resize_handle) |handle|
+                return resizeCursor(handle.edge, handle.tiled);
+            return null;
+        }
+
+        fn resizeCursor(edge: anytype, tiled: bool) CursorShape {
+            if (tiled) return switch (edge) {
+                .left, .right => .ew_resize,
+                else => .ns_resize,
+            };
+            return switch (edge) {
+                .top => .n_resize,
+                .bottom => .s_resize,
+                .left => .w_resize,
+                .right => .e_resize,
+                .top_left => .nw_resize,
+                .top_right => .ne_resize,
+                .bottom_left => .sw_resize,
+                .bottom_right => .se_resize,
+            };
+        }
+
         pub fn cursorRequest(self: *Self, surface: ?SurfaceId, hotspot: geometry.Point) void {
             self.cursor.request(surface, hotspot);
         }
@@ -505,6 +557,7 @@ fn interactionWithKeyConsumer(comptime Desktop: type, comptime KeyConsumerFactor
             self.hover = null;
             self.keyboard_focus = null;
             self.mode = .default;
+            self.resize_handle = null;
             self.removeFocusCommands();
             self.enqueueCancellation(cancellation);
         }
@@ -549,6 +602,7 @@ fn interactionWithKeyConsumer(comptime Desktop: type, comptime KeyConsumerFactor
             if (!std.meta.eql(self.hover, target)) self.enqueue(.{ .pointer_focus = target });
             self.hover = target;
             self.pointer_inside = target != null;
+            self.resize_handle = if (target != null and !target.?.managed) null else try desktop.resizeHandleAt(self.pointerPosition());
         }
 
         fn targetAtPointer(
@@ -600,7 +654,7 @@ fn interactionWithKeyConsumer(comptime Desktop: type, comptime KeyConsumerFactor
             dy: f64,
         ) !void {
             try self.validatePointerMotion(device_id, dx, dy);
-            try self.ensureCommandCapacity(1);
+            try self.ensureCommandCapacity(2);
             const requested_x = clampFixed(
                 self.x_fixed +| fixedDelta(dx),
                 self.bounds.x,
@@ -614,7 +668,7 @@ fn interactionWithKeyConsumer(comptime Desktop: type, comptime KeyConsumerFactor
             const clamped = clampFixedToAreas(requested_x, requested_y, self.outputAreas());
             const next_x = clamped.x;
             const next_y = clamped.y;
-            const interactive_rect: ?geometry.Rect = if (self.mode == .interactive) rect: {
+            const interactive_rect: ?geometry.Rect = if (self.mode == .interactive and self.mode.interactive.kind != .reorder) rect: {
                 const operation = self.mode.interactive;
                 break :rect interactiveRect(
                     operation,
@@ -660,12 +714,16 @@ fn interactionWithKeyConsumer(comptime Desktop: type, comptime KeyConsumerFactor
                 self.keyboard_focus = keyboard_target.?;
                 self.enqueue(.{ .keyboard_focus = keyboard_target.? });
             }
-            self.enqueue(.{ .pointer_focus = target });
+            if (self.compositorGrab()) {
+                self.enqueue(.{ .pointer_focus = null });
+                self.enqueue(.pointer_consumed);
+            } else self.enqueue(.{ .pointer_focus = target });
             self.x_fixed = next_x;
             self.y_fixed = next_y;
             self.hover = target;
             self.pointer_inside = inside;
             self.cursor.move(point);
+            self.resize_handle = if (self.mode != .default or (target != null and !target.?.managed)) null else try desktop.resizeHandleAt(point);
         }
 
         fn pointerButton(
@@ -674,12 +732,70 @@ fn interactionWithKeyConsumer(comptime Desktop: type, comptime KeyConsumerFactor
             device_id: input.DeviceId,
             button: u32,
             pressed: bool,
+            shortcuts_inhibited: bool,
         ) !void {
             if (button >= code_count) return error.InvalidCode;
             const device = try self.resolveDevice(device_id);
             if (!device.capabilities.pointer) return error.MissingCapability;
             const was = bitSet(&device.buttons, button);
             if (was == pressed) return;
+            try self.ensureCommandCapacity(3);
+            // Retain consumed releases even if a security/lifetime boundary
+            // cancelled the operation before the physical button came up.
+            if (self.compositorGrab() or bitSet(&device.swallowed_buttons, button)) {
+                if (self.compositorGrab() and !pressed and button == 272 and
+                    !self.otherDeviceButton(device, button))
+                {
+                    const operation = self.mode.interactive;
+                    const dx = @abs(self.x_fixed - operation.start_x_fixed);
+                    const dy = @abs(self.y_fixed - operation.start_y_fixed);
+                    if (operation.kind == .reorder and @max(dx, dy) >= 8 * 256)
+                        try desktop.finishReorder(operation.target.toplevel, self.pointerPosition());
+                    try desktop.endInteractive(operation.target.toplevel);
+                    self.mode = .default;
+                    self.resize_handle = null;
+                }
+                writeBit(&device.buttons, button, pressed);
+                writeBit(&device.swallowed_buttons, button, pressed);
+                self.enqueue(.pointer_consumed);
+                return;
+            }
+            if (pressed and button == 272 and !self.anyPressedButton() and self.mode == .default) {
+                var target: ?Target = null;
+                var kind: Desktop.InteractiveKind = .move;
+                const super = self.keymap_state.trigger(key_left_meta).modifiers.super and !shortcuts_inhibited;
+                if (super) {
+                    if (self.hover) |hover| if (hover.managed) {
+                        target = try keyboardTarget(desktop, hover);
+                        if ((try desktop.scene(hover.toplevel)).mode == .tiled) kind = .reorder;
+                    };
+                } else if (self.resize_handle) |handle| {
+                    const window = try desktop.scene(handle.id);
+                    target = .{ .toplevel = handle.id, .surface = window.surface, .point = .{ .x = 0, .y = 0 } };
+                    kind = .{ .resize = handle.edge };
+                }
+                if (target) |value| {
+                    const tiled = (try desktop.scene(value.toplevel)).mode == .tiled;
+                    if (try desktop.beginInteractive(.{ .id = value.toplevel, .kind = kind })) |initial| {
+                        self.mode = .{ .interactive = .{
+                            .target = value,
+                            .kind = kind,
+                            .start_x_fixed = self.x_fixed,
+                            .start_y_fixed = self.y_fixed,
+                            .geometry = initial,
+                            .compositor = true,
+                            .tiled = tiled,
+                        } };
+                        self.keyboard_focus = value;
+                        self.enqueue(.{ .keyboard_focus = value });
+                        self.enqueue(.{ .pointer_focus = null });
+                        self.enqueue(.pointer_consumed);
+                        writeBit(&device.buttons, button, true);
+                        writeBit(&device.swallowed_buttons, button, true);
+                        return;
+                    }
+                }
+            }
             const aggregate_was = self.anyDeviceButton(button);
             const aggregate_after = pressed or self.otherDeviceButton(device, button);
             const dismisses_popup = !aggregate_was and aggregate_after and
@@ -835,6 +951,7 @@ fn interactionWithKeyConsumer(comptime Desktop: type, comptime KeyConsumerFactor
             if (pointer) self.hover = null;
             if (keyboard) self.keyboard_focus = null;
             if (grab) self.mode = .default;
+            self.resize_handle = null;
             self.enqueueCancellation(.{
                 .pointer_focus = pointer,
                 .keyboard_focus = keyboard,
@@ -1030,6 +1147,7 @@ fn interactionWithKeyConsumer(comptime Desktop: type, comptime KeyConsumerFactor
                 .keyboard_focus => |target| matches(target, toplevel, surface),
                 .cancel => false,
                 .key_consumed => false,
+                .pointer_consumed => false,
             };
         }
 
@@ -1118,7 +1236,9 @@ const TestDesktop = struct {
     pub const InteractiveKind = union(enum) {
         move,
         resize: enum { top, bottom, left, top_left, bottom_left, right, top_right, bottom_right },
+        reorder,
     };
+    pub const ResizeHandle = struct { id: TestId, edge: @FieldType(InteractiveKind, "resize"), tiled: bool };
     pub const InteractiveRequest = struct { id: TestId, kind: InteractiveKind };
     pub const InteractiveGeometry = struct {
         rect: geometry.Rect,
@@ -1136,6 +1256,7 @@ const TestDesktop = struct {
         content_ready: bool,
         managed: bool = true,
         keyboard_focusable: bool = true,
+        mode: enum { tiled, floating } = .tiled,
     };
 
     windows: [2]SceneWindow,
@@ -1153,6 +1274,16 @@ const TestDesktop = struct {
     floating_count: usize = 0,
     interactive_rect: ?geometry.Rect = null,
     resizing: bool = false,
+    resize_handle: ?ResizeHandle = null,
+    reorder_point: ?geometry.Point = null,
+
+    pub fn resizeHandleAt(self: *const @This(), _: geometry.Point) !?ResizeHandle {
+        return self.resize_handle;
+    }
+
+    pub fn finishReorder(self: *@This(), _: TestId, point: geometry.Point) !void {
+        self.reorder_point = point;
+    }
 
     pub fn sceneSnapshot(self: *const @This(), output: []SceneWindow) ![]SceneWindow {
         if (output.len < self.len) return error.Exhausted;
@@ -1855,6 +1986,106 @@ test "interaction: interactive geometry clamps moves and constrained left-edge r
             .geometry = limits,
         }, -100, 0, bounds),
     );
+}
+
+test "interaction: Super left drag reorders on release and moves floating windows" {
+    for ([_]bool{ false, true }) |floating| {
+        var interaction = try initTestInteraction(4);
+        defer interaction.deinit();
+        var desktop = testDesktop();
+        desktop.windows[0].mode = if (floating) .floating else .tiled;
+        var surfaces = TestSurfaces{};
+        try addPointer(&interaction, &desktop, &surfaces);
+        try interaction.consume(&desktop, &surfaces, .{ .device_added = .{
+            .device = device_b,
+            .info = .{ .capabilities = .{ .keyboard = true } },
+        } });
+        try interaction.consume(&desktop, &surfaces, .{ .keyboard_key = .{
+            .device = device_b,
+            .time_usec = 1,
+            .key = key_left_meta,
+            .pressed = true,
+        } });
+        try interaction.reconcilePointer(&desktop, &surfaces);
+        while (interaction.peekCommand() != null) interaction.dropCommand();
+        try interaction.pointerButton(&desktop, device_a, 272, true, false);
+        try std.testing.expect(interaction.compositorGrab());
+        try std.testing.expect(if (floating) interaction.mode.interactive.kind == .move else interaction.mode.interactive.kind == .reorder);
+        try std.testing.expectEqual(TestInteraction.CursorShape.grabbing, interaction.cursorShape().?);
+        try std.testing.expectEqual(TestInteraction.Command{ .keyboard_focus = interaction.keyboard_focus.? }, interaction.peekCommand().?);
+        interaction.dropCommand();
+        try std.testing.expectEqual(TestInteraction.Command{ .pointer_focus = null }, interaction.peekCommand().?);
+        interaction.dropCommand();
+        try std.testing.expect(interaction.peekCommand().? == .pointer_consumed);
+        interaction.dropCommand();
+        // Releasing Super does not end the pointer grab.
+        try interaction.consume(&desktop, &surfaces, .{ .keyboard_key = .{
+            .device = device_b,
+            .time_usec = 2,
+            .key = key_left_meta,
+            .pressed = false,
+        } });
+        try interaction.pointerMotion(&desktop, &surfaces, device_a, 15, 10);
+        try std.testing.expect(desktop.reorder_point == null);
+        if (floating) {
+            try std.testing.expectEqual(geometry.Rect{ .x = 15, .y = 10, .width = 40, .height = 30 }, desktop.interactive_rect.?);
+        } else try std.testing.expect(desktop.interactive_rect == null);
+        while (interaction.peekCommand() != null) interaction.dropCommand();
+        try interaction.pointerButton(&desktop, device_a, 272, false, false);
+        try std.testing.expect(interaction.mode == .default);
+        try std.testing.expect(interaction.peekCommand().? == .pointer_consumed);
+        if (!floating) try std.testing.expectEqual(geometry.Point{ .x = 16, .y = 11 }, desktop.reorder_point.?);
+    }
+}
+
+test "interaction: resize handle works in a gap and owns extra button releases" {
+    var interaction = try initTestInteraction(4);
+    defer interaction.deinit();
+    var desktop = testDesktop();
+    var surfaces = TestSurfaces{};
+    try addPointer(&interaction, &desktop, &surfaces);
+    const handle: TestDesktop.ResizeHandle = .{ .id = desktop.windows[0].id, .edge = .right, .tiled = true };
+    desktop.resize_handle = handle;
+    interaction.resize_handle = handle;
+    interaction.hover = null;
+    try std.testing.expectEqual(TestInteraction.CursorShape.ew_resize, interaction.cursorShape().?);
+    try interaction.pointerButton(&desktop, device_a, 272, true, false);
+    try std.testing.expect(desktop.resizing);
+    try interaction.pointerMotion(&desktop, &surfaces, device_a, 5, 0);
+    try std.testing.expectEqual(@as(i32, 45), desktop.interactive_rect.?.width);
+    try interaction.pointerButton(&desktop, device_a, 273, true, false);
+    try interaction.pointerButton(&desktop, device_a, 272, false, false);
+    try std.testing.expect(interaction.mode == .default);
+    try std.testing.expect(!desktop.resizing);
+    while (interaction.peekCommand() != null) interaction.dropCommand();
+    try interaction.pointerButton(&desktop, device_a, 273, false, false);
+    try std.testing.expect(interaction.peekCommand().? == .pointer_consumed);
+}
+
+test "interaction: reorder threshold, cancellation, and inhibited shortcuts" {
+    for (0..4) |scenario| {
+        var interaction = try initTestInteraction(4);
+        defer interaction.deinit();
+        var desktop = testDesktop();
+        var surfaces = TestSurfaces{};
+        try addPointer(&interaction, &desktop, &surfaces);
+        interaction.keymap_state.update(key_left_meta, true);
+        try interaction.reconcilePointer(&desktop, &surfaces);
+        while (interaction.peekCommand() != null) interaction.dropCommand();
+        if (scenario == 3) interaction.setPopupGrab(@as(?TestInteraction.Target, targetFor(desktop.windows[0])));
+        try interaction.pointerButton(&desktop, device_a, 272, true, scenario == 2);
+        if (scenario >= 2) {
+            try std.testing.expect(!interaction.compositorGrab());
+            continue;
+        }
+        try interaction.pointerMotion(&desktop, &surfaces, device_a, if (scenario == 0) 7 else 20, 0);
+        if (scenario == 1) interaction.surfaceDestroyed(desktop.windows[0].surface);
+        while (interaction.peekCommand() != null) interaction.dropCommand();
+        try interaction.pointerButton(&desktop, device_a, 272, false, false);
+        try std.testing.expect(desktop.reorder_point == null);
+        try std.testing.expect(interaction.peekCommand().? == .pointer_consumed);
+        try std.testing.expect(interaction.mode == .default);
+    }
 }
 
 test "interaction: failed desktop focus leaves press and grab unchanged" {

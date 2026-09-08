@@ -918,6 +918,7 @@ pub fn Coordinator(comptime protocol: type) type {
         input_gesture_accepted: bool = false,
         input_idle_accepted: bool = false,
         input_keyboard_consumed: bool = false,
+        input_pointer_consumed: bool = false,
         input_seat_accepted: bool = false,
         input_tablet_accepted: bool = false,
         input_drag_accepted: bool = false,
@@ -1141,6 +1142,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.input_idle_accepted = false;
             self.input_gesture_accepted = false;
             self.input_keyboard_consumed = false;
+            self.input_pointer_consumed = false;
             self.input_seat_accepted = false;
             self.input_tablet_accepted = false;
             self.input_drag_accepted = false;
@@ -3760,6 +3762,7 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             if (!self.input_interaction_accepted) {
                 self.input_keyboard_consumed = false;
+                self.input_pointer_consumed = false;
                 if (self.input_delivery_event) |delivery_event| {
                     const lock_keyboard = self.sessionLockActive() and delivery_event == .keyboard_key;
                     if (!lock_keyboard) {
@@ -3790,7 +3793,7 @@ pub fn Coordinator(comptime protocol: type) type {
                         };
             }
             if (!self.input_relative_accepted) {
-                if (!self.sessionLockActive())
+                if (!self.sessionLockActive() and !self.input_pointer_consumed)
                     self.relative_pointer_adapter.consume(event) catch return false;
                 self.input_relative_accepted = true;
             }
@@ -3825,7 +3828,7 @@ pub fn Coordinator(comptime protocol: type) type {
                             keyboard_accepted = true;
                         }
                     }
-                    if (!self.input_keyboard_consumed) {
+                    if (!self.input_keyboard_consumed and !self.input_pointer_consumed) {
                         (switch (delivery_event) {
                             .pointer_motion => self.seat_adapter.consumePointerMotionAt(
                                 delivery_event,
@@ -3883,13 +3886,15 @@ pub fn Coordinator(comptime protocol: type) type {
                 },
                 else => {},
             }
+            if (self.input_pointer_consumed and event == .pointer_button and !event.pointer_button.pressed)
+                self.pointer_reconcile_pending = true;
             self.resetInputAdmission();
             self.stats.input_events += 1;
             self.markProtocolAll(ProtocolReady.seat | ProtocolReady.relative_pointer |
                 ProtocolReady.pointer_gestures | ProtocolReady.tablet | ProtocolReady.input_method);
             try self.advanceShell();
             switch (event) {
-                .pointer_motion, .device_added, .device_removed => try self.requestCursorRedraw(),
+                .pointer_motion, .pointer_button, .device_added, .device_removed => try self.requestCursorRedraw(),
                 else => {},
             }
             try self.processSeatEvents();
@@ -3903,6 +3908,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.input_gesture_accepted = false;
             self.input_idle_accepted = false;
             self.input_keyboard_consumed = false;
+            self.input_pointer_consumed = false;
             self.input_seat_accepted = false;
             self.input_tablet_accepted = false;
             self.input_drag_accepted = false;
@@ -5730,7 +5736,7 @@ pub fn Coordinator(comptime protocol: type) type {
             var width: u32 = 0;
             var height: u32 = 0;
             var hotspot = self.interaction.cursor.hotspot;
-            if (self.themed_cursor_shape != null) {
+            if (self.effectiveCursorShape() != null) {
                 const cursor = self.cursorThemeForOutput(physical) catch return null;
                 const sample = (cursor.sample(self.globalOutputBounds() catch return null) catch return null) orelse return null;
                 width = sample.destination.width;
@@ -6232,6 +6238,7 @@ pub fn Coordinator(comptime protocol: type) type {
                         if (cancel.pointer_grab) try self.seat_adapter.cancelPointerGrab();
                     },
                     .key_consumed => self.input_keyboard_consumed = true,
+                    .pointer_consumed => self.input_pointer_consumed = true,
                 }
                 self.interaction.dropCommand();
                 self.stats.interaction_commands += 1;
@@ -6320,6 +6327,8 @@ pub fn Coordinator(comptime protocol: type) type {
                 self.interaction.cancelKeyConsumerInput();
                 try self.syncConsumerTimer();
                 @memset(&self.input_method_key_owners, null);
+                if (self.interaction.interactionMode() == .interactive)
+                    try self.desktop.endInteractive(self.interaction.interactionMode().interactive.target.toplevel);
                 self.interaction.suspendClientFocus();
                 var input_ready = true;
                 self.input_method_adapter.setGrabInhibited(true) catch {
@@ -6791,6 +6800,12 @@ pub fn Coordinator(comptime protocol: type) type {
             return self.cursor_cache.load(path, size) catch null;
         }
 
+        fn effectiveCursorShape(self: *const Self) ?protocol_cursor_shape.Shape {
+            if (!self.sessionLockActive()) if (self.interaction.cursorShape()) |shape|
+                return std.meta.stringToEnum(protocol_cursor_shape.Shape, @tagName(shape)).?;
+            return self.themed_cursor_shape;
+        }
+
         fn cursorThemeForOutput(self: *Self, physical: *PhysicalOutput) !*theme_cursor.Cursor {
             const cursor = &physical.themed_cursor;
             // KMS output generations are globally unique, including reconnects.
@@ -6799,7 +6814,7 @@ pub fn Coordinator(comptime protocol: type) type {
             cursor.logical_size = self.cursor_size;
             cursor.move(self.interaction.cursor.position);
             cursor.setPointerAvailable(self.interaction.cursor.pointer_available);
-            const image = if (self.themed_cursor_shape) |shape| blk: {
+            const image = if (self.effectiveCursorShape()) |shape| blk: {
                 const head = try self.output_management_adapter.lifecycle.currentHead(physical.management_head);
                 const size: u32 = @intCast(@min(std.math.maxInt(u32), (@as(u64, self.cursor_size) * head.scale_120 + 119) / 120));
                 break :blk self.cursorImage(shape.name(), size) orelse
@@ -6951,7 +6966,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn requestCursorRedraw(self: *Self) !void {
-            if (!self.cursor_layer.active and self.themed_cursor_shape == null and
+            if (!self.cursor_layer.active and self.effectiveCursorShape() == null and
                 self.drag_icon_root == null and !self.anyCursorPrevious()) return;
             try self.requestOutputDamage();
         }
@@ -9837,7 +9852,7 @@ pub fn Coordinator(comptime protocol: type) type {
             var next_client_cursor_previous: ?damage.SurfaceState = null;
             var client_cursor_visible = false;
             if (!self.sessionLockActive() and self.cursor_layer.active and
-                self.themed_cursor_shape == null)
+                self.effectiveCursorShape() == null)
             {
                 const global_bounds = try self.globalOutputBounds();
                 const root = self.cursor_layer.id.?;
@@ -10179,9 +10194,9 @@ pub fn Coordinator(comptime protocol: type) type {
                                     binding.surface.index,
                                     binding.surface.generation,
                                     binding.sample.commit_sequence,
-                                    if (self.themed_cursor_shape != null) "theme" else "client",
-                                    if (self.themed_cursor_shape) |shape| shape.name() else "client",
-                                    if (self.themed_cursor_shape != null) themed.image.?.nominal_size else @as(u32, 0),
+                                    if (self.effectiveCursorShape() != null) "theme" else "client",
+                                    if (self.effectiveCursorShape()) |shape| shape.name() else "client",
+                                    if (self.effectiveCursorShape() != null) themed.image.?.nominal_size else @as(u32, 0),
                                     head_state.scale_120,
                                     sample.source.size.width,
                                     sample.source.size.height,
@@ -10993,7 +11008,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 sample_count += 1;
             }
             if (capture.paint_cursors and !self.sessionLockActive()) {
-                if (self.themed_cursor_shape != null) {
+                if (self.effectiveCursorShape() != null) {
                     const physical = self.physicalOutputForKmsIdMutable(output.outputId()) orelse return error.NoOutput;
                     const cursor = try self.cursorThemeForOutput(physical);
                     if (try cursor.sample(bounds)) |sample| {
@@ -12682,7 +12697,7 @@ pub fn Coordinator(comptime protocol: type) type {
             // cursor now so enter/leave and preferred scale do not wait for a
             // later frame (or for another input event after crossing outputs).
             if (!self.cursor_layer.active or self.cursor_layer.sample == null or
-                self.themed_cursor_shape != null or
+                self.effectiveCursorShape() != null or
                 !std.meta.eql(self.interaction.cursor.surface, self.cursor_layer.id)) return;
             const bounds = self.globalOutputBounds() catch |err| switch (err) {
                 error.NoOutput => return,

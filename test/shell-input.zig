@@ -3288,10 +3288,13 @@ test "shell-input: two mapped toplevels sustain independent commit cycles" {
     } }));
     try std.testing.expectEqual(@as(i32, 255), coordinator.seat_adapter.pointerState().point.x);
     try coordinator.pointer_constraints_adapter.state.destroy(confined);
+    // These synthetic 3x2 windows have no interior outside resize handles.
+    // Use right-click for the client activation-serial exercise; left-click
+    // on the split now belongs to the compositor.
     try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_button = .{
         .device = pointer_device,
         .time_usec = 4,
-        .button = 0x110,
+        .button = 0x111,
         .pressed = true,
     } }));
     try std.testing.expectEqual(windows[0].id, coordinator.desktop.focused().?);
@@ -3309,10 +3312,50 @@ test "shell-input: two mapped toplevels sustain independent commit cycles" {
     try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_button = .{
         .device = pointer_device,
         .time_usec = 10_000,
-        .button = 0x110,
+        .button = 0x111,
         .pressed = false,
     } }));
     try std.testing.expect(coordinator.interaction.interactionMode() == .default);
+
+    // Compositor gestures never create a Wayland button grab or leak their
+    // press/release to the client, and deactivate pointer constraints.
+    for ([_]bool{ true, false }) |super| {
+        if (super) try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .keyboard_key = .{
+            .device = keyboard_device,
+            .time_usec = 11_000,
+            .key = 125,
+            .pressed = true,
+        } }));
+        try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_button = .{
+            .device = pointer_device,
+            .time_usec = 12_000,
+            .button = 0x110,
+            .pressed = true,
+        } }));
+        try std.testing.expect(coordinator.interaction.compositorGrab());
+        try std.testing.expect(coordinator.seat_adapter.grabState() == .idle);
+        try std.testing.expect(coordinator.seat_adapter.pointerState().focus == null);
+        try std.testing.expect(coordinator.pointer_constraints_adapter.motionPolicy() == .free);
+        const kind = coordinator.interaction.interactionMode().interactive.kind;
+        try std.testing.expect(if (super) kind == .reorder else kind == .resize);
+        try std.testing.expect(coordinator.interaction.cursorShape() != null);
+        if (super) try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .keyboard_key = .{
+            .device = keyboard_device,
+            .time_usec = 13_000,
+            .key = 125,
+            .pressed = false,
+        } }));
+        try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_button = .{
+            .device = pointer_device,
+            .time_usec = 14_000,
+            .button = 0x110,
+            .pressed = false,
+        } }));
+        try std.testing.expect(coordinator.interaction.interactionMode() == .default);
+        try std.testing.expect(coordinator.seat_adapter.grabState() == .idle);
+    }
+    try coordinator.focusNext();
+    _ = try loop.turn(coordinator);
 
     // Client teardown removes resources before the coordinator's next input
     // admission. Keep the desktop destruction event pending, as when a client

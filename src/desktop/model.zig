@@ -90,6 +90,7 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
         pub const InteractiveKind = union(enum) {
             move,
             resize: Shell.ResizeEdge,
+            reorder,
         };
         pub const InteractiveRequest = struct {
             id: ToplevelId,
@@ -101,6 +102,11 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
             min_height: i32,
             max_width: i32,
             max_height: i32,
+        };
+        pub const ResizeHandle = struct {
+            id: ToplevelId,
+            edge: Shell.ResizeEdge,
+            tiled: bool,
         };
 
         pub const Metadata = struct {
@@ -639,13 +645,69 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
                 return null;
             try desktop.reflow();
             const state = try desktop.policy.windowState(request.id);
+            const tiled = state.mode == .tiled;
             return .{
                 .rect = if (state.mode == .tiled) current_geometry else state.floating,
-                .min_width = @max(slot.min_width, 1),
-                .min_height = @max(slot.min_height, 1),
-                .max_width = slot.max_width,
-                .max_height = slot.max_height,
+                .min_width = if (tiled) 1 else @max(slot.min_width, 1),
+                .min_height = if (tiled) 1 else @max(slot.min_height, 1),
+                .max_width = if (tiled) 0 else slot.max_width,
+                .max_height = if (tiled) 0 else slot.max_height,
             };
+        }
+
+        /// Returns the pointer resize affordance without exposing policy to
+        /// interaction code. The scene's topmost surface owns the point.
+        pub fn resizeHandleAt(desktop: *const Self, point: geometry.Point) !?ResizeHandle {
+            var top: ?SceneWindow = null;
+            for (desktop.slots) |slot| {
+                if (!slot.header.active or !slot.scene.visible or !slot.scene.content_ready) continue;
+                const rect = slot.scene.geometry;
+                if (point.x < rect.x or point.x >= rect.x + rect.width or point.y < rect.y or point.y >= rect.y + rect.height) continue;
+                if (top == null or slot.scene.stacking >= top.?.stacking) top = slot.scene;
+            }
+            for (desktop.popups) |popup| {
+                if (!popup.active or !popup.scene.visible or !popup.scene.content_ready) continue;
+                const rect = popup.scene.geometry;
+                if (point.x >= rect.x and point.x < rect.x + rect.width and point.y >= rect.y and point.y < rect.y + rect.height and
+                    (top == null or popup.scene.stacking >= top.?.stacking)) return null;
+            }
+            for (desktop.external_roots[0..desktop.external_root_len]) |root| {
+                if (!root.visible or !root.content_ready) continue;
+                const rect = root.geometry;
+                if (point.x >= rect.x and point.x < rect.x + rect.width and point.y >= rect.y and point.y < rect.y + rect.height and
+                    (top == null or root.stacking >= top.?.stacking)) return null;
+            }
+            if (top) |window| {
+                if (!window.managed) return null;
+                const state = try desktop.policy.windowState(window.id);
+                if (state.fullscreen or state.maximized or state.minimized) return null;
+                if (window.mode == .floating) {
+                    const rect = window.geometry;
+                    const left = point.x - rect.x < 8;
+                    const right = rect.x + rect.width - point.x <= 8;
+                    const top_edge = point.y - rect.y < 8;
+                    const bottom = rect.y + rect.height - point.y <= 8;
+                    const edge: ?Shell.ResizeEdge = if (top_edge and left) .top_left else if (top_edge and right) .top_right else if (bottom and left) .bottom_left else if (bottom and right) .bottom_right else if (left) .left else if (right) .right else if (top_edge) .top else if (bottom) .bottom else null;
+                    return if (edge) |value| .{ .id = window.id, .edge = value, .tiled = false } else null;
+                }
+            }
+            if (desktop.policy.tiledBoundaryAt(point)) |hit| return .{
+                .id = hit.id,
+                .edge = switch (hit.direction) {
+                    .left => .left,
+                    .right => .right,
+                    .up => .top,
+                    .down => .bottom,
+                },
+                .tiled = true,
+            };
+            return null;
+        }
+
+        pub fn finishReorder(desktop: *Self, id: ToplevelId, point: geometry.Point) !void {
+            _ = try desktop.resolveIndex(id);
+            try desktop.requireCommandCapacity(desktop.live);
+            if (try desktop.policy.finishReorder(id, point, PolicyView{ .context = desktop })) try desktop.reflow();
         }
 
         pub fn updateInteractive(desktop: *Self, id: ToplevelId, rect: geometry.Rect) !void {
@@ -4355,6 +4417,189 @@ test "desktop: interactive resize preserves geometry and publishes resizing stat
     try std.testing.expectEqual(@as(i32, 80), (try desktop.policy.windowState(id)).floating.width);
     try desktop.endInteractive(id);
     try std.testing.expect(!desktop.slots[id.index].last_configure.states.resizing);
+}
+
+test "desktop: pointer drops swap centers and insert on all four sides without floating" {
+    const points = [_]geometry.Point{
+        .{ .x = 450, .y = 200 }, // center
+        .{ .x = 310, .y = 200 }, // left
+        .{ .x = 560, .y = 200 }, // right, outside the output edge strip
+        .{ .x = 450, .y = 10 }, // top
+        .{ .x = 450, .y = 390 }, // bottom
+    };
+    for (points, 0..) |point, direction| {
+        var desktop = try initTestDesktop(16);
+        defer desktop.deinit();
+        try desktop.setWorkArea(.{ .x = 0, .y = 0, .width = 600, .height = 400 });
+        var shell = TestShell{};
+        shell.push(created(0));
+        shell.push(created(1));
+        _ = try desktop.consume(&shell, 2);
+        try settleDesktop(&desktop, &shell);
+        const first = try desktop.idForShell(.{ .index = 0, .generation = 1 });
+        const second = try desktop.idForShell(.{ .index = 1, .generation = 1 });
+        const before = (try desktop.scene(first)).geometry;
+        _ = (try desktop.beginInteractive(.{ .id = first, .kind = .reorder })).?;
+        try std.testing.expectEqual(before, (try desktop.scene(first)).geometry);
+        try desktop.finishReorder(first, point);
+        try desktop.endInteractive(first);
+        try settleDesktop(&desktop, &shell);
+        const a = (try desktop.scene(first)).geometry;
+        const b = (try desktop.scene(second)).geometry;
+        try std.testing.expectEqual(TestDesktop.Mode.tiled, (try desktop.policy.windowState(first)).mode);
+        try std.testing.expectEqual(first, desktop.focused().?);
+        switch (direction) {
+            0, 2 => try std.testing.expectEqual(b.x + b.width, a.x),
+            1 => try std.testing.expectEqual(a.x + a.width, b.x),
+            3 => try std.testing.expectEqual(a.y + a.height, b.y),
+            4 => try std.testing.expectEqual(b.y + b.height, a.y),
+            else => unreachable,
+        }
+    }
+}
+
+test "desktop: reorder transfers only source across outputs and honors active workspace" {
+    var desktop = try initTestDesktop(16);
+    defer desktop.deinit();
+    const topology = [_]TestDesktop.OutputArea{
+        .{ .id = .{ .value = 10 }, .geometry = .{ .x = 0, .y = 0, .width = 600, .height = 400 } },
+        .{ .id = .{ .value = 20 }, .geometry = .{ .x = 600, .y = 0, .width = 600, .height = 400 } },
+    };
+    desktop.applyTopology(.{ .x = 0, .y = 0, .width = 1200, .height = 400 }, &topology);
+    var shell = TestShell{};
+    desktop.setNextSpawnOutput(topology[0].id);
+    shell.push(created(0));
+    _ = try desktop.consume(&shell, 1);
+    try settleDesktop(&desktop, &shell);
+    try desktop.switchWorkspace(topology[1].id, 3);
+    desktop.setNextSpawnOutput(topology[1].id);
+    shell.push(created(1));
+    _ = try desktop.consume(&shell, 1);
+    try settleDesktop(&desktop, &shell);
+    const first = try desktop.idForShell(.{ .index = 0, .generation = 1 });
+    const second = try desktop.idForShell(.{ .index = 1, .generation = 1 });
+    try desktop.finishReorder(first, .{ .x = 900, .y = 200 });
+    try settleDesktop(&desktop, &shell);
+    for ([_]TestDesktop.ToplevelId{ first, second }) |id| {
+        const state = try desktop.policy.windowState(id);
+        try std.testing.expectEqual(topology[1].id, state.output.?);
+        try std.testing.expectEqual(@as(u8, 3), state.workspace);
+        try std.testing.expect((try desktop.scene(id)).geometry.x >= 600);
+    }
+    try desktop.finishReorder(first, .{ .x = 300, .y = 200 }); // empty output
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expectEqual(topology[0].geometry, (try desktop.scene(first)).geometry);
+    try std.testing.expectEqual(@as(u8, 1), (try desktop.policy.windowState(first)).workspace);
+    const before = (try desktop.scene(first)).geometry;
+    try desktop.finishReorder(first, .{ .x = 300, .y = 200 }); // own tile
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expectEqual(before, (try desktop.scene(first)).geometry);
+}
+
+test "desktop: handles resize real tiled boundaries without a gap jump" {
+    var desktop = try initTestDesktop(16);
+    defer desktop.deinit();
+    var gaps: TestDesktop.PolicySnapshot = .{ .inner_gap = 12, .outer_gap = 5 };
+    try desktop.installPolicySnapshot(&gaps);
+    var shell = TestShell{};
+    shell.push(created(0));
+    shell.push(created(1));
+    _ = try desktop.consume(&shell, 2);
+    try settleDesktop(&desktop, &shell);
+    const first = try desktop.idForShell(.{ .index = 0, .generation = 1 });
+    const before = (try desktop.scene(first)).geometry;
+    try std.testing.expect(try desktop.resizeHandleAt(.{ .x = 5, .y = 30 }) == null);
+    const handle = (try desktop.resizeHandleAt(.{ .x = 50, .y = 30 })).?;
+    try std.testing.expect(handle.tiled);
+    const initial = (try desktop.beginInteractive(.{ .id = handle.id, .kind = .{ .resize = handle.edge } })).?;
+    try desktop.updateInteractive(handle.id, initial.rect);
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expectEqual(before, (try desktop.scene(first)).geometry);
+    var resized = initial.rect;
+    if (handle.edge == .right) resized.width += 10 else {
+        resized.x += 10;
+        resized.width -= 10;
+    }
+    try desktop.updateInteractive(handle.id, resized);
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expect((try desktop.scene(first)).geometry.width > before.width);
+    try desktop.endInteractive(handle.id);
+    try desktop.focusToplevel(first);
+    try desktop.toggleFocusedFullscreen();
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expect(try desktop.resizeHandleAt(.{ .x = 50, .y = 30 }) == null);
+}
+
+test "desktop: floating handles cover eight edges and do not expose underlying tiles" {
+    var desktop = try initTestDesktop(16);
+    defer desktop.deinit();
+    var shell = TestShell{};
+    shell.push(created(0));
+    shell.push(created(1));
+    _ = try desktop.consume(&shell, 2);
+    try settleDesktop(&desktop, &shell);
+    const id = desktop.focused().?;
+    try desktop.setFloating(id, true);
+    try desktop.setFloatingGeometry(id, .{ .x = 10, .y = 10, .width = 80, .height = 40 });
+    try settleDesktop(&desktop, &shell);
+    const cases = .{
+        .{ 10, 10, TestShell.ResizeEdge.top_left },     .{ 50, 10, TestShell.ResizeEdge.top },
+        .{ 89, 10, TestShell.ResizeEdge.top_right },    .{ 89, 30, TestShell.ResizeEdge.right },
+        .{ 89, 49, TestShell.ResizeEdge.bottom_right }, .{ 50, 49, TestShell.ResizeEdge.bottom },
+        .{ 10, 49, TestShell.ResizeEdge.bottom_left },  .{ 10, 30, TestShell.ResizeEdge.left },
+    };
+    inline for (cases) |case| {
+        const handle = (try desktop.resizeHandleAt(.{ .x = case[0], .y = case[1] })).?;
+        try std.testing.expectEqual(id, handle.id);
+        try std.testing.expectEqual(case[2], handle.edge);
+        try std.testing.expect(!handle.tiled);
+    }
+    try std.testing.expect(try desktop.resizeHandleAt(.{ .x = 50, .y = 30 }) == null);
+    try std.testing.expect(try desktop.resizeHandleAt(.{ .x = 90, .y = 50 }) == null);
+    try desktop.toggleFocusedMaximized();
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expect(try desktop.resizeHandleAt(.{ .x = 0, .y = 0 }) == null);
+}
+
+test "desktop: nested handles skip hidden splits and survive retile during a grab" {
+    var desktop = try initTestDesktop(16);
+    defer desktop.deinit();
+    try desktop.setWorkArea(.{ .x = 0, .y = 0, .width = 600, .height = 100 });
+    var shell = TestShell{};
+    shell.push(created(0));
+    shell.push(created(1));
+    _ = try desktop.consume(&shell, 2);
+    try settleDesktop(&desktop, &shell);
+    const first = try desktop.idForShell(.{ .index = 0, .generation = 1 });
+    try desktop.focusToplevel(first);
+    shell.push(created(2));
+    _ = try desktop.consume(&shell, 1);
+    try settleDesktop(&desktop, &shell);
+    const third = try desktop.idForShell(.{ .index = 2, .generation = 1 });
+    const boundary = (try desktop.resizeHandleAt(.{ .x = 300, .y = 50 })).?;
+    try std.testing.expect(!std.meta.eql(boundary.id, first));
+    shell.push(.{ .state_requested = .{
+        .id = .{ .index = 2, .generation = 1 },
+        .state = .minimized,
+        .enabled = true,
+    } });
+    _ = try desktop.consume(&shell, 1);
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expect(!(try desktop.scene(third)).visible);
+    const initial = (try desktop.beginInteractive(.{ .id = first, .kind = .{ .resize = .right } })).?;
+    try std.testing.expectEqual(TestDesktop.Mode.tiled, (try desktop.policy.windowState(first)).mode);
+    var larger = initial.rect;
+    larger.width += 60;
+    try desktop.updateInteractive(first, larger);
+    try desktop.endInteractive(first);
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expectEqual(@as(i32, 360), (try desktop.scene(first)).geometry.width);
+    try desktop.setFloating(first, true);
+    _ = (try desktop.beginInteractive(.{ .id = first, .kind = .move })).?;
+    try desktop.setFloating(first, false);
+    try desktop.updateInteractive(first, larger);
+    try desktop.endInteractive(first);
+    try std.testing.expectEqual(TestDesktop.Mode.tiled, (try desktop.policy.windowState(first)).mode);
 }
 
 test "desktop: keyboard tile movement reorders layout transactionally" {

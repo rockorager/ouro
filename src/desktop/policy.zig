@@ -351,18 +351,115 @@ pub fn Policy(
                             _ = try policy.setFloatingGeometry(id, current_geometry);
                         }
                     },
+                    .reorder => {},
                 }
-            }
+            } else if (kind == .reorder) return false;
             _ = try policy.setResizing(id, kind == .resize);
             _ = try policy.focus(id);
             return true;
         }
 
+        pub fn tiledBoundaryAt(policy: *const Self, point: geometry.Point) ?Tiling.BoundaryHit {
+            return policy.tiling.boundaryAt(point, 8, Eligibility{ .policy = policy });
+        }
+
+        /// Applies a completed reorder in one topology mutation. Motion itself
+        /// deliberately carries no policy state.
+        pub fn finishReorder(policy: *Self, id: ToplevelId, point: geometry.Point, view: anytype) !bool {
+            const state = try policy.resolve(id);
+            if (!policy.layoutEligible(state.*)) return false;
+            var output_index: ?usize = null;
+            for (0..view.outputCount()) |index| {
+                const rect = view.output(index).geometry;
+                if (point.x >= rect.x and point.x < rect.x + rect.width and
+                    point.y >= rect.y and point.y < rect.y + rect.height)
+                    output_index = index;
+            }
+            const index = output_index orelse return false;
+            const output = view.output(index);
+            const destination = LayoutOutput{ .output = output.id, .workspace = policy.activeWorkspace(output.id) };
+            const source = policy.layoutOutput(state.*);
+            const same_workspace = std.meta.eql(source, destination);
+
+            // The outer horizontal strips are explicit output-root insertion.
+            if (point.x < output.geometry.x + 32 or point.x >= output.geometry.x + output.geometry.width - 32) {
+                const direction: layout.Direction = if (point.x < output.geometry.x + 32) .left else .right;
+                const changed = policy.tiling.insertAtRoot(id, destination, direction);
+                if (changed) {
+                    state.output = output.id;
+                    state.workspace = destination.workspace;
+                    policy.workspace_revision +%= 1;
+                }
+                return changed;
+            }
+
+            var drop_target: ?ToplevelId = null;
+            var target_rect: geometry.Rect = undefined;
+            var best_stacking: u32 = 0;
+            var windows = view.windows();
+            while (windows.next()) |window| {
+                if (std.meta.eql(window.id, id)) {
+                    const rect = window.current_geometry;
+                    if (same_workspace and point.x >= rect.x and point.x < rect.x + rect.width and
+                        point.y >= rect.y and point.y < rect.y + rect.height) return false;
+                    continue;
+                }
+                const candidate = policy.resolveConst(window.id) catch continue;
+                if (!policy.layoutEligible(candidate.*) or candidate.output == null or
+                    !std.meta.eql(candidate.output.?, output.id)) continue;
+                const rect = window.current_geometry;
+                if (point.x < rect.x or point.x >= rect.x + rect.width or point.y < rect.y or point.y >= rect.y + rect.height) continue;
+                const stacking = for (policy.tiles[0..policy.tile_len], 0..) |tile, order| {
+                    if (std.meta.eql(tile, window.id)) break @as(u32, @intCast(order));
+                } else 0;
+                if (drop_target == null or stacking >= best_stacking) {
+                    drop_target = window.id;
+                    target_rect = rect;
+                    best_stacking = stacking;
+                }
+            }
+            const target_id = drop_target orelse {
+                if (same_workspace) return false;
+                const changed = policy.tiling.insertAtRoot(id, destination, .right);
+                if (changed) {
+                    state.output = output.id;
+                    state.workspace = destination.workspace;
+                    policy.workspace_revision +%= 1;
+                }
+                return changed;
+            };
+            const nx = @as(f64, @floatFromInt(point.x - target_rect.x)) / @as(f64, @floatFromInt(target_rect.width)) * 2.0 - 1.0;
+            const ny = @as(f64, @floatFromInt(point.y - target_rect.y)) / @as(f64, @floatFromInt(target_rect.height)) * 2.0 - 1.0;
+            const center = @abs(nx) <= 0.5 and @abs(ny) <= 0.5;
+            if (center and !same_workspace) {
+                policy.tiling.moveToOutput(id, destination, target_id);
+                state.output = output.id;
+                state.workspace = destination.workspace;
+            }
+            const changed = if (center)
+                policy.tiling.swap(id, target_id)
+            else
+                policy.tiling.insertBeside(id, target_id, if (@abs(nx) >= @abs(ny))
+                    if (nx < 0) .left else .right
+                else if (ny < 0) .up else .down);
+            if (changed) {
+                state.output = output.id;
+                state.workspace = destination.workspace;
+                policy.workspace_revision +%= 1;
+            }
+            return changed;
+        }
+
         pub fn updateInteractive(policy: *Self, id: ToplevelId, rect: geometry.Rect) !bool {
+            const state = try policy.resolve(id);
+            if (!policy.isVisible(state.*) or state.fullscreen or state.maximized) return false;
             if (policy.tiled_resize) |resize| {
                 if (!std.meta.eql(resize.id, id)) return false;
                 return policy.tiling.updateResize(resize, rect);
             }
+            // A keyboard action can retile the subject while its button is
+            // still held. Do not turn the next motion into NotFloating.
+            if (state.mode != .floating) return false;
             return policy.setFloatingGeometry(id, rect);
         }
 
