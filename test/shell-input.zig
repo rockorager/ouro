@@ -4735,6 +4735,129 @@ test "shell-input: synchronized cursor subsurface batch renders root and child" 
     try root.deinit();
 }
 
+test "shell-input: floating left resize keeps the right edge fixed across buffer admission" {
+    const allocator = std.testing.allocator;
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-floating-resize-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+    var fixture = try physical_fixture.Fixture.init();
+    defer fixture.deinit();
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), physical_fixture.compositorConfig());
+    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), physical_fixture.coordinatorConfig());
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
+    try coordinator.start(&loop);
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(allocator, .{ .entries = 16, .flags = 0 }, physical_fixture.clientReactorConfig());
+    var client = try ClientConnection.attach(
+        allocator,
+        &reactor,
+        try wayring.unix_socket.connect(path),
+        .{ .received_fd_budget = 1, .transmit_byte_budget = 4096, .transmit_fd_budget = 1 },
+        .{ .max_objects = 32, .max_client_ids = 31 },
+    );
+    const actor = try client.actor();
+    var driver = ClientDriver.init(&client);
+    var handler: MultiHandler = .{
+        .objects = &client.objects,
+        .queue = &actor.transmit,
+        .registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null),
+        .surface_count = 1,
+        .cycle_count = 1,
+        .fractional_mode = true,
+    };
+    try submitMultiClient(&reactor, &driver, &handler);
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    for (0..256) |_| {
+        _ = try drainMultiClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.frame_done == 1 and handler.buffer_releases == 1 and fixture.flip_len == 0) break;
+        try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expectEqual(@as(usize, 1), handler.frame_done);
+    var windows: [2]Coordinator.Desktop.SceneWindow = undefined;
+    const window = (try coordinator.desktop.sceneSnapshot(&windows))[0];
+    try coordinator.desktop.setFloating(window.id, true);
+    try coordinator.desktop.setFloatingGeometry(window.id, .{ .x = 1, .y = 0, .width = 2, .height = 1 });
+    for (0..256) |_| {
+        _ = try drainMultiClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (!coordinator.desktop.transactionPending() and coordinator.pending_surface_len == 0 and
+            fixture.flip_len == 0 and (try coordinator.desktop.scene(window.id)).geometry.x == 1) break;
+        try waitForEither(&root.ring, reactor.ring);
+    }
+    const original = findLayer(coordinator.app_layers, window.surface).?.sample.?.destination;
+    try std.testing.expectEqual(@as(i32, 1), original.x);
+    try std.testing.expectEqual(@as(u32, 2), original.width);
+    _ = (try coordinator.desktop.beginInteractive(.{ .id = window.id, .kind = .{ .resize = .left } })).?;
+    try coordinator.desktop.updateInteractive(window.id, .{ .x = 0, .y = 0, .width = 3, .height = 1 });
+    for (0..256) |_| {
+        _ = try drainMultiClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (!coordinator.desktop.transactionPending() and coordinator.pending_surface_len == 0 and fixture.flip_len == 0) break;
+        try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expectEqual(original, findLayer(coordinator.app_layers, window.surface).?.sample.?.destination);
+
+    // Hold a repaint of the old buffer, then commit a wider replacement.
+    const output = coordinator.primaryKmsOutput().?;
+    fixture.held_crtc = output.kms_output.crtc.id;
+    var now: linux.timespec = undefined;
+    try std.testing.expectEqual(@as(usize, 0), linux.clock_gettime(.MONOTONIC, &now));
+    try output.request(.damage, @as(u64, @intCast(now.sec)) * std.time.ns_per_s + @as(u64, @intCast(now.nsec)));
+    for (0..128) |_| {
+        _ = try drainMultiClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (output.in_flight_frame != null) break;
+        try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expect(output.in_flight_frame != null);
+    try protocol.wp_viewport.encodeRequest(handler.queue, handler.viewports[0].?.id, .{
+        .set_destination = .{ .width = 3, .height = 1 },
+    });
+    try handler.mapSurface(0);
+    try submitMultiClient(&reactor, &driver, &handler);
+    for (0..128) |_| {
+        _ = try drainMultiClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if ((try coordinator.desktop.scene(window.id)).geometry.width == 3) break;
+        try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expectEqual(@as(i32, 3), (try coordinator.desktop.scene(window.id)).geometry.width);
+    try std.testing.expectEqual(original, findLayer(coordinator.app_layers, window.surface).?.sample.?.destination);
+    try fixture.releaseHeldFlips();
+    for (0..256) |_| {
+        _ = try drainMultiClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.frame_done == 2 and handler.buffer_releases == 2 and fixture.flip_len == 0) break;
+        try waitForEither(&root.ring, reactor.ring);
+    }
+    const resized = findLayer(coordinator.app_layers, window.surface).?.sample.?.destination;
+    try std.testing.expectEqual(@as(i32, 0), resized.x);
+    try std.testing.expectEqual(@as(u32, 3), resized.width);
+    try std.testing.expectEqual(original.x + @as(i32, @intCast(original.width)), resized.x + @as(i32, @intCast(resized.width)));
+    try std.testing.expectEqual(@as(usize, 2), handler.frame_done);
+    try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+    try coordinator.requestStop();
+    _ = try client.prepareClose();
+    try submitMultiClient(&reactor, &driver, &handler);
+    var drained = false;
+    for (0..256) |_| {
+        const cp = try drainMultiClient(&reactor, &driver, &handler);
+        const progress = try loop.turn(coordinator);
+        drained = progress.wayring.shutdown_complete and cp.quiescent and coordinator.backendDrainComplete();
+        if (drained) break;
+        try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expect(drained);
+    try client.deinit(allocator);
+    reactor.deinit(allocator);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
 test "shell-input: independent commits proceed while another output flip is held" {
     try runCommitDuringRepaint(false, false);
 }

@@ -729,6 +729,7 @@ pub fn Coordinator(comptime protocol: type) type {
             surface: ?wayring.objects.Handle = null,
             id: ?Adapter.SurfaceId = null,
             content_origin: geometry.Point = .{ .x = 0, .y = 0 },
+            window_geometry: ?geometry.Rect = null,
             content: OwnedValue(Adapter.Content) = .{},
             effects: ?surface_state.SurfaceRegions.EffectSnapshot = null,
             rendered: ?render_content.Handle = null,
@@ -8839,6 +8840,18 @@ pub fn Coordinator(comptime protocol: type) type {
                         };
                     }
                 }
+                // A scene commit can precede admission of its buffer (for
+                // example while a page flip still owns the previous content).
+                // Do not move that old, natural-sized buffer to the new
+                // resize origin. Pure moves still reposition it immediately.
+                if (!scene.subsurface and scene.root.has_window_geometry) {
+                    if (layer.window_geometry) |previous_geometry| {
+                        if ((previous_geometry.width != scene.root.geometry.width or
+                            previous_geometry.height != scene.root.geometry.height) and
+                            self.pendingSurfaceContains(id))
+                            sample.destination = layer.sample.?.destination;
+                    }
+                }
                 sample.clip = clipToOutput(sample.destination, output_bounds) catch unreachable orelse {
                     self.retireLayer(layer);
                     visibility_changed = true;
@@ -9344,6 +9357,7 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             layer.active = true;
             layer.content_origin = content_origin;
+            layer.window_geometry = if (surface_scene) |scene| scene.root.geometry else null;
             layer.content.set(published.content);
             layer.rendered = rendered;
             layer.peer = published.peer;
@@ -9568,6 +9582,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .buffer_damage = published.content.surface.buffer_damage,
             };
             layer.content_origin = content_origin;
+            layer.window_geometry = if (surface_scene) |scene| scene.root.geometry else null;
             layer.content.set(published.content);
             layer.rendered = rendered;
             layer.peer = published.peer;
