@@ -115,10 +115,15 @@ pub const Waits = struct {
             if (entry.cancel) |cancel| if (std.meta.eql(cancel, token)) {
                 try router.retire(token);
                 entry.cancel = null;
-                // poll_remove may race a completed poll; its terminal CQE is
-                // still required before the descriptor can be closed.
-                if (result < 0 and result != -@as(i32, @intFromEnum(linux.E.NOENT)))
+                // poll_remove may race a completed (ENOENT) or completing
+                // (EALREADY) poll. Its terminal CQE is still required before
+                // the descriptor can be closed.
+                if (result < 0 and result != -@as(i32, @intFromEnum(linux.E.NOENT)) and
+                    result != -@as(i32, @intFromEnum(linux.E.ALREADY)))
+                {
+                    std.log.err("acquire fence cancellation failed: fd={d} token={d} result={d}", .{ entry.fd, token.encode(), result });
                     return error.AcquireFenceCancelFailed;
+                }
                 return;
             };
         }
@@ -219,6 +224,50 @@ test "acquire fence abandonment and shutdown drain both CQEs in either order bef
                 try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(fd, linux.F.GETFD, 0)));
             }
         }
+    }
+}
+
+test "acquire fence EALREADY cancellation drains both CQEs before closing" {
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |cancel_first| {
+        var ring = try linux.IoUring.init(8, 0);
+        defer ring.deinit();
+        var router = try completion.Router.init(allocator, 4);
+        defer router.deinit(allocator);
+        var waits: Waits = .{};
+        defer waits.deinit(allocator);
+        const fd = try testEventFd(1);
+        const entry = try waits.arm(allocator, &router, &ring, fd);
+        _ = try ring.submit_and_wait(1);
+        entry.state.owned = false;
+        try waits.prepare(allocator, &router, &ring);
+        const cancel = entry.cancel.?;
+        _ = try ring.submit_and_wait(2);
+        var cqes = [_]linux.io_uring_cqe{ try ring.copy_cqe(), try ring.copy_cqe() };
+        // The kernel poll has finished; inject the other legal race outcome
+        // rather than depending on catching a poll mid-completion on this CPU.
+        for (&cqes) |*cqe| {
+            if (cqe.user_data == cancel.encode())
+                cqe.res = -@as(i32, @intFromEnum(linux.E.ALREADY));
+        }
+        if ((cqes[0].user_data == cancel.encode()) != cancel_first)
+            std.mem.swap(linux.io_uring_cqe, &cqes[0], &cqes[1]);
+        // Save errors until both completions are drained so failures still
+        // clean up the descriptor, entry, and router tokens.
+        const first = waits.complete(&router, router.route(cqes[0].user_data).?, cqes[0].res);
+        try waits.prepare(allocator, &router, &ring);
+        try std.testing.expect(!waits.drained());
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(fd, linux.F.GETFD, 0)));
+        try std.testing.expectEqual(@as(usize, 1), router.active_count);
+        try std.testing.expectEqual(@as(u32, 0), ring.sq_ready());
+        const second = waits.complete(&router, router.route(cqes[1].user_data).?, cqes[1].res);
+        try waits.prepare(allocator, &router, &ring);
+        try std.testing.expect(waits.drained());
+        try std.testing.expect(waits.head == null);
+        try std.testing.expectEqual(@as(usize, 0), router.active_count);
+        try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(fd, linux.F.GETFD, 0)));
+        try first;
+        try second;
     }
 }
 
