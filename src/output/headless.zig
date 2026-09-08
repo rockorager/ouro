@@ -64,8 +64,7 @@ pub const Config = struct {
     /// CLOCK_MONOTONIC phase of the modeled refresh clock.
     phase_ns: Timestamp = 0,
     refresh_ns: Timestamp,
-    /// Conservative ceiling used until adaptive physical timing is ready and
-    /// whenever adaptive timing is disabled.
+    /// Initial allowance for adaptive timing, or fixed allowance when disabled.
     render_budget_ns: Timestamp,
     /// Display readiness deadline precedes the reported presentation time by
     /// this much (physical vertical blanking). Not part of learned render time.
@@ -74,6 +73,8 @@ pub const Config = struct {
     /// rendering toward vblank. Zero retains the fixed-budget behavior.
     adaptive_render_samples: u16 = 0,
     adaptive_render_margin_ns: Timestamp = 0,
+    /// Reserve inside the refresh interval, in addition to physical blanking.
+    adaptive_render_safety_ns: Timestamp = 0,
     adaptive_miss_tolerance_ns: Timestamp = std.time.ns_per_ms,
 
     pub fn validate(config: Config) Error!void {
@@ -82,12 +83,23 @@ pub const Config = struct {
             config.adaptive_render_samples > adaptive_render_sample_capacity or
             (config.adaptive_render_samples != 0 and
                 (config.adaptive_render_margin_ns >= config.render_budget_ns or
+                    config.presentation_lead_ns >= config.refresh_ns or
+                    @max(1, config.adaptive_render_safety_ns) >= config.refresh_ns - config.presentation_lead_ns or
                     config.adaptive_miss_tolerance_ns == 0)))
             return error.InvalidConfig;
     }
 };
 
 const adaptive_render_sample_capacity = 256;
+
+pub const PresentationMiss = enum { none, render, presentation, unknown };
+
+pub fn presentationMiss(config: Config, started: Timestamp, ready: ?Timestamp, target: Timestamp, actual: Timestamp) PresentationMiss {
+    if (actual -| target <= config.adaptive_miss_tolerance_ns) return .none;
+    const timestamp = ready orelse return .unknown;
+    if (timestamp < started or timestamp > actual or target < config.presentation_lead_ns) return .unknown;
+    return if (timestamp > target - config.presentation_lead_ns) .render else .presentation;
+}
 
 pub const Error = std.mem.Allocator.Error || error{
     InvalidConfig,
@@ -195,6 +207,7 @@ pub fn Scheduler(comptime PresentationToken: type) type {
         render_duration_count: u16 = 0,
         render_duration_cursor: u16 = 0,
         maximum_render_duration_ns: Timestamp = 0,
+        learned_render_budget_ns: ?Timestamp = null,
 
         pub fn init(
             allocator: std.mem.Allocator,
@@ -258,8 +271,14 @@ pub fn Scheduler(comptime PresentationToken: type) type {
         /// to share its wakeup with rendering. The coordinator must revalidate
         /// the frame identity and requested stage after admitting the update.
         pub fn planRender(self: *const Self, eligible_ns: Timestamp) Error!TimerRequest {
-            const budget = self.renderBudget();
-            const target = try self.nextTargetWithBudget(eligible_ns, budget);
+            const preferred_budget = self.renderBudget();
+            const target = try self.nextTargetWithBudget(eligible_ns, preferred_budget);
+            // Adaptive timing must not buy fewer misses by skipping a refresh.
+            // When the preferred start is past, render now with the time left.
+            const budget = if (self.config.adaptive_render_samples != 0)
+                @min(preferred_budget, target - self.config.presentation_lead_ns - eligible_ns)
+            else
+                preferred_budget;
             return .{
                 .purpose = .render_deadline,
                 .frame = try self.prospectiveFrameId(),
@@ -512,7 +531,8 @@ pub fn Scheduler(comptime PresentationToken: type) type {
             now_ns: Timestamp,
             render_budget_ns: Timestamp,
         ) Error!Timestamp {
-            const ready_threshold = std.math.add(Timestamp, now_ns, render_budget_ns) catch
+            const target_budget = if (self.config.adaptive_render_samples != 0) 0 else render_budget_ns;
+            const ready_threshold = std.math.add(Timestamp, now_ns, target_budget) catch
                 return error.TimestampOverflow;
             const threshold = std.math.add(Timestamp, ready_threshold, self.config.presentation_lead_ns) catch
                 return error.TimestampOverflow;
@@ -532,36 +552,28 @@ pub fn Scheduler(comptime PresentationToken: type) type {
         }
 
         fn renderBudget(self: *const Self) Timestamp {
-            if (!self.adaptiveReady()) return self.config.render_budget_ns;
-            const learned = std.math.add(
-                Timestamp,
-                self.maximum_render_duration_ns,
-                self.config.adaptive_render_margin_ns,
-            ) catch return self.config.render_budget_ns;
-            return @max(1, @min(learned, self.config.render_budget_ns));
+            if (self.config.adaptive_render_samples == 0) return self.config.render_budget_ns;
+            return @min(self.learned_render_budget_ns orelse self.config.render_budget_ns, self.maximumRenderBudget());
+        }
+
+        fn maximumRenderBudget(self: *const Self) Timestamp {
+            return self.config.refresh_ns - self.config.presentation_lead_ns -
+                @max(1, self.config.adaptive_render_safety_ns);
         }
 
         fn recordPhysicalTiming(
             self: *Self,
             render_started_ns: Timestamp,
             ready_ns: ?Timestamp,
-            target_ns: Timestamp,
+            _: Timestamp,
             actual_ns: Timestamp,
         ) void {
             if (self.config.adaptive_render_samples == 0) return;
-            const ready = ready_ns orelse {
-                self.resetAdaptiveTiming();
-                return;
-            };
-            const tolerated_target = std.math.add(
-                Timestamp,
-                target_ns,
-                self.config.adaptive_miss_tolerance_ns,
-            ) catch target_ns;
-            if (ready < render_started_ns or ready > actual_ns or actual_ns > tolerated_target) {
-                self.resetAdaptiveTiming();
-                return;
-            }
+            // A late presentation is not proof of slow rendering. Learn from
+            // valid fence durations even on misses; missing/invalid timestamps
+            // must not erase the history of previous trustworthy samples.
+            const ready = ready_ns orelse return;
+            if (ready < render_started_ns or ready > actual_ns) return;
             const duration = ready - render_started_ns;
             const sample_count = self.config.adaptive_render_samples;
             const cursor: usize = self.render_duration_cursor;
@@ -584,12 +596,19 @@ pub fn Scheduler(comptime PresentationToken: type) type {
                     duration,
                 );
             }
-        }
-
-        fn resetAdaptiveTiming(self: *Self) void {
-            self.render_duration_count = 0;
-            self.render_duration_cursor = 0;
-            self.maximum_render_duration_ns = 0;
+            const desired = @max(1, @min(
+                self.maximum_render_duration_ns +| self.config.adaptive_render_margin_ns,
+                self.maximumRenderBudget(),
+            ));
+            const current = self.renderBudget();
+            if (desired > current) {
+                self.learned_render_budget_ns = desired;
+            } else if (self.adaptiveReady() and desired < current) {
+                // Increase immediately, but only shed slack gradually after a
+                // full window of evidence. A single fast frame cannot undo a
+                // slow-frame allowance.
+                self.learned_render_budget_ns = current - @max(1, (current - desired) / self.config.adaptive_render_samples);
+            }
         }
 
         fn requireFrame(self: *const Self, frame_id: FrameId, stage: Stage) Error!void {
@@ -909,8 +928,8 @@ test "physical blanking lead skips an already latched future timestamp and prese
     _ = try scheduler.renderComplete(frame, 39); // Ready inside blanking, misses the latch.
     try scheduler.submitPhysical(frame, 39);
     _ = try scheduler.presentPhysical(frame, 50, 39);
-    try std.testing.expect(!scheduler.adaptiveReady());
-    try std.testing.expectEqual(@as(Timestamp, 3), scheduler.renderBudget());
+    try std.testing.expect(scheduler.adaptiveReady());
+    try std.testing.expectEqual(@as(Timestamp, 5), scheduler.renderBudget());
 }
 
 test "presentation lead arithmetic checks overflow without restricting combined budget" {
@@ -925,7 +944,7 @@ test "presentation lead arithmetic checks overflow without restricting combined 
     try std.testing.expectError(error.TimestampOverflow, scheduler.nextTarget(0));
 }
 
-test "physical timing warms adaptive render deadlines and resets after a miss" {
+test "physical timing preserves learned duration after a presentation-only miss" {
     const config: Config = .{
         .phase_ns = 0,
         .refresh_ns = 10,
@@ -963,13 +982,115 @@ test "physical timing warms adaptive render deadlines and resets after a miss" {
     _ = try scheduler.renderComplete(render.frame, 39);
     try scheduler.submitPhysical(render.frame, 39);
     _ = try scheduler.presentPhysical(render.frame, 50, 39);
-    try std.testing.expect(!scheduler.adaptiveReady());
+    try std.testing.expect(scheduler.adaptiveReady());
+    try std.testing.expectEqual(@as(Timestamp, 3), scheduler.renderBudget());
 
     try scheduler.request(.damage, 51);
     const frame = try armRender(&scheduler, 51, fakeHandle(5));
-    _ = try startRender(&scheduler, fakeHandle(5), 56);
+    _ = try startRender(&scheduler, fakeHandle(5), 57);
     try scheduler.captureSamples(frame, &.{});
     _ = try scheduler.failRender(frame);
+}
+
+test "adaptive allowance grows on render misses and decays after slow samples age out" {
+    var scheduler = try TestScheduler.init(std.testing.allocator, test_output, .{
+        .refresh_ns = 100,
+        .render_budget_ns = 30,
+        .presentation_lead_ns = 10,
+        .adaptive_render_samples = 3,
+        .adaptive_render_margin_ns = 5,
+        .adaptive_render_safety_ns = 2,
+    }, 1);
+    defer scheduler.deinit(std.testing.allocator);
+    scheduler.recordPhysicalTiming(60, 95, 100, 200);
+    try std.testing.expectEqual(@as(Timestamp, 40), scheduler.renderBudget());
+    try std.testing.expectEqual(@as(u16, 1), scheduler.render_duration_count);
+    // Even an over-one-refresh render must not extend the ceiling.
+    scheduler.recordPhysicalTiming(200, 350, 300, 400);
+    try std.testing.expectEqual(@as(Timestamp, 88), scheduler.renderBudget());
+    for (0..2) |_| scheduler.recordPhysicalTiming(400, 410, 500, 500);
+    try std.testing.expectEqual(@as(Timestamp, 88), scheduler.renderBudget());
+    scheduler.recordPhysicalTiming(400, 410, 500, 500);
+    try std.testing.expectEqual(@as(Timestamp, 64), scheduler.renderBudget());
+    for (0..20) |_| scheduler.recordPhysicalTiming(400, 410, 500, 500);
+    try std.testing.expectEqual(@as(Timestamp, 15), scheduler.renderBudget());
+}
+
+test "adaptive planning renders immediately instead of buying latency with a later refresh" {
+    var scheduler = try TestScheduler.init(std.testing.allocator, test_output, .{
+        .refresh_ns = 100,
+        .render_budget_ns = 30,
+        .presentation_lead_ns = 10,
+        .adaptive_render_samples = 3,
+        .adaptive_render_margin_ns = 5,
+    }, 1);
+    defer scheduler.deinit(std.testing.allocator);
+    scheduler.recordPhysicalTiming(0, 70, 50, 100);
+    const plan = try scheduler.planRender(80);
+    try std.testing.expectEqual(@as(Timestamp, 80), try nsFromDeadline(plan.deadline));
+    try std.testing.expectEqual(@as(Timestamp, 10), plan.render_budget_ns);
+    try scheduler.request(.damage, 80);
+    try scheduler.timerArmed(plan, fakeHandle(1), 80);
+    const frame = try startRender(&scheduler, fakeHandle(1), 80);
+    try scheduler.captureSamples(frame, &.{});
+    _ = try scheduler.renderComplete(frame, 95);
+    try scheduler.submitPhysical(frame, 95);
+    const outcome = try scheduler.presentPhysical(frame, 200, 95);
+    // Preserve the missed target; do not relabel the late frame as on time.
+    try std.testing.expectEqual(@as(Timestamp, 100), outcome.target_ns);
+    try std.testing.expectEqual(@as(Timestamp, 80), outcome.requested_ns);
+    try std.testing.expectEqual(@as(Timestamp, 200), outcome.actual_ns.?);
+    // At the completed frame's latch, only the following refresh is available.
+    const next = try scheduler.planRender(190);
+    try std.testing.expectEqual(@as(Timestamp, 215), try nsFromDeadline(next.deadline));
+}
+
+test "invalid fence timestamps preserve adaptive history" {
+    var scheduler = try TestScheduler.init(std.testing.allocator, test_output, .{
+        .refresh_ns = 100,
+        .render_budget_ns = 30,
+        .adaptive_render_samples = 1,
+        .adaptive_render_margin_ns = 5,
+    }, 1);
+    defer scheduler.deinit(std.testing.allocator);
+    scheduler.recordPhysicalTiming(0, 50, 100, 100);
+    scheduler.recordPhysicalTiming(0, null, 100, 100);
+    scheduler.recordPhysicalTiming(50, 49, 100, 100);
+    scheduler.recordPhysicalTiming(0, 101, 100, 100);
+    try std.testing.expectEqual(@as(Timestamp, 55), scheduler.renderBudget());
+    try std.testing.expectEqual(@as(u16, 1), scheduler.render_duration_count);
+}
+
+test "adaptive ceiling validates blanking and safety without unsigned underflow" {
+    var config: Config = .{
+        .refresh_ns = 10,
+        .render_budget_ns = 3,
+        .adaptive_render_samples = 1,
+        .presentation_lead_ns = 10,
+    };
+    try std.testing.expectError(error.InvalidConfig, config.validate());
+    config.presentation_lead_ns = 9;
+    try std.testing.expectError(error.InvalidConfig, config.validate());
+    config.presentation_lead_ns = 7;
+    config.adaptive_render_safety_ns = 3;
+    try std.testing.expectError(error.InvalidConfig, config.validate());
+    config.adaptive_render_safety_ns = 2;
+    try config.validate();
+}
+
+test "presentation misses distinguish slow fences from display delay" {
+    const config: Config = .{
+        .refresh_ns = 100,
+        .render_budget_ns = 30,
+        .presentation_lead_ns = 10,
+        .adaptive_miss_tolerance_ns = 1,
+    };
+    try std.testing.expectEqual(PresentationMiss.none, presentationMiss(config, 60, 80, 100, 101));
+    try std.testing.expectEqual(PresentationMiss.render, presentationMiss(config, 60, 91, 100, 200));
+    try std.testing.expectEqual(PresentationMiss.presentation, presentationMiss(config, 60, 90, 100, 200));
+    try std.testing.expectEqual(PresentationMiss.unknown, presentationMiss(config, 60, null, 100, 200));
+    try std.testing.expectEqual(PresentationMiss.unknown, presentationMiss(config, 60, 59, 100, 200));
+    try std.testing.expectEqual(PresentationMiss.unknown, presentationMiss(config, 60, 201, 100, 200));
 }
 
 test "stale frame timer and output generations cannot alias" {

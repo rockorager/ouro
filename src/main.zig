@@ -25,6 +25,7 @@ const Options = struct {
     headless: bool = false,
     disable_hdr: bool = false,
     trace_pacing: bool = false,
+    hardware_cursor: bool = true,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -220,11 +221,13 @@ pub fn main(init: std.process.Init) !void {
                 .render_budget_ns = 7_000_000,
                 .adaptive_render_samples = 256,
                 .adaptive_render_margin_ns = 2 * std.time.ns_per_ms,
+                .adaptive_render_safety_ns = 200 * std.time.ns_per_us,
             },
             .renderer = options.renderer,
             .scanout_modifier = options.scanout_modifier,
             .enable_hdr = !options.disable_hdr,
             .trace_pacing = options.trace_pacing,
+            .hardware_cursor = options.hardware_cursor,
             .image_count = 3,
             .max_samples = 17,
             .max_source_bytes = 32 * 1024 * 1024,
@@ -476,6 +479,8 @@ fn parseOptions(args: std.process.Args) !Options {
             options.disable_hdr = true;
         } else if (std.mem.eql(u8, argument, "--trace-pacing")) {
             options.trace_pacing = true;
+        } else if (std.mem.eql(u8, argument, "--software-cursor")) {
+            options.hardware_cursor = false;
         } else return error.UnknownArgument;
     }
     if (options.scanout_modifier != null and options.renderer != .vulkan)
@@ -493,6 +498,7 @@ fn usage() void {
         \\  --scanout-modifier=0xHEX  diagnostic: require exact Vulkan output layout; no fallback
         \\  --disable-hdr  disable automatic HDR output selection (use SDR)
         \\  --trace-pacing  diagnostic: log per-frame monotonic timing; adds measurement overhead
+        \\  --software-cursor  disable hardware cursor updates for comparison/troubleshooting
         \\  --drm-device  require this DRM card instead of automatic selection
         \\  --config      load JSON output rules, including per-output ICC profiles
         \\  --managed-session  publish and bind the systemd graphical session lifecycle

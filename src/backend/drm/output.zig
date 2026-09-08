@@ -8,6 +8,7 @@ const completion = @import("../../runtime/completion.zig");
 const drm = @import("manager.zig");
 const framebuffer = @import("framebuffer.zig");
 const atomic = @import("atomic.zig");
+const cursor = @import("cursor.zig");
 
 pub const State = enum {
     initial,
@@ -168,6 +169,7 @@ pub const Output = struct {
     crtc: drm.Crtc,
     plane: drm.Plane,
     overlay_plane: ?drm.Plane,
+    cursor_plane: ?drm.Plane = null,
     overlay_zpos: ?drm.OverlayZpos,
     inherited_planes: []drm.Plane,
     mode: drm.Mode,
@@ -252,6 +254,7 @@ pub const Output = struct {
             .crtc = snapshot.selectedCrtc(),
             .plane = snapshot.selectedPlane(),
             .overlay_plane = if (overlay) |value| snapshot.planes[value.plane_index] else null,
+            .cursor_plane = cursor.selectPlane(snapshot),
             .overlay_zpos = if (overlay) |value| value.zpos else null,
             .inherited_planes = inherited_planes,
             .mode = snapshot.selectedMode(),
@@ -792,6 +795,10 @@ pub const Output = struct {
         self.platform.resetRequest(request);
         try self.platform.addProperty(request, self.plane.id, self.plane.properties.fb_id, 0);
         try self.platform.addProperty(request, self.plane.id, self.plane.properties.crtc_id, 0);
+        if (self.cursor_plane) |plane| {
+            try self.platform.addProperty(request, plane.id, plane.properties.fb_id, 0);
+            try self.platform.addProperty(request, plane.id, plane.properties.crtc_id, 0);
+        }
         if (self.overlay_plane) |plane| {
             try self.platform.addProperty(request, plane.id, plane.properties.fb_id, 0);
             try self.platform.addProperty(request, plane.id, plane.properties.crtc_id, 0);
@@ -1200,6 +1207,25 @@ test "kms: modeset owns SDR connector state and disable restores link depth" {
     try output.processCallbacks();
     try output.requestPause();
     try std.testing.expect(fixture.atomic_state.hasProperty(10, 53, 12));
+    try fixture.drainAndDestroy(output);
+}
+
+test "kms: pause detaches a cursor enabled after the initial primary modeset" {
+    var fixture = Fixture{};
+    const output = try fixture.create(.{});
+    var cursor_plane = fixture.plane[0];
+    cursor_plane.id = 31;
+    cursor_plane.plane_type_value = 2;
+    cursor_plane.current_crtc_id = 0;
+    output.cursor_plane = cursor_plane;
+    try output.queue(fixture.acquire(0), null);
+    try output.commitQueued();
+    fixture.flip(output, fixture.crtc[0].id, false);
+    try output.processCallbacks();
+    fixture.atomic_state.property_count = 0;
+    try output.requestPause();
+    try std.testing.expect(fixture.atomic_state.hasProperty(31, cursor_plane.properties.fb_id, 0));
+    try std.testing.expect(fixture.atomic_state.hasProperty(31, cursor_plane.properties.crtc_id, 0));
     try fixture.drainAndDestroy(output);
 }
 

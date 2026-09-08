@@ -396,6 +396,33 @@ test-shell-input`; lower-level physical presentation, libinput ownership, seat,
 and interaction steps remain available as `test-drm-presentation`,
 `test-input-backend`, `test-seat`, and `test-interaction`.
 
+### Hardware cursors and capture
+
+On ordinary sRGB outputs with an unambiguous KMS cursor plane, compositor-owned
+theme cursors use the DRM cursor IOCTL interface. Pointer motion updates that
+plane independently of primary-plane rendering, including while a primary
+frame is in flight. The kernel driver determines whether these updates can be
+applied asynchronously. Startup logs capability and `cursor path` logs show
+hardware/software handoffs. Use `--software-cursor` for comparison.
+
+Cursor images are scaled into immutable, transparent-padded ARGB dumb buffers;
+motion does not rewrite scanning buffers. The per-output cache retains up to
+64 distinct images until the CRTC drains. Unsupported dimensions, ambiguous
+plane ownership, client-supplied cursor trees, rotated outputs, and HDR/ICC
+output transforms use software cursors. A failed hardware update also falls
+back, while a temporarily busy driver can retry. Hardware activation waits
+until a presented primary frame has erased the old software cursor.
+
+Output screenshots temporarily use software composition. Source-capture
+streams keep that path for their session lifetime, avoiding repeated cursor
+handoffs between captured frames. Both cursor-including and cursor-excluding
+requests use the existing before/after-cursor capture partition in Pixman and
+Vulkan, including SHM and DMA-BUF destinations. If a visible hardware cursor
+cannot be detached, the capture fails instead of silently returning an
+incorrect image. Cursor-only capture sessions retain their separate image and
+position protocol. Hardware cursors resume after the software cursor has been
+erased from scanout; capture does not bake a duplicate into the display.
+
 ### Startup and frame-pacing diagnostics
 
 Normal stderr logs include output activation identities, power transitions,
@@ -469,7 +496,27 @@ completion of SHM copying or renderer-owned publication. A dispatch record alone
 does not imply that validation succeeded. `pacing-sample` connects a submitted
 output/frame to each sampled surface/commit; join it to the existing `pacing`
 record for render deadline, render start/readiness, target/actual presentation,
-and page-flip dispatch timing. `pacing-defer` identifies the surface and
+and page-flip dispatch timing. `ready_deadline` subtracts physical blanking from
+the target timestamp. `miss=render` means a late frame's fence became ready
+after that deadline; `miss=presentation` means it was ready by the deadline but
+the display still presented late. Missing fence timing produces `miss=unknown`;
+presentations within the timing tolerance use `miss=none`.
+`request_to_present_ns` measures damage-request-to-presentation delay, not
+mouse-input latency. Compare it alongside misses so a later target cannot hide
+extra latency.
+
+Physical scheduling uses the selected mode's refresh interval. The adaptive
+render allowance starts at 7 ms, grows immediately with slow fence durations,
+and decreases gradually once old slow samples leave its 256-frame window.
+Its ceiling is the refresh interval minus vertical blanking and a 200 us safety
+reserve. Late presentations retain valid render samples; presentation delay
+alone does not increase the learned render duration. Adaptive planning always
+targets the next refresh whose latch has not passed and starts immediately if
+the preferred render start is already past, instead of skipping a refresh to
+fit the allowance. These timings include CPU submission and fence readiness,
+not isolated GPU execution time.
+
+`pacing-defer` identifies the surface and
 in-flight output/frame holding up a pending commit. Independent surfaces may
 apply while another frame is in flight; a surface sampled by that frame cannot
 replace its content until the flip completes, even on a repaint after its

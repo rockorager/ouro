@@ -6969,9 +6969,40 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn requestCursorRedraw(self: *Self) !void {
-            if (!self.cursor_layer.active and self.effectiveCursorShape() == null and
-                self.drag_icon_root == null and !self.anyCursorPrevious()) return;
-            try self.requestOutputDamage();
+            const now = try monotonicNs();
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                const hardware = try self.syncHardwareCursor(physical);
+                if (self.drag_icon_root != null or (!hardware and
+                    (self.cursor_layer.active or self.effectiveCursorShape() != null or
+                        physical.themed_cursor_previous != null or physical.client_cursor_previous != null)))
+                    _ = try requestPhysicalOutputDamage(physical, now);
+            }
+        }
+
+        fn syncHardwareCursor(self: *Self, physical: *PhysicalOutput) !bool {
+            const output = physical.kms_output orelse return false;
+            const cursor = if (output.hardware_cursor) |*value| value else return false;
+            if (!output.accepting_frames) return false;
+            const capture = physical.pending_screencopy != null or physical.pending_image_copy != null or
+                self.image_copy_capture_adapter.sourceCaptureActive();
+            var sample: ?render.SurfaceSample = null;
+            // Client cursor trees and rotated outputs retain the established
+            // composition path, including their buffer and callback ownership.
+            if (!capture and output.planner.output_transform == .normal and self.effectiveCursorShape() != null) {
+                const bounds = try self.outputBoundsFor(physical);
+                const head = try self.output_management_adapter.lifecycle.currentHead(physical.management_head);
+                const themed = try self.cursorThemeForOutput(physical);
+                if (try themed.sample(bounds)) |value| sample = try scaleSample(value, bounds, try geometry.OutputScale.init(head.scale_120));
+            }
+            const before = output.cursor_hardware;
+            const hardware = cursor.update(sample);
+            output.cursor_hardware = hardware;
+            if (before != hardware) std.log.info("cursor path: output={d} hardware={any} capture={any}", .{
+                physical.id.index, hardware, capture,
+            });
+            if (before != hardware or (hardware and !cursor.primary_clean and output.scheduler.currentStage() == .idle))
+                _ = try requestPhysicalOutputDamage(physical, try monotonicNs());
+            return hardware;
         }
 
         fn anyCursorPrevious(self: *const Self) bool {
@@ -9800,6 +9831,12 @@ pub fn Coordinator(comptime protocol: type) type {
         fn renderFrame(self: *Self, frame: @import("../output/headless.zig").FrameId) !void {
             const physical = self.physicalOutputForKmsIdMutable(frame.output) orelse return;
             const output = physical.kms_output orelse return;
+            const hardware_cursor = try self.syncHardwareCursor(physical);
+            if (hardware_cursor and (physical.pending_screencopy != null or physical.pending_image_copy != null)) {
+                // If the driver cannot detach the plane, fail capture rather
+                // than returning an image with a missing/duplicated cursor.
+                try self.finishActiveCapture(physical, false, 0, null);
+            }
             const render_start = if (self.performance != null) diagnostics.Stamp.now() else null;
             const perf_context: diagnostics.Context = .{
                 .output = (@as(u64, frame.output.generation) << 32) | frame.output.index,
@@ -9868,7 +9905,7 @@ pub fn Coordinator(comptime protocol: type) type {
             const cursor_start = sample_count;
             var next_client_cursor_previous: ?damage.SurfaceState = null;
             var client_cursor_visible = false;
-            if (!self.sessionLockActive() and self.cursor_layer.active and
+            if (!hardware_cursor and !self.sessionLockActive() and self.cursor_layer.active and
                 self.effectiveCursorShape() == null)
             {
                 const global_bounds = try self.globalOutputBounds();
@@ -10009,7 +10046,7 @@ pub fn Coordinator(comptime protocol: type) type {
             }
             const themed = try self.cursorThemeForOutput(physical);
             var next_themed_cursor_previous = physical.themed_cursor_previous;
-            if (themed.image != null) {
+            if (!hardware_cursor and themed.image != null) {
                 if (try themed.sample(output_bounds)) |sample| {
                     try self.ensureFrameStorage(@max(sample_count, change_count) + 1);
                     self.frame_samples[sample_count] = try scaleSample(
@@ -10148,6 +10185,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     self.outputDamageRetired(physical, damage_generation);
                     try self.finishOutcome(rendered.retired.frame, false);
                 } else {
+                    if (output.hardware_cursor) |*cursor| cursor.submitted_clean = true;
                     self.advanceScreencopyGeneration(physical, frame.output);
                     if (output.rendererKind() == .pixman)
                         try output.renderReady(frame, try monotonicNs());
@@ -10186,6 +10224,7 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             switch (render_result) {
                 .submitted => {
+                    if (output.hardware_cursor) |*cursor| cursor.submitted_clean = sample_count == cursor_start;
                     self.advanceScreencopyGeneration(physical, frame.output);
                     if (output.rendererKind() == .pixman)
                         try output.renderReady(frame, try monotonicNs());
@@ -11607,7 +11646,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (was_presented) {
                     layer.feedback_outcome = .{ .presented = .{
                         .actual_ns = outcome.actual_ns.?,
-                        .refresh_ns = @intCast(self.output_config.scheduler.refresh_ns),
+                        .refresh_ns = std.math.cast(u32, physical.?.kms_output.?.scheduler.config.refresh_ns) orelse 0,
                         .flags = 1 | 2 | 4,
                     } };
                     layer.feedback_output = physical.?.protocol_output;
@@ -12756,6 +12795,8 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn syncOutputAssociations(self: *Self) !void {
             try self.syncCursorGeometry();
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical|
+                _ = try self.syncHardwareCursor(physical);
             if (!self.output_associations_dirty) return;
             const needed = std.math.add(
                 usize,

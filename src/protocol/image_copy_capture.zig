@@ -168,6 +168,15 @@ pub fn Adapter(comptime protocol: type, comptime SourceAdapter: type, comptime C
             @memset(outbound, .{});
             return .{ .allocator = allocator, .sessions = sessions, .cursor_sessions = cursor_sessions, .frames = frames, .captures = captures, .outbound = outbound };
         }
+
+        /// Keep the software cursor path stable between frames of a capture
+        /// stream. Cursor-only sessions have their own image/position path.
+        pub fn sourceCaptureActive(self: *const Self) bool {
+            for (self.sessions.entries.items) |session|
+                if (session.active and !session.stopped and session.target != null and
+                    session.target.? == .source) return true;
+            return false;
+        }
         pub fn deinit(self: *Self) void {
             self.allocator.free(self.outbound);
             self.allocator.free(self.captures);
@@ -1033,8 +1042,11 @@ test "image copy capture ownership reservations grow beyond one" {
         .outbound_capacity = 8,
     });
     defer adapter.deinit();
+    try std.testing.expect(!adapter.sourceCaptureActive());
 
     const first = try adapter.admitSession(test_peer, .{ .id = 10, .generation = 1 }, test_snapshot, null, false);
+    // Even cursor-excluding source streams keep a stable software partition.
+    try std.testing.expect(adapter.sourceCaptureActive());
     const first_ptr = try adapter.resolveSession(first);
     const second = try adapter.admitSession(test_peer, .{ .id = 11, .generation = 1 }, test_snapshot, null, false);
     try std.testing.expect(first_ptr == try adapter.resolveSession(first));
@@ -1045,6 +1057,8 @@ test "image copy capture ownership reservations grow beyond one" {
     try std.testing.expectEqual(@as(usize, 2), adapter.sessions.entries.items.len);
     try std.testing.expectEqual(@as(usize, 2), adapter.frames.entries.items.len);
     try std.testing.expectEqual(@as(usize, 2), adapter.cursor_sessions.entries.items.len);
+    _ = try adapter.invalidate(test_target);
+    try std.testing.expect(!adapter.sourceCaptureActive());
 }
 
 test "image copy capture: constraints and successful completion retain protocol order" {
@@ -1471,6 +1485,7 @@ test "image copy capture: cursor metadata deduplicates and nested session has in
         .{ .width = 16, .height = 24 },
     );
     const nested = try adapter.createCursorCaptureSession(cursor, .{ .id = 11, .generation = 1 });
+    try std.testing.expect(!adapter.sourceCaptureActive());
     try std.testing.expectError(error.DuplicateSession, adapter.createCursorCaptureSession(cursor, .{ .id = 12, .generation = 1 }));
     adapter.clearOutbound();
 

@@ -466,9 +466,11 @@ test "render: phased readback separates base composition from cursor" {
     });
     defer renderer.deinit();
     const red = [_]u8{ 0, 0, 255, 255 };
-    const green = [_]u8{ 0, 255, 0, 255 };
+    // A translucent cursor distinguishes one blend from a duplicate blend.
+    const green = [_]u8{ 0, 128, 0, 128 };
     const base = sample(&red, 1, 1, 4, .{ .x = 0, .y = 0, .width = 2, .height = 1 });
     var cursor = sample(&green, 1, 1, 4, .{ .x = 1, .y = 0, .width = 1, .height = 1 });
+    cursor.source.format = .argb8888_premultiplied;
     cursor.sample.surface = 2;
     var target = FakeTarget{ .width = 2, .height = 1, .stride = 12 };
     var without_cursor = [_]u8{0xaa} ** 12;
@@ -484,10 +486,10 @@ test "render: phased readback separates base composition from cursor" {
     );
 
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255, 0, 0, 255, 255 }, without_cursor[0..8]);
-    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255, 0, 255, 0, 255 }, with_cursor[0..8]);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255, 0, 128, 127, 255 }, with_cursor[0..8]);
     try std.testing.expectEqualSlices(u8, &.{ 0xaa, 0xaa, 0xaa, 0xaa }, without_cursor[8..12]);
     try std.testing.expectEqualSlices(u8, &.{ 0xbb, 0xbb, 0xbb, 0xbb }, with_cursor[8..12]);
-    try expectPixels(&target, &.{ 0xffff0000, 0xff00ff00 });
+    try expectPixels(&target, &.{ 0xffff0000, 0xff7f8000 });
     try std.testing.expectEqual(@as(usize, 1), target.map_count);
     try std.testing.expectEqual(@as(usize, 1), target.unmap_count);
 }

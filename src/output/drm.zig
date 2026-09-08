@@ -10,6 +10,7 @@ const timer = @import("../runtime/timer.zig");
 const gbm = @import("../backend/gbm.zig");
 const drm = @import("../backend/drm/manager.zig");
 const framebuffer = @import("../backend/drm/framebuffer.zig");
+const cursor_api = @import("../backend/drm/cursor.zig");
 const atomic = @import("../backend/drm/atomic.zig");
 const kms = @import("../backend/drm/output.zig");
 const render = @import("../render/types.zig");
@@ -41,6 +42,7 @@ pub const Config = struct {
     scanout_modifier: ?u64 = null,
     /// Diagnostic only: logging perturbs timing; leave disabled for CPU comparisons.
     trace_pacing: bool = false,
+    hardware_cursor: bool = true,
     image_count: usize = framebuffer.default_capacity,
     /// Total imported output images across every output sharing one renderer.
     max_render_targets: usize = framebuffer.default_capacity * 4,
@@ -71,6 +73,7 @@ pub const Config = struct {
 };
 
 pub const Platforms = struct {
+    cursor: cursor_api.Platform = .{},
     gbm: gbm.Platform = gbm.real,
     framebuffer: framebuffer.Platform = framebuffer.real,
     atomic: atomic.Platform = atomic.real,
@@ -770,6 +773,8 @@ pub fn sessionAction(event: @import("../backend/session.zig").Event) SessionActi
 /// Heap-stable because R11 retains pointers into `kms_output` commit records
 /// and its image adapter points at the embedded pool.
 pub const Output = struct {
+    hardware_cursor: ?cursor_api.Cursor = null,
+    cursor_hardware: bool = false,
     allocator: std.mem.Allocator,
     pool: framebuffer.Pool,
     scanout_images: ScanoutImages,
@@ -979,7 +984,13 @@ pub const Output = struct {
         });
         errdefer self.planner.deinit();
         var scheduler_config = config.scheduler;
+        scheduler_config.refresh_ns = try modeRefreshNs(mode);
         scheduler_config.presentation_lead_ns = try verticalBlankNs(mode);
+        // The startup allowance must also fit high-refresh display modes.
+        scheduler_config.render_budget_ns = @min(scheduler_config.render_budget_ns, scheduler_config.refresh_ns - 1);
+        if (scheduler_config.render_budget_ns == 0) return error.InvalidConfig;
+        if (scheduler_config.adaptive_render_samples != 0)
+            scheduler_config.adaptive_render_margin_ns = @min(scheduler_config.adaptive_render_margin_ns, scheduler_config.render_budget_ns - 1);
         self.scheduler = try Scheduler.init(allocator, config.output_id, scheduler_config, config.max_samples);
         errdefer self.scheduler.deinit(allocator);
         self.sample_storage = try allocator.alloc(
@@ -1007,6 +1018,15 @@ pub const Output = struct {
             snapshot,
             kms_config,
         );
+        self.hardware_cursor = null;
+        self.cursor_hardware = false;
+        if (config.hardware_cursor and cursor_api.selectPlane(snapshot) != null and
+            std.meta.eql(config.output_color_description, @import("../render/color.zig").Description.srgb))
+            self.hardware_cursor = cursor_api.Cursor.init(platforms.cursor, platforms.framebuffer, self.kms_output.fd, snapshot.selectedCrtc().id) catch null;
+        if (self.hardware_cursor) |cursor|
+            std.log.info("hardware cursor available: connector={d} crtc={d} size={d}x{d}", .{
+                snapshot.selectedConnector().id, cursor.crtc, cursor.size.width, cursor.size.height,
+            });
         self.overlay_formats = overlay_formats;
         self.allocator = allocator;
         self.clear = config.clear;
@@ -1043,6 +1063,9 @@ pub const Output = struct {
             self.pending_capture != null or self.pending_capture_target != null or
             self.in_flight_render_fence != null or self.in_flight_ready_ns != null)
             return error.DrainIncomplete;
+        // KMS drain includes disabling the cursor plane. Its immutable BOs
+        // must outlive scanout even when the cursor IOCTL itself failed.
+        if (self.hardware_cursor) |*cursor| cursor.deinit();
         try self.kms_output.destroy();
         try self.scanout_images.deinit();
         if (self.render_device.renderer) |*value| {
@@ -1598,6 +1621,7 @@ pub const Output = struct {
                         // stable identity source at this handoff boundary.
                         const dispatch_ns = if (self.trace_pacing or self.performance != null) pacingTimestamp() else null;
                         const ready_ns = self.takeRenderReadyTimestamp(ring);
+                        if (self.hardware_cursor) |*cursor| cursor.presented();
                         self.pending_callback = try self.scheduler.presentPhysical(
                             frame_id,
                             timestamp_ns,
@@ -1627,10 +1651,19 @@ pub const Output = struct {
                         }
                         if (self.trace_pacing) {
                             const timing = self.pending_callback.?;
-                            std.log.info("pacing output={d} frame={d} requested={d} deadline={d} started={d} ready={?d} target={d} actual={d} dispatch={?d}", .{
+                            const ready_deadline = timing.target_ns - self.scheduler.config.presentation_lead_ns;
+                            const miss = scheduler_api.presentationMiss(
+                                self.scheduler.config,
+                                timing.render_started_ns,
+                                ready_ns,
+                                timing.target_ns,
+                                timestamp_ns,
+                            );
+                            std.log.info("pacing output={d} frame={d} requested={d} deadline={d} started={d} ready={?d} target={d} actual={d} dispatch={?d} ready_deadline={d} miss={s} request_to_present_ns={d}", .{
                                 frame_id.output.index,     frame_id.sequence,        timing.requested_ns,
                                 timing.render_deadline_ns, timing.render_started_ns, ready_ns,
                                 timing.target_ns,          timestamp_ns,             dispatch_ns,
+                                ready_deadline,            @tagName(miss),           timestamp_ns -| timing.requested_ns,
                             });
                         }
                         // The page flip is physically complete before the
@@ -1745,6 +1778,11 @@ pub const Output = struct {
     /// Starts the Session-disable path. A submitted frame is allowed to flip
     /// and produce its real callback before R11 disables scanout.
     pub fn requestPause(self: *Output) !?RetireAction {
+        self.cursor_hardware = false;
+        if (self.hardware_cursor) |*cursor| {
+            cursor.desired = null;
+            cursor.hide() catch {};
+        }
         self.accepting_frames = false;
         const removal = try self.scheduler.remove();
         try self.kms_output.requestPause();
@@ -2345,6 +2383,18 @@ fn pacingTimestamp() ?u64 {
     return @as(u64, @intCast(now.tv_sec)) * std.time.ns_per_s + @as(u64, @intCast(now.tv_nsec));
 }
 
+fn modeRefreshNs(mode: drm.Mode) !u64 {
+    if (mode.clock == 0 or mode.htotal == 0 or mode.vtotal == 0) return error.MalformedTopology;
+    var numerator: u128 = @as(u128, mode.htotal) * mode.vtotal * std.time.ns_per_ms;
+    var denominator: u128 = mode.clock;
+    if (mode.flags & c.DRM_MODE_FLAG_INTERLACE != 0) denominator *= 2;
+    if (mode.flags & c.DRM_MODE_FLAG_DBLSCAN != 0) numerator *= 2;
+    if (mode.vscan > 1) numerator *= mode.vscan;
+    const interval = std.math.cast(u64, numerator / denominator) orelse return error.MalformedTopology;
+    if (interval <= 1) return error.MalformedTopology;
+    return interval;
+}
+
 fn verticalBlankNs(mode: drm.Mode) !u64 {
     if (mode.clock == 0 or mode.vtotal < mode.vdisplay) return error.MalformedTopology;
     // Progressive mode timestamps describe scanout start, while the latch is
@@ -2377,13 +2427,25 @@ test "drm-sim: physical presentation lead follows progressive mode blanking" {
     mode.htotal = 2200;
     mode.vtotal = 1125;
     mode.vdisplay = 1080;
+    try std.testing.expectEqual(@as(u64, 16_666_666), try modeRefreshNs(mode));
+    mode.clock = 297000;
+    try std.testing.expectEqual(@as(u64, 8_333_333), try modeRefreshNs(mode));
+    mode.clock = 148500;
     try std.testing.expectEqual(@as(u64, 666_666), try verticalBlankNs(mode));
     mode.flags = c.DRM_MODE_FLAG_INTERLACE;
+    try std.testing.expectEqual(@as(u64, 8_333_333), try modeRefreshNs(mode));
     try std.testing.expectEqual(@as(u64, 0), try verticalBlankNs(mode));
     mode.flags = 0;
+    mode.flags = c.DRM_MODE_FLAG_DBLSCAN;
+    try std.testing.expectEqual(@as(u64, 33_333_333), try modeRefreshNs(mode));
+    mode.flags = 0;
+    mode.vscan = 2;
+    try std.testing.expectEqual(@as(u64, 33_333_333), try modeRefreshNs(mode));
+    mode.vscan = 0;
     mode.vtotal = mode.vdisplay;
     try std.testing.expectEqual(@as(u64, 0), try verticalBlankNs(mode));
     mode.clock = 0;
+    try std.testing.expectError(error.MalformedTopology, modeRefreshNs(mode));
     try std.testing.expectError(error.MalformedTopology, verticalBlankNs(mode));
 }
 

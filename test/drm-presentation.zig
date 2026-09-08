@@ -3242,7 +3242,9 @@ const ClientHandler = struct {
                     try std.testing.expectEqual(@as(u32, 0), value.tv_sec_hi);
                     try std.testing.expectEqual(@as(u32, 2), value.tv_sec_lo);
                     try std.testing.expectEqual(@as(u32, 3_000_000), value.tv_nsec);
-                    try std.testing.expectEqual(@as(u32, 4_000_000), value.refresh);
+                    // The fake mode is 3x2 pixels at a 1 kHz pixel clock;
+                    // presentation feedback follows it, not the 4 ms default.
+                    try std.testing.expectEqual(@as(u32, 6_000_000), value.refresh);
                     try std.testing.expectEqual(@as(u32, 0), value.seq_hi);
                     try std.testing.expectEqual(@as(u32, 0), value.seq_lo);
                     try std.testing.expectEqual(@as(u32, 7), value.flags.value);
