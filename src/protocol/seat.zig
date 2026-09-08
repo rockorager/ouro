@@ -771,6 +771,11 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             return .{ .focus = adapter.pointer_focus, .point = adapter.pointer_point };
         }
 
+        /// Client event focus stays on the grab origin even when hover moves.
+        pub fn pointerDeliveryTarget(adapter: *const Self) ?FocusTarget {
+            return adapter.pointer_delivery;
+        }
+
         pub fn nextSerial(adapter: *Self) u32 {
             return adapter.issueSerial();
         }
@@ -3125,14 +3130,19 @@ test "seat: pointer grab retains focus and device removal cancels it" {
         .pressed = true,
     } });
     try std.testing.expectEqual(TestAdapter.GrabState.active, std.meta.activeTag(adapter.grabState()));
+    const other = try adapter.makeTarget(.{ .slot = 2, .generation = 9 }, target.surface);
+    try adapter.setPointerFocus(other, .{ .x = 0, .y = 0 });
+    try std.testing.expectEqual(other, adapter.pointerState().focus.?);
+    try std.testing.expectEqual(target, adapter.pointerDeliveryTarget().?);
     try adapter.setPointerFocus(null, .{ .x = 0, .y = 0 });
-    try std.testing.expect(adapter.pointer_delivery != null);
+    try std.testing.expect(adapter.pointerState().focus == null);
+    try std.testing.expectEqual(target, adapter.pointerDeliveryTarget().?);
 
     try adapter.consume(.{ .device_removed = device });
     try std.testing.expectEqual(TestAdapter.GrabState.idle, std.meta.activeTag(adapter.grabState()));
     const event = adapter.popEvent() orelse return error.MissingCancellation;
     try std.testing.expectEqual(TestAdapter.Event.pointer_grab_cancelled, std.meta.activeTag(event));
-    try std.testing.expect(adapter.pointer_delivery == null);
+    try std.testing.expect(adapter.pointerDeliveryTarget() == null);
 }
 
 test "seat: grabbed key press and release return aggregate events" {

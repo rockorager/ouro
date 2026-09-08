@@ -3962,7 +3962,9 @@ pub fn Coordinator(comptime protocol: type) type {
                 .hold_end => |value| @truncate(value.time_usec / 1000),
                 else => return,
             };
-            const focus = self.seat_adapter.pointerState().focus;
+            // Match pointerFocused's recipient during an implicit grab, not
+            // the hovered surface whose wire ID may belong to another client.
+            const focus = self.seat_adapter.pointerDeliveryTarget();
             switch (event) {
                 .swipe_begin => |value| if (focus) |target| try self.pointer_gestures_adapter.beginFocusedSwipe(
                     &self.seat_adapter,
