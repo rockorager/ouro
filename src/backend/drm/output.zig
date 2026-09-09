@@ -769,7 +769,10 @@ pub const Output = struct {
                 try self.platform.addProperty(request, plane.id, plane.properties.in_fence_fd, @bitCast(@as(i64, fence)));
             if (self.overlay_zpos.?.property_id) |property|
                 try self.platform.addProperty(request, plane.id, property, self.overlay_zpos.?.value);
-        } else {
+        } else if (modeset or self.current_overlay != null) {
+            // Rewriting an already-unbound plane creates a DRM fake_commit
+            // dependency that can outlive the primary flip and cause EBUSY.
+            // Disable only for takeover/resume or an active overlay transition.
             try self.platform.addProperty(request, plane.id, plane.properties.fb_id, 0);
             try self.platform.addProperty(request, plane.id, plane.properties.crtc_id, 0);
         };
@@ -1327,6 +1330,38 @@ test "kms: direct candidates receive an active-state TEST_ONLY commit" {
     try fixture.drainAndDestroy(output);
 }
 
+test "kms: disabled overlays are omitted between modesets" {
+    var fixture = Fixture{};
+    const output = try fixture.create(.{});
+    defer fixture.destroy(output) catch unreachable;
+    try output.queue(fixture.acquire(0), null);
+    try output.commitQueued();
+    try std.testing.expect(fixture.atomic_state.hasProperty(50, 52, 0));
+    try std.testing.expect(fixture.atomic_state.hasProperty(50, 53, 0));
+    fixture.flip(output, fixture.crtc[0].id, false);
+    try output.processCallbacks();
+
+    fixture.atomic_state.property_count = 0;
+    try output.queueTested(fixture.acquire(1), null);
+    try output.commitQueued();
+    // Check both TEST_ONLY and real requests, not just zero-valued fields.
+    for (fixture.atomic_state.properties[0..fixture.atomic_state.property_count]) |property|
+        try std.testing.expect(property.object != 50);
+    try std.testing.expect(fixture.atomic_state.hasProperty(30, 32, 101));
+    fixture.flip(output, fixture.crtc[0].id, false);
+    try output.processCallbacks();
+    try output.requestPause();
+
+    fixture.atomic_state.property_count = 0;
+    try output.queue(fixture.acquire(0), null);
+    try output.commitQueued();
+    try std.testing.expect(fixture.atomic_state.hasProperty(50, 52, 0));
+    try std.testing.expect(fixture.atomic_state.hasProperty(50, 53, 0));
+    fixture.flip(output, fixture.crtc[0].id, false);
+    try output.processCallbacks();
+    try output.requestPause();
+}
+
 test "kms: overlay ownership is atomic through replacement flip" {
     var fixture = Fixture{};
     const output = try fixture.create(.{});
@@ -1356,6 +1391,14 @@ test "kms: overlay ownership is atomic through replacement flip" {
     try output.processCallbacks();
     try std.testing.expect(output.current_overlay != null);
 
+    fixture.atomic_state.fail_commit_at = fixture.atomic_state.commit_count + 1;
+    try output.queue(fixture.acquire(2), null);
+    try std.testing.expectError(error.FakeCommit, output.commitQueued());
+    try std.testing.expect(output.current_overlay != null);
+    try std.testing.expectEqual(@as(usize, 0), fixture.images_state.release_count);
+
+    fixture.atomic_state.property_count = 0;
+    fixture.atomic_state.fail_commit_at = 0;
     try output.queue(fixture.acquire(2), null);
     try output.commitQueued();
     try std.testing.expect(fixture.atomic_state.hasProperty(50, 52, 0));
@@ -1364,6 +1407,12 @@ test "kms: overlay ownership is atomic through replacement flip" {
     try output.processCallbacks();
     try std.testing.expectEqual(@as(usize, 2), fixture.images_state.release_count);
     try std.testing.expect(output.current_overlay == null);
+
+    fixture.atomic_state.property_count = 0;
+    try output.queueTested(fixture.acquire(0), null);
+    try output.testQueued();
+    for (fixture.atomic_state.properties[0..fixture.atomic_state.property_count]) |property|
+        try std.testing.expect(property.object != 50);
     try output.requestPause();
     try fixture.drainAndDestroy(output);
 }
