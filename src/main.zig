@@ -9,6 +9,7 @@ const Compositor = ouro.compositor.Compositor(protocol);
 const Runtime = ouro.physical.Coordinator(protocol);
 const Runner = ouro.physical.Runner(protocol);
 const SystemdSession = @import("systemd_session.zig");
+const PreparedConfig = ouro.configuration.Prepared(Runtime);
 const fatal_shutdown_grace_ns = 5 * std.time.ns_per_s;
 
 const shm_formats = [_]wayring.shm.Format{
@@ -22,6 +23,7 @@ const Options = struct {
     scanout_modifier: ?u64 = null,
     drm_device: ?[]const u8 = null,
     config: ?[]const u8 = null,
+    export_config: bool = false,
     managed_session: bool = false,
     headless: bool = false,
     disable_hdr: bool = false,
@@ -36,6 +38,19 @@ pub fn main(init: std.process.Init) !void {
         usage();
         return err;
     };
+    if (options.export_config) {
+        const store: ouro.config.Store = .{
+            .allocator = allocator,
+            .io = init.io,
+            .environ_map = init.environ_map,
+            .explicit_path = options.config,
+        };
+        const source = try store.exportSource();
+        defer allocator.free(source);
+        try std.Io.File.stdout().writeStreamingAll(init.io, source);
+        try std.Io.File.stdout().writeStreamingAll(init.io, "\n");
+        return;
+    }
     if (options.headless and (options.drm_device == null or options.managed_session)) {
         usage();
         return error.InvalidHeadlessOptions;
@@ -72,38 +87,40 @@ pub fn main(init: std.process.Init) !void {
     // Diagnostics must not prevent a graphical session from starting.
     performance.start() catch |err| std.log.warn("performance recorder unavailable: {t}", .{err});
     defer performance.stop();
-    try systemd_session.prepare();
-    defer systemd_session.shutdown() catch |err| {
-        std.log.warn("could not shut down the managed graphical session: {t}", .{err});
-    };
     const config_store: ouro.config.Store = .{
         .allocator = allocator,
         .io = init.io,
         .environ_map = init.environ_map,
         .explicit_path = options.config,
     };
-    var initial_config = try config_store.load();
-    defer initial_config.deinit();
-    var initial_engine_settings = try Runtime.EngineSettings.init(
-        allocator,
-        initial_config.input_rules,
-        initial_config.output_rules,
-    );
-    var initial_engine_settings_owned = true;
-    defer if (initial_engine_settings_owned) initial_engine_settings.deinit();
-    var initial_key_consumer = try Runtime.Bindings.snapshotFromReferenceConfig(
-        allocator,
-        &initial_config,
-    );
-    var initial_key_consumer_owned = true;
-    defer if (initial_key_consumer_owned) initial_key_consumer.deinit();
-    var initial_policy: Runtime.PolicySnapshot = .{
-        .focus_follows_mouse = initial_config.general.focus_follows_mouse,
-        .inner_gap = initial_config.general.inner_gap,
-        .outer_gap = initial_config.general.outer_gap,
+    var settings: ?ouro.settings_client.Client = null;
+    defer if (settings) |*client| client.deinit();
+    var initial_config = if (options.config != null) try config_store.load() else from_settings: {
+        try systemd_session.startSettingsSocket();
+        const runtime_dir = init.environ_map.get("XDG_RUNTIME_DIR") orelse return error.MissingRuntimeDirectory;
+        const path = try std.fmt.allocPrint(allocator, "{s}/ouro/settings.sock", .{runtime_dir});
+        defer allocator.free(path);
+        settings = try ouro.settings_client.Client.init(allocator, path);
+        var update = settings.?.waitInitial(shutdown_signals.descriptor(), 10_000) catch |err| {
+            std.log.err("cannot load ourosettings at {s}: {t}; start ourosettings.socket or use --config=PATH", .{ path, err });
+            return err;
+        };
+        defer update.deinit(allocator);
+        break :from_settings ouro.configuration.parseSettings(allocator, update) catch |err| {
+            std.log.err("invalid ourosettings /compositor at startup: {t}", .{err});
+            return err;
+        };
     };
-    var initial_policy_owned = true;
-    defer if (initial_policy_owned) initial_policy.deinit();
+    defer initial_config.deinit();
+    var initial = try PreparedConfig.init(allocator, &initial_config);
+    var initial_owned = true;
+    defer if (initial_owned) initial.deinit();
+    // Do not tear down a managed graphical session before startup settings
+    // have been received and validated.
+    try systemd_session.prepare();
+    defer systemd_session.shutdown() catch |err| {
+        std.log.warn("could not shut down the managed graphical session: {t}", .{err});
+    };
     const launcher: ouro.launcher.Systemd = .{
         .allocator = allocator,
         .io = init.io,
@@ -134,7 +151,7 @@ pub fn main(init: std.process.Init) !void {
         .input = if (options.headless) null else ouro.input_platform.real,
         .hotplug = if (options.headless) null else ouro.drm_hotplug.real,
     }, .{
-        .router_capacity = 17,
+        .router_capacity = 18,
         .timer_capacity = 6,
         .device_capacity = 36,
         .input = .{
@@ -251,9 +268,9 @@ pub fn main(init: std.process.Init) !void {
     };
     if (performance.thread != null) coordinator.performance = &performance;
     coordinator.installConfig(
-        &initial_engine_settings,
-        &initial_key_consumer,
-        &initial_policy,
+        &initial.engine,
+        &initial.bindings,
+        &initial.policy,
     ) catch |err| {
         exit_deadline.arm(fatal_shutdown_grace_ns);
         coordinator.requestStop() catch unreachable;
@@ -262,9 +279,7 @@ pub fn main(init: std.process.Init) !void {
         root.deinit() catch {};
         return err;
     };
-    initial_engine_settings_owned = false;
-    initial_key_consumer_owned = false;
-    initial_policy_owned = false;
+    initial_owned = false;
     var runner = Runner.init(
         allocator,
         coordinator,
@@ -287,6 +302,9 @@ pub fn main(init: std.process.Init) !void {
     if (run_error == null) runner.installShutdown(&shutdown_signals) catch |err| {
         run_error = err;
     };
+    if (run_error == null) if (settings) |*client| runner.loop.installSettings(client) catch |err| {
+        run_error = err;
+    };
     if (run_error != null) exit_deadline.arm(fatal_shutdown_grace_ns);
 
     if (run_error == null)
@@ -296,7 +314,9 @@ pub fn main(init: std.process.Init) !void {
         });
     var wayring_drained = false;
     var signal_stop_started = false;
-    while (!wayring_drained or !coordinator.backendDrainComplete()) {
+    var pending_config: ?PreparedConfig = null;
+    defer if (pending_config) |*candidate| candidate.deinit();
+    while (!wayring_drained or !coordinator.backendDrainComplete() or !runner.loop.settingsDrained()) {
         if (coordinator.terminalFailure()) |terminal_error| {
             exit_deadline.arm(fatal_shutdown_grace_ns);
             std.log.err("backend cannot safely drain: {t}; exiting with scanout pinned for kernel teardown", .{terminal_error});
@@ -359,45 +379,43 @@ pub fn main(init: std.process.Init) !void {
             };
             signal_stop_started = true;
         }
-        if (!signal_stop_started and progress.reload_requested) {
-            var candidate = config_store.load() catch |err| {
+        if (!signal_stop_started and (progress.settings_changed or (progress.reload_requested and settings == null))) update_config: {
+            var candidate = if (settings) |*client| from_settings: {
+                var update = client.take() orelse break :update_config;
+                defer update.deinit(allocator);
+                break :from_settings ouro.configuration.parseSettings(allocator, update) catch |err| {
+                    std.log.err("invalid ourosettings /compositor; keeping active configuration: {t}", .{err});
+                    break :update_config;
+                };
+            } else config_store.load() catch |err| {
                 std.log.err("configuration reload failed; keeping active configuration: {t}", .{err});
-                continue;
+                break :update_config;
             };
             defer candidate.deinit();
-            var engine_settings_candidate = Runtime.EngineSettings.init(
-                allocator,
-                candidate.input_rules,
-                candidate.output_rules,
-            ) catch |err| {
+            const prepared = PreparedConfig.init(allocator, &candidate) catch |err| {
                 std.log.err("configuration reload failed; keeping active configuration: {t}", .{err});
-                continue;
+                break :update_config;
             };
-            var policy_candidate: Runtime.PolicySnapshot = .{
-                .focus_follows_mouse = candidate.general.focus_follows_mouse,
-                .inner_gap = candidate.general.inner_gap,
-                .outer_gap = candidate.general.outer_gap,
-            };
-            var key_consumer_candidate = Runtime.Bindings.snapshotFromReferenceConfig(
-                allocator,
-                &candidate,
-            ) catch |err| {
-                engine_settings_candidate.deinit();
-                std.log.err("configuration reload failed; keeping active configuration: {t}", .{err});
-                continue;
-            };
+            if (pending_config) |*old| old.deinit();
+            pending_config = prepared;
+            runner.loop.configuration_pending = true;
+        }
+        if (!signal_stop_started and pending_config != null and coordinator.configInstallReady()) {
+            const candidate = &pending_config.?;
             coordinator.installConfig(
-                &engine_settings_candidate,
-                &key_consumer_candidate,
-                &policy_candidate,
+                &candidate.engine,
+                &candidate.bindings,
+                &candidate.policy,
             ) catch |err| {
-                engine_settings_candidate.deinit();
-                key_consumer_candidate.deinit();
-                policy_candidate.deinit();
+                candidate.deinit();
+                pending_config = null;
+                runner.loop.configuration_pending = false;
                 std.log.err("configuration reload failed; keeping active configuration: {t}", .{err});
                 continue;
             };
-            std.log.info("configuration reloaded", .{});
+            pending_config = null;
+            runner.loop.configuration_pending = false;
+            std.log.info("configuration accepted; output changes complete asynchronously", .{});
         }
     }
     runner.deinit();
@@ -483,6 +501,8 @@ fn parseOptions(args: std.process.Args) !Options {
         } else if (std.mem.startsWith(u8, argument, "--config=")) {
             options.config = argument["--config=".len..];
             if (options.config.?.len == 0) return error.InvalidConfigPath;
+        } else if (std.mem.eql(u8, argument, "--export-config")) {
+            options.export_config = true;
         } else if (std.mem.eql(u8, argument, "--managed-session")) {
             options.managed_session = true;
         } else if (std.mem.eql(u8, argument, "--headless")) {
@@ -512,10 +532,12 @@ fn usage() void {
         \\  --trace-pacing  diagnostic: log per-frame monotonic timing; adds measurement overhead
         \\  --software-cursor  disable hardware cursor updates for comparison/troubleshooting
         \\  --drm-device  require this DRM card instead of automatic selection
-        \\  --config      load JSON output rules, including per-output ICC profiles
+        \\  --config      file-only override (base JSON and adjacent config.d); no ourosettings
+        \\                otherwise subscribe to ourosettings /compositor (10s startup deadline)
+        \\  --export-config  print merged legacy file configuration and exit (no settings writes)
         \\  --managed-session  publish and bind the systemd graphical session lifecycle
         \\  --headless     bypass libseat and input for an explicitly selected virtual DRM device
-        \\  SIGHUP        reload configuration; invalid replacements are rejected
+        \\  SIGHUP        reload --config sources; ourosettings updates arrive automatically
         \\
     , .{});
 }

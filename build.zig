@@ -620,6 +620,18 @@ pub fn build(b: *std.Build) void {
     );
     drm_presentation_test_step.dependOn(&run_drm_presentation_tests.step);
 
+    const settings_tests = b.addTest(.{
+        .root_module = ouro,
+        .filters = &.{ "settings", "config.", "invalid paths and stop readiness" },
+    });
+    const settings_runtime_tests = b.addTest(.{
+        .root_module = drm_presentation_tests.root_module,
+        .filters = &.{ "WatchPath", "settings readiness", "primary scale reconfiguration" },
+    });
+    const settings_test_step = b.step("test-settings", "Run configuration, Varlink transport and runtime handoff tests");
+    settings_test_step.dependOn(&b.addRunArtifact(settings_tests).step);
+    settings_test_step.dependOn(&b.addRunArtifact(settings_runtime_tests).step);
+
     const shell_input_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("test/shell-input.zig"),

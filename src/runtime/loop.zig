@@ -5,6 +5,7 @@ const wayring = @import("wayring");
 const completion = @import("completion.zig");
 const compositor = @import("compositor.zig");
 const shutdown_signal = @import("shutdown_signal.zig");
+const settings_client = @import("../settings_client.zig");
 const timer = @import("timer.zig");
 
 const linux = std.os.linux;
@@ -61,6 +62,7 @@ pub fn Loop(comptime protocol: type) type {
             submitted: u32,
             shutdown_requested: bool,
             reload_requested: bool,
+            settings_changed: bool,
             /// More CQEs or deferred Wayring preparation remain for a future
             /// turn. The caller can use this to avoid blocking.
             needs_more_work: bool,
@@ -79,6 +81,11 @@ pub fn Loop(comptime protocol: type) type {
         shutdown: ?*shutdown_signal.Watcher = null,
         shutdown_token: ?completion.Token = null,
         shutdown_seen: bool = false,
+        settings: ?*settings_client.Client = null,
+        settings_token: ?completion.Token = null,
+        retained_settings_changed: bool = false,
+        /// A validated replacement is waiting for an output/input transaction.
+        configuration_pending: bool = false,
         pending_wayring_count: usize = 0,
         retained_wayring_progress: Driver.Progress = .{},
         retained_shutdown_requested: bool = false,
@@ -128,6 +135,7 @@ pub fn Loop(comptime protocol: type) type {
         /// last turn.
         pub fn deinit(self: *Self) void {
             std.debug.assert(self.shutdown_token == null);
+            std.debug.assert(self.settings_token == null);
             std.debug.assert(self.pending_wayring_count == 0);
             self.driver.deinit(self.allocator);
             self.allocator.free(self.unrouted_completions);
@@ -146,6 +154,23 @@ pub fn Loop(comptime protocol: type) type {
             try self.armSignalPoll();
         }
 
+        pub fn installSettings(self: *Self, client: *settings_client.Client) !void {
+            if (self.settings != null) return error.AlreadyInstalled;
+            self.settings = client;
+            try self.armSettingsPoll();
+        }
+
+        pub fn settingsDrained(self: *const Self) bool {
+            return self.settings_token == null;
+        }
+
+        fn armSettingsPoll(self: *Self) !void {
+            const token = try self.router.acquire(.settings);
+            errdefer self.router.retire(token) catch unreachable;
+            _ = try self.compositor.ring.poll_add(token.encode(), self.settings.?.descriptor(), linux.POLL.IN);
+            self.settings_token = token;
+        }
+
         fn armSignalPoll(self: *Self) !void {
             const token = try self.router.acquire(.shutdown);
             errdefer self.router.retire(token) catch unreachable;
@@ -161,6 +186,10 @@ pub fn Loop(comptime protocol: type) type {
         /// prepared by the next turn and all resulting CQEs must continue to be
         /// processed until `Progress.wayring.shutdown_complete` is true.
         pub fn requestShutdown(self: *Self) !void {
+            self.configuration_pending = false;
+            // Wake the stable descriptor instead of closing it underneath an
+            // in-flight poll. Its final CQE must retire before client teardown.
+            if (self.settings) |client| try client.stop();
             if (self.shutdown) |watcher| watcher.request();
             try self.driver.requestShutdown();
         }
@@ -236,6 +265,21 @@ pub fn Loop(comptime protocol: type) type {
                     return error.UnexpectedSkippedCompletion;
                 }
                 if (self.router.route(cqe.user_data)) |token| {
+                    if (token.kind == .settings) {
+                        if (self.settings_token == null or !std.meta.eql(self.settings_token.?, token))
+                            return error.UnexpectedSettingsCompletion;
+                        try self.router.retire(token);
+                        self.settings_token = null;
+                        if (cqe.res < 0 or @as(u32, @intCast(cqe.res)) & linux.POLL.IN == 0)
+                            return error.SettingsPollFailed;
+                        const client = self.settings.?;
+                        try client.dispatch();
+                        if (!client.stopping) {
+                            self.retained_settings_changed = true;
+                            try self.armSettingsPoll();
+                        }
+                        continue;
+                    }
                     if (token.kind == .shutdown) {
                         if (self.shutdown_token == null or
                             !std.meta.eql(self.shutdown_token.?, token))
@@ -254,6 +298,7 @@ pub fn Loop(comptime protocol: type) type {
                         self.retained_reload_requested =
                             self.retained_reload_requested or events.reload;
                         self.shutdown_seen = self.shutdown_seen or events.shutdown;
+                        if (events.shutdown) if (self.settings) |client| try client.stop();
                         if (!self.shutdown_seen) try self.armSignalPoll();
                         continue;
                     }
@@ -355,11 +400,15 @@ pub fn Loop(comptime protocol: type) type {
                 handler.submissionWorkPending()
             else
                 false;
+            const configuration_ready = if (@hasDecl(@TypeOf(handler.*), "configInstallReady"))
+                self.configuration_pending and !self.shutdown_seen and handler.configInstallReady()
+            else
+                false;
             const can_wait = wait_on_idle and self.compositor.ring.cq_ready() == 0 and
                 !wayring_progress.pending and !self.retained_shutdown_requested and
-                !self.retained_reload_requested and
-                !bindings_work_pending and !submission_work_pending and
-                !(wayring_progress.shutdown_complete and backend_drained);
+                !self.retained_reload_requested and !self.retained_settings_changed and
+                !bindings_work_pending and !submission_work_pending and !configuration_ready and
+                !(wayring_progress.shutdown_complete and backend_drained and self.settingsDrained());
             phase = .submit;
             const submitted = if (can_wait)
                 self.compositor.ring.submit_and_wait(1) catch |err| switch (err) {
@@ -383,13 +432,15 @@ pub fn Loop(comptime protocol: type) type {
                 .submitted = submitted,
                 .shutdown_requested = self.retained_shutdown_requested,
                 .reload_requested = self.retained_reload_requested,
+                .settings_changed = self.retained_settings_changed,
                 .needs_more_work = self.compositor.ring.cq_ready() != 0 or
                     self.pending_wayring_count != 0 or wayring_progress.pending or
-                    bindings_work_pending or submission_work_pending,
+                    bindings_work_pending or submission_work_pending or configuration_ready,
             };
             self.retained_wayring_progress = .{};
             self.retained_shutdown_requested = false;
             self.retained_reload_requested = false;
+            self.retained_settings_changed = false;
             return progress;
         }
     };

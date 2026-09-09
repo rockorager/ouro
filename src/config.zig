@@ -526,7 +526,32 @@ pub const Store = struct {
     pub fn load(self: *const Store) !Snapshot {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
+        const root = try self.loadValue(arena.allocator());
+        return snapshotFromValue(&arena, root);
+    }
+
+    /// Export the effective legacy file configuration as a standalone patch
+    /// over built-in defaults. Does not contact or modify ourosettings.
+    pub fn exportSource(self: *const Store) ![]u8 {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        var root = try self.loadValue(arena.allocator());
+        _ = try snapshotFromValue(&arena, root); // Validate before exporting.
         const a = arena.allocator();
+        // Merge-patch removes null members. Restore tombstones so applying the
+        // export over defaults cannot resurrect deleted built-in bindings.
+        if (root.object.getPtr("bindings")) |bindings| {
+            const defaults = try parseValue(a, default_source);
+            var keys = defaults.object.get("bindings").?.object.iterator();
+            while (keys.next()) |entry| {
+                if (!bindings.object.contains(entry.key_ptr.*))
+                    try bindings.object.put(a, entry.key_ptr.*, .null);
+            }
+        } else try root.object.put(a, "bindings", .null);
+        return std.json.Stringify.valueAlloc(self.allocator, root, .{ .whitespace = .indent_2 });
+    }
+
+    fn loadValue(self: *const Store, a: std.mem.Allocator) !std.json.Value {
         var root = try parseValue(a, default_source);
 
         if (self.explicit_path) |path| {
@@ -535,7 +560,7 @@ pub const Store = struct {
             const fragments = try std.fs.path.join(self.allocator, &.{ parent, "config.d" });
             defer self.allocator.free(fragments);
             try applyDirectory(self, a, &root, fragments);
-            return snapshotFromValue(&arena, root);
+            return root;
         }
 
         const system_directories = self.environ_map.get("XDG_CONFIG_DIRS") orelse "/etc/xdg";
@@ -558,7 +583,7 @@ pub const Store = struct {
             defer self.allocator.free(directory);
             try applyBelow(self, a, &root, directory);
         }
-        return snapshotFromValue(&arena, root);
+        return root;
     }
 
     fn applyBelow(
@@ -721,7 +746,7 @@ test "store applies sibling fragments in lexical order" {
     });
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "config.d/20-last.json",
-        .data = "{\"bindings\":{\"super+x\":[\"close\"]}}",
+        .data = "{\"general\":{\"inner_gap\":29,\"outer_gap\":3},\"bindings\":{\"super+x\":[\"close\"],\"super+q\":null}}",
     });
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "config.d/10-first.json",
@@ -749,6 +774,24 @@ test "store applies sibling fragments in lexical order" {
             c.xkb_keysym_from_name("x", c.XKB_KEYSYM_NO_FLAGS)) found = true;
     }
     try std.testing.expect(found);
+    const exported = try store.exportSource();
+    defer std.testing.allocator.free(exported);
+    var restored = try mergeSources(std.testing.allocator, &.{exported});
+    defer restored.deinit();
+    try std.testing.expectEqual(@as(u32, 29), restored.general.inner_gap);
+    try std.testing.expectEqual(@as(u32, 3), restored.general.outer_gap);
+    try std.testing.expectEqualDeep(snapshot.bindings, restored.bindings);
+
+    // Clearing the entire class must not restore any default bindings either.
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "config.d/30-clear.json",
+        .data = "{\"bindings\":null}",
+    });
+    const cleared = try store.exportSource();
+    defer std.testing.allocator.free(cleared);
+    var restored_clear = try mergeSources(std.testing.allocator, &.{cleared});
+    defer restored_clear.deinit();
+    try std.testing.expectEqual(@as(usize, 0), restored_clear.bindings.len);
 }
 
 test "default bindings" {

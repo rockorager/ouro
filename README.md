@@ -185,14 +185,31 @@ buttons rather than delivering them to applications.
 
 ## Configuration
 
-Ouro loads strict JSON from `$XDG_CONFIG_HOME/ouro/config.json` (or
-`$HOME/.config/ouro/config.json`) and then applies lexically sorted
-`config.d/*.json` fragments. System locations from `XDG_CONFIG_DIRS` are
-applied first at lower precedence. `--config=PATH` instead selects one base
-file and a `config.d` directory beside it. Missing files retain the built-in
-defaults; malformed JSON, duplicate object keys, unknown fields, invalid
-keysyms, and invalid actions reject the complete candidate. `SIGHUP` reloads
-the same sources atomically and preserves the active snapshot on failure.
+By default Ouro subscribes to `/compositor` through
+`dev.rockorager.ouro.Settings.WatchPath` at
+`$XDG_RUNTIME_DIR/ouro/settings.sock`. Install
+[ourosettings](https://github.com/rockorager/ourosettings) with WatchPath support
+and its user socket/service units. Each publication is a complete compositor
+configuration applied over built-in defaults, **not** over the previous
+publication or local config files. Other desktop preferences do not trigger
+compositor reloads.
+
+Startup waits up to ten seconds for the initial reply and rejects missing or
+invalid compositor settings before opening the display. Runtime invalid
+updates preserve the active configuration. Disconnects also preserve it and
+retry with backoff from 250 ms to five seconds; reconnecting obtains a fresh
+snapshot. The live subscription keeps the socket-activated daemon running.
+A validated replacement waits for pending input/output transactions; newer
+valid updates replace that waiting candidate. Settings persistence is not an
+acknowledgement of hardware application: output changes complete asynchronously
+and can roll back. Watch replies are bounded to 256 KiB including the NUL.
+
+`--config=PATH` is a **file-only override**: it loads that base JSON and then
+lexically sorted `config.d/*.json` fragments beside it, without connecting to
+ourosettings. Missing files retain built-in defaults. `SIGHUP` reloads these
+same sources; it is unnecessary in settings mode. In either mode, malformed
+JSON, duplicate object keys, unknown fields, invalid keysyms, and invalid
+actions reject the complete candidate rather than partially applying it.
 
 Every source after the built-in defaults is an
 [RFC 7396 JSON Merge Patch](https://www.rfc-editor.org/rfc/rfc7396). Objects
@@ -222,6 +239,51 @@ number from 1 through 10, `move-focused-to-workspace` followed by the same,
 `run` never invokes a shell and delegates process ownership to
 `systemd-run --user`; Ouro does not supervise applications.
 
+### Moving existing configuration into ourosettings
+
+Ouro does not automatically migrate or delete configuration files.
+`ouro --export-config` prints a validated standalone compositor object and
+exits without contacting settings, Wayland, systemd, or DRM. It reads the old
+layering: system `XDG_CONFIG_DIRS` at lower precedence, then
+`$XDG_CONFIG_HOME/ouro/config.json` (or `$HOME/.config/ouro/config.json`) and
+lexically sorted `config.d/*.json`. Use `--config=PATH --export-config` to
+export a specific base and its adjacent fragments instead. Removed default
+bindings retain null tombstones in the export.
+
+After installing the binaries and ourosettings units, these commands export
+the old configuration, back up the daemon's current preferences, and replace
+only its compositor section. Inspect the export and backup **before** running
+SetSection; it replaces any existing compositor preferences. These commands
+need `jq` and `varlinkctl`:
+
+```sh
+umask 077
+backup=$(mktemp -d "$HOME/ouro-settings-migration.XXXXXX")
+ouro --export-config > "$backup/compositor.json"
+systemctl --user enable --now ourosettings.socket
+address="unix:$XDG_RUNTIME_DIR/ouro/settings.sock"
+interface=dev.rockorager.ouro.Settings
+varlinkctl call "$address" "$interface.Get" '{}' > "$backup/before.json"
+
+# Inspect both JSON files before replacing the compositor section.
+params=$(jq -n --slurpfile old "$backup/before.json" \
+  --slurpfile config "$backup/compositor.json" \
+  '{expected_revision:$old[0].revision, section:"compositor", value:$config[0]}')
+varlinkctl call "$address" "$interface.SetSection" "$params"
+```
+
+A revision conflict leaves settings unchanged; refetch and review before
+retrying. Existing config files remain available for `--config=PATH` recovery.
+Use a new login to start the new compositor; do not restart a working desktop
+just to migrate preferences.
+
+`zig build test-settings` exercises configuration parsing/export, bounded Unix
+transport, and the deterministic runtime handoff/drain. After building Ouro,
+`python3 test/settings.py --daemon /path/to/ourosettings` additionally checks
+the real daemon's initial/change/filter/reconnect contract, migration, semantic
+rejection, file-only override, and startup timeout in private directories.
+These checks do not require or validate a real display or user-systemd session.
+
 ## Display-manager session
 
 `zig build install` installs `ouro.desktop` under `share/wayland-sessions` and
@@ -232,6 +294,14 @@ environment to the systemd user manager and D-Bus activation environment,
 starts `ouro-session.target` bound to `graphical-session.target`, and clears
 that environment and stops both targets when Ouro exits. Direct launches stay
 standalone and do not alter the user's graphical-session targets.
+
+In settings mode, managed startup first starts `ourosettings.socket`, then
+connects to activate the daemon, before preparing the graphical session.
+The settings units must not depend on `graphical-session.target`; that would
+create a startup cycle. Standalone launches expect the socket already running
+(for example `systemctl --user enable --now ourosettings.socket`). No
+`Requires=ourosettings.service` or compositor restart on daemon restart is
+needed. `--config=PATH` skips this dependency entirely.
 
 A binding may use an object when compositor-side repetition is desired:
 

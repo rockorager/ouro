@@ -29,6 +29,17 @@ pub fn init(
     return .{ .io = io, .environ_map = environ_map, .enabled = enabled };
 }
 
+/// Display managers launch Ouro directly, not through an ouro.service unit.
+/// Start only the listener before connecting; the connection activates the
+/// daemon. Settings must not depend on the graphical target Ouro starts later.
+pub fn startSettingsSocket(self: *const Self) !void {
+    if (!self.enabled) return;
+    if (!try self.run(&.{ "systemctl", "--user", "start", "ourosettings.socket" })) {
+        log.err("could not start ourosettings.socket; install the ourosettings user units or use --config=PATH", .{});
+        return error.SettingsSocketStartFailed;
+    }
+}
+
 pub fn prepare(self: *const Self) !void {
     if (!self.enabled) return;
     if (!try self.run(&.{

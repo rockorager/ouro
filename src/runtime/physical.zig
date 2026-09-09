@@ -2048,6 +2048,12 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.processInput();
         }
 
+        /// Whether a replacement can be attempted without racing pending work.
+        pub fn configInstallReady(self: *const Self) bool {
+            self.interaction.canInstallKeyConsumerSnapshot() catch return false;
+            return self.output_reconfigure == null and self.output_power_transition == null;
+        }
+
         /// Atomically installs engine, key-consumer, and desktop-policy state.
         /// On success, ownership of all three snapshots transfers to the runtime.
         pub fn installConfig(
