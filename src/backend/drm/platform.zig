@@ -21,6 +21,8 @@ pub const Card = struct {
     syspath: [path_capacity:0]u8 = [_:0]u8{0} ** path_capacity,
     syspath_len: u16 = 0,
     boot_vga: bool = false,
+    pci_vendor_id: u16 = 0,
+    pci_device_id: u16 = 0,
 
     pub fn devicePath(self: *const Card) [:0]const u8 {
         return self.path[0..self.path_len :0];
@@ -285,6 +287,12 @@ fn realDiscover(_: *anyopaque, cards: []Card, seat: []const u8) !usize {
         var card: Card = .{};
         try copyZ(&card.path, &card.path_len, std.mem.span(devnode));
         try copyZ(&card.syspath, &card.syspath_len, std.mem.span(syspath_ptr));
+        if (c.udev_device_get_parent_with_subsystem_devtype(device, "pci", null)) |pci| {
+            if (c.udev_device_get_sysattr_value(pci, "vendor")) |value|
+                card.pci_vendor_id = std.fmt.parseInt(u16, std.mem.span(value), 0) catch 0;
+            if (c.udev_device_get_sysattr_value(pci, "device")) |value|
+                card.pci_device_id = std.fmt.parseInt(u16, std.mem.span(value), 0) catch 0;
+        }
         var parent = c.udev_device_get_parent(device);
         while (parent != null) : (parent = c.udev_device_get_parent(parent)) {
             if (c.udev_device_get_sysattr_value(parent, "boot_vga")) |value| {

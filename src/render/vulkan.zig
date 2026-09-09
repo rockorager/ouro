@@ -140,6 +140,28 @@ pub const Renderer = struct {
         };
     }
 
+    /// Import a fresh output pool before committing to its layout. The caller
+    /// destroys Targets on failure, including any successfully imported prefix.
+    pub fn importPoolTargets(self: *Renderer, targets: *Targets, pool: *framebuffer.Pool) !void {
+        std.debug.assert(targets.owner == self.implementation);
+        std.debug.assert(targets.records.len == pool.slots.len);
+        const handles = try self.allocator.alloc(framebuffer.Handle, targets.records.len);
+        defer self.allocator.free(handles);
+        var count: usize = 0;
+        defer for (handles[0..count]) |handle| pool.discard(handle) catch unreachable;
+        for (targets.records) |*record| {
+            std.debug.assert(record.imported == null);
+            const handle = try pool.acquire();
+            handles[count] = handle;
+            count += 1;
+            const image = try pool.image(handle);
+            if (image.metadata.plane_count != 1) return error.UnsupportedPlaneCount;
+            const fd = try pool.exportPlaneFd(handle, 0);
+            record.imported = try self.platform.importTarget(self.implementation, image.metadata, fd);
+            record.metadata = image.metadata;
+        }
+    }
+
     pub fn contentProvider(self: *Renderer) ?@import("content.zig").Provider {
         return self.platform.contentProvider(self.implementation);
     }

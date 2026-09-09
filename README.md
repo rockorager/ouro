@@ -351,13 +351,20 @@ Renderer selection is explicit:
 - `--renderer=vulkan` requires Vulkan and a primary KMS plane with
   `IN_FENCE_FD`. Vulkan exports a sync-file fence to KMS and never host-waits.
 
+Vulkan prefers uncompressed Intel 4-tiled scanout on the measured Lunar Lake
+device (PCI `8086:64a0`). Each output independently falls back to linear if its
+selected pixel format lacks the modifier, allocation fails, or Vulkan cannot
+import the buffers. Failed attempts release their resources before retrying.
+AMD, other Intel devices, and unknown hardware keep the existing linear-first
+policy; Pixman remains linear. This applies at startup and output recreation.
+
 For controlled output-layout experiments, strict Vulkan mode accepts
 `--scanout-modifier=0xHEX`. It preserves the normally selected pixel format
 and requires that exact modifier on every output. Unsupported KMS pairs,
 GBM allocation failures, and incompatible Vulkan targets fail rather than
 silently falling back. Startup logs the actual format, modifier, and stride.
-Omitting the option preserves the existing allocation policy; there is no
-vendor-specific automatic selection.
+An explicit modifier overrides the automatic preference, including
+`--scanout-modifier=0` to force linear.
 
 For example, compare `--scanout-modifier=0` (linear) with
 `--scanout-modifier=0x100000000000009` (Intel 4-tiled) on hardware that supports

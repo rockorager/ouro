@@ -12,6 +12,9 @@ const c = @cImport({
 pub const max_planes = 4;
 pub const modifier_linear: u64 = 0;
 pub const modifier_invalid: u64 = (@as(u64, 1) << 56) - 1;
+// I915_FORMAT_MOD_4_TILED: drm_fourcc.h's token-pasting macro is not
+// translatable by @cImport. Intel vendor byte 0x01, uncompressed layout 9.
+pub const modifier_intel_4_tiled: u64 = (@as(u64, 1) << 56) | 9;
 pub const format_xrgb8888: u32 = fourcc('X', 'R', '2', '4');
 pub const format_argb8888: u32 = fourcc('A', 'R', '2', '4');
 pub const format_xbgr8888: u32 = fourcc('X', 'B', '2', '4');

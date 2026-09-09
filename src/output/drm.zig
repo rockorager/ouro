@@ -1936,6 +1936,34 @@ fn initVulkanOutput(
     config: Config,
     renderer: *vulkan.Renderer,
 ) !OutputPath {
+    // The measured win is on Lunar Lake/Xe: 4-tiled scanout avoids mapping
+    // every pixel page into GGTT on each flip. Do not extend this policy to
+    // other devices (or compressed modifiers) without measurements.
+    if (config.scanout_modifier == null and snapshot.card.pci_vendor_id == 0x8086 and
+        snapshot.card.pci_device_id == 0x64a0)
+    {
+        var preferred = config;
+        preferred.scanout_modifier = gbm.modifier_intel_4_tiled;
+        if (initVulkanOutputLayout(allocator, platforms, fd, snapshot, preferred, renderer)) |output| {
+            std.log.info("Vulkan scanout: using preferred Intel 4-tiled layout on connector {d}", .{snapshot.selectedConnector().id});
+            return output;
+        } else |err| {
+            std.log.warn("Vulkan scanout: Intel 4-tiled unavailable on connector {d} ({t}); trying linear", .{ snapshot.selectedConnector().id, err });
+        }
+        preferred.scanout_modifier = gbm.modifier_linear;
+        return initVulkanOutputLayout(allocator, platforms, fd, snapshot, preferred, renderer);
+    }
+    return initVulkanOutputLayout(allocator, platforms, fd, snapshot, config, renderer);
+}
+
+fn initVulkanOutputLayout(
+    allocator: std.mem.Allocator,
+    platforms: Platforms,
+    fd: std.posix.fd_t,
+    snapshot: drm.Snapshot,
+    config: Config,
+    renderer: *vulkan.Renderer,
+) !OutputPath {
     if (snapshot.selectedPlane().properties.in_fence_fd == 0)
         return error.InFenceUnsupported;
     const prefer_10bit = hdrOutputMetadata(snapshot, config.output_color_description) != null;
@@ -1973,9 +2001,15 @@ fn initVulkanOutput(
     }
     if (prefer_10bit and pool.allocation.format != gbm.format_xrgb2101010)
         return error.HdrUnsupported;
+    var targets = try renderer.createTargets(config.image_count);
+    errdefer renderer.destroyTargets(&targets);
+    // A capability query alone cannot guarantee that these GBM BOs import.
+    // Validate the entire candidate before making its layout the output path.
+    if (config.scanout_modifier != null)
+        try renderer.importPoolTargets(&targets, &pool);
     return .{
         .pool = pool,
-        .vulkan_targets = try renderer.createTargets(config.image_count),
+        .vulkan_targets = targets,
     };
 }
 
@@ -1999,17 +2033,6 @@ fn initVulkan(allocator: std.mem.Allocator, platforms: Platforms, fd: std.posix.
     const prefer_10bit = hdrOutputMetadata(snapshot, config.output_color_description) != null;
     if (hdrRequested(config.output_color_description) and !prefer_10bit)
         return error.HdrUnsupported;
-    var pool = try vulkan.initTargetPool(
-        allocator,
-        platforms.gbm,
-        platforms.framebuffer,
-        fd,
-        snapshot,
-        config.image_count,
-        prefer_10bit,
-        config.scanout_modifier,
-    );
-    errdefer pool.deinit() catch {};
     const content_version_capacity = try contentVersionCapacity(config);
     const content_store_bytes = try contentByteCapacity(config);
     const retained_upload_bytes = std.math.mul(
@@ -2041,34 +2064,8 @@ fn initVulkan(allocator: std.mem.Allocator, platforms: Platforms, fd: std.posix.
     });
     var owned_renderer = renderer;
     errdefer owned_renderer.deinit();
-    if (!owned_renderer.supportsTarget(pool.allocation)) {
-        if (config.scanout_modifier != null) return error.UnsupportedOutputFormat;
-        var fallback = try vulkan.initTargetPool(
-            allocator,
-            platforms.gbm,
-            platforms.framebuffer,
-            fd,
-            snapshot,
-            config.image_count,
-            false,
-            null,
-        );
-        pool.deinit() catch |err| {
-            fallback.deinit() catch {};
-            return err;
-        };
-        pool = fallback;
-        if (!owned_renderer.supportsTarget(pool.allocation))
-            return error.UnsupportedOutputFormat;
-    }
-    if (prefer_10bit and pool.allocation.format != gbm.format_xrgb2101010)
-        return error.HdrUnsupported;
-    const targets = try owned_renderer.createTargets(config.image_count);
     return .{
-        .output = .{
-            .pool = pool,
-            .vulkan_targets = targets,
-        },
+        .output = try initVulkanOutput(allocator, platforms, fd, snapshot, config, &owned_renderer),
         .renderer = .{ .vulkan = owned_renderer },
     };
 }
@@ -2713,6 +2710,140 @@ test "drm-sim: Session generations select create and quiesce actions" {
     try std.testing.expectEqual(SessionAction.none, sessionAction(.{ .disabled = 2 }));
 }
 
+test "drm-sim: Intel scanout preference falls back transactionally and preserves overrides" {
+    const Probe = struct {
+        reject_tiled: bool = false,
+        fail_second_import: bool = false,
+        imports: usize = 0,
+        imported: usize = 0,
+        destroyed: usize = 0,
+
+        fn create(context: *anyopaque, _: std.posix.fd_t, _: vulkan_platform.Config) !vulkan_platform.Renderer {
+            return context;
+        }
+        fn destroy(_: *anyopaque, _: vulkan_platform.Renderer) void {}
+        fn packs(_: *anyopaque, _: vulkan_platform.Renderer) bool {
+            return false;
+        }
+        fn supports(context: *anyopaque, _: vulkan_platform.Renderer, allocation: gbm.Allocation) bool {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            return !self.reject_tiled or allocation.modifier == gbm.modifier_linear;
+        }
+        fn import(context: *anyopaque, _: vulkan_platform.Renderer, _: gbm.Metadata, fd: std.posix.fd_t) !vulkan_platform.Target {
+            defer _ = linux.close(fd);
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.imports += 1;
+            if (self.fail_second_import and self.imports == 2) return error.ImportFailed;
+            self.imported += 1;
+            return context;
+        }
+        fn destroyTarget(context: *anyopaque, _: vulkan_platform.Renderer, _: vulkan_platform.Target) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.destroyed += 1;
+        }
+    };
+    const Case = struct {
+        vendor: u16 = 0x8086,
+        device: u16 = 0x64a0,
+        modifier: ?u64 = null,
+        tiled_advertised: bool = true,
+        wrong_tiled_format: bool = false,
+        allocation_failure: bool = false,
+        capability_failure: bool = false,
+        import_failure: bool = false,
+        renderer: RendererPreference = .vulkan,
+        expected: u64 = gbm.modifier_linear,
+        expected_error: ?anyerror = null,
+        recreate: bool = false,
+    };
+    const cases = [_]Case{
+        .{ .expected = 0x100000000000009, .recreate = true },
+        .{ .vendor = 0x1002 },
+        .{ .device = 0x56a0 },
+        .{ .vendor = 0, .device = 0 },
+        .{ .tiled_advertised = false },
+        .{ .wrong_tiled_format = true },
+        .{ .allocation_failure = true },
+        .{ .capability_failure = true },
+        .{ .import_failure = true },
+        .{ .renderer = .vulkan_then_pixman, .import_failure = true },
+        .{ .renderer = .pixman },
+        .{ .modifier = 0 },
+        .{ .vendor = 0x1002, .modifier = 0x100000000000009, .expected = 0x100000000000009 },
+        .{ .modifier = 0x100000000000009, .import_failure = true, .expected_error = error.ImportFailed },
+        .{ .modifier = 0x100000000000009, .tiled_advertised = false, .expected_error = error.ScanoutModifierUnsupported },
+    };
+    for (cases, 0..) |case, case_index| {
+        errdefer std.debug.print("scanout policy case {d}\n", .{case_index});
+        var fixture: SimFixture = .{
+            .allow_export = true,
+            .fail_modifier = if (case.allocation_failure) gbm.modifier_intel_4_tiled else null,
+        };
+        var platforms = fixture.platforms();
+        defer fixture.router.deinit(std.testing.allocator);
+        defer fixture.ring.deinit();
+        var probe: Probe = .{ .reject_tiled = case.capability_failure, .fail_second_import = case.import_failure };
+        var vtable = vulkan_platform.real.vtable.*;
+        vtable.create = Probe.create;
+        vtable.destroy = Probe.destroy;
+        vtable.packs_sources = Probe.packs;
+        vtable.supports_target = Probe.supports;
+        vtable.import_target = Probe.import;
+        vtable.destroy_target = Probe.destroyTarget;
+        platforms.vulkan = .{ .context = &probe, .vtable = &vtable };
+        var snapshot = fixture.snapshot();
+        snapshot.card.pci_vendor_id = case.vendor;
+        snapshot.card.pci_device_id = case.device;
+        // Put compression first to catch accidentally selecting the first
+        // advertised non-linear modifier rather than uncompressed 4-tiled.
+        var formats = [_]drm.Format{
+            .{ .fourcc = gbm.format_xrgb8888, .modifier = 0x100000000000010 },
+            .{ .fourcc = gbm.format_xrgb8888, .modifier = 0 },
+            .{ .fourcc = if (case.wrong_tiled_format) gbm.format_argb8888 else gbm.format_xrgb8888, .modifier = 0x100000000000009 },
+        };
+        var planes = [_]drm.Plane{snapshot.selectedPlane()};
+        planes[0].format_count = if (case.tiled_advertised) 3 else 2;
+        planes[0].properties.in_fence_fd = 15;
+        snapshot.planes = &planes;
+        snapshot.formats = &formats;
+        const config: Config = .{
+            .output_id = .{ .index = 0, .generation = 1 },
+            .scheduler = .{ .refresh_ns = 10, .render_budget_ns = 3 },
+            .renderer = case.renderer,
+            .scanout_modifier = case.modifier,
+            .image_count = 2,
+            .max_render_targets = 2,
+            .max_samples = 1,
+            .max_source_bytes = 4,
+            .max_source_width = 1,
+            .max_source_height = 1,
+        };
+        if (case.expected_error) |expected| {
+            try std.testing.expectError(expected, initRenderPath(std.testing.allocator, platforms, 99, snapshot, config));
+        } else {
+            var initial = try initRenderPath(std.testing.allocator, platforms, 99, snapshot, config);
+            defer initial.renderer.deinit();
+            var output = initial.output;
+            for (0..if (case.recreate) @as(usize, 2) else 1) |iteration| {
+                if (iteration != 0)
+                    output = try initVulkanOutput(std.testing.allocator, platforms, 99, snapshot, config, &initial.renderer.vulkan);
+                defer output.pool.deinit() catch unreachable;
+                defer if (output.vulkan_targets) |*targets| initial.renderer.vulkan.destroyTargets(targets);
+                try std.testing.expectEqual(case.expected, output.pool.allocation.modifier);
+                try std.testing.expectEqual(gbm.format_xrgb8888, output.pool.allocation.format);
+                try std.testing.expectEqual(case.renderer == .pixman, initial.renderer == .pixman);
+                if (case.expected != 0 or case.import_failure)
+                    for (output.vulkan_targets.?.records) |record| try std.testing.expect(record.imported != null);
+                for (output.pool.slots) |slot| try std.testing.expectEqual(framebuffer.State.free, slot.state);
+            }
+        }
+        try std.testing.expectEqual(fixture.bo_count, fixture.bos_destroyed);
+        try std.testing.expectEqual(fixture.bo_count, fixture.framebuffers_removed);
+        try std.testing.expectEqual(probe.imported, probe.destroyed);
+        if (case.import_failure) try std.testing.expectEqual(@as(usize, if (case.expected_error != null) 2 else 4), probe.imports);
+    }
+}
+
 test "drm-sim: render device survives output target recreation" {
     var fixture = SimFixture{};
     const platforms = fixture.platforms();
@@ -3024,6 +3155,9 @@ const SimFixture = struct {
     bytes: [4][4]u8 align(4) = [_][4]u8{[_]u8{0} ** 4} ** 4,
     dumb_bytes: [4][std.heap.page_size_min]u8 align(std.heap.page_size_min) =
         [_][std.heap.page_size_min]u8{[_]u8{0} ** std.heap.page_size_min} ** 4,
+    allocations: [4]gbm.Allocation = undefined,
+    fail_modifier: ?u64 = null,
+    allow_export: bool = false,
     bo_count: usize = 0,
     bos_destroyed: usize = 0,
     framebuffers_removed: usize = 0,
@@ -3114,9 +3248,11 @@ const SimFixture = struct {
         return context;
     }
     fn destroyDevice(_: *anyopaque, _: gbm.Device) void {}
-    fn createBo(context: *anyopaque, _: gbm.Device, _: gbm.Allocation) !gbm.Bo {
+    fn createBo(context: *anyopaque, _: gbm.Device, allocation: gbm.Allocation) !gbm.Bo {
         const self: *SimFixture = @ptrCast(@alignCast(context));
+        if (self.fail_modifier == allocation.modifier) return error.CreateBoFailed;
         const index = self.bo_count;
+        self.allocations[index] = allocation;
         self.bo_count += 1;
         return @ptrCast(&self.bytes[index]);
     }
@@ -3134,11 +3270,18 @@ const SimFixture = struct {
         const self: *SimFixture = @ptrCast(@alignCast(context));
         self.bos_destroyed += 1;
     }
-    fn metadata(_: *anyopaque, bo: gbm.Bo) !gbm.Metadata {
-        return .{ .width = 1, .height = 1, .format = gbm.format_xrgb8888, .modifier = gbm.modifier_linear, .plane_count = 1, .handles = .{ @intCast(@intFromPtr(bo) & 0xffffffff), 0, 0, 0 }, .strides = .{ 4, 0, 0, 0 } };
+    fn metadata(context: *anyopaque, bo: gbm.Bo) !gbm.Metadata {
+        const self: *SimFixture = @ptrCast(@alignCast(context));
+        const index = (@intFromPtr(bo) - @intFromPtr(&self.bytes)) / 4;
+        const allocation = self.allocations[index];
+        return .{ .width = allocation.width, .height = allocation.height, .format = allocation.format, .modifier = allocation.modifier, .plane_count = 1, .handles = .{ @intCast(@intFromPtr(bo) & 0xffffffff), 0, 0, 0 }, .strides = .{ 4, 0, 0, 0 } };
     }
-    fn exportPlaneFd(_: *anyopaque, _: gbm.Bo, _: u8) !std.posix.fd_t {
-        return error.UnexpectedExport;
+    fn exportPlaneFd(context: *anyopaque, _: gbm.Bo, _: u8) !std.posix.fd_t {
+        const self: *SimFixture = @ptrCast(@alignCast(context));
+        if (!self.allow_export) return error.UnexpectedExport;
+        const fd = linux.eventfd(0, linux.EFD.CLOEXEC);
+        if (linux.errno(fd) != .SUCCESS) return error.EventFdFailed;
+        return @intCast(fd);
     }
     fn map(context: *anyopaque, bo: gbm.Bo, access: gbm.MapAccess) !gbm.Mapping {
         const self: *SimFixture = @ptrCast(@alignCast(context));
