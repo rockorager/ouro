@@ -258,7 +258,12 @@ pub fn Loop(comptime protocol: type) type {
                         continue;
                     }
                     if (token.kind == .timer) {
-                        const completed = try self.timers.complete(self.router, token, cqe.res);
+                        const completed = self.timers.complete(self.router, token, cqe.res) catch |err| {
+                            std.log.err("timer completion failed: {t}; token=0x{x} result={d}", .{
+                                err, cqe.user_data, cqe.res,
+                            });
+                            return err;
+                        };
                         self.timer_outcomes[timer_count] = .{
                             .token = token,
                             .handle = completed.handle,

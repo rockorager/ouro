@@ -9,6 +9,7 @@ const Compositor = ouro.compositor.Compositor(protocol);
 const Runtime = ouro.physical.Coordinator(protocol);
 const Runner = ouro.physical.Runner(protocol);
 const SystemdSession = @import("systemd_session.zig");
+const fatal_shutdown_grace_ns = 5 * std.time.ns_per_s;
 
 const shm_formats = [_]wayring.shm.Format{
     .{ .value = protocol.wl_shm.format.argb8888.value, .bytes_per_pixel = 4 },
@@ -119,6 +120,10 @@ pub fn main(init: std.process.Init) !void {
     defer wayring.unix_socket.unlink(socket) catch {};
     const session_state_path = try std.fmt.allocPrint(allocator, "{s}.sessions-v1", .{socket});
     defer allocator.free(session_state_path);
+    var exit_deadline: ouro.shutdown_signal.ExitDeadline = .{};
+    // Keep the deadline armed through all deferred cleanup, including stopping
+    // the managed session and joining the diagnostics thread.
+    errdefer exit_deadline.arm(fatal_shutdown_grace_ns);
     const root = try Compositor.create(
         allocator,
         try wayring.unix_socket.listen(socket, 128),
@@ -240,6 +245,7 @@ pub fn main(init: std.process.Init) !void {
             .enable_color_management = options.renderer == .vulkan,
         },
     }) catch |err| {
+        exit_deadline.arm(fatal_shutdown_grace_ns);
         root.deinit() catch {};
         return err;
     };
@@ -249,6 +255,7 @@ pub fn main(init: std.process.Init) !void {
         &initial_key_consumer,
         &initial_policy,
     ) catch |err| {
+        exit_deadline.arm(fatal_shutdown_grace_ns);
         coordinator.requestStop() catch unreachable;
         std.debug.assert(coordinator.backendDrainComplete());
         coordinator.destroy() catch {};
@@ -263,6 +270,7 @@ pub fn main(init: std.process.Init) !void {
         coordinator,
         .{ .completion_batch = 32 },
     ) catch |err| {
+        exit_deadline.arm(fatal_shutdown_grace_ns);
         coordinator.requestStop() catch unreachable;
         std.debug.assert(coordinator.backendDrainComplete());
         coordinator.destroy() catch {};
@@ -279,6 +287,7 @@ pub fn main(init: std.process.Init) !void {
     if (run_error == null) runner.installShutdown(&shutdown_signals) catch |err| {
         run_error = err;
     };
+    if (run_error != null) exit_deadline.arm(fatal_shutdown_grace_ns);
 
     if (run_error == null)
         std.log.info("Ouro listening on {s}; renderer policy={s}", .{
@@ -289,6 +298,7 @@ pub fn main(init: std.process.Init) !void {
     var signal_stop_started = false;
     while (!wayring_drained or !coordinator.backendDrainComplete()) {
         if (coordinator.terminalFailure()) |terminal_error| {
+            exit_deadline.arm(fatal_shutdown_grace_ns);
             std.log.err("backend cannot safely drain: {t}; exiting with scanout pinned for kernel teardown", .{terminal_error});
             // Do not run the normal destructors or publish buffer releases:
             // neither a failed disable nor loss of the seat connection proves
@@ -304,6 +314,7 @@ pub fn main(init: std.process.Init) !void {
             signal_stop_started = true;
         }
         const progress = runner.turnAndWait() catch |err| {
+            exit_deadline.arm(fatal_shutdown_grace_ns);
             if (run_error) |original_error| {
                 // A fatal turn gets one attempt to start a normal drain. If
                 // draining also fails, retrying retained work can spin forever
@@ -342,6 +353,7 @@ pub fn main(init: std.process.Init) !void {
             // Waiting until the compositor defer runs creates a cycle: Ouro
             // waits for clients which systemd keeps alive until Ouro exits.
             beginShutdown(&systemd_session, coordinator) catch |err| {
+                exit_deadline.arm(fatal_shutdown_grace_ns);
                 if (run_error == null) run_error = err;
                 continue;
             };

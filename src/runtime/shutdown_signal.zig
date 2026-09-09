@@ -3,9 +3,42 @@
 //! signalfd so signal delivery is part of the ordinary io_uring event loop.
 
 const std = @import("std");
+const c = @cImport({
+    @cInclude("signal.h");
+    @cInclude("time.h");
+});
 
 const linux = std.os.linux;
 const posix = std.posix;
+
+/// Bounds fatal-error cleanup even if the event loop or a destructor blocks.
+/// Deliberately remains armed until process exit: releasing DRM ownership must
+/// not depend on another event-loop turn or successful userspace teardown.
+pub const ExitDeadline = struct {
+    armed: bool = false,
+
+    pub fn arm(self: *ExitDeadline, grace_ns: u64) void {
+        if (self.armed) return;
+        std.debug.assert(grace_ns != 0);
+        var event = std.mem.zeroes(c.struct_sigevent);
+        event.sigev_notify = c.SIGEV_SIGNAL;
+        // SIGKILL cannot be caught or blocked by the inherited signalfd mask.
+        event.sigev_signo = c.SIGKILL;
+        var timer: c.timer_t = undefined;
+        if (c.timer_create(c.CLOCK_MONOTONIC, &event, &timer) != 0)
+            linux.exit_group(1);
+        const spec: c.struct_itimerspec = .{
+            .it_interval = .{ .tv_sec = 0, .tv_nsec = 0 },
+            .it_value = .{
+                .tv_sec = @intCast(grace_ns / std.time.ns_per_s),
+                .tv_nsec = @intCast(grace_ns % std.time.ns_per_s),
+            },
+        };
+        if (c.timer_settime(timer, 0, &spec, null) != 0)
+            linux.exit_group(1);
+        self.armed = true;
+    }
+};
 
 pub const Events = struct {
     shutdown: bool = false,
@@ -112,4 +145,47 @@ test "signalfd reports HUP as reload without shutdown" {
     const events = try watcher.consume();
     try std.testing.expect(events.reload);
     try std.testing.expect(!events.shutdown);
+}
+
+test "fatal exit deadline kills blocked cleanup without extending on rearm" {
+    const child = linux.fork();
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(child));
+    if (child == 0) {
+        // Use only signal/timer syscalls in the child, not inherited runtime
+        // locks or allocators. No event loop consumes the blocked TERM signal.
+        _ = Watcher.install() catch linux.exit_group(2);
+        var deadline: ExitDeadline = .{};
+        deadline.arm(20 * std.time.ns_per_ms);
+        deadline.arm(5 * std.time.ns_per_s);
+        _ = linux.nanosleep(&.{ .sec = 0, .nsec = 150 * std.time.ns_per_ms }, null);
+        linux.exit_group(42);
+    }
+    var status: u32 = 0;
+    while (true) {
+        const result = linux.wait4(@intCast(child), &status, 0, null);
+        if (linux.errno(result) == .INTR) continue;
+        try std.testing.expectEqual(child, result);
+        break;
+    }
+    try std.testing.expect(linux.W.IFSIGNALED(status));
+    try std.testing.expectEqual(linux.SIG.KILL, linux.W.TERMSIG(status));
+}
+
+test "fatal exit deadline allows prompt process exit" {
+    const child = linux.fork();
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(child));
+    if (child == 0) {
+        var deadline: ExitDeadline = .{};
+        deadline.arm(5 * std.time.ns_per_s);
+        linux.exit_group(0);
+    }
+    var status: u32 = 0;
+    while (true) {
+        const result = linux.wait4(@intCast(child), &status, 0, null);
+        if (linux.errno(result) == .INTR) continue;
+        try std.testing.expectEqual(child, result);
+        break;
+    }
+    try std.testing.expect(linux.W.IFEXITED(status));
+    try std.testing.expectEqual(@as(u32, 0), linux.W.EXITSTATUS(status));
 }

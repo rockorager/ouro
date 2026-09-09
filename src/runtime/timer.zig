@@ -192,8 +192,11 @@ pub const Timers = struct {
                 try router.retire(token);
                 slot.cancel_done = true;
 
+                // The timeout callback may already be running. Its own CQE
+                // still reports expiration, in either order with this one.
                 const valid = result == 0 or
                     result == negativeErrno(.NOENT) or
+                    result == negativeErrno(.ALREADY) or
                     result == negativeErrno(.BUSY);
                 if (slot.timeout_done) {
                     timers.release(@intCast(index));
@@ -335,6 +338,48 @@ test "expiration race reports once then awaits cancel cleanup" {
         negativeErrno(.NOENT),
     ));
     try std.testing.expectError(error.StaleHandle, timers.get(handle));
+}
+
+test "already-firing cancellation preserves expiration in either CQE order" {
+    for ([_]bool{ false, true }) |cancel_first| {
+        var router = try completion.Router.init(std.testing.allocator, 2);
+        defer router.deinit(std.testing.allocator);
+        var timers = try Timers.init(std.testing.allocator, 1);
+        defer timers.deinit(std.testing.allocator);
+
+        const handle, const timeout_token, const cancel_token =
+            try setupState(&timers, &router, true);
+        const first_token = if (cancel_first) cancel_token.? else timeout_token;
+        const second_token = if (cancel_first) timeout_token else cancel_token.?;
+        // Inspect the results only after delivering both CQEs, so a failing
+        // assertion cannot strand live state in the test's destructors.
+        const first = timers.complete(&router, first_token, if (cancel_first)
+            negativeErrno(.ALREADY)
+        else
+            negativeErrno(.TIME));
+        const occupied_after_first = timers.available() == 0;
+        const first_retired = router.route(first_token.encode()) == null;
+        const second_live = router.route(second_token.encode()) != null;
+        const second = timers.complete(&router, second_token, if (cancel_first)
+            negativeErrno(.TIME)
+        else
+            negativeErrno(.ALREADY));
+
+        try std.testing.expectEqual(Completion{
+            .handle = handle,
+            .event = if (cancel_first) .pending_cleanup else .fired,
+        }, try first);
+        try std.testing.expect(occupied_after_first);
+        try std.testing.expect(first_retired);
+        try std.testing.expect(second_live);
+        try std.testing.expectEqual(Completion{
+            .handle = handle,
+            .event = if (cancel_first) .fired else .cleanup_complete,
+        }, try second);
+        try std.testing.expectEqual(@as(usize, 1), timers.available());
+        try std.testing.expectEqual(@as(usize, 2), router.available());
+        try std.testing.expectError(error.StaleHandle, timers.get(handle));
+    }
 }
 
 test "real io_uring absolute timeout fires" {
