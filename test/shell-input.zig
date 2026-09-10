@@ -3535,6 +3535,8 @@ fn layerPopupOutputLifecycle(power_cycle: bool) !void {
     var fixture = try physical_fixture.Fixture.init();
     defer fixture.deinit();
     fixture.second_desktop = true;
+    fixture.second_mode_width = 4;
+    fixture.mode_height = 3;
     var root_config = physical_fixture.compositorConfig();
     root_config.runtime.object_capacity = 52;
     root_config.runtime.object_quota = 52;
@@ -3556,6 +3558,16 @@ fn layerPopupOutputLifecycle(power_cycle: bool) !void {
     config.output.max_samples = 3;
     config.output.max_source_bytes = pixels.len * 2;
     const coordinator = try Coordinator.create(allocator, root, fixture.platformsWithHotplug(), config);
+    var reference = try ouro.config.defaultSnapshot(allocator);
+    defer reference.deinit();
+    const rules = [_]ouro.config.OutputRule{
+        .{ .name = "laptop", .match = .{ .connector_id = 10 }, .settings = .{ .scale_120 = 180 } },
+        .{ .name = "external", .match = .{ .connector_id = 11 }, .settings = .{ .scale_120 = 150, .position = .{ .x = 2, .y = -1 } } },
+    };
+    var engine = try Coordinator.EngineSettings.init(allocator, &.{}, &rules);
+    var bindings = try Coordinator.Bindings.snapshotFromReferenceConfig(allocator, &reference);
+    var policy: Coordinator.PolicySnapshot = .{ .inner_gap = 0, .outer_gap = 0 };
+    try coordinator.installConfig(&engine, &bindings, &policy);
     var loop = try Loop.init(
         allocator,
         root,
@@ -3599,6 +3611,8 @@ fn layerPopupOutputLifecycle(power_cycle: bool) !void {
         .minimum_outputs = 2,
         .reactive = true,
         .test_output_power = power_cycle,
+        .layer_height = 1,
+        .fractional_scale = true,
         // Model Vulkan clients which cannot allocate their first buffer until
         // the compositor publishes the selected output.
         .require_layer_enter_before_map = true,
@@ -3616,7 +3630,7 @@ fn layerPopupOutputLifecycle(power_cycle: bool) !void {
             try std.testing.expectEqual(@as(usize, 1), layer_ids.len);
             const layer_state = try coordinator.layer_shell_adapter.state(layer_ids[0]);
             const work_area: @TypeOf(coordinator.desktop.workArea()) =
-                .{ .x = 0, .y = 1, .width = 6, .height = 1 };
+                .{ .x = 0, .y = 0, .width = 5, .height = 2 };
             try std.testing.expectEqual(work_area, coordinator.desktop.workArea());
             var popup_storage: [2]@TypeOf(coordinator.scene_windows[0]) = undefined;
             const popups = try coordinator.desktop.externalPopupSnapshot(
@@ -3641,15 +3655,21 @@ fn layerPopupOutputLifecycle(power_cycle: bool) !void {
             }
             try std.testing.expectEqual(layer.binding.?.surface, submitted[0].surface);
             try std.testing.expectEqual(popup.binding.?.surface, submitted[1].surface);
-            try std.testing.expectEqual(@as(i32, 3), layer.sample.?.destination.x);
+            // The bar lies wholly in its exclusive strip, outside both work
+            // areas. Its popup must still render on the external output.
+            try std.testing.expectEqual(@as(i32, 2), layer.sample.?.destination.x);
+            try std.testing.expectEqual(@as(i32, -1), layer.sample.?.destination.y);
+            try std.testing.expectEqual(@as(i32, 3), popups[0].geometry.x);
+            try std.testing.expectEqual(@as(i32, -1), popups[0].geometry.y);
             try std.testing.expectEqual(@as(usize, 0), (try coordinator.desktop.sceneSnapshot(coordinator.scene_windows)).len);
             observed = true;
         }
-        if (observed and handler.releases == 2) break;
+        if (observed and handler.releases == 2 and handler.popup_preferred_scale == 150) break;
         if (root.ring.cq_ready() == 0 and client_reactor.ring.cq_ready() == 0)
             try waitForEither(&root.ring, client_reactor.ring);
     }
     try std.testing.expect(observed);
+    try std.testing.expectEqual(@as(u32, 150), handler.popup_preferred_scale);
     try std.testing.expectEqual(@as(usize, 2), handler.releases);
     try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
     try std.testing.expectEqual(@as(usize, 1), handler.layer_enters);
@@ -7435,6 +7455,10 @@ const LayerPopupHandler = struct {
     require_layer_enter_before_map: bool = false,
     popup_mapped: bool = false,
     reactive: bool = false,
+    layer_height: i32 = 2,
+    fractional_scale: bool = false,
+    fractional_manager: ?wayring.objects.Handle = null,
+    popup_preferred_scale: u32 = 0,
     hold_popup_configures: bool = false,
     popup_configures: [8]u32 = undefined,
     popup_configure_count: usize = 0,
@@ -7537,6 +7561,10 @@ const LayerPopupHandler = struct {
                 .popup_done => self.popup_done += 1,
                 else => {},
             }
+        } else if (target.object.interface == &protocol.wp_fractional_scale_v1.info) {
+            switch (try protocol.wp_fractional_scale_v1.decodeEvent(message, fds)) {
+                .preferred_scale => |value| self.popup_preferred_scale = value.scale,
+            }
         } else if (target.object.interface == &protocol.xdg_toplevel.info) {
             _ = try protocol.xdg_toplevel.decodeEvent(message, fds);
         } else if (target.object.interface == &protocol.xdg_surface.info) {
@@ -7624,6 +7652,8 @@ const LayerPopupHandler = struct {
         }
         if (self.test_output_power and std.mem.eql(u8, value.interface, protocol.zwlr_output_power_manager_v1.info.name))
             self.power_manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.zwlr_output_power_manager_v1.info, 1, null);
+        if (self.fractional_scale and std.mem.eql(u8, value.interface, protocol.wp_fractional_scale_manager_v1.info.name))
+            self.fractional_manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wp_fractional_scale_manager_v1.info, 1, null);
         if (std.mem.eql(u8, value.interface, protocol.zwlr_layer_shell_v1.info.name))
             self.layer_shell = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.zwlr_layer_shell_v1.info, @min(value.version, 5), null);
     }
@@ -7632,6 +7662,7 @@ const LayerPopupHandler = struct {
         if (self.created or self.compositor == null or self.shm == null or
             self.wm_base == null or (!self.toplevel_root and self.layer_shell == null) or
             (self.test_output_power and self.power_manager == null) or
+            (self.fractional_scale and self.fractional_manager == null) or
             self.output_count < self.minimum_outputs) return;
         if (self.test_output_power) for (self.power_outputs, 0..) |output, index| {
             self.powers[index] = (try protocol.zwlr_output_power_manager_v1.construct_get_output_power(
@@ -7680,7 +7711,7 @@ const LayerPopupHandler = struct {
             },
         )).id;
         try protocol.zwlr_layer_surface_v1.encodeRequest(self.queue, self.layer_surface.?.id, .{
-            .set_size = .{ .width = 3, .height = 2 },
+            .set_size = .{ .width = 3, .height = @intCast(self.layer_height) },
         });
         try protocol.zwlr_layer_surface_v1.encodeRequest(self.queue, self.layer_surface.?.id, .{
             .set_anchor = .{ .anchor = .{ .value = 13 } },
@@ -7700,6 +7731,12 @@ const LayerPopupHandler = struct {
             self.compositor.?,
             .{},
         )).id;
+        if (self.fractional_manager) |manager| _ = try protocol.wp_fractional_scale_manager_v1.construct_get_fractional_scale(
+            self.objects,
+            self.queue,
+            manager,
+            .{ .surface = self.popup_surface.?.id },
+        );
         self.popup_xdg_surface = (try protocol.xdg_wm_base.construct_get_xdg_surface(
             self.objects,
             self.queue,
@@ -7806,7 +7843,7 @@ const LayerPopupHandler = struct {
             .{
                 .offset = 16,
                 .width = if (index == 0 and !self.toplevel_root) 3 else if (index == 0) 2 else 1,
-                .height = if (index == 0) 2 else 1,
+                .height = if (index == 0) self.layer_height else 1,
                 .stride = 16,
                 .format = .argb8888,
             },

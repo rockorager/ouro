@@ -12178,6 +12178,7 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn layerShellSceneState(self: *Self, state: LayerShellAdapter.State) ?Desktop.SceneWindow {
             const rect = self.layerGeometry(state) catch return null;
+            const physical = self.physicalOutputForProtocolId(state.output) orelse return null;
             return .{
                 // Interaction targets require a desktop-shaped identity even
                 // when `managed` is false. Keep it valid and outside the
@@ -12191,6 +12192,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .managed = false,
                 .keyboard_focusable = state.keyboard_interactivity != .none,
                 .geometry = rect,
+                .popup_bounds = self.outputBoundsFor(physical) catch return null,
                 .visible = state.mapped,
                 .stacking = @intFromEnum(state.layer),
                 .mode = .floating,

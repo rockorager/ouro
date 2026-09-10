@@ -4589,6 +4589,7 @@ pub const Fixture = struct {
     discover_cards: bool = true,
     first_desktop: bool = true,
     first_mode_width: u16 = 3,
+    mode_height: u16 = 2,
     second_desktop: bool = false,
     second_mode_width: u16 = 3,
     change_second_mode_after_read: bool = false,
@@ -4819,7 +4820,7 @@ pub const Fixture = struct {
         const self: *Fixture = @ptrCast(@alignCast(context));
         out.reset();
         out.connectors[0] = .{ .id = 10, .connector_type = 1, .connector_type_id = 1, .connected = true, .desktop = self.first_desktop, .width_mm = 1, .height_mm = 1, .encoder_id = 20, .mode_start = 0, .mode_count = 1, .encoder_start = 0, .encoder_count = 1, .properties = .{ .crtc_id = 1, .vrr_capable = self.vrr_supported } };
-        out.modes[0] = .{ .clock = 1, .hdisplay = self.first_mode_width, .hsync_start = self.first_mode_width, .hsync_end = self.first_mode_width, .htotal = self.first_mode_width, .hskew = 0, .vdisplay = 2, .vsync_start = 2, .vsync_end = 2, .vtotal = 2, .vscan = 0, .vrefresh = 60, .flags = 0, .mode_type = 0 };
+        out.modes[0] = .{ .clock = 1, .hdisplay = self.first_mode_width, .hsync_start = self.first_mode_width, .hsync_end = self.first_mode_width, .htotal = self.first_mode_width, .hskew = 0, .vdisplay = self.mode_height, .vsync_start = self.mode_height, .vsync_end = self.mode_height, .vtotal = self.mode_height, .vscan = 0, .vrefresh = 60, .flags = 0, .mode_type = 0 };
         out.connector_encoders[0] = 20;
         out.encoders[0] = .{ .id = 20, .crtc_id = 30, .possible_crtcs = 1 };
         out.crtcs[0] = .{ .id = 30, .index = 0, .properties = .{ .active = 2, .mode_id = 3, .vrr_enabled = if (self.vrr_supported) 15 else 0 } };

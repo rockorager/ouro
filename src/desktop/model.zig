@@ -126,6 +126,9 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
             managed: bool = true,
             keyboard_focusable: bool = true,
             geometry: geometry.Rect,
+            // External roots can bind their popup tree to an exact output,
+            // including reserved areas that do not intersect desktop work areas.
+            popup_bounds: ?geometry.Rect = null,
             has_window_geometry: bool = false,
             surface_offset: geometry.Point = .{ .x = 0, .y = 0 },
             visible: bool,
@@ -1522,7 +1525,7 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
             const positioned = try placePopup(
                 value.placement,
                 parent.geometry,
-                outputAreaForRect(parent.geometry, desktop.outputAreas()),
+                desktop.popupBounds(parent.geometry, root_surface),
             );
             const configure: Shell.PopupConfigure = .{
                 .x = positioned.x,
@@ -1716,7 +1719,7 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
             const positioned = try placePopup(
                 value.placement,
                 parent.geometry,
-                outputAreaForRect(parent.geometry, desktop.outputAreas()),
+                desktop.popupBounds(parent.geometry, slot.root_surface),
             );
             const configure: Shell.PopupConfigure = .{
                 .x = positioned.x,
@@ -2131,7 +2134,7 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
                 const positioned = placePopup(
                     popup.placement,
                     parent.geometry,
-                    outputAreaForRect(parent.geometry, desktop.outputAreas()),
+                    desktop.popupBounds(parent.geometry, popup.root_surface),
                 ) catch unreachable;
                 const configure: Shell.PopupConfigure = .{
                     .x = positioned.x,
@@ -2165,6 +2168,12 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
                 };
                 desktop.popup_command_len += 1;
             }
+        }
+
+        fn popupBounds(desktop: *const Self, parent: geometry.Rect, root_surface: Shell.SurfaceId) geometry.Rect {
+            if (desktop.externalRootForSurface(root_surface)) |root|
+                if (root.popup_bounds) |bounds| return bounds;
+            return outputAreaForRect(parent, desktop.outputAreas());
         }
 
         fn externalRootForSurface(desktop: *const Self, surface: Shell.SurfaceId) ?SceneWindow {
@@ -4473,6 +4482,108 @@ test "desktop: reactive popup reconfigures when its root changes output" {
     shell.push(.{ .popup_commit_ready = .{ .id = popup_id, .serial = moved_serial } });
     _ = try desktop.consume(&shell, 1);
     try std.testing.expectEqual(@as(i32, 70), (try desktop.sceneForSurface(popup_surface)).geometry.x);
+}
+
+test "desktop: layer popup tree uses bound output outside reserved work areas" {
+    for ([_]i32{ 420, 340 }, [_]i32{ 257, 124 }) |width, height| {
+        var desktop = try initTestDesktop(8);
+        defer desktop.deinit();
+        // Logical geometry for a 150% laptop beside a 125% external output.
+        // Both bars reserve 40px, so the external bar intersects neither area.
+        const areas = [_]geometry.Rect{
+            .{ .x = 0, .y = 40, .width = 1920, .height = 1160 },
+            .{ .x = 1920, .y = -488, .width = 3072, .height = 1688 },
+        };
+        desktop.applyOutputAreas(&areas);
+        const root_surface: TestShell.SurfaceId = .{ .index = 10, .generation = 1 };
+        const popup_surface: TestShell.SurfaceId = .{ .index = 11, .generation = 1 };
+        const popup_id: TestShell.PopupId = .{ .index = 0, .generation = 1 };
+        var root: TestDesktop.SceneWindow = .{
+            .id = .{ .index = 99, .generation = 1 },
+            .surface = root_surface,
+            .managed = false,
+            .geometry = .{ .x = 1920, .y = -528, .width = 3072, .height = 40 },
+            .popup_bounds = .{ .x = 1920, .y = -528, .width = 3072, .height = 1728 },
+            .visible = true,
+            .stacking = 1,
+            .mode = .floating,
+            .content_ready = true,
+        };
+        try desktop.setExternalRoot(root);
+        var placement: TestShell.PopupPlacement = .{
+            .width = width,
+            .height = height,
+            .anchor_x = 2720,
+            .anchor_y = 0,
+            .anchor_width = 40,
+            .anchor_height = 40,
+            .anchor = 8, // bottom right
+            .gravity = 6, // bottom left: end-aligned below the anchor
+            .constraint_adjustment = 1 | 2,
+            .offset_x = 0,
+            .offset_y = 4,
+            .reactive = true,
+        };
+        // The old work-area fallback reproduces the user's exact bad configure.
+        try std.testing.expectEqual(PopupGeometry{
+            .x = -width,
+            .y = 568,
+            .width = width,
+            .height = height,
+        }, try placePopup(placement, root.geometry, outputAreaForRect(root.geometry, &areas)));
+        var shell = TestShell{};
+        shell.push(.{ .popup_created = .{
+            .id = popup_id,
+            .surface = popup_surface,
+            .parent = root_surface,
+            .placement = placement,
+        } });
+        shell.push(.{ .popup_commit_ready = .{ .id = popup_id, .serial = 0, .initial_commit = true } });
+        _ = try desktop.consume(&shell, 2);
+        const serial = (try desktop.flushConfigure(&shell)).?;
+        try std.testing.expectEqual(@as(i32, 2760) - width, shell.popup_configured.?.x);
+        try std.testing.expectEqual(@as(i32, 44), shell.popup_configured.?.y);
+        shell.push(.{ .popup_commit_ready = .{ .id = popup_id, .serial = serial } });
+        _ = try desktop.consume(&shell, 1);
+        try std.testing.expectEqual(geometry.Rect{
+            .x = 4680 - width,
+            .y = -484,
+            .width = width,
+            .height = height,
+        }, (try desktop.sceneForSurface(popup_surface)).geometry);
+
+        // Explicit reposition must use the same bounds and slide at the right edge.
+        placement.anchor_x = 3200;
+        shell.push(.{ .popup_reposition_requested = .{ .id = popup_id, .placement = placement, .token = 7 } });
+        _ = try desktop.consume(&shell, 1);
+        const reposition_serial = (try desktop.flushConfigure(&shell)).?;
+        try std.testing.expectEqual(@as(i32, 3072) - width, shell.popup_configured.?.x);
+        try std.testing.expectEqual(@as(i32, 44), shell.popup_configured.?.y);
+        shell.push(.{ .popup_commit_ready = .{ .id = popup_id, .serial = reposition_serial } });
+        _ = try desktop.consume(&shell, 1);
+
+        // A bounds-only output change must reconfigure reactive popups.
+        root.popup_bounds.?.width = 3000;
+        try desktop.setExternalRoot(root);
+        _ = (try desktop.flushConfigure(&shell)).?;
+        try std.testing.expectEqual(@as(i32, 3000) - width, shell.popup_configured.?.x);
+
+        // Nested popups inherit the updated root bounds rather than selecting
+        // the still-wider desktop work area from their immediate parent.
+        const child_id: TestShell.PopupId = .{ .index = 1, .generation = 1 };
+        placement.anchor_x = 4000;
+        shell.push(.{ .popup_created = .{
+            .id = child_id,
+            .surface = .{ .index = 12, .generation = 1 },
+            .parent = popup_surface,
+            .placement = placement,
+        } });
+        shell.push(.{ .popup_commit_ready = .{ .id = child_id, .serial = 0, .initial_commit = true } });
+        _ = try desktop.consume(&shell, 2);
+        _ = (try desktop.flushConfigure(&shell)).?;
+        const parent = try desktop.sceneForSurface(popup_surface);
+        try std.testing.expectEqual(@as(i32, 4920), parent.geometry.x + shell.popup_configured.?.x + width);
+    }
 }
 
 test "desktop: popup placement flips before sliding or resizing" {
