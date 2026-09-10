@@ -764,7 +764,7 @@ fn clippedPlanRect(
     );
 }
 
-fn subtractRect(
+pub fn subtractRect(
     allocator: std.mem.Allocator,
     output: *std.ArrayListUnmanaged(render.Rect),
     value: render.Rect,
@@ -800,7 +800,7 @@ fn rectFromEdges(left: i64, top: i64, right: i64, bottom: i64) ?render.Rect {
     return .{ .x = @intCast(left), .y = @intCast(top), .width = @intCast(right - left), .height = @intCast(bottom - top) };
 }
 
-fn intersect(a: render.Rect, b: render.Rect) ?render.Rect {
+pub fn intersect(a: render.Rect, b: render.Rect) ?render.Rect {
     return rectFromEdges(
         @max(a.x, b.x),
         @max(a.y, b.y),

@@ -193,6 +193,7 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
             initial_committed: bool = false,
             content_ready: bool = false,
             configured: bool = false,
+            repaint_suspended: bool = false,
             last_configure: Shell.ToplevelConfigure = .{ .width = 0, .height = 0 },
             applied_configure: ?Shell.ToplevelConfigure = null,
             expected_serial: ?u32 = null,
@@ -806,6 +807,24 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
             const changed = desktop.scene_changed;
             desktop.scene_changed = false;
             return changed;
+        }
+
+        /// Repaint availability is independent of workspace/input visibility.
+        /// A state-only notification must not create a layout barrier: clients
+        /// are explicitly allowed to stop repainting while suspended.
+        pub fn setRepaintSuspended(desktop: *Self, id: ToplevelId, suspended: bool) !void {
+            const index = try desktop.resolveIndex(id);
+            const slot = &desktop.slots[index];
+            const effective = desktop.desired[index].suspended or suspended;
+            if (slot.configured and slot.last_configure.states.suspended != effective) {
+                try desktop.requireCommandCapacity(1);
+                var configure = slot.last_configure;
+                configure.states.suspended = effective;
+                desktop.enqueue(.{ .id = id, .shell_id = slot.shell_id, .configure = configure });
+                slot.last_configure = configure;
+                if (slot.applied_configure) |*applied| applied.states.suspended = effective;
+            }
+            slot.repaint_suspended = suspended;
         }
 
         pub fn foreignToplevelChanged(desktop: *const Self) bool {
@@ -1838,6 +1857,7 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
                 desktop.foreign_toplevel_changed;
             slot.initial_committed = false;
             slot.configured = false;
+            slot.repaint_suspended = false;
             slot.applied_configure = null;
             slot.expected_serial = null;
             slot.configure_ready = false;
@@ -1967,7 +1987,7 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
                         .tiled_top = desired.mode == .tiled and desired.rect.y == output_area.y,
                         .tiled_bottom = desired.mode == .tiled and
                             desired.rect.y + desired.rect.height == output_area.y + output_area.height,
-                        .suspended = desired.suspended,
+                        .suspended = desired.suspended or slot.repaint_suspended,
                     },
                 };
                 if (!slot.configured or !std.meta.eql(slot.last_configure, configure)) {
@@ -3436,6 +3456,59 @@ test "desktop: workspace switches publish visibility before suspended configures
     try std.testing.expect(!desktop.slots[window.index].last_configure.states.suspended);
     try std.testing.expectEqual(established.geometry, restored.geometry);
     try std.testing.expect(desktop.takeSceneChanged());
+}
+
+test "desktop: repaint suspension is deduplicated and never creates a layout barrier" {
+    var desktop = try initTestDesktop(8);
+    defer desktop.deinit();
+    var shell = TestShell{};
+    shell.push(created(0));
+    _ = try desktop.consume(&shell, 1);
+    try settleDesktop(&desktop, &shell);
+    const id = try desktop.idForShell(.{ .index = 0, .generation = 1 });
+    const established = try desktop.scene(id);
+    _ = desktop.takeSceneChanged();
+
+    try desktop.setRepaintSuspended(id, true);
+    try std.testing.expect(desktop.peekCommand().?.configure.states.suspended);
+    try std.testing.expect(!desktop.transactionPending());
+    try std.testing.expectEqual(established, try desktop.scene(id));
+    try std.testing.expect(!desktop.takeSceneChanged());
+    try desktop.setRepaintSuspended(id, true);
+    try std.testing.expectEqual(@as(usize, 1), desktop.pendingCommands());
+    _ = try desktop.flushConfigure(&shell);
+    try std.testing.expect(!desktop.transactionPending());
+
+    // Exposure must wake the client without an intervening ack or commit.
+    try desktop.setRepaintSuspended(id, false);
+    try std.testing.expect(!desktop.peekCommand().?.configure.states.suspended);
+    try std.testing.expect(!desktop.transactionPending());
+    try std.testing.expectEqual(established, try desktop.scene(id));
+}
+
+test "desktop: repaint updates preserve an outstanding resize transaction" {
+    var desktop = try initTestDesktop(8);
+    defer desktop.deinit();
+    var shell = TestShell{};
+    shell.push(created(0));
+    _ = try desktop.consume(&shell, 1);
+    try settleDesktop(&desktop, &shell);
+    const id = try desktop.idForShell(.{ .index = 0, .generation = 1 });
+    const established = try desktop.scene(id);
+    try desktop.validateTopology(.{ .x = 0, .y = 0, .width = 137, .height = 83 }, &.{
+        .{ .id = desktop.output_ids[0], .geometry = .{ .x = 0, .y = 0, .width = 137, .height = 83 } },
+    });
+    desktop.applyTopology(.{ .x = 0, .y = 0, .width = 137, .height = 83 }, &.{
+        .{ .id = desktop.output_ids[0], .geometry = .{ .x = 0, .y = 0, .width = 137, .height = 83 } },
+    });
+    try std.testing.expect(desktop.transactionPending());
+    try desktop.setRepaintSuspended(id, true);
+    try std.testing.expect(desktop.transactionPending());
+    try std.testing.expectEqual(established.geometry, (try desktop.scene(id)).geometry);
+    try settleDesktop(&desktop, &shell);
+    try std.testing.expect(!desktop.transactionPending());
+    try std.testing.expectEqual(@as(i32, 137), (try desktop.scene(id)).geometry.width);
+    try std.testing.expect(desktop.slots[id.index].last_configure.states.suspended);
 }
 
 test "desktop: hidden windows decline focus requests without changing focus" {

@@ -51,6 +51,7 @@ pub const vulkan_renderer = @import("render/vulkan.zig");
 pub const vulkan_platform = @import("render/vulkan_platform.zig");
 pub const render_list = @import("scene/render_list.zig");
 pub const scene_damage = @import("scene/damage.zig");
+pub const scene_visibility = @import("scene/visibility.zig");
 pub const headless_output = @import("output/headless.zig");
 pub const real_output = @import("output/drm.zig");
 pub const core_surface = @import("protocol/core_surface.zig");
@@ -162,6 +163,7 @@ test {
     _ = vulkan_platform;
     _ = render_list;
     _ = scene_damage;
+    _ = scene_visibility;
     _ = headless_output;
     _ = real_output;
     _ = core_surface;

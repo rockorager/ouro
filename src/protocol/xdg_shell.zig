@@ -1273,7 +1273,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     }
                     if (command.phase == 1) {
                         var state_bytes: [9 * 4]u8 = undefined;
-                        const states = encodeStates(command.value.states, &state_bytes);
+                        const states = encodeStates(command.value.states, role.version, &state_bytes);
                         try Toplevel.encodeEvent(queue, role.header.resource.id, .{ .configure = .{
                             .width = command.value.width,
                             .height = command.value.height,
@@ -2597,18 +2597,18 @@ fn serialAtOrBefore(value: u32, limit: u32) bool {
     return @as(i32, @bitCast(limit -% value)) >= 0;
 }
 
-fn encodeStates(states: anytype, storage: *[9 * 4]u8) []const u8 {
+fn encodeStates(states: anytype, version: u32, storage: *[9 * 4]u8) []const u8 {
     var offset: usize = 0;
     inline for (.{
         .{ states.maximized, StateValue.maximized },
         .{ states.fullscreen, StateValue.fullscreen },
         .{ states.resizing, StateValue.resizing },
         .{ states.activated, StateValue.activated },
-        .{ states.tiled_left, StateValue.tiled_left },
-        .{ states.tiled_right, StateValue.tiled_right },
-        .{ states.tiled_top, StateValue.tiled_top },
-        .{ states.tiled_bottom, StateValue.tiled_bottom },
-        .{ states.suspended, StateValue.suspended },
+        .{ states.tiled_left and version >= 2, StateValue.tiled_left },
+        .{ states.tiled_right and version >= 2, StateValue.tiled_right },
+        .{ states.tiled_top and version >= 2, StateValue.tiled_top },
+        .{ states.tiled_bottom and version >= 2, StateValue.tiled_bottom },
+        .{ states.suspended and version >= 6, StateValue.suspended },
     }) |entry| if (entry[0]) {
         std.mem.writeInt(u32, storage[offset..][0..4], @intFromEnum(entry[1]), native_endian);
         offset += 4;
@@ -3064,6 +3064,36 @@ fn expectClientOutbound(
     try std.testing.expectEqual(@as(usize, close_message.header.size), bytes.len);
 }
 
+fn expectToplevelConfigureStates(
+    context: *TestContext,
+    queue: *wayring.tx.Queue,
+    expected: []const []const u8,
+) !void {
+    var descriptor_scratch: [1]std.os.linux.fd_t = undefined;
+    var control: [64]u8 align(@alignOf(std.os.linux.cmsghdr)) = undefined;
+    const snapshot = try queue.snapshot(&descriptor_scratch, &control);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.second.len);
+    var bytes = snapshot.first;
+    for (expected) |expected_states| {
+        const role_message = (try wayring.wire.Message.decode(bytes)).?;
+        const role_event = try test_protocol.xdg_toplevel.decodeEvent(
+            role_message,
+            &context.received_fds,
+        );
+        const states = switch (role_event) {
+            .configure => |configure| configure.states,
+            else => return error.UnexpectedEvent,
+        };
+        try std.testing.expectEqualSlices(u8, expected_states, states);
+        bytes = bytes[role_message.header.size..];
+
+        const surface_message = (try wayring.wire.Message.decode(bytes)).?;
+        _ = try test_protocol.xdg_surface.decodeEvent(surface_message, &context.received_fds);
+        bytes = bytes[surface_message.header.size..];
+    }
+    try std.testing.expectEqual(@as(usize, 0), bytes.len);
+}
+
 test "xdg-shell: serial ordering is wrap safe" {
     try std.testing.expect(serialAtOrBefore(10, 10));
     try std.testing.expect(serialAtOrBefore(std.math.maxInt(u32), 1));
@@ -3113,7 +3143,7 @@ test "xdg-shell: state arrays contain native protocol uints" {
         .tiled_top = false,
         .tiled_bottom = false,
         .suspended = false,
-    }, &storage);
+    }, 7, &storage);
     try std.testing.expectEqual(@as(usize, 8), bytes.len);
     try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, bytes[0..4], native_endian));
     try std.testing.expectEqual(@as(u32, 4), std.mem.readInt(u32, bytes[4..8], native_endian));
@@ -3724,6 +3754,62 @@ test "xdg-shell: pre-v5 toplevel configure omits wm capabilities" {
     const message = (try wayring.wire.Message.decode(snapshot.first)).?;
     const event = try test_protocol.xdg_toplevel.decodeEvent(message, &context.received_fds);
     try std.testing.expectEqual(@as(i32, 80), event.configure.width);
+}
+
+test "xdg-shell: pre-v6 configure omits suspended without changing transitions" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    context.server_objects.namespace.resolve(context.manager).?.version = 5;
+    const id = try context.createToplevel();
+    context.adapter.toplevels[id.index].capabilities_sent = true;
+
+    _ = try context.adapter.queueToplevelConfigure(id, .{
+        .width = 80,
+        .height = 60,
+        .states = .{ .suspended = true },
+    });
+    _ = try context.adapter.queueToplevelConfigure(id, .{
+        .width = 80,
+        .height = 60,
+        .states = .{ .suspended = false },
+    });
+    try std.testing.expectEqual(@as(usize, 2), context.adapter.pendingOutbound());
+
+    var output = wayring.tx.Queue.init(&context.blocks, 128, &context.descriptors, 0);
+    defer output.deinit();
+    try std.testing.expectEqual(@as(usize, 2), try context.adapter.flushOn(
+        &context.server_objects,
+        &output,
+    ));
+    try expectToplevelConfigureStates(context, &output, &.{ &.{}, &.{} });
+}
+
+test "xdg-shell: v6 configure includes suspended and transition clearing" {
+    const context = try TestContext.init();
+    defer context.deinit();
+    context.server_objects.namespace.resolve(context.manager).?.version = 6;
+    const id = try context.createToplevel();
+    context.adapter.toplevels[id.index].capabilities_sent = true;
+
+    _ = try context.adapter.queueToplevelConfigure(id, .{
+        .width = 80,
+        .height = 60,
+        .states = .{ .suspended = true },
+    });
+    _ = try context.adapter.queueToplevelConfigure(id, .{
+        .width = 80,
+        .height = 60,
+        .states = .{ .suspended = false },
+    });
+
+    var output = wayring.tx.Queue.init(&context.blocks, 128, &context.descriptors, 0);
+    defer output.deinit();
+    try std.testing.expectEqual(@as(usize, 2), try context.adapter.flushOn(
+        &context.server_objects,
+        &output,
+    ));
+    const suspended: u32 = 9;
+    try expectToplevelConfigureStates(context, &output, &.{ std.mem.asBytes(&suspended), &.{} });
 }
 
 test "xdg-shell: unmap resets role state and requires a fresh initial commit" {

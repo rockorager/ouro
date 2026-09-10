@@ -6301,6 +6301,225 @@ const InputMethodHandler = struct {
     }
 };
 
+test "shell-input: repaint visibility publishes suspended lifecycle without client commits" {
+    try repaintSuspendedLifecycle(false);
+    try repaintSuspendedLifecycle(true);
+}
+
+fn repaintSuspendedLifecycle(second_desktop: bool) !void {
+    const allocator = std.testing.allocator;
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-repaint-suspend-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+
+    var fixture = try physical_fixture.Fixture.init();
+    defer fixture.deinit();
+    fixture.second_desktop = second_desktop;
+    var root_config = physical_fixture.compositorConfig();
+    root_config.runtime.object_capacity = 40;
+    root_config.runtime.object_quota = 40;
+    root_config.runtime.actor.received_fd_budget = 2;
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), root_config);
+    var config = physical_fixture.coordinatorConfig();
+    config.shm.pool_capacity = 2;
+    config.shm.buffer_capacity = 2;
+    config.surface.surface_capacity = 2;
+    config.surface.frame_callback_capacity = 2;
+    config.surface.content_update_capacity = 4;
+    config.surface.dependency_capacity = 2;
+    config.surface.attachment_capacity = 2;
+    config.surface.copy_capacity = 2;
+    config.output.max_samples = 3;
+    config.output.max_source_bytes = pixels.len * 2;
+    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), config);
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
+    try coordinator.start(&loop);
+
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(allocator, .{ .entries = 16, .flags = 0 }, physical_fixture.clientReactorConfig());
+    var client = try ClientConnection.attach(
+        allocator,
+        &reactor,
+        try wayring.unix_socket.connect(path),
+        .{ .received_fd_budget = 2, .transmit_byte_budget = 4096, .transmit_fd_budget = 2 },
+        .{ .max_objects = 40, .max_client_ids = 39 },
+    );
+    const actor = try client.actor();
+    var driver = ClientDriver.init(&client);
+    const registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null);
+    var handler: MultiHandler = .{
+        .objects = &client.objects,
+        .queue = &actor.transmit,
+        .registry = registry,
+        .cycle_count = 1,
+        .opaque_on_map = true,
+        .repaint_lifecycle_mode = true,
+    };
+    try submitMultiClient(&reactor, &driver, &handler);
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    for (0..512) |_| {
+        _ = try drainMultiClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.mapped[0] and handler.mapped[1] and handler.power != null and
+            (try coordinator.desktop.sceneSnapshot(coordinator.scene_windows)).len == 2) break;
+        _ = linux.sched_yield();
+    }
+    const windows = try coordinator.desktop.sceneSnapshot(coordinator.scene_windows);
+    try std.testing.expectEqual(@as(usize, 2), windows.len);
+    for (windows) |window| {
+        try coordinator.desktop.setFloating(window.id, true);
+        try coordinator.desktop.setFloatingGeometry(window.id, .{ .x = 0, .y = 0, .width = 3, .height = 2 });
+    }
+    for (0..256) |_| {
+        _ = try drainMultiClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.suspended[0] and !handler.suspended[1]) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(handler.suspended[0]);
+    try std.testing.expect(!handler.suspended[1]);
+
+    // A suspended client may stop committing. Removing its cover must still
+    // deliver the clearing configure solely from retained scene state.
+    handler.no_commit_on_reconfigure = true;
+    const lower_configures = handler.configure_count[0];
+    try wayring.client.sendRequest(
+        protocol.xdg_toplevel,
+        handler.objects,
+        handler.queue,
+        handler.toplevels[1].?,
+        .{ .destroy = .{} },
+    );
+    try submitMultiClient(&reactor, &driver, &handler);
+    for (0..256) |_| {
+        _ = try drainMultiClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (!handler.suspended[0] and handler.configure_count[0] > lower_configures) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(!handler.suspended[0]);
+    try std.testing.expect(handler.configure_count[0] > lower_configures);
+
+    // Offscreen placement and exposure also work without another client
+    // commit: the renderer must retain the offscreen content.
+    const remaining_id = (try coordinator.desktop.sceneSnapshot(coordinator.scene_windows))[0].id;
+    for ([_]i32{ 100, 0 }) |x| {
+        try coordinator.desktop.setFloatingGeometry(remaining_id, .{ .x = x, .y = 0, .width = 3, .height = 2 });
+        _ = coordinator.desktop.expireTransaction();
+        for (0..256) |_| {
+            _ = try drainMultiClient(&reactor, &driver, &handler);
+            _ = try loop.turn(coordinator);
+            if (handler.suspended[0] == (x != 0)) break;
+        }
+        try std.testing.expectEqual(x != 0, handler.suspended[0]);
+    }
+
+    const lock = (try protocol.ext_session_lock_manager_v1.construct_lock(
+        handler.objects,
+        handler.queue,
+        handler.lock_manager.?,
+        .{},
+    )).id;
+    try submitMultiClient(&reactor, &driver, &handler);
+    for (0..512) |_| {
+        _ = try drainMultiClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.suspended[0] and handler.locked) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expect(handler.suspended[0]);
+    try std.testing.expect(handler.locked);
+    try wayring.client.sendRequest(protocol.ext_session_lock_v1, handler.objects, handler.queue, lock, .{ .unlock_and_destroy = .{} });
+    try submitMultiClient(&reactor, &driver, &handler);
+    for (0..512) |_| {
+        _ = try drainMultiClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (!handler.suspended[0]) break;
+    }
+    try std.testing.expect(!handler.suspended[0]);
+
+    try coordinator.switchWorkspace(2);
+    for (0..256) |_| {
+        _ = try drainMultiClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.suspended[0]) break;
+    }
+    try std.testing.expect(handler.suspended[0]);
+    try coordinator.switchWorkspace(1);
+    for (0..256) |_| {
+        _ = try drainMultiClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (!handler.suspended[0]) break;
+    }
+    try std.testing.expect(!handler.suspended[0]);
+
+    if (second_desktop) {
+        // Only one pixel column remains visible on the second output. Output
+        // assignment alone must not suspend a window spanning both displays.
+        const remaining = try coordinator.desktop.sceneSnapshot(coordinator.scene_windows);
+        try coordinator.desktop.setFloatingGeometry(remaining[0].id, .{ .x = 1, .y = 0, .width = 3, .height = 2 });
+        _ = coordinator.desktop.expireTransaction();
+    }
+    try protocol.zwlr_output_power_v1.encodeRequest(handler.queue, handler.power.?.id, .{ .set_mode = .{ .mode = .off } });
+    try submitMultiClient(&reactor, &driver, &handler);
+    for (0..512) |_| {
+        _ = try drainMultiClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.suspended[0] == !second_desktop and coordinator.physical_outputs[0].kms_output == null) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expect(coordinator.physical_outputs[0].kms_output == null);
+    try std.testing.expectEqual(!second_desktop, handler.suspended[0]);
+    try protocol.zwlr_output_power_v1.encodeRequest(handler.queue, handler.power.?.id, .{ .set_mode = .{ .mode = .on } });
+    try submitMultiClient(&reactor, &driver, &handler);
+    for (0..512) |_| {
+        _ = try drainMultiClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (!handler.suspended[0] and coordinator.physical_outputs[0].kms_output != null) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expect(!handler.suspended[0]);
+
+    try fixture.signalSession(.disable);
+    for (0..512) |_| {
+        _ = try drainMultiClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.suspended[0] and coordinator.session.state == .disabled) break;
+    }
+    try std.testing.expect(handler.suspended[0]);
+    try fixture.signalSession(.enable);
+    for (0..512) |_| {
+        _ = try drainMultiClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (!handler.suspended[0] and coordinator.physical_outputs[0].kms_output != null) break;
+    }
+    try std.testing.expect(!handler.suspended[0]);
+    try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+
+    _ = try client.prepareClose();
+    try submitMultiClient(&reactor, &driver, &handler);
+    try coordinator.requestStop();
+    var drained = false;
+    for (0..512) |_| {
+        const cp = try drainMultiClient(&reactor, &driver, &handler);
+        const progress = try loop.turn(coordinator);
+        drained = progress.wayring.shutdown_complete and cp.quiescent and coordinator.backendDrainComplete();
+        if (drained) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(drained);
+    try client.deinit(allocator);
+    reactor.deinit(allocator);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
 const MultiHandler = struct {
     objects: *wayring.objects.ClientObjects,
     queue: *wayring.tx.Queue,
@@ -6355,6 +6574,16 @@ const MultiHandler = struct {
     preferred_scales: [2]u32 = .{ 0, 0 },
     initial_configure_scales: [2]?u32 = .{ null, null },
     surface_enters: [2]usize = .{ 0, 0 },
+    configure_count: [2]usize = .{ 0, 0 },
+    suspended: [2]bool = .{ false, false },
+    no_commit_on_reconfigure: bool = false,
+    opaque_on_map: bool = false,
+    repaint_lifecycle_mode: bool = false,
+    output: ?wayring.objects.Handle = null,
+    power_manager: ?wayring.objects.Handle = null,
+    power: ?wayring.objects.Handle = null,
+    lock_manager: ?wayring.objects.Handle = null,
+    locked: bool = false,
 
     pub fn eventError(
         self: *MultiHandler,
@@ -6380,6 +6609,16 @@ const MultiHandler = struct {
             _ = try protocol.wl_shm.decodeEvent(message, fds);
         } else if (target.object.interface == &protocol.wl_output.info) {
             _ = try protocol.wl_output.decodeEvent(message, fds);
+        } else if (target.object.interface == &protocol.zwlr_output_power_v1.info) {
+            switch (try protocol.zwlr_output_power_v1.decodeEvent(message, fds)) {
+                .mode => {},
+                .failed => return error.PowerFailed,
+            }
+        } else if (target.object.interface == &protocol.ext_session_lock_v1.info) {
+            switch (try protocol.ext_session_lock_v1.decodeEvent(message, fds)) {
+                .locked => self.locked = true,
+                .finished => return error.LockDenied,
+            }
         } else if (target.object.interface == &protocol.zxdg_toplevel_decoration_v1.info) {
             const index = self.indexFor(self.decorations, message.header.object_id) orelse
                 return error.UnknownDecoration;
@@ -6402,7 +6641,20 @@ const MultiHandler = struct {
                 else => {},
             }
         } else if (target.object.interface == &protocol.xdg_toplevel.info) {
-            _ = try protocol.xdg_toplevel.decodeEvent(message, fds);
+            const index = self.indexFor(self.toplevels, message.header.object_id) orelse
+                return error.UnknownToplevel;
+            switch (try protocol.xdg_toplevel.decodeEvent(message, fds)) {
+                .configure => |value| {
+                    self.configure_count[index] += 1;
+                    self.suspended[index] = false;
+                    var offset: usize = 0;
+                    while (offset + 4 <= value.states.len) : (offset += 4) {
+                        if (std.mem.readInt(u32, value.states[offset..][0..4], @import("builtin").cpu.arch.endian()) == 9)
+                            self.suspended[index] = true;
+                    }
+                },
+                else => {},
+            }
         } else if (target.object.interface == &protocol.wl_seat.info) {
             switch (try protocol.wl_seat.decodeEvent(message, fds)) {
                 .capabilities => |value| {
@@ -6479,7 +6731,7 @@ const MultiHandler = struct {
                         if (self.defer_mapping) return .continue_dispatch;
                         if (self.subsurface_mode) try self.mapSurface(1);
                         try self.mapSurface(index);
-                    } else {
+                    } else if (!self.no_commit_on_reconfigure) {
                         try protocol.wl_surface.encodeRequest(
                             self.queue,
                             self.surfaces[index].?.id,
@@ -6538,6 +6790,19 @@ const MultiHandler = struct {
             self.shm = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_shm.info, @min(value.version, 2), null);
         if (std.mem.eql(u8, value.interface, protocol.xdg_wm_base.info.name))
             self.wm_base = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.xdg_wm_base.info, @min(value.version, 7), null);
+        if (self.repaint_lifecycle_mode and self.output == null and std.mem.eql(u8, value.interface, protocol.wl_output.info.name))
+            self.output = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_output.info, @min(value.version, 4), null);
+        if (self.repaint_lifecycle_mode and std.mem.eql(u8, value.interface, protocol.zwlr_output_power_manager_v1.info.name))
+            self.power_manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.zwlr_output_power_manager_v1.info, 1, null);
+        if (self.repaint_lifecycle_mode and std.mem.eql(u8, value.interface, protocol.ext_session_lock_manager_v1.info.name))
+            self.lock_manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.ext_session_lock_manager_v1.info, 1, null);
+        if (self.repaint_lifecycle_mode and self.power == null and self.output != null and self.power_manager != null)
+            self.power = (try protocol.zwlr_output_power_manager_v1.construct_get_output_power(
+                self.objects,
+                self.queue,
+                self.power_manager.?,
+                .{ .output = self.output.?.id },
+            )).id;
         if (self.decoration_mode and std.mem.eql(u8, value.interface, protocol.zxdg_decoration_manager_v1.info.name))
             self.decoration_manager = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.zxdg_decoration_manager_v1.info, @min(value.version, 2), null);
         if ((self.activation_mode or self.subsurface_mode) and std.mem.eql(u8, value.interface, protocol.wl_seat.info.name))
@@ -6676,6 +6941,21 @@ const MultiHandler = struct {
         try protocol.wl_surface.encodeRequest(self.queue, self.surfaces[index].?.id, .{
             .damage_buffer = .{ .x = 0, .y = 0, .width = 3, .height = 2 },
         });
+        if (self.opaque_on_map) {
+            const region = (try protocol.wl_compositor.construct_create_region(
+                self.objects,
+                self.queue,
+                self.compositor.?,
+                .{},
+            )).id;
+            try protocol.wl_region.encodeRequest(self.queue, region.id, .{
+                .add = .{ .x = 0, .y = 0, .width = 3, .height = 2 },
+            });
+            try protocol.wl_surface.encodeRequest(self.queue, self.surfaces[index].?.id, .{
+                .set_opaque_region = .{ .region = region.id },
+            });
+            try wayring.client.sendRequest(protocol.wl_region, self.objects, self.queue, region, .{ .destroy = .{} });
+        }
         try protocol.wl_surface.encodeRequest(
             self.queue,
             self.surfaces[index].?.id,

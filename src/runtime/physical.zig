@@ -34,6 +34,7 @@ const diagnostics = @import("../diagnostics.zig");
 const render_pixman = @import("../render/pixman.zig");
 const render_list = @import("../scene/render_list.zig");
 const damage = @import("../scene/damage.zig");
+const scene_visibility = @import("../scene/visibility.zig");
 const geometry = @import("../scene/geometry.zig");
 const hit_test = @import("../scene/hit_test.zig");
 const presentation = @import("../presentation.zig");
@@ -522,6 +523,7 @@ pub fn Coordinator(comptime protocol: type) type {
             desired_enabled: bool = true,
             // DPMS suspends scanout, not the logical display used by clients.
             power_suspended: bool = false,
+            repaint_available: bool = false,
             removing: bool = false,
             removal_global_pending: bool = false,
             removal_protocol_retired: bool = false,
@@ -1078,6 +1080,9 @@ pub fn Coordinator(comptime protocol: type) type {
         removed_layer_len: usize = 0,
         association_surfaces: []wayring.objects.Handle,
         output_associations_dirty: bool = true,
+        repaint_visibility: scene_visibility.Tracker,
+        repaint_visibility_dirty: bool,
+        repaint_locked: bool,
         layer_surface_ids: []LayerShellAdapter.LayerSurfaceId,
         lock_surface_ids: []SessionLockAdapter.LockSurfaceId,
         inhibitor_surface_ids: []Adapter.SurfaceId,
@@ -1292,6 +1297,9 @@ pub fn Coordinator(comptime protocol: type) type {
             );
             errdefer allocator.free(self.association_surfaces);
             self.output_associations_dirty = true;
+            self.repaint_visibility = .{};
+            self.repaint_visibility_dirty = true;
+            self.repaint_locked = false;
             self.layer_surface_ids = try allocator.alloc(
                 LayerShellAdapter.LayerSurfaceId,
                 config.layer_shell.resource_capacity,
@@ -2370,6 +2378,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.allocator.free(self.inhibitor_surface_ids);
             self.allocator.free(self.layer_surface_ids);
             self.allocator.free(self.association_surfaces);
+            self.repaint_visibility.deinit(self.allocator);
             self.allocator.free(self.frame_change_layers);
             self.allocator.free(self.frame_changes);
             self.allocator.free(self.removed_layer_outputs);
@@ -3323,6 +3332,8 @@ pub fn Coordinator(comptime protocol: type) type {
             try self.syncOutputAssociations();
             try self.advanceDrain();
             try self.syncForeignToplevelOutputChanges();
+            try self.syncRepaintVisibility();
+            if (self.desktop.pendingCommands() != 0) try self.advanceShell();
             try self.flushProtocol();
             if (self.foreign_toplevel_outputs_dirty) {
                 try self.syncForeignToplevelOutputChanges();
@@ -3394,6 +3405,7 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn surfaceCommitted(context: *anyopaque, id: Adapter.SurfaceId) !void {
             const self: *Self = @ptrCast(@alignCast(context));
+            self.repaint_visibility_dirty = true;
             if (self.output_config.trace_pacing) {
                 const state = try self.adapter.getSurfaceById(id);
                 self.traceSurfacePacing("commit-published", id, state.sequence);
@@ -3573,6 +3585,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn finishPendingCandidate(self: *Self, id: Adapter.SurfaceId) void {
+            self.repaint_visibility_dirty = true;
             for (0..self.pending_surface_len) |offset| {
                 const index = (self.pending_surface_head + offset) % self.pending_surfaces.len;
                 if (std.meta.eql(self.pending_surfaces[index].id, id)) {
@@ -7055,6 +7068,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn requestOutputDamage(self: *Self) !void {
+            self.repaint_visibility_dirty = true;
             const now = try monotonicNs();
             for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
                 _ = try requestPhysicalOutputDamage(physical, now);
@@ -8704,6 +8718,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn publishOutputLayout(self: *Self) !void {
+            self.repaint_visibility_dirty = true;
             const bounds = try self.globalOutputBounds();
             const interaction_areas = try self.physicalOutputAreas();
             try self.interaction.validateTopology(bounds, interaction_areas);
@@ -8903,11 +8918,11 @@ pub fn Coordinator(comptime protocol: type) type {
                 } else {
                     layer.window_geometry = scene.root.geometry;
                 }
-                sample.clip = clipToOutput(sample.destination, output_bounds) catch unreachable orelse {
-                    self.retireLayer(layer);
-                    visibility_changed = true;
-                    continue;
-                };
+                // Keep offscreen content so exposure can resume a suspended
+                // client without waiting for it to submit another buffer.
+                // Per-output sampling excludes offscreen destinations; damage
+                // state still requires a nonempty clip for coordinate scaling.
+                sample.clip = clipToOutput(sample.destination, output_bounds) catch unreachable orelse sample.destination;
                 if (!std.meta.eql(sample.destination, layer.sample.?.destination))
                     self.output_associations_dirty = true;
                 const previous = layer.change.?.current;
@@ -9143,10 +9158,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .width = rendered_width,
                 .height = rendered_height,
             };
-            const clip = try clipToOutput(destination, output_bounds);
-            const visible_clip = clip orelse {
-                return try self.discardPendingCandidate(layer, pending.id);
-            };
+            const visible_clip = (try clipToOutput(destination, output_bounds)) orelse destination;
             if (trace) |*work| work.mark("source-access-begin");
             var source = try self.adapter.bufferSource(lease);
             if (trace) |*work| switch (source) {
@@ -9546,11 +9558,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .width = rendered_width,
                 .height = rendered_height,
             };
-            const visible_clip = (try clipToOutput(destination, output_bounds)) orelse
-                return self.discardPendingCandidate(
-                    layer,
-                    pending_id,
-                );
+            const visible_clip = (try clipToOutput(destination, output_bounds)) orelse destination;
             var sample = layer.sample.?;
             sample.upload_damage = .{};
             sample.crop = try sourceCrop(
@@ -12874,6 +12882,82 @@ pub fn Coordinator(comptime protocol: type) type {
             }
         }
 
+        /// Observe retained content, not successful frames or pending damage.
+        /// An idle output must wake exposed clients before they repaint, and a
+        /// sleeping output must not keep a window awake on another output.
+        fn syncRepaintVisibility(self: *Self) !void {
+            if (self.stopping) return;
+            const locked = self.sessionLockActive();
+            if (self.repaint_locked != locked) {
+                self.repaint_locked = locked;
+                self.repaint_visibility_dirty = true;
+            }
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                const available = !locked and self.session.state == .enabled and
+                    physical.connected and !physical.removing and
+                    if (physical.kms_output) |output| output.accepting_frames else false;
+                if (physical.repaint_available != available) {
+                    physical.repaint_available = available;
+                    self.repaint_visibility_dirty = true;
+                }
+            }
+            if (!self.repaint_visibility_dirty) return;
+            const windows = try self.desktop.sceneSnapshotGrowing(self.allocator, &self.scene_windows);
+            self.repaint_visibility.begin();
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                if (!physical.repaint_available) continue;
+                const bounds = try self.outputBoundsFor(physical);
+                var count: usize = 0;
+                // Bottom layers cannot cover a desktop window. Top/overlay
+                // layers and their popups can; match the renderer's ordering.
+                for (windows) |window| {
+                    if (!window.visible) continue;
+                    try self.appendSceneRoot(physical, window.surface, &count, bounds);
+                }
+                try self.appendLayerShell(physical, .top, &count, bounds);
+                try self.appendLayerShell(physical, .overlay, &count, bounds);
+                try self.appendInputMethodPopups(physical, &count, bounds);
+                const head = try self.output_management_adapter.lifecycle.currentHead(physical.management_head);
+                const scale = try geometry.OutputScale.init(head.scale_120);
+                const output_clip = try scaleRenderRect(.{
+                    .x = bounds.x,
+                    .y = bounds.y,
+                    .width = @intCast(bounds.width),
+                    .height = @intCast(bounds.height),
+                }, bounds, scale);
+                for (self.frame_samples[0..count], self.frame_bindings[0..count]) |value, binding| {
+                    var sample = value;
+                    sample.clip = damage.intersect(sample.clip, output_clip) orelse continue;
+                    const scene = self.surfaceScene(.{
+                        .index = binding.surface.index,
+                        .generation = binding.surface.generation,
+                    });
+                    const owner: ?u64 = if (scene) |s| if (s.root.managed)
+                        (@as(u64, s.root.id.generation) << 32) | s.root.id.index
+                    else
+                        null else null;
+                    try self.repaint_visibility.append(
+                        self.allocator,
+                        (@as(u64, physical.id.generation) << 32) | physical.id.index,
+                        owner,
+                        sample,
+                    );
+                }
+            }
+            _ = try self.repaint_visibility.finish(self.allocator);
+            for (windows) |window| {
+                // Popups share their toplevel ID; only update the owner once.
+                const root = self.desktop.scene(window.id) catch continue;
+                if (!std.meta.eql(root.surface, window.surface)) continue;
+                const owner = (@as(u64, window.id.generation) << 32) | window.id.index;
+                // Never prevent an initial buffer from arriving. Workspace
+                // policy still suspends hidden windows independently.
+                try self.desktop.setRepaintSuspended(window.id, window.content_ready and
+                    !self.repaint_visibility.isVisible(owner));
+            }
+            self.repaint_visibility_dirty = false;
+        }
+
         fn syncOutputAssociations(self: *Self) !void {
             try self.syncCursorGeometry();
             for (self.physical_outputs[0..self.physical_output_count]) |*physical|
@@ -13674,6 +13758,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn abandonLayer(self: *Self, layer: *Layer) void {
+            if (layer.active) self.repaint_visibility_dirty = true;
             if (layerHasOutputAssociation(layer)) self.output_associations_dirty = true;
             if (layer.presentation) |token| self.presentations.discard(token) catch unreachable;
             if (layer.content.get()) |content| content.deinit();
@@ -13696,6 +13781,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn retireLayer(self: *Self, layer: *Layer) void {
+            if (layer.active) self.repaint_visibility_dirty = true;
             defer self.syncLayerRetry(layer);
             // A role can disappear before wl_surface destruction. Preserve
             // its old bounds while the layer is still active so every scanout
