@@ -2224,7 +2224,10 @@ test "shell-input: pollable backend retains a backpressured suffix without repla
     try std.testing.expectEqual(@as(usize, 1), handler.pointer_axis_source);
     try std.testing.expectEqual(@as(usize, 1), handler.pointer_axis);
     try std.testing.expectEqual(@as(usize, 1), handler.pointer_axis_value120);
-    try std.testing.expectEqual(@as(usize, 5), handler.pointer_frame);
+    // One focus enter, two motions, two buttons, and one axis group each
+    // complete a frame, including focus changes without hardware motion.
+    try std.testing.expectEqual(@as(usize, 1), handler.pointer_enter);
+    try std.testing.expectEqual(@as(usize, 6), handler.pointer_frame);
     try std.testing.expectEqual(@as(i32, 15 * 256), handler.pointer_axis_fixed);
     try std.testing.expectEqual(@as(i32, 120), handler.pointer_axis_value120_value);
     try std.testing.expectEqual(@as(usize, 1), handler.keyboard_key);

@@ -469,7 +469,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                     slot.capability_generation = adapter.pointer_capability_generation;
                     const focused = adapter.pointer_delivery != null and
                         sameClient(clientId(seat.peer), adapter.pointer_delivery.?.client);
-                    if (focused) adapter.ensureOutbound(1) catch {
+                    if (focused) adapter.ensureOutbound(2) catch {
                         adapter.pointers.release(slot);
                         return try adapter.noMemory(actor);
                     };
@@ -485,6 +485,10 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                             .serial = serial,
                             .target = focus,
                             .point = adapter.pointer_point,
+                        } });
+                        try adapter.enqueue(clientId(seat.peer), .{ .pointer_frame = .{
+                            .pointer = adapter.pointerId(slot),
+                            .target = focus,
                         } });
                         slot.last_serial = serial;
                         slot.enter_serial = serial;
@@ -1038,11 +1042,13 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
 
         pub fn setPointerFocus(adapter: *Self, target: ?FocusTarget, point: Point) !void {
             if (target) |value| _ = try adapter.core.getSurfaceById(value.surface);
-            adapter.pointer_point = point;
             if (adapter.pointer_grab == .active) {
+                adapter.pointer_point = point;
                 adapter.pointer_focus = target;
                 return;
             }
+            try adapter.ensureOutbound(adapter.pointerTransitionCount(target));
+            adapter.pointer_point = point;
             try adapter.transitionPointer(target);
             adapter.pointer_focus = target;
         }
@@ -1937,29 +1943,39 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         fn transitionPointer(adapter: *Self, target: ?FocusTarget) !void {
             if (optionalTargetEqual(adapter.pointer_delivery, target)) return;
             const old = adapter.pointer_delivery;
-            const count = adapter.pointerResourceCount(if (old) |v| v.client else null) +
-                adapter.pointerResourceCount(if (target) |v| v.client else null);
-            try adapter.ensureOutbound(count);
+            try adapter.ensureOutbound(adapter.pointerTransitionCount(target));
             if (old) |value| {
                 const serial = adapter.issueSerial();
-                for (adapter.pointers.entries.items, 0..) |slot, index| if (adapter.pointerBelongs(slot, value.client))
+                for (adapter.pointers.entries.items, 0..) |slot, index| if (adapter.pointerBelongs(slot, value.client)) {
+                    const id: Id = .{ .index = @intCast(index), .generation = slot.header.generation };
                     adapter.enqueue(value.client, .{ .pointer_leave = .{
-                        .pointer = .{ .index = @intCast(index), .generation = slot.header.generation },
+                        .pointer = id,
                         .serial = serial,
                         .target = value,
                     } }) catch unreachable;
+                    adapter.enqueue(value.client, .{ .pointer_frame = .{
+                        .pointer = id,
+                        .target = value,
+                    } }) catch unreachable;
+                };
                 adapter.setPointerEnterSerial(value.client, 0);
             }
             adapter.pointer_delivery = target;
             if (target) |value| {
                 const serial = adapter.issueSerial();
-                for (adapter.pointers.entries.items, 0..) |slot, index| if (adapter.pointerBelongs(slot, value.client))
+                for (adapter.pointers.entries.items, 0..) |slot, index| if (adapter.pointerBelongs(slot, value.client)) {
+                    const id: Id = .{ .index = @intCast(index), .generation = slot.header.generation };
                     adapter.enqueue(value.client, .{ .pointer_enter = .{
-                        .pointer = .{ .index = @intCast(index), .generation = slot.header.generation },
+                        .pointer = id,
                         .serial = serial,
                         .target = value,
                         .point = adapter.pointer_point,
                     } }) catch unreachable;
+                    adapter.enqueue(value.client, .{ .pointer_frame = .{
+                        .pointer = id,
+                        .target = value,
+                    } }) catch unreachable;
+                };
                 adapter.setLastPointerSerial(value.client, serial);
                 adapter.setPointerEnterSerial(value.client, serial);
             }
@@ -2071,8 +2087,8 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
 
         fn pointerTransitionCount(adapter: *const Self, target: ?FocusTarget) usize {
             if (optionalTargetEqual(adapter.pointer_delivery, target)) return 0;
-            return adapter.pointerResourceCount(if (adapter.pointer_delivery) |value| value.client else null) +
-                adapter.pointerResourceCount(if (target) |value| value.client else null);
+            return 2 * (adapter.pointerResourceCount(if (adapter.pointer_delivery) |value| value.client else null) +
+                adapter.pointerResourceCount(if (target) |value| value.client else null));
         }
 
         fn pointerCancellationOutbound(adapter: *const Self) usize {
@@ -2599,6 +2615,59 @@ fn testAdapterWithCapacity(core: *FakeCore, outbound_capacity: usize, event_capa
 
 fn clearTestOutbound(adapter: *TestAdapter) void {
     for (adapter.outbound) |*slot| if (slot.active) adapter.removeOutbound(slot);
+}
+
+test "seat: pointer focus transitions complete frames atomically" {
+    var core: FakeCore = .{};
+    var adapter = try testAdapterWithCapacity(&core, 4, 2);
+    defer adapter.deinit();
+    const peer_a: wayring.io_uring.Peer = .{ .slot = 0, .generation = 1 };
+    const peer_b: wayring.io_uring.Peer = .{ .slot = 1, .generation = 1 };
+    const target_a = try adapter.makeTarget(peer_a, .{ .index = 0, .generation = 1 });
+    const target_b = try adapter.makeTarget(peer_b, .{ .index = 0, .generation = 1 });
+    const pointer_a = try adapter.pointers.acquire();
+    pointer_a.client = clientId(peer_a);
+    const pointer_b = try adapter.pointers.acquire();
+    pointer_b.client = clientId(peer_b);
+
+    try adapter.setPointerFocus(target_a, .{ .x = 1, .y = 2 });
+    try std.testing.expectEqual(@as(usize, 1), countTestOutbound(&adapter, .pointer_enter));
+    try std.testing.expectEqual(@as(usize, 1), countTestOutbound(&adapter, .pointer_frame));
+    clearTestOutbound(&adapter);
+
+    try adapter.setPointerFocus(target_b, .{ .x = 3, .y = 4 });
+    try std.testing.expectEqual(@as(usize, 1), countTestOutbound(&adapter, .pointer_leave));
+    try std.testing.expectEqual(@as(usize, 1), countTestOutbound(&adapter, .pointer_enter));
+    try std.testing.expectEqual(@as(usize, 2), countTestOutbound(&adapter, .pointer_frame));
+    // Each client must receive its own frame after its transition. Global
+    // counts alone would also accept two frames sent to the same client.
+    for ([_]TestAdapter.FocusTarget{ target_a, target_b }, 0..) |target, index| {
+        const head = adapter.outbound_clients.get(@bitCast(target.client)).?.head.?;
+        const transition = if (index == 0) head.value.pointer_leave.pointer else head.value.pointer_enter.pointer;
+        const frame = head.next.?;
+        try std.testing.expectEqual(transition, frame.value.pointer_frame.pointer);
+        try std.testing.expectEqual(target, frame.value.pointer_frame.target.?);
+        try std.testing.expect(frame.next == null);
+    }
+    clearTestOutbound(&adapter);
+
+    try adapter.setPointerFocus(null, .{ .x = 5, .y = 6 });
+    try std.testing.expectEqual(@as(usize, 1), countTestOutbound(&adapter, .pointer_leave));
+    try std.testing.expectEqual(@as(usize, 1), countTestOutbound(&adapter, .pointer_frame));
+
+    clearTestOutbound(&adapter);
+    try adapter.setPointerFocus(target_a, .{ .x = 7, .y = 8 });
+    clearTestOutbound(&adapter);
+    try adapter.enqueue(clientId(peer_a), .{ .seat_name = .{ .index = 0, .generation = 1 } });
+    const old_point = adapter.pointer_point;
+    try std.testing.expectError(error.Exhausted, adapter.setPointerFocus(target_b, .{ .x = 9, .y = 10 }));
+    try std.testing.expectEqual(target_a, adapter.pointerState().focus.?);
+    try std.testing.expectEqual(target_a, adapter.pointerDeliveryTarget().?);
+    try std.testing.expectEqual(old_point, adapter.pointer_point);
+    try std.testing.expectEqual(@as(usize, 1), adapter.pendingOutbound());
+    try std.testing.expectEqual(@as(usize, 0), countTestOutbound(&adapter, .pointer_leave));
+    try std.testing.expectEqual(@as(usize, 0), countTestOutbound(&adapter, .pointer_enter));
+    try std.testing.expectEqual(@as(usize, 0), countTestOutbound(&adapter, .pointer_frame));
 }
 
 test "seat: per-client FIFO survives removal, exhaustion and peer generation reuse" {
