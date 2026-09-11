@@ -461,7 +461,7 @@ fn parseTrigger(allocator: std.mem.Allocator, text: []const u8) !Trigger {
     return .{ .modifiers = modifiers, .keysym = keysym };
 }
 
-fn parseAction(allocator: std.mem.Allocator, value: std.json.Value) !Action {
+pub fn parseAction(allocator: std.mem.Allocator, value: std.json.Value) !Action {
     if (value != .array) return error.InvalidActionType;
     const items = value.array.items;
     if (items.len == 0 or items[0] != .string) return error.InvalidAction;

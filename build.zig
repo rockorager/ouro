@@ -188,6 +188,10 @@ pub fn build(b: *std.Build) void {
     // Fatal compositor errors need their originating return path in production.
     if (optimize == .ReleaseSafe) executable.root_module.error_tracing = true;
     b.installArtifact(executable);
+    const export_mcp = b.addRunArtifact(executable);
+    export_mcp.addArg("--export-mcp-descriptor");
+    const install_mcp = b.addInstallFile(export_mcp.captureStdOut(.{}), "share/ouro/mcp/apps/ouro.json");
+    b.getInstallStep().dependOn(&install_mcp.step);
     b.installFile(
         "resources/ouro.desktop",
         "share/wayland-sessions/ouro.desktop",

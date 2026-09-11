@@ -24,6 +24,8 @@ const Options = struct {
     drm_device: ?[]const u8 = null,
     config: ?[]const u8 = null,
     export_config: bool = false,
+    export_mcp_descriptor: bool = false,
+    mcp_socket: ?[]const u8 = null,
     managed_session: bool = false,
     headless: bool = false,
     disable_hdr: bool = false,
@@ -38,6 +40,14 @@ pub fn main(init: std.process.Init) !void {
         usage();
         return err;
     };
+    if (options.export_mcp_descriptor) {
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        defer output.deinit();
+        try ouro.control.writeDescriptor(&output.writer);
+        try output.writer.writeByte('\n');
+        try std.Io.File.stdout().writeStreamingAll(init.io, output.written());
+        return;
+    }
     if (options.export_config) {
         const store: ouro.config.Store = .{
             .allocator = allocator,
@@ -128,6 +138,13 @@ pub fn main(init: std.process.Init) !void {
     };
     var mcp = try ouro.mcp_client.Client.init(allocator);
     defer mcp.deinit();
+    const control_path = if (options.mcp_socket) |path| try allocator.dupe(u8, path) else try std.fmt.allocPrint(allocator, "{s}/ouro.mcp.sock", .{init.environ_map.get("XDG_RUNTIME_DIR") orelse return error.MissingRuntimeDirectory});
+    defer allocator.free(control_path);
+    var catalog: std.Io.Writer.Allocating = .init(allocator);
+    defer catalog.deinit();
+    try ouro.control.writeCatalog(&catalog.writer);
+    var control = try ouro.mcp_server.Server.init(allocator, control_path, catalog.written());
+    defer control.deinit();
     const dri_result = linux.open("/dev/dri", .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
     if (linux.errno(dri_result) != .SUCCESS) {
         std.log.err("DRM smoke unavailable: /dev/dri is absent or inaccessible", .{});
@@ -153,7 +170,7 @@ pub fn main(init: std.process.Init) !void {
         .input = if (options.headless) null else ouro.input_platform.real,
         .hotplug = if (options.headless) null else ouro.drm_hotplug.real,
     }, .{
-        .router_capacity = 19,
+        .router_capacity = 20,
         .timer_capacity = 6,
         .device_capacity = 36,
         .input = .{
@@ -310,18 +327,22 @@ pub fn main(init: std.process.Init) !void {
     if (run_error == null) runner.loop.installMcp(&mcp) catch |err| {
         run_error = err;
     };
+    if (run_error == null) runner.loop.installControl(&control) catch |err| {
+        run_error = err;
+    };
     if (run_error != null) exit_deadline.arm(fatal_shutdown_grace_ns);
 
     if (run_error == null)
-        std.log.info("Ouro listening on {s}; renderer policy={s}", .{
+        std.log.info("Ouro listening on {s}; MCP at {s}; renderer policy={s}", .{
             socket,
+            control_path,
             @tagName(options.renderer),
         });
     var wayring_drained = false;
     var signal_stop_started = false;
     var pending_config: ?PreparedConfig = null;
     defer if (pending_config) |*candidate| candidate.deinit();
-    while (!wayring_drained or !coordinator.backendDrainComplete() or !runner.loop.settingsDrained() or !runner.loop.mcpDrained()) {
+    while (!wayring_drained or !coordinator.backendDrainComplete() or !runner.loop.settingsDrained() or !runner.loop.mcpDrained() or !runner.loop.controlDrained()) {
         if (coordinator.terminalFailure()) |terminal_error| {
             exit_deadline.arm(fatal_shutdown_grace_ns);
             std.log.err("backend cannot safely drain: {t}; exiting with scanout pinned for kernel teardown", .{terminal_error});
@@ -357,12 +378,12 @@ pub fn main(init: std.process.Init) !void {
         };
         const key_consumer = coordinator.bindingState();
         while (key_consumer.peekAction()) |binding| {
-            const binding_stopped = applyBinding(
+            const binding_stopped = applyAction(
                 coordinator,
                 &systemd_session,
                 &launcher,
                 &mcp,
-                binding,
+                binding.action,
             ) catch |err| failed: {
                 std.log.err("binding action failed: {t}", .{err});
                 break :failed false;
@@ -371,6 +392,30 @@ pub fn main(init: std.process.Init) !void {
             if (binding_stopped) {
                 signal_stop_started = true;
                 break;
+            }
+        }
+        var control_reload = false;
+        if (!signal_stop_started and !progress.shutdown_requested) {
+            while (control.peekCall()) |call| {
+                var arena = std.heap.ArenaAllocator.init(allocator);
+                defer arena.deinit();
+                const command = ouro.control.decode(arena.allocator(), call.name, call.arguments) catch |err| {
+                    try control.failCall(-32602, @errorName(err));
+                    continue;
+                };
+                // Bound even a future larger desktop's snapshot to one frame.
+                var response_storage: [ouro.mcp_server.maximum_frame_size - 2048]u8 = undefined;
+                var response = std.Io.Writer.fixed(&response_storage);
+                const stopped = executeControl(command, coordinator, &systemd_session, &launcher, &mcp, settings == null, &control_reload, &response) catch |err| failed: {
+                    response = std.Io.Writer.fixed(&response_storage);
+                    try response.print("{{\"resultType\":\"complete\",\"content\":[{{\"type\":\"text\",\"text\":{f}}}],\"isError\":true}}", .{std.json.fmt(@errorName(err), .{})});
+                    break :failed false;
+                };
+                try control.completeCall(response.buffered());
+                if (stopped) {
+                    signal_stop_started = true;
+                    break;
+                }
             }
         }
         wayring_drained = progress.wayring.shutdown_complete;
@@ -385,7 +430,7 @@ pub fn main(init: std.process.Init) !void {
             };
             signal_stop_started = true;
         }
-        if (!signal_stop_started and (progress.settings_changed or (progress.reload_requested and settings == null))) update_config: {
+        if (!signal_stop_started and (progress.settings_changed or ((progress.reload_requested or control_reload) and settings == null))) update_config: {
             var candidate = if (settings) |*client| from_settings: {
                 var update = client.take() orelse break :update_config;
                 defer update.deinit(allocator);
@@ -439,50 +484,57 @@ fn beginShutdown(systemd_session: *SystemdSession, coordinator: *Runtime) !void 
     try coordinator.requestStop();
 }
 
-fn applyBinding(
+fn applyAction(
     coordinator: *Runtime,
     systemd_session: *SystemdSession,
     launcher: *const ouro.launcher.Systemd,
     mcp: *ouro.mcp_client.Client,
-    binding: ouro.config.Binding,
+    action: ouro.config.Action,
 ) !bool {
-    switch (binding.action) {
-        .focus_next => try coordinator.focusNext(),
-        .focus_previous => try coordinator.focusPrevious(),
-        .move_next => try coordinator.moveFocusedTile(.next),
-        .move_previous => try coordinator.moveFocusedTile(.previous),
-        .focus_left => try coordinator.focusDirection(.left),
-        .focus_right => try coordinator.focusDirection(.right),
-        .focus_up => try coordinator.focusDirection(.up),
-        .focus_down => try coordinator.focusDirection(.down),
-        .move_left => try coordinator.moveFocusedDirection(.left),
-        .move_right => try coordinator.moveFocusedDirection(.right),
-        .move_up => try coordinator.moveFocusedDirection(.up),
-        .move_down => try coordinator.moveFocusedDirection(.down),
-        .move_output_next => try coordinator.moveFocusedToOutput(false),
-        .move_output_previous => try coordinator.moveFocusedToOutput(true),
-        .switch_workspace => |number| try coordinator.switchWorkspace(number),
-        .move_to_workspace => |number| try coordinator.moveFocusedToWorkspace(number),
-        .close => if (coordinator.focusedToplevel()) |id| try coordinator.requestClose(id),
-        .toggle_fullscreen => try coordinator.toggleFocusedFullscreen(),
-        .toggle_maximized => try coordinator.toggleFocusedMaximized(),
-        .toggle_floating => try coordinator.toggleFocusedFloating(),
+    switch (action) {
         .exit => {
             try beginShutdown(systemd_session, coordinator);
             return true;
         },
-        .run => |argv| {
-            launcher.launch(argv) catch |err| {
-                std.log.err("could not launch {s}: {t}", .{ argv[0], err });
-            };
-        },
-        .call => |call| {
-            mcp.enqueue(call) catch |err| {
-                std.log.warn("could not call {s} at {s}: {t}", .{ call.method, call.address, err });
-            };
-        },
+        .run => |argv| try launcher.launch(argv),
+        .call => |call| try mcp.enqueue(call),
+        else => try ouro.control.apply(coordinator, action),
     }
     return false;
+}
+
+fn executeControl(
+    command: ouro.control.Command,
+    coordinator: *Runtime,
+    systemd_session: *SystemdSession,
+    launcher: *const ouro.launcher.Systemd,
+    mcp: *ouro.mcp_client.Client,
+    file_config: bool,
+    reload: *bool,
+    writer: *std.Io.Writer,
+) !bool {
+    if (coordinator.session_lock_adapter.pendingLock() != null or
+        coordinator.session_lock_adapter.activeLock() != null or coordinator.session_lock_adapter.isFailClosed())
+        return error.SessionLocked;
+    switch (command) {
+        .get_state => {
+            try writer.writeAll("{\"resultType\":\"complete\",\"content\":[],\"structuredContent\":");
+            try coordinator.desktop.writeControlState(writer);
+            try writer.writeAll(",\"isError\":false}");
+            return false;
+        },
+        .reload_config => {
+            if (!file_config) return error.SettingsUpdateAutomatically;
+            try writer.writeAll(ouro.control.accepted);
+            reload.* = true;
+            return false;
+        },
+        .action => |action| {
+            // Construct the acknowledgment before any mutation.
+            try writer.writeAll(ouro.control.accepted);
+            return applyAction(coordinator, systemd_session, launcher, mcp, action);
+        },
+    }
 }
 
 fn parseOptions(args: std.process.Args) !Options {
@@ -515,6 +567,11 @@ fn parseOptions(args: std.process.Args) !Options {
             if (options.config.?.len == 0) return error.InvalidConfigPath;
         } else if (std.mem.eql(u8, argument, "--export-config")) {
             options.export_config = true;
+        } else if (std.mem.eql(u8, argument, "--export-mcp-descriptor")) {
+            options.export_mcp_descriptor = true;
+        } else if (std.mem.startsWith(u8, argument, "--mcp-socket=")) {
+            options.mcp_socket = argument["--mcp-socket=".len..];
+            if (options.mcp_socket.?.len == 0) return error.InvalidSocket;
         } else if (std.mem.eql(u8, argument, "--managed-session")) {
             options.managed_session = true;
         } else if (std.mem.eql(u8, argument, "--headless")) {
@@ -547,6 +604,8 @@ fn usage() void {
         \\  --config      file-only override (base JSON and adjacent config.d); no ourosettings
         \\                otherwise subscribe to ourosettings /compositor (10s startup deadline)
         \\  --export-config  print merged legacy file configuration and exit (no settings writes)
+        \\  --export-mcp-descriptor  print installed discovery JSON and exit (no display/settings needed)
+        \\  --mcp-socket   override $XDG_RUNTIME_DIR/ouro.mcp.sock; parent must be private
         \\  --managed-session  publish and bind the systemd graphical session lifecycle
         \\  --headless     bypass libseat and input for an explicitly selected virtual DRM device
         \\  SIGHUP        reload --config sources; ourosettings updates arrive automatically

@@ -221,6 +221,71 @@ test "MCP readiness sends a filesystem socket call and drains its final poll" {
     try root.deinit();
 }
 
+test "MCP readiness receives control calls without sleeping and retires the server poll" {
+    const allocator = std.testing.allocator;
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    var directory_buffer: [128]u8 = undefined;
+    const directory = try std.fmt.bufPrintZ(&directory_buffer, "/tmp/ouro-mcp-runtime-{d}", .{linux.getpid()});
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mkdir(directory, 0o700)));
+    defer _ = linux.rmdir(directory);
+    const display = try std.fmt.allocPrint(allocator, "{s}/wayland.sock", .{directory});
+    defer allocator.free(display);
+    defer wayring.unix_socket.unlink(display) catch {};
+    const path = try std.fmt.allocPrint(allocator, "{s}/control.sock", .{directory});
+    defer allocator.free(path);
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(display, 1), compositorConfig());
+    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), coordinatorConfig());
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
+    var server = try ouro.mcp_server.Server.init(allocator, path, "{\"tools\":[]}");
+    defer server.deinit();
+    var client = try ouro.mcp_client.Client.init(allocator);
+    defer client.deinit();
+    try loop.installControl(&server);
+    try loop.installMcp(&client);
+    const address = try std.fmt.allocPrint(allocator, "unix:{s}", .{path});
+    defer allocator.free(address);
+    const call = try ouro.mcp_client.Call.init(allocator, address, "focus-previous", .{ .object = .empty });
+    defer allocator.free(call.request);
+    try client.enqueue(call);
+    for (0..32) |_| {
+        _ = try loop.turn(coordinator);
+        if (server.hasCalls()) break;
+        try waitReady(&root.ring);
+    }
+    const incoming = server.peekCall() orelse return error.MissingControlCall;
+    try std.testing.expectEqualStrings("focus-previous", incoming.name);
+    // No new input is needed for main to receive a queued control command.
+    const progress = try loop.turnAndWait(coordinator);
+    try std.testing.expect(progress.needs_more_work);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const decoded = try ouro.control.decode(arena.allocator(), incoming.name, incoming.arguments);
+    try std.testing.expectEqual(ouro.config.Action.focus_previous, decoded.action);
+    try ouro.control.apply(coordinator, decoded.action);
+    try server.completeCall(ouro.control.accepted);
+    for (0..32) |_| {
+        _ = try loop.turn(coordinator);
+        if (client.pending[0] == null) break;
+        try waitReady(&root.ring);
+    }
+    try std.testing.expect(client.pending[0] == null);
+    try std.testing.expect(!server.hasCalls());
+    try coordinator.requestStop();
+    try loop.requestShutdown();
+    for (0..32) |_| {
+        _ = try loop.turn(coordinator);
+        if (loop.controlDrained() and loop.mcpDrained()) break;
+        try waitReady(&root.ring);
+    }
+    try std.testing.expect(loop.controlDrained() and loop.mcpDrained());
+    try std.testing.expect(server.stopping);
+    try drainServer(root, coordinator, &loop);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
 test "generated ordinary SHM traverses the physical coordinator exactly once and drains" {
     try runVertical(.session_disable, .shm, false);
 }

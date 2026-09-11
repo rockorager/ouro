@@ -880,6 +880,59 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
             try desktop.policy.writeWorkspaceInventory(PolicyView{ .context = desktop }, writer);
         }
 
+        /// Read-only control snapshot at a turn boundary. Geometry is the
+        /// published scene; state and workspace membership are logical targets.
+        pub fn writeControlState(desktop: *Self, writer: *std.Io.Writer) !void {
+            var json: std.json.Stringify = .{ .writer = writer };
+            try json.beginObject();
+            try json.objectField("focused");
+            try json.write(desktop.focusedToplevel());
+            try json.objectField("windows");
+            try json.beginArray();
+            for (desktop.slots, 0..) |slot, index| {
+                if (!slot.header.active) continue;
+                const id: ToplevelId = .{ .index = @intCast(index), .generation = slot.header.generation };
+                const state = try desktop.policy.windowState(id);
+                try json.write(.{
+                    .id = id,
+                    .title = slot.title[0..slot.title_len],
+                    .app_id = slot.app_id[0..slot.app_id_len],
+                    .geometry = slot.scene.geometry,
+                    .visible = slot.scene.visible,
+                    .mode = state.mode,
+                    .output = state.output,
+                    .workspace = state.workspace,
+                    .fullscreen = state.fullscreen,
+                    .maximized = state.maximized,
+                    .minimized = state.minimized,
+                });
+            }
+            try json.endArray();
+            try json.objectField("outputs");
+            try json.beginArray();
+            for (0..desktop.output_area_len) |index| {
+                try json.write(.{ .id = desktop.output_ids[index], .geometry = desktop.output_bounds[index], .work_area = desktop.output_areas[index] });
+            }
+            try json.endArray();
+            try json.objectField("workspaces");
+            try json.beginArray();
+            var inventory = struct {
+                json: *std.json.Stringify,
+                output: ?OutputId = null,
+                pub fn begin(_: *@This(), _: u64) !void {}
+                pub fn addGroup(_: *@This(), _: workspace.Group) !void {}
+                pub fn addOutput(self: *@This(), _: workspace.GroupId, output: OutputId) !void {
+                    self.output = output;
+                }
+                pub fn addWorkspace(self: *@This(), entry: workspace.Workspace) !void {
+                    try self.json.write(.{ .id = entry.id.value, .output = self.output, .name = entry.name, .active = entry.state.active });
+                }
+            }{ .json = &json };
+            try desktop.writeWorkspaceInventory(&inventory);
+            try json.endArray();
+            try json.endObject();
+        }
+
         pub fn workspaceRevision(desktop: *const Self) WorkspaceRevision {
             return .{ .policy = desktop.policy.workspaceRevision(), .outputs = desktop.output_revision };
         }
@@ -3688,6 +3741,20 @@ test "desktop: workspace inventory publishes active and occupied workspaces" {
     try std.testing.expectEqual(@as(usize, 2), occupied.active);
     try std.testing.expect(occupied.second_workspace != null);
     try std.testing.expect(!occupied.second_active);
+
+    var state_json: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer state_json.deinit();
+    try desktop.writeControlState(&state_json.writer);
+    const snapshot = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, state_json.written(), .{});
+    defer snapshot.deinit();
+    const windows = snapshot.value.object.get("windows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), windows.len);
+    try std.testing.expectEqual(@as(i64, 2), windows[0].object.get("workspace").?.integer);
+    try std.testing.expectEqual(@as(i64, 10), windows[0].object.get("output").?.object.get("value").?.integer);
+    const outputs = snapshot.value.object.get("outputs").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), outputs.len);
+    try std.testing.expectEqual(@as(i64, 100), outputs[1].object.get("geometry").?.object.get("x").?.integer);
+    try std.testing.expectEqual(@as(usize, 3), snapshot.value.object.get("workspaces").?.array.items.len);
 
     try std.testing.expect(try desktop.requestWorkspace(.{
         .workspace = occupied.second_workspace.?,

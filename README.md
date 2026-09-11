@@ -274,8 +274,8 @@ out after five seconds and are **never retried**, since a lost reply may follow
 a successful side effect. Ouro allows at most 16 in-flight calls and 256 KiB per
 request or reply (including its terminating newline); excess calls are logged and
 dropped. Config reloads preserve in-flight calls; compositor shutdown closes
-them without waiting for replies. This action does not expose compositor
-commands as an MCP server.
+them without waiting for replies. The separate control server below exposes
+compositor commands to other MCP clients.
 
 Both clients send MCP 2026-07-28 newline-delimited JSON-RPC 2.0 with per-request
 protocol version, empty client capabilities, and client identity in `params._meta`.
@@ -283,6 +283,81 @@ There is no `initialize` handshake. The `call` configuration shape is unchanged,
 but **existing Varlink targets must migrate to MCP**; this is not wire-compatible.
 ourosettings exposes only MCP at `settings.mcp.sock`; there is no Varlink
 compatibility endpoint.
+
+### MCP compositor control
+
+Ouro also serves MCP 2026-07-28 on `$XDG_RUNTIME_DIR/ouro.mcp.sock`, using
+the same newline-delimited JSON-RPC profile and per-request `_meta` as its
+clients. Override the endpoint with `--mcp-socket=/absolute/path`. The parent
+directory must be private and owned by the effective UID. The socket is mode
+0600 and accepts only same-UID peers; this is user isolation, **not per-app
+authorization**. Existing socket paths are never unlinked on startup.
+
+`server/discover`, `tools/list`, and `tools/call` expose these tools:
+
+| Tools | Arguments |
+| --- | --- |
+| `focus-next`, `focus-previous`, `focus-left`, `focus-right`, `focus-up`, `focus-down` | `{}` |
+| `move-next`, `move-previous`, `move-left`, `move-right`, `move-up`, `move-down` | `{}` |
+| `move-output-next`, `move-output-previous` | `{}` |
+| `switch-workspace`, `move-focused-to-workspace` | `{"number": 1}` (1–10) |
+| `close`, `toggle-fullscreen`, `toggle-maximized`, `toggle-floating`, `exit` | `{}` |
+| `run` | `{"argv": ["application", "argument"]}` |
+| `call` | `{"address": "unix:/absolute/path", "method": "tool-name", "arguments": {}}` |
+| `get-state`, `reload-config` | `{}` |
+
+Controls use the same typed dispatch as keybindings at a turn boundary. Their
+success result means **accepted**, not that a client has repainted, closed, or
+completed a remote call. `get-state` returns `structuredContent` with window
+IDs (index and generation), titles, app IDs, logical state/workspace membership,
+published geometry, output IDs/bounds/work areas, and active or occupied
+workspaces. `reload-config` requests an asynchronous file reload; it returns a
+tool error in settings mode, where updates already arrive automatically.
+Invalid names/arguments return JSON-RPC errors; execution failures return MCP
+`isError: true`. All tool calls, including state reads, are rejected while a
+session lock is pending, active, or fail-closed. Input injection and screenshots
+are not exposed.
+
+The server bounds clients and pending calls to 16 each, permits one outstanding
+tool call per connection, and limits frames to 256 KiB including the newline.
+Slow peers do not block other clients. A disconnected
+peer's queued calls are discarded; executed actions are never retried. The
+`exit` acknowledgment is best-effort before shutdown closes the connection.
+
+Clients can send `subscriptions/listen` with
+`"notifications":{"toolsListChanged":true}`. Ouro acknowledges with
+`notifications/subscriptions/acknowledged`, carrying the request ID in
+`params._meta["io.modelcontextprotocol/subscriptionId"]`. Cancel with
+`notifications/cancelled` and `params.requestId`; cancellation has no reply.
+Disconnect releases subscriptions. `tools/list` has `ttlMs: 60000` and
+`cacheScope: "private"`; `notifications/tools/list_changed` invalidates it
+immediately. The current catalog is compiled in, so successful, failed, and
+unchanged settings reloads all leave it unchanged and emit no catalog event.
+
+### Installed MCP discovery descriptor
+
+`zig build` installs `share/ouro/mcp/apps/ouro.json`, generated from the same
+tool declarations as the live catalog. Packaging can explicitly run
+`ouro --export-mcp-descriptor` without a display, settings daemon, or runtime
+directory. Cross-packaging needs a runnable build of Ouro for this export.
+
+The version-1 descriptor contains `id: "ouro"`, an `endpoint` with
+`transport: "unix"`, `runtimeRelativePath: "ouro.mcp.sock"`, and
+`protocolVersion: "2026-07-28"`, plus `catalog` containing the initial
+`tools/list` result. The endpoint path is relative to `$XDG_RUNTIME_DIR`, not
+the data directory. A custom `--mcp-socket` is not described by this default
+descriptor.
+
+This establishes Ouro's discovery convention; it is not yet a shared standard
+implemented by Ourokit or ourosettings. Discovery consumers should search
+`$XDG_DATA_HOME/ouro/mcp/apps` (default `~/.local/share/ouro/mcp/apps`) first,
+then the corresponding directories under `$XDG_DATA_DIRS` (default
+`/usr/local/share:/usr/share`). The first matching app ID wins. Read descriptors
+only—never execute installed applications to discover their tools. Keep any
+derived catalogs under `$XDG_CACHE_HOME` (default `~/.cache`), separate from
+installed descriptors and runtime sockets. An installed catalog is an initial
+snapshot, not evidence that a compositor instance is running; refresh from the
+live endpoint and apply its TTL and invalidation notifications.
 
 ### Moving existing configuration into ourosettings
 
