@@ -26,6 +26,8 @@ pub const Color = struct {
 
 pub const Size = struct { width: u32, height: u32 };
 
+pub const Point = struct { x: i32, y: i32 };
+
 pub const Rect = struct {
     x: i32,
     y: i32,
@@ -168,6 +170,9 @@ pub const SurfaceSample = struct {
     crop: SourceRect,
     destination: Rect,
     clip: Rect,
+    /// Logical surface-tree origin snapped before output scaling. Cleared
+    /// when destination and clip have been converted to physical pixels.
+    scale_origin: ?Point = null,
     transform: Transform = .normal,
     /// Vulkan selects reconstruction from the source mapping; Pixman uses
     /// bilinear. Both preserve aligned 1:1 pixels without filtering.

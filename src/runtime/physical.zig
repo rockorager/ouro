@@ -8916,6 +8916,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 if (self.retainedResizePending(layer, scene)) {
                     sample.destination = layer.sample.?.destination;
                 } else {
+                    sample.scale_origin = surfaceScaleOrigin(self, scene, layer.content_origin);
                     layer.window_geometry = scene.root.geometry;
                 }
                 // Keep offscreen content so exposure can resume a suspended
@@ -9393,6 +9394,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .crop = crop,
                 .destination = destination,
                 .clip = visible_clip,
+                .scale_origin = if (surface_scene) |scene| surfaceScaleOrigin(self, scene, content_origin) else null,
                 .transform = inverseSurfaceTransform(content.surface.transform),
                 .color_description = content.surface.color_description,
                 .color_representation = content.surface.color_representation,
@@ -9568,6 +9570,7 @@ pub fn Coordinator(comptime protocol: type) type {
             );
             sample.destination = destination;
             sample.clip = visible_clip;
+            sample.scale_origin = if (surface_scene) |scene| surfaceScaleOrigin(self, scene, content_origin) else null;
             sample.transform = inverseSurfaceTransform(content.surface.transform);
             sample.color_description = content.surface.color_description;
             sample.color_representation = content.surface.color_representation;
@@ -10702,10 +10705,12 @@ pub fn Coordinator(comptime protocol: type) type {
             if (self.retainedResizePending(layer, scene)) {
                 sample.destination = layer.sample.?.destination;
             } else {
+                sample.scale_origin = surfaceScaleOrigin(self, scene, layer.content_origin);
                 layer.window_geometry = scene.root.geometry;
             }
             sample.clip = try clipToOutput(sample.destination, output_bounds) orelse return false;
             if (std.meta.eql(sample.destination, layer.sample.?.destination) and
+                std.meta.eql(sample.scale_origin, layer.sample.?.scale_origin) and
                 std.meta.eql(sample.clip, layer.sample.?.clip)) return true;
             if (!std.meta.eql(sample.destination, layer.sample.?.destination))
                 self.output_associations_dirty = true;
@@ -14397,6 +14402,153 @@ test "physical: displaced output scene rectangles map to local physical pixels" 
     }, physical);
 }
 
+test "physical: XDG scale origins follow root content rather than child positions" {
+    const Owner = struct {
+        content_origin: geometry.Point = .{ .x = 3, .y = -1 },
+        fn findAppLayer(owner: *@This(), id: u32) ?*@This() {
+            return if (id == 4) owner else null;
+        }
+    };
+    var owner: Owner = .{};
+    const Scene = struct {
+        root: struct {
+            surface: u32 = 4,
+            managed: bool,
+            geometry: geometry.Rect = .{ .x = 1542, .y = 52, .width = 1518, .height = 1664 },
+            has_window_geometry: bool = true,
+            surface_offset: geometry.Point = .{ .x = 5, .y = 7 },
+        },
+        subsurface: bool,
+    };
+    var scene: Scene = .{ .root = .{ .managed = true }, .subsurface = false };
+    const expected: ?render.Point = .{ .x = 1540, .y = 44 };
+    try std.testing.expectEqual(expected, surfaceScaleOrigin(&owner, scene, owner.content_origin));
+    scene.subsurface = true;
+    try std.testing.expectEqual(expected, surfaceScaleOrigin(&owner, scene, .{ .x = 11, .y = 13 }));
+    scene.root.managed = false;
+    try std.testing.expect(surfaceScaleOrigin(&owner, scene, .{ .x = 11, .y = 13 }) == null);
+}
+
+test "physical: fractional XDG tiles keep client pixel sizes and historical damage origins" {
+    const output: geometry.Rect = .{ .x = 1920, .y = -528, .width = 3072, .height = 1728 };
+    const scale = try geometry.OutputScale.init(150);
+    var previous: ?damage.SurfaceState = null;
+    for ([_]i32{ 12, 1542 }, [_]i32{ 15, 1928 }) |x, physical_x| {
+        const destination: render.Rect = .{ .x = output.x + x, .y = output.y + 52, .width = 1518, .height = 1664 };
+        const sample: render.SurfaceSample = .{
+            .sample = .{ .surface = 1, .commit_sequence = 1 },
+            .presentation = .{ .slot = 0, .generation = 1 },
+            .source = .{ .size = .{ .width = 1898, .height = 2080 }, .stride = 1898 * 4, .format = .xrgb8888, .bytes = &.{} },
+            .crop = render.SourceRect.pixels(0, 0, 1898, 2080),
+            .destination = destination,
+            .clip = destination,
+            .scale_origin = .{ .x = destination.x, .y = destination.y },
+        };
+        const physical = try scaleSample(sample, output, scale);
+        const expected: render.Rect = .{ .x = physical_x, .y = 65, .width = 1898, .height = 2080 };
+        try std.testing.expectEqual(expected, physical.destination);
+        try std.testing.expectEqual(expected, physical.clip);
+        try std.testing.expect(physical.scale_origin == null);
+        try std.testing.expect(render.pixelAligned(physical.crop, .{ .width = 1898, .height = 2080 }, physical.transform));
+        const current = damage.SurfaceState.fromSample(sample, .{ .width = 1518, .height = 1664 });
+        const change = try scaleChange(.{ .previous = previous, .current = current }, output, scale);
+        try std.testing.expectEqual(expected, change.current.?.destination);
+        try std.testing.expectEqual(expected, change.current.?.clip);
+        try std.testing.expect(change.current.?.scale_origin == null);
+        if (previous != null) try std.testing.expectEqual(@as(i32, 15), change.previous.?.destination.x);
+        previous = current;
+    }
+    const removal = try scaleChange(.{ .previous = previous }, output, scale);
+    try std.testing.expectEqual(render.Rect{ .x = 1928, .y = 65, .width = 1898, .height = 2080 }, removal.previous.?.destination);
+    try std.testing.expect(removal.current == null);
+}
+
+test "physical: snapped trees keep child adjacency and output clipping" {
+    const output: geometry.Rect = .{ .x = 0, .y = 0, .width = 6, .height = 6 };
+    const scale = try geometry.OutputScale.init(150);
+    const origin: render.Point = .{ .x = 2, .y = 1 };
+    const first = try scaleSurfaceRect(.{ .x = 3, .y = 1, .width = 1, .height = 4 }, origin, output, scale);
+    const second = try scaleSurfaceRect(.{ .x = 4, .y = 1, .width = 1, .height = 4 }, origin, output, scale);
+    try std.testing.expectEqual(render.Rect{ .x = 4, .y = 1, .width = 2, .height = 5 }, first);
+    try std.testing.expectEqual(render.Rect{ .x = 6, .y = 1, .width = 1, .height = 5 }, second);
+    // Independently rounding child widths would leave a pixel-wide seam.
+    try std.testing.expectEqual(@as(i64, first.x) + first.width, second.x);
+    const negative_child = try scaleSurfaceRect(.{ .x = 1, .y = -1, .width = 1, .height = 2 }, origin, output, scale);
+    try std.testing.expectEqual(render.Rect{ .x = 2, .y = -2, .width = 1, .height = 3 }, negative_child);
+    // A clipped tree must cover the last output pixel even when rounding the
+    // output edge relative to its root would turn an 8-pixel clip into 7.
+    const clip = try scaleSurfaceClip(.{ .x = 0, .y = 0, .width = 6, .height = 6 }, .{ .x = 1, .y = 1 }, output, scale);
+    try std.testing.expectEqual(render.Rect{ .x = 0, .y = 0, .width = 8, .height = 8 }, clip);
+    const interior = try scaleSurfaceClip(.{ .x = 3, .y = 1, .width = 1, .height = 4 }, origin, output, scale);
+    try std.testing.expectEqual(first, interior);
+}
+
+test "physical: snapped pixels survive rendering movement partial damage and removal" {
+    const output: geometry.Rect = .{ .x = 0, .y = 0, .width = 40, .height = 20 };
+    const size: render.Size = .{ .width = 50, .height = 25 };
+    const scale = try geometry.OutputScale.init(150);
+    var pixels: [18 * 10]u32 = undefined;
+    for (&pixels, 0..) |*pixel, index| pixel.* = 0xff000000 | @as(u32, @intCast(index * 7919));
+    var target: [50 * 25]u32 = undefined;
+    var renderer = try render_pixman.Renderer.init(std.testing.allocator, .{ .max_samples = 1, .max_source_width = 18, .max_source_height = 10 });
+    defer renderer.deinit();
+    var planner = try damage.Planner.init(std.testing.allocator, size, .normal, .{
+        .image_count = 1,
+        .max_samples = 1,
+        .max_client_rects = 8,
+        .max_scene_rects = 8,
+        .max_repair_rects = 8,
+        .max_render_rects = 8,
+    });
+    defer planner.deinit();
+    var previous: ?damage.SurfaceState = null;
+    // The second position rounds down, the first up. The third frame changes
+    // only the last source column; the fourth removes the surface entirely.
+    for ([_]i32{ 2, 7, 7, 7 }, 0..) |x, frame| {
+        if (frame == 2) pixels[17] = 0xffff00ff;
+        const destination: render.Rect = .{ .x = x, .y = 2, .width = 14, .height = 8 };
+        const logical: render.SurfaceSample = .{
+            .sample = .{ .surface = 1, .commit_sequence = frame + 1 },
+            .presentation = .{ .slot = 0, .generation = 1 },
+            .source = .{ .size = .{ .width = 18, .height = 10 }, .stride = 18 * 4, .format = .xrgb8888, .bytes = std.mem.sliceAsBytes(&pixels) },
+            .crop = render.SourceRect.pixels(0, 0, 18, 10),
+            .destination = destination,
+            .clip = destination,
+            .scale_origin = .{ .x = x, .y = 2 },
+        };
+        const physical = try scaleSample(logical, output, scale);
+        const current = if (frame == 3) null else damage.SurfaceState.fromSample(logical, .{ .width = 14, .height = 8 });
+        var change: damage.Change = .{ .previous = previous, .current = current };
+        if (frame == 2) {
+            var region: surface_state.DamageRegion = .{};
+            region.rects[0] = .{ .min_x = 17, .min_y = 0, .max_x = 18, .max_y = 1, .empty = false };
+            region.count = 1;
+            change.buffer_damage = region;
+        }
+        const list: render.List = .{
+            .output = size,
+            .output_format = .xrgb8888,
+            .clear = .{ .r = 32, .g = 32, .b = 32 },
+            .samples = if (frame == 3) &.{} else &.{physical},
+        };
+        const plan = try planner.prepare(.{ .slot = 0, .generation = @intCast(frame + 1) }, list, &.{try scaleChange(change, output, scale)});
+        if (frame != 0) try std.testing.expect(!plan.render_full);
+        try renderer.draw(list, plan, std.mem.sliceAsBytes(&target), 50 * 4);
+        const left: usize = if (frame == 0) 3 else 9;
+        for (target, 0..) |actual, index| {
+            const px = index % 50;
+            const py = index / 50;
+            const expected = if (frame != 3 and px >= left and px < left + 18 and py >= 3 and py < 13)
+                pixels[(py - 3) * 18 + px - left]
+            else
+                @as(u32, 0xff202020);
+            try std.testing.expectEqual(expected, actual);
+        }
+        try planner.publish();
+        previous = current;
+    }
+}
+
 fn alphaMultiplier(multiplier: u32) u8 {
     const maximum = std.math.maxInt(u32);
     return @intCast((@as(u64, multiplier) * 255 + maximum / 2) / maximum);
@@ -14726,15 +14878,94 @@ fn scaleRenderRect(
     };
 }
 
+fn surfaceScaleOrigin(owner: anytype, scene: anytype, content_origin: geometry.Point) ?render.Point {
+    // Layer-shell/lock surfaces and compositor geometry retain their
+    // output-edge rounding. XDG trees round relative to one snapped
+    // root, matching fractional-scale clients' rounded buffer sizes.
+    if (!scene.root.managed) return null;
+    const root_content = if (scene.subsurface)
+        if (owner.findAppLayer(scene.root.surface)) |root| root.content_origin else geometry.Point{ .x = 0, .y = 0 }
+    else
+        content_origin;
+    return .{
+        .x = translatedCoordinate(
+            if (scene.root.has_window_geometry)
+                alignedOrigin(scene.root.geometry.x, scene.root.surface_offset.x)
+            else
+                scene.root.geometry.x,
+            root_content.x,
+        ),
+        .y = translatedCoordinate(
+            if (scene.root.has_window_geometry)
+                alignedOrigin(scene.root.geometry.y, scene.root.surface_offset.y)
+            else
+                scene.root.geometry.y,
+            root_content.y,
+        ),
+    };
+}
+
 fn scaleSample(
     sample_value: render.SurfaceSample,
     output: geometry.Rect,
     scale: geometry.OutputScale,
 ) !render.SurfaceSample {
     var result = sample_value;
-    result.destination = try scaleRenderRect(result.destination, output, scale);
-    result.clip = try scaleRenderRect(result.clip, output, scale);
+    result.destination = try scaleSurfaceRect(result.destination, result.scale_origin, output, scale);
+    result.clip = try scaleSurfaceClip(result.clip, result.scale_origin, output, scale);
+    result.scale_origin = null;
     return result;
+}
+
+fn scaleSurfaceRect(
+    rect: render.Rect,
+    origin: ?render.Point,
+    output: geometry.Rect,
+    scale: geometry.OutputScale,
+) !render.Rect {
+    const root = origin orelse return scaleRenderRect(rect, output, scale);
+    // Round tree-local edges to retain adjacency between subsurfaces, then
+    // translate by the snapped root. Do not independently snap each child.
+    var result = try scaleRenderRect(rect, .{
+        .x = root.x,
+        .y = root.y,
+        .width = output.width,
+        .height = output.height,
+    }, scale);
+    const x = try scale.physicalEdge(@as(i64, root.x) - output.x);
+    const y = try scale.physicalEdge(@as(i64, root.y) - output.y);
+    result.x = std.math.cast(i32, @as(i64, result.x) + x) orelse return error.InvalidDestination;
+    result.y = std.math.cast(i32, @as(i64, result.y) + y) orelse return error.InvalidDestination;
+    return result;
+}
+
+fn scaleSurfaceClip(
+    clip: render.Rect,
+    origin: ?render.Point,
+    output: geometry.Rect,
+    scale: geometry.OutputScale,
+) !render.Rect {
+    const scaled = try scaleSurfaceRect(clip, origin, output, scale);
+    if (origin == null) return scaled;
+    // Logical output clipping precedes scaling. Its boundary belongs to the
+    // output, not the snapped tree: never round it inward and lose an edge
+    // pixel. The renderer intersects this with the destination and output.
+    const left = if (clip.x <= output.x) @min(scaled.x, 0) else scaled.x;
+    const top = if (clip.y <= output.y) @min(scaled.y, 0) else scaled.y;
+    const right = if (@as(i64, clip.x) + clip.width >= @as(i64, output.x) + output.width)
+        @max(@as(i64, scaled.x) + scaled.width, try scale.physicalEdge(output.width))
+    else
+        @as(i64, scaled.x) + scaled.width;
+    const bottom = if (@as(i64, clip.y) + clip.height >= @as(i64, output.y) + output.height)
+        @max(@as(i64, scaled.y) + scaled.height, try scale.physicalEdge(output.height))
+    else
+        @as(i64, scaled.y) + scaled.height;
+    return .{
+        .x = left,
+        .y = top,
+        .width = std.math.cast(u32, right - left) orelse return error.InvalidDestination,
+        .height = std.math.cast(u32, bottom - top) orelse return error.InvalidDestination,
+    };
 }
 
 fn scaleSurfaceState(
@@ -14743,8 +14974,9 @@ fn scaleSurfaceState(
     scale: geometry.OutputScale,
 ) !damage.SurfaceState {
     var result = state;
-    result.destination = try scaleRenderRect(result.destination, output, scale);
-    result.clip = try scaleRenderRect(result.clip, output, scale);
+    result.destination = try scaleSurfaceRect(result.destination, result.scale_origin, output, scale);
+    result.clip = try scaleSurfaceClip(result.clip, result.scale_origin, output, scale);
+    result.scale_origin = null;
     return result;
 }
 
