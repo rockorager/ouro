@@ -403,11 +403,16 @@ pub fn main(init: std.process.Init) !void {
                     try control.failCall(-32602, @errorName(err));
                     continue;
                 };
-                // Bound even a future larger desktop's snapshot to one frame.
-                var response_storage: [ouro.mcp_server.maximum_frame_size - 2048]u8 = undefined;
-                var response = std.Io.Writer.fixed(&response_storage);
-                const stopped = executeControl(command, coordinator, &systemd_session, &launcher, &mcp, settings == null, &control_reload, &response) catch |err| failed: {
-                    response = std.Io.Writer.fixed(&response_storage);
+                // Large snapshot buffers are transient heap allocations, not
+                // part of the compositor stack or every action acknowledgment.
+                var small_response: [4096]u8 = undefined;
+                const response_storage = if (command == .get_state)
+                    try arena.allocator().alloc(u8, ouro.mcp_server.maximum_frame_size - 2048)
+                else
+                    &small_response;
+                var response = std.Io.Writer.fixed(response_storage);
+                const stopped = executeControl(arena.allocator(), command, coordinator, &systemd_session, &launcher, &mcp, settings == null, &control_reload, &response) catch |err| failed: {
+                    response = std.Io.Writer.fixed(response_storage);
                     try response.print("{{\"resultType\":\"complete\",\"content\":[{{\"type\":\"text\",\"text\":{f}}}],\"isError\":true}}", .{std.json.fmt(@errorName(err), .{})});
                     break :failed false;
                 };
@@ -504,6 +509,7 @@ fn applyAction(
 }
 
 fn executeControl(
+    allocator: std.mem.Allocator,
     command: ouro.control.Command,
     coordinator: *Runtime,
     systemd_session: *SystemdSession,
@@ -518,9 +524,11 @@ fn executeControl(
         return error.SessionLocked;
     switch (command) {
         .get_state => {
-            try writer.writeAll("{\"resultType\":\"complete\",\"content\":[],\"structuredContent\":");
-            try coordinator.desktop.writeControlState(writer);
-            try writer.writeAll(",\"isError\":false}");
+            const state_storage = try allocator.alloc(u8, ouro.mcp_server.maximum_frame_size);
+            defer allocator.free(state_storage);
+            var state = std.Io.Writer.fixed(state_storage);
+            try coordinator.desktop.writeControlState(&state);
+            try ouro.control.writeStateResult(writer, state.buffered());
             return false;
         },
         .reload_config => {

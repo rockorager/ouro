@@ -1,7 +1,7 @@
 //! The local MCP 2026-07-28 Unix-socket profile shared by Ouro's clients.
 const std = @import("std");
 
-pub const maximum_frame_size = 256 * 1024;
+pub const maximum_frame_size = 4 * 1024 * 1024;
 pub const meta = .{
     .@"io.modelcontextprotocol/protocolVersion" = "2026-07-28",
     .@"io.modelcontextprotocol/clientCapabilities" = struct {}{},

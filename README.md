@@ -201,7 +201,7 @@ snapshot. The live subscription keeps the socket-activated daemon running.
 A validated replacement waits for pending input/output transactions; newer
 valid updates replace that waiting candidate. Settings persistence is not an
 acknowledgement of hardware application: output changes complete asynchronously
-and can roll back. MCP records are bounded to 256 KiB including the newline.
+and can roll back. MCP records are bounded to 4 MiB including the newline.
 Ouro waits for the subscription acknowledgment before `resources/read`, keeps
 one read outstanding, and rereads if a change arrived during that read. Resource
 contents are `application/json` text containing `{revision, exists, value}`;
@@ -271,7 +271,7 @@ are logged. Unsupported interim results such as `input_required` fail rather
 than prompting or retrying. An absent `resultType` means complete as required
 by MCP; malformed or unknown explicit result types fail. Calls time
 out after five seconds and are **never retried**, since a lost reply may follow
-a successful side effect. Ouro allows at most 16 in-flight calls and 256 KiB per
+a successful side effect. Ouro allows at most 16 in-flight calls and 4 MiB per
 request or reply (including its terminating newline); excess calls are logged and
 dropped. Config reloads preserve in-flight calls; compositor shutdown closes
 them without waiting for replies. The separate control server below exposes
@@ -313,13 +313,15 @@ IDs (index and generation), titles, app IDs, logical state/workspace membership,
 published geometry, output IDs/bounds/work areas, and active or occupied
 workspaces. `reload-config` requests an asynchronous file reload; it returns a
 tool error in settings mode, where updates already arrive automatically.
+Structured tool results also include the identical serialized JSON in a text
+content block, so content-only MCP hosts can read state and acknowledgments.
 Invalid names/arguments return JSON-RPC errors; execution failures return MCP
 `isError: true`. All tool calls, including state reads, are rejected while a
 session lock is pending, active, or fail-closed. Input injection and screenshots
 are not exposed.
 
 The server bounds clients and pending calls to 16 each, permits one outstanding
-tool call per connection, and limits frames to 256 KiB including the newline.
+tool call per connection, and limits frames to 4 MiB including the newline.
 Slow peers do not block other clients. A disconnected
 peer's queued calls are discarded; executed actions are never retried. The
 `exit` acknowledgment is best-effort before shutdown closes the connection.

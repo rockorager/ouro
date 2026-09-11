@@ -43,7 +43,14 @@ comptime {
 
 const empty_schema = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}";
 const accepted_schema = "{\"type\":\"object\",\"properties\":{\"accepted\":{\"type\":\"boolean\"}},\"required\":[\"accepted\"],\"additionalProperties\":false}";
-pub const accepted = "{\"resultType\":\"complete\",\"content\":[{\"type\":\"text\",\"text\":\"Command accepted; presentation and application responses may complete asynchronously.\"}],\"structuredContent\":{\"accepted\":true},\"isError\":false}";
+pub const accepted = "{\"resultType\":\"complete\",\"content\":[{\"type\":\"text\",\"text\":\"{\\\"accepted\\\":true}\"}],\"structuredContent\":{\"accepted\":true},\"isError\":false}";
+
+/// Include JSON text for hosts that expose content rather than structuredContent.
+pub fn writeStateResult(writer: *std.Io.Writer, state_json: []const u8) !void {
+    try writer.print("{{\"resultType\":\"complete\",\"content\":[{{\"type\":\"text\",\"text\":{f}}}],\"structuredContent\":{s},\"isError\":false}}", .{
+        std.json.fmt(state_json, .{}), state_json,
+    });
+}
 
 fn inputSchema(tag: Tag) []const u8 {
     return switch (tag) {
@@ -149,6 +156,45 @@ pub fn apply(coordinator: anytype, action: config.Action) !void {
         .toggle_floating => try coordinator.toggleFocusedFloating(),
         .exit, .run, .call => unreachable, // Process lifecycle belongs to main.
     }
+}
+
+test "MCP acknowledgment includes the structured result as JSON text" {
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, accepted, .{});
+    defer parsed.deinit();
+    const result = parsed.value.object;
+    const content = result.get("content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), content.len);
+    try std.testing.expectEqualStrings("text", content[0].object.get("type").?.string);
+    try std.testing.expectEqualStrings("{\"accepted\":true}", content[0].object.get("text").?.string);
+    try std.testing.expect(result.get("structuredContent").?.object.get("accepted").?.bool);
+}
+
+test "MCP state result preserves escaped text and structured state within the reply bound" {
+    const state = "{\"focused\":null,\"windows\":[{\"title\":\"a\\\"b\\nc\\\\d é\",\"x\":-37}],\"outputs\":[],\"workspaces\":[7]}";
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeStateResult(&out.writer, state);
+    try std.testing.expect(std.mem.indexOfScalar(u8, out.written(), '\n') == null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.written(), .{});
+    defer parsed.deinit();
+    const result = parsed.value.object;
+    try std.testing.expectEqualStrings("complete", result.get("resultType").?.string);
+    try std.testing.expect(!result.get("isError").?.bool);
+    const content = result.get("content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), content.len);
+    try std.testing.expectEqualStrings("text", content[0].object.get("type").?.string);
+    try std.testing.expectEqualStrings(state, content[0].object.get("text").?.string);
+    const structured = try std.json.Stringify.valueAlloc(std.testing.allocator, result.get("structuredContent").?, .{});
+    defer std.testing.allocator.free(structured);
+    try std.testing.expectEqualStrings(state, structured);
+
+    const buffer = try std.testing.allocator.alloc(u8, out.written().len);
+    defer std.testing.allocator.free(buffer);
+    var exact = std.Io.Writer.fixed(buffer);
+    try writeStateResult(&exact, state);
+    try std.testing.expectEqualStrings(out.written(), exact.buffered());
+    var short = std.Io.Writer.fixed(buffer[0 .. buffer.len - 1]);
+    try std.testing.expectError(error.WriteFailed, writeStateResult(&short, state));
 }
 
 test "MCP descriptor follows shared discovery contract and preserves live tool schemas" {

@@ -19,6 +19,7 @@ pub const maximum_frame_size = mcp.maximum_frame_size;
 pub const maximum_clients = 16;
 const maximum_calls = 16;
 const maximum_output_size = maximum_frame_size;
+const maximum_catalog_size = 256 * 1024 - 2048;
 const io_chunk = 16 * 1024;
 const maximum_events = 32;
 const version = "2026-07-28";
@@ -148,6 +149,9 @@ pub const Server = struct {
         if (total > maximum_frame_size) return error.ReplyTooLarge;
         const client = &self.clients[p.client].?;
         std.debug.assert(client.output.items.len == 0);
+        // Action acknowledgments fit the reservation made before execution;
+        // only larger read-only snapshots need to grow this buffer.
+        try client.output.ensureTotalCapacity(self.allocator, total);
         client.output.appendSliceAssumeCapacity(prefix);
         client.output.appendSliceAssumeCapacity(encoded_id);
         client.output.appendSliceAssumeCapacity(suffix);
@@ -174,7 +178,7 @@ pub const Server = struct {
 
     pub fn updateCatalog(self: *Server, catalog: []const u8) !void {
         if (std.mem.eql(u8, self.catalog, catalog)) return;
-        if (catalog.len > maximum_frame_size - 2048) return error.ReplyTooLarge;
+        if (catalog.len > maximum_catalog_size) return error.ReplyTooLarge;
         const replacement = try self.allocator.dupe(u8, catalog);
         errdefer self.allocator.free(replacement);
         var notifications: [maximum_clients]std.ArrayList(u8) = @splat(.empty);
@@ -399,7 +403,7 @@ pub const Server = struct {
             for (self.calls[0..self.call_count]) |pending| {
                 if (pending.?.client == i) return self.rpcError(i, id, -32000, "Previous tool call is still pending");
             }
-            try self.clients[i].?.output.ensureTotalCapacity(self.allocator, maximum_frame_size);
+            try self.clients[i].?.output.ensureTotalCapacity(self.allocator, 4096);
             self.calls[self.call_count] = .{ .client = i, .generation = self.clients[i].?.generation, .parsed = parsed, .id = id, .name = name.string, .arguments = args };
             self.call_count += 1;
             retained = true;
@@ -601,7 +605,7 @@ fn testReceive(server: *Server, fd: c_int, lines: usize) ![]u8 {
     var attempts: usize = 0;
     while (std.mem.count(u8, out.items, "\n") < lines and attempts < 1000) : (attempts += 1) {
         try server.dispatch();
-        var buf: [4096]u8 = undefined;
+        var buf: [io_chunk]u8 = undefined;
         const n = c.recv(fd, &buf, buf.len, 0);
         if (n > 0) try out.appendSlice(std.testing.allocator, buf[0..@intCast(n)]) else if (n < 0 and c.__errno_location().* != c.EAGAIN) return error.ReceiveFailed;
     }
@@ -670,6 +674,33 @@ test "MCP server coalesced integer and string IDs, call completion and failure" 
     const failed = try testReceive(&server, fd, 1);
     defer std.testing.allocator.free(failed);
     try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":7,\"error\":{\"code\":-32602,\"message\":\"bad args\"}}\n", failed);
+}
+
+test "MCP server grows small reply reservation and transmits exact 4 MiB frame" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var server = try testServer(&tmp);
+    defer server.deinit();
+    const fd = try testConnect(&server);
+    defer _ = c.close(fd);
+    try testSend(fd, "{\"jsonrpc\":\"2.0\",\"id\":19,\"method\":\"tools/call\",\"params\":{" ++ test_meta ++ ",\"name\":\"get-state\"}}\n");
+    try server.dispatch();
+    try std.testing.expect(server.peekCall() != null);
+    try std.testing.expect(server.clients[0].?.output.capacity < 64 * 1024);
+    const prefix = "{\"jsonrpc\":\"2.0\",\"id\":19,\"result\":";
+    const result = try std.testing.allocator.alloc(u8, maximum_frame_size - prefix.len - 2 + 1);
+    defer std.testing.allocator.free(result);
+    @memset(result, ' ');
+    @memcpy(result[0..2], "{}");
+    try std.testing.expectError(error.ReplyTooLarge, server.completeCall(result));
+    try std.testing.expect(server.hasCalls());
+    try server.completeCall(result[0 .. result.len - 1]);
+    const reply = try testReceive(&server, fd, 1);
+    defer std.testing.allocator.free(reply);
+    try std.testing.expectEqual(@as(usize, 4 * 1024 * 1024), reply.len);
+    try std.testing.expectEqualStrings(prefix, reply[0..prefix.len]);
+    try std.testing.expectEqualStrings(result[0 .. result.len - 1], reply[prefix.len .. reply.len - 2]);
+    try std.testing.expectEqualStrings("}\n", reply[reply.len - 2 ..]);
 }
 
 test "MCP server invalid requests, subscriptions, catalog changes and cancellation" {

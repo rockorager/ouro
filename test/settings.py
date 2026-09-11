@@ -75,7 +75,7 @@ def main():
                     part = connection.recv(65536)
                     assert part, "EOF before final reply"
                     reply.extend(part)
-                    assert len(reply) <= 256 * 1024, "oversized MCP record"
+                    assert len(reply) <= 4 * 1024 * 1024, "oversized MCP record"
                 result = json.loads(reply.split(b"\n")[0])
                 assert result["jsonrpc"] == "2.0" and result["id"] == 1, result
                 assert "error" not in result, result
