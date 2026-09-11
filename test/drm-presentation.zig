@@ -68,7 +68,7 @@ test "configuration installs before physical startup claims an output" {
     try root.deinit();
 }
 
-test "WatchPath JSON prepares coordinator policy rules and bindings" {
+test "settings resource JSON prepares coordinator policy rules and bindings" {
     const allocator = std.testing.allocator;
     const json =
         \\{"general":{"focus_follows_mouse":true,"inner_gap":37,"outer_gap":9},"bindings":{"super+q":null},"input_rules":{"trackpad":{"match":{"type":"touchpad"},"settings":{"natural_scroll":true}}},"output_rules":{"panel":{"match":{"connector_id":10},"settings":{"scale":1.5}}}}
@@ -156,6 +156,65 @@ test "io_uring loop dispatches settings readiness and drains its final poll" {
     loop.configuration_pending = true;
     try loop.requestShutdown();
     try std.testing.expect(!loop.configuration_pending);
+    try drainServer(root, coordinator, &loop);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
+test "MCP readiness sends a filesystem socket call and drains its final poll" {
+    const allocator = std.testing.allocator;
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    var display_storage: [128]u8 = undefined;
+    const display = try std.fmt.bufPrint(&display_storage, "/tmp/ouro-call-display-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(display) catch {};
+    defer wayring.unix_socket.unlink(display) catch {};
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(display, 1), compositorConfig());
+    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), coordinatorConfig());
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
+    var client = try ouro.mcp_client.Client.init(allocator);
+    defer client.deinit();
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-call-service-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+    const listener = try wayring.unix_socket.listen(path, 1);
+    defer _ = linux.close(listener);
+    const address = try std.fmt.allocPrint(allocator, "unix:{s}", .{path});
+    defer allocator.free(address);
+    const call = try ouro.mcp_client.Call.init(allocator, address, "toggle_launcher", .{ .object = .empty });
+    defer allocator.free(call.request);
+    try loop.installMcp(&client);
+    try client.enqueue(call);
+    const accepted = linux.accept4(listener, null, null, linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(accepted));
+    const peer: linux.fd_t = @intCast(accepted);
+    defer _ = linux.close(peer);
+    _ = try loop.turn(coordinator);
+    try waitReady(&root.ring);
+    const progress = try loop.turn(coordinator);
+    try std.testing.expect(!progress.settings_changed);
+    try std.testing.expect(!loop.mcpDrained());
+    var bytes: [512]u8 = undefined;
+    const n = linux.read(peer, &bytes, bytes.len);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(n));
+    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"toggle_launcher\",\"arguments\":{},\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientCapabilities\":{},\"io.modelcontextprotocol/clientInfo\":{\"name\":\"ouro\",\"version\":\"0.0.0\"}}}}\n", bytes[0..n]);
+    const reply = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"complete\",\"content\":[]}}\n";
+    try std.testing.expectEqual(@as(usize, reply.len), linux.write(peer, reply, reply.len));
+    try waitReady(&root.ring);
+    _ = try loop.turn(coordinator);
+    try std.testing.expectEqual(@as(usize, 0), linux.read(peer, &bytes, bytes.len));
+    try std.testing.expect(!loop.mcpDrained());
+    try coordinator.requestStop();
+    try loop.requestShutdown();
+    for (0..16) |_| {
+        _ = try loop.turn(coordinator);
+        if (loop.mcpDrained()) break;
+        try waitReady(&root.ring);
+    }
+    try std.testing.expect(loop.mcpDrained());
+    try std.testing.expect(client.stopping);
     try drainServer(root, coordinator, &loop);
     loop.deinit();
     try coordinator.destroy();

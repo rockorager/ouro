@@ -25,6 +25,7 @@ pub const Kind = enum(u8) {
     security_cancel = 0x89,
     hotplug_ready = 0x8a,
     settings = 0x8b,
+    mcp = 0x8c,
 };
 
 pub const DecodeError = error{

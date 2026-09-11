@@ -3520,8 +3520,341 @@ test "shell-input: last window removal clears every reused scanout image" {
     }
 }
 
+test "shell-input: fullscreen covers top bars but preserves overlays and restores bar input" {
+    try fullscreenLayer(false);
+    try fullscreenLayer(true);
+}
+
+fn fullscreenLayer(overlay: bool) !void {
+    const allocator = std.testing.allocator;
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-fullscreen-bar-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+    var fixture = try physical_fixture.Fixture.init();
+    defer fixture.deinit();
+    var root_config = physical_fixture.compositorConfig();
+    root_config.runtime.actor.received_fd_budget = 2;
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), root_config);
+    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), physical_fixture.coordinatorConfig());
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
+    try coordinator.start(&loop);
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(allocator, .{ .entries = 16, .flags = 0 }, physical_fixture.clientReactorConfig());
+    var client = try ClientConnection.attach(
+        allocator,
+        &reactor,
+        try wayring.unix_socket.connect(path),
+        .{ .received_fd_budget = 2, .transmit_byte_budget = 4096, .transmit_fd_budget = 2 },
+        .{ .max_objects = 32, .max_client_ids = 31 },
+    );
+    const actor = try client.actor();
+    var driver = ClientDriver.init(&client);
+    const registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null);
+    var handler: MultiHandler = .{
+        .objects = &client.objects,
+        .queue = &actor.transmit,
+        .registry = registry,
+        .layer_mode = true,
+        .layer_overlay = overlay,
+        .cycle_count = 1,
+    };
+    try submitMultiClient(&reactor, &driver, &handler);
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    for (0..512) |_| {
+        _ = try drainMultiClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.frame_done == 2 and handler.buffer_releases == 2) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expectEqual(@as(usize, 2), handler.frame_done);
+    const bar = try coordinator.layer_shell_adapter.state((try coordinator.layer_shell_adapter.ids(coordinator.layer_surface_ids))[0]);
+    const window = coordinator.desktop.focused().?;
+    const window_surface = (try coordinator.desktop.scene(window)).surface;
+    try std.testing.expectEqual(@as(i32, 1), coordinator.desktop.workArea().y);
+    const device: ouro.input_backend.DeviceId = .{ .slot = 0, .generation = 1, .seat_generation = 1 };
+    try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .device_added = .{
+        .device = device,
+        .info = .{ .capabilities = .{ .pointer = true } },
+    } }));
+
+    for (0..3) |stage| {
+        const fullscreen = stage == 1;
+        const bar_visible = overlay or !fullscreen;
+        const presented = coordinator.stats.presented;
+        if (stage != 0) {
+            try protocol.xdg_toplevel.encodeRequest(handler.queue, handler.toplevels[0].?.id, if (fullscreen)
+                .{ .set_fullscreen = .{ .output = null } }
+            else
+                .{ .unset_fullscreen = .{} });
+        } else try coordinator.primaryKmsOutput().?.request(.damage, 1);
+        try submitMultiClient(&reactor, &driver, &handler);
+        const expected_row: []const u8 = if (bar_visible) &([_]u8{ 0xff, 0, 0, 0xff } ** 3) else pixels[0..12];
+        var rendered = false;
+        for (0..512) |_| {
+            _ = try drainMultiClient(&reactor, &driver, &handler);
+            _ = try loop.turn(coordinator);
+            const output = coordinator.primaryKmsOutput().?;
+            if (coordinator.stats.presented > presented and output.kms_output.current != null) {
+                const image = fixture.dumb_bytes[output.kms_output.current.?.slot];
+                if (std.mem.eql(u8, expected_row, image[0..12]) and
+                    ((try coordinator.desktop.scene(window)).fullscreen_output != null) == fullscreen)
+                {
+                    rendered = true;
+                    break;
+                }
+            }
+            if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+                try waitForEither(&root.ring, reactor.ring);
+        }
+        try std.testing.expect(rendered);
+        const scene = try coordinator.desktop.scene(window);
+        try std.testing.expectEqual(@as(i32, if (fullscreen) 0 else 1), scene.geometry.y);
+        if (fullscreen) {
+            try std.testing.expectEqual(@as(i32, 3), scene.geometry.width);
+            try std.testing.expectEqual(@as(i32, 2), scene.geometry.height);
+        }
+        const delta = coordinator.interaction.motionToPoint(.{ .x = 0, .y = 0 });
+        try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_motion = .{
+            .device = device,
+            .time_usec = (stage + 1) * 1_000,
+            .dx = delta.dx,
+            .dy = delta.dy,
+        } }));
+        try std.testing.expectEqual(if (bar_visible) bar.surface else window_surface, coordinator.seat_adapter.pointerState().focus.?.surface);
+    }
+    try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+    try coordinator.requestStop();
+    var drained = false;
+    for (0..512) |_| {
+        const cp = try drainMultiClient(&reactor, &driver, &handler);
+        const progress = try loop.turn(coordinator);
+        drained = progress.wayring.shutdown_complete and cp.quiescent and coordinator.backendDrainComplete();
+        if (drained) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expect(drained);
+    try client.deinit(allocator);
+    reactor.deinit(allocator);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
 test "shell-input: secondary output removal closes its reactive layer popup root" {
     try layerPopupOutputLifecycle(false);
+}
+
+test "shell-input: positive exclusive-zone bars stack in adapter order" {
+    try runLayerStacking(false);
+}
+
+test "shell-input: destroying an exclusive bar repositions the remaining bar" {
+    try runLayerStacking(true);
+}
+
+fn runLayerStacking(destroy: bool) !void {
+    const allocator = std.testing.allocator;
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-layer-stack-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+
+    var fixture = try physical_fixture.Fixture.init();
+    defer fixture.deinit();
+    fixture.mode_height = 4;
+    var root_config = physical_fixture.compositorConfig();
+    root_config.runtime.object_capacity = 40;
+    root_config.runtime.object_quota = 40;
+    root_config.runtime.actor.received_fd_budget = 2;
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), root_config);
+    var config = physical_fixture.coordinatorConfig();
+    config.shm.pool_capacity = 2;
+    config.shm.buffer_capacity = 2;
+    config.surface.surface_capacity = 2;
+    config.surface.content_update_capacity = 2;
+    config.surface.attachment_capacity = 2;
+    config.surface.copy_capacity = 2;
+    config.surface.max_copy_bytes = 24;
+    config.output.max_samples = 2;
+    config.output.max_source_bytes = 24;
+    config.output.max_source_height = 2;
+    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), config);
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
+    try coordinator.start(&loop);
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(allocator, .{ .entries = 16, .flags = 0 }, physical_fixture.clientReactorConfig());
+    var client = try ClientConnection.attach(allocator, &reactor, try wayring.unix_socket.connect(path), .{ .received_fd_budget = 2, .transmit_byte_budget = 4096, .transmit_fd_budget = 2 }, .{ .max_objects = 40, .max_client_ids = 39 });
+    const actor = try client.actor();
+    var driver = ClientDriver.init(&client);
+    var handler: LayerPopupHandler = .{
+        .objects = &client.objects,
+        .queue = &actor.transmit,
+        .registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null),
+        .layer_height = 1,
+        .stacked_layer_height = 2,
+    };
+    try submitLayerPopupClient(&reactor, &driver, &handler);
+    var stacked = false;
+    for (0..512) |_| {
+        _ = try drainLayerPopupClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.releases == 2 and coordinator.stats.presented > 0 and
+            coordinator.primaryKmsOutput().?.in_flight_frame == null)
+        {
+            const ids = try coordinator.layer_shell_adapter.ids(coordinator.layer_surface_ids);
+            if (ids.len == 2) {
+                const first = try coordinator.layer_shell_adapter.state(ids[0]);
+                const second = try coordinator.layer_shell_adapter.state(ids[1]);
+                const first_layer = findLayer(coordinator.app_layers, first.surface) orelse continue;
+                const second_layer = findLayer(coordinator.app_layers, second.surface) orelse continue;
+                if (first_layer.sample != null and second_layer.sample != null) {
+                    try std.testing.expectEqual(@as(i32, 0), first_layer.sample.?.destination.y);
+                    try std.testing.expectEqual(@as(i32, 1), second_layer.sample.?.destination.y);
+                    try std.testing.expectEqual(@as(i32, 3), coordinator.desktop.workArea().y);
+                    try std.testing.expectEqual(@as(i32, 1), coordinator.desktop.workArea().height);
+                    stacked = true;
+                    break;
+                }
+            }
+        }
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expect(stacked);
+    const output = coordinator.primaryKmsOutput().?;
+    const layer_ids = try coordinator.layer_shell_adapter.ids(coordinator.layer_surface_ids);
+    const second_surface = (try coordinator.layer_shell_adapter.state(layer_ids[1])).surface;
+    const image = fixture.dumb_bytes[output.kms_output.current.?.slot];
+    for (0..4) |y| for (0..3) |x| {
+        const expected: []const u8 = if (y == 0)
+            &.{ 0x20, 0x20, 0xe0, 0xff }
+        else if (y < 3)
+            &.{ 0x20, 0xc0, 0x20, 0xff }
+        else
+            &.{ 0, 0, 0, 0xff };
+        try std.testing.expectEqualSlices(u8, expected, image[y * 16 + x * 4 ..][0..4]);
+    };
+
+    // Zero avoids the first bar without reserving space. Negative zones ignore
+    // reservations. Restore exclusivity before testing removal below.
+    for ([_]i32{ 0, -1, 2 }) |zone| {
+        const previous_frame = coordinator.stats.presented;
+        try protocol.zwlr_layer_surface_v1.encodeRequest(&actor.transmit, handler.stacked_layer_surface.?.id, .{
+            .set_exclusive_zone = .{ .zone = zone },
+        });
+        try protocol.wl_surface.encodeRequest(&actor.transmit, handler.stacked_wl_surface.?.id, .{ .commit = .{} });
+        try submitLayerPopupClient(&reactor, &driver, &handler);
+        for (0..256) |_| {
+            _ = try drainLayerPopupClient(&reactor, &driver, &handler);
+            _ = try loop.turn(coordinator);
+            if (coordinator.stats.presented > previous_frame) break;
+            if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+                try waitForEither(&root.ring, reactor.ring);
+        }
+        try std.testing.expect(coordinator.stats.presented > previous_frame);
+        const ids = try coordinator.layer_shell_adapter.ids(coordinator.layer_surface_ids);
+        const second = try coordinator.layer_shell_adapter.state(ids[1]);
+        try std.testing.expectEqual(zone, second.exclusive_zone);
+        const layer = findLayer(coordinator.app_layers, second.surface).?;
+        try std.testing.expectEqual(@as(i32, if (zone < 0) 0 else 1), layer.sample.?.destination.y);
+        try std.testing.expectEqual(@as(i32, if (zone > 0) 3 else 1), coordinator.desktop.workArea().y);
+    }
+
+    // A right-side panel's automatic height must use the space below the first
+    // bar, and change when that bar's reservation changes without a new buffer.
+    try protocol.zwlr_layer_surface_v1.encodeRequest(&actor.transmit, handler.stacked_layer_surface.?.id, .{
+        .set_size = .{ .width = 1, .height = 0 },
+    });
+    try protocol.zwlr_layer_surface_v1.encodeRequest(&actor.transmit, handler.stacked_layer_surface.?.id, .{
+        .set_anchor = .{ .anchor = .{ .value = 11 } },
+    });
+    for ([_]i32{ 1, 0, 1 }, 0..) |zone, index| {
+        try protocol.zwlr_layer_surface_v1.encodeRequest(&actor.transmit, handler.layer_surface.?.id, .{
+            .set_exclusive_zone = .{ .zone = zone },
+        });
+        try protocol.wl_surface.encodeRequest(&actor.transmit, handler.layer_wl_surface.?.id, .{ .commit = .{} });
+        if (index == 0) try protocol.wl_surface.encodeRequest(&actor.transmit, handler.stacked_wl_surface.?.id, .{ .commit = .{} });
+        try submitLayerPopupClient(&reactor, &driver, &handler);
+        const expected_height: u32 = if (zone == 0) 4 else 3;
+        for (0..256) |_| {
+            _ = try drainLayerPopupClient(&reactor, &driver, &handler);
+            _ = try loop.turn(coordinator);
+            if (handler.stacked_configure_height == expected_height) break;
+            if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+                try waitForEither(&root.ring, reactor.ring);
+        }
+        try std.testing.expectEqual(expected_height, handler.stacked_configure_height);
+    }
+    try protocol.zwlr_layer_surface_v1.encodeRequest(&actor.transmit, handler.stacked_layer_surface.?.id, .{
+        .set_size = .{ .width = 3, .height = 2 },
+    });
+    try protocol.zwlr_layer_surface_v1.encodeRequest(&actor.transmit, handler.stacked_layer_surface.?.id, .{
+        .set_anchor = .{ .anchor = .{ .value = 13 } },
+    });
+    try protocol.wl_surface.encodeRequest(&actor.transmit, handler.stacked_wl_surface.?.id, .{ .commit = .{} });
+
+    const presented = coordinator.stats.presented;
+    if (destroy) {
+        try wayring.client.sendRequest(protocol.zwlr_layer_surface_v1, handler.objects, handler.queue, handler.layer_surface.?, .{ .destroy = .{} });
+    } else {
+        try protocol.wl_surface.encodeRequest(&actor.transmit, handler.layer_wl_surface.?.id, .{
+            .attach = .{ .buffer = null, .x = 0, .y = 0 },
+        });
+        try protocol.wl_surface.encodeRequest(&actor.transmit, handler.layer_wl_surface.?.id, .{ .commit = .{} });
+    }
+    try submitLayerPopupClient(&reactor, &driver, &handler);
+    var moved = false;
+    for (0..256) |_| {
+        _ = try drainLayerPopupClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        const layer = findLayer(coordinator.app_layers, second_surface) orelse continue;
+        if (layer.sample != null and layer.sample.?.destination.y == 0 and
+            coordinator.stats.presented > presented)
+        {
+            try std.testing.expectEqual(@as(i32, 2), coordinator.desktop.workArea().y);
+            try std.testing.expectEqual(@as(i32, 2), coordinator.desktop.workArea().height);
+            moved = true;
+            break;
+        }
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expect(moved);
+    const remaining = fixture.dumb_bytes[output.kms_output.current.?.slot];
+    for (0..4) |y| for (0..3) |x| {
+        const expected: []const u8 = if (y < 2)
+            &.{ 0x20, 0xc0, 0x20, 0xff }
+        else
+            &.{ 0, 0, 0, 0xff };
+        try std.testing.expectEqualSlices(u8, expected, remaining[y * 16 + x * 4 ..][0..4]);
+    };
+    try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+
+    _ = try client.prepareClose();
+    try submitLayerPopupClient(&reactor, &driver, &handler);
+    try coordinator.requestStop();
+    var drained = false;
+    for (0..256) |_| {
+        const cp = try drainLayerPopupClient(&reactor, &driver, &handler);
+        const progress = try loop.turn(coordinator);
+        drained = progress.wayring.shutdown_complete and cp.quiescent and coordinator.backendDrainComplete();
+        if (drained) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expect(drained);
+    try client.deinit(allocator);
+    reactor.deinit(allocator);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
 }
 
 test "shell-input: powered off outputs retain client commits and resume after pointer input" {
@@ -3856,6 +4189,199 @@ fn layerPopupOutputLifecycle(power_cycle: bool) !void {
     try std.testing.expect(drained);
     try client.deinit(allocator);
     client_reactor.deinit(allocator);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
+test "shell-input: grabbed layer popup receives keys instead of its exclusive bar and restores focus" {
+    try popupKeyboardFocus(false);
+}
+
+test "shell-input: grabbed toplevel popup receives keys and restores focus on dismissal" {
+    try popupKeyboardFocus(true);
+}
+
+fn popupKeyboardFocus(toplevel_root: bool) !void {
+    const allocator = std.testing.allocator;
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-popup-keyboard-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+    var fixture = try physical_fixture.Fixture.init();
+    defer fixture.deinit();
+    var root_config = physical_fixture.compositorConfig();
+    root_config.runtime.object_capacity = 52;
+    root_config.runtime.object_quota = 52;
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), root_config);
+    var config = physical_fixture.coordinatorConfig();
+    config.shm.pool_capacity = 2;
+    config.shm.buffer_capacity = 2;
+    config.surface.surface_capacity = 2;
+    config.surface.content_update_capacity = 2;
+    config.surface.attachment_capacity = 2;
+    config.surface.copy_capacity = 2;
+    config.output.max_samples = 3;
+    config.output.max_source_bytes = pixels.len * 2;
+    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), config);
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
+    try coordinator.start(&loop);
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(allocator, .{ .entries = 16, .flags = 0 }, physical_fixture.clientReactorConfig());
+    var client = try ClientConnection.attach(allocator, &reactor, try wayring.unix_socket.connect(path), .{ .received_fd_budget = 2, .transmit_byte_budget = 4096, .transmit_fd_budget = 2 }, .{ .max_objects = 52, .max_client_ids = 51 });
+    const actor = try client.actor();
+    var driver = ClientDriver.init(&client);
+    var handler: LayerPopupHandler = .{
+        .objects = &client.objects,
+        .queue = &actor.transmit,
+        .registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null),
+        .toplevel_root = toplevel_root,
+        .defer_popup = true,
+    };
+    try submitLayerPopupClient(&reactor, &driver, &handler);
+    const device: ouro.input_backend.DeviceId = .{ .slot = 10, .generation = 1, .seat_generation = 1 };
+    try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .device_added = .{
+        .device = device,
+        .info = .{ .capabilities = .{ .pointer = true, .keyboard = true } },
+    } }));
+    for (0..512) |_| {
+        _ = try drainLayerPopupClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.layer_mapped and handler.releases == 1 and handler.pointer != null and handler.keyboard != null) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(usize, 1), handler.releases);
+    const parent = handler.layer_wl_surface.?.id;
+    const delta = coordinator.interaction.motionToPoint(.{ .x = 0, .y = 0 });
+    try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_motion = .{
+        .device = device,
+        .time_usec = 1_000,
+        .dx = delta.dx,
+        .dy = delta.dy,
+    } }));
+    for ([_]bool{ true, false }) |pressed| try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_button = .{
+        .device = device,
+        .time_usec = 2_000,
+        .button = 273,
+        .pressed = pressed,
+    } }));
+    for (0..256) |_| {
+        _ = try drainLayerPopupClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.button_serial != null) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expect(handler.button_serial != null);
+
+    // Keywork switches the bar to exclusive, then creates and grabs its popup
+    // using the opening press serial. The password field belongs to the popup.
+    if (!toplevel_root) {
+        try protocol.zwlr_layer_surface_v1.encodeRequest(handler.queue, handler.layer_surface.?.id, .{
+            .set_keyboard_interactivity = .{ .keyboard_interactivity = .exclusive },
+        });
+        try protocol.wl_surface.encodeRequest(handler.queue, parent, .{ .commit = .{} });
+    }
+    handler.popup_grab_serial = handler.button_serial;
+    try handler.createPopup();
+    try submitLayerPopupClient(&reactor, &driver, &handler);
+    const popup = handler.popup_surface.?.id;
+    for (0..512) |_| {
+        _ = try drainLayerPopupClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.releases == 2 and handler.keyboard_surface == popup) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(usize, 0), handler.popup_done);
+    try std.testing.expectEqual(popup, handler.keyboard_surface.?);
+
+    // Nested grabs transfer focus to the child, then back to the still-live
+    // grabbing parent when only the child role is destroyed.
+    const first_popup = handler.popup.?;
+    const first_xdg_surface = handler.popup_xdg_surface.?;
+    const first_surface = handler.popup_surface.?;
+    handler.popup_parent = first_xdg_surface;
+    handler.popup_mapped = false;
+    try handler.createPopup();
+    try submitLayerPopupClient(&reactor, &driver, &handler);
+    for (0..512) |_| {
+        _ = try drainLayerPopupClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.releases == 3 and handler.keyboard_surface == handler.popup_surface.?.id) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(usize, 0), handler.popup_done);
+    try std.testing.expectEqual(handler.popup_surface.?.id, handler.keyboard_surface.?);
+    try wayring.client.sendRequest(protocol.xdg_popup, handler.objects, handler.queue, handler.popup.?, .{ .destroy = .{} });
+    try submitLayerPopupClient(&reactor, &driver, &handler);
+    for (0..256) |_| {
+        _ = try drainLayerPopupClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.keyboard_surface == popup) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(popup, handler.keyboard_surface.?);
+    handler.popup = first_popup;
+    handler.popup_xdg_surface = first_xdg_surface;
+    handler.popup_surface = first_surface;
+
+    // A parent redraw and pointer movement back onto it must not steal keys.
+    try protocol.wl_surface.encodeRequest(handler.queue, parent, .{ .commit = .{} });
+    try submitLayerPopupClient(&reactor, &driver, &handler);
+    for (0..32) |_| {
+        _ = try drainLayerPopupClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+    }
+    try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_motion = .{
+        .device = device,
+        .time_usec = 3_000,
+        .dx = 0,
+        .dy = 0,
+    } }));
+    for ([_]bool{ true, false }) |pressed| try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .keyboard_key = .{
+        .device = device,
+        .time_usec = 4_000,
+        .key = 30,
+        .pressed = pressed,
+    } }));
+    for (0..256) |_| {
+        _ = try drainLayerPopupClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.keyboard_keys == 2) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(@as(usize, 2), handler.keyboard_keys);
+    try std.testing.expectEqual(popup, handler.key_surface.?);
+
+    if (toplevel_root) {
+        try std.testing.expect(try coordinator.desktop.dismissPopupGrab());
+    } else {
+        try wayring.client.sendRequest(protocol.xdg_popup, handler.objects, handler.queue, handler.popup.?, .{ .destroy = .{} });
+        try submitLayerPopupClient(&reactor, &driver, &handler);
+    }
+    for (0..256) |_| {
+        _ = try drainLayerPopupClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.keyboard_surface == parent) break;
+        _ = linux.sched_yield();
+    }
+    try std.testing.expectEqual(parent, handler.keyboard_surface.?);
+    try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+    try coordinator.requestStop();
+    var drained = false;
+    for (0..512) |_| {
+        const cp = try drainLayerPopupClient(&reactor, &driver, &handler);
+        const progress = try loop.turn(coordinator);
+        drained = progress.wayring.shutdown_complete and cp.quiescent and coordinator.backendDrainComplete();
+        if (drained) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expect(drained);
+    try client.deinit(allocator);
+    reactor.deinit(allocator);
     loop.deinit();
     try coordinator.destroy();
     try root.deinit();
@@ -6579,6 +7105,10 @@ const MultiHandler = struct {
     source_pixels: []const u8 = &pixels,
     subsurface_mode: bool = false,
     cursor_mode: bool = false,
+    layer_mode: bool = false,
+    layer_overlay: bool = false,
+    layer_shell: ?wayring.objects.Handle = null,
+    layer_surface: ?wayring.objects.Handle = null,
     activation_mode: bool = false,
     metadata_commit_after_attach: bool = false,
     activation_requested: bool = false,
@@ -6662,6 +7192,16 @@ const MultiHandler = struct {
                     self.surface_enters[index] += 1;
                 },
                 else => {},
+            }
+        } else if (target.object.interface == &protocol.zwlr_layer_surface_v1.info) {
+            switch (try protocol.zwlr_layer_surface_v1.decodeEvent(message, fds)) {
+                .configure => |value| {
+                    try protocol.zwlr_layer_surface_v1.encodeRequest(self.queue, self.layer_surface.?.id, .{
+                        .ack_configure = .{ .serial = value.serial },
+                    });
+                    if (!self.mapped[1]) try self.mapSurface(1);
+                },
+                .closed => {},
             }
         } else if (target.object.interface == &protocol.xdg_toplevel.info) {
             const index = self.indexFor(self.toplevels, message.header.object_id) orelse
@@ -6813,6 +7353,8 @@ const MultiHandler = struct {
             self.shm = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_shm.info, @min(value.version, 2), null);
         if (std.mem.eql(u8, value.interface, protocol.xdg_wm_base.info.name))
             self.wm_base = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.xdg_wm_base.info, @min(value.version, 7), null);
+        if (self.layer_mode and std.mem.eql(u8, value.interface, protocol.zwlr_layer_shell_v1.info.name))
+            self.layer_shell = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.zwlr_layer_shell_v1.info, @min(value.version, 5), null);
         if (self.repaint_lifecycle_mode and self.output == null and std.mem.eql(u8, value.interface, protocol.wl_output.info.name))
             self.output = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_output.info, @min(value.version, 4), null);
         if (self.repaint_lifecycle_mode and std.mem.eql(u8, value.interface, protocol.zwlr_output_power_manager_v1.info.name))
@@ -6848,6 +7390,7 @@ const MultiHandler = struct {
         if ((self.subsurface_mode or self.cursor_mode) and self.subcompositor == null) return;
         if (self.fractional_mode and (self.fractional_manager == null or self.viewporter == null)) return;
         if (self.decoration_mode and self.decoration_manager == null) return;
+        if (self.layer_mode and self.layer_shell == null) return;
         for (0..self.surface_count) |index| {
             if (self.surfaces[index] != null) continue;
             self.surfaces[index] = (try protocol.wl_compositor.construct_create_surface(
@@ -6879,6 +7422,25 @@ const MultiHandler = struct {
                 });
             }
             if (self.cursor_mode or (self.subsurface_mode and index != 0)) continue;
+            if (self.layer_mode and index == 1) {
+                self.layer_surface = (try protocol.zwlr_layer_shell_v1.construct_get_layer_surface(
+                    self.objects,
+                    self.queue,
+                    self.layer_shell.?,
+                    .{ .surface = self.surfaces[index].?.id, .output = null, .layer = if (self.layer_overlay) .overlay else .top, .namespace = "fullscreen-test" },
+                )).id;
+                try protocol.zwlr_layer_surface_v1.encodeRequest(self.queue, self.layer_surface.?.id, .{
+                    .set_size = .{ .width = 3, .height = 1 },
+                });
+                try protocol.zwlr_layer_surface_v1.encodeRequest(self.queue, self.layer_surface.?.id, .{
+                    .set_anchor = .{ .anchor = .{ .value = 13 } },
+                });
+                try protocol.zwlr_layer_surface_v1.encodeRequest(self.queue, self.layer_surface.?.id, .{
+                    .set_exclusive_zone = .{ .zone = 1 },
+                });
+                try protocol.wl_surface.encodeRequest(self.queue, self.surfaces[index].?.id, .{ .commit = .{} });
+                continue;
+            }
             self.xdg_surfaces[index] = (try protocol.xdg_wm_base.construct_get_xdg_surface(
                 self.objects,
                 self.queue,
@@ -6933,7 +7495,8 @@ const MultiHandler = struct {
             self.xdg_surfaces[index].?.id,
             .{ .set_window_geometry = .{ .x = 1, .y = 1, .width = 2, .height = 1 } },
         );
-        const descriptor = try ordinaryMemfd(4096, 16, self.source_pixels);
+        const bar_pixels = [_]u8{ 0xff, 0, 0, 0xff } ** 4;
+        const descriptor = try ordinaryMemfd(4096, 16, if (self.layer_mode and index == 1) &bar_pixels else self.source_pixels);
         const pool = try protocol.wl_shm.construct_create_pool(
             self.objects,
             self.queue,
@@ -6947,7 +7510,7 @@ const MultiHandler = struct {
             .{
                 .offset = 16,
                 .width = 3,
-                .height = if (self.fractional_mode) @intCast((self.preferred_scales[index] + 60) / 120) else 2,
+                .height = if (self.layer_mode and index == 1) 1 else if (self.fractional_mode) @intCast((self.preferred_scales[index] + 60) / 120) else 2,
                 .stride = 16,
                 .format = .argb8888,
             },
@@ -7432,6 +7995,12 @@ const LayerPopupHandler = struct {
     keyboard_surface: ?u32 = null,
     keyboard_enters: usize = 0,
     keyboard_leaves: usize = 0,
+    keyboard_keys: usize = 0,
+    key_surface: ?u32 = null,
+    button_serial: ?u32 = null,
+    defer_popup: bool = false,
+    popup_grab_serial: ?u32 = null,
+    popup_parent: ?wayring.objects.Handle = null,
     popup_done: usize = 0,
     wm_base: ?wayring.objects.Handle = null,
     output: ?wayring.objects.Handle = null,
@@ -7445,6 +8014,8 @@ const LayerPopupHandler = struct {
     layer_shell: ?wayring.objects.Handle = null,
     layer_surface: ?wayring.objects.Handle = null,
     layer_wl_surface: ?wayring.objects.Handle = null,
+    stacked_layer_surface: ?wayring.objects.Handle = null,
+    stacked_wl_surface: ?wayring.objects.Handle = null,
     root_xdg_surface: ?wayring.objects.Handle = null,
     root_toplevel: ?wayring.objects.Handle = null,
     popup_surface: ?wayring.objects.Handle = null,
@@ -7459,6 +8030,9 @@ const LayerPopupHandler = struct {
     popup_mapped: bool = false,
     reactive: bool = false,
     layer_height: i32 = 2,
+    stacked_layer_height: ?i32 = null,
+    stacked_mapped: bool = false,
+    stacked_configure_height: u32 = 0,
     fractional_scale: bool = false,
     fractional_manager: ?wayring.objects.Handle = null,
     popup_preferred_scale: u32 = 0,
@@ -7505,6 +8079,9 @@ const LayerPopupHandler = struct {
             switch (try protocol.wl_pointer.decodeEvent(message, fds)) {
                 .enter => |value| self.pointer_surface = value.surface,
                 .leave => self.pointer_surface = null,
+                .button => |value| if (value.state.value == protocol.wl_pointer.button_state.pressed.value) {
+                    self.button_serial = value.serial;
+                },
                 else => {},
             }
         } else if (target.object.interface == &protocol.wl_keyboard.info) {
@@ -7517,6 +8094,10 @@ const LayerPopupHandler = struct {
                 .leave => {
                     self.keyboard_surface = null;
                     self.keyboard_leaves += 1;
+                },
+                .key => {
+                    self.keyboard_keys += 1;
+                    self.key_surface = self.keyboard_surface;
                 },
                 else => {},
             }
@@ -7549,13 +8130,23 @@ const LayerPopupHandler = struct {
         } else if (target.object.interface == &protocol.zwlr_layer_surface_v1.info) {
             switch (try protocol.zwlr_layer_surface_v1.decodeEvent(message, fds)) {
                 .configure => |value| {
+                    const stacked = self.stacked_layer_surface != null and
+                        message.header.object_id == self.stacked_layer_surface.?.id;
                     try protocol.zwlr_layer_surface_v1.encodeRequest(
                         self.queue,
-                        self.layer_surface.?.id,
+                        if (stacked) self.stacked_layer_surface.?.id else self.layer_surface.?.id,
                         .{ .ack_configure = .{ .serial = value.serial } },
                     );
-                    self.layer_configured = true;
-                    try self.maybeMapLayer();
+                    if (stacked) {
+                        self.stacked_configure_height = value.height;
+                        if (!self.stacked_mapped) {
+                            try self.mapSurface(1, self.stacked_wl_surface.?);
+                            self.stacked_mapped = true;
+                        }
+                    } else {
+                        self.layer_configured = true;
+                        try self.maybeMapLayer();
+                    }
                 },
                 .closed => self.layer_closed += 1,
             }
@@ -7583,7 +8174,7 @@ const LayerPopupHandler = struct {
                         );
                         if (!self.layer_mapped) {
                             try self.mapSurface(0, self.layer_wl_surface.?);
-                            try self.createPopup();
+                            if (!self.defer_popup) try self.createPopup();
                             self.layer_mapped = true;
                         } else {
                             try protocol.wl_surface.encodeRequest(
@@ -7634,7 +8225,7 @@ const LayerPopupHandler = struct {
         if (self.layer_mapped or !self.layer_configured or
             (self.require_layer_enter_before_map and self.layer_enters == 0)) return;
         try self.mapSurface(0, self.layer_wl_surface.?);
-        try self.createPopup();
+        if (self.stacked_layer_height == null and !self.defer_popup) try self.createPopup();
         self.layer_mapped = true;
     }
 
@@ -7643,7 +8234,7 @@ const LayerPopupHandler = struct {
             self.compositor = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_compositor.info, @min(value.version, 7), null);
         if (std.mem.eql(u8, value.interface, protocol.wl_shm.info.name))
             self.shm = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_shm.info, @min(value.version, 2), null);
-        if (self.toplevel_root and std.mem.eql(u8, value.interface, protocol.wl_seat.info.name))
+        if ((self.toplevel_root or self.defer_popup) and std.mem.eql(u8, value.interface, protocol.wl_seat.info.name))
             self.seat = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_seat.info, @min(value.version, 9), null);
         if (std.mem.eql(u8, value.interface, protocol.xdg_wm_base.info.name))
             self.wm_base = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.xdg_wm_base.info, @min(value.version, 7), null);
@@ -7720,8 +8311,33 @@ const LayerPopupHandler = struct {
             .set_anchor = .{ .anchor = .{ .value = 13 } },
         });
         try protocol.zwlr_layer_surface_v1.encodeRequest(self.queue, self.layer_surface.?.id, .{
-            .set_exclusive_zone = .{ .zone = 1 },
+            .set_exclusive_zone = .{ .zone = if (self.stacked_layer_height == null) 1 else self.layer_height },
         });
+
+        if (self.stacked_layer_height) |height| {
+            self.stacked_wl_surface = (try protocol.wl_compositor.construct_create_surface(
+                self.objects,
+                self.queue,
+                self.compositor.?,
+                .{},
+            )).id;
+            self.stacked_layer_surface = (try protocol.zwlr_layer_shell_v1.construct_get_layer_surface(
+                self.objects,
+                self.queue,
+                self.layer_shell.?,
+                .{ .surface = self.stacked_wl_surface.?.id, .output = self.output.?.id, .layer = .top, .namespace = "ouro-stack-test" },
+            )).id;
+            try protocol.zwlr_layer_surface_v1.encodeRequest(self.queue, self.stacked_layer_surface.?.id, .{
+                .set_size = .{ .width = 3, .height = @intCast(height) },
+            });
+            try protocol.zwlr_layer_surface_v1.encodeRequest(self.queue, self.stacked_layer_surface.?.id, .{
+                .set_anchor = .{ .anchor = .{ .value = 13 } },
+            });
+            try protocol.zwlr_layer_surface_v1.encodeRequest(self.queue, self.stacked_layer_surface.?.id, .{
+                .set_exclusive_zone = .{ .zone = height },
+            });
+            try protocol.wl_surface.encodeRequest(self.queue, self.stacked_wl_surface.?.id, .{ .commit = .{} });
+        }
 
         try protocol.wl_surface.encodeRequest(self.queue, self.layer_wl_surface.?.id, .{ .commit = .{} });
         self.created = true;
@@ -7771,14 +8387,19 @@ const LayerPopupHandler = struct {
             self.queue,
             self.popup_xdg_surface.?,
             .{
-                .parent = if (self.root_xdg_surface) |root| root.id else null,
+                .parent = if (self.popup_parent orelse self.root_xdg_surface) |root| root.id else null,
                 .positioner = positioner.id.id,
             },
         )).id;
-        if (!self.toplevel_root) try protocol.zwlr_layer_surface_v1.encodeRequest(
+        if (!self.toplevel_root and self.popup_parent == null) try protocol.zwlr_layer_surface_v1.encodeRequest(
             self.queue,
             self.layer_surface.?.id,
             .{ .get_popup = .{ .popup = self.popup.?.id } },
+        );
+        if (self.popup_grab_serial) |serial| try protocol.xdg_popup.encodeRequest(
+            self.queue,
+            self.popup.?.id,
+            .{ .grab = .{ .seat = self.seat.?.id, .serial = serial } },
         );
         try protocol.wl_surface.encodeRequest(
             self.queue,
@@ -7832,7 +8453,15 @@ const LayerPopupHandler = struct {
         index: usize,
         surface: wayring.objects.Handle,
     ) !void {
-        const descriptor = try ordinaryMemfd(4096, 16, &pixels);
+        const red = [_]u8{ 0x20, 0x20, 0xe0, 0xff } ** 6;
+        const green = [_]u8{ 0x20, 0xc0, 0x20, 0xff } ** 6;
+        const source: []const u8 = if (self.stacked_layer_height != null and index == 0)
+            &red
+        else if (self.stacked_layer_height != null)
+            &green
+        else
+            &pixels;
+        const descriptor = try ordinaryMemfd(4096, 16, source);
         const pool = try protocol.wl_shm.construct_create_pool(
             self.objects,
             self.queue,
@@ -7845,9 +8474,9 @@ const LayerPopupHandler = struct {
             pool.id,
             .{
                 .offset = 16,
-                .width = if (index == 0 and !self.toplevel_root) 3 else if (index == 0) 2 else 1,
-                .height = if (index == 0) self.layer_height else 1,
-                .stride = 16,
+                .width = if (self.stacked_layer_height != null) 3 else if (index == 0 and !self.toplevel_root) 3 else if (index == 0) 2 else 1,
+                .height = if (index == 0) self.layer_height else if (self.stacked_layer_height) |height| height else 1,
+                .stride = if (self.stacked_layer_height != null) 12 else 16,
                 .format = .argb8888,
             },
         )).id;

@@ -28,6 +28,7 @@ pub const diagnostics = @import("diagnostics.zig");
 pub const shutdown_signal = @import("runtime/shutdown_signal.zig");
 pub const config = @import("config.zig");
 pub const settings_client = @import("settings_client.zig");
+pub const mcp_client = @import("mcp_client.zig");
 pub const configuration = @import("runtime/configuration.zig");
 pub const launcher = @import("launcher.zig");
 pub const backend_platform = @import("backend/platform.zig");
@@ -141,6 +142,7 @@ test {
     _ = shutdown_signal;
     _ = config;
     _ = settings_client;
+    _ = mcp_client;
     _ = configuration;
     _ = launcher;
     _ = backend_platform;

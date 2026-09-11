@@ -936,6 +936,7 @@ pub fn Coordinator(comptime protocol: type) type {
         processing_virtual_pointer: bool = false,
         shell_maintenance_pending: bool = false,
         pointer_reconcile_pending: bool = false,
+        popup_keyboard_root: ?Adapter.SurfaceId = null,
         manager: drm.Manager,
         hotplug: ?drm_hotplug.Monitor = null,
         hotplug_connector_ids: []u32,
@@ -1162,6 +1163,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.processing_virtual_pointer = false;
             self.shell_maintenance_pending = false;
             self.pointer_reconcile_pending = false;
+            self.popup_keyboard_root = null;
             self.reorder_preview = null;
             self.render_device = null;
             self.syncobj_device = null;
@@ -3430,6 +3432,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 try self.shell_adapter.publishWindowGeometryRefresh(root);
             }
             if (self.layer_shell_adapter.ownsSurface(id)) {
+                const previous = self.layer_shell_adapter.stateForSurface(id) orelse unreachable;
                 self.layer_shell_adapter.publishSurfaceCommitted(id) catch unreachable;
                 // A layer client may wait for enter/preferred-scale before it
                 // can allocate and attach its first Vulkan buffer.
@@ -3449,9 +3452,19 @@ pub fn Coordinator(comptime protocol: type) type {
                 };
                 self.syncLayerKeyboardFocus() catch unreachable;
                 try self.syncLayerPopupRoots();
-                const peer = self.adapter.surfacePeer(id) catch unreachable;
-                if (self.layer_shell_adapter.pendingOutbound(peer))
-                    self.markProtocol(peer, ProtocolReady.layer_shell);
+                // Ordinary bar redraws do not rearrange the rest of the scene.
+                if (previous.mapped != layer_state.mapped or
+                    previous.exclusive_zone != layer_state.exclusive_zone or
+                    !std.meta.eql(previous.exclusive_edge, layer_state.exclusive_edge) or
+                    !std.meta.eql(previous.anchors, layer_state.anchors) or
+                    !std.meta.eql(previous.margins, layer_state.margins))
+                {
+                    try self.recomputeLayerConfigures();
+                    self.markProtocolAll(ProtocolReady.layer_shell);
+                    try self.desktopSceneChanged();
+                } else if (self.layer_shell_adapter.pendingOutbound(layer_state.peer)) {
+                    self.markProtocol(layer_state.peer, ProtocolReady.layer_shell);
+                }
             }
             if (self.session_lock_adapter.ownsSurface(id)) {
                 try self.session_lock_adapter.publishSurfaceCommitted(id);
@@ -4421,6 +4434,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 }
             }
             self.interaction.setPopupGrab(self.desktop.popupGrabTarget());
+            try self.syncPopupKeyboardFocus();
             try self.syncDesktopTimer();
             if (self.desktop.takeSceneChanged()) try self.desktopSceneChanged();
             try self.syncToplevelDrag();
@@ -6314,6 +6328,34 @@ pub fn Coordinator(comptime protocol: type) type {
             return selected;
         }
 
+        fn popupKeyboardSurface(self: *Self) ?Adapter.SurfaceId {
+            if (self.sessionLockActive()) return null;
+            const grab = self.desktop.popupGrabTarget() orelse return null;
+            const scene = self.desktop.sceneForSurface(grab.surface) catch return null;
+            if (!scene.visible or !scene.content_ready) return null;
+            // An exclusive layer owns its popup's focus too, but another
+            // exclusive layer must still be able to take over the seat.
+            if (self.exclusiveLayerSurface()) |exclusive|
+                if (!std.meta.eql(exclusive, grab.root_surface)) return null;
+            return grab.surface;
+        }
+
+        fn syncPopupKeyboardFocus(self: *Self) !void {
+            if (self.popupKeyboardSurface()) |surface| {
+                try self.setKeyboardSurface(surface);
+                self.popup_keyboard_root = self.desktop.popupGrabTarget().?.root_surface;
+            } else if (self.popup_keyboard_root) |root| {
+                // Restore an on-demand layer as well as exclusive layers and
+                // desktop windows. The root may already have been destroyed.
+                if (self.layer_shell_adapter.stateForSurface(root)) |state| {
+                    if (state.mapped and state.keyboard_interactivity != .none) {
+                        try self.setKeyboardSurface(self.exclusiveLayerSurface() orelse root);
+                    } else try self.syncLayerKeyboardFocus();
+                } else try self.syncLayerKeyboardFocus();
+                self.popup_keyboard_root = null;
+            }
+        }
+
         fn syncLayerKeyboardFocus(self: *Self) !void {
             if (self.exclusiveLayerSurface()) |surface| {
                 try self.setKeyboardSurface(surface);
@@ -6413,7 +6455,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 (requested == null or self.sessionLockScene(requested.?) == null))
                 self.firstSessionLockSurface()
             else
-                requested;
+                self.popupKeyboardSurface() orelse requested;
             const focus: ?protocol_text_input.Focus = if (surface) |id| focus: {
                 const peer = try self.adapter.surfacePeer(id);
                 break :focus .{
@@ -10471,6 +10513,7 @@ pub fn Coordinator(comptime protocol: type) type {
             count: *usize,
             output_bounds: geometry.Rect,
         ) !void {
+            if (selected == .top and self.outputHasFullscreen(physical)) return;
             const ids = try self.layer_shell_adapter.ids(self.layer_surface_ids);
             for (ids) |id| {
                 const state = try self.layer_shell_adapter.state(id);
@@ -12293,6 +12336,10 @@ pub fn Coordinator(comptime protocol: type) type {
                     index -= 1;
                     const state = self.layer_shell_adapter.state(ids[index]) catch continue;
                     if (!state.mapped or @intFromEnum(state.layer) != layer_value) continue;
+                    if (state.layer == .top) {
+                        const physical = self.physicalOutputForProtocolId(state.output) orelse continue;
+                        if (self.outputHasFullscreen(physical)) continue;
+                    }
                     const window = self.layerShellScene(state.surface) orelse continue;
                     const popups = self.desktop.externalPopupSnapshot(
                         state.surface,
@@ -12399,6 +12446,12 @@ pub fn Coordinator(comptime protocol: type) type {
             };
         }
 
+        fn outputHasFullscreen(self: *const Self, physical: *const PhysicalOutput) bool {
+            return self.desktop.hasFullscreen(.{
+                .value = @as(u64, physical.id.generation) << 32 | physical.id.index,
+            });
+        }
+
         fn desktopOutputAreas(
             self: *Self,
             pending_surface: ?Adapter.SurfaceId,
@@ -12415,7 +12468,9 @@ pub fn Coordinator(comptime protocol: type) type {
                     .geometry = try self.layerWorkAreaFor(
                         physical.protocol_output,
                         pending_surface,
+                        null,
                     ),
+                    .bounds = bounds,
                     .primary_area = @as(i64, bounds.width) * bounds.height,
                 };
                 count += 1;
@@ -12448,6 +12503,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 const local = try self.layerWorkAreaFor(
                     physical.protocol_output,
                     pending_surface,
+                    null,
                 );
                 if (bounds.y == area.y) top = @max(top, local.y - bounds.y);
                 const bounds_bottom = @as(i64, bounds.y) + bounds.height;
@@ -12475,6 +12531,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self: *Self,
             output: OutputAdapter.OutputId,
             pending_surface: ?Adapter.SurfaceId,
+            before_surface: ?Adapter.SurfaceId,
         ) !geometry.Rect {
             const physical = self.physicalOutputForProtocolId(output) orelse
                 return error.InvalidOutput;
@@ -12483,6 +12540,10 @@ pub fn Coordinator(comptime protocol: type) type {
             for (ids) |layer_id| {
                 var state = try self.layer_shell_adapter.state(layer_id);
                 if (!std.meta.eql(state.output, output)) continue;
+                // Exclusive surfaces occupy successive strips in adapter order.
+                // Their bounds exclude their own reservation and all later ones.
+                if (before_surface) |surface|
+                    if (std.meta.eql(state.surface, surface)) break;
                 var mapped = state.mapped;
                 if (pending_surface != null and std.meta.eql(state.surface, pending_surface.?)) {
                     state = self.layer_shell_adapter.pendingStateForSurface(state.surface) orelse
@@ -12534,14 +12595,19 @@ pub fn Coordinator(comptime protocol: type) type {
             return null;
         }
 
-        fn layerGeometry(self: *Self, state: LayerShellAdapter.State) !geometry.Rect {
+        fn layerArea(self: *Self, state: LayerShellAdapter.State) !geometry.Rect {
+            if (state.exclusive_zone >= 0) return self.layerWorkAreaFor(
+                state.output,
+                null,
+                if (state.exclusive_zone > 0) state.surface else null,
+            );
             const physical = self.physicalOutputForProtocolId(state.output) orelse
                 return error.InvalidOutput;
-            const bounds = try self.outputBoundsFor(physical);
-            const area = if (state.exclusive_zone == 0)
-                try self.layerWorkAreaFor(state.output, null)
-            else
-                bounds;
+            return self.outputBoundsFor(physical);
+        }
+
+        fn layerGeometry(self: *Self, state: LayerShellAdapter.State) !geometry.Rect {
+            const area = try self.layerArea(state);
             const surface = try self.adapter.getSurfaceById(state.surface);
             const size = surface.committedSize();
             if (size.width == 0 or size.height == 0 or
@@ -12591,13 +12657,7 @@ pub fn Coordinator(comptime protocol: type) type {
         }
 
         fn layerConfigureSize(self: *Self, state: LayerShellAdapter.State) !render.Size {
-            const area = if (state.exclusive_zone == 0)
-                try self.layerWorkAreaFor(state.output, null)
-            else
-                try self.outputBoundsFor(
-                    self.physicalOutputForProtocolId(state.output) orelse
-                        return error.InvalidOutput,
-                );
+            const area = try self.layerArea(state);
             const available_width = try std.math.sub(
                 i32,
                 try std.math.sub(i32, area.width, state.margins.left),
@@ -14013,8 +14073,10 @@ pub fn Coordinator(comptime protocol: type) type {
                 const output_areas = self.desktopOutputAreas(null) catch unreachable;
                 self.desktop.applyTopology(work_area, output_areas);
                 self.syncLayerPopupRoots() catch {};
+                self.recomputeLayerConfigures() catch {};
+                self.markProtocolAll(ProtocolReady.layer_shell);
                 self.syncLayerKeyboardFocus() catch {};
-                self.requestOutputDamage() catch {};
+                self.desktopSceneChanged() catch {};
             }
             if (session_lock_removed) self.sessionLockChanged() catch {};
             if (idle_inhibit_removed or idle_notify_removed) self.syncIdleNotifications() catch {};

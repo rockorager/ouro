@@ -835,7 +835,8 @@ pub fn Policy(
                     if (state_value.committed and !std.meta.eql(state_value.output, output.id))
                         policy.workspace_revision +%= 1;
                     state_value.output = output.id;
-                    try transaction.place(id, policy.target(state_value.*, output.geometry, true, stacking));
+                    const rect = if (state_value.fullscreen) output.bounds orelse output.geometry else output.geometry;
+                    try transaction.place(id, policy.target(state_value.*, rect, true, stacking));
                 } else try transaction.setStacking(id, stacking);
                 stacking += 1;
             }
@@ -851,7 +852,7 @@ pub fn Policy(
                         policy.workspace_revision +%= 1;
                     }
                     state_value.output = output.id;
-                    break :rect output.geometry;
+                    break :rect if (state_value.fullscreen) output.bounds orelse output.geometry else output.geometry;
                 } else rect: {
                     const output = view.output(view.outputIndexForRect(state_value.floating));
                     if (state_value.output == null or !std.meta.eql(state_value.output.?, output.id)) {

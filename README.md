@@ -185,10 +185,9 @@ buttons rather than delivering them to applications.
 
 ## Configuration
 
-By default Ouro subscribes to `/compositor` through
-`dev.rockorager.ouro.Settings.WatchPath` at
-`$XDG_RUNTIME_DIR/ouro/settings.sock`. Install
-[ourosettings](https://github.com/rockorager/ourosettings) with WatchPath support
+By default Ouro subscribes to `ouro://settings/compositor` through MCP
+`subscriptions/listen` at `$XDG_RUNTIME_DIR/ouro/settings.mcp.sock`. Install
+[ourosettings](https://github.com/rockorager/ourosettings) with MCP support
 and its user socket/service units. Each publication is a complete compositor
 configuration applied over built-in defaults, **not** over the previous
 publication or local config files. Other desktop preferences do not trigger
@@ -202,7 +201,11 @@ snapshot. The live subscription keeps the socket-activated daemon running.
 A validated replacement waits for pending input/output transactions; newer
 valid updates replace that waiting candidate. Settings persistence is not an
 acknowledgement of hardware application: output changes complete asynchronously
-and can roll back. Watch replies are bounded to 256 KiB including the NUL.
+and can roll back. MCP records are bounded to 256 KiB including the newline.
+Ouro waits for the subscription acknowledgment before `resources/read`, keeps
+one read outstanding, and rereads if a change arrived during that read. Resource
+contents are `application/json` text containing `{revision, exists, value}`;
+revisions remain opaque strings. The `ourosettings.socket` unit name is unchanged.
 
 `--config=PATH` is a **file-only override**: it loads that base JSON and then
 lexically sorted `config.d/*.json` fragments beside it, without connecting to
@@ -235,9 +238,51 @@ not physical evdev positions. Actions are exact JSON arrays: `focus-next`,
 `move-output-next`, `move-output-previous`, `switch-workspace` followed by a
 number from 1 through 10, `move-focused-to-workspace` followed by the same,
 `close`, `toggle-fullscreen`,
-`toggle-maximized`, `toggle-floating`, `exit`, or `run` followed by an argv.
+`toggle-maximized`, `toggle-floating`, `exit`, `run` followed by an argv,
+or `call` followed by a Unix address, MCP tool name, and arguments object.
 `run` never invokes a shell and delegates process ownership to
 `systemd-run --user`; Ouro does not supervise applications.
+
+`call` invokes an MCP tool directly, without launching a helper or discovering
+tools first. For example, if your shell exposes this tool (replace its address and name
+with those of your service):
+
+```json
+{
+  "bindings": {
+    "super+space": [
+      "call",
+      "unix:/run/user/1000/ouro-shell",
+      "toggle_launcher",
+      {}
+    ]
+  }
+}
+```
+
+Arguments must be a JSON object; use `{}` for no arguments. Tool names are
+case-sensitive, 1–128 ASCII letters, digits, underscores, hyphens, or dots;
+unqualified names are valid. Addresses support
+absolute Unix socket paths (`unix:/path`) and Linux abstract sockets
+(`unix:@name`), with no shell or environment-variable expansion. Each activation
+opens an independent nonblocking connection and consumes one reply; returned
+results are discarded and transport, JSON-RPC, or tool (`isError: true`) errors
+are logged. Unsupported interim results such as `input_required` fail rather
+than prompting or retrying. An absent `resultType` means complete as required
+by MCP; malformed or unknown explicit result types fail. Calls time
+out after five seconds and are **never retried**, since a lost reply may follow
+a successful side effect. Ouro allows at most 16 in-flight calls and 256 KiB per
+request or reply (including its terminating newline); excess calls are logged and
+dropped. Config reloads preserve in-flight calls; compositor shutdown closes
+them without waiting for replies. This action does not expose compositor
+commands as an MCP server.
+
+Both clients send MCP 2026-07-28 newline-delimited JSON-RPC 2.0 with per-request
+protocol version, empty client capabilities, and client identity in `params._meta`.
+There is no `initialize` handshake. The `call` configuration shape is unchanged,
+but **existing Varlink targets must migrate to MCP**; this is not wire-compatible.
+ourosettings exposes only MCP at `settings.mcp.sock`; there is no Varlink
+compatibility endpoint.
 
 ### Moving existing configuration into ourosettings
 
@@ -250,30 +295,35 @@ lexically sorted `config.d/*.json`. Use `--config=PATH --export-config` to
 export a specific base and its adjacent fragments instead. Removed default
 bindings retain null tombstones in the export.
 
-After installing the binaries and ourosettings units, these commands export
-the old configuration, back up the daemon's current preferences, and replace
-only its compositor section. Inspect the export and backup **before** running
-SetSection; it replaces any existing compositor preferences. These commands
-need `jq` and `varlinkctl`:
+After installing the binaries and ourosettings units, export and inspect the
+old configuration:
 
 ```sh
 umask 077
 backup=$(mktemp -d "$HOME/ouro-settings-migration.XXXXXX")
 ouro --export-config > "$backup/compositor.json"
 systemctl --user enable --now ourosettings.socket
-address="unix:$XDG_RUNTIME_DIR/ouro/settings.sock"
-interface=dev.rockorager.ouro.Settings
-varlinkctl call "$address" "$interface.Get" '{}' > "$backup/before.json"
-
-# Inspect both JSON files before replacing the compositor section.
-params=$(jq -n --slurpfile old "$backup/before.json" \
-  --slurpfile config "$backup/compositor.json" \
-  '{expected_revision:$old[0].revision, section:"compositor", value:$config[0]}')
-varlinkctl call "$address" "$interface.SetSection" "$params"
 ```
 
-A revision conflict leaves settings unchanged; refetch and review before
-retrying. Existing config files remain available for `--config=PATH` recovery.
+Using an MCP client that supports the Unix transport described above, read
+`ouro://settings` with `resources/read` and save its JSON `text` selection as
+`$backup/before.json`. Inspect both JSON files before replacing the compositor
+section. Send `tools/call` with tool name `settings.set_section` and arguments:
+
+```json
+{
+  "expected_revision": "the revision from before.json",
+  "section": "compositor",
+  "value": { "the": "complete object from compositor.json" }
+}
+```
+
+The example values are placeholders, not a literal migration request.
+`settings.set_section` replaces the whole section, not a merge patch. A successful
+result's `structuredContent` contains `{revision, settings}`. A revision conflict
+is a tool error and leaves settings unchanged; refetch and review before retrying.
+Do not replay a mutation after a timeout or lost response: read back its state
+first. Existing config files remain available for `--config=PATH` recovery.
 Use a new login to start the new compositor; do not restart a working desktop
 just to migrate preferences.
 
