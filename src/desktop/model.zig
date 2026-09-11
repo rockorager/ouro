@@ -1240,10 +1240,11 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
         pub fn popupGrabTarget(desktop: *const Self) ?struct {
             toplevel: ToplevelId,
             surface: Shell.SurfaceId,
+            root_surface: Shell.SurfaceId,
         } {
             const id = desktop.popup_grab orelse return null;
             for (desktop.popups) |slot| if (slot.active and std.meta.eql(slot.shell_id, id))
-                return .{ .toplevel = slot.owner, .surface = slot.surface };
+                return .{ .toplevel = slot.owner, .surface = slot.surface, .root_surface = slot.root_surface };
             return null;
         }
 

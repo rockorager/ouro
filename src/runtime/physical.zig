@@ -936,6 +936,7 @@ pub fn Coordinator(comptime protocol: type) type {
         processing_virtual_pointer: bool = false,
         shell_maintenance_pending: bool = false,
         pointer_reconcile_pending: bool = false,
+        popup_keyboard_root: ?Adapter.SurfaceId = null,
         manager: drm.Manager,
         hotplug: ?drm_hotplug.Monitor = null,
         hotplug_connector_ids: []u32,
@@ -1162,6 +1163,7 @@ pub fn Coordinator(comptime protocol: type) type {
             self.processing_virtual_pointer = false;
             self.shell_maintenance_pending = false;
             self.pointer_reconcile_pending = false;
+            self.popup_keyboard_root = null;
             self.reorder_preview = null;
             self.render_device = null;
             self.syncobj_device = null;
@@ -4432,6 +4434,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 }
             }
             self.interaction.setPopupGrab(self.desktop.popupGrabTarget());
+            try self.syncPopupKeyboardFocus();
             try self.syncDesktopTimer();
             if (self.desktop.takeSceneChanged()) try self.desktopSceneChanged();
             try self.syncToplevelDrag();
@@ -6325,6 +6328,34 @@ pub fn Coordinator(comptime protocol: type) type {
             return selected;
         }
 
+        fn popupKeyboardSurface(self: *Self) ?Adapter.SurfaceId {
+            if (self.sessionLockActive()) return null;
+            const grab = self.desktop.popupGrabTarget() orelse return null;
+            const scene = self.desktop.sceneForSurface(grab.surface) catch return null;
+            if (!scene.visible or !scene.content_ready) return null;
+            // An exclusive layer owns its popup's focus too, but another
+            // exclusive layer must still be able to take over the seat.
+            if (self.exclusiveLayerSurface()) |exclusive|
+                if (!std.meta.eql(exclusive, grab.root_surface)) return null;
+            return grab.surface;
+        }
+
+        fn syncPopupKeyboardFocus(self: *Self) !void {
+            if (self.popupKeyboardSurface()) |surface| {
+                try self.setKeyboardSurface(surface);
+                self.popup_keyboard_root = self.desktop.popupGrabTarget().?.root_surface;
+            } else if (self.popup_keyboard_root) |root| {
+                // Restore an on-demand layer as well as exclusive layers and
+                // desktop windows. The root may already have been destroyed.
+                if (self.layer_shell_adapter.stateForSurface(root)) |state| {
+                    if (state.mapped and state.keyboard_interactivity != .none) {
+                        try self.setKeyboardSurface(self.exclusiveLayerSurface() orelse root);
+                    } else try self.syncLayerKeyboardFocus();
+                } else try self.syncLayerKeyboardFocus();
+                self.popup_keyboard_root = null;
+            }
+        }
+
         fn syncLayerKeyboardFocus(self: *Self) !void {
             if (self.exclusiveLayerSurface()) |surface| {
                 try self.setKeyboardSurface(surface);
@@ -6424,7 +6455,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 (requested == null or self.sessionLockScene(requested.?) == null))
                 self.firstSessionLockSurface()
             else
-                requested;
+                self.popupKeyboardSurface() orelse requested;
             const focus: ?protocol_text_input.Focus = if (surface) |id| focus: {
                 const peer = try self.adapter.surfacePeer(id);
                 break :focus .{
