@@ -609,6 +609,28 @@ fn testReceive(server: *Server, fd: c_int, lines: usize) ![]u8 {
     return out.toOwnedSlice(std.testing.allocator);
 }
 
+test "MCP server production catalog is one complete newline-delimited frame" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var server = try testServer(&tmp);
+    defer server.deinit();
+    const control = @import("control.zig");
+    var catalog: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer catalog.deinit();
+    try control.writeCatalog(&catalog.writer);
+    try server.updateCatalog(catalog.written());
+    const fd = try testConnect(&server);
+    defer _ = c.close(fd);
+    try testSend(fd, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{" ++ test_meta ++ "}}\n");
+    const reply = try testReceive(&server, fd, 1);
+    defer std.testing.allocator.free(reply);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, reply, .{});
+    defer parsed.deinit();
+    const tools = field(field(parsed.value, "result"), "tools").array.items;
+    try std.testing.expectEqual(control.actions.len + 2, tools.len);
+    try std.testing.expectEqualStrings("reload-config", field(tools[tools.len - 1], "name").string);
+}
+
 test "MCP server coalesced integer and string IDs, call completion and failure" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

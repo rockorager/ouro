@@ -341,19 +341,19 @@ tool declarations as the live catalog. Packaging can explicitly run
 `ouro --export-mcp-descriptor` without a display, settings daemon, or runtime
 directory. Cross-packaging needs a runnable build of Ouro for this export.
 
-The version-1 descriptor contains `id: "ouro"`, an `endpoint` with
-`transport: "unix"`, `runtimeRelativePath: "ouro.mcp.sock"`, and
-`protocolVersion: "2026-07-28"`, plus `catalog` containing the initial
-`tools/list` result. The endpoint path is relative to `$XDG_RUNTIME_DIR`, not
-the data directory. A custom `--mcp-socket` is not described by this default
-descriptor.
+The version-1 descriptor follows the shared Ourokit/`ouro-mcp` discovery
+contract: `schema_version: 1`, `application_id: "ouro"`,
+`endpoint: {"runtime_path": "ouro.mcp.sock"}`, and a top-level `tools` array
+containing the same complete tool declarations as `tools/list`. The endpoint
+path names the socket itself relative to `$XDG_RUNTIME_DIR`, not the data
+directory. A custom `--mcp-socket` is not described by this default descriptor.
 
-This establishes Ouro's discovery convention; it is not yet a shared standard
-implemented by Ourokit or ourosettings. Discovery consumers should search
+Discovery consumers should search
 `$XDG_DATA_HOME/ouro/mcp/apps` (default `~/.local/share/ouro/mcp/apps`) first,
 then the corresponding directories under `$XDG_DATA_DIRS` (default
-`/usr/local/share:/usr/share`). The first matching app ID wins. Read descriptors
-only—never execute installed applications to discover their tools. Keep any
+`/usr/local/share:/usr/share`). The first `<application-id>.json` wins, even
+if invalid; it masks lower-priority copies. Read descriptors only—never execute
+installed applications to discover their tools. Keep any
 derived catalogs under `$XDG_CACHE_HOME` (default `~/.cache`), separate from
 installed descriptors and runtime sockets. An installed catalog is an initial
 snapshot, not evidence that a compositor instance is running; refresh from the

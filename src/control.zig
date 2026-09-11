@@ -55,7 +55,13 @@ fn inputSchema(tag: Tag) []const u8 {
 }
 
 pub fn writeCatalog(writer: *std.Io.Writer) !void {
-    try writer.writeAll("{\"resultType\":\"complete\",\"tools\":[");
+    try writer.writeAll("{\"resultType\":\"complete\",\"tools\":");
+    try writeTools(writer);
+    try writer.writeAll(",\"ttlMs\":60000,\"cacheScope\":\"private\"}");
+}
+
+fn writeTools(writer: *std.Io.Writer) !void {
+    try writer.writeByte('[');
     for (actions, 0..) |action, i| {
         if (i != 0) try writer.writeByte(',');
         try writer.print("{{\"name\":{f},\"description\":{f},\"inputSchema\":{s},\"outputSchema\":{s}}}", .{
@@ -68,16 +74,18 @@ pub fn writeCatalog(writer: *std.Io.Writer) !void {
     try writer.writeAll(empty_schema);
     try writer.writeAll(
         \\,"outputSchema":{"type":"object","required":["windows","outputs","workspaces","focused"],"properties":{"windows":{"type":"array"},"outputs":{"type":"array"},"workspaces":{"type":"array"},"focused":{"type":["object","null"]}}}},
+    );
+    try writer.writeAll(
         \\{"name":"reload-config","description":"Request a reload of --config files. In ourosettings mode settings update automatically and this tool returns an error.","inputSchema":
     );
     try writer.writeAll(empty_schema);
-    try writer.print(",\"outputSchema\":{s}}}],\"ttlMs\":60000,\"cacheScope\":\"private\"}}", .{accepted_schema});
+    try writer.print(",\"outputSchema\":{s}}}]", .{accepted_schema});
 }
 
 /// Packaging runs this explicit command; discovery clients read its output.
 pub fn writeDescriptor(writer: *std.Io.Writer) !void {
-    try writer.writeAll("{\"version\":1,\"id\":\"ouro\",\"endpoint\":{\"transport\":\"unix\",\"runtimeRelativePath\":\"ouro.mcp.sock\",\"protocolVersion\":\"2026-07-28\"},\"catalog\":");
-    try writeCatalog(writer);
+    try writer.writeAll("{\"schema_version\":1,\"application_id\":\"ouro\",\"endpoint\":{\"runtime_path\":\"ouro.mcp.sock\"},\"tools\":");
+    try writeTools(writer);
     try writer.writeByte('}');
 }
 
@@ -143,14 +151,42 @@ pub fn apply(coordinator: anytype, action: config.Action) !void {
     }
 }
 
-test "MCP control catalog and descriptor share declarations and validate asymmetric arguments" {
+test "MCP descriptor follows shared discovery contract and preserves live tool schemas" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     var out: std.Io.Writer.Allocating = .init(a);
     try writeDescriptor(&out.writer);
-    const descriptor = try std.json.parseFromSlice(std.json.Value, a, out.written(), .{});
-    const tools = descriptor.value.object.get("catalog").?.object.get("tools").?.array.items;
+    const Descriptor = struct {
+        schema_version: u32,
+        application_id: []const u8,
+        endpoint: struct { runtime_path: []const u8 },
+        tools: []std.json.Value,
+    };
+    const descriptor = try std.json.parseFromSlice(Descriptor, a, out.written(), .{});
+    try std.testing.expectEqual(@as(u32, 1), descriptor.value.schema_version);
+    try std.testing.expectEqualStrings("ouro", descriptor.value.application_id);
+    try std.testing.expectEqualStrings("ouro.mcp.sock", descriptor.value.endpoint.runtime_path);
+    var live: std.Io.Writer.Allocating = .init(a);
+    try writeCatalog(&live.writer);
+    const catalog = try std.json.parseFromSlice(std.json.Value, a, live.written(), .{});
+    try std.testing.expectEqualStrings("complete", catalog.value.object.get("resultType").?.string);
+    try std.testing.expectEqual(@as(i64, 60000), catalog.value.object.get("ttlMs").?.integer);
+    try std.testing.expectEqualStrings("private", catalog.value.object.get("cacheScope").?.string);
+    try std.testing.expectEqualStrings(
+        try std.json.Stringify.valueAlloc(a, catalog.value.object.get("tools").?, .{}),
+        try std.json.Stringify.valueAlloc(a, descriptor.value.tools, .{}),
+    );
+}
+
+test "MCP control catalog shares declarations and validates asymmetric arguments" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var out: std.Io.Writer.Allocating = .init(a);
+    try writeCatalog(&out.writer);
+    const catalog = try std.json.parseFromSlice(std.json.Value, a, out.written(), .{});
+    const tools = catalog.value.object.get("tools").?.array.items;
     try std.testing.expectEqual(actions.len + 2, tools.len);
     for (actions, tools[0..actions.len]) |action, tool| {
         try std.testing.expectEqualStrings(action.name, tool.object.get("name").?.string);
