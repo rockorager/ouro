@@ -98,7 +98,7 @@ pub fn main(init: std.process.Init) !void {
     var initial_config = if (options.config != null) try config_store.load() else from_settings: {
         try systemd_session.startSettingsSocket();
         const runtime_dir = init.environ_map.get("XDG_RUNTIME_DIR") orelse return error.MissingRuntimeDirectory;
-        const path = try std.fmt.allocPrint(allocator, "{s}/ouro/settings.sock", .{runtime_dir});
+        const path = try std.fmt.allocPrint(allocator, "{s}/ouro/settings.mcp.sock", .{runtime_dir});
         defer allocator.free(path);
         settings = try ouro.settings_client.Client.init(allocator, path);
         var update = settings.?.waitInitial(shutdown_signals.descriptor(), 10_000) catch |err| {
@@ -126,8 +126,8 @@ pub fn main(init: std.process.Init) !void {
         .io = init.io,
         .environ_map = init.environ_map,
     };
-    var varlink = try ouro.varlink_client.Client.init(allocator);
-    defer varlink.deinit();
+    var mcp = try ouro.mcp_client.Client.init(allocator);
+    defer mcp.deinit();
     const dri_result = linux.open("/dev/dri", .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
     if (linux.errno(dri_result) != .SUCCESS) {
         std.log.err("DRM smoke unavailable: /dev/dri is absent or inaccessible", .{});
@@ -307,7 +307,7 @@ pub fn main(init: std.process.Init) !void {
     if (run_error == null) if (settings) |*client| runner.loop.installSettings(client) catch |err| {
         run_error = err;
     };
-    if (run_error == null) runner.loop.installVarlink(&varlink) catch |err| {
+    if (run_error == null) runner.loop.installMcp(&mcp) catch |err| {
         run_error = err;
     };
     if (run_error != null) exit_deadline.arm(fatal_shutdown_grace_ns);
@@ -321,7 +321,7 @@ pub fn main(init: std.process.Init) !void {
     var signal_stop_started = false;
     var pending_config: ?PreparedConfig = null;
     defer if (pending_config) |*candidate| candidate.deinit();
-    while (!wayring_drained or !coordinator.backendDrainComplete() or !runner.loop.settingsDrained() or !runner.loop.varlinkDrained()) {
+    while (!wayring_drained or !coordinator.backendDrainComplete() or !runner.loop.settingsDrained() or !runner.loop.mcpDrained()) {
         if (coordinator.terminalFailure()) |terminal_error| {
             exit_deadline.arm(fatal_shutdown_grace_ns);
             std.log.err("backend cannot safely drain: {t}; exiting with scanout pinned for kernel teardown", .{terminal_error});
@@ -361,7 +361,7 @@ pub fn main(init: std.process.Init) !void {
                 coordinator,
                 &systemd_session,
                 &launcher,
-                &varlink,
+                &mcp,
                 binding,
             ) catch |err| failed: {
                 std.log.err("binding action failed: {t}", .{err});
@@ -443,7 +443,7 @@ fn applyBinding(
     coordinator: *Runtime,
     systemd_session: *SystemdSession,
     launcher: *const ouro.launcher.Systemd,
-    varlink: *ouro.varlink_client.Client,
+    mcp: *ouro.mcp_client.Client,
     binding: ouro.config.Binding,
 ) !bool {
     switch (binding.action) {
@@ -477,7 +477,7 @@ fn applyBinding(
             };
         },
         .call => |call| {
-            varlink.enqueue(call) catch |err| {
+            mcp.enqueue(call) catch |err| {
                 std.log.warn("could not call {s} at {s}: {t}", .{ call.method, call.address, err });
             };
         },

@@ -57,7 +57,7 @@ pub const Action = union(enum) {
     toggle_floating,
     exit,
     run: []const []const u8,
-    call: @import("varlink_client.zig").Call,
+    call: @import("mcp_client.zig").Call,
 };
 
 pub const Binding = struct {
@@ -484,7 +484,7 @@ fn parseAction(allocator: std.mem.Allocator, value: std.json.Value) !Action {
     if (std.mem.eql(u8, name, "call")) {
         if (items.len != 4) return error.InvalidActionArity;
         if (items[1] != .string or items[2] != .string) return error.InvalidActionType;
-        return .{ .call = try @import("varlink_client.zig").Call.init(allocator, items[1].string, items[2].string, items[3]) };
+        return .{ .call = try @import("mcp_client.zig").Call.init(allocator, items[1].string, items[2].string, items[3]) };
     }
 
     if (std.mem.eql(u8, name, "switch-workspace") or
@@ -680,25 +680,25 @@ test "parse bindings and preserve argv boundaries" {
 
 test "call bindings preserve structured parameters and validate the complete action" {
     var snapshot = try parseSource(std.testing.allocator,
-        \\{"bindings":{"super+p":{"action":["call","unix:/run/user/1000/shell.sock","org.example.Shell.Toggle",{"output":"DP-2","value":null,"nested":[false,3,"a\u0000b"]}],"repeat":true}}}
+        \\{"bindings":{"super+p":{"action":["call","unix:/run/user/1000/shell.sock","toggle_launcher",{"output":"DP-2","value":null,"nested":[false,3,"a\u0000b"]}],"repeat":true}}}
     );
     defer snapshot.deinit();
     const call = snapshot.bindings[0].action.call;
     try std.testing.expect(snapshot.bindings[0].repeat);
     try std.testing.expectEqualStrings("unix:/run/user/1000/shell.sock", call.address);
-    try std.testing.expectEqualStrings("org.example.Shell.Toggle", call.method);
+    try std.testing.expectEqualStrings("toggle_launcher", call.method);
     try std.testing.expectEqualStrings(
-        "{\"method\":\"org.example.Shell.Toggle\",\"parameters\":{\"output\":\"DP-2\",\"value\":null,\"nested\":[false,3,\"a\\u0000b\"]}}\x00",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"toggle_launcher\",\"arguments\":{\"output\":\"DP-2\",\"value\":null,\"nested\":[false,3,\"a\\u0000b\"]},\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientCapabilities\":{},\"io.modelcontextprotocol/clientInfo\":{\"name\":\"ouro\",\"version\":\"0.0.0\"}}}}\n",
         call.request,
     );
     const invalid = [_]struct { action: []const u8, err: anyerror }{
         .{ .action = "[\"call\",\"unix:/tmp/s\",\"org.example.Ping\"]", .err = error.InvalidActionArity },
         .{ .action = "[\"call\",\"unix:/tmp/s\",4,{}]", .err = error.InvalidActionType },
-        .{ .action = "[\"call\",\"tcp:localhost:1234\",\"org.example.Ping\",{}]", .err = error.InvalidVarlinkAddress },
-        .{ .action = "[\"call\",\"unix:relative\",\"org.example.Ping\",{}]", .err = error.InvalidVarlinkAddress },
-        .{ .action = "[\"call\",\"unix:/tmp/s\\u0000x\",\"org.example.Ping\",{}]", .err = error.InvalidVarlinkAddress },
-        .{ .action = "[\"call\",\"unix:/tmp/s\",\"Ping\",{}]", .err = error.InvalidVarlinkMethod },
-        .{ .action = "[\"call\",\"unix:/tmp/s\",\"org..Ping\",{}]", .err = error.InvalidVarlinkMethod },
+        .{ .action = "[\"call\",\"tcp:localhost:1234\",\"org.example.Ping\",{}]", .err = error.InvalidMcpAddress },
+        .{ .action = "[\"call\",\"unix:relative\",\"org.example.Ping\",{}]", .err = error.InvalidMcpAddress },
+        .{ .action = "[\"call\",\"unix:/tmp/s\\u0000x\",\"org.example.Ping\",{}]", .err = error.InvalidMcpAddress },
+        .{ .action = "[\"call\",\"unix:/tmp/s\",\"\",{}]", .err = error.InvalidToolName },
+        .{ .action = "[\"call\",\"unix:/tmp/s\",\"bad name\",{}]", .err = error.InvalidToolName },
         .{ .action = "[\"call\",\"unix:/tmp/s\",\"org.example.Ping\",[]]", .err = error.InvalidCallParameters },
         .{ .action = "[\"call\",\"unix:/tmp/s\",\"org.example.Ping\",null]", .err = error.InvalidCallParameters },
     };

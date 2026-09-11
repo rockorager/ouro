@@ -1,6 +1,7 @@
-//! Bounded, one-shot Varlink calls. No retries: a lost reply may follow a
+//! Bounded, one-shot MCP tool calls. No retries: a lost reply may follow a
 //! successful side effect. One stable epoll FD integrates with the main ring.
 const std = @import("std");
+const mcp = @import("mcp.zig");
 const linux = std.os.linux;
 const c = @cImport({
     @cInclude("errno.h");
@@ -12,7 +13,7 @@ const c = @cImport({
     @cInclude("unistd.h");
 });
 
-pub const maximum_frame_size = 262144;
+pub const maximum_frame_size = mcp.maximum_frame_size;
 pub const capacity = 16;
 const timeout_ms = 5000;
 
@@ -22,19 +23,14 @@ const timeout_ms = 5000;
 pub const Call = struct {
     address: []const u8,
     method: []const u8,
-    /// Includes the terminating NUL byte.
+    /// Includes the terminating newline. Each call has its own connection/ID.
     request: []const u8,
 
     pub fn init(allocator: std.mem.Allocator, address: []const u8, method: []const u8, parameters: std.json.Value) !Call {
         _ = try socketAddress(address);
-        if (!validMethod(method)) return error.InvalidVarlinkMethod;
+        if (!validMethod(method)) return error.InvalidToolName;
         if (parameters != .object) return error.InvalidCallParameters;
-        const json = try std.json.Stringify.valueAlloc(allocator, .{ .method = method, .parameters = parameters }, .{});
-        defer allocator.free(json);
-        if (json.len >= maximum_frame_size) return error.CallTooLarge;
-        const request = try allocator.alloc(u8, json.len + 1);
-        @memcpy(request[0..json.len], json);
-        request[json.len] = 0;
+        const request = try mcp.request(allocator, 1, "tools/call", .{ .name = method, .arguments = parameters, ._meta = mcp.meta });
         return .{ .address = address, .method = method, .request = request };
     }
 
@@ -54,30 +50,19 @@ pub const Call = struct {
 };
 
 fn validMethod(method: []const u8) bool {
-    const dot = std.mem.lastIndexOfScalar(u8, method, '.') orelse return false;
-    const member = method[dot + 1 ..];
-    if (member.len == 0 or !std.ascii.isUpper(member[0])) return false;
-    for (member) |ch| if (!std.ascii.isAlphanumeric(ch)) return false;
-    var parts = std.mem.splitScalar(u8, method[0..dot], '.');
-    var count: usize = 0;
-    while (parts.next()) |part| {
-        if (part.len == 0 or !std.ascii.isAlphabetic(part[0]) or !std.ascii.isAlphanumeric(part[part.len - 1])) return false;
-        for (part) |ch| if (!std.ascii.isAlphanumeric(ch) and ch != '-') return false;
-        count += 1;
-    }
-    return count >= 2;
+    if (method.len == 0 or method.len > 128) return false;
+    for (method) |ch| if (!std.ascii.isAlphanumeric(ch) and ch != '_' and ch != '-' and ch != '.') return false;
+    return true;
 }
 
 fn socketAddress(text: []const u8) !struct { address: c.struct_sockaddr_un, length: c.socklen_t } {
     if (!std.mem.startsWith(u8, text, "unix:") or std.mem.indexOfScalar(u8, text, 0) != null)
-        return error.InvalidVarlinkAddress;
-    // Varlink reserves semicolon suffixes for transport properties.
-    const end = std.mem.indexOfScalar(u8, text, ';') orelse text.len;
-    const path = text[5..end];
+        return error.InvalidMcpAddress;
+    const path = text[5..];
     var address = std.mem.zeroes(c.struct_sockaddr_un);
     if (path.len < 2 or (path[0] != '/' and path[0] != '@') or
         path.len > address.sun_path.len or (path[0] == '/' and path.len == address.sun_path.len))
-        return error.InvalidVarlinkAddress;
+        return error.InvalidMcpAddress;
     address.sun_family = c.AF_UNIX;
     @memcpy(address.sun_path[0..path.len], path);
     if (path[0] == '@') address.sun_path[0] = 0;
@@ -166,7 +151,7 @@ pub const Client = struct {
                 const index: usize = @intCast(event.data.u64 - 1);
                 if (self.pending[index] != null) self.socketEvent(index, event.events) catch |err| {
                     const call = self.pending[index].?.call;
-                    std.log.warn("Varlink call {s} at {s} failed: {t}", .{ call.method, call.address, err });
+                    std.log.warn("MCP call {s} at {s} failed: {t}", .{ call.method, call.address, err });
                     self.finish(index);
                 };
             }
@@ -174,7 +159,7 @@ pub const Client = struct {
         const now = monotonicMs();
         for (self.pending, 0..) |pending, i| if (pending) |p| {
             if (p.deadline <= now) {
-                std.log.warn("Varlink call {s} at {s} timed out; not retrying", .{ p.call.method, p.call.address });
+                std.log.warn("MCP call {s} at {s} timed out; not retrying", .{ p.call.method, p.call.address });
                 self.finish(i);
             }
         };
@@ -205,7 +190,7 @@ pub const Client = struct {
             const n = c.recv(p.fd, &bytes, bytes.len, 0);
             if (n > 0) {
                 const received = bytes[0..@intCast(n)];
-                const end = std.mem.indexOfScalar(u8, received, 0);
+                const end = std.mem.indexOfScalar(u8, received, '\n');
                 const frame = received[0 .. end orelse received.len];
                 if (p.input.items.len + frame.len >= maximum_frame_size) return error.ReplyTooLarge;
                 try p.input.appendSlice(self.allocator, frame);
@@ -222,20 +207,14 @@ pub const Client = struct {
     }
 
     fn parseReply(self: *Client, call: Call, frame: []const u8) !void {
-        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, frame, .{
-            .duplicate_field_behavior = .@"error",
-            .max_value_len = maximum_frame_size,
-        }) catch return error.InvalidReply;
+        _ = call;
+        const parsed = try mcp.parse(self.allocator, frame);
         defer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidReply;
-        const object = parsed.value.object;
-        if (object.get("parameters")) |parameters| if (parameters != .object) return error.InvalidReply;
-        if (object.get("continues")) |continues| {
-            if (continues != .bool or continues.bool) return error.InvalidReply;
-        }
-        if (object.get("error")) |err| {
-            if (err != .string or !validMethod(err.string)) return error.InvalidReply;
-            std.log.warn("Varlink call {s} at {s}: {s}", .{ call.method, call.address, err.string });
+        const result = try mcp.complete(parsed.value, 1);
+        if ((try mcp.field(result, "content")) != .array) return error.InvalidReply;
+        if (result.object.get("isError")) |is_error| {
+            if (is_error != .bool) return error.InvalidReply;
+            if (is_error.bool) return error.ToolError;
         }
     }
 
@@ -305,7 +284,8 @@ const TestServer = struct {
     }
 };
 
-const test_request = "{\"method\":\"org.example.Shell.Toggle\",\"parameters\":{\"output\":\"DP-2\",\"enabled\":false}}\x00";
+const test_request = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"org.example.Shell.Toggle\",\"arguments\":{\"output\":\"DP-2\",\"enabled\":false},\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientCapabilities\":{},\"io.modelcontextprotocol/clientInfo\":{\"name\":\"ouro\",\"version\":\"0.0.0\"}}}}\n";
+const test_reply = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"complete\",\"content\":[]}}\n";
 
 fn expectRequest(client: *Client, peer: c_int, expected: []const u8) !void {
     const received = try std.testing.allocator.alloc(u8, expected.len);
@@ -330,19 +310,36 @@ fn expectIdle(client: *Client) !void {
     try std.testing.expectEqual(@as(usize, 0), linux.poll(&fds, 1, 0));
 }
 
-test "Varlink preparation enforces exact address and request size limits" {
-    const path = try socketAddress("unix:/" ++ "a" ** 106 ++ ";extension=ignored");
+test "MCP preparation enforces exact address tool name and request size limits" {
+    const path = try socketAddress("unix:/" ++ "a" ** 106);
     try std.testing.expectEqual(@as(u8, 0), path.address.sun_path[107]);
     try std.testing.expectEqual(@as(c.socklen_t, 110), path.length);
-    try std.testing.expectError(error.InvalidVarlinkAddress, socketAddress("unix:/" ++ "a" ** 107));
+    try std.testing.expectError(error.InvalidMcpAddress, socketAddress("unix:/" ++ "a" ** 107));
+    try std.testing.expectError(error.InvalidMcpAddress, socketAddress("unix:/" ++ "a" ** 106 ++ ";"));
     const abstract = try socketAddress("unix:@" ++ "a" ** 107);
     try std.testing.expectEqual(@as(u8, 0), abstract.address.sun_path[0]);
     try std.testing.expectEqual(@as(u8, 'a'), abstract.address.sun_path[107]);
     try std.testing.expectEqual(@as(c.socklen_t, 110), abstract.length);
-    try std.testing.expectError(error.InvalidVarlinkAddress, socketAddress("unix:@" ++ "a" ** 108));
+    try std.testing.expectError(error.InvalidMcpAddress, socketAddress("unix:@" ++ "a" ** 108));
+    try std.testing.expectError(error.InvalidMcpAddress, socketAddress("unix:@" ++ "a" ** 107 ++ ";"));
 
-    const prefix = "{\"method\":\"org.example.Ping\",\"parameters\":{\"text\":\"";
-    const suffix = "\"}}\x00";
+    const literal_path = "/tmp/service;extension=literal";
+    const literal = try socketAddress("unix:" ++ literal_path);
+    try std.testing.expectEqualStrings(literal_path, literal.address.sun_path[0..literal_path.len]);
+    try std.testing.expectEqual(@as(c.socklen_t, @offsetOf(c.struct_sockaddr_un, "sun_path") + literal_path.len + 1), literal.length);
+    const literal_name = "service;v=2";
+    const named = try socketAddress("unix:@" ++ literal_name);
+    try std.testing.expectEqual(@as(u8, 0), named.address.sun_path[0]);
+    try std.testing.expectEqualStrings(literal_name, named.address.sun_path[1 .. 1 + literal_name.len]);
+    try std.testing.expectEqual(@as(c.socklen_t, @offsetOf(c.struct_sockaddr_un, "sun_path") + 1 + literal_name.len), named.length);
+
+    for ([_][]const u8{ "toggle_launcher", "getUser", "DATA_EXPORT_v2", "admin.tools.list", "a" ** 128 }) |name|
+        try std.testing.expect(validMethod(name));
+    for ([_][]const u8{ "", "a" ** 129, "bad name", "bad/name", "bad\x00name" }) |name|
+        try std.testing.expect(!validMethod(name));
+
+    const prefix = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"org.example.Ping\",\"arguments\":{\"text\":\"";
+    const suffix = "\"},\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientCapabilities\":{},\"io.modelcontextprotocol/clientInfo\":{\"name\":\"ouro\",\"version\":\"0.0.0\"}}}}\n";
     const bytes = try std.testing.allocator.alloc(u8, maximum_frame_size - prefix.len - suffix.len + 1);
     defer std.testing.allocator.free(bytes);
     @memset(bytes, 'a');
@@ -358,7 +355,7 @@ test "Varlink preparation enforces exact address and request size limits" {
     try std.testing.expectError(error.CallTooLarge, Call.init(std.testing.allocator, "unix:/tmp/s", "org.example.Ping", parameters));
 }
 
-test "Varlink fragmented reply, owned request, independent calls and idle readiness" {
+test "MCP fragmented reply, owned request, independent calls and idle readiness" {
     var client = try Client.init(std.testing.allocator);
     defer client.deinit();
     const server = try TestServer.init();
@@ -374,41 +371,49 @@ test "Varlink fragmented reply, owned request, independent calls and idle readin
     const peer = try server.accept();
     defer _ = c.close(peer);
     try expectRequest(&client, peer, test_request);
-    try sendReply(peer, "{\"parameters\":{\"done\":");
+    try sendReply(peer, test_reply[0..25]);
     try client.dispatch();
     try std.testing.expect(client.pending[1] != null);
-    try sendReply(peer, "true}}\x00");
+    try sendReply(peer, test_reply[25..]);
     _ = c.shutdown(peer, c.SHUT_WR);
     try client.dispatch();
     try std.testing.expect(client.pending[0] != null);
     try std.testing.expect(client.pending[1] == null);
-    try sendReply(stalled, "{}\x00");
+    try sendReply(stalled, test_reply);
     try client.dispatch();
     try expectIdle(&client);
 }
 
-test "Varlink rejects invalid replies and disconnects without retries" {
+test "MCP distinguishes RPC tool and interim errors and never retries ambiguous calls" {
     var client = try Client.init(std.testing.allocator);
     defer client.deinit();
     const server = try TestServer.init();
     defer server.deinit();
-    const cases = [_]struct { reply: []const u8, valid: bool = false }{
-        .{ .reply = "not JSON\x00" },
-        .{ .reply = "[]\x00" },
-        .{ .reply = "{\"parameters\":[]}\x00" },
-        .{ .reply = "{\"continues\":true}\x00" },
-        .{ .reply = "{\"continues\":null}\x00" },
-        .{ .reply = "{\"parameters\":{},\"parameters\":{}}\x00" },
-        .{ .reply = "{\"error\":4}\x00" },
-        .{ .reply = "{\"error\":\"org.varlink.service.MethodNotFound\",\"parameters\":{}}\x00", .valid = true },
-        .{ .reply = "{\"parameters\":" }, // EOF mid-frame is terminal too.
+    const cases = [_]struct { reply: []const u8, err: ?anyerror = error.InvalidReply }{
+        .{ .reply = "not JSON\n" },
+        .{ .reply = "[]\n" },
+        .{ .reply = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"resultType\":\"complete\",\"content\":[]}}\n" },
+        .{ .reply = "{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"result\":{\"resultType\":\"complete\",\"content\":[]}}\n" },
+        .{ .reply = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[]}}\n", .err = null },
+        .{ .reply = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":null,\"content\":[]}}\n" },
+        .{ .reply = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":3,\"content\":[]}}\n" },
+        .{ .reply = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"input_required\"}}\n", .err = error.UnsupportedResult },
+        .{ .reply = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"future\"}}\n", .err = error.UnsupportedResult },
+        .{ .reply = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"complete\",\"content\":[],\"isError\":true}}\n", .err = error.ToolError },
+        .{ .reply = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32602,\"message\":\"unknown tool\"}}\n", .err = error.RpcError },
+        .{ .reply = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"complete\",\"content\":[],\"isError\":\"false\"}}\n" },
+        .{ .reply = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{},\"result\":{}}\n" },
+        .{ .reply = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":4}\n" },
+        .{ .reply = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-1,\"message\":\"bad\"},\"result\":{}}\n" },
+        .{ .reply = test_reply, .err = null },
+        .{ .reply = "{\"jsonrpc\":" }, // EOF after a side effect is terminal too.
     };
     for (cases) |case| {
-        const frame = std.mem.sliceTo(case.reply, 0);
-        if (case.valid) {
-            try client.parseReply(server.call(), frame);
+        const frame = std.mem.sliceTo(case.reply, '\n');
+        if (case.err) |err| {
+            try std.testing.expectError(err, client.parseReply(server.call(), frame));
         } else {
-            try std.testing.expectError(error.InvalidReply, client.parseReply(server.call(), frame));
+            try client.parseReply(server.call(), frame);
         }
         try client.enqueue(server.call());
         const peer = try server.accept();
@@ -421,7 +426,7 @@ test "Varlink rejects invalid replies and disconnects without retries" {
     }
 }
 
-test "Varlink partial writes resume exactly and frame limit includes NUL" {
+test "MCP partial writes resume exactly and frame limit includes newline" {
     var client = try Client.init(std.testing.allocator);
     defer client.deinit();
     const server = try TestServer.init();
@@ -430,7 +435,7 @@ test "Varlink partial writes resume exactly and frame limit includes NUL" {
     defer std.testing.allocator.free(request);
     @memset(request, ' ');
     @memcpy(request[0 .. test_request.len - 1], test_request[0 .. test_request.len - 1]);
-    request[request.len - 1] = 0;
+    request[request.len - 1] = '\n';
     var call = server.call();
     call.request = request;
     try client.enqueue(call);
@@ -447,9 +452,9 @@ test "Varlink partial writes resume exactly and frame limit includes NUL" {
     const reply = try std.testing.allocator.alloc(u8, maximum_frame_size);
     defer std.testing.allocator.free(reply);
     @memset(reply, ' ');
-    @memcpy(reply[0..2], "{}");
-    reply[reply.len - 1] = 0;
-    // Each chunk is consumed separately; the final NUL is its own read.
+    @memcpy(reply[0 .. test_reply.len - 1], test_reply[0 .. test_reply.len - 1]);
+    reply[reply.len - 1] = '\n';
+    // Each chunk is consumed separately; the final newline is its own read.
     var offset: usize = 0;
     while (offset < reply.len - 1) {
         const end = @min(offset + 8192, reply.len - 1);
@@ -458,7 +463,7 @@ test "Varlink partial writes resume exactly and frame limit includes NUL" {
         offset = end;
     }
     try std.testing.expect(client.pending[0] != null);
-    try sendReply(peer, "\x00");
+    try sendReply(peer, "\n");
     try client.dispatch();
     try expectIdle(&client);
     try client.enqueue(server.call());
@@ -474,7 +479,7 @@ test "Varlink partial writes resume exactly and frame limit includes NUL" {
     try expectIdle(&client);
 }
 
-test "Varlink call limit, real timeout readiness and stop discard outstanding calls" {
+test "MCP call limit, real timeout readiness and stop discard outstanding calls" {
     var client = try Client.init(std.testing.allocator);
     defer client.deinit();
     const server = try TestServer.init();

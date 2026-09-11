@@ -2,7 +2,7 @@
 """Isolated real-ourosettings interoperability, migration, and startup checks.
 
 Usage: python3 test/settings.py --daemon /path/to/ourosettings
-Requires a built Ouro, Zig 0.16, and an ourosettings with WatchPath support.
+Requires a built Ouro, Zig 0.16, and an MCP-only ourosettings daemon.
 No user services, display, settings, or live sockets are touched.
 """
 import argparse
@@ -17,7 +17,11 @@ import time
 
 
 ROOT = Path(__file__).resolve().parent.parent
-INTERFACE = "dev.rockorager.ouro.Settings"
+META = {
+    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+    "io.modelcontextprotocol/clientCapabilities": {},
+    "io.modelcontextprotocol/clientInfo": {"name": "ouro-interop", "version": "0.0.0"},
+}
 
 
 def stop(process):
@@ -45,7 +49,7 @@ def main():
             path.mkdir(parents=True, mode=0o700)
         env = dict(os.environ, XDG_RUNTIME_DIR=str(runtime),
                    XDG_CONFIG_HOME=str(config), XDG_CONFIG_DIRS=str(system))
-        address = runtime / "ouro/settings.sock"
+        address = runtime / "ouro/settings.mcp.sock"
         state = config / "ouro/settings.json"
         probe_path = base / "probe"
         subprocess.run([
@@ -63,17 +67,30 @@ def main():
                 connection.settimeout(3)
                 connection.connect(str(address))
                 connection.sendall(json.dumps({
-                    "method": f"{INTERFACE}.{method}",
-                    "parameters": parameters or {},
-                }).encode() + b"\0")
+                    "jsonrpc": "2.0", "id": 1, "method": method,
+                    "params": {**(parameters or {}), "_meta": META},
+                }).encode() + b"\n")
                 reply = bytearray()
-                while b"\0" not in reply:
+                while b"\n" not in reply:
                     part = connection.recv(65536)
                     assert part, "EOF before final reply"
                     reply.extend(part)
-                result = json.loads(reply.split(b"\0")[0])
+                    assert len(reply) <= 256 * 1024, "oversized MCP record"
+                result = json.loads(reply.split(b"\n")[0])
+                assert result["jsonrpc"] == "2.0" and result["id"] == 1, result
                 assert "error" not in result, result
-                return result["parameters"]
+                result = result["result"]
+                assert result["resultType"] == "complete", result
+                assert not result.get("isError", False), result
+                return result
+
+        def read_root():
+            result = call("resources/read", {"uri": "ouro://settings"})
+            contents = [entry for entry in result["contents"] if entry["uri"] == "ouro://settings"]
+            assert len(contents) == 1 and contents[0]["mimeType"] == "application/json", result
+            selection = json.loads(contents[0]["text"])
+            assert selection["exists"] is True, selection
+            return {"revision": selection["revision"], "settings": selection["value"]}
 
         def start_daemon():
             nonlocal daemon
@@ -85,13 +102,13 @@ def main():
             while time.monotonic() < deadline:
                 assert daemon.poll() is None, "daemon startup failed"
                 try:
-                    return call("Get")
+                    return read_root()
                 except (FileNotFoundError, ConnectionRefusedError):
                     time.sleep(0.01)
             raise AssertionError("daemon readiness timeout")
 
         def publication(expected):
-            assert select.select([probe.stdout], [], [], 5)[0], "WatchPath timeout"
+            assert select.select([probe.stdout], [], [], 5)[0], "MCP subscription timeout"
             line = probe.stdout.readline()
             assert line, "probe exited"
             value = json.loads(line)
@@ -100,9 +117,12 @@ def main():
             assert json.loads(value["value_json"]) == expected["settings"]["compositor"]
 
         def replace(section, value):
-            current = call("Get")
-            return call("SetSection", dict(expected_revision=current["revision"],
-                                           section=section, value=value))
+            current = read_root()
+            result = call("tools/call", {
+                "name": "settings.set_section",
+                "arguments": dict(expected_revision=current["revision"], section=section, value=value),
+            })
+            return result["structuredContent"]
 
         def ouro(*arguments, timeout=5):
             return subprocess.run([str(args.ouro.resolve()), *arguments], env=env,
@@ -119,6 +139,9 @@ def main():
                 "output_rules": {"panel": {"match": {"name": "DP-1"}, "settings": {"scale": 1.5}}},
             })
             publication(changed)
+            # No-op writes do not cause another compositor read/publication.
+            replace("compositor", changed["settings"]["compositor"])
+            assert not select.select([probe.stdout], [], [], 0.15)[0], "no-op publication"
             replace("appearance", {"color_scheme": "dark"})
             assert not select.select([probe.stdout], [], [], 0.15)[0], "unrelated publication"
             changed = replace("compositor", {})
@@ -126,7 +149,7 @@ def main():
             stop(daemon)
             restarted = start_daemon()
             publication(restarted)
-            print("PASS real WatchPath initial/change/filter/reset/restart")
+            print("PASS real MCP initial/change/filter/no-op/reset/restart")
 
             # Export the old XDG layers without touching the daemon's state.
             (system / "ouro/config.json").write_text(json.dumps({
@@ -148,14 +171,16 @@ def main():
             assert state.read_bytes() == before
             changed = replace("compositor", exported)
             publication(changed)
-            print("PASS XDG export, binding tombstone, SetSection migration")
+            print("PASS XDG export, binding tombstone, settings.set_section migration")
 
             # The daemon stores desired JSON; Ouro remains its semantic validator.
-            changed = replace("compositor", {"general": {"inner_gap": "bad"}})
-            publication(changed)
-            result = ouro("--renderer=pixman")
-            assert result.returncode != 0
-            assert "invalid ourosettings /compositor at startup" in result.stderr, result.stderr
+            # In particular, the MCP text adapter must not turn 1.0 into 1.
+            for invalid_gap in ("bad", 1.0):
+                changed = replace("compositor", {"general": {"inner_gap": invalid_gap}})
+                publication(changed)
+                result = ouro("--renderer=pixman")
+                assert result.returncode != 0
+                assert "invalid ourosettings /compositor at startup" in result.stderr, result.stderr
             invalid = base / "invalid.json"
             invalid.write_text('{"bindings":{"super+q":["not-an-action"]}}')
             result = ouro(f"--config={invalid}")
@@ -163,7 +188,7 @@ def main():
             assert "ourosettings" not in result.stderr, "file override contacted settings"
             result = ouro(f"--config={invalid}", "--export-config")
             assert result.returncode != 0 and not result.stdout
-            print("PASS semantic rejection and file-only override")
+            print("PASS semantic rejection (including float in integer field) and file-only override")
 
             stop(probe)
             stop(daemon)

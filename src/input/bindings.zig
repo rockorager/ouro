@@ -173,7 +173,7 @@ pub fn KeyConsumer() type {
     };
 }
 
-test "Varlink key activation owns address method and serialized parameters" {
+test "MCP key activation owns address tool name and serialized arguments" {
     const Consumer = KeyConsumer();
     var consumer = try Consumer.init(std.testing.allocator, 1);
     defer consumer.deinit();
@@ -201,7 +201,7 @@ test "Varlink key activation owns address method and serialized parameters" {
     const call = consumer.peekAction().?.action.call;
     try std.testing.expectEqualStrings("unix:/tmp/shell.sock", call.address);
     try std.testing.expectEqualStrings("org.example.Shell.Toggle", call.method);
-    try std.testing.expectEqualStrings("{\"method\":\"org.example.Shell.Toggle\",\"parameters\":{\"output\":\"DP-2\"}}\x00", call.request);
+    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"org.example.Shell.Toggle\",\"arguments\":{\"output\":\"DP-2\"},\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientCapabilities\":{},\"io.modelcontextprotocol/clientInfo\":{\"name\":\"ouro\",\"version\":\"0.0.0\"}}}}\n", call.request);
     consumer.dropAction();
     try std.testing.expect(consumer.peekAction() == null);
     try std.testing.expect(consumer.nextDeadlineNs() == null);
