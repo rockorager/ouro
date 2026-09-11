@@ -11,12 +11,27 @@ import argparse
 from contextlib import ExitStack
 import math
 from pathlib import Path
+import statistics
 import struct
 
 import vulkan as v
 from PIL import Image, ImageDraw
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def scene_sample(source_size, destination, affine, filtering="nearest", clip=None, crop=None):
+    """Pack a recorded SDR sample without recomputing its affine mapping.
+
+    Identity primaries, premultiplied ARGB, global alpha 255, no LUT or direct
+    color shortcut. Pixel opacity remains a property of the synthetic texture.
+    """
+    sw, sh = source_size
+    crop = crop or (0, 0, sw * 65536, sh * 65536)
+    flags = {"nearest": 0, "reconstruction": 1, "bilinear": 2, "area": 3}[filtering] << 28
+    return struct.pack("<4I12i4I8i12f", 0, sw, sh, sw * 4,
+                       *crop, *destination, *(clip or destination), 0, flags, 255, 0,
+                       *affine, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 0, 0, 1, 0)
 
 
 def sampling_filter(source_size, size, crop):
@@ -42,7 +57,8 @@ class Renderer:
         self.device = v.vkCreateDevice(self.gpu, v.VkDeviceCreateInfo(
             pQueueCreateInfos=[v.VkDeviceQueueCreateInfo(queueFamilyIndex=self.family,
                                                        pQueuePriorities=[1.0])],
-            pEnabledFeatures=v.VkPhysicalDeviceFeatures(shaderStorageImageWriteWithoutFormat=True)), None)
+            pEnabledFeatures=v.VkPhysicalDeviceFeatures(shaderStorageImageWriteWithoutFormat=True,
+                                                       shaderSampledImageArrayDynamicIndexing=True)), None)
         self.queue = v.vkGetDeviceQueue(self.device, self.family, 0)
         self.memory = v.vkGetPhysicalDeviceMemoryProperties(self.gpu)
         print("Vulkan device:", v.vkGetPhysicalDeviceProperties(self.gpu).deviceName)
@@ -56,11 +72,14 @@ class Renderer:
                alpha_mode=0, background=(80, 100, 120), background_alpha=255, ten_bit=False,
                output_transfer=0, source_transfer=0, color_matrix=(1, 0, 0, 0, 1, 0, 0, 0, 1),
                luminance_scale=1, capture_matrix=(1, 0, 0, 0, 1, 0, 0, 0, 1),
-               capture_phases=None, continuation=False, capture_sequence=False, copy_capture=False):
+               capture_phases=None, continuation=False, capture_sequence=False, copy_capture=False,
+               timings=None, scene=None, damage=None, timing_repeats=1):
         d = self.device
         sw, sh = source_size
         w, h = size
         texture = mode != "buffer"
+        damage = damage or [(0, 0, w, h)]
+        assert timing_repeats >= 1 and (timings is not None or timing_repeats == 1)
         with ExitStack() as cleanup:
             def own(create, destroy, info):
                 obj = create(d, info, None)
@@ -122,17 +141,34 @@ class Renderer:
                 0, 0, w, h, 0, 0, w, h, int(xrgb), flags, alpha, source_transfer,
                 xx, xy, x0, yx, yy, y0, alpha_mode, 0,
                 *color_matrix[:3], luminance_scale, *color_matrix[3:6], 0, *color_matrix[6:], 0)
+            # Explicit scenes retain the recorded affine/crop instead of
+            # deriving a new mapping from rounded destination dimensions.
+            layers = scene if scene is not None else [(sample, pixels, source_size)]
+            assert 1 <= len(layers) <= 32
+            packed_samples, source_pixels, offsets = [], [], []
+            source_offset = 0
+            for packed, data, dimensions in layers:
+                assert len(packed) == 160 and len(data) == dimensions[0] * dimensions[1] * 4
+                packed = bytearray(packed)
+                struct.pack_into("<I", packed, 0, source_offset)
+                if mode == "texture-buffer":
+                    struct.pack_into("<I", packed, 68, struct.unpack_from("<I", packed, 68)[0] | 0x40000000)
+                packed_samples.append(packed)
+                source_pixels.append(data)
+                offsets.append(source_offset)
+                source_offset += len(data)
             storage = v.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
-            samples = buffer(sample, storage)
-            source = buffer(pixels, storage | v.VK_BUFFER_USAGE_TRANSFER_SRC_BIT)
+            samples = buffer(b"".join(packed_samples), storage)
+            source = buffer(b"".join(source_pixels), storage | v.VK_BUFFER_USAGE_TRANSFER_SRC_BIT)
             lut = buffer(bytes(16), storage)
             readback = buffer(bytes(w * h * 4), v.VK_BUFFER_USAGE_TRANSFER_DST_BIT)
             captures = [buffer(bytes([37]) * (w * h * 4), storage | v.VK_BUFFER_USAGE_TRANSFER_SRC_BIT)
                         for _ in range(2)]
             target, target_view = image(w, h, v.VK_FORMAT_A2B10G10R10_UNORM_PACK32 if ten_bit else v.VK_FORMAT_R8G8B8A8_UNORM,
                 v.VK_IMAGE_USAGE_STORAGE_BIT | v.VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
-            src_image, src_view = image(sw, sh, v.VK_FORMAT_B8G8R8A8_UNORM,
+            source_images = [image(*dimensions, v.VK_FORMAT_B8G8R8A8_UNORM,
                 v.VK_IMAGE_USAGE_SAMPLED_BIT | v.VK_IMAGE_USAGE_TRANSFER_DST_BIT)
+                for _, _, dimensions in layers]
             linear, linear_view = image(w, h, v.VK_FORMAT_R16G16B16A16_SFLOAT, v.VK_IMAGE_USAGE_STORAGE_BIT)
             if copy_capture:
                 copied, _ = image(w, h, v.VK_FORMAT_B8G8R8A8_UNORM,
@@ -169,9 +205,10 @@ class Renderer:
                     buf = captures[b - 10] if b >= 10 else samples if b == 1 else lut if b == 4 else source
                     args = dict(pBufferInfo=[v.VkDescriptorBufferInfo(buffer=buf[0], offset=0, range=buf[2])])
                 else:
-                    view = target_view if b == 0 else linear_view if b == 5 else src_view
+                    views = ([target_view] if b == 0 else [linear_view] if b == 5 else
+                             [view for _, view in source_images] + [source_images[0][1]] * (32 - len(layers)))
                     args = dict(pImageInfo=[v.VkDescriptorImageInfo(sampler=sampler, imageView=view,
-                                                                  imageLayout=v.VK_IMAGE_LAYOUT_GENERAL)] * n)
+                                                                  imageLayout=v.VK_IMAGE_LAYOUT_GENERAL) for view in views])
                 writes.append(v.VkWriteDescriptorSet(dstSet=ds, dstBinding=b, descriptorType=t,
                                                     descriptorCount=n, **args))
             v.vkUpdateDescriptorSets(d, len(writes), writes, 0, None)
@@ -197,28 +234,46 @@ class Renderer:
                 newLayout=v.VK_IMAGE_LAYOUT_GENERAL, image=im, subresourceRange=subresource,
                 srcQueueFamilyIndex=v.VK_QUEUE_FAMILY_IGNORED, dstQueueFamilyIndex=v.VK_QUEUE_FAMILY_IGNORED,
                 dstAccessMask=v.VK_ACCESS_SHADER_WRITE_BIT | v.VK_ACCESS_TRANSFER_WRITE_BIT)
-                for im in (target, src_image, linear)]
+                for im in [target, linear] + [im for im, _ in source_images]]
             v.vkCmdPipelineBarrier(cmd, v.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                 v.VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, None, 0, None, len(barriers), barriers)
-            def region(width, height):
-                return v.VkBufferImageCopy(imageSubresource=v.VkImageSubresourceLayers(
+            def region(width, height, offset=0):
+                return v.VkBufferImageCopy(bufferOffset=offset, imageSubresource=v.VkImageSubresourceLayers(
                     aspectMask=v.VK_IMAGE_ASPECT_COLOR_BIT, layerCount=1),
                     imageExtent=v.VkExtent3D(width=width, height=height, depth=1))
-            v.vkCmdCopyBufferToImage(cmd, source[0], src_image, v.VK_IMAGE_LAYOUT_GENERAL, 1, [region(sw, sh)])
+            for (im, _), (_, _, dimensions), offset in zip(source_images, layers, offsets):
+                v.vkCmdCopyBufferToImage(cmd, source[0], im, v.VK_IMAGE_LAYOUT_GENERAL, 1, [region(*dimensions, offset)])
             def barrier(src, dst, src_access, dst_access):
                 v.vkCmdPipelineBarrier(cmd, src, dst, 0, 1, [v.VkMemoryBarrier(
                     srcAccessMask=src_access, dstAccessMask=dst_access)], 0, None, 0, None)
             barrier(v.VK_PIPELINE_STAGE_TRANSFER_BIT, v.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                     v.VK_ACCESS_TRANSFER_WRITE_BIT, v.VK_ACCESS_SHADER_READ_BIT)
+            if timings is not None:
+                # Upload once, then replay composition with the same resources.
+                # No allocation, upload or pipeline compilation in timed spans.
+                v.vkEndCommandBuffer(cmd)
+                v.vkQueueSubmit(self.queue, 1, [v.VkSubmitInfo(pCommandBuffers=[cmd])], v.VK_NULL_HANDLE)
+                v.vkQueueWaitIdle(self.queue)
+                v.vkResetCommandPool(d, cp, 0)
+                v.vkBeginCommandBuffer(cmd, v.VkCommandBufferBeginInfo())
+                # Include prior readback/capture writes when replaying, not
+                # just the target's shader writes. This is outside the timer.
+                barrier(v.VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, v.VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                        v.VK_ACCESS_MEMORY_WRITE_BIT, v.VK_ACCESS_MEMORY_READ_BIT | v.VK_ACCESS_MEMORY_WRITE_BIT)
+                queries = own(v.vkCreateQueryPool, v.vkDestroyQueryPool, v.VkQueryPoolCreateInfo(
+                    queryType=v.VK_QUERY_TYPE_TIMESTAMP, queryCount=2))
+                v.vkCmdResetQueryPool(cmd, queries, 0, 2)
+                v.vkCmdWriteTimestamp(cmd, v.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, 0)
             v.vkCmdBindPipeline(cmd, v.VK_PIPELINE_BIND_POINT_COMPUTE, pipeline)
             v.vkCmdBindDescriptorSets(cmd, v.VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, [ds], 0, None)
             def dispatch(count, phases=capture_phases):
-                push = struct.pack("<16I12f", background_alpha, *background, w, h,
-                    int(background_alpha == 255), count, 0, 0, w, h, output_transfer, 0, 0, 0,
-                    *capture_matrix[:3], phases or 0,
-                    *capture_matrix[3:6], 0, *capture_matrix[6:], 0)
-                v.vkCmdPushConstants(cmd, pl, v.VK_SHADER_STAGE_COMPUTE_BIT, 0, 112, v.ffi.from_buffer(push))
-                v.vkCmdDispatch(cmd, (w + 7) // 8, (h + 7) // 8, 1)
+                for rect in damage:
+                    push = struct.pack("<16I12f", background_alpha, *background, w, h,
+                        int(background_alpha == 255), count, *rect, output_transfer, 0, 0, 0,
+                        *capture_matrix[:3], phases or 0,
+                        *capture_matrix[3:6], 0, *capture_matrix[6:], 0)
+                    v.vkCmdPushConstants(cmd, pl, v.VK_SHADER_STAGE_COMPUTE_BIT, 0, 112, v.ffi.from_buffer(push))
+                    v.vkCmdDispatch(cmd, (rect[2] + 7) // 8, (rect[3] + 7) // 8, 1)
             if capture_sequence:
                 dispatch(0, 1)
                 barrier(v.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, v.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -231,7 +286,9 @@ class Renderer:
                         v.VK_ACCESS_SHADER_WRITE_BIT, v.VK_ACCESS_SHADER_READ_BIT | v.VK_ACCESS_SHADER_WRITE_BIT)
                 dispatch(0x80000000)
             else:
-                dispatch(1)
+                dispatch(len(layers))
+            if timings is not None:
+                v.vkCmdWriteTimestamp(cmd, v.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, 1)
             barrier(v.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, v.VK_PIPELINE_STAGE_TRANSFER_BIT,
                     v.VK_ACCESS_SHADER_WRITE_BIT, v.VK_ACCESS_TRANSFER_READ_BIT)
             v.vkCmdCopyImageToBuffer(cmd, target, v.VK_IMAGE_LAYOUT_GENERAL, readback[0], 1, [region(w, h)])
@@ -253,8 +310,16 @@ class Renderer:
             barrier(v.VK_PIPELINE_STAGE_TRANSFER_BIT, v.VK_PIPELINE_STAGE_HOST_BIT,
                     v.VK_ACCESS_TRANSFER_WRITE_BIT, v.VK_ACCESS_HOST_READ_BIT)
             v.vkEndCommandBuffer(cmd)
-            v.vkQueueSubmit(self.queue, 1, [v.VkSubmitInfo(pCommandBuffers=[cmd])], v.VK_NULL_HANDLE)
-            v.vkQueueWaitIdle(self.queue)
+            for _ in range(timing_repeats):
+                v.vkQueueSubmit(self.queue, 1, [v.VkSubmitInfo(pCommandBuffers=[cmd])], v.VK_NULL_HANDLE)
+                v.vkQueueWaitIdle(self.queue)
+                if timings is not None:
+                    ticks = v.ffi.new("uint64_t[2]")
+                    v.vkGetQueryPoolResults(d, queries, 0, 2, 16, ticks, 8, v.VK_QUERY_RESULT_64_BIT)
+                    bits = v.vkGetPhysicalDeviceQueueFamilyProperties(self.gpu)[self.family].timestampValidBits
+                    assert bits > 0, "selected queue does not support GPU timestamps"
+                    period = v.vkGetPhysicalDeviceProperties(self.gpu).limits.timestampPeriod
+                    timings.append(((ticks[1] - ticks[0]) % (1 << bits)) * period / 1e6)
             mapped = v.vkMapMemory(d, readback[1], 0, readback[2], 0)
             result = bytes(mapped)
             v.vkUnmapMemory(d, readback[1])
@@ -387,6 +452,35 @@ def test(renderer, compare_shader_dir):
                 current = renderer.render(pixels, (2, 1), size, mode, filtering="nearest")
                 assert previous == current, "ordinary nearest sampling changed"
     print(f"PASS: {renderer.draw_count - start} Vulkan cursor draws; sampling, alpha, crop and fallback checks")
+
+
+def test_scene(renderer):
+    # Distinct textures, a clipped non-origin destination, and overlapping top
+    # layer catch descriptor reuse, wrong upload offsets, order and clip errors.
+    identity = (65536, 0, 32768, 0, 65536, 32768)
+    background = bytes((17, 61, 193, 255)) * 20
+    middle = bytes(c for y in range(2) for x in range(3)
+                   for c in (x * 37 + y * 11, x * 9 + y * 43, x * 67 + y * 3, 255))
+    top = bytes((85, 23, 172, 255))
+    scene = [
+        (scene_sample((5, 4), (0, 0, 5, 4), identity), background, (5, 4)),
+        (scene_sample((3, 2), (1, 1, 2, 2), identity, clip=(2, 0, 2, 3)), middle, (3, 2)),
+        (scene_sample((1, 1), (2, 2, 1, 1), identity), top, (1, 1)),
+    ]
+    expected = bytearray(background)
+    # Output (2,1) reads middle texel (1,0), not a re-derived 3:2 mapping.
+    # Output (2,2) is covered by the third texture.
+    expected[28:32] = bytes((37, 9, 67, 255))
+    expected[48:52] = top
+    for mode in ("buffer", "texture", "texture-buffer"):
+        for ten_bit in (False, True):
+            for damage in (None, [(0, 0, 5, 1), (0, 1, 2, 3), (2, 1, 3, 3)]):
+                timings = []
+                result = renderer.render(background, (5, 4), (5, 4), mode, scene=scene,
+                                         ten_bit=ten_bit, damage=damage, timings=timings, timing_repeats=3)
+                assert len(timings) == 3 and all(math.isfinite(t) and t > 0 for t in timings), timings
+                assert all(abs(a - b) <= 1 for a, b in zip(result, expected)), (mode, ten_bit, damage, result)
+    print("PASS: 12 multi-layer scene draws; 8/10-bit, packed/texture/content, affine, clipping, damage, query replay")
 
 
 def test_hdr_capture(renderer, capture_path):
@@ -557,17 +651,106 @@ def capture(renderer, path, compare_shader_dir):
     print("Capture:", path)
 
 
+def benchmark(renderer):
+    # A 2x client on a 125% UHD output: 1.6 source texels per output pixel.
+    # This is a controlled single opaque surface, not a replay of a live frame.
+    source_size, size = (6144, 3456), (3840, 2160)
+    pattern = Image.new("RGBA", (96, 54))
+    pattern.putdata([((x * 17 + y * 3) % 256, (x * 7 + y * 19) % 256,
+                      (x * 23 + y * 11) % 256, 255) for y in range(54) for x in range(96)])
+    pixels = pattern.resize(source_size, Image.Resampling.NEAREST).tobytes("raw", "BGRA")
+    results = {mode: [] for mode in ("nearest", "bilinear", "reconstruction")}
+    # Interleave variants to reduce warmup/frequency/order bias. Discard the
+    # first measurement of each. Setup, upload and readback are outside timing.
+    for iteration in range(6):
+        modes = list(results)
+        if iteration % 2:
+            modes.reverse()
+        for mode in modes:
+            renderer.render(pixels, source_size, size, "texture", xrgb=True,
+                            filtering=mode, timings=results[mode])
+    for mode, values in results.items():
+        values = values[1:]
+        print(f"BENCH {mode}: median={statistics.median(values):.3f} ms "
+              f"min={min(values):.3f} max={max(values):.3f} samples={values}")
+    print("GPU spans include preemption/waits. Nearest and bilinear are cost controls, not quality-equivalent replacements.")
+
+
+def benchmark_stall(renderer):
+    # 2026-09-11 09:34:40, output 3840x2160, submit_ns=70231935993529.
+    # Live sampled span: 35.637 ms. All source/output transfers are sRGB,
+    # no LUTs, global alpha 255, ARGB, direct_color_eligible=false.
+    identity = (65536, 0, 32768, 0, 65536, 32768)
+    geometry = [
+        ((3840, 2160), (0, 0, 3840, 2160), identity, "nearest"),
+        ((3850, 2133), (0, 53, 3840, 2107), (65536, 0, 360448, 0, 65566, 32783), "reconstruction"),
+        ((3840, 50), (0, 0, 3840, 50), identity, "nearest"),
+        ((30, 30), (161, 223, 30, 30), identity, "nearest"),
+    ]
+    scene = []
+    for seed, (dimensions, destination, affine, filtering) in enumerate(geometry):
+        pattern = Image.new("RGBA", (96, 54))
+        pattern.putdata([((x * 17 + y * 3 + seed * 41) % 256,
+                          (x * 7 + y * 19 + seed * 13) % 256,
+                          (x * 23 + y * 11 + seed * 71) % 256, 255)
+                         for y in range(54) for x in range(96)])
+        image = pattern.resize(dimensions, Image.Resampling.NEAREST)
+        if seed == 3:
+            image = Image.new("RGBA", dimensions)
+            ImageDraw.Draw(image).polygon([(1, 1), (1, 26), (9, 19), (19, 19)], fill=(255, 255, 255, 255))
+        scene.append((scene_sample(dimensions, destination, affine, filtering),
+                      image.tobytes("raw", "BGRA"), dimensions))
+    cases = [
+        ("recorded-cubic-10bit", "reconstruction", True, False, None),
+        ("bilinear-control-10bit", "bilinear", True, False, None),
+        ("nearest-control-10bit", "nearest", True, False, None),
+        ("cubic-8bit", "reconstruction", False, False, None),
+        ("cubic-window-only-10bit", "reconstruction", True, True, None),
+        ("cubic-small-damage-10bit", "reconstruction", True, False, [(100, 200, 768, 432)]),
+    ]
+    results = {name: [] for name, *_ in cases}
+    print("STALL workload: external 09:34:40; recorded geometry/flags, synthetic pixels, identity color matrices.")
+    print("Optimal-tiled textures replace imported DMA-BUFs; no ICC LUT, client fences or cross-output queue replay.")
+    # Reverse case order in the second round. Each batch uploads/compiles once
+    # and replays 12 submissions; discard two warmups, retain 20 samples/case.
+    for round_index in range(2):
+        for name, filtering, ten_bit, window_only, damage in (cases if round_index == 0 else cases[::-1]):
+            layers = list(scene)
+            dimensions, destination, affine, _ = geometry[1]
+            layers[1] = (scene_sample(dimensions, destination, affine, filtering), scene[1][1], dimensions)
+            if window_only:
+                layers = layers[1:2]
+            timings = []
+            renderer.render(scene[0][1], (3840, 2160), (3840, 2160), "texture", scene=layers,
+                            ten_bit=ten_bit, damage=damage, timings=timings, timing_repeats=12)
+            results[name].extend(timings[2:])
+            print(f"STALL batch={round_index + 1} case={name} samples_ms={timings[2:]}", flush=True)
+    for name, values in results.items():
+        p95 = sorted(values)[math.ceil(0.95 * len(values)) - 1]
+        print(f"STALL {name}: median={statistics.median(values):.3f} ms p95={p95:.3f} "
+              f"min={min(values):.3f} max={max(values):.3f} n={len(values)}")
+    print("Filter/depth variants are diagnostic controls, not quality-equivalent proposed replacements.")
+    print("GPU spans still include preemption. The running desktop shares this GPU.")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--capture", type=Path)
     parser.add_argument("--capture-hdr", type=Path)
     parser.add_argument("--capture-surface", type=Path, nargs=2, metavar=("SOURCE_2X", "OUTPUT"))
     parser.add_argument("--compare-shader-dir", type=Path)
+    parser.add_argument("--benchmark", action="store_true", help="time UHD sampled-composition filter variants offscreen")
+    parser.add_argument("--benchmark-stall", action="store_true", help="time the recorded UHD multi-layer cubic workload and controls")
     args = parser.parse_args()
     renderer = Renderer()
     try:
+        if args.benchmark:
+            benchmark(renderer)
         test(renderer, args.compare_shader_dir)
+        test_scene(renderer)
         test_hdr_capture(renderer, args.capture_hdr)
+        if args.benchmark_stall:
+            benchmark_stall(renderer)
         if args.capture:
             capture(renderer, args.capture, args.compare_shader_dir)
         if args.capture_surface:

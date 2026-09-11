@@ -8,6 +8,7 @@ const gbm = @import("../backend/gbm.zig");
 const render = @import("types.zig");
 const render_content = @import("content.zig");
 const icc = @import("icc.zig");
+const trace_gpu = @import("diagnostics_options").trace_gpu;
 
 const c = @cImport({
     @cInclude("drm_fourcc.h");
@@ -16,6 +17,7 @@ const c = @cImport({
     @cInclude("sys/ioctl.h");
     @cInclude("sys/sysmacros.h");
     @cInclude("sys/stat.h");
+    @cInclude("time.h");
     @cInclude("vulkan/vulkan.h");
 });
 
@@ -204,7 +206,7 @@ const device_extensions = [_][*:0]const u8{
     c.VK_EXT_PHYSICAL_DEVICE_DRM_EXTENSION_NAME,
     c.VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
     c.VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME,
-};
+} ++ if (trace_gpu) [_][*:0]const u8{c.VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME} else [_][*:0]const u8{};
 
 const sampled_image_capacity = 32;
 pub const direct_color_bit: u32 = 1 << 31;
@@ -349,7 +351,580 @@ const RealRenderer = struct {
     lut_hashes: [][32]u8,
     lut_count: usize,
     resource_epoch: u64,
+    gpu_clock: GpuClock,
 };
+
+const GpuClock = struct {
+    get: c.PFN_vkGetCalibratedTimestampsKHR = null,
+    period: f64 = 0,
+    valid_bits: u7 = 0,
+
+    fn init(self: *RealRenderer) !GpuClock {
+        var properties: c.VkPhysicalDeviceProperties = undefined;
+        c.vkGetPhysicalDeviceProperties(self.physical_device, &properties);
+        var count: u32 = 64;
+        var queues: [64]c.VkQueueFamilyProperties = undefined;
+        c.vkGetPhysicalDeviceQueueFamilyProperties(self.physical_device, &count, &queues);
+        const bits = queues[self.queue_family].timestampValidBits;
+        if (bits == 0 or bits > 64 or properties.limits.timestampPeriod <= 0)
+            return error.GpuTimestampsUnsupported;
+        const domains_fn: c.PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR = @ptrCast(
+            c.vkGetInstanceProcAddr(self.instance, "vkGetPhysicalDeviceCalibrateableTimeDomainsKHR") orelse
+                return error.GpuCalibrationUnsupported,
+        );
+        var domains: [8]c.VkTimeDomainKHR = undefined;
+        count = domains.len;
+        try vk(domains_fn.?(self.physical_device, &count, &domains), error.GpuCalibrationUnsupported);
+        if (std.mem.indexOfScalar(c.VkTimeDomainKHR, domains[0..count], c.VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR) == null)
+            return error.GpuMonotonicCalibrationUnsupported;
+        return .{
+            .get = @ptrCast(c.vkGetDeviceProcAddr(self.device, "vkGetCalibratedTimestampsKHR") orelse
+                return error.GpuCalibrationUnsupported),
+            .period = properties.limits.timestampPeriod,
+            .valid_bits = @intCast(bits),
+        };
+    }
+};
+
+const GpuCalibration = struct {
+    ticks: u64,
+    monotonic_ns: u64,
+    deviation_ns: u64,
+
+    fn sample(renderer: *RealRenderer) !GpuCalibration {
+        const infos = [_]c.VkCalibratedTimestampInfoKHR{
+            .{ .sType = c.VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR, .timeDomain = c.VK_TIME_DOMAIN_DEVICE_KHR },
+            .{ .sType = c.VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR, .timeDomain = c.VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR },
+        };
+        var values: [2]u64 = undefined;
+        var deviation: u64 = undefined;
+        try vk(renderer.gpu_clock.get.?(renderer.device, infos.len, &infos, &values, &deviation), error.GpuCalibrationFailed);
+        return .{ .ticks = values[0], .monotonic_ns = values[1], .deviation_ns = deviation };
+    }
+
+    // Subtract in the device's modular tick domain before converting to ns.
+    // Converting large absolute counters to f64 first loses precision.
+    fn monotonic(self: GpuCalibration, clock: GpuClock, ticks: u64) i128 {
+        const range = @as(i128, 1) << clock.valid_bits;
+        var delta = @mod(@as(i128, ticks) - self.ticks, range);
+        if (delta >= @divExact(range, 2)) delta -= range;
+        return @as(i128, self.monotonic_ns) + @as(i128, @intFromFloat(@round(@as(f64, @floatFromInt(delta)) * clock.period)));
+    }
+};
+
+/// Opt-in per-target queries. Collection happens on reuse, after the existing
+/// fence check, or during destruction; it never waits for a query result.
+const GpuTrace = struct {
+    const capacity = 64;
+    const workload_capacity = 64;
+    const Path = enum { buffer, sampled, batched, blur };
+    const WorkloadSample = struct {
+        packed_sample: Sample,
+        intersect_pixels: u64,
+        backing: enum { buffer, content, external, native, uploaded },
+    };
+    const Phase = enum {
+        start,
+        acquire,
+        native_copies,
+        uploads,
+        target_acquire,
+        packed_composite,
+        sampled,
+        composite_segment,
+        blur_horizontal,
+        blur_vertical,
+        capture,
+        end,
+    };
+
+    pool: c.VkQueryPool = null,
+    phases: [capacity]Phase = undefined,
+    query_count: u32 = 0,
+    phases_complete: bool = true,
+    sample_count: usize = 0,
+    damage_rects: usize = 0,
+    damage_pixels: u64 = 0,
+    replay: bool = false,
+    path: Path = .buffer,
+    ten_bit: bool = false,
+    output_transfer: u32 = 0,
+    output_lut: bool = false,
+    workload_samples: [workload_capacity]WorkloadSample = undefined,
+    workload_damage: [workload_capacity]render.Rect = undefined,
+    opaque_copy_pixels: [workload_capacity]u64 = @splat(0),
+    calibration: ?GpuCalibration = null,
+    submit_ns: u64 = 0,
+    pending: bool = false,
+    completion_fd: ?std.posix.fd_t = null,
+    acquires: std.ArrayList(std.posix.fd_t) = .empty,
+    acquires_complete: bool = true,
+    capture_wait: bool = false,
+
+    fn init(device: c.VkDevice) !GpuTrace {
+        var self: GpuTrace = .{};
+        const info: c.VkQueryPoolCreateInfo = .{
+            .sType = c.VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+            .queryType = c.VK_QUERY_TYPE_TIMESTAMP,
+            .queryCount = capacity,
+        };
+        try vk(c.vkCreateQueryPool(device, &info, null, &self.pool), error.CreateGpuQueryPoolFailed);
+        return self;
+    }
+
+    fn clearAcquires(self: *GpuTrace) void {
+        for (self.acquires.items) |fd| _ = linux.close(fd);
+        self.acquires.clearRetainingCapacity();
+        self.acquires_complete = true;
+    }
+
+    fn deinit(self: *GpuTrace, device: c.VkDevice) void {
+        self.clearAcquires();
+        self.acquires.deinit(std.heap.c_allocator);
+        if (self.completion_fd) |fd| _ = linux.close(fd);
+        c.vkDestroyQueryPool(device, self.pool, null);
+    }
+
+    fn retainAcquire(self: *GpuTrace, fd: std.posix.fd_t) void {
+        const copy = duplicateFd(fd) catch {
+            self.acquires_complete = false;
+            return;
+        };
+        self.acquires.append(std.heap.c_allocator, copy) catch {
+            _ = linux.close(copy);
+            self.acquires_complete = false;
+        };
+    }
+
+    fn begin(self: *GpuTrace, command: c.VkCommandBuffer) void {
+        // The reset is recorded too, so cached command-buffer replay obtains
+        // new timestamps rather than reporting the preceding frame's values.
+        self.query_count = 1;
+        self.phases[0] = .start;
+        self.phases_complete = true;
+        @memset(&self.opaque_copy_pixels, 0);
+        c.vkCmdResetQueryPool(command, self.pool, 0, capacity);
+        c.vkCmdWriteTimestamp(command, c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, self.pool, 0);
+    }
+
+    fn mark(self: *GpuTrace, command: c.VkCommandBuffer, phase: Phase) void {
+        // Reserve the final query even when a complex frame exhausts the
+        // detail budget. Keep that tail in the total instead of truncating it.
+        if (self.query_count == capacity - 1) {
+            self.phases_complete = false;
+            return;
+        }
+        self.phases[self.query_count] = phase;
+        c.vkCmdWriteTimestamp(command, c.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, self.pool, self.query_count);
+        self.query_count += 1;
+    }
+
+    fn end(self: *GpuTrace, command: c.VkCommandBuffer) void {
+        self.phases[self.query_count] = .end;
+        c.vkCmdWriteTimestamp(command, c.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, self.pool, self.query_count);
+        self.query_count += 1;
+    }
+
+    fn describe(self: *GpuTrace, frame: Frame, replay: bool, path: Path, ten_bit: bool) void {
+        self.sample_count = frame.samples.len;
+        self.damage_rects = frame.render_damage.len;
+        self.damage_pixels = 0;
+        for (frame.render_damage) |rect| self.damage_pixels += @as(u64, rect.width) * rect.height;
+        self.replay = replay;
+        self.path = path;
+        self.ten_bit = ten_bit;
+        self.output_transfer = @intFromEnum(frame.output_color_description.transfer);
+        self.output_lut = frame.output_lut_slot != null;
+        const damage_count = @min(frame.render_damage.len, workload_capacity);
+        @memcpy(self.workload_damage[0..damage_count], frame.render_damage[0..damage_count]);
+        // Own the metadata: frame storage is borrowed and can be overwritten
+        // by another output before this target's completion is collected.
+        for (frame.samples[0..@min(frame.samples.len, workload_capacity)], 0..) |sample, index| {
+            var pixels: u64 = 0;
+            for (frame.render_damage) |rect| {
+                const visible = sampleIntersection(sample, rect) orelse continue;
+                pixels += @as(u64, @intCast(visible.max_x - visible.min_x)) * @as(u64, @intCast(visible.max_y - visible.min_y));
+            }
+            self.workload_samples[index] = .{
+                .packed_sample = sample,
+                .intersect_pixels = pixels,
+                .backing = if (path == .buffer) .buffer else if (sample.attributes[1] & direct_content_bit != 0)
+                    .content
+                else if (frame.sources[index].source.native != null)
+                    .native
+                else if (frame.sources[index].source.external != null)
+                    .external
+                else
+                    .uploaded,
+            };
+        }
+    }
+
+    fn recordOpaqueCopy(self: *GpuTrace, index: usize, rect: render.Rect) void {
+        if (index < workload_capacity)
+            self.opaque_copy_pixels[index] += @as(u64, rect.width) * rect.height;
+    }
+
+    fn workloadComplete(self: GpuTrace) bool {
+        return self.sample_count <= workload_capacity and self.damage_rects <= workload_capacity;
+    }
+
+    fn beforeSubmit(self: *GpuTrace, renderer: *RealRenderer, capture_wait: bool) void {
+        self.calibration = GpuCalibration.sample(renderer) catch null;
+        self.capture_wait = capture_wait;
+        var now: c.struct_timespec = undefined;
+        self.submit_ns = if (c.clock_gettime(c.CLOCK_MONOTONIC, &now) == 0)
+            @as(u64, @intCast(now.tv_sec)) * std.time.ns_per_s + @as(u64, @intCast(now.tv_nsec))
+        else
+            0;
+    }
+
+    fn times(self: *GpuTrace, renderer: *RealRenderer) ![capacity]i128 {
+        const calibration = self.calibration orelse return error.GpuCalibrationFailed;
+        var ticks: [capacity]u64 = undefined;
+        try vk(c.vkGetQueryPoolResults(
+            renderer.device,
+            self.pool,
+            0,
+            self.query_count,
+            @sizeOf(@TypeOf(ticks)),
+            &ticks,
+            @sizeOf(u64),
+            c.VK_QUERY_RESULT_64_BIT,
+        ), error.GpuQueryUnavailable);
+        var result: [capacity]i128 = undefined;
+        for (ticks[0..self.query_count], result[0..self.query_count]) |tick, *ns|
+            ns.* = calibration.monotonic(renderer.gpu_clock, tick);
+        return result;
+    }
+
+    fn collect(self: *GpuTrace, renderer: *RealRenderer, width: u32, height: u32) void {
+        if (!self.pending) return;
+        self.pending = false;
+        defer {
+            self.clearAcquires();
+            if (self.completion_fd) |fd| _ = linux.close(fd);
+            self.completion_fd = null;
+        }
+        const timestamps = self.times(renderer) catch |err| {
+            std.log.warn("gpu-trace unavailable: {t}; submit_ns={d}", .{ err, self.submit_ns });
+            return;
+        };
+        const ready = if (self.completion_fd) |fd| gpuFenceSignal(fd) else null;
+        // Emit only slow submissions, not a per-frame trace. Keep calibration
+        // uncertainty visible instead of clamping small negative intervals.
+        const end_ns = timestamps[self.query_count - 1];
+        if (@max(end_ns, @as(i128, ready orelse 0)) - self.submit_ns < 8 * std.time.ns_per_ms) return;
+        var acquire_ns: u64 = 0;
+        for (self.acquires.items) |fd| {
+            if (gpuFenceSignal(fd)) |ns|
+                acquire_ns = @max(acquire_ns, ns)
+            else
+                self.acquires_complete = false;
+        }
+        std.log.info("gpu-trace size={d}x{d} submit_ns={d} gpu_start_ns={d} gpu_end_ns={d} ready_ns={?d} pending_acquires={d} acquire_signal_ns={d} acquires_complete={} capture_wait={} calibration_deviation_ns={d} samples={d} damage_rects={d} damage_pixels={d} replay={} phases_complete={} path={t} ten_bit={} output_transfer={d} output_lut={} workload_complete={}", .{
+            width,                   height,             self.submit_ns,          timestamps[0],        end_ns,                          ready,
+            self.acquires.items.len, acquire_ns,         self.acquires_complete,  self.capture_wait,    self.calibration.?.deviation_ns, self.sample_count,
+            self.damage_rects,       self.damage_pixels, self.replay,             self.phases_complete, self.path,                       self.ten_bit,
+            self.output_transfer,    self.output_lut,    self.workloadComplete(),
+        });
+        for (1..self.query_count) |index| {
+            std.log.info("gpu-phase size={d}x{d} submit_ns={d} index={d} phase={t} from_ns={d} to_ns={d} duration_ns={d}", .{
+                width, height, self.submit_ns, index, self.phases[index], timestamps[index - 1], timestamps[index], timestamps[index] - timestamps[index - 1],
+            });
+        }
+        for (self.workload_damage[0..@min(self.damage_rects, workload_capacity)], 0..) |rect, index| {
+            std.log.info("gpu-damage size={d}x{d} submit_ns={d} index={d} rect={d},{d},{d},{d}", .{
+                width, height, self.submit_ns, index, rect.x, rect.y, rect.width, rect.height,
+            });
+        }
+        for (self.workload_samples[0..@min(self.sample_count, workload_capacity)], 0..) |work, index| {
+            const sample = work.packed_sample;
+            const filter: enum { nearest, reconstruction, bilinear, area } = @enumFromInt((sample.attributes[1] & filter_mask) >> 28);
+            std.log.info("gpu-sample size={d}x{d} submit_ns={d} index={d} filter={t} backing={t} source_size={d}x{d} destination={d},{d},{d},{d} clip={d},{d},{d},{d} crop_16_16={d},{d},{d},{d} affine_16_16={d},{d},{d},{d},{d},{d} intersect_pixels={d} opaque_copy_pixels={d}", .{
+                width,                 height,                self.submit_ns,        index,                          filter,           work.backing,     sample.source[1], sample.source[2],
+                sample.destination[0], sample.destination[1], sample.destination[2], sample.destination[3],          sample.clip[0],   sample.clip[1],   sample.clip[2],   sample.clip[3],
+                sample.crop[0],        sample.crop[1],        sample.crop[2],        sample.crop[3],                 sample.affine[0], sample.affine[1], sample.affine[2], sample.affine[3],
+                sample.affine_tail[0], sample.affine_tail[1], work.intersect_pixels, self.opaque_copy_pixels[index],
+            });
+            std.log.info("gpu-sample-color size={d}x{d} submit_ns={d} index={d} direct_color_eligible={} format={d} alpha={d} alpha_mode={d} source_transfer={d} source_lut={} luminance_scale={d}", .{
+                width,                    height,               self.submit_ns,        index,                sample.attributes[1] & direct_color_bit != 0,
+                sample.attributes[0],     sample.attributes[2], sample.affine_tail[2], sample.attributes[3], sample.affine_tail[3] != 0,
+                sample.color_matrix_0[3],
+            });
+        }
+    }
+};
+
+fn gpuFenceSignal(fd: std.posix.fd_t) ?u64 {
+    var fences: [64]c.struct_sync_fence_info = undefined;
+    var info: c.struct_sync_file_info = std.mem.zeroes(c.struct_sync_file_info);
+    info.num_fences = fences.len;
+    info.sync_fence_info = @intFromPtr(&fences);
+    while (c.ioctl(fd, c.SYNC_IOC_FILE_INFO, &info) != 0) {
+        if (std.posix.errno(@as(c_int, -1)) != .INTR) return null;
+    }
+    if (info.status != 1 or info.num_fences == 0 or info.num_fences > fences.len) return null;
+    var latest: u64 = 0;
+    for (fences[0..info.num_fences]) |fence| {
+        if (fence.status != 1 or fence.timestamp_ns == 0) return null;
+        latest = @max(latest, fence.timestamp_ns);
+    }
+    return latest;
+}
+
+test "render-vulkan: GPU clock conversion preserves precision and wraps both ways" {
+    const narrow: GpuClock = .{ .period = 2.5, .valid_bits = 32 };
+    const before_wrap: GpuCalibration = .{ .ticks = 0xffff_fffc, .monotonic_ns = 1000, .deviation_ns = 1 };
+    try std.testing.expectEqual(@as(i128, 1020), before_wrap.monotonic(narrow, 4));
+    const after_wrap: GpuCalibration = .{ .ticks = 4, .monotonic_ns = 1000, .deviation_ns = 1 };
+    try std.testing.expectEqual(@as(i128, 980), after_wrap.monotonic(narrow, 0xffff_fffc));
+    const large: GpuCalibration = .{ .ticks = 0xffff_ffff_ffff_f000, .monotonic_ns = 1000, .deviation_ns = 1 };
+    const wide: GpuClock = .{ .period = 52.25, .valid_bits = 64 };
+    try std.testing.expectEqual(@as(i128, 1209), large.monotonic(wide, large.ticks + 4));
+    try std.testing.expectEqual(@as(i128, 791), large.monotonic(wide, large.ticks - 4));
+}
+
+test "render-vulkan: GPU workload owns clipped sample and damage metadata" {
+    var samples = [_]Sample{std.mem.zeroes(Sample)} ** 2;
+    samples[0].destination = .{ -3, 2, 20, 11 };
+    samples[0].clip = .{ 4, -1, 15, 11 };
+    samples[0].crop = .{ 65536, 131072, 196608, 262144 };
+    samples[0].attributes[1] = reconstruction_bit | direct_color_bit;
+    samples[1].destination = .{ 30, 30, 2, 3 };
+    samples[1].clip = samples[1].destination;
+    var damage = [_]render.Rect{
+        .{ .x = 0, .y = 0, .width = 9, .height = 7 },
+        .{ .x = 12, .y = 8, .width = 10, .height = 9 },
+        .{ .x = 17, .y = 2, .width = 2, .height = 3 },
+    };
+    var trace: GpuTrace = .{};
+    trace.describe(.{
+        .output = .{ .width = 40, .height = 40 },
+        .output_format = .xrgb8888,
+        .clear = .{ .r = 0, .g = 0, .b = 0 },
+        .samples = &samples,
+        .sources = &.{}, // Packed-buffer rendering doesn't need source metadata.
+        .source_byte_count = 0,
+        .render_damage = &damage,
+        .output_lut_slot = 0,
+    }, false, .buffer, true);
+    samples[0].crop = @splat(0);
+    samples[0].attributes[1] = 0;
+    damage[0].width = 100;
+    // First intersection is 5x5, second is 5x2, third only touches an edge.
+    try std.testing.expectEqual(@as(u64, 35), trace.workload_samples[0].intersect_pixels);
+    try std.testing.expectEqual(@as(u64, 0), trace.workload_samples[1].intersect_pixels);
+    try std.testing.expectEqual(@as(u64, 159), trace.damage_pixels);
+    try std.testing.expectEqual(@as(u32, 9), trace.workload_damage[0].width);
+    try std.testing.expectEqual([4]i32{ 65536, 131072, 196608, 262144 }, trace.workload_samples[0].packed_sample.crop);
+    try std.testing.expectEqual(reconstruction_bit | direct_color_bit, trace.workload_samples[0].packed_sample.attributes[1]);
+    try std.testing.expectEqual(.buffer, trace.workload_samples[0].backing);
+    try std.testing.expect(trace.workloadComplete());
+    try std.testing.expect(trace.ten_bit and trace.output_lut and !trace.replay);
+}
+
+test "render-vulkan: GPU workload truncates detail but preserves totals and replay copies" {
+    var samples = [_]Sample{std.mem.zeroes(Sample)} ** 65;
+    for (&samples) |*sample| {
+        sample.destination = .{ 0, 0, 200, 3 };
+        sample.clip = sample.destination;
+    }
+    var damage: [65]render.Rect = undefined;
+    for (&damage, 0..) |*rect, index|
+        rect.* = .{ .x = @intCast(index * 3), .y = 0, .width = 2, .height = 3 };
+    var trace: GpuTrace = .{};
+    var frame: Frame = .{
+        .output = .{ .width = 200, .height = 3 },
+        .output_format = .xrgb8888,
+        .clear = .{ .r = 0, .g = 0, .b = 0 },
+        .samples = samples[0..64],
+        .sources = &.{},
+        .source_byte_count = 0,
+        .render_damage = damage[0..64],
+    };
+    trace.describe(frame, false, .buffer, false);
+    try std.testing.expect(trace.workloadComplete());
+    frame.samples = &samples;
+    trace.describe(frame, false, .buffer, false);
+    try std.testing.expect(!trace.workloadComplete());
+    frame.samples = samples[0..64];
+    frame.render_damage = &damage;
+    trace.describe(frame, false, .buffer, false);
+    try std.testing.expect(!trace.workloadComplete());
+    try std.testing.expectEqual(@as(usize, 65), trace.damage_rects);
+    try std.testing.expectEqual(@as(u64, 390), trace.damage_pixels);
+    try std.testing.expectEqual(@as(u64, 390), trace.workload_samples[63].intersect_pixels);
+    try std.testing.expectEqual(damage[63], trace.workload_damage[63]);
+    trace.recordOpaqueCopy(63, .{ .x = 0, .y = 0, .width = 7, .height = 3 });
+    trace.recordOpaqueCopy(63, damage[0]);
+    trace.recordOpaqueCopy(64, damage[0]);
+    trace.describe(frame, true, .buffer, false);
+    try std.testing.expectEqual(@as(u64, 27), trace.opaque_copy_pixels[63]);
+    try std.testing.expectEqual(@as(u64, 0), trace.opaque_copy_pixels[0]);
+    try std.testing.expect(trace.replay);
+}
+
+test "render-vulkan: GPU workload distinguishes sampled source backings" {
+    var samples = [_]Sample{std.mem.zeroes(Sample)} ** 4;
+    samples[0].attributes[1] = direct_content_bit | bilinear_bit;
+    var sources = [_]render.SurfaceSample{testSurfaceSample(1, &.{}, .{})} ** 4;
+    sources[1].source.native = .{ .owner = &sources, .token = 1 };
+    sources[2].source.external = @as(render.ExternalSource, undefined);
+    var trace: GpuTrace = .{};
+    trace.describe(.{
+        .output = .{ .width = 1, .height = 1 },
+        .output_format = .xrgb8888,
+        .clear = .{ .r = 0, .g = 0, .b = 0 },
+        .samples = &samples,
+        .sources = &sources,
+        .source_byte_count = 0,
+        .render_damage = &.{},
+    }, false, .sampled, false);
+    sources[1].source.native = null;
+    sources[2].source.external = null;
+    try std.testing.expectEqual(.content, trace.workload_samples[0].backing);
+    try std.testing.expectEqual(.native, trace.workload_samples[1].backing);
+    try std.testing.expectEqual(.external, trace.workload_samples[2].backing);
+    try std.testing.expectEqual(.uploaded, trace.workload_samples[3].backing);
+}
+
+test "render-vulkan: GPU trace owns only duplicate acquire descriptors" {
+    var trace: GpuTrace = .{};
+    defer trace.acquires.deinit(std.heap.c_allocator);
+    defer trace.clearAcquires();
+    var pipe: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&pipe, .{ .CLOEXEC = true })));
+    defer _ = linux.close(pipe[0]);
+    defer _ = linux.close(pipe[1]);
+    trace.retainAcquire(pipe[0]);
+    try std.testing.expectEqual(@as(usize, 1), trace.acquires.items.len);
+    const retained = trace.acquires.items[0];
+    try std.testing.expect(retained != pipe[0]);
+    try std.testing.expectEqual(@as(usize, linux.FD_CLOEXEC), linux.fcntl(retained, linux.F.GETFD, 0));
+    try std.testing.expectEqual(@as(?u64, null), gpuFenceSignal(retained));
+    trace.retainAcquire(-1);
+    try std.testing.expect(!trace.acquires_complete);
+    trace.clearAcquires();
+    try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(retained, linux.F.GETFD, 0)));
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(pipe[0], linux.F.GETFD, 0)));
+    try std.testing.expect(trace.acquires_complete);
+    try std.testing.expectEqual(@as(usize, 0), trace.acquires.items.len);
+}
+
+test "render-vulkan: real calibrated GPU queries replay without stale results" {
+    if (!trace_gpu) return error.SkipZigTest;
+    // Only opens a GPU device and submits offscreen commands. Never acquires
+    // DRM master, touches KMS, or connects to the running compositor.
+    const opened = linux.open("/dev/dri/card0", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(opened) != .SUCCESS) return error.SkipZigTest;
+    const fd: std.posix.fd_t = @intCast(opened);
+    defer _ = linux.close(fd);
+    var context: u8 = 0;
+    const renderer = try realCreate(&context, fd, .{
+        .max_samples = 1,
+        .max_color_luts = 1,
+        .max_source_bytes = 4096,
+        .max_targets = 1,
+        .content_bytes = 4096,
+    });
+    defer realDestroy(&context, renderer);
+    const self: *RealRenderer = @ptrCast(@alignCast(renderer));
+    var trace = try GpuTrace.init(self.device);
+    defer trace.deinit(self.device);
+    var pool: c.VkCommandPool = undefined;
+    const pool_info: c.VkCommandPoolCreateInfo = .{
+        .sType = c.VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .queueFamilyIndex = self.queue_family,
+    };
+    try vk(c.vkCreateCommandPool(self.device, &pool_info, null, &pool), error.CreateCommandPoolFailed);
+    defer c.vkDestroyCommandPool(self.device, pool, null);
+    var command: c.VkCommandBuffer = undefined;
+    const allocate: c.VkCommandBufferAllocateInfo = .{
+        .sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = pool,
+        .level = c.VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1,
+    };
+    try vk(c.vkAllocateCommandBuffers(self.device, &allocate, &command), error.AllocateCommandBufferFailed);
+    const begin: c.VkCommandBufferBeginInfo = .{ .sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    var fence: c.VkFence = undefined;
+    const fence_info: c.VkFenceCreateInfo = .{ .sType = c.VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    try vk(c.vkCreateFence(self.device, &fence_info, null, &fence), error.CreateFenceFailed);
+    defer c.vkDestroyFence(self.device, fence, null);
+    const semaphore = try createExportSemaphore(self);
+    defer c.vkDestroySemaphore(self.device, semaphore, null);
+    var previous_end: i128 = 0;
+    // Exercise the exact detail limit, overflow, then a shorter recording:
+    // reading stale/unwritten queries or retaining the overflow flag must fail.
+    for ([_]usize{ 62, 63, 2 }) |mark_count| {
+        try vk(c.vkResetCommandPool(self.device, pool, 0), error.ResetCommandPoolFailed);
+        try vk(c.vkBeginCommandBuffer(command, &begin), error.BeginCommandBufferFailed);
+        trace.begin(command);
+        try std.testing.expectEqual(@as(u64, 0), trace.opaque_copy_pixels[0]);
+        trace.recordOpaqueCopy(0, .{ .x = 0, .y = 0, .width = 7, .height = 3 });
+        for (0..mark_count) |index|
+            trace.mark(command, if (index % 2 == 0) .sampled else .capture);
+        trace.end(command);
+        try vk(c.vkEndCommandBuffer(command), error.EndCommandBufferFailed);
+        try std.testing.expectEqual(@as(u32, if (mark_count == 2) 4 else 64), trace.query_count);
+        try std.testing.expectEqual(mark_count != 63, trace.phases_complete);
+        try std.testing.expectEqual(GpuTrace.Phase.start, trace.phases[0]);
+        try std.testing.expectEqual(GpuTrace.Phase.end, trace.phases[trace.query_count - 1]);
+        for (1..trace.query_count - 1) |index|
+            try std.testing.expectEqual(if (index % 2 == 1) GpuTrace.Phase.sampled else GpuTrace.Phase.capture, trace.phases[index]);
+        for (0..2) |_| {
+            // Re-submit the same recorded query reset/writes. No re-recording.
+            trace.beforeSubmit(self, false);
+            const submit: c.VkSubmitInfo = .{
+                .sType = c.VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                .commandBufferCount = 1,
+                .pCommandBuffers = &command,
+                .signalSemaphoreCount = 1,
+                .pSignalSemaphores = &semaphore,
+            };
+            try vk(c.vkQueueSubmit(self.queue, 1, &submit, fence), error.QueueSubmitFailed);
+            const export_info: c.VkSemaphoreGetFdInfoKHR = .{
+                .sType = c.VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
+                .semaphore = semaphore,
+                .handleType = c.VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+            };
+            var completion: c_int = -1;
+            try vk(self.get_semaphore_fd.?(self.device, &export_info, &completion), error.ExportCompletionFailed);
+            defer if (completion >= 0) {
+                _ = linux.close(completion);
+            };
+            try std.testing.expect(completion >= 0);
+            // Waiting is confined to this offscreen test, never the trace reader.
+            try vk(c.vkWaitForFences(self.device, 1, &fence, c.VK_TRUE, std.time.ns_per_s), error.TestGpuTimeout);
+            const times = try trace.times(self);
+            const after = try GpuCalibration.sample(self);
+            const uncertainty: i128 = trace.calibration.?.deviation_ns + after.deviation_ns;
+            try std.testing.expect(uncertainty < 5 * std.time.ns_per_ms);
+            try std.testing.expect(times[0] >= @as(i128, trace.submit_ns) - uncertainty);
+            for (1..trace.query_count) |index|
+                try std.testing.expect(times[index] >= times[index - 1]);
+            const end_ns = times[trace.query_count - 1];
+            try std.testing.expect(end_ns <= @as(i128, after.monotonic_ns) + uncertainty);
+            try std.testing.expect(times[0] > previous_end);
+            previous_end = end_ns;
+            const signal = gpuFenceSignal(completion) orelse return error.MissingFenceTimestamp;
+            try std.testing.expect(@as(i128, signal) >= end_ns - uncertainty);
+            trace.retainAcquire(completion);
+            trace.completion_fd = try duplicateFd(completion);
+            trace.pending = true;
+            const retained = trace.acquires.items[0];
+            const retained_completion = trace.completion_fd.?;
+            trace.collect(self, 1, 1);
+            try std.testing.expectEqual(@as(u64, 21), trace.opaque_copy_pixels[0]);
+            try std.testing.expect(!trace.pending);
+            try std.testing.expectEqual(@as(?std.posix.fd_t, null), trace.completion_fd);
+            try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(retained, linux.F.GETFD, 0)));
+            try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(retained_completion, linux.F.GETFD, 0)));
+            try vk(c.vkResetFences(self.device, 1, &fence), error.ResetFenceFailed);
+        }
+    }
+}
 
 const TargetState = enum { ready, in_flight, queue_failed, export_failed };
 
@@ -401,6 +976,7 @@ const RealTarget = struct {
     readback_size: usize,
     captured: Captures = .{},
     recorded_sampled_frame: RecordedSampledFrame = .{},
+    gpu_trace: GpuTrace,
 };
 
 const RealCaptureTarget = struct {
@@ -684,6 +1260,8 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
     self.get_memory_fd_properties = @ptrCast(c.vkGetDeviceProcAddr(self.device, "vkGetMemoryFdPropertiesKHR") orelse return error.MissingMemoryFdPropertiesFunction);
     self.get_semaphore_fd = @ptrCast(c.vkGetDeviceProcAddr(self.device, "vkGetSemaphoreFdKHR") orelse return error.MissingSemaphoreFdFunction);
     self.import_semaphore_fd = @ptrCast(c.vkGetDeviceProcAddr(self.device, "vkImportSemaphoreFdKHR") orelse return error.MissingSemaphoreFdFunction);
+    self.gpu_clock = if (trace_gpu) try GpuClock.init(self) else .{};
+    if (trace_gpu) std.log.info("gpu-trace enabled: calibrated timestamps; slow submissions >=8ms; results collected on target reuse", .{});
 
     const bindings = [_]c.VkDescriptorSetLayoutBinding{
         descriptorBinding(0, c.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE),
@@ -1992,6 +2570,8 @@ fn realImportTarget(_: *anyopaque, renderer: Renderer, metadata: gbm.Metadata, d
     errdefer c.vkDestroyCommandPool(self.device, target.command_pool, null);
     var command_allocate: c.VkCommandBufferAllocateInfo = .{ .sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .pNext = null, .commandPool = target.command_pool, .level = c.VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
     try vk(c.vkAllocateCommandBuffers(self.device, &command_allocate, &target.command_buffer), error.AllocateCommandBufferFailed);
+    target.gpu_trace = if (trace_gpu) try GpuTrace.init(self.device) else .{};
+    errdefer if (trace_gpu) target.gpu_trace.deinit(self.device);
     var fence_info: c.VkFenceCreateInfo = .{ .sType = c.VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .pNext = null, .flags = 0 };
     try vk(c.vkCreateFence(self.device, &fence_info, null, &target.fence), error.CreateFenceFailed);
     errdefer c.vkDestroyFence(self.device, target.fence, null);
@@ -2019,6 +2599,10 @@ fn realDestroyTarget(_: *anyopaque, renderer: Renderer, target_value: Target) vo
     const target: *RealTarget = @ptrCast(@alignCast(target_value));
     if (target.state == .in_flight or target.state == .export_failed)
         _ = c.vkWaitForFences(self.device, 1, &target.fence, c.VK_TRUE, std.math.maxInt(u64));
+    if (trace_gpu) {
+        target.gpu_trace.collect(self, target.width, target.height);
+        target.gpu_trace.deinit(self.device);
+    }
     drainContentLeases(self, target);
     drainNativeLeases(self, target);
     drainImportedLeases(self, target);
@@ -2622,6 +3206,7 @@ fn recordPackedPass(
     input: Frame,
     sample_count: usize,
 ) !void {
+    defer if (trace_gpu) target.gpu_trace.mark(target.command_buffer, .packed_composite);
     const frame = capturePassFrame(input, sample_count);
     if (sample_count > sample_count_mask) return error.CapacityExceeded;
     c.vkCmdBindPipeline(
@@ -2649,6 +3234,7 @@ fn recordPackedPass(
 }
 
 fn recordCapture(self: *RealRenderer, target: *RealTarget, frame: Frame, phase: CapturePhase) void {
+    defer if (trace_gpu) target.gpu_trace.mark(target.command_buffer, .capture);
     if (frame.capture_destination) |destination| {
         recordCaptureTargetCopy(self, target, destination, phase);
         return;
@@ -2897,6 +3483,7 @@ fn realDraw(_: *anyopaque, renderer: Renderer, target_value: Target, input: Fram
         .ready => {},
         .in_flight => {
             if (c.vkGetFenceStatus(self.device, target.fence) != c.VK_SUCCESS) return error.TargetBusy;
+            if (trace_gpu) target.gpu_trace.collect(self, target.width, target.height);
             target.state = .ready;
             target.fence_needs_reset = true;
             drainContentLeases(self, target);
@@ -2905,6 +3492,7 @@ fn realDraw(_: *anyopaque, renderer: Renderer, target_value: Target, input: Fram
         },
         .queue_failed, .export_failed => return error.TargetTerminal,
     }
+    if (trace_gpu) target.gpu_trace.clearAcquires();
     try ensureReadbacks(self, target, frame.captures);
     target.captured = .{};
     drainRetiredTextures(self, target);
@@ -2933,6 +3521,7 @@ fn realDraw(_: *anyopaque, renderer: Renderer, target_value: Target, input: Fram
     try vk(c.vkResetCommandBuffer(target.command_buffer, 0), error.ResetCommandBufferFailed);
     var begin: c.VkCommandBufferBeginInfo = .{ .sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .pNext = null, .flags = c.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, .pInheritanceInfo = null };
     try vk(c.vkBeginCommandBuffer(target.command_buffer, &begin), error.BeginCommandBufferFailed);
+    if (trace_gpu) target.gpu_trace.begin(target.command_buffer);
     var barrier: c.VkImageMemoryBarrier = .{
         .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
         .pNext = null,
@@ -2946,6 +3535,7 @@ fn realDraw(_: *anyopaque, renderer: Renderer, target_value: Target, input: Fram
         .subresourceRange = colorRange(),
     };
     c.vkCmdPipelineBarrier(target.command_buffer, c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, null, 0, null, 1, &barrier);
+    if (trace_gpu) target.gpu_trace.mark(target.command_buffer, .target_acquire);
     if (frame.captures.before_cursor) {
         try recordPackedPass(self, target, frame, frame.cursor_start);
         recordCapture(self, target, frame, .before_cursor);
@@ -2981,6 +3571,7 @@ fn realDraw(_: *anyopaque, renderer: Renderer, target_value: Target, input: Fram
         1,
         &release_barrier,
     );
+    if (trace_gpu) target.gpu_trace.end(target.command_buffer);
     try vk(c.vkEndCommandBuffer(target.command_buffer), error.EndCommandBufferFailed);
     const capture_wait: ?c.VkSemaphore = if (frame.capture_destination) |destination|
         (@as(*RealCaptureTarget, @ptrCast(@alignCast(destination.target)))).acquire_semaphore
@@ -3002,10 +3593,15 @@ fn realDraw(_: *anyopaque, renderer: Renderer, target_value: Target, input: Fram
         try vk(c.vkResetFences(self.device, 1, &target.fence), error.ResetFenceFailed);
         target.fence_needs_reset = false;
     }
+    if (trace_gpu) {
+        target.gpu_trace.describe(frame, false, .buffer, target.ten_bit);
+        target.gpu_trace.beforeSubmit(self, capture_wait != null);
+    }
     if (c.vkQueueSubmit(self.queue, 1, &submit, target.fence) != c.VK_SUCCESS) {
         target.state = .queue_failed;
         return error.QueueSubmitFailed;
     }
+    if (trace_gpu) target.gpu_trace.pending = true;
     if (frame.capture_destination) |destination|
         (@as(*RealCaptureTarget, @ptrCast(@alignCast(destination.target)))).completion_fence = target.fence;
     target.state = .in_flight;
@@ -3017,6 +3613,7 @@ fn realDraw(_: *anyopaque, renderer: Renderer, target_value: Target, input: Fram
         target.state = .export_failed;
         return error.CompletionExportFailedAfterSubmit;
     }
+    if (trace_gpu) target.gpu_trace.completion_fd = duplicateFd(completion_fd) catch null;
     return completion_fd;
 }
 
@@ -3026,6 +3623,7 @@ fn recordSampledPass(
     input: Frame,
     sample_count: usize,
 ) !void {
+    defer if (trace_gpu) target.gpu_trace.mark(target.command_buffer, .sampled);
     const frame = capturePassFrame(input, sample_count);
     const pass_batch_count = if (sample_count == 0)
         1
@@ -3066,6 +3664,7 @@ fn recordSampledPass(
             // are identical. The last intersecting sample is topmost.
             const source_index = range.first + range.count - 1;
             if (opaqueCopyOrigin(frame, source_index, damage)) |origin| {
+                if (trace_gpu) target.gpu_trace.recordOpaqueCopy(source_index, damage);
                 const push: Push = .{
                     .clear_color = .{ origin[0], origin[1], source_index, 0 },
                     .output = @splat(0),
@@ -3152,6 +3751,7 @@ fn recordSampledRange(
     end: usize,
     intermediate: bool,
 ) void {
+    defer if (trace_gpu) target.gpu_trace.mark(target.command_buffer, .composite_segment);
     std.debug.assert(first <= end and end <= self.max_samples);
     c.vkCmdBindPipeline(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.sampled_pipeline.?);
     const flags: u32 = (if (first != 0) continuation_bit else 0) |
@@ -3189,11 +3789,13 @@ fn recordBlurRegions(
         recordBlurDispatch(self, target, frame, expandVertical(exact, support, frame.output), false, scale);
     };
     recordBlurBarrier(target);
+    if (trace_gpu) target.gpu_trace.mark(target.command_buffer, .blur_horizontal);
     for (regions) |region| for (frame.render_damage) |damage| {
         const exact = intersectRect(region, damage) orelse continue;
         recordBlurDispatch(self, target, frame, exact, true, scale);
     };
     recordSampledBarrier(target);
+    if (trace_gpu) target.gpu_trace.mark(target.command_buffer, .blur_vertical);
 }
 
 fn recordBlurDispatch(
@@ -3688,6 +4290,7 @@ fn sampledFrameReplayable(frame: Frame, prepared_batch: []const PreparedTexture)
 
 fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.posix.fd_t {
     const allocator = std.heap.c_allocator;
+    errdefer if (trace_gpu and !target.gpu_trace.pending) target.gpu_trace.clearAcquires();
     const has_blur = try frameHasVisibleBlur(frame);
     if (has_blur and frame.samples.len > self.max_samples) return error.CapacityExceeded;
     const batch_count = try ensureSampledFrameCapacity(self, target, frame.samples.len);
@@ -3807,6 +4410,8 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
             mergeAcquireFences(acquire_fds[0..acquire_fd_count])
         else
             null;
+        if (trace_gpu) for (acquire_fds[0..acquire_fd_count]) |fd|
+            target.gpu_trace.retainAcquire(fd);
         if (merged) |fd| {
             var owned = true;
             defer if (owned) {
@@ -3899,6 +4504,7 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
             .pInheritanceInfo = null,
         };
         try vk(c.vkBeginCommandBuffer(target.command_buffer, &begin), error.BeginCommandBufferFailed);
+        if (trace_gpu) target.gpu_trace.begin(target.command_buffer);
         var acquire_start: usize = 0;
         while (acquire_start < batch.count) : (acquire_start += sampled_image_capacity) {
             const acquire_end = @min(acquire_start + sampled_image_capacity, batch.count);
@@ -3939,6 +4545,7 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
                 &barriers,
             );
         }
+        if (trace_gpu) target.gpu_trace.mark(target.command_buffer, .acquire);
         for (self.prepared[0..batch.count]) |prepared| {
             if (prepared.upload_count == 0) continue;
             if (prepared.imported_token) |token| {
@@ -3947,6 +4554,7 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
                 recordNativeCopies(self, target.command_buffer, prepared, imported);
             }
         }
+        if (trace_gpu) target.gpu_trace.mark(target.command_buffer, .native_copies);
         var upload_start: usize = 0;
         while (upload_start < batch.count) : (upload_start += sampled_image_capacity) {
             const upload_batch = self.prepared[upload_start..@min(
@@ -4032,6 +4640,7 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
                 &barriers,
             );
         }
+        if (trace_gpu) target.gpu_trace.mark(target.command_buffer, .uploads);
         var target_barrier: c.VkImageMemoryBarrier = .{
             .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             .pNext = null,
@@ -4090,6 +4699,7 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
             };
             c.vkCmdPipelineBarrier(target.command_buffer, c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, null, 0, null, 1, &blur_barrier);
         }
+        if (trace_gpu) target.gpu_trace.mark(target.command_buffer, .target_acquire);
         if (frame.captures.before_cursor) {
             if (has_blur)
                 try recordBackdropEffectPass(self, target, frame, frame.cursor_start)
@@ -4180,6 +4790,7 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
             1,
             &release_barrier,
         );
+        if (trace_gpu) target.gpu_trace.end(target.command_buffer);
         try vk(c.vkEndCommandBuffer(target.command_buffer), error.EndCommandBufferFailed);
         if (replayable) try target.recorded_sampled_frame.replace(
             allocator,
@@ -4204,10 +4815,15 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
         .signalSemaphoreCount = if (source_bridge_count == 0) 1 else 2,
         .pSignalSemaphores = &[_]c.VkSemaphore{ target.semaphore, target.source_semaphore },
     };
+    if (trace_gpu) {
+        target.gpu_trace.describe(frame, replay, if (has_blur) .blur else if (batch_count > 1) .batched else .sampled, target.ten_bit);
+        target.gpu_trace.beforeSubmit(self, frame.capture_destination != null);
+    }
     if (c.vkQueueSubmit(self.queue, 1, &submit, target.fence) != c.VK_SUCCESS) {
         target.state = .queue_failed;
         return error.QueueSubmitFailed;
     }
+    if (trace_gpu) target.gpu_trace.pending = true;
     if (frame.capture_destination) |destination|
         (@as(*RealCaptureTarget, @ptrCast(@alignCast(destination.target)))).completion_fence = target.fence;
     target.state = .in_flight;
@@ -4306,6 +4922,7 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
         target.state = .export_failed;
         return error.CompletionExportFailedAfterSubmit;
     }
+    if (trace_gpu) target.gpu_trace.completion_fd = duplicateFd(completion_fd) catch null;
     return completion_fd;
 }
 

@@ -560,6 +560,76 @@ shutdown joins the worker and may wait for that sink. Reports are best-effort,
 not crash/hang dumps; they require measured work to finish. Keep session logs
 rotated using the existing logging setup.
 
+For a targeted GPU timing experiment, build a separate diagnostic executable:
+
+```sh
+zig build -Doptimize=ReleaseSafe -Dtrace-gpu=true --prefix /tmp/ouro-gpu-trace
+zig build test-render-vulkan -Dtrace-gpu=true
+```
+
+Run that executable in a separate compositor session with `--renderer=vulkan`,
+without `--trace-pacing`. This requires `VK_KHR_calibrated_timestamps`, timestamp
+queries on the selected queue, and CLOCK_MONOTONIC calibration support. The test
+command also exercises real offscreen GPU queries on `/dev/dri/card0` when
+accessible; it does not acquire DRM master or change the active display.
+
+`gpu-trace` lines describe submissions taking at least 8 ms, with calibrated
+`gpu_start_ns` / `gpu_end_ns`, CPU `submit_ns`, exported-fence `ready_ns`, and the
+latest retained client `acquire_signal_ns`. All times are monotonic nanoseconds;
+`calibration_deviation_ns` reports calibration uncertainty. Start-minus-submit
+includes queueing and semaphore waits; end-minus-start includes GPU work and any
+preemption or intervening waits; ready-minus-end measures fence notification
+after the GPU timestamp. None is a pure hardware utilization measurement.
+`pending_acquires` counts retained client fences that were not already signaled
+at submission preparation. `acquires_complete=false` means some timing evidence
+is missing, and `capture_wait=true` identifies an additional capture-buffer wait
+not included in the client-fence timings.
+
+Each slow submission also emits ordered `gpu-phase` lines, joined by output
+`size` and `submit_ns`. Each names the work preceding its bottom-of-pipe
+timestamp: imported-image acquisition, native copies, uploads, target acquisition,
+packed or sampled composition, backdrop composition segments, horizontal and
+vertical blur, captures, and the final `end` (release barriers). Durations are
+differences between consecutive timestamps, not exclusive shader execution
+times: commands can overlap, waits/preemption remain included, and timestamps
+themselves add overhead. No extra pipeline barriers or GPU waits are inserted.
+At most 64 timestamps are recorded per target submission. If the detail budget
+is exhausted, `phases_complete=false` and the final `end` includes all unmarked
+work as well as release; the overall start/end measurement remains complete.
+Cached command replay retains the phase labels but resets and rewrites queries.
+
+The parent `gpu-trace` includes `samples`, `damage_rects`, `damage_pixels` (sum
+of requested damage rectangle areas, not shader invocations or unique pixels),
+and `replay` to help correlate slow stages with the recorded workload. `path`
+distinguishes packed-buffer, sampled, batched, and blur rendering; `ten_bit`,
+`output_transfer`, and `output_lut` describe the output's color path.
+
+Slow submissions also emit `gpu-damage`, `gpu-sample`, and `gpu-sample-color`
+lines, joined by the same `size` and `submit_ns` (and sample `index` for color).
+Damage rectangles and sample destinations/clips use
+output pixels in x,y,width,height order. Samples include source dimensions,
+filter mode (`reconstruction` is cubic), backing type, crop and affine mapping
+in signed 16.16 fixed point, and color/alpha metadata. `intersect_pixels` sums
+damage intersected with the sample's destination and clip. It is not a texture
+read count: occlusion, shader shortcuts, and repeated capture passes affect
+actual work. `opaque_copy_pixels` counts pixels dispatched through the dedicated
+opaque-copy shader, accumulated across recorded passes and retained on replay.
+`direct_color_eligible` only reports the packed color-identity/opacity flag; it
+does not prove either the dedicated copy or a per-pixel shader shortcut ran.
+
+Detail is limited to the first 64 samples and 64 damage rectangles per
+submission. `workload_complete=false` flags truncation; `damage_pixels` and each
+retained sample's `intersect_pixels` still include all damage rectangles. The
+metadata is copied before submission, not borrowed until completion. No pixels
+or window titles are recorded: this identifies workload shape and filtering,
+not enough data for a pixel-exact replay.
+
+Results are read without a query wait when the target is next reused after its
+normal completion check, or on destruction; an idle target can delay logging.
+This diagnostic build adds query, calibration, FD, metadata, and slow-record
+stderr costs. It is disabled in normal builds and is not an always-on flight recorder. Use
+short captures and return to the normal executable after the experiment.
+
 Add `--trace-pacing` to the existing compositor invocation and capture stderr
 to a file. This opt-in trace adds measurement overhead; use a release build and
 compare several launches. Capture the client separately with
@@ -629,6 +699,30 @@ comparison, and `--compare-shader-dir DIR` to compare against saved older
 source images. `--capture-surface app-2x.png comparison.png` compares nearest
 and adaptive sampling of a 2× app screenshot at 125%, 150%, 175%, and 200%,
 checks SHM/texture agreement, and verifies that aligned 1:1 pixels are unchanged.
+
+Add `--benchmark` for an offscreen GPU-timestamp comparison of nearest, bilinear,
+and cubic reconstruction at UHD, using a synthetic opaque 2× client at 125%.
+It interleaves six runs per filter and reports five after warmup, timing only
+the composition interval rather than setup, upload, or readback. GPU spans can
+include preemption and waits; this is not a replay of the live desktop. The
+cheaper filters are cost controls, not quality-equivalent replacements.
+
+`--benchmark-stall` reproduces the geometry of a recorded UHD cubic-filtered
+repaint: background, a 3850×2133 source at destination (0,53,3840,2107), bar,
+and cursor, with the recorded fixed-point affine, crop, and SDR flags. It uses
+synthetic opaque textures (a transparent cursor), identity color matrices,
+10-bit output, and no LUTs. It does not reproduce private pixels, DMA-BUF
+modifiers, client fences, or the other output's queue. The internal display's
+ICC workload is not modeled by this fixture.
+
+Controls change only the main surface's filter, output depth, layer count, or
+damage area. Two rounds reverse case order; each case uploads and compiles once
+per round, replays 12 submissions, and discards the first two. Timings bracket
+composition only, excluding setup, upload, readback, and inter-submission
+barriers. Batch samples are printed separately because frequency changes and
+other GPU clients can make pooled medians misleading. The ordinary test run
+also checks multi-texture indexing, clipping, exact affine mappings, multiple
+damage rectangles, and timestamp replay against independently expected pixels.
 
 Vulkan screenshots export 8-bit sRGB from the linear composition, before the
 monitor's HDR or ICC encoding. SDR white and colors are preserved on HDR

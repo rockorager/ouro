@@ -3,6 +3,12 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const diagnostics_options = b.addOptions();
+    diagnostics_options.addOption(bool, "trace_gpu", b.option(
+        bool,
+        "trace-gpu",
+        "Record calibrated Vulkan timestamps and pending acquire-fence timing",
+    ) orelse false);
     const wayring_dependency = b.dependency("wayring", .{
         .target = target,
         .optimize = optimize,
@@ -154,6 +160,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "xdg_protocol", .module = xdg_protocol },
         },
     });
+    ouro.addOptions("diagnostics_options", diagnostics_options);
     ouro.linkSystemLibrary("seat", .{});
     ouro.linkSystemLibrary("libinput", .{});
     ouro.linkSystemLibrary("libudev", .{});
