@@ -3520,6 +3520,130 @@ test "shell-input: last window removal clears every reused scanout image" {
     }
 }
 
+test "shell-input: fullscreen covers top bars but preserves overlays and restores bar input" {
+    try fullscreenLayer(false);
+    try fullscreenLayer(true);
+}
+
+fn fullscreenLayer(overlay: bool) !void {
+    const allocator = std.testing.allocator;
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-fullscreen-bar-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+    var fixture = try physical_fixture.Fixture.init();
+    defer fixture.deinit();
+    var root_config = physical_fixture.compositorConfig();
+    root_config.runtime.actor.received_fd_budget = 2;
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), root_config);
+    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), physical_fixture.coordinatorConfig());
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
+    try coordinator.start(&loop);
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(allocator, .{ .entries = 16, .flags = 0 }, physical_fixture.clientReactorConfig());
+    var client = try ClientConnection.attach(
+        allocator,
+        &reactor,
+        try wayring.unix_socket.connect(path),
+        .{ .received_fd_budget = 2, .transmit_byte_budget = 4096, .transmit_fd_budget = 2 },
+        .{ .max_objects = 32, .max_client_ids = 31 },
+    );
+    const actor = try client.actor();
+    var driver = ClientDriver.init(&client);
+    const registry = try ClientCore.getRegistry(&client.objects, &actor.transmit, null);
+    var handler: MultiHandler = .{
+        .objects = &client.objects,
+        .queue = &actor.transmit,
+        .registry = registry,
+        .layer_mode = true,
+        .layer_overlay = overlay,
+        .cycle_count = 1,
+    };
+    try submitMultiClient(&reactor, &driver, &handler);
+    _ = try loop.turn(coordinator);
+    try fixture.signalSession(.enable);
+    for (0..512) |_| {
+        _ = try drainMultiClient(&reactor, &driver, &handler);
+        _ = try loop.turn(coordinator);
+        if (handler.frame_done == 2 and handler.buffer_releases == 2) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expectEqual(@as(usize, 2), handler.frame_done);
+    const bar = try coordinator.layer_shell_adapter.state((try coordinator.layer_shell_adapter.ids(coordinator.layer_surface_ids))[0]);
+    const window = coordinator.desktop.focused().?;
+    const window_surface = (try coordinator.desktop.scene(window)).surface;
+    try std.testing.expectEqual(@as(i32, 1), coordinator.desktop.workArea().y);
+    const device: ouro.input_backend.DeviceId = .{ .slot = 0, .generation = 1, .seat_generation = 1 };
+    try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .device_added = .{
+        .device = device,
+        .info = .{ .capabilities = .{ .pointer = true } },
+    } }));
+
+    for (0..3) |stage| {
+        const fullscreen = stage == 1;
+        const bar_visible = overlay or !fullscreen;
+        const presented = coordinator.stats.presented;
+        if (stage != 0) {
+            try protocol.xdg_toplevel.encodeRequest(handler.queue, handler.toplevels[0].?.id, if (fullscreen)
+                .{ .set_fullscreen = .{ .output = null } }
+            else
+                .{ .unset_fullscreen = .{} });
+        } else try coordinator.primaryKmsOutput().?.request(.damage, 1);
+        try submitMultiClient(&reactor, &driver, &handler);
+        const expected_row: []const u8 = if (bar_visible) &([_]u8{ 0xff, 0, 0, 0xff } ** 3) else pixels[0..12];
+        var rendered = false;
+        for (0..512) |_| {
+            _ = try drainMultiClient(&reactor, &driver, &handler);
+            _ = try loop.turn(coordinator);
+            const output = coordinator.primaryKmsOutput().?;
+            if (coordinator.stats.presented > presented and output.kms_output.current != null) {
+                const image = fixture.dumb_bytes[output.kms_output.current.?.slot];
+                if (std.mem.eql(u8, expected_row, image[0..12]) and
+                    ((try coordinator.desktop.scene(window)).fullscreen_output != null) == fullscreen)
+                {
+                    rendered = true;
+                    break;
+                }
+            }
+            if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+                try waitForEither(&root.ring, reactor.ring);
+        }
+        try std.testing.expect(rendered);
+        const scene = try coordinator.desktop.scene(window);
+        try std.testing.expectEqual(@as(i32, if (fullscreen) 0 else 1), scene.geometry.y);
+        if (fullscreen) {
+            try std.testing.expectEqual(@as(i32, 3), scene.geometry.width);
+            try std.testing.expectEqual(@as(i32, 2), scene.geometry.height);
+        }
+        const delta = coordinator.interaction.motionToPoint(.{ .x = 0, .y = 0 });
+        try std.testing.expect(try coordinator.acceptNormalizedInput(.{ .pointer_motion = .{
+            .device = device,
+            .time_usec = (stage + 1) * 1_000,
+            .dx = delta.dx,
+            .dy = delta.dy,
+        } }));
+        try std.testing.expectEqual(if (bar_visible) bar.surface else window_surface, coordinator.seat_adapter.pointerState().focus.?.surface);
+    }
+    try std.testing.expectEqual(@as(usize, 0), handler.event_failures);
+    try coordinator.requestStop();
+    var drained = false;
+    for (0..512) |_| {
+        const cp = try drainMultiClient(&reactor, &driver, &handler);
+        const progress = try loop.turn(coordinator);
+        drained = progress.wayring.shutdown_complete and cp.quiescent and coordinator.backendDrainComplete();
+        if (drained) break;
+        if (root.ring.cq_ready() == 0 and reactor.ring.cq_ready() == 0)
+            try waitForEither(&root.ring, reactor.ring);
+    }
+    try std.testing.expect(drained);
+    try client.deinit(allocator);
+    reactor.deinit(allocator);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
 test "shell-input: secondary output removal closes its reactive layer popup root" {
     try layerPopupOutputLifecycle(false);
 }
@@ -6788,6 +6912,10 @@ const MultiHandler = struct {
     source_pixels: []const u8 = &pixels,
     subsurface_mode: bool = false,
     cursor_mode: bool = false,
+    layer_mode: bool = false,
+    layer_overlay: bool = false,
+    layer_shell: ?wayring.objects.Handle = null,
+    layer_surface: ?wayring.objects.Handle = null,
     activation_mode: bool = false,
     metadata_commit_after_attach: bool = false,
     activation_requested: bool = false,
@@ -6871,6 +6999,16 @@ const MultiHandler = struct {
                     self.surface_enters[index] += 1;
                 },
                 else => {},
+            }
+        } else if (target.object.interface == &protocol.zwlr_layer_surface_v1.info) {
+            switch (try protocol.zwlr_layer_surface_v1.decodeEvent(message, fds)) {
+                .configure => |value| {
+                    try protocol.zwlr_layer_surface_v1.encodeRequest(self.queue, self.layer_surface.?.id, .{
+                        .ack_configure = .{ .serial = value.serial },
+                    });
+                    if (!self.mapped[1]) try self.mapSurface(1);
+                },
+                .closed => {},
             }
         } else if (target.object.interface == &protocol.xdg_toplevel.info) {
             const index = self.indexFor(self.toplevels, message.header.object_id) orelse
@@ -7022,6 +7160,8 @@ const MultiHandler = struct {
             self.shm = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_shm.info, @min(value.version, 2), null);
         if (std.mem.eql(u8, value.interface, protocol.xdg_wm_base.info.name))
             self.wm_base = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.xdg_wm_base.info, @min(value.version, 7), null);
+        if (self.layer_mode and std.mem.eql(u8, value.interface, protocol.zwlr_layer_shell_v1.info.name))
+            self.layer_shell = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.zwlr_layer_shell_v1.info, @min(value.version, 5), null);
         if (self.repaint_lifecycle_mode and self.output == null and std.mem.eql(u8, value.interface, protocol.wl_output.info.name))
             self.output = try ClientCore.bind(self.objects, self.queue, self.registry, value.name, &protocol.wl_output.info, @min(value.version, 4), null);
         if (self.repaint_lifecycle_mode and std.mem.eql(u8, value.interface, protocol.zwlr_output_power_manager_v1.info.name))
@@ -7057,6 +7197,7 @@ const MultiHandler = struct {
         if ((self.subsurface_mode or self.cursor_mode) and self.subcompositor == null) return;
         if (self.fractional_mode and (self.fractional_manager == null or self.viewporter == null)) return;
         if (self.decoration_mode and self.decoration_manager == null) return;
+        if (self.layer_mode and self.layer_shell == null) return;
         for (0..self.surface_count) |index| {
             if (self.surfaces[index] != null) continue;
             self.surfaces[index] = (try protocol.wl_compositor.construct_create_surface(
@@ -7088,6 +7229,25 @@ const MultiHandler = struct {
                 });
             }
             if (self.cursor_mode or (self.subsurface_mode and index != 0)) continue;
+            if (self.layer_mode and index == 1) {
+                self.layer_surface = (try protocol.zwlr_layer_shell_v1.construct_get_layer_surface(
+                    self.objects,
+                    self.queue,
+                    self.layer_shell.?,
+                    .{ .surface = self.surfaces[index].?.id, .output = null, .layer = if (self.layer_overlay) .overlay else .top, .namespace = "fullscreen-test" },
+                )).id;
+                try protocol.zwlr_layer_surface_v1.encodeRequest(self.queue, self.layer_surface.?.id, .{
+                    .set_size = .{ .width = 3, .height = 1 },
+                });
+                try protocol.zwlr_layer_surface_v1.encodeRequest(self.queue, self.layer_surface.?.id, .{
+                    .set_anchor = .{ .anchor = .{ .value = 13 } },
+                });
+                try protocol.zwlr_layer_surface_v1.encodeRequest(self.queue, self.layer_surface.?.id, .{
+                    .set_exclusive_zone = .{ .zone = 1 },
+                });
+                try protocol.wl_surface.encodeRequest(self.queue, self.surfaces[index].?.id, .{ .commit = .{} });
+                continue;
+            }
             self.xdg_surfaces[index] = (try protocol.xdg_wm_base.construct_get_xdg_surface(
                 self.objects,
                 self.queue,
@@ -7142,7 +7302,8 @@ const MultiHandler = struct {
             self.xdg_surfaces[index].?.id,
             .{ .set_window_geometry = .{ .x = 1, .y = 1, .width = 2, .height = 1 } },
         );
-        const descriptor = try ordinaryMemfd(4096, 16, self.source_pixels);
+        const bar_pixels = [_]u8{ 0xff, 0, 0, 0xff } ** 4;
+        const descriptor = try ordinaryMemfd(4096, 16, if (self.layer_mode and index == 1) &bar_pixels else self.source_pixels);
         const pool = try protocol.wl_shm.construct_create_pool(
             self.objects,
             self.queue,
@@ -7156,7 +7317,7 @@ const MultiHandler = struct {
             .{
                 .offset = 16,
                 .width = 3,
-                .height = if (self.fractional_mode) @intCast((self.preferred_scales[index] + 60) / 120) else 2,
+                .height = if (self.layer_mode and index == 1) 1 else if (self.fractional_mode) @intCast((self.preferred_scales[index] + 60) / 120) else 2,
                 .stride = 16,
                 .format = .argb8888,
             },

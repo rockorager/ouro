@@ -46,6 +46,8 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
         pub const OutputArea = struct {
             id: OutputId,
             geometry: geometry.Rect,
+            // Full logical output extent, before layer-shell reservations.
+            bounds: ?geometry.Rect = null,
             primary_area: i64 = 0,
         };
 
@@ -135,6 +137,7 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
             stacking: u32,
             mode: Mode,
             content_ready: bool,
+            fullscreen_output: ?OutputId = null,
         };
 
         pub const Command = struct {
@@ -270,6 +273,7 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
                 return .{
                     .id = desktop.output_ids[index],
                     .geometry = desktop.output_areas[index],
+                    .bounds = desktop.output_bounds[index],
                     .primary_area = desktop.output_primary_areas[index],
                 };
             }
@@ -441,6 +445,7 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
         external_root_len: usize = 0,
         work_area: geometry.Rect,
         output_areas: []geometry.Rect,
+        output_bounds: []geometry.Rect,
         output_ids: []OutputId,
         output_primary_areas: []i64,
         output_area_len: usize = 1,
@@ -483,6 +488,8 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
             errdefer allocator.free(external_roots);
             const output_areas = try allocator.alloc(geometry.Rect, config.output_capacity);
             errdefer allocator.free(output_areas);
+            const output_bounds = try allocator.alloc(geometry.Rect, config.output_capacity);
+            errdefer allocator.free(output_bounds);
             const output_ids = try allocator.alloc(OutputId, config.output_capacity);
             errdefer allocator.free(output_ids);
             const output_primary_areas = try allocator.alloc(i64, config.output_capacity);
@@ -525,6 +532,7 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
             };
             @memset(desired_epochs, 0);
             output_areas[0] = work_area;
+            output_bounds[0] = work_area;
             output_ids[0] = .{ .value = 0 };
             output_primary_areas[0] = @as(i64, work_area.width) * work_area.height;
             return .{
@@ -536,6 +544,7 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
                 .external_roots = external_roots,
                 .work_area = work_area,
                 .output_areas = output_areas,
+                .output_bounds = output_bounds,
                 .output_ids = output_ids,
                 .output_primary_areas = output_primary_areas,
                 .metadata_storage = metadata_storage,
@@ -558,6 +567,7 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
             desktop.allocator.free(desktop.output_primary_areas);
             desktop.allocator.free(desktop.output_ids);
             desktop.allocator.free(desktop.output_areas);
+            desktop.allocator.free(desktop.output_bounds);
             desktop.allocator.free(desktop.popups);
             desktop.allocator.free(desktop.external_roots);
             desktop.allocator.free(desktop.slots);
@@ -1059,6 +1069,7 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
             desktop.work_area = rect;
             if (desktop.output_area_len == 1) {
                 desktop.output_areas[0] = rect;
+                desktop.output_bounds[0] = rect;
                 desktop.output_primary_areas[0] = @as(i64, rect.width) * rect.height;
             }
             desktop.reflow() catch unreachable;
@@ -1080,6 +1091,7 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
             desktop.validateOutputAreas(areas) catch unreachable;
             for (areas, 0..) |area, index| {
                 desktop.output_areas[index] = area;
+                desktop.output_bounds[index] = area;
                 desktop.output_ids[index] = .{ .value = index };
                 desktop.output_primary_areas[index] = @as(i64, area.width) * area.height;
             }
@@ -1093,6 +1105,7 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
             if (areas.len == 0 or areas.len > desktop.output_areas.len) return error.Exhausted;
             for (areas, 0..) |area, index| {
                 try area.geometry.validate();
+                if (area.bounds) |bounds| try bounds.validate();
                 for (areas[0..index]) |previous|
                     if (std.meta.eql(previous.id, area.id)) return error.DuplicateOutput;
             }
@@ -1121,6 +1134,7 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
             desktop.work_area = work_area;
             for (output_areas, 0..) |area, index| {
                 desktop.output_areas[index] = area.geometry;
+                desktop.output_bounds[index] = area.bounds orelse area.geometry;
                 desktop.output_ids[index] = area.id;
                 desktop.output_primary_areas[index] = if (area.primary_area > 0)
                     area.primary_area
@@ -1135,6 +1149,15 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
 
         pub fn scene(desktop: *const Self, id: ToplevelId) !SceneWindow {
             return desktop.slots[try desktop.resolveIndex(id)].scene;
+        }
+
+        pub fn hasFullscreen(desktop: *const Self, output: OutputId) bool {
+            for (desktop.slots) |slot| {
+                if (!slot.header.active or !slot.scene.visible or !slot.scene.content_ready) continue;
+                if (slot.scene.fullscreen_output) |id|
+                    if (std.meta.eql(id, output)) return true;
+            }
+            return false;
         }
 
         pub fn sceneForSurface(desktop: *const Self, surface: Shell.SurfaceId) !SceneWindow {
@@ -2014,6 +2037,7 @@ fn desktopWithPolicy(comptime Shell: type, comptime PolicyFactory: type) type {
                     .stacking = desired.stacking,
                     .mode = desired.mode,
                     .content_ready = slot.content_ready,
+                    .fullscreen_output = if (desired.fullscreen) desired.output else null,
                 };
                 if (slot.content_ready and slot.window_width > 0 and slot.window_height > 0) {
                     if (slot.resize_anchor) |anchor| {
@@ -3349,6 +3373,54 @@ test "desktop: topology keeps tiled and fullscreen windows on exact outputs" {
         try std.testing.expect(rect.y >= areas[0].y);
         try std.testing.expect(rect.x + rect.width <= areas[0].x + areas[0].width);
         try std.testing.expect(rect.y + rect.height <= areas[0].y + areas[0].height);
+    }
+}
+
+test "desktop: fullscreen ignores reservations while maximized respects them" {
+    for ([_]bool{ false, true }) |floating| {
+        var desktop = try initTestDesktop(16);
+        defer desktop.deinit();
+        var shell = TestShell{};
+        const bounds: geometry.Rect = .{ .x = 200, .y = -30, .width = 80, .height = 70 };
+        var topology = [_]TestDesktop.OutputArea{
+            .{ .id = .{ .value = 10 }, .geometry = .{ .x = 0, .y = 0, .width = 100, .height = 60 } },
+            .{ .id = .{ .value = 20 }, .geometry = .{ .x = 207, .y = -19, .width = 73, .height = 59 }, .bounds = bounds },
+        };
+        const global: geometry.Rect = .{ .x = 0, .y = -30, .width = 280, .height = 90 };
+        desktop.applyTopology(global, &topology);
+        shell.push(created(0));
+        _ = try desktop.consume(&shell, 1);
+        try settleDesktop(&desktop, &shell);
+        const id = try desktop.idForShell(.{ .index = 0, .generation = 1 });
+        try desktop.setFloating(id, floating);
+        try desktop.setToplevelFullscreen(id, true, topology[1].id);
+        try std.testing.expect(!desktop.hasFullscreen(topology[1].id));
+        try settleDesktop(&desktop, &shell);
+        try std.testing.expectEqual(bounds, (try desktop.scene(id)).geometry);
+        try std.testing.expect(desktop.hasFullscreen(topology[1].id));
+        try std.testing.expect(!desktop.hasFullscreen(topology[0].id));
+
+        // A bar changing its reservation cannot resize a fullscreen window.
+        topology[1].geometry = .{ .x = 213, .y = -13, .width = 67, .height = 53 };
+        desktop.applyTopology(global, &topology);
+        try settleDesktop(&desktop, &shell);
+        try std.testing.expectEqual(bounds, (try desktop.scene(id)).geometry);
+
+        try desktop.switchWorkspace(topology[1].id, 2);
+        try std.testing.expect(!desktop.hasFullscreen(topology[1].id));
+        try settleDesktop(&desktop, &shell);
+        try desktop.switchWorkspace(topology[1].id, 1);
+        try settleDesktop(&desktop, &shell);
+        try std.testing.expect(desktop.hasFullscreen(topology[1].id));
+
+        try desktop.setToplevelState(id, .maximized, true);
+        try settleDesktop(&desktop, &shell);
+        try std.testing.expectEqual(bounds, (try desktop.scene(id)).geometry);
+        try desktop.setToplevelFullscreen(id, false, null);
+        try std.testing.expect(desktop.hasFullscreen(topology[1].id));
+        try settleDesktop(&desktop, &shell);
+        try std.testing.expect(!desktop.hasFullscreen(topology[1].id));
+        try std.testing.expectEqual(topology[1].geometry, (try desktop.scene(id)).geometry);
     }
 }
 

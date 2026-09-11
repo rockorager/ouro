@@ -10479,6 +10479,7 @@ pub fn Coordinator(comptime protocol: type) type {
             count: *usize,
             output_bounds: geometry.Rect,
         ) !void {
+            if (selected == .top and self.outputHasFullscreen(physical)) return;
             const ids = try self.layer_shell_adapter.ids(self.layer_surface_ids);
             for (ids) |id| {
                 const state = try self.layer_shell_adapter.state(id);
@@ -12299,6 +12300,10 @@ pub fn Coordinator(comptime protocol: type) type {
                     index -= 1;
                     const state = self.layer_shell_adapter.state(ids[index]) catch continue;
                     if (!state.mapped or @intFromEnum(state.layer) != layer_value) continue;
+                    if (state.layer == .top) {
+                        const physical = self.physicalOutputForProtocolId(state.output) orelse continue;
+                        if (self.outputHasFullscreen(physical)) continue;
+                    }
                     const window = self.layerShellScene(state.surface) orelse continue;
                     const popups = self.desktop.externalPopupSnapshot(
                         state.surface,
@@ -12405,6 +12410,12 @@ pub fn Coordinator(comptime protocol: type) type {
             };
         }
 
+        fn outputHasFullscreen(self: *const Self, physical: *const PhysicalOutput) bool {
+            return self.desktop.hasFullscreen(.{
+                .value = @as(u64, physical.id.generation) << 32 | physical.id.index,
+            });
+        }
+
         fn desktopOutputAreas(
             self: *Self,
             pending_surface: ?Adapter.SurfaceId,
@@ -12423,6 +12434,7 @@ pub fn Coordinator(comptime protocol: type) type {
                         pending_surface,
                         null,
                     ),
+                    .bounds = bounds,
                     .primary_area = @as(i64, bounds.width) * bounds.height,
                 };
                 count += 1;
