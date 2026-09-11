@@ -57,6 +57,7 @@ pub const Action = union(enum) {
     toggle_floating,
     exit,
     run: []const []const u8,
+    call: @import("varlink_client.zig").Call,
 };
 
 pub const Binding = struct {
@@ -480,6 +481,12 @@ fn parseAction(allocator: std.mem.Allocator, value: std.json.Value) !Action {
         return .{ .run = argv };
     }
 
+    if (std.mem.eql(u8, name, "call")) {
+        if (items.len != 4) return error.InvalidActionArity;
+        if (items[1] != .string or items[2] != .string) return error.InvalidActionType;
+        return .{ .call = try @import("varlink_client.zig").Call.init(allocator, items[1].string, items[2].string, items[3]) };
+    }
+
     if (std.mem.eql(u8, name, "switch-workspace") or
         std.mem.eql(u8, name, "move-focused-to-workspace"))
     {
@@ -669,6 +676,37 @@ test "parse bindings and preserve argv boundaries" {
     try std.testing.expectEqualStrings("hello world", argv[1]);
     try std.testing.expectEqualStrings("", argv[2]);
     try std.testing.expect(snapshot.bindings[0].trigger.modifiers.super);
+}
+
+test "call bindings preserve structured parameters and validate the complete action" {
+    var snapshot = try parseSource(std.testing.allocator,
+        \\{"bindings":{"super+p":{"action":["call","unix:/run/user/1000/shell.sock","org.example.Shell.Toggle",{"output":"DP-2","value":null,"nested":[false,3,"a\u0000b"]}],"repeat":true}}}
+    );
+    defer snapshot.deinit();
+    const call = snapshot.bindings[0].action.call;
+    try std.testing.expect(snapshot.bindings[0].repeat);
+    try std.testing.expectEqualStrings("unix:/run/user/1000/shell.sock", call.address);
+    try std.testing.expectEqualStrings("org.example.Shell.Toggle", call.method);
+    try std.testing.expectEqualStrings(
+        "{\"method\":\"org.example.Shell.Toggle\",\"parameters\":{\"output\":\"DP-2\",\"value\":null,\"nested\":[false,3,\"a\\u0000b\"]}}\x00",
+        call.request,
+    );
+    const invalid = [_]struct { action: []const u8, err: anyerror }{
+        .{ .action = "[\"call\",\"unix:/tmp/s\",\"org.example.Ping\"]", .err = error.InvalidActionArity },
+        .{ .action = "[\"call\",\"unix:/tmp/s\",4,{}]", .err = error.InvalidActionType },
+        .{ .action = "[\"call\",\"tcp:localhost:1234\",\"org.example.Ping\",{}]", .err = error.InvalidVarlinkAddress },
+        .{ .action = "[\"call\",\"unix:relative\",\"org.example.Ping\",{}]", .err = error.InvalidVarlinkAddress },
+        .{ .action = "[\"call\",\"unix:/tmp/s\\u0000x\",\"org.example.Ping\",{}]", .err = error.InvalidVarlinkAddress },
+        .{ .action = "[\"call\",\"unix:/tmp/s\",\"Ping\",{}]", .err = error.InvalidVarlinkMethod },
+        .{ .action = "[\"call\",\"unix:/tmp/s\",\"org..Ping\",{}]", .err = error.InvalidVarlinkMethod },
+        .{ .action = "[\"call\",\"unix:/tmp/s\",\"org.example.Ping\",[]]", .err = error.InvalidCallParameters },
+        .{ .action = "[\"call\",\"unix:/tmp/s\",\"org.example.Ping\",null]", .err = error.InvalidCallParameters },
+    };
+    for (invalid) |case| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "{{\"bindings\":{{\"super+p\":{s}}}}}", .{case.action});
+        defer std.testing.allocator.free(source);
+        try std.testing.expectError(case.err, parseSource(std.testing.allocator, source));
+    }
 }
 
 test "empty and missing bindings are valid" {

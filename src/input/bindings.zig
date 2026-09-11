@@ -61,6 +61,8 @@ pub fn KeyConsumer() type {
                     for (candidate.action.run, argv) |argument, *argument_copy|
                         argument_copy.* = try a.dupe(u8, argument);
                     copy.action = .{ .run = argv };
+                } else if (candidate.action == .call) {
+                    copy.action = .{ .call = try candidate.action.call.clone(a) };
                 }
             }
             return .{ .arena = arena, .bindings = bindings };
@@ -169,4 +171,38 @@ pub fn KeyConsumer() type {
             return null;
         }
     };
+}
+
+test "Varlink key activation owns address method and serialized parameters" {
+    const Consumer = KeyConsumer();
+    var consumer = try Consumer.init(std.testing.allocator, 1);
+    defer consumer.deinit();
+    {
+        var source = try user_config.parseSource(std.testing.allocator,
+            \\{"bindings":{"super+p":["call","unix:/tmp/shell.sock","org.example.Shell.Toggle",{"output":"DP-2"}]}}
+        );
+        defer source.deinit();
+        var snapshot = try Consumer.snapshotFromReferenceConfig(std.testing.allocator, &source);
+        errdefer snapshot.deinit();
+        const original = source.bindings[0].action.call;
+        @memset(@constCast(original.address), '!');
+        @memset(@constCast(original.method), '!');
+        @memset(@constCast(original.request), '!');
+        try consumer.install(&snapshot);
+    }
+    try std.testing.expectEqual(binding.Owner.consumer, try consumer.keyPressed(.{
+        .trigger = consumer.snapshot.bindings[0].trigger,
+        .repeat_rate = @as(i32, 25),
+        .repeat_delay = @as(i32, 600),
+        .time_usec = @as(u64, 10),
+        .device = @import("../backend/input/backend.zig").DeviceId{ .slot = 0, .generation = 1, .seat_generation = 1 },
+        .key = @as(u32, 25),
+    }));
+    const call = consumer.peekAction().?.action.call;
+    try std.testing.expectEqualStrings("unix:/tmp/shell.sock", call.address);
+    try std.testing.expectEqualStrings("org.example.Shell.Toggle", call.method);
+    try std.testing.expectEqualStrings("{\"method\":\"org.example.Shell.Toggle\",\"parameters\":{\"output\":\"DP-2\"}}\x00", call.request);
+    consumer.dropAction();
+    try std.testing.expect(consumer.peekAction() == null);
+    try std.testing.expect(consumer.nextDeadlineNs() == null);
 }

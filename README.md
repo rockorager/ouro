@@ -235,9 +235,39 @@ not physical evdev positions. Actions are exact JSON arrays: `focus-next`,
 `move-output-next`, `move-output-previous`, `switch-workspace` followed by a
 number from 1 through 10, `move-focused-to-workspace` followed by the same,
 `close`, `toggle-fullscreen`,
-`toggle-maximized`, `toggle-floating`, `exit`, or `run` followed by an argv.
+`toggle-maximized`, `toggle-floating`, `exit`, `run` followed by an argv,
+or `call` followed by a Varlink address, fully qualified method, and parameters.
 `run` never invokes a shell and delegates process ownership to
 `systemd-run --user`; Ouro does not supervise applications.
+
+`call` invokes a Varlink method directly, without launching a helper. For
+example, if your shell exposes this method (replace the address and method
+with those of your service):
+
+```json
+{
+  "bindings": {
+    "super+space": [
+      "call",
+      "unix:/run/user/1000/ouro-shell",
+      "dev.rockorager.ouro.Shell.ToggleLauncher",
+      {}
+    ]
+  }
+}
+```
+
+Parameters must be a JSON object; use `{}` for no arguments. Addresses support
+absolute Unix socket paths (`unix:/path`) and Linux abstract sockets
+(`unix:@name`), with no shell or environment-variable expansion. Each activation
+opens an independent nonblocking connection and consumes one reply; returned
+parameters are discarded and transport or method errors are logged. Calls time
+out after five seconds and are **never retried**, since a lost reply may follow
+a successful side effect. Ouro allows at most 16 in-flight calls and 256 KiB per
+request or reply (including its terminating NUL); excess calls are logged and
+dropped. Config reloads preserve in-flight calls; compositor shutdown closes
+them without waiting for replies. This action does not expose compositor
+commands as a Varlink service.
 
 ### Moving existing configuration into ourosettings
 

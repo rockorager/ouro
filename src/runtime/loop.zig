@@ -6,6 +6,7 @@ const completion = @import("completion.zig");
 const compositor = @import("compositor.zig");
 const shutdown_signal = @import("shutdown_signal.zig");
 const settings_client = @import("../settings_client.zig");
+const varlink_client = @import("../varlink_client.zig");
 const timer = @import("timer.zig");
 
 const linux = std.os.linux;
@@ -84,6 +85,8 @@ pub fn Loop(comptime protocol: type) type {
         settings: ?*settings_client.Client = null,
         settings_token: ?completion.Token = null,
         retained_settings_changed: bool = false,
+        varlink: ?*varlink_client.Client = null,
+        varlink_token: ?completion.Token = null,
         /// A validated replacement is waiting for an output/input transaction.
         configuration_pending: bool = false,
         pending_wayring_count: usize = 0,
@@ -136,6 +139,7 @@ pub fn Loop(comptime protocol: type) type {
         pub fn deinit(self: *Self) void {
             std.debug.assert(self.shutdown_token == null);
             std.debug.assert(self.settings_token == null);
+            std.debug.assert(self.varlink_token == null);
             std.debug.assert(self.pending_wayring_count == 0);
             self.driver.deinit(self.allocator);
             self.allocator.free(self.unrouted_completions);
@@ -164,6 +168,23 @@ pub fn Loop(comptime protocol: type) type {
             return self.settings_token == null;
         }
 
+        pub fn installVarlink(self: *Self, client: *varlink_client.Client) !void {
+            if (self.varlink != null) return error.AlreadyInstalled;
+            self.varlink = client;
+            try self.armVarlinkPoll();
+        }
+
+        pub fn varlinkDrained(self: *const Self) bool {
+            return self.varlink_token == null;
+        }
+
+        fn armVarlinkPoll(self: *Self) !void {
+            const token = try self.router.acquire(.varlink);
+            errdefer self.router.retire(token) catch unreachable;
+            _ = try self.compositor.ring.poll_add(token.encode(), self.varlink.?.descriptor(), linux.POLL.IN);
+            self.varlink_token = token;
+        }
+
         fn armSettingsPoll(self: *Self) !void {
             const token = try self.router.acquire(.settings);
             errdefer self.router.retire(token) catch unreachable;
@@ -190,6 +211,7 @@ pub fn Loop(comptime protocol: type) type {
             // Wake the stable descriptor instead of closing it underneath an
             // in-flight poll. Its final CQE must retire before client teardown.
             if (self.settings) |client| try client.stop();
+            if (self.varlink) |client| try client.stop();
             if (self.shutdown) |watcher| watcher.request();
             try self.driver.requestShutdown();
         }
@@ -265,6 +287,18 @@ pub fn Loop(comptime protocol: type) type {
                     return error.UnexpectedSkippedCompletion;
                 }
                 if (self.router.route(cqe.user_data)) |token| {
+                    if (token.kind == .varlink) {
+                        if (self.varlink_token == null or !std.meta.eql(self.varlink_token.?, token))
+                            return error.UnexpectedVarlinkCompletion;
+                        try self.router.retire(token);
+                        self.varlink_token = null;
+                        if (cqe.res < 0 or @as(u32, @intCast(cqe.res)) & linux.POLL.IN == 0)
+                            return error.VarlinkPollFailed;
+                        const client = self.varlink.?;
+                        try client.dispatch();
+                        if (!client.stopping) try self.armVarlinkPoll();
+                        continue;
+                    }
                     if (token.kind == .settings) {
                         if (self.settings_token == null or !std.meta.eql(self.settings_token.?, token))
                             return error.UnexpectedSettingsCompletion;
@@ -299,6 +333,7 @@ pub fn Loop(comptime protocol: type) type {
                             self.retained_reload_requested or events.reload;
                         self.shutdown_seen = self.shutdown_seen or events.shutdown;
                         if (events.shutdown) if (self.settings) |client| try client.stop();
+                        if (events.shutdown) if (self.varlink) |client| try client.stop();
                         if (!self.shutdown_seen) try self.armSignalPoll();
                         continue;
                     }
@@ -408,7 +443,7 @@ pub fn Loop(comptime protocol: type) type {
                 !wayring_progress.pending and !self.retained_shutdown_requested and
                 !self.retained_reload_requested and !self.retained_settings_changed and
                 !bindings_work_pending and !submission_work_pending and !configuration_ready and
-                !(wayring_progress.shutdown_complete and backend_drained and self.settingsDrained());
+                !(wayring_progress.shutdown_complete and backend_drained and self.settingsDrained() and self.varlinkDrained());
             phase = .submit;
             const submitted = if (can_wait)
                 self.compositor.ring.submit_and_wait(1) catch |err| switch (err) {

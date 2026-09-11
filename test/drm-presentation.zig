@@ -162,6 +162,64 @@ test "io_uring loop dispatches settings readiness and drains its final poll" {
     try root.deinit();
 }
 
+test "Varlink readiness sends a filesystem socket call and drains its final poll" {
+    const allocator = std.testing.allocator;
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    var display_storage: [128]u8 = undefined;
+    const display = try std.fmt.bufPrint(&display_storage, "/tmp/ouro-call-display-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(display) catch {};
+    defer wayring.unix_socket.unlink(display) catch {};
+    const root = try Compositor.create(allocator, try wayring.unix_socket.listen(display, 1), compositorConfig());
+    const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), coordinatorConfig());
+    var loop = try Loop.init(allocator, root, &coordinator.router, &coordinator.timers, coordinator, .{ .completion_batch = 16 });
+    var client = try ouro.varlink_client.Client.init(allocator);
+    defer client.deinit();
+    var path_storage: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_storage, "/tmp/ouro-call-service-{d}.sock", .{linux.getpid()});
+    wayring.unix_socket.unlink(path) catch {};
+    defer wayring.unix_socket.unlink(path) catch {};
+    const listener = try wayring.unix_socket.listen(path, 1);
+    defer _ = linux.close(listener);
+    const address = try std.fmt.allocPrint(allocator, "unix:{s}", .{path});
+    defer allocator.free(address);
+    const call = try ouro.varlink_client.Call.init(allocator, address, "org.example.Shell.Toggle", .{ .object = .empty });
+    defer allocator.free(call.request);
+    try loop.installVarlink(&client);
+    try client.enqueue(call);
+    const accepted = linux.accept4(listener, null, null, linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(accepted));
+    const peer: linux.fd_t = @intCast(accepted);
+    defer _ = linux.close(peer);
+    _ = try loop.turn(coordinator);
+    try waitReady(&root.ring);
+    const progress = try loop.turn(coordinator);
+    try std.testing.expect(!progress.settings_changed);
+    try std.testing.expect(!loop.varlinkDrained());
+    var bytes: [128]u8 = undefined;
+    const n = linux.read(peer, &bytes, bytes.len);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(n));
+    try std.testing.expectEqualStrings("{\"method\":\"org.example.Shell.Toggle\",\"parameters\":{}}\x00", bytes[0..n]);
+    try std.testing.expectEqual(@as(usize, 3), linux.write(peer, "{}\x00", 3));
+    try waitReady(&root.ring);
+    _ = try loop.turn(coordinator);
+    try std.testing.expectEqual(@as(usize, 0), linux.read(peer, &bytes, bytes.len));
+    try std.testing.expect(!loop.varlinkDrained());
+    try coordinator.requestStop();
+    try loop.requestShutdown();
+    for (0..16) |_| {
+        _ = try loop.turn(coordinator);
+        if (loop.varlinkDrained()) break;
+        try waitReady(&root.ring);
+    }
+    try std.testing.expect(loop.varlinkDrained());
+    try std.testing.expect(client.stopping);
+    try drainServer(root, coordinator, &loop);
+    loop.deinit();
+    try coordinator.destroy();
+    try root.deinit();
+}
+
 test "generated ordinary SHM traverses the physical coordinator exactly once and drains" {
     try runVertical(.session_disable, .shm, false);
 }
