@@ -1429,9 +1429,16 @@ pub const Output = struct {
             } else value.renderPool(&self.pool, handle, list, plan) catch |cause| {
                 return self.retireAndDiscard(frame_id, cause, handle);
             },
-            .vulkan => |*value| {
+            .vulkan => |*value| vulkan_render: {
                 if (self.vulkan_targets == null)
                     return self.retireAndDiscard(frame_id, error.RendererUnavailable, handle);
+                // Only reuse an image whose immediately preceding use reached
+                // KMS and was released. Discard after a failed render/commit
+                // also increments the pool generation, without proving GPU
+                // completion. Keep that path behind the renderer's fence check.
+                if (capture == null and !plan.render_full and plan.render_damage.len == 0 and
+                    self.planner.images[handle.slot].last_generation == handle.generation - 1)
+                    break :vulkan_render;
                 const composition = compositionList(list);
                 const render_result = if (capture) |capture_request| capture_result: {
                     const captures: vulkan_platform.Captures = if (capture_request.overlay_cursor)
@@ -2993,6 +3000,142 @@ test "drm-sim: ordinary and capture frames keep ICC and non-ICC output encoding 
     }
 }
 
+test "drm-sim: Vulkan zero-damage reuse preserves flips and excludes repairs captures and discarded images" {
+    const Probe = struct {
+        calls: usize = 0,
+        presented: usize = 0,
+        fail_draw: ?anyerror = null,
+        expected_damage: usize = 1,
+        expected_capture: bool = false,
+
+        fn create(context: *anyopaque, _: std.posix.fd_t, _: vulkan_platform.Config) !vulkan_platform.Renderer {
+            return context;
+        }
+        fn destroy(_: *anyopaque, _: vulkan_platform.Renderer) void {}
+        fn packs(_: *anyopaque, _: vulkan_platform.Renderer) bool {
+            return false;
+        }
+        fn destroyTarget(_: *anyopaque, _: vulkan_platform.Renderer, _: vulkan_platform.Target) void {}
+        fn draw(context: *anyopaque, _: vulkan_platform.Renderer, _: vulkan_platform.Target, frame: vulkan_platform.Frame) !std.posix.fd_t {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.calls += 1;
+            try std.testing.expectEqual(self.expected_damage, frame.render_damage.len);
+            try std.testing.expectEqual(self.expected_capture, frame.captures.after_cursor);
+            if (self.fail_draw) |err| return err;
+            const fd = linux.eventfd(0, linux.EFD.CLOEXEC);
+            if (linux.errno(fd) != .SUCCESS) return error.EventFdFailed;
+            return @intCast(fd);
+        }
+        fn presentedFrame(context: *anyopaque, outcome: FrameOutcome, _: u32) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            try std.testing.expect(outcome.frame_callbacks_due);
+            try std.testing.expectEqual(@as(usize, 1), outcome.sampled.len);
+            try std.testing.expectEqual(scheduler_api.SurfaceId{ .index = 4, .generation = 3 }, outcome.sampled[0].surface);
+            try std.testing.expectEqual(render.PresentationIdentity{ .slot = 7, .generation = 2 }, outcome.sampled[0].presentation);
+            self.presented += 1;
+        }
+    };
+    const Scenario = enum { capture, discard, repair, commit_failure };
+    for (std.enums.values(Scenario)) |scenario| {
+        var probe: Probe = .{};
+        var fixture: SimFixture = .{};
+        const output = try Output.create(std.testing.allocator, fixture.platforms(), fixture.device(), fixture.snapshot(), .{
+            .output_id = .{ .index = 0, .generation = 1 },
+            .scheduler = .{ .refresh_ns = 10, .render_budget_ns = 3 },
+            .renderer = .pixman,
+            .image_count = 2,
+            .max_samples = 1,
+            .max_source_bytes = 4,
+            .max_source_width = 1,
+            .max_source_height = 1,
+        });
+        defer fixture.router.deinit(std.testing.allocator);
+        defer fixture.ring.deinit();
+        defer drainIdleSimOutput(output, &fixture) catch unreachable;
+        var vtable = vulkan_platform.real.vtable.*;
+        vtable.create = Probe.create;
+        vtable.destroy = Probe.destroy;
+        vtable.packs_sources = Probe.packs;
+        vtable.draw = Probe.draw;
+        vtable.destroy_target = Probe.destroyTarget;
+        const renderer = try vulkan.Renderer.init(std.testing.allocator, .{ .context = &probe, .vtable = &vtable }, -1, .{ .max_samples = 1, .max_source_bytes = 4 });
+        output.render_device.renderer.?.pixman.deinit();
+        output.render_device.renderer = .{ .vulkan = renderer };
+        output.vulkan_targets = try output.render_device.renderer.?.vulkan.createTargets(2);
+        output.kms_output.plane.properties.in_fence_fd = 15;
+        for (output.vulkan_targets.?.records, output.pool.slots) |*record, slot| {
+            record.imported = &probe;
+            record.metadata = slot.metadata;
+        }
+        const sample: render.SurfaceSample = .{
+            .sample = .{ .surface = (@as(u64, 3) << 32) | 4, .commit_sequence = 1 },
+            .presentation = .{ .slot = 7, .generation = 2 },
+            .source = .{ .size = .{ .width = 1, .height = 1 }, .stride = 4, .format = .xrgb8888, .bytes = &.{ 20, 40, 80, 255 } },
+            .crop = render.SourceRect.pixels(0, 0, 1, 1),
+            .destination = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+            .clip = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+        };
+        const binding: SampleBinding = .{
+            .surface = .{ .index = 4, .generation = 3 },
+            .sample = sample.sample,
+            .presentation = sample.presentation,
+        };
+        // Prime both images through real planner/KMS transitions, then reuse
+        // both. A fence on either skipped submission would fail this check.
+        for (0..4) |index| {
+            const frame = try startSimFrame(output, 1 + index * 3_000_000_000, .{ .slot = 0, .generation = @intCast(index + 1) });
+            try std.testing.expectEqual(RenderResult.submitted, try output.renderFrame(frame, &.{sample}, &.{}, &.{binding}, 8 + index * 3_000_000_000));
+            try std.testing.expectEqual(@min(index + 1, 2), probe.calls);
+            try std.testing.expectEqual(index < 2, output.in_flight_render_fence != null);
+            if (index >= 2) try std.testing.expectEqual(@as(?u64, null), fixture.last_in_fence);
+            const handle = output.in_flight_handle.?;
+            try std.testing.expectEqual(handle.generation, output.planner.images[handle.slot].last_generation);
+            // Feed the same callback fact that the fake DRM event source uses.
+            const record = &output.kms_output.records[output.kms_output.in_flight_slot.?];
+            record.fact = .{ .sequence = @intCast(index + 1), .seconds = @intCast(2 + index * 3), .microseconds = 3000, .crtc_id = 30 };
+            record.callback_count = 1;
+            record.state = .callback;
+            try output.processKmsEvents(.{ .context = &probe, .presented_fn = Probe.presentedFrame, .retired_fn = SimFixture.unexpectedRetired });
+            try std.testing.expectEqual(index + 1, probe.presented);
+        }
+        probe.expected_damage = 0;
+        probe.fail_draw = error.TargetTerminal;
+        if (scenario == .discard) {
+            const handle = try output.pool.acquire();
+            try output.pool.discard(handle);
+        } else if (scenario == .repair) {
+            output.planner.invalidateAll();
+            probe.expected_damage = 1;
+        } else if (scenario == .capture) {
+            probe.expected_capture = true;
+        } else {
+            fixture.fail_commit = true;
+        }
+        const frame = try startSimFrame(output, 12_000_000_001, .{ .slot = 0, .generation = 5 });
+        var bytes: [4]u8 = @splat(0);
+        const result = if (scenario == .capture)
+            try output.renderFrameCapture(frame, &.{sample}, &.{}, &.{binding}, 12_000_000_008, .{
+                .token = 1,
+                .cursor_start = 1,
+                .overlay_cursor = true,
+                .destination = .{ .shm = .{ .bytes = &bytes, .stride = 4 } },
+            })
+        else
+            try output.renderFrame(frame, &.{sample}, &.{}, &.{binding}, 12_000_000_008);
+        try std.testing.expectEqual(if (scenario == .commit_failure) error.FakeCommit else error.TargetTerminal, result.retired.cause);
+        try std.testing.expect(!output.planner.pending);
+        try std.testing.expect(output.in_flight_frame == null);
+        if (scenario == .commit_failure) {
+            try std.testing.expectEqual(@as(usize, 2), probe.calls);
+            fixture.fail_commit = false;
+            const retry = try startSimFrame(output, 15_000_000_001, .{ .slot = 0, .generation = 6 });
+            const failed = try output.renderFrame(retry, &.{sample}, &.{}, &.{binding}, 15_000_000_008);
+            try std.testing.expectEqual(error.TargetTerminal, failed.retired.cause);
+        }
+        try std.testing.expectEqual(@as(usize, 3), probe.calls);
+    }
+}
+
 test "drm-sim: pre-capture failures retire scheduler and remain removable" {
     var fixture = SimFixture{};
     const output = try Output.create(
@@ -3164,6 +3307,8 @@ const SimFixture = struct {
     pool_removal_started_before_bo: bool = false,
     requests: [4]u8 = .{ 0, 0, 0, 0 },
     request_count: usize = 0,
+    fail_commit: bool = false,
+    last_in_fence: ?u64 = null,
     flip_userdata: ?*anyopaque = null,
     presented_count: usize = 0,
     captured_count: usize = 0,
@@ -3332,10 +3477,17 @@ const SimFixture = struct {
         return @ptrCast(request);
     }
     fn destroyRequest(_: *anyopaque, _: atomic.Request) void {}
-    fn resetRequest(_: *anyopaque, _: atomic.Request) void {}
-    fn addProperty(_: *anyopaque, _: atomic.Request, _: u32, _: u32, _: u64) !void {}
+    fn resetRequest(context: *anyopaque, _: atomic.Request) void {
+        const self: *SimFixture = @ptrCast(@alignCast(context));
+        self.last_in_fence = null;
+    }
+    fn addProperty(context: *anyopaque, _: atomic.Request, _: u32, property: u32, value: u64) !void {
+        const self: *SimFixture = @ptrCast(@alignCast(context));
+        if (property == 15) self.last_in_fence = value;
+    }
     fn commit(context: *anyopaque, _: std.posix.fd_t, _: atomic.Request, _: atomic.CommitFlags, userdata: ?*anyopaque) !void {
         const self: *SimFixture = @ptrCast(@alignCast(context));
+        if (self.fail_commit) return error.FakeCommit;
         if (userdata) |value| self.flip_userdata = value;
     }
     fn handleEvents(context: *anyopaque, _: []const u8, callback: atomic.FlipCallback) !void {
