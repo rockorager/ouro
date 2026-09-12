@@ -1535,8 +1535,6 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
         try vk(c.vkCreateSampler(self.device, &sampler_info, null, &sampler), error.CreateSamplerFailed);
         self.sampler = sampler;
         errdefer c.vkDestroySampler(self.device, sampler, null);
-        sampler_info.magFilter = c.VK_FILTER_LINEAR;
-        sampler_info.minFilter = c.VK_FILTER_LINEAR;
         var blur_sampler: c.VkSampler = undefined;
         try vk(c.vkCreateSampler(self.device, &sampler_info, null, &blur_sampler), error.CreateSamplerFailed);
         self.blur_sampler = blur_sampler;
@@ -5685,7 +5683,7 @@ fn createLinearImage(
         .pNext = null,
         .flags = 0,
         .imageType = c.VK_IMAGE_TYPE_2D,
-        .format = c.VK_FORMAT_R16G16B16A16_SFLOAT,
+        .format = c.VK_FORMAT_R32G32B32A32_SFLOAT,
         .extent = .{ .width = width, .height = height, .depth = 1 },
         .mipLevels = 1,
         .arrayLayers = 1,
@@ -5716,7 +5714,7 @@ fn createLinearImage(
         .flags = 0,
         .image = image.*,
         .viewType = c.VK_IMAGE_VIEW_TYPE_2D,
-        .format = c.VK_FORMAT_R16G16B16A16_SFLOAT,
+        .format = c.VK_FORMAT_R32G32B32A32_SFLOAT,
         .components = .{
             .r = c.VK_COMPONENT_SWIZZLE_IDENTITY,
             .g = c.VK_COMPONENT_SWIZZLE_IDENTITY,

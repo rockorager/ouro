@@ -76,7 +76,7 @@ class Renderer:
                timings=None, scene=None, damage=None, timing_repeats=1,
                source_format=0, source_stride=None, raw_output=False, output_reference=80,
                video_planes=None, representation=0, capture_transfer=0, capture_shoulder=False, rgb_output=False,
-               capture16=False):
+               capture16=False, blur=False):
         d = self.device
         sw, sh = source_size
         w, h = size
@@ -131,6 +131,8 @@ class Renderer:
                 m = memory(v.vkGetImageMemoryRequirements(d, im), 0)
                 cleanup.callback(v.vkDestroyImage, d, im, None)
                 v.vkBindImageMemory(d, im, m, 0)
+                if not usage & (v.VK_IMAGE_USAGE_SAMPLED_BIT | v.VK_IMAGE_USAGE_STORAGE_BIT):
+                    return im, None  # Transfer-only capture targets do not need a view.
                 view = own(v.vkCreateImageView, v.vkDestroyImageView, v.VkImageViewCreateInfo(
                     image=im, viewType=v.VK_IMAGE_VIEW_TYPE_2D, format=fmt, subresourceRange=subresource))
                 return im, view
@@ -191,7 +193,12 @@ class Renderer:
                 source_images = [image(*dimensions, fmt, v.VK_IMAGE_USAGE_SAMPLED_BIT | v.VK_IMAGE_USAGE_TRANSFER_DST_BIT)
                                  for data, dimensions, fmt, stride, texel_bytes in video_planes]
                 plane_uploads = [buffer(data, v.VK_BUFFER_USAGE_TRANSFER_SRC_BIT) for data, *_ in video_planes]
-            linear, linear_view = image(w, h, v.VK_FORMAT_R16G16B16A16_SFLOAT, v.VK_IMAGE_USAGE_STORAGE_BIT)
+            linear, linear_view = image(w, h, v.VK_FORMAT_R32G32B32A32_SFLOAT,
+                v.VK_IMAGE_USAGE_STORAGE_BIT | v.VK_IMAGE_USAGE_SAMPLED_BIT)
+            if blur:
+                assert texture and continuation
+                blurred, blurred_view = image(w, h, v.VK_FORMAT_R32G32B32A32_SFLOAT,
+                    v.VK_IMAGE_USAGE_STORAGE_BIT | v.VK_IMAGE_USAGE_SAMPLED_BIT)
             if copy_capture:
                 copied, _ = image(w, h, v.VK_FORMAT_B8G8R8A8_UNORM,
                                   v.VK_IMAGE_USAGE_TRANSFER_DST_BIT | v.VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
@@ -212,6 +219,10 @@ class Renderer:
                               6: (v.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1)})
             else:
                 types[2] = (v.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1)
+            if blur:
+                types.update({7: (v.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1),
+                              8: (v.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1),
+                              9: (v.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1)})
             layout = own(v.vkCreateDescriptorSetLayout, v.vkDestroyDescriptorSetLayout,
                 v.VkDescriptorSetLayoutCreateInfo(pBindings=[v.VkDescriptorSetLayoutBinding(
                     binding=b, descriptorType=t, descriptorCount=n, stageFlags=v.VK_SHADER_STAGE_COMPUTE_BIT)
@@ -227,7 +238,7 @@ class Renderer:
                     buf = captures[b - 10] if b >= 10 else samples if b == 1 else lut if b == 4 else source
                     args = dict(pBufferInfo=[v.VkDescriptorBufferInfo(buffer=buf[0], offset=0, range=buf[2])])
                 else:
-                    views = ([target_view] if b == 0 else [linear_view] if b == 5 else
+                    views = ([target_view] if b == 0 else [linear_view] if b in (5, 8) else [blurred_view] if b in (7, 9) else
                              [view for _, view in source_images] + [source_images[0][1]] * (n - len(layers)))
                     if b == 3 and video_planes:
                         views = [source_images[0][1]] * 96
@@ -254,6 +265,15 @@ class Renderer:
             pipeline = v.vkCreateComputePipelines(d, v.VK_NULL_HANDLE, 1,
                 [v.VkComputePipelineCreateInfo(stage=stage, layout=pl)], None)[0]
             cleanup.callback(v.vkDestroyPipeline, d, pipeline, None)
+            if blur:
+                code = (ROOT / "src/render/vulkan_backdrop_blur.spv").read_bytes()
+                module = own(v.vkCreateShaderModule, v.vkDestroyShaderModule,
+                    v.VkShaderModuleCreateInfo(codeSize=len(code), pCode=code))
+                blur_stage = v.VkPipelineShaderStageCreateInfo(
+                    stage=v.VK_SHADER_STAGE_COMPUTE_BIT, module=module, pName="main")
+                blur_pipeline = v.vkCreateComputePipelines(d, v.VK_NULL_HANDLE, 1,
+                    [v.VkComputePipelineCreateInfo(stage=blur_stage, layout=pl)], None)[0]
+                cleanup.callback(v.vkDestroyPipeline, d, blur_pipeline, None)
             cp = own(v.vkCreateCommandPool, v.vkDestroyCommandPool,
                      v.VkCommandPoolCreateInfo(queueFamilyIndex=self.family))
             cmd = v.vkAllocateCommandBuffers(d, v.VkCommandBufferAllocateInfo(commandPool=cp,
@@ -263,7 +283,7 @@ class Renderer:
                 newLayout=v.VK_IMAGE_LAYOUT_GENERAL, image=im, subresourceRange=subresource,
                 srcQueueFamilyIndex=v.VK_QUEUE_FAMILY_IGNORED, dstQueueFamilyIndex=v.VK_QUEUE_FAMILY_IGNORED,
                 dstAccessMask=v.VK_ACCESS_SHADER_WRITE_BIT | v.VK_ACCESS_TRANSFER_WRITE_BIT)
-                for im in [target, linear] + [im for im, _ in source_images]]
+                for im in [target, linear] + ([blurred] if blur else []) + [im for im, _ in source_images]]
             v.vkCmdPipelineBarrier(cmd, v.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                 v.VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, None, 0, None, len(barriers), barriers)
             def region(width, height, offset=0):
@@ -322,6 +342,16 @@ class Renderer:
                 dispatch(0x40000001)
                 barrier(v.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, v.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                         v.VK_ACCESS_SHADER_WRITE_BIT, v.VK_ACCESS_SHADER_READ_BIT | v.VK_ACCESS_SHADER_WRITE_BIT)
+                if blur:
+                    v.vkCmdBindPipeline(cmd, v.VK_PIPELINE_BIND_POINT_COMPUTE, blur_pipeline)
+                    for vertical in (0, 1):
+                        push = struct.pack("<16I", 0, 0, 0, 0, w, h, 0, 0, 0, 0, w, h,
+                            vertical, 0x3f800000, 0, 0)
+                        v.vkCmdPushConstants(cmd, pl, v.VK_SHADER_STAGE_COMPUTE_BIT, 0, 64, v.ffi.from_buffer(push))
+                        v.vkCmdDispatch(cmd, (w + 7) // 8, (h + 7) // 8, 1)
+                        barrier(v.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, v.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            v.VK_ACCESS_SHADER_WRITE_BIT, v.VK_ACCESS_SHADER_READ_BIT | v.VK_ACCESS_SHADER_WRITE_BIT)
+                    v.vkCmdBindPipeline(cmd, v.VK_PIPELINE_BIND_POINT_COMPUTE, pipeline)
                 dispatch(0x80000000)
             else:
                 dispatch(len(layers))
@@ -566,16 +596,39 @@ def test_capture16(renderer):
     pixels = b"".join(struct.pack("<8H", *values[2 * y], *values[2 * y + 1]) + bytes([0xcc]) * 8 for y in range(2))
     expected = [component for r, g, b, a in values for component in
                 (*(round((c / 65535) ** (1 / 2.2) * a) for c in (r, g, b)), a)]
-    for mode in ("buffer", "texture", "texture-buffer"):
+    for mode, continuation in (("buffer", False), ("texture", False), ("texture-buffer", False), ("texture", True), ("texture-buffer", True)):
         for ten_bit in (False, True):
             _, before, after = renderer.render(pixels, (2, 2), (2, 2), mode,
                 source_format=2, source_stride=24, source_transfer=1, output_transfer=2, alpha_mode=2,
-                background_alpha=0, capture_transfer=2, capture_phases=3, capture16=True, ten_bit=ten_bit)
+                background_alpha=0, capture_transfer=2, capture_phases=3, capture16=True, ten_bit=ten_bit, continuation=continuation)
             actual = struct.unpack("<16H", before)
             assert max(abs(a - b) for a, b in zip(actual, expected)) <= 2, (mode, actual, expected)
             assert actual[7] == 129 and before == after
             assert actual[0] % 257 != 0, "capture must not be expanded from 8 bits"
     print(f"RGBA16 capture: {renderer.draw_count - start} draws passed (low RGB/alpha, channel order, padded stride, 8/10-bit display)")
+
+
+def test_blur_precision(renderer):
+    # Independent 49-tap Gaussian, not the shader's paired weights/offsets.
+    width, height = 9, 7
+    values = [[(x / 16, y / 12, int(x == 1 and y == 4), 1)
+               for x in range(width)] for y in range(height)]
+    weights = [math.exp(-i * i / 128) for i in range(-24, 25)]
+    total = sum(weights)
+    horizontal = [[[sum(values[y][min(width - 1, max(0, x + i))][c] * weights[i + 24]
+                        for i in range(-24, 25)) / total for c in range(4)]
+                   for x in range(width)] for y in range(height)]
+    expected = [round(sum(horizontal[min(height - 1, max(0, y + i))][x][c] * weights[i + 24]
+                         for i in range(-24, 25)) / total * 65535)
+                for y in range(height) for x in range(width) for c in range(4)]
+    pixels = b"".join(struct.pack("<4f", *pixel) for row in values for pixel in row)
+    for mode in ("texture", "texture-buffer"):
+        _, actual, _ = renderer.render(pixels, (width, height), (width, height), mode,
+            source_format=12, source_transfer=1, output_transfer=1, capture_transfer=1,
+            background_alpha=0, alpha_mode=2, continuation=True, blur=True, capture16=True, capture_phases=1)
+        actual = struct.unpack(f"<{width * height * 4}H", actual)
+        assert max(abs(a - b) for a, b in zip(actual, expected)) <= 2, (mode, actual, expected)
+    print("FP32 blur: 2 draws passed (independent Gaussian, clamped edges, low impulse, RGBA16 export)")
 
 
 def test_output_order(renderer):
@@ -1133,6 +1186,7 @@ if __name__ == "__main__":
         test_capture_roundtrip(renderer, args.capture_roundtrip)
         test_capture_shoulder(renderer, args.capture_roundtrip)
         test_capture16(renderer)
+        test_blur_precision(renderer)
         test_output_order(renderer)
         test_video(renderer, args.capture_video)
         if args.benchmark_stall:

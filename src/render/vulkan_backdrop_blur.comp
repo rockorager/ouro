@@ -1,8 +1,8 @@
 #version 450
 
 layout(local_size_x = 8, local_size_y = 8) in;
-layout(set = 0, binding = 5, rgba16f) uniform image2D linear_image;
-layout(set = 0, binding = 7, rgba16f) uniform image2D blur_image;
+layout(set = 0, binding = 5, rgba32f) uniform image2D linear_image;
+layout(set = 0, binding = 7, rgba32f) uniform image2D blur_image;
 layout(set = 0, binding = 8) uniform sampler2D linear_source;
 layout(set = 0, binding = 9) uniform sampler2D blur_source;
 
@@ -25,21 +25,33 @@ const float offsets[12] = float[](
     17.4320633892, 19.4244119867, 21.4167966432, 23.4092207951
 );
 
+// FP32 linear filtering is optional in Vulkan. Interpolate the paired taps
+// explicitly so preserving UNORM16 precision does not require that feature.
+vec4 interpolated(sampler2D source, vec2 position) {
+    ivec2 base = ivec2(floor(position));
+    ivec2 limit = textureSize(source, 0) - 1;
+    vec2 fraction = fract(position);
+    vec4 top = mix(texelFetch(source, clamp(base, ivec2(0), limit), 0),
+        texelFetch(source, clamp(base + ivec2(1, 0), ivec2(0), limit), 0), fraction.x);
+    vec4 bottom = mix(texelFetch(source, clamp(base + ivec2(0, 1), ivec2(0), limit), 0),
+        texelFetch(source, clamp(base + ivec2(1, 1), ivec2(0), limit), 0), fraction.x);
+    return mix(top, bottom, fraction.y);
+}
+
 void main() {
     ivec2 local = ivec2(gl_GlobalInvocationID.xy);
     if (local.x >= int(frame.damage.z) || local.y >= int(frame.damage.w)) return;
     ivec2 pixel = ivec2(frame.damage.xy) + local;
-    vec2 extent = vec2(frame.output_info.xy);
-    vec2 uv = (vec2(pixel) + vec2(0.5)) / extent;
+    vec2 position = vec2(pixel);
     float scale = uintBitsToFloat(frame.blur_info.y);
     bool vertical = frame.blur_info.x != 0u;
-    vec2 axis = vertical ? vec2(0.0, 1.0 / extent.y) : vec2(1.0 / extent.x, 0.0);
-    vec4 color = (vertical ? texture(blur_source, uv) : texture(linear_source, uv)) * center_weight;
+    vec2 axis = vertical ? vec2(0.0, 1.0) : vec2(1.0, 0.0);
+    vec4 color = (vertical ? texelFetch(blur_source, pixel, 0) : texelFetch(linear_source, pixel, 0)) * center_weight;
     for (int index = 0; index < 12; ++index) {
         vec2 delta = axis * offsets[index] * scale;
         vec4 pair = vertical
-            ? texture(blur_source, uv - delta) + texture(blur_source, uv + delta)
-            : texture(linear_source, uv - delta) + texture(linear_source, uv + delta);
+            ? interpolated(blur_source, position - delta) + interpolated(blur_source, position + delta)
+            : interpolated(linear_source, position - delta) + interpolated(linear_source, position + delta);
         color += pair * weights[index];
     }
     if (vertical)
