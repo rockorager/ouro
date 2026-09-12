@@ -296,7 +296,7 @@ pub const Surface = struct {
     current_content_type: u32 = 0,
     current_presentation_hint: PresentationHint = .vsync,
     viewport: Viewport = .{},
-    current_color_description: color.Description = .srgb,
+    current_color_description: color.Description = .desktop,
     current_color_representation: color.Representation = .{},
     current_alpha_multiplier: u32 = std.math.maxInt(u32),
 
@@ -308,7 +308,7 @@ pub const Surface = struct {
     pending_transform: Transform = .normal,
     pending_scale: i32 = 1,
     pending_offset: Point = .{},
-    pending_color_description: color.Description = .srgb,
+    pending_color_description: color.Description = .desktop,
     pending_color_representation: color.Representation = .{},
     pending_alpha_multiplier: u32 = std.math.maxInt(u32),
     pending_content_type: u32 = 0,
@@ -394,7 +394,7 @@ pub const Surface = struct {
     }
 
     pub fn unsetColorDescription(surface: *Surface) void {
-        surface.pending_color_description = .srgb;
+        surface.pending_color_description = .desktop;
     }
 
     pub fn setColorRepresentation(surface: *Surface, representation: color.Representation) void {

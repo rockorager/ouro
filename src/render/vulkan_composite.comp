@@ -45,8 +45,8 @@ vec3 decode_transfer(vec3 value, uint transfer) {
         return mix(pow((value + 0.055) / 1.055, vec3(2.4)), value / 12.92, low);
     }
     if (transfer == 1u) return value;
-    if (transfer == 2u) return pow(max(value, vec3(0.0)), vec3(2.2));
-    if (transfer == 3u) return pow(max(value, vec3(0.0)), vec3(2.8));
+    if (transfer == 2u) return sign(value) * pow(abs(value), vec3(2.2));
+    if (transfer == 3u) return sign(value) * pow(abs(value), vec3(2.8));
     if (transfer == 4u) {
         const float m1 = 2610.0 / 16384.0;
         const float m2 = 2523.0 / 32.0;
@@ -76,7 +76,7 @@ vec3 encode_transfer(vec3 value, uint transfer) {
         const float c1 = 3424.0 / 4096.0;
         const float c2 = 2413.0 / 128.0;
         const float c3 = 2392.0 / 128.0;
-        vec3 p = pow(value / 125.0, vec3(m1));
+        vec3 p = pow(value * uintBitsToFloat(frame.output_color.y) / 10000.0, vec3(m1));
         return pow((c1 + c2 * p) / (1.0 + c3 * p), vec3(m2));
     }
     bvec3 low = lessThanEqual(value, vec3(1.0 / 12.0));
@@ -151,7 +151,8 @@ void main() {
 
     float alpha = frame.output_info.z == 1u ? 1.0 : float(frame.clear_color.x) / 255.0;
     vec3 clear_electrical = vec3(frame.clear_color.yzw) / 255.0;
-    vec4 color = vec4(decode_transfer(clear_electrical, frame.output_color.x) * alpha, alpha);
+    float clear_scale = frame.output_color.x == 4u ? 10000.0 / uintBitsToFloat(frame.output_color.y) : 1.0;
+    vec4 color = vec4(decode_transfer(clear_electrical, frame.output_color.x) * clear_scale * alpha, alpha);
     for (uint index = 0u; index < frame.output_info.w; ++index) {
         Sample item = items[index];
         ivec2 destination_end = item.destination.xy + item.destination.zw;

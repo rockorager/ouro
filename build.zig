@@ -637,7 +637,7 @@ pub fn build(b: *std.Build) void {
     });
     const shm_runtime_tests = b.addTest(.{
         .root_module = drm_presentation_tests.root_module,
-        .filters = &.{"high precision SHM"},
+        .filters = &.{ "high precision SHM", "single pixel buffer" },
     });
     const shm_test_step = b.step("test-shm", "Run SHM precision, layout, and generated-client tests");
     shm_test_step.dependOn(&b.addRunArtifact(shm_tests).step);

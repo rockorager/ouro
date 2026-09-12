@@ -5958,12 +5958,12 @@ test "long-lived extension slots grow beyond their initial reservation" {
     defer context.deinit();
 
     const first_pixel = try context.adapter.acquireSinglePixel();
-    first_pixel.bytes = .{ 1, 2, 3, 4 };
+    first_pixel.bytes = .{ 1, 2, 3, 4 } ** 4;
     _ = try context.adapter.acquireSinglePixel();
     _ = try context.adapter.acquireSinglePixel();
     try std.testing.expectEqual(@as(usize, 4), context.adapter.single_pixels.len);
     try std.testing.expectEqual(first_pixel, context.adapter.single_pixels[0]);
-    try std.testing.expectEqual([4]u8{ 1, 2, 3, 4 }, first_pixel.bytes);
+    try std.testing.expectEqual([4]u8{ 1, 2, 3, 4 } ** 4, first_pixel.bytes);
 
     const first_content_type = try context.adapter.acquireContentType();
     _ = try context.adapter.acquireContentType();

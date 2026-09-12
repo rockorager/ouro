@@ -74,7 +74,7 @@ class Renderer:
                luminance_scale=1, capture_matrix=(1, 0, 0, 0, 1, 0, 0, 0, 1),
                capture_phases=None, continuation=False, capture_sequence=False, copy_capture=False,
                timings=None, scene=None, damage=None, timing_repeats=1,
-               source_format=0, source_stride=None, raw_output=False):
+               source_format=0, source_stride=None, raw_output=False, output_reference=80):
         d = self.device
         sw, sh = source_size
         w, h = size
@@ -285,7 +285,8 @@ class Renderer:
             def dispatch(count, phases=capture_phases):
                 for rect in damage:
                     push = struct.pack("<16I12f", background_alpha, *background, w, h,
-                        int(background_alpha == 255), count, *rect, output_transfer, 0, 0, 0,
+                        int(background_alpha == 255), count, *rect, output_transfer,
+                        struct.unpack("<I", struct.pack("<f", output_reference))[0], 0, 0,
                         *capture_matrix[:3], phases or 0,
                         *capture_matrix[3:6], 0, *capture_matrix[6:], 0)
                     v.vkCmdPushConstants(cmd, pl, v.VK_SHADER_STAGE_COMPUTE_BIT, 0, 112, v.ffi.from_buffer(push))
@@ -467,6 +468,41 @@ def test_modern_rgb(renderer, capture_path):
     print(f"Modern RGB: {renderer.draw_count - start} draws passed (X bits, float range, all filters and capture)")
 
 
+def test_desktop_color(renderer, capture_path):
+    start = renderer.draw_count
+    sheet = Image.new("RGB", (640, 200), "#202020")
+    draw = ImageDraw.Draw(sheet)
+    for mode in ("buffer", "texture", "texture-buffer"):
+        for transfer in (0, 2):
+            pixels = bytes(c for x in range(256) for c in (x, x, x, 255))
+            result, capture, _ = renderer.render(pixels, (256, 1), (256, 1), mode,
+                source_transfer=transfer, output_transfer=2, capture_phases=1)
+            expected = []
+            for x in range(256):
+                linear = (x / 255) ** 2.2 if transfer == 2 else x / 255 / 12.92 if x <= 10 else ((x / 255 + 0.055) / 1.055) ** 2.4
+                srgb = 12.92 * linear if linear <= 0.0031308 else 1.055 * linear ** (1 / 2.4) - 0.055
+                expected.extend([round(srgb * 255)] * 3 + [255])
+                assert abs(result[4 * x] - round(linear ** (1 / 2.2) * 255)) <= 1
+            assert max(abs(a - b) for a, b in zip(capture, expected)) <= 1
+            if mode == "texture":
+                y = 20 if transfer == 2 else 110
+                draw.text((12, y), "gamma22 desktop: sRGB capture" if transfer == 2 else "explicit compound_power_2_4: sRGB capture", fill="white")
+                sheet.paste(Image.frombytes("RGBA", (256, 1), capture, "raw", "BGRA").resize((616, 48)), (12, y + 20))
+        # The same absolute 203-nit white must receive the same PQ code with
+        # either an 80-nit or 203-nit working reference white.
+        expected_pq = ((3424 / 4096 + (2413 / 128) * (203 / 10000) ** (2610 / 16384)) /
+                       (1 + (2392 / 128) * (203 / 10000) ** (2610 / 16384))) ** (2523 / 32)
+        for reference in (80, 203):
+            result = renderer.render(struct.pack("<4e", 1, 1, 1, 1), (1, 1), (1, 1), mode,
+                source_format=10, source_transfer=1, output_transfer=4, output_reference=reference,
+                luminance_scale=203 / reference, ten_bit=True, raw_output=True)
+            actual = struct.unpack("<I", result)[0] & 1023
+            assert abs(actual - round(expected_pq * 1023)) <= 1, (mode, reference, actual)
+    if capture_path:
+        sheet.save(capture_path.with_stem(capture_path.stem + "-gamma22"))
+    print(f"Desktop color: {renderer.draw_count - start} draws passed (gamma22, explicit sRGB, reference-independent PQ)")
+
+
 def test(renderer, compare_shader_dir):
     # BGRA: opaque red next to transparent black. Correct premultiplied
     # filtering keeps saturated red, without dark/colored fringes.
@@ -625,7 +661,7 @@ def test_hdr_capture(renderer, capture_path):
     for mode in ("buffer", "texture", "texture-buffer"):
         for ten_bit in (False, True):
             for transfer in (4, 5):  # PQ and HLG output
-                options = dict(ten_bit=ten_bit, output_transfer=transfer,
+                options = dict(ten_bit=ten_bit, output_transfer=transfer, output_reference=203,
                                color_matrix=to_2020, luminance_scale=80 / 203,
                                capture_matrix=capture_matrix, background=(0, 0, 0), background_alpha=0)
                 scanout = renderer.render(pixels, size, size, mode, **options)
@@ -875,6 +911,7 @@ if __name__ == "__main__":
         test_hdr_capture(renderer, args.capture_hdr)
         test_shm(renderer, args.capture_shm)
         test_modern_rgb(renderer, args.capture_shm)
+        test_desktop_color(renderer, args.capture_shm)
         if args.benchmark_stall:
             benchmark_stall(renderer)
         if args.capture:

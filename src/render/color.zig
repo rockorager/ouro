@@ -55,6 +55,10 @@ pub const Description = struct {
         .transfer = .srgb,
     };
 
+    /// Untagged desktop content and unprofiled SDR outputs follow the
+    /// color-management-v1 gamma22 guidance. `srgb` retains piecewise math.
+    pub const desktop: Description = .{ .primaries = srgb.primaries, .transfer = .gamma22 };
+
     pub fn targetPrimaries(value: Description) Primaries {
         return value.mastering_primaries orelse value.primaries;
     }
@@ -238,6 +242,15 @@ fn inverse(value: Matrix3) ?Matrix3 {
             (value[0][0] * value[1][1] - value[0][1] * value[1][0]) * reciprocal,
         },
     };
+}
+
+test "color: desktop gamma22 remains distinct from explicit piecewise sRGB" {
+    try std.testing.expectEqual(TransferFunction.gamma22, Description.desktop.transfer);
+    try std.testing.expectEqual(TransferFunction.srgb, Description.srgb.transfer);
+    const transform = try compile(.desktop, .srgb);
+    try std.testing.expectEqual(TransferFunction.gamma22, transform.source_transfer);
+    try std.testing.expectEqual(TransferFunction.srgb, transform.output_transfer);
+    try std.testing.expectEqualDeep(Description.srgb.primaries, Description.desktop.primaries);
 }
 
 test "color: sRGB transform is identity" {

@@ -250,6 +250,7 @@ pub const Renderer = struct {
             destination_stride,
             plan.output,
             list.output_format,
+            list.output_color_description.transfer,
         );
         if (draws) try self.drawRange(
             list,
@@ -266,6 +267,7 @@ pub const Renderer = struct {
             destination_stride,
             plan.output,
             list.output_format,
+            list.output_color_description.transfer,
         );
     }
 
@@ -762,6 +764,7 @@ fn copyReadback(
     source_stride: u32,
     output: render.Size,
     format: render.PixelFormat,
+    transfer: render.color.TransferFunction,
 ) Error!void {
     try validateReadback(readback, output);
     const row_bytes = std.math.mul(u32, output.width, 4) catch return error.InvalidTarget;
@@ -777,6 +780,18 @@ fn copyReadback(
         if (format == .xrgb8888) for (0..output.width) |x| {
             readback.bytes[destination_start + x * 4 + 3] = 255;
         };
+        // Pixman composes desktop electrical values. Export the declared
+        // piecewise sRGB encoding rather than copying monitor gamma22 bytes.
+        if (transfer == .gamma22) for (0..output.width) |x| {
+            const pixel = readback.bytes[destination_start + x * 4 ..][0..4];
+            const alpha: f64 = @as(f64, @floatFromInt(pixel[3])) / 255;
+            for (pixel[0..3]) |*component| {
+                const encoded = if (alpha > 0) @as(f64, @floatFromInt(component.*)) / (255 * alpha) else 0;
+                const linear = std.math.pow(f64, encoded, 2.2);
+                const srgb = if (linear <= 0.0031308) linear * 12.92 else 1.055 * std.math.pow(f64, linear, 1.0 / 2.4) - 0.055;
+                component.* = @intFromFloat(@round(std.math.clamp(srgb * alpha, 0, 1) * 255));
+            }
+        };
     }
 }
 
@@ -785,10 +800,16 @@ test "render: capture normalizes unused X bits but preserves ARGB alpha" {
     var bytes: [12]u8 = @splat(0xcc);
     const readback = Readback{ .bytes = &bytes, .stride = 12 };
     const size = render.Size{ .width = 2, .height = 1 };
-    try copyReadback(readback, &source, 9, size, .xrgb8888);
+    try copyReadback(readback, &source, 9, size, .xrgb8888, .srgb);
     try std.testing.expectEqualSlices(u8, &.{ 3, 5, 7, 255, 11, 13, 17, 255, 0xcc, 0xcc, 0xcc, 0xcc }, &bytes);
-    try copyReadback(readback, &source, 9, size, .argb8888_premultiplied);
+    try copyReadback(readback, &source, 9, size, .argb8888_premultiplied, .srgb);
     try std.testing.expectEqualSlices(u8, source[0..8], bytes[0..8]);
+}
+
+test "render: desktop capture converts gamma22 to declared sRGB" {
+    var bytes: [4]u8 = undefined;
+    try copyReadback(.{ .bytes = &bytes, .stride = 4 }, &.{ 16, 64, 128, 0 }, 4, .{ .width = 1, .height = 1 }, .xrgb8888, .gamma22);
+    try std.testing.expectEqualSlices(u8, &.{ 7, 62, 129, 255 }, &bytes);
 }
 
 fn validateReadback(readback: Readback, output: render.Size) Error!void {
@@ -1194,7 +1215,9 @@ test "render-pixman: opaque cursor does not suppress pre-cursor clear" {
         .{ .bytes = &after, .stride = 4 },
     );
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 255 }, &before);
-    try std.testing.expectEqualSlices(u8, &source, &after);
+    // Gamma22 desktop values 1,2,3 become < 0.5 in 8-bit sRGB capture.
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 255 }, &after);
+    try std.testing.expectEqualSlices(u8, &source, &destination);
 }
 
 test "render-pixman: backdrop blur smooths transparency and skips opaque coverage" {

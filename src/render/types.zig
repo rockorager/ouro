@@ -235,7 +235,7 @@ pub const SurfaceSample = struct {
     effect_size: Size = .{ .width = 0, .height = 0 },
     opaque_region: []const RegionOperation = &.{},
     blur_region: []const RegionOperation = &.{},
-    color_description: color.Description = .srgb,
+    color_description: color.Description = .desktop,
     color_representation: color.Representation = .{},
 };
 
@@ -247,7 +247,7 @@ pub const List = struct {
     output_format: PixelFormat,
     clear: Color,
     samples: []const SurfaceSample,
-    output_color_description: color.Description = .srgb,
+    output_color_description: color.Description = .desktop,
 };
 
 /// One immutable R12 sample selected by an R13 plan. Geometry is in physical

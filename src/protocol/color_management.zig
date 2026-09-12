@@ -348,7 +348,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
                 .get_preferred_parametric => |value| {
                     const image = self.create(.image, undefined, resource.peer, null, resource.version) catch
                         return try self.noMemory(actor);
-                    image.description = .srgb;
+                    image.description = .desktop;
                     image.information_allowed = true;
                     const admitted = Feedback.admit_get_preferred_parametric(
                         server_objects,
@@ -771,18 +771,18 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
         }
 
         fn preferredIdentity(self: *Self, peer: wayring.io_uring.Peer, surface: CoreSurface.SurfaceId) u64 {
-            const resolver = self.output_resolver orelse return descriptionIdentity(.srgb);
-            const resource = self.core.surfaceResource(surface) catch return descriptionIdentity(.srgb);
+            const resolver = self.output_resolver orelse return descriptionIdentity(.desktop);
+            const resource = self.core.surfaceResource(surface) catch return descriptionIdentity(.desktop);
             const resolved = resolver.resolve(resolver.context, peer, null, resource) orelse
-                return descriptionIdentity(.srgb);
+                return descriptionIdentity(.desktop);
             defer releaseResolvedOutput(resolved);
             return descriptionIdentity(resolved.description);
         }
 
         fn outputIdentity(self: *Self, peer: wayring.io_uring.Peer, output: objects.Handle) u64 {
-            const resolver = self.output_resolver orelse return descriptionIdentity(.srgb);
+            const resolver = self.output_resolver orelse return descriptionIdentity(.desktop);
             const resolved = resolver.resolve(resolver.context, peer, output, null) orelse
-                return descriptionIdentity(.srgb);
+                return descriptionIdentity(.desktop);
             defer releaseResolvedOutput(resolved);
             return descriptionIdentity(resolved.description);
         }
@@ -848,7 +848,7 @@ pub fn Adapter(comptime protocol: type, comptime CoreSurface: type) type {
             surface: ?objects.Handle,
         ) bool {
             const resolver = self.output_resolver orelse {
-                image.description = .srgb;
+                image.description = .desktop;
                 image.information_allowed = true;
                 return true;
             };

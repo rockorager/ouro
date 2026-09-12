@@ -486,7 +486,8 @@ test "render: phased readback separates base composition from cursor" {
     );
 
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255, 0, 0, 255, 255 }, without_cursor[0..8]);
-    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255, 0, 128, 127, 255 }, with_cursor[0..8]);
+    // Monitor gamma22 values 128/127 export as piecewise-sRGB 129/128.
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255, 0, 129, 128, 255 }, with_cursor[0..8]);
     try std.testing.expectEqualSlices(u8, &.{ 0xaa, 0xaa, 0xaa, 0xaa }, without_cursor[8..12]);
     try std.testing.expectEqualSlices(u8, &.{ 0xbb, 0xbb, 0xbb, 0xbb }, with_cursor[8..12]);
     try expectPixels(&target, &.{ 0xffff0000, 0xff7f8000 });
@@ -518,7 +519,8 @@ test "render: readback without render damage preserves current target" {
         .repair_full = false,
         .render_full = false,
     }, 0, .{ .bytes = &readback, .stride = 8 }, null);
-    try std.testing.expectEqualSlices(u8, target.bytes[0..8], &readback);
+    try std.testing.expectEqualSlices(u8, &.{ 48, 28, 9, 255, 102, 84, 66, 255 }, &readback);
+    try expectPixels(&target, &.{ 0xff112233, 0xff445566 });
 }
 
 test "render: crop nearest scale and source stride padding are exact" {

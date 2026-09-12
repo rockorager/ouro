@@ -50,9 +50,9 @@ pub const Config = struct {
     max_color_luts: usize = 16,
     enable_color_management: bool = false,
     /// Prefer HDR automatically when the connector and render path support it.
-    /// Explicit non-sRGB output descriptions are never replaced by this policy.
+    /// Explicit non-default output descriptions are never replaced by this policy.
     enable_hdr: bool = true,
-    output_color_description: render.color.Description = .srgb,
+    output_color_description: render.color.Description = .desktop,
     /// Aggregate packed source bytes available to one fallback render frame.
     max_source_bytes: usize,
     /// Maximum bytes retained for one surface version. Defaults to the frame
@@ -1021,7 +1021,7 @@ pub const Output = struct {
         self.hardware_cursor = null;
         self.cursor_hardware = false;
         if (config.hardware_cursor and cursor_api.selectPlane(snapshot) != null and
-            std.meta.eql(config.output_color_description, @import("../render/color.zig").Description.srgb))
+            std.meta.eql(config.output_color_description, @import("../render/color.zig").Description.desktop))
             self.hardware_cursor = cursor_api.Cursor.init(platforms.cursor, platforms.framebuffer, self.kms_output.fd, snapshot.selectedCrtc().id) catch null;
         if (self.hardware_cursor) |cursor|
             std.log.info("hardware cursor available: connector={d} crtc={d} size={d}x{d}", .{
@@ -1439,7 +1439,6 @@ pub const Output = struct {
                 if (capture == null and !plan.render_full and plan.render_damage.len == 0 and
                     self.planner.images[handle.slot].last_generation == handle.generation - 1)
                     break :vulkan_render;
-                const composition = compositionList(list);
                 const render_result = if (capture) |capture_request| capture_result: {
                     const captures: vulkan_platform.Captures = if (capture_request.overlay_cursor)
                         .{ .after_cursor = true }
@@ -1450,7 +1449,7 @@ pub const Output = struct {
                             &self.vulkan_targets.?,
                             vulkan.Target.fromPool(&self.pool),
                             handle,
-                            composition,
+                            list,
                             plan,
                             capture_request.cursor_start,
                             captures,
@@ -1462,7 +1461,7 @@ pub const Output = struct {
                                 &self.vulkan_targets.?,
                                 vulkan.Target.fromPool(&self.pool),
                                 handle,
-                                composition,
+                                list,
                                 plan,
                                 capture_request.cursor_start,
                                 captures,
@@ -1474,7 +1473,7 @@ pub const Output = struct {
                     &self.vulkan_targets.?,
                     &self.pool,
                     handle,
-                    composition,
+                    list,
                     plan,
                 );
                 in_fence = render_result catch |cause| {
@@ -2100,33 +2099,6 @@ fn targetFormatFromDrm(value: u32) ?render.PixelFormat {
     return formatFromDrm(value);
 }
 
-// The ICC capture fix must not also switch the established non-ICC HDR
-// scanout encoding. Keep that behavior until HDR conversion is validated
-// end-to-end. Captures must use the same composition encoding as scanout.
-fn compositionList(configured: render.List) render.List {
-    var list = configured;
-    if (list.output_color_description.lut == null)
-        list.output_color_description = .srgb;
-    return list;
-}
-
-test "drm-sim: ICC fix preserves ordinary non-ICC HDR composition encoding" {
-    var list: render.List = .{
-        .output = .{ .width = 1, .height = 1 },
-        .output_format = .xrgb8888,
-        .clear = .{ .r = 0, .g = 0, .b = 0 },
-        .samples = &.{},
-    };
-    for ([_]render.color.TransferFunction{ .srgb, .st2084_pq, .hlg }) |transfer| {
-        list.output_color_description.transfer = transfer;
-        list.output_color_description.reference_luminance = 203;
-        list.output_color_description.max_luminance = 1000;
-        try std.testing.expectEqualDeep(render.color.Description.srgb, compositionList(list).output_color_description);
-        // Selecting composition must not mutate the configured output state.
-        try std.testing.expectEqual(transfer, list.output_color_description.transfer);
-    }
-}
-
 fn hdrRequested(description: render.color.Description) bool {
     return description.transfer == .st2084_pq or description.transfer == .hlg;
 }
@@ -2137,7 +2109,7 @@ fn automaticHdrDescription(
     renderer_capable: bool,
 ) ?render.color.Description {
     if (!config.enable_hdr or !renderer_capable or
-        !std.meta.eql(config.output_color_description, render.color.Description.srgb)) return null;
+        !std.meta.eql(config.output_color_description, render.color.Description.desktop)) return null;
     const capabilities = snapshot.selectedConnector().properties.hdr_capabilities;
     const transfer: render.color.TransferFunction = if (capabilities.pq)
         .st2084_pq
@@ -2561,6 +2533,7 @@ test "drm-output: direct scanout eligibility is exact and conservative" {
         .crop = render.SourceRect.pixels(0, 0, 2, 1),
         .destination = .{ .x = 0, .y = 0, .width = 2, .height = 1 },
         .clip = .{ .x = 0, .y = 0, .width = 2, .height = 1 },
+        .color_description = .srgb,
     };
     var list: render.List = .{
         .output = .{ .width = 2, .height = 1 },
@@ -2569,6 +2542,7 @@ test "drm-output: direct scanout eligibility is exact and conservative" {
         .samples = &.{sample},
     };
     try std.testing.expect(directScanoutSource(list, .srgb) != null);
+    try std.testing.expect(directScanoutSource(list, .desktop) == null);
     sample.destination.width = 1;
     list.samples = &.{sample};
     try std.testing.expect(directScanoutSource(list, .srgb) == null);
@@ -2649,6 +2623,7 @@ test "drm-output: overlay eligibility requires an exact topmost scanout" {
         .crop = render.SourceRect.pixels(0, 0, 2, 1),
         .destination = .{ .x = 0, .y = 0, .width = 2, .height = 1 },
         .clip = .{ .x = 0, .y = 0, .width = 2, .height = 1 },
+        .color_description = .srgb,
     };
     var top = background;
     top.sample.surface = 2;
@@ -2928,6 +2903,11 @@ test "drm-sim: ordinary and capture frames keep ICC and non-ICC output encoding 
             const self: *@This() = @ptrCast(@alignCast(context));
             var expected = render.color.Description.srgb;
             expected.lut = self.expected;
+            if (self.expected == null) {
+                expected.transfer = .st2084_pq;
+                expected.reference_luminance = 203;
+                expected.max_luminance = 1000;
+            }
             try std.testing.expectEqualDeep(expected, frame.output_color_description);
             try std.testing.expectEqual(self.capture, frame.captures.after_cursor);
             self.calls += 1;

@@ -3036,7 +3036,11 @@ fn runVertical(trigger: TerminalTrigger, source: ClientSource, options: struct {
                 const rendered = try coordinator.render_device.?.content.resolve(
                     coordinator.cursor_layer.rendered.?,
                 );
-                try std.testing.expectEqualSlices(u8, &.{ 4, 3, 2, 255 }, rendered.bytes);
+                try std.testing.expectEqual(@as(usize, 16), rendered.bytes.len);
+                for ([_]f32{ 2.0 / 255.0, 3.0 / 255.0, 4.0 / 255.0, 1.0 }, 0..) |expected, channel| {
+                    const actual: f32 = @bitCast(std.mem.readInt(u32, rendered.bytes[channel * 4 ..][0..4], .little));
+                    try std.testing.expectEqual(expected, actual);
+                }
                 try std.testing.expectEqual(@as(u32, 3), sample.destination.width);
                 try std.testing.expectEqual(@as(u32, 2), sample.destination.height);
             }

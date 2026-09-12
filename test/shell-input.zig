@@ -2807,7 +2807,9 @@ fn runInitialToplevelScale(transmit_byte_budget: usize, shadow: bool) !void {
     defer fixture.deinit();
     fixture.second_desktop = true;
     var root_config = physical_fixture.compositorConfig();
-    root_config.runtime.actor.transmit_byte_budget = transmit_byte_budget;
+    // wl_shm.bind reserves its format events as one batch. Keep the small
+    // backpressure case large enough for this mandatory advertisement.
+    root_config.runtime.actor.transmit_byte_budget = @max(transmit_byte_budget, ouro.core_surface.shm_formats.len * 12);
     const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), root_config);
     var config = physical_fixture.coordinatorConfig();
     config.surface.surface_capacity = 2;

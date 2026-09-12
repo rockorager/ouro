@@ -71,7 +71,7 @@ pub const Frame = struct {
     output: render.Size,
     output_transform: render.Transform = .normal,
     output_format: render.PixelFormat,
-    output_color_description: render.color.Description = .srgb,
+    output_color_description: render.color.Description = .desktop,
     output_lut_slot: ?u32 = null,
     clear: render.Color,
     samples: []const Sample,

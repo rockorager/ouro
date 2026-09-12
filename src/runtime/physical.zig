@@ -4812,12 +4812,12 @@ pub fn Coordinator(comptime protocol: type) type {
                 break :blk self.physicalOutputForProtocolId(output_id) orelse return null;
             } else if (surface) |resource| blk: {
                 const output_id = self.output_adapter.firstOutputForSurface(peer, resource) orelse
-                    return .{ .description = .srgb };
+                    return .{ .description = .desktop };
                 break :blk self.physicalOutputForProtocolId(output_id) orelse
-                    return .{ .description = .srgb };
+                    return .{ .description = .desktop };
             } else return null;
             const profile = physical.output_profile orelse return .{
-                .description = .srgb,
+                .description = if (physical.kms_output) |kms_output| kms_output.output_color_description else .desktop,
             };
             _ = profile.retain();
             var description = render.color.Description.srgb;
