@@ -868,13 +868,32 @@ other GPU clients can make pooled medians misleading. The ordinary test run
 also checks multi-texture indexing, clipping, exact affine mappings, multiple
 damage rectangles, and timestamp replay against independently expected pixels.
 
-Vulkan screenshots export 8-bit sRGB from the linear composition, before the
-monitor's HDR or ICC encoding. SDR white and colors are preserved on HDR
-outputs; highlights above SDR white and out-of-gamut colors are clipped.
-Capture redraws the full output, including unchanged regions, but does not
-change its display encoding. The same offscreen check covers PQ/HLG capture,
-cursor phases, and 8-bit image export; add `--capture-hdr hdr.png` for a visual
-comparison of the old raw HDR readback and the sRGB capture.
+Raw Wayland screenshots use SDR **sRGB primaries with gamma22**, matching
+Ouro's untagged desktop, independently of monitor HDR/ICC encoding. Neither
+[wlr-screencopy v3](https://gitlab.freedesktop.org/wlroots/wlr-protocols/-/blob/master/unstable/wlr-screencopy-unstable-v1.xml)
+nor [ext-image-copy-capture v1](https://gitlab.freedesktop.org/wayland/wayland-protocols/-/blob/main/staging/ext-image-copy-capture/ext-image-copy-capture-v1.xml)
+communicates a capture color description. ARGB/XRGB describe layout, not
+transfer functions. Output color descriptions are not capture descriptions.
+This is an Ouro-specific raw-byte contract, not a portable Wayland guarantee.
+Ordinary SDR desktop -> raw capture -> untagged desktop preserves bytes;
+piecewise-sRGB bytes instead darken this round trip, especially in shadows.
+
+Color-managed export is separate. The internal Vulkan capture API can request
+piecewise sRGB, but its caller must communicate that interpretation. Raw
+gamma22 bytes must be converted before tagging an image/video as sRGB, or
+accompanied by accurate gamma22 metadata where the file format supports it.
+In ouroshot, `shot_png_fd` omits metadata, simplified-libpng `shot_png` assumes
+sRGB, and video declares IEC61966-2-1. Those consumers need a companion change
+to select the source interpretation and convert/tag appropriately; they cannot
+discover it from these capture protocols. No ouroshot code is changed here.
+
+Capture redraws the full output, including unchanged regions, without changing
+display encoding. Export remains 8-bit SDR; above-white and out-of-gamut values
+are currently clipped, **not tone mapped**. HDR input acceptance is not complete
+HDR capture support. The offscreen checks cover monitor-independent capture,
+cursor phases and image export. `--capture-roundtrip roundtrip.png` compares
+raw identity, explicitly managed redisplay and the incorrect interpretation.
+`--capture-hdr hdr.png` exercises explicitly sRGB export from PQ/HLG composition.
 
 `pacing-work` subdivides candidate application and active-source release using
 the same peer/object/surface/commit identity. Its `stage` boundaries cover:

@@ -50,6 +50,9 @@ pub const Sample = extern struct {
 };
 
 pub const CapturePhase = enum { before_cursor, after_cursor };
+/// Wayland raw captures use the untagged desktop interpretation. An internal
+/// exporter may explicitly request sRGB, but must communicate that encoding.
+pub const CaptureEncoding = enum(u32) { srgb = 0, desktop_gamma22 = 2 };
 
 pub const Captures = packed struct(u2) {
     before_cursor: bool = false,
@@ -57,9 +60,10 @@ pub const Captures = packed struct(u2) {
 };
 
 pub const Readback = struct {
-    /// sRGB-encoded 8-bit B, G, R, A/X bytes, independent of scanout encoding.
+    /// 8-bit B, G, R, A/X bytes, independent of scanout encoding.
     bytes: []const u8,
     stride: u32,
+    encoding: CaptureEncoding = .desktop_gamma22,
 };
 
 pub const CaptureDestination = struct {
@@ -80,6 +84,7 @@ pub const Frame = struct {
     render_damage: []const render.Rect,
     cursor_start: usize = 0,
     captures: Captures = .{},
+    capture_encoding: CaptureEncoding = .desktop_gamma22,
     capture_destination: ?CaptureDestination = null,
     /// Internal linear working-space to sRGB transform. Row 0's w selects
     /// the capture phases written by a compositor pass (1 = before, 2 = after).
@@ -980,6 +985,7 @@ const RealTarget = struct {
     readback_maps: [2]*anyopaque,
     readback_size: usize,
     captured: Captures = .{},
+    capture_encoding: CaptureEncoding = .desktop_gamma22,
     recorded_sampled_frame: RecordedSampledFrame = .{},
     gpu_trace: GpuTrace,
 };
@@ -2949,11 +2955,12 @@ fn realReadback(_: *anyopaque, renderer: Renderer, target_value: Target, phase: 
     return .{
         .bytes = readbackBytes(target, phase),
         .stride = try captureStride(target.width),
+        .encoding = target.capture_encoding,
     };
 }
 
 /// Called only after the submission fence signals. The compositor shader
-/// writes sRGB BGRA directly, before the output's HDR/ICC encoding.
+/// writes capture BGRA directly, before the output's HDR/ICC encoding.
 fn readbackBytes(target: *RealTarget, phase: CapturePhase) []const u8 {
     const index = @intFromEnum(phase);
     return @as([*]u8, @ptrCast(target.readback_maps[index]))[0..target.readback_size];
@@ -3568,6 +3575,7 @@ fn captureFrame(input: Frame, full_damage: []const render.Rect) !Frame {
         for (0..3) |column|
             frame.capture_color[row][column] = transform.matrix[row][column] * transform.luminance_scale;
     }
+    frame.capture_color[1][3] = @floatFromInt(@intFromEnum(frame.capture_encoding));
     return frame;
 }
 
@@ -3758,6 +3766,7 @@ fn realDraw(_: *anyopaque, renderer: Renderer, target_value: Target, input: Fram
     target.state = .in_flight;
     target.initialized_layout = true;
     target.captured = frame.captures;
+    target.capture_encoding = frame.capture_encoding;
     var fd_info: c.VkSemaphoreGetFdInfoKHR = .{ .sType = c.VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR, .pNext = null, .semaphore = target.semaphore, .handleType = c.VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT };
     var completion_fd: c_int = -1;
     if (self.get_semaphore_fd.?(self.device, &fd_info, &completion_fd) != c.VK_SUCCESS or completion_fd < 0) {
@@ -4989,6 +4998,7 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
     target.initialized_layout = true;
     if (has_blur) target.blur_initialized_layout = true;
     target.captured = frame.captures;
+    target.capture_encoding = frame.capture_encoding;
     std.debug.assert(target.content_lease_count == 0);
     @memcpy(target.content_leases[0..content_token_count], content_tokens[0..content_token_count]);
     target.content_lease_count = content_token_count;
@@ -5963,6 +5973,10 @@ test "render-vulkan: capture converts the HDR working space without changing sca
     const frame = try captureFrame(input, &full);
     try std.testing.expectEqualSlices(render.Rect, &full, frame.render_damage);
     try std.testing.expectEqualDeep(hdr, frame.output_color_description);
+    try std.testing.expectEqual(@as(f32, 2), frame.capture_color[1][3]);
+    var managed = input;
+    managed.capture_encoding = .srgb;
+    try std.testing.expectEqual(@as(f32, 0), (try captureFrame(managed, &full)).capture_color[1][3]);
     try std.testing.expectEqual(@as(f32, 1), capturePassFrame(frame, 1).capture_color[0][3]);
     try std.testing.expectEqual(@as(f32, 2), capturePassFrame(frame, 2).capture_color[0][3]);
     input.cursor_start = 2;

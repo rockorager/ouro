@@ -75,7 +75,7 @@ class Renderer:
                capture_phases=None, continuation=False, capture_sequence=False, copy_capture=False,
                timings=None, scene=None, damage=None, timing_repeats=1,
                source_format=0, source_stride=None, raw_output=False, output_reference=80,
-               video_planes=None, representation=0):
+               video_planes=None, representation=0, capture_transfer=0):
         d = self.device
         sw, sh = source_size
         w, h = size
@@ -206,7 +206,7 @@ class Renderer:
                      10: (v.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1),
                      11: (v.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1)}
             if texture:
-                types.update({3: (v.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 96),
+                types.update({3: (v.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 96 if video_planes else 32),
                               5: (v.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1),
                               6: (v.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1)})
             else:
@@ -227,7 +227,7 @@ class Renderer:
                     args = dict(pBufferInfo=[v.VkDescriptorBufferInfo(buffer=buf[0], offset=0, range=buf[2])])
                 else:
                     views = ([target_view] if b == 0 else [linear_view] if b == 5 else
-                             [view for _, view in source_images] + [source_images[0][1]] * (96 - len(layers)))
+                             [view for _, view in source_images] + [source_images[0][1]] * (n - len(layers)))
                     if b == 3 and video_planes:
                         views = [source_images[0][1]] * 96
                         for plane, (_, view) in enumerate(source_images):
@@ -308,7 +308,7 @@ class Renderer:
                         int(background_alpha == 255), count, *rect, output_transfer,
                         struct.unpack("<I", struct.pack("<f", output_reference))[0], 0, 0,
                         *capture_matrix[:3], phases or 0,
-                        *capture_matrix[3:6], 0, *capture_matrix[6:], 0)
+                        *capture_matrix[3:6], capture_transfer, *capture_matrix[6:], 0)
                     v.vkCmdPushConstants(cmd, pl, v.VK_SHADER_STAGE_COMPUTE_BIT, 0, 112, v.ffi.from_buffer(push))
                     v.vkCmdDispatch(cmd, (rect[2] + 7) // 8, (rect[3] + 7) // 8, 1)
             if capture_sequence:
@@ -521,6 +521,42 @@ def test_desktop_color(renderer, capture_path):
     if capture_path:
         sheet.save(capture_path.with_stem(capture_path.stem + "-gamma22"))
     print(f"Desktop color: {renderer.draw_count - start} draws passed (gamma22, explicit sRGB, reference-independent PQ)")
+
+
+def test_capture_roundtrip(renderer, capture_path):
+    start = renderer.draw_count
+    # Asymmetric low-light desktop RGB. Capture protocols carry no color tag.
+    pixels = bytes(c for x in range(65) for c in (x, x * 2, x * 3, 255))
+    def srgb_encode(linear):
+        return 12.92 * linear if linear <= .0031308 else 1.055 * linear ** (1 / 2.4) - .055
+    def srgb_decode(electrical):
+        return electrical / 12.92 if electrical <= .04045 else ((electrical + .055) / 1.055) ** 2.4
+    managed_expected = bytes(255 if i % 4 == 3 else round(255 * srgb_encode((n / 255) ** 2.2)) for i, n in enumerate(pixels))
+    for mode in ("buffer", "texture", "texture-buffer"):
+        original, raw, _ = renderer.render(pixels, (65, 1), (65, 1), mode,
+            source_transfer=2, output_transfer=2, capture_phases=1, capture_transfer=2)
+        assert raw == pixels and original == pixels, mode
+        redisplay = renderer.render(raw, (65, 1), (65, 1), mode, source_transfer=2, output_transfer=2)
+        assert redisplay == original, mode
+        _, managed, _ = renderer.render(pixels, (65, 1), (65, 1), mode,
+            source_transfer=2, output_transfer=2, capture_phases=1, capture_transfer=0)
+        assert max(abs(a - b) for a, b in zip(managed, managed_expected)) <= 1
+        tagged = renderer.render(managed, (65, 1), (65, 1), mode, source_transfer=0, output_transfer=2)
+        want = bytes(255 if i % 4 == 3 else round(255 * srgb_decode(n / 255) ** (1 / 2.2)) for i, n in enumerate(managed))
+        assert max(abs(a - b) for a, b in zip(tagged, want)) <= 1
+        wrong = renderer.render(managed, (65, 1), (65, 1), mode, source_transfer=2, output_transfer=2)
+        assert abs(tagged[64] - 16) <= 1 and wrong[64] == 7, (mode, tagged[64], wrong[64])
+    if capture_path:
+        sheet = Image.new("RGB", (720, 400), "#202020")
+        draw = ImageDraw.Draw(sheet)
+        for row, (label, data) in enumerate((("Desktop original", original), ("Raw gamma22 capture -> untagged desktop (exact)", redisplay),
+                ("Managed sRGB capture -> explicitly sRGB surface", tagged), ("Incorrect: sRGB bytes -> untagged gamma22 (darker)", wrong))):
+            draw.text((12, 10 + row * 100), label, fill="white")
+            # Encode the review image itself as sRGB for browser viewing.
+            preview = bytes(255 if i % 4 == 3 else round(255 * srgb_encode((n / 255) ** 2.2)) for i, n in enumerate(data))
+            sheet.paste(Image.frombytes("RGBA", (65, 1), preview, "raw", "BGRA").resize((696, 60)), (12, 30 + row * 100))
+        sheet.save(capture_path)
+    print(f"Capture round trip: {renderer.draw_count - start} draws passed (exact raw low-light identity, explicit sRGB, rejected interpretation)")
 
 
 def test_video(renderer, capture_path):
@@ -1002,6 +1038,7 @@ if __name__ == "__main__":
     parser.add_argument("--capture-hdr", type=Path)
     parser.add_argument("--capture-shm", type=Path)
     parser.add_argument("--capture-video", type=Path)
+    parser.add_argument("--capture-roundtrip", type=Path)
     parser.add_argument("--capture-surface", type=Path, nargs=2, metavar=("SOURCE_2X", "OUTPUT"))
     parser.add_argument("--compare-shader-dir", type=Path)
     parser.add_argument("--benchmark", action="store_true", help="time UHD sampled-composition filter variants offscreen")
@@ -1017,6 +1054,7 @@ if __name__ == "__main__":
         test_shm(renderer, args.capture_shm)
         test_modern_rgb(renderer, args.capture_shm)
         test_desktop_color(renderer, args.capture_shm)
+        test_capture_roundtrip(renderer, args.capture_roundtrip)
         test_video(renderer, args.capture_video)
         if args.benchmark_stall:
             benchmark_stall(renderer)
