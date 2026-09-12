@@ -12,7 +12,18 @@ void capture_pixel(ivec2 pixel, vec4 color) {
                           frame.capture_color[1].xyz,
                           frame.capture_color[2].xyz);
     vec3 straight = transpose(transform) * color.rgb / max(color.a, 0.000001);
-    // SDR captures clip out-of-gamut colors and highlights above SDR white.
+    if (frame.capture_color[2].w != 0.0) {
+        // Simple SDR shoulder, not an HDR mastering transform. Keep shadows
+        // through 0.5 unchanged; compress the maximum RGB component towards
+        // one and scale all channels together to retain their ratios. SDR
+        // reference white maps to 0.75, leaving headroom for HDR highlights.
+        float peak = max(max(straight.r, straight.g), straight.b);
+        if (peak > 0.5) {
+            float shoulder = 0.5 + (peak - 0.5) / (1.0 + 2.0 * (peak - 0.5));
+            straight *= shoulder / peak;
+        }
+    }
+    // Negative out-of-gamut values still clip at SDR export.
     vec3 encoded = clamp(encode_transfer(straight, uint(frame.capture_color[1].w)), 0.0, 1.0) * color.a;
     uint packed = packUnorm4x8(vec4(encoded.bgr, color.a));
     uint offset = uint(pixel.y) * frame.output_info.x + uint(pixel.x);

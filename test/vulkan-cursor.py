@@ -75,7 +75,7 @@ class Renderer:
                capture_phases=None, continuation=False, capture_sequence=False, copy_capture=False,
                timings=None, scene=None, damage=None, timing_repeats=1,
                source_format=0, source_stride=None, raw_output=False, output_reference=80,
-               video_planes=None, representation=0, capture_transfer=0):
+               video_planes=None, representation=0, capture_transfer=0, capture_shoulder=False):
         d = self.device
         sw, sh = source_size
         w, h = size
@@ -308,7 +308,7 @@ class Renderer:
                         int(background_alpha == 255), count, *rect, output_transfer,
                         struct.unpack("<I", struct.pack("<f", output_reference))[0], 0, 0,
                         *capture_matrix[:3], phases or 0,
-                        *capture_matrix[3:6], capture_transfer, *capture_matrix[6:], 0)
+                        *capture_matrix[3:6], capture_transfer, *capture_matrix[6:], int(capture_shoulder))
                     v.vkCmdPushConstants(cmd, pl, v.VK_SHADER_STAGE_COMPUTE_BIT, 0, 112, v.ffi.from_buffer(push))
                     v.vkCmdDispatch(cmd, (rect[2] + 7) // 8, (rect[3] + 7) // 8, 1)
             if capture_sequence:
@@ -557,6 +557,40 @@ def test_capture_roundtrip(renderer, capture_path):
             sheet.paste(Image.frombytes("RGBA", (65, 1), preview, "raw", "BGRA").resize((696, 60)), (12, 30 + row * 100))
         sheet.save(capture_path)
     print(f"Capture round trip: {renderer.draw_count - start} draws passed (exact raw low-light identity, explicit sRGB, rejected interpretation)")
+
+
+def test_capture_shoulder(renderer, capture_path):
+    start = renderer.draw_count
+    # Independent evaluated points: shadow, knee, reference white, 2x and 4x.
+    peaks = (1 / 1024, .5, 1, 2, 4)
+    mapped = (1 / 1024, .5, .75, .875, .9375)
+    for mode in ("buffer", "texture", "texture-buffer"):
+        for alpha in (1, .25):
+            pixels = b"".join(struct.pack("<4e", peak, peak / 4, peak / 16, alpha) for peak in peaks)
+            args = dict(source_format=10, source_transfer=1, alpha_mode=2, output_transfer=2,
+                        background_alpha=0, capture_phases=3, capture_transfer=2, copy_capture=True)
+            original, clipped, _ = renderer.render(pixels, (5, 1), (5, 1), mode, **args)
+            output, before, after = renderer.render(pixels, (5, 1), (5, 1), mode, capture_shoulder=True, **args)
+            expected = bytes(c for peak in mapped for c in
+                (*(round(255 * alpha * (peak * ratio) ** (1 / 2.2)) for ratio in (1 / 16, 1 / 4, 1)), round(255 * alpha)))
+            assert output == original and before == after
+            assert max(abs(a - b) for a, b in zip(before, expected)) <= 1, (mode, before, expected)
+            assert before[:8] == clipped[:8], "shoulder must preserve shadows and knee"
+            assert before[10] < before[14] < before[18], "above-white detail must not clip"
+            if capture_path and mode == "texture" and alpha == 1:
+                sheet = Image.new("RGB", (720, 220), "#202020")
+                draw = ImageDraw.Draw(sheet)
+                for row, (label, data) in enumerate((("Clipped SDR: shadow / knee / white / 2x / 4x", clipped),
+                                                     ("SDR shoulder: shadows unchanged, highlight detail retained", before))):
+                    draw.text((12, row * 110 + 10), label, fill="white")
+                    preview = []
+                    for i, n in enumerate(data):
+                        linear = (n / 255) ** 2.2
+                        encoded = 12.92 * linear if linear <= .0031308 else 1.055 * linear ** (1 / 2.4) - .055
+                        preview.append(255 if i % 4 == 3 else round(255 * encoded))
+                    sheet.paste(Image.frombytes("RGBA", (5, 1), bytes(preview), "raw", "BGRA").resize((696, 60), Image.Resampling.NEAREST), (12, row * 110 + 35))
+                sheet.save(capture_path.with_stem(capture_path.stem + "-shoulder"))
+    print(f"SDR shoulder: {renderer.draw_count - start} draws passed (HDR detail, low light, alpha, image export, unchanged display)")
 
 
 def test_video(renderer, capture_path):
@@ -1055,6 +1089,7 @@ if __name__ == "__main__":
         test_modern_rgb(renderer, args.capture_shm)
         test_desktop_color(renderer, args.capture_shm)
         test_capture_roundtrip(renderer, args.capture_roundtrip)
+        test_capture_shoulder(renderer, args.capture_roundtrip)
         test_video(renderer, args.capture_video)
         if args.benchmark_stall:
             benchmark_stall(renderer)

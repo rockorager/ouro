@@ -888,9 +888,15 @@ to select the source interpretation and convert/tag appropriately; they cannot
 discover it from these capture protocols. No ouroshot code is changed here.
 
 Capture redraws the full output, including unchanged regions, without changing
-display encoding. Export remains 8-bit SDR; above-white and out-of-gamut values
-are currently clipped, **not tone mapped**. HDR input acceptance is not complete
-HDR capture support. The offscreen checks cover monitor-independent capture,
+display encoding. Export remains 8-bit SDR. Declared PQ/HLG or above-reference
+source luminance enables a simple SDR shoulder: maximum linear RGB `p` stays
+unchanged through 0.5, then maps to `1 - 1/(4p)`; RGB is scaled together to
+retain channel ratios. Reference white maps to 0.75, leaving highlight headroom.
+This is a fixed scene-wide policy, not content-adaptive HDR mastering. Negative
+out-of-gamut values still clip. Untagged out-of-range inputs are not inferred to
+be HDR from their format; those highlights still clip. The output's HDR mode
+alone does not enable the shoulder. HDR input acceptance is not complete HDR
+capture support. The offscreen checks cover monitor-independent capture,
 cursor phases and image export. `--capture-roundtrip roundtrip.png` compares
 raw identity, explicitly managed redisplay and the incorrect interpretation.
 `--capture-hdr hdr.png` exercises explicitly sRGB export from PQ/HLG composition.
