@@ -151,9 +151,10 @@ fn copyCaptureRegion(
     source: output_api.CaptureReadback,
     output: render.Size,
 ) !void {
-    const destination_row_bytes = try std.math.mul(usize, destination_width, 4);
+    const bpp = source.pixel_bytes;
+    const destination_row_bytes = try std.math.mul(usize, destination_width, bpp);
     const destination_required = try std.math.mul(usize, destination_stride, destination_height);
-    const source_row_bytes = try std.math.mul(usize, output.width, 4);
+    const source_row_bytes = try std.math.mul(usize, output.width, bpp);
     const source_required = try std.math.mul(usize, source.stride, output.height);
     if (destination_stride < destination_row_bytes or destination.len < destination_required or
         source.stride < source_row_bytes or source.bytes.len < source_required)
@@ -170,10 +171,10 @@ fn copyCaptureRegion(
     else
         0;
     const copy_bytes: usize = if (has_columns)
-        @intCast((source_right - source_left) * 4)
+        @intCast((source_right - source_left) * bpp)
     else
         0;
-    const prefix_bytes = destination_x * 4;
+    const prefix_bytes = destination_x * bpp;
     if (prefix_bytes + copy_bytes > destination_row_bytes)
         return error.CaptureCapacityExceeded;
 
@@ -188,7 +189,7 @@ fn copyCaptureRegion(
         const source_start = try std.math.add(
             usize,
             try std.math.mul(usize, @intCast(source_y), source.stride),
-            @as(usize, @intCast(source_left)) * 4,
+            @as(usize, @intCast(source_left)) * bpp,
         );
         if (source_start + copy_bytes > source.bytes.len)
             return error.CaptureCapacityExceeded;
@@ -309,10 +310,11 @@ fn copyTransformedCaptureRegion(
         source,
         output,
     );
-    const destination_row_bytes = try std.math.mul(usize, destination_width, 4);
+    const bpp = source.pixel_bytes;
+    const destination_row_bytes = try std.math.mul(usize, destination_width, bpp);
     const destination_required = try std.math.mul(usize, destination_stride, destination_height);
     const physical = transformedCaptureSize(output, transform);
-    const source_row_bytes = try std.math.mul(usize, physical.width, 4);
+    const source_row_bytes = try std.math.mul(usize, physical.width, bpp);
     const source_required = try std.math.mul(usize, source.stride, physical.height);
     if (destination_stride < destination_row_bytes or destination.len < destination_required or
         source.stride < source_row_bytes or source.bytes.len < source_required)
@@ -323,7 +325,7 @@ fn copyTransformedCaptureRegion(
         const destination_row = destination[destination_start..][0..destination_row_bytes];
         const logical_y = @as(i64, region.y) + @as(i64, @intCast(destination_y));
         for (0..destination_width) |destination_x| {
-            const destination_pixel = destination_row[destination_x * 4 ..][0..4];
+            const destination_pixel = destination_row[destination_x * bpp ..][0..bpp];
             const logical_x = @as(i64, region.x) + @as(i64, @intCast(destination_x));
             if (logical_x < 0 or logical_y < 0 or
                 logical_x >= output.width or logical_y >= output.height)
@@ -340,11 +342,11 @@ fn copyTransformedCaptureRegion(
             const source_start = try std.math.add(
                 usize,
                 try std.math.mul(usize, source_pixel[1], source.stride),
-                @as(usize, source_pixel[0]) * 4,
+                @as(usize, source_pixel[0]) * bpp,
             );
-            if (source_start + 4 > source.bytes.len)
+            if (source_start + bpp > source.bytes.len)
                 return error.CaptureCapacityExceeded;
-            @memcpy(destination_pixel, source.bytes[source_start..][0..4]);
+            @memcpy(destination_pixel, source.bytes[source_start..][0..bpp]);
         }
     }
 }
@@ -592,6 +594,7 @@ pub fn Coordinator(comptime protocol: type) type {
             full_stride: u32,
             overlay_cursor: bool,
             transform_to_upright: bool,
+            high_precision: bool = false,
             awaiting_output: bool = false,
             copied: bool = false,
             success: bool = false,
@@ -5636,6 +5639,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     .output => |id| if (self.physicalOutputForKmsId(id)) |physical| .{
                         .width = physical.kms_output.?.planner.physical_output.width,
                         .height = physical.kms_output.?.planner.physical_output.height,
+                        .high_precision = self.output_config.renderer == .vulkan and physical.kms_output.?.supportsPreciseCapture(),
                         .transform = @intFromEnum(
                             physical.kms_output.?.planner.output_transform,
                         ),
@@ -10241,6 +10245,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     .token = pending.token,
                     .cursor_start = cursor_start,
                     .overlay_cursor = pending.overlay_cursor,
+                    .high_precision = pending.high_precision,
                     .destination = switch (pending.destination) {
                         .shm => .{ .shm = .{
                             .bytes = physical.capture_bytes.items,
@@ -11047,18 +11052,25 @@ pub fn Coordinator(comptime protocol: type) type {
                 },
             };
             const transform_to_upright = captureTransformToUpright(capture.target, output);
+            var high_precision = false;
             const destination: ImageCopyDestination = if (self.shm.bufferToken(object)) |token| shm: {
                 const info = self.shm.store.bufferInfo(token) catch {
                     try self.failImageCopy(capture);
                     return;
                 };
-                const stride = std.math.mul(u32, capture.width, 4) catch {
+                high_precision = info.format.value == protocol.wl_shm.format.abgr16161616.value;
+                const constraints = self.captureConstraints(capture.target) orelse {
+                    try self.failImageCopy(capture);
+                    return;
+                };
+                const stride = std.math.mul(u32, capture.width, if (high_precision) 8 else 4) catch {
                     try self.failImageCopy(capture);
                     return;
                 };
                 if (info.width != capture.width or info.height != capture.height or info.stride != stride or
                     (info.format.value != protocol.wl_shm.format.argb8888.value and
-                        info.format.value != protocol.wl_shm.format.xrgb8888.value))
+                        info.format.value != protocol.wl_shm.format.xrgb8888.value and !high_precision) or
+                    (high_precision and !constraints.high_precision))
                 {
                     try self.image_copy_capture_adapter.fail(capture.frame, .buffer_constraints);
                     self.markProtocol(capture.peer, ProtocolReady.image_copy_capture);
@@ -11136,6 +11148,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     .source => false,
                 },
                 .transform_to_upright = transform_to_upright,
+                .high_precision = high_precision,
             };
             if (!(requestPhysicalOutputDamage(physical, try monotonicNs()) catch false)) {
                 try self.finishImageCopy(physical, false, 0, null);
@@ -11247,6 +11260,16 @@ pub fn Coordinator(comptime protocol: type) type {
                 imported.* = null;
             };
             for (self.frame_samples[0..sample_count], 0..) |*sample, index| {
+                // Isolated toplevel capture currently uses the electrical
+                // Pixman path. Do not silently reinterpret managed/video
+                // content as desktop gamma22; full-output Vulkan capture is
+                // available for those sources until offscreen capture moves.
+                if (!std.meta.eql(sample.color_description, render.color.Description.desktop) or
+                    !std.meta.eql(sample.color_representation, render.color.Representation{}) or sample.source.format.isVideo())
+                {
+                    try self.failImageCopy(capture);
+                    return;
+                }
                 sample.destination.x = std.math.sub(i32, sample.destination.x, bounds.x) catch {
                     try self.failImageCopy(capture);
                     return;
@@ -11634,7 +11657,12 @@ pub fn Coordinator(comptime protocol: type) type {
             var access = try self.shm.store.writeAccess(pin);
             var ended = false;
             defer if (!ended) access.end() catch {};
-            const destination_stride = try std.math.mul(usize, pending.width, 4);
+            const source: output_api.CaptureReadback = if (pending.high_precision) .{
+                .bytes = readback.rgba16,
+                .stride = try std.math.mul(u32, readback.stride, 2),
+                .pixel_bytes = 8,
+            } else readback;
+            const destination_stride = try std.math.mul(usize, pending.width, source.pixel_bytes);
             const required = try std.math.mul(usize, destination_stride, pending.height);
             if (required > access.bytes.len) return error.CaptureCapacityExceeded;
             const physical = self.physicalOutputForKmsId(pending.output) orelse
@@ -11647,7 +11675,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     pending.width,
                     pending.height,
                     pending.region,
-                    readback,
+                    source,
                     output.planner.output,
                     output.planner.output_transform,
                 );
@@ -11658,7 +11686,7 @@ pub fn Coordinator(comptime protocol: type) type {
                     pending.width,
                     pending.height,
                     pending.region,
-                    readback,
+                    source,
                     output.planner.physical_output,
                 );
             }
@@ -15534,6 +15562,18 @@ test "physical: screencopy inverse maps every output transform" {
         );
         try std.testing.expectEqualSlices(u32, &expected, &destination);
     }
+}
+
+test "physical: capture preserves 64-bit pixels through rotation and padded stride" {
+    const pixels = [_]u64{ 0x0001000200030004, 0x0011002200330044, 0x0101020203030404, 0x1111222233334444, 0xaaaa1111bbbb2222, 0xcccc3333dddd4444 };
+    const poison: u64 = 0xefefefefefefefef;
+    const source = [_]u64{ pixels[1], pixels[3], pixels[5], poison, pixels[0], pixels[2], pixels[4], poison };
+    const expected = [_]u64{ pixels[0], pixels[1], poison, pixels[2], pixels[3], poison, pixels[4], pixels[5], poison };
+    var destination = [_]u64{poison} ** 9;
+    const readback: output_api.CaptureReadback = .{ .bytes = std.mem.sliceAsBytes(&source), .stride = 32, .pixel_bytes = 8 };
+    try copyTransformedCaptureRegion(std.mem.sliceAsBytes(&destination), 24, 2, 3, .{ .x = 0, .y = 0, .width = 2, .height = 3 }, readback, .{ .width = 2, .height = 3 }, .@"90");
+    try std.testing.expectEqualSlices(u64, &expected, &destination);
+    try std.testing.expectError(error.CaptureCapacityExceeded, copyTransformedCaptureRegion(std.mem.sliceAsBytes(&destination), 8, 2, 3, .{ .x = 0, .y = 0, .width = 2, .height = 3 }, readback, .{ .width = 2, .height = 3 }, .@"90"));
 }
 
 test "physical: window geometry origin alignment clamps hostile offsets" {

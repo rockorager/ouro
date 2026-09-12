@@ -12,7 +12,8 @@ void capture_pixel(ivec2 pixel, vec4 color) {
                           frame.capture_color[1].xyz,
                           frame.capture_color[2].xyz);
     vec3 straight = transpose(transform) * color.rgb / max(color.a, 0.000001);
-    if (frame.capture_color[2].w != 0.0) {
+    uint export_flags = uint(frame.capture_color[2].w);
+    if ((export_flags & 1u) != 0u) {
         // Simple SDR shoulder, not an HDR mastering transform. Keep shadows
         // through 0.5 unchanged; compress the maximum RGB component towards
         // one and scale all channels together to retain their ratios. SDR
@@ -27,6 +28,20 @@ void capture_pixel(ivec2 pixel, vec4 color) {
     vec3 encoded = clamp(encode_transfer(straight, uint(frame.capture_color[1].w)), 0.0, 1.0) * color.a;
     uint packed = packUnorm4x8(vec4(encoded.bgr, color.a));
     uint offset = uint(pixel.y) * frame.output_info.x + uint(pixel.x);
-    if ((phases & 1u) != 0u) capture_before[offset] = packed;
-    if ((phases & 2u) != 0u) capture_after[offset] = packed;
+    uint precise_offset = frame.output_info.x * frame.output_info.y + 2u * offset;
+    uvec2 packed16 = uvec2(packUnorm2x16(encoded.rg), packUnorm2x16(vec2(encoded.b, color.a)));
+    if ((phases & 1u) != 0u) {
+        capture_before[offset] = packed;
+        if ((export_flags & 2u) != 0u) {
+            capture_before[precise_offset] = packed16.x;
+            capture_before[precise_offset + 1u] = packed16.y;
+        }
+    }
+    if ((phases & 2u) != 0u) {
+        capture_after[offset] = packed;
+        if ((export_flags & 2u) != 0u) {
+            capture_after[precise_offset] = packed16.x;
+            capture_after[precise_offset + 1u] = packed16.y;
+        }
+    }
 }

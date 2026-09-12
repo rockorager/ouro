@@ -579,19 +579,21 @@ calibration is included when present. Auto and Pixman modes reject configured
 output profiles and do not advertise color-management behavior they cannot
 guarantee.
 
-SHM clients can use ARGB/XRGB/ABGR/XBGR8888, all four 2101010 variants,
+With `--renderer=vulkan`, SHM clients can use ARGB/XRGB/ABGR/XBGR8888, all four 2101010 variants,
 ABGR/XBGR16161616 (unsigned normalized integer), and ABGR/XBGR16161616F
 (half-float). X channels are opaque. Vulkan retains source precision in uploads
 and extended-range floating-point RGB through linear-light composition.
 Single-pixel u32 colors normalize directly to float, without an 8-bit step.
-Pixman uses native 10-bit sources and a float wrapper for 16-bit sources,
-without changing its non-color-managed policy. Vulkan also imports these RGB
+The early SHM global in auto/Pixman mode advertises only mandatory ARGB/XRGB8888:
+auto can fall back to non-color-managed electrical Pixman composition.
+Vulkan also imports these RGB
 DMA-BUF formats when the driver supports their exact format/modifier pair.
 Modifier memory planes (including compression metadata) retain their own
 offsets and strides. Shared allocations bind once; separate allocations require
 driver-supported disjoint binding. Acquire and completion fences cover every
-plane. Import support is independent of KMS scanout support. Capture remains 8-bit
-sRGB. `zig build test-shm` checks layout, precision, and generated-client
+plane. Import support is independent of KMS scanout support. Raw capture uses
+desktop gamma22, with optional 16-bit SDR output capture (see below).
+`zig build test-shm` checks layout, precision, and generated-client
 integration. `uv run --with vulkan --with pillow python test/vulkan-cursor.py
 --capture-shm shm.png` checks the SHM formats offscreen, including low linear
 values, alpha, padded strides, both shader paths, and 8/10-bit output.
@@ -888,7 +890,17 @@ to select the source interpretation and convert/tag appropriately; they cannot
 discover it from these capture protocols. No ouroshot code is changed here.
 
 Capture redraws the full output, including unchanged regions, without changing
-display encoding. Export remains 8-bit SDR. Declared PQ/HLG or above-reference
+display encoding. Existing clients retain 8-bit SDR. Ext-image-copy output
+sessions additionally advertise ABGR16161616 when explicitly using Vulkan and
+the output size fits the driver's storage-buffer limit. This is **16-bit SDR**,
+not HDR: both exports use the same raw gamma22 contract. The shader quantizes
+directly from linear composition to each export depth. The larger readback is
+allocated only for a 16-bit request; ordinary captures retain their existing
+memory requirement. Higher-precision DMA-BUF capture is not implemented.
+Isolated toplevel capture still uses Pixman; managed/video content fails that
+path rather than being silently reinterpreted. Use full-output capture for it.
+
+Declared PQ/HLG or above-reference
 source luminance enables a simple SDR shoulder: maximum linear RGB `p` stays
 unchanged through 0.5, then maps to `1 - 1/(4p)`; RGB is scaled together to
 retain channel ratios. Reference white maps to 0.75, leaving highlight headroom.

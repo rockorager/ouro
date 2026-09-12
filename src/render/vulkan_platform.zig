@@ -54,9 +54,10 @@ pub const CapturePhase = enum { before_cursor, after_cursor };
 /// exporter may explicitly request sRGB, but must communicate that encoding.
 pub const CaptureEncoding = enum(u32) { srgb = 0, desktop_gamma22 = 2 };
 
-pub const Captures = packed struct(u2) {
+pub const Captures = packed struct(u3) {
     before_cursor: bool = false,
     after_cursor: bool = false,
+    high_precision: bool = false,
 };
 
 pub const Readback = struct {
@@ -64,6 +65,8 @@ pub const Readback = struct {
     bytes: []const u8,
     stride: u32,
     encoding: CaptureEncoding = .desktop_gamma22,
+    /// Little-endian UNORM16 R,G,B,A, encoded independently before quantization.
+    rgba16: []const u8 = &.{},
 };
 
 pub const CaptureDestination = struct {
@@ -112,6 +115,7 @@ pub const Platform = struct {
         sampled_dmabuf_formats: *const fn (*anyopaque, Renderer, []gbm.FormatModifier) anyerror!usize,
         packs_sources: *const fn (*anyopaque, Renderer) bool,
         cache_lut: *const fn (*anyopaque, Renderer, *const icc.Lut) anyerror!u32,
+        supports_precise_capture: ?*const fn (*anyopaque, Renderer, render.Size) bool = null,
     };
 
     pub fn create(self: Platform, fd: std.posix.fd_t, config: Config) !Renderer {
@@ -180,6 +184,10 @@ pub const Platform = struct {
     pub fn cacheLut(self: Platform, renderer: Renderer, lut: *const icc.Lut) !u32 {
         return self.vtable.cache_lut(self.context, renderer, lut);
     }
+    pub fn supportsPreciseCapture(self: Platform, renderer: Renderer, size: render.Size) bool {
+        const supports = self.vtable.supports_precise_capture orelse return false;
+        return supports(self.context, renderer, size);
+    }
 };
 
 var real_context: u8 = 0;
@@ -202,6 +210,7 @@ const real_vtable: Platform.VTable = .{
     .sampled_dmabuf_formats = realSampledDmabufFormats,
     .packs_sources = realPacksSources,
     .cache_lut = realCacheLut,
+    .supports_precise_capture = realSupportsPreciseCapture,
 };
 
 const device_extensions = [_][*:0]const u8{
@@ -1659,6 +1668,14 @@ fn realSupportsTarget(_: *anyopaque, renderer: Renderer, allocation: gbm.Allocat
     return true;
 }
 
+fn realSupportsPreciseCapture(_: *anyopaque, renderer: Renderer, size: render.Size) bool {
+    const self: *RealRenderer = @ptrCast(@alignCast(renderer));
+    const bytes = std.math.mul(usize, captureByteCount(size.width, size.height) catch return false, 3) catch return false;
+    var properties: c.VkPhysicalDeviceProperties = undefined;
+    c.vkGetPhysicalDeviceProperties(self.physical_device, &properties);
+    return bytes != 0 and bytes <= properties.limits.maxStorageBufferRange;
+}
+
 fn realContentProvider(_: *anyopaque, renderer: Renderer) ?render_content.Provider {
     const self: *RealRenderer = @ptrCast(@alignCast(renderer));
     if (!self.sampled_enabled) return null;
@@ -2958,6 +2975,10 @@ fn realReadback(_: *anyopaque, renderer: Renderer, target_value: Target, phase: 
         .bytes = readbackBytes(target, phase),
         .stride = try captureStride(target.width),
         .encoding = target.capture_encoding,
+        .rgba16 = if (target.captured.high_precision)
+            @as([*]u8, @ptrCast(target.readback_maps[@intFromEnum(phase)]))[try captureByteCount(target.width, target.height)..target.readback_size]
+        else
+            &.{},
     };
 }
 
@@ -2965,7 +2986,7 @@ fn realReadback(_: *anyopaque, renderer: Renderer, target_value: Target, phase: 
 /// writes capture BGRA directly, before the output's HDR/ICC encoding.
 fn readbackBytes(target: *RealTarget, phase: CapturePhase) []const u8 {
     const index = @intFromEnum(phase);
-    return @as([*]u8, @ptrCast(target.readback_maps[index]))[0..target.readback_size];
+    return @as([*]u8, @ptrCast(target.readback_maps[index]))[0 .. @as(usize, target.width) * target.height * 4];
 }
 
 fn destroyTargetBatchResources(self: *RealRenderer, target: *RealTarget) void {
@@ -3590,6 +3611,7 @@ fn captureFrame(input: Frame, full_damage: []const render.Rect) !Frame {
             break;
         }
     }
+    if (input.captures.high_precision) frame.capture_color[2][3] += 2;
     return frame;
 }
 
@@ -5584,13 +5606,25 @@ fn captureStride(width: u32) !u32 {
 }
 
 fn captureByteCount(width: u32, height: u32) !usize {
-    return std.math.mul(usize, try captureStride(width), height) catch
+    const pixels = try std.math.mul(usize, width, height);
+    return std.math.mul(usize, pixels, 4) catch
         error.CaptureCapacityExceeded;
 }
 
 fn ensureReadbacks(self: *RealRenderer, target: *RealTarget, captures: Captures) !void {
     var changed = false;
     defer if (changed) updateCaptureDescriptors(self, target);
+    const needed = try std.math.mul(usize, try captureByteCount(target.width, target.height), if (captures.high_precision) 3 else 1);
+    if (needed != target.readback_size) {
+        // Submission completion was checked before reaching this point. Keep
+        // ordinary 8-bit captures at their original memory/range requirement.
+        for (target.readback_buffers, target.readback_memories) |buffer, memory|
+            if (buffer != null) destroyBuffer(self, buffer, memory);
+        target.readback_buffers = .{ null, null };
+        target.readback_memories = .{ null, null };
+        target.readback_size = needed;
+        changed = true;
+    }
     for ([_]CapturePhase{ .before_cursor, .after_cursor }) |phase| {
         const requested = switch (phase) {
             .before_cursor => captures.before_cursor,
@@ -5969,10 +6003,12 @@ test "render-vulkan: 10-bit DRM targets preserve packed channel order" {
 }
 
 test "render-vulkan: sRGB readbacks preserve bytes independently of scanout depth" {
-    var before = [_]u8{ 0, 128, 255, 255 };
-    var after = [_]u8{ 37, 37, 37, 128 };
+    var before = [_]u8{ 0, 128, 255, 255 } ++ [_]u8{0xcc} ** 8;
+    var after = [_]u8{ 37, 37, 37, 128 } ++ [_]u8{0xdd} ** 8;
     var target: RealTarget = undefined;
     target.readback_size = before.len;
+    target.width = 1;
+    target.height = 1;
     target.readback_maps = .{ &before, &after };
     for ([_]bool{ false, true }) |ten_bit| {
         target.ten_bit = ten_bit;
@@ -6014,6 +6050,8 @@ test "render-vulkan: capture converts the HDR working space without changing sca
     var managed = input;
     managed.capture_encoding = .srgb;
     try std.testing.expectEqual(@as(f32, 0), (try captureFrame(managed, &full)).capture_color[1][3]);
+    managed.captures.high_precision = true;
+    try std.testing.expectEqual(@as(f32, 2), (try captureFrame(managed, &full)).capture_color[2][3]);
     try std.testing.expectEqual(@as(f32, 1), capturePassFrame(frame, 1).capture_color[0][3]);
     try std.testing.expectEqual(@as(f32, 2), capturePassFrame(frame, 2).capture_color[0][3]);
     input.cursor_start = 2;

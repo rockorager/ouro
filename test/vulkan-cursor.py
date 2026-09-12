@@ -75,7 +75,8 @@ class Renderer:
                capture_phases=None, continuation=False, capture_sequence=False, copy_capture=False,
                timings=None, scene=None, damage=None, timing_repeats=1,
                source_format=0, source_stride=None, raw_output=False, output_reference=80,
-               video_planes=None, representation=0, capture_transfer=0, capture_shoulder=False, rgb_output=False):
+               video_planes=None, representation=0, capture_transfer=0, capture_shoulder=False, rgb_output=False,
+               capture16=False):
         d = self.device
         sw, sh = source_size
         w, h = size
@@ -178,7 +179,7 @@ class Renderer:
             source = buffer(b"".join(source_pixels), storage | v.VK_BUFFER_USAGE_TRANSFER_SRC_BIT)
             lut = buffer(bytes(16), storage)
             readback = buffer(bytes(w * h * 4), v.VK_BUFFER_USAGE_TRANSFER_DST_BIT)
-            captures = [buffer(bytes([37]) * (w * h * 4), storage | v.VK_BUFFER_USAGE_TRANSFER_SRC_BIT)
+            captures = [buffer(bytes([37]) * (w * h * (12 if capture16 else 4)), storage | v.VK_BUFFER_USAGE_TRANSFER_SRC_BIT)
                         for _ in range(2)]
             target, target_view = image(w, h, v.VK_FORMAT_A2B10G10R10_UNORM_PACK32 if ten_bit else v.VK_FORMAT_R8G8B8A8_UNORM,
                 v.VK_IMAGE_USAGE_STORAGE_BIT | v.VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
@@ -308,7 +309,7 @@ class Renderer:
                         int(background_alpha == 255) | (int(rgb_output) << 31), count, *rect, output_transfer,
                         struct.unpack("<I", struct.pack("<f", output_reference))[0], 0, 0,
                         *capture_matrix[:3], phases or 0,
-                        *capture_matrix[3:6], capture_transfer, *capture_matrix[6:], int(capture_shoulder))
+                        *capture_matrix[3:6], capture_transfer, *capture_matrix[6:], int(capture_shoulder) | (int(capture16) << 1))
                     v.vkCmdPushConstants(cmd, pl, v.VK_SHADER_STAGE_COMPUTE_BIT, 0, 112, v.ffi.from_buffer(push))
                     v.vkCmdDispatch(cmd, (rect[2] + 7) // 8, (rect[3] + 7) // 8, 1)
             if capture_sequence:
@@ -371,7 +372,7 @@ class Renderer:
                 captured = []
                 for buf in captures:
                     mapped = v.vkMapMemory(d, buf[1], 0, buf[2], 0)
-                    captured.append(bytes(mapped))
+                    captured.append(bytes(mapped)[w * h * 4:] if capture16 else bytes(mapped)[:w * h * 4])
                     v.vkUnmapMemory(d, buf[1])
                 if copy_capture:
                     mapped = v.vkMapMemory(d, copied_readback[1], 0, copied_readback[2], 0)
@@ -557,6 +558,24 @@ def test_capture_roundtrip(renderer, capture_path):
             sheet.paste(Image.frombytes("RGBA", (65, 1), preview, "raw", "BGRA").resize((696, 60)), (12, 30 + row * 100))
         sheet.save(capture_path)
     print(f"Capture round trip: {renderer.draw_count - start} draws passed (exact raw low-light identity, explicit sRGB, rejected interpretation)")
+
+
+def test_capture16(renderer):
+    start = renderer.draw_count
+    values = ((1, 7, 31, 65535), (31, 67, 127, 129), (129, 503, 9001, 32769), (12345, 23456, 34567, 65535))
+    pixels = b"".join(struct.pack("<8H", *values[2 * y], *values[2 * y + 1]) + bytes([0xcc]) * 8 for y in range(2))
+    expected = [component for r, g, b, a in values for component in
+                (*(round((c / 65535) ** (1 / 2.2) * a) for c in (r, g, b)), a)]
+    for mode in ("buffer", "texture", "texture-buffer"):
+        for ten_bit in (False, True):
+            _, before, after = renderer.render(pixels, (2, 2), (2, 2), mode,
+                source_format=2, source_stride=24, source_transfer=1, output_transfer=2, alpha_mode=2,
+                background_alpha=0, capture_transfer=2, capture_phases=3, capture16=True, ten_bit=ten_bit)
+            actual = struct.unpack("<16H", before)
+            assert max(abs(a - b) for a, b in zip(actual, expected)) <= 2, (mode, actual, expected)
+            assert actual[7] == 129 and before == after
+            assert actual[0] % 257 != 0, "capture must not be expanded from 8 bits"
+    print(f"RGBA16 capture: {renderer.draw_count - start} draws passed (low RGB/alpha, channel order, padded stride, 8/10-bit display)")
 
 
 def test_output_order(renderer):
@@ -1113,6 +1132,7 @@ if __name__ == "__main__":
         test_desktop_color(renderer, args.capture_shm)
         test_capture_roundtrip(renderer, args.capture_roundtrip)
         test_capture_shoulder(renderer, args.capture_roundtrip)
+        test_capture16(renderer)
         test_output_order(renderer)
         test_video(renderer, args.capture_video)
         if args.benchmark_stall:

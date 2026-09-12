@@ -120,6 +120,8 @@ pub const FrameOutcome = scheduler_api.FrameOutcome(render.PresentationIdentity)
 pub const CaptureReadback = struct {
     bytes: []const u8,
     stride: u32,
+    pixel_bytes: u8 = 4,
+    rgba16: []const u8 = &.{},
 };
 
 /// The protocol/runtime implementation must transactionally activate and queue
@@ -704,6 +706,7 @@ pub const CaptureRequest = struct {
     token: u64,
     cursor_start: usize,
     overlay_cursor: bool,
+    high_precision: bool = false,
     destination: union(enum) {
         shm: struct { bytes: []u8, stride: u32 },
         dmabuf: CaptureDmabuf,
@@ -1138,6 +1141,14 @@ pub const Output = struct {
         return self.render_device.rendererKind();
     }
 
+    pub fn supportsPreciseCapture(self: *const Output) bool {
+        const renderer = &(self.render_device.renderer orelse return false);
+        return switch (renderer.*) {
+            .pixman => false,
+            .vulkan => |*value| value.platform.supportsPreciseCapture(value.implementation, self.planner.physical_output),
+        };
+    }
+
     pub fn topologyHandle(self: *const Output) drm.Handle {
         return self.kms_output.snapshotHandle();
     }
@@ -1441,9 +1452,9 @@ pub const Output = struct {
                     break :vulkan_render;
                 const render_result = if (capture) |capture_request| capture_result: {
                     const captures: vulkan_platform.Captures = if (capture_request.overlay_cursor)
-                        .{ .after_cursor = true }
+                        .{ .after_cursor = true, .high_precision = capture_request.high_precision }
                     else
-                        .{ .before_cursor = true };
+                        .{ .before_cursor = true, .high_precision = capture_request.high_precision };
                     break :capture_result switch (capture_request.destination) {
                         .shm => value.renderCapture(
                             &self.vulkan_targets.?,
@@ -1767,7 +1778,7 @@ pub const Output = struct {
                             success = false;
                             break :vulkan_readback;
                         };
-                        readback = .{ .bytes = source.bytes, .stride = source.stride };
+                        readback = .{ .bytes = source.bytes, .stride = source.stride, .rgba16 = source.rgba16 };
                     },
                 }
             },
