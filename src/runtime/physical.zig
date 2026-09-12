@@ -11445,27 +11445,15 @@ pub fn Coordinator(comptime protocol: type) type {
 
         fn dmabufCaptureImport(buffer: *const protocol_linux_dmabuf.Buffer) !gbm.Import {
             const import = try dmabufImport(buffer);
-            if (import.modifier != gbm.modifier_linear)
+            if (import.modifier != gbm.modifier_linear or import.plane_count != 1 or
+                (import.format != gbm.format_argb8888 and import.format != gbm.format_xrgb8888 and
+                    import.format != gbm.format_abgr8888 and import.format != gbm.format_xbgr8888))
                 return error.UnsupportedCaptureTarget;
             return import;
         }
 
         fn dmabufImport(buffer: *const protocol_linux_dmabuf.Buffer) !gbm.Import {
-            if (buffer.plane_count != 1 or buffer.planes[0] == null or
-                (buffer.format != gbm.format_argb8888 and buffer.format != gbm.format_xrgb8888 and
-                    buffer.format != gbm.format_abgr8888 and buffer.format != gbm.format_xbgr8888))
-                return error.UnsupportedDmabuf;
-            const plane = buffer.planes[0].?;
-            return .{
-                .width = buffer.width,
-                .height = buffer.height,
-                .format = buffer.format,
-                .modifier = plane.modifier,
-                .plane_count = buffer.plane_count,
-                .fds = .{ plane.fd, -1, -1, -1 },
-                .strides = .{ plane.stride, 0, 0, 0 },
-                .offsets = .{ plane.offset, 0, 0, 0 },
-            };
+            return buffer.importDescriptor();
         }
 
         fn validateDmabufImport(

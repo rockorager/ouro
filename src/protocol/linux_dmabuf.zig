@@ -84,7 +84,54 @@ pub const Buffer = struct {
     flags: u32,
     planes: [max_planes]?Plane,
     plane_count: u8,
+
+    /// Preserve modifier memory planes, including auxiliary planes and shared
+    /// descriptors. The renderer, not the protocol bridge, validates importability.
+    pub fn importDescriptor(buffer: *const Buffer) Error!@import("../backend/gbm.zig").Import {
+        if (buffer.plane_count == 0 or buffer.plane_count > max_planes)
+            return error.Incomplete;
+        var result: @import("../backend/gbm.zig").Import = .{
+            .width = buffer.width,
+            .height = buffer.height,
+            .format = buffer.format,
+            .modifier = (buffer.planes[0] orelse return error.Incomplete).modifier,
+            .plane_count = buffer.plane_count,
+        };
+        for (buffer.planes[0..buffer.plane_count], 0..) |optional, i| {
+            const plane = optional orelse return error.Incomplete;
+            if (plane.modifier != result.modifier) return error.InvalidFormat;
+            result.fds[i] = plane.fd;
+            result.strides[i] = plane.stride;
+            result.offsets[i] = plane.offset;
+        }
+        return result;
+    }
 };
+
+test "linux-dmabuf: runtime import preserves memory planes without RGB restrictions" {
+    var buffer: Buffer = .{
+        .width = 7,
+        .height = 3,
+        .format = 0x30313050,
+        .flags = 0,
+        .plane_count = 3,
+        .planes = .{
+            .{ .fd = 17, .stride = 32, .offset = 128, .modifier = 99 },
+            .{ .fd = 17, .stride = 16, .offset = 224, .modifier = 99 },
+            .{ .fd = 23, .stride = 64, .offset = 4096, .modifier = 99 },
+            null,
+        },
+    };
+    const imported = try buffer.importDescriptor();
+    try std.testing.expectEqual(@as(u32, 0x30313050), imported.format);
+    try std.testing.expectEqualSlices(i32, &.{ 17, 17, 23, -1 }, &imported.fds);
+    try std.testing.expectEqualSlices(u32, &.{ 32, 16, 64, 0 }, &imported.strides);
+    try std.testing.expectEqualSlices(u32, &.{ 128, 224, 4096, 0 }, &imported.offsets);
+    buffer.planes[2].?.modifier = 100;
+    try std.testing.expectError(error.InvalidFormat, buffer.importDescriptor());
+    buffer.planes[2] = null;
+    try std.testing.expectError(error.Incomplete, buffer.importDescriptor());
+}
 
 pub const ImportValidator = struct {
     context: *anyopaque,

@@ -181,7 +181,10 @@ pub fn main(init: std.process.Init) !void {
             .limits = .{ .max_pool_bytes = 1024 * 1024 * 1024 },
             .pool_capacity = 64,
             .buffer_capacity = 64,
-            .formats = &shm_formats,
+            // The global predates device selection. Auto can fall back to
+            // Pixman's electrical 8-bit composition, so it must not promise
+            // the precision-preserving Vulkan formats before selection.
+            .formats = if (options.renderer == .vulkan) &shm_formats else shm_formats[0..2],
         },
         .surface = .{
             .surface_capacity = 16,
