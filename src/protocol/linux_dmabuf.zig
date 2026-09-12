@@ -142,6 +142,11 @@ pub const ImportValidator = struct {
     }
 };
 
+pub const ScanoutFeedback = struct {
+    context: *anyopaque,
+    supports_fn: *const fn (*anyopaque, wayring.io_uring.Peer, objects.Handle, Format) bool,
+};
+
 const ParamsSlot = struct {
     active: bool = false,
     generation: u32 = 1,
@@ -403,7 +408,7 @@ pub fn Adapter(comptime protocol: type) type {
             header: Header = .{},
             peer: wayring.io_uring.Peer = undefined,
             version: u32 = 0,
-            advertisement: u8 = 0,
+            advertisement: usize = 0,
         };
         const Pending = union(enum) {
             none,
@@ -426,6 +431,10 @@ pub fn Adapter(comptime protocol: type) type {
             peer: wayring.io_uring.Peer = undefined,
             version: u32 = 4,
             stage: u8 = 0,
+            surface: ?objects.Handle = null,
+            scanout_indices: []u16 = &.{},
+            scanout_count: usize = 0,
+            dirty: bool = false,
         };
         const FormatEntry = extern struct {
             format: u32,
@@ -447,6 +456,7 @@ pub fn Adapter(comptime protocol: type) type {
         format_table_fd: linux.fd_t,
         device: [@sizeOf(linux.dev_t)]u8 = undefined,
         import_validator: ?ImportValidator = null,
+        scanout_feedback: ?ScanoutFeedback = null,
         pending_len: usize = 0,
 
         pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
@@ -492,6 +502,7 @@ pub fn Adapter(comptime protocol: type) type {
             adapter.allocator.free(adapter.format_indices);
             adapter.allocator.free(adapter.format_entries);
             adapter.store.deinit();
+            for (adapter.feedback.entries.items) |slot| adapter.allocator.free(slot.scanout_indices);
             adapter.feedback.deinit();
             adapter.buffers.deinit();
             adapter.params.deinit();
@@ -540,6 +551,18 @@ pub fn Adapter(comptime protocol: type) type {
 
         pub fn setImportValidator(adapter: *Self, validator: ?ImportValidator) void {
             adapter.import_validator = validator;
+        }
+
+        /// Topology/placement changes refresh per-surface preferences. A
+        /// partially transmitted tranche keeps its snapshot through done.
+        pub fn refreshFeedback(adapter: *Self) void {
+            for (adapter.feedback.entries.items) |slot| {
+                if (!slot.header.active or slot.surface == null) continue;
+                if (slot.stage == feedbackStageCount(slot.version) + @as(u8, if (slot.scanout_count != 0) 4 else 0)) {
+                    slot.stage = 0;
+                    adapter.pending_len += 1;
+                } else slot.dirty = true;
+            }
         }
 
         fn bind(context: ?*anyopaque, binding: wayring.server.Binding) !?*anyopaque {
@@ -631,6 +654,7 @@ pub fn Adapter(comptime protocol: type) type {
                         const slot = adapter.acquireFeedback() catch return try adapter.noMemory(actor);
                         slot.peer = manager.peer;
                         slot.version = manager.version;
+                        slot.surface = surface_handle;
                         const admitted = Dmabuf.admit_get_surface_feedback(server_objects, decoded.handle, payload, .{ .id = slot }) catch |cause| {
                             adapter.feedback.release(slot);
                             return try adapter.failure(actor, decoded.handle.id, cause);
@@ -863,10 +887,34 @@ pub fn Adapter(comptime protocol: type) type {
             }
             for (adapter.feedback.entries.items) |slot| {
                 if (!slot.header.active or !samePeer(slot.peer, peer)) continue;
-                const stage_count = feedbackStageCount(slot.version);
+                if (slot.stage == 0) {
+                    slot.dirty = false;
+                    slot.scanout_count = 0;
+                    if (slot.surface) |surface| if (adapter.scanout_feedback) |provider| {
+                        if (slot.scanout_indices.len < adapter.format_entries.len)
+                            slot.scanout_indices = try adapter.allocator.realloc(slot.scanout_indices, adapter.format_entries.len);
+                        for (adapter.format_entries, 0..) |entry, index| {
+                            if (!provider.supports_fn(provider.context, peer, surface, .{ .fourcc = entry.format, .modifier = entry.modifier })) continue;
+                            slot.scanout_indices[slot.scanout_count] = @intCast(index);
+                            slot.scanout_count += 1;
+                        }
+                    };
+                }
+                const extra: u8 = if (slot.scanout_count != 0) 4 else 0;
+                const stage_count = feedbackStageCount(slot.version) + extra;
                 if (slot.stage >= stage_count) continue;
                 while (slot.stage < stage_count) {
-                    const event: Feedback.Event = if (slot.version >= 6) switch (slot.stage) {
+                    const start: u8 = if (slot.version >= 6) 1 else 2;
+                    const scanout = extra != 0 and slot.stage >= start and slot.stage < start + extra;
+                    const stage = if (slot.stage >= start + extra) slot.stage - extra else slot.stage;
+                    const event: Feedback.Event = if (scanout) switch (slot.stage - start) {
+                        0 => .{ .tranche_target_device = .{ .device = &adapter.device } },
+                        1 => .{ .tranche_flags = .{ .flags = .{ .value = Feedback.tranche_flags.scanout.value |
+                            (if (slot.version >= 6) Feedback.tranche_flags.sampling.value else 0) } } },
+                        2 => .{ .tranche_formats = .{ .indices = std.mem.sliceAsBytes(slot.scanout_indices[0..slot.scanout_count]) } },
+                        3 => .{ .tranche_done = .{} },
+                        else => unreachable,
+                    } else if (slot.version >= 6) switch (stage) {
                         0 => {
                             const duplicated = linux.fcntl(adapter.format_table_fd, linux.F.DUPFD_CLOEXEC, 0);
                             if (linux.errno(duplicated) != .SUCCESS) return error.SystemCallFailed;
@@ -888,7 +936,7 @@ pub fn Adapter(comptime protocol: type) type {
                         4 => .{ .tranche_done = .{} },
                         5 => .{ .done = .{} },
                         else => unreachable,
-                    } else switch (slot.stage) {
+                    } else switch (stage) {
                         0 => {
                             const duplicated = linux.fcntl(adapter.format_table_fd, linux.F.DUPFD_CLOEXEC, 0);
                             if (linux.errno(duplicated) != .SUCCESS) return error.SystemCallFailed;
@@ -919,7 +967,9 @@ pub fn Adapter(comptime protocol: type) type {
                     slot.stage += 1;
                     completed += 1;
                 }
-                adapter.pending_len -= 1;
+                if (slot.dirty) {
+                    slot.stage = 0;
+                } else adapter.pending_len -= 1;
             }
             return completed;
         }
@@ -941,7 +991,7 @@ pub fn Adapter(comptime protocol: type) type {
                     return true;
             for (adapter.feedback.entries.items) |slot|
                 if (slot.header.active and samePeer(slot.peer, peer) and
-                    slot.stage < feedbackStageCount(slot.version))
+                    slot.stage < feedbackStageCount(slot.version) + @as(u8, if (slot.scanout_count != 0) 4 else 0))
                     return true;
             return false;
         }
@@ -1044,7 +1094,8 @@ pub fn Adapter(comptime protocol: type) type {
             if (object.interface == &Feedback.info) {
                 const slot = adapter.feedback.fromContext(object.context) orelse return false;
                 if (!std.meta.eql(slot.header.resource, handle)) return false;
-                if (slot.stage < feedbackStageCount(slot.version)) adapter.pending_len -= 1;
+                if (slot.stage < feedbackStageCount(slot.version) + @as(u8, if (slot.scanout_count != 0) 4 else 0)) adapter.pending_len -= 1;
+                adapter.allocator.free(slot.scanout_indices);
                 adapter.feedback.release(slot);
                 return true;
             }
@@ -1094,6 +1145,9 @@ pub fn Adapter(comptime protocol: type) type {
                 return error.OutOfMemory;
             const slot = try adapter.feedback.acquire();
             slot.stage = 0;
+            slot.surface = null;
+            slot.scanout_count = 0;
+            slot.dirty = false;
             return slot;
         }
 
@@ -1573,6 +1627,86 @@ test "linux-dmabuf: version 6 feedback resumes with sampling tranche and no main
     const reused = try adapter.acquireFeedback();
     try std.testing.expect(reused == feedback);
     adapter.feedback.release(reused);
+}
+
+test "linux-dmabuf: scanout feedback keeps fallback and snapshots across backpressure" {
+    const protocol = @import("core_protocol");
+    const Provider = struct {
+        fn supports(context: *anyopaque, peer: wayring.io_uring.Peer, surface: objects.Handle, format: Format) bool {
+            const modifier: *u64 = @ptrCast(@alignCast(context));
+            return peer.slot == 9 and surface.id == 5 and format.modifier == modifier.*;
+        }
+    };
+    for ([_]u32{ 4, 6 }) |version| {
+        var modifier: u64 = 7;
+        var adapter = try Adapter(protocol).init(std.testing.allocator, .{ .formats = &.{
+            .{ .fourcc = drm_format_argb8888, .modifier = 0 },
+            .{ .fourcc = drm_format_xrgb8888, .modifier = 7 },
+            .{ .fourcc = drm_format_abgr8888, .modifier = 9 },
+        } });
+        defer adapter.deinit();
+        adapter.device = @splat(0);
+        adapter.scanout_feedback = .{ .context = &modifier, .supports_fn = Provider.supports };
+        var server_objects = try wayring.objects.ServerObjects.init(std.testing.allocator, 8, 4, &protocol.wl_display.info, null);
+        defer server_objects.deinit(std.testing.allocator);
+        var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 1024, 8);
+        defer blocks.deinit(std.testing.allocator);
+        var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 4);
+        defer descriptors.deinit(std.testing.allocator);
+        const peer: wayring.io_uring.Peer = .{ .slot = 9, .generation = 3 };
+        const feedback = try adapter.acquireFeedback();
+        feedback.peer = peer;
+        feedback.version = version;
+        feedback.surface = .{ .id = 5, .generation = 1 };
+        feedback.header.resource = try server_objects.insertClient(7, &protocol.zwp_linux_dmabuf_feedback_v1.info, 1, feedback);
+        adapter.pending_len += 1;
+        var partial = wayring.tx.Queue.init(&blocks, 20, &descriptors, 1);
+        defer partial.deinit();
+        try std.testing.expectEqual(@as(usize, 1), try adapter.flushOn(peer, &server_objects, &partial));
+        modifier = 9;
+        adapter.refreshFeedback();
+        for (0..2) |round| {
+            var queue = wayring.tx.Queue.init(&blocks, 1024, &descriptors, 1);
+            defer queue.deinit();
+            _ = try adapter.flushOn(peer, &server_objects, &queue);
+            var scratch: [1]linux.fd_t = undefined;
+            var control: [64]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+            const snapshot = try queue.snapshot(&scratch, &control);
+            var bytes = snapshot.first;
+            if (round == 1) {
+                // The queue owns this table FD. Remaining events carry none.
+                const table = (try wayring.wire.Message.decode(bytes)).?;
+                bytes = bytes[table.header.size..];
+            }
+            var fds = wayring.ancillary.FdQueue.init(&descriptors, 0);
+            defer fds.deinit();
+            var tranches: usize = 0;
+            var done = false;
+            while (bytes.len != 0) {
+                const message = (try wayring.wire.Message.decode(bytes)).?;
+                const event = try protocol.zwp_linux_dmabuf_feedback_v1.decodeEvent(message, &fds);
+                switch (event) {
+                    .tranche_flags => |value| try std.testing.expectEqual(@as(u32, if (tranches == 0) 1 else 0) |
+                        @as(u32, if (version == 6) 2 else 0), value.flags.value),
+                    .tranche_formats => |value| {
+                        const expected = [_]u16{@intCast(round + 1)};
+                        try std.testing.expectEqualSlices(u8, if (tranches == 0) std.mem.sliceAsBytes(&expected) else std.mem.sliceAsBytes(&[_]u16{ 0, 1, 2 }), value.indices);
+                        tranches += 1;
+                    },
+                    .done => done = true,
+                    else => {},
+                }
+                bytes = bytes[message.header.size..];
+            }
+            try std.testing.expectEqual(@as(usize, 2), tranches);
+            try std.testing.expect(done);
+            try std.testing.expectEqual(round == 0, adapter.pendingOutbound(peer));
+        }
+        adapter.refreshFeedback();
+        const object = server_objects.namespace.resolve(feedback.header.resource).?.*;
+        try std.testing.expect(adapter.resourceRemoved(feedback.header.resource, object));
+        try std.testing.expectEqual(@as(usize, 0), adapter.pending_len);
+    }
 }
 
 test "linux-dmabuf: async created event retains buffer across params teardown" {

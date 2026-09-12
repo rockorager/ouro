@@ -1651,6 +1651,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 .context = self,
                 .validate_fn = validateDmabufImport,
             });
+            self.dmabuf_adapter.scanout_feedback = .{ .context = self, .supports_fn = surfaceScanoutFormat };
             try self.adapter.setExternalImporter(self.dmabuf_adapter.externalImporter(Adapter));
             self.activation_adapter = try ActivationAdapter.init(
                 allocator,
@@ -11456,6 +11457,45 @@ pub fn Coordinator(comptime protocol: type) type {
             return buffer.importDescriptor();
         }
 
+        fn surfaceScanoutFormat(context: *anyopaque, peer: wayring.io_uring.Peer, surface: wayring.objects.Handle, format: protocol_linux_dmabuf.Format) bool {
+            const self: *Self = @ptrCast(@alignCast(context));
+            const pixel_format = render.PixelFormat.fromDrm(format.fourcc) orelse return false;
+            // Video still requires composition: KMS matrix/range/chroma
+            // properties are not programmed by this output implementation.
+            if (pixel_format.isVideo()) return false;
+            var latest: ?*Layer = null;
+            for (self.app_layers[0..self.app_layer_count]) |*layer| {
+                if (!layerHasOutputAssociation(layer) or !samePeer(layer.peer.?, peer) or
+                    !std.meta.eql(layer.surface.?, surface)) continue;
+                if (latest == null or layer.sample.?.sample.commit_sequence > latest.?.sample.?.sample.commit_sequence)
+                    latest = layer;
+            }
+            const layer = latest orelse return false;
+            var selected: ?*PhysicalOutput = null;
+            var largest: u64 = 0;
+            for (self.physical_outputs[0..self.physical_output_count]) |*physical| {
+                if (!physical.connected or physical.kms_output == null or physical.claim == null) continue;
+                if (self.boundLayerOutput(layer)) |bound| if (!std.meta.eql(bound, physical.protocol_output)) continue;
+                const bounds = self.outputBoundsFor(physical) catch continue;
+                const intersection = (clipToOutput(layer.sample.?.destination, bounds) catch continue) orelse continue;
+                const area = @as(u64, intersection.width) * intersection.height;
+                if (area > largest) {
+                    largest = area;
+                    selected = physical;
+                }
+            }
+            const physical = selected orelse return false;
+            const output = physical.kms_output.?;
+            if (output.planner.output_transform != .normal or
+                !std.meta.eql(output.output_color_description, layer.sample.?.color_description)) return false;
+            const snapshot = self.manager.claimSnapshot(physical.claim.?) catch return false;
+            const plane = snapshot.selectedPlane();
+            for (snapshot.formats[plane.format_start..][0..plane.format_count]) |pair| {
+                if (pair.fourcc == format.fourcc and pair.modifier == format.modifier) return true;
+            }
+            return false;
+        }
+
         fn validateDmabufImport(
             context: *anyopaque,
             buffer: *const protocol_linux_dmabuf.Buffer,
@@ -13144,6 +13184,8 @@ pub fn Coordinator(comptime protocol: type) type {
             };
             if (self.color_management_adapter.refreshPreferred())
                 self.markProtocolAll(ProtocolReady.color_management);
+            self.dmabuf_adapter.refreshFeedback();
+            self.markProtocolAll(ProtocolReady.dmabuf);
             self.output_associations_dirty = false;
         }
 
