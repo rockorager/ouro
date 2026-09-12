@@ -974,6 +974,7 @@ const RealTarget = struct {
     fence_needs_reset: bool = false,
     initialized_layout: bool = false,
     ten_bit: bool = false,
+    rgb_order: bool = false,
     content_leases: []u64,
     content_lease_count: usize = 0,
     native_leases: []u64,
@@ -2748,6 +2749,7 @@ fn realImportTarget(_: *anyopaque, renderer: Renderer, metadata: gbm.Metadata, d
     target.fence_needs_reset = false;
     target.initialized_layout = false;
     target.ten_bit = target_format.ten_bit;
+    target.rgb_order = target_format.rgb_order;
     return @ptrCast(target);
 }
 
@@ -3376,7 +3378,7 @@ fn recordPackedPass(
     for (frame.render_damage) |damage| {
         const push: Push = .{
             .clear_color = .{ frame.clear.a, frame.clear.r, frame.clear.g, frame.clear.b },
-            .output = .{ frame.output.width, frame.output.height, @intFromEnum(frame.output_format), @intCast(sample_count) },
+            .output = .{ frame.output.width, frame.output.height, @intFromEnum(frame.output_format) | (@as(u32, @intFromBool(target.rgb_order)) << 31), @intCast(sample_count) },
             .damage = .{ @intCast(damage.x), @intCast(damage.y), damage.width, damage.height },
             .output_color = .{
                 @intFromEnum(frame.output_color_description.transfer),
@@ -3831,7 +3833,7 @@ fn recordSampledPass(
     c.vkCmdBindDescriptorSets(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 0, 1, &target.descriptor_sets[0], 0, null);
     for (frame.render_damage) |damage| {
         const range = damageSampleRange(frame.samples[0..sample_count], damage);
-        if (!target.ten_bit and range.count != 0) {
+        if (!target.ten_bit and !target.rgb_order and range.count != 0) {
             // In the single descriptor batch, source and descriptor indices
             // are identical. The last intersecting sample is topmost.
             const source_index = range.first + range.count - 1;
@@ -4014,7 +4016,7 @@ fn recordSampledDispatch(
 ) void {
     const push: Push = .{
         .clear_color = .{ frame.clear.a, frame.clear.r, frame.clear.g, frame.clear.b },
-        .output = .{ frame.output.width, frame.output.height, @intFromEnum(frame.output_format), encoded_count },
+        .output = .{ frame.output.width, frame.output.height, @intFromEnum(frame.output_format) | (@as(u32, @intFromBool(target.rgb_order)) << 31), encoded_count },
         .damage = .{ @intCast(damage.x), @intCast(damage.y), damage.width, damage.height },
         .output_color = .{
             @intFromEnum(frame.output_color_description.transfer),
@@ -5333,18 +5335,31 @@ const TargetVkFormat = struct {
     image: c.VkFormat,
     view: c.VkFormat,
     ten_bit: bool,
+    rgb_order: bool = false,
 };
 
 fn targetVkFormat(fourcc: u32) ?TargetVkFormat {
-    if (fourcc == gbm.format_xrgb2101010) return .{
+    if (fourcc == gbm.format_xrgb2101010 or fourcc == gbm.format_argb2101010) return .{
         .image = c.VK_FORMAT_A2R10G10B10_UNORM_PACK32,
         .view = c.VK_FORMAT_A2B10G10R10_UNORM_PACK32,
         .ten_bit = true,
+    };
+    if (fourcc == gbm.format_xbgr2101010 or fourcc == gbm.format_abgr2101010) return .{
+        .image = c.VK_FORMAT_A2B10G10R10_UNORM_PACK32,
+        .view = c.VK_FORMAT_A2B10G10R10_UNORM_PACK32,
+        .ten_bit = true,
+        .rgb_order = true,
     };
     if (fourcc == gbm.format_xrgb8888 or fourcc == gbm.format_argb8888) return .{
         .image = c.VK_FORMAT_B8G8R8A8_UNORM,
         .view = c.VK_FORMAT_R8G8B8A8_UNORM,
         .ten_bit = false,
+    };
+    if (fourcc == gbm.format_xbgr8888 or fourcc == gbm.format_abgr8888) return .{
+        .image = c.VK_FORMAT_R8G8B8A8_UNORM,
+        .view = c.VK_FORMAT_R8G8B8A8_UNORM,
+        .ten_bit = false,
+        .rgb_order = true,
     };
     return null;
 }
@@ -5941,6 +5956,16 @@ test "render-vulkan: 10-bit DRM targets preserve packed channel order" {
         target.view,
     );
     try std.testing.expect(!targetVkFormat(gbm.format_xrgb8888).?.ten_bit);
+    const formats = [_]render.PixelFormat{
+        .argb8888_premultiplied, .xrgb8888,    .abgr8888,    .xbgr8888,
+        .argb2101010,            .xrgb2101010, .abgr2101010, .xbgr2101010,
+    };
+    for (formats, 0..) |format, i| {
+        const mapped = targetVkFormat(format.drmFormat().?).?;
+        try std.testing.expectEqual(i >= 4, mapped.ten_bit);
+        try std.testing.expectEqual(i % 4 >= 2, mapped.rgb_order);
+    }
+    try std.testing.expect(targetVkFormat(render.PixelFormat.nv12.drmFormat().?) == null);
 }
 
 test "render-vulkan: sRGB readbacks preserve bytes independently of scanout depth" {

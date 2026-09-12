@@ -75,7 +75,7 @@ class Renderer:
                capture_phases=None, continuation=False, capture_sequence=False, copy_capture=False,
                timings=None, scene=None, damage=None, timing_repeats=1,
                source_format=0, source_stride=None, raw_output=False, output_reference=80,
-               video_planes=None, representation=0, capture_transfer=0, capture_shoulder=False):
+               video_planes=None, representation=0, capture_transfer=0, capture_shoulder=False, rgb_output=False):
         d = self.device
         sw, sh = source_size
         w, h = size
@@ -305,7 +305,7 @@ class Renderer:
             def dispatch(count, phases=capture_phases):
                 for rect in damage:
                     push = struct.pack("<16I12f", background_alpha, *background, w, h,
-                        int(background_alpha == 255), count, *rect, output_transfer,
+                        int(background_alpha == 255) | (int(rgb_output) << 31), count, *rect, output_transfer,
                         struct.unpack("<I", struct.pack("<f", output_reference))[0], 0, 0,
                         *capture_matrix[:3], phases or 0,
                         *capture_matrix[3:6], capture_transfer, *capture_matrix[6:], int(capture_shoulder))
@@ -557,6 +557,29 @@ def test_capture_roundtrip(renderer, capture_path):
             sheet.paste(Image.frombytes("RGBA", (65, 1), preview, "raw", "BGRA").resize((696, 60)), (12, 30 + row * 100))
         sheet.save(capture_path)
     print(f"Capture round trip: {renderer.draw_count - start} draws passed (exact raw low-light identity, explicit sRGB, rejected interpretation)")
+
+
+def test_output_order(renderer):
+    start = renderer.draw_count
+    for mode in ("buffer", "texture", "texture-buffer"):
+        for ten_bit in (False, True):
+            for alpha in (1, .25):
+                captures = []
+                for rgb in (False, True):
+                    output, before, _ = renderer.render(struct.pack("<4e", .125, .25, .5, alpha), (1, 1), (1, 1), mode,
+                        source_format=10, source_transfer=1, output_transfer=1, alpha_mode=2, background_alpha=0,
+                        capture_phases=1, ten_bit=ten_bit, raw_output=True, rgb_output=rgb)
+                    if ten_bit:
+                        word, = struct.unpack("<I", output)
+                        actual = (word & 1023, (word >> 10) & 1023, (word >> 20) & 1023, word >> 30)
+                    else:
+                        actual = output
+                    channels = (.125, .25, .5) if rgb else (.5, .25, .125)
+                    expected = [round(x * alpha * (1023 if ten_bit else 255)) for x in channels] + [round(alpha * (3 if ten_bit else 255))]
+                    assert max(abs(a - b) for a, b in zip(actual, expected)) <= 1, (mode, rgb, actual, expected)
+                    captures.append(before)
+                assert captures[0] == captures[1], "raw capture must not inherit output channel order"
+    print(f"Output order: {renderer.draw_count - start} draws passed (RGB/BGR, 8/10-bit, alpha, independent capture)")
 
 
 def test_capture_shoulder(renderer, capture_path):
@@ -1090,6 +1113,7 @@ if __name__ == "__main__":
         test_desktop_color(renderer, args.capture_shm)
         test_capture_roundtrip(renderer, args.capture_roundtrip)
         test_capture_shoulder(renderer, args.capture_roundtrip)
+        test_output_order(renderer)
         test_video(renderer, args.capture_video)
         if args.benchmark_stall:
             benchmark_stall(renderer)

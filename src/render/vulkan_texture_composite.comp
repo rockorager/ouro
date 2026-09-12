@@ -163,7 +163,7 @@ void main() {
     bool continuation = (frame.output_info.w & 0x80000000u) != 0u;
     bool intermediate = (frame.output_info.w & 0x40000000u) != 0u;
     uint sample_count = frame.output_info.w & 0x3fffffffu;
-    float alpha = frame.output_info.z == 1u ? 1.0 : float(frame.clear_color.x) / 255.0;
+    float alpha = (frame.output_info.z & 0x7fffffffu) == 1u ? 1.0 : float(frame.clear_color.x) / 255.0;
     vec3 clear_electrical = vec3(frame.clear_color.yzw) / 255.0;
     float clear_scale = frame.output_color.x == 4u ? 10000.0 / uintBitsToFloat(frame.output_color.y) : 1.0;
     vec4 base_color = continuation
@@ -220,6 +220,6 @@ void main() {
             ? sample_lut(straight, int(frame.output_color.z))
             : encode_transfer(straight, frame.output_color.x);
         encoded *= color.a;
-        imageStore(target_image, pixel, vec4(encoded.bgr, color.a));
+        imageStore(target_image, pixel, vec4((frame.output_info.z & 0x80000000u) != 0u ? encoded : encoded.bgr, color.a));
     }
 }

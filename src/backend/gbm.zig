@@ -20,6 +20,9 @@ pub const format_argb8888: u32 = fourcc('A', 'R', '2', '4');
 pub const format_xbgr8888: u32 = fourcc('X', 'B', '2', '4');
 pub const format_abgr8888: u32 = fourcc('A', 'B', '2', '4');
 pub const format_xrgb2101010: u32 = fourcc('X', 'R', '3', '0');
+pub const format_argb2101010: u32 = fourcc('A', 'R', '3', '0');
+pub const format_xbgr2101010: u32 = fourcc('X', 'B', '3', '0');
+pub const format_abgr2101010: u32 = fourcc('A', 'B', '3', '0');
 
 pub const FormatModifier = struct {
     fourcc: u32,

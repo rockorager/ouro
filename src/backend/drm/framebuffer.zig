@@ -471,14 +471,14 @@ fn negotiate(
     const end = start + plane.format_count;
     if (end > snapshot.formats.len) return error.MalformedTopology;
     const formats = snapshot.formats[start..end];
-    if (prefer_10bit) if (formatAllocation(
-        formats,
-        width,
-        height,
-        gbm.format_xrgb2101010,
-        !linear_only,
-    )) |allocation| return allocation;
-    const preferred = [_]u32{ gbm.format_xrgb8888, gbm.format_argb8888 };
+    if (prefer_10bit and !linear_only) for ([_]u32{
+        gbm.format_xrgb2101010, gbm.format_xbgr2101010,
+        gbm.format_argb2101010, gbm.format_abgr2101010,
+    }) |fourcc| {
+        if (formatAllocation(formats, width, height, fourcc, true)) |allocation| return allocation;
+    };
+    const rgb = [_]u32{ gbm.format_xrgb8888, gbm.format_argb8888, gbm.format_xbgr8888, gbm.format_abgr8888 };
+    const preferred = rgb[0..@as(usize, if (linear_only) 2 else 4)];
 
     // Prefer a CPU-capable target across all supported compositor formats
     // before considering a tiled modifier for GPU startup.
@@ -643,6 +643,21 @@ test "scanout: 10-bit preference remains an explicit GPU choice" {
     }});
     allocation = try negotiate(fixture.snapshot(), 100, 50, false, true);
     try std.testing.expectEqual(gbm.format_xrgb8888, allocation.format);
+}
+
+test "scanout: modern RGB output variants keep Pixman fallback narrow" {
+    for ([_]u32{ gbm.format_xrgb2101010, gbm.format_xbgr2101010, gbm.format_argb2101010, gbm.format_abgr2101010 }) |fourcc| {
+        var fixture = TestSnapshot.init(&.{.{ .fourcc = fourcc, .modifier = 19 }});
+        const allocation = try negotiate(fixture.snapshot(), 31, 17, false, true);
+        try std.testing.expectEqual(fourcc, allocation.format);
+        try std.testing.expectEqual(@as(u64, 19), allocation.modifier);
+        try std.testing.expectError(error.NoLinearRenderFormat, negotiate(fixture.snapshot(), 31, 17, true, true));
+    }
+    for ([_]u32{ gbm.format_xbgr8888, gbm.format_abgr8888 }) |fourcc| {
+        var fixture = TestSnapshot.init(&.{.{ .fourcc = fourcc, .modifier = 0 }});
+        try std.testing.expectEqual(fourcc, (try negotiate(fixture.snapshot(), 31, 17, false, false)).format);
+        try std.testing.expectError(error.NoLinearRenderFormat, negotiate(fixture.snapshot(), 31, 17, true, false));
+    }
 }
 
 test "scanout: multiplane metadata is copied and mismatches roll back" {

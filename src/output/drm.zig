@@ -2095,8 +2095,14 @@ pub fn formatFromDrm(value: u32) ?render.PixelFormat {
 }
 
 fn targetFormatFromDrm(value: u32) ?render.PixelFormat {
-    if (value == gbm.format_xrgb2101010) return .xrgb8888;
-    return formatFromDrm(value);
+    const format = formatFromDrm(value) orelse return null;
+    // Logical output alpha is independent of physical depth/channel order.
+    // Vulkan owns the actual storage encoding, while Pixman negotiates BGRA8.
+    return switch (format) {
+        .xrgb8888, .xbgr8888, .xrgb2101010, .xbgr2101010 => .xrgb8888,
+        .argb8888_premultiplied, .abgr8888, .argb2101010, .abgr2101010 => .argb8888_premultiplied,
+        else => null,
+    };
 }
 
 fn hdrRequested(description: render.color.Description) bool {
@@ -2332,8 +2338,9 @@ fn overlayScanoutCandidate(
     const sample = list.samples[list.samples.len - 1];
     const external = sample.source.external orelse return null;
     if (sample.source.native != null or sample.source.upload != null or
-        sample.source.format != .xrgb8888 or list.output_format != .xrgb8888 or
-        targetFormatFromDrm(external.drm_format) != .xrgb8888 or
+        !sample.source.format.isOpaque() or sample.source.format.bytesPerPixel() != 4 or
+        list.output_format != .xrgb8888 or
+        formatFromDrm(external.drm_format) != sample.source.format or
         sample.transform != .normal or sample.global_alpha != 255 or
         !std.meta.eql(sample.color_description, output_color) or
         !std.meta.eql(sample.color_representation, render.color.Representation{}) or
@@ -2544,6 +2551,19 @@ test "drm-output: direct scanout eligibility is exact and conservative" {
     };
     try std.testing.expect(directScanoutSource(list, .srgb) != null);
     try std.testing.expect(directScanoutSource(list, .desktop) == null);
+    for (std.enums.values(render.PixelFormat)) |format| {
+        const fourcc = format.drmFormat() orelse continue;
+        var candidate = sample;
+        candidate.source.format = format;
+        candidate.source.external.?.drm_format = fourcc;
+        candidate.source.stride = 2 * format.bytesPerPixel();
+        candidate.source.external.?.strides[0] = candidate.source.stride;
+        candidate.effect_size = .{ .width = 2, .height = 1 };
+        candidate.opaque_region = &.{.{ .add = .{ .x = 0, .y = 0, .width = 2, .height = 1 } }};
+        var modern = list;
+        modern.samples = &.{candidate};
+        try std.testing.expectEqual(!format.isVideo(), directScanoutSource(modern, .srgb) != null);
+    }
     sample.destination.width = 1;
     list.samples = &.{sample};
     try std.testing.expect(directScanoutSource(list, .srgb) == null);
