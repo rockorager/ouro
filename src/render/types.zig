@@ -42,6 +42,31 @@ pub const PixelFormat = enum {
             else => false,
         };
     }
+
+    pub fn drmFormat(format: PixelFormat) ?u32 {
+        return switch (format) {
+            .argb8888_premultiplied => 0x34325241,
+            .xrgb8888 => 0x34325258,
+            .abgr8888 => 0x34324241,
+            .xbgr8888 => 0x34324258,
+            .argb2101010 => 0x30335241,
+            .xrgb2101010 => 0x30335258,
+            .abgr2101010 => 0x30334241,
+            .xbgr2101010 => 0x30334258,
+            .abgr16161616 => 0x38344241,
+            .xbgr16161616 => 0x38344258,
+            .abgr16161616f => 0x48344241,
+            .xbgr16161616f => 0x48344258,
+            .rgba32f => null,
+        };
+    }
+
+    pub fn fromDrm(value: u32) ?PixelFormat {
+        for (std.enums.values(PixelFormat)) |format| {
+            if (format.drmFormat() == value) return format;
+        }
+        return null;
+    }
 };
 
 pub const Color = struct {

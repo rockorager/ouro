@@ -8786,13 +8786,24 @@ pub fn Coordinator(comptime protocol: type) type {
         fn ensureDmabuf(self: *Self, handle: drm.Handle) !void {
             if (self.dmabuf_adapter.global != null) return;
             const render_device = self.render_device orelse return error.RendererUnavailable;
-            var renderer_formats: [256]gbm.FormatModifier = undefined;
-            const supported = try render_device.sampledDmabufFormats(&renderer_formats);
+            var renderer_formats = try self.allocator.alloc(gbm.FormatModifier, 256);
+            defer self.allocator.free(renderer_formats);
+            const supported = while (true) {
+                break render_device.sampledDmabufFormats(renderer_formats) catch |cause| switch (cause) {
+                    error.OutputTooSmall => {
+                        if (renderer_formats.len == std.math.maxInt(u16)) return cause;
+                        renderer_formats = try self.allocator.realloc(renderer_formats, @min(renderer_formats.len * 2, std.math.maxInt(u16)));
+                        continue;
+                    },
+                    else => return cause,
+                };
+            };
             if (supported.len == 0) return;
-            var protocol_formats: [renderer_formats.len]protocol_linux_dmabuf.Format = undefined;
-            for (supported, protocol_formats[0..supported.len]) |format, *entry|
+            const protocol_formats = try self.allocator.alloc(protocol_linux_dmabuf.Format, supported.len);
+            defer self.allocator.free(protocol_formats);
+            for (supported, protocol_formats) |format, *entry|
                 entry.* = .{ .fourcc = format.fourcc, .modifier = format.modifier };
-            try self.dmabuf_adapter.setFormats(protocol_formats[0..supported.len]);
+            try self.dmabuf_adapter.setFormats(protocol_formats);
             const fd = try kms.Device.fromManager(&self.manager).fd(handle);
             var status: libc.struct_stat = undefined;
             if (libc.fstat(fd, &status) != 0) return error.DrmDeviceUnavailable;

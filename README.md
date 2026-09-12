@@ -585,9 +585,12 @@ ABGR/XBGR16161616 (unsigned normalized integer), and ABGR/XBGR16161616F
 and extended-range floating-point RGB through linear-light composition.
 Single-pixel u32 colors normalize directly to float, without an 8-bit step.
 Pixman uses native 10-bit sources and a float wrapper for 16-bit sources,
-without changing its non-color-managed policy. These are client SHM layouts:
-DMA-BUF import remains limited to the existing 8-bit formats, and the existing
-XRGB2101010 scanout support is independent. Capture destinations remain 8-bit
+without changing its non-color-managed policy. Vulkan also imports these RGB
+DMA-BUF formats when the driver supports their exact format/modifier pair.
+Modifier memory planes (including compression metadata) retain their own
+offsets and strides. Shared allocations bind once; separate allocations require
+driver-supported disjoint binding. Acquire and completion fences cover every
+plane. Import support is independent of KMS scanout support. Capture remains 8-bit
 sRGB. `zig build test-shm` checks layout, precision, and generated-client
 integration. `uv run --with vulkan --with pillow python test/vulkan-cursor.py
 --capture-shm shm.png` checks the SHM formats offscreen, including low linear

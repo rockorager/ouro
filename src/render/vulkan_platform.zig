@@ -257,6 +257,7 @@ const ImportedImage = struct {
     format: render.PixelFormat = undefined,
     image: c.VkImage = undefined,
     memory: c.VkDeviceMemory = undefined,
+    plane_memories: [3]c.VkDeviceMemory = @splat(null),
     view: c.VkImageView = undefined,
 };
 
@@ -1686,7 +1687,7 @@ fn prepareNative(
         allocation.texture.size,
         inferExternalFormat(source.drm_format) orelse return error.UnsupportedExternalFormat,
     );
-    const acquire_fd = try exportDmaBufFence(source.fds[0]);
+    const acquire_fd = try exportSourceFence(source);
     errdefer _ = linux.close(acquire_fd);
     const pending_index = for (self.pending_acquires, 0..) |candidate, index| {
         if (!candidate.occupied) break index;
@@ -1843,7 +1844,7 @@ fn validateRetainedExternal(
 ) !void {
     const self: *RealRenderer = @ptrCast(@alignCast(context));
     if (try cachedImportedImage(self, source, size, format) != null) return;
-    try requireExternalSampling(self, source, size, format);
+    try requireExternalSampling(self, source, size, format, 0);
 }
 
 fn realValidateExternal(
@@ -1869,54 +1870,30 @@ fn realSampledDmabufFormats(
     output: []gbm.FormatModifier,
 ) !usize {
     const self: *RealRenderer = @ptrCast(@alignCast(renderer));
-    const candidates = [_]struct {
-        fourcc: u32,
-        format: render.PixelFormat,
-        vk_format: c.VkFormat,
-    }{
-        .{ .fourcc = c.DRM_FORMAT_ARGB8888, .format = .argb8888_premultiplied, .vk_format = c.VK_FORMAT_B8G8R8A8_UNORM },
-        .{ .fourcc = c.DRM_FORMAT_XRGB8888, .format = .xrgb8888, .vk_format = c.VK_FORMAT_B8G8R8A8_UNORM },
-        .{ .fourcc = c.DRM_FORMAT_ABGR8888, .format = .argb8888_premultiplied, .vk_format = c.VK_FORMAT_R8G8B8A8_UNORM },
-        .{ .fourcc = c.DRM_FORMAT_XBGR8888, .format = .xrgb8888, .vk_format = c.VK_FORMAT_R8G8B8A8_UNORM },
-    };
     var count: usize = 0;
-    for (candidates) |candidate| {
-        var modifier_list: c.VkDrmFormatModifierPropertiesListEXT = .{
-            .sType = c.VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT,
-            .pNext = null,
-            .drmFormatModifierCount = 0,
-            .pDrmFormatModifierProperties = null,
-        };
-        var properties: c.VkFormatProperties2 = .{
-            .sType = c.VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
-            .pNext = &modifier_list,
-            .formatProperties = undefined,
-        };
-        c.vkGetPhysicalDeviceFormatProperties2(self.physical_device, candidate.vk_format, &properties);
-        if (modifier_list.drmFormatModifierCount == 0 or
-            modifier_list.drmFormatModifierCount > 64) continue;
-        var modifiers: [64]c.VkDrmFormatModifierPropertiesEXT = undefined;
-        modifier_list.pDrmFormatModifierProperties = &modifiers;
-        c.vkGetPhysicalDeviceFormatProperties2(self.physical_device, candidate.vk_format, &properties);
-        for (modifiers[0..modifier_list.drmFormatModifierCount]) |modifier| {
-            if (modifier.drmFormatModifierPlaneCount != 1 or
+    for (std.enums.values(render.PixelFormat)) |format| {
+        const fourcc = format.drmFormat() orelse continue;
+        const modifiers = try formatModifierProperties(self.physical_device, sourceVkFormat(format));
+        defer std.heap.page_allocator.free(modifiers);
+        for (modifiers) |modifier| {
+            if (modifier.drmFormatModifierPlaneCount == 0 or modifier.drmFormatModifierPlaneCount > 4 or
                 modifier.drmFormatModifierTilingFeatures & c.VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT == 0)
                 continue;
             const source: render.ExternalSource = .{
                 .context = self,
                 .token = 0,
                 .alive_fn = validationSourceAlive,
-                .drm_format = candidate.fourcc,
+                .drm_format = fourcc,
                 .modifier = modifier.drmFormatModifier,
-                .plane_count = 1,
-                .fds = .{ 0, -1, -1, -1 },
-                .strides = .{ 4, 0, 0, 0 },
+                .plane_count = @intCast(modifier.drmFormatModifierPlaneCount),
+                .fds = @splat(0),
+                .strides = @splat(format.bytesPerPixel()),
                 .offsets = .{ 0, 0, 0, 0 },
             };
-            requireExternalSampling(self, source, .{ .width = 1, .height = 1 }, candidate.format) catch
+            requireExternalSampling(self, source, .{ .width = 1, .height = 1 }, format, 0) catch
                 continue;
             if (count == output.len) return error.OutputTooSmall;
-            output[count] = .{ .fourcc = candidate.fourcc, .modifier = modifier.drmFormatModifier };
+            output[count] = .{ .fourcc = fourcc, .modifier = modifier.drmFormatModifier };
             count += 1;
         }
     }
@@ -1927,16 +1904,146 @@ fn validationSourceAlive(_: *anyopaque, _: u64) bool {
     return false;
 }
 
+fn formatModifierProperties(device: c.VkPhysicalDevice, format: c.VkFormat) ![]c.VkDrmFormatModifierPropertiesEXT {
+    var list = std.mem.zeroes(c.VkDrmFormatModifierPropertiesListEXT);
+    list.sType = c.VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT;
+    var properties = std.mem.zeroes(c.VkFormatProperties2);
+    properties.sType = c.VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2;
+    properties.pNext = &list;
+    c.vkGetPhysicalDeviceFormatProperties2(device, format, &properties);
+    const modifiers = try std.heap.page_allocator.alloc(c.VkDrmFormatModifierPropertiesEXT, list.drmFormatModifierCount);
+    list.pDrmFormatModifierProperties = modifiers.ptr;
+    c.vkGetPhysicalDeviceFormatProperties2(device, format, &properties);
+    return modifiers;
+}
+
+fn externalModifierProperties(device: c.VkPhysicalDevice, format: c.VkFormat, modifier: u64) !c.VkDrmFormatModifierPropertiesEXT {
+    const modifiers = try formatModifierProperties(device, format);
+    defer std.heap.page_allocator.free(modifiers);
+    for (modifiers) |properties| if (properties.drmFormatModifier == modifier) return properties;
+    return error.ExternalModifierUnsupported;
+}
+
+/// DRM modifier planes describe memory, not YUV components. Repeated handles
+/// to one allocation use one non-disjoint binding, even when FD numbers differ.
+const ExternalBacking = struct { disjoint: bool, sizes: [4]u64 };
+
+fn externalBacking(source: render.ExternalSource) !ExternalBacking {
+    if (source.plane_count == 0 or source.plane_count > 4) return error.UnsupportedExternalSource;
+    var result: ExternalBacking = .{ .disjoint = false, .sizes = @splat(0) };
+    var first: c.struct_stat = undefined;
+    for (0..source.plane_count) |plane| {
+        var status: c.struct_stat = undefined;
+        if (c.fstat(source.fds[plane], &status) != 0 or status.st_size <= 0 or
+            source.offsets[plane] >= @as(u64, @intCast(status.st_size))) return error.InvalidExternalFd;
+        result.sizes[plane] = @intCast(status.st_size);
+        if (plane == 0) first = status else if (status.st_dev != first.st_dev or status.st_ino != first.st_ino) {
+            result.disjoint = true;
+        }
+    }
+    return result;
+}
+
+test "render-vulkan: external backing distinguishes shared and disjoint modifier planes" {
+    const raw = linux.memfd_create("ouro-plane-test", linux.MFD.CLOEXEC);
+    if (linux.errno(raw) != .SUCCESS) return error.SystemCallFailed;
+    const fd: std.posix.fd_t = @intCast(raw);
+    defer _ = linux.close(fd);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.ftruncate(fd, 8192)));
+    const duplicate = try duplicateFd(fd);
+    defer _ = linux.close(duplicate);
+    var owner: u8 = 0;
+    var source: render.ExternalSource = .{
+        .context = &owner,
+        .token = 1,
+        .alive_fn = validationSourceAlive,
+        .drm_format = c.DRM_FORMAT_ABGR16161616,
+        .modifier = 7,
+        .plane_count = 2,
+        .fds = .{ fd, duplicate, -1, -1 },
+        .strides = .{ 256, 64, 0, 0 },
+        .offsets = .{ 0, 4096, 0, 0 },
+    };
+    const shared = try externalBacking(source);
+    try std.testing.expect(!shared.disjoint);
+    try std.testing.expectEqualSlices(u64, &.{ 8192, 8192, 0, 0 }, &shared.sizes);
+    source.offsets[1] = 8192;
+    try std.testing.expectError(error.InvalidExternalFd, externalBacking(source));
+    const other_raw = linux.memfd_create("ouro-other-plane-test", linux.MFD.CLOEXEC);
+    if (linux.errno(other_raw) != .SUCCESS) return error.SystemCallFailed;
+    const other: std.posix.fd_t = @intCast(other_raw);
+    defer _ = linux.close(other);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.ftruncate(other, 2048)));
+    source.fds[1] = other;
+    source.offsets[1] = 128;
+    const separate = try externalBacking(source);
+    try std.testing.expect(separate.disjoint);
+    try std.testing.expectEqualSlices(u64, &.{ 8192, 2048, 0, 0 }, &separate.sizes);
+}
+
+fn importExternalPlane(self: *RealRenderer, image: c.VkImage, fd: std.posix.fd_t, size: u64, plane: ?u2) !c.VkDeviceMemory {
+    var plane_info = std.mem.zeroes(c.VkImagePlaneMemoryRequirementsInfo);
+    plane_info.sType = c.VK_STRUCTURE_TYPE_IMAGE_PLANE_MEMORY_REQUIREMENTS_INFO;
+    plane_info.planeAspect = @as(u32, c.VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT) << (plane orelse 0);
+    var query = std.mem.zeroes(c.VkImageMemoryRequirementsInfo2);
+    query.sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2;
+    query.image = image;
+    query.pNext = if (plane != null) &plane_info else null;
+    var dedicated_requirements = std.mem.zeroes(c.VkMemoryDedicatedRequirements);
+    dedicated_requirements.sType = c.VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS;
+    var requirements = std.mem.zeroes(c.VkMemoryRequirements2);
+    requirements.sType = c.VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2;
+    requirements.pNext = &dedicated_requirements;
+    c.vkGetImageMemoryRequirements2(self.device, &query, &requirements);
+    if (size < requirements.memoryRequirements.size) return error.ExternalAllocationTooSmall;
+    if (plane != null and dedicated_requirements.requiresDedicatedAllocation != 0)
+        return error.DisjointExternalUnsupported;
+    const duplicate = try duplicateFd(fd);
+    var owned = true;
+    defer if (owned) {
+        _ = linux.close(duplicate);
+    };
+    var properties = std.mem.zeroes(c.VkMemoryFdPropertiesKHR);
+    properties.sType = c.VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR;
+    try vk(self.get_memory_fd_properties.?(self.device, c.VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, duplicate, &properties), error.GetMemoryFdPropertiesFailed);
+    const bits = intersectMemoryTypeBits(requirements.memoryRequirements.memoryTypeBits, properties.memoryTypeBits);
+    if (bits == 0) return error.NoCompatibleMemoryType;
+    var dedicated = std.mem.zeroes(c.VkMemoryDedicatedAllocateInfo);
+    dedicated.sType = c.VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+    dedicated.image = image;
+    var import = std.mem.zeroes(c.VkImportMemoryFdInfoKHR);
+    import.sType = c.VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
+    import.pNext = if (plane == null) &dedicated else null;
+    import.handleType = c.VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    import.fd = duplicate;
+    var allocation = std.mem.zeroes(c.VkMemoryAllocateInfo);
+    allocation.sType = c.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocation.pNext = &import;
+    allocation.allocationSize = size;
+    allocation.memoryTypeIndex = try memoryType(self, bits, 0);
+    var memory: c.VkDeviceMemory = undefined;
+    try vk(c.vkAllocateMemory(self.device, &allocation, null, &memory), error.ImportExternalMemoryFailed);
+    owned = false;
+    return memory;
+}
+
 fn requireExternalSampling(
     self: *RealRenderer,
     source: render.ExternalSource,
     size: render.Size,
     format: render.PixelFormat,
+    flags: c.VkImageCreateFlags,
 ) !void {
-    if (source.plane_count != 1 or source.fds[0] < 0 or source.strides[0] == 0)
+    if (source.plane_count == 0 or source.plane_count > 4)
         return error.UnsupportedExternalSource;
+    for (0..source.plane_count) |plane| {
+        if (source.fds[plane] < 0 or source.strides[plane] == 0) return error.UnsupportedExternalSource;
+    }
     const vk_format = externalVkFormat(source.drm_format, format) orelse
         return error.UnsupportedExternalFormat;
+    const modifier_properties = try externalModifierProperties(self.physical_device, vk_format, source.modifier);
+    if (modifier_properties.drmFormatModifierPlaneCount != source.plane_count)
+        return error.UnsupportedExternalSource;
     var modifier_query: c.VkPhysicalDeviceImageDrmFormatModifierInfoEXT = .{
         .sType = c.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT,
         .pNext = null,
@@ -1957,7 +2064,7 @@ fn requireExternalSampling(
         .type = c.VK_IMAGE_TYPE_2D,
         .tiling = c.VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
         .usage = c.VK_IMAGE_USAGE_TRANSFER_SRC_BIT | c.VK_IMAGE_USAGE_SAMPLED_BIT,
-        .flags = 0,
+        .flags = flags,
     };
     var external_properties: c.VkExternalImageFormatProperties = .{
         .sType = c.VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
@@ -1978,6 +2085,9 @@ fn requireExternalSampling(
         size.height > format_properties.imageFormatProperties.maxExtent.height)
         return error.ExternalSamplingUnsupported;
     const external_memory = external_properties.externalMemoryProperties;
+    if (flags & c.VK_IMAGE_CREATE_DISJOINT_BIT != 0 and
+        external_memory.externalMemoryFeatures & c.VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT != 0)
+        return error.DisjointExternalUnsupported;
     if (external_memory.externalMemoryFeatures & c.VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT == 0 or
         external_memory.compatibleHandleTypes & c.VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT == 0)
         return error.ExternalSamplingUnsupported;
@@ -1998,8 +2108,15 @@ fn cachedImportedImage(self: *const RealRenderer, source: render.ExternalSource,
 
 fn importedImage(self: *RealRenderer, source: render.ExternalSource, size: render.Size, format: render.PixelFormat) !u64 {
     if (try cachedImportedImage(self, source, size, format)) |token| return token;
-    try requireExternalSampling(self, source, size, format);
+    try requireExternalSampling(self, source, size, format, 0);
     const vk_format = externalVkFormat(source.drm_format, format) orelse unreachable;
+    const backing = try externalBacking(source);
+    if (backing.disjoint) {
+        const properties = try externalModifierProperties(self.physical_device, vk_format, source.modifier);
+        if (properties.drmFormatModifierTilingFeatures & c.VK_FORMAT_FEATURE_DISJOINT_BIT == 0)
+            return error.DisjointExternalUnsupported;
+        try requireExternalSampling(self, source, size, format, c.VK_IMAGE_CREATE_DISJOINT_BIT);
+    }
 
     // Reclaim cache-only imports whose protocol source has gone away before
     // consuming another slot. Persistent buffers remain cached, while buffer
@@ -2021,10 +2138,11 @@ fn importedImage(self: *RealRenderer, source: render.ExternalSource, size: rende
     const entry = &self.imported_images[index];
     destroyImportedImage(self, entry);
 
-    var layout: c.VkSubresourceLayout = .{
-        .offset = source.offsets[0],
+    var layouts: [4]c.VkSubresourceLayout = undefined;
+    for (layouts[0..source.plane_count], 0..) |*layout, plane| layout.* = .{
+        .offset = source.offsets[plane],
         .size = 0,
-        .rowPitch = source.strides[0],
+        .rowPitch = source.strides[plane],
         .arrayPitch = 0,
         .depthPitch = 0,
     };
@@ -2032,8 +2150,8 @@ fn importedImage(self: *RealRenderer, source: render.ExternalSource, size: rende
         .sType = c.VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
         .pNext = null,
         .drmFormatModifier = source.modifier,
-        .drmFormatModifierPlaneCount = 1,
-        .pPlaneLayouts = &layout,
+        .drmFormatModifierPlaneCount = source.plane_count,
+        .pPlaneLayouts = &layouts,
     };
     var external: c.VkExternalMemoryImageCreateInfo = .{
         .sType = c.VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
@@ -2043,7 +2161,7 @@ fn importedImage(self: *RealRenderer, source: render.ExternalSource, size: rende
     var info: c.VkImageCreateInfo = .{
         .sType = c.VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .pNext = &external,
-        .flags = 0,
+        .flags = if (backing.disjoint) c.VK_IMAGE_CREATE_DISJOINT_BIT else 0,
         .imageType = c.VK_IMAGE_TYPE_2D,
         .format = vk_format,
         .extent = .{ .width = size.width, .height = size.height, .depth = 1 },
@@ -2060,49 +2178,22 @@ fn importedImage(self: *RealRenderer, source: render.ExternalSource, size: rende
     var image: c.VkImage = undefined;
     try vk(c.vkCreateImage(self.device, &info, null, &image), error.CreateExternalImageFailed);
     errdefer c.vkDestroyImage(self.device, image, null);
-    var requirements: c.VkMemoryRequirements = undefined;
-    c.vkGetImageMemoryRequirements(self.device, image, &requirements);
-    const duplicate = try duplicateFd(source.fds[0]);
-    var duplicate_owned = true;
-    defer if (duplicate_owned) {
-        _ = linux.close(duplicate);
-    };
-    var properties: c.VkMemoryFdPropertiesKHR = .{
-        .sType = c.VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR,
-        .pNext = null,
-        .memoryTypeBits = 0,
-    };
-    try vk(self.get_memory_fd_properties.?(
-        self.device,
-        c.VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-        duplicate,
-        &properties,
-    ), error.GetMemoryFdPropertiesFailed);
-    const bits = intersectMemoryTypeBits(requirements.memoryTypeBits, properties.memoryTypeBits);
-    if (bits == 0) return error.NoCompatibleMemoryType;
-    var dedicated: c.VkMemoryDedicatedAllocateInfo = .{
-        .sType = c.VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
-        .pNext = null,
-        .image = image,
-        .buffer = null,
-    };
-    var import: c.VkImportMemoryFdInfoKHR = .{
-        .sType = c.VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
-        .pNext = &dedicated,
-        .handleType = c.VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-        .fd = duplicate,
-    };
-    var allocation: c.VkMemoryAllocateInfo = .{
-        .sType = c.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .pNext = &import,
-        .allocationSize = requirements.size,
-        .memoryTypeIndex = try memoryType(self, bits, 0),
-    };
-    var memory: c.VkDeviceMemory = undefined;
-    try vk(c.vkAllocateMemory(self.device, &allocation, null, &memory), error.ImportExternalMemoryFailed);
-    duplicate_owned = false;
-    errdefer c.vkFreeMemory(self.device, memory, null);
-    try vk(c.vkBindImageMemory(self.device, image, memory, 0), error.BindExternalMemoryFailed);
+    var memories: [4]c.VkDeviceMemory = @splat(null);
+    errdefer for (memories) |memory| if (memory != null) c.vkFreeMemory(self.device, memory, null);
+    const allocation_count: u8 = if (backing.disjoint) source.plane_count else 1;
+    var plane_bindings: [4]c.VkBindImagePlaneMemoryInfo = @splat(std.mem.zeroes(c.VkBindImagePlaneMemoryInfo));
+    var bindings: [4]c.VkBindImageMemoryInfo = @splat(std.mem.zeroes(c.VkBindImageMemoryInfo));
+    for (0..allocation_count) |plane| {
+        memories[plane] = try importExternalPlane(self, image, source.fds[plane], backing.sizes[plane], if (backing.disjoint) @intCast(plane) else null);
+        plane_bindings[plane].sType = c.VK_STRUCTURE_TYPE_BIND_IMAGE_PLANE_MEMORY_INFO;
+        plane_bindings[plane].planeAspect = @as(u32, c.VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT) << @as(u5, @intCast(plane));
+        bindings[plane].sType = c.VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO;
+        bindings[plane].pNext = if (backing.disjoint) &plane_bindings[plane] else null;
+        bindings[plane].image = image;
+        bindings[plane].memory = memories[plane];
+    }
+    // VUID-vkBindImageMemory2-pBindInfos-02858 requires all disjoint planes.
+    try vk(c.vkBindImageMemory2(self.device, allocation_count, &bindings), error.BindExternalMemoryFailed);
     var view_info: c.VkImageViewCreateInfo = .{
         .sType = c.VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
         .pNext = null,
@@ -2131,7 +2222,8 @@ fn importedImage(self: *RealRenderer, source: render.ExternalSource, size: rende
         .size = size,
         .format = format,
         .image = image,
-        .memory = memory,
+        .memory = memories[0],
+        .plane_memories = memories[1..4].*,
         .view = view,
     };
     return importedToken(entry, index);
@@ -2214,29 +2306,11 @@ test "cached external imports preserve metadata and bypass device queries" {
 }
 
 fn inferExternalFormat(drm_format: u32) ?render.PixelFormat {
-    if (drm_format == c.DRM_FORMAT_XRGB8888 or drm_format == c.DRM_FORMAT_XBGR8888)
-        return .xrgb8888;
-    if (drm_format == c.DRM_FORMAT_ARGB8888 or drm_format == c.DRM_FORMAT_ABGR8888)
-        return .argb8888_premultiplied;
-    return null;
+    return render.PixelFormat.fromDrm(drm_format);
 }
 
 fn externalVkFormat(drm_format: u32, format: render.PixelFormat) ?c.VkFormat {
-    return switch (format) {
-        .xrgb8888 => if (drm_format == c.DRM_FORMAT_XRGB8888)
-            c.VK_FORMAT_B8G8R8A8_UNORM
-        else if (drm_format == c.DRM_FORMAT_XBGR8888)
-            c.VK_FORMAT_R8G8B8A8_UNORM
-        else
-            null,
-        .argb8888_premultiplied => if (drm_format == c.DRM_FORMAT_ARGB8888)
-            c.VK_FORMAT_B8G8R8A8_UNORM
-        else if (drm_format == c.DRM_FORMAT_ABGR8888)
-            c.VK_FORMAT_R8G8B8A8_UNORM
-        else
-            null,
-        else => null,
-    };
+    return if (inferExternalFormat(drm_format) == format) sourceVkFormat(format) else null;
 }
 
 test "external DMA-BUF channel order selects the matching Vulkan format" {
@@ -2246,11 +2320,11 @@ test "external DMA-BUF channel order selects the matching Vulkan format" {
     ) == c.VK_FORMAT_B8G8R8A8_UNORM);
     try std.testing.expect(externalVkFormat(
         c.DRM_FORMAT_ABGR8888,
-        .argb8888_premultiplied,
+        .abgr8888,
     ) == c.VK_FORMAT_R8G8B8A8_UNORM);
     try std.testing.expect(externalVkFormat(
         c.DRM_FORMAT_XBGR8888,
-        .xrgb8888,
+        .xbgr8888,
     ) == c.VK_FORMAT_R8G8B8A8_UNORM);
     try std.testing.expect(externalVkFormat(
         c.DRM_FORMAT_ABGR8888,
@@ -2313,6 +2387,7 @@ fn destroyImportedImage(self: *RealRenderer, entry: *ImportedImage) void {
     c.vkDestroyImageView(self.device, entry.view, null);
     c.vkDestroyImage(self.device, entry.image, null);
     c.vkFreeMemory(self.device, entry.memory, null);
+    for (entry.plane_memories) |memory| if (memory != null) c.vkFreeMemory(self.device, memory, null);
     const generation = entry.generation;
     entry.* = .{ .generation = generation };
     bumpResourceEpoch(self);
@@ -2331,6 +2406,19 @@ fn duplicateFd(fd: std.posix.fd_t) !std.posix.fd_t {
 
 fn exportDmaBufFence(fd: std.posix.fd_t) !std.posix.fd_t {
     return exportDmaBufFenceFor(fd, c.DMA_BUF_SYNC_READ);
+}
+
+fn exportSourceFence(source: render.ExternalSource) !std.posix.fd_t {
+    var merged = try exportDmaBufFence(source.fds[0]);
+    errdefer _ = linux.close(merged);
+    for (source.fds[1..source.plane_count]) |fd| {
+        const next = try exportDmaBufFence(fd);
+        defer _ = linux.close(next);
+        const combined = try mergeSyncFiles(merged, next);
+        _ = linux.close(merged);
+        merged = combined;
+    }
+    return merged;
 }
 
 fn exportDmaBufWriteFence(fd: std.posix.fd_t) !std.posix.fd_t {
@@ -4377,7 +4465,7 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
         } else external: {
             const source = frame.sources[prepared.source_index].source.external orelse
                 return error.MissingExternalSource;
-            break :external try exportDmaBufFence(source.fds[0]);
+            break :external try exportSourceFence(source);
         };
         acquire_fds[acquire_fd_count] = acquire_fd;
         acquire_fd_count += 1;
@@ -4888,7 +4976,8 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
             if (prepared.imported_token == null or prepared.native_token == null) continue;
             const source = frame.sources[prepared.source_index].source.external orelse
                 break :source_sync;
-            importDmaBufFence(source.fds[0], source_completion_fd) catch break :source_sync;
+            for (source.fds[0..source.plane_count]) |fd|
+                importDmaBufFence(fd, source_completion_fd) catch break :source_sync;
         }
         source_safe = true;
     }

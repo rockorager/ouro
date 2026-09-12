@@ -189,15 +189,13 @@ pub const Store = struct {
         if (params.used) return error.AlreadyUsed;
         params.used = true;
         if (width <= 0 or height <= 0) return error.InvalidDimensions;
-        if (format != drm_format_argb8888 and format != drm_format_xrgb8888 and
-            format != drm_format_abgr8888 and format != drm_format_xbgr8888)
-        {
+        const pixel_format = @import("../render/types.zig").PixelFormat.fromDrm(format) orelse {
             std.log.warn(
                 "rejecting DMA-BUF format {x:0>8} ({c}{c}{c}{c}), size {d}x{d}, flags {x}",
                 .{ format, @as(u8, @truncate(format)), @as(u8, @truncate(format >> 8)), @as(u8, @truncate(format >> 16)), @as(u8, @truncate(format >> 24)), width, height, flags },
             );
             return error.InvalidFormat;
-        }
+        };
         // Ouro does not yet deinterlace or invert imported content. These
         // layouts must not be accepted until the renderer models them.
         if (flags != 0) {
@@ -208,13 +206,21 @@ pub const Store = struct {
             return error.InvalidFormat;
         }
         const plane = params.planes[0] orelse return error.Incomplete;
-        for (params.planes[1..]) |candidate| if (candidate != null)
-            return error.Incomplete;
+        var plane_count: u8 = 0;
+        for (params.planes, 0..) |candidate, index| {
+            if (candidate) |item| {
+                if (index != plane_count) return error.Incomplete;
+                if (item.modifier != plane.modifier) return error.InvalidFormat;
+                if (item.stride == 0) return error.OutOfBounds;
+                plane_count += 1;
+            }
+        }
         // Linear layout has a portable byte-bound check. Modifier-specific
         // layouts are admitted to the renderer validator, which queries the
         // exact Vulkan import contract before the wl_buffer becomes usable.
         if (plane.modifier == modifier_linear or plane.modifier == modifier_invalid) {
-            const row_bytes = std.math.mul(u32, @intCast(width), 4) catch
+            if (plane_count != 1) return error.Incomplete;
+            const row_bytes = std.math.mul(u32, @intCast(width), pixel_format.bytesPerPixel()) catch
                 return error.OutOfBounds;
             if (plane.stride < row_bytes) return error.OutOfBounds;
             const plane_bytes = std.math.mul(u64, plane.stride, @as(u32, @intCast(height))) catch
@@ -239,7 +245,7 @@ pub const Store = struct {
                 .format = format,
                 .flags = flags,
                 .planes = params.planes,
-                .plane_count = 1,
+                .plane_count = plane_count,
             },
         };
         params.planes = [_]?Plane{null} ** max_planes;
@@ -1152,6 +1158,39 @@ fn sizedFd(size: usize) !linux.fd_t {
 
 fn expectClosed(fd: linux.fd_t) !void {
     try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(fd, linux.F.GETFD, 0)));
+}
+
+test "linux-dmabuf: modern RGB bounds and modifier memory planes" {
+    var store = try Store.init(std.testing.allocator, .{});
+    defer store.deinit();
+    for (std.enums.values(@import("../render/types.zig").PixelFormat)) |format| {
+        const fourcc_value = format.drmFormat() orelse continue;
+        const bpp = format.bytesPerPixel();
+        const params = try store.createParams();
+        try store.addPlane(params, try sizedFd(2 * (3 * bpp + 1) + 7), 0, 7, 3 * bpp + 1, modifier_linear);
+        const buffer_id = try store.createBuffer(params, 3, 2, fourcc_value, 0);
+        try std.testing.expectEqual(fourcc_value, (try store.buffer(buffer_id)).format);
+        const short = try store.createParams();
+        try store.addPlane(short, try sizedFd(1024), 0, 0, 3 * bpp - 1, modifier_linear);
+        try std.testing.expectError(error.OutOfBounds, store.createBuffer(short, 3, 2, fourcc_value, 0));
+    }
+    const shared = try sizedFd(8192);
+    const duplicate_raw = linux.fcntl(shared, linux.F.DUPFD_CLOEXEC, 0);
+    if (linux.errno(duplicate_raw) != .SUCCESS) {
+        _ = linux.close(shared);
+        return error.SystemCallFailed;
+    }
+    const params = try store.createParams();
+    try store.addPlane(params, shared, 0, 0, 256, 7);
+    try store.addPlane(params, @intCast(duplicate_raw), 1, 4096, 64, 7);
+    const buffer_id = try store.createBuffer(params, 32, 16, drm_format_xrgb8888, 0);
+    const buffer_value = try store.buffer(buffer_id);
+    try std.testing.expectEqual(@as(u8, 2), buffer_value.plane_count);
+    try std.testing.expectEqual(@as(u32, 4096), buffer_value.planes[1].?.offset);
+    const mismatch = try store.createParams();
+    try store.addPlane(mismatch, try sizedFd(4096), 0, 0, 256, 7);
+    try store.addPlane(mismatch, try sizedFd(4096), 1, 0, 64, 8);
+    try std.testing.expectError(error.InvalidFormat, store.createBuffer(mismatch, 32, 16, drm_format_xrgb8888, 0));
 }
 
 test "linux-dmabuf: generated wire adapter is complete" {

@@ -643,6 +643,14 @@ pub fn build(b: *std.Build) void {
     shm_test_step.dependOn(&b.addRunArtifact(shm_tests).step);
     shm_test_step.dependOn(&b.addRunArtifact(shm_runtime_tests).step);
 
+    const buffer_tests = b.addTest(.{
+        .root_module = ouro,
+        .filters = &.{ "linux-dmabuf:", "external", "direct scanout", "color", "render:", "render-vulkan:", "render-content:" },
+    });
+    const buffer_test_step = b.step("test-buffers", "Run buffer, color, import, and composition conformance tests");
+    buffer_test_step.dependOn(shm_test_step);
+    buffer_test_step.dependOn(&b.addRunArtifact(buffer_tests).step);
+
     const settings_tests = b.addTest(.{
         .root_module = ouro,
         .filters = &.{ "settings", "config.", "MCP", "invalid paths and stop readiness" },

@@ -591,7 +591,7 @@ fn mapImportedBo(
     const format = formatFromDrm(import.format) orelse return error.UnsupportedFormat;
     const mapping = try platform.map(bo, .read);
     errdefer platform.unmap(bo, mapping.token);
-    const row_bytes = std.math.mul(u32, import.width, 4) catch return error.InvalidSource;
+    const row_bytes = std.math.mul(u32, import.width, format.bytesPerPixel()) catch return error.InvalidSource;
     if (mapping.stride < row_bytes) return error.InvalidSource;
     const length = std.math.mul(usize, mapping.stride, import.height) catch
         return error.InvalidSource;
@@ -613,8 +613,8 @@ fn mapImportedBo(
 fn directMap(import: gbm.Import) ![]align(std.heap.page_size_min) u8 {
     if (import.plane_count != 1 or import.modifier != gbm.modifier_linear)
         return error.UnsupportedDirectMap;
-    _ = formatFromDrm(import.format) orelse return error.UnsupportedFormat;
-    const row_bytes = std.math.mul(u32, import.width, 4) catch return error.InvalidSource;
+    const format = formatFromDrm(import.format) orelse return error.UnsupportedFormat;
+    const row_bytes = std.math.mul(u32, import.width, format.bytesPerPixel()) catch return error.InvalidSource;
     if (import.width == 0 or import.height == 0 or import.strides[0] < row_bytes)
         return error.InvalidSource;
     const length = std.math.mul(usize, import.strides[0], import.height) catch
@@ -2092,10 +2092,7 @@ fn bindSamples(list: render.List, bindings: []const SampleBinding, output: []sch
 }
 
 pub fn formatFromDrm(value: u32) ?render.PixelFormat {
-    if (value == gbm.format_xrgb8888 or value == gbm.format_xbgr8888) return .xrgb8888;
-    if (value == gbm.format_argb8888 or value == gbm.format_abgr8888)
-        return .argb8888_premultiplied;
-    return null;
+    return render.PixelFormat.fromDrm(value);
 }
 
 fn targetFormatFromDrm(value: u32) ?render.PixelFormat {
@@ -2329,7 +2326,7 @@ fn directScanoutSource(
         return null;
     // Alpha-capable buffers are opaque when the client declares their entire
     // surface opaque. Keep the original DRM format for KMS validation.
-    if (sample.source.format != .xrgb8888 and
+    if (!sample.source.format.isOpaque() and
         !render.effectRegionCoversSurface(sample.opaque_region, sample.effect_size))
         return null;
     const fixed_width = @as(i64, sample.source.size.width) * render.fixed_one;
@@ -2585,7 +2582,7 @@ test "drm-output: direct scanout eligibility is exact and conservative" {
     try std.testing.expect(directScanoutSource(list, .srgb) == null);
 
     sample.source.native = null;
-    sample.source.format = .argb8888_premultiplied;
+    sample.source.format = .abgr8888;
     sample.source.external.?.drm_format = gbm.format_abgr8888;
     sample.effect_size = .{ .width = 2, .height = 1 };
     list.samples = &.{sample};
