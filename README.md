@@ -598,6 +598,100 @@ integration. `uv run --with vulkan --with pillow python test/vulkan-cursor.py
 --capture-shm shm.png` checks the SHM formats offscreen, including low linear
 values, alpha, padded strides, both shader paths, and 8/10-bit output.
 
+### Modern buffer support and conformance
+
+The table describes strict Vulkan mode. DMA-BUF entries require driver support
+for the exact format, modifier, image usage, plane views, and backing layout;
+they are not unconditional advertisements. SHM and DMA-BUF use separate import
+paths, so supporting a SHM format does not imply DMA-BUF import or KMS support.
+
+| Format family | SHM input | DMA-BUF input/composition | Capture destination | KMS output/scanout |
+| --- | --- | --- | --- | --- |
+| ARGB/XRGB8888 | Yes; also auto/Pixman | Capability-gated | Existing 8-bit SDR | Capability-gated |
+| ABGR/XBGR8888 | Yes | Capability-gated | No new destinations | Capability-gated |
+| ARGB/XRGB/ABGR/XBGR2101010 | Yes | Capability-gated | No | Capability-gated |
+| ABGR/XBGR16161616 UNORM | Yes | Capability-gated | ABGR16 SHM output capture only | No |
+| ABGR/XBGR16161616F | Yes, distinct FP16 | Capability-gated | No | No |
+| NV12/NV21, P010/P012/P016 | No | Capability-gated, even dimensions | Converted SDR RGB | No; compose |
+| YUV420/YVU420 | No | Capability-gated, even dimensions | Converted SDR RGB | No; compose |
+| YUYV/UYVY | No | Capability-gated, even width, linear modifier only | Converted SDR RGB | No; compose |
+| Single-pixel u32 RGBA | Protocol object | Float composition | Converted SDR RGB | Compose |
+
+RGB input bytes are retained through upload. Composition batches and blur use
+RGBA32F intermediates, avoiding FP16 quantization of UNORM16 and single-pixel
+values before export. This doubles intermediate image memory relative to
+RGBA16F; blur interpolates explicitly because FP32 linear filtering is optional
+in Vulkan. High-precision input/composition does not require a high-depth output.
+
+Video defaults to BT.709 coefficients, limited range, and horizontally cosited,
+vertically midpoint 4:2:0 chroma (H.273 location 0). These are documented Ouro
+defaults, not metadata inferred from FourCC or resolution. The
+[color-representation protocol](https://gitlab.freedesktop.org/wayland/wayland-protocols/-/blob/main/staging/color-representation/color-representation-v1.xml)
+allows clients to set BT.601/709/2020 coefficients, full/limited range and all
+six H.273 4:2:0 locations. Transfer/primaries remain a separate color-management
+description. Incompatible metadata and pixel layouts are rejected at commit.
+Vulkan modifier **memory planes** (including auxiliary compression planes) are
+not YUV **color planes**: offsets/strides and allocation bindings describe the
+former, while plane views and chroma sampling describe the latter. Shared
+backings bind once; distinct backings require disjoint support. Unsupported
+modifier/plane-view combinations are withheld or rejected, not reinterpreted.
+
+Surface DMA-BUF feedback prefers the largest-overlap output's compatible
+scanout pairs, intersected with renderer import capabilities, and retains a
+full sampling fallback tranche. Moving surfaces and output/color changes
+refresh feedback; a preference is not a scanout guarantee. RGB bypass retains
+the scene/color/geometry/synchronization checks and atomic TEST_ONLY fallback.
+Native-video bypass stays disabled until KMS color encoding, range and chroma
+requirements can be established and programmed correctly.
+
+Untagged desktop and unprofiled SDR output use sRGB primaries plus gamma22,
+following current
+[color-management guidance](https://gitlab.freedesktop.org/wayland/wayland-protocols/-/blob/main/staging/color-management/color-management-v1.xml).
+Explicit compound_power_2_4 remains piecewise sRGB; linear, PQ, HLG and ICC
+transforms retain distinct behavior. HLG currently applies its inverse OETF,
+not a complete display OOTF. Input format acceptance is not full HDR support.
+
+| Conformance area | Executable coverage | Still requires hardware |
+| --- | --- | --- |
+| Layout/import | `zig build test-buffers`: SHM bounds/stride, 32/64-bit distinction, DMA-BUF offsets, shared/disjoint backing validation, malformed inputs, protocol lifetime | Actual exported DMA-BUF FDs, tiled/compressed and auxiliary-plane imports |
+| Composition | `test/vulkan-cursor.py`: asymmetric RGB, X/alpha, UNORM/FP16, low light, extended range, filtering, partial damage, 8/10-bit targets, video coefficients/range/siting | Driver-specific external plane views and synchronization |
+| Capture | Offscreen raw/managed round trip, monitor independence, tone shoulder, cursor phases, 16-bit export, continuation and blur precision; Zig region/rotation copies | Real capture clients, DMA-BUF target negotiation and fences |
+| Feedback/scanout | Zig output-specific tranches, backpressure snapshots, simulated atomic rejection/fallback and sync lifetime | Real KMS plane/modifier support, direct scanout, hotplug, explicit-sync release timing |
+
+Run the combined checks with:
+
+```sh
+zig build test-buffers -j2 --summary all
+zig build -j2 --summary all
+zig build test -j2 --summary all
+uv run --with vulkan --with pillow python test/vulkan-cursor.py
+```
+
+The offscreen test creates Vulkan images directly; it is not a Wayland client,
+external DMA-BUF import test, or KMS/Foot session. In this orb it runs on
+lavapipe with no `/dev/dri`. The complete suite also has baseline tests that
+return nonzero after deliberately logging startup/readiness/shutdown errors;
+report their diagnostics separately from passed assertions.
+
+Remaining hardware acceptance, in a dedicated session on Intel, AMD and NVIDIA:
+
+1. Run strict Vulkan mode, inspect advertised SHM and DMA-BUF feedback, and
+   confirm each advertised pair really imports. Test both shared-FD and
+   separate-FD layouts with nonzero offsets, padded/subsampled strides and
+   supported compressed modifiers. Run Vulkan validation and check FD leaks.
+2. Run Foot with `gamma-correct-blending=yes`, confirm ABGR16161616 selection,
+   then exercise 2101010 fallbacks. Compare low-light ramps, translucent text,
+   sparse damage and resize with 8-bit physical output as well as 10-bit.
+3. Exercise fullscreen eligible RGB scanout, then force composition by adding
+   overlap, changing color descriptions, scaling/rotation and moving between
+   outputs. Check TEST_ONLY rejection preserves rendering. Video must compose.
+4. Delay acquire fences, reuse imported buffers, destroy surfaces and hotplug
+   during presentation. Verify no access before acquire and no release before
+   the final renderer/KMS use; include every backing FD.
+5. Capture unchanged and damaged regions with/without cursor on SDR and HDR/ICC
+   outputs. Check 8-bit compatibility, opt-in 16-bit output capture, raw gamma22
+   redisplay, and separately interpreted PNG/video export as described below.
+
 The physical path activates every eligible desktop output and requires a usable
 `/dev/dri` device and libseat backend. `Loop.turn` is the sole io_uring
 submitter; protocol, backend, render, and presentation callbacks only retain
