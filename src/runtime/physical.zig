@@ -9215,7 +9215,8 @@ pub fn Coordinator(comptime protocol: type) type {
             defer if (imported_source) |*imported| imported.deinit();
             var borrowed_source: render.Source = switch (source) {
                 .shm => |shm| shm_source: {
-                    const pixel_format: render.PixelFormat = if (shm.format.value == protocol.wl_shm.format.argb8888.value) .argb8888_premultiplied else if (shm.format.value == protocol.wl_shm.format.xrgb8888.value) .xrgb8888 else return error.UnsupportedShmFormat;
+                    const pixel_format = core_surface.shmPixelFormat(shm.format.value) orelse
+                        return error.UnsupportedShmFormat;
                     if (shm.stride > std.math.maxInt(u32)) return error.InvalidSource;
                     break :shm_source .{
                         .size = .{ .width = shm.width, .height = shm.height },
@@ -9282,7 +9283,7 @@ pub fn Coordinator(comptime protocol: type) type {
                 }
             }
             if (content_work.scope) |*scope| {
-                scope.context.bytes = @as(u64, borrowed_source.size.width) * borrowed_source.size.height * 4;
+                scope.context.bytes = @as(u64, borrowed_source.size.width) * borrowed_source.size.height * borrowed_source.format.bytesPerPixel();
                 for (upload_damage.rects[0..upload_damage.count]) |rect| {
                     scope.context.damage_pixels +|= @as(u64, @intCast(rect.max_x - rect.min_x)) *
                         @as(u64, @intCast(rect.max_y - rect.min_y));

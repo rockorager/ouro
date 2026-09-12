@@ -13,6 +13,25 @@ const region_state = @import("../region.zig");
 const objects = wayring.objects;
 const none = std.math.maxInt(u32);
 
+/// One table owns advertisement, Wayring's layout validation, and ingestion.
+const shm_pixel_formats = [_]@import("../render/types.zig").PixelFormat{
+    .argb8888_premultiplied, .xrgb8888, .abgr16161616, .argb2101010, .abgr2101010,
+};
+pub const shm_formats: [shm_pixel_formats.len]wayring.shm.Format = blk: {
+    const formats = @import("core_protocol").wl_shm.format;
+    const values = [_]u32{ formats.argb8888.value, formats.xrgb8888.value, formats.abgr16161616.value, formats.argb2101010.value, formats.abgr2101010.value };
+    var result: [values.len]wayring.shm.Format = undefined;
+    for (values, shm_pixel_formats, 0..) |value, format, index|
+        result[index] = .{ .value = value, .bytes_per_pixel = format.bytesPerPixel() };
+    break :blk result;
+};
+
+pub fn shmPixelFormat(value: u32) ?@import("../render/types.zig").PixelFormat {
+    for (shm_formats, shm_pixel_formats) |wire, format|
+        if (wire.value == value) return format;
+    return null;
+}
+
 pub const InputSnapshot = struct {
     width: u32,
     height: u32,
@@ -3611,10 +3630,29 @@ const TestShm = wayring.server.Shm(test_protocol);
 const TestCore = wayring.server.Core(test_protocol);
 const linux = std.os.linux;
 
-const test_formats = [_]wayring.shm.Format{
-    .{ .value = test_protocol.wl_shm.format.argb8888.value, .bytes_per_pixel = 4 },
-    .{ .value = test_protocol.wl_shm.format.xrgb8888.value, .bytes_per_pixel = 4 },
-};
+const test_formats = shm_formats;
+
+test "SHM high precision formats validate full rows and pool bounds" {
+    const values = [_]u32{ 0x38344241, 0x30335241, 0x30334241 };
+    const pixels = [_]@import("../render/types.zig").PixelFormat{ .abgr16161616, .argb2101010, .abgr2101010 };
+    for (values, pixels, [_]u32{ 8, 4, 4 }) |value, pixel, bpp| {
+        try std.testing.expectEqual(pixel, shmPixelFormat(value).?);
+        const wire = for (shm_formats) |format| {
+            if (format.value == value) break format;
+        } else return error.MissingShmFormat;
+        try std.testing.expectEqual(bpp, wire.bytes_per_pixel);
+        const row: i32 = @intCast(3 * bpp);
+        const stride = row + 1;
+        const extent: usize = @intCast(stride * 2);
+        const buffer = try wayring.shm.createBuffer(1 + extent, wire, 1, 3, 2, stride);
+        try std.testing.expectEqual(extent, buffer.extent);
+        try std.testing.expectError(error.InvalidStride, wayring.shm.createBuffer(100, wire, 0, 3, 2, row - 1));
+        try std.testing.expectError(error.OutOfBounds, wayring.shm.createBuffer(extent, wire, 1, 3, 2, stride));
+    }
+    // ABGR16161616F and the X variants are not part of this advertisement.
+    try std.testing.expectEqual(null, shmPixelFormat(0x48344241));
+    try std.testing.expectEqual(null, shmPixelFormat(0x30335258));
+}
 
 const TestContext = struct {
     blocks: wayring.pool.SharedBlocks,

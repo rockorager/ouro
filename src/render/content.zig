@@ -157,7 +157,7 @@ pub const Store = struct {
     ) !Prepared {
         if (identity.surface == 0 or identity.commit_sequence == 0)
             return error.InvalidIdentity;
-        const packed_stride = std.math.mul(u32, source.size.width, 4) catch
+        const packed_stride = std.math.mul(u32, source.size.width, source.format.bytesPerPixel()) catch
             return error.InvalidSource;
         if (source.size.width == 0 or source.size.height == 0 or
             source.stride < packed_stride)
@@ -466,7 +466,7 @@ pub const Store = struct {
         if (identity.commit_sequence != next and !coversSource(damage, source.size))
             return error.NonAdjacentCommit;
 
-        const packed_stride = std.math.mul(u32, source.size.width, 4) catch
+        const packed_stride = std.math.mul(u32, source.size.width, source.format.bytesPerPixel()) catch
             return error.InvalidSource;
         if (source.size.width == 0 or source.size.height == 0 or
             source.stride < packed_stride)
@@ -759,7 +759,7 @@ fn validateRetainedShm(identity: render.SampleIdentity, source: render.Source) !
         !source.retained_shm or source.native != null or source.upload != null or
         source.external != null or source.size.width == 0 or source.size.height == 0)
         return error.InvalidSource;
-    const row_bytes = std.math.mul(u32, source.size.width, 4) catch
+    const row_bytes = std.math.mul(u32, source.size.width, source.format.bytesPerPixel()) catch
         return error.InvalidSource;
     if (source.stride < row_bytes) return error.InvalidSource;
     const logical_bytes = std.math.mul(usize, source.stride, source.size.height) catch
@@ -810,8 +810,8 @@ fn copyRect(
     const max_x: u32 = @intCast(std.math.clamp(damage.max_x, 0, @as(i64, source.size.width)));
     const max_y: u32 = @intCast(std.math.clamp(damage.max_y, 0, @as(i64, source.size.height)));
     if (min_x >= max_x or min_y >= max_y) return;
-    const byte_x = @as(usize, min_x) * 4;
-    const byte_count = @as(usize, max_x - min_x) * 4;
+    const byte_x = @as(usize, min_x) * source.format.bytesPerPixel();
+    const byte_count = @as(usize, max_x - min_x) * source.format.bytesPerPixel();
     for (min_y..max_y) |row| {
         const source_start = @as(usize, source.stride) * row + byte_x;
         const destination_start = @as(usize, packed_stride) * row + byte_x;
@@ -998,6 +998,50 @@ test "render-content: large packed full copy preserves every byte" {
 
     copyFull(destination, width * 4, testSource(source, width, height, width * 4));
     try std.testing.expectEqualSlices(u8, source, destination);
+}
+
+test "render-content: high precision SHM keeps odd-stride rows and complete damaged pixels" {
+    for ([_]render.PixelFormat{ .abgr16161616, .argb2101010, .abgr2101010 }, [_]u32{ 8, 4, 4 }) |format, bpp| {
+        var store = try Store.init(std.testing.allocator, .{ .version_capacity = 3, .byte_capacity = 128 });
+        defer store.deinit();
+        const stride = 2 * bpp + 1;
+        var bytes: [35]u8 = @splat(0xee);
+        for (0..2) |y| for (0..2 * bpp) |x| {
+            bytes[1 + y * stride + x] = @intCast(y * 2 * bpp + x);
+        };
+        var source = testSource(bytes[1 .. 1 + 2 * stride], 2, 2, stride);
+        source.format = format;
+        const identity: render.SampleIdentity = .{ .surface = 1, .commit_sequence = 1 };
+        const first = store.publish(try store.prepare(identity, source, .{}));
+        var expected: [32]u8 = undefined;
+        for (&expected, 0..) |*byte, index| byte.* = @intCast(index);
+        try std.testing.expectEqual(2 * bpp, (try store.resolve(first)).stride);
+        try std.testing.expectEqualSlices(u8, expected[0 .. 4 * bpp], (try store.resolve(first)).bytes);
+
+        @memset(&bytes, 0xaa);
+        const damage = testDamage(&.{.{ .min_x = 1, .min_y = 1, .max_x = 2, .max_y = 2 }});
+        const second = store.publish(try store.prepare(.{ .surface = 1, .commit_sequence = 2 }, source, damage));
+        @memset(expected[3 * bpp .. 4 * bpp], 0xaa);
+        try std.testing.expectEqualSlices(u8, expected[0 .. 4 * bpp], (try store.resolve(second)).bytes);
+        store.release(first);
+
+        @memset(&bytes, 0xbb);
+        const replacement = try store.prepareReplacing(second, .{ .surface = 1, .commit_sequence = 3 }, source, damage);
+        try std.testing.expect(replacement.replaces);
+        const third = store.publish(replacement);
+        @memset(expected[3 * bpp .. 4 * bpp], 0xbb);
+        try std.testing.expectEqualSlices(u8, expected[0 .. 4 * bpp], (try store.resolve(third)).bytes);
+        store.release(third);
+
+        source.retained_shm = true;
+        try std.testing.expectEqual(@as(usize, 2 * stride), try validateRetainedShm(identity, source));
+        source.bytes = source.bytes[0 .. source.bytes.len - 1];
+        try std.testing.expectError(error.InvalidSource, validateRetainedShm(identity, source));
+        source.retained_shm = false;
+        try std.testing.expectError(error.InvalidSource, store.prepare(identity, source, .{}));
+        source.stride = 2 * bpp - 1;
+        try std.testing.expectError(error.InvalidSource, store.prepare(identity, source, .{}));
+    }
 }
 
 test "render-content: alternating buffers patch one logical surface history" {

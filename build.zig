@@ -631,6 +631,18 @@ pub fn build(b: *std.Build) void {
     );
     drm_presentation_test_step.dependOn(&run_drm_presentation_tests.step);
 
+    const shm_tests = b.addTest(.{
+        .root_module = ouro,
+        .filters = &.{ "high precision", "UNORM16", "capture normalizes", "mixed SHM widths" },
+    });
+    const shm_runtime_tests = b.addTest(.{
+        .root_module = drm_presentation_tests.root_module,
+        .filters = &.{"high precision SHM"},
+    });
+    const shm_test_step = b.step("test-shm", "Run SHM precision, layout, and generated-client tests");
+    shm_test_step.dependOn(&b.addRunArtifact(shm_tests).step);
+    shm_test_step.dependOn(&b.addRunArtifact(shm_runtime_tests).step);
+
     const settings_tests = b.addTest(.{
         .root_module = ouro,
         .filters = &.{ "settings", "config.", "MCP", "invalid paths and stop readiness" },

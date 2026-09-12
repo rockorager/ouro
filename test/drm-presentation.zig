@@ -16,10 +16,7 @@ const pixels = [_]u8{
     0x04, 0x03, 0x02, 0xff, 0x14, 0x13, 0x12, 0xff, 0x24, 0x23, 0x22, 0xff, 0, 0, 0, 0,
     0x34, 0x33, 0x32, 0xff, 0x44, 0x43, 0x42, 0xff, 0x54, 0x53, 0x52, 0xff, 0, 0, 0, 0,
 };
-const shm_formats = [_]wayring.shm.Format{
-    .{ .value = protocol.wl_shm.format.argb8888.value, .bytes_per_pixel = 4 },
-    .{ .value = protocol.wl_shm.format.xrgb8888.value, .bytes_per_pixel = 4 },
-};
+const shm_formats = ouro.core_surface.shm_formats;
 
 test "configuration installs before physical startup claims an output" {
     const allocator = std.testing.allocator;
@@ -287,14 +284,19 @@ test "MCP readiness receives control calls without sleeping and retires the serv
 }
 
 test "generated ordinary SHM traverses the physical coordinator exactly once and drains" {
-    try runVertical(.session_disable, .shm, false);
+    try runVertical(.session_disable, .shm, .{});
+}
+
+test "generated high precision SHM traverses ingestion rendering release and teardown" {
+    for ([_]protocol.wl_shm.format{ .abgr16161616, .argb2101010, .abgr2101010 }) |format|
+        try runVertical(.session_disable, .shm, .{ .shm_format = format });
 }
 
 test "pacing trace preserves generated SHM presentation and teardown" {
     const previous_level = std.testing.log_level;
     std.testing.log_level = .info;
     defer std.testing.log_level = previous_level;
-    try runVertical(.session_disable, .shm, true);
+    try runVertical(.session_disable, .shm, .{ .trace_pacing = true });
 }
 
 test "shutdown: failed disable after final flip is terminal without releasing scanout" {
@@ -464,23 +466,23 @@ fn runShutdownFailure(trigger: enum { shutdown, seat_disable, seat_failure }, ev
 }
 
 test "client disconnect before render deadline abandons pending presentation" {
-    try runVertical(.client_disconnect, .shm, false);
+    try runVertical(.client_disconnect, .shm, .{});
 }
 
 test "generated DMA-BUF traverses GBM import and the physical coordinator" {
-    try runVertical(.client_disconnect, .dmabuf, false);
+    try runVertical(.client_disconnect, .dmabuf, .{});
 }
 
 test "generated single pixel buffer scales through the physical coordinator" {
-    try runVertical(.client_disconnect, .single_pixel, false);
+    try runVertical(.client_disconnect, .single_pixel, .{});
 }
 
 test "generated alpha modifier reaches the physical render sample" {
-    try runVertical(.client_disconnect, .alpha_shm, false);
+    try runVertical(.client_disconnect, .alpha_shm, .{});
 }
 
 test "generated background effect reaches the physical render sample" {
-    try runVertical(.client_disconnect, .blur_shm, false);
+    try runVertical(.client_disconnect, .blur_shm, .{});
 }
 
 test "physical coordinator keeps serving until its final client disconnects" {
@@ -2954,7 +2956,10 @@ test "output readiness exhaustion destroys output and releases device" {
 const TerminalTrigger = enum { session_disable, client_disconnect };
 const ClientSource = enum { shm, alpha_shm, blur_shm, dmabuf, single_pixel };
 
-fn runVertical(trigger: TerminalTrigger, source: ClientSource, trace_pacing: bool) !void {
+fn runVertical(trigger: TerminalTrigger, source: ClientSource, options: struct {
+    trace_pacing: bool = false,
+    shm_format: protocol.wl_shm.format = .argb8888,
+}) !void {
     const allocator = std.testing.allocator;
     var fixture = try Fixture.init();
     defer fixture.deinit();
@@ -2965,7 +2970,9 @@ fn runVertical(trigger: TerminalTrigger, source: ClientSource, trace_pacing: boo
 
     const root = try Compositor.create(allocator, try wayring.unix_socket.listen(path, 1), compositorConfig());
     var config = coordinatorConfig();
-    config.output.trace_pacing = trace_pacing;
+    config.output.trace_pacing = options.trace_pacing;
+    config.output.max_source_bytes = 64;
+    config.surface.max_copy_bytes = 64;
     const coordinator = try Coordinator.create(allocator, root, fixture.platforms(), config);
     // Exercise the recorder independently of --trace-pacing, without a log
     // worker. Synthetic DRM timestamps are not real performance evidence.
@@ -2991,6 +2998,7 @@ fn runVertical(trigger: TerminalTrigger, source: ClientSource, trace_pacing: boo
         .queue = &actor.transmit,
         .registry = registry,
         .source = source,
+        .shm_format = options.shm_format,
     };
     _ = try client_driver.schedule();
     _ = try client_driver.prepare(&client_handler);
@@ -3034,6 +3042,16 @@ fn runVertical(trigger: TerminalTrigger, source: ClientSource, trace_pacing: boo
             }
             if (source == .alpha_shm)
                 try std.testing.expectEqual(@as(u8, 128), sample.global_alpha);
+            if (source == .shm) {
+                try std.testing.expectEqual(ouro.core_surface.shmPixelFormat(options.shm_format.value).?, sample.source.format);
+                const rendered = try coordinator.render_device.?.content.resolve(coordinator.cursor_layer.rendered.?);
+                const wide = options.shm_format.value == protocol.wl_shm.format.abgr16161616.value;
+                try std.testing.expectEqual(@as(u32, if (wide) 24 else 12), rendered.stride);
+                if (wide) {
+                    try std.testing.expectEqualSlices(u8, &.{ 2, 2, 3, 3, 4, 4, 255, 255 }, rendered.bytes[0..8]);
+                    try std.testing.expectEqualSlices(u8, &.{ 82, 82, 83, 83, 84, 84, 255, 255 }, rendered.bytes[40..48]);
+                }
+            }
             if (source == .blur_shm) {
                 try std.testing.expectEqual(ouro.render.Size{ .width = 3, .height = 2 }, sample.effect_size);
                 try std.testing.expectEqualSlices(ouro.render.RegionOperation, &.{.{
@@ -3048,6 +3066,7 @@ fn runVertical(trigger: TerminalTrigger, source: ClientSource, trace_pacing: boo
         _ = try loop.turn(coordinator);
     }
     try std.testing.expect(client_handler.complete());
+    if (source == .shm) try std.testing.expect(client_handler.shm_format_advertised);
     try std.testing.expect(observed_identity);
     try std.testing.expectEqual(@as(usize, 1), coordinator.stats.selected_outputs);
     try std.testing.expectEqual(@as(usize, 1), coordinator.stats.applied);
@@ -3357,6 +3376,8 @@ const ClientHandler = struct {
     xdg_descriptions: usize = 0,
     tablet_v2_announced: bool = false,
     source: ClientSource = .shm,
+    shm_format: protocol.wl_shm.format = .argb8888,
+    shm_format_advertised: bool = false,
 
     fn complete(self: ClientHandler) bool {
         return self.frame_done == 1 and self.release_done == 1 and
@@ -3398,7 +3419,11 @@ const ClientHandler = struct {
                 .global_remove => {},
             }
         } else if (target.object.interface == &protocol.wl_shm.info) {
-            _ = try wayring.client.decodeEvent(protocol.wl_shm, self.objects, self.shm.?, message, fds);
+            switch (try wayring.client.decodeEvent(protocol.wl_shm, self.objects, self.shm.?, message, fds)) {
+                .format => |advertisement| if (advertisement.format.value == self.shm_format.value) {
+                    self.shm_format_advertised = true;
+                },
+            }
         } else if (target.object.interface == &protocol.ext_background_effect_manager_v1.info) {
             switch (try wayring.client.decodeEvent(
                 protocol.ext_background_effect_manager_v1,
@@ -3646,14 +3671,34 @@ const ClientHandler = struct {
     }
 
     fn createShmBuffer(self: *ClientHandler) !wayring.objects.Handle {
-        const descriptor = try ordinaryMemfd(4096, 16, &pixels);
+        var bytes: [64]u8 = @splat(0xee);
+        const wide = self.shm_format.value == protocol.wl_shm.format.abgr16161616.value;
+        const stride: u32 = if (wide) 25 else 16;
+        if (self.shm_format.value == protocol.wl_shm.format.argb8888.value) {
+            @memcpy(bytes[0..pixels.len], &pixels);
+        } else for (0..2) |y| {
+            for (0..3) |x| {
+                const bgra = pixels[y * 16 + x * 4 ..][0..4];
+                if (wide) {
+                    for ([_]usize{ 2, 1, 0, 3 }, 0..) |channel, i|
+                        std.mem.writeInt(u16, bytes[y * stride + x * 8 + i * 2 ..][0..2], @as(u16, bgra[channel]) * 257, .little);
+                } else {
+                    const r = @as(u32, bgra[2]) * 4;
+                    const g = @as(u32, bgra[1]) * 4;
+                    const b = @as(u32, bgra[0]) * 4;
+                    const value = (3 << 30) | (g << 10) | (if (self.shm_format.value == protocol.wl_shm.format.argb2101010.value) (r << 20) | b else (b << 20) | r);
+                    std.mem.writeInt(u32, bytes[y * stride + x * 4 ..][0..4], value, .little);
+                }
+            }
+        }
+        const descriptor = try ordinaryMemfd(4096, 16, bytes[0 .. stride * 2]);
         const pool = try protocol.wl_shm.construct_create_pool(self.objects, self.queue, self.shm.?, .{ .fd = descriptor, .size = 4096 });
         const buffer = (try protocol.wl_shm_pool.construct_create_buffer(self.objects, self.queue, pool.id, .{
             .offset = 16,
             .width = 3,
             .height = 2,
-            .stride = 16,
-            .format = .argb8888,
+            .stride = @intCast(stride),
+            .format = self.shm_format,
         })).id;
         try wayring.client.sendRequest(protocol.wl_shm_pool, self.objects, self.queue, pool.id, .{ .destroy = .{} });
         return buffer;

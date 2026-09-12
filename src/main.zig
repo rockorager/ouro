@@ -12,10 +12,7 @@ const SystemdSession = @import("systemd_session.zig");
 const PreparedConfig = ouro.configuration.Prepared(Runtime);
 const fatal_shutdown_grace_ns = 5 * std.time.ns_per_s;
 
-const shm_formats = [_]wayring.shm.Format{
-    .{ .value = protocol.wl_shm.format.argb8888.value, .bytes_per_pixel = 4 },
-    .{ .value = protocol.wl_shm.format.xrgb8888.value, .bytes_per_pixel = 4 },
-};
+const shm_formats = ouro.core_surface.shm_formats;
 
 const Options = struct {
     socket: ?[]const u8 = null,

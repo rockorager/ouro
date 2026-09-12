@@ -1,7 +1,8 @@
 //! Renderer-neutral M2 surface render contract.
 //!
-//! Pixels are 8-bit premultiplied ARGB or opaque XRGB. On little-endian hosts
-//! each pixel is stored in byte order B, G, R, A/X. Source coordinates are
+//! Pixels use the little-endian wl_shm channel layouts, without quantization
+//! on ingestion. Alpha is premultiplied unless overridden by the sample's
+//! color representation. Source coordinates are
 //! signed 16.16 fixed point, allowing Wayland viewport crops to be represented
 //! without choosing a renderer API. Samples are ordered back-to-front.
 
@@ -14,6 +15,13 @@ pub const fixed_one: i32 = 1 << 16;
 pub const PixelFormat = enum {
     argb8888_premultiplied,
     xrgb8888,
+    abgr16161616,
+    argb2101010,
+    abgr2101010,
+
+    pub fn bytesPerPixel(format: PixelFormat) u32 {
+        return if (format == .abgr16161616) 8 else 4;
+    }
 };
 
 pub const Color = struct {
@@ -243,6 +251,9 @@ pub const ValidationError = error{
 
 pub fn validateList(list: List) ValidationError!void {
     try validateOutput(list.output);
+    // High precision formats are source layouts, not new scanout targets.
+    if (list.output_format != .xrgb8888 and list.output_format != .argb8888_premultiplied)
+        return error.InvalidOutput;
     list.output_color_description.validate() catch return error.InvalidSource;
     for (list.samples) |sample| _ = try validateSample(sample);
 }
@@ -262,7 +273,7 @@ pub fn validateSample(sample: SurfaceSample) ValidationError!usize {
         sample.source.size.width > std.math.maxInt(i32) or
         sample.source.size.height > std.math.maxInt(i32))
         return error.InvalidSource;
-    const row_bytes = std.math.mul(u32, sample.source.size.width, 4) catch
+    const row_bytes = std.math.mul(u32, sample.source.size.width, sample.source.format.bytesPerPixel()) catch
         return error.InvalidSource;
     if (sample.source.stride < row_bytes or sample.source.stride > std.math.maxInt(i32))
         return error.InvalidSource;

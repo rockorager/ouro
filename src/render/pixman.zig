@@ -249,6 +249,7 @@ pub const Renderer = struct {
             destination_bytes,
             destination_stride,
             plan.output,
+            list.output_format,
         );
         if (draws) try self.drawRange(
             list,
@@ -264,6 +265,7 @@ pub const Renderer = struct {
             destination_bytes,
             destination_stride,
             plan.output,
+            list.output_format,
         );
     }
 
@@ -322,17 +324,24 @@ pub const Renderer = struct {
             defer if (scratch) |pixels| self.allocator.free(pixels);
             var source_bytes = sample.source.bytes;
             var source_stride = sample.source.stride;
-            if (@intFromPtr(source_bytes.ptr) % @alignOf(u32) != 0) {
+            const float_source = sample.source.format == .abgr16161616;
+            const source_bpp: u32 = if (float_source) 16 else sample.source.format.bytesPerPixel();
+            if (float_source or @intFromPtr(source_bytes.ptr) % @alignOf(u32) != 0 or source_stride % 4 != 0) {
                 const pixel_count = std.math.mul(
                     usize,
                     sample.source.size.width,
                     sample.source.size.height,
                 ) catch return error.SourceCapacityExceeded;
-                const packed_stride = std.math.mul(u32, sample.source.size.width, 4) catch
+                const packed_stride = std.math.mul(u32, sample.source.size.width, source_bpp) catch
                     return error.SourceCapacityExceeded;
-                scratch = try self.allocator.alloc(u32, pixel_count);
+                const word_count = std.math.mul(usize, pixel_count, source_bpp / 4) catch
+                    return error.SourceCapacityExceeded;
+                scratch = try self.allocator.alloc(u32, word_count);
                 const packed_bytes = std.mem.sliceAsBytes(scratch.?);
-                copySource(packed_bytes, packed_stride, sample.source);
+                if (float_source)
+                    unpackAbgr16(std.mem.bytesAsSlice(f32, packed_bytes), sample.source)
+                else
+                    copySource(packed_bytes, packed_stride, sample.source);
                 source_bytes = packed_bytes;
                 source_stride = packed_stride;
             }
@@ -355,7 +364,7 @@ pub const Renderer = struct {
                 @intCast(std.math.divCeil(i64, @as(i64, sample.crop.y) + sample.crop.height, render.fixed_one) catch unreachable)
             else
                 sample.source.size.height;
-            const source_offset = @as(usize, top) * source_stride + @as(usize, left) * 4;
+            const source_offset = @as(usize, top) * source_stride + @as(usize, left) * source_bpp;
             const source = c.pixman_image_create_bits(
                 pixmanFormat(sample.source.format),
                 @intCast(right - left),
@@ -752,6 +761,7 @@ fn copyReadback(
     source: []const u8,
     source_stride: u32,
     output: render.Size,
+    format: render.PixelFormat,
 ) Error!void {
     try validateReadback(readback, output);
     const row_bytes = std.math.mul(u32, output.width, 4) catch return error.InvalidTarget;
@@ -762,7 +772,23 @@ fn copyReadback(
             readback.bytes[destination_start..][0..row_bytes],
             source[source_start..][0..row_bytes],
         );
+        // Pixman's float-to-XRGB store can leave X at zero. Captures may be
+        // consumed as ARGB, so export opacity rather than the unused X bits.
+        if (format == .xrgb8888) for (0..output.width) |x| {
+            readback.bytes[destination_start + x * 4 + 3] = 255;
+        };
     }
+}
+
+test "render: capture normalizes unused X bits but preserves ARGB alpha" {
+    const source = [_]u8{ 3, 5, 7, 0, 11, 13, 17, 129, 0xee };
+    var bytes: [12]u8 = @splat(0xcc);
+    const readback = Readback{ .bytes = &bytes, .stride = 12 };
+    const size = render.Size{ .width = 2, .height = 1 };
+    try copyReadback(readback, &source, 9, size, .xrgb8888);
+    try std.testing.expectEqualSlices(u8, &.{ 3, 5, 7, 255, 11, 13, 17, 255, 0xcc, 0xcc, 0xcc, 0xcc }, &bytes);
+    try copyReadback(readback, &source, 9, size, .argb8888_premultiplied);
+    try std.testing.expectEqualSlices(u8, source[0..8], bytes[0..8]);
 }
 
 fn validateReadback(readback: Readback, output: render.Size) Error!void {
@@ -782,7 +808,7 @@ fn deinitCaches(caches: []Cache) void {
 }
 
 fn copySource(destination: []u8, destination_stride: u32, source: render.Source) void {
-    const row_bytes: usize = @as(usize, source.size.width) * 4;
+    const row_bytes: usize = @as(usize, source.size.width) * source.format.bytesPerPixel();
     for (0..source.size.height) |row| {
         const source_start = @as(usize, source.stride) * row;
         const destination_start = @as(usize, destination_stride) * row;
@@ -793,10 +819,43 @@ fn copySource(destination: []u8, destination_stride: u32, source: render.Source)
     }
 }
 
+/// Pixman has no 16-bit integer RGBA layout. Its float accessor preserves every
+/// UNORM16 value through filtering/composition, until the destination conversion.
+fn unpackAbgr16(destination: []f32, source: render.Source) void {
+    for (0..source.size.height) |y| {
+        for (0..source.size.width) |x| {
+            const offset = y * source.stride + x * 8;
+            for (0..4) |channel| {
+                const value = std.mem.readInt(u16, source.bytes[offset + channel * 2 ..][0..2], .little);
+                destination[(y * source.size.width + x) * 4 + channel] = @as(f32, @floatFromInt(value)) / 65535.0;
+            }
+        }
+    }
+}
+
+test "render: UNORM16 float wrapper retains low RGB and alpha bits" {
+    const bytes = [_]u8{
+        0xee, 1,  0, 64,  0,   1,   1, 129, 0,    0xee,
+        0,    64, 0, 128, 255, 255, 1, 128, 0xee,
+    };
+    var rgba: [8]f32 = undefined;
+    unpackAbgr16(&rgba, .{
+        .size = .{ .width = 1, .height = 2 },
+        .stride = 9,
+        .format = .abgr16161616,
+        .bytes = bytes[1..],
+    });
+    for ([_]f32{ 1, 64, 257, 129, 16384, 32768, 65535, 32769 }, rgba) |integer, actual|
+        try std.testing.expectApproxEqAbs(integer / 65535.0, actual, 0.00000001);
+}
+
 fn pixmanFormat(format: render.PixelFormat) c.pixman_format_code_t {
     return switch (format) {
         .argb8888_premultiplied => c.PIXMAN_a8r8g8b8,
         .xrgb8888 => c.PIXMAN_x8r8g8b8,
+        .abgr16161616 => c.PIXMAN_rgba_float,
+        .argb2101010 => c.PIXMAN_a2r10g10b10,
+        .abgr2101010 => c.PIXMAN_a2b10g10r10,
     };
 }
 

@@ -107,17 +107,14 @@ vec3 sample_lut(vec3 value, int packed_slot) {
     return mix(z0, z1, fraction.z);
 }
 
+#include "vulkan_shm.glsl"
+
 vec4 raw_pixel(Sample item, uint index, ivec2 coordinate) {
     uint byte_offset = item.source.x + uint(coordinate.y) * item.source.w +
-        uint(coordinate.x) * 4u;
-    uint packed = source_words[byte_offset / 4u];
-    vec4 value = vec4(
-        (packed >> 16u) & 255u,
-        (packed >> 8u) & 255u,
-        packed & 255u,
-        (packed >> 24u) & 255u
-    );
-    return value / 255.0;
+        uint(coordinate.x) * shm_pixel_bytes(item.attributes.x);
+    uint word = byte_offset >> 2u;
+    uint high = item.attributes.x == 2u ? source_words[word + 1u] : 0u;
+    return unpack_shm(source_words[word], high, item.attributes.x);
 }
 
 vec4 decode_pixel(Sample item, vec4 value) {

@@ -1176,12 +1176,14 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
     c.vkGetPhysicalDeviceProperties(self.physical_device, &physical_properties);
     var physical_features: c.VkPhysicalDeviceFeatures = undefined;
     c.vkGetPhysicalDeviceFeatures(self.physical_device, &physical_features);
-    var source_format: c.VkFormatProperties = undefined;
-    c.vkGetPhysicalDeviceFormatProperties(
-        self.physical_device,
-        c.VK_FORMAT_B8G8R8A8_UNORM,
-        &source_format,
-    );
+    var sampled_formats_supported = true;
+    for (std.enums.values(render.PixelFormat)) |format| {
+        var properties: c.VkFormatProperties = undefined;
+        c.vkGetPhysicalDeviceFormatProperties(self.physical_device, sourceVkFormat(format), &properties);
+        const required = c.VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | c.VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+        sampled_formats_supported = sampled_formats_supported and
+            properties.optimalTilingFeatures & required == required;
+    }
     const sample_size = std.math.mul(usize, config.max_samples, @sizeOf(Sample)) catch
         return error.InvalidConfig;
     const descriptor_count = std.math.mul(usize, config.max_targets, 3) catch
@@ -1220,9 +1222,7 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
         physical_properties.limits.maxDescriptorSetSampledImages >= sampled_image_capacity + 2 and
         physical_properties.limits.maxPerStageDescriptorSamplers >= sampled_image_capacity + 2 and
         physical_properties.limits.maxDescriptorSetSamplers >= sampled_image_capacity + 2 and
-        source_format.optimalTilingFeatures &
-            (c.VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | c.VK_FORMAT_FEATURE_TRANSFER_DST_BIT) ==
-            (c.VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | c.VK_FORMAT_FEATURE_TRANSFER_DST_BIT);
+        sampled_formats_supported;
     if (config.require_color_management and !self.sampled_enabled)
         return error.ColorManagementUnavailable;
     try requireSyncFdSemaphore(self.physical_device);
@@ -1516,7 +1516,7 @@ fn realCreate(_: *anyopaque, drm_fd: std.posix.fd_t, config: Config) !Renderer {
     self.max_source_bytes = config.max_source_bytes;
     self.copy_offset_alignment = @max(
         @as(usize, @intCast(physical_properties.limits.optimalBufferCopyOffsetAlignment)),
-        @alignOf(u32),
+        8, // VkBufferImageCopy offsets must align to the largest SHM texel.
     );
     self.staging_buffer_size = std.math.add(
         usize,
@@ -1785,14 +1785,14 @@ fn nativeAllocation(self: *RealRenderer, token: u64) ?*NativeAllocation {
     return allocation;
 }
 
-fn allocateNative(context: *anyopaque, size: render.Size, _: render.PixelFormat) !render.NativeBacking {
+fn allocateNative(context: *anyopaque, size: render.Size, format: render.PixelFormat) !render.NativeBacking {
     const self: *RealRenderer = @ptrCast(@alignCast(context));
     const index = for (self.native_allocations, 0..) |allocation, candidate| {
         if (!allocation.active) break candidate;
     } else try growRecords(NativeAllocation, &self.native_allocations);
     const allocation = &self.native_allocations[index];
     if (allocation.generation != 0) destroyTexture(self, allocation.texture);
-    allocation.texture = try createTexture(self, size);
+    allocation.texture = try createTexture(self, size, format);
     allocation.generation +%= 1;
     if (allocation.generation == 0) allocation.generation = 1;
     allocation.active = true;
@@ -2235,6 +2235,7 @@ fn externalVkFormat(drm_format: u32, format: render.PixelFormat) ?c.VkFormat {
             c.VK_FORMAT_R8G8B8A8_UNORM
         else
             null,
+        .abgr16161616, .argb2101010, .abgr2101010 => null,
     };
 }
 
@@ -2978,7 +2979,7 @@ fn prepareTextures(self: *RealRenderer, frame: Frame, staging_capacity: usize) !
                 .initialized = true,
             }
         else if (created)
-            try createTexture(self, surface.source.size)
+            try createTexture(self, surface.source.size, surface.source.format)
         else
             existing.?.texture;
         const prepared_index = count;
@@ -3018,7 +3019,7 @@ fn prepareTextures(self: *RealRenderer, frame: Frame, staging_capacity: usize) !
         for (upload_damage.items()) |rect| {
             const width: usize = @intCast(rect.max_x - rect.min_x);
             const height: usize = @intCast(rect.max_y - rect.min_y);
-            const row_bytes = std.math.mul(usize, width, 4) catch
+            const row_bytes = std.math.mul(usize, width, surface.source.format.bytesPerPixel()) catch
                 return error.CapacityExceeded;
             const byte_count = std.math.mul(usize, row_bytes, height) catch
                 return error.CapacityExceeded;
@@ -3033,7 +3034,7 @@ fn prepareTextures(self: *RealRenderer, frame: Frame, staging_capacity: usize) !
                 const column_offset = std.math.mul(
                     usize,
                     @intCast(rect.min_x),
-                    4,
+                    surface.source.format.bytesPerPixel(),
                 ) catch return error.CapacityExceeded;
                 const offset = std.math.add(
                     usize,
@@ -3041,7 +3042,7 @@ fn prepareTextures(self: *RealRenderer, frame: Frame, staging_capacity: usize) !
                     std.math.add(usize, row_offset, column_offset) catch
                         return error.CapacityExceeded,
                 ) catch return error.CapacityExceeded;
-                break :direct .{ offset, surface.source.stride / 4, true };
+                break :direct .{ offset, surface.source.stride / surface.source.format.bytesPerPixel(), true };
             } else fallback: {
                 staging_bytes = std.mem.alignForward(
                     usize,
@@ -3450,7 +3451,7 @@ fn realDraw(_: *anyopaque, renderer: Renderer, target_value: Target, input: Fram
     var validated_bytes: usize = 0;
     for (frame.sources, frame.samples) |surface, sample| {
         const source = surface.source;
-        const packed_stride = std.math.mul(u32, source.size.width, 4) catch
+        const packed_stride = std.math.mul(u32, source.size.width, source.format.bytesPerPixel()) catch
             return error.CapacityExceeded;
         const length = if (self.sampled_enabled or source.native != null or source.upload != null)
             0
@@ -3506,7 +3507,7 @@ fn realDraw(_: *anyopaque, renderer: Renderer, target_value: Target, input: Fram
     var offset: usize = 0;
     for (frame.sources) |surface| {
         const source = surface.source;
-        const packed_stride = source.size.width * 4;
+        const packed_stride = source.size.width * source.format.bytesPerPixel();
         for (0..source.size.height) |row| {
             const source_start = @as(usize, source.stride) * row;
             const packed_start = offset + @as(usize, packed_stride) * row;
@@ -4450,10 +4451,10 @@ fn realDrawSampled(self: *RealRenderer, target: *RealTarget, frame: Frame) !std.
         if (prepared.native_token != null) continue;
         for (prepared.uploads[0..prepared.upload_count]) |upload| {
             if (upload.direct) continue;
-            const row_bytes = @as(usize, upload.width) * 4;
+            const row_bytes = @as(usize, upload.width) * source.format.bytesPerPixel();
             for (0..upload.height) |row| {
                 const source_start = @as(usize, source.stride) * (upload.y + row) +
-                    @as(usize, upload.x) * 4;
+                    @as(usize, upload.x) * source.format.bytesPerPixel();
                 const destination_start = upload.staging_offset + row_bytes * row;
                 @memcpy(
                     staging[destination_start..][0..row_bytes],
@@ -5554,13 +5555,22 @@ fn destroyBlurImage(self: *RealRenderer, target: *RealTarget) void {
     target.blur_initialized_layout = false;
 }
 
-fn createTexture(self: *RealRenderer, size: render.Size) !Texture {
+fn sourceVkFormat(format: render.PixelFormat) c.VkFormat {
+    return switch (format) {
+        .argb8888_premultiplied, .xrgb8888 => c.VK_FORMAT_B8G8R8A8_UNORM,
+        .abgr16161616 => c.VK_FORMAT_R16G16B16A16_UNORM,
+        .argb2101010 => c.VK_FORMAT_A2R10G10B10_UNORM_PACK32,
+        .abgr2101010 => c.VK_FORMAT_A2B10G10R10_UNORM_PACK32,
+    };
+}
+
+fn createTexture(self: *RealRenderer, size: render.Size, format: render.PixelFormat) !Texture {
     var image_info: c.VkImageCreateInfo = .{
         .sType = c.VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .pNext = null,
         .flags = 0,
         .imageType = c.VK_IMAGE_TYPE_2D,
-        .format = c.VK_FORMAT_B8G8R8A8_UNORM,
+        .format = sourceVkFormat(format),
         .extent = .{ .width = size.width, .height = size.height, .depth = 1 },
         .mipLevels = 1,
         .arrayLayers = 1,
@@ -5601,7 +5611,7 @@ fn createTexture(self: *RealRenderer, size: render.Size) !Texture {
         .flags = 0,
         .image = texture.image,
         .viewType = c.VK_IMAGE_VIEW_TYPE_2D,
-        .format = c.VK_FORMAT_B8G8R8A8_UNORM,
+        .format = sourceVkFormat(format),
         .components = .{
             .r = c.VK_COMPONENT_SWIZZLE_IDENTITY,
             .g = c.VK_COMPONENT_SWIZZLE_IDENTITY,

@@ -73,10 +73,17 @@ class Renderer:
                output_transfer=0, source_transfer=0, color_matrix=(1, 0, 0, 0, 1, 0, 0, 0, 1),
                luminance_scale=1, capture_matrix=(1, 0, 0, 0, 1, 0, 0, 0, 1),
                capture_phases=None, continuation=False, capture_sequence=False, copy_capture=False,
-               timings=None, scene=None, damage=None, timing_repeats=1):
+               timings=None, scene=None, damage=None, timing_repeats=1,
+               source_format=0, source_stride=None, raw_output=False):
         d = self.device
         sw, sh = source_size
         w, h = size
+        bpp = 8 if source_format == 2 else 4
+        source_stride = source_stride or sw * bpp
+        source_vk_format = {0: v.VK_FORMAT_B8G8R8A8_UNORM,
+                            2: v.VK_FORMAT_R16G16B16A16_UNORM,
+                            3: v.VK_FORMAT_A2R10G10B10_UNORM_PACK32,
+                            4: v.VK_FORMAT_A2B10G10R10_UNORM_PACK32}[source_format]
         texture = mode != "buffer"
         damage = damage or [(0, 0, w, h)]
         assert timing_repeats >= 1 and (timings is not None or timing_repeats == 1)
@@ -136,9 +143,9 @@ class Renderer:
             # Include the opaque fast path: it must not bypass filtering.
             if xrgb and alpha == 255 and output_transfer == source_transfer:
                 flags |= 0x80000000
-            sample = struct.pack("<4I12i4I8i12f", 0, sw, sh, sw * 4,
+            sample = struct.pack("<4I12i4I8i12f", 0, sw, sh, source_stride,
                 int(sx * 65536), int(sy * 65536), int(cw * 65536), int(ch * 65536),
-                0, 0, w, h, 0, 0, w, h, int(xrgb), flags, alpha, source_transfer,
+                0, 0, w, h, 0, 0, w, h, source_format or int(xrgb), flags, alpha, source_transfer,
                 xx, xy, x0, yx, yy, y0, alpha_mode, 0,
                 *color_matrix[:3], luminance_scale, *color_matrix[3:6], 0, *color_matrix[6:], 0)
             # Explicit scenes retain the recorded affine/crop instead of
@@ -148,7 +155,7 @@ class Renderer:
             packed_samples, source_pixels, offsets = [], [], []
             source_offset = 0
             for packed, data, dimensions in layers:
-                assert len(packed) == 160 and len(data) == dimensions[0] * dimensions[1] * 4
+                assert len(packed) == 160 and len(data) == struct.unpack_from("<I", packed, 12)[0] * dimensions[1]
                 packed = bytearray(packed)
                 struct.pack_into("<I", packed, 0, source_offset)
                 if mode == "texture-buffer":
@@ -166,7 +173,7 @@ class Renderer:
                         for _ in range(2)]
             target, target_view = image(w, h, v.VK_FORMAT_A2B10G10R10_UNORM_PACK32 if ten_bit else v.VK_FORMAT_R8G8B8A8_UNORM,
                 v.VK_IMAGE_USAGE_STORAGE_BIT | v.VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
-            source_images = [image(*dimensions, v.VK_FORMAT_B8G8R8A8_UNORM,
+            source_images = [image(*dimensions, source_vk_format,
                 v.VK_IMAGE_USAGE_SAMPLED_BIT | v.VK_IMAGE_USAGE_TRANSFER_DST_BIT)
                 for _, _, dimensions in layers]
             linear, linear_view = image(w, h, v.VK_FORMAT_R16G16B16A16_SFLOAT, v.VK_IMAGE_USAGE_STORAGE_BIT)
@@ -241,8 +248,10 @@ class Renderer:
                 return v.VkBufferImageCopy(bufferOffset=offset, imageSubresource=v.VkImageSubresourceLayers(
                     aspectMask=v.VK_IMAGE_ASPECT_COLOR_BIT, layerCount=1),
                     imageExtent=v.VkExtent3D(width=width, height=height, depth=1))
-            for (im, _), (_, _, dimensions), offset in zip(source_images, layers, offsets):
-                v.vkCmdCopyBufferToImage(cmd, source[0], im, v.VK_IMAGE_LAYOUT_GENERAL, 1, [region(*dimensions, offset)])
+            for (im, _), (packed, _, dimensions), offset in zip(source_images, layers, offsets):
+                copy = region(*dimensions, offset)
+                copy.bufferRowLength = struct.unpack_from("<I", packed, 12)[0] // bpp
+                v.vkCmdCopyBufferToImage(cmd, source[0], im, v.VK_IMAGE_LAYOUT_GENERAL, 1, [copy])
             def barrier(src, dst, src_access, dst_access):
                 v.vkCmdPipelineBarrier(cmd, src, dst, 0, 1, [v.VkMemoryBarrier(
                     srcAccessMask=src_access, dstAccessMask=dst_access)], 0, None, 0, None)
@@ -324,7 +333,7 @@ class Renderer:
             result = bytes(mapped)
             v.vkUnmapMemory(d, readback[1])
             self.draw_count += 1
-            if ten_bit:
+            if ten_bit and not raw_output:
                 result = bytes(channel for (pixel,) in struct.iter_unpack("<I", result)
                                for channel in (round((pixel & 1023) * 255 / 1023),
                                                round(((pixel >> 10) & 1023) * 255 / 1023),
@@ -342,6 +351,73 @@ class Renderer:
                     v.vkUnmapMemory(d, copied_readback[1])
                 return result, *captured
             return result
+
+
+def test_shm(renderer, capture_path):
+    """Independent UNORM/OVER/sRGB oracle, including values below 8-bit linear."""
+    def srgb(linear):
+        return 12.92 * linear if linear <= 0.0031308 else 1.055 * linear ** (1 / 2.4) - 0.055
+
+    background = (29, 83, 151)
+    background_linear = [c / 255 / 12.92 if c / 255 <= 0.04045
+                         else ((c / 255 + 0.055) / 1.055) ** 2.4 for c in background]
+    preview = Image.new("RGB", (720, 290), "#202020")
+    draw = ImageDraw.Draw(preview)
+    draw.text((16, 10), "SHM integer formats: Vulkan sRGB captures (nearest pixel enlargement)", fill="white")
+    start_count = renderer.draw_count
+    for column, (fmt, label) in enumerate(((2, "ABGR16161616"), (3, "ARGB2101010"), (4, "ABGR2101010"))):
+        if fmt == 2:
+            maximum, alpha_maximum, bpp = 65535, 65535, 8
+            values = [(64, 129, 257, 65535), (15000, 7500, 1250, 21845),
+                      (400, 900, 1200, 32769), (60000, 40000, 30000, 65535)]
+            pack = lambda r, g, b, a: struct.pack("<4H", r, g, b, a)
+        else:
+            maximum, alpha_maximum, bpp = 1023, 3, 4
+            values = [(1, 2, 3, 3), (230, 113, 19, 1), (7, 14, 25, 2), (941, 627, 470, 3)]
+            pack = lambda r, g, b, a: struct.pack("<I", (a << 30) | (g << 10) |
+                                                 ((r << 20) | b if fmt == 3 else (b << 20) | r))
+        # Poison padding catches both incorrect row stride and 4/8-byte addressing.
+        pixels = b"".join(pack(*values[y * 2]) + pack(*values[y * 2 + 1]) + b"\xee" * bpp for y in range(2))
+        for mode in ("buffer", "texture", "texture-buffer"):
+            for ten_bit in (False, True):
+                for transparent in (False, True):
+                    result, before, after = renderer.render(
+                        pixels, (2, 2), (2, 2), mode, source_format=fmt, source_stride=3 * bpp,
+                        source_transfer=1, alpha_mode=1, background=background,
+                        background_alpha=0 if transparent else 255, ten_bit=ten_bit,
+                        raw_output=True, capture_phases=3, copy_capture=True)
+                    expected_capture, expected_output = [], []
+                    for r, g, b, a in values:
+                        source_alpha = a / alpha_maximum
+                        alpha = source_alpha if transparent else 1
+                        rgb = [c / maximum + (0 if transparent else bg * (1 - source_alpha))
+                               for c, bg in zip((r, g, b), background_linear)]
+                        encoded = [srgb(c / alpha) * alpha for c in rgb]
+                        expected_capture.extend([round(c * 255) for c in encoded[::-1]] + [round(alpha * 255)])
+                        expected_output.extend([round(c * (1023 if ten_bit else 255)) for c in encoded[::-1]] +
+                                               [round(alpha * (3 if ten_bit else 255))])
+                    actual_output = ([c for (p,) in struct.iter_unpack("<I", result)
+                                      for c in (p & 1023, (p >> 10) & 1023, (p >> 20) & 1023, p >> 30)]
+                                     if ten_bit else list(result))
+                    # One output-code tolerance permits implementation rounding, not 8-bit ingestion.
+                    assert max(abs(a - b) for a, b in zip(actual_output, expected_output)) <= 1, (label, mode, actual_output, expected_output)
+                    assert max(abs(a - b) for a, b in zip(before, expected_capture)) <= 1, (label, mode, before, expected_capture)
+                    assert before == after
+                    if mode == "texture" and not ten_bit and not transparent:
+                        image = Image.frombytes("RGBA", (2, 2), before, "raw", "BGRA")
+                        preview.paste(image.convert("RGB").resize((208, 208), Image.Resampling.NEAREST), (16 + column * 240, 56))
+        draw.text((16 + column * 240, 36), label, fill="white")
+    for mode in ("buffer", "texture", "texture-buffer"):
+        # Alpha 129/65535 attenuates linear white to code 1021. Premature UNORM8
+        # alpha rounding would give code 1019; zero alpha must leave white intact.
+        for alpha, expected in ((0, 1023), (129, 1021)):
+            result = renderer.render(struct.pack("<4H", 0, 0, 0, alpha), (1, 1), (1, 1), mode,
+                                     source_format=2, source_transfer=1, output_transfer=1,
+                                     background=(255, 255, 255), ten_bit=True, raw_output=True)
+            assert struct.unpack("<I", result)[0] == (3 << 30) | (expected << 20) | (expected << 10) | expected
+    if capture_path:
+        preview.save(capture_path)
+    print(f"SHM precision: {renderer.draw_count - start_count} draws passed (3 layouts, 3 paths, 8/10-bit output, alpha and capture)")
 
 
 def test(renderer, compare_shader_dir):
@@ -737,6 +813,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--capture", type=Path)
     parser.add_argument("--capture-hdr", type=Path)
+    parser.add_argument("--capture-shm", type=Path)
     parser.add_argument("--capture-surface", type=Path, nargs=2, metavar=("SOURCE_2X", "OUTPUT"))
     parser.add_argument("--compare-shader-dir", type=Path)
     parser.add_argument("--benchmark", action="store_true", help="time UHD sampled-composition filter variants offscreen")
@@ -749,6 +826,7 @@ if __name__ == "__main__":
         test(renderer, args.compare_shader_dir)
         test_scene(renderer)
         test_hdr_capture(renderer, args.capture_hdr)
+        test_shm(renderer, args.capture_shm)
         if args.benchmark_stall:
             benchmark_stall(renderer)
         if args.capture:

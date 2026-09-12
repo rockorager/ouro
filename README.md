@@ -579,6 +579,18 @@ calibration is included when present. Auto and Pixman modes reject configured
 output profiles and do not advertise color-management behavior they cannot
 guarantee.
 
+SHM clients can use ARGB8888, XRGB8888, ABGR16161616 (unsigned 16-bit
+channels, not half-float), ARGB2101010, and ABGR2101010. Vulkan retains the
+integer precision in uploads and decodes into its linear-light composition;
+Pixman uses native 10-bit sources and a float wrapper for UNORM16 sources,
+without changing its non-color-managed policy. These are client SHM layouts:
+DMA-BUF import remains limited to the existing 8-bit formats, and the existing
+XRGB2101010 scanout support is independent. Capture destinations remain 8-bit
+sRGB. `zig build test-shm` checks layout, precision, and generated-client
+integration. `uv run --with vulkan --with pillow python test/vulkan-cursor.py
+--capture-shm shm.png` checks the SHM formats offscreen, including low linear
+values, alpha, padded strides, both shader paths, and 8/10-bit output.
+
 The physical path activates every eligible desktop output and requires a usable
 `/dev/dri` device and libseat backend. `Loop.turn` is the sole io_uring
 submitter; protocol, backend, render, and presentation callbacks only retain

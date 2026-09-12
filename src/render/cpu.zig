@@ -608,6 +608,48 @@ test "render: premultiplied per-pixel and global alpha blend exactly" {
     try std.testing.expectEqual(@as(u32, 0xff80007f), std.mem.readInt(u32, target.bytes[4..8], .little));
 }
 
+test "render: high precision SHM channel order alpha and odd row strides" {
+    var renderer = try Renderer.init(std.testing.allocator, .{
+        .max_samples = 1,
+        .max_source_width = 1,
+        .max_source_height = 2,
+    });
+    defer renderer.deinit();
+    for ([_]render_types.PixelFormat{ .abgr16161616, .argb2101010, .abgr2101010 }, [_]u32{ 8, 4, 4 }) |format, bpp| {
+        var bytes: [19]u8 = @splat(0xee);
+        const stride = bpp + 1;
+        for (0..2) |row| {
+            const offset = 1 + row * stride;
+            if (format == .abgr16161616) {
+                const rgba: [4]u16 = if (row == 0) .{ 8192, 16384, 32768, 65535 } else .{ 4096, 8192, 16384, 21845 };
+                for (rgba, 0..) |channel, i| std.mem.writeInt(u16, bytes[offset + 2 * i ..][0..2], channel, .little);
+            } else {
+                const r: u32 = if (row == 0) 128 else 64;
+                const g: u32 = if (row == 0) 256 else 128;
+                const b: u32 = if (row == 0) 512 else 256;
+                const a: u32 = if (row == 0) 3 else 1;
+                const pixel = (a << 30) | (g << 10) | (if (format == .argb2101010) (r << 20) | b else (b << 20) | r);
+                std.mem.writeInt(u32, bytes[offset..][0..4], pixel, .little);
+            }
+        }
+        var value = sample(bytes[1 .. 1 + 2 * stride], 1, 2, stride, .{ .x = 0, .y = 0, .width = 1, .height = 2 });
+        value.source.format = format;
+        var render_list = list(1, 2, &.{value});
+        render_list.output_format = .argb8888_premultiplied;
+        render_list.clear = .{ .r = 30, .g = 60, .b = 90 };
+        var target = FakeTarget{ .width = 1, .height = 2, .stride = 4, .format = gbm.format_argb8888 };
+        try renderFull(&renderer, &target, render_list);
+        // Electrical OVER (Pixman does not advertise color management).
+        for ([_]u8{ 128, 64, 32, 255, 124, 72, 36, 255 }, target.bytes[0..8]) |expected, actual|
+            try std.testing.expect(@abs(@as(i16, expected) - actual) <= 1);
+        value.source.stride = bpp - 1;
+        try std.testing.expectError(error.InvalidSource, render_types.validateSample(value));
+        value.source.stride = stride;
+        value.source.bytes = value.source.bytes[0 .. value.source.bytes.len - 1];
+        try std.testing.expectError(error.InvalidSource, render_types.validateSample(value));
+    }
+}
+
 test "render: R10 map unmap discard recovery and no submit" {
     var renderer = try Renderer.init(std.testing.allocator, .{
         .max_samples = 1,

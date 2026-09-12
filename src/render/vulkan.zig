@@ -338,7 +338,7 @@ pub const Renderer = struct {
             validated.transform = planned.transform;
             validated.global_alpha = planned.global_alpha;
             _ = try render_types.validateSample(validated);
-            const packed_stride = std.math.mul(u32, source.source.size.width, 4) catch
+            const packed_stride = std.math.mul(u32, source.source.size.width, source.source.format.bytesPerPixel()) catch
                 return error.SourceCapacityExceeded;
             const length = if (!self.packs_sources or
                 source.source.native != null or source.source.upload != null)
@@ -1181,6 +1181,45 @@ test "render-vulkan: odd source strides repack to aligned contiguous shader word
     try std.testing.expectEqual([4]u32{ 4, 1, 1, 4 }, fake.last_samples[1].source);
 }
 
+test "render-vulkan: mixed SHM widths pack complete pixels without row padding" {
+    var fake = FakePlatform{};
+    var renderer = try Renderer.init(std.testing.allocator, fake.platform(), 41, .{
+        .max_samples = 2,
+        .max_source_bytes = 24,
+        .max_targets = 1,
+    });
+    defer renderer.deinit();
+    var targets = try renderer.createTargets(1);
+    defer renderer.destroyTargets(&targets);
+    const narrow = [_]u8{ 1, 2, 3, 4, 0xaa, 5, 6, 7, 8, 0xbb };
+    const wide = [_]u8{ 9, 10, 11, 12, 13, 14, 15, 16, 0xcc, 17, 18, 19, 20, 21, 22, 23, 24, 0xdd };
+    var samples: [2]render_types.SurfaceSample = undefined;
+    var list = testList(&narrow, &samples[0]);
+    _ = testList(&wide, &samples[1]);
+    samples[0].source.format = .argb2101010;
+    samples[1].source.format = .abgr16161616;
+    samples[0].source.stride = 5;
+    samples[1].source.stride = 9;
+    samples[0].source.size.height = 2;
+    samples[1].source.size.height = 2;
+    samples[1].sample.surface = 2;
+    list.samples = &samples;
+    const planned = [_]render_types.PlannedSample{ plannedFromSample(samples[0], 0), plannedFromSample(samples[1], 1) };
+    const damage = [_]render_types.Rect{.{ .x = 0, .y = 0, .width = 1, .height = 1 }};
+    var plan = damagePlan(&planned[0], &damage, true);
+    plan.samples = &planned;
+    var target = FakeTarget{};
+    const completion = try renderer.render(&targets, target.target(), .{ .slot = 0, .generation = 1 }, list, plan);
+    _ = linux.close(completion);
+    var expected: [24]u8 = undefined;
+    for (&expected, 1..) |*byte, index| byte.* = @intCast(index);
+    try std.testing.expectEqualSlices(u8, &expected, fake.last_bytes[0..fake.last_byte_count]);
+    try std.testing.expectEqual([4]u32{ 0, 1, 2, 4 }, fake.last_samples[0].source);
+    try std.testing.expectEqual([4]u32{ 8, 1, 2, 8 }, fake.last_samples[1].source);
+    try std.testing.expectEqual(@as(u32, 3), fake.last_samples[0].attributes[0]);
+    try std.testing.expectEqual(@as(u32, 2), fake.last_samples[1].attributes[0]);
+}
+
 test "render-vulkan: direct upload sources do not consume fallback frame bytes" {
     var fake = FakePlatform{};
     var renderer = try Renderer.init(std.testing.allocator, fake.platform(), 41, .{
@@ -1410,7 +1449,7 @@ const FakePlatform = struct {
     draw_count: usize = 0,
     destroy_target_count: usize = 0,
     destroy_count: usize = 0,
-    last_bytes: [16]u8 = undefined,
+    last_bytes: [24]u8 = undefined,
     last_byte_count: usize = 0,
     last_sample: vk.Sample = undefined,
     last_samples: [2]vk.Sample = undefined,
@@ -1520,7 +1559,7 @@ const FakePlatform = struct {
         var offset: usize = 0;
         for (frame.sources) |sample| {
             const source = sample.source;
-            const packed_stride = source.size.width * 4;
+            const packed_stride = source.size.width * source.format.bytesPerPixel();
             if (source.native != null or source.upload != null) continue;
             for (0..source.size.height) |row| {
                 const source_start = @as(usize, source.stride) * row;
