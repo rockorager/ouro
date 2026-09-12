@@ -2073,6 +2073,20 @@ fn importExternalPlane(self: *RealRenderer, image: c.VkImage, fd: std.posix.fd_t
     return memory;
 }
 
+fn externalImageFlags(format: render.PixelFormat, flags: c.VkImageCreateFlags) c.VkImageCreateFlags {
+    if (format.colorPlanes() > 1) return flags | c.VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+    // VUID-VkImageCreateInfo-format-01577 also applies to RGB images whose
+    // modifier has multiple memory planes rather than multiple color planes.
+    return flags | (if (flags & c.VK_IMAGE_CREATE_DISJOINT_BIT != 0) @as(u32, c.VK_IMAGE_CREATE_ALIAS_BIT) else 0);
+}
+
+test "render-vulkan: disjoint RGB modifier planes require alias creation flags" {
+    try std.testing.expectEqual(@as(u32, 0), externalImageFlags(.abgr16161616, 0));
+    try std.testing.expectEqual(@as(u32, c.VK_IMAGE_CREATE_DISJOINT_BIT | c.VK_IMAGE_CREATE_ALIAS_BIT), externalImageFlags(.abgr16161616, c.VK_IMAGE_CREATE_DISJOINT_BIT));
+    try std.testing.expectEqual(@as(u32, c.VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT), externalImageFlags(.nv12, 0));
+    try std.testing.expectEqual(@as(u32, c.VK_IMAGE_CREATE_DISJOINT_BIT | c.VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT), externalImageFlags(.nv12, c.VK_IMAGE_CREATE_DISJOINT_BIT));
+}
+
 fn requireExternalSampling(
     self: *RealRenderer,
     source: render.ExternalSource,
@@ -2123,7 +2137,7 @@ fn requireExternalSampling(
         .type = c.VK_IMAGE_TYPE_2D,
         .tiling = c.VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
         .usage = c.VK_IMAGE_USAGE_TRANSFER_SRC_BIT | c.VK_IMAGE_USAGE_SAMPLED_BIT,
-        .flags = flags | (if (format.colorPlanes() > 1) @as(u32, c.VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) else 0),
+        .flags = externalImageFlags(format, flags),
     };
     var external_properties: c.VkExternalImageFormatProperties = .{
         .sType = c.VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
@@ -2233,8 +2247,7 @@ fn importedImage(self: *RealRenderer, source: render.ExternalSource, size: rende
     var info: c.VkImageCreateInfo = .{
         .sType = c.VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .pNext = &external,
-        .flags = @as(u32, if (backing.disjoint) c.VK_IMAGE_CREATE_DISJOINT_BIT else 0) |
-            (if (format.colorPlanes() > 1) @as(u32, c.VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) else 0),
+        .flags = externalImageFlags(format, if (backing.disjoint) c.VK_IMAGE_CREATE_DISJOINT_BIT else 0),
         .imageType = c.VK_IMAGE_TYPE_2D,
         .format = vk_format,
         // Linear packed 4:2:2 is viewed as four UNORM8 bytes per pixel pair.
